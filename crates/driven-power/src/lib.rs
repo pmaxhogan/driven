@@ -18,6 +18,32 @@
 use async_trait::async_trait;
 use tokio::sync::broadcast;
 
+// Metered / reachability detection shared by every per-OS backend
+// (DESIGN s5.7). Kept private; backends call it from their poll loop.
+mod network;
+
+// Per-OS [`PowerSource`] backends (DESIGN s5.7, s5.10.1). Exactly one is
+// compiled per target; each exports a `RealPowerSource` re-exported below so
+// the app wires `RealPowerSource::new()` without a `cfg` at the call site.
+#[cfg(target_os = "linux")]
+mod linux;
+#[cfg(target_os = "macos")]
+mod macos;
+#[cfg(target_os = "windows")]
+mod windows;
+
+#[cfg(target_os = "linux")]
+pub use linux::RealPowerSource;
+#[cfg(target_os = "macos")]
+pub use macos::RealPowerSource;
+/// The host's real [`PowerSource`] implementation. The app constructs it via
+/// [`RealPowerSource::new`] and drives the 30 s poll loop via
+/// `RealPowerSource::spawn_poller`. Exactly one per-OS definition is in
+/// scope per target; tests use `FakePowerSource` from
+/// `driven-test-fixtures` instead.
+#[cfg(target_os = "windows")]
+pub use windows::RealPowerSource;
+
 /// Current power / network reachability snapshot (SPEC s10).
 ///
 /// This struct is read on every orchestrator tick and embedded in
