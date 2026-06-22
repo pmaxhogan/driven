@@ -398,6 +398,20 @@ pub trait StateRepo: Send + Sync {
     /// or after the orchestrator gives up on it.
     async fn delete_pending_op(&self, id: PendingOpId) -> Result<()>;
 
+    /// Overwrites the `payload_json` of an existing `pending_ops` row
+    /// (DESIGN s5.4 / s5.6). The executor uses this to persist the
+    /// uploaded blake3 hash and the live resumable session (URL,
+    /// last-acked offset, etc.) into the op AFTER it has hashed the file
+    /// but before/while the bytes land on Drive, so a crash mid-upload can
+    /// resume from the persisted offset rather than re-uploading from zero
+    /// and so an adopted orphan can be re-hashed against the bytes that
+    /// were actually uploaded. Idempotent; a missing id is an error.
+    async fn update_pending_op_payload(
+        &self,
+        id: PendingOpId,
+        payload_json: &serde_json::Value,
+    ) -> Result<()>;
+
     /// Atomically commit the result of a successful `create` op.
     ///
     /// Upserts the new `file_state` row AND deletes the `pending_op` that

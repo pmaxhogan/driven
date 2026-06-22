@@ -42,7 +42,7 @@ use driven_crypto::key::SourceKey;
 use driven_crypto::{ContentDecryptor, DrivenCryptoSuite, SourceCryptoSuite, HEADER_LEN};
 
 use driven_drive::fake::{InMemoryRemoteStore, CLIENT_OP_UUID_KEY};
-use driven_drive::remote_store::RemoteStore;
+use driven_drive::remote_store::{RemoteStore, ResumableKind, ResumeProgress, UploadBody};
 
 use driven_power::{PowerSource, PowerState};
 use driven_test_fixtures::clock::FakeClock;
@@ -486,22 +486,25 @@ async fn rate_limit_on_seventh_file_retries_and_completes() {
 }
 
 // ---------------------------------------------------------------------------
-// Row: crash mid-upload -> next sync adopts the orphaned remote object,
-//      no duplicate (DESIGN s5.6 client_op_uuid reconciliation)
+// Row: crash mid-upload -> next sync recovers. BOTH recovery mechanisms exist
+//      per DESIGN s5.4 (byte-level resumable resume) + s5.6 (client_op_uuid
+//      orphan adoption), and are covered by the two tests below.
 // ---------------------------------------------------------------------------
 //
-// SPEC AMBIGUITY (see report): the ROADMAP row says "next sync resumes the
-// resumable session", but the executor has no byte-level cross-restart resume -
-// `upload_resumable` opens a fresh session every call and `reconcile` never
-// reopens a session or calls `resume_chunk`. Recovery is the `client_op_uuid`
-// reconciliation protocol (DESIGN s5.6): the create's UUID lands in the remote
-// object's `appProperties` atomically with the bytes, so after a crash the
-// orphaned object is ADOPTED via `find_by_op_uuid` rather than re-uploaded.
+// 1. ADOPT (DESIGN s5.6): the object FINALIZED on Drive (UUID stamped in
+//    appProperties atomically with the bytes) but the local
+//    `commit_create_result` was lost before it ran. Reconcile finds the orphan
+//    via `find_by_op_uuid`, re-hashes the current local file against the
+//    uploaded blake3 (P1-2), and adopts the SAME object id - no duplicate.
 //
-// The only crash window where a DUPLICATE could occur is: the object landed on
-// Drive (with its UUID stamped) but the local `commit_create_result` was lost
-// before it ran. We model exactly that leftover state and prove reconcile
-// adopts the orphan instead of creating a second object.
+// 2. RESUME (DESIGN s5.4): the crash happened MID-upload - a resumable session
+//    was open with some chunks acked but the object NOT yet finalized. The
+//    session (url/issued_at/total/kind/last-acked offset) was persisted in
+//    `pending_ops.payload_json`; reconcile resumes it BYTE-FOR-BYTE from the
+//    persisted offset (P1-3) rather than re-uploading from zero. Because the
+//    fake rejects any `resume_chunk` whose offset != bytes-already-received,
+//    completing the upload through the SAME session is itself proof the resume
+//    started from the persisted offset, not from zero.
 
 #[tokio::test]
 async fn crash_mid_upload_adopts_orphan_without_duplicate() {
@@ -571,6 +574,9 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
     //     path, which finds the orphan by UUID).
     state.delete_file_state(src.id, &rel).await.unwrap();
     let now = clock.now_ms();
+    // P1-2: the op records the blake3 (over plaintext) of what it uploaded so
+    // adoption can re-hash the current local file and prove it still matches.
+    let uploaded_hex = hex::encode(blake3::hash(&big).as_bytes());
     state
         .enqueue_pending_op(NewPendingOp {
             source_id: src.id,
@@ -579,6 +585,7 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
             payload_json: serde_json::json!({
                 "client_op_uuid": op_uuid,
                 "drive_file_id": serde_json::Value::Null,
+                "uploaded_blake3_hex": uploaded_hex,
             }),
             scheduled_for: now,
             created_at: now,
@@ -636,6 +643,303 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
         live_object_count(&remote, &folder).await,
         1,
         "still exactly one object after a full follow-up cycle"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row: crash MID-upload (object NOT finalized) -> next sync RESUMES the
+//      persisted resumable session BYTE-FOR-BYTE from the last-acked offset
+//      (DESIGN s5.4 / s5.6, P1-3). Distinct from the adopt-orphan row above.
+// ---------------------------------------------------------------------------
+//
+// We model a partial create: a resumable session is opened and one 4 MiB wire
+// chunk is acked, but the final chunk never lands, so the object does NOT
+// materialize (a Create only commits on its final chunk). We persist the live
+// session + last-acked offset into `pending_ops.payload_json` exactly as the
+// executor does, then a fresh executor reconciles. The ONLY way the upload can
+// complete is to push the remaining bytes from the persisted offset through the
+// SAME session - the fake rejects any chunk whose offset != bytes-received, so
+// a from-zero retry would be `SessionInvalid`. Completion is therefore proof of
+// byte-level resume.
+
+#[tokio::test]
+async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
+    use bytes::Bytes;
+
+    const CHUNK_256K: usize = 256 * 1024;
+    const WIRE_CHUNK: usize = 4 * 1024 * 1024;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
+
+    // A file spanning > 1 wire chunk so a partial upload leaves a real offset.
+    let total_len = WIRE_CHUNK + 2 * CHUNK_256K + 17; // 4 MiB + 512 KiB + tail
+    let big: Vec<u8> = (0..total_len).map(|i| (i % 251) as u8).collect();
+    write_file(src_dir.path(), "resume.bin", &big);
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+    let rel = RelativePath::try_from("resume.bin".to_string()).unwrap();
+
+    let clock = Arc::new(FakeClock::new());
+
+    // --- model the crash: open a Create session, ack the first wire chunk ---
+    let op_uuid = uuid::Uuid::new_v4().to_string();
+    let mut app_props = std::collections::HashMap::new();
+    app_props.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.clone());
+    app_props.insert("driven.source_id".to_string(), src.id.to_string());
+
+    let session = remote
+        .resumable_session(
+            ResumableKind::Create {
+                parent_id: folder.clone(),
+                name: "resume.bin".to_string(),
+                app_properties: app_props.clone(),
+            },
+            "application/octet-stream",
+            total_len as u64,
+        )
+        .await
+        .unwrap();
+
+    // Push exactly the first wire chunk; it must be accepted (InProgress).
+    let first = Bytes::copy_from_slice(&big[..WIRE_CHUNK]);
+    match remote.resume_chunk(&session, 0, first).await.unwrap() {
+        ResumeProgress::InProgress { received } => {
+            assert_eq!(received as usize, WIRE_CHUNK, "first chunk acked");
+        }
+        other => panic!("expected InProgress, got {other:?}"),
+    }
+    // The object has NOT materialized yet (Create commits only on final chunk).
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        0,
+        "no object until the resumable Create finalizes"
+    );
+
+    // --- persist the op exactly as the executor would (P1-3 payload) --------
+    // The JSON shape mirrors executor::PendingOpPayload + PersistedResumable:
+    // resumable.session is the serialized ResumableSession; acked_offset is the
+    // last byte count Drive acknowledged.
+    let session_json = serde_json::to_value(&session).unwrap();
+    let uploaded_hex = hex::encode(blake3::hash(&big).as_bytes());
+    let now = clock.now_ms();
+    state
+        .enqueue_pending_op(NewPendingOp {
+            source_id: src.id,
+            op_type: "upload".to_string(),
+            relative_path: rel.clone(),
+            payload_json: serde_json::json!({
+                "client_op_uuid": op_uuid,
+                "drive_file_id": serde_json::Value::Null,
+                "uploaded_blake3_hex": uploaded_hex,
+                "resumable": {
+                    "session": session_json,
+                    "acked_offset": WIRE_CHUNK as u64,
+                }
+            }),
+            scheduled_for: now,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+
+    // --- phase 2: a fresh executor reconciles -> resumes the session --------
+    let exec = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote: remote.clone(),
+            state: state.clone(),
+            pacer: test_pacer(clock.clone()),
+            crypto: None,
+        },
+        clock.clone(),
+    );
+    exec.reconcile(&src).await.unwrap();
+
+    // The upload completed via byte-level resume: exactly one object, and it
+    // carries the full byte count (proving the resumed tail bytes landed, NOT a
+    // truncated or from-zero re-do).
+    let children = remote.list_folder(&folder).await.unwrap();
+    assert_eq!(children.len(), 1, "resume finalized exactly one object");
+    assert_eq!(
+        children[0].size,
+        Some(total_len as u64),
+        "resumed object has the full size (tail bytes landed via resume)"
+    );
+    // No session leaked (completed sessions are removed).
+    assert_eq!(remote.open_session_count(), 0, "session consumed by resume");
+
+    // file_state committed Synced with the real plaintext hash, op drained.
+    let fs = state
+        .get_file_state(src.id, &rel)
+        .await
+        .unwrap()
+        .expect("file_state committed by resume");
+    assert_eq!(
+        fs.drive_file_id.as_deref(),
+        Some(children[0].id.as_str()),
+        "committed the resumed object id"
+    );
+    assert!(state
+        .get_pending_ops_for_source(src.id)
+        .await
+        .unwrap()
+        .is_empty());
+
+    // A follow-up steady-state cycle re-uploads nothing and does not duplicate.
+    let orch = orchestrator(
+        account,
+        state.clone(),
+        remote.clone(),
+        Arc::new(FakePowerSource::new(power_on_ac())),
+        Arc::new(FakeNetProbe::online()),
+        clock.clone(),
+        OrchestratorConfig::default(),
+    );
+    let progress = run_cycle_capture_progress(&orch).await;
+    assert_eq!(progress.files_done, 0, "steady-state: nothing re-uploaded");
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        1,
+        "still exactly one object after the resume + a full follow-up cycle"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// Row: crash-mid-upload orphan whose LOCAL bytes changed before recovery ->
+//      reconcile requeues + the NEXT full sync cycle re-uploads the NEW bytes
+//      as an UPDATE (no duplicate). This is the end-to-end proof of P1-2: it
+//      runs the real scan -> plan -> execute pipeline so a requeue row that
+//      the FastPath scanner would treat as "unchanged" (the data-loss trap)
+//      fails loudly here.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn reconcile_requeue_reuploads_changed_bytes_on_next_cycle() {
+    use tokio::io::AsyncReadExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
+
+    let old_bytes = b"OLD uploaded bytes".to_vec();
+    let new_bytes = b"NEW locally-edited bytes - different length".to_vec();
+
+    // The orphan landed on Drive with the OLD bytes + its client_op_uuid.
+    let op_uuid = uuid::Uuid::new_v4().to_string();
+    let mut app = std::collections::HashMap::new();
+    app.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.clone());
+    let created = remote
+        .create(
+            &folder,
+            "drift.bin",
+            "application/octet-stream",
+            UploadBody::Bytes(bytes::Bytes::from(old_bytes.clone())),
+            app,
+        )
+        .await
+        .unwrap();
+
+    // But locally the file now holds the NEW bytes (edited after the upload,
+    // before the lost commit).
+    write_file(src_dir.path(), "drift.bin", &new_bytes);
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+    let rel = RelativePath::try_from("drift.bin".to_string()).unwrap();
+
+    let clock = Arc::new(FakeClock::new());
+    // The op recorded the OLD bytes' hash; reconcile re-hashes the NEW local
+    // file, sees a mismatch, and requeues.
+    let uploaded_hex = hex::encode(blake3::hash(&old_bytes).as_bytes());
+    let now = clock.now_ms();
+    state
+        .enqueue_pending_op(NewPendingOp {
+            source_id: src.id,
+            op_type: "upload".to_string(),
+            relative_path: rel.clone(),
+            payload_json: serde_json::json!({
+                "client_op_uuid": op_uuid,
+                "drive_file_id": serde_json::Value::Null,
+                "uploaded_blake3_hex": uploaded_hex,
+            }),
+            scheduled_for: now,
+            created_at: now,
+        })
+        .await
+        .unwrap();
+
+    // Phase 1: reconcile requeues the orphan (no duplicate, not Synced).
+    let exec = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote: remote.clone(),
+            state: state.clone(),
+            pacer: test_pacer(clock.clone()),
+            crypto: None,
+        },
+        clock.clone(),
+    );
+    exec.reconcile(&src).await.unwrap();
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        1,
+        "reconcile produced no duplicate"
+    );
+
+    // Phase 2: a full sync cycle MUST re-upload the NEW bytes. This is the
+    // discriminating check - a requeue row stamped with the current local
+    // identity would be skipped by the FastPath scanner and files_done would
+    // be 0 with Drive still holding the OLD bytes.
+    let orch = orchestrator(
+        account,
+        state.clone(),
+        remote.clone(),
+        Arc::new(FakePowerSource::new(power_on_ac())),
+        Arc::new(FakeNetProbe::online()),
+        clock.clone(),
+        OrchestratorConfig::default(),
+    );
+    let progress = run_cycle_capture_progress(&orch).await;
+    assert_eq!(
+        progress.files_done, 1,
+        "the changed file must be re-uploaded on the next cycle"
+    );
+    assert_eq!(progress.errors, 0);
+
+    // Still exactly one object (UPDATE against the same id, no duplicate)...
+    let children = remote.list_folder(&folder).await.unwrap();
+    assert_eq!(children.len(), 1, "re-upload was an UPDATE, not a CREATE");
+    assert_eq!(
+        children[0].id, created.id,
+        "the SAME drive object id was updated"
+    );
+    // ...and its bytes are now the NEW content, not the stale OLD bytes.
+    let mut blob = Vec::new();
+    remote
+        .download(&children[0].id)
+        .await
+        .unwrap()
+        .0
+        .read_to_end(&mut blob)
+        .await
+        .unwrap();
+    assert_eq!(blob, new_bytes, "Drive now holds the re-uploaded NEW bytes");
+
+    // And the file is finally Synced with the NEW plaintext hash.
+    let fs = state
+        .get_file_state(src.id, &rel)
+        .await
+        .unwrap()
+        .expect("file_state after re-upload");
+    assert_eq!(
+        fs.hash_blake3,
+        *blake3::hash(&new_bytes).as_bytes(),
+        "file_state carries the NEW bytes' hash after re-upload"
     );
 }
 

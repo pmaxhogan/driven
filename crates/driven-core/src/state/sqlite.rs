@@ -919,6 +919,26 @@ impl StateRepo for SqliteStateRepo {
         Ok(())
     }
 
+    async fn update_pending_op_payload(
+        &self,
+        id: PendingOpId,
+        payload_json: &serde_json::Value,
+    ) -> Result<()> {
+        let id_v = id.0;
+        let payload = serde_json::to_string(payload_json)?;
+        let result = sqlx::query!(
+            "UPDATE pending_ops SET payload_json = ?1 WHERE id = ?2",
+            payload,
+            id_v,
+        )
+        .execute(&self.pool)
+        .await?;
+        if result.rows_affected() == 0 {
+            anyhow::bail!("state.update_pending_op_payload: pending_op id {id_v} not found");
+        }
+        Ok(())
+    }
+
     // --- activity_log -------------------------------------------------------
 
     async fn write_activity(&self, row: NewActivity) -> Result<ActivityId> {

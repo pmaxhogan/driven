@@ -23,6 +23,7 @@ use std::collections::HashMap;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use serde::{Deserialize, Serialize};
 
 // -----------------------------------------------------------------------------
 // Value types.
@@ -58,7 +59,12 @@ pub struct RemoteEntry {
 
 /// A resumable upload session issued by [`RemoteStore::resumable_session`]
 /// (SPEC s3).
-#[derive(Debug)]
+///
+/// Derives `Serialize`/`Deserialize` so the executor can persist the live
+/// session in `pending_ops.payload_json` and resume it byte-for-byte after
+/// a process restart (DESIGN s5.4: "Resumable session URLs survive process
+/// restarts: persisted in `pending_ops.payload_json`").
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub struct ResumableSession {
     /// The session URL Drive issues. Caller posts chunks to this URL.
     pub url: String,
@@ -75,7 +81,7 @@ pub struct ResumableSession {
 /// (SPEC s3). Drive uses different endpoints for the two; POST always
 /// creates a new object and would produce a duplicate if used to
 /// "overwrite".
-#[derive(Debug)]
+#[derive(Debug, Clone, Serialize, Deserialize)]
 pub enum ResumableKind {
     /// Create a new file under `parent_id` with `name`. The
     /// `app_properties` are attached at session-open time so they land

@@ -121,6 +121,83 @@ const MAX_TRANSIENT_RETRIES: u32 = 6;
 /// not loop forever.
 const MAX_SESSION_RESTARTS: u32 = 3;
 
+/// Max age of a persisted resumable session before it is discarded and the
+/// transfer restarts from offset 0 (DESIGN s5.4: "Driven discards sessions
+/// older than 6 days; Drive expires at 7"). Expressed in milliseconds.
+const SESSION_MAX_AGE_MS: i64 = 6 * 24 * 60 * 60 * 1000;
+
+/// Sentinel `mtime_ns` stamped on a requeued `file_state` row when an
+/// adopted orphan's local bytes no longer match what was uploaded (P1-2).
+///
+/// The FastPath scanner (scanner.rs) treats a file as unchanged iff its
+/// current `(size, mtime_ns)` equals the stored row's. To GUARANTEE the
+/// changed bytes get re-uploaded, the requeue row must store an identity
+/// the live file can never match - `i64::MIN` is never produced by a real
+/// filesystem mtime, so the next scan always sees a mismatch, re-emits the
+/// file, and (because the row keeps its `drive_file_id`) the executor
+/// re-uploads it as an UPDATE against the same object (no duplicate).
+const REQUEUE_FORCE_RESCAN_MTIME_NS: i64 = i64::MIN;
+
+// -----------------------------------------------------------------------------
+// Pending-op payload (persisted in pending_ops.payload_json; DESIGN s5.4 / s5.6).
+// -----------------------------------------------------------------------------
+
+/// The structured payload Driven persists in `pending_ops.payload_json` for
+/// an upload op. Carries the crash-safe `client_op_uuid` (DESIGN s5.6), the
+/// optional pre-existing `drive_file_id` (create vs update), the BLAKE3 of
+/// the plaintext that was uploaded (so a reconciled orphan can be re-hashed
+/// against the bytes that actually landed - P1-2), and the live resumable
+/// session if one is in flight (so a crash mid-upload resumes from the
+/// last-acked offset rather than restarting from zero - P1-3).
+///
+/// Serialized as a free-form JSON object (the column is TEXT), so adding
+/// fields needs no migration. Unknown/absent fields default, which keeps it
+/// forward- and backward-compatible with rows written by older code.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+struct PendingOpPayload {
+    /// The crash-safe create/update UUID (DESIGN s5.6 step 1).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    client_op_uuid: Option<String>,
+    /// The existing Drive file id, present iff this op is an UPDATE. `None`
+    /// (or JSON `null`) marks a CREATE.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    drive_file_id: Option<String>,
+    /// Hex-encoded BLAKE3 (over plaintext) of the bytes uploaded by this
+    /// op. Persisted once the file has been hashed, before the bytes land,
+    /// so reconciliation can verify an adopted orphan still matches (P1-2).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    uploaded_blake3_hex: Option<String>,
+    /// The live resumable session, persisted while an upload is in flight
+    /// (P1-3). Carries the session URL, issued-at, total size, kind, and
+    /// the last offset Drive acknowledged.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resumable: Option<PersistedResumable>,
+}
+
+/// A resumable session persisted across process restarts (DESIGN s5.4).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+struct PersistedResumable {
+    /// The full session as issued by the [`RemoteStore`] (url, issued_at,
+    /// total size, kind).
+    session: ResumableSession,
+    /// The byte offset Drive has acknowledged so far; resume pushes the
+    /// next chunk from here (P1-3). Updated after every accepted chunk.
+    acked_offset: u64,
+}
+
+impl PendingOpPayload {
+    /// Parse the JSON payload; an empty/old/garbage payload yields the
+    /// default (all-`None`), never an error.
+    fn from_value(v: &serde_json::Value) -> Self {
+        serde_json::from_value(v.clone()).unwrap_or_default()
+    }
+
+    /// Serialize back to a JSON value for persistence.
+    fn to_value(&self) -> serde_json::Value {
+        serde_json::to_value(self).unwrap_or_else(|_| serde_json::json!({}))
+    }
+}
+
 // -----------------------------------------------------------------------------
 // SkipReason / OpOutcome / Executor trait (Phase-1 surface, re-stated).
 // -----------------------------------------------------------------------------
@@ -277,6 +354,15 @@ fn default_pool_size() -> usize {
 #[cfg(test)]
 type MidUploadHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
+/// Test-only hook fired exactly once, AFTER the upload bytes have landed on
+/// Drive but BEFORE the post-upload identity re-check (P1-1), so a test can
+/// deterministically mutate or replace the file on disk once the bytes are
+/// already remote and exercise the post-upload
+/// `file_changed_during_upload` defence (SPEC s8). Production builds carry
+/// no such field.
+#[cfg(test)]
+type PostUploadHook = Arc<dyn Fn(&Path) + Send + Sync>;
+
 /// The production [`Executor`] (SPEC s8, DESIGN s5.4 / s5.6 / s11.4).
 ///
 /// Holds the injected seams plus an [`UploadPool`](Semaphore) bounding
@@ -293,6 +379,8 @@ pub struct DefaultExecutor {
     pool: Arc<Semaphore>,
     #[cfg(test)]
     mid_upload_hook: Option<MidUploadHook>,
+    #[cfg(test)]
+    post_upload_hook: Option<PostUploadHook>,
 }
 
 impl DefaultExecutor {
@@ -315,6 +403,8 @@ impl DefaultExecutor {
             pool,
             #[cfg(test)]
             mid_upload_hook: None,
+            #[cfg(test)]
+            post_upload_hook: None,
         }
     }
 
@@ -325,10 +415,25 @@ impl DefaultExecutor {
         self
     }
 
+    /// Test-only: install the post-upload hook (see [`PostUploadHook`]).
+    #[cfg(test)]
+    fn with_post_upload_hook(mut self, hook: PostUploadHook) -> Self {
+        self.post_upload_hook = Some(hook);
+        self
+    }
+
     /// Fire the mid-upload hook, if installed (no-op in production).
     fn fire_mid_upload_hook(&self, _path: &Path) {
         #[cfg(test)]
         if let Some(hook) = &self.mid_upload_hook {
+            hook(_path);
+        }
+    }
+
+    /// Fire the post-upload hook, if installed (no-op in production).
+    fn fire_post_upload_hook(&self, _path: &Path) {
+        #[cfg(test)]
+        if let Some(hook) = &self.post_upload_hook {
             hook(_path);
         }
     }
@@ -397,17 +502,18 @@ impl DefaultExecutor {
         // BEFORE we issue the create/update.)
         let op_uuid = uuid::Uuid::new_v4().to_string();
         let now = self.clock.now_ms();
-        let payload = serde_json::json!({
-            "client_op_uuid": op_uuid,
-            "drive_file_id": existing_file_id,
-        });
+        let payload = PendingOpPayload {
+            client_op_uuid: Some(op_uuid.clone()),
+            drive_file_id: existing_file_id.clone(),
+            ..PendingOpPayload::default()
+        };
         let op_id = self
             .state
             .enqueue_pending_op(NewPendingOp {
                 source_id: source.id,
                 op_type: OP_TYPE_UPLOAD.to_string(),
                 relative_path: relative_path.clone(),
-                payload_json: payload,
+                payload_json: payload.to_value(),
                 scheduled_for: now,
                 created_at: now,
             })
@@ -424,6 +530,7 @@ impl DefaultExecutor {
                 pre,
                 existing_file_id.as_deref(),
                 op_id,
+                payload,
                 app_props,
             )
             .await;
@@ -431,9 +538,31 @@ impl DefaultExecutor {
         match outcome {
             Ok(out) => Ok(out),
             Err(UploadError::Skip(reason)) => {
-                // File changed/replaced mid-upload: do NOT commit, drop the
-                // pending_op so the next scan re-enqueues cleanly.
+                // File changed/replaced BEFORE the bytes reached Drive (SPEC
+                // s8 post-read defence). No remote object was created, so the
+                // pending_op is always safe to drop; the next scan
+                // re-enqueues a clean op.
                 self.state.delete_pending_op(op_id).await?;
+                Ok(OpOutcome::Skipped {
+                    relative_path: relative_path.clone(),
+                    reason,
+                })
+            }
+            Err(UploadError::SkipPostUpload(reason)) => {
+                // P1-1: file changed/replaced AFTER the bytes landed on
+                // Drive. Do NOT mark synced. For an UPDATE the prior
+                // file_state row keeps the existing drive_file_id, so
+                // dropping the op is safe - the next scan re-enqueues a clean
+                // update. For a CREATE the bytes are an orphan with no
+                // file_state row; dropping the op would strand it (there is
+                // no general orphan sweep, only the pending_ops-driven
+                // reconcile pass). Leave the create op in place so reconcile
+                // adopts the orphan and re-hashes it (P1-2): if the orphan's
+                // bytes still match it is committed, otherwise it is requeued
+                // as an update against the SAME file_id (no duplicate).
+                if existing_file_id.is_some() {
+                    self.state.delete_pending_op(op_id).await?;
+                }
                 Ok(OpOutcome::Skipped {
                     relative_path: relative_path.clone(),
                     reason,
@@ -462,6 +591,7 @@ impl DefaultExecutor {
         pre: FileIdentity,
         existing_file_id: Option<&str>,
         op_id: PendingOpId,
+        mut payload: PendingOpPayload,
         app_props: HashMap<String, String>,
     ) -> Result<OpOutcome, UploadError> {
         let full_path = join_source_path(&source.local_path, relative_path);
@@ -504,6 +634,19 @@ impl DefaultExecutor {
             return Err(UploadError::Skip(SkipReason::ChangedDuringUpload));
         }
 
+        // --- P1-2: persist the uploaded blake3 BEFORE the bytes land -------
+        // The hash is over the plaintext we just read and verified coherent.
+        // Persisting it now (before `upload_bytes` issues the create/update)
+        // means a crash with the object already on Drive leaves a pending_op
+        // that records exactly which bytes were uploaded, so reconciliation
+        // can re-hash the (possibly since-changed) local file against this
+        // and only adopt-as-Synced on a match.
+        payload.uploaded_blake3_hex = Some(hex::encode(blake3));
+        self.state
+            .update_pending_op_payload(op_id, &payload.to_value())
+            .await
+            .map_err(UploadError::Fatal)?;
+
         // --- issue the upload (small simple, large resumable) --------------
         let mime = "application/octet-stream";
         let entry = self
@@ -514,6 +657,8 @@ impl DefaultExecutor {
                 sent_bytes,
                 mime,
                 app_props,
+                op_id,
+                &mut payload,
             )
             .await?;
 
@@ -521,6 +666,34 @@ impl DefaultExecutor {
         // `upload_bytes`: it compared `entry.md5` (Drive's md5 of the stored
         // bytes - ciphertext when encrypted, plaintext otherwise) against the
         // local md5 the read/encrypt pass accumulated over those same bytes.
+
+        // --- P1-1: post-UPLOAD identity re-check (SPEC s8) -----------------
+        // The first fstat above proved the file did not change while we were
+        // READING it; but the bytes could still be mutated between the read
+        // and the moment Drive finishes accepting them. Re-stat the open
+        // handle AND the path now that the object is fully uploaded, before
+        // we commit it as Synced. On any change/replace, do NOT commit: the
+        // remote object is an orphan that reconcile adopts + re-hashes
+        // (P1-2), and the op is re-enqueued by the caller.
+        self.fire_post_upload_hook(&full_path);
+        let post2 = fstat_identity(file).await.map_err(UploadError::Fatal)?;
+        if (post2.size, post2.ctime_ns) != (pre.size, pre.ctime_ns) {
+            return Err(UploadError::SkipPostUpload(SkipReason::ChangedDuringUpload));
+        }
+        match lstat_identity(&full_path) {
+            Ok(now_path) => {
+                if (now_path.dev, now_path.inode) != (pre.dev, pre.inode) {
+                    return Err(UploadError::SkipPostUpload(
+                        SkipReason::ReplacedDuringUpload,
+                    ));
+                }
+            }
+            Err(_) => {
+                return Err(UploadError::SkipPostUpload(
+                    SkipReason::ReplacedDuringUpload,
+                ))
+            }
+        }
 
         // --- build + commit the file_state row, atomically with op delete --
         let now = self.clock.now_ms();
@@ -564,6 +737,7 @@ impl DefaultExecutor {
     /// returned md5 against the local md5 of the exact bytes sent. Chooses
     /// the simple multipart path below [`RESUMABLE_THRESHOLD`] and the
     /// resumable protocol at or above it.
+    #[allow(clippy::too_many_arguments)]
     async fn upload_bytes(
         &self,
         source: &SourceRow,
@@ -572,6 +746,8 @@ impl DefaultExecutor {
         sent: SentBytes,
         mime: &str,
         app_props: HashMap<String, String>,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
     ) -> Result<RemoteEntry, UploadError> {
         let total = sent.bytes.len() as u64;
         let mut transient_retries = 0u32;
@@ -584,6 +760,8 @@ impl DefaultExecutor {
                     &sent,
                     mime,
                     &app_props,
+                    op_id,
+                    payload,
                 )
                 .await
             } else {
@@ -676,6 +854,14 @@ impl DefaultExecutor {
     /// On a session-invalidating 4xx the session is discarded and the whole
     /// transfer restarts from offset 0 (DESIGN s5.4), bounded by
     /// [`MAX_SESSION_RESTARTS`].
+    ///
+    /// P1-3: the live session (url, issued_at, total, kind, last-acked
+    /// offset) is persisted into `pending_ops.payload_json` so a crash
+    /// mid-upload resumes from the acked offset rather than from zero. A
+    /// session opened here always starts at offset 0; the cross-restart
+    /// resume entry point is [`Self::resume_persisted`], driven by
+    /// `reconcile`.
+    #[allow(clippy::too_many_arguments)]
     async fn upload_resumable(
         &self,
         parent_id: &str,
@@ -684,6 +870,8 @@ impl DefaultExecutor {
         sent: &SentBytes,
         mime: &str,
         app_props: &HashMap<String, String>,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
     ) -> anyhow::Result<RemoteEntry> {
         let total = sent.bytes.len() as u64;
         let mut restarts = 0u32;
@@ -705,10 +893,30 @@ impl DefaultExecutor {
                 self.pacer.permit_file_create().await;
             }
             let session = self.remote.resumable_session(kind, mime, total).await?;
-            match self.push_chunks(&session, &sent.bytes).await? {
-                Some(entry) => return Ok(entry),
+
+            // Persist the freshly-opened session at offset 0 BEFORE pushing
+            // any bytes, so a crash after the first chunk lands can resume.
+            payload.resumable = Some(PersistedResumable {
+                session: session.clone(),
+                acked_offset: 0,
+            });
+            self.persist_payload(op_id, payload).await?;
+
+            match self
+                .push_chunks(&session, &sent.bytes, 0, op_id, payload)
+                .await?
+            {
+                Some(entry) => {
+                    // Done: clear the persisted session.
+                    payload.resumable = None;
+                    self.persist_payload(op_id, payload).await?;
+                    return Ok(entry);
+                }
                 None => {
-                    // Session invalidated (4xx). Restart from scratch.
+                    // Session invalidated (4xx). Discard it and restart from
+                    // offset 0 (DESIGN s5.4: never reuse a 4xx-d session).
+                    payload.resumable = None;
+                    self.persist_payload(op_id, payload).await?;
                     restarts += 1;
                     if restarts > MAX_SESSION_RESTARTS {
                         anyhow::bail!("drive.resumable_session_invalid: exhausted restarts");
@@ -725,17 +933,22 @@ impl DefaultExecutor {
         }
     }
 
-    /// Push the body to an open resumable session in 4 MiB wire chunks
-    /// (non-final chunks are multiples of 256 KiB per SPEC s3). Returns
-    /// `Some(entry)` on completion, `None` if the session was invalidated
-    /// (caller restarts).
+    /// Push `body[start_offset..]` to an open resumable session in 4 MiB
+    /// wire chunks (non-final chunks are multiples of 256 KiB per SPEC s3).
+    /// Returns `Some(entry)` on completion, `None` if the session was
+    /// invalidated (caller restarts). After every accepted chunk the
+    /// last-acked offset is persisted into the op payload (P1-3) so a crash
+    /// resumes from there.
     async fn push_chunks(
         &self,
         session: &ResumableSession,
         body: &Bytes,
+        start_offset: u64,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
     ) -> anyhow::Result<Option<RemoteEntry>> {
         let total = body.len();
-        let mut offset = 0usize;
+        let mut offset = start_offset as usize;
         while offset < total {
             let end = (offset + WIRE_CHUNK).min(total);
             // Non-final chunks must be a 256-KiB multiple; the final chunk
@@ -752,6 +965,11 @@ impl DefaultExecutor {
                 ResumeProgress::Completed(entry) => return Ok(Some(entry)),
                 ResumeProgress::InProgress { received } => {
                     offset = received as usize;
+                    // Persist the new acked offset so a crash resumes here.
+                    if let Some(r) = payload.resumable.as_mut() {
+                        r.acked_offset = received;
+                    }
+                    self.persist_payload(op_id, payload).await?;
                 }
                 ResumeProgress::SessionInvalid => return Ok(None),
             }
@@ -762,6 +980,18 @@ impl DefaultExecutor {
         // RESUMABLE_THRESHOLD), so reaching here means the session never
         // completed - treat as invalidated so the caller restarts.
         Ok(None)
+    }
+
+    /// Persist the current op payload, mapping any state error to a fatal
+    /// upload error (a state-DB write failure aborts the whole `execute`).
+    async fn persist_payload(
+        &self,
+        op_id: PendingOpId,
+        payload: &PendingOpPayload,
+    ) -> anyhow::Result<()> {
+        self.state
+            .update_pending_op_payload(op_id, &payload.to_value())
+            .await
     }
 
     /// Build the canonical `appProperties` for an object Driven owns
@@ -889,22 +1119,37 @@ impl Executor for DefaultExecutor {
     async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()> {
         let pending = self.state.get_pending_ops_for_source(source.id).await?;
         for op in pending {
-            let uuid = op
-                .payload_json
-                .get("client_op_uuid")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
-            let Some(uuid) = uuid else {
+            let payload = PendingOpPayload::from_value(&op.payload_json);
+            let Some(uuid) = payload.client_op_uuid.clone() else {
                 // No UUID carried (older row): leave it for the normal queue.
                 continue;
             };
-            let drive_file_id = op
-                .payload_json
-                .get("drive_file_id")
-                .and_then(|v| v.as_str())
-                .map(|s| s.to_string());
 
-            if let Some(file_id) = drive_file_id {
+            // --- P1-3: a live resumable session takes precedence -----------
+            // If the crash happened mid-upload with a persisted session, try
+            // to resume it byte-for-byte from the last-acked offset rather
+            // than re-uploading from zero (or adopting a not-yet-finalized
+            // create, which `find_by_op_uuid` cannot even see). On success
+            // we adopt the resulting entry; on a stale/invalid session we
+            // fall through to the adopt-or-requeue path below.
+            if let Some(resumable) = payload.resumable.clone() {
+                match self
+                    .resume_persisted(source, &op, &payload, resumable)
+                    .await?
+                {
+                    Some(entry) => {
+                        self.adopt_reconciled(source, &op, &payload, entry).await?;
+                        continue;
+                    }
+                    None => {
+                        // Could not resume (stale / invalidated / no session
+                        // bytes left). Fall through: adopt the orphan if it
+                        // finalized, else requeue.
+                    }
+                }
+            }
+
+            if let Some(file_id) = payload.drive_file_id.clone() {
                 // Update path: compare the existing object's appProperties.
                 match self.remote.metadata(&file_id).await {
                     Ok(entry)
@@ -914,12 +1159,13 @@ impl Executor for DefaultExecutor {
                             .map(|v| v == &uuid)
                             .unwrap_or(false) =>
                     {
-                        // Already committed remotely; finish the local commit.
-                        self.adopt_reconciled(source, &op, entry).await?;
+                        // Already committed remotely; re-hash + finish.
+                        self.adopt_reconciled(source, &op, &payload, entry).await?;
                     }
                     _ => {
                         // Not committed; drop the stale op so the next scan
-                        // re-enqueues it cleanly.
+                        // re-enqueues it cleanly (the prior file_state row
+                        // keeps the existing drive_file_id for the update).
                         self.state.delete_pending_op(op.id).await?;
                     }
                 }
@@ -930,7 +1176,7 @@ impl Executor for DefaultExecutor {
                     .find_by_op_uuid(&source.drive_folder_id, &uuid)
                     .await?
                 {
-                    Some(entry) => self.adopt_reconciled(source, &op, entry).await?,
+                    Some(entry) => self.adopt_reconciled(source, &op, &payload, entry).await?,
                     None => {
                         self.state.delete_pending_op(op.id).await?;
                     }
@@ -942,45 +1188,234 @@ impl Executor for DefaultExecutor {
 }
 
 impl DefaultExecutor {
-    /// Adopt an orphaned remote object found during reconciliation: write
-    /// the `file_state` row + delete the pending_op atomically (DESIGN s5.6
-    /// step 3). Best-effort on the local stat (the file may have changed
-    /// since the crash); the adopted row carries the remote md5 so a later
-    /// scan re-uploads only if the local bytes actually differ.
+    /// P1-3: resume a persisted resumable session after a restart. Discards
+    /// the session (returns `None`) when it is older than
+    /// [`SESSION_MAX_AGE_MS`] or Drive 4xx-invalidates it; otherwise it
+    /// re-reads the local file, re-derives the exact upload body, and pushes
+    /// the remaining bytes from the persisted acked offset. A successful
+    /// resume returns the finalized [`RemoteEntry`].
+    ///
+    /// If the local file changed since the crash the body would no longer
+    /// match the partially-uploaded bytes; rather than corrupt the object we
+    /// discard the session (the partial create is GC'd by Drive when it
+    /// expires; a partial update leaves the old object intact) and return
+    /// `None` so the caller requeues a clean upload.
+    async fn resume_persisted(
+        &self,
+        source: &SourceRow,
+        op: &crate::state::PendingOpRow,
+        payload: &PendingOpPayload,
+        resumable: PersistedResumable,
+    ) -> anyhow::Result<Option<RemoteEntry>> {
+        // Byte-level resume is only sound when re-reading the local file
+        // reproduces the EXACT bytes already pushed. For an ENCRYPTED source
+        // that is false: each `content_encryptor()` draws a fresh random
+        // 24-byte nonce (driven-crypto content.rs), so re-encrypting the same
+        // plaintext yields a different header + ciphertext. Splicing the new
+        // ciphertext onto the old partial bytes would finalize a corrupt
+        // object that blake3 (computed over plaintext) cannot detect. So for
+        // encrypted sources we never resume - we fall through to restart from
+        // offset 0, which DESIGN s5.4 already sanctions ("any 4xx -> recreate
+        // from scratch"). True encrypted resume (persisting the crypto
+        // header) is an M4 follow-up.
+        if self.crypto.is_some() {
+            return Ok(None);
+        }
+        let now = self.clock.now_ms();
+        if now - resumable.session.issued_at > SESSION_MAX_AGE_MS {
+            warn!(
+                target: TARGET,
+                path = %op.relative_path,
+                "persisted resumable session older than 6 days; discarding"
+            );
+            return Ok(None);
+        }
+
+        // Re-derive the exact bytes that were being uploaded. The body must
+        // be byte-identical to the partially-uploaded one for the resume to
+        // be coherent, so we verify the re-read plaintext blake3 matches the
+        // hash persisted with the op (P1-2/P1-3 share this invariant).
+        let full_path = join_source_path(&source.local_path, &op.relative_path);
+        let mut file = match open_shared(&full_path).await {
+            Ok(f) => f,
+            // File gone/locked: cannot resume; let the caller requeue.
+            Err(_) => return Ok(None),
+        };
+        let HashedBody {
+            blake3, sent_bytes, ..
+        } = match read_hash_encrypt(&mut file, self.crypto.as_deref()).await {
+            Ok(h) => h,
+            Err(_) => return Ok(None),
+        };
+        if let Some(expected_hex) = payload.uploaded_blake3_hex.as_deref() {
+            if hex::encode(blake3) != expected_hex {
+                // Local file changed since the crash: the partial bytes are
+                // stale. Discard the session and requeue a clean upload.
+                return Ok(None);
+            }
+        } else {
+            // No recorded hash to verify against: do not risk a corrupt
+            // resume. Requeue from scratch.
+            return Ok(None);
+        }
+        if sent_bytes.bytes.len() as u64 != resumable.session.size {
+            // Body length disagrees with the session's declared size; the
+            // resume would be rejected. Requeue.
+            return Ok(None);
+        }
+
+        // Push the remaining bytes from the last-acked offset. A fresh
+        // payload copy carries the live session so push_chunks can persist
+        // progress against the same op.
+        let mut live = payload.clone();
+        live.resumable = Some(resumable.clone());
+        match self
+            .push_chunks(
+                &resumable.session,
+                &sent_bytes.bytes,
+                resumable.acked_offset,
+                op.id,
+                &mut live,
+            )
+            .await
+        {
+            Ok(Some(entry)) => {
+                // Verify md5 over the exact bytes sent (SPEC s8).
+                match entry.md5 {
+                    Some(remote) if remote == sent_bytes.md5 => Ok(Some(entry)),
+                    _ => {
+                        warn!(
+                            target: TARGET,
+                            path = %op.relative_path,
+                            "resumed upload md5 mismatch; requeueing"
+                        );
+                        Ok(None)
+                    }
+                }
+            }
+            // Session invalidated (4xx) or could not complete: discard +
+            // requeue (DESIGN s5.4 never reuse a 4xx-d session).
+            Ok(None) => Ok(None),
+            Err(e) => Err(e),
+        }
+    }
+
+    /// Adopt an orphaned/just-resumed remote object found during
+    /// reconciliation: re-hash the CURRENT local file and commit the
+    /// `file_state` row + delete the pending_op atomically (DESIGN s5.6
+    /// step 3).
+    ///
+    /// P1-2: the adopted row must NEVER carry a zeroed hash marked
+    /// `Synced` - that would let a post-upload local change slip past the
+    /// `(size, mtime, hash)` fast scan forever. Instead we re-hash the
+    /// current local plaintext and compare it to the blake3 the op recorded
+    /// as uploaded:
+    ///
+    /// - Match (or the entry's remote md5 is unavailable but the hash
+    ///   agrees): the local bytes equal what landed remotely - mark
+    ///   `Synced` with the real blake3.
+    /// - Mismatch / unreadable / no recorded hash: the local file changed
+    ///   after the upload (or we cannot prove it didn't) - do NOT mark
+    ///   `Synced`. Write a `Pending` row that PRESERVES the adopted
+    ///   `drive_file_id` so the next scan re-uploads as an UPDATE against
+    ///   the same object (never a duplicate), then drop the op.
     async fn adopt_reconciled(
         &self,
         source: &SourceRow,
         op: &crate::state::PendingOpRow,
+        payload: &PendingOpPayload,
         entry: RemoteEntry,
     ) -> anyhow::Result<()> {
         let full_path = join_source_path(&source.local_path, &op.relative_path);
-        let (size, mtime_ns) = match lstat_identity(&full_path) {
-            Ok(id) => (id.size, id.mtime_ns),
-            Err(_) => (entry.size.unwrap_or(0), entry.modified_time * 1_000_000),
-        };
+
+        // Re-hash the current local file (plaintext). On any read failure we
+        // cannot prove identity, so treat as a mismatch (requeue).
+        let local = self.rehash_local_plaintext(&full_path).await;
+        let expected_hex = payload.uploaded_blake3_hex.clone();
+
         let now = self.clock.now_ms();
-        let row = FileStateRow {
-            source_id: source.id,
-            relative_path: op.relative_path.clone(),
-            size,
-            mtime_ns,
-            // We do not have the plaintext blake3 here (the bytes were
-            // hashed pre-crash); leave it zeroed so the next FastPath scan,
-            // which compares (size, mtime), re-derives identity. A zeroed
-            // hash never matches a real file, so the next deep-verify would
-            // re-upload; the (size, mtime) fast path avoids that in practice.
-            hash_blake3: [0u8; 32],
-            drive_file_id: Some(entry.id.clone()),
-            drive_md5: entry.md5,
-            encrypted_remote_path: None,
-            status: FileStateStatus::Synced,
-            last_uploaded_at: Some(now),
-            last_verified_at: None,
-        };
-        // The op was a create iff it carried no drive_file_id; either commit
-        // path performs the same atomic upsert+delete.
-        self.state.commit_create_result(op.id, &row).await?;
+        match (local, expected_hex) {
+            (Some((cur_hash, size, mtime_ns)), Some(expected_hex))
+                if hex::encode(cur_hash) == expected_hex =>
+            {
+                // Identity proven: the local bytes match what was uploaded.
+                let row = FileStateRow {
+                    source_id: source.id,
+                    relative_path: op.relative_path.clone(),
+                    size,
+                    mtime_ns,
+                    hash_blake3: cur_hash,
+                    drive_file_id: Some(entry.id.clone()),
+                    drive_md5: entry.md5,
+                    encrypted_remote_path: None,
+                    status: FileStateStatus::Synced,
+                    last_uploaded_at: Some(now),
+                    last_verified_at: Some(now),
+                };
+                self.state.commit_create_result(op.id, &row).await?;
+            }
+            (_, _) => {
+                // Either the file changed since upload, or we have nothing to
+                // verify against. Do NOT mark Synced. Preserve the adopted
+                // drive_file_id so the re-upload is an UPDATE (no duplicate).
+                //
+                // CRITICAL (P1-2): the FastPath scanner keys "unchanged" off
+                // `(size, mtime_ns)` ONLY, never `status`. If we stored the
+                // CURRENT local identity here, the next scan would see local
+                // == stored and never re-emit the file - the stale uploaded
+                // bytes would stay on Drive forever. So we stamp a sentinel
+                // `mtime_ns` the live file can never match, forcing the next
+                // scan to detect a change and re-upload as an update. We also
+                // store the uploaded (stale) blake3 + the on-Drive size so the
+                // row honestly reflects what is currently on Drive, not the
+                // local file.
+                warn!(
+                    target: TARGET,
+                    source = %source.id,
+                    path = %op.relative_path,
+                    "adopted orphan does not match uploaded hash; requeueing as update"
+                );
+                let stale_hash = payload
+                    .uploaded_blake3_hex
+                    .as_deref()
+                    .and_then(decode_blake3_hex)
+                    .unwrap_or([0u8; 32]);
+                let row = FileStateRow {
+                    source_id: source.id,
+                    relative_path: op.relative_path.clone(),
+                    size: entry.size.unwrap_or(0),
+                    mtime_ns: REQUEUE_FORCE_RESCAN_MTIME_NS,
+                    hash_blake3: stale_hash,
+                    drive_file_id: Some(entry.id.clone()),
+                    drive_md5: entry.md5,
+                    encrypted_remote_path: None,
+                    status: FileStateStatus::Pending,
+                    last_uploaded_at: None,
+                    last_verified_at: None,
+                };
+                // Upsert the requeue row + drop the op atomically (the next
+                // scan re-enqueues a clean update). commit_create_result
+                // performs the same atomic upsert+delete for create + update.
+                self.state.commit_create_result(op.id, &row).await?;
+            }
+        }
         Ok(())
+    }
+
+    /// Re-read the local file and return its plaintext blake3 + current
+    /// `(size, mtime_ns)`. Returns `None` if the file cannot be opened/read
+    /// (gone, locked, IO error) - the caller treats that as an identity
+    /// mismatch. The hash is over the PLAINTEXT (matching the upload-side
+    /// blake3), so it is comparable for both encrypted and plaintext
+    /// sources.
+    async fn rehash_local_plaintext(&self, full_path: &Path) -> Option<([u8; 32], u64, i64)> {
+        let mut file = open_shared(full_path).await.ok()?;
+        let id = fstat_identity(&file).await.ok()?;
+        // We only need the blake3-over-plaintext; pass crypto=None so the
+        // body bytes are not built up unnecessarily - read_hash_encrypt still
+        // hashes the plaintext identically in both arms.
+        let HashedBody { blake3, .. } = read_hash_encrypt(&mut file, None).await.ok()?;
+        Some((blake3, id.size, id.mtime_ns))
     }
 }
 
@@ -1176,7 +1611,17 @@ fn crypto_to_io(e: CryptoError) -> std::io::Error {
 /// failure (logged, file left non-synced), and a fatal error that aborts
 /// the whole `execute` (e.g. a state-DB write failure).
 enum UploadError {
+    /// File changed/replaced BEFORE the bytes reached Drive (the post-read
+    /// check, the length guard). No remote object was created, so the
+    /// pending_op is always safe to drop.
     Skip(SkipReason),
+    /// P1-1: file changed/replaced AFTER `upload_bytes` returned - the
+    /// bytes already landed on Drive. For a CREATE this leaves an orphan
+    /// with no `file_state` row, so the op MUST be kept for the reconcile
+    /// pass to adopt + re-hash (requeues as an update vs the same id, no
+    /// duplicate). For an UPDATE the prior `file_state` row already carries
+    /// the id, so the op is safe to drop.
+    SkipPostUpload(SkipReason),
     Failed(ErrorCode),
     Fatal(anyhow::Error),
 }
@@ -1447,6 +1892,15 @@ fn filename_of(rel: &RelativePath) -> String {
 fn relative_path_hash(rel: &RelativePath) -> String {
     let h = blake3::hash(rel.as_str().as_bytes());
     hex::encode(&h.as_bytes()[..16])
+}
+
+/// Decode a 32-byte blake3 hash from its hex encoding (the form persisted in
+/// `pending_ops.payload_json`). Returns `None` if the string is not exactly
+/// 64 hex chars.
+fn decode_blake3_hex(hex_str: &str) -> Option<[u8; 32]> {
+    let mut out = [0u8; 32];
+    hex::decode_to_slice(hex_str, &mut out).ok()?;
+    Some(out)
 }
 
 // =============================================================================
@@ -1737,12 +2191,20 @@ mod tests {
             .await
             .unwrap();
         let now = h.clock.now_ms();
+        // P1-2: the op records the blake3 (over plaintext) of the bytes it
+        // uploaded. The local file is unchanged since the crash, so adoption
+        // re-hashes it, finds a match, and marks Synced.
+        let uploaded_hex = hex::encode(blake3::hash(b"orphaned bytes").as_bytes());
         h.state
             .enqueue_pending_op(NewPendingOp {
                 source_id: h.source.id,
                 op_type: OP_TYPE_UPLOAD.to_string(),
                 relative_path: rel.clone(),
-                payload_json: serde_json::json!({ "client_op_uuid": op_uuid, "drive_file_id": null }),
+                payload_json: serde_json::json!({
+                    "client_op_uuid": op_uuid,
+                    "drive_file_id": null,
+                    "uploaded_blake3_hex": uploaded_hex,
+                }),
                 scheduled_for: now,
                 created_at: now,
             })
@@ -1761,6 +2223,12 @@ mod tests {
             .expect("adopted row");
         assert!(row.drive_file_id.is_some());
         assert_eq!(row.status, FileStateStatus::Synced);
+        // The adopted row carries the REAL plaintext blake3, never a zero hash.
+        assert_eq!(
+            row.hash_blake3,
+            *blake3::hash(b"orphaned bytes").as_bytes(),
+            "adopted Synced row must carry the real uploaded hash, not zero"
+        );
         assert!(h
             .state
             .get_pending_ops_for_source(h.source.id)
@@ -1801,6 +2269,177 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    // --- P1-2: orphan whose local bytes CHANGED post-upload requeues --------
+
+    #[tokio::test]
+    async fn reconcile_requeues_orphan_when_local_changed_after_upload() {
+        let h = harness().await;
+        // The bytes that were uploaded pre-crash.
+        let (rel, _size) = h.write_file("drift.txt", b"uploaded version");
+        let uploaded_hex = hex::encode(blake3::hash(b"uploaded version").as_bytes());
+
+        // The orphan landed on Drive with its uuid.
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let mut app = HashMap::new();
+        app.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.clone());
+        let created = h
+            .remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "drift.txt",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from_static(b"uploaded version")),
+                app,
+            )
+            .await
+            .unwrap();
+
+        // But the local file changed AFTER the upload, before the commit ran.
+        h.write_file("drift.txt", b"locally edited NEW content - longer");
+
+        let now = h.clock.now_ms();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                payload_json: serde_json::json!({
+                    "client_op_uuid": op_uuid,
+                    "drive_file_id": null,
+                    "uploaded_blake3_hex": uploaded_hex,
+                }),
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let exec = h.executor();
+        exec.reconcile(&h.source).await.unwrap();
+
+        // The orphan is adopted as an object id (no duplicate) BUT the row is
+        // NOT Synced - the changed local bytes must be re-uploaded. It must
+        // preserve the drive_file_id so the re-upload is an UPDATE.
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("requeued row");
+        assert_ne!(
+            row.status,
+            FileStateStatus::Synced,
+            "a post-upload local change must NOT be marked Synced"
+        );
+        assert_eq!(
+            row.drive_file_id.as_deref(),
+            Some(created.id.as_str()),
+            "requeue must preserve the orphan's drive_file_id (re-upload as update, no duplicate)"
+        );
+        // The requeue row stores a force-rescan mtime sentinel so the
+        // FastPath scanner (which keys off (size, mtime) ONLY) is GUARANTEED
+        // to see a change and re-emit the file - otherwise the stale bytes
+        // would stay on Drive forever (P1-2 core invariant). It carries the
+        // stale uploaded hash (non-zero), never a zero hash marked Synced.
+        assert_eq!(row.mtime_ns, i64::MIN, "force-rescan sentinel mtime");
+        assert_eq!(
+            row.hash_blake3,
+            *blake3::hash(b"uploaded version").as_bytes(),
+            "row reflects the on-Drive (stale) uploaded hash"
+        );
+        // pending_ops drained (next scan re-enqueues the update).
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+        // Still exactly one object on Drive - no duplicate.
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+    }
+
+    // --- P1-1: file changed AFTER upload completes -> skip, no commit -------
+
+    #[tokio::test]
+    async fn changed_after_upload_skips_and_does_not_commit() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("post.txt", b"original-content");
+        let src_path = h.tmp_src.path().to_path_buf();
+        // Hook fires AFTER upload_bytes returns, before the post-upload
+        // identity re-check: mutate the file so the second fstat detects it.
+        let hook: PostUploadHook = Arc::new(move |_p: &Path| {
+            let full = src_path.join("post.txt");
+            std::fs::write(&full, b"original-content-MUTATED-AFTER-UPLOAD").unwrap();
+        });
+        let exec = h.executor().with_post_upload_hook(hook);
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out[0],
+                OpOutcome::Skipped {
+                    reason: SkipReason::ChangedDuringUpload,
+                    ..
+                }
+            ),
+            "got {:?}",
+            out[0]
+        );
+        // Not committed as Synced.
+        let row = h.state.get_file_state(h.source.id, &rel).await.unwrap();
+        assert!(row.is_none() || row.unwrap().status != FileStateStatus::Synced);
+
+        // The bytes DID land on Drive (the change was detected post-upload),
+        // leaving an orphan create object + its pending_op for reconcile. The
+        // op must still be present so the orphan is not stranded (P1-1).
+        let pending = h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap();
+        assert_eq!(pending.len(), 1, "create op kept for reconcile to adopt");
+        let before = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(before.len(), 1, "the post-upload orphan is on Drive");
+
+        // Reconcile closes the loop: it finds the orphan, re-hashes the
+        // (now-changed) local file, sees a MISMATCH, and requeues it as an
+        // UPDATE against the SAME object id - never a duplicate.
+        exec.reconcile(&h.source).await.unwrap();
+        let after = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1, "reconcile produced no duplicate");
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("requeued row");
+        assert_ne!(
+            row.status,
+            FileStateStatus::Synced,
+            "changed bytes must be re-uploaded, not adopted as Synced"
+        );
+        assert_eq!(
+            row.drive_file_id.as_deref(),
+            Some(before[0].id.as_str()),
+            "requeue preserves the orphan id so re-upload is an update"
+        );
     }
 
     // --- parallel uploads, no corruption ------------------------------------

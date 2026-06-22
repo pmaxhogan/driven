@@ -259,6 +259,13 @@ mod tests {
         async fn delete_pending_op(&self, _id: PendingOpId) -> Result<()> {
             unimplemented!()
         }
+        async fn update_pending_op_payload(
+            &self,
+            _id: PendingOpId,
+            _payload_json: &serde_json::Value,
+        ) -> Result<()> {
+            unimplemented!()
+        }
         async fn commit_create_result(
             &self,
             _op_id: PendingOpId,
