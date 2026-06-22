@@ -247,6 +247,7 @@ fn file_state_status_to_str(s: FileStateStatus) -> &'static str {
         FileStateStatus::Corrupt => "corrupt",
         FileStateStatus::Locked => "locked",
         FileStateStatus::Error => "error",
+        FileStateStatus::ExcludedOrphan => "excluded_orphan",
     }
 }
 
@@ -257,6 +258,7 @@ fn file_state_status_from_str(s: &str) -> Result<FileStateStatus> {
         "corrupt" => Ok(FileStateStatus::Corrupt),
         "locked" => Ok(FileStateStatus::Locked),
         "error" => Ok(FileStateStatus::Error),
+        "excluded_orphan" => Ok(FileStateStatus::ExcludedOrphan),
         other => Err(anyhow!("invalid file_state.status value: {other}")),
     }
 }

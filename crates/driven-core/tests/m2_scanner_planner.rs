@@ -31,9 +31,11 @@
 //! - gitignore respected (`node_modules/foo.js` excluded):
 //!   [`gitignore_respected_node_modules_excluded`]
 //! - `!.env` override re-includes `.env`: [`env_override_reincludes_dotenv`]
-//!   (BLOCKED / `#[ignore]`d - Phase-2 exclude.rs single-Override cannot
-//!   re-include without whitelist-mode data loss; see that test's docs)
+//! - gitignore `!Thumbs.db` beats the default exclude (F5):
+//!   [`gitignore_reinclude_beats_default_exclude`]
 //! - `*.log` exclude wins: [`exclude_pattern_log_wins`]
+//! - Excluded-orphan: a now-ignored backed-up file is NOT trashed (DESIGN
+//!   s5.5, F1): [`ignore_change_yields_excluded_orphan_no_trash`]
 //! - Deep-verify catches bit-rot: [`deep_verify_catches_bit_rot`]
 //! - Symlink skipped (policy doc): [`symlink_skipped`] (unix-only)
 
@@ -400,18 +402,13 @@ async fn gitignore_respected_node_modules_excluded() {
 /// override"). The user-facing effect is "`!.env`"; the stored glob is the
 /// bare `.env`.
 ///
-/// BLOCKED / `#[ignore]`d: the Phase-2 `exclude.rs` single-`Override` design
-/// cannot re-include a gitignored path without flipping the `ignore`-crate
-/// `Override` into whitelist-only mode, which silently drops every
-/// non-included file - a backup data-loss bug. The integrate pass shipped the
-/// safer excludes-only behaviour instead and deferred re-inclusion to a
-/// focused exclude.rs rework (see this file's module docs, `exclude.rs`
-/// `build_override` docs, and the M2 Phase-3 report). This test is retained,
-/// strengthened (it now also asserts `keep.txt` survives, so it would catch
-/// the whitelist-mode data-loss regression), and left ignored rather than
-/// deleted so the missing row stays visible.
+/// Now PASSES: the M2 matcher rework replaced the single `Override` with a
+/// combined [`ignore::gitignore::Gitignore`] matcher where `include_patterns`
+/// are added last as `!`-rules, so they re-include over the gitignore cascade
+/// WITHOUT flipping to whitelist-only mode. The test also asserts `keep.txt`
+/// survives, which would catch any regression that silently dropped unrelated
+/// files.
 #[tokio::test]
-#[ignore = "BLOCKED: Phase-2 exclude.rs single-Override cannot re-include a gitignored path without whitelist-mode (silent mass file-drop). Needs ignore-tier rework. See M2 Phase-3 report; ROADMAP M2 '!.env override' row deferred."]
 async fn env_override_reincludes_dotenv() {
     let dir = tree! {
         ".gitignore" => ".env\n",
@@ -459,6 +456,84 @@ async fn exclude_pattern_log_wins() {
     assert!(
         !uploads.contains("app.log"),
         "*.log exclude must force-out app.log: {uploads:?}"
+    );
+}
+
+/// F5 / gitignore-wins-over-defaults: a source `.gitignore` with `!Thumbs.db`
+/// re-includes Thumbs.db despite it being a DESIGN s5.2 DEFAULT exclude. The
+/// old single-`Override` evaluated defaults ABOVE gitignore and inverted this;
+/// the new last-match-wins matcher adds defaults BELOW the gitignore cascade.
+#[tokio::test]
+async fn gitignore_reinclude_beats_default_exclude() {
+    let dir = tree! {
+        ".gitignore" => "!Thumbs.db\n",
+        "Thumbs.db" => "thumbs",
+        "real.txt" => "x",
+    };
+    let (repo, _db) = temp_repo().await;
+    let src = seed_source(&repo, dir.path(), true, &[], &[]).await;
+
+    let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
+    let p = plan(&src, &scanned, &repo).await.unwrap();
+
+    let uploads = upload_paths(&p.ops);
+    assert!(uploads.contains("real.txt"), "{uploads:?}");
+    assert!(
+        uploads.contains("Thumbs.db"),
+        "gitignore !Thumbs.db must re-include over the default exclude: {uploads:?}"
+    );
+}
+
+/// Excluded-orphan (DESIGN s5.5, F1): a file that was previously backed up
+/// (has a `file_state` row with a `drive_file_id`) but is now EXCLUDED by a
+/// later ignore-rule change must NOT be trashed - the local file may still
+/// exist; only the rules changed. The scanner reports it in
+/// `excluded_orphans` and the planner emits ZERO trash ops for it.
+#[tokio::test]
+async fn ignore_change_yields_excluded_orphan_no_trash() {
+    // app.log is on disk AND has a synced file_state row (it was backed up
+    // before *.log was added to exclude_patterns).
+    let dir = tree! {
+        "app.log" => "lines",
+        "keep.txt" => "x",
+    };
+    let (repo, _db) = temp_repo().await;
+    // *.log is now excluded - simulating a config change after app.log was
+    // already backed up.
+    let src = seed_source(&repo, dir.path(), true, &[], &["*.log"]).await;
+
+    let (size, mtime) = stat_of(&dir.path().join("app.log"));
+    repo.upsert_file_state(&file_row(
+        src.id,
+        "app.log",
+        size,
+        mtime,
+        *blake3::hash(b"lines").as_bytes(),
+        Some("drive-app-log"), // reached Drive => a naive delete would TRASH it
+    ))
+    .await
+    .unwrap();
+
+    let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
+
+    // The excluded backed-up file is an orphan, NOT a deletion.
+    assert!(
+        scanned.excluded_orphans.contains(&rel("app.log")),
+        "app.log must be reported as an excluded-orphan: {:?}",
+        scanned.excluded_orphans
+    );
+    assert!(
+        !scanned.deleted.contains(&rel("app.log")),
+        "an excluded backed-up file must never be classified as deleted: {:?}",
+        scanned.deleted
+    );
+
+    let p = plan(&src, &scanned, &repo).await.unwrap();
+    assert_eq!(
+        p.summary().trashes,
+        0,
+        "an ignore-rule change must NEVER trash a backed-up file (DESIGN s5.5): {:?}",
+        p.ops
     );
 }
 

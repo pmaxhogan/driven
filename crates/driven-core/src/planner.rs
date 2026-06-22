@@ -370,6 +370,7 @@ mod tests {
             new_or_changed: vec![local_entry("a.txt", 1), local_entry("b/c.txt", 2)],
             deleted: Vec::new(),
             collisions: Vec::new(),
+            excluded_orphans: Vec::new(),
         };
         let state = FakeStateRepo::default();
 
@@ -409,6 +410,7 @@ mod tests {
             new_or_changed: vec![local_entry("doc.txt", 42)],
             deleted: Vec::new(),
             collisions: Vec::new(),
+            excluded_orphans: Vec::new(),
         };
         let state = FakeStateRepo::default();
 
@@ -439,6 +441,7 @@ mod tests {
             new_or_changed: Vec::new(),
             deleted: vec![rel("gone.txt")],
             collisions: Vec::new(),
+            excluded_orphans: Vec::new(),
         };
         let state = FakeStateRepo::with_rows(vec![row]);
 
@@ -475,6 +478,7 @@ mod tests {
             new_or_changed: Vec::new(),
             deleted: vec![rel("never-up.txt")],
             collisions: Vec::new(),
+            excluded_orphans: Vec::new(),
         };
         let state = FakeStateRepo::with_rows(vec![row]);
 
@@ -501,6 +505,7 @@ mod tests {
             new_or_changed: vec![local_entry("new-name.txt", 7)],
             deleted: vec![rel("old-name.txt")],
             collisions: Vec::new(),
+            excluded_orphans: Vec::new(),
         };
         let state = FakeStateRepo::with_rows(vec![old_row]);
 

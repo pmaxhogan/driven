@@ -50,7 +50,7 @@ use std::time::UNIX_EPOCH;
 
 use anyhow::Context;
 
-use crate::exclude::build_walker;
+use crate::exclude::{build_source_matcher, build_walker};
 use crate::state::{SourceRow, StateRepo};
 use crate::types::{LocalEntry, RelativePath, ScanMode, ScanResult};
 
@@ -99,6 +99,12 @@ pub async fn scan(
             return Ok(ScanResult::default());
         }
     }
+
+    // The include/exclude decision matcher (DESIGN s5.2). The walker itself
+    // does NO ignore logic now; we ask the matcher per entry here AND reuse it
+    // below to split not-seen known paths into genuine deletions vs
+    // excluded-orphans (DESIGN s5.5).
+    let matcher = build_source_matcher(source)?;
 
     let walker = build_walker(source)?.build();
 
@@ -169,6 +175,19 @@ pub async fn scan(
                 continue;
             }
         };
+
+        // Include/exclude decision (DESIGN s5.2): consult the same matcher the
+        // orphan split below uses, on the NFC `RelativePath` so both agree. We
+        // are past the is_file filter, so `is_dir = false`. An excluded file is
+        // simply not backed up - and, crucially, never lands in `seen`, so if a
+        // stored `file_state` row exists for it the orphan split classifies it
+        // as an excluded-orphan (no trash), not a deletion.
+        // TODO(perf): prune excluded directories via WalkBuilder::filter_entry
+        //   so we do not descend e.g. node_modules just to discard each file.
+        if !matcher.is_included(Path::new(rel.as_str()), false) {
+            tracing::trace!(target: TARGET, source_id = %source.id, path = %rel, "excluded by ignore rules");
+            continue;
+        }
 
         let meta = match entry.metadata() {
             Ok(m) => m,
@@ -254,19 +273,33 @@ pub async fn scan(
         }
     }
 
-    // An unattributable walk error means we cannot trust the "not seen =>
-    // deleted" inference anywhere, so propagate no deletions at all this
-    // cycle; the next scan retries once the error clears.
-    let deleted: Vec<RelativePath> = if unattributed_error {
-        Vec::new()
-    } else {
-        known
-            .keys()
-            .filter(|p| !seen.contains(*p))
-            .filter(|p| !is_under_any(p, &errored_prefixes))
-            .cloned()
-            .collect()
-    };
+    // Split the known-but-not-seen paths into genuine deletions vs
+    // excluded-orphans (DESIGN s5.5). A `file_state` key the walk did not
+    // yield is either (a) genuinely gone from disk -> `deleted` (planner
+    // trashes), or (b) still present locally but now EXCLUDED by the current
+    // ignore rules -> `excluded_orphan` (planner emits NO trash; an
+    // ignore-rule change must never delete a backed-up file). A `file_state`
+    // key is always a file, so consult the matcher with `is_dir = false`.
+    //
+    // The error-suppression guard applies ONLY to `deleted`: trashing is the
+    // destructive action, so a transient permission error must hold it back.
+    // Classifying an orphan is non-destructive (no op either way), so it is
+    // safe even mid-error and is not gated.
+    let mut deleted: Vec<RelativePath> = Vec::new();
+    let mut excluded_orphans: Vec<RelativePath> = Vec::new();
+    for path in known.keys().filter(|p| !seen.contains(*p)) {
+        if !matcher.is_included(Path::new(path.as_str()), false) {
+            // (b) excluded by a (possibly new) ignore rule - not a deletion.
+            excluded_orphans.push(path.clone());
+            continue;
+        }
+        // (a) still included, so genuinely missing from disk -> a deletion,
+        // subject to the walk-error suppression.
+        if unattributed_error || is_under_any(path, &errored_prefixes) {
+            continue;
+        }
+        deleted.push(path.clone());
+    }
 
     tracing::debug!(
         target: TARGET,
@@ -274,6 +307,7 @@ pub async fn scan(
         ?mode,
         new_or_changed = new_or_changed.len(),
         deleted = deleted.len(),
+        excluded_orphans = excluded_orphans.len(),
         skipped_symlinks,
         skipped_cloud_only,
         collisions = collisions.len(),
@@ -286,6 +320,7 @@ pub async fn scan(
         new_or_changed,
         deleted,
         collisions,
+        excluded_orphans,
     })
 }
 

@@ -250,7 +250,8 @@ pub enum RelativePathError {
 // -----------------------------------------------------------------------------
 
 /// Status of a row in the `file_state` table (SPEC s2: TEXT column with
-/// values `'synced' | 'pending' | 'corrupt' | 'locked' | 'error'`).
+/// values `'synced' | 'pending' | 'corrupt' | 'locked' | 'error' |
+/// 'excluded_orphan'`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum FileStateStatus {
@@ -265,6 +266,15 @@ pub enum FileStateStatus {
     Locked,
     /// Last attempt failed with a non-retryable error.
     Error,
+    /// The file was previously backed up but a later ignore-rule change
+    /// (gitignore / default / `exclude_patterns`) now EXCLUDES it. Per
+    /// DESIGN s5.5 such a path is NOT trashed on Drive - the local file may
+    /// still exist, only the rules changed - so it is flagged here rather
+    /// than treated as a local deletion. The implicit-delete path is
+    /// reserved for actual on-disk deletions. (Serialized `"excluded_orphan"`;
+    /// not constructed/persisted in M2, where the scanner only surfaces the
+    /// orphan set on its [`ScanResult`] for the later Activity-banner UI.)
+    ExcludedOrphan,
 }
 
 // -----------------------------------------------------------------------------
@@ -423,6 +433,15 @@ pub struct ScanResult {
     /// collision instead of silently losing a file. One entry per
     /// additional collider (the first occurrence is not recorded).
     pub collisions: Vec<RelativePath>,
+    /// Paths present in `file_state` (so previously backed up) that the walk
+    /// did NOT yield because the CURRENT ignore rules now exclude them - an
+    /// ignore-rule change, not a local deletion (DESIGN s5.5). These are
+    /// split out of `deleted` precisely so the planner emits NO trash for
+    /// them: the local file may still be on disk, only the rules changed, and
+    /// trashing the Drive copy on a pure config change would be data loss.
+    /// At M2 this is surfaced for the later Activity-banner UI; the planner
+    /// no-ops on it.
+    pub excluded_orphans: Vec<RelativePath>,
 }
 
 /// One local file the scanner observed (SPEC s6 `LocalEntry`).

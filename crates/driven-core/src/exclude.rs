@@ -1,38 +1,55 @@
 //! gitignore + default + custom excludes; DESIGN s5.2.
 //!
-//! Builds the [`ignore::WalkBuilder`] the scanner (SPEC s6) walks with. The
-//! builder layers, in increasing precedence:
+//! Builds ONE combined [`ignore::gitignore::Gitignore`] decision matcher
+//! ([`build_source_matcher`]) that the scanner (SPEC s6) consults for every
+//! entry, plus the plain [`ignore::WalkBuilder`] it walks with. ALL ignore
+//! decisions are made by our matcher; the walker does NO ignore logic of its
+//! own (its built-in gitignore / git-exclude / git-global layers are turned
+//! off).
 //!
-//! 1. The gitignore cascade (`.gitignore`, `.git/info/exclude`, and the
-//!    user's global gitignore), gated on [`SourceRow::respect_gitignore`].
-//! 2. The DESIGN s5.2 DEFAULT EXCLUDE list (OS noise / editor swap / misc
-//!    transient globs), copied verbatim from the design doc.
-//! 3. The source's own `include_patterns` (opt-back-in, e.g. a bare `.env`)
-//!    and `exclude_patterns` (force-out, e.g. `*.log`).
+//! ## Precedence (gitignore semantics: LAST matching rule wins)
 //!
-//! Precedence note / KNOWN DEVIATION (flagged for integrate): DESIGN s5.2
-//! states the gitignore cascade should *beat* the default-exclude list
-//! ("if a user's gitignore says `!Thumbs.db`, Thumbs.db is included"). The
-//! `ignore` crate evaluates an [`ignore::overrides::Override`] at a
-//! *higher* precedence than the gitignore cascade, so packing the defaults
-//! and the user rules into one `Override` (as done here, mirroring the SPEC
-//! s6 single-`Override` sketch) places the defaults *above* gitignore
-//! rather than below. Within a single `Override` later globs win, so the
-//! user's own `include_patterns` still re-include over a default exclude
-//! and `exclude_patterns` still force-out - the user-vs-default precedence
-//! the ROADMAP rows require is correct. Only the defaults-vs-gitignore
-//! ordering is inverted. Restoring it needs the defaults moved to a lower
-//! `ignore` tier (e.g. an `add_ignore` global file); deferred past phase 2A.
+//! Rules are added LOWEST-precedence FIRST, so a later rule overrides an
+//! earlier one (DESIGN s5.2):
 //!
-//! Glob semantics reminder: inside an `Override`, a *bare* glob is a
-//! whitelist (include) and a `!glob` is an ignore (exclude) - the inverse
-//! of gitignore. So `include_patterns` are added verbatim as whitelist
-//! globs and `exclude_patterns` get a `!` prepended. A source whose intent
-//! is "re-include `.env`" therefore stores the bare string `.env` in
-//! `include_patterns`, NOT `!.env` (the "e.g. !.env" wording in the task /
-//! SPEC s6 describes the user-facing *effect*, not the stored glob).
+//! 1. (lowest) the DESIGN s5.2 DEFAULT EXCLUDE list (OS noise / editor swap /
+//!    misc transient globs), each added as a bare exclude glob.
+//! 2. the source's `.gitignore` cascade, IF [`SourceRow::respect_gitignore`]:
+//!    every `.gitignore` under the source root, root-first, added in order so
+//!    a deeper file's rule wins over a shallower one. A user `!Thumbs.db` in
+//!    gitignore therefore beats the default Thumbs.db exclude (DESIGN s5.2:
+//!    "gitignore wins where they conflict").
+//! 3. (highest) the source's own `exclude_patterns` (bare globs = force-out,
+//!    e.g. `*.log`) then `include_patterns` (`!`-prefixed = re-include, e.g.
+//!    a bare `.env` that opts a gitignored secret back in). These are the
+//!    user's source-level overrides and beat BOTH gitignore and the defaults
+//!    (DESIGN s5.2: `include_patterns` opt-back-in things gitignore excludes;
+//!    `exclude_patterns` force-out things gitignore includes).
+//!
+//! ## Glob semantics (true gitignore, NOT the inverted `Override` form)
+//!
+//! These are real gitignore rules: a *bare* glob EXCLUDES and a leading `!`
+//! RE-INCLUDES. So `exclude_patterns` are added verbatim and `include_patterns`
+//! get a `!` prepended. A source whose intent is "re-include `.env`" stores
+//! the bare string `.env` in `include_patterns` (the matcher prepends the
+//! `!`); the "e.g. !.env" wording in the SPEC describes the user-facing
+//! *effect*, not the stored glob.
+//!
+//! ## Why a custom matcher (replaces the old single `Override`)
+//!
+//! The previous implementation packed defaults + user rules into one
+//! [`ignore::overrides::Override`]. That tier is WHITELIST-mode (one whitelist
+//! glob drops every unmatched file - a backup data-loss bug) and is evaluated
+//! ABOVE the gitignore cascade, inverting the DESIGN defaults-vs-gitignore
+//! precedence so a gitignore `!Thumbs.db` could not re-include over a default.
+//! A `Gitignore` matcher has neither problem: unmatched paths stay
+//! `Match::None` (included) and `!`-rules re-include naturally without
+//! flipping any global mode - which is what lets `!.env` (F2) and a gitignore
+//! `!Thumbs.db` (F5) work.
 
-use ignore::overrides::{Override, OverrideBuilder};
+use std::path::Path;
+
+use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
 
 use crate::state::SourceRow;
@@ -73,80 +90,161 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".Trashes/",
 ];
 
-/// Builds the [`Override`] layering the DESIGN s5.2 default excludes with
-/// the source's own `exclude_patterns`.
+/// The combined include/exclude decision matcher for one source.
 ///
-/// The returned `Override` is the highest-precedence ignore tier the
-/// scanner's [`WalkBuilder`] consults. It carries ONLY ignore globs (the
-/// DEFAULT_EXCLUDES followed by the source's `exclude_patterns`), each added
-/// as a `!glob` so the `ignore`-crate `Override`'s inverted-`!` semantics
-/// turn it into an ignore. Within it, later globs win, so a source's
-/// `exclude_patterns` can still force-out something a default would have let
-/// through; no entry contradicts a default here, so order is moot in
-/// practice.
-///
-/// ## KNOWN LIMITATION / BLOCKED M2 row: `include_patterns` re-inclusion
-///
-/// `include_patterns` (the user "opt-back-in" re-include globs, e.g. a bare
-/// `.env` that re-surfaces a gitignored secret) are NOT applied here, and as
-/// a result the ROADMAP M2 "`!.env` override" row is unimplemented. This is a
-/// deliberate safety choice, not an oversight:
-///
-/// A re-include needs a WHITELIST glob. The `ignore` crate's `Override`
-/// (`overrides.rs::Override::matched`) switches to whitelist-ONLY mode the
-/// instant it contains a single whitelist glob: every path that matches no
-/// whitelist glob is then returned `Match::Ignore` and dropped. For a backup
-/// tool that is catastrophic - adding ONE include pattern would silently stop
-/// backing up every other file in the source. The previous single-`Override`
-/// implementation had exactly this data-loss bug (it packed `include_patterns`
-/// as bare whitelist globs), which the `overrides_passthrough_for_unmatched`
-/// test surfaces.
-///
-/// Re-inclusion that beats the `.gitignore` cascade WITHOUT whitelist-mode
-/// requires a higher gitignore-semantics tier (where a leading `!` is a
-/// natural re-include and unmatched paths stay `Match::None`). In the
-/// `ignore` crate the only such tiers are the by-name, searched-in-tree
-/// `.ignore` / custom-ignore-filename files (writing one into the user's
-/// source tree would corrupt the backup) or a full takeover of gitignore
-/// evaluation via `WalkBuilder::filter_entry` plus an in-memory matcher that
-/// re-implements nested-`.gitignore` precedence. Both are out of scope for
-/// the M2-integrate pass; this is flagged as a Phase-2 architectural defect
-/// for a focused exclude.rs rework. Until then, excludes-only is shipped
-/// because a missed re-include leaves ONE intended file unbacked (bounded,
-/// visible) whereas whitelist-mode silently drops EVERY non-included file
-/// (unbounded, catastrophic).
-pub fn build_override(source: &SourceRow) -> anyhow::Result<Override> {
-    let mut ob = OverrideBuilder::new(&source.local_path);
+/// Thin wrapper over a single [`ignore::gitignore::Gitignore`] built by
+/// [`build_source_matcher`]. The scanner consults it for BOTH the walk filter
+/// and the excluded-orphan split (DESIGN s5.5) via [`SourceMatcher::is_included`],
+/// so include/exclude semantics are identical in both places.
+#[derive(Debug)]
+pub struct SourceMatcher {
+    inner: Gitignore,
+}
 
-    // Defaults first. Each is an ignore glob, so prepend `!`.
+impl SourceMatcher {
+    /// Whether `rel` (a source-root-relative path) is INCLUDED under the
+    /// current rules. `is_dir` distinguishes a directory from a file so a
+    /// trailing-slash gitignore rule (`node_modules/`) applies correctly.
+    ///
+    /// Uses [`Gitignore::matched_path_or_any_parents`], NOT `matched`: a
+    /// directory-scoped rule such as `node_modules/` matches the *directory*,
+    /// and `matched("node_modules/foo.js", false)` would return `None`
+    /// (included) - the file would leak in. Walking ancestors catches the
+    /// excluded parent and returns `Ignore`. A `Whitelist` (a `!`-re-include)
+    /// or `None` (no rule) both mean INCLUDED; only `Ignore` excludes.
+    pub fn is_included(&self, rel: &Path, is_dir: bool) -> bool {
+        !self
+            .inner
+            .matched_path_or_any_parents(rel, is_dir)
+            .is_ignore()
+    }
+}
+
+/// Builds the combined [`SourceMatcher`] for `source` (DESIGN s5.2).
+///
+/// Adds rules in LAST-MATCH-WINS order (see the module docs): defaults
+/// (lowest), then the `.gitignore` cascade if `respect_gitignore`, then the
+/// source's `exclude_patterns` and `include_patterns` (highest). The matcher
+/// is anchored at the source root so all rules match against root-relative
+/// paths - the same form the scanner strips each entry to.
+pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher> {
+    let root = Path::new(&source.local_path);
+    let mut gb = GitignoreBuilder::new(root);
+
+    // 1. (lowest) DESIGN s5.2 default excludes - bare gitignore globs.
     for glob in DEFAULT_EXCLUDES {
-        ob.add(&format!("!{glob}"))?;
-    }
-    // The source's own exclude_patterns: force-out, so `!glob`. Added after
-    // the defaults so a later exclude wins over an earlier same-path entry.
-    //
-    // NOTE: `include_patterns` are intentionally NOT added here - adding any
-    // bare whitelist glob would flip the Override into whitelist-only mode
-    // and silently drop every unmatched file (see the fn docs above).
-    for exc in &source.exclude_patterns {
-        ob.add(&format!("!{exc}"))?;
+        gb.add_line(None, glob)
+            .map_err(|e| anyhow::anyhow!("adding default exclude `{glob}`: {e}"))?;
     }
 
-    Ok(ob.build()?)
+    // 2. the source's `.gitignore` cascade, root-first so a deeper file's
+    //    rule wins over a shallower one (approximation of the per-directory
+    //    cascade for M2).
+    // TODO(perf/correctness): true per-directory gitignore scoping - rules in
+    //    a nested `.gitignore` should apply only under that directory, and a
+    //    pattern with no slash should match at any depth below its file. This
+    //    flattens all rules into one matcher rooted at the source root, which
+    //    is a close-but-not-exact approximation accepted for M2.
+    if source.respect_gitignore {
+        for gitignore in collect_gitignore_files(root) {
+            // `GitignoreBuilder::add` returns Some(err) on a partial/parse
+            // error; a missing or unreadable `.gitignore` is non-fatal (we
+            // simply apply no rules from it) so only log.
+            if let Some(err) = gb.add(&gitignore) {
+                tracing::warn!(
+                    target: TARGET,
+                    source_id = %source.id,
+                    path = %gitignore.display(),
+                    %err,
+                    "failed to parse a .gitignore; ignoring its rules"
+                );
+            }
+        }
+    }
+
+    // 3. (highest) the source's own overrides: exclude_patterns force-out
+    //    (bare glob), then include_patterns opt-back-in (`!`-prefixed). Added
+    //    LAST so they beat both gitignore and the defaults.
+    for exc in &source.exclude_patterns {
+        gb.add_line(None, exc)
+            .map_err(|e| anyhow::anyhow!("adding exclude_pattern `{exc}`: {e}"))?;
+    }
+    for inc in &source.include_patterns {
+        let reinclude = format!("!{inc}");
+        gb.add_line(None, &reinclude)
+            .map_err(|e| anyhow::anyhow!("adding include_pattern `{inc}`: {e}"))?;
+    }
+
+    let inner = gb
+        .build()
+        .map_err(|e| anyhow::anyhow!("building source matcher: {e}"))?;
+
+    tracing::debug!(
+        target: TARGET,
+        source_id = %source.id,
+        respect_gitignore = source.respect_gitignore,
+        includes = source.include_patterns.len(),
+        excludes = source.exclude_patterns.len(),
+        num_ignores = inner.num_ignores(),
+        "built source matcher"
+    );
+    Ok(SourceMatcher { inner })
+}
+
+/// Collects every `.gitignore` file under `root`, root-first (shallowest
+/// first), so [`build_source_matcher`] can add them in last-match-wins order
+/// where a deeper file's rule overrides a shallower one.
+///
+/// A dependency-free breadth-first `std::fs::read_dir` walk: BFS visits
+/// shallower directories before deeper ones, giving the root-first ordering
+/// directly. Symlinked directories are NOT descended (mirrors the scanner's
+/// `follow_links(false)` policy, DESIGN s5.2.1, and avoids cycles). I/O errors
+/// on a directory are logged and that subtree skipped - never fatal, since a
+/// failed enumerate just means we apply fewer gitignore rules, never that we
+/// wrongly back up or drop a file (the per-entry walk re-checks each path).
+// TODO(perf): prune directories the matcher already excludes (e.g.
+//   `node_modules`) so we do not descend them just to find a `.gitignore`.
+fn collect_gitignore_files(root: &Path) -> Vec<std::path::PathBuf> {
+    let mut found = Vec::new();
+    let mut queue = std::collections::VecDeque::new();
+    queue.push_back(root.to_path_buf());
+
+    while let Some(dir) = queue.pop_front() {
+        let entries = match std::fs::read_dir(&dir) {
+            Ok(e) => e,
+            Err(err) => {
+                tracing::debug!(target: TARGET, path = %dir.display(), %err, "read_dir failed while collecting .gitignore files; skipping subtree");
+                continue;
+            }
+        };
+        for entry in entries.flatten() {
+            let path = entry.path();
+            match entry.file_type() {
+                // Do not follow symlinks (cycle / out-of-root safety).
+                Ok(ft) if ft.is_dir() => queue.push_back(path),
+                Ok(ft)
+                    if ft.is_file() && entry.file_name() == std::ffi::OsStr::new(".gitignore") =>
+                {
+                    found.push(path);
+                }
+                _ => {}
+            }
+        }
+    }
+    found
 }
 
 /// Builds the configured [`WalkBuilder`] for `source` (SPEC s6
 /// `build_walker`).
 ///
-/// Layers the gitignore cascade (gated on
-/// [`SourceRow::respect_gitignore`]) under the [`build_override`] result.
+/// The walker does NO ignore logic of its own: `git_ignore` /
+/// `git_exclude` / `git_global` are all turned OFF because the scanner makes
+/// every include/exclude decision via [`build_source_matcher`]. The walker is
+/// just a plain recursive directory traversal.
 ///
 /// `hidden(false)` is mandatory: Driven backs up dotfiles, and leaving the
 /// `ignore` default `hidden(true)` would silently drop every `.env` /
-/// `.config` before any rule applies. `require_git(false)` makes the
-/// gitignore cascade apply even when the source root is not a git
-/// repository (the default `require_git(true)` would make a plain
-/// `.gitignore` in a non-repo a no-op).
+/// `.config` before any rule applies.
 ///
 /// `follow_links(false)` (the `ignore` default, set explicitly for clarity)
 /// implements the [`crate::types::SymlinkPolicy::Skip`] policy from DESIGN
@@ -155,13 +253,12 @@ pub fn build_override(source: &SourceRow) -> anyhow::Result<Override> {
 /// entries themselves.
 pub fn build_walker(source: &SourceRow) -> anyhow::Result<WalkBuilder> {
     let mut wb = WalkBuilder::new(&source.local_path);
-    wb.git_ignore(source.respect_gitignore)
-        .git_exclude(source.respect_gitignore)
-        .git_global(source.respect_gitignore)
+    wb.git_ignore(false)
+        .git_exclude(false)
+        .git_global(false)
         .require_git(false)
         .hidden(false)
-        .follow_links(false)
-        .overrides(build_override(source)?);
+        .follow_links(false);
 
     tracing::debug!(
         target: TARGET,
@@ -218,16 +315,29 @@ mod tests {
         }
     }
 
-    /// Collects the file basenames (relative to `root`) the walker yields.
+    /// Collects the included file basenames (relative to `root`), applying
+    /// the same matcher + walker the scanner uses. The walker itself no longer
+    /// filters (all ignore decisions live in [`SourceMatcher`]), so this
+    /// mirrors the scanner: strip to a root-relative path and ask the matcher
+    /// `is_included(rel, is_dir)`.
     fn walked_names(source: &SourceRow) -> Vec<String> {
+        let matcher = build_source_matcher(source).expect("matcher");
         let mut out = Vec::new();
         for res in build_walker(source).expect("walker").build() {
             let entry = res.expect("entry");
+            let is_dir = entry.file_type().is_some_and(|t| t.is_dir());
+            let rel = entry
+                .path()
+                .strip_prefix(&source.local_path)
+                .expect("under root");
+            // The root entry strips to "" - skip it.
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            if !matcher.is_included(rel, is_dir) {
+                continue;
+            }
             if entry.file_type().is_some_and(|t| t.is_file()) {
-                let rel = entry
-                    .path()
-                    .strip_prefix(&source.local_path)
-                    .expect("under root");
                 out.push(rel.to_string_lossy().replace('\\', "/"));
             }
         }
@@ -270,21 +380,49 @@ mod tests {
     }
 
     #[test]
-    #[ignore = "BLOCKED: Phase-2 exclude.rs single-Override cannot re-include a gitignored path without flipping to whitelist-mode (silent mass file-drop, a backup data-loss bug). Needs an ignore-tier rework (filter_entry + in-memory nested-gitignore matcher). See M2 Phase-3 report; ROADMAP M2 '!.env override' row deferred."]
     fn include_pattern_reincludes_gitignored() {
-        // A bare `.env` whitelist glob re-includes a path the gitignore
+        // F2: a bare `.env` include_pattern re-includes a path the gitignore
         // cascade would drop (ROADMAP "!.env wins" row; stored as the bare
-        // glob, not the literal `!.env`).
+        // glob - the matcher prepends the `!`). `keep.txt` must survive too:
+        // the new Gitignore matcher never flips to whitelist-only mode, so
+        // adding an include cannot silently drop unrelated files.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(&root.join(".gitignore"), ".env\n");
         write(&root.join(".env"), "x");
+        write(&root.join("keep.txt"), "x");
 
         let src = source_at(root, true, &[".env"], &[]);
         let names = walked_names(&src);
         assert!(
             names.contains(&".env".to_string()),
             "include_pattern must re-include the gitignored .env: {names:?}"
+        );
+        assert!(
+            names.contains(&"keep.txt".to_string()),
+            "adding an include must never drop unrelated files: {names:?}"
+        );
+    }
+
+    #[test]
+    fn gitignore_reinclude_beats_default_exclude() {
+        // F5: a gitignore `!Thumbs.db` re-includes Thumbs.db despite the
+        // DESIGN s5.2 default exclude - "gitignore wins where they conflict".
+        // This is the defaults-vs-gitignore precedence the old single-Override
+        // inverted; the new last-match-wins matcher adds defaults BELOW the
+        // gitignore cascade so the `!Thumbs.db` rule overrides them.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "!Thumbs.db\n");
+        write(&root.join("Thumbs.db"), "x");
+        write(&root.join("real.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let names = walked_names(&src);
+        assert!(names.contains(&"real.txt".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"Thumbs.db".to_string()),
+            "gitignore !Thumbs.db must re-include over the default exclude: {names:?}"
         );
     }
 
@@ -331,9 +469,11 @@ mod tests {
     }
 
     #[test]
-    fn overrides_passthrough_for_unmatched() {
+    fn matcher_passthrough_for_unmatched() {
         // An ordinary file matching no include/exclude/default still passes
-        // - i.e. the Override never silently flips to whitelist-only mode.
+        // - the Gitignore matcher returns Match::None (included) for an
+        // unmatched path even when include_patterns are present, so it never
+        // flips to a whitelist-only mode that would drop unrelated files.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(&root.join("ordinary.dat"), "x");
