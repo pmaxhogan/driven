@@ -415,6 +415,14 @@ pub struct ScanResult {
     /// planner trashes the ones that reached Drive and drops the rest
     /// (SPEC s7).
     pub deleted: Vec<RelativePath>,
+    /// NFC `RelativePath` keys that two or more distinct raw on-disk paths
+    /// normalised onto (DESIGN s5.2.3, SPEC s24 `local.unicode_collision`).
+    /// The scanner keeps the first-seen file for each colliding key and
+    /// drops the later one(s) rather than emitting a duplicate upload op;
+    /// each dropped key is recorded here so the UI can surface the
+    /// collision instead of silently losing a file. One entry per
+    /// additional collider (the first occurrence is not recorded).
+    pub collisions: Vec<RelativePath>,
 }
 
 /// One local file the scanner observed (SPEC s6 `LocalEntry`).

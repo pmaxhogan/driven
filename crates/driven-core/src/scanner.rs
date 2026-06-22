@@ -56,6 +56,14 @@ use crate::types::{LocalEntry, RelativePath, ScanMode, ScanResult};
 
 static TARGET: &str = "driven::core::scanner";
 
+/// `FILE_ATTRIBUTE_RECALL_ON_OPEN` (DESIGN s5.2.1): set by OneDrive Files-On-
+/// Demand (and similar cloud providers) on a placeholder whose bytes are not
+/// resident on disk. Reading such a file forces a network hydration, so the
+/// scanner skips these by default rather than pulling down TBs of cloud-only
+/// data. Matches the Win32 SDK constant `0x00400000`.
+#[cfg(windows)]
+const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0040_0000;
+
 /// Walks one source and returns the new-or-changed / deleted diff (SPEC s6).
 ///
 /// `mode` selects the change-detection predicate (see the module docs).
@@ -96,6 +104,16 @@ pub async fn scan(
 
     let mut seen: HashSet<RelativePath> = HashSet::new();
     let mut new_or_changed: Vec<LocalEntry> = Vec::new();
+    // NFC collision keys: a second distinct raw path that normalises onto an
+    // already-seen `RelativePath` (DESIGN s5.2.3, SPEC s24
+    // `local.unicode_collision`). We keep the first file, drop the later one,
+    // and record the key here instead of emitting a duplicate op.
+    let mut collisions: Vec<RelativePath> = Vec::new();
+    // Count of cloud-only (OneDrive Files-On-Demand) placeholders skipped
+    // before stat/hash (DESIGN s5.2.1). Mutated only on Windows; the
+    // attribute (and thus the increment) never exists on other targets.
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut skipped_cloud_only: u64 = 0;
     // Directory prefixes (relative, `/`-joined) under which the walk hit an
     // error. Any known path under one of these is held back from `deleted`.
     let mut errored_prefixes: Vec<RelativePath> = Vec::new();
@@ -164,11 +182,40 @@ pub async fn scan(
             }
         };
 
+        // OneDrive Files-On-Demand skip (DESIGN s5.2.1): a cloud-only
+        // placeholder has FILE_ATTRIBUTE_RECALL_ON_OPEN set; opening it to
+        // stat/hash would force a network hydration. Skip it, but FIRST mark
+        // it `seen` so the deletion sweep below does NOT treat its existing
+        // `file_state` row as "known but missing" and trash the Drive backup
+        // - a placeholder is still present locally, just dehydrated.
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::MetadataExt;
+            if meta.file_attributes() & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0 {
+                // TODO(M6): per-source "include cloud-only OneDrive files" toggle (default skip)
+                seen.insert(rel.clone());
+                skipped_cloud_only += 1;
+                tracing::trace!(target: TARGET, source_id = %source.id, path = %rel, "skipping cloud-only (OneDrive Files-On-Demand) placeholder");
+                continue;
+            }
+        }
+
         let size = meta.len();
         let mtime_ns = mtime_ns(&meta);
-        seen.insert(rel.clone());
+        // NFC collision detection (DESIGN s5.2.3, SPEC s24
+        // local.unicode_collision): `RelativePath::try_from` NFC-normalised
+        // `rel`, so two byte-distinct raw paths can collapse to one key.
+        // `HashSet::insert` returns false when the key was already present;
+        // keep the first file, record + drop the later collider rather than
+        // emitting a duplicate upload op for the same `file_state` key.
+        if !seen.insert(rel.clone()) {
+            tracing::warn!(target: TARGET, source_id = %source.id, path = %rel, "local.unicode_collision: distinct raw paths normalise to one NFC key; dropping later duplicate");
+            collisions.push(rel.clone());
+            continue;
+        }
 
         let stored = known.get(&rel);
+        // TODO(M3): FS-granularity probe + ctime/birthtime fallback + hash-within-last-scan-window per DESIGN s5.2 step 2
         let stat_match =
             matches!(stored, Some(row) if row.size == size && row.mtime_ns == mtime_ns);
 
@@ -228,6 +275,8 @@ pub async fn scan(
         new_or_changed = new_or_changed.len(),
         deleted = deleted.len(),
         skipped_symlinks,
+        skipped_cloud_only,
+        collisions = collisions.len(),
         errored_prefixes = errored_prefixes.len(),
         unattributed_error,
         "scan complete"
@@ -236,6 +285,7 @@ pub async fn scan(
     Ok(ScanResult {
         new_or_changed,
         deleted,
+        collisions,
     })
 }
 
@@ -285,6 +335,7 @@ fn error_path(err: &ignore::Error) -> Option<&Path> {
 /// BLAKE3 hash of a file's bytes, read in bounded chunks (DESIGN s3.3
 /// deep-verify). Streams so memory stays bounded regardless of file size.
 fn hash_file(path: &Path) -> anyhow::Result<[u8; 32]> {
+    // TODO(M3): use FILE_SHARE_DELETE platform-open helper per DESIGN s5.3 (executor open path)
     let mut file = std::fs::File::open(path)
         .with_context(|| format!("opening {} for deep-verify", path.display()))?;
     let mut hasher = blake3::Hasher::new();
@@ -747,5 +798,84 @@ mod tests {
             !got.contains(&"link.txt".to_string()),
             "symlink must be skipped, not backed up: {got:?}"
         );
+    }
+
+    /// Two byte-distinct raw filenames that NFC-normalise to the same key
+    /// (precomposed "cafe-acute" vs the decomposed "e + combining acute")
+    /// must collapse to ONE `file_state` key: exactly one upload op and one
+    /// recorded collision, never a duplicate op (DESIGN s5.2.3, SPEC s24
+    /// `local.unicode_collision`).
+    ///
+    /// macOS/APFS itself normalises filenames, so the two paths would be the
+    /// SAME file on disk and the collision could never arise from a walk;
+    /// gate the on-disk variant off macOS. NTFS and ext4 keep them distinct,
+    /// so the walk yields two entries and the scanner must dedup them. The
+    /// `dedup_logic_drops_nfc_collider` test below exercises the same dedup
+    /// branch directly with no filesystem dependency as a portable backstop.
+    #[cfg(not(target_os = "macos"))]
+    #[tokio::test]
+    async fn nfc_collision_dedups_to_one_op() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // Precomposed U+00E9 vs decomposed "e" + U+0301; both render "cafe"
+        // with an acute accent.
+        write(&root.join("caf\u{00e9}.txt"), b"precomposed");
+        write(&root.join("cafe\u{0301}.txt"), b"decomposed");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+
+        // If the underlying FS silently merged the two names into one file
+        // (some configurations do), there is nothing to dedup; the dedicated
+        // unit test below still covers the logic, so only assert the
+        // collision invariant when the walk actually saw two raw entries.
+        if res.new_or_changed.len() + res.collisions.len() >= 2 {
+            assert_eq!(
+                res.new_or_changed.len(),
+                1,
+                "collision must yield exactly one upload op: {:?}",
+                res.new_or_changed
+            );
+            assert_eq!(
+                res.collisions.len(),
+                1,
+                "collision must be recorded exactly once: {:?}",
+                res.collisions
+            );
+        }
+        assert!(res.deleted.is_empty());
+    }
+
+    /// Portable backstop for the NFC dedup branch: drive the `HashSet::insert`
+    /// contract the scanner relies on. The constructor NFC-normalises, so the
+    /// two spellings produce equal keys; the second `insert` returns `false`,
+    /// which is exactly the signal the walk loop uses to record a collision
+    /// and drop the duplicate.
+    #[test]
+    fn dedup_logic_drops_nfc_collider() {
+        let precomposed = RelativePath::try_from("caf\u{00e9}.txt".to_string()).unwrap();
+        let decomposed = RelativePath::try_from("cafe\u{0301}.txt".to_string()).unwrap();
+        assert_eq!(
+            precomposed, decomposed,
+            "NFC normalisation must collapse the two spellings to one key"
+        );
+
+        let mut seen: HashSet<RelativePath> = HashSet::new();
+        assert!(seen.insert(precomposed.clone()), "first insert is new");
+        assert!(
+            !seen.insert(decomposed.clone()),
+            "second insert of an NFC-equal key must report a collision"
+        );
+    }
+
+    /// The cloud-only skip constant must match the Win32 SDK value
+    /// `FILE_ATTRIBUTE_RECALL_ON_OPEN` (DESIGN s5.2.1). Synthesising the
+    /// actual attribute on a temp file is not portably possible, so pin the
+    /// bit value to guard against an accidental edit.
+    #[cfg(windows)]
+    #[test]
+    fn recall_on_open_bit_is_correct() {
+        assert_eq!(super::FILE_ATTRIBUTE_RECALL_ON_OPEN, 0x0040_0000);
     }
 }
