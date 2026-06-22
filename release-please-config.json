@@ -1,0 +1,20 @@
+{
+  "$schema": "https://raw.githubusercontent.com/googleapis/release-please/main/schemas/config.json",
+  "release-type": "rust",
+  "include-component-in-tag": false,
+  "bump-minor-pre-major": true,
+  "bump-patch-for-minor-pre-major": false,
+  "draft": false,
+  "prerelease": false,
+  "extra-files": [
+    "src-tauri/tauri.conf.json",
+    "ui/package.json"
+  ],
+  "packages": {
+    ".": {
+      "package-name": "driven",
+      "component": "driven",
+      "release-type": "rust"
+    }
+  }
+}

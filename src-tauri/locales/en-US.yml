@@ -1,0 +1,30 @@
+_version: 2
+
+app:
+  name: "Driven"
+  tagline: "One-way local-folder backup to Google Drive"
+
+tray:
+  open: "Open Driven"
+  sync_now: "Sync now"
+  pause: "Pause sync"
+  resume: "Resume sync"
+  pause_30m: "Pause for 30 minutes"
+  activity: "Activity"
+  settings: "Settings"
+  restore: "Restore"
+  quit: "Quit Driven"
+
+notifications:
+  first_sync_complete:
+    title: "First sync complete"
+    body: "%{count} files backed up to Google Drive."
+  needs_reauth:
+    title: "Driven needs to sign in again"
+    body: "Sign in to %{account} to keep backups running."
+  paused_battery:
+    title: "Sync paused"
+    body: "On battery power; sync will resume on AC."
+  paused_metered:
+    title: "Sync paused"
+    body: "On metered network; sync will resume on unmetered."

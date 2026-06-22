@@ -1,0 +1,15 @@
+[package]
+name = "driven-crypto"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven authenticated-encryption format (XChaCha20-Poly1305 STREAM, filename encryption)"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+bytes.workspace = true

@@ -1,0 +1,40 @@
+[workspace]
+resolver = "2"
+members = [
+    "crates/driven-core",
+    "crates/driven-drive",
+    "crates/driven-crypto",
+    "crates/driven-power",
+    "crates/driven-test-fixtures",
+    "crates/driven-chaos",
+    "src-tauri",
+]
+
+[workspace.package]
+version = "0.1.0"
+edition = "2021"
+rust-version = "1.85"
+authors = ["Driven contributors"]
+license = "MIT OR Apache-2.0"
+repository = "https://github.com/pmaxhogan/driven"
+homepage = "https://driven.maxhogan.dev"
+
+[workspace.dependencies]
+tokio = { version = "1", features = ["full"] }
+anyhow = "1"
+thiserror = "2"
+serde = { version = "1", features = ["derive"] }
+serde_json = "1"
+tracing = "0.1"
+tracing-subscriber = { version = "0.3", features = ["env-filter"] }
+async-trait = "0.1"
+bytes = "1"
+futures = "0.3"
+
+[profile.dev]
+opt-level = 1
+
+[profile.release]
+lto = "thin"
+codegen-units = 1
+strip = "symbols"

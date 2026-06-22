@@ -1,0 +1,10 @@
+{
+  "app": {
+    "name": "Driven",
+    "welcome": "Driven",
+    "tagline": "One-way local-folder backup to Google Drive.",
+    "boot": {
+      "bootstrap": "Bootstrapping in progress. Setup wizard arrives in M6."
+    }
+  }
+}

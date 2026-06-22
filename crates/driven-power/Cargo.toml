@@ -1,0 +1,16 @@
+[package]
+name = "driven-power"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven power-source / metered-network / sleep-wake signals, normalized across OSes"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true

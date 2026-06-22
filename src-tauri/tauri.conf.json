@@ -1,0 +1,52 @@
+{
+  "$schema": "https://schema.tauri.app/config/2",
+  "productName": "Driven",
+  "version": "0.1.0",
+  "identifier": "app.driven",
+  "build": {
+    "frontendDist": "../ui/dist",
+    "devUrl": "http://localhost:5173",
+    "beforeDevCommand": "pnpm --dir ../ui dev",
+    "beforeBuildCommand": "pnpm --dir ../ui build"
+  },
+  "app": {
+    "windows": [
+      {
+        "label": "main",
+        "title": "Driven",
+        "width": 1100,
+        "height": 720,
+        "visible": false,
+        "decorations": true,
+        "resizable": true,
+        "minWidth": 880,
+        "minHeight": 560
+      }
+    ],
+    "trayIcon": {
+      "iconPath": "icons/tray.png",
+      "iconAsTemplate": true
+    },
+    "security": {
+      "csp": "default-src 'self'; img-src 'self' data:; connect-src 'self' ipc: tauri:"
+    }
+  },
+  "bundle": {
+    "active": true,
+    "createUpdaterArtifacts": true,
+    "targets": ["app", "dmg", "msi", "nsis", "deb", "appimage"],
+    "icon": [
+      "icons/32x32.png",
+      "icons/128x128.png",
+      "icons/128x128@2x.png",
+      "icons/icon.icns",
+      "icons/icon.ico"
+    ],
+    "category": "Utility",
+    "shortDescription": "One-way backup to Google Drive",
+    "longDescription": "Driven backs up local folders to Google Drive, one way, fast, with encryption, scheduling, and battery awareness.",
+    "publisher": "Driven",
+    "macOS": { "minimumSystemVersion": "11.0" },
+    "windows": { "wix": { "language": "en-US" } }
+  }
+}

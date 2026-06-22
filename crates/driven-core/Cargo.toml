@@ -1,0 +1,20 @@
+[package]
+name = "driven-core"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven sync engine: scanner, planner, orchestrator, pacer, scheduler"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true

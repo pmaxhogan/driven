@@ -1,0 +1,45 @@
+# Rust
+/target
+**/*.rs.bk
+Cargo.lock.bak
+
+# Tauri
+/src-tauri/target
+/src-tauri/gen
+/src-tauri/WixTools
+
+# Node
+node_modules/
+ui/dist
+ui/.vite
+*.local
+
+# Editor
+.idea/
+.vscode/
+*.swp
+*.swo
+*~
+
+# OS noise
+.DS_Store
+Thumbs.db
+Desktop.ini
+
+# Driven runtime / dev artefacts
+.env
+.env.local
+.env.test
+*.log
+/logs
+/state.db
+/state.db-*
+
+# Pre-implementation audit (informational; not part of source)
+/.audit-out
+
+# Claude Code session state
+/.claude
+
+# Tauri build outputs not under src-tauri/target
+/release
