@@ -464,6 +464,292 @@ async fn fake_session_invalidation_via_fault() {
     assert!(matches!(r3, ResumeProgress::SessionInvalid));
 }
 
+// ---------------------------------------------------------------------------
+// Arm-fires-once tests: one per fault injector, asserting the trip edge
+// (after N successes the (N+1)-th call surfaces the fault) and the
+// post-trip state (latching vs single-shot).
+// ---------------------------------------------------------------------------
+
+/// Helper: do a benign read-only `about()` call against the store.
+async fn ping_read(store: &dyn RemoteStore) -> anyhow::Result<()> {
+    store.about().await.map(|_| ())
+}
+
+/// Helper: do a benign write `create()` call.
+async fn ping_write(store: &dyn RemoteStore, root: &str, name: &str) -> anyhow::Result<()> {
+    store
+        .create(
+            root,
+            name,
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"x")),
+            props(&[]),
+        )
+        .await
+        .map(|_| ())
+}
+
+#[tokio::test]
+async fn fake_rate_limit_after_trips_once() {
+    let store = InMemoryRemoteStore::new().with_rate_limit_after(2);
+    // Calls 0..2 succeed; call 2 trips with rate_limited; call 3
+    // recovers (single-shot).
+    ping_read(&store).await.expect("call 0 ok");
+    ping_read(&store).await.expect("call 1 ok");
+    let err = ping_read(&store).await.expect_err("call 2 trips");
+    assert!(format!("{err}").contains("rate_limited"));
+    ping_read(&store).await.expect("call 3 recovers");
+}
+
+#[tokio::test]
+async fn fake_5xx_after_trips_once() {
+    let store = InMemoryRemoteStore::new().with_5xx_after(1);
+    ping_read(&store).await.expect("call 0 ok");
+    let err = ping_read(&store).await.expect_err("call 1 trips");
+    assert!(format!("{err}").contains("unreachable"));
+    ping_read(&store).await.expect("call 2 recovers");
+}
+
+#[tokio::test]
+async fn fake_network_drop_after_trips_once() {
+    let store = InMemoryRemoteStore::new().with_network_drop_after(1);
+    ping_read(&store).await.expect("call 0 ok");
+    let err = ping_read(&store).await.expect_err("call 1 trips");
+    assert!(format!("{err}").contains("net.intermittent"));
+    ping_read(&store).await.expect("call 2 recovers");
+}
+
+#[tokio::test]
+async fn fake_invalid_grant_after_latches() {
+    let store = InMemoryRemoteStore::new().with_invalid_grant_after(1);
+    ping_read(&store).await.expect("call 0 ok");
+    let err = ping_read(&store).await.expect_err("call 1 trips");
+    assert!(format!("{err}").contains("invalid_grant"));
+    // Latches: subsequent calls also fail with the same.
+    let err2 = ping_read(&store).await.expect_err("call 2 still bad");
+    assert!(format!("{err2}").contains("invalid_grant"));
+}
+
+#[tokio::test]
+async fn fake_quota_exhausted_latches_on_writes() {
+    let store = InMemoryRemoteStore::new().with_quota_exhausted_after(3);
+    let root = store.root_id().to_string();
+    // 3-byte budget: first 1-byte write ok, second 1-byte ok, third
+    // 1-byte ok (consumes the last byte). The fourth write requests 1
+    // byte from a 0-byte budget -> rejected. The budget stays at 0 so
+    // the fault latches on subsequent write requests.
+    ping_write(&store, &root, "a").await.expect("write 1 ok");
+    ping_write(&store, &root, "b").await.expect("write 2 ok");
+    ping_write(&store, &root, "c").await.expect("write 3 ok");
+    let err = ping_write(&store, &root, "d")
+        .await
+        .expect_err("write 4 trips");
+    assert!(format!("{err}").contains("quota_exhausted"));
+    let err2 = ping_write(&store, &root, "e")
+        .await
+        .expect_err("write 5 still bad");
+    assert!(format!("{err2}").contains("quota_exhausted"));
+}
+
+#[tokio::test]
+async fn fake_dest_folder_missing_latches_on_writes_only() {
+    let store = InMemoryRemoteStore::new().with_dest_folder_missing();
+    let root = store.root_id().to_string();
+    // Read paths keep working...
+    ping_read(&store).await.expect("read ok");
+    store.list_folder(&root).await.expect("list ok");
+    // ...write paths latch.
+    let err = ping_write(&store, &root, "x")
+        .await
+        .expect_err("write trips");
+    assert!(format!("{err}").contains("dest_folder_missing"));
+    let err2 = ping_write(&store, &root, "y")
+        .await
+        .expect_err("write still bad");
+    assert!(format!("{err2}").contains("dest_folder_missing"));
+}
+
+#[tokio::test]
+async fn fake_dest_folder_readonly_latches_on_writes_only() {
+    let store = InMemoryRemoteStore::new().with_dest_folder_readonly();
+    let root = store.root_id().to_string();
+    ping_read(&store).await.expect("read ok");
+    let err = ping_write(&store, &root, "x")
+        .await
+        .expect_err("write trips");
+    assert!(format!("{err}").contains("permission_denied"));
+    let err2 = ping_write(&store, &root, "y")
+        .await
+        .expect_err("write still bad");
+    assert!(format!("{err2}").contains("permission_denied"));
+}
+
+#[tokio::test]
+async fn fake_md5_mismatch_latches_on_entry() {
+    // After 0 successes, the very next write trips - and the latch
+    // persists across all subsequent reads of THAT entry until it is
+    // re-uploaded.
+    let store = InMemoryRemoteStore::new().with_md5_mismatch_after(0);
+    let root = store.root_id().to_string();
+    let created = store
+        .create(
+            &root,
+            "bad.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"hi")),
+            props(&[]),
+        )
+        .await
+        .expect("create ok");
+    let real_md5 = {
+        use md5::{Digest, Md5};
+        let mut h = Md5::new();
+        h.update(b"hi");
+        let out = h.finalize();
+        let mut bytes = [0u8; 16];
+        bytes.copy_from_slice(&out);
+        bytes
+    };
+    assert_ne!(
+        created.md5,
+        Some(real_md5),
+        "fault returned wrong md5 from create"
+    );
+
+    // Latch persists: a follow-up metadata call returns the SAME bad
+    // md5 (no re-trip needed).
+    let meta = store.metadata(&created.id).await.expect("metadata ok");
+    assert_eq!(meta.md5, created.md5, "md5 latched across reads");
+
+    // ...and list_folder agrees.
+    let listing = store.list_folder(&root).await.expect("list ok");
+    let listed = listing
+        .iter()
+        .find(|e| e.id == created.id)
+        .expect("found in listing");
+    assert_eq!(listed.md5, created.md5, "md5 latched across list_folder");
+
+    // Re-upload via update clears the latch.
+    let updated = store
+        .update(
+            &created.id,
+            UploadBody::Bytes(Bytes::from_static(b"hi")),
+            props(&[]),
+        )
+        .await
+        .expect("update ok");
+    assert_eq!(updated.md5, Some(real_md5), "re-upload cleared latch");
+}
+
+#[tokio::test]
+async fn fake_trashed_visible_in_find_by_op_uuid() {
+    let store = InMemoryRemoteStore::new().with_trashed_visible_in_find_by_op_uuid();
+    let root = store.root_id().to_string();
+    let uuid = "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa";
+    let created = store
+        .create(
+            &root,
+            "t.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"x")),
+            props(&[(CLIENT_OP_UUID_KEY, uuid)]),
+        )
+        .await
+        .expect("create");
+    store.trash(&created.id).await.expect("trash");
+    // Without the fault, find_by_op_uuid would skip trashed children
+    // and return None. With the fault, the trashed entry surfaces.
+    let found = store
+        .find_by_op_uuid(&root, uuid)
+        .await
+        .expect("find succeeds")
+        .expect("trashed entry visible under fault");
+    assert_eq!(found.id, created.id);
+    assert!(found.trashed, "the surfaced entry is the trashed one");
+}
+
+#[tokio::test]
+async fn fake_session_invalid_after_chunks_targets_correct_session() {
+    // Open session A and arm A specifically; open session B with no
+    // arming. Push 3 chunks to B (all clean). Push 2 valid chunks to
+    // A (clean); the 3rd attempt on A trips.
+    let store = InMemoryRemoteStore::new();
+    let root = store.root_id().to_string();
+    let chunk = CHUNK_MULTIPLE as usize;
+    let total = chunk * 3;
+
+    let session_a = store
+        .resumable_session(
+            ResumableKind::Create {
+                parent_id: root.clone(),
+                name: "a.bin".into(),
+                app_properties: props(&[]),
+            },
+            "application/octet-stream",
+            (total + chunk) as u64, // 4 chunks so the 3rd is non-final
+        )
+        .await
+        .expect("open A");
+    assert!(
+        store.arm_session_invalidated_after(&session_a.url, 2),
+        "arm A"
+    );
+    let session_b = store
+        .resumable_session(
+            ResumableKind::Create {
+                parent_id: root.clone(),
+                name: "b.bin".into(),
+                app_properties: props(&[]),
+            },
+            "application/octet-stream",
+            total as u64,
+        )
+        .await
+        .expect("open B");
+
+    let buf = vec![0u8; chunk];
+
+    // Three chunks to B - last is final, so it completes.
+    let r1 = store
+        .resume_chunk(&session_b, 0, Bytes::copy_from_slice(&buf))
+        .await
+        .expect("B1");
+    assert!(matches!(r1, ResumeProgress::InProgress { .. }));
+    let r2 = store
+        .resume_chunk(&session_b, chunk as u64, Bytes::copy_from_slice(&buf))
+        .await
+        .expect("B2");
+    assert!(matches!(r2, ResumeProgress::InProgress { .. }));
+    let r3 = store
+        .resume_chunk(&session_b, 2 * chunk as u64, Bytes::copy_from_slice(&buf))
+        .await
+        .expect("B3");
+    assert!(
+        matches!(r3, ResumeProgress::Completed(_)),
+        "B unaffected by A's armed budget"
+    );
+
+    // Two clean chunks to A; the 3rd attempt trips.
+    let a1 = store
+        .resume_chunk(&session_a, 0, Bytes::copy_from_slice(&buf))
+        .await
+        .expect("A1");
+    assert!(matches!(a1, ResumeProgress::InProgress { .. }));
+    let a2 = store
+        .resume_chunk(&session_a, chunk as u64, Bytes::copy_from_slice(&buf))
+        .await
+        .expect("A2");
+    // A's budget was 2 (after(2) sets internal counter to 3). First two
+    // chunks decrement 3->2 and 2->1 (no trip). The third decrements
+    // 1->0 and trips.
+    assert!(matches!(a2, ResumeProgress::InProgress { .. }));
+    let a3 = store
+        .resume_chunk(&session_a, 2 * chunk as u64, Bytes::copy_from_slice(&buf))
+        .await
+        .expect("A3 returns SessionInvalid");
+    assert!(matches!(a3, ResumeProgress::SessionInvalid));
+}
+
 /// Concurrent `create()` calls on the same parent do not corrupt the
 /// index. ROADMAP M1 acceptance: "parallel uploads don't corrupt the
 /// fake's state."

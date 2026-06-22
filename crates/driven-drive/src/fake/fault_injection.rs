@@ -19,12 +19,21 @@
 //!
 //! - "After N" means "the (N+1)-th matching request trips". Set N=0
 //!   to make the very next request fail.
-//! - Transient faults (rate-limit, 5xx, network-drop, single-shot
-//!   md5-mismatch, single-session-invalidation) reset to "never trip"
-//!   once they fire; the next request after the trip succeeds.
+//! - Transient faults (rate-limit, 5xx, network-drop) reset to "never
+//!   trip" once they fire; the next request after the trip succeeds.
 //! - "Stay-broken" faults (auth.invalid_grant, dest-folder missing /
-//!   readonly) latch on first trigger and remain set for the lifetime
-//!   of the store.
+//!   readonly, trashed-visible-in-find) latch on first trigger and
+//!   remain set for the lifetime of the store.
+//! - `md5_mismatch_after` latches **on the affected entry**: when it
+//!   trips during a write, the entry's wrong md5 is stamped onto the
+//!   entry so every subsequent read of that entry (metadata,
+//!   list_folder, find_by_op_uuid) returns the bad value until the
+//!   entry is re-uploaded (which clears the latch).
+//! - `session_invalidated_after_chunks` is bound at session-open time:
+//!   the next session opened consumes the armed value (which is then
+//!   reset on the global counter so later sessions are unaffected);
+//!   use [`crate::fake::InMemoryRemoteStore::arm_session_invalidated_after`]
+//!   to arm a specific, already-open session by URL.
 //! - Quota is a byte-budget rather than a request count - calls that
 //!   would push the cumulative committed-byte total over the budget
 //!   are rejected with `drive.quota_exhausted`; smaller-or-equal calls
@@ -75,11 +84,19 @@ impl InMemoryRemoteStore {
         self
     }
 
-    /// Trips a session-invalidating 4xx after `n_chunks` more
-    /// `resume_chunk` calls have gone through. The session that was
-    /// being chunked into stays dead - the caller must open a new
-    /// session and re-upload from byte 0 (SPEC s3 `resume_chunk` +
-    /// DESIGN s5.4 "4xx during in-flight resumable").
+    /// Arms a session-invalidating 4xx on the NEXT resumable session
+    /// opened by this store: after `n_chunks` accepted chunks the
+    /// session invalidates with [`ResumeProgress::SessionInvalid`] and
+    /// stays dead. The caller must open a new session and re-upload
+    /// from byte 0 (SPEC s3 `resume_chunk` + DESIGN s5.4 "4xx during
+    /// in-flight resumable").
+    ///
+    /// Each [`crate::fake::InMemoryRemoteStore::resumable_session`]
+    /// call consumes the armed value (resetting the global counter to
+    /// `u64::MAX`) so later sessions are unaffected - the C.2 fix
+    /// guards against "session B consumes A's chunk budget" cross-talk.
+    /// Use [`crate::fake::InMemoryRemoteStore::arm_session_invalidated_after`]
+    /// to arm a specific, already-open session by URL.
     pub fn with_session_invalidated_after(self, n_chunks: u32) -> Self {
         self.faults
             .session_invalidated_after_chunks
@@ -87,10 +104,15 @@ impl InMemoryRemoteStore {
         self
     }
 
-    /// Trips an md5 mismatch on the next `n+1`-th response. The
-    /// committed bytes are correct but the returned [`crate::remote_store::RemoteEntry`]
-    /// carries a deliberately-wrong md5, exercising the executor's
-    /// `drive.checksum_mismatch` -> retry path (SPEC s24).
+    /// Trips an md5 mismatch on the next `(n+1)`-th write. The
+    /// committed bytes are correct but the affected entry's
+    /// `corrupted_md5` is latched onto a deliberately-wrong value -
+    /// every subsequent read of that entry (metadata, list_folder,
+    /// find_by_op_uuid, etc.) returns the bad md5 until the entry is
+    /// re-uploaded (which clears the latch). This matches Drive's
+    /// real failure mode: a checksum-mismatched object stays bad until
+    /// you replace its bytes. Exercises the executor's
+    /// `drive.checksum_mismatch` -> retry path (SPEC s8 + s24).
     pub fn with_md5_mismatch_after(self, n: u64) -> Self {
         self.faults
             .md5_mismatch_after
@@ -135,13 +157,17 @@ impl InMemoryRemoteStore {
         self
     }
 
-    /// Enables Drive's documented (rare) file_id-reuse behaviour:
-    /// `find_by_op_uuid` will consider trashed children as candidates,
-    /// modelling the case where a previously-trashed object's id is
-    /// recycled and matched. The reconciliation pass (DESIGN s5.6) must
-    /// tolerate this.
-    pub fn with_fileid_recycle(self) -> Self {
-        self.faults.fileid_recycle.store(true, Ordering::Release);
+    /// Latches `find_by_op_uuid` to surface trashed children alongside
+    /// live ones, modelling the "I trashed a row but did not delete its
+    /// `file_state` entry" reconciliation case (DESIGN s5.6). The fault
+    /// is misnamed in early drafts as "fileid_recycle" - the behaviour
+    /// here is NOT actual Drive file_id recycling (that would need a
+    /// dedicated id-pool flag and lands in M3 design). The renamed
+    /// builder makes the intent obvious at call sites.
+    pub fn with_trashed_visible_in_find_by_op_uuid(self) -> Self {
+        self.faults
+            .trashed_visible_in_find
+            .store(true, Ordering::Release);
         self
     }
 }

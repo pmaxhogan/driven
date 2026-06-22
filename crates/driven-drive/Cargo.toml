@@ -33,3 +33,7 @@ md-5 = "0.10"
 tokio.workspace = true
 futures.workspace = true
 bytes.workspace = true
+# The md5_mismatch contract test recomputes the real md5 of its payload
+# to verify the fault injector returns a different value (and that
+# re-uploading clears the latch).
+md-5 = "0.10"

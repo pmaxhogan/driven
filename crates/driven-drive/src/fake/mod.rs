@@ -123,6 +123,13 @@ struct FileEntry {
     /// fake independent of wall-clock so concurrent tests are
     /// reproducible.
     seq: u64,
+    /// Latched-bad md5. Set by [`maybe_md5_mismatch`] when the
+    /// `with_md5_mismatch_after` fault trips on a write; cleared on any
+    /// subsequent successful write that rewrites this entry's bytes.
+    /// Every read path ([`Self::to_remote_entry`]) prefers this value
+    /// over the freshly-computed md5 so the executor's checksum-mismatch
+    /// retry path (SPEC s8) fires consistently across read calls.
+    corrupted_md5: Option<[u8; 16]>,
 }
 
 impl FileEntry {
@@ -143,7 +150,10 @@ impl FileEntry {
         Some(bytes)
     }
 
-    fn to_remote_entry(&self, md5_override: Option<[u8; 16]>) -> RemoteEntry {
+    /// Build a [`RemoteEntry`] from this entry. The md5 returned is
+    /// `corrupted_md5` if the md5-mismatch fault has latched on this
+    /// entry, otherwise the freshly-computed md5 of the stored bytes.
+    fn to_remote_entry(&self) -> RemoteEntry {
         let size = if self.is_folder() {
             None
         } else {
@@ -154,7 +164,7 @@ impl FileEntry {
             name: self.name.clone(),
             parents: vec![self.parent_id.clone()],
             size,
-            md5: md5_override.or_else(|| self.md5()),
+            md5: self.corrupted_md5.or_else(|| self.md5()),
             mime_type: self.mime_type.clone(),
             modified_time: self.modified_time_ms,
             trashed: self.trashed,
@@ -192,6 +202,12 @@ struct ResumableSessionState {
     /// Whether the session has been invalidated by a 4xx (real or
     /// fault-injected) or a non-256-KiB-multiple non-final chunk.
     invalid: bool,
+    /// Per-session chunk countdown: when > 0 each accepted chunk
+    /// decrements; when the decrement hits zero the session
+    /// invalidates. `u64::MAX` = "never trip", so a session opened
+    /// without an arming call is unaffected by another session's
+    /// budget (the C.2 fix the task brief calls out).
+    session_invalidated_after_chunks: u64,
 }
 
 /// The mutable core of the fake.
@@ -297,10 +313,12 @@ pub(crate) struct Faults {
     /// Dest-folder states are latched on construction by the builder.
     pub(crate) dest_folder_missing: std::sync::atomic::AtomicBool,
     pub(crate) dest_folder_readonly: std::sync::atomic::AtomicBool,
-    /// When true, `find_by_op_uuid()` may return a "recycled" file_id
-    /// for an old, since-trashed object, modelling Drive's documented
-    /// (rare) id-reuse on permanent deletion.
-    pub(crate) fileid_recycle: std::sync::atomic::AtomicBool,
+    /// When true, `find_by_op_uuid()` surfaces trashed children
+    /// alongside live ones, modelling the "trashed remote object whose
+    /// `file_state` row has not yet been reconciled" case (DESIGN s5.6).
+    /// Not actual Drive file_id recycling - that would need a separate
+    /// id-pool flag and is out of M1 scope.
+    pub(crate) trashed_visible_in_find: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Faults {
@@ -317,7 +335,7 @@ impl Default for Faults {
             invalid_grant_latched: AtomicBool::new(false),
             dest_folder_missing: AtomicBool::new(false),
             dest_folder_readonly: AtomicBool::new(false),
-            fileid_recycle: AtomicBool::new(false),
+            trashed_visible_in_find: AtomicBool::new(false),
         }
     }
 }
@@ -338,6 +356,7 @@ impl InMemoryRemoteStore {
             modified_time_ms: 0,
             trashed: false,
             seq: 0,
+            corrupted_md5: None,
         };
         let inner = Inner {
             objects: HashMap::from([(root_id.clone(), root)]),
@@ -370,7 +389,7 @@ impl InMemoryRemoteStore {
         guard
             .children(folder_id)
             .into_iter()
-            .map(|e| e.to_remote_entry(None))
+            .map(|e| e.to_remote_entry())
             .collect()
     }
 
@@ -385,6 +404,28 @@ impl InMemoryRemoteStore {
     /// non-trashed object content.
     pub fn bytes_stored(&self) -> u64 {
         self.inner.lock().bytes_stored
+    }
+
+    /// Arm the session-invalidated-after-N-chunks fault on a specific,
+    /// already-open session. After `n_chunks` more accepted chunks
+    /// the session invalidates with
+    /// [`ResumeProgress::SessionInvalid`]. Returns `false` if the
+    /// session URL is unknown.
+    ///
+    /// Counterpart to the construction-time builder
+    /// [`InMemoryRemoteStore::with_session_invalidated_after`]: the
+    /// builder arms the NEXT session opened; this method arms THIS
+    /// session specifically. Useful for tests that need to open
+    /// multiple sessions and only fault one of them (the C.2 test
+    /// case).
+    pub fn arm_session_invalidated_after(&self, url: &str, n_chunks: u32) -> bool {
+        let mut guard = self.inner.lock();
+        if let Some(state) = guard.sessions.get_mut(url) {
+            state.session_invalidated_after_chunks = u64::from(n_chunks) + 1;
+            true
+        } else {
+            false
+        }
     }
 
     // ---------------------------------------------------------------
@@ -495,7 +536,7 @@ impl RemoteStore for InMemoryRemoteStore {
             .find(|e| e.app_properties.contains_key(FOLDER_MARKER_KEY))
             .copied()
         {
-            return Ok(marked.to_remote_entry(None));
+            return Ok(marked.to_remote_entry());
         }
 
         if matches.len() > 1 {
@@ -509,7 +550,7 @@ impl RemoteStore for InMemoryRemoteStore {
         }
         if !matches.is_empty() {
             matches.sort_by_key(|e| e.seq);
-            return Ok(matches[0].to_remote_entry(None));
+            return Ok(matches[0].to_remote_entry());
         }
         drop(matches);
 
@@ -529,8 +570,9 @@ impl RemoteStore for InMemoryRemoteStore {
             modified_time_ms,
             trashed: false,
             seq,
+            corrupted_md5: None,
         };
-        let out = entry.to_remote_entry(None);
+        let out = entry.to_remote_entry();
         guard.objects.insert(file_id, entry);
         Ok(out)
     }
@@ -545,7 +587,7 @@ impl RemoteStore for InMemoryRemoteStore {
             .children(folder_id)
             .into_iter()
             .filter(|e| !e.trashed)
-            .map(|e| e.to_remote_entry(None))
+            .map(|e| e.to_remote_entry())
             .collect())
     }
 
@@ -579,7 +621,7 @@ impl RemoteStore for InMemoryRemoteStore {
         let file_id = Uuid::new_v4().to_string();
         let seq = guard.next_seq();
         let modified_time_ms = guard.tick();
-        let entry = FileEntry {
+        let mut entry = FileEntry {
             file_id: file_id.clone(),
             name: name.to_string(),
             parent_id: parent_id.to_string(),
@@ -589,10 +631,14 @@ impl RemoteStore for InMemoryRemoteStore {
             modified_time_ms,
             trashed: false,
             seq,
+            corrupted_md5: None,
         };
         guard.bytes_stored = guard.bytes_stored.saturating_add(entry.bytes.len() as u64);
-        let md5_override = maybe_md5_mismatch(&self.faults, &entry);
-        let out = entry.to_remote_entry(md5_override);
+        // Latch the md5 fault on the entry itself so every subsequent
+        // read (metadata, list_folder, find_by_op_uuid, ...) returns the
+        // bad md5 until the file is rewritten.
+        maybe_latch_md5_mismatch(&self.faults, &mut entry);
+        let out = entry.to_remote_entry();
         guard.objects.insert(file_id, entry);
         Ok(out)
     }
@@ -619,11 +665,15 @@ impl RemoteStore for InMemoryRemoteStore {
             entry.app_properties.insert(k, v);
         }
         entry.modified_time_ms = new_now;
+        // Re-upload clears any prior md5-mismatch latch on this entry
+        // (the executor's checksum-retry path is supposed to recover
+        // from a transient corruption by re-uploading the bytes).
+        entry.corrupted_md5 = None;
+        maybe_latch_md5_mismatch(&self.faults, entry);
         // Build the RemoteEntry *before* touching `guard.bytes_stored`
         // - NLL ends the &mut FileEntry borrow at last use, allowing
         // the subsequent reborrow of `guard`.
-        let md5_override = maybe_md5_mismatch(&self.faults, entry);
-        let out = entry.to_remote_entry(md5_override);
+        let out = entry.to_remote_entry();
         if new_len >= old_len {
             guard.bytes_stored = guard.bytes_stored.saturating_add(new_len - old_len);
         } else {
@@ -657,6 +707,18 @@ impl RemoteStore for InMemoryRemoteStore {
             }
         }
         let issued_at = guard.tick();
+        // Bind the global `session_invalidated_after_chunks` counter to
+        // this session if it has been armed via
+        // [`fault_injection::with_session_invalidated_after`]. The
+        // global is reset to `u64::MAX` so subsequently-opened sessions
+        // are unaffected, satisfying the C.2 "B does not consume A's
+        // budget" requirement. Use a swap so concurrent
+        // resumable_session calls race for the binding deterministically
+        // (whoever wins the swap gets the budget).
+        let armed = self
+            .faults
+            .session_invalidated_after_chunks
+            .swap(u64::MAX, Ordering::AcqRel);
         guard.sessions.insert(
             url.clone(),
             ResumableSessionState {
@@ -666,6 +728,7 @@ impl RemoteStore for InMemoryRemoteStore {
                 kind: clone_kind(&kind),
                 issued_at,
                 invalid: false,
+                session_invalidated_after_chunks: armed,
             },
         );
         Ok(ResumableSession {
@@ -684,13 +747,6 @@ impl RemoteStore for InMemoryRemoteStore {
     ) -> anyhow::Result<ResumeProgress> {
         self.check_request_faults(RequestKind::WriteTarget)?;
 
-        // Fault: session-invalidated-after-N-chunks. Note we trip this
-        // regardless of chunk validity, because Drive returns a 4xx
-        // mid-session and the contract is "any 4xx kills the session"
-        // (DESIGN s5.4 "4xx during in-flight resumable" / SPEC s24
-        // drive.resumable_session_invalid).
-        let chunk_trip = decrement_to_zero(&self.faults.session_invalidated_after_chunks);
-
         let mut guard = self.inner.lock();
         let state = guard
             .sessions
@@ -698,10 +754,6 @@ impl RemoteStore for InMemoryRemoteStore {
             .ok_or_else(|| anyhow::anyhow!("fake: unknown session {}", session.url))?;
 
         if state.invalid {
-            return Ok(ResumeProgress::SessionInvalid);
-        }
-        if chunk_trip {
-            state.invalid = true;
             return Ok(ResumeProgress::SessionInvalid);
         }
 
@@ -726,6 +778,20 @@ impl RemoteStore for InMemoryRemoteStore {
             // real GoogleDriveStore in M4).
             state.invalid = true;
             return Ok(ResumeProgress::SessionInvalid);
+        }
+
+        // Per-session chunk-invalidation budget. Decrement only AFTER
+        // chunk-validity checks pass so a malformed chunk does not
+        // burn budget on the wrong session. Trip when the counter
+        // reaches zero (C.2 fix).
+        if state.session_invalidated_after_chunks != u64::MAX
+            && state.session_invalidated_after_chunks > 0
+        {
+            state.session_invalidated_after_chunks -= 1;
+            if state.session_invalidated_after_chunks == 0 {
+                state.invalid = true;
+                return Ok(ResumeProgress::SessionInvalid);
+            }
         }
 
         state.received.extend_from_slice(&chunk);
@@ -773,7 +839,7 @@ impl RemoteStore for InMemoryRemoteStore {
                 let file_id = Uuid::new_v4().to_string();
                 let seq = guard.next_seq();
                 let modified_time_ms = guard.tick();
-                let entry = FileEntry {
+                let mut entry = FileEntry {
                     file_id: file_id.clone(),
                     name,
                     parent_id,
@@ -783,10 +849,11 @@ impl RemoteStore for InMemoryRemoteStore {
                     modified_time_ms,
                     trashed: false,
                     seq,
+                    corrupted_md5: None,
                 };
                 guard.bytes_stored = guard.bytes_stored.saturating_add(entry.bytes.len() as u64);
-                let md5_override = maybe_md5_mismatch(&self.faults, &entry);
-                let out = entry.to_remote_entry(md5_override);
+                maybe_latch_md5_mismatch(&self.faults, &mut entry);
+                let out = entry.to_remote_entry();
                 guard.objects.insert(file_id, entry);
                 out
             }
@@ -799,11 +866,13 @@ impl RemoteStore for InMemoryRemoteStore {
                 let old_len = entry.bytes.len() as u64;
                 entry.bytes = received;
                 entry.modified_time_ms = new_now;
+                // Re-upload clears any prior md5 latch (see `update`).
+                entry.corrupted_md5 = None;
+                maybe_latch_md5_mismatch(&self.faults, entry);
                 // Build the RemoteEntry *before* reborrowing `guard`
                 // for `bytes_stored`. NLL ends the &mut FileEntry
                 // borrow at the last use of `entry`.
-                let md5_override = maybe_md5_mismatch(&self.faults, entry);
-                let out = entry.to_remote_entry(md5_override);
+                let out = entry.to_remote_entry();
                 if new_len >= old_len {
                     guard.bytes_stored = guard.bytes_stored.saturating_add(new_len - old_len);
                 } else {
@@ -840,8 +909,10 @@ impl RemoteStore for InMemoryRemoteStore {
         self.check_request_faults(RequestKind::Read)?;
         let guard = self.inner.lock();
         let entry = guard.ensure_object(file_id)?;
-        let md5_override = maybe_md5_mismatch(&self.faults, entry);
-        Ok(entry.to_remote_entry(md5_override))
+        // Md5 mismatch (if any) is latched on the entry at write time -
+        // see [`maybe_latch_md5_mismatch`]. Reads just round-trip
+        // [`FileEntry::corrupted_md5`].
+        Ok(entry.to_remote_entry())
     }
 
     async fn download(&self, file_id: &str) -> anyhow::Result<DownloadStream> {
@@ -862,7 +933,7 @@ impl RemoteStore for InMemoryRemoteStore {
         op_uuid: &str,
     ) -> anyhow::Result<Option<RemoteEntry>> {
         self.check_request_faults(RequestKind::Read)?;
-        let include_trashed = self.faults.fileid_recycle.load(Ordering::Acquire);
+        let include_trashed = self.faults.trashed_visible_in_find.load(Ordering::Acquire);
         let guard = self.inner.lock();
         let mut matches: Vec<&FileEntry> = guard
             .children(parent_id)
@@ -891,7 +962,7 @@ impl RemoteStore for InMemoryRemoteStore {
         }
         // Most-recent by monotonic seq (deterministic for tests).
         matches.sort_by_key(|e| std::cmp::Reverse(e.seq));
-        Ok(Some(matches[0].to_remote_entry(None)))
+        Ok(Some(matches[0].to_remote_entry()))
     }
 
     async fn about(&self) -> anyhow::Result<AboutInfo> {
@@ -986,21 +1057,25 @@ fn try_consume_bytes(counter: &AtomicU64, n_bytes: u64) -> Option<u64> {
     }
 }
 
-/// If `with_md5_mismatch_after` is armed and trips on this request,
-/// return a deliberately wrong md5 so the executor's verification step
-/// (SPEC s8 "md5 mismatch -> retry") fires. The real file content is
-/// unaffected.
-fn maybe_md5_mismatch(faults: &Faults, entry: &FileEntry) -> Option<[u8; 16]> {
+/// Latch the md5-mismatch fault on `entry` if the `with_md5_mismatch_after`
+/// counter trips on this request.
+///
+/// The real file content is unaffected; the entry's `corrupted_md5`
+/// holds a deliberately-wrong md5 (every bit flipped vs the truth) so
+/// every subsequent read path that calls
+/// [`FileEntry::to_remote_entry`] keeps returning the wrong value
+/// until the entry is rewritten (`update` / final-chunk commit). This
+/// matches the SPEC s8 "md5 mismatch -> retry" path: the executor will
+/// see the bad md5 on metadata / list_folder / find_by_op_uuid until
+/// it re-uploads the file.
+fn maybe_latch_md5_mismatch(faults: &Faults, entry: &mut FileEntry) {
     if decrement_to_zero(&faults.md5_mismatch_after) {
-        // Flip every bit of the real md5 - guaranteed not to match.
-        let real = entry.md5();
-        let mut wrong = real.unwrap_or([0u8; 16]);
+        let mut wrong = entry.md5().unwrap_or([0u8; 16]);
         for b in &mut wrong {
             *b ^= 0xff;
         }
-        return Some(wrong);
+        entry.corrupted_md5 = Some(wrong);
     }
-    None
 }
 
 // ---------------------------------------------------------------------------
