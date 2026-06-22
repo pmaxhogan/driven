@@ -348,6 +348,22 @@ pub trait StateRepo: Send + Sync {
     /// Deletes a `file_state` row by primary key.
     async fn delete_file_state(&self, source: SourceId, path: &RelativePath) -> Result<()>;
 
+    /// Marks the given `(source, relative_path)` rows `status =
+    /// 'excluded_orphan'` (DESIGN s5.5), transactionally, returning the number
+    /// of rows updated.
+    ///
+    /// An excluded-orphan is a `file_state` row whose path is still present on
+    /// disk but is now EXCLUDED by the current ignore rules; it must NOT be
+    /// trashed on Drive, only flagged so the UI / reconciliation can surface
+    /// it. The normal [`Self::upsert_file_state`] (which writes
+    /// `status='synced'`) clears the flag automatically when a path is
+    /// re-included and re-synced.
+    ///
+    /// The M3 orchestrator calls this post-scan with
+    /// `ScanResult.excluded_orphans`; M2 has no persistence step (scan/plan
+    /// are pure), so this method is added now and wired by M3.
+    async fn mark_excluded_orphans(&self, source: SourceId, paths: &[RelativePath]) -> Result<u64>;
+
     // --- pending_ops --------------------------------------------------------
 
     /// Enqueues a `pending_ops` row. Returns the new auto-increment id.

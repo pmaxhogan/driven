@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE file_state SET status = 'excluded_orphan' WHERE source_id = ?1 AND relative_path = ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "564914e24520d045d3f02a68d2660ebaab346c2a946821c183991d6015ae35f8"
+}

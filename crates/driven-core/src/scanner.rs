@@ -552,6 +552,13 @@ mod tests {
         ) -> anyhow::Result<()> {
             unimplemented!()
         }
+        async fn mark_excluded_orphans(
+            &self,
+            _source: SourceId,
+            _paths: &[RelativePath],
+        ) -> anyhow::Result<u64> {
+            unimplemented!("not used by scanner tests")
+        }
         async fn enqueue_pending_op(&self, _row: NewPendingOp) -> anyhow::Result<PendingOpId> {
             unimplemented!()
         }
@@ -733,6 +740,76 @@ mod tests {
         let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
         assert!(res.new_or_changed.is_empty(), "{:?}", res.new_or_changed);
         assert_eq!(res.deleted, vec![rel("gone.txt")]);
+    }
+
+    #[tokio::test]
+    async fn dot_ignore_excluded_row_is_orphan_not_deleted() {
+        // P1-1/P1-2: a path STILL ON DISK but excluded by a `.ignore` file
+        // (not just `.gitignore`) must be reported as an excluded_orphan, NOT
+        // deleted - so an ignore-rule change never trashes a backed-up file.
+        // Before the fix the matcher only loaded `.gitignore`, so the
+        // WalkBuilder's native `.ignore` layer would drop the file from the
+        // walk while the matcher still considered it included, and the orphan
+        // split would misclassify it as `deleted`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let hidden = root.join("hidden.txt");
+        write(&hidden, b"x");
+        // The `.ignore` excludes both the target file AND itself, so the only
+        // walk-yielded, matcher-included file is none - keeping new_or_changed
+        // empty so the assertion below is a strong one.
+        write(&root.join(".ignore"), b"hidden.txt\n.ignore\n");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let (size, mtime) = stat_of(&hidden);
+        // A synced row for the now-excluded, still-present file.
+        state.put(row(
+            src.id,
+            "hidden.txt",
+            size,
+            mtime,
+            *blake3::hash(b"x").as_bytes(),
+        ));
+
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+        assert_eq!(
+            res.excluded_orphans,
+            vec![rel("hidden.txt")],
+            "still-present .ignore-excluded file must be an excluded_orphan: {res:?}"
+        );
+        assert!(
+            res.deleted.is_empty(),
+            "excluded-but-present file must NOT be deleted: {:?}",
+            res.deleted
+        );
+        assert!(res.new_or_changed.is_empty(), "{:?}", res.new_or_changed);
+    }
+
+    #[tokio::test]
+    async fn git_info_exclude_drops_from_walk() {
+        // P1-2: a `.git/info/exclude` rule must exclude a file from the walk
+        // (not yielded in new_or_changed).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("secret.bin"), b"x");
+        write(&root.join("keep.txt"), b"x");
+        write(&root.join(".git/info/exclude"), b"secret.bin\n");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+
+        let got: Vec<String> = res
+            .new_or_changed
+            .iter()
+            .map(|e| e.rel.as_str().to_string())
+            .collect();
+        assert!(got.contains(&"keep.txt".to_string()), "{got:?}");
+        assert!(
+            !got.contains(&"secret.bin".to_string()),
+            ".git/info/exclude rule must drop the file from the walk: {got:?}"
+        );
     }
 
     #[tokio::test]

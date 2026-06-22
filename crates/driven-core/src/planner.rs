@@ -181,6 +181,14 @@ mod tests {
             Ok(())
         }
 
+        async fn mark_excluded_orphans(
+            &self,
+            _source: SourceId,
+            _paths: &[RelativePath],
+        ) -> Result<u64> {
+            unimplemented!()
+        }
+
         // --- everything below is untouched by plan(); test-only stubs. -------
 
         async fn list_accounts(&self) -> Result<Vec<AccountRow>> {

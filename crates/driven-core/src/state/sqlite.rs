@@ -778,6 +778,33 @@ impl StateRepo for SqliteStateRepo {
         Ok(())
     }
 
+    async fn mark_excluded_orphans(&self, source: SourceId, paths: &[RelativePath]) -> Result<u64> {
+        if paths.is_empty() {
+            return Ok(0);
+        }
+        let source_str = source.to_string();
+        // One transaction, one compile-time-checked UPDATE per path. A
+        // per-path loop keeps the `query!` macro static (no dynamic IN-list
+        // that would defeat offline sqlx) while still being atomic: the
+        // implicit `tx` drop on any `?` rolls back every prior UPDATE.
+        let mut tx = self.pool.begin().await?;
+        let mut updated: u64 = 0;
+        for path in paths {
+            let path_str = path.as_str().to_string();
+            updated += sqlx::query!(
+                "UPDATE file_state SET status = 'excluded_orphan' \
+                 WHERE source_id = ?1 AND relative_path = ?2",
+                source_str,
+                path_str,
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        }
+        tx.commit().await?;
+        Ok(updated)
+    }
+
     // --- pending_ops --------------------------------------------------------
 
     async fn enqueue_pending_op(&self, row: NewPendingOp) -> Result<PendingOpId> {
@@ -1437,6 +1464,46 @@ mod tests {
 
         repo.delete_file_state(src.id, &rp("c.txt")).await.unwrap();
         assert_eq!(repo.load_source_file_state(src.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn mark_excluded_orphans_flips_only_named_rows() {
+        // P1-3: marking one of two synced rows excluded_orphan must flip that
+        // row's status and leave the other untouched (DESIGN s5.5).
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let mut a = sample_file(src.id, "a.txt", 0x11);
+        a.status = FileStateStatus::Synced;
+        let mut b = sample_file(src.id, "b.txt", 0x22);
+        b.status = FileStateStatus::Synced;
+        repo.upsert_file_state(&a).await.unwrap();
+        repo.upsert_file_state(&b).await.unwrap();
+
+        let updated = repo
+            .mark_excluded_orphans(src.id, &[rp("a.txt")])
+            .await
+            .unwrap();
+        assert_eq!(updated, 1);
+
+        let map = repo.load_source_file_state(src.id).await.unwrap();
+        assert_eq!(
+            map.get(&rp("a.txt")).unwrap().status,
+            FileStateStatus::ExcludedOrphan,
+            "named row must be flipped to excluded_orphan"
+        );
+        assert_eq!(
+            map.get(&rp("b.txt")).unwrap().status,
+            FileStateStatus::Synced,
+            "unnamed row must be untouched"
+        );
+
+        // Empty slice is a no-op (returns 0, touches nothing).
+        let none = repo.mark_excluded_orphans(src.id, &[]).await.unwrap();
+        assert_eq!(none, 0);
     }
 
     #[tokio::test]

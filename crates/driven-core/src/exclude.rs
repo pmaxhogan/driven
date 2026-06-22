@@ -123,10 +123,12 @@ impl SourceMatcher {
 /// Builds the combined [`SourceMatcher`] for `source` (DESIGN s5.2).
 ///
 /// Adds rules in LAST-MATCH-WINS order (see the module docs): defaults
-/// (lowest), then the `.gitignore` cascade if `respect_gitignore`, then the
-/// source's `exclude_patterns` and `include_patterns` (highest). The matcher
-/// is anchored at the source root so all rules match against root-relative
-/// paths - the same form the scanner strips each entry to.
+/// (lowest), then - if `respect_gitignore` - the gitignore tier (`.gitignore`
+/// cascade, then `.ignore` cascade, then `<root>/.git/info/exclude`, then the
+/// global gitignore), then the source's `exclude_patterns` and
+/// `include_patterns` (highest). The matcher is anchored at the source root so
+/// all rules match against root-relative paths - the same form the scanner
+/// strips each entry to.
 pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher> {
     let root = Path::new(&source.local_path);
     let mut gb = GitignoreBuilder::new(root);
@@ -137,27 +139,74 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
             .map_err(|e| anyhow::anyhow!("adding default exclude `{glob}`: {e}"))?;
     }
 
-    // 2. the source's `.gitignore` cascade, root-first so a deeper file's
+    // 2. the gitignore tier (DESIGN s5.2: respect .gitignore, .ignore,
+    //    .git/info/exclude, and the global gitignore). All four sub-sources sit
+    //    at the SAME precedence (above the defaults, below the source's own
+    //    exclude/include overrides). Within the tier they are added in the
+    //    order: `.gitignore` cascade, then `.ignore` cascade, then
+    //    `.git/info/exclude`, then global - each root-first so a deeper file's
     //    rule wins over a shallower one (approximation of the per-directory
     //    cascade for M2).
     // TODO(perf/correctness): true per-directory gitignore scoping - rules in
-    //    a nested `.gitignore` should apply only under that directory, and a
+    //    a nested ignore file should apply only under that directory, and a
     //    pattern with no slash should match at any depth below its file. This
     //    flattens all rules into one matcher rooted at the source root, which
     //    is a close-but-not-exact approximation accepted for M2.
     if source.respect_gitignore {
-        for gitignore in collect_gitignore_files(root) {
+        // `.gitignore` cascade, then `.ignore` cascade. `.ignore` uses the
+        // identical gitignore syntax and sits just above the `.gitignore`
+        // cascade at the same tier (matching the `ignore` crate's own
+        // precedence where `.ignore` overrides `.gitignore`).
+        for ignore_file in collect_ignore_files(root, ".gitignore")
+            .into_iter()
+            .chain(collect_ignore_files(root, ".ignore"))
+        {
             // `GitignoreBuilder::add` returns Some(err) on a partial/parse
-            // error; a missing or unreadable `.gitignore` is non-fatal (we
+            // error; a missing or unreadable ignore file is non-fatal (we
             // simply apply no rules from it) so only log.
-            if let Some(err) = gb.add(&gitignore) {
+            if let Some(err) = gb.add(&ignore_file) {
                 tracing::warn!(
                     target: TARGET,
                     source_id = %source.id,
-                    path = %gitignore.display(),
+                    path = %ignore_file.display(),
                     %err,
-                    "failed to parse a .gitignore; ignoring its rules"
+                    "failed to parse an ignore file; ignoring its rules"
                 );
+            }
+        }
+
+        // `<root>/.git/info/exclude` - the repo-local private exclude list.
+        let info_exclude = root.join(".git").join("info").join("exclude");
+        if info_exclude.is_file() {
+            if let Some(err) = gb.add(&info_exclude) {
+                tracing::warn!(
+                    target: TARGET,
+                    source_id = %source.id,
+                    path = %info_exclude.display(),
+                    %err,
+                    "failed to parse .git/info/exclude; ignoring its rules"
+                );
+            }
+        }
+
+        // Global gitignore: `$XDG_CONFIG_HOME/git/ignore`, falling back to
+        // `~/.config/git/ignore` when XDG is unset (DESIGN s5.2). Wired here
+        // but not hermetically tested - $XDG_CONFIG_HOME / $HOME are
+        // process-global and would race parallel tests (see the exclude
+        // tests' note); a focused unit test instead proves the tier loads via
+        // `.git/info/exclude` + `.ignore`.
+        // TODO(M2-followup): honor git core.excludesFile (needs git config parse)
+        if let Some(global) = global_gitignore_path() {
+            if global.is_file() {
+                if let Some(err) = gb.add(&global) {
+                    tracing::warn!(
+                        target: TARGET,
+                        source_id = %source.id,
+                        path = %global.display(),
+                        %err,
+                        "failed to parse global gitignore; ignoring its rules"
+                    );
+                }
             }
         }
     }
@@ -191,20 +240,22 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
     Ok(SourceMatcher { inner })
 }
 
-/// Collects every `.gitignore` file under `root`, root-first (shallowest
-/// first), so [`build_source_matcher`] can add them in last-match-wins order
-/// where a deeper file's rule overrides a shallower one.
+/// Collects every file named `filename` (e.g. `.gitignore` or `.ignore`)
+/// under `root`, root-first (shallowest first), so [`build_source_matcher`]
+/// can add them in last-match-wins order where a deeper file's rule overrides
+/// a shallower one.
 ///
 /// A dependency-free breadth-first `std::fs::read_dir` walk: BFS visits
 /// shallower directories before deeper ones, giving the root-first ordering
 /// directly. Symlinked directories are NOT descended (mirrors the scanner's
 /// `follow_links(false)` policy, DESIGN s5.2.1, and avoids cycles). I/O errors
 /// on a directory are logged and that subtree skipped - never fatal, since a
-/// failed enumerate just means we apply fewer gitignore rules, never that we
+/// failed enumerate just means we apply fewer ignore rules, never that we
 /// wrongly back up or drop a file (the per-entry walk re-checks each path).
 // TODO(perf): prune directories the matcher already excludes (e.g.
-//   `node_modules`) so we do not descend them just to find a `.gitignore`.
-fn collect_gitignore_files(root: &Path) -> Vec<std::path::PathBuf> {
+//   `node_modules`) so we do not descend them just to find an ignore file.
+fn collect_ignore_files(root: &Path, filename: &str) -> Vec<std::path::PathBuf> {
+    let target_name = std::ffi::OsStr::new(filename);
     let mut found = Vec::new();
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(root.to_path_buf());
@@ -213,7 +264,7 @@ fn collect_gitignore_files(root: &Path) -> Vec<std::path::PathBuf> {
         let entries = match std::fs::read_dir(&dir) {
             Ok(e) => e,
             Err(err) => {
-                tracing::debug!(target: TARGET, path = %dir.display(), %err, "read_dir failed while collecting .gitignore files; skipping subtree");
+                tracing::debug!(target: TARGET, path = %dir.display(), %err, "read_dir failed while collecting ignore files; skipping subtree");
                 continue;
             }
         };
@@ -222,9 +273,7 @@ fn collect_gitignore_files(root: &Path) -> Vec<std::path::PathBuf> {
             match entry.file_type() {
                 // Do not follow symlinks (cycle / out-of-root safety).
                 Ok(ft) if ft.is_dir() => queue.push_back(path),
-                Ok(ft)
-                    if ft.is_file() && entry.file_name() == std::ffi::OsStr::new(".gitignore") =>
-                {
+                Ok(ft) if ft.is_file() && entry.file_name() == target_name => {
                     found.push(path);
                 }
                 _ => {}
@@ -234,13 +283,38 @@ fn collect_gitignore_files(root: &Path) -> Vec<std::path::PathBuf> {
     found
 }
 
+/// Resolves the global gitignore path (DESIGN s5.2): `$XDG_CONFIG_HOME/git/ignore`,
+/// or `~/.config/git/ignore` when `$XDG_CONFIG_HOME` is unset/empty. Returns
+/// `None` when neither base directory can be resolved.
+///
+/// This intentionally does NOT honour a custom git `core.excludesFile`, which
+/// would need git-config parsing (out of scope for M2).
+// TODO(M2-followup): honor git core.excludesFile (needs git config parse)
+fn global_gitignore_path() -> Option<std::path::PathBuf> {
+    let base = match std::env::var_os("XDG_CONFIG_HOME") {
+        Some(xdg) if !xdg.is_empty() => std::path::PathBuf::from(xdg),
+        _ => {
+            // `~/.config`. `HOME` covers Unix; `USERPROFILE` covers Windows.
+            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
+            std::path::PathBuf::from(home).join(".config")
+        }
+    };
+    Some(base.join("git").join("ignore"))
+}
+
 /// Builds the configured [`WalkBuilder`] for `source` (SPEC s6
 /// `build_walker`).
 ///
-/// The walker does NO ignore logic of its own: `git_ignore` /
-/// `git_exclude` / `git_global` are all turned OFF because the scanner makes
-/// every include/exclude decision via [`build_source_matcher`]. The walker is
-/// just a plain recursive directory traversal.
+/// The walker does NO include/exclude decision of its own: `git_ignore` /
+/// `git_exclude` / `git_global` / `ignore` (`.ignore` files) / `parents`
+/// (parent-directory ignore files ABOVE the source root) are all turned OFF
+/// because [`build_source_matcher`] is the SOLE ignore authority. Leaving the
+/// `ignore` crate's native `.ignore` handling on (its default) would let the
+/// WalkBuilder silently drop a `.ignore`-hidden file the matcher does not know
+/// about, so the scanner's orphan split would misclassify it as `deleted` and
+/// trash it on Drive; turning it off here and loading `.ignore` into the
+/// matcher keeps both in lockstep. `parents(false)` scopes the walk to the
+/// source root, which is the backup boundary.
 ///
 /// `hidden(false)` is mandatory: Driven backs up dotfiles, and leaving the
 /// `ignore` default `hidden(true)` would silently drop every `.env` /
@@ -251,14 +325,55 @@ fn collect_gitignore_files(root: &Path) -> Vec<std::path::PathBuf> {
 /// s5.2.1: symlinks are yielded as entries but never traversed, so the walk
 /// can never leave the source root or loop. The scanner then drops the link
 /// entries themselves.
+///
+/// ## Excluded-directory pruning (perf)
+///
+/// When `include_patterns` is EMPTY, a [`WalkBuilder::filter_entry`] closure
+/// prunes any directory the matcher excludes (e.g. `node_modules`, `build`),
+/// so the walk never descends it - the whole point of P2-1. The closure only
+/// ever prunes directories (files are still decided per-entry by the scanner's
+/// matcher check) and never prunes the root. It is GATED on
+/// `include_patterns.is_empty()`: a non-empty include set could `!`-re-include
+/// a file INSIDE an excluded directory, and pruning the directory would lose
+/// it. The closure owns its own [`SourceMatcher`] because `filter_entry`
+/// requires a `'static + Send + Sync` predicate; the scanner builds a separate
+/// matcher for its per-entry / orphan-split checks.
 pub fn build_walker(source: &SourceRow) -> anyhow::Result<WalkBuilder> {
     let mut wb = WalkBuilder::new(&source.local_path);
     wb.git_ignore(false)
         .git_exclude(false)
         .git_global(false)
+        .ignore(false)
+        .parents(false)
         .require_git(false)
         .hidden(false)
         .follow_links(false);
+
+    // P2-1: prune excluded DIRECTORIES so the walk never descends e.g.
+    // node_modules just to discard each file. Only safe when there are no
+    // include_patterns (a `!`-re-include could live inside an excluded dir).
+    if source.include_patterns.is_empty() {
+        // TODO(perf): prune excluded dirs even with include_patterns (needs ancestor check)
+        let prune_matcher = build_source_matcher(source)?;
+        let root = std::path::PathBuf::from(&source.local_path);
+        wb.filter_entry(move |entry| {
+            // Never prune the root, and only ever act on directories - files
+            // are decided per-entry by the scanner's matcher check.
+            if entry.depth() == 0 {
+                return true;
+            }
+            if !entry.file_type().is_some_and(|t| t.is_dir()) {
+                return true;
+            }
+            let rel = match entry.path().strip_prefix(&root) {
+                Ok(r) if !r.as_os_str().is_empty() => r,
+                // Not under root or empty - leave it to the per-entry check.
+                _ => return true,
+            };
+            // Keep (descend) iff the directory is included.
+            prune_matcher.is_included(rel, true)
+        });
+    }
 
     tracing::debug!(
         target: TARGET,
@@ -483,6 +598,100 @@ mod tests {
         assert!(
             names.contains(&"ordinary.dat".to_string()),
             "unmatched ordinary file must pass through: {names:?}"
+        );
+    }
+
+    #[test]
+    fn dot_ignore_file_excludes_from_walk() {
+        // P1-2: a `.ignore` rule (identical gitignore syntax) must exclude a
+        // file from the walk. Before the fix the matcher only loaded
+        // `.gitignore`, so a `.ignore`-hidden file leaked through here while
+        // the WalkBuilder's native `.ignore` layer dropped it - the
+        // misclassification the orphan split would later read as `deleted`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".ignore"), "hidden.txt\n");
+        write(&root.join("hidden.txt"), "x");
+        write(&root.join("keep.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let names = walked_names(&src);
+        assert!(names.contains(&"keep.txt".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"hidden.txt".to_string()),
+            ".ignore rule must exclude the file from the walk: {names:?}"
+        );
+    }
+
+    #[test]
+    fn git_info_exclude_excludes_from_walk() {
+        // P1-2: `<root>/.git/info/exclude` rules must be honoured (DESIGN s5.2;
+        // the matcher previously ignored them entirely - a privacy regression).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".git/info/exclude"), "secret.bin\n");
+        write(&root.join("secret.bin"), "x");
+        write(&root.join("keep.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let names = walked_names(&src);
+        assert!(names.contains(&"keep.txt".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"secret.bin".to_string()),
+            ".git/info/exclude rule must exclude the file from the walk: {names:?}"
+        );
+    }
+
+    #[test]
+    fn gitignore_tier_loads_ignore_and_info_exclude() {
+        // Focused unit test proving the gitignore TIER wires both `.ignore`
+        // and `.git/info/exclude` into a SINGLE matcher (the global gitignore
+        // is also wired in `build_source_matcher` but is NOT hermetically
+        // tested here because $XDG_CONFIG_HOME / $HOME are process-global and
+        // would race parallel tests). Asserts on the matcher directly rather
+        // than driving a walk so it does not depend on the WalkBuilder.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".ignore"), "a.dat\n");
+        write(&root.join(".git/info/exclude"), "b.dat\n");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(
+            !matcher.is_included(Path::new("a.dat"), false),
+            ".ignore rule must exclude via the matcher"
+        );
+        assert!(
+            !matcher.is_included(Path::new("b.dat"), false),
+            ".git/info/exclude rule must exclude via the matcher"
+        );
+        assert!(
+            matcher.is_included(Path::new("c.dat"), false),
+            "an unmatched file must remain included"
+        );
+    }
+
+    #[test]
+    fn excluded_dir_is_pruned_when_no_include_patterns() {
+        // P2-1: a gitignored directory (`skip/`) must NOT be descended when
+        // there are no include_patterns, so the WalkBuilder::filter_entry
+        // prune closure skips its whole subtree. A direct "was-it-traversed"
+        // assertion is not feasible here (the matcher's `.gitignore`
+        // collection is a SEPARATE read_dir BFS, independent of filter_entry),
+        // so this keeps the correctness assertion: no file inside the excluded
+        // dir leaks into the walk, and unrelated files are unaffected.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "skip/\n");
+        write(&root.join("skip/inside.txt"), "x");
+        write(&root.join("keep.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let names = walked_names(&src);
+        assert!(names.contains(&"keep.txt".to_string()), "{names:?}");
+        assert!(
+            !names.contains(&"skip/inside.txt".to_string()),
+            "file inside an excluded dir must not be walked: {names:?}"
         );
     }
 }
