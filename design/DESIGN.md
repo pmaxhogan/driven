@@ -290,7 +290,20 @@ $RECYCLE.BIN/
 .fseventsd/
 .TemporaryItems/
 .Trashes/
+
+# VCS internals
+.git/
 ```
+
+`.git/` is excluded by default (toggleable, like the rest). The working
+tree's files are still backed up as ordinary files, so current file contents
+are preserved; what is dropped by default is the git history, branch
+structure, and stashes (stashes live only inside `.git/` - the sharp edge).
+Backing up only the *unpushed* objects is not feasible in a file-copy backup
+model (it would need `git bundle` synthesis and git-aware restore - deferred
+to a V2+ git-aware backup mode), so the default is full exclusion. A user with
+local-only or unpushed repositories they care about re-includes `.git/`
+per-source via `include_patterns`.
 
 These are configurable: Settings → Rules → "Default exclude patterns"
 shows them as a checked list the user can disable individually. They

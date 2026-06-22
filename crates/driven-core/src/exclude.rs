@@ -88,6 +88,15 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".fseventsd/",
     ".TemporaryItems/",
     ".Trashes/",
+    // VCS internals. Excluded by default (toggleable): a working tree's files
+    // are backed up as ordinary files, but .git/ itself is large, churns on
+    // every commit/fetch/gc, and is mostly redundant with a remote. Backing up
+    // only unpushed objects is not feasible in a file-copy model (it needs
+    // git bundle synthesis + git-aware restore - a V2+ feature), so .git/ is
+    // excluded by default. A user with local-only/unpushed repos (incl.
+    // stashes, which live only in .git/) re-includes it per-source via
+    // include_patterns. See DESIGN s5.2.
+    ".git/",
 ];
 
 /// The combined include/exclude decision matcher for one source.
@@ -580,6 +589,34 @@ mod tests {
         assert!(
             !names.contains(&"Thumbs.db".to_string()),
             "Thumbs.db must be a default-exclude: {names:?}"
+        );
+    }
+
+    #[test]
+    fn dotgit_excluded_by_default_and_reincludable() {
+        // `.git/` is a default-exclude (DESIGN s5.2 VCS internals): its contents
+        // are dropped by default, but the working-tree files alongside it stay,
+        // and a source can opt the whole dir back in via include_patterns.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".git/config"), "x");
+        write(&root.join(".git/objects/pack/p.pack"), "x");
+        write(&root.join("src.txt"), "x");
+
+        let default_src = source_at(root, true, &[], &[]);
+        let names = walked_names(&default_src);
+        assert!(names.contains(&"src.txt".to_string()), "{names:?}");
+        assert!(
+            !names.iter().any(|n| n.starts_with(".git/")),
+            ".git/ must be excluded by default: {names:?}"
+        );
+
+        // Re-include via include_patterns (the per-source escape hatch).
+        let reinclude_src = source_at(root, true, &[".git/"], &[]);
+        let reincluded = walked_names(&reinclude_src);
+        assert!(
+            reincluded.iter().any(|n| n.starts_with(".git/")),
+            ".git/ must be re-includable via include_patterns: {reincluded:?}"
         );
     }
 
