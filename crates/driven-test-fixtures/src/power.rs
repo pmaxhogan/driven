@@ -38,7 +38,10 @@ const CHANNEL_CAPACITY: usize = 32;
 /// activity-log test.
 ///
 /// `set()` atomically updates the snapshot and broadcasts the new state
-/// to all active subscribers in one call.
+/// to all active subscribers in one call - concurrent `set(A)`/`set(B)`
+/// callers produce a totally-ordered (snapshot, broadcast) sequence,
+/// not an interleaved one. `broadcast::send` is non-blocking so
+/// holding the sync mutex across it is safe.
 ///
 /// ```ignore
 /// use driven_power::{PowerSource, PowerState};
@@ -86,16 +89,19 @@ impl FakePowerSource {
     }
 
     /// Pushes a new [`PowerState`], updating the snapshot and broadcasting
-    /// the transition.
+    /// the transition under a single mutex hold so concurrent callers
+    /// produce a totally-ordered sequence of `(snapshot, broadcast)`
+    /// pairs - never an interleaving where one caller's broadcast lands
+    /// after another caller's snapshot. `broadcast::send` is
+    /// non-blocking, so holding the [`parking_lot::Mutex`] guard across
+    /// it is safe (no `.await` and no risk of deadlock).
     ///
     /// If no subscribers are active, the broadcast send-result is
     /// `Err(SendError)` and ignored - tests routinely set initial state
     /// before subscribing.
     pub fn set(&self, next: PowerState) {
-        {
-            let mut g = self.inner.state.lock();
-            *g = next.clone();
-        }
+        let mut g = self.inner.state.lock();
+        *g = next.clone();
         let _ = self.inner.tx.send(next);
     }
 

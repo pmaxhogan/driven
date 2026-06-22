@@ -15,13 +15,18 @@
 //!   about the exact `file_id` or `modified_time` the fake or Drive
 //!   assigned.
 //!
-//! Both sides are normalised to a stable `BTreeMap<String,
-//! RemoteSnapshot>` keyed by entry name. The expected side is supplied as
-//! a slice of [`ExpectedEntry`] (constructed by the macro from a tuple
-//! DSL); the actual side is any iterator of `RemoteEntry`. Trashed
-//! entries are skipped on both sides by default - tests for trashing
-//! semantics should use the lower-level
-//! [`normalize_actual`] / [`normalize_expected`] helpers directly.
+//! Both sides are normalised to a stable
+//! `Vec<(String, RemoteSnapshot)>` sorted by `(name, file_id)` so a
+//! folder containing two entries with the same name produces TWO rows
+//! on the actual side and the expected side must list the duplicate
+//! twice as well. The file_id is the sort tiebreaker only - it is NOT
+//! stored in [`RemoteSnapshot`], because the expected side has no id.
+//! The expected side is supplied as a slice of [`ExpectedEntry`]
+//! (constructed by the macro from a tuple DSL); the actual side is any
+//! iterator of `RemoteEntry`. Trashed entries are skipped on both
+//! sides by default - tests for trashing semantics should use the
+//! lower-level [`normalize_actual`] / [`normalize_expected`] helpers
+//! directly.
 //!
 //! ```ignore
 //! use driven_test_fixtures::assert_remote_eq;
@@ -32,8 +37,6 @@
 //!     ("sub", dir),
 //! ]);
 //! ```
-
-use std::collections::BTreeMap;
 
 use driven_drive::remote_store::RemoteEntry;
 
@@ -62,24 +65,41 @@ pub struct ExpectedEntry {
 }
 
 /// Normalises an iterator of actual [`RemoteEntry`] values into the
-/// comparable map shape. Trashed entries are dropped.
-pub fn normalize_actual<I>(entries: I) -> BTreeMap<String, RemoteSnapshot>
+/// comparable [`Vec`] shape, sorted by `(name, file_id)`. Trashed
+/// entries are dropped. The `file_id` is the deterministic tiebreaker
+/// for duplicate-name rows and is NOT included in the compared
+/// [`RemoteSnapshot`] (the expected side has no id).
+pub fn normalize_actual<I>(entries: I) -> Vec<(String, RemoteSnapshot)>
 where
     I: IntoIterator<Item = RemoteEntry>,
 {
-    entries
+    let mut paired: Vec<(String, String, RemoteSnapshot)> = entries
         .into_iter()
         .filter(|e| !e.trashed)
-        .map(|e| (e.name.clone(), RemoteSnapshot { size: e.size }))
-        .collect()
+        .map(|e| {
+            (
+                e.name.clone(),
+                e.id.clone(),
+                RemoteSnapshot { size: e.size },
+            )
+        })
+        .collect();
+    paired.sort_by(|a, b| a.0.cmp(&b.0).then(a.1.cmp(&b.1)));
+    paired.into_iter().map(|(n, _id, s)| (n, s)).collect()
 }
 
-/// Normalises a slice of [`ExpectedEntry`] into the comparable map shape.
-pub fn normalize_expected(expected: &[ExpectedEntry]) -> BTreeMap<String, RemoteSnapshot> {
-    expected
+/// Normalises a slice of [`ExpectedEntry`] into the comparable [`Vec`]
+/// shape, sorted by name (stable sort preserves the in-source order
+/// for duplicate names so a test author can write
+/// `[("dup", 1u64), ("dup", 1u64)]` and have it match an actual
+/// listing with two `dup` entries).
+pub fn normalize_expected(expected: &[ExpectedEntry]) -> Vec<(String, RemoteSnapshot)> {
+    let mut out: Vec<(String, RemoteSnapshot)> = expected
         .iter()
         .map(|e| (e.name.clone(), RemoteSnapshot { size: e.size }))
-        .collect()
+        .collect();
+    out.sort_by(|a, b| a.0.cmp(&b.0));
+    out
 }
 
 /// Helper trait that lets the [`assert_remote_eq!`] DSL accept either a
@@ -217,5 +237,48 @@ mod tests {
     fn mismatch_panics() {
         let actual = vec![entry("a.txt", Some(5), false)];
         assert_remote_eq!(actual, [("a.txt", 6u64),]);
+    }
+
+    #[test]
+    fn surfaces_duplicate_names() {
+        // Two distinct entries named "dup.txt" (Drive allows duplicate
+        // names in a folder); the expected list mirrors the count.
+        let actual = vec![
+            RemoteEntry {
+                id: "id-a".into(),
+                name: "dup.txt".into(),
+                parents: vec!["root".into()],
+                size: Some(1),
+                md5: None,
+                mime_type: "application/octet-stream".into(),
+                modified_time: 0,
+                trashed: false,
+                app_properties: HashMap::new(),
+            },
+            RemoteEntry {
+                id: "id-b".into(),
+                name: "dup.txt".into(),
+                parents: vec!["root".into()],
+                size: Some(1),
+                md5: None,
+                mime_type: "application/octet-stream".into(),
+                modified_time: 0,
+                trashed: false,
+                app_properties: HashMap::new(),
+            },
+        ];
+        assert_remote_eq!(actual, [("dup.txt", 1u64), ("dup.txt", 1u64)]);
+    }
+
+    #[test]
+    #[should_panic(expected = "assertion")]
+    fn duplicate_actual_one_expected_panics() {
+        // Two actual dup.txt rows but expected only mentions one - must
+        // surface as a mismatch, not silently dedup.
+        let actual = vec![
+            entry("dup.txt", Some(1), false),
+            entry("dup.txt", Some(1), false),
+        ];
+        assert_remote_eq!(actual, [("dup.txt", 1u64)]);
     }
 }
