@@ -30,10 +30,17 @@ Desktop.ini
 .env
 .env.local
 .env.test
+.env.*.local
 *.log
 /logs
 /state.db
 /state.db-*
+
+# OAuth client credentials (Desktop client secret is technically not-secret
+# but treat as one for hygiene). Stash values into .env.test instead.
+client_secret*.json
+gcp-oauth-*.json
+*-oauth-client.json
 
 # Pre-implementation audit (informational; not part of source)
 /.audit-out
