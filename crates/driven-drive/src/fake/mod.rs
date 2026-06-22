@@ -210,6 +210,20 @@ struct ResumableSessionState {
     session_invalidated_after_chunks: u64,
 }
 
+impl ResumableSessionState {
+    /// Mark the session dead AND release its received-bytes buffer.
+    ///
+    /// An invalidated session can never commit, so retaining the partial
+    /// upload only leaks memory (a 1 GiB transfer that 4xx'd mid-stream
+    /// would otherwise pin ~1 GiB until the session is dropped). We keep
+    /// only the lightweight `invalid` tombstone so future `resume_chunk`
+    /// calls still return [`ResumeProgress::SessionInvalid`].
+    fn invalidate(&mut self) {
+        self.invalid = true;
+        self.received = Vec::new();
+    }
+}
+
 /// The mutable core of the fake.
 #[derive(Debug)]
 struct Inner {
@@ -723,7 +737,10 @@ impl RemoteStore for InMemoryRemoteStore {
             url.clone(),
             ResumableSessionState {
                 size,
-                received: Vec::with_capacity(size as usize),
+                // Do NOT preallocate `size`: a 1 GiB declared upload must not
+                // commit 1 GiB up front (M3's memory-ceiling acceptance test
+                // would otherwise fail inside the fake). Grow per chunk.
+                received: Vec::new(),
                 mime: mime.to_string(),
                 kind: clone_kind(&kind),
                 issued_at,
@@ -761,11 +778,11 @@ impl RemoteStore for InMemoryRemoteStore {
             // Drive responds with 308 + Range header to request the
             // bytes it actually has. The trait does not surface that
             // back-channel; treat as a session-invalidating client bug.
-            state.invalid = true;
+            state.invalidate();
             return Ok(ResumeProgress::SessionInvalid);
         }
         if offset + chunk.len() as u64 > state.size {
-            state.invalid = true;
+            state.invalidate();
             return Ok(ResumeProgress::SessionInvalid);
         }
 
@@ -776,7 +793,7 @@ impl RemoteStore for InMemoryRemoteStore {
             // trait surfaces that as `SessionInvalid` (advisor finding
             // #4 reconciliation: keep the contract test portable to the
             // real GoogleDriveStore in M4).
-            state.invalid = true;
+            state.invalidate();
             return Ok(ResumeProgress::SessionInvalid);
         }
 
@@ -789,7 +806,7 @@ impl RemoteStore for InMemoryRemoteStore {
         {
             state.session_invalidated_after_chunks -= 1;
             if state.session_invalidated_after_chunks == 0 {
-                state.invalid = true;
+                state.invalidate();
                 return Ok(ResumeProgress::SessionInvalid);
             }
         }
@@ -998,10 +1015,21 @@ async fn collect_body(body: UploadBody) -> anyhow::Result<Vec<u8>> {
     match body {
         UploadBody::Bytes(b) => Ok(b.to_vec()),
         UploadBody::Stream { len, mut stream } => {
-            let mut buf = Vec::with_capacity(len as usize);
+            // Do NOT preallocate `len` here - a large declared upload would
+            // commit that memory up front. Let the buffer grow per chunk.
+            let mut buf = Vec::new();
             while let Some(chunk) = stream.next().await {
                 let chunk = chunk?;
                 buf.extend_from_slice(&chunk);
+            }
+            // The fake is the test oracle for a backup tool: a truncated (or
+            // over-long) stream must NOT be silently accepted with a valid
+            // MD5 of the wrong bytes. Reject any length mismatch against the
+            // declared `len` so a corrupt/incomplete backup can never pass
+            // here when it would fail in production.
+            let actual = buf.len() as u64;
+            if actual != len {
+                anyhow::bail!("fake: stream length mismatch: declared {len}, got {actual}");
             }
             Ok(buf)
         }

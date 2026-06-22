@@ -801,3 +801,162 @@ async fn fake_parallel_creates_under_same_parent() {
         assert_eq!(bytes, body.into_bytes());
     }
 }
+
+// ---------------------------------------------------------------------------
+// Stream-body length integrity + resumable-session memory hygiene.
+// ---------------------------------------------------------------------------
+
+/// Build an `UploadBody::Stream` that yields `payload` (one chunk) while
+/// declaring `len` as its content length. When `len != payload.len()` this
+/// models a truncated or over-long stream.
+fn stream_body(len: u64, payload: &'static [u8]) -> UploadBody {
+    let chunks: Vec<anyhow::Result<Bytes>> = vec![Ok(Bytes::from_static(payload))];
+    UploadBody::Stream {
+        len,
+        stream: Box::new(futures::stream::iter(chunks)),
+    }
+}
+
+#[tokio::test]
+async fn stream_shorter_than_len_rejected() {
+    // The fake is the test oracle for a backup tool. A stream that yields
+    // FEWER bytes than declared must be rejected, not accepted with a valid
+    // MD5 of the truncated bytes (silent truncation is the worst case).
+    let store = fake();
+    let root = store.root_id().to_string();
+    // Declare 10 bytes, yield 3.
+    let res = store
+        .create(
+            &root,
+            "short.bin",
+            "application/octet-stream",
+            stream_body(10, b"abc"),
+            props(&[]),
+        )
+        .await;
+    assert!(res.is_err(), "truncated stream must be rejected");
+    // And nothing was committed.
+    let listing = store.list_folder(&root).await.unwrap();
+    assert!(
+        listing.is_empty(),
+        "no object created for a truncated stream"
+    );
+
+    // Same on the update path.
+    let seed = store
+        .create(
+            &root,
+            "u.bin",
+            "application/octet-stream",
+            UploadBody::Bytes(Bytes::from_static(b"seed")),
+            props(&[]),
+        )
+        .await
+        .expect("seed create");
+    let upd = store
+        .update(&seed.id, stream_body(10, b"abc"), props(&[]))
+        .await;
+    assert!(upd.is_err(), "truncated update stream must be rejected");
+}
+
+#[tokio::test]
+async fn stream_longer_than_len_rejected() {
+    // A stream that yields MORE bytes than declared is equally a mismatch.
+    let store = fake();
+    let root = store.root_id().to_string();
+    let res = store
+        .create(
+            &root,
+            "long.bin",
+            "application/octet-stream",
+            stream_body(2, b"abcdef"),
+            props(&[]),
+        )
+        .await;
+    assert!(res.is_err(), "over-long stream must be rejected");
+    let listing = store.list_folder(&root).await.unwrap();
+    assert!(
+        listing.is_empty(),
+        "no object created for an over-long stream"
+    );
+}
+
+#[tokio::test]
+async fn resumable_session_large_len_does_not_preallocate() {
+    // Smoke test (M3 owns the real RSS measurement): opening a session for a
+    // 1 GiB declared upload must return promptly without committing 1 GiB of
+    // memory, and a small chunk still works against it.
+    let store = fake();
+    let root = store.root_id().to_string();
+    let one_gib: u64 = 1024 * 1024 * 1024;
+    let session = store
+        .resumable_session(
+            ResumableKind::Create {
+                parent_id: root.clone(),
+                name: "big.bin".into(),
+                app_properties: props(&[]),
+            },
+            "application/octet-stream",
+            one_gib,
+        )
+        .await
+        .expect("open large session quickly without OOM");
+
+    // A single non-final 256 KiB chunk is accepted (proves the buffer grows
+    // on demand rather than being preallocated to 1 GiB).
+    let chunk = vec![0u8; CHUNK_MULTIPLE as usize];
+    let progress = store
+        .resume_chunk(&session, 0, Bytes::copy_from_slice(&chunk))
+        .await
+        .expect("first chunk accepted");
+    assert!(matches!(progress, ResumeProgress::InProgress { .. }));
+}
+
+#[tokio::test]
+async fn invalidated_session_releases_buffer_and_stays_invalid() {
+    // Invalidating a session must drop its received buffer yet keep the
+    // tombstone so future resume_chunk calls still report SessionInvalid.
+    let store = fake();
+    let root = store.root_id().to_string();
+    let chunk = CHUNK_MULTIPLE as usize;
+    let session = store
+        .resumable_session(
+            ResumableKind::Create {
+                parent_id: root.clone(),
+                name: "inv.bin".into(),
+                app_properties: props(&[]),
+            },
+            "application/octet-stream",
+            (chunk * 3) as u64,
+        )
+        .await
+        .expect("open session");
+
+    // First chunk lands fine.
+    let buf = vec![0u8; chunk];
+    let r1 = store
+        .resume_chunk(&session, 0, Bytes::copy_from_slice(&buf))
+        .await
+        .expect("chunk 1");
+    assert!(matches!(r1, ResumeProgress::InProgress { .. }));
+
+    // A non-256-KiB-multiple non-final chunk invalidates the session (which
+    // also drops the received buffer via `invalidate`).
+    let bad = vec![0u8; 7];
+    let r2 = store
+        .resume_chunk(&session, chunk as u64, Bytes::copy_from_slice(&bad))
+        .await
+        .expect("invalidating chunk returns SessionInvalid");
+    assert!(matches!(r2, ResumeProgress::SessionInvalid));
+
+    // The session stays dead: a subsequent (otherwise valid) chunk still
+    // returns SessionInvalid rather than resuming.
+    let r3 = store
+        .resume_chunk(&session, chunk as u64, Bytes::copy_from_slice(&buf))
+        .await
+        .expect("post-invalidation resume_chunk");
+    assert!(
+        matches!(r3, ResumeProgress::SessionInvalid),
+        "invalidated session must remain invalid"
+    );
+}
