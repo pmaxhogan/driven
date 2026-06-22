@@ -1,6 +1,6 @@
 //! Driven Tauri shell entry point.
 //!
-//! Per `design/SPEC.md` §14, plugin order matters in Tauri v2 — register
+//! Per `design/SPEC.md` s14, plugin order matters in Tauri v2 - register
 //! `tauri-plugin-single-instance` first (M5 wires it in), then deep-link.
 //! For M0 we ship the bare minimum that builds and opens a window.
 

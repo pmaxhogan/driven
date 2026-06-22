@@ -10,7 +10,7 @@ feature-depth = 1
 [advisories]
 yanked = "deny"
 ignore = [
-    # GTK3 unmaintained — pulled in transitively by Tauri 2 on Linux.
+    # GTK3 unmaintained - pulled in transitively by Tauri 2 on Linux.
     # Tauri ecosystem migration to GTK4 is upstream-tracked; nothing
     # to do at our layer.
     "RUSTSEC-2024-0411",

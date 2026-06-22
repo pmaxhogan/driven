@@ -1,4 +1,4 @@
-//! `driven-crypto` — Driven's authenticated-encryption format.
+//! `driven-crypto` - Driven's authenticated-encryption format.
 //!
 //! Owns master/per-source key types, OS-keychain key storage,
 //! per-path filename encryption (XChaCha20-Poly1305 + base32),

@@ -3,7 +3,7 @@
 //! The webview surface uses `vue-i18n`; this module covers the strings
 //! the webview can't reach (tray, OS notifications, autostart launcher
 //! tooltip). Locale is OS-detected on first run and overridable via
-//! `Settings -> UI -> locale` (DESIGN §8.7 / SPEC §22).
+//! `Settings -> UI -> locale` (DESIGN s8.7 / SPEC s22).
 
 rust_i18n::i18n!("locales", fallback = "en-US");
 

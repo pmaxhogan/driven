@@ -1,4 +1,4 @@
-//! `driven-chaos` — stress / chaos harness binary.
+//! `driven-chaos` - stress / chaos harness binary.
 //!
 //! See `design/STRESS_HARNESS.md`. Drives the headless core (does not
 //! depend on `src-tauri/`) and exits with code 0 on all-pass/skip,
