@@ -414,16 +414,20 @@ fn path_is_excluded(path: &Path, roots: &StripRoots, matcher: &SourceMatcher) ->
     });
     match rel {
         Some(rel) if !rel.as_os_str().is_empty() => {
-            // `is_dir` is unknown from a delete event (the path may be gone),
-            // so query as a file: `is_included` walks ancestors and still
-            // catches an excluded ANCESTOR directory (e.g. `.git/`), which is
-            // the git-noise case s5.9.3 targets. Note: a directory-scoped
-            // exclude (`noise/`) filters the dir's CHILDREN (the high-volume
-            // ones, e.g. `.git/objects/...`) but not a bare event ON the dir
-            // entry itself - acceptable, since the s5.9.3 goal is buffer-
-            // pressure relief and the scanner remains authoritative, so an
-            // occasional leaked bare-dir tick costs only a wasted cheap scan.
-            !matcher.is_included(rel, false)
+            // The event carries no reliable file-vs-dir flag (a delete event's
+            // path may already be gone, and inotify reports modifications to a
+            // watched subdirectory as a bare event ON that directory). Treat
+            // the path as excluded if it is excluded under EITHER
+            // interpretation: querying as a file catches an excluded ancestor
+            // (e.g. `.git/objects/x`), and querying as a directory catches a
+            // bare event on a directory-scoped exclude itself (e.g. the `noise`
+            // entry against a `noise/` rule, which `is_included(_, false)`
+            // alone would leak because the trailing-slash rule is dir-only).
+            // `is_included` walks ancestors in both cases, so a child under an
+            // excluded dir is still filtered. This is the git-noise / excluded-
+            // prefix buffer-pressure relief s5.9.3 targets; a kept file or dir
+            // matches no exclude under either query and is never dropped.
+            !matcher.is_included(rel, false) || !matcher.is_included(rel, true)
         }
         _ => false,
     }
