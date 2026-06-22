@@ -1,1 +1,751 @@
 //! Local tree walk; SPEC s6 / DESIGN s5.2.
+//!
+//! [`scan`] walks one backup source with the [`crate::exclude`]-configured
+//! [`ignore::WalkBuilder`], diffs each file against the source's stored
+//! `file_state` rows (SPEC s2), and returns the [`ScanResult`] the planner
+//! (SPEC s7) turns into a [`crate::types::Plan`].
+//!
+//! Change detection (DESIGN s5.2 step 2):
+//! - [`ScanMode::FastPath`]: a file is unchanged iff its `(size, mtime_ns)`
+//!   match the stored row; otherwise it is new-or-changed. No content read.
+//! - [`ScanMode::DeepVerify`]: additionally re-hashes (BLAKE3) the bytes of
+//!   every file whose `(size, mtime_ns)` matched, and treats a hash that
+//!   differs from `file_state.hash_blake3` as a change. This catches silent
+//!   bit-rot and filesystem timestamp lies (DESIGN s3.3, s5.2 step 4;
+//!   ROADMAP M2 "deep-verify catches bit-rot" row).
+//!
+//! Symlink policy (DESIGN s5.2.1, [`crate::types::SymlinkPolicy::Skip`]):
+//! symlinks are never followed and the link itself is never backed up. The
+//! walker is built with `follow_links(false)` so traversal cannot leave the
+//! source root; this scanner additionally drops any yielded entry whose own
+//! type is a symlink (a link *to* a file would otherwise pass the is_file
+//! check on some platforms) and counts it. Because V1 never follows links,
+//! traversal cycles cannot occur - we do NOT and need NOT claim
+//! visited-inode cycle detection (the "visited-inode set when following"
+//! note in DESIGN s5.2.1 applies only to the V2 follow mode). Hardlinks are
+//! out of scope: two paths sharing one inode are each backed up
+//! independently (DESIGN s5.2.1); a consumer wanting to dedup may do so by
+//! `(dev, inode)` at its own layer.
+//!
+//! Safe deletion (DESIGN s5.2 step 3): a `file_state` path the walk did not
+//! yield is reported `deleted` ONLY when the walk completed without error
+//! over the subtree that should have visited it. Walker errors (a
+//! permission denial on a directory, an unreadable entry) are NOT swallowed
+//! with `filter_map(Result::ok)`; instead the errored path prefixes are
+//! collected and any known path under such a prefix is suppressed from
+//! `deleted` so a transient permission error can never cascade into
+//! trashing a whole subtree on Drive. Errors are logged via `tracing`.
+//!
+//! Blocking-I/O caveat (deferred past phase 2A): the walk and the
+//! deep-verify hashing are synchronous, blocking calls run inline on the
+//! async task. Ideally they would move to `spawn_blocking`, but the
+//! `&dyn StateRepo` / `&SourceRow` borrows make that awkward at this phase;
+//! left inline and noted for a later pass.
+
+use std::collections::HashSet;
+use std::fs::Metadata;
+use std::io::Read;
+use std::path::{Path, PathBuf};
+use std::time::UNIX_EPOCH;
+
+use anyhow::Context;
+
+use crate::exclude::build_walker;
+use crate::state::{SourceRow, StateRepo};
+use crate::types::{LocalEntry, RelativePath, ScanMode, ScanResult};
+
+static TARGET: &str = "driven::core::scanner";
+
+/// Walks one source and returns the new-or-changed / deleted diff (SPEC s6).
+///
+/// `mode` selects the change-detection predicate (see the module docs).
+/// Pure aside from local filesystem reads and the `state` load; emits no
+/// ops and mutates no state - the planner (SPEC s7) and executor (SPEC s8)
+/// own those side effects.
+pub async fn scan(
+    source: &SourceRow,
+    state: &dyn StateRepo,
+    mode: ScanMode,
+) -> anyhow::Result<ScanResult> {
+    let known = state
+        .load_source_file_state(source.id)
+        .await
+        .with_context(|| format!("loading file_state for source {}", source.id))?;
+
+    let root = Path::new(&source.local_path);
+
+    // Root pre-check (DESIGN s5.2 step 3, mass-delete guard): if the source
+    // root is missing or not a directory - an unmounted external drive, a
+    // dropped network share - the walk yields zero files and a naive diff
+    // would report EVERY known path as deleted, cascading into trashing the
+    // whole Drive backup. Refuse: report nothing new and nothing deleted,
+    // log, and let the next scan retry once the root is back.
+    match std::fs::metadata(root) {
+        Ok(m) if m.is_dir() => {}
+        Ok(_) => {
+            tracing::warn!(target: TARGET, source_id = %source.id, path = %root.display(), "source root is not a directory; skipping scan (no deletions)");
+            return Ok(ScanResult::default());
+        }
+        Err(err) => {
+            tracing::warn!(target: TARGET, source_id = %source.id, path = %root.display(), %err, "source root unreadable/missing; skipping scan (no deletions)");
+            return Ok(ScanResult::default());
+        }
+    }
+
+    let walker = build_walker(source)?.build();
+
+    let mut seen: HashSet<RelativePath> = HashSet::new();
+    let mut new_or_changed: Vec<LocalEntry> = Vec::new();
+    // Directory prefixes (relative, `/`-joined) under which the walk hit an
+    // error. Any known path under one of these is held back from `deleted`.
+    let mut errored_prefixes: Vec<RelativePath> = Vec::new();
+    // Set when a walk error could NOT be attributed to a recoverable
+    // relative prefix (e.g. a root-level error, or one whose path does not
+    // strip under the root). Such an error means our view of the tree is
+    // incomplete in an unknown region, so we cannot safely propagate ANY
+    // deletion this cycle (DESIGN s5.2 step 3).
+    let mut unattributed_error = false;
+    let mut skipped_symlinks: u64 = 0;
+
+    for result in walker {
+        let entry = match result {
+            Ok(e) => e,
+            Err(err) => {
+                // DESIGN s5.2 step 3: never swallow walker errors. Record
+                // the errored path's relative prefix (when one is
+                // recoverable) so deletions under it are suppressed; if no
+                // attributable prefix, suppress ALL deletions this cycle.
+                match error_path(&err)
+                    .and_then(|p| p.strip_prefix(root).ok())
+                    .and_then(|p| RelativePath::try_from(p).ok())
+                {
+                    Some(rel) => errored_prefixes.push(rel),
+                    None => unattributed_error = true,
+                }
+                tracing::warn!(target: TARGET, source_id = %source.id, %err, "walk error; suppressing deletes under this subtree");
+                continue;
+            }
+        };
+
+        // Symlink check BEFORE the is_file filter: a link to a file can read
+        // as a file on some platforms, and we must skip + count it either
+        // way (DESIGN s5.2.1 SymlinkPolicy::Skip).
+        if entry.file_type().is_some_and(|t| t.is_symlink()) {
+            skipped_symlinks += 1;
+            tracing::trace!(target: TARGET, source_id = %source.id, path = %entry.path().display(), "skipping symlink");
+            continue;
+        }
+        // Files only; directories and other non-files are not backed up.
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            continue;
+        }
+
+        let abs = entry.path();
+        let rel = match abs.strip_prefix(root).ok().and_then(|p| {
+            // RelativePath::try_from enforces the NFC / no-`..` invariants.
+            RelativePath::try_from(p).ok()
+        }) {
+            Some(r) => r,
+            None => {
+                tracing::warn!(target: TARGET, source_id = %source.id, path = %abs.display(), "skipping path not representable as a relative path");
+                continue;
+            }
+        };
+
+        let meta = match entry.metadata() {
+            Ok(m) => m,
+            Err(err) => {
+                // A stat failure on a single file is a per-file error, not a
+                // subtree walk error; suppress this path from deletion (its
+                // row, if any, should not be trashed) and move on.
+                errored_prefixes.push(rel.clone());
+                tracing::warn!(target: TARGET, source_id = %source.id, path = %abs.display(), %err, "metadata read failed; skipping file");
+                continue;
+            }
+        };
+
+        let size = meta.len();
+        let mtime_ns = mtime_ns(&meta);
+        seen.insert(rel.clone());
+
+        let stored = known.get(&rel);
+        let stat_match =
+            matches!(stored, Some(row) if row.size == size && row.mtime_ns == mtime_ns);
+
+        if stat_match {
+            // FastPath: stat match => unchanged. DeepVerify: re-hash and
+            // treat a hash mismatch against the stored blake3 as changed.
+            if mode == ScanMode::DeepVerify {
+                let stored_hash = stored.map(|r| r.hash_blake3);
+                match hash_file(abs) {
+                    Ok(hash) => {
+                        if stored_hash != Some(hash) {
+                            tracing::info!(target: TARGET, source_id = %source.id, path = %rel, "deep-verify hash mismatch; marking changed");
+                            new_or_changed.push(LocalEntry {
+                                rel,
+                                size,
+                                mtime_ns,
+                            });
+                        }
+                    }
+                    Err(err) => {
+                        // Could not read to verify: don't claim changed (no
+                        // evidence) but suppress this path from deletion.
+                        errored_prefixes.push(rel.clone());
+                        tracing::warn!(target: TARGET, source_id = %source.id, path = %rel, %err, "deep-verify read failed; skipping file");
+                    }
+                }
+            }
+            // FastPath stat-match: unchanged, nothing to emit.
+        } else {
+            // New (no row) or changed (stat differs).
+            new_or_changed.push(LocalEntry {
+                rel,
+                size,
+                mtime_ns,
+            });
+        }
+    }
+
+    // An unattributable walk error means we cannot trust the "not seen =>
+    // deleted" inference anywhere, so propagate no deletions at all this
+    // cycle; the next scan retries once the error clears.
+    let deleted: Vec<RelativePath> = if unattributed_error {
+        Vec::new()
+    } else {
+        known
+            .keys()
+            .filter(|p| !seen.contains(*p))
+            .filter(|p| !is_under_any(p, &errored_prefixes))
+            .cloned()
+            .collect()
+    };
+
+    tracing::debug!(
+        target: TARGET,
+        source_id = %source.id,
+        ?mode,
+        new_or_changed = new_or_changed.len(),
+        deleted = deleted.len(),
+        skipped_symlinks,
+        errored_prefixes = errored_prefixes.len(),
+        unattributed_error,
+        "scan complete"
+    );
+
+    Ok(ScanResult {
+        new_or_changed,
+        deleted,
+    })
+}
+
+/// Modification time in signed nanoseconds since the Unix epoch.
+///
+/// Matches `file_state.mtime_ns` (SPEC s2) and [`LocalEntry::mtime_ns`].
+/// Signed so a pre-epoch mtime is representable rather than clamped, which
+/// keeps the equality test against a stored pre-epoch value exact. A
+/// platform that cannot report an mtime yields `0` (epoch), which simply
+/// makes the file look changed until a real mtime is observed - safe, since
+/// the failure mode is "upload again", never "miss a change".
+fn mtime_ns(meta: &Metadata) -> i64 {
+    let modified = match meta.modified() {
+        Ok(t) => t,
+        Err(_) => return 0,
+    };
+    match modified.duration_since(UNIX_EPOCH) {
+        Ok(d) => d.as_nanos() as i64,
+        // Pre-epoch mtime: negate the magnitude of the reverse duration.
+        Err(e) => -(e.duration().as_nanos() as i64),
+    }
+}
+
+/// Extracts the offending path from an [`ignore::Error`], if it carries one.
+///
+/// `ignore::Error` exposes no public `path()` accessor; the path lives in
+/// the public [`ignore::Error::WithPath`] variant. Walk errors are commonly
+/// wrapped (`WithDepth` / `WithLineNumber` around `WithPath`, or a `Partial`
+/// bundle), so this recurses through the wrapper variants rather than
+/// matching only the top level - a top-level-only match would drop the path
+/// for a wrapped error and wrongly flip it to `unattributed_error`,
+/// suppressing every deletion that cycle (DESIGN s5.2 step 3). The leaf
+/// variants that carry no path (`Io`, `Glob`, `Loop`, etc.) yield `None`,
+/// which the caller treats as an unattributable error - the conservative
+/// choice (suppress all deletes this cycle).
+fn error_path(err: &ignore::Error) -> Option<&Path> {
+    match err {
+        ignore::Error::WithPath { path, .. } => Some(path.as_path()),
+        ignore::Error::WithLineNumber { err, .. } | ignore::Error::WithDepth { err, .. } => {
+            error_path(err)
+        }
+        ignore::Error::Partial(errs) => errs.iter().find_map(error_path),
+        _ => None,
+    }
+}
+
+/// BLAKE3 hash of a file's bytes, read in bounded chunks (DESIGN s3.3
+/// deep-verify). Streams so memory stays bounded regardless of file size.
+fn hash_file(path: &Path) -> anyhow::Result<[u8; 32]> {
+    let mut file = std::fs::File::open(path)
+        .with_context(|| format!("opening {} for deep-verify", path.display()))?;
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; 64 * 1024];
+    loop {
+        let n = file
+            .read(&mut buf)
+            .with_context(|| format!("reading {} for deep-verify", path.display()))?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+    }
+    Ok(*hasher.finalize().as_bytes())
+}
+
+/// True if `path` equals, or is a descendant of, any prefix in `prefixes`.
+///
+/// Compares on `/`-separated path segments so a prefix `a/b` matches
+/// `a/b/c.txt` but NOT the sibling `a/bc.txt` (a raw `starts_with` on the
+/// string would wrongly match the latter).
+fn is_under_any(path: &RelativePath, prefixes: &[RelativePath]) -> bool {
+    prefixes.iter().any(|prefix| is_under(path, prefix))
+}
+
+fn is_under(path: &RelativePath, prefix: &RelativePath) -> bool {
+    let p = path.as_str();
+    let pre = prefix.as_str();
+    if p == pre {
+        return true;
+    }
+    // Segment-boundary descendant check.
+    let pb = PathBuf::from(p);
+    let preb = PathBuf::from(pre);
+    pb.starts_with(&preb)
+}
+
+#[cfg(test)]
+mod tests {
+    use std::collections::HashMap;
+    use std::fs;
+    use std::path::Path;
+    use std::sync::Mutex;
+
+    use async_trait::async_trait;
+
+    use super::*;
+    use crate::state::{
+        AccountRow, ActivityFilter, ActivityPage, FileSearchHit, FileStateRow, NewActivity,
+        NewPendingOp, PageRequest, PendingOpRow,
+    };
+    use crate::types::{
+        AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, SourceId,
+    };
+
+    fn source_at(root: &Path) -> SourceRow {
+        SourceRow {
+            id: SourceId::new_v4(),
+            account_id: AccountId::new_v4(),
+            display_name: "t".into(),
+            enabled: true,
+            local_path: root.to_string_lossy().into_owned(),
+            drive_folder_id: "f".into(),
+            drive_folder_path: "/f".into(),
+            encryption_enabled: false,
+            wrapped_source_key: None,
+            respect_gitignore: true,
+            include_patterns: vec![],
+            exclude_patterns: vec![],
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: 604_800,
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            created_at: 0,
+        }
+    }
+
+    fn write(path: &Path, contents: &[u8]) {
+        if let Some(parent) = path.parent() {
+            fs::create_dir_all(parent).expect("mkdir");
+        }
+        fs::write(path, contents).expect("write");
+    }
+
+    /// Minimal in-memory `StateRepo` covering only the methods the scanner
+    /// calls (`load_source_file_state`); the rest are unreachable in these
+    /// tests and bail loudly if ever hit.
+    #[derive(Default)]
+    struct FakeState {
+        files: Mutex<HashMap<(SourceId, RelativePath), FileStateRow>>,
+    }
+
+    impl FakeState {
+        fn put(&self, row: FileStateRow) {
+            self.files
+                .lock()
+                .unwrap()
+                .insert((row.source_id, row.relative_path.clone()), row);
+        }
+    }
+
+    fn row(source: SourceId, rel: &str, size: u64, mtime_ns: i64, hash: [u8; 32]) -> FileStateRow {
+        FileStateRow {
+            source_id: source,
+            relative_path: RelativePath::try_from(rel.to_string()).unwrap(),
+            size,
+            mtime_ns,
+            hash_blake3: hash,
+            drive_file_id: Some("drive-id".into()),
+            drive_md5: None,
+            encrypted_remote_path: None,
+            status: FileStateStatus::Synced,
+            last_uploaded_at: None,
+            last_verified_at: None,
+        }
+    }
+
+    #[async_trait]
+    impl StateRepo for FakeState {
+        async fn load_source_file_state(
+            &self,
+            source: SourceId,
+        ) -> anyhow::Result<HashMap<RelativePath, FileStateRow>> {
+            Ok(self
+                .files
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|((s, _), _)| *s == source)
+                .map(|((_, p), r)| (p.clone(), r.clone()))
+                .collect())
+        }
+
+        async fn list_accounts(&self) -> anyhow::Result<Vec<AccountRow>> {
+            unimplemented!("not used by scanner tests")
+        }
+        async fn upsert_account(&self, _row: &AccountRow) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn mark_account_state(
+            &self,
+            _id: AccountId,
+            _state: AccountState,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_account(&self, _id: AccountId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn list_sources(&self) -> anyhow::Result<Vec<SourceRow>> {
+            unimplemented!()
+        }
+        async fn list_enabled_sources_for(
+            &self,
+            _account: AccountId,
+        ) -> anyhow::Result<Vec<SourceRow>> {
+            unimplemented!()
+        }
+        async fn upsert_source(&self, _row: &SourceRow) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_source(&self, _id: SourceId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn get_file_state(
+            &self,
+            _source: SourceId,
+            _path: &RelativePath,
+        ) -> anyhow::Result<Option<FileStateRow>> {
+            unimplemented!()
+        }
+        async fn upsert_file_state(&self, _row: &FileStateRow) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_file_state(
+            &self,
+            _source: SourceId,
+            _path: &RelativePath,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn enqueue_pending_op(&self, _row: NewPendingOp) -> anyhow::Result<PendingOpId> {
+            unimplemented!()
+        }
+        async fn get_pending_ops_due(
+            &self,
+            _now_ms: i64,
+            _limit: u32,
+        ) -> anyhow::Result<Vec<PendingOpRow>> {
+            unimplemented!()
+        }
+        async fn get_pending_ops_for_source(
+            &self,
+            _source: SourceId,
+        ) -> anyhow::Result<Vec<PendingOpRow>> {
+            unimplemented!()
+        }
+        async fn mark_pending_op_attempted(
+            &self,
+            _id: PendingOpId,
+            _error: Option<&str>,
+            _next_attempt_ms: i64,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn delete_pending_op(&self, _id: PendingOpId) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn commit_create_result(
+            &self,
+            _op_id: PendingOpId,
+            _file_state: &FileStateRow,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn commit_update_result(
+            &self,
+            _op_id: PendingOpId,
+            _file_state: &FileStateRow,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn write_activity(&self, _row: NewActivity) -> anyhow::Result<ActivityId> {
+            unimplemented!()
+        }
+        async fn query_activity(
+            &self,
+            _filter: ActivityFilter,
+            _page: PageRequest,
+        ) -> anyhow::Result<ActivityPage> {
+            unimplemented!()
+        }
+        async fn prune_activity_older_than(
+            &self,
+            _before_ms: i64,
+            _hard_cap: u64,
+            _batch_size: Option<u32>,
+        ) -> anyhow::Result<u64> {
+            unimplemented!()
+        }
+        async fn delete_activity_by_source(&self, _source: SourceId) -> anyhow::Result<u64> {
+            unimplemented!()
+        }
+        async fn get_setting(&self, _key: &str) -> anyhow::Result<Option<serde_json::Value>> {
+            unimplemented!()
+        }
+        async fn set_setting(&self, _key: &str, _value: &serde_json::Value) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn search_files(
+            &self,
+            _source: Option<SourceId>,
+            _query: &str,
+            _limit: u32,
+        ) -> anyhow::Result<Vec<FileSearchHit>> {
+            unimplemented!()
+        }
+    }
+
+    fn rel(s: &str) -> RelativePath {
+        RelativePath::try_from(s.to_string()).unwrap()
+    }
+
+    /// Read back the on-disk (size, mtime_ns) the scanner would observe for
+    /// a path, so tests can seed a matching `file_state` row.
+    fn stat_of(path: &Path) -> (u64, i64) {
+        let meta = fs::metadata(path).unwrap();
+        (meta.len(), mtime_ns(&meta))
+    }
+
+    #[tokio::test]
+    async fn first_scan_all_new() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("a.txt"), b"hello");
+        write(&root.join("sub/b.txt"), b"world");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+
+        let mut got: Vec<String> = res
+            .new_or_changed
+            .iter()
+            .map(|e| e.rel.as_str().to_string())
+            .collect();
+        got.sort();
+        assert_eq!(got, vec!["a.txt".to_string(), "sub/b.txt".to_string()]);
+        assert!(res.deleted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn unchanged_scan_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("a.txt");
+        write(&p, b"hello");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let (size, mtime) = stat_of(&p);
+        state.put(row(
+            src.id,
+            "a.txt",
+            size,
+            mtime,
+            *blake3::hash(b"hello").as_bytes(),
+        ));
+
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+        assert!(res.new_or_changed.is_empty(), "{:?}", res.new_or_changed);
+        assert!(res.deleted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn single_mtime_change_yields_one() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("a.txt");
+        write(&p, b"hello");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let (size, mtime) = stat_of(&p);
+        // Stored mtime differs by one ns => changed under FastPath.
+        state.put(row(
+            src.id,
+            "a.txt",
+            size,
+            mtime + 1,
+            *blake3::hash(b"hello").as_bytes(),
+        ));
+
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+        assert_eq!(res.new_or_changed.len(), 1);
+        assert_eq!(res.new_or_changed[0].rel, rel("a.txt"));
+        assert!(res.deleted.is_empty());
+    }
+
+    #[tokio::test]
+    async fn deleted_file_reported_once() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("present.txt");
+        write(&p, b"x");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let (size, mtime) = stat_of(&p);
+        state.put(row(
+            src.id,
+            "present.txt",
+            size,
+            mtime,
+            *blake3::hash(b"x").as_bytes(),
+        ));
+        // A row whose file is gone from disk.
+        state.put(row(src.id, "gone.txt", 1, 1, [0u8; 32]));
+
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+        assert!(res.new_or_changed.is_empty(), "{:?}", res.new_or_changed);
+        assert_eq!(res.deleted, vec![rel("gone.txt")]);
+    }
+
+    #[tokio::test]
+    async fn missing_root_never_deletes() {
+        // The mass-delete guard: a missing / unmounted source root must
+        // yield an empty scan, NEVER report every known path as deleted
+        // (DESIGN s5.2 step 3).
+        let dir = tempfile::tempdir().unwrap();
+        let missing = dir.path().join("not-mounted");
+        let src = source_at(&missing);
+
+        let state = FakeState::default();
+        // Seed several known rows whose files cannot possibly be seen.
+        state.put(row(src.id, "a.txt", 1, 1, [0u8; 32]));
+        state.put(row(src.id, "sub/b.txt", 1, 1, [0u8; 32]));
+
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+        assert!(res.new_or_changed.is_empty(), "{:?}", res.new_or_changed);
+        assert!(
+            res.deleted.is_empty(),
+            "missing root must never cascade deletions: {:?}",
+            res.deleted
+        );
+    }
+
+    #[tokio::test]
+    async fn deep_verify_catches_corrupted_bytes() {
+        // Size + mtime unchanged but bytes differ from the stored hash:
+        // FastPath misses it, DeepVerify catches it (bit-rot row).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("a.txt");
+        write(&p, b"corrupted-bytes");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let (size, mtime) = stat_of(&p);
+        // Stored hash is of DIFFERENT content, but size+mtime match disk.
+        let stale_hash = *blake3::hash(b"original-content").as_bytes();
+        // Make the stale row's size equal the on-disk size so (size, mtime)
+        // matches and only the hash differs.
+        state.put(row(src.id, "a.txt", size, mtime, stale_hash));
+
+        // FastPath: stat matches => unchanged.
+        let fast = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+        assert!(fast.new_or_changed.is_empty(), "{:?}", fast.new_or_changed);
+
+        // DeepVerify: hash mismatch => changed.
+        let deep = scan(&src, &state, ScanMode::DeepVerify).await.unwrap();
+        assert_eq!(deep.new_or_changed.len(), 1, "{:?}", deep.new_or_changed);
+        assert_eq!(deep.new_or_changed[0].rel, rel("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn deep_verify_clean_file_is_empty() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("a.txt");
+        write(&p, b"hello");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let (size, mtime) = stat_of(&p);
+        state.put(row(
+            src.id,
+            "a.txt",
+            size,
+            mtime,
+            *blake3::hash(b"hello").as_bytes(),
+        ));
+
+        let res = scan(&src, &state, ScanMode::DeepVerify).await.unwrap();
+        assert!(res.new_or_changed.is_empty(), "{:?}", res.new_or_changed);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn symlink_is_skipped() {
+        use std::os::unix::fs::symlink;
+
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let target = root.join("real.txt");
+        write(&target, b"hello");
+        symlink(&target, root.join("link.txt")).unwrap();
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+
+        let got: Vec<String> = res
+            .new_or_changed
+            .iter()
+            .map(|e| e.rel.as_str().to_string())
+            .collect();
+        assert!(got.contains(&"real.txt".to_string()), "{got:?}");
+        assert!(
+            !got.contains(&"link.txt".to_string()),
+            "symlink must be skipped, not backed up: {got:?}"
+        );
+    }
+}

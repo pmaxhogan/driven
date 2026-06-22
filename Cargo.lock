@@ -993,6 +993,7 @@ dependencies = [
  "async-trait",
  "blake3",
  "bytes",
+ "driven-test-fixtures",
  "futures",
  "hex",
  "ignore",

@@ -37,3 +37,8 @@ sqlx = { version = "0.8", default-features = false, features = [
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
 tempfile = "3"
+# M2 acceptance snapshots: the tree!() temp-tree builder (DESIGN s16,
+# ROADMAP M2). Scanner + planner are remote-free, so the InMemoryRemoteStore
+# in driven-drive is NOT needed here (no remote is consumed until M3
+# execution); only the fixtures crate is pulled in.
+driven-test-fixtures = { path = "../driven-test-fixtures" }
