@@ -275,6 +275,21 @@ impl Inner {
             .get(file_id)
             .ok_or_else(|| anyhow::anyhow!("fake: no object with file_id {file_id}"))
     }
+
+    /// Validate that `parent_id` names an existing FOLDER. Real Drive
+    /// rejects a create / ensure_folder whose parent is a file (or does
+    /// not exist); the fake mirrors that so tests cannot construct an
+    /// impossible Drive state (a file used as a parent). Returns an `Err`
+    /// when the parent is missing OR is a non-folder object.
+    fn ensure_folder_parent(&self, parent_id: &str) -> anyhow::Result<()> {
+        match self.objects.get(parent_id) {
+            None => anyhow::bail!("fake: parent folder {parent_id} does not exist"),
+            Some(e) if !e.is_folder() => {
+                anyhow::bail!("fake: parent {parent_id} is not a folder")
+            }
+            Some(_) => Ok(()),
+        }
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -322,6 +337,13 @@ pub(crate) struct Faults {
     pub(crate) session_invalidated_after_chunks: AtomicU64,
     pub(crate) md5_mismatch_after: AtomicU64,
     pub(crate) quota_exhausted_after_bytes: AtomicU64,
+    /// Artificial per-request latency in nanoseconds, injected by
+    /// [`fault_injection::with_slow_responses`]. `0` (the default) means
+    /// no delay. Every trait method awaits this before doing its work
+    /// (DESIGN s5.8.1 "lossy: +500ms latency"); the sleep happens in
+    /// `maybe_delay` BEFORE the inner mutex is acquired so no guard is
+    /// held across the `.await`.
+    pub(crate) response_delay_nanos: AtomicU64,
     /// Latched once tripped (auth.invalid_grant is "stay-broken").
     pub(crate) invalid_grant_latched: std::sync::atomic::AtomicBool,
     /// Dest-folder states are latched on construction by the builder.
@@ -346,6 +368,7 @@ impl Default for Faults {
             session_invalidated_after_chunks: AtomicU64::new(u64::MAX),
             md5_mismatch_after: AtomicU64::new(u64::MAX),
             quota_exhausted_after_bytes: AtomicU64::new(u64::MAX),
+            response_delay_nanos: AtomicU64::new(0),
             invalid_grant_latched: AtomicBool::new(false),
             dest_folder_missing: AtomicBool::new(false),
             dest_folder_readonly: AtomicBool::new(false),
@@ -453,7 +476,14 @@ impl InMemoryRemoteStore {
     /// `path_kind` is a coarse classifier so dest-folder-missing /
     /// readonly only trip for create / update calls and not for, say,
     /// `about()` calls.
-    fn check_request_faults(&self, path_kind: RequestKind) -> anyhow::Result<()> {
+    ///
+    /// Async because it first awaits any injected per-request latency
+    /// ([`fault_injection::with_slow_responses`]). The sleep runs here -
+    /// the single insertion point at the top of every trait method, BEFORE
+    /// any `self.inner.lock()` - so the `.await` never spans a held
+    /// `parking_lot` guard (DESIGN s5.8.1).
+    async fn check_request_faults(&self, path_kind: RequestKind) -> anyhow::Result<()> {
+        self.maybe_delay().await;
         // auth.invalid_grant is latched: once tripped it stays broken.
         if self.faults.invalid_grant_latched.load(Ordering::Acquire) {
             anyhow::bail!("fake: auth.invalid_grant (latched)");
@@ -484,6 +514,18 @@ impl InMemoryRemoteStore {
             anyhow::bail!("fake: drive.dest_folder_permission_denied");
         }
         Ok(())
+    }
+
+    /// Await the injected per-request latency, if any. Reads the delay,
+    /// drops nothing (no guard is held here), then `tokio::time::sleep`s.
+    /// A `0` delay (the default) is a no-op fast path. Used by
+    /// [`fault_injection::with_slow_responses`] to model DESIGN s5.8.1's
+    /// "lossy: +500ms latency".
+    async fn maybe_delay(&self) {
+        let nanos = self.faults.response_delay_nanos.load(Ordering::Acquire);
+        if nanos != 0 {
+            tokio::time::sleep(std::time::Duration::from_nanos(nanos)).await;
+        }
     }
 }
 
@@ -530,11 +572,10 @@ impl Default for InMemoryRemoteStore {
 #[async_trait]
 impl RemoteStore for InMemoryRemoteStore {
     async fn ensure_folder(&self, parent_id: &str, name: &str) -> anyhow::Result<RemoteEntry> {
-        self.check_request_faults(RequestKind::WriteTarget)?;
+        self.check_request_faults(RequestKind::WriteTarget).await?;
         let mut guard = self.inner.lock();
-        if !guard.objects.contains_key(parent_id) {
-            anyhow::bail!("fake: parent folder {parent_id} does not exist");
-        }
+        // Parent must be an existing FOLDER (not a file, not missing).
+        guard.ensure_folder_parent(parent_id)?;
 
         // SPEC s3 `ensure_folder`: search by name; if multiple matches,
         // pick the one with our folder marker; else the oldest non-
@@ -592,7 +633,7 @@ impl RemoteStore for InMemoryRemoteStore {
     }
 
     async fn list_folder(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
-        self.check_request_faults(RequestKind::Read)?;
+        self.check_request_faults(RequestKind::Read).await?;
         let guard = self.inner.lock();
         if !guard.objects.contains_key(folder_id) {
             anyhow::bail!("fake: folder {folder_id} does not exist");
@@ -613,7 +654,7 @@ impl RemoteStore for InMemoryRemoteStore {
         body: UploadBody,
         app_properties: HashMap<String, String>,
     ) -> anyhow::Result<RemoteEntry> {
-        self.check_request_faults(RequestKind::WriteTarget)?;
+        self.check_request_faults(RequestKind::WriteTarget).await?;
         // Drain stream BEFORE locking (advisor finding #3): never hold
         // a parking_lot::Mutex guard across an .await.
         let bytes = collect_body(body).await?;
@@ -629,9 +670,8 @@ impl RemoteStore for InMemoryRemoteStore {
         }
 
         let mut guard = self.inner.lock();
-        if !guard.objects.contains_key(parent_id) {
-            anyhow::bail!("fake: parent folder {parent_id} does not exist");
-        }
+        // Parent must be an existing FOLDER (not a file, not missing).
+        guard.ensure_folder_parent(parent_id)?;
         let file_id = Uuid::new_v4().to_string();
         let seq = guard.next_seq();
         let modified_time_ms = guard.tick();
@@ -663,7 +703,7 @@ impl RemoteStore for InMemoryRemoteStore {
         body: UploadBody,
         app_properties_patch: HashMap<String, String>,
     ) -> anyhow::Result<RemoteEntry> {
-        self.check_request_faults(RequestKind::WriteTarget)?;
+        self.check_request_faults(RequestKind::WriteTarget).await?;
         let bytes = collect_body(body).await?;
 
         let new_len = bytes.len() as u64;
@@ -702,7 +742,7 @@ impl RemoteStore for InMemoryRemoteStore {
         mime: &str,
         size: u64,
     ) -> anyhow::Result<ResumableSession> {
-        self.check_request_faults(RequestKind::WriteTarget)?;
+        self.check_request_faults(RequestKind::WriteTarget).await?;
         let url = format!("memory://fake/resumable/{}", Uuid::new_v4());
 
         // Validate the target up front (matches Drive's "open the
@@ -712,9 +752,8 @@ impl RemoteStore for InMemoryRemoteStore {
         let mut guard = self.inner.lock();
         match &kind {
             ResumableKind::Create { parent_id, .. } => {
-                if !guard.objects.contains_key(parent_id) {
-                    anyhow::bail!("fake: parent folder {parent_id} does not exist");
-                }
+                // Parent must be an existing FOLDER (not a file, not missing).
+                guard.ensure_folder_parent(parent_id)?;
             }
             ResumableKind::Update { file_id } => {
                 guard.ensure_object(file_id)?;
@@ -762,7 +801,7 @@ impl RemoteStore for InMemoryRemoteStore {
         offset: u64,
         chunk: Bytes,
     ) -> anyhow::Result<ResumeProgress> {
-        self.check_request_faults(RequestKind::WriteTarget)?;
+        self.check_request_faults(RequestKind::WriteTarget).await?;
 
         let mut guard = self.inner.lock();
         let state = guard
@@ -850,8 +889,12 @@ impl RemoteStore for InMemoryRemoteStore {
                 name,
                 app_properties,
             } => {
-                if !guard.objects.contains_key(&parent_id) {
-                    anyhow::bail!("fake: parent folder {parent_id} disappeared mid-upload");
+                // Parent must still be an existing FOLDER (not a file,
+                // not missing) at commit time.
+                if guard.ensure_folder_parent(&parent_id).is_err() {
+                    anyhow::bail!(
+                        "fake: parent folder {parent_id} missing or not a folder mid-upload"
+                    );
                 }
                 let file_id = Uuid::new_v4().to_string();
                 let seq = guard.next_seq();
@@ -902,7 +945,7 @@ impl RemoteStore for InMemoryRemoteStore {
     }
 
     async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
-        self.check_request_faults(RequestKind::WriteTarget)?;
+        self.check_request_faults(RequestKind::WriteTarget).await?;
         let mut guard = self.inner.lock();
         let freed = match guard.objects.get_mut(file_id) {
             // Idempotent: trashing an already-trashed file succeeds.
@@ -923,7 +966,7 @@ impl RemoteStore for InMemoryRemoteStore {
     }
 
     async fn metadata(&self, file_id: &str) -> anyhow::Result<RemoteEntry> {
-        self.check_request_faults(RequestKind::Read)?;
+        self.check_request_faults(RequestKind::Read).await?;
         let guard = self.inner.lock();
         let entry = guard.ensure_object(file_id)?;
         // Md5 mismatch (if any) is latched on the entry at write time -
@@ -933,7 +976,7 @@ impl RemoteStore for InMemoryRemoteStore {
     }
 
     async fn download(&self, file_id: &str) -> anyhow::Result<DownloadStream> {
-        self.check_request_faults(RequestKind::Read)?;
+        self.check_request_faults(RequestKind::Read).await?;
         let guard = self.inner.lock();
         let entry = guard.ensure_object(file_id)?;
         if entry.is_folder() {
@@ -949,7 +992,7 @@ impl RemoteStore for InMemoryRemoteStore {
         parent_id: &str,
         op_uuid: &str,
     ) -> anyhow::Result<Option<RemoteEntry>> {
-        self.check_request_faults(RequestKind::Read)?;
+        self.check_request_faults(RequestKind::Read).await?;
         let include_trashed = self.faults.trashed_visible_in_find.load(Ordering::Acquire);
         let guard = self.inner.lock();
         let mut matches: Vec<&FileEntry> = guard
@@ -987,7 +1030,7 @@ impl RemoteStore for InMemoryRemoteStore {
         // dest-folder bits but still honours rate-limit / 5xx /
         // network-drop / invalid-grant (which would also kill an
         // `about` call against real Drive).
-        self.check_request_faults(RequestKind::Read)?;
+        self.check_request_faults(RequestKind::Read).await?;
         let guard = self.inner.lock();
         let trash_bytes: u64 = guard
             .objects

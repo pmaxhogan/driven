@@ -84,6 +84,36 @@ impl InMemoryRemoteStore {
         self
     }
 
+    /// Convenience: trip a `net.intermittent` error on the VERY NEXT
+    /// request (= [`Self::with_network_drop_after`] with `n == 0`). The
+    /// ROADMAP M1 fault-injection surface names this builder; it reads
+    /// cleaner than `with_network_drop_after(0)` at call sites.
+    pub fn with_network_drop(self) -> Self {
+        self.with_network_drop_after(0)
+    }
+
+    /// Injects an artificial `delay` before EVERY request the fake
+    /// serves (read or write). Models DESIGN s5.8.1's "lossy: +500ms
+    /// latency" so the M3 network-resilience tests can exercise the
+    /// orchestrator's latency / timeout paths deterministically.
+    ///
+    /// The delay is awaited in
+    /// [`crate::fake::InMemoryRemoteStore::maybe_delay`] - the single
+    /// insertion point at the top of every trait method, BEFORE the
+    /// internal store mutex is acquired - so the `tokio::time::sleep`
+    /// never spans a held `parking_lot` guard. Unlike the transient
+    /// `with_*_after` faults this latches: every subsequent request waits
+    /// `delay` until the store is replaced.
+    pub fn with_slow_responses(self, delay: std::time::Duration) -> Self {
+        // Saturate to u64 nanos; a delay longer than ~584 years is not a
+        // realistic test input and clamping avoids an overflow panic.
+        let nanos = u64::try_from(delay.as_nanos()).unwrap_or(u64::MAX);
+        self.faults
+            .response_delay_nanos
+            .store(nanos, Ordering::Release);
+        self
+    }
+
     /// Arms a session-invalidating 4xx on the NEXT resumable session
     /// opened by this store: after `n_chunks` accepted chunks the
     /// session invalidates with [`ResumeProgress::SessionInvalid`] and

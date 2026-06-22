@@ -960,3 +960,77 @@ async fn invalidated_session_releases_buffer_and_stays_invalid() {
         "invalidated session must remain invalid"
     );
 }
+
+// ---------------------------------------------------------------------------
+// P2-2: a file cannot be used as a parent folder.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fake_create_under_file_parent_errs() {
+    let store = InMemoryRemoteStore::new();
+    let root = store.root_id().to_string();
+
+    // Create a regular FILE under root.
+    let file = store
+        .create(
+            &root,
+            "afile.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"x")),
+            props(&[]),
+        )
+        .await
+        .expect("create file");
+
+    // Using that file as a parent must error (it exists but is not a
+    // folder), not silently construct an impossible Drive state.
+    let res = store
+        .create(
+            &file.id,
+            "child.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"y")),
+            props(&[]),
+        )
+        .await;
+    let err = res.expect_err("create under a file-as-parent must Err");
+    assert!(
+        format!("{err}").contains("not a folder"),
+        "expected 'not a folder', got: {err}"
+    );
+
+    // ensure_folder under a file-as-parent must also error.
+    let res2 = store.ensure_folder(&file.id, "sub").await;
+    assert!(
+        res2.is_err(),
+        "ensure_folder under a file-as-parent must Err"
+    );
+}
+
+// ---------------------------------------------------------------------------
+// P2-3: ROADMAP-named fault hooks.
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fake_with_network_drop_trips_on_first_call() {
+    // `with_network_drop()` == `with_network_drop_after(0)`: the very next
+    // request trips.
+    let store = InMemoryRemoteStore::new().with_network_drop();
+    let err = ping_read(&store).await.expect_err("first call trips");
+    assert!(format!("{err}").contains("net.intermittent"));
+    // Single-shot: the next call recovers.
+    ping_read(&store).await.expect("recovers");
+}
+
+#[tokio::test]
+async fn fake_with_slow_responses_delays_each_call() {
+    use std::time::{Duration, Instant};
+    let store = InMemoryRemoteStore::new().with_slow_responses(Duration::from_millis(50));
+    let started = Instant::now();
+    ping_read(&store).await.expect("delayed read ok");
+    let elapsed = started.elapsed();
+    assert!(
+        elapsed >= Duration::from_millis(40),
+        "expected >= ~40ms latency, got {elapsed:?}"
+    );
+}
