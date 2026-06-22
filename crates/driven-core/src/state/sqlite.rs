@@ -27,7 +27,9 @@ use std::path::Path;
 use anyhow::{anyhow, Result};
 use async_trait::async_trait;
 use serde_json::Value;
-use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteSynchronous};
+use sqlx::sqlite::{
+    SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqlitePoolOptions, SqliteSynchronous,
+};
 use uuid::Uuid;
 
 use super::{
@@ -59,6 +61,16 @@ impl SqliteStateRepo {
     /// - `busy_timeout = 5s` so the rare contended commit waits instead of
     ///   surfacing `SQLITE_BUSY` to the orchestrator.
     ///
+    /// The pool is capped at a single connection (`max_connections = 1`).
+    /// SQLite permits only one writer at a time regardless of pool size, and
+    /// with a multi-connection pool the M3 concurrency=4 executor races
+    /// produce a write-transaction upgrade deadlock that `busy_timeout` cannot
+    /// resolve (it returns `SQLITE_BUSY_SNAPSHOT` immediately, not after the
+    /// timeout). Serializing every statement through one connection makes
+    /// `busy_timeout` fully effective and removes the deadlock; at this app's
+    /// state-DB scale (a few MB, sub-millisecond statements) the lost read
+    /// concurrency is immaterial.
+    ///
     /// Surfaces [`crate::types::ErrorCode::StateDbCorrupt`] (as an
     /// `anyhow` error carrying the `state.db_corrupt` code prefix) when
     /// `PRAGMA integrity_check` returns anything other than `ok`.
@@ -83,7 +95,10 @@ impl SqliteStateRepo {
             .foreign_keys(true)
             .busy_timeout(std::time::Duration::from_secs(5));
 
-        let pool = SqlitePool::connect_with(opts).await?;
+        let pool = SqlitePoolOptions::new()
+            .max_connections(1)
+            .connect_with(opts)
+            .await?;
 
         sqlx::migrate!("./src/migrations").run(&pool).await?;
 

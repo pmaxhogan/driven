@@ -30,3 +30,6 @@ pub mod state;
 pub mod time;
 pub mod types;
 pub mod watcher;
+
+#[cfg(test)]
+mod test_support;

@@ -44,6 +44,14 @@ driven-power = { path = "../driven-power" }
 # M3 CPU-bound hashing + encryption off the tokio reactor (DESIGN s11.4.4,
 # s11.4.5). Used by the executor impl in the M3 implement phase.
 rayon.workspace = true
+# M3 filesystem watcher backend (inotify / FSEvents / ReadDirectoryChangesW,
+# DESIGN s5.9.1). Wired into the watcher impl; driven-core holds the concrete
+# backend here because the OS event source lives with the orchestrator wiring.
+notify.workspace = true
+# Drive's `md5Checksum` is the ciphertext MD5 (DESIGN s7.1); the executor's
+# plaintext upload path also hashes with MD5. Aliased to `md5` to match the
+# `use md5::{Digest, Md5}` call site.
+md5 = { workspace = true }
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
