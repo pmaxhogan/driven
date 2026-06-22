@@ -665,6 +665,17 @@ mod tests {
         watcher.watch(source_id).expect("watch establishes");
         tokio::time::sleep(Duration::from_millis(150)).await;
 
+        // Drain any setup/arming noise queued before the watch fully armed
+        // (Linux inotify can still deliver the `.gitignore` create + `noise/`
+        // mkdir from above as non-excluded events). Draining BEFORE the
+        // excluded write below means this only swallows pre-write arming
+        // noise; if the excluded write itself leaked the filter, the assert
+        // would still fail (not masked).
+        while recv_within(&mut rx, Duration::from_millis(200))
+            .await
+            .is_some()
+        {}
+
         // An edit confined to the excluded dir: expect NO scan-tick.
         fs::write(root.join("noise").join("junk.tmp"), b"x").unwrap();
         let excluded = recv_within(&mut rx, Duration::from_millis(900)).await;
