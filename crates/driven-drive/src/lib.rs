@@ -7,7 +7,7 @@
 //! - `fake::InMemoryRemoteStore` is the in-memory backend exercised by
 //!   the contract tests and by every sync-engine test in this workspace.
 //!
-//! M1 phase 1 (interfaces only): only [`remote_store`] is wired up; the
-//! `google` and `fake` modules land in subsequent M1 phases.
+//! M1 phase 2B: the `fake` module is wired up. `google` lands in M4.
 
+pub mod fake;
 pub mod remote_store;

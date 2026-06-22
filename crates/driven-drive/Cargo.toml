@@ -19,3 +19,17 @@ async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 uuid.workspace = true
+# Direct deps (not yet in workspace.dependencies). parking_lot for an
+# await-free Mutex over the fake's in-memory state; md-5 for the
+# `RemoteEntry.md5` field the fake faithfully computes (and the
+# `with_md5_mismatch_after` fault injector tampers with).
+parking_lot = "0.12"
+md-5 = "0.10"
+
+[dev-dependencies]
+# Workspace tokio already enables the "full" feature set (macros +
+# rt-multi-thread); re-state the dep so dev-only tests link cleanly
+# even if a future refactor narrows the runtime-deps feature list.
+tokio.workspace = true
+futures.workspace = true
+bytes.workspace = true
