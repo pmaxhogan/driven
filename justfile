@@ -43,6 +43,27 @@ bundle:
 deny:
     cargo deny check
 
+# --- sqlx dev helpers (need `cargo install sqlx-cli`) ---
+
+# Regenerate the committed .sqlx/ offline query cache. Spins up a throwaway
+# SQLite db, applies the driven-core migrations, prepares the workspace
+# (tests included) against it, then drops it. Run this after changing any
+# sqlx::query!/query_as! so CI's SQLX_OFFLINE build keeps resolving.
+sqlx-prepare:
+    cargo sqlx database create --database-url "sqlite:./.driven-prepare.db?mode=rwc"
+    cargo sqlx migrate run --source crates/driven-core/src/migrations --database-url "sqlite:./.driven-prepare.db?mode=rwc"
+    cargo sqlx prepare --workspace --database-url "sqlite:./.driven-prepare.db?mode=rwc" -- --all-targets
+    cargo sqlx database drop -y --database-url "sqlite:./.driven-prepare.db?mode=rwc"
+
+# Apply the driven-core migrations to a given database URL.
+# Example: just migrate "sqlite:./state.db?mode=rwc"
+migrate db_url:
+    cargo sqlx migrate run --source crates/driven-core/src/migrations --database-url "{{db_url}}"
+
+# Drop the local sqlx-prepare scratch db if a previous run left it behind.
+db-reset:
+    cargo sqlx database drop -y --database-url "sqlite:./.driven-prepare.db?mode=rwc"
+
 clean:
     cargo clean
     Remove-Item -Recurse -Force ui/dist, ui/node_modules -ErrorAction SilentlyContinue
