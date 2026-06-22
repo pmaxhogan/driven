@@ -357,6 +357,17 @@ pub trait StateRepo: Send + Sync {
     /// `scheduled_for` ascending. Caps the result at `limit`.
     async fn get_pending_ops_due(&self, now_ms: UnixMs, limit: u32) -> Result<Vec<PendingOpRow>>;
 
+    /// Per-source pending_ops fetch (DESIGN s5.6 reconciliation).
+    ///
+    /// On startup the reconciliation pass scoops in-flight resumable
+    /// sessions per source so it can resume or invalidate them. The
+    /// existing [`Self::get_pending_ops_due`] returns globally-due ops
+    /// across all sources; this one is per-source so the orchestrator
+    /// can reason about one source at a time. Rows are ordered by `id`
+    /// ascending (insertion order), which is also the order resumable
+    /// ops should be inspected on recovery.
+    async fn get_pending_ops_for_source(&self, source: SourceId) -> Result<Vec<PendingOpRow>>;
+
     /// Increments `attempts`, sets `last_error`, and rolls `scheduled_for`
     /// forward to the next retry time. Used after a non-terminal failure
     /// per the pacer's backoff classification (SPEC s9).
@@ -371,6 +382,32 @@ pub trait StateRepo: Send + Sync {
     /// or after the orchestrator gives up on it.
     async fn delete_pending_op(&self, id: PendingOpId) -> Result<()>;
 
+    /// Atomically commit the result of a successful `create` op.
+    ///
+    /// Upserts the new `file_state` row AND deletes the `pending_op` that
+    /// produced it in a single SQL transaction. DESIGN s5.6 step 3 calls
+    /// this the load-bearing transaction for the reconciliation protocol:
+    /// without it, a crash between the two writes leaves an orphaned
+    /// `pending_op` whose result is already adopted into `file_state`, and
+    /// the next reconciliation pass cannot tell whether the op completed
+    /// or not.
+    async fn commit_create_result(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+    ) -> Result<()>;
+
+    /// Atomically commit the result of a successful `update` op.
+    ///
+    /// Same DESIGN s5.6 invariant as [`Self::commit_create_result`] and
+    /// identical SQL semantics; named distinctly so the caller's intent
+    /// (create vs update) is clear at the call site.
+    async fn commit_update_result(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+    ) -> Result<()>;
+
     // --- activity_log -------------------------------------------------------
 
     /// Appends an `activity_log` row. Returns the new auto-increment id.
@@ -383,10 +420,33 @@ pub trait StateRepo: Send + Sync {
         page: PageRequest,
     ) -> Result<ActivityPage>;
 
-    /// Deletes rows older than `before_ms` and enforces an absolute
-    /// `hard_cap` on total rows (DESIGN s17 retention policy). Returns
-    /// the number of rows deleted.
-    async fn prune_activity_older_than(&self, before_ms: UnixMs, hard_cap: u64) -> Result<u64>;
+    /// Prune `activity_log` rows older than `before_ms`, batched to keep
+    /// the write transaction short (DESIGN s18.4 retention policy).
+    ///
+    /// Deletes in rounds of at most `batch_size` rows per transaction
+    /// (default `10_000` if `None`), stopping when a round deletes fewer
+    /// than `batch_size` (no more eligible rows) OR when the cumulative
+    /// total reaches `hard_cap`. After the loop runs
+    /// `PRAGMA wal_checkpoint(TRUNCATE)` so a catastrophic-growth prune
+    /// does not leave the freed pages stranded in the WAL. Returns the
+    /// total number of rows deleted across batches.
+    async fn prune_activity_older_than(
+        &self,
+        before_ms: UnixMs,
+        hard_cap: u64,
+        batch_size: Option<u32>,
+    ) -> Result<u64>;
+
+    /// Null out `activity_log.source_id` for every row owned by `source`.
+    ///
+    /// Companion to [`Self::delete_source`] for admin-driven source
+    /// removal: even though the schema has `ON DELETE SET NULL` on the
+    /// FK, calling this explicitly before [`Self::delete_source`] keeps
+    /// the activity rows preserved for cross-source reporting (the
+    /// retention path still prunes by `ts` per
+    /// [`Self::prune_activity_older_than`]). Returns the number of rows
+    /// touched.
+    async fn delete_activity_by_source(&self, source: SourceId) -> Result<u64>;
 
     // --- settings -----------------------------------------------------------
 

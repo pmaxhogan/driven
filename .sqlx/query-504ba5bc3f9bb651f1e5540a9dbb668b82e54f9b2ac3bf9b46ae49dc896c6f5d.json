@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                DELETE FROM activity_log\n                 WHERE id IN (\n                    SELECT id FROM activity_log\n                     WHERE ts < ?1\n                     ORDER BY ts ASC, id ASC\n                     LIMIT ?2\n                 )\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "504ba5bc3f9bb651f1e5540a9dbb668b82e54f9b2ac3bf9b46ae49dc896c6f5d"
+}

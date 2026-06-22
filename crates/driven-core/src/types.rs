@@ -151,24 +151,42 @@ impl fmt::Display for RelativePath {
 impl TryFrom<String> for RelativePath {
     type Error = RelativePathError;
 
-    fn try_from(_value: String) -> Result<Self, Self::Error> {
-        // Real validation lands in M2.
-        todo!("RelativePath validation lands in M2")
+    fn try_from(value: String) -> Result<Self, Self::Error> {
+        // Normalise Windows separators to forward slashes so the
+        // canonical form is portable across platforms (the doc invariant
+        // above and SPEC s2 `file_state.relative_path`).
+        let s = value.replace('\\', "/");
+        if s.is_empty() {
+            return Err(RelativePathError::Empty);
+        }
+        if s.starts_with('/') {
+            return Err(RelativePathError::NotRelative);
+        }
+        if s.contains('\0') {
+            return Err(RelativePathError::NulByte);
+        }
+        if s.split('/').any(|seg| seg == "..") {
+            return Err(RelativePathError::ParentSegment);
+        }
+        Ok(Self(s))
     }
 }
 
 impl TryFrom<&Path> for RelativePath {
     type Error = RelativePathError;
 
-    fn try_from(_value: &Path) -> Result<Self, Self::Error> {
-        // Real validation lands in M2.
-        todo!("RelativePath validation lands in M2")
+    fn try_from(value: &Path) -> Result<Self, Self::Error> {
+        let s = value.to_str().ok_or(RelativePathError::NotUtf8)?;
+        Self::try_from(s.to_string())
     }
 }
 
 /// Errors produced when constructing a [`RelativePath`].
 #[derive(Debug, thiserror::Error)]
 pub enum RelativePathError {
+    /// Path is the empty string.
+    #[error("path must not be empty")]
+    Empty,
     /// Path is absolute or starts with a leading separator.
     #[error("path must be relative")]
     NotRelative,
@@ -454,5 +472,68 @@ impl ErrorCode {
 impl fmt::Display for ErrorCode {
     fn fmt(&self, f: &mut fmt::Formatter<'_>) -> fmt::Result {
         f.write_str(self.code())
+    }
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn relative_path_accepts_canonical_forms() {
+        for s in ["a/b.txt", "deeply/nested/file", "file.txt"] {
+            let rp = RelativePath::try_from(s.to_string()).expect("happy");
+            assert_eq!(rp.as_str(), s);
+        }
+    }
+
+    #[test]
+    fn relative_path_normalises_backslashes() {
+        let rp = RelativePath::try_from(r"a\b\c.txt".to_string()).unwrap();
+        assert_eq!(rp.as_str(), "a/b/c.txt");
+    }
+
+    #[test]
+    fn relative_path_rejects_empty() {
+        assert!(matches!(
+            RelativePath::try_from(String::new()),
+            Err(RelativePathError::Empty)
+        ));
+    }
+
+    #[test]
+    fn relative_path_rejects_absolute() {
+        assert!(matches!(
+            RelativePath::try_from("/etc/passwd".to_string()),
+            Err(RelativePathError::NotRelative)
+        ));
+    }
+
+    #[test]
+    fn relative_path_rejects_parent_segment() {
+        assert!(matches!(
+            RelativePath::try_from("a/../b".to_string()),
+            Err(RelativePathError::ParentSegment)
+        ));
+        assert!(matches!(
+            RelativePath::try_from("..".to_string()),
+            Err(RelativePathError::ParentSegment)
+        ));
+        // A leading "." is fine; a segment that just contains ".." is not.
+        assert!(RelativePath::try_from("a/..b/c".to_string()).is_ok());
+    }
+
+    #[test]
+    fn relative_path_rejects_nul_byte() {
+        assert!(matches!(
+            RelativePath::try_from("a\0b".to_string()),
+            Err(RelativePathError::NulByte)
+        ));
+    }
+
+    #[test]
+    fn relative_path_from_path_round_trips() {
+        let rp: RelativePath = std::path::Path::new("a/b.txt").try_into().unwrap();
+        assert_eq!(rp.as_str(), "a/b.txt");
     }
 }

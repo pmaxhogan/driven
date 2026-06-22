@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE activity_log SET source_id = NULL WHERE source_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "d8c89ba7625d78e83084729d5f8b69c56b75ac0d3440d9a159790beb4ea45776"
+}

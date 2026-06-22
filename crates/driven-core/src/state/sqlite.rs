@@ -96,6 +96,73 @@ impl SqliteStateRepo {
     pub fn pool(&self) -> &SqlitePool {
         &self.pool
     }
+
+    /// Internal helper backing both [`StateRepo::commit_create_result`] and
+    /// [`StateRepo::commit_update_result`].
+    ///
+    /// Opens a single transaction, upserts the `file_state` row, deletes
+    /// the `pending_ops` row, and commits. The `?` on each statement
+    /// causes the implicit `tx` drop on the `Err` path to roll back both
+    /// writes - DESIGN s5.6 step 3 atomicity.
+    async fn commit_op_result_inner(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+    ) -> Result<()> {
+        let source_id = file_state.source_id.to_string();
+        let relative_path = file_state.relative_path.as_str().to_string();
+        let size = file_state.size as i64;
+        let hash: &[u8] = &file_state.hash_blake3[..];
+        let md5_owned: Option<Vec<u8>> = file_state.drive_md5.map(|m| m.to_vec());
+        let md5: Option<&[u8]> = md5_owned.as_deref();
+        let status = file_state_status_to_str(file_state.status);
+        let op_id_v = op_id.0;
+
+        let mut tx = self.pool.begin().await?;
+        sqlx::query!(
+            r#"
+            INSERT INTO file_state (
+                source_id, relative_path, size, mtime_ns,
+                hash_blake3, drive_file_id, drive_md5, encrypted_remote_path,
+                status, last_uploaded_at, last_verified_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11
+            )
+            ON CONFLICT(source_id, relative_path) DO UPDATE SET
+                size                  = excluded.size,
+                mtime_ns              = excluded.mtime_ns,
+                hash_blake3           = excluded.hash_blake3,
+                drive_file_id         = excluded.drive_file_id,
+                drive_md5             = excluded.drive_md5,
+                encrypted_remote_path = excluded.encrypted_remote_path,
+                status                = excluded.status,
+                last_uploaded_at      = excluded.last_uploaded_at,
+                last_verified_at      = excluded.last_verified_at
+            "#,
+            source_id,
+            relative_path,
+            size,
+            file_state.mtime_ns,
+            hash,
+            file_state.drive_file_id,
+            md5,
+            file_state.encrypted_remote_path,
+            status,
+            file_state.last_uploaded_at,
+            file_state.last_verified_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        sqlx::query!("DELETE FROM pending_ops WHERE id = ?1", op_id_v)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -866,44 +933,121 @@ impl StateRepo for SqliteStateRepo {
         })
     }
 
-    async fn prune_activity_older_than(&self, before_ms: UnixMs, hard_cap: u64) -> Result<u64> {
-        // DESIGN s18.4: two complementary deletes.
-        // 1. Age-based: delete rows older than `before_ms`.
-        // 2. Hard cap: if more than `hard_cap` rows remain, delete the oldest
-        //    until exactly `hard_cap` newest rows survive.
-        // Returns the total number of deleted rows across both passes.
-        let mut tx = self.pool.begin().await?;
-        let age_deleted = sqlx::query!("DELETE FROM activity_log WHERE ts < ?1", before_ms)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-
-        let remaining: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM activity_log")
-            .fetch_one(&mut *tx)
-            .await?;
-        let hard_cap_i = i64::try_from(hard_cap).unwrap_or(i64::MAX);
-        let cap_deleted = if remaining > hard_cap_i {
-            let excess = remaining - hard_cap_i;
-            sqlx::query!(
+    async fn prune_activity_older_than(
+        &self,
+        before_ms: UnixMs,
+        hard_cap: u64,
+        batch_size: Option<u32>,
+    ) -> Result<u64> {
+        // DESIGN s18.4: prune in batches so a catastrophic-growth prune
+        // does not hold a single transaction over 1B rows. Stop when a
+        // round deletes fewer than `batch_size` (no more eligible) or
+        // when the cumulative total reaches `hard_cap`. After the loop
+        // runs `PRAGMA wal_checkpoint(TRUNCATE)` so freed pages do not
+        // sit in the WAL.
+        let batch = batch_size.unwrap_or(10_000).max(1) as u64;
+        let mut total: u64 = 0;
+        loop {
+            if total >= hard_cap {
+                break;
+            }
+            let this_round = batch.min(hard_cap - total);
+            let limit_i = i64::try_from(this_round).unwrap_or(i64::MAX);
+            let deleted = sqlx::query!(
                 r#"
                 DELETE FROM activity_log
                  WHERE id IN (
                     SELECT id FROM activity_log
+                     WHERE ts < ?1
                      ORDER BY ts ASC, id ASC
-                     LIMIT ?1
+                     LIMIT ?2
                  )
                 "#,
-                excess,
+                before_ms,
+                limit_i,
             )
-            .execute(&mut *tx)
+            .execute(&self.pool)
             .await?
-            .rows_affected()
-        } else {
-            0
-        };
+            .rows_affected();
+            total = total.saturating_add(deleted);
+            if deleted < this_round {
+                break;
+            }
+        }
+        // `PRAGMA wal_checkpoint(TRUNCATE)` returns three rows; use the
+        // dynamic query API (the `query!` macro chokes on PRAGMA shapes).
+        let _ = sqlx::query("PRAGMA wal_checkpoint(TRUNCATE);")
+            .execute(&self.pool)
+            .await?;
+        Ok(total)
+    }
 
-        tx.commit().await?;
-        Ok(age_deleted + cap_deleted)
+    async fn delete_activity_by_source(&self, source: SourceId) -> Result<u64> {
+        let source_str = source.to_string();
+        let n = sqlx::query!(
+            "UPDATE activity_log SET source_id = NULL WHERE source_id = ?1",
+            source_str,
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(n)
+    }
+
+    async fn get_pending_ops_for_source(&self, source: SourceId) -> Result<Vec<PendingOpRow>> {
+        let source_str = source.to_string();
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id            AS "id!: i64",
+                source_id     AS "source_id!: String",
+                op_type       AS "op_type!: String",
+                relative_path AS "relative_path!: String",
+                payload_json  AS "payload_json!: String",
+                attempts      AS "attempts!: i64",
+                last_error    AS "last_error: String",
+                scheduled_for AS "scheduled_for!: i64",
+                created_at    AS "created_at!: i64"
+            FROM pending_ops
+            WHERE source_id = ?1
+            ORDER BY id ASC
+            "#,
+            source_str,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(PendingOpRow {
+                    id: PendingOpId(r.id),
+                    source_id: SourceId(uuid_from_str(&r.source_id)?),
+                    op_type: r.op_type,
+                    relative_path: relative_path_from_string(r.relative_path)?,
+                    payload_json: serde_json::from_str(&r.payload_json)?,
+                    attempts: r.attempts as u32,
+                    last_error: r.last_error,
+                    scheduled_for: r.scheduled_for,
+                    created_at: r.created_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn commit_create_result(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+    ) -> Result<()> {
+        self.commit_op_result_inner(op_id, file_state).await
+    }
+
+    async fn commit_update_result(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+    ) -> Result<()> {
+        self.commit_op_result_inner(op_id, file_state).await
     }
 
     // --- settings -----------------------------------------------------------
@@ -1347,7 +1491,7 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn prune_activity_respects_hard_cap() {
+    async fn prune_activity_age_only() {
         let (repo, _dir) = temp_repo().await;
         for ts in 0..200 {
             repo.write_activity(NewActivity {
@@ -1362,24 +1506,272 @@ mod tests {
             .await
             .unwrap();
         }
-        // before_ms = 0 means no rows match the age cut; only the hard cap
-        // takes effect. 200 inserted - keep 150 -> 50 deleted (oldest).
-        let deleted = repo.prune_activity_older_than(0, 150).await.unwrap();
-        assert_eq!(deleted, 50);
+        // Age-only semantics: prune rows with ts < 150. hard_cap is a
+        // ceiling on rows-deleted-this-call, not a row-count target.
+        let deleted = repo
+            .prune_activity_older_than(150, 10_000, None)
+            .await
+            .unwrap();
+        assert_eq!(deleted, 150);
 
         let page = repo
             .query_activity(ActivityFilter::default(), PageRequest { page: 0, limit: 1 })
             .await
             .unwrap();
-        assert_eq!(page.total, 150);
+        assert_eq!(page.total, 50);
         // newest row survived
         assert_eq!(page.rows[0].ts, 199);
+    }
 
-        // Age-based pass: prune everything older than ts=180, no cap change.
-        let deleted_age = repo.prune_activity_older_than(180, 150).await.unwrap();
-        // We deleted rows with ts in 50..=179 (130 rows), then hard cap
-        // doesn't kick because 150 - 130 = 20 <= 150.
-        assert_eq!(deleted_age, 130);
+    #[tokio::test]
+    async fn prune_with_batch_size_iterates() {
+        let (repo, _dir) = temp_repo().await;
+        for ts in 0..123 {
+            repo.write_activity(NewActivity {
+                ts,
+                source_id: None,
+                level: ActivityLevel::Info,
+                event_type: "noise".into(),
+                file_count: None,
+                bytes: None,
+                message: None,
+            })
+            .await
+            .unwrap();
+        }
+        // Batch size 10, no hard cap. Every row is eligible -> all 123
+        // deleted across ceil(123/10) = 13 rounds.
+        let deleted = repo
+            .prune_activity_older_than(i64::MAX, 10_000, Some(10))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 123);
+        let page = repo
+            .query_activity(ActivityFilter::default(), PageRequest { page: 0, limit: 1 })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 0);
+    }
+
+    #[tokio::test]
+    async fn prune_honours_hard_cap_ceiling() {
+        let (repo, _dir) = temp_repo().await;
+        for ts in 0..50 {
+            repo.write_activity(NewActivity {
+                ts,
+                source_id: None,
+                level: ActivityLevel::Info,
+                event_type: "noise".into(),
+                file_count: None,
+                bytes: None,
+                message: None,
+            })
+            .await
+            .unwrap();
+        }
+        // 50 rows eligible, hard_cap = 20 caps deletion at 20 (oldest).
+        let deleted = repo
+            .prune_activity_older_than(i64::MAX, 20, Some(7))
+            .await
+            .unwrap();
+        assert_eq!(deleted, 20);
+        let page = repo
+            .query_activity(
+                ActivityFilter::default(),
+                PageRequest {
+                    page: 0,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, 30);
+        // newest 30 survived
+        assert_eq!(page.rows[0].ts, 49);
+        assert_eq!(page.rows[29].ts, 20);
+    }
+
+    #[tokio::test]
+    async fn commit_create_result_atomic_persists_both() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let op_id = repo
+            .enqueue_pending_op(NewPendingOp {
+                source_id: src.id,
+                op_type: "upload".into(),
+                relative_path: rp("a.txt"),
+                payload_json: serde_json::json!({}),
+                scheduled_for: 100,
+                created_at: 50,
+            })
+            .await
+            .unwrap();
+
+        let f = sample_file(src.id, "a.txt", 0xAB);
+        repo.commit_create_result(op_id, &f).await.unwrap();
+
+        // file_state row landed.
+        let got = repo
+            .get_file_state(src.id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.hash_blake3, [0xAB; 32]);
+        // pending_op row removed.
+        assert!(repo
+            .get_pending_ops_due(i64::MAX, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn commit_create_result_rolls_back_on_failure() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let real_src = sample_source(acct.id);
+        repo.upsert_source(&real_src).await.unwrap();
+
+        // Enqueue a pending_op against the REAL source (so the row
+        // exists and can survive a rollback).
+        let op_id = repo
+            .enqueue_pending_op(NewPendingOp {
+                source_id: real_src.id,
+                op_type: "upload".into(),
+                relative_path: rp("a.txt"),
+                payload_json: serde_json::json!({}),
+                scheduled_for: 100,
+                created_at: 50,
+            })
+            .await
+            .unwrap();
+
+        // Build a FileStateRow whose source_id does NOT exist. The
+        // file_state.source_id FK violates -> upsert errors -> `?`
+        // bubbles -> tx drops without commit -> rollback. The
+        // pending_op must survive.
+        let phantom = SourceId::new_v4();
+        let bad = sample_file(phantom, "a.txt", 0xCD);
+        let res = repo.commit_create_result(op_id, &bad).await;
+        assert!(res.is_err(), "FK violation must surface as Err");
+
+        let still_there = repo.get_pending_ops_due(i64::MAX, 10).await.unwrap();
+        assert_eq!(still_there.len(), 1);
+        assert_eq!(still_there[0].id, op_id);
+        // And no orphan file_state row landed.
+        assert!(repo
+            .get_file_state(phantom, &rp("a.txt"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn get_pending_ops_for_source_filters() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src_a = sample_source(acct.id);
+        let mut src_b = sample_source(acct.id);
+        src_b.display_name = "B".into();
+        repo.upsert_source(&src_a).await.unwrap();
+        repo.upsert_source(&src_b).await.unwrap();
+
+        repo.enqueue_pending_op(NewPendingOp {
+            source_id: src_a.id,
+            op_type: "upload".into(),
+            relative_path: rp("a1.txt"),
+            payload_json: serde_json::json!({}),
+            scheduled_for: 100,
+            created_at: 50,
+        })
+        .await
+        .unwrap();
+        repo.enqueue_pending_op(NewPendingOp {
+            source_id: src_b.id,
+            op_type: "upload".into(),
+            relative_path: rp("b1.txt"),
+            payload_json: serde_json::json!({}),
+            scheduled_for: 100,
+            created_at: 50,
+        })
+        .await
+        .unwrap();
+        repo.enqueue_pending_op(NewPendingOp {
+            source_id: src_a.id,
+            op_type: "upload".into(),
+            relative_path: rp("a2.txt"),
+            payload_json: serde_json::json!({}),
+            scheduled_for: 100,
+            created_at: 50,
+        })
+        .await
+        .unwrap();
+
+        let a = repo.get_pending_ops_for_source(src_a.id).await.unwrap();
+        assert_eq!(a.len(), 2);
+        assert_eq!(a[0].relative_path.as_str(), "a1.txt");
+        assert_eq!(a[1].relative_path.as_str(), "a2.txt");
+        let b = repo.get_pending_ops_for_source(src_b.id).await.unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].relative_path.as_str(), "b1.txt");
+    }
+
+    #[tokio::test]
+    async fn delete_activity_by_source_nulls_not_deletes() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        for ts in 0..3 {
+            repo.write_activity(NewActivity {
+                ts,
+                source_id: Some(src.id),
+                level: ActivityLevel::Info,
+                event_type: "scan_done".into(),
+                file_count: None,
+                bytes: None,
+                message: None,
+            })
+            .await
+            .unwrap();
+        }
+        // A global row not owned by the source.
+        repo.write_activity(NewActivity {
+            ts: 5,
+            source_id: None,
+            level: ActivityLevel::Info,
+            event_type: "global".into(),
+            file_count: None,
+            bytes: None,
+            message: None,
+        })
+        .await
+        .unwrap();
+
+        let n = repo.delete_activity_by_source(src.id).await.unwrap();
+        assert_eq!(n, 3);
+
+        // Rows are still present, just with source_id NULL.
+        let page = repo
+            .query_activity(
+                ActivityFilter::default(),
+                PageRequest {
+                    page: 0,
+                    limit: 100,
+                },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, 4);
+        assert!(page.rows.iter().all(|r| r.source_id.is_none()));
     }
 
     #[tokio::test]

@@ -58,13 +58,18 @@ fn monotonic_origin() -> Instant {
 }
 
 impl Clock for SystemClock {
+    /// Returns the signed offset from the Unix epoch in milliseconds.
+    ///
+    /// Pre-epoch readings return a negative value (DESIGN s18.7 -
+    /// backwards wall jumps must be representable so subtraction across
+    /// the epoch boundary stays monotone in sign; clamping a pre-epoch
+    /// reading to 0 would make a backwards-jumped clock indistinguishable
+    /// from a clock that has not advanced). We deliberately avoid
+    /// `.expect()` per the house rule.
     fn now_ms(&self) -> UnixMs {
-        // Pre-epoch readings are treated as the epoch (SystemTime can in
-        // principle be moved before 1970 by a misconfigured machine).
-        // We deliberately avoid `.expect()` per the house rule.
         match SystemTime::now().duration_since(UNIX_EPOCH) {
             Ok(d) => d.as_millis() as i64,
-            Err(_) => 0,
+            Err(e) => -(e.duration().as_millis() as i64),
         }
     }
 
