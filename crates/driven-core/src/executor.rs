@@ -183,6 +183,18 @@ struct PendingOpPayload {
     /// the last offset Drive acknowledged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resumable: Option<PersistedResumable>,
+    /// The resume-safe file IDENTITY captured at session start (P1-2). The
+    /// streaming upload produces the plaintext blake3 only DURING the upload,
+    /// so a crash mid-stream leaves no `uploaded_blake3_hex` to validate a
+    /// resume against. Instead we stamp the open handle's
+    /// `(dev, inode, size, mtime_ns, ctime_ns)` BEFORE the first chunk: a
+    /// resume re-opens the file, checks the identity is unchanged, resumes
+    /// the byte stream from `acked_offset`, and computes the blake3 over the
+    /// FULL re-read stream for the final integrity check (md5 vs Drive). The
+    /// identity is the resume GATE; the content hash is computed fresh on
+    /// resume, never required to start one.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    resume_identity: Option<ResumeIdentity>,
 }
 
 /// A resumable session persisted across process restarts (DESIGN s5.4).
@@ -194,6 +206,54 @@ struct PersistedResumable {
     /// The byte offset Drive has acknowledged so far; resume pushes the
     /// next chunk from here (P1-3). Updated after every accepted chunk.
     acked_offset: u64,
+}
+
+/// The resume-safe identity of the local file an in-flight resumable upload
+/// is reading (P1-2). Captured at session start from the OPEN handle, before
+/// any bytes are pushed, so a resume after a crash can prove the local file
+/// is byte-identical to what was being uploaded WITHOUT needing the (then
+/// unknowable) final content hash. Mirrors the [`FileIdentity`] fields the
+/// SPEC s8 change/replace defences compare; serialized into the op payload.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+struct ResumeIdentity {
+    /// Device id (Unix `dev`) / volume serial (Windows; 0 on stable).
+    dev: u64,
+    /// Inode (Unix `ino`) / file index (Windows; 0 on stable).
+    inode: u64,
+    /// File size in bytes at session start.
+    size: u64,
+    /// Modification time (ns since the Unix epoch) at session start.
+    mtime_ns: i64,
+    /// Change time (ns since the Unix epoch; Unix `ctime`, falls back to
+    /// mtime on Windows) at session start.
+    ctime_ns: i64,
+}
+
+impl ResumeIdentity {
+    /// Capture the resume identity from an [`FileIdentity`] (the same struct
+    /// the SPEC s8 defences fstat into), so the resume gate and the
+    /// changed-during-upload guard share one source of truth.
+    fn from_file_identity(id: FileIdentity) -> Self {
+        Self {
+            dev: id.dev,
+            inode: id.inode,
+            size: id.size,
+            mtime_ns: id.mtime_ns,
+            ctime_ns: id.ctime_ns,
+        }
+    }
+
+    /// Does a freshly-fstat'd identity still match what we recorded at
+    /// session start? Compares the full `(dev, inode, size, mtime, ctime)`
+    /// tuple - any change means the local bytes are no longer the ones we
+    /// were uploading, so the resume must be abandoned.
+    fn matches(&self, id: &FileIdentity) -> bool {
+        self.dev == id.dev
+            && self.inode == id.inode
+            && self.size == id.size
+            && self.mtime_ns == id.mtime_ns
+            && self.ctime_ns == id.ctime_ns
+    }
 }
 
 impl PendingOpPayload {
@@ -642,6 +702,33 @@ impl DefaultExecutor {
                     code,
                 })
             }
+            Err(UploadError::DeferToReconcile(code)) => {
+                // P1-3: ambiguous create failure. KEEP the pending op (do NOT
+                // delete it) so the reconcile pass can adopt the orphan by
+                // op-uuid (if Drive did create it) or requeue a clean create
+                // (if it did not) - either way no duplicate. The file is
+                // reported as Failed for this pass (left non-synced), but the
+                // surviving op carries the recovery forward. This is the only
+                // Failed-shaped outcome that does NOT drop the op.
+                //
+                // Post-state (op kept, NO file_state row, create semantics) is
+                // byte-identical to the SkipPostUpload-create arm above, so the
+                // next scan re-plans the path the same way that already-shipped
+                // path does. Recovery is reconcile's job; reconcile iterates
+                // pending_ops (not file_state), so the surviving op IS the
+                // discovery handle. Writing a file_state row here would be
+                // wrong both ways: a sentinel-mtime row has no drive_file_id to
+                // update against (fresh create -> duplicate), and a real-mtime
+                // row makes the FastPath scanner treat the never-created file
+                // as handled (silent data loss). The mid-run-defer-before-next-
+                // reconcile window (reconcile is startup-gated) is the
+                // orchestrator's cadence concern, shared identically with
+                // SkipPostUpload - not fixable from inside the executor.
+                Ok(OpOutcome::Failed {
+                    relative_path: relative_path.clone(),
+                    code,
+                })
+            }
             Err(UploadError::Fatal(e)) => Err(e),
         }
     }
@@ -686,6 +773,25 @@ impl DefaultExecutor {
             .resolve_remote_target(source, relative_path, app_props)
             .await
             .map_err(UploadError::Fatal)?;
+
+        // --- P1-2: stamp the resume-safe IDENTITY before any bytes leave ---
+        // Only resumable uploads can be resumed across a crash; for those, the
+        // streaming pipeline cannot persist the final content hash until the
+        // upload finishes, so a mid-stream crash would otherwise leave a
+        // session with no way to validate a resume. We persist the open
+        // handle's identity NOW (it is byte-identical to what the reader will
+        // hash), so `resume_persisted` can prove the local file is unchanged
+        // without the (still-unknown) content hash. The plaintext blake3 is
+        // re-derived over the full re-read stream on resume (final integrity
+        // check vs Drive's md5). For sub-resumable uploads there is no resume,
+        // so we skip the extra write.
+        if size >= RESUMABLE_THRESHOLD {
+            payload.resume_identity = Some(ResumeIdentity::from_file_identity(pre));
+            self.state
+                .update_pending_op_payload(op_id, &payload.to_value())
+                .await
+                .map_err(UploadError::Fatal)?;
+        }
 
         // --- produce the exact upload body + its hashes --------------------
         // Below the pipeline threshold: buffer the whole file once. At or
@@ -950,6 +1056,16 @@ impl DefaultExecutor {
                     entry.md5,
                     md5
                 );
+                // P1-4: the just-finalized object is corrupt (its bytes do not
+                // match what we sent). For a CREATE it is a brand-new orphan
+                // carrying this op's uuid; leaving it would let reconcile
+                // adopt it as Synced (its local-vs-uploaded hash still agrees)
+                // and strand corrupt bytes on Drive, while the next scan
+                // uploads a second copy. Trash it before failing so the
+                // failure leaves NO object behind. Never trash on an UPDATE -
+                // that id is the user's pre-existing file.
+                self.trash_corrupt_create(existing_file_id, &entry.id, relative_path.as_str())
+                    .await;
                 return Err(UploadError::Failed(ErrorCode::DriveChecksumMismatch));
             }
         }
@@ -1036,7 +1152,18 @@ impl DefaultExecutor {
         result.map_err(|e| {
             let class = classify_drive_error(&e);
             self.pacer.note_response(class.response_class());
-            UploadError::Failed(class.error_code())
+            // P1-3: the simple-band (4-5 MiB) CREATE is also a single POST -
+            // an ambiguous transient (network/5xx) may have committed the
+            // object before the response was lost. Defer to reconcile (keep
+            // the op) instead of failing + dropping the op (which would both
+            // strand the orphan and lose the recovery handle). Updates are
+            // idempotent and rate-limits were rejected, so only a transient
+            // create defers; everything else fails as before.
+            if existing_file_id.is_none() && matches!(class, DriveError::Transient) {
+                UploadError::DeferToReconcile(class.error_code())
+            } else {
+                UploadError::Failed(class.error_code())
+            }
         })
     }
 
@@ -1228,6 +1355,14 @@ impl DefaultExecutor {
         let total = sent.bytes.len() as u64;
         let mut transient_retries = 0u32;
         loop {
+            // A simple-multipart CREATE is the one ambiguous case: a single
+            // POST creates the object, so a network drop / timeout AFTER Drive
+            // committed it but BEFORE the response arrived leaves a real
+            // orphan, and an inline re-POST would duplicate it (P1-3). The
+            // resumable CREATE path finalizes only on its final chunk, so a
+            // mid-stream transient leaves no object - safe to retry inline.
+            // Updates are idempotent (same file_id) - safe either way.
+            let ambiguous_simple_create = total < RESUMABLE_THRESHOLD && existing_file_id.is_none();
             let result = if total >= RESUMABLE_THRESHOLD {
                 self.upload_resumable(target, existing_file_id, &sent, mime, op_id, payload)
                     .await
@@ -1253,13 +1388,25 @@ impl DefaultExecutor {
                                 entry.md5,
                                 sent.md5
                             );
+                            // P1-4: trash a corrupt CREATE before failing so
+                            // no bad object is stranded (see
+                            // `trash_corrupt_create`). Never on an UPDATE.
+                            self.trash_corrupt_create(existing_file_id, &entry.id, &target.name)
+                                .await;
                             return Err(UploadError::Failed(ErrorCode::DriveChecksumMismatch));
                         }
                     }
                 }
-                Err(e) => match self.classify_retry(&e, &mut transient_retries)? {
+                Err(e) => match self.classify_retry(
+                    &e,
+                    &mut transient_retries,
+                    ambiguous_simple_create,
+                )? {
                     RetryDecision::Retry => continue,
                     RetryDecision::Fail(code) => return Err(UploadError::Failed(code)),
+                    RetryDecision::DeferCreate(code) => {
+                        return Err(UploadError::DeferToReconcile(code))
+                    }
                 },
             }
         }
@@ -1412,15 +1559,37 @@ impl DefaultExecutor {
     /// decision, ticking the pacer and the transient-retry counter. Shared
     /// by the buffered and streaming upload loops so both honour the same
     /// `5xx -> backoff, max 6 retries` / `4xx -> fail` policy (DESIGN s5.4).
+    ///
+    /// `ambiguous_create` is `true` only for a simple-multipart CREATE, whose
+    /// single POST may have committed the object before the response was lost
+    /// (P1-3); on a transient error there we defer to reconcile instead of
+    /// re-POSTing (which would duplicate).
     fn classify_retry(
         &self,
         e: &anyhow::Error,
         transient_retries: &mut u32,
+        ambiguous_create: bool,
     ) -> Result<RetryDecision, UploadError> {
         let class = classify_drive_error(e);
         self.pacer.note_response(class.response_class());
         match class {
-            DriveError::RateLimited | DriveError::Transient => {
+            // P2-8: rate limits (429 / userRateLimitExceeded) retry
+            // INDEFINITELY under the pacer's backoff (`note_response` above
+            // already halved the ceiling + scheduled the wait); they do NOT
+            // share the finite 5xx transient cap. A permanently-throttled
+            // Drive loops here by design, paced ever slower, rather than
+            // giving up after a handful of attempts and stranding the upload.
+            // A rate-limited request was REJECTED (no object created), so it
+            // is unambiguous even for a create - retry inline.
+            DriveError::RateLimited => Ok(RetryDecision::Retry),
+            // 5xx / lower-level transient errors are bounded: retry with
+            // backoff up to MAX_TRANSIENT_RETRIES, then surface a failure.
+            DriveError::Transient => {
+                // P1-3: on an AMBIGUOUS simple-create the object may already
+                // exist; defer to reconcile rather than re-POST a duplicate.
+                if ambiguous_create {
+                    return Ok(RetryDecision::DeferCreate(class.error_code()));
+                }
                 *transient_retries += 1;
                 if *transient_retries > MAX_TRANSIENT_RETRIES {
                     return Ok(RetryDecision::Fail(class.error_code()));
@@ -1576,6 +1745,37 @@ impl DefaultExecutor {
         }
     }
 
+    /// P2-6: re-derive the `encrypted_remote_path` for `relative_path` during
+    /// reconcile so an adopted/requeued row restores the same ciphertext path
+    /// the original upload stored (crash recovery must not blank it, since
+    /// restore and listing key off it). Returns `None` for a plaintext source (the
+    /// column is genuinely empty there) and the slash-joined ciphertext path
+    /// for an encrypted source, derived via the SAME idempotent
+    /// `ensure_encrypted_parents` chain + leaf encryption as the upload
+    /// (`resolve_remote_target`), so it is byte-identical to what was written.
+    async fn reconcile_encrypted_remote_path(
+        &self,
+        source: &SourceRow,
+        relative_path: &RelativePath,
+    ) -> anyhow::Result<Option<String>> {
+        let Some(crypto) = self.crypto.as_deref() else {
+            return Ok(None);
+        };
+        let EncryptedParents {
+            parent_aad,
+            mut encrypted_components,
+            leaf,
+            ..
+        } = self
+            .ensure_encrypted_parents(source, relative_path, crypto)
+            .await?;
+        let enc_leaf = crypto
+            .encrypt_filename(&leaf, &parent_aad)
+            .map_err(|e| anyhow::anyhow!("filename encrypt failed for the leaf: {e}"))?;
+        encrypted_components.push(enc_leaf);
+        Ok(Some(encrypted_components.join("/")))
+    }
+
     /// Walk the directory components of `relative_path`, encrypting each
     /// under its parent's ciphertext AAD and `ensure_folder`ing it on Drive
     /// (idempotent), returning the deepest folder id, the AAD to bind the
@@ -1641,6 +1841,52 @@ impl DefaultExecutor {
             relative_path_hash(relative_path),
         );
         m
+    }
+
+    /// P1-4: trash a corrupt object that a CREATE upload just finalized with
+    /// a checksum mismatch, so the failure leaves NOTHING behind on Drive.
+    ///
+    /// Scoped to creates: `existing_file_id.is_none()`. For an UPDATE the
+    /// returned `file_id` is the user's PRE-EXISTING object - we must never
+    /// trash it on a mismatch (the prior good bytes stay put; the op is
+    /// dropped and the next scan retries the update). For a CREATE the object
+    /// is a brand-new orphan carrying this op's uuid; if left in place,
+    /// reconcile would adopt it as Synced (local-vs-uploaded blake3 still
+    /// agrees - only the on-wire md5 disagreed) and corrupt bytes would
+    /// persist while the next scan uploads a duplicate. Trashing it is
+    /// best-effort: a failure here is logged, not propagated (the upload has
+    /// already failed; a left-behind orphan is caught by a later reconcile).
+    async fn trash_corrupt_create(
+        &self,
+        existing_file_id: Option<&str>,
+        file_id: &str,
+        context: &str,
+    ) {
+        if existing_file_id.is_some() {
+            return;
+        }
+        self.pacer.permit_request().await;
+        match self.remote.trash(file_id).await {
+            Ok(()) => {
+                self.pacer.note_response(ResponseClass::Ok);
+                warn!(
+                    target: TARGET,
+                    name = %context,
+                    file_id = %file_id,
+                    "trashed the corrupt create object after md5 mismatch"
+                );
+            }
+            Err(e) => {
+                let class = classify_drive_error(&e);
+                self.pacer.note_response(class.response_class());
+                warn!(
+                    target: TARGET,
+                    name = %context,
+                    file_id = %file_id,
+                    "failed to trash corrupt create object after md5 mismatch: {e}"
+                );
+            }
+        }
     }
 
     /// Execute one [`Op::Trash`]: idempotently trash the remote object and
@@ -1768,8 +2014,18 @@ impl Executor for DefaultExecutor {
                     .resume_persisted(source, &op, &payload, resumable)
                     .await?
                 {
-                    Some(entry) => {
-                        self.adopt_reconciled(source, &op, &payload, entry).await?;
+                    Some((entry, resumed_blake3)) => {
+                        // P1-2 trap: the streaming-crash payload carries no
+                        // `uploaded_blake3_hex`, so adopt would otherwise hit
+                        // its mismatch branch and REQUEUE the object we just
+                        // resumed. `resume_persisted` already proved identity
+                        // + re-hashed the full stream + verified md5 vs Drive,
+                        // so the re-read blake3 IS the proven content hash:
+                        // hand it to adopt so the row is marked Synced with
+                        // the real hash, not a placeholder.
+                        let mut adopted = payload.clone();
+                        adopted.uploaded_blake3_hex = Some(hex::encode(resumed_blake3));
+                        self.adopt_reconciled(source, &op, &adopted, entry).await?;
                         continue;
                     }
                     None => {
@@ -1822,12 +2078,26 @@ impl Executor for DefaultExecutor {
 }
 
 impl DefaultExecutor {
-    /// P1-3: resume a persisted resumable session after a restart. Discards
-    /// the session (returns `None`) when it is older than
-    /// [`SESSION_MAX_AGE_MS`] or Drive 4xx-invalidates it; otherwise it
-    /// re-reads the local file, re-derives the exact upload body, and pushes
-    /// the remaining bytes from the persisted acked offset. A successful
-    /// resume returns the finalized [`RemoteEntry`].
+    /// P1-2 / P1-3: resume a persisted resumable session after a restart.
+    /// Discards the session (returns `None`) when it is older than
+    /// [`SESSION_MAX_AGE_MS`], the local file changed, or Drive
+    /// 4xx-invalidates it; otherwise it re-reads the local file, re-derives
+    /// the exact upload body, and pushes the remaining bytes from the
+    /// persisted acked offset. A successful resume returns the finalized
+    /// [`RemoteEntry`] together with the plaintext blake3 computed over the
+    /// re-read stream (the caller adopts it as the proven content hash, so
+    /// the now-Synced row never carries a placeholder).
+    ///
+    /// P1-2: resume validation does NOT depend on the final content hash -
+    /// the streaming pipeline only produces that hash DURING the upload, so a
+    /// crash mid-stream leaves none. Instead the session-start IDENTITY
+    /// (`resume_identity`: dev/inode/size/mtime/ctime, persisted before the
+    /// first chunk) is the gate: re-stat the re-opened handle and require it
+    /// matches. With identity proven unchanged, re-reading reproduces the
+    /// EXACT bytes already pushed, so the byte-level resume is coherent; the
+    /// blake3 over the full re-read stream is the final integrity check (md5
+    /// vs Drive). A legacy row that recorded `uploaded_blake3_hex` (the
+    /// buffered path) is additionally cross-checked against it.
     ///
     /// If the local file changed since the crash the body would no longer
     /// match the partially-uploaded bytes; rather than corrupt the object we
@@ -1840,7 +2110,7 @@ impl DefaultExecutor {
         op: &crate::state::PendingOpRow,
         payload: &PendingOpPayload,
         resumable: PersistedResumable,
-    ) -> anyhow::Result<Option<RemoteEntry>> {
+    ) -> anyhow::Result<Option<(RemoteEntry, [u8; 32])>> {
         // Byte-level resume is only sound when re-reading the local file
         // reproduces the EXACT bytes already pushed. For an ENCRYPTED source
         // that is false: each `content_encryptor()` draws a fresh random
@@ -1865,32 +2135,55 @@ impl DefaultExecutor {
             return Ok(None);
         }
 
-        // Re-derive the exact bytes that were being uploaded. The body must
-        // be byte-identical to the partially-uploaded one for the resume to
-        // be coherent, so we verify the re-read plaintext blake3 matches the
-        // hash persisted with the op (P1-2/P1-3 share this invariant).
+        // Re-open the local file and check the resume-safe IDENTITY recorded
+        // at session start (P1-2). The identity - not the content hash - is
+        // what proves the bytes we are about to re-read are the same ones the
+        // crashed run was uploading.
         let full_path = join_source_path(&source.local_path, &op.relative_path);
         let mut file = match open_shared(&full_path).await {
             Ok(f) => f,
             // File gone/locked: cannot resume; let the caller requeue.
             Err(_) => return Ok(None),
         };
+        match payload.resume_identity {
+            Some(expected) => {
+                let cur = match fstat_identity(&file).await {
+                    Ok(id) => id,
+                    Err(_) => return Ok(None),
+                };
+                if !expected.matches(&cur) {
+                    // Local file changed since the crash: the partial bytes
+                    // are stale. Discard the session and requeue a clean
+                    // upload (the partial create is GC'd by Drive on expiry).
+                    return Ok(None);
+                }
+            }
+            None => {
+                // No identity AND no legacy hash to validate against: do not
+                // risk a corrupt resume. (A legacy row with only
+                // `uploaded_blake3_hex` is still accepted via the hash check
+                // below.)
+                if payload.uploaded_blake3_hex.is_none() {
+                    return Ok(None);
+                }
+            }
+        }
+
+        // Re-derive the exact bytes that were being uploaded + the plaintext
+        // blake3 over the full re-read stream (the final integrity check).
         let HashedBody {
             blake3, sent_bytes, ..
         } = match read_hash_encrypt(&mut file, self.crypto.as_deref()).await {
             Ok(h) => h,
             Err(_) => return Ok(None),
         };
+        // Legacy cross-check: a row written by the buffered path recorded the
+        // uploaded blake3 up front; honour it if present (identity already
+        // covered the streaming path).
         if let Some(expected_hex) = payload.uploaded_blake3_hex.as_deref() {
             if hex::encode(blake3) != expected_hex {
-                // Local file changed since the crash: the partial bytes are
-                // stale. Discard the session and requeue a clean upload.
                 return Ok(None);
             }
-        } else {
-            // No recorded hash to verify against: do not risk a corrupt
-            // resume. Requeue from scratch.
-            return Ok(None);
         }
         if sent_bytes.bytes.len() as u64 != resumable.session.size {
             // Body length disagrees with the session's declared size; the
@@ -1916,7 +2209,7 @@ impl DefaultExecutor {
             Ok(Some(entry)) => {
                 // Verify md5 over the exact bytes sent (SPEC s8).
                 match entry.md5 {
-                    Some(remote) if remote == sent_bytes.md5 => Ok(Some(entry)),
+                    Some(remote) if remote == sent_bytes.md5 => Ok(Some((entry, blake3))),
                     _ => {
                         warn!(
                             target: TARGET,
@@ -1962,6 +2255,14 @@ impl DefaultExecutor {
     ) -> anyhow::Result<()> {
         let full_path = join_source_path(&source.local_path, &op.relative_path);
 
+        // P2-6: re-derive the ciphertext remote path so the adopted/requeued
+        // row restores the same `encrypted_remote_path` the upload wrote (None
+        // for a plaintext source). Crash recovery must preserve it - restore +
+        // listing look the object up by this path.
+        let encrypted_remote_path = self
+            .reconcile_encrypted_remote_path(source, &op.relative_path)
+            .await?;
+
         // Re-hash the current local file (plaintext). On any read failure we
         // cannot prove identity, so treat as a mismatch (requeue).
         let local = self.rehash_local_plaintext(&full_path).await;
@@ -1981,7 +2282,7 @@ impl DefaultExecutor {
                     hash_blake3: cur_hash,
                     drive_file_id: Some(entry.id.clone()),
                     drive_md5: entry.md5,
-                    encrypted_remote_path: None,
+                    encrypted_remote_path: encrypted_remote_path.clone(),
                     status: FileStateStatus::Synced,
                     last_uploaded_at: Some(now),
                     last_verified_at: Some(now),
@@ -2022,7 +2323,7 @@ impl DefaultExecutor {
                     hash_blake3: stale_hash,
                     drive_file_id: Some(entry.id.clone()),
                     drive_md5: entry.md5,
-                    encrypted_remote_path: None,
+                    encrypted_remote_path: encrypted_remote_path.clone(),
                     status: FileStateStatus::Pending,
                     last_uploaded_at: None,
                     last_verified_at: None,
@@ -2169,6 +2470,11 @@ enum RetryDecision {
     Retry,
     /// Non-retryable, or the transient budget is exhausted; fail with code.
     Fail(ErrorCode),
+    /// P1-3: an ambiguous transient error on a simple-multipart CREATE - the
+    /// object MIGHT already exist on Drive. Do NOT re-POST inline; defer to
+    /// the reconcile pass (keep the op) so a later cycle adopts-or-requeues
+    /// without risking a duplicate.
+    DeferCreate(ErrorCode),
 }
 
 /// Result of pushing one wire chunk to a resumable session.
@@ -2500,6 +2806,17 @@ enum UploadError {
     /// the id, so the op is safe to drop.
     SkipPostUpload(SkipReason),
     Failed(ErrorCode),
+    /// P1-3: an AMBIGUOUS create failure - a network drop / timeout on a
+    /// CREATE POST where Drive MIGHT have created the object even though the
+    /// response was lost. Re-POSTing inline would risk a duplicate (and the
+    /// search-backed `find_by_op_uuid` can return a false "not found" inside
+    /// Drive's index-lag window, so an inline probe cannot disambiguate
+    /// safely). So the op is KEPT and the failure surfaces here; the next
+    /// reconcile pass (a LATER cycle, outside the lag window) adopts the
+    /// object by op-uuid if it exists, else requeues cleanly. Only ever
+    /// raised for creates (`existing_file_id.is_none()`); updates are
+    /// idempotent and retry inline.
+    DeferToReconcile(ErrorCode),
     Fatal(anyhow::Error),
 }
 
@@ -3390,6 +3707,30 @@ mod tests {
         // file_state NOT marked synced (the pending_op was dropped, no commit).
         let row = h.state.get_file_state(h.source.id, &rel).await.unwrap();
         assert!(row.is_none() || row.unwrap().status != FileStateStatus::Synced);
+
+        // P1-4: the corrupt CREATE object must NOT be stranded on Drive. The
+        // executor trashes it before failing, so no LIVE object remains (if it
+        // stayed, reconcile would adopt it as Synced - its local-vs-uploaded
+        // blake3 still agrees, only the wire md5 disagreed - and the next scan
+        // would upload a duplicate).
+        let live = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert!(
+            live.is_empty(),
+            "corrupt create object trashed, none stranded; got {live:?}"
+        );
+        // It is present-but-trashed (idempotent trash, not a hard delete).
+        let with_trashed = h
+            .remote
+            .list_folder_with_trashed(h.source.drive_folder_id.as_str());
+        assert_eq!(
+            with_trashed.iter().filter(|e| e.trashed).count(),
+            1,
+            "the corrupt object is trashed, not gone"
+        );
     }
 
     // --- fstat mid-upload change aborts + requeues ---------------------------

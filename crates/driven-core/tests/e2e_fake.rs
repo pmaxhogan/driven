@@ -42,7 +42,7 @@ use driven_crypto::key::SourceKey;
 use driven_crypto::{ContentDecryptor, DrivenCryptoSuite, SourceCryptoSuite, HEADER_LEN};
 
 use driven_drive::fake::{InMemoryRemoteStore, CLIENT_OP_UUID_KEY};
-use driven_drive::remote_store::{RemoteStore, ResumableKind, ResumeProgress, UploadBody};
+use driven_drive::remote_store::{RemoteStore, UploadBody};
 
 use driven_power::{PowerSource, PowerState};
 use driven_test_fixtures::clock::FakeClock;
@@ -649,23 +649,34 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
 // ---------------------------------------------------------------------------
 // Row: crash MID-upload (object NOT finalized) -> next sync RESUMES the
 //      persisted resumable session BYTE-FOR-BYTE from the last-acked offset
-//      (DESIGN s5.4 / s5.6, P1-3). Distinct from the adopt-orphan row above.
+//      (DESIGN s5.4 / s5.6, P1-2 / P1-3). Distinct from the adopt-orphan row.
 // ---------------------------------------------------------------------------
 //
-// We model a partial create: a resumable session is opened and one 4 MiB wire
-// chunk is acked, but the final chunk never lands, so the object does NOT
-// materialize (a Create only commits on its final chunk). We persist the live
-// session + last-acked offset into `pending_ops.payload_json` exactly as the
-// executor does, then a fresh executor reconciles. The ONLY way the upload can
-// complete is to push the remaining bytes from the persisted offset through the
-// SAME session - the fake rejects any chunk whose offset != bytes-received, so
-// a from-zero retry would be `SessionInvalid`. Completion is therefore proof of
-// byte-level resume.
+// P1-2: this test exercises the REAL executor's streaming-resumable path -
+// there is NO manually-seeded `uploaded_blake3_hex`. Phase 1 runs the actual
+// `execute()` against a remote rigged to DROP the 3rd request (the 2nd wire
+// chunk's `resume_chunk`): the session opens (req 1), the first wire chunk
+// acks + the executor persists `acked_offset` + the resume IDENTITY into
+// `pending_ops.payload_json` (req 2), then the next chunk drops (req 3). The
+// streaming pipeline produces the plaintext blake3 only DURING the upload, so
+// the persisted op carries NO content hash - exactly the mid-stream-crash
+// state. The drop surfaces as a fatal upload error, so the op is KEPT (never
+// deleted) with the acked offset + identity but no hash.
+//
+// Phase 2: a FRESH executor over the same state + remote reconciles. The ONLY
+// way it can complete is to validate the identity, re-read the file, and push
+// the remaining bytes from the persisted offset through the SAME session - the
+// fake rejects any chunk whose offset != bytes-received, so a from-zero retry
+// would be `SessionInvalid`. Completion at the full byte count is therefore
+// proof of byte-level resume driven entirely by the executor (no hash seed).
+//
+// This test goes RED on the pre-fix executor (which refuses to resume without
+// a persisted hash and falls through to `find_by_op_uuid`, finds nothing - the
+// create never finalized - and drops the op) and GREEN only once resume
+// validates the persisted identity + offset and re-hashes the full stream.
 
 #[tokio::test]
 async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
-    use bytes::Bytes;
-
     const CHUNK_256K: usize = 256 * 1024;
     const WIRE_CHUNK: usize = 4 * 1024 * 1024;
 
@@ -673,11 +684,17 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
     let src_dir = tempfile::tempdir().unwrap();
     let state = open_state(dir.path()).await;
     let account = seed_account(&state).await;
-    let remote = Arc::new(InMemoryRemoteStore::new());
+    // Drop the 3rd request: req1 = resumable_session open, req2 = first wire
+    // chunk (acks + persists offset/identity), req3 = second wire chunk DROPS.
+    let remote = Arc::new(InMemoryRemoteStore::new().with_network_drop_after(2));
     let folder = remote.root_id().to_string();
 
-    // A file spanning > 1 wire chunk so a partial upload leaves a real offset.
-    let total_len = WIRE_CHUNK + 2 * CHUNK_256K + 17; // 4 MiB + 512 KiB + tail
+    // A ~20 MiB file (>= RESUMABLE_THRESHOLD 5 MiB and >= PIPELINE_THRESHOLD
+    // 4 MiB so it runs the STREAMING resumable path) large enough that the
+    // drain loop flushes at least two 4 MiB wire chunks before EOF (the drain
+    // holds back until acc >= 2 * WIRE_CHUNK), so the first chunk acks an
+    // offset and the SECOND chunk is the one the drop lands on.
+    let total_len = 5 * WIRE_CHUNK + 3 * CHUNK_256K + 17;
     let big: Vec<u8> = (0..total_len).map(|i| (i % 251) as u8).collect();
     write_file(src_dir.path(), "resume.bin", &big);
     let src = source_in(account, src_dir.path(), &folder);
@@ -686,68 +703,7 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
 
     let clock = Arc::new(FakeClock::new());
 
-    // --- model the crash: open a Create session, ack the first wire chunk ---
-    let op_uuid = uuid::Uuid::new_v4().to_string();
-    let mut app_props = std::collections::HashMap::new();
-    app_props.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.clone());
-    app_props.insert("driven.source_id".to_string(), src.id.to_string());
-
-    let session = remote
-        .resumable_session(
-            ResumableKind::Create {
-                parent_id: folder.clone(),
-                name: "resume.bin".to_string(),
-                app_properties: app_props.clone(),
-            },
-            "application/octet-stream",
-            total_len as u64,
-        )
-        .await
-        .unwrap();
-
-    // Push exactly the first wire chunk; it must be accepted (InProgress).
-    let first = Bytes::copy_from_slice(&big[..WIRE_CHUNK]);
-    match remote.resume_chunk(&session, 0, first).await.unwrap() {
-        ResumeProgress::InProgress { received } => {
-            assert_eq!(received as usize, WIRE_CHUNK, "first chunk acked");
-        }
-        other => panic!("expected InProgress, got {other:?}"),
-    }
-    // The object has NOT materialized yet (Create commits only on final chunk).
-    assert_eq!(
-        live_object_count(&remote, &folder).await,
-        0,
-        "no object until the resumable Create finalizes"
-    );
-
-    // --- persist the op exactly as the executor would (P1-3 payload) --------
-    // The JSON shape mirrors executor::PendingOpPayload + PersistedResumable:
-    // resumable.session is the serialized ResumableSession; acked_offset is the
-    // last byte count Drive acknowledged.
-    let session_json = serde_json::to_value(&session).unwrap();
-    let uploaded_hex = hex::encode(blake3::hash(&big).as_bytes());
-    let now = clock.now_ms();
-    state
-        .enqueue_pending_op(NewPendingOp {
-            source_id: src.id,
-            op_type: "upload".to_string(),
-            relative_path: rel.clone(),
-            payload_json: serde_json::json!({
-                "client_op_uuid": op_uuid,
-                "drive_file_id": serde_json::Value::Null,
-                "uploaded_blake3_hex": uploaded_hex,
-                "resumable": {
-                    "session": session_json,
-                    "acked_offset": WIRE_CHUNK as u64,
-                }
-            }),
-            scheduled_for: now,
-            created_at: now,
-        })
-        .await
-        .unwrap();
-
-    // --- phase 2: a fresh executor reconciles -> resumes the session --------
+    // --- phase 1: a REAL upload that crashes mid-stream ---------------------
     let exec = DefaultExecutor::with_clock(
         ExecutorDeps {
             remote: remote.clone(),
@@ -757,7 +713,73 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
         },
         clock.clone(),
     );
-    exec.reconcile(&src).await.unwrap();
+    let plan = Plan {
+        ops: vec![Op::HashThenUpload {
+            source_id: src.id,
+            relative_path: rel.clone(),
+            size: total_len as u64,
+        }],
+        collisions: vec![],
+    };
+    // The dropped chunk is a fatal Drive error -> `execute` returns Err and the
+    // pending op is KEPT (the SkipPostUpload/Fatal contract never deletes a
+    // create op mid-stream).
+    let phase1 = exec.execute(&src, &plan, &noop_progress).await;
+    assert!(
+        phase1.is_err(),
+        "the mid-stream network drop aborts the upload: {phase1:?}"
+    );
+    // The object has NOT materialized (a resumable Create commits only on its
+    // final chunk, which never landed).
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        0,
+        "no object until the resumable Create finalizes"
+    );
+
+    // The executor persisted an op carrying the live session + a NON-zero
+    // acked offset + the resume IDENTITY, and critically NO content hash (the
+    // streaming hash is only known at the end). We assert the payload shape
+    // straight from the DB so the test proves the real executor wrote it.
+    let pending = state.get_pending_ops_for_source(src.id).await.unwrap();
+    assert_eq!(pending.len(), 1, "the create op survived the crash");
+    let payload = &pending[0].payload_json;
+    assert!(
+        payload
+            .get("uploaded_blake3_hex")
+            .map(|v| v.is_null())
+            .unwrap_or(true),
+        "NO content hash was seeded (this is the mid-stream-crash invariant): {payload}"
+    );
+    let acked = payload
+        .pointer("/resumable/acked_offset")
+        .and_then(|v| v.as_u64())
+        .expect("the executor persisted a resumable acked_offset");
+    assert!(
+        acked >= WIRE_CHUNK as u64,
+        "at least the first wire chunk was acked before the drop; got {acked}"
+    );
+    assert!(
+        acked < total_len as u64,
+        "but NOT the whole file (it crashed mid-stream); got {acked}"
+    );
+    assert!(
+        payload.get("resume_identity").is_some_and(|v| !v.is_null()),
+        "the executor persisted a resume identity: {payload}"
+    );
+
+    // --- phase 2: a fresh executor reconciles -> resumes the session --------
+    // The network drop was single-shot, so phase 2's requests all succeed.
+    let exec2 = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote: remote.clone(),
+            state: state.clone(),
+            pacer: test_pacer(clock.clone()),
+            crypto: None,
+        },
+        clock.clone(),
+    );
+    exec2.reconcile(&src).await.unwrap();
 
     // The upload completed via byte-level resume: exactly one object, and it
     // carries the full byte count (proving the resumed tail bytes landed, NOT a
@@ -772,7 +794,8 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
     // No session leaked (completed sessions are removed).
     assert_eq!(remote.open_session_count(), 0, "session consumed by resume");
 
-    // file_state committed Synced with the real plaintext hash, op drained.
+    // file_state committed Synced with the REAL plaintext hash (re-derived by
+    // the resume over the full stream, NOT seeded), op drained.
     let fs = state
         .get_file_state(src.id, &rel)
         .await
@@ -782,6 +805,11 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
         fs.drive_file_id.as_deref(),
         Some(children[0].id.as_str()),
         "committed the resumed object id"
+    );
+    assert_eq!(
+        fs.hash_blake3,
+        *blake3::hash(&big).as_bytes(),
+        "file_state carries the real plaintext blake3 from the resumed stream"
     );
     assert!(state
         .get_pending_ops_for_source(src.id)
