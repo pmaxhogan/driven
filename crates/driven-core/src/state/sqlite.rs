@@ -156,9 +156,22 @@ impl SqliteStateRepo {
         .execute(&mut *tx)
         .await?;
 
-        sqlx::query!("DELETE FROM pending_ops WHERE id = ?1", op_id_v)
+        // DESIGN s5.6 step 3: the pending_op delete is the load-bearing
+        // reconciliation invariant. A wrong/already-committed op_id must NOT
+        // be allowed to commit `file_state` (and must not silently delete an
+        // unrelated row). Require the DELETE to affect EXACTLY one row;
+        // otherwise return an `Err` so the implicit `tx` drop rolls back the
+        // `file_state` upsert too.
+        let deleted = sqlx::query!("DELETE FROM pending_ops WHERE id = ?1", op_id_v)
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
+        if deleted != 1 {
+            return Err(anyhow!(
+                "state.reconcile_op_missing: pending_op id {op_id_v} not found \
+                 (DELETE affected {deleted} rows); refusing to commit file_state"
+            ));
+        }
 
         tx.commit().await?;
         Ok(())
@@ -170,11 +183,11 @@ impl SqliteStateRepo {
 // -----------------------------------------------------------------------------
 
 fn relative_path_from_string(s: String) -> Result<RelativePath> {
-    // `RelativePath::TryFrom<String>` is currently `todo!()` (M2 lands the
-    // real validator). The serde-transparent shape over `String` lets us
-    // reconstruct rows that round-trip through SQLite without panicking.
-    serde_json::from_value::<RelativePath>(Value::String(s))
-        .map_err(|e| anyhow!("invalid relative_path on read: {e}"))
+    // Route DB reads through the real validator+normalizer so a stored row
+    // is held to the same invariants as a freshly-constructed path (NFC
+    // normalization, no `..`/NUL/absolute). SPEC s24 local.unicode_collision
+    // relies on `file_state.relative_path` being a stable NFC key.
+    RelativePath::try_from(s).map_err(|e| anyhow!("invalid stored relative_path: {e}"))
 }
 
 fn account_state_to_str(s: AccountState) -> &'static str {
@@ -830,10 +843,15 @@ impl StateRepo for SqliteStateRepo {
         filter: ActivityFilter,
         page: PageRequest,
     ) -> Result<ActivityPage> {
-        // The combined predicate is the AND of all populated filter fields.
-        // sqlx macro form cannot bind a dynamic IN-list for `event_types`,
-        // so that filter is evaluated client-side after the page is paged
-        // off the SQL row order. The remaining predicates push down to SQL.
+        // The combined predicate is the AND of all populated filter fields,
+        // pushed down to SQL so paging + the total count stay correct.
+        //
+        // `event_types`: a dynamic IN-list. Rather than build the query at
+        // runtime (losing sqlx's compile-time column typing), encode the
+        // list as a JSON array and match against `json_each` - this keeps a
+        // single static bind and applies the filter in BOTH the page query
+        // and the count, so pagination counts cannot lie (M7's activity UI
+        // depends on this).
         //
         // `min_level`: TEXT compare on `level` is alphabetical and would
         // sort `error < info < warn`. Compare numeric rank instead.
@@ -841,6 +859,12 @@ impl StateRepo for SqliteStateRepo {
         let since = filter.since_ms;
         let before = filter.before_ms;
         let min_rank = filter.min_level.map(activity_level_rank);
+        // `None` => no event_type filter; `Some(json)` => filter to the set.
+        let event_types_json: Option<String> = if filter.event_types.is_empty() {
+            None
+        } else {
+            Some(serde_json::to_string(&filter.event_types)?)
+        };
         let limit_i = page.limit as i64;
         let offset_i = (page.page as i64) * limit_i;
 
@@ -865,13 +889,16 @@ impl StateRepo for SqliteStateRepo {
                                     WHEN 'error' THEN 2
                                     ELSE -1
                                  END >= ?4)
+              AND (?5 IS NULL
+                   OR event_type IN (SELECT value FROM json_each(?5)))
             ORDER BY ts DESC, id DESC
-            LIMIT ?5 OFFSET ?6
+            LIMIT ?6 OFFSET ?7
             "#,
             source_id,
             since,
             before,
             min_rank,
+            event_types_json,
             limit_i,
             offset_i,
         )
@@ -891,11 +918,14 @@ impl StateRepo for SqliteStateRepo {
                                     WHEN 'error' THEN 2
                                     ELSE -1
                                  END >= ?4)
+              AND (?5 IS NULL
+                   OR event_type IN (SELECT value FROM json_each(?5)))
             "#,
             source_id,
             since,
             before,
             min_rank,
+            event_types_json,
         )
         .fetch_one(&self.pool)
         .await?
@@ -908,13 +938,6 @@ impl StateRepo for SqliteStateRepo {
                 Some(s) => Some(SourceId(uuid_from_str(&s)?)),
             };
             let event_type = r.event_type;
-            // Apply the event_type filter client-side: sqlx macro form can't
-            // bind a dynamic IN-list against SQLite at compile time.
-            if !filter.event_types.is_empty()
-                && !filter.event_types.iter().any(|e| e == &event_type)
-            {
-                continue;
-            }
             decoded.push(ActivityRow {
                 id: ActivityId(r.id),
                 ts: r.ts,
@@ -1433,6 +1456,83 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn query_activity_event_type_filter_paginates_correctly() {
+        // Regression for the event_type filter being applied AFTER the SQL
+        // LIMIT (so a page could come back empty even with matching rows
+        // further down) and the total ignoring it. Both must now be SQL-side.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // 10 rows: alternating "keep" / "skip" by ts. After ORDER BY ts DESC
+        // the newest 5 (ts 6..10) are a mix; "keep" rows are the even ts.
+        for ts in 1..=10 {
+            let et = if ts % 2 == 0 { "keep" } else { "skip" };
+            repo.write_activity(NewActivity {
+                ts,
+                source_id: Some(src.id),
+                level: ActivityLevel::Info,
+                event_type: et.into(),
+                file_count: None,
+                bytes: None,
+                message: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        // 5 "keep" rows total (ts 2,4,6,8,10). Page them 2-at-a-time.
+        let filter = || ActivityFilter {
+            event_types: vec!["keep".into()],
+            ..Default::default()
+        };
+
+        let p0 = repo
+            .query_activity(filter(), PageRequest { page: 0, limit: 2 })
+            .await
+            .unwrap();
+        // total must reflect ONLY the filtered type, not all 10 rows.
+        assert_eq!(p0.total, 5, "total must count only matching event_type");
+        assert_eq!(p0.rows.len(), 2);
+        assert!(p0.rows.iter().all(|r| r.event_type == "keep"));
+        // newest-first: ts 10 then ts 8.
+        assert_eq!(p0.rows[0].ts, 10);
+        assert_eq!(p0.rows[1].ts, 8);
+
+        // Page 2 (offset past several "skip" rows in raw order) must still
+        // return matching rows - the old client-side filter could yield an
+        // empty page here.
+        let p2 = repo
+            .query_activity(filter(), PageRequest { page: 2, limit: 2 })
+            .await
+            .unwrap();
+        assert_eq!(p2.total, 5);
+        assert_eq!(p2.rows.len(), 1, "last page holds the 5th match");
+        assert_eq!(p2.rows[0].ts, 2);
+        assert_eq!(p2.rows[0].event_type, "keep");
+    }
+
+    #[test]
+    fn relative_path_nfc_normalizes() {
+        // SPEC s24 local.unicode_collision: byte-distinct NFD/NFC spellings
+        // of the same logical path must collapse to one canonical key.
+        // Construct via the real validator (NOT the serde-transparent `rp()`
+        // helper, which bypasses normalization).
+        let nfd = "cafe\u{0301}.txt".to_string(); // 'e' + combining acute
+        let nfc = "caf\u{00e9}.txt".to_string(); // precomposed 'e-acute'
+        assert_ne!(nfd, nfc, "inputs must be byte-distinct to prove the point");
+
+        let from_nfd = RelativePath::try_from(nfd).expect("nfd path valid");
+        let from_nfc = RelativePath::try_from(nfc.clone()).expect("nfc path valid");
+
+        // Both normalize to the same NFC form and compare equal.
+        assert_eq!(from_nfd, from_nfc);
+        assert_eq!(from_nfd.as_str(), nfc, "stored form is NFC");
+    }
+
+    #[tokio::test]
     async fn settings_round_trip() {
         let (repo, _dir) = temp_repo().await;
 
@@ -1666,6 +1766,36 @@ mod tests {
         // And no orphan file_state row landed.
         assert!(repo
             .get_file_state(phantom, &rp("a.txt"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn commit_op_result_rolls_back_on_missing_pending_op() {
+        // DESIGN s5.6: committing a result for an op_id that has no
+        // pending_ops row must NOT persist the file_state. Distinct from the
+        // FK-violation test: here the file_state upsert WOULD succeed, so the
+        // only thing that can stop the commit is the `rows_affected == 1`
+        // guard on the pending_op DELETE.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // Fabricate an op_id that was never enqueued (no pending_ops row).
+        let phantom_op = PendingOpId(999_999);
+        let f = sample_file(src.id, "ghost.txt", 0xEE);
+        let res = repo.commit_create_result(phantom_op, &f).await;
+        assert!(
+            res.is_err(),
+            "committing against a missing pending_op must Err"
+        );
+
+        // The file_state upsert must have been rolled back.
+        assert!(repo
+            .get_file_state(src.id, &rp("ghost.txt"))
             .await
             .unwrap()
             .is_none());

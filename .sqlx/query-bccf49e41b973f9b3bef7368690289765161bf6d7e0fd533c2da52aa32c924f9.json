@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT COUNT(*) AS \"total!: i64\"\n            FROM activity_log\n            WHERE (?1 IS NULL OR source_id = ?1)\n              AND (?2 IS NULL OR ts >= ?2)\n              AND (?3 IS NULL OR ts <  ?3)\n              AND (?4 IS NULL OR CASE level\n                                    WHEN 'info'  THEN 0\n                                    WHEN 'warn'  THEN 1\n                                    WHEN 'error' THEN 2\n                                    ELSE -1\n                                 END >= ?4)\n              AND (?5 IS NULL\n                   OR event_type IN (SELECT value FROM json_each(?5)))\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "total!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 5
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "bccf49e41b973f9b3bef7368690289765161bf6d7e0fd533c2da52aa32c924f9"
+}

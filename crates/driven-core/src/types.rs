@@ -152,6 +152,8 @@ impl TryFrom<String> for RelativePath {
     type Error = RelativePathError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
+        use unicode_normalization::UnicodeNormalization;
+
         // Normalise Windows separators to forward slashes so the
         // canonical form is portable across platforms (the doc invariant
         // above and SPEC s2 `file_state.relative_path`).
@@ -168,6 +170,12 @@ impl TryFrom<String> for RelativePath {
         if s.split('/').any(|seg| seg == "..") {
             return Err(RelativePathError::ParentSegment);
         }
+        // NFC-normalize so byte-distinct spellings of the same logical path
+        // (NFC vs NFD unicode) collapse to one `file_state` key. SPEC s24
+        // local.unicode_collision depends on this canonical form. The
+        // validity checks above run on the pre-normalized string because
+        // NFC never introduces `/`, `..`, NUL, or a leading separator.
+        let s: String = s.nfc().collect();
         Ok(Self(s))
     }
 }
