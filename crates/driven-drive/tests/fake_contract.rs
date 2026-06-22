@@ -669,6 +669,89 @@ async fn fake_trashed_visible_in_find_by_op_uuid() {
 }
 
 #[tokio::test]
+async fn fake_create_under_trashed_folder_is_rejected() {
+    // A trashed folder must be treated as a MISSING parent: real Drive
+    // will not create a child under a trashed folder. The fake mirrors
+    // that so the production dest-folder-deleted path (STRESS_HARNESS +
+    // M4) is exercised rather than masked.
+    let store = fake();
+    let root = store.root_id().to_string();
+
+    // Create a live sub-folder, confirm a child can be created under it.
+    let folder = store
+        .ensure_folder(&root, "sub")
+        .await
+        .expect("ensure_folder ok");
+    store
+        .create(
+            &folder.id,
+            "live.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"ok")),
+            props(&[]),
+        )
+        .await
+        .expect("create under live folder ok");
+
+    // Trash the folder, then a create under it must Err (parent missing).
+    store.trash(&folder.id).await.expect("trash folder ok");
+    let err = store
+        .create(
+            &folder.id,
+            "dead.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"no")),
+            props(&[]),
+        )
+        .await
+        .expect_err("create under trashed folder must Err");
+    assert!(
+        format!("{err}").contains("trashed") || format!("{err}").contains("does not exist"),
+        "trashed parent reported as missing, got: {err}"
+    );
+
+    // ensure_folder under a trashed parent is likewise rejected.
+    let err2 = store
+        .ensure_folder(&folder.id, "nested")
+        .await
+        .expect_err("ensure_folder under trashed parent must Err");
+    assert!(
+        format!("{err2}").contains("trashed") || format!("{err2}").contains("does not exist"),
+        "trashed parent reported as missing for ensure_folder, got: {err2}"
+    );
+
+    // resumable_session create under a trashed parent is rejected too.
+    let err3 = store
+        .resumable_session(
+            ResumableKind::Create {
+                parent_id: folder.id.clone(),
+                name: "stream.txt".to_string(),
+                app_properties: props(&[]),
+            },
+            "text/plain",
+            4,
+        )
+        .await
+        .expect_err("resumable create under trashed parent must Err");
+    assert!(
+        format!("{err3}").contains("trashed") || format!("{err3}").contains("does not exist"),
+        "trashed parent reported as missing for resumable create, got: {err3}"
+    );
+
+    // A create under the LIVE root still works (sanity).
+    store
+        .create(
+            &root,
+            "still-fine.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"yes")),
+            props(&[]),
+        )
+        .await
+        .expect("create under live root still ok");
+}
+
+#[tokio::test]
 async fn fake_session_invalid_after_chunks_targets_correct_session() {
     // Open session A and arm A specifically; open session B with no
     // arming. Push 3 chunks to B (all clean). Push 2 valid chunks to

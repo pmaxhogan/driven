@@ -276,16 +276,25 @@ impl Inner {
             .ok_or_else(|| anyhow::anyhow!("fake: no object with file_id {file_id}"))
     }
 
-    /// Validate that `parent_id` names an existing FOLDER. Real Drive
-    /// rejects a create / ensure_folder whose parent is a file (or does
-    /// not exist); the fake mirrors that so tests cannot construct an
-    /// impossible Drive state (a file used as a parent). Returns an `Err`
-    /// when the parent is missing OR is a non-folder object.
+    /// Validate that `parent_id` names an existing, LIVE FOLDER. Real
+    /// Drive rejects a create / ensure_folder whose parent is a file, does
+    /// not exist, OR is trashed (a trashed folder cannot receive new
+    /// children - the write fails as "parent not found"). The fake mirrors
+    /// that so tests cannot construct an impossible Drive state and so the
+    /// production dest-folder-deleted path (STRESS_HARNESS + M4) is not
+    /// masked by the fake silently accepting a trashed parent. Returns an
+    /// `Err` when the parent is missing, is a non-folder object, OR is a
+    /// trashed folder (the trashed case is reported the same as missing).
     fn ensure_folder_parent(&self, parent_id: &str) -> anyhow::Result<()> {
         match self.objects.get(parent_id) {
             None => anyhow::bail!("fake: parent folder {parent_id} does not exist"),
             Some(e) if !e.is_folder() => {
                 anyhow::bail!("fake: parent {parent_id} is not a folder")
+            }
+            // A trashed folder is treated as missing: real Drive will not
+            // create a child under a trashed parent.
+            Some(e) if e.trashed => {
+                anyhow::bail!("fake: parent folder {parent_id} is trashed (treated as missing)")
             }
             Some(_) => Ok(()),
         }
