@@ -32,6 +32,31 @@ bytes = "1"
 futures = "0.3"
 uuid = { version = "1", features = ["v4", "serde"] }
 hex = "0.4"
+parking_lot = "0.12"
+# M3 CPU-bound work: parallel hashing + encryption off the tokio reactor
+# (DESIGN s11.4.4, s11.4.5). Consumed by driven-core's executor impl and
+# the deep-verify pass.
+rayon = "1.10"
+# M3 filesystem watcher backend (inotify / FSEvents / ReadDirectoryChangesW,
+# DESIGN s5.9.1). Wired into the watcher impl crate; driven-core stays
+# I/O-free and holds only the trait surface.
+notify = "8"
+# M3 network-resilience layer (DESIGN s5.8): DNS re-resolution probes and
+# the HTTP client for the three-probe topology + Drive traffic. rustls so
+# we use the OS trust store via rustls-native-certs (DESIGN s5.8.7).
+hickory-resolver = "0.24"
+reqwest = { version = "0.12", default-features = false, features = [
+    "rustls-tls",
+    "http2",
+    "stream",
+] }
+# M3 encryption (DESIGN s7): XChaCha20-Poly1305 STREAM for content +
+# single-shot for filenames; BIP39 recovery phrase over the master key;
+# base32hex filename encoding; zeroize to scrub key material.
+chacha20poly1305 = { version = "0.10", features = ["stream"] }
+bip39 = "2"
+base32 = "0.5"
+zeroize = { version = "1", features = ["derive"] }
 
 [profile.dev]
 opt-level = 1

@@ -9,14 +9,24 @@
 //! is exercisable from plain `cargo test --workspace` with no Tauri shell,
 //! no real Google Drive, and no real wall clock.
 //!
-//! M1 phase 1 (interfaces only): this crate currently exposes shared
-//! types, the [`Clock`](time::Clock) abstraction, and the
-//! [`StateRepo`](state::StateRepo) trait surface. Concrete sync-engine
-//! modules (scanner, planner, orchestrator, ...) land in later milestones.
+//! Implementation is milestoned. M1 landed the shared types, the
+//! [`Clock`](time::Clock) abstraction, and the [`StateRepo`](state::StateRepo)
+//! surface; M2 landed the [`scanner`], [`exclude`] rules, and [`planner`].
+//! M3 phase 1 (interfaces only) adds the orchestrator/pacer/executor/
+//! watcher/network *contract* surface - the [`OrchestratorState`](types::OrchestratorState)
+//! machine + event/progress types, the [`pacer::Pacer`], [`executor::Executor`],
+//! [`orchestrator::Orchestrator`], [`watcher::SourceWatcher`], and
+//! [`network::NetworkProbe`] traits - with no behaviour; the bodies land in
+//! the M3 implement phase.
 
 pub mod exclude;
+pub mod executor;
+pub mod network;
+pub mod orchestrator;
+pub mod pacer;
 pub mod planner;
 pub mod scanner;
 pub mod state;
 pub mod time;
 pub mod types;
+pub mod watcher;

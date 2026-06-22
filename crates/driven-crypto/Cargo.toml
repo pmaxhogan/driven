@@ -13,3 +13,13 @@ anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true
 bytes.workspace = true
+# M3 crypto implementation (DESIGN s7): XChaCha20-Poly1305 STREAM content
+# encryption + single-shot filename encryption, BIP39 recovery phrase,
+# base32hex filename encoding, BLAKE3-derived filename sub-keys, and
+# zeroize to scrub key material. The seam traits in lib.rs reference none
+# of these (only `bytes`/`&str`/`[u8;16]`); the impl phase fills them in.
+chacha20poly1305 = { workspace = true }
+bip39 = { workspace = true }
+base32 = { workspace = true }
+zeroize = { workspace = true }
+blake3 = "1"

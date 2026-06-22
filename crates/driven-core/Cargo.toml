@@ -33,6 +33,17 @@ sqlx = { version = "0.8", default-features = false, features = [
     "macros",
     "migrate",
 ] }
+# M3 seams the orchestrator + executor code against. The dependency graph
+# stays one-way (driven-core -> these; never the reverse): driven-drive,
+# driven-crypto, and driven-power carry no driven-core dep, so adding them
+# here is acyclic. The executor holds the RemoteStore + SourceCryptoSuite
+# seams; the orchestrator holds the PowerSource seam (SPEC s5).
+driven-drive = { path = "../driven-drive" }
+driven-crypto = { path = "../driven-crypto" }
+driven-power = { path = "../driven-power" }
+# M3 CPU-bound hashing + encryption off the tokio reactor (DESIGN s11.4.4,
+# s11.4.5). Used by the executor impl in the M3 implement phase.
+rayon.workspace = true
 
 [dev-dependencies]
 tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }

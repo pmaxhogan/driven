@@ -14,3 +14,22 @@ thiserror.workspace = true
 tracing.workspace = true
 tokio.workspace = true
 async-trait.workspace = true
+
+# Per-OS power / metered-network / sleep-wake backends (DESIGN s5.7,
+# s5.10.1). Declared now so the M3 implement phase has them; features are
+# kept minimal here (the impl widens them to the specific Win32 / DBus
+# modules it calls) to keep `cargo build --workspace` light.
+[target.'cfg(windows)'.dependencies]
+# GetSystemPowerStatus, INetworkCostManager, RegisterPowerSettingNotification
+# + WM_POWERBROADCAST message pump (DESIGN s5.7, s5.10.1).
+windows = "0.62"
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# systemd-logind PrepareForSleep DBus signal + NetworkManager Metered /
+# Connectivity (DESIGN s5.7, s5.10.1).
+zbus = "5"
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# NSWorkspace sleep/wake notifications + IOPMCopyAssertionsByType bridged
+# via objc2 (DESIGN s5.7, s5.10.1).
+objc2 = "0.6"

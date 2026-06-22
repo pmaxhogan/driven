@@ -1,7 +1,159 @@
 //! `driven-crypto` - Driven's authenticated-encryption format.
 //!
 //! Owns master/per-source key types, OS-keychain key storage,
-//! per-path filename encryption (XChaCha20-Poly1305 + base32),
-//! chunked content encryption (XChaCha20-Poly1305 STREAM via
+//! per-path filename encryption (XChaCha20-Poly1305 + base32hex), chunked
+//! content encryption (XChaCha20-Poly1305 STREAM via
 //! `chacha20poly1305::aead::stream::EncryptorBE32`), and BIP39
-//! recovery-phrase encoding of the master key.
+//! recovery-phrase encoding of the master key (DESIGN s7, CRYPTO_FORMAT).
+//!
+//! ## The executor seam
+//!
+//! The M3 executor (in `driven-core`) encrypts content on the read path
+//! and encrypts filenames before issuing a Drive create. It codes against
+//! the [`SourceCryptoSuite`] trait declared here, NOT against the concrete
+//! cipher. To keep the crate dependency graph one-way (`driven-core`
+//! depends on `driven-crypto`, never the reverse), **this trait must not
+//! reference any `driven-core` type**: every signature is in terms of
+//! `&str` / [`Bytes`] / `[u8; 16]` and the crate-local [`CryptoError`].
+//! The executor maps a [`CryptoError`] onto the core `ErrorCode`
+//! (`crypto.*`) at the call site.
+//!
+//! Content encryption is *stateful* (STREAM keeps a per-file 32-bit chunk
+//! counter and a last-chunk flag; the ciphertext MD5 Drive verifies is
+//! only known once the final chunk is sealed). So the seam yields a
+//! per-file [`ContentEncryptor`] / [`ContentDecryptor`] object rather than
+//! a one-shot `encrypt(stream) -> stream`, which could not return the MD5
+//! cleanly. Filename encryption is per path-component, with the parent
+//! component's ciphertext as AEAD AAD (DESIGN s7), so it takes the parent
+//! AAD explicitly.
+
+use bytes::Bytes;
+
+/// Errors the crypto seam surfaces to the executor (mapped to the core
+/// `crypto.*` `ErrorCode` at the boundary - this enum deliberately holds
+/// no `driven-core` type so the dependency graph stays one-way).
+#[derive(Debug, thiserror::Error)]
+pub enum CryptoError {
+    /// The per-source / master key could not be found in the OS keychain
+    /// (maps to `crypto.key_missing`).
+    #[error("encryption key not found in keychain")]
+    KeyMissing,
+    /// AEAD verification failed on decrypt - wrong key, corrupted
+    /// ciphertext, or a reorder/truncate the STREAM construction caught
+    /// (maps to `crypto.decrypt_failed`).
+    #[error("AEAD verification failed")]
+    DecryptFailed,
+    /// A supplied BIP39 recovery phrase failed its checksum (maps to
+    /// `crypto.recovery_phrase_invalid`).
+    #[error("recovery phrase failed BIP39 checksum")]
+    RecoveryPhraseInvalid,
+    /// The encryptor was used out of contract (e.g. a chunk pushed after
+    /// `finalize`, or a header read that ran short). Indicates a caller or
+    /// format bug.
+    #[error("crypto stream protocol violation: {0}")]
+    Protocol(String),
+}
+
+/// A per-file content encryptor implementing the XChaCha20-Poly1305 STREAM
+/// construction (DESIGN s7.1).
+///
+/// Lifecycle, driven by the executor's CPU-pipeline stage (DESIGN
+/// s11.4.3):
+/// 1. [`Self::header`] - emit the 40-byte `magic | nonce` file header that
+///    must be the first bytes of the Drive object's body.
+/// 2. [`Self::encrypt_chunk`] once per plaintext chunk (64 KiB plaintext
+///    -> 64 KiB + 16-byte tag ciphertext), in order. The STREAM 32-bit
+///    big-endian counter advances internally.
+/// 3. [`Self::finalize_last`] for the final chunk (sets the STREAM
+///    last-chunk flag) and consume the encryptor, returning the trailing
+///    ciphertext and the MD5 over **all** ciphertext bytes emitted
+///    (header + every chunk) - the value compared against Drive's
+///    `md5Checksum` (DESIGN s7.1 "Drive's md5Checksum is the ciphertext
+///    md5").
+///
+/// Implementations accumulate the ciphertext MD5 across `header`,
+/// `encrypt_chunk`, and `finalize_last`, so the executor must feed exactly
+/// the bytes it uploads, in order.
+pub trait ContentEncryptor: Send {
+    /// Returns the fixed-size file header (`magic` + per-file random
+    /// nonce, 40 bytes per DESIGN s7.1) that prefixes the ciphertext body.
+    /// Must be called once, before any [`Self::encrypt_chunk`].
+    fn header(&mut self) -> Bytes;
+
+    /// Encrypts one non-final plaintext chunk, returning its ciphertext
+    /// (plaintext length + 16-byte tag). Advances the STREAM counter.
+    fn encrypt_chunk(&mut self, plaintext: &[u8]) -> Result<Bytes, CryptoError>;
+
+    /// Encrypts the final plaintext chunk with the STREAM last-chunk flag
+    /// set, consuming the encryptor. Returns the final ciphertext and the
+    /// MD5 over every ciphertext byte emitted (header + all chunks), for
+    /// the Drive `md5Checksum` verification (DESIGN s7.1).
+    fn finalize_last(self: Box<Self>, plaintext: &[u8]) -> Result<(Bytes, [u8; 16]), CryptoError>;
+}
+
+/// A per-file content decryptor: the inverse of [`ContentEncryptor`], used
+/// by the Restore browser (DESIGN s7.3).
+///
+/// The executor / restore sink reads the 40-byte header first (handed to
+/// the suite via [`SourceCryptoSuite::content_decryptor`]), then streams
+/// ciphertext chunks through [`Self::decrypt_chunk`], marking the final
+/// chunk with [`Self::decrypt_last`]. A failed AEAD tag (wrong key, a
+/// reorder, a truncation) surfaces [`CryptoError::DecryptFailed`].
+pub trait ContentDecryptor: Send {
+    /// Decrypts one non-final ciphertext chunk back to plaintext.
+    fn decrypt_chunk(&mut self, ciphertext: &[u8]) -> Result<Bytes, CryptoError>;
+
+    /// Decrypts the final ciphertext chunk (STREAM last-chunk flag
+    /// expected), consuming the decryptor.
+    fn decrypt_last(self: Box<Self>, ciphertext: &[u8]) -> Result<Bytes, CryptoError>;
+}
+
+/// The encryption contract the M3 executor codes against (DESIGN s7).
+///
+/// One instance corresponds to one source's per-source key (so cross-source
+/// ciphertext is uncorrelatable, DESIGN s7.1). When a source has
+/// encryption disabled the executor holds `None` instead of a suite and
+/// uploads plaintext.
+///
+/// Object-safe and `Send + Sync` so the orchestrator can hold an
+/// `Option<std::sync::Arc<dyn SourceCryptoSuite>>` (the SPEC s5
+/// `Option<SourceCryptoSuite>` field; SPEC s5 is explicitly illustrative
+/// on the exact spelling - see the M3 phase-1 finding).
+pub trait SourceCryptoSuite: Send + Sync {
+    /// Opens a fresh per-file [`ContentEncryptor`] with a newly generated
+    /// file nonce (DESIGN s7.1). Called once per uploaded file.
+    fn content_encryptor(&self) -> Box<dyn ContentEncryptor>;
+
+    /// Opens a [`ContentDecryptor`] for a file, given the 40-byte header
+    /// (`magic | nonce`) read from the start of the Drive object
+    /// (DESIGN s7.1, s7.3). Returns [`CryptoError::Protocol`] if the
+    /// header is malformed.
+    fn content_decryptor(&self, header: &[u8]) -> Result<Box<dyn ContentDecryptor>, CryptoError>;
+
+    /// Encrypts one path component, returning the base32hex (RFC 4648 s7,
+    /// lowercase, no padding) ciphertext usable as a Drive filename
+    /// (DESIGN s7.1 filename encryption).
+    ///
+    /// `component` is the single NFC-canonical path segment (the executor
+    /// canonicalises before calling). `parent_ciphertext_aad` is the
+    /// parent folder's already-encrypted ciphertext name, bound in as the
+    /// AEAD AAD so moving a folder re-derives its children's ciphertext
+    /// (DESIGN s7.1). For a top-level component pass an empty slice.
+    /// Deterministic: the same `(component, parent_aad)` always yields the
+    /// same ciphertext (needed for `files.list` lookups).
+    fn encrypt_filename(
+        &self,
+        component: &str,
+        parent_ciphertext_aad: &[u8],
+    ) -> Result<String, CryptoError>;
+
+    /// Inverse of [`Self::encrypt_filename`]: decodes the base32hex
+    /// ciphertext name and AEAD-decrypts it back to the plaintext path
+    /// component (DESIGN s7.3 restore browser shows plaintext names). The
+    /// same `parent_ciphertext_aad` used to encrypt must be supplied.
+    fn decrypt_filename(
+        &self,
+        ciphertext_name: &str,
+        parent_ciphertext_aad: &[u8],
+    ) -> Result<String, CryptoError>;
+}

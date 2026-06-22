@@ -316,6 +316,227 @@ pub enum PauseReason {
 }
 
 // -----------------------------------------------------------------------------
+// Orchestrator state machine: OrchestratorState, ExecProgress, ErrorDetail
+// -----------------------------------------------------------------------------
+
+/// The orchestrator's coarse-grained lifecycle state (SPEC s5, DESIGN
+/// s5.1 state machine).
+///
+/// One orchestrator runs per account (DESIGN s5.1); two accounts with work
+/// run two independent state machines. The variants and the transitions
+/// between them are load-bearing (SPEC s5 calls them out as fixed even
+/// though the surrounding struct shape is "illustrative"); the payloads
+/// carry just enough for the tray + Activity dashboard to render "is it
+/// stuck or working?" (DESIGN s5.8.6) without shipping the full plan or
+/// op list across the IPC boundary.
+///
+/// `Clone` so a snapshot can be handed to the IPC layer; `Serialize`/
+/// `Deserialize` so it crosses the Tauri boundary. The richer
+/// network-aware substates DESIGN s5.8.6 sketches (`Idle.NetworkOffline`,
+/// `Backoff.ServiceOpen`, `Executing.Degraded`) are modelled in M3 via the
+/// [`PauseReason`] / [`NetworkState`](crate::network::NetworkState) /
+/// [`ServiceHealth`](crate::network::ServiceHealth) payloads rather than as
+/// extra top-level variants; see the M3 phase-1 finding.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "state")]
+pub enum OrchestratorState {
+    /// No work in progress. `last_run_at` is the wall-clock ms of the last
+    /// completed cycle, or `None` before the first run.
+    Idle {
+        /// Unix epoch ms of the last completed cycle, if any.
+        last_run_at: Option<UnixMs>,
+    },
+    /// Checking the power / network gates (DESIGN s5.7) before starting a
+    /// batch. A failed gate transitions to [`OrchestratorState::Paused`].
+    PowerCheck,
+    /// Walking + diffing one source's local tree (SPEC s6). `scanned` is a
+    /// running count of files visited, for a live progress readout.
+    Scanning {
+        /// Source currently being scanned.
+        source_id: SourceId,
+        /// Files visited so far this scan.
+        scanned: u64,
+    },
+    /// The planner has produced a [`Plan`]; the summary is carried for the
+    /// activity-log line and the dry-run display (SPEC s5, s7).
+    Planning {
+        /// Counts-only digest of the plan.
+        plan: PlanSummary,
+    },
+    /// Executing the plan's ops (SPEC s8). `progress` is updated as ops
+    /// complete.
+    Executing {
+        /// Live execution progress.
+        progress: ExecProgress,
+    },
+    /// Running the sample-based post-upload verification pass (SPEC s5,
+    /// DESIGN s3.3). `sampled` files checked so far, `mismatches` found.
+    Verifying {
+        /// Files sampled so far this pass.
+        sampled: u64,
+        /// Checksum mismatches found so far.
+        mismatches: u64,
+    },
+    /// Backing off after a rate-limit or circuit-breaker trip (SPEC s5,
+    /// DESIGN s5.8.3). `until` is the wall-clock ms the backoff lifts.
+    Backoff {
+        /// Unix epoch ms at which the backoff window ends.
+        until: UnixMs,
+    },
+    /// Sync is paused. `reason` distinguishes a user pause from a
+    /// gate-driven pause (battery / metered / offline / service-down) per
+    /// DESIGN s5.7.
+    Paused {
+        /// Why sync is paused.
+        reason: PauseReason,
+    },
+    /// A non-recoverable error halted the cycle; surfaced via the red tray
+    /// icon + an OS notification (DESIGN s5.1).
+    Error {
+        /// The error, in the stable IPC shape (SPEC s24).
+        detail: ErrorDetail,
+    },
+}
+
+/// Live progress of an [`OrchestratorState::Executing`] phase (SPEC s5).
+///
+/// All counters are monotonic within one execution and reset to zero at
+/// the start of each plan via [`ExecProgress::zero`]. Carried in the
+/// state so the tray / Activity dashboard can show "N of M files, X of Y
+/// bytes" without re-reading the plan.
+#[derive(Clone, Copy, Debug, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ExecProgress {
+    /// Upload ops completed (succeeded) so far.
+    pub files_done: u64,
+    /// Total upload ops in the plan (the denominator for "N of M").
+    pub files_total: u64,
+    /// Bytes uploaded so far (sum of completed upload sizes).
+    pub bytes_done: u64,
+    /// Total bytes the plan's upload ops will move.
+    pub bytes_total: u64,
+    /// Trash ops completed so far.
+    pub trashes_done: u64,
+    /// Total trash ops in the plan.
+    pub trashes_total: u64,
+    /// Ops that failed (non-retryable) so far this execution. A non-zero
+    /// value does not by itself stop the run; the orchestrator decides
+    /// fail-fast vs continue per error class.
+    pub errors: u64,
+}
+
+impl ExecProgress {
+    /// Returns a zeroed progress, the starting value at the head of an
+    /// [`OrchestratorState::Executing`] phase (SPEC s5
+    /// `ExecProgress::zero()`).
+    pub fn zero() -> Self {
+        Self::default()
+    }
+}
+
+/// An error in the stable IPC JSON shape (SPEC s24).
+///
+/// This is the payload of [`OrchestratorState::Error`] and the body the
+/// IPC layer serialises to `{ code, message, retry_after_ms?, details? }`.
+/// The [`code`](Self::code) is the i18n key (load-bearing; see [`ErrorCode`]);
+/// `message` is a human-readable fallback (the frontend prefers
+/// `t('errors.${code}.short')`).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ErrorDetail {
+    /// The stable dotted error code (SPEC s24); serialised as its string
+    /// form via [`ErrorCode::code`].
+    pub code: ErrorCode,
+    /// Human-readable fallback message. Not localised; the frontend maps
+    /// `code` to a localised string and uses `message` only as a backstop.
+    pub message: String,
+    /// Optional retry-after hint in milliseconds, populated for codes that
+    /// carry one (e.g. `drive.rate_limited`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub retry_after_ms: Option<u64>,
+    /// Optional free-form structured detail (SPEC s24 `details`).
+    #[serde(skip_serializing_if = "Option::is_none")]
+    pub details: Option<serde_json::Value>,
+}
+
+impl ErrorDetail {
+    /// Builds an [`ErrorDetail`] from a code and message with no
+    /// retry-after or extra details.
+    pub fn new(code: ErrorCode, message: impl Into<String>) -> Self {
+        Self {
+            code,
+            message: message.into(),
+            retry_after_ms: None,
+            details: None,
+        }
+    }
+}
+
+/// An event the orchestrator broadcasts to long-lived consumers
+/// (the IPC event bridge, the tray, the activity-log writer) (SPEC s5
+/// `events: broadcast::Sender<OrchestratorEvent>`, s11.7).
+///
+/// The orchestrator owns a [`tokio::sync::broadcast`] sender; consumers
+/// `subscribe`. A slow consumer that lags the channel sees
+/// `broadcast::error::RecvError::Lagged` and should re-read the current
+/// [`OrchestratorState`] rather than assume an intermediate event is lost
+/// data (the same recovery contract as [`PowerSource`](driven_power::PowerSource)).
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case", tag = "kind")]
+pub enum OrchestratorEvent {
+    /// The orchestrator transitioned to a new lifecycle state.
+    StateChanged {
+        /// The state just entered.
+        state: OrchestratorState,
+    },
+    /// An execution-progress tick (throttled; not one per byte). Carried
+    /// separately from [`OrchestratorEvent::StateChanged`] so the UI can
+    /// update a progress bar without a full state re-render.
+    Progress {
+        /// Source the progress belongs to.
+        source_id: SourceId,
+        /// The latest progress snapshot.
+        progress: ExecProgress,
+    },
+    /// A power transition observed by the orchestrator (DESIGN s5.10).
+    Power {
+        /// The power event.
+        event: PowerEvent,
+    },
+    /// A network transition observed by the orchestrator (DESIGN s5.8).
+    Network {
+        /// The network event.
+        event: crate::network::NetworkEvent,
+    },
+}
+
+// -----------------------------------------------------------------------------
+// Power / sleep-wake events: PowerEvent
+// -----------------------------------------------------------------------------
+
+/// A sleep / wake transition the OS power layer surfaces to the
+/// orchestrator (DESIGN s5.10).
+///
+/// Distinct from [`driven_power::PowerState`] (a steady-state snapshot of
+/// AC / battery / metered / reachability): a [`PowerEvent`] marks the
+/// *edge* of a suspend or resume so the orchestrator can run the strict
+/// on-suspend / on-resume sequences in DESIGN s5.10.2 / s5.10.3 (snapshot
+/// in-flight sessions on suspend; defer-30s, re-probe, refresh tokens,
+/// discard stale resumable sessions on resume). Flows into the
+/// orchestrator on the same channel as power-source and network events
+/// (DESIGN s5.10.1).
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PowerEvent {
+    /// The machine is entering sleep / hibernate (`PBT_APMSUSPEND` /
+    /// `NSWorkspaceWillSleepNotification` / `PrepareForSleep(true)`).
+    /// Triggers the DESIGN s5.10.2 graceful-pause + session-snapshot path.
+    Suspending,
+    /// The machine has resumed from sleep (`PBT_APMRESUMEAUTOMATIC` /
+    /// `NSWorkspaceDidWakeNotification` / `PrepareForSleep(false)`).
+    /// Triggers the strict DESIGN s5.10.3 resume sequence.
+    Resumed,
+}
+
+// -----------------------------------------------------------------------------
 // Op + Plan
 // -----------------------------------------------------------------------------
 
@@ -669,6 +890,57 @@ impl ErrorCode {
             ErrorCode::InternalBug => "internal.bug",
         }
     }
+
+    /// Parses a dotted code string back into an [`ErrorCode`] (the inverse
+    /// of [`ErrorCode::code`]). Returns `None` for an unknown code so a
+    /// forward-compatible reader can degrade gracefully rather than panic
+    /// (SPEC s24: codes may be added across versions).
+    pub fn from_code(s: &str) -> Option<Self> {
+        // Exhaustive over the variant set; kept paired with `code()` so a
+        // new variant fails to compile here until it is added.
+        Some(match s {
+            "auth.invalid_grant" => ErrorCode::AuthInvalidGrant,
+            "auth.consent_required" => ErrorCode::AuthConsentRequired,
+            "auth.network_unreachable" => ErrorCode::AuthNetworkUnreachable,
+            "drive.rate_limited" => ErrorCode::DriveRateLimited,
+            "drive.daily_quota_exhausted" => ErrorCode::DriveDailyQuotaExhausted,
+            "drive.quota_exhausted" => ErrorCode::DriveQuotaExhausted,
+            "drive.upload_size_limit" => ErrorCode::DriveUploadSizeLimit,
+            "drive.checksum_mismatch" => ErrorCode::DriveChecksumMismatch,
+            "drive.unreachable" => ErrorCode::DriveUnreachable,
+            "drive.resumable_session_invalid" => ErrorCode::DriveResumableSessionInvalid,
+            "drive.dest_folder_missing" => ErrorCode::DriveDestFolderMissing,
+            "drive.dest_folder_permission_denied" => ErrorCode::DriveDestFolderPermissionDenied,
+            "local.file_locked" => ErrorCode::LocalFileLocked,
+            "local.vss_unavailable" => ErrorCode::LocalVssUnavailable,
+            "local.file_changed_during_upload" => ErrorCode::LocalFileChangedDuringUpload,
+            "local.file_replaced_during_upload" => ErrorCode::LocalFileReplacedDuringUpload,
+            "local.io_error" => ErrorCode::LocalIoError,
+            "local.path_too_long" => ErrorCode::LocalPathTooLong,
+            "local.unicode_collision" => ErrorCode::LocalUnicodeCollision,
+            "local.disk_full" => ErrorCode::LocalDiskFull,
+            "local.invalid_filename" => ErrorCode::LocalInvalidFilename,
+            "local.ads_skipped" => ErrorCode::LocalAdsSkipped,
+            "net.offline" => ErrorCode::NetOffline,
+            "net.no_internet" => ErrorCode::NetNoInternet,
+            "net.dns_failed" => ErrorCode::NetDnsFailed,
+            "net.captive_portal" => ErrorCode::NetCaptivePortal,
+            "net.timeout" => ErrorCode::NetTimeout,
+            "net.intermittent" => ErrorCode::NetIntermittent,
+            "net.proxy_required" => ErrorCode::NetProxyRequired,
+            "update.endpoint_unreachable" => ErrorCode::UpdateEndpointUnreachable,
+            "update.signature_invalid" => ErrorCode::UpdateSignatureInvalid,
+            "crypto.key_missing" => ErrorCode::CryptoKeyMissing,
+            "crypto.decrypt_failed" => ErrorCode::CryptoDecryptFailed,
+            "crypto.recovery_phrase_invalid" => ErrorCode::CryptoRecoveryPhraseInvalid,
+            "state.db_locked" => ErrorCode::StateDbLocked,
+            "state.db_corrupt" => ErrorCode::StateDbCorrupt,
+            "state.reconcile_orphan" => ErrorCode::StateReconcileOrphan,
+            "harness.timeout" => ErrorCode::HarnessTimeout,
+            "internal.bug" => ErrorCode::InternalBug,
+            _ => return None,
+        })
+    }
 }
 
 impl fmt::Display for ErrorCode {
@@ -676,6 +948,39 @@ impl fmt::Display for ErrorCode {
         f.write_str(self.code())
     }
 }
+
+impl Serialize for ErrorCode {
+    /// Serialises as the stable dotted code string (SPEC s24), so the IPC
+    /// `code` field and any persisted activity row carry the i18n key
+    /// rather than a Rust variant name.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        serializer.serialize_str(self.code())
+    }
+}
+
+impl<'de> Deserialize<'de> for ErrorCode {
+    /// Deserialises from the dotted code string. An unknown code is a hard
+    /// error here (the value crossed our own IPC boundary); use
+    /// [`ErrorCode::from_code`] directly for lenient forward-compat reads.
+    fn deserialize<D: serde::Deserializer<'de>>(deserializer: D) -> Result<Self, D::Error> {
+        let s = String::deserialize(deserializer)?;
+        ErrorCode::from_code(&s)
+            .ok_or_else(|| serde::de::Error::custom(format!("unknown error code: {s}")))
+    }
+}
+
+impl FromStr for ErrorCode {
+    type Err = UnknownErrorCode;
+    fn from_str(s: &str) -> Result<Self, Self::Err> {
+        ErrorCode::from_code(s).ok_or_else(|| UnknownErrorCode(s.to_string()))
+    }
+}
+
+/// Error returned when [`ErrorCode::from_str`] is given an unrecognised
+/// dotted code.
+#[derive(Debug, thiserror::Error)]
+#[error("unknown error code: {0}")]
+pub struct UnknownErrorCode(pub String);
 
 #[cfg(test)]
 mod tests {
