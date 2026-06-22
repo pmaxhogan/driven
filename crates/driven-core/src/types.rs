@@ -355,6 +355,14 @@ pub struct Plan {
     /// concurrency but must preserve happens-before semantics for ops on
     /// the same `(source_id, relative_path)`.
     pub ops: Vec<Op>,
+    /// NFC `RelativePath` keys the scanner dropped because two distinct raw
+    /// on-disk paths normalised onto one key (DESIGN s5.2.3, SPEC s24
+    /// `local.unicode_collision`), copied verbatim from
+    /// [`ScanResult::collisions`]. The planner emits no op for these (M2 just
+    /// threads them through); the M3 orchestrator surfaces them as
+    /// `local.unicode_collision` activity errors and decides fail-closed
+    /// (block the source) vs skip-the-colliding-file-with-an-error policy.
+    pub collisions: Vec<RelativePath>,
 }
 
 impl Plan {

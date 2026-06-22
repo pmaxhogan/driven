@@ -60,6 +60,10 @@ const TARGET: &str = "driven::core::planner";
 /// happens-before semantics per `(source_id, relative_path)` (see
 /// [`Plan::ops`]).
 ///
+/// The scanner's NFC collisions are copied verbatim into [`Plan::collisions`]
+/// (no op emitted); the M3 orchestrator surfaces them as
+/// `local.unicode_collision` activity errors and owns the fail-closed policy.
+///
 /// See the module docs for why renames yield one upload + one trash in V1.
 pub async fn plan(source: &SourceRow, scan: &ScanResult, state: &dyn StateRepo) -> Result<Plan> {
     let mut ops = Vec::with_capacity(scan.new_or_changed.len() + scan.deleted.len());
@@ -95,7 +99,14 @@ pub async fn plan(source: &SourceRow, scan: &ScanResult, state: &dyn StateRepo) 
         }
     }
 
-    Ok(Plan { ops })
+    // P1-3: thread the scanner's NFC collisions through to the Plan untouched.
+    // The M3 orchestrator surfaces these as `local.unicode_collision` activity
+    // errors and decides fail-closed (block the source) vs skip-the-colliding-
+    // file-with-an-error policy; the planner itself emits no op for them.
+    Ok(Plan {
+        ops,
+        collisions: scan.collisions.clone(),
+    })
 }
 
 #[cfg(test)]

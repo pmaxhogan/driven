@@ -41,7 +41,7 @@ CREATE TABLE file_state (
   drive_file_id TEXT,                 -- null until first upload
   drive_md5 BLOB,                     -- 16 bytes; ciphertext md5 if encrypted
   encrypted_remote_path TEXT,         -- cached, for encrypted sources
-  status TEXT NOT NULL,               -- 'synced' | 'pending' | 'corrupt' | 'locked' | 'error'
+  status TEXT NOT NULL,               -- 'synced' | 'pending' | 'corrupt' | 'locked' | 'error' | 'excluded_orphan'
   last_uploaded_at INTEGER,
   last_verified_at INTEGER,
   PRIMARY KEY (source_id, relative_path)

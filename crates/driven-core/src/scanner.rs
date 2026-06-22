@@ -787,6 +787,54 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn nested_negation_under_excluded_dir_not_false_deleted() {
+        // P1-1 (data-loss guard): a nested negation (`vendor/.gitignore:
+        // !keep.txt`) re-includes `vendor/keep.txt` even though a parent rule
+        // excludes `vendor/`. The flattened matcher classifies it INCLUDED, so
+        // if dir-pruning skipped `vendor/` the file would never be walked, land
+        // un-`seen`, and the orphan split would false-classify its stored
+        // file_state row as `deleted` - trashing a file that still exists.
+        // With the fix, build_walker disables pruning whenever the matcher has
+        // negations, so `vendor/` IS walked, `keep.txt` is seen, and the row is
+        // neither deleted nor an excluded_orphan.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), b"vendor/\n");
+        // Nested negation re-including a file inside the excluded dir. A
+        // no-slash `!keep.txt` matches the path itself before the excluded
+        // parent is consulted (the exact P1-1 mechanism).
+        write(&root.join("vendor/.gitignore"), b"!keep.txt\n");
+        let keep = root.join("vendor/keep.txt");
+        write(&keep, b"x");
+        write(&root.join("top.txt"), b"x");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        // Seed a synced row for the re-included file: if pruning false-deletes
+        // it, this row lands in `deleted`.
+        let (size, mtime) = stat_of(&keep);
+        state.put(row(
+            src.id,
+            "vendor/keep.txt",
+            size,
+            mtime,
+            *blake3::hash(b"x").as_bytes(),
+        ));
+
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+        assert!(
+            !res.deleted.contains(&rel("vendor/keep.txt")),
+            "a nested-negation re-included file under an excluded dir must NOT be deleted: {:?}",
+            res.deleted
+        );
+        assert!(
+            !res.excluded_orphans.contains(&rel("vendor/keep.txt")),
+            "the re-included file is INCLUDED, so it is not an excluded_orphan either: {:?}",
+            res.excluded_orphans
+        );
+    }
+
+    #[tokio::test]
     async fn git_info_exclude_drops_from_walk() {
         // P1-2: a `.git/info/exclude` rule must exclude a file from the walk
         // (not yielded in new_or_changed).

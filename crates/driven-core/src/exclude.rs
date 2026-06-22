@@ -108,9 +108,28 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
 #[derive(Debug)]
 pub struct SourceMatcher {
     inner: Gitignore,
+    /// True when ANY rule can RE-INCLUDE a path a broader rule excluded - i.e.
+    /// the source has `include_patterns` (each stored as a `!`-re-include) OR
+    /// any tier (`.gitignore` / `.ignore` / `.git/info/exclude` / global /
+    /// `core.excludesFile`) contributed a `!`-prefixed whitelist rule. Used to
+    /// disable directory pruning in [`build_walker`]: a nested `!keep.txt`
+    /// under an excluded parent dir would be classified INCLUDED by the
+    /// flattened matcher, so pruning that parent (never walking it) would leave
+    /// the file unseen and the orphan split would false-classify it `deleted`
+    /// and trash a file that still exists (P1-1, data loss). When this is set
+    /// the walker prunes nothing and the per-file matcher decides every path,
+    /// keeping the walk filter and orphan split in lockstep.
+    has_negations: bool,
 }
 
 impl SourceMatcher {
+    /// Whether any rule can re-include an otherwise-excluded path (see the
+    /// [`SourceMatcher::has_negations`] field docs). [`build_walker`] gates
+    /// excluded-directory pruning on this being `false`.
+    pub fn has_negations(&self) -> bool {
+        self.has_negations
+    }
+
     /// Whether `rel` (a source-root-relative path) is INCLUDED under the
     /// current rules. `is_dir` distinguishes a directory from a file so a
     /// trailing-slash gitignore rule (`node_modules/`) applies correctly.
@@ -198,13 +217,12 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
             }
         }
 
-        // Global gitignore: `$XDG_CONFIG_HOME/git/ignore`, falling back to
-        // `~/.config/git/ignore` when XDG is unset (DESIGN s5.2). Wired here
-        // but not hermetically tested - $XDG_CONFIG_HOME / $HOME are
-        // process-global and would race parallel tests (see the exclude
-        // tests' note); a focused unit test instead proves the tier loads via
-        // `.git/info/exclude` + `.ignore`.
-        // TODO(M2-followup): honor git core.excludesFile (needs git config parse)
+        // Global gitignore (DESIGN s5.2). Resolved by [`global_gitignore_path`]:
+        // git's own `core.excludesFile` when set, else `$XDG_CONFIG_HOME/git/ignore`,
+        // else `~/.config/git/ignore`. Wired here but not hermetically tested -
+        // $XDG_CONFIG_HOME / $HOME and the machine-global git config would race
+        // parallel tests (see the exclude tests' note); a focused unit test
+        // instead proves the tier loads via `.git/info/exclude` + `.ignore`.
         if let Some(global) = global_gitignore_path() {
             if global.is_file() {
                 if let Some(err) = gb.add(&global) {
@@ -237,6 +255,15 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
         .build()
         .map_err(|e| anyhow::anyhow!("building source matcher: {e}"))?;
 
+    // P1-1: a source has negations when it carries `include_patterns` (each
+    // added as a `!`-re-include) OR any tier contributed a `!`-prefixed
+    // whitelist rule. `Gitignore::num_whitelists` counts exactly those
+    // `!`-rules across every tier we added above (cheaper and more correct
+    // than re-reading each ignore file to scan for `!` lines - it handles
+    // escaped `\!`, the global / core.excludesFile tiers, and read failures
+    // identically to how the matcher itself parsed them).
+    let has_negations = !source.include_patterns.is_empty() || inner.num_whitelists() > 0;
+
     tracing::debug!(
         target: TARGET,
         source_id = %source.id,
@@ -244,9 +271,14 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
         includes = source.include_patterns.len(),
         excludes = source.exclude_patterns.len(),
         num_ignores = inner.num_ignores(),
+        num_whitelists = inner.num_whitelists(),
+        has_negations,
         "built source matcher"
     );
-    Ok(SourceMatcher { inner })
+    Ok(SourceMatcher {
+        inner,
+        has_negations,
+    })
 }
 
 /// Collects every file named `filename` (e.g. `.gitignore` or `.ignore`)
@@ -292,23 +324,87 @@ fn collect_ignore_files(root: &Path, filename: &str) -> Vec<std::path::PathBuf> 
     found
 }
 
-/// Resolves the global gitignore path (DESIGN s5.2): `$XDG_CONFIG_HOME/git/ignore`,
-/// or `~/.config/git/ignore` when `$XDG_CONFIG_HOME` is unset/empty. Returns
-/// `None` when neither base directory can be resolved.
+/// Resolves the global gitignore path (DESIGN s5.2).
 ///
-/// This intentionally does NOT honour a custom git `core.excludesFile`, which
-/// would need git-config parsing (out of scope for M2).
-// TODO(M2-followup): honor git core.excludesFile (needs git config parse)
+/// Mirrors git's own resolution order: a configured `core.excludesFile`
+/// (P1-2) takes precedence and REPLACES the default slot; when it is unset (or
+/// git is unavailable) this falls back to `$XDG_CONFIG_HOME/git/ignore`, then
+/// to `~/.config/git/ignore` when `$XDG_CONFIG_HOME` is unset/empty. Returns
+/// `None` when none of those resolve to a usable path.
+///
+/// `core.excludesFile` is read by shelling out to `git config --get
+/// core.excludesFile` (no in-process git-config parser). Driven must NOT
+/// hard-require git: a missing binary or an unset key is a graceful skip (the
+/// XDG/`~` fallback still applies), never an error.
 fn global_gitignore_path() -> Option<std::path::PathBuf> {
+    // 1. `core.excludesFile` from git config, if git is present and it is set.
+    if let Some(path) = git_core_excludes_file() {
+        return Some(path);
+    }
+
+    // 2. XDG / `~/.config` fallback.
     let base = match std::env::var_os("XDG_CONFIG_HOME") {
         Some(xdg) if !xdg.is_empty() => std::path::PathBuf::from(xdg),
         _ => {
             // `~/.config`. `HOME` covers Unix; `USERPROFILE` covers Windows.
-            let home = std::env::var_os("HOME").or_else(|| std::env::var_os("USERPROFILE"))?;
-            std::path::PathBuf::from(home).join(".config")
+            let home = home_dir()?;
+            home.join(".config")
         }
     };
     Some(base.join("git").join("ignore"))
+}
+
+/// Reads git's `core.excludesFile` via `git config --get core.excludesFile`
+/// (P1-2). Returns the resolved path only when git is on PATH, the key is set,
+/// and the value (after `~` expansion) names an existing file; otherwise
+/// `None` so the caller falls back to the XDG/`~` default.
+///
+/// Driven does not hard-require git: any failure to run git, a non-zero exit
+/// (key unset), unreadable output, or a non-file path all yield `None` rather
+/// than propagating an error.
+fn git_core_excludes_file() -> Option<std::path::PathBuf> {
+    let output = std::process::Command::new("git")
+        .args(["config", "--get", "core.excludesFile"])
+        .output()
+        .ok()?;
+    if !output.status.success() {
+        // Exit 1 = key not set; any other failure also falls back gracefully.
+        return None;
+    }
+    let raw = String::from_utf8(output.stdout).ok()?;
+    let trimmed = raw.trim();
+    if trimmed.is_empty() {
+        return None;
+    }
+    let expanded = expand_tilde(trimmed);
+    if expanded.is_file() {
+        Some(expanded)
+    } else {
+        None
+    }
+}
+
+/// The user's home directory: `HOME` (Unix) or `USERPROFILE` (Windows).
+fn home_dir() -> Option<std::path::PathBuf> {
+    std::env::var_os("HOME")
+        .or_else(|| std::env::var_os("USERPROFILE"))
+        .map(std::path::PathBuf::from)
+}
+
+/// Expands a leading `~` (a `~`-only string, or `~/...`) to the home dir.
+/// Any other input - including a `~user` form we do not resolve - is returned
+/// verbatim as a path.
+fn expand_tilde(path: &str) -> std::path::PathBuf {
+    if path == "~" {
+        if let Some(home) = home_dir() {
+            return home;
+        }
+    } else if let Some(rest) = path.strip_prefix("~/").or_else(|| path.strip_prefix("~\\")) {
+        if let Some(home) = home_dir() {
+            return home.join(rest);
+        }
+    }
+    std::path::PathBuf::from(path)
 }
 
 /// Builds the configured [`WalkBuilder`] for `source` (SPEC s6
@@ -337,16 +433,25 @@ fn global_gitignore_path() -> Option<std::path::PathBuf> {
 ///
 /// ## Excluded-directory pruning (perf)
 ///
-/// When `include_patterns` is EMPTY, a [`WalkBuilder::filter_entry`] closure
+/// When the matcher has NO negations, a [`WalkBuilder::filter_entry`] closure
 /// prunes any directory the matcher excludes (e.g. `node_modules`, `build`),
 /// so the walk never descends it - the whole point of P2-1. The closure only
 /// ever prunes directories (files are still decided per-entry by the scanner's
 /// matcher check) and never prunes the root. It is GATED on
-/// `include_patterns.is_empty()`: a non-empty include set could `!`-re-include
-/// a file INSIDE an excluded directory, and pruning the directory would lose
-/// it. The closure owns its own [`SourceMatcher`] because `filter_entry`
-/// requires a `'static + Send + Sync` predicate; the scanner builds a separate
-/// matcher for its per-entry / orphan-split checks.
+/// [`SourceMatcher::has_negations`] being `false` (P1-1): ANY `!`-re-include -
+/// whether from `include_patterns` OR a nested `.gitignore`/`.ignore`
+/// negation - could re-include a file INSIDE an excluded directory, and
+/// pruning that directory would leave the file un-walked. Worse than a missed
+/// file: because the flattened matcher would still classify that path INCLUDED,
+/// the scanner's orphan split would read a stored `file_state` row for it as a
+/// genuine deletion and trash a file that still exists (data loss). With no
+/// negations, an excluded directory contains only excluded files, so pruning
+/// is safe and the walk filter / orphan split stay consistent. `has_negations`
+/// subsumes the old `include_patterns.is_empty()` gate (every include pattern
+/// becomes a `!`-rule, so it sets `has_negations`). The closure owns its own
+/// [`SourceMatcher`] because `filter_entry` requires a `'static + Send + Sync`
+/// predicate; the scanner builds a separate matcher for its per-entry /
+/// orphan-split checks.
 pub fn build_walker(source: &SourceRow) -> anyhow::Result<WalkBuilder> {
     let mut wb = WalkBuilder::new(&source.local_path);
     wb.git_ignore(false)
@@ -359,11 +464,14 @@ pub fn build_walker(source: &SourceRow) -> anyhow::Result<WalkBuilder> {
         .follow_links(false);
 
     // P2-1: prune excluded DIRECTORIES so the walk never descends e.g.
-    // node_modules just to discard each file. Only safe when there are no
-    // include_patterns (a `!`-re-include could live inside an excluded dir).
-    if source.include_patterns.is_empty() {
-        // TODO(perf): prune excluded dirs even with include_patterns (needs ancestor check)
-        let prune_matcher = build_source_matcher(source)?;
+    // node_modules just to discard each file. P1-1: only safe when the matcher
+    // has NO negations - any `!`-re-include (from include_patterns OR a nested
+    // .gitignore/.ignore) could live inside an excluded dir, and pruning that
+    // dir while the flattened matcher still classifies the re-included file as
+    // INCLUDED would make the orphan split false-delete a still-present file.
+    let prune_matcher = build_source_matcher(source)?;
+    if !prune_matcher.has_negations() {
+        // TODO(perf): prune excluded dirs even with negations (needs ancestor check)
         let root = std::path::PathBuf::from(&source.local_path);
         wb.filter_entry(move |entry| {
             // Never prune the root, and only ever act on directories - files
@@ -729,6 +837,58 @@ mod tests {
         assert!(
             !names.contains(&"skip/inside.txt".to_string()),
             "file inside an excluded dir must not be walked: {names:?}"
+        );
+    }
+
+    #[test]
+    fn nested_negation_disables_pruning_and_keeps_reincluded_file() {
+        // P1-1: a nested `.gitignore` negation (`vendor/.gitignore: !keep.txt`)
+        // under an excluded parent (`vendor/`) sets has_negations, which MUST
+        // disable dir-pruning so `vendor/` is walked and `keep.txt` survives.
+        // If pruning stayed on, the walk would skip `vendor/` entirely and the
+        // file would be lost from the walk (and the scanner's orphan split
+        // would then false-delete its stored row - see the scanner test).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "vendor/\n");
+        write(&root.join("vendor/.gitignore"), "!keep.txt\n");
+        write(&root.join("vendor/keep.txt"), "x");
+        write(&root.join("top.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(
+            matcher.has_negations(),
+            "a `!`-negation in any tier must set has_negations"
+        );
+        assert!(
+            matcher.is_included(Path::new("vendor/keep.txt"), false),
+            "the nested !keep.txt must re-include the file in the matcher"
+        );
+
+        let names = walked_names(&src);
+        assert!(names.contains(&"top.txt".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"vendor/keep.txt".to_string()),
+            "pruning must be disabled so the re-included file is still walked: {names:?}"
+        );
+    }
+
+    #[test]
+    fn no_negations_when_only_plain_excludes() {
+        // The gate's negative case: a source with only plain exclude rules and
+        // no include_patterns / `!`-rules has NO negations, so pruning stays
+        // enabled (the common, fast path).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "build/\n");
+        write(&root.join("keep.txt"), "x");
+
+        let src = source_at(root, true, &[], &["*.log"]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(
+            !matcher.has_negations(),
+            "plain excludes with no `!`-rule and no include_patterns must NOT set has_negations"
         );
     }
 }
