@@ -23,3 +23,17 @@ bip39 = { workspace = true }
 base32 = { workspace = true }
 zeroize = { workspace = true }
 blake3 = "1"
+# OS keychain storage for the account master key (DESIGN s7.1). keyring 4.x's
+# default `v1` feature bundles the per-OS native stores (macOS Keychain,
+# Windows Credential Manager, Linux Secret Service) and lazily installs the
+# right one on first `Entry::new`; without it the crate has no default store
+# and every op errors.
+keyring = "4"
+# Drive's `md5Checksum` is the ciphertext MD5 (DESIGN s7.1), so the content
+# encryptor hashes every emitted ciphertext byte (header + chunks) with MD5
+# for the verify-on-upload comparison.
+md5 = { workspace = true }
+# `getrandom`-backed RNG for the per-file STREAM nonce, the wrapped-key
+# nonce, and fresh master / per-source key material (DESIGN s7.1). Pinned to
+# 0.8 to match `chacha20poly1305` 0.10's `rand_core` 0.6 `OsRng`.
+rand = "0.8"

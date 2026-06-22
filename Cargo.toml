@@ -57,6 +57,10 @@ chacha20poly1305 = { version = "0.10", features = ["stream"] }
 bip39 = "2"
 base32 = "0.5"
 zeroize = { version = "1", features = ["derive"] }
+# Drive's `md5Checksum` is the ciphertext MD5 (DESIGN s7.1). The crypto
+# content encryptor and the executor's plaintext-path hasher both compute it
+# (the RustCrypto `md-5` crate, imported as `md_5`).
+md5 = { version = "0.10", package = "md-5" }
 
 [profile.dev]
 opt-level = 1

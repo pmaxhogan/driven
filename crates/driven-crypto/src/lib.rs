@@ -29,6 +29,17 @@
 
 use bytes::Bytes;
 
+pub mod content;
+pub mod filename;
+pub mod key;
+pub mod keystore;
+pub mod recovery;
+
+pub use content::{ContentDecryptorImpl, ContentEncryptorImpl, CONTENT_MAGIC, HEADER_LEN};
+pub use key::{MasterKey, SourceKey, WrappedSourceKey, KEY_LEN};
+pub use keystore::{Keystore, KeystoreError};
+pub use recovery::{master_key_to_phrase, phrase_to_master_key};
+
 /// Errors the crypto seam surfaces to the executor (mapped to the core
 /// `crypto.*` `ErrorCode` at the boundary - this enum deliberately holds
 /// no `driven-core` type so the dependency graph stays one-way).
@@ -156,4 +167,109 @@ pub trait SourceCryptoSuite: Send + Sync {
         ciphertext_name: &str,
         parent_ciphertext_aad: &[u8],
     ) -> Result<String, CryptoError>;
+}
+
+/// The concrete [`SourceCryptoSuite`] the executor holds, bound to one
+/// source's per-source key (DESIGN s7.1).
+///
+/// Construct it from an unwrapped [`SourceKey`] (the orchestrator unwraps
+/// the source key off the [`MasterKey`] via
+/// [`MasterKey::unwrap_source_key`] at source-start). It owns the source
+/// key and the two BLAKE3-derived filename sub-keys; all key material is
+/// zeroized on drop. Wrap it in an `Arc` to share across the executor's
+/// upload tasks (the trait is `Send + Sync`).
+pub struct DrivenCryptoSuite {
+    source_key: key::SourceKey,
+    filename_keys: filename::FilenameKeys,
+}
+
+impl DrivenCryptoSuite {
+    /// Builds a suite for one source from its unwrapped per-source key. The
+    /// filename sub-keys are derived once up front (DESIGN s7.1).
+    #[must_use]
+    pub fn new(source_key: key::SourceKey) -> Self {
+        let filename_keys = filename::FilenameKeys::derive(&source_key);
+        Self {
+            source_key,
+            filename_keys,
+        }
+    }
+}
+
+impl SourceCryptoSuite for DrivenCryptoSuite {
+    fn content_encryptor(&self) -> Box<dyn ContentEncryptor> {
+        Box::new(content::ContentEncryptorImpl::new(&self.source_key))
+    }
+
+    fn content_decryptor(&self, header: &[u8]) -> Result<Box<dyn ContentDecryptor>, CryptoError> {
+        let dec = content::ContentDecryptorImpl::from_header(&self.source_key, header)?;
+        Ok(Box::new(dec))
+    }
+
+    fn encrypt_filename(
+        &self,
+        component: &str,
+        parent_ciphertext_aad: &[u8],
+    ) -> Result<String, CryptoError> {
+        self.filename_keys.encrypt(component, parent_ciphertext_aad)
+    }
+
+    fn decrypt_filename(
+        &self,
+        ciphertext_name: &str,
+        parent_ciphertext_aad: &[u8],
+    ) -> Result<String, CryptoError> {
+        self.filename_keys
+            .decrypt(ciphertext_name, parent_ciphertext_aad)
+    }
+}
+
+#[cfg(test)]
+mod suite_tests {
+    use super::*;
+
+    fn suite() -> DrivenCryptoSuite {
+        DrivenCryptoSuite::new(key::SourceKey::generate())
+    }
+
+    #[test]
+    fn content_round_trip_via_suite() {
+        let s = suite();
+        let mut enc = s.content_encryptor();
+        let header = enc.header();
+        let c0 = enc.encrypt_chunk(b"chunk-zero").unwrap();
+        let (c1, _md5) = enc.finalize_last(b"chunk-last").unwrap();
+
+        let mut dec = s.content_decryptor(&header).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&dec.decrypt_chunk(&c0).unwrap());
+        out.extend_from_slice(&dec.decrypt_last(&c1).unwrap());
+        assert_eq!(out, b"chunk-zerochunk-last");
+    }
+
+    #[test]
+    fn filename_round_trip_via_suite() {
+        let s = suite();
+        let parent = s.encrypt_filename("dir", &[]).unwrap();
+        let child = s.encrypt_filename("file.txt", parent.as_bytes()).unwrap();
+        assert_eq!(
+            s.decrypt_filename(&child, parent.as_bytes()).unwrap(),
+            "file.txt"
+        );
+    }
+
+    #[test]
+    fn suite_is_send_sync() {
+        fn assert_send_sync<T: Send + Sync>() {}
+        assert_send_sync::<DrivenCryptoSuite>();
+    }
+
+    #[test]
+    fn bad_header_via_suite_errors() {
+        let s = suite();
+        assert!(matches!(
+            s.content_decryptor(&[0u8; 4]),
+            Err(CryptoError::Protocol(_))
+        ));
+    }
 }
