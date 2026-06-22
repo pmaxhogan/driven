@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM activity_log WHERE ts < ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "f090dda42492e09d735e4805008ef40e1e33f31e905120a2e6014f4e80c76488"
+}

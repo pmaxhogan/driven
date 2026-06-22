@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                fs.source_id     AS \"source_id!: String\",\n                fs.relative_path AS \"relative_path!: String\",\n                fs.status        AS \"status!: String\",\n                fs.drive_file_id AS \"drive_file_id: String\"\n            FROM file_state_fts\n            JOIN file_state fs ON fs.rowid = file_state_fts.rowid\n            WHERE file_state_fts MATCH ?1\n              AND (?2 IS NULL OR fs.source_id = ?2)\n            ORDER BY rank\n            LIMIT ?3\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "source_id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "relative_path!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "status!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "drive_file_id: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "15f86c1ad7ff40a4902159eba280ae9c47b8ea31c5eb295e8e71db48baafc3ae"
+}

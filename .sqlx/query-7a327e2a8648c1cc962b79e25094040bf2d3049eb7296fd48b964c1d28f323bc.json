@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            UPDATE pending_ops\n               SET attempts = attempts + 1,\n                   last_error = ?2,\n                   scheduled_for = ?3\n             WHERE id = ?1\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "7a327e2a8648c1cc962b79e25094040bf2d3049eb7296fd48b964c1d28f323bc"
+}

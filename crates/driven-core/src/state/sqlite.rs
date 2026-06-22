@@ -1,0 +1,1469 @@
+//! SQLite-backed [`StateRepo`] implementation (SPEC s2).
+//!
+//! Concrete implementation of the [`StateRepo`] trait declared in
+//! [`crate::state`]. Opens the DB at `<config_dir>/driven/state.db` with WAL
+//! mode + foreign keys on, runs the embedded migrations under
+//! `src/migrations/`, and verifies `PRAGMA integrity_check` on first open
+//! (returning `state.db_corrupt` per SPEC s24 when corruption is detected).
+//!
+//! Conventions:
+//! - `sqlx::query!` (anonymous-record macro) is used so queries are
+//!   compile-time-checked against the schema; the `.sqlx/` offline cache at
+//!   the workspace root keeps CI green without a live DB.
+//! - Newtype wrappers / enums (e.g. [`SourceId`], [`FileStateStatus`]) do not
+//!   have `sqlx::Encode`/`Decode` impls; rows are reassembled by hand from
+//!   the primitive `String` / `i64` / `Vec<u8>` columns sqlx returns.
+//! - `INSERT ... ON CONFLICT DO UPDATE` is used for every upsert (never
+//!   `INSERT OR REPLACE`) so the `ON DELETE CASCADE` chain on `accounts` /
+//!   `backup_sources` does not nuke dependent rows on a benign re-upsert,
+//!   and `file_state.rowid` stays stable for the external-content FTS index.
+//! - [`RelativePath`] currently has a `todo!()` `TryFrom` (M2 lands the real
+//!   validator); rows are deserialised via [`serde_json`] over the
+//!   `#[serde(transparent)] String` shape so reads do not panic before then.
+
+use std::collections::HashMap;
+use std::path::Path;
+
+use anyhow::{anyhow, Result};
+use async_trait::async_trait;
+use serde_json::Value;
+use sqlx::sqlite::{SqliteConnectOptions, SqliteJournalMode, SqlitePool, SqliteSynchronous};
+use uuid::Uuid;
+
+use super::{
+    AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, FileSearchHit,
+    FileStateRow, NewActivity, NewPendingOp, PageRequest, PendingOpRow, SourceRow, StateRepo,
+};
+use crate::types::{
+    AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
+    UnixMs,
+};
+
+/// SQLite-backed [`StateRepo`] handle.
+///
+/// Wraps a [`SqlitePool`] over `<config_dir>/driven/state.db` (SPEC s2).
+/// Cheap to clone via the inner pool's `Arc`-shaped handle.
+#[derive(Debug, Clone)]
+pub struct SqliteStateRepo {
+    pool: SqlitePool,
+}
+
+impl SqliteStateRepo {
+    /// Open (or create) the SQLite state DB at `path`, configure pragmas,
+    /// run all embedded migrations, then verify integrity.
+    ///
+    /// Pragmas applied (DESIGN s5.6, SPEC s2):
+    /// - `journal_mode = WAL` for concurrent reads with one writer.
+    /// - `synchronous = NORMAL` (the WAL-mode-safe choice).
+    /// - `foreign_keys = ON` so the schema's `ON DELETE CASCADE` chain works.
+    /// - `busy_timeout = 5s` so the rare contended commit waits instead of
+    ///   surfacing `SQLITE_BUSY` to the orchestrator.
+    ///
+    /// Surfaces [`crate::types::ErrorCode::StateDbCorrupt`] (as an
+    /// `anyhow` error carrying the `state.db_corrupt` code prefix) when
+    /// `PRAGMA integrity_check` returns anything other than `ok`.
+    pub async fn open(path: &Path) -> Result<Self> {
+        let opts = SqliteConnectOptions::new()
+            .filename(path)
+            .create_if_missing(true)
+            .journal_mode(SqliteJournalMode::Wal)
+            .synchronous(SqliteSynchronous::Normal)
+            .foreign_keys(true)
+            .busy_timeout(std::time::Duration::from_secs(5));
+
+        let pool = SqlitePool::connect_with(opts).await?;
+
+        sqlx::migrate!("./src/migrations").run(&pool).await?;
+
+        // Integrity check on every open (SPEC s24 state.db_corrupt). Cheap
+        // for the V1 state.db (typically a few MB).
+        let check: (String,) = sqlx::query_as("PRAGMA integrity_check;")
+            .fetch_one(&pool)
+            .await?;
+        if check.0 != "ok" {
+            return Err(anyhow!(
+                "state.db_corrupt: PRAGMA integrity_check returned {}",
+                check.0
+            ));
+        }
+
+        Ok(Self { pool })
+    }
+
+    /// Borrow the underlying pool. Useful for advanced callers that want
+    /// to run their own transaction; the trait surface is enough for
+    /// every orchestrator path.
+    pub fn pool(&self) -> &SqlitePool {
+        &self.pool
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Encoding / decoding helpers between SQL primitives and the typed rows.
+// -----------------------------------------------------------------------------
+
+fn relative_path_from_string(s: String) -> Result<RelativePath> {
+    // `RelativePath::TryFrom<String>` is currently `todo!()` (M2 lands the
+    // real validator). The serde-transparent shape over `String` lets us
+    // reconstruct rows that round-trip through SQLite without panicking.
+    serde_json::from_value::<RelativePath>(Value::String(s))
+        .map_err(|e| anyhow!("invalid relative_path on read: {e}"))
+}
+
+fn account_state_to_str(s: AccountState) -> &'static str {
+    match s {
+        AccountState::Ok => "ok",
+        AccountState::NeedsReauth => "needs_reauth",
+        AccountState::Disabled => "disabled",
+    }
+}
+
+fn account_state_from_str(s: &str) -> Result<AccountState> {
+    match s {
+        "ok" => Ok(AccountState::Ok),
+        "needs_reauth" => Ok(AccountState::NeedsReauth),
+        "disabled" => Ok(AccountState::Disabled),
+        other => Err(anyhow!("invalid accounts.state value: {other}")),
+    }
+}
+
+fn file_state_status_to_str(s: FileStateStatus) -> &'static str {
+    match s {
+        FileStateStatus::Synced => "synced",
+        FileStateStatus::Pending => "pending",
+        FileStateStatus::Corrupt => "corrupt",
+        FileStateStatus::Locked => "locked",
+        FileStateStatus::Error => "error",
+    }
+}
+
+fn file_state_status_from_str(s: &str) -> Result<FileStateStatus> {
+    match s {
+        "synced" => Ok(FileStateStatus::Synced),
+        "pending" => Ok(FileStateStatus::Pending),
+        "corrupt" => Ok(FileStateStatus::Corrupt),
+        "locked" => Ok(FileStateStatus::Locked),
+        "error" => Ok(FileStateStatus::Error),
+        other => Err(anyhow!("invalid file_state.status value: {other}")),
+    }
+}
+
+fn activity_level_to_str(l: ActivityLevel) -> &'static str {
+    match l {
+        ActivityLevel::Info => "info",
+        ActivityLevel::Warn => "warn",
+        ActivityLevel::Error => "error",
+    }
+}
+
+fn activity_level_from_str(s: &str) -> Result<ActivityLevel> {
+    match s {
+        "info" => Ok(ActivityLevel::Info),
+        "warn" => Ok(ActivityLevel::Warn),
+        "error" => Ok(ActivityLevel::Error),
+        other => Err(anyhow!("invalid activity_log.level value: {other}")),
+    }
+}
+
+/// Numeric severity for `activity_level` ordering (`info < warn < error`).
+/// Used for `ActivityFilter.min_level` filtering because the on-disk value
+/// is TEXT and alphabetical ordering would put `error < info < warn`.
+fn activity_level_rank(l: ActivityLevel) -> i64 {
+    match l {
+        ActivityLevel::Info => 0,
+        ActivityLevel::Warn => 1,
+        ActivityLevel::Error => 2,
+    }
+}
+
+fn hash32_from_bytes(b: Vec<u8>) -> Result<[u8; 32]> {
+    <[u8; 32]>::try_from(b.as_slice()).map_err(|_| anyhow!("hash_blake3 must be 32 bytes"))
+}
+
+fn md5_from_bytes(b: Option<Vec<u8>>) -> Result<Option<[u8; 16]>> {
+    match b {
+        None => Ok(None),
+        Some(v) => <[u8; 16]>::try_from(v.as_slice())
+            .map(Some)
+            .map_err(|_| anyhow!("drive_md5 must be 16 bytes")),
+    }
+}
+
+fn uuid_from_str(s: &str) -> Result<Uuid> {
+    Uuid::parse_str(s).map_err(|e| anyhow!("invalid uuid {s:?}: {e}"))
+}
+
+// -----------------------------------------------------------------------------
+// StateRepo impl.
+// -----------------------------------------------------------------------------
+
+#[async_trait]
+impl StateRepo for SqliteStateRepo {
+    // --- accounts -----------------------------------------------------------
+
+    async fn list_accounts(&self) -> Result<Vec<AccountRow>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id                       AS "id!: String",
+                email                    AS "email!: String",
+                display_name             AS "display_name: String",
+                state                    AS "state!: String",
+                encryption_master_key_id AS "encryption_master_key_id: String",
+                created_at               AS "created_at!: i64",
+                last_synced_at           AS "last_synced_at: i64"
+            FROM accounts
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(AccountRow {
+                    id: AccountId(uuid_from_str(&r.id)?),
+                    email: r.email,
+                    display_name: r.display_name,
+                    state: account_state_from_str(&r.state)?,
+                    encryption_master_key_id: r.encryption_master_key_id,
+                    created_at: r.created_at,
+                    last_synced_at: r.last_synced_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn upsert_account(&self, row: &AccountRow) -> Result<()> {
+        let id = row.id.to_string();
+        let state = account_state_to_str(row.state);
+        sqlx::query!(
+            r#"
+            INSERT INTO accounts (
+                id, email, display_name, state,
+                encryption_master_key_id, created_at, last_synced_at
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            ON CONFLICT(id) DO UPDATE SET
+                email                    = excluded.email,
+                display_name             = excluded.display_name,
+                state                    = excluded.state,
+                encryption_master_key_id = excluded.encryption_master_key_id,
+                created_at               = excluded.created_at,
+                last_synced_at           = excluded.last_synced_at
+            "#,
+            id,
+            row.email,
+            row.display_name,
+            state,
+            row.encryption_master_key_id,
+            row.created_at,
+            row.last_synced_at,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_account_state(&self, id: AccountId, state: AccountState) -> Result<()> {
+        let id_str = id.to_string();
+        let state_str = account_state_to_str(state);
+        sqlx::query!(
+            "UPDATE accounts SET state = ?1 WHERE id = ?2",
+            state_str,
+            id_str,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_account(&self, id: AccountId) -> Result<()> {
+        let id_str = id.to_string();
+        sqlx::query!("DELETE FROM accounts WHERE id = ?1", id_str)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // --- backup_sources -----------------------------------------------------
+
+    async fn list_sources(&self) -> Result<Vec<SourceRow>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id                        AS "id!: String",
+                account_id                AS "account_id!: String",
+                display_name              AS "display_name!: String",
+                enabled                   AS "enabled!: i64",
+                local_path                AS "local_path!: String",
+                drive_folder_id           AS "drive_folder_id!: String",
+                drive_folder_path         AS "drive_folder_path!: String",
+                encryption_enabled        AS "encryption_enabled!: i64",
+                wrapped_source_key        AS "wrapped_source_key: Vec<u8>",
+                respect_gitignore         AS "respect_gitignore!: i64",
+                include_patterns          AS "include_patterns!: String",
+                exclude_patterns          AS "exclude_patterns!: String",
+                schedule_json_v2_reserved AS "schedule_json_v2_reserved: String",
+                deep_verify_interval_secs AS "deep_verify_interval_secs!: i64",
+                last_full_scan_at         AS "last_full_scan_at: i64",
+                last_deep_verify_at       AS "last_deep_verify_at: i64",
+                created_at                AS "created_at!: i64"
+            FROM backup_sources
+            ORDER BY created_at ASC, id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(SourceRow {
+                    id: SourceId(uuid_from_str(&r.id)?),
+                    account_id: AccountId(uuid_from_str(&r.account_id)?),
+                    display_name: r.display_name,
+                    enabled: r.enabled != 0,
+                    local_path: r.local_path,
+                    drive_folder_id: r.drive_folder_id,
+                    drive_folder_path: r.drive_folder_path,
+                    encryption_enabled: r.encryption_enabled != 0,
+                    wrapped_source_key: r.wrapped_source_key,
+                    respect_gitignore: r.respect_gitignore != 0,
+                    include_patterns: serde_json::from_str(&r.include_patterns)?,
+                    exclude_patterns: serde_json::from_str(&r.exclude_patterns)?,
+                    schedule_json_v2_reserved: r.schedule_json_v2_reserved,
+                    deep_verify_interval_secs: u32::try_from(r.deep_verify_interval_secs)
+                        .map_err(|_| anyhow!("deep_verify_interval_secs out of u32 range"))?,
+                    last_full_scan_at: r.last_full_scan_at,
+                    last_deep_verify_at: r.last_deep_verify_at,
+                    created_at: r.created_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn list_enabled_sources_for(&self, account: AccountId) -> Result<Vec<SourceRow>> {
+        let account_str = account.to_string();
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id                        AS "id!: String",
+                account_id                AS "account_id!: String",
+                display_name              AS "display_name!: String",
+                enabled                   AS "enabled!: i64",
+                local_path                AS "local_path!: String",
+                drive_folder_id           AS "drive_folder_id!: String",
+                drive_folder_path         AS "drive_folder_path!: String",
+                encryption_enabled        AS "encryption_enabled!: i64",
+                wrapped_source_key        AS "wrapped_source_key: Vec<u8>",
+                respect_gitignore         AS "respect_gitignore!: i64",
+                include_patterns          AS "include_patterns!: String",
+                exclude_patterns          AS "exclude_patterns!: String",
+                schedule_json_v2_reserved AS "schedule_json_v2_reserved: String",
+                deep_verify_interval_secs AS "deep_verify_interval_secs!: i64",
+                last_full_scan_at         AS "last_full_scan_at: i64",
+                last_deep_verify_at       AS "last_deep_verify_at: i64",
+                created_at                AS "created_at!: i64"
+            FROM backup_sources
+            WHERE account_id = ?1 AND enabled = 1
+            ORDER BY created_at ASC, id ASC
+            "#,
+            account_str,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(SourceRow {
+                    id: SourceId(uuid_from_str(&r.id)?),
+                    account_id: AccountId(uuid_from_str(&r.account_id)?),
+                    display_name: r.display_name,
+                    enabled: r.enabled != 0,
+                    local_path: r.local_path,
+                    drive_folder_id: r.drive_folder_id,
+                    drive_folder_path: r.drive_folder_path,
+                    encryption_enabled: r.encryption_enabled != 0,
+                    wrapped_source_key: r.wrapped_source_key,
+                    respect_gitignore: r.respect_gitignore != 0,
+                    include_patterns: serde_json::from_str(&r.include_patterns)?,
+                    exclude_patterns: serde_json::from_str(&r.exclude_patterns)?,
+                    schedule_json_v2_reserved: r.schedule_json_v2_reserved,
+                    deep_verify_interval_secs: u32::try_from(r.deep_verify_interval_secs)
+                        .map_err(|_| anyhow!("deep_verify_interval_secs out of u32 range"))?,
+                    last_full_scan_at: r.last_full_scan_at,
+                    last_deep_verify_at: r.last_deep_verify_at,
+                    created_at: r.created_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn upsert_source(&self, row: &SourceRow) -> Result<()> {
+        let id = row.id.to_string();
+        let account_id = row.account_id.to_string();
+        let enabled = row.enabled as i64;
+        let encryption_enabled = row.encryption_enabled as i64;
+        let respect_gitignore = row.respect_gitignore as i64;
+        let include_patterns = serde_json::to_string(&row.include_patterns)?;
+        let exclude_patterns = serde_json::to_string(&row.exclude_patterns)?;
+        let wrapped: Option<&[u8]> = row.wrapped_source_key.as_deref();
+        let deep_verify_interval_secs = row.deep_verify_interval_secs as i64;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO backup_sources (
+                id, account_id, display_name, enabled,
+                local_path, drive_folder_id, drive_folder_path,
+                encryption_enabled, wrapped_source_key, respect_gitignore,
+                include_patterns, exclude_patterns, schedule_json_v2_reserved,
+                deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
+                created_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, ?6, ?7,
+                ?8, ?9, ?10,
+                ?11, ?12, ?13,
+                ?14, ?15, ?16,
+                ?17
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                account_id                = excluded.account_id,
+                display_name              = excluded.display_name,
+                enabled                   = excluded.enabled,
+                local_path                = excluded.local_path,
+                drive_folder_id           = excluded.drive_folder_id,
+                drive_folder_path         = excluded.drive_folder_path,
+                encryption_enabled        = excluded.encryption_enabled,
+                wrapped_source_key        = excluded.wrapped_source_key,
+                respect_gitignore         = excluded.respect_gitignore,
+                include_patterns          = excluded.include_patterns,
+                exclude_patterns          = excluded.exclude_patterns,
+                schedule_json_v2_reserved = excluded.schedule_json_v2_reserved,
+                deep_verify_interval_secs = excluded.deep_verify_interval_secs,
+                last_full_scan_at         = excluded.last_full_scan_at,
+                last_deep_verify_at       = excluded.last_deep_verify_at,
+                created_at                = excluded.created_at
+            "#,
+            id,
+            account_id,
+            row.display_name,
+            enabled,
+            row.local_path,
+            row.drive_folder_id,
+            row.drive_folder_path,
+            encryption_enabled,
+            wrapped,
+            respect_gitignore,
+            include_patterns,
+            exclude_patterns,
+            row.schedule_json_v2_reserved,
+            deep_verify_interval_secs,
+            row.last_full_scan_at,
+            row.last_deep_verify_at,
+            row.created_at,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_source(&self, id: SourceId) -> Result<()> {
+        let id_str = id.to_string();
+        sqlx::query!("DELETE FROM backup_sources WHERE id = ?1", id_str)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // --- file_state ---------------------------------------------------------
+
+    async fn load_source_file_state(
+        &self,
+        source: SourceId,
+    ) -> Result<HashMap<RelativePath, FileStateRow>> {
+        let source_str = source.to_string();
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                source_id             AS "source_id!: String",
+                relative_path         AS "relative_path!: String",
+                size                  AS "size!: i64",
+                mtime_ns              AS "mtime_ns!: i64",
+                hash_blake3           AS "hash_blake3!: Vec<u8>",
+                drive_file_id         AS "drive_file_id: String",
+                drive_md5             AS "drive_md5: Vec<u8>",
+                encrypted_remote_path AS "encrypted_remote_path: String",
+                status                AS "status!: String",
+                last_uploaded_at      AS "last_uploaded_at: i64",
+                last_verified_at      AS "last_verified_at: i64"
+            FROM file_state
+            WHERE source_id = ?1
+            "#,
+            source_str,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut out = HashMap::with_capacity(rows.len());
+        for r in rows {
+            let path = relative_path_from_string(r.relative_path)?;
+            let row = FileStateRow {
+                source_id: SourceId(uuid_from_str(&r.source_id)?),
+                relative_path: path.clone(),
+                size: r.size as u64,
+                mtime_ns: r.mtime_ns,
+                hash_blake3: hash32_from_bytes(r.hash_blake3)?,
+                drive_file_id: r.drive_file_id,
+                drive_md5: md5_from_bytes(r.drive_md5)?,
+                encrypted_remote_path: r.encrypted_remote_path,
+                status: file_state_status_from_str(&r.status)?,
+                last_uploaded_at: r.last_uploaded_at,
+                last_verified_at: r.last_verified_at,
+            };
+            out.insert(path, row);
+        }
+        Ok(out)
+    }
+
+    async fn get_file_state(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+    ) -> Result<Option<FileStateRow>> {
+        let source_str = source.to_string();
+        let path_str = path.as_str().to_string();
+        let opt = sqlx::query!(
+            r#"
+            SELECT
+                source_id             AS "source_id!: String",
+                relative_path         AS "relative_path!: String",
+                size                  AS "size!: i64",
+                mtime_ns              AS "mtime_ns!: i64",
+                hash_blake3           AS "hash_blake3!: Vec<u8>",
+                drive_file_id         AS "drive_file_id: String",
+                drive_md5             AS "drive_md5: Vec<u8>",
+                encrypted_remote_path AS "encrypted_remote_path: String",
+                status                AS "status!: String",
+                last_uploaded_at      AS "last_uploaded_at: i64",
+                last_verified_at      AS "last_verified_at: i64"
+            FROM file_state
+            WHERE source_id = ?1 AND relative_path = ?2
+            "#,
+            source_str,
+            path_str,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+
+        let Some(r) = opt else { return Ok(None) };
+        let rp = relative_path_from_string(r.relative_path)?;
+        Ok(Some(FileStateRow {
+            source_id: SourceId(uuid_from_str(&r.source_id)?),
+            relative_path: rp,
+            size: r.size as u64,
+            mtime_ns: r.mtime_ns,
+            hash_blake3: hash32_from_bytes(r.hash_blake3)?,
+            drive_file_id: r.drive_file_id,
+            drive_md5: md5_from_bytes(r.drive_md5)?,
+            encrypted_remote_path: r.encrypted_remote_path,
+            status: file_state_status_from_str(&r.status)?,
+            last_uploaded_at: r.last_uploaded_at,
+            last_verified_at: r.last_verified_at,
+        }))
+    }
+
+    async fn upsert_file_state(&self, row: &FileStateRow) -> Result<()> {
+        let source_id = row.source_id.to_string();
+        let relative_path = row.relative_path.as_str().to_string();
+        let size = row.size as i64;
+        let hash: &[u8] = &row.hash_blake3[..];
+        let md5_owned: Option<Vec<u8>> = row.drive_md5.map(|m| m.to_vec());
+        let md5: Option<&[u8]> = md5_owned.as_deref();
+        let status = file_state_status_to_str(row.status);
+
+        sqlx::query!(
+            r#"
+            INSERT INTO file_state (
+                source_id, relative_path, size, mtime_ns,
+                hash_blake3, drive_file_id, drive_md5, encrypted_remote_path,
+                status, last_uploaded_at, last_verified_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11
+            )
+            ON CONFLICT(source_id, relative_path) DO UPDATE SET
+                size                  = excluded.size,
+                mtime_ns              = excluded.mtime_ns,
+                hash_blake3           = excluded.hash_blake3,
+                drive_file_id         = excluded.drive_file_id,
+                drive_md5             = excluded.drive_md5,
+                encrypted_remote_path = excluded.encrypted_remote_path,
+                status                = excluded.status,
+                last_uploaded_at      = excluded.last_uploaded_at,
+                last_verified_at      = excluded.last_verified_at
+            "#,
+            source_id,
+            relative_path,
+            size,
+            row.mtime_ns,
+            hash,
+            row.drive_file_id,
+            md5,
+            row.encrypted_remote_path,
+            status,
+            row.last_uploaded_at,
+            row.last_verified_at,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_file_state(&self, source: SourceId, path: &RelativePath) -> Result<()> {
+        let source_str = source.to_string();
+        let path_str = path.as_str().to_string();
+        sqlx::query!(
+            "DELETE FROM file_state WHERE source_id = ?1 AND relative_path = ?2",
+            source_str,
+            path_str,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // --- pending_ops --------------------------------------------------------
+
+    async fn enqueue_pending_op(&self, row: NewPendingOp) -> Result<PendingOpId> {
+        let source_id = row.source_id.to_string();
+        let relative_path = row.relative_path.as_str().to_string();
+        let payload_json = serde_json::to_string(&row.payload_json)?;
+        let result = sqlx::query!(
+            r#"
+            INSERT INTO pending_ops (
+                source_id, op_type, relative_path, payload_json,
+                attempts, last_error, scheduled_for, created_at
+            ) VALUES (?1, ?2, ?3, ?4, 0, NULL, ?5, ?6)
+            "#,
+            source_id,
+            row.op_type,
+            relative_path,
+            payload_json,
+            row.scheduled_for,
+            row.created_at,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(PendingOpId(result.last_insert_rowid()))
+    }
+
+    async fn get_pending_ops_due(&self, now_ms: UnixMs, limit: u32) -> Result<Vec<PendingOpRow>> {
+        let limit_i = limit as i64;
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id            AS "id!: i64",
+                source_id     AS "source_id!: String",
+                op_type       AS "op_type!: String",
+                relative_path AS "relative_path!: String",
+                payload_json  AS "payload_json!: String",
+                attempts      AS "attempts!: i64",
+                last_error    AS "last_error: String",
+                scheduled_for AS "scheduled_for!: i64",
+                created_at    AS "created_at!: i64"
+            FROM pending_ops
+            WHERE scheduled_for <= ?1
+            ORDER BY scheduled_for ASC, id ASC
+            LIMIT ?2
+            "#,
+            now_ms,
+            limit_i,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(PendingOpRow {
+                    id: PendingOpId(r.id),
+                    source_id: SourceId(uuid_from_str(&r.source_id)?),
+                    op_type: r.op_type,
+                    relative_path: relative_path_from_string(r.relative_path)?,
+                    payload_json: serde_json::from_str(&r.payload_json)?,
+                    attempts: r.attempts as u32,
+                    last_error: r.last_error,
+                    scheduled_for: r.scheduled_for,
+                    created_at: r.created_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn mark_pending_op_attempted(
+        &self,
+        id: PendingOpId,
+        error: Option<&str>,
+        next_attempt_ms: UnixMs,
+    ) -> Result<()> {
+        let id_v = id.0;
+        sqlx::query!(
+            r#"
+            UPDATE pending_ops
+               SET attempts = attempts + 1,
+                   last_error = ?2,
+                   scheduled_for = ?3
+             WHERE id = ?1
+            "#,
+            id_v,
+            error,
+            next_attempt_ms,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_pending_op(&self, id: PendingOpId) -> Result<()> {
+        let id_v = id.0;
+        sqlx::query!("DELETE FROM pending_ops WHERE id = ?1", id_v)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    // --- activity_log -------------------------------------------------------
+
+    async fn write_activity(&self, row: NewActivity) -> Result<ActivityId> {
+        let source_id = row.source_id.map(|s| s.to_string());
+        let level = activity_level_to_str(row.level);
+        let file_count: Option<i64> = row.file_count.map(|v| v as i64);
+        let bytes: Option<i64> = row.bytes.map(|v| v as i64);
+        let result = sqlx::query!(
+            r#"
+            INSERT INTO activity_log (
+                ts, source_id, level, event_type, file_count, bytes, message
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+            "#,
+            row.ts,
+            source_id,
+            level,
+            row.event_type,
+            file_count,
+            bytes,
+            row.message,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(ActivityId(result.last_insert_rowid()))
+    }
+
+    async fn query_activity(
+        &self,
+        filter: ActivityFilter,
+        page: PageRequest,
+    ) -> Result<ActivityPage> {
+        // The combined predicate is the AND of all populated filter fields.
+        // sqlx macro form cannot bind a dynamic IN-list for `event_types`,
+        // so that filter is evaluated client-side after the page is paged
+        // off the SQL row order. The remaining predicates push down to SQL.
+        //
+        // `min_level`: TEXT compare on `level` is alphabetical and would
+        // sort `error < info < warn`. Compare numeric rank instead.
+        let source_id = filter.source_id.map(|s| s.to_string());
+        let since = filter.since_ms;
+        let before = filter.before_ms;
+        let min_rank = filter.min_level.map(activity_level_rank);
+        let limit_i = page.limit as i64;
+        let offset_i = (page.page as i64) * limit_i;
+
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id         AS "id!: i64",
+                ts         AS "ts!: i64",
+                source_id  AS "source_id: String",
+                level      AS "level!: String",
+                event_type AS "event_type!: String",
+                file_count AS "file_count: i64",
+                bytes      AS "bytes: i64",
+                message    AS "message: String"
+            FROM activity_log
+            WHERE (?1 IS NULL OR source_id = ?1)
+              AND (?2 IS NULL OR ts >= ?2)
+              AND (?3 IS NULL OR ts <  ?3)
+              AND (?4 IS NULL OR CASE level
+                                    WHEN 'info'  THEN 0
+                                    WHEN 'warn'  THEN 1
+                                    WHEN 'error' THEN 2
+                                    ELSE -1
+                                 END >= ?4)
+            ORDER BY ts DESC, id DESC
+            LIMIT ?5 OFFSET ?6
+            "#,
+            source_id,
+            since,
+            before,
+            min_rank,
+            limit_i,
+            offset_i,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let total = sqlx::query!(
+            r#"
+            SELECT COUNT(*) AS "total!: i64"
+            FROM activity_log
+            WHERE (?1 IS NULL OR source_id = ?1)
+              AND (?2 IS NULL OR ts >= ?2)
+              AND (?3 IS NULL OR ts <  ?3)
+              AND (?4 IS NULL OR CASE level
+                                    WHEN 'info'  THEN 0
+                                    WHEN 'warn'  THEN 1
+                                    WHEN 'error' THEN 2
+                                    ELSE -1
+                                 END >= ?4)
+            "#,
+            source_id,
+            since,
+            before,
+            min_rank,
+        )
+        .fetch_one(&self.pool)
+        .await?
+        .total;
+
+        let mut decoded = Vec::with_capacity(rows.len());
+        for r in rows {
+            let parsed_source = match r.source_id {
+                None => None,
+                Some(s) => Some(SourceId(uuid_from_str(&s)?)),
+            };
+            let event_type = r.event_type;
+            // Apply the event_type filter client-side: sqlx macro form can't
+            // bind a dynamic IN-list against SQLite at compile time.
+            if !filter.event_types.is_empty()
+                && !filter.event_types.iter().any(|e| e == &event_type)
+            {
+                continue;
+            }
+            decoded.push(ActivityRow {
+                id: ActivityId(r.id),
+                ts: r.ts,
+                source_id: parsed_source,
+                level: activity_level_from_str(&r.level)?,
+                event_type,
+                file_count: r.file_count.map(|v| v as u64),
+                bytes: r.bytes.map(|v| v as u64),
+                message: r.message,
+            });
+        }
+
+        Ok(ActivityPage {
+            rows: decoded,
+            total: total as u64,
+        })
+    }
+
+    async fn prune_activity_older_than(&self, before_ms: UnixMs, hard_cap: u64) -> Result<u64> {
+        // DESIGN s18.4: two complementary deletes.
+        // 1. Age-based: delete rows older than `before_ms`.
+        // 2. Hard cap: if more than `hard_cap` rows remain, delete the oldest
+        //    until exactly `hard_cap` newest rows survive.
+        // Returns the total number of deleted rows across both passes.
+        let mut tx = self.pool.begin().await?;
+        let age_deleted = sqlx::query!("DELETE FROM activity_log WHERE ts < ?1", before_ms)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+
+        let remaining: i64 = sqlx::query_scalar!("SELECT COUNT(*) FROM activity_log")
+            .fetch_one(&mut *tx)
+            .await?;
+        let hard_cap_i = i64::try_from(hard_cap).unwrap_or(i64::MAX);
+        let cap_deleted = if remaining > hard_cap_i {
+            let excess = remaining - hard_cap_i;
+            sqlx::query!(
+                r#"
+                DELETE FROM activity_log
+                 WHERE id IN (
+                    SELECT id FROM activity_log
+                     ORDER BY ts ASC, id ASC
+                     LIMIT ?1
+                 )
+                "#,
+                excess,
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+        } else {
+            0
+        };
+
+        tx.commit().await?;
+        Ok(age_deleted + cap_deleted)
+    }
+
+    // --- settings -----------------------------------------------------------
+
+    async fn get_setting(&self, key: &str) -> Result<Option<Value>> {
+        let row = sqlx::query!(
+            r#"SELECT value AS "value!: String" FROM settings WHERE key = ?1"#,
+            key,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        match row {
+            None => Ok(None),
+            Some(r) => Ok(Some(serde_json::from_str(&r.value)?)),
+        }
+    }
+
+    async fn set_setting(&self, key: &str, value: &Value) -> Result<()> {
+        let v = serde_json::to_string(value)?;
+        sqlx::query!(
+            r#"
+            INSERT INTO settings (key, value) VALUES (?1, ?2)
+            ON CONFLICT(key) DO UPDATE SET value = excluded.value
+            "#,
+            key,
+            v,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    // --- search -------------------------------------------------------------
+
+    async fn search_files(
+        &self,
+        source: Option<SourceId>,
+        query: &str,
+        limit: u32,
+    ) -> Result<Vec<FileSearchHit>> {
+        let source_str = source.map(|s| s.to_string());
+        let limit_i = limit as i64;
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                fs.source_id     AS "source_id!: String",
+                fs.relative_path AS "relative_path!: String",
+                fs.status        AS "status!: String",
+                fs.drive_file_id AS "drive_file_id: String"
+            FROM file_state_fts
+            JOIN file_state fs ON fs.rowid = file_state_fts.rowid
+            WHERE file_state_fts MATCH ?1
+              AND (?2 IS NULL OR fs.source_id = ?2)
+            ORDER BY rank
+            LIMIT ?3
+            "#,
+            query,
+            source_str,
+            limit_i,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(FileSearchHit {
+                    source_id: SourceId(uuid_from_str(&r.source_id)?),
+                    relative_path: relative_path_from_string(r.relative_path)?,
+                    status: file_state_status_from_str(&r.status)?,
+                    drive_file_id: r.drive_file_id,
+                })
+            })
+            .collect()
+    }
+}
+
+// -----------------------------------------------------------------------------
+// Tests
+// -----------------------------------------------------------------------------
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::state::{ActivityFilter, NewActivity, NewPendingOp, PageRequest};
+    use std::sync::Arc;
+    use tempfile::TempDir;
+
+    async fn temp_repo() -> (SqliteStateRepo, TempDir) {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+        let repo = SqliteStateRepo::open(&path).await.expect("open");
+        (repo, dir)
+    }
+
+    fn rp(s: &str) -> RelativePath {
+        // Tests construct RelativePath via the serde-transparent string
+        // shape (TryFrom is `todo!()` until M2 lands the real validator).
+        serde_json::from_value(Value::String(s.to_string())).expect("rp")
+    }
+
+    fn sample_account() -> AccountRow {
+        AccountRow {
+            id: AccountId::new_v4(),
+            email: "alice@example.com".into(),
+            display_name: Some("Alice".into()),
+            state: AccountState::Ok,
+            encryption_master_key_id: Some("kc:alice".into()),
+            created_at: 1_700_000_000_000,
+            last_synced_at: None,
+        }
+    }
+
+    fn sample_source(account_id: AccountId) -> SourceRow {
+        SourceRow {
+            id: SourceId::new_v4(),
+            account_id,
+            display_name: "Docs".into(),
+            enabled: true,
+            local_path: "/home/alice/docs".into(),
+            drive_folder_id: "folder-1".into(),
+            drive_folder_path: "/Driven/Docs".into(),
+            encryption_enabled: false,
+            wrapped_source_key: None,
+            respect_gitignore: true,
+            include_patterns: vec!["**/*".into()],
+            exclude_patterns: vec!["**/*.tmp".into()],
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: 604_800,
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            created_at: 1_700_000_000_000,
+        }
+    }
+
+    fn sample_file(source_id: SourceId, path: &str, hash_byte: u8) -> FileStateRow {
+        FileStateRow {
+            source_id,
+            relative_path: rp(path),
+            size: 1024,
+            mtime_ns: 1_700_000_000_000_000_000,
+            hash_blake3: [hash_byte; 32],
+            drive_file_id: None,
+            drive_md5: None,
+            encrypted_remote_path: None,
+            status: FileStateStatus::Pending,
+            last_uploaded_at: None,
+            last_verified_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn account_round_trip() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+
+        let listed = repo.list_accounts().await.unwrap();
+        assert_eq!(listed.len(), 1);
+        assert_eq!(&listed[0], &acct);
+
+        // Idempotent upsert (would have cascade-nuked if REPLACE was used).
+        repo.upsert_account(&acct).await.unwrap();
+        assert_eq!(repo.list_accounts().await.unwrap().len(), 1);
+
+        repo.mark_account_state(acct.id, AccountState::NeedsReauth)
+            .await
+            .unwrap();
+        let after = repo.list_accounts().await.unwrap();
+        assert_eq!(after[0].state, AccountState::NeedsReauth);
+
+        repo.delete_account(acct.id).await.unwrap();
+        assert!(repo.list_accounts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn source_round_trip() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let all = repo.list_sources().await.unwrap();
+        assert_eq!(all, vec![src.clone()]);
+
+        let enabled = repo.list_enabled_sources_for(acct.id).await.unwrap();
+        assert_eq!(enabled, vec![src.clone()]);
+
+        let mut disabled = src.clone();
+        disabled.enabled = false;
+        repo.upsert_source(&disabled).await.unwrap();
+        let still_one_total = repo.list_sources().await.unwrap();
+        assert_eq!(still_one_total.len(), 1);
+        let enabled_after = repo.list_enabled_sources_for(acct.id).await.unwrap();
+        assert!(enabled_after.is_empty());
+
+        repo.delete_source(src.id).await.unwrap();
+        assert!(repo.list_sources().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn cascade_delete_account_removes_sources_and_files() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        let f = sample_file(src.id, "a.txt", 0xAA);
+        repo.upsert_file_state(&f).await.unwrap();
+
+        repo.delete_account(acct.id).await.unwrap();
+        assert!(repo.list_accounts().await.unwrap().is_empty());
+        assert!(repo.list_sources().await.unwrap().is_empty());
+        let map = repo.load_source_file_state(src.id).await.unwrap();
+        assert!(map.is_empty());
+    }
+
+    #[tokio::test]
+    async fn file_state_round_trip() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let f1 = sample_file(src.id, "a/b.txt", 0x11);
+        let f2 = sample_file(src.id, "c.txt", 0x22);
+        repo.upsert_file_state(&f1).await.unwrap();
+        repo.upsert_file_state(&f2).await.unwrap();
+
+        let map = repo.load_source_file_state(src.id).await.unwrap();
+        assert_eq!(map.len(), 2);
+        assert_eq!(map.get(&rp("a/b.txt")), Some(&f1));
+        assert_eq!(map.get(&rp("c.txt")), Some(&f2));
+
+        let got = repo
+            .get_file_state(src.id, &rp("a/b.txt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got, f1);
+
+        // Update via upsert (must NOT cascade-nuke).
+        let mut f1_upd = f1.clone();
+        f1_upd.status = FileStateStatus::Synced;
+        f1_upd.drive_file_id = Some("drv-1".into());
+        f1_upd.drive_md5 = Some([0xFF; 16]);
+        repo.upsert_file_state(&f1_upd).await.unwrap();
+        assert_eq!(
+            repo.get_file_state(src.id, &rp("a/b.txt"))
+                .await
+                .unwrap()
+                .unwrap(),
+            f1_upd
+        );
+
+        repo.delete_file_state(src.id, &rp("c.txt")).await.unwrap();
+        assert_eq!(repo.load_source_file_state(src.id).await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn pending_op_lifecycle() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let id = repo
+            .enqueue_pending_op(NewPendingOp {
+                source_id: src.id,
+                op_type: "upload".into(),
+                relative_path: rp("a.txt"),
+                payload_json: serde_json::json!({ "session": "abc" }),
+                scheduled_for: 1_000,
+                created_at: 500,
+            })
+            .await
+            .unwrap();
+        assert!(id.0 > 0);
+
+        let due = repo.get_pending_ops_due(2_000, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, id);
+        assert_eq!(due[0].attempts, 0);
+
+        let none_due = repo.get_pending_ops_due(500, 10).await.unwrap();
+        assert!(none_due.is_empty());
+
+        repo.mark_pending_op_attempted(id, Some("boom"), 5_000)
+            .await
+            .unwrap();
+        let due_after = repo.get_pending_ops_due(10_000, 10).await.unwrap();
+        assert_eq!(due_after.len(), 1);
+        assert_eq!(due_after[0].attempts, 1);
+        assert_eq!(due_after[0].last_error.as_deref(), Some("boom"));
+        assert_eq!(due_after[0].scheduled_for, 5_000);
+
+        repo.delete_pending_op(id).await.unwrap();
+        assert!(repo
+            .get_pending_ops_due(10_000, 10)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn activity_write_and_query() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        for (ts, level, et) in [
+            (100, ActivityLevel::Info, "scan_done"),
+            (200, ActivityLevel::Warn, "paused"),
+            (300, ActivityLevel::Error, "error"),
+        ] {
+            repo.write_activity(NewActivity {
+                ts,
+                source_id: Some(src.id),
+                level,
+                event_type: et.into(),
+                file_count: Some(42),
+                bytes: Some(1024),
+                message: Some("hello".into()),
+            })
+            .await
+            .unwrap();
+        }
+
+        let page = repo
+            .query_activity(
+                ActivityFilter::default(),
+                PageRequest { page: 0, limit: 10 },
+            )
+            .await
+            .unwrap();
+        assert_eq!(page.total, 3);
+        // newest-first order
+        assert_eq!(page.rows.len(), 3);
+        assert_eq!(page.rows[0].ts, 300);
+        assert_eq!(page.rows[2].ts, 100);
+
+        let warn_plus = repo
+            .query_activity(
+                ActivityFilter {
+                    min_level: Some(ActivityLevel::Warn),
+                    ..Default::default()
+                },
+                PageRequest { page: 0, limit: 10 },
+            )
+            .await
+            .unwrap();
+        assert_eq!(warn_plus.rows.len(), 2);
+        assert_eq!(warn_plus.total, 2);
+
+        let only_paused = repo
+            .query_activity(
+                ActivityFilter {
+                    event_types: vec!["paused".into()],
+                    ..Default::default()
+                },
+                PageRequest { page: 0, limit: 10 },
+            )
+            .await
+            .unwrap();
+        assert_eq!(only_paused.rows.len(), 1);
+        assert_eq!(only_paused.rows[0].event_type, "paused");
+
+        let since_200 = repo
+            .query_activity(
+                ActivityFilter {
+                    since_ms: Some(200),
+                    ..Default::default()
+                },
+                PageRequest { page: 0, limit: 10 },
+            )
+            .await
+            .unwrap();
+        assert_eq!(since_200.rows.len(), 2);
+    }
+
+    #[tokio::test]
+    async fn settings_round_trip() {
+        let (repo, _dir) = temp_repo().await;
+
+        // Migration 0002 seeded the canonical keys.
+        let global = repo.get_setting("global").await.unwrap().unwrap();
+        assert_eq!(global["scan_interval_secs"], serde_json::json!(600));
+
+        let telemetry = repo.get_setting("telemetry").await.unwrap().unwrap();
+        let install_id = telemetry["install_id"].as_str().unwrap();
+        assert_eq!(install_id.len(), 32); // hex of 16 bytes
+
+        // Round-trip a custom value.
+        let v = serde_json::json!({"foo": "bar", "n": 7});
+        repo.set_setting("custom", &v).await.unwrap();
+        assert_eq!(repo.get_setting("custom").await.unwrap(), Some(v.clone()));
+
+        // Overwrite.
+        let v2 = serde_json::json!({"foo": "baz"});
+        repo.set_setting("custom", &v2).await.unwrap();
+        assert_eq!(repo.get_setting("custom").await.unwrap(), Some(v2));
+
+        assert_eq!(repo.get_setting("does_not_exist").await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn concurrent_upsert_file_state() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let repo = Arc::new(repo);
+        let mut handles = Vec::new();
+        // 50 tasks upsert IDENTICAL bytes to the same key. Race-free
+        // assertion: the final row matches the agreed payload.
+        for _ in 0..50 {
+            let repo = repo.clone();
+            let f = sample_file(src.id, "race.txt", 0x77);
+            handles.push(tokio::spawn(async move {
+                repo.upsert_file_state(&f).await.unwrap();
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        let got = repo
+            .get_file_state(src.id, &rp("race.txt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(got.hash_blake3, [0x77; 32]);
+        // Exactly one row exists.
+        let map = repo.load_source_file_state(src.id).await.unwrap();
+        assert_eq!(map.len(), 1);
+    }
+
+    #[tokio::test]
+    async fn prune_activity_respects_hard_cap() {
+        let (repo, _dir) = temp_repo().await;
+        for ts in 0..200 {
+            repo.write_activity(NewActivity {
+                ts,
+                source_id: None,
+                level: ActivityLevel::Info,
+                event_type: "noise".into(),
+                file_count: None,
+                bytes: None,
+                message: None,
+            })
+            .await
+            .unwrap();
+        }
+        // before_ms = 0 means no rows match the age cut; only the hard cap
+        // takes effect. 200 inserted - keep 150 -> 50 deleted (oldest).
+        let deleted = repo.prune_activity_older_than(0, 150).await.unwrap();
+        assert_eq!(deleted, 50);
+
+        let page = repo
+            .query_activity(ActivityFilter::default(), PageRequest { page: 0, limit: 1 })
+            .await
+            .unwrap();
+        assert_eq!(page.total, 150);
+        // newest row survived
+        assert_eq!(page.rows[0].ts, 199);
+
+        // Age-based pass: prune everything older than ts=180, no cap change.
+        let deleted_age = repo.prune_activity_older_than(180, 150).await.unwrap();
+        // We deleted rows with ts in 50..=179 (130 rows), then hard cap
+        // doesn't kick because 150 - 130 = 20 <= 150.
+        assert_eq!(deleted_age, 130);
+    }
+
+    #[tokio::test]
+    async fn fts5_prefix_search() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        for p in ["projects/alpha.md", "projects/beta.md", "notes/gamma.md"] {
+            repo.upsert_file_state(&sample_file(src.id, p, 0x01))
+                .await
+                .unwrap();
+        }
+
+        let hits = repo.search_files(None, "projects*", 10).await.unwrap();
+        assert_eq!(hits.len(), 2);
+        for h in &hits {
+            assert!(h.relative_path.as_str().starts_with("projects/"));
+        }
+
+        let only_notes = repo.search_files(None, "gamma*", 10).await.unwrap();
+        assert_eq!(only_notes.len(), 1);
+        assert_eq!(only_notes[0].relative_path.as_str(), "notes/gamma.md");
+    }
+
+    #[tokio::test]
+    async fn fts5_trigger_keeps_index_synced() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // FTS5 unicode61 tokenizer treats `-` and `.` as separators, so a
+        // path like "unique-token.txt" indexes the tokens `unique`, `token`,
+        // `txt`. The FTS5 MATCH grammar also reads a bare `-` as NOT, so we
+        // search by a single token (with prefix wildcard) rather than the
+        // literal hyphenated string.
+        let f = sample_file(src.id, "uniquetoken.txt", 0x33);
+        repo.upsert_file_state(&f).await.unwrap();
+        let hits = repo.search_files(None, "uniquetoken*", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+
+        repo.delete_file_state(src.id, &rp("uniquetoken.txt"))
+            .await
+            .unwrap();
+        let gone = repo.search_files(None, "uniquetoken*", 10).await.unwrap();
+        assert!(gone.is_empty());
+
+        // Update: rename a file's path. Old token should disappear from
+        // FTS, new token should appear.
+        let renamed = sample_file(src.id, "beforename.txt", 0x44);
+        repo.upsert_file_state(&renamed).await.unwrap();
+        let mut after = renamed.clone();
+        after.relative_path = rp("aftername.txt");
+        // Upsert against the new PK first, then delete the old row, since
+        // the PK is (source_id, relative_path) and updating the path means
+        // a new row from the table's perspective.
+        repo.upsert_file_state(&after).await.unwrap();
+        repo.delete_file_state(src.id, &rp("beforename.txt"))
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.search_files(None, "beforename*", 10)
+                .await
+                .unwrap()
+                .len(),
+            0
+        );
+        assert_eq!(
+            repo.search_files(None, "aftername*", 10)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+    }
+
+    #[tokio::test]
+    async fn integrity_check_happy_path() {
+        let (_repo, _dir) = temp_repo().await;
+        // Reaching here means open() succeeded: migrations ran and the
+        // PRAGMA integrity_check returned "ok".
+    }
+}

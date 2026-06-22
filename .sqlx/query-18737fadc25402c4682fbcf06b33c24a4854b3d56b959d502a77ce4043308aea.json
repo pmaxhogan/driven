@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM file_state WHERE source_id = ?1 AND relative_path = ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "18737fadc25402c4682fbcf06b33c24a4854b3d56b959d502a77ce4043308aea"
+}

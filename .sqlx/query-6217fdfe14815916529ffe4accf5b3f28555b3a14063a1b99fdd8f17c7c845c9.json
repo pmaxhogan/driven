@@ -1,0 +1,68 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                id            AS \"id!: i64\",\n                source_id     AS \"source_id!: String\",\n                op_type       AS \"op_type!: String\",\n                relative_path AS \"relative_path!: String\",\n                payload_json  AS \"payload_json!: String\",\n                attempts      AS \"attempts!: i64\",\n                last_error    AS \"last_error: String\",\n                scheduled_for AS \"scheduled_for!: i64\",\n                created_at    AS \"created_at!: i64\"\n            FROM pending_ops\n            WHERE scheduled_for <= ?1\n            ORDER BY scheduled_for ASC, id ASC\n            LIMIT ?2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "source_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "op_type!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "relative_path!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "payload_json!: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      },
+      {
+        "name": "attempts!: i64",
+        "ordinal": 5,
+        "type_info": "Integer"
+      },
+      {
+        "name": "last_error: String",
+        "ordinal": 6,
+        "type_info": "Text"
+      },
+      {
+        "name": "scheduled_for!: i64",
+        "ordinal": 7,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at!: i64",
+        "ordinal": 8,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "6217fdfe14815916529ffe4accf5b3f28555b3a14063a1b99fdd8f17c7c845c9"
+}

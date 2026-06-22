@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO activity_log (\n                ts, source_id, level, event_type, file_count, bytes, message\n            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "dc28a17be94145f86e69c934629f98f608a492cce9638d6ef393f42bfdd4a6b4"
+}

@@ -25,6 +25,9 @@ use crate::types::{
     UnixMs,
 };
 
+pub mod sqlite;
+pub use sqlite::SqliteStateRepo;
+
 // -----------------------------------------------------------------------------
 // Row types - mirror SPEC s2 column shapes.
 // -----------------------------------------------------------------------------

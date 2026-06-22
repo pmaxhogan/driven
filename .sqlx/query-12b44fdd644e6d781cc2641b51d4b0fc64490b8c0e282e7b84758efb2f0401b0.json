@@ -1,0 +1,80 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                source_id             AS \"source_id!: String\",\n                relative_path         AS \"relative_path!: String\",\n                size                  AS \"size!: i64\",\n                mtime_ns              AS \"mtime_ns!: i64\",\n                hash_blake3           AS \"hash_blake3!: Vec<u8>\",\n                drive_file_id         AS \"drive_file_id: String\",\n                drive_md5             AS \"drive_md5: Vec<u8>\",\n                encrypted_remote_path AS \"encrypted_remote_path: String\",\n                status                AS \"status!: String\",\n                last_uploaded_at      AS \"last_uploaded_at: i64\",\n                last_verified_at      AS \"last_verified_at: i64\"\n            FROM file_state\n            WHERE source_id = ?1 AND relative_path = ?2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "source_id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "relative_path!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "size!: i64",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "mtime_ns!: i64",
+        "ordinal": 3,
+        "type_info": "Integer"
+      },
+      {
+        "name": "hash_blake3!: Vec<u8>",
+        "ordinal": 4,
+        "type_info": "Blob"
+      },
+      {
+        "name": "drive_file_id: String",
+        "ordinal": 5,
+        "type_info": "Text"
+      },
+      {
+        "name": "drive_md5: Vec<u8>",
+        "ordinal": 6,
+        "type_info": "Blob"
+      },
+      {
+        "name": "encrypted_remote_path: String",
+        "ordinal": 7,
+        "type_info": "Text"
+      },
+      {
+        "name": "status!: String",
+        "ordinal": 8,
+        "type_info": "Text"
+      },
+      {
+        "name": "last_uploaded_at: i64",
+        "ordinal": 9,
+        "type_info": "Integer"
+      },
+      {
+        "name": "last_verified_at: i64",
+        "ordinal": 10,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      true,
+      false,
+      true,
+      true
+    ]
+  },
+  "hash": "12b44fdd644e6d781cc2641b51d4b0fc64490b8c0e282e7b84758efb2f0401b0"
+}

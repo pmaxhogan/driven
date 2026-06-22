@@ -36,6 +36,10 @@ Desktop.ini
 /state.db
 /state.db-*
 
+# sqlx prepare scratch DB (regenerate with `cargo sqlx prepare`)
+/.driven-prepare.db
+/.driven-prepare.db-*
+
 # OAuth client credentials (Desktop client secret is technically not-secret
 # but treat as one for hygiene). Stash values into .env.test instead.
 client_secret*.json
