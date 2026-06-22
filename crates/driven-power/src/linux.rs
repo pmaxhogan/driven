@@ -133,12 +133,12 @@ fn read_ac_and_battery(root: &Path) -> (bool, Option<u8>) {
                 }
             }
             "Battery" => {
-                if battery_percent.is_none() {
-                    if let Some(cap) =
-                        read_trimmed(&dir.join("capacity")).and_then(|s| s.parse::<u32>().ok())
-                    {
-                        battery_percent = Some(cap.min(100) as u8);
-                    }
+                // First battery's capacity wins; ignore later batteries.
+                if let (None, Some(cap)) = (
+                    battery_percent,
+                    read_trimmed(&dir.join("capacity")).and_then(|s| s.parse::<u32>().ok()),
+                ) {
+                    battery_percent = Some(cap.min(100) as u8);
                 }
             }
             _ => {}
