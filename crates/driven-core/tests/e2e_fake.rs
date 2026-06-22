@@ -29,7 +29,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 
-use driven_core::executor::{DefaultExecutor, Executor, ExecutorDeps, OpOutcome};
+use driven_core::executor::{DefaultExecutor, Executor, ExecutorDeps, MemGauge, OpOutcome};
 use driven_core::network::{NetworkProbe, NetworkState, ServiceHealth, ServiceName};
 use driven_core::orchestrator::{Orchestrator, OrchestratorConfig, SyncOrchestrator, TickSource};
 use driven_core::state::{AccountRow, NewPendingOp, SourceRow, SqliteStateRepo, StateRepo};
@@ -1187,6 +1187,150 @@ async fn encryption_on_round_trip_bytes_match() {
 }
 
 // ---------------------------------------------------------------------------
+// Row: encryption ON + NESTED path -> the REMOTE filenames are CIPHERTEXT
+//      (folders AND leaf), the file lands under the encrypted path, and a
+//      full restore (decrypt_filename per component + decrypt content)
+//      recovers the original path + bytes. This is the P1-5 deliverable: it
+//      proves filenames do not LEAK (DESIGN s7) AND, because the file is
+//      > PIPELINE_THRESHOLD, exercises the encrypted STREAMING pipeline + the
+//      up-front length prediction against real crypto framing at the same
+//      time (the flat row above only covers the inline path).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn encryption_nested_remote_is_ciphertext_and_restores() {
+    use driven_crypto::SourceCryptoSuite as _;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
+
+    // A nested path so encrypt_filename's parent-AAD chaining + ensure_folder
+    // of the encrypted parents both run. > PIPELINE_THRESHOLD so it streams.
+    let rel_str = "docs/private/big-secret.bin";
+    let plaintext: Vec<u8> = (0..(5 * 1024 * 1024usize))
+        .map(|i| (i % 247) as u8)
+        .collect();
+    write_file(src_dir.path(), rel_str, &plaintext);
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+
+    let source_key = SourceKey::generate();
+    let suite: Arc<dyn driven_crypto::SourceCryptoSuite> =
+        Arc::new(DrivenCryptoSuite::new(source_key.clone()));
+    let clock = Arc::new(FakeClock::new());
+    let exec = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote: remote.clone(),
+            state: state.clone(),
+            pacer: test_pacer(clock.clone()),
+            crypto: Some(suite),
+        },
+        clock,
+    );
+
+    let rel = RelativePath::try_from(rel_str.to_string()).unwrap();
+    let plan = Plan {
+        ops: vec![Op::HashThenUpload {
+            source_id: src.id,
+            relative_path: rel.clone(),
+            size: plaintext.len() as u64,
+        }],
+        collisions: vec![],
+    };
+    let out = exec.execute(&src, &plan, &noop_progress).await.unwrap();
+    assert!(
+        out.iter().all(|o| matches!(o, OpOutcome::Done { .. })),
+        "got {out:?}"
+    );
+
+    // The source ROOT must contain a CIPHERTEXT folder named neither "docs"
+    // nor anything plaintext - the first encrypted path component.
+    let root_children = remote.list_folder(&folder).await.unwrap();
+    assert_eq!(
+        root_children.len(),
+        1,
+        "exactly one top-level encrypted folder"
+    );
+    let lvl1 = &root_children[0];
+    assert_ne!(
+        lvl1.name, "docs",
+        "top folder name must be ciphertext, not 'docs'"
+    );
+
+    // Restore the WHOLE path from ciphertext: decrypt each component's name
+    // with its parent's ciphertext as AAD (DESIGN s7.3), proving both that
+    // the names are real ciphertext and that nothing plaintext leaked.
+    let restore = DrivenCryptoSuite::new(source_key);
+    let d1 = restore.decrypt_filename(&lvl1.name, &[]).unwrap();
+    assert_eq!(d1, "docs", "level-1 ciphertext decrypts to 'docs'");
+
+    let lvl2_children = remote.list_folder(&lvl1.id).await.unwrap();
+    assert_eq!(lvl2_children.len(), 1);
+    let lvl2 = &lvl2_children[0];
+    assert_ne!(lvl2.name, "private");
+    let d2 = restore
+        .decrypt_filename(&lvl2.name, lvl1.name.as_bytes())
+        .unwrap();
+    assert_eq!(d2, "private", "level-2 ciphertext decrypts to 'private'");
+
+    let leaf_children = remote.list_folder(&lvl2.id).await.unwrap();
+    assert_eq!(leaf_children.len(), 1);
+    let leaf = &leaf_children[0];
+    assert_ne!(leaf.name, "big-secret.bin", "leaf name must be ciphertext");
+    let d_leaf = restore
+        .decrypt_filename(&leaf.name, lvl2.name.as_bytes())
+        .unwrap();
+    assert_eq!(
+        d_leaf, "big-secret.bin",
+        "leaf ciphertext decrypts to the real name"
+    );
+
+    // The reconstructed plaintext path equals the original.
+    assert_eq!(format!("{d1}/{d2}/{d_leaf}"), rel_str);
+
+    // file_state persisted the encrypted_remote_path (the slash-joined
+    // ciphertext path) + the plaintext blake3.
+    let row = state.get_file_state(src.id, &rel).await.unwrap().unwrap();
+    assert_eq!(
+        row.encrypted_remote_path.as_deref(),
+        Some(format!("{}/{}/{}", lvl1.name, lvl2.name, leaf.name).as_str()),
+        "encrypted_remote_path is the slash-joined ciphertext path"
+    );
+    assert_eq!(row.hash_blake3, *blake3::hash(&plaintext).as_bytes());
+
+    // Restore the CONTENT: download the ciphertext blob + decrypt -> original.
+    let mut blob = Vec::new();
+    remote
+        .download(&leaf.id)
+        .await
+        .unwrap()
+        .0
+        .read_to_end(&mut blob)
+        .await
+        .unwrap();
+    assert_ne!(blob, plaintext, "stored content must be encrypted");
+    let mut dec: Box<dyn ContentDecryptor> =
+        restore.content_decryptor(&blob[..HEADER_LEN]).unwrap();
+    let ct_chunk = 64 * 1024 + 16; // 64 KiB plaintext chunk + Poly1305 tag
+    let body = &blob[HEADER_LEN..];
+    let mut off = 0;
+    let mut restored = Vec::new();
+    while body.len() - off > ct_chunk {
+        restored.extend_from_slice(&dec.decrypt_chunk(&body[off..off + ct_chunk]).unwrap());
+        off += ct_chunk;
+    }
+    restored.extend_from_slice(&dec.decrypt_last(&body[off..]).unwrap());
+    assert_eq!(
+        restored, plaintext,
+        "decrypted content matches the original bytes"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Network-resilience matrix (orchestrator-reaction rows; DESIGN s5.8.1)
 // ---------------------------------------------------------------------------
 
@@ -1317,11 +1461,121 @@ async fn throughput_5x_serial_baseline() {}
             file; flaky/infeasible as a correctness test against the fake."]
 async fn blake3_rayon_2x() {}
 
+// ---------------------------------------------------------------------------
+// Row: bounded-memory streaming pipeline (P1-4, DESIGN s11.4.3 / s11.4.6).
+//      The 16x100MB RSS<400MiB ceiling and the 1 GiB CPU-idle<90% multiplier
+//      are two distinct claims. The MEMORY-BOUND half IS deterministically
+//      measurable against the instantaneous fake: the streaming pipeline must
+//      never buffer a whole file, so its peak in-flight bytes stay a small
+//      multiple of the channel/wire-chunk sizes regardless of file size. We
+//      instrument that directly with a MemGauge and assert it. The CPU-idle
+//      / throughput-multiplier half is NOT measurable against a zero-latency
+//      fake (it needs a real upload cost + a wall-clock/CPU probe) and stays
+//      a reported-qualitative claim (see throughput_5x_serial_baseline /
+//      blake3_rayon_2x, which remain ignored as perf micro-benchmarks).
+// ---------------------------------------------------------------------------
+
 #[tokio::test]
-#[ignore = "1 GiB pipeline CPU-idle <90% and the 16x100MB RSS<400MiB ceiling are \
-            resource/timing measurements needing a real large-file workload and \
-            an RSS probe; not assertable against an in-memory fake on CI."]
-async fn pipeline_cpu_and_memory_bounds() {}
+async fn pipeline_streaming_keeps_memory_bounded() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
+
+    // Several files, each well above PIPELINE_THRESHOLD and large enough to
+    // run the uploader accumulator's flush loop many times. A regression to
+    // whole-file buffering would push peak in-flight to file_size * N.
+    let file_bytes = 32 * 1024 * 1024usize; // 32 MiB each
+    let n_files = 4u32;
+    let mut ops = Vec::new();
+    for i in 0..n_files {
+        let name = format!("big{i}.bin");
+        let contents: Vec<u8> = (0..file_bytes)
+            .map(|j| ((i as usize + j) % 251) as u8)
+            .collect();
+        write_file(src_dir.path(), &name, &contents);
+        let rel = RelativePath::try_from(name).unwrap();
+        ops.push(Op::HashThenUpload {
+            source_id: driven_core::types::SourceId::new_v4(),
+            relative_path: rel,
+            size: file_bytes as u64,
+        });
+    }
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+    let ops: Vec<Op> = ops
+        .into_iter()
+        .map(|op| match op {
+            Op::HashThenUpload {
+                relative_path,
+                size,
+                ..
+            } => Op::HashThenUpload {
+                source_id: src.id,
+                relative_path,
+                size,
+            },
+            other => other,
+        })
+        .collect();
+    let plan = Plan {
+        ops,
+        collisions: vec![],
+    };
+
+    let clock = Arc::new(FakeClock::new());
+    let gauge = Arc::new(MemGauge::default());
+    let exec = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote: remote.clone(),
+            state: state.clone(),
+            pacer: test_pacer(clock.clone()),
+            crypto: None,
+        },
+        clock,
+    )
+    .with_mem_gauge(gauge.clone());
+
+    let out = exec.execute(&src, &plan, &noop_progress).await.unwrap();
+    assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        n_files as usize,
+        "every streamed file landed"
+    );
+
+    // The pipeline ran across up to default_pool_size() files concurrently,
+    // yet peak in-flight bytes stayed bounded by (pool * (channel backlog +
+    // accumulator)), NOT by total bytes. With 4 x 32 MiB = 128 MiB of data
+    // the peak must be a small fraction. The bound here is generous (per-file
+    // ~10 MiB accumulator+channels x concurrency) but emphatically far below
+    // the 128 MiB total, and a whole-file-buffering regression blows past it.
+    let peak = gauge.peak();
+    let total_bytes = (file_bytes as u64) * (n_files as u64);
+    // Lower bound: prove the STREAMING path actually ran. peak==0 would mean
+    // these large files took the inline buffered path (gauge records nothing)
+    // and every upper-bound assertion below would pass vacuously. The
+    // uploader's 2 x WIRE_CHUNK (8 MiB) hold-back guarantees peak >= one wire
+    // chunk (4 MiB) for any 32 MiB file.
+    const WIRE_CHUNK: u64 = 4 * 1024 * 1024;
+    assert!(
+        peak >= WIRE_CHUNK,
+        "streaming must actually run (peak >= one 4 MiB wire chunk proves accumulation), got {peak}"
+    );
+    assert!(
+        peak < total_bytes / 2,
+        "streaming peak in-flight {peak} bytes must stay far below the {total_bytes}-byte total (bounded pipeline, not whole-file buffering)"
+    );
+    // Per-file, the bound is the channel backlog + < 2 wire chunks (~9 MiB);
+    // even under full concurrency the peak per the default pool is well under
+    // 100 MiB. This is the discriminating ceiling.
+    assert!(
+        peak < 100 * 1024 * 1024,
+        "peak in-flight {peak} bytes must respect the bounded-memory ceiling"
+    );
+}
 
 #[tokio::test]
 #[ignore = "Adaptive-parallelism pool reaction to induced latency needs the real \

@@ -18,6 +18,10 @@ tokio.workspace = true
 async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
+# M3 streaming upload pipeline (DESIGN s11.4.3): ReceiverStream adapts the
+# cpu stage's bounded mpsc output into the `UploadBody::Stream` for the
+# 4-5 MiB simple band.
+tokio-stream = "0.1"
 uuid.workspace = true
 hex.workspace = true
 unicode-normalization = "0.1"
@@ -25,7 +29,9 @@ unicode-normalization = "0.1"
 # confirmed - DESIGN s16). Pulls walkdir transitively.
 ignore = "0.4.26"
 # M2 deep-verify re-hash to catch bit-rot (DESIGN s3.3 / ROADMAP M2).
-blake3 = "1"
+# The `rayon` feature enables `Hasher::update_rayon` for multi-core hashing
+# of large files in the M3 streaming upload pipeline (DESIGN s11.4.4).
+blake3 = { version = "1", features = ["rayon"] }
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",

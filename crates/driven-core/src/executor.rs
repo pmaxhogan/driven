@@ -58,21 +58,32 @@ const TARGET: &str = "driven::core::executor";
 /// `RESUMABLE_THRESHOLD = 5 MiB`).
 pub const RESUMABLE_THRESHOLD: u64 = 5 * 1024 * 1024;
 
-/// Files at or above this use the 3-stage producer/consumer pipeline
-/// (DESIGN s5.4 / s11.4.3 `PIPELINE_THRESHOLD = 4 MiB`); below run inline
-/// in one task. Currently informational: the streaming reader is used for
-/// every resumable upload regardless, and the small-file path is fully
-/// inline; the threshold is retained as the canonical constant the
-/// orchestrator and acceptance tests refer to.
+/// Files at or above this use the bounded 3-stage producer/consumer
+/// pipeline (DESIGN s5.4 / s11.4.3 `PIPELINE_THRESHOLD = 4 MiB`); below run
+/// inline in one task (pipeline overhead would dominate). The pipeline
+/// reads 64 KiB plaintext chunks (reader stage), hashes + encrypts them
+/// (cpu stage), and accumulates the output into wire chunks for the
+/// uploader stage - connected by BOUNDED channels so a 1 GiB file never
+/// buffers more than [`PIPELINE_CHANNEL_CAP`] x [`READ_BUF`] of in-flight
+/// data plus one wire chunk (DESIGN s11.4.6 memory bound).
 pub const PIPELINE_THRESHOLD: u64 = 4 * 1024 * 1024;
 
-/// Files at or above this would trigger `blake3::Hasher::update_rayon`
-/// for multi-core hashing (DESIGN s5.4 / s11.4.4
-/// `RAYON_HASH_THRESHOLD = 100 MiB`). NOTE: `blake3 = "1"` is pulled
-/// without its `rayon` feature, so multi-core hashing is deferred; the
-/// CPU stage hashes single-threaded today. The constant is kept so the
-/// feature can be turned on without re-deriving the boundary.
+/// Files at or above this hash with `blake3::Hasher::update_rayon` for
+/// multi-core hashing in the pipeline cpu stage (DESIGN s5.4 / s11.4.4
+/// `RAYON_HASH_THRESHOLD = 100 MiB`). The `blake3` crate is pulled with its
+/// `rayon` feature so `update_rayon` is available; it is applied per
+/// pipeline chunk above this size (not over a full mmap'd file, so the
+/// DESIGN's 5 GB/s figure - which assumes one contiguous buffer - does not
+/// apply; the win is multi-core hashing of each bounded chunk).
 pub const RAYON_HASH_THRESHOLD: u64 = 100 * 1024 * 1024;
+
+/// Bound on each inter-stage channel in the streaming pipeline (DESIGN
+/// s11.4.3 "bounded(4)"). A small capacity so backpressure caps the
+/// in-flight memory: the reader blocks once the cpu stage is this many
+/// chunks behind, and the cpu stage blocks once the uploader is this many
+/// wire chunks behind. 8 (vs the DESIGN's 4) leaves a little slack for
+/// cooperative scheduling without materially raising the memory ceiling.
+const PIPELINE_CHANNEL_CAP: usize = 8;
 
 /// Drive's resumable chunk multiple: every non-final chunk pushed to a
 /// resumable session must be a multiple of 256 KiB (SPEC s3
@@ -377,10 +388,56 @@ pub struct DefaultExecutor {
     clock: Arc<dyn Clock>,
     /// Inter-file concurrency gate (DESIGN s11.4.2). `acquire`d per op.
     pool: Arc<Semaphore>,
+    /// Test-only peak-memory gauge for the streaming pipeline (P1-4
+    /// acceptance). `None` in production (zero overhead beyond an
+    /// `Option::is_none` check per chunk). Exposed via the doc-hidden
+    /// [`Self::with_mem_gauge`] so the `pipeline_cpu_and_memory_bounds`
+    /// integration row can assert the in-flight bytes stay bounded far below
+    /// the file size - the one qualitative pipeline contract that IS
+    /// deterministically measurable against the instantaneous fake.
+    mem_gauge: Option<Arc<MemGauge>>,
     #[cfg(test)]
     mid_upload_hook: Option<MidUploadHook>,
     #[cfg(test)]
     post_upload_hook: Option<PostUploadHook>,
+}
+
+/// A peak in-flight-bytes gauge for the streaming pipeline (P1-4 test
+/// instrumentation). The reader stage bumps `current` (and tracks `peak`)
+/// when it buffers a chunk; the uploader stage drops `current` once Drive
+/// accepts a wire chunk. A correctly-bounded pipeline keeps `peak` a small
+/// multiple of the channel/wire-chunk sizes regardless of file size; a
+/// regression to whole-file buffering pushes `peak` to the file size.
+///
+/// `#[doc(hidden)]` + `pub` so the acceptance integration test (a separate
+/// crate) can read it; not part of the supported API.
+#[doc(hidden)]
+#[derive(Debug, Default)]
+pub struct MemGauge {
+    current: std::sync::atomic::AtomicU64,
+    peak: std::sync::atomic::AtomicU64,
+}
+
+impl MemGauge {
+    /// Record `n` more bytes resident in the pipeline, updating the peak.
+    fn add(&self, n: u64) {
+        use std::sync::atomic::Ordering;
+        let cur = self.current.fetch_add(n, Ordering::AcqRel) + n;
+        self.peak.fetch_max(cur, Ordering::AcqRel);
+    }
+
+    /// Record `n` bytes leaving the pipeline (accepted by Drive).
+    fn sub(&self, n: u64) {
+        self.current
+            .fetch_sub(n, std::sync::atomic::Ordering::AcqRel);
+    }
+
+    /// The peak simultaneous resident bytes observed. Read by the acceptance
+    /// test after an upload to assert the pipeline stayed bounded.
+    #[doc(hidden)]
+    pub fn peak(&self) -> u64 {
+        self.peak.load(std::sync::atomic::Ordering::Acquire)
+    }
 }
 
 impl DefaultExecutor {
@@ -401,11 +458,21 @@ impl DefaultExecutor {
             crypto: deps.crypto,
             clock,
             pool,
+            mem_gauge: None,
             #[cfg(test)]
             mid_upload_hook: None,
             #[cfg(test)]
             post_upload_hook: None,
         }
+    }
+
+    /// Test-only (doc-hidden): attach a [`MemGauge`] so the streaming
+    /// pipeline records its peak in-flight bytes. Used by the
+    /// `pipeline_cpu_and_memory_bounds` acceptance row.
+    #[doc(hidden)]
+    pub fn with_mem_gauge(mut self, gauge: Arc<MemGauge>) -> Self {
+        self.mem_gauge = Some(gauge);
+        self
     }
 
     /// Test-only: install the mid-upload hook (see [`MidUploadHook`]).
@@ -581,6 +648,20 @@ impl DefaultExecutor {
 
     /// The read/hash/encrypt/upload/verify/commit inner loop. Split out so
     /// `hash_then_upload` can own the pending_op lifecycle around it.
+    ///
+    /// Two upload strategies share this driver:
+    /// - Files below [`PIPELINE_THRESHOLD`] read fully into memory once
+    ///   (`read_hash_encrypt`), then upload the buffered bytes. Cheap; the
+    ///   pipeline overhead would dominate a tiny file.
+    /// - Files at or above it run the bounded 3-stage streaming pipeline
+    ///   (`stream_upload`, DESIGN s11.4.3): reader -> cpu(hash+encrypt) ->
+    ///   uploader, connected by BOUNDED channels so the in-flight memory is
+    ///   capped regardless of file size (a 1 GiB file never buffers 1 GiB).
+    ///
+    /// Both produce identical observable state - blake3-over-plaintext,
+    /// md5-over-the-exact-sent-bytes, the P1-1 post-upload identity recheck,
+    /// the P1-5 encrypted remote path - and commit the same `file_state`
+    /// row. The Cluster-A crash-safety invariants are preserved in both.
     #[allow(clippy::too_many_arguments)]
     async fn upload_and_commit(
         &self,
@@ -595,89 +676,65 @@ impl DefaultExecutor {
         app_props: HashMap<String, String>,
     ) -> Result<OpOutcome, UploadError> {
         let full_path = join_source_path(&source.local_path, relative_path);
+        let mime = "application/octet-stream";
 
-        // Read the whole file into memory once, computing blake3 over the
-        // plaintext and building the exact bytes to send (ciphertext when
-        // encrypted, else plaintext). The pipeline (DESIGN s11.4.3) is an
-        // internal throughput refinement over this same data flow; the
-        // observable contract - blake3-over-plaintext, md5-over-sent-bytes,
-        // no full-size prealloc - is identical and is what the fake checks.
-        let HashedBody {
-            blake3,
-            sent_bytes,
-            plaintext_len,
-        } = read_hash_encrypt(file, self.crypto.as_deref())
-            .await
-            .map_err(UploadError::from_read)?;
-
-        // --- post-read fstat identity check (SPEC s8 defence #3) -----------
-        let post = fstat_identity(file).await.map_err(UploadError::Fatal)?;
-        if (post.size, post.ctime_ns) != (pre.size, pre.ctime_ns) {
-            return Err(UploadError::Skip(SkipReason::ChangedDuringUpload));
-        }
-        match lstat_identity(&full_path) {
-            Ok(now_path) => {
-                if (now_path.dev, now_path.inode) != (pre.dev, pre.inode) {
-                    return Err(UploadError::Skip(SkipReason::ReplacedDuringUpload));
-                }
-            }
-            // The path vanished mid-read (atomic replace + delete): treat as
-            // replaced, re-queue.
-            Err(_) => return Err(UploadError::Skip(SkipReason::ReplacedDuringUpload)),
-        }
-
-        // The plaintext we read must match the size the planner observed; a
-        // grow/shrink is the changed-during-upload case the fstat check
-        // above already catches, but guard explicitly so the declared
-        // upload length is never wrong for an unencrypted body.
-        if self.crypto.is_none() && plaintext_len != size {
-            return Err(UploadError::Skip(SkipReason::ChangedDuringUpload));
-        }
-
-        // --- P1-2: persist the uploaded blake3 BEFORE the bytes land -------
-        // The hash is over the plaintext we just read and verified coherent.
-        // Persisting it now (before `upload_bytes` issues the create/update)
-        // means a crash with the object already on Drive leaves a pending_op
-        // that records exactly which bytes were uploaded, so reconciliation
-        // can re-hash the (possibly since-changed) local file against this
-        // and only adopt-as-Synced on a match.
-        payload.uploaded_blake3_hex = Some(hex::encode(blake3));
-        self.state
-            .update_pending_op_payload(op_id, &payload.to_value())
+        // --- P1-5: resolve the remote target (encrypted path when the source
+        // is encrypted; flat plaintext name otherwise). This ensure_folders
+        // the encrypted parent directory components up front so the upload
+        // lands under the ciphertext path, not a leaked plaintext name.
+        let target = self
+            .resolve_remote_target(source, relative_path, app_props)
             .await
             .map_err(UploadError::Fatal)?;
 
-        // --- issue the upload (small simple, large resumable) --------------
-        let mime = "application/octet-stream";
-        let entry = self
-            .upload_bytes(
+        // --- produce the exact upload body + its hashes --------------------
+        // Below the pipeline threshold: buffer the whole file once. At or
+        // above: drive the bounded streaming pipeline. Both yield the same
+        // (blake3-over-plaintext, the uploaded RemoteEntry) and verify the
+        // md5 over the exact sent bytes (SPEC s8). The streaming arm returns
+        // the entry directly (it cannot return a buffered body); the inline
+        // arm buffers then uploads.
+        let UploadProduct { blake3, entry } = if size >= PIPELINE_THRESHOLD {
+            self.stream_upload(
                 source,
                 relative_path,
+                size,
+                file,
+                pre,
                 existing_file_id,
-                sent_bytes,
                 mime,
-                app_props,
+                &target,
                 op_id,
                 &mut payload,
             )
-            .await?;
-
-        // md5 verification over the EXACT bytes sent (SPEC s8) happened inside
-        // `upload_bytes`: it compared `entry.md5` (Drive's md5 of the stored
-        // bytes - ciphertext when encrypted, plaintext otherwise) against the
-        // local md5 the read/encrypt pass accumulated over those same bytes.
+            .await?
+        } else {
+            self.inline_upload(
+                source,
+                relative_path,
+                size,
+                file,
+                pre,
+                existing_file_id,
+                mime,
+                &target,
+                op_id,
+                &mut payload,
+            )
+            .await?
+        };
 
         // --- P1-1: post-UPLOAD identity re-check (SPEC s8) -----------------
-        // The first fstat above proved the file did not change while we were
-        // READING it; but the bytes could still be mutated between the read
-        // and the moment Drive finishes accepting them. Re-stat the open
-        // handle AND the path now that the object is fully uploaded, before
-        // we commit it as Synced. On any change/replace, do NOT commit: the
-        // remote object is an orphan that reconcile adopts + re-hashes
-        // (P1-2), and the op is re-enqueued by the caller.
+        // The hash/read proved the file did not change while we were READING
+        // it; but the bytes could still be mutated between the read and the
+        // moment Drive finishes accepting them. Re-stat the open handle AND
+        // the path now that the object is fully uploaded, before we commit it
+        // as Synced. On any change/replace, do NOT commit: the remote object
+        // is an orphan that reconcile adopts + re-hashes (P1-2), and the op
+        // is re-enqueued by the caller.
         self.fire_post_upload_hook(&full_path);
-        let post2 = fstat_identity(file).await.map_err(UploadError::Fatal)?;
-        if (post2.size, post2.ctime_ns) != (pre.size, pre.ctime_ns) {
+        let post = fstat_identity(file).await.map_err(UploadError::Fatal)?;
+        if (post.size, post.ctime_ns) != (pre.size, pre.ctime_ns) {
             return Err(UploadError::SkipPostUpload(SkipReason::ChangedDuringUpload));
         }
         match lstat_identity(&full_path) {
@@ -705,7 +762,7 @@ impl DefaultExecutor {
             hash_blake3: blake3,
             drive_file_id: Some(entry.id.clone()),
             drive_md5: entry.md5,
-            encrypted_remote_path: None,
+            encrypted_remote_path: target.encrypted_remote_path.clone(),
             status: FileStateStatus::Synced,
             last_uploaded_at: Some(now),
             last_verified_at: Some(now),
@@ -733,19 +790,438 @@ impl DefaultExecutor {
         })
     }
 
-    /// Upload an in-memory body, retrying transient errors and verifying the
-    /// returned md5 against the local md5 of the exact bytes sent. Chooses
-    /// the simple multipart path below [`RESUMABLE_THRESHOLD`] and the
-    /// resumable protocol at or above it.
+    /// Inline (fully-buffered) upload path for files below
+    /// [`PIPELINE_THRESHOLD`]. Reads + hashes + (encrypts) the whole file
+    /// once, runs the post-read identity check, persists the uploaded blake3
+    /// (P1-2), then uploads the buffered bytes and verifies md5.
     #[allow(clippy::too_many_arguments)]
-    async fn upload_bytes(
+    async fn inline_upload(
         &self,
         source: &SourceRow,
         relative_path: &RelativePath,
+        size: u64,
+        file: &mut tokio::fs::File,
+        pre: FileIdentity,
+        existing_file_id: Option<&str>,
+        mime: &str,
+        target: &RemoteTarget,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
+    ) -> Result<UploadProduct, UploadError> {
+        let full_path = join_source_path(&source.local_path, relative_path);
+
+        let HashedBody {
+            blake3,
+            sent_bytes,
+            plaintext_len,
+        } = read_hash_encrypt(file, self.crypto.as_deref())
+            .await
+            .map_err(UploadError::from_read)?;
+
+        // --- post-read fstat identity check (SPEC s8 defence #3) -----------
+        let post = fstat_identity(file).await.map_err(UploadError::Fatal)?;
+        if (post.size, post.ctime_ns) != (pre.size, pre.ctime_ns) {
+            return Err(UploadError::Skip(SkipReason::ChangedDuringUpload));
+        }
+        match lstat_identity(&full_path) {
+            Ok(now_path) => {
+                if (now_path.dev, now_path.inode) != (pre.dev, pre.inode) {
+                    return Err(UploadError::Skip(SkipReason::ReplacedDuringUpload));
+                }
+            }
+            Err(_) => return Err(UploadError::Skip(SkipReason::ReplacedDuringUpload)),
+        }
+
+        // The plaintext we read must match the size the planner observed; a
+        // grow/shrink is the changed-during-upload case the fstat check above
+        // already catches, but guard explicitly so the declared upload length
+        // is never wrong for an unencrypted body.
+        if self.crypto.is_none() && plaintext_len != size {
+            return Err(UploadError::Skip(SkipReason::ChangedDuringUpload));
+        }
+
+        // --- P1-2: persist the uploaded blake3 BEFORE the bytes land -------
+        payload.uploaded_blake3_hex = Some(hex::encode(blake3));
+        self.state
+            .update_pending_op_payload(op_id, &payload.to_value())
+            .await
+            .map_err(UploadError::Fatal)?;
+
+        let entry = self
+            .upload_bytes(target, existing_file_id, sent_bytes, mime, op_id, payload)
+            .await?;
+        Ok(UploadProduct { blake3, entry })
+    }
+
+    /// The bounded 3-stage streaming upload pipeline for files at or above
+    /// [`PIPELINE_THRESHOLD`] (DESIGN s11.4.3). Reader -> cpu(hash+encrypt) ->
+    /// uploader, connected by BOUNDED [`tokio::sync::mpsc`] channels so the
+    /// in-flight memory is capped by backpressure: a 1 GiB file never buffers
+    /// more than a handful of [`READ_BUF`] chunks plus one [`WIRE_CHUNK`]
+    /// (DESIGN s11.4.6). The three stages are concurrent in-task futures
+    /// (`try_join!`) - NOT `'static` spawns - so the reader borrows
+    /// `&mut file` and the post-upload identity recheck (P1-1, done by the
+    /// caller) re-uses the same handle.
+    ///
+    /// The exact wire length is PREDICTED up front from `size` (DESIGN s7.1
+    /// framing) so the resumable session / `UploadBody::Stream` can declare
+    /// `Content-Length` before the bytes are produced. blake3 is over the
+    /// plaintext; the md5 is accumulated over the exact bytes sent and
+    /// verified against Drive's md5 at the end (SPEC s8). If the local file
+    /// changed mid-read so the byte count disagrees with the prediction, the
+    /// transfer is abandoned as `ChangedDuringUpload` (the caller's
+    /// post-upload fstat also catches it - this just fails fast and cleanly).
+    #[allow(clippy::too_many_arguments)]
+    async fn stream_upload(
+        &self,
+        _source: &SourceRow,
+        relative_path: &RelativePath,
+        size: u64,
+        file: &mut tokio::fs::File,
+        _pre: FileIdentity,
+        existing_file_id: Option<&str>,
+        mime: &str,
+        target: &RemoteTarget,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
+    ) -> Result<UploadProduct, UploadError> {
+        // Predict the exact number of bytes that will be sent to Drive.
+        let total = predicted_sent_len(size, self.crypto.is_some());
+        let encrypted = self.crypto.is_some();
+
+        // P1-2: persist the uploaded blake3 once it is known. With streaming
+        // the hash is produced DURING the upload, so we persist it after the
+        // pipeline completes but before commit. A crash before this point
+        // leaves either no finalized object (resumable Create commits only on
+        // the final chunk -> reconcile drops the op) or a finalized orphan
+        // with no recorded hash -> reconcile requeues it (safe: a redundant
+        // re-upload, never a silent adopt of stale bytes). Either way the
+        // P1-2 "never adopt-as-Synced without a hash match" invariant holds.
+
+        // Bounded channels: reader -> cpu (plaintext chunks), cpu -> uploader
+        // (output chunks). Small caps so backpressure bounds the memory.
+        let (raw_tx, raw_rx) = tokio::sync::mpsc::channel::<Bytes>(PIPELINE_CHANNEL_CAP);
+        let (out_tx, out_rx) = tokio::sync::mpsc::channel::<Bytes>(PIPELINE_CHANNEL_CAP);
+
+        // The pacer's byte bucket is applied in the READER stage, before each
+        // chunk is read/emitted, so the bandwidth cap + backpressure are at
+        // the source of the data flow (SPEC s8 / DESIGN s5.4).
+        let pacer = self.pacer.clone();
+        let reader = read_stage(file, size, pacer, raw_tx, self.mem_gauge.clone());
+        let cpu = cpu_stage(raw_rx, out_tx, self.crypto.clone(), size);
+        let uploader = self.upload_stage(
+            target,
+            existing_file_id,
+            mime,
+            total,
+            encrypted,
+            out_rx,
+            op_id,
+            payload,
+        );
+
+        // Run all three concurrently. The cpu stage returns (blake3, md5);
+        // the uploader returns the entry. `try_join!` short-circuits on the
+        // first error and drops the others (closing channels, unblocking
+        // peers).
+        let (read_res, cpu_res, entry) = tokio::join!(reader, cpu, uploader);
+        // PRECEDENCE (advisor): the uploader's Drive-side error is the real
+        // failure and must win. When the uploader errors mid-stream it drops
+        // `out_rx`, so the cpu stage's `out_tx.send` fails and the cpu stage
+        // returns `StageError::DownstreamGone` - an ARTIFACT of the uploader
+        // error, not a real local change. So surface the uploader error
+        // FIRST; only then consider a genuine reader/cpu error (identity /
+        // size / crypto), and never let a `DownstreamGone` artifact mask the
+        // upload failure.
+        let entry = entry?;
+        read_res.map_err(stage_err_to_upload)?;
+        let CpuOutput { blake3, md5 } = cpu_res.map_err(stage_err_to_upload)?;
+
+        // md5 verify over the exact bytes sent (SPEC s8).
+        match entry.md5 {
+            Some(remote) if remote == md5 => {
+                self.pacer.note_response(ResponseClass::Ok);
+            }
+            _ => {
+                warn!(
+                    target: TARGET,
+                    path = %relative_path,
+                    "streamed md5 mismatch: remote {:?} vs local {:?}",
+                    entry.md5,
+                    md5
+                );
+                return Err(UploadError::Failed(ErrorCode::DriveChecksumMismatch));
+            }
+        }
+
+        // Persist the now-known plaintext blake3 (P1-2) before the caller
+        // commits the row.
+        payload.uploaded_blake3_hex = Some(hex::encode(blake3));
+        self.persist_payload(op_id, payload)
+            .await
+            .map_err(UploadError::Fatal)?;
+
+        Ok(UploadProduct { blake3, entry })
+    }
+
+    /// The uploader stage of the streaming pipeline. Drains the cpu stage's
+    /// output channel, accumulates it into [`WIRE_CHUNK`] wire chunks (each a
+    /// 256-KiB multiple except the final one, SPEC s3), and pushes them to
+    /// Drive. Files at or above [`RESUMABLE_THRESHOLD`] use the resumable
+    /// session protocol (persisting acked offsets for P1-3 resume); the
+    /// 4-5 MiB simple band hands the channel straight to `create`/`update`
+    /// via [`UploadBody::Stream`].
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_stage(
+        &self,
+        target: &RemoteTarget,
+        existing_file_id: Option<&str>,
+        mime: &str,
+        total: u64,
+        _encrypted: bool,
+        out_rx: tokio::sync::mpsc::Receiver<Bytes>,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
+    ) -> Result<RemoteEntry, UploadError> {
+        if total >= RESUMABLE_THRESHOLD {
+            self.upload_stage_resumable(
+                target,
+                existing_file_id,
+                mime,
+                total,
+                out_rx,
+                op_id,
+                payload,
+            )
+            .await
+        } else {
+            self.upload_stage_simple(target, existing_file_id, mime, total, out_rx)
+                .await
+        }
+    }
+
+    /// Simple-band streaming upload (4 MiB <= size < 5 MiB): hand the cpu
+    /// output channel directly to `create`/`update` as an [`UploadBody::Stream`].
+    async fn upload_stage_simple(
+        &self,
+        target: &RemoteTarget,
+        existing_file_id: Option<&str>,
+        mime: &str,
+        total: u64,
+        out_rx: tokio::sync::mpsc::Receiver<Bytes>,
+    ) -> Result<RemoteEntry, UploadError> {
+        use futures::StreamExt;
+        let stream = tokio_stream::wrappers::ReceiverStream::new(out_rx).map(Ok);
+        let body = UploadBody::Stream {
+            len: total,
+            stream: Box::new(stream),
+        };
+        let result = if let Some(file_id) = existing_file_id {
+            self.pacer.permit_request().await;
+            self.remote
+                .update(file_id, body, target.app_props.clone())
+                .await
+        } else {
+            self.pacer.permit_file_create().await;
+            self.remote
+                .create(
+                    &target.parent_id,
+                    &target.name,
+                    mime,
+                    body,
+                    target.app_props.clone(),
+                )
+                .await
+        };
+        result.map_err(|e| {
+            let class = classify_drive_error(&e);
+            self.pacer.note_response(class.response_class());
+            UploadError::Failed(class.error_code())
+        })
+    }
+
+    /// Resumable streaming upload (size >= 5 MiB): open a resumable session,
+    /// then accumulate the cpu output channel into [`WIRE_CHUNK`] wire chunks
+    /// and push them, persisting acked offsets (P1-3). On a session 4xx the
+    /// session restarts from offset 0 - but the cpu output channel can only
+    /// be consumed ONCE, so a streaming restart would need a re-read. We
+    /// surface the (rare) streamed-session-invalidation as a per-op failure
+    /// that the next scan retries from scratch, rather than buffering the
+    /// whole file to replay (which would defeat the memory bound).
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_stage_resumable(
+        &self,
+        target: &RemoteTarget,
+        existing_file_id: Option<&str>,
+        mime: &str,
+        total: u64,
+        mut out_rx: tokio::sync::mpsc::Receiver<Bytes>,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
+    ) -> Result<RemoteEntry, UploadError> {
+        let session = self
+            .open_resumable_session(target, existing_file_id, mime, total, op_id, payload)
+            .await
+            .map_err(UploadError::Fatal)?;
+
+        let mut acc: Vec<u8> = Vec::with_capacity(WIRE_CHUNK);
+        let mut offset: u64 = 0;
+        let mut produced: u64 = 0;
+
+        // Drain the cpu output, flushing full WIRE_CHUNKs as they fill.
+        loop {
+            let chunk = out_rx.recv().await;
+            match chunk {
+                Some(bytes) => {
+                    produced += bytes.len() as u64;
+                    acc.extend_from_slice(&bytes);
+                    // Flush every full wire chunk, but never the byte that
+                    // would make this the final chunk - we only know a chunk
+                    // is final once the channel closes, and a final chunk may
+                    // be any size while non-final ones must be 256-KiB
+                    // multiples. So hold back at least one wire chunk's worth
+                    // until EOF.
+                    while acc.len() >= 2 * WIRE_CHUNK {
+                        let wire = Bytes::copy_from_slice(&acc[..WIRE_CHUNK]);
+                        acc.drain(..WIRE_CHUNK);
+                        match self
+                            .push_one_wire_chunk(&session, offset, wire, op_id, payload)
+                            .await?
+                        {
+                            PushOne::Acked(new_off) => offset = new_off,
+                            PushOne::Done(entry) => {
+                                // Final-chunk completion mid-stream means the
+                                // declared size was already reached; the
+                                // remaining channel data would overshoot.
+                                return self
+                                    .finish_streamed(entry, produced, total, payload, op_id)
+                                    .await;
+                            }
+                            PushOne::Invalid => {
+                                return Err(UploadError::Failed(ErrorCode::DriveUnreachable));
+                            }
+                        }
+                    }
+                }
+                None => break,
+            }
+        }
+
+        // EOF: flush whatever remains in `acc` as a tail of >=1 wire chunks,
+        // the last of which is the (any-size) final chunk.
+        while !acc.is_empty() {
+            let take = acc.len().min(WIRE_CHUNK);
+            let is_final = take == acc.len();
+            // A non-final chunk MUST be a 256-KiB multiple; if the remaining
+            // tail is not a multiple and is NOT final, trim to a multiple so
+            // the leftover joins the final chunk.
+            let take = if is_final {
+                take
+            } else {
+                (take / CHUNK_MULTIPLE) * CHUNK_MULTIPLE
+            };
+            let wire = Bytes::copy_from_slice(&acc[..take]);
+            acc.drain(..take);
+            match self
+                .push_one_wire_chunk(&session, offset, wire, op_id, payload)
+                .await?
+            {
+                PushOne::Acked(new_off) => offset = new_off,
+                PushOne::Done(entry) => {
+                    return self
+                        .finish_streamed(entry, produced, total, payload, op_id)
+                        .await;
+                }
+                PushOne::Invalid => {
+                    return Err(UploadError::Failed(ErrorCode::DriveUnreachable));
+                }
+            }
+        }
+
+        // The channel closed without a Completed - the produced byte count
+        // disagreed with the declared session size (the local file changed
+        // mid-read). Treat as changed-during-upload: the session never
+        // finalized, so no object materialized.
+        Err(UploadError::Skip(SkipReason::ChangedDuringUpload))
+    }
+
+    /// Push exactly one wire chunk to a resumable session and persist the new
+    /// acked offset (P1-3). Maps Drive errors to a fatal/abort path. The
+    /// pacer byte bucket was already spent in the reader stage (one bucket
+    /// charge per byte), so only the per-request gate is taken here.
+    async fn push_one_wire_chunk(
+        &self,
+        session: &ResumableSession,
+        offset: u64,
+        wire: Bytes,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
+    ) -> Result<PushOne, UploadError> {
+        let wire_len = wire.len() as u64;
+        self.pacer.permit_request().await;
+        let progress = self
+            .remote
+            .resume_chunk(session, offset, wire)
+            .await
+            .map_err(UploadError::Fatal)?;
+        // Drive accepted the chunk: it has left the in-flight buffers (test
+        // instrumentation; matches the reader stage's `add`).
+        if let Some(g) = self.mem_gauge.as_ref() {
+            g.sub(wire_len);
+        }
+        match progress {
+            ResumeProgress::Completed(entry) => Ok(PushOne::Done(entry)),
+            ResumeProgress::InProgress { received } => {
+                if let Some(r) = payload.resumable.as_mut() {
+                    r.acked_offset = received;
+                }
+                self.persist_payload(op_id, payload)
+                    .await
+                    .map_err(UploadError::Fatal)?;
+                Ok(PushOne::Acked(received))
+            }
+            ResumeProgress::SessionInvalid => Ok(PushOne::Invalid),
+        }
+    }
+
+    /// Finish a streamed resumable upload that completed: verify the produced
+    /// byte count matched the declared size and clear the persisted session.
+    async fn finish_streamed(
+        &self,
+        entry: RemoteEntry,
+        produced: u64,
+        total: u64,
+        payload: &mut PendingOpPayload,
+        op_id: PendingOpId,
+    ) -> Result<RemoteEntry, UploadError> {
+        if produced != total {
+            // Unreachable in practice: Drive/the fake only returns Completed
+            // once received == the declared session size, so produced ==
+            // total here. Defensive: if the object DID finalize with the
+            // wrong byte count it is a finalized orphan, so use
+            // SkipPostUpload (keep the create op for reconcile to adopt +
+            // re-hash) rather than Skip (which would strand it).
+            return Err(UploadError::SkipPostUpload(SkipReason::ChangedDuringUpload));
+        }
+        payload.resumable = None;
+        self.persist_payload(op_id, payload)
+            .await
+            .map_err(UploadError::Fatal)?;
+        Ok(entry)
+    }
+
+    /// Upload an in-memory body, retrying transient errors and verifying the
+    /// returned md5 against the local md5 of the exact bytes sent. Chooses
+    /// the simple multipart path below [`RESUMABLE_THRESHOLD`] and the
+    /// resumable protocol at or above it. Uploads to `target` (the resolved
+    /// parent folder + name; the encrypted ciphertext path for an encrypted
+    /// source, the flat plaintext name otherwise - P1-5).
+    async fn upload_bytes(
+        &self,
+        target: &RemoteTarget,
         existing_file_id: Option<&str>,
         sent: SentBytes,
         mime: &str,
-        app_props: HashMap<String, String>,
         op_id: PendingOpId,
         payload: &mut PendingOpPayload,
     ) -> Result<RemoteEntry, UploadError> {
@@ -753,27 +1229,11 @@ impl DefaultExecutor {
         let mut transient_retries = 0u32;
         loop {
             let result = if total >= RESUMABLE_THRESHOLD {
-                self.upload_resumable(
-                    &source.drive_folder_id,
-                    relative_path,
-                    existing_file_id,
-                    &sent,
-                    mime,
-                    &app_props,
-                    op_id,
-                    payload,
-                )
-                .await
+                self.upload_resumable(target, existing_file_id, &sent, mime, op_id, payload)
+                    .await
             } else {
-                self.upload_simple(
-                    &source.drive_folder_id,
-                    relative_path,
-                    existing_file_id,
-                    &sent,
-                    mime,
-                    &app_props,
-                )
-                .await
+                self.upload_simple(target, existing_file_id, &sent, mime)
+                    .await
             };
 
             match result {
@@ -788,7 +1248,7 @@ impl DefaultExecutor {
                         _ => {
                             warn!(
                                 target: TARGET,
-                                path = %relative_path,
+                                name = %target.name,
                                 "md5 mismatch: remote {:?} vs local {:?}",
                                 entry.md5,
                                 sent.md5
@@ -797,31 +1257,10 @@ impl DefaultExecutor {
                         }
                     }
                 }
-                Err(e) => {
-                    let class = classify_drive_error(&e);
-                    self.pacer.note_response(class.response_class());
-                    match class {
-                        DriveError::RateLimited | DriveError::Transient => {
-                            transient_retries += 1;
-                            if transient_retries > MAX_TRANSIENT_RETRIES {
-                                return Err(UploadError::Failed(class.error_code()));
-                            }
-                            // The pacer's note_response set a backoff window
-                            // for rate-limits; permit_request below sleeps it
-                            // out. For plain 5xx/network we loop immediately
-                            // (the fake's transient faults are single-shot).
-                            continue;
-                        }
-                        DriveError::QuotaExhausted
-                        | DriveError::DailyQuota
-                        | DriveError::InvalidGrant
-                        | DriveError::DestFolderMissing
-                        | DriveError::DestFolderPermissionDenied
-                        | DriveError::Other => {
-                            return Err(UploadError::Failed(class.error_code()));
-                        }
-                    }
-                }
+                Err(e) => match self.classify_retry(&e, &mut transient_retries)? {
+                    RetryDecision::Retry => continue,
+                    RetryDecision::Fail(code) => return Err(UploadError::Failed(code)),
+                },
             }
         }
     }
@@ -830,22 +1269,27 @@ impl DefaultExecutor {
     /// [`RESUMABLE_THRESHOLD`].
     async fn upload_simple(
         &self,
-        parent_id: &str,
-        relative_path: &RelativePath,
+        target: &RemoteTarget,
         existing_file_id: Option<&str>,
         sent: &SentBytes,
         mime: &str,
-        app_props: &HashMap<String, String>,
     ) -> anyhow::Result<RemoteEntry> {
         let body = UploadBody::Bytes(sent.bytes.clone());
         if let Some(file_id) = existing_file_id {
             self.pacer.permit_request().await;
-            self.remote.update(file_id, body, app_props.clone()).await
+            self.remote
+                .update(file_id, body, target.app_props.clone())
+                .await
         } else {
             self.pacer.permit_file_create().await;
-            let name = filename_of(relative_path);
             self.remote
-                .create(parent_id, &name, mime, body, app_props.clone())
+                .create(
+                    &target.parent_id,
+                    &target.name,
+                    mime,
+                    body,
+                    target.app_props.clone(),
+                )
                 .await
         }
     }
@@ -861,46 +1305,21 @@ impl DefaultExecutor {
     /// session opened here always starts at offset 0; the cross-restart
     /// resume entry point is [`Self::resume_persisted`], driven by
     /// `reconcile`.
-    #[allow(clippy::too_many_arguments)]
     async fn upload_resumable(
         &self,
-        parent_id: &str,
-        relative_path: &RelativePath,
+        target: &RemoteTarget,
         existing_file_id: Option<&str>,
         sent: &SentBytes,
         mime: &str,
-        app_props: &HashMap<String, String>,
         op_id: PendingOpId,
         payload: &mut PendingOpPayload,
     ) -> anyhow::Result<RemoteEntry> {
         let total = sent.bytes.len() as u64;
         let mut restarts = 0u32;
         loop {
-            let kind = if let Some(file_id) = existing_file_id {
-                ResumableKind::Update {
-                    file_id: file_id.to_string(),
-                }
-            } else {
-                ResumableKind::Create {
-                    parent_id: parent_id.to_string(),
-                    name: filename_of(relative_path),
-                    app_properties: app_props.clone(),
-                }
-            };
-            if existing_file_id.is_some() {
-                self.pacer.permit_request().await;
-            } else {
-                self.pacer.permit_file_create().await;
-            }
-            let session = self.remote.resumable_session(kind, mime, total).await?;
-
-            // Persist the freshly-opened session at offset 0 BEFORE pushing
-            // any bytes, so a crash after the first chunk lands can resume.
-            payload.resumable = Some(PersistedResumable {
-                session: session.clone(),
-                acked_offset: 0,
-            });
-            self.persist_payload(op_id, payload).await?;
+            let session = self
+                .open_resumable_session(target, existing_file_id, mime, total, op_id, payload)
+                .await?;
 
             match self
                 .push_chunks(&session, &sent.bytes, 0, op_id, payload)
@@ -913,23 +1332,107 @@ impl DefaultExecutor {
                     return Ok(entry);
                 }
                 None => {
-                    // Session invalidated (4xx). Discard it and restart from
-                    // offset 0 (DESIGN s5.4: never reuse a 4xx-d session).
-                    payload.resumable = None;
-                    self.persist_payload(op_id, payload).await?;
-                    restarts += 1;
-                    if restarts > MAX_SESSION_RESTARTS {
+                    if !self
+                        .restart_resumable(&target.name, op_id, payload, &mut restarts)
+                        .await?
+                    {
                         anyhow::bail!("drive.resumable_session_invalid: exhausted restarts");
                     }
-                    warn!(
-                        target: TARGET,
-                        path = %relative_path,
-                        restarts,
-                        "resumable session invalidated; restarting from offset 0"
-                    );
                     continue;
                 }
             }
+        }
+    }
+
+    /// Open a fresh resumable session against `target` and persist it (at
+    /// offset 0) into the op payload BEFORE any bytes are pushed, so a crash
+    /// after the first chunk lands can resume (P1-3). Shared by the buffered
+    /// [`Self::upload_resumable`] and the streaming [`Self::stream_upload`].
+    async fn open_resumable_session(
+        &self,
+        target: &RemoteTarget,
+        existing_file_id: Option<&str>,
+        mime: &str,
+        total: u64,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
+    ) -> anyhow::Result<ResumableSession> {
+        let kind = if let Some(file_id) = existing_file_id {
+            ResumableKind::Update {
+                file_id: file_id.to_string(),
+            }
+        } else {
+            ResumableKind::Create {
+                parent_id: target.parent_id.clone(),
+                name: target.name.clone(),
+                app_properties: target.app_props.clone(),
+            }
+        };
+        if existing_file_id.is_some() {
+            self.pacer.permit_request().await;
+        } else {
+            self.pacer.permit_file_create().await;
+        }
+        let session = self.remote.resumable_session(kind, mime, total).await?;
+        payload.resumable = Some(PersistedResumable {
+            session: session.clone(),
+            acked_offset: 0,
+        });
+        self.persist_payload(op_id, payload).await?;
+        Ok(session)
+    }
+
+    /// A resumable session was invalidated (4xx). Clear it from the payload
+    /// and decide whether to restart from offset 0 (DESIGN s5.4: never reuse
+    /// a 4xx-d session), bounded by [`MAX_SESSION_RESTARTS`]. Returns `true`
+    /// to retry, `false` when the restart budget is exhausted.
+    async fn restart_resumable(
+        &self,
+        name: &str,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
+        restarts: &mut u32,
+    ) -> anyhow::Result<bool> {
+        payload.resumable = None;
+        self.persist_payload(op_id, payload).await?;
+        *restarts += 1;
+        if *restarts > MAX_SESSION_RESTARTS {
+            return Ok(false);
+        }
+        warn!(
+            target: TARGET,
+            name = %name,
+            restarts = *restarts,
+            "resumable session invalidated; restarting from offset 0"
+        );
+        Ok(true)
+    }
+
+    /// Classify a Drive-side error from an upload attempt into a retry
+    /// decision, ticking the pacer and the transient-retry counter. Shared
+    /// by the buffered and streaming upload loops so both honour the same
+    /// `5xx -> backoff, max 6 retries` / `4xx -> fail` policy (DESIGN s5.4).
+    fn classify_retry(
+        &self,
+        e: &anyhow::Error,
+        transient_retries: &mut u32,
+    ) -> Result<RetryDecision, UploadError> {
+        let class = classify_drive_error(e);
+        self.pacer.note_response(class.response_class());
+        match class {
+            DriveError::RateLimited | DriveError::Transient => {
+                *transient_retries += 1;
+                if *transient_retries > MAX_TRANSIENT_RETRIES {
+                    return Ok(RetryDecision::Fail(class.error_code()));
+                }
+                Ok(RetryDecision::Retry)
+            }
+            DriveError::QuotaExhausted
+            | DriveError::DailyQuota
+            | DriveError::InvalidGrant
+            | DriveError::DestFolderMissing
+            | DriveError::DestFolderPermissionDenied
+            | DriveError::Other => Ok(RetryDecision::Fail(class.error_code())),
         }
     }
 
@@ -992,6 +1495,134 @@ impl DefaultExecutor {
         self.state
             .update_pending_op_payload(op_id, &payload.to_value())
             .await
+    }
+
+    /// P1-5: resolve the Drive destination for `relative_path` under
+    /// `source`, carrying the canonical `app_props` (built by the caller with
+    /// the op_uuid).
+    ///
+    /// - **Plaintext source**: the file lands flat under the source's
+    ///   `drive_folder_id` with its plaintext final component as the name
+    ///   (the pre-existing M3 behaviour; nested plaintext folders are not in
+    ///   scope here).
+    /// - **Encrypted source** (DESIGN s7): every path component is encrypted
+    ///   independently via [`SourceCryptoSuite::encrypt_filename`], chaining
+    ///   each child under its parent's ciphertext as AEAD AAD. The encrypted
+    ///   parent directory components are `ensure_folder`ed on Drive so the
+    ///   object lands under the CIPHERTEXT path - the plaintext name never
+    ///   leaves the machine. The slash-joined encrypted path is returned as
+    ///   `encrypted_remote_path` for the `file_state` row; the plaintext
+    ///   `relative_path` stays only in local state / the restore UI.
+    async fn resolve_remote_target(
+        &self,
+        source: &SourceRow,
+        relative_path: &RelativePath,
+        app_props: HashMap<String, String>,
+    ) -> anyhow::Result<RemoteTarget> {
+        let Some(crypto) = self.crypto.as_deref() else {
+            // Plaintext: flat under the source root with the plaintext name.
+            return Ok(RemoteTarget {
+                parent_id: source.drive_folder_id.clone(),
+                name: filename_of(relative_path),
+                app_props,
+                encrypted_remote_path: None,
+            });
+        };
+
+        // Encrypted: ensure_folder the encrypted parent chain, then encrypt
+        // the leaf under the deepest folder's ciphertext AAD.
+        let EncryptedParents {
+            parent_id,
+            parent_aad,
+            mut encrypted_components,
+            leaf,
+        } = self
+            .ensure_encrypted_parents(source, relative_path, crypto)
+            .await?;
+
+        let enc_leaf = crypto
+            .encrypt_filename(&leaf, &parent_aad)
+            .map_err(|e| anyhow::anyhow!("filename encrypt failed for the leaf: {e}"))?;
+        encrypted_components.push(enc_leaf.clone());
+
+        Ok(RemoteTarget {
+            parent_id,
+            name: enc_leaf,
+            app_props,
+            encrypted_remote_path: Some(encrypted_components.join("/")),
+        })
+    }
+
+    /// Re-derive (read path) the Drive folder id the orphan of
+    /// `relative_path` would live directly under, for the reconcile create
+    /// path (P1-5 / Cluster-A no-duplicate). For a plaintext source this is
+    /// the source root; for an encrypted source it is the deepest encrypted
+    /// parent folder, re-derived via the same idempotent `ensure_folder`
+    /// chain `resolve_remote_target` used on the original upload (so the
+    /// `find_by_op_uuid` search hits the right parent, not the root).
+    async fn reconcile_parent_id(
+        &self,
+        source: &SourceRow,
+        relative_path: &RelativePath,
+    ) -> anyhow::Result<String> {
+        match self.crypto.as_deref() {
+            None => Ok(source.drive_folder_id.clone()),
+            Some(crypto) => {
+                let EncryptedParents { parent_id, .. } = self
+                    .ensure_encrypted_parents(source, relative_path, crypto)
+                    .await?;
+                Ok(parent_id)
+            }
+        }
+    }
+
+    /// Walk the directory components of `relative_path`, encrypting each
+    /// under its parent's ciphertext AAD and `ensure_folder`ing it on Drive
+    /// (idempotent), returning the deepest folder id, the AAD to bind the
+    /// leaf under, the encrypted directory components, and the plaintext
+    /// leaf. Shared by `resolve_remote_target` (upload) and
+    /// `reconcile_parent_id` (recovery).
+    async fn ensure_encrypted_parents(
+        &self,
+        source: &SourceRow,
+        relative_path: &RelativePath,
+        crypto: &dyn SourceCryptoSuite,
+    ) -> anyhow::Result<EncryptedParents> {
+        let components: Vec<&str> = relative_path
+            .as_str()
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .collect();
+        // RelativePath is validated non-empty with a real final component;
+        // this is the SPEC s0 trivially-unreachable carve-out.
+        let (leaf, dirs) = components
+            .split_last()
+            .ok_or_else(|| anyhow::anyhow!("relative_path has no components: {relative_path}"))?;
+
+        let mut parent_id = source.drive_folder_id.clone();
+        // The parent ciphertext name bound in as AEAD AAD (empty at the root,
+        // DESIGN s7.1). Tracks the deepest folder's ciphertext name.
+        let mut parent_aad: Vec<u8> = Vec::new();
+        let mut encrypted_components: Vec<String> = Vec::with_capacity(components.len());
+
+        for dir in dirs {
+            let enc_name = crypto
+                .encrypt_filename(dir, &parent_aad)
+                .map_err(|e| anyhow::anyhow!("filename encrypt failed for a directory: {e}"))?;
+            self.pacer.permit_request().await;
+            let folder = self.remote.ensure_folder(&parent_id, &enc_name).await?;
+            self.pacer.note_response(ResponseClass::Ok);
+            parent_id = folder.id;
+            parent_aad = enc_name.as_bytes().to_vec();
+            encrypted_components.push(enc_name);
+        }
+
+        Ok(EncryptedParents {
+            parent_id,
+            parent_aad,
+            encrypted_components,
+            leaf: leaf.to_string(),
+        })
     }
 
     /// Build the canonical `appProperties` for an object Driven owns
@@ -1170,12 +1801,15 @@ impl Executor for DefaultExecutor {
                     }
                 }
             } else {
-                // Create path: find the orphaned object by op uuid.
-                match self
-                    .remote
-                    .find_by_op_uuid(&source.drive_folder_id, &uuid)
-                    .await?
-                {
+                // Create path: find the orphaned object by op uuid under its
+                // PARENT folder. For an encrypted source the object lives
+                // under a nested ciphertext folder, not the source root, so
+                // searching the root alone would miss the orphan and leave a
+                // duplicate on the next scan (P1-5 must not regress the
+                // Cluster-A no-duplicate contract). Re-derive the parent
+                // (idempotent `ensure_folder` for the encrypted dir chain).
+                let parent_id = self.reconcile_parent_id(source, &op.relative_path).await?;
+                match self.remote.find_by_op_uuid(&parent_id, &uuid).await? {
                     Some(entry) => self.adopt_reconciled(source, &op, &payload, entry).await?,
                     None => {
                         self.state.delete_pending_op(op.id).await?;
@@ -1482,6 +2116,249 @@ fn update_progress(progress: &mut ExecProgress, outcome: &OpOutcome, plan: &Plan
         OpOutcome::Failed { .. } => progress.errors += 1,
         OpOutcome::Skipped { .. } => {}
     }
+}
+
+// -----------------------------------------------------------------------------
+// Streaming pipeline support types + stages (P1-4, DESIGN s11.4.3)
+// -----------------------------------------------------------------------------
+
+/// The resolved Drive destination for one upload (P1-5). For a plaintext
+/// source this is the source root + the plaintext leaf name; for an
+/// encrypted source the parent is the deepest `ensure_folder`ed ciphertext
+/// directory and `name` is the leaf's ciphertext, with the full slash-joined
+/// ciphertext path captured in `encrypted_remote_path`.
+struct RemoteTarget {
+    /// Drive folder id the object lives directly under.
+    parent_id: String,
+    /// The object's Drive display name (ciphertext for encrypted sources).
+    name: String,
+    /// The canonical `appProperties` (identity + crash-safe op_uuid).
+    app_props: HashMap<String, String>,
+    /// The slash-joined ciphertext path for an encrypted source; `None` for
+    /// plaintext. Persisted in `file_state.encrypted_remote_path`.
+    encrypted_remote_path: Option<String>,
+}
+
+/// What an upload (buffered or streamed) produced: the plaintext blake3 and
+/// the resulting Drive object.
+struct UploadProduct {
+    blake3: [u8; 32],
+    entry: RemoteEntry,
+}
+
+/// The result of `ensure_encrypted_parents`: the deepest encrypted parent
+/// folder, the AAD to bind the leaf under, the encrypted dir components, and
+/// the plaintext leaf component.
+struct EncryptedParents {
+    parent_id: String,
+    parent_aad: Vec<u8>,
+    encrypted_components: Vec<String>,
+    leaf: String,
+}
+
+/// The cpu stage's result: the plaintext blake3 + the md5 over the exact
+/// bytes it emitted to the uploader.
+struct CpuOutput {
+    blake3: [u8; 32],
+    md5: [u8; 16],
+}
+
+/// Retry decision returned by [`DefaultExecutor::classify_retry`].
+enum RetryDecision {
+    /// Transient (5xx / network / rate-limit) within the budget; loop again.
+    Retry,
+    /// Non-retryable, or the transient budget is exhausted; fail with code.
+    Fail(ErrorCode),
+}
+
+/// Result of pushing one wire chunk to a resumable session.
+enum PushOne {
+    /// Drive acked up to this offset (exclusive); keep going.
+    Acked(u64),
+    /// The final chunk completed the upload.
+    Done(RemoteEntry),
+    /// The session 4xx'd; abort the streamed transfer.
+    Invalid,
+}
+
+/// Error from the reader / cpu pipeline stages. Distinguishes a local
+/// changed/replaced-during-upload skip from a crypto / IO per-op failure so
+/// `stage_err_to_upload` can map it to the right [`UploadError`].
+enum StageError {
+    /// The local file changed/shrank/grew mid-read (byte count disagreed
+    /// with the planner's size) -> `ChangedDuringUpload` skip.
+    Changed,
+    /// A read IO error.
+    Io(std::io::Error),
+    /// A crypto error in the cpu stage.
+    Crypto(CryptoError),
+    /// The downstream channel closed while this stage still had data to send:
+    /// an ARTIFACT of a downstream (uploader) error, not a real local change.
+    /// The caller surfaces the uploader's real error first; this only maps if
+    /// it somehow leaks through (it should not).
+    DownstreamGone,
+}
+
+/// Map a [`StageError`] onto the executor's [`UploadError`].
+fn stage_err_to_upload(e: StageError) -> UploadError {
+    match e {
+        // The bytes may or may not have landed; the caller's post-upload
+        // fstat treats a CREATE orphan correctly. Use SkipPostUpload so a
+        // create orphan is kept for reconcile (mirrors the inline post-read
+        // skip semantics for the streamed window).
+        StageError::Changed => UploadError::SkipPostUpload(SkipReason::ChangedDuringUpload),
+        StageError::Io(io) => {
+            warn!(target: TARGET, error = %io, "streaming read IO error");
+            UploadError::Failed(ErrorCode::LocalIoError)
+        }
+        StageError::Crypto(ce) => UploadError::Failed(crypto_error_code(&ce)),
+        // Should be unreachable: the caller surfaces the uploader error
+        // first. Map to a transient failure so the op is retried rather than
+        // silently swallowed if it ever does surface.
+        StageError::DownstreamGone => UploadError::Failed(ErrorCode::DriveUnreachable),
+    }
+}
+
+/// Predict the EXACT number of bytes that will be sent to Drive for a file
+/// of `plaintext_len` plaintext bytes (DESIGN s7.1 framing). Needed up front
+/// so the streaming upload can declare its `Content-Length` before producing
+/// the bytes.
+///
+/// - Plaintext: `plaintext_len`.
+/// - Encrypted: `HEADER_LEN` (40) + every plaintext byte + a 16-byte
+///   Poly1305 tag per 64-KiB plaintext chunk. An empty file still emits one
+///   (empty) final chunk, hence `max(1, ...)` chunks.
+fn predicted_sent_len(plaintext_len: u64, encrypted: bool) -> u64 {
+    if !encrypted {
+        return plaintext_len;
+    }
+    let read_buf = READ_BUF as u64;
+    let chunks = plaintext_len.div_ceil(read_buf).max(1);
+    driven_crypto::HEADER_LEN as u64 + plaintext_len + chunks * TAG_LEN as u64
+}
+
+/// Poly1305 tag length appended to each STREAM chunk's ciphertext
+/// (chacha20poly1305). Used by [`predicted_sent_len`].
+const TAG_LEN: usize = 16;
+
+/// The READER stage of the streaming pipeline (DESIGN s11.4.3). Reads the
+/// open `file` in [`READ_BUF`] (64 KiB) plaintext chunks - the format chunk
+/// boundary the content encryptor and the restore decryptor both replay -
+/// applying the pacer byte bucket BEFORE each read so the bandwidth cap +
+/// backpressure are at the source. Sends each chunk to the cpu stage over
+/// the bounded channel. Stops early (no error) if the downstream channel
+/// closes. Reads AT MOST `size` bytes and errors `Changed` if the file's
+/// byte count disagrees with the planner's `size`.
+async fn read_stage(
+    file: &mut tokio::fs::File,
+    size: u64,
+    pacer: Arc<dyn Pacer>,
+    raw_tx: tokio::sync::mpsc::Sender<Bytes>,
+    mem_gauge: Option<Arc<MemGauge>>,
+) -> Result<(), StageError> {
+    let mut buf = vec![0u8; READ_BUF];
+    let mut read_total: u64 = 0;
+    loop {
+        let n = file.read(&mut buf).await.map_err(StageError::Io)?;
+        if n == 0 {
+            break;
+        }
+        read_total += n as u64;
+        if read_total > size {
+            // The file grew mid-read; the declared length would be wrong.
+            return Err(StageError::Changed);
+        }
+        pacer.permit_bytes(n as u64).await;
+        // Record the bytes entering the pipeline (test instrumentation; the
+        // matching `sub` happens once Drive accepts the wire chunk).
+        if let Some(g) = mem_gauge.as_ref() {
+            g.add(n as u64);
+        }
+        if raw_tx
+            .send(Bytes::copy_from_slice(&buf[..n]))
+            .await
+            .is_err()
+        {
+            // Downstream (cpu/uploader) gone - a downstream error aborted the
+            // pipeline. The real error surfaces from that stage; this is just
+            // an artifact (the caller surfaces the uploader error first).
+            return Err(StageError::DownstreamGone);
+        }
+    }
+    if read_total != size {
+        // The file shrank mid-read.
+        return Err(StageError::Changed);
+    }
+    Ok(())
+}
+
+/// The CPU stage of the streaming pipeline (DESIGN s11.4.3 / s11.4.4).
+/// Drains the reader's plaintext chunks, hashing blake3 over the plaintext
+/// (`update_rayon` for files above [`RAYON_HASH_THRESHOLD`], multi-core) and,
+/// when `crypto` is `Some`, encrypting each 64-KiB plaintext chunk through
+/// the [`ContentEncryptor`] (header first, last chunk via `finalize_last`).
+/// Accumulates the md5 over the exact bytes it emits and forwards them to the
+/// uploader over the bounded channel. Returns the plaintext blake3 + that
+/// md5. Reads one chunk ahead so it can flag the final plaintext chunk for
+/// the STREAM last-block marker.
+async fn cpu_stage(
+    mut raw_rx: tokio::sync::mpsc::Receiver<Bytes>,
+    out_tx: tokio::sync::mpsc::Sender<Bytes>,
+    crypto: Option<Arc<dyn SourceCryptoSuite>>,
+    size: u64,
+) -> Result<CpuOutput, StageError> {
+    use md5::{Digest, Md5};
+
+    let mut hasher = blake3::Hasher::new();
+    let use_rayon = size >= RAYON_HASH_THRESHOLD;
+    let mut md5 = Md5::new();
+
+    // Hash a plaintext chunk into blake3, multi-core for big files.
+    let hash_chunk = |h: &mut blake3::Hasher, chunk: &[u8]| {
+        if use_rayon {
+            h.update_rayon(chunk);
+        } else {
+            h.update(chunk);
+        }
+    };
+
+    if let Some(suite) = crypto {
+        let mut enc: Box<dyn ContentEncryptor> = suite.content_encryptor();
+        let header = enc.header();
+        md5.update(&header);
+        if out_tx.send(header).await.is_err() {
+            return Err(StageError::DownstreamGone);
+        }
+        // Read one chunk ahead so the final chunk can be finalized.
+        let mut pending: Option<Bytes> = None;
+        while let Some(chunk) = raw_rx.recv().await {
+            hash_chunk(&mut hasher, &chunk);
+            if let Some(prev) = pending.take() {
+                let ct = enc.encrypt_chunk(&prev).map_err(StageError::Crypto)?;
+                md5.update(&ct);
+                if out_tx.send(ct).await.is_err() {
+                    return Err(StageError::DownstreamGone);
+                }
+            }
+            pending = Some(chunk);
+        }
+        let last = pending.unwrap_or_default();
+        let (ct, _ct_md5) = enc.finalize_last(&last).map_err(StageError::Crypto)?;
+        md5.update(&ct);
+        let _ = out_tx.send(ct).await; // downstream may have finished
+    } else {
+        while let Some(chunk) = raw_rx.recv().await {
+            hash_chunk(&mut hasher, &chunk);
+            md5.update(&chunk);
+            if out_tx.send(chunk).await.is_err() {
+                return Err(StageError::DownstreamGone);
+            }
+        }
+    }
+
+    let blake3: [u8; 32] = hasher.finalize().into();
+    let md5: [u8; 16] = md5.finalize().into();
+    Ok(CpuOutput { blake3, md5 })
 }
 
 // -----------------------------------------------------------------------------
@@ -2679,5 +3556,332 @@ mod tests {
             .unwrap();
         let expect_blake3: [u8; 32] = blake3::hash(&plaintext).into();
         assert_eq!(row.hash_blake3, expect_blake3);
+    }
+
+    // --- P1-4: predicted_sent_len must match the REAL crypto framing --------
+
+    /// The streaming pipeline declares its `Content-Length` (the resumable
+    /// session size / `UploadBody::Stream { len }`) BEFORE producing the
+    /// bytes, from [`predicted_sent_len`]. If that prediction is off by even
+    /// one Poly1305 tag the fake rejects the upload (length mismatch). Prove
+    /// the formula matches the real `DrivenCryptoSuite` framing across the
+    /// boundary cases (empty, exact-READ_BUF multiple, READ_BUF+1, multi).
+    #[test]
+    fn predicted_sent_len_matches_real_crypto_framing() {
+        use driven_crypto::{DrivenCryptoSuite, SourceCryptoSuite as _};
+
+        // Unencrypted is trivially the plaintext length.
+        for n in [0u64, 1, READ_BUF as u64, READ_BUF as u64 + 1, 5_000_003] {
+            assert_eq!(predicted_sent_len(n, false), n);
+        }
+        // Empty encrypted file: header(40) + 0 plaintext + 1 final tag(16).
+        assert_eq!(predicted_sent_len(0, true), 40 + 16);
+
+        let suite = DrivenCryptoSuite::new(driven_crypto::key::SourceKey::generate());
+        // Drive the real encryptor exactly as the cpu stage does (64 KiB
+        // plaintext chunks, last via finalize_last) and compare the byte
+        // count to the prediction.
+        for plaintext_len in [
+            0usize,
+            1,
+            READ_BUF,
+            READ_BUF + 1,
+            2 * READ_BUF,
+            3 * READ_BUF + 777,
+        ] {
+            let plaintext = vec![0x42u8; plaintext_len];
+            let mut enc = suite.content_encryptor();
+            let mut produced = enc.header().len();
+            let mut chunks: Vec<&[u8]> = plaintext.chunks(READ_BUF).collect();
+            if chunks.is_empty() {
+                chunks.push(&[]);
+            }
+            let (last, rest) = chunks.split_last().unwrap();
+            for c in rest {
+                produced += enc.encrypt_chunk(c).unwrap().len();
+            }
+            let (ct, _md5) = enc.finalize_last(last).unwrap();
+            produced += ct.len();
+            assert_eq!(
+                produced as u64,
+                predicted_sent_len(plaintext_len as u64, true),
+                "framing mismatch for plaintext_len={plaintext_len}"
+            );
+        }
+    }
+
+    // --- P1-4: large file streams (recv-loop flush + bounded memory) --------
+
+    /// A file well above [`PIPELINE_THRESHOLD`] AND large enough to fill the
+    /// uploader's `while acc.len() >= 2 * WIRE_CHUNK` flush branch (which the
+    /// 5-MiB+7 `large_file_uses_resumable_and_commits` never reaches). Drives
+    /// the full 3-stage streaming pipeline and asserts the bytes land intact
+    /// and the in-flight memory stayed bounded far below the file size.
+    #[tokio::test]
+    async fn large_file_streams_with_bounded_memory() {
+        let h = harness().await;
+        // 64 MiB: > 2*WIRE_CHUNK (8 MiB) so the streaming flush loop runs many
+        // times; bounded memory must keep peak far below 64 MiB.
+        let size_bytes = 64 * 1024 * 1024usize;
+        let big: Vec<u8> = (0..size_bytes).map(|i| (i % 251) as u8).collect();
+        let (rel, size) = h.write_file("huge.bin", &big);
+        let gauge = Arc::new(MemGauge::default());
+        let exec = h.executor().with_mem_gauge(gauge.clone());
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
+
+        // Bytes landed intact.
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].size, Some(size));
+        assert_eq!(h.remote.open_session_count(), 0, "no leaked session");
+
+        // Peak in-flight bytes stayed BOUNDED: a regression to whole-file
+        // buffering would push peak to ~64 MiB. The bound is the channel
+        // backlog (8 x 64 KiB) + the uploader accumulator (< 2 x 4 MiB wire
+        // chunks) + slack -> comfortably under 16 MiB and emphatically <<
+        // the 64 MiB file.
+        let peak = gauge.peak();
+        // Lower bound: prove the STREAMING path actually ran (peak==0 would
+        // mean the file took the inline buffered path and the gauge recorded
+        // nothing - a vacuous pass). The 2 x WIRE_CHUNK hold-back guarantees
+        // peak >= WIRE_CHUNK for any file far above 8 MiB.
+        assert!(
+            peak >= WIRE_CHUNK as u64,
+            "streaming must actually run (peak >= one wire chunk proves accumulation), got {peak}"
+        );
+        assert!(
+            peak < 16 * 1024 * 1024,
+            "streaming peak in-flight {peak} bytes must stay bounded (<16 MiB), not buffer the 64 MiB file"
+        );
+        assert!(
+            peak < size / 4,
+            "peak {peak} must be far below the {size}-byte file size"
+        );
+    }
+
+    // --- P1-4: streamed-session-invalidation fails without hanging ----------
+
+    /// If a resumable session 4xx's mid-stream, the streamed transfer cannot
+    /// replay the consumed channel, so it surfaces a per-op failure. The
+    /// three concurrent stages must NOT deadlock when one errors: a
+    /// `tokio::time::timeout` turns a hang into a failure rather than stalling
+    /// CI. (Validates the `join!` + send-error-terminates design.)
+    #[tokio::test]
+    async fn streamed_session_invalid_fails_without_hang() {
+        // Arm the next-opened session to die after its first accepted chunk.
+        let remote = InMemoryRemoteStore::new().with_session_invalidated_after(1);
+        let h = harness_with_remote(remote).await;
+        // > PIPELINE_THRESHOLD and > 1 wire chunk so a mid-stream chunk push
+        // hits the armed invalidation.
+        let big = vec![0x33u8; 12 * 1024 * 1024];
+        let (rel, size) = h.write_file("dies.bin", &big);
+        let exec = h.executor();
+        let out = tokio::time::timeout(
+            std::time::Duration::from_secs(30),
+            exec.execute(&h.source, &h.upload_plan(&rel, size), &noop_progress),
+        )
+        .await
+        .expect("streaming must not hang on a mid-stream session failure")
+        .unwrap();
+        assert!(
+            matches!(out[0], OpOutcome::Failed { .. }),
+            "a mid-stream session 4xx surfaces a per-op failure, got {:?}",
+            out[0]
+        );
+        // Not committed as Synced. (The fake keeps an invalidated session as
+        // a dead tombstone in its map - that is fake-internal modelling, not
+        // an executor leak - so we do not assert open_session_count here.)
+        let row = h.state.get_file_state(h.source.id, &rel).await.unwrap();
+        assert!(row.is_none() || row.unwrap().status != FileStateStatus::Synced);
+    }
+
+    // --- P1-5: large encrypted file streams under a ciphertext name ---------
+
+    /// An encrypted file above [`PIPELINE_THRESHOLD`] exercises the encrypted
+    /// streaming pipeline + the up-front length prediction against REAL
+    /// crypto framing (the `FakeSuite` test above only covers the inline
+    /// path). Asserts the upload lands, the stored name is ciphertext (not
+    /// the plaintext name), and the content round-trips through decryption.
+    #[tokio::test]
+    async fn large_encrypted_file_streams_and_round_trips() {
+        use driven_crypto::{ContentDecryptor, DrivenCryptoSuite, HEADER_LEN};
+        use tokio::io::AsyncReadExt;
+
+        let h = harness().await;
+        let source_key = driven_crypto::key::SourceKey::generate();
+        let suite = Arc::new(DrivenCryptoSuite::new(source_key.clone()));
+        let exec = h.executor_with_crypto(Some(suite));
+
+        // > PIPELINE_THRESHOLD so the encrypted STREAMING path runs.
+        let plaintext: Vec<u8> = (0..(6 * 1024 * 1024usize))
+            .map(|i| (i % 253) as u8)
+            .collect();
+        let (rel, size) = h.write_file("big-secret.bin", &plaintext);
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out[0], OpOutcome::Done { .. }),
+            "encrypted streamed upload should land: {:?}",
+            out[0]
+        );
+
+        // The stored object's NAME is ciphertext, not "big-secret.bin".
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_ne!(
+            children[0].name, "big-secret.bin",
+            "the Drive object name must be the ciphertext, not the plaintext filename"
+        );
+
+        // Download the ciphertext + decrypt -> the original plaintext.
+        let mut blob = Vec::new();
+        h.remote
+            .download(&children[0].id)
+            .await
+            .unwrap()
+            .0
+            .read_to_end(&mut blob)
+            .await
+            .unwrap();
+        assert_ne!(blob, plaintext, "stored bytes must be encrypted");
+        let restore = DrivenCryptoSuite::new(source_key);
+        let mut dec: Box<dyn ContentDecryptor> =
+            restore.content_decryptor(&blob[..HEADER_LEN]).unwrap();
+        let mut restored = Vec::new();
+        // Decrypt chunk-by-chunk at the 64-KiB+tag boundary the encryptor used.
+        let ct_chunk = READ_BUF + 16; // plaintext chunk + Poly1305 tag
+        let body = &blob[HEADER_LEN..];
+        let mut off = 0;
+        while body.len() - off > ct_chunk {
+            restored.extend_from_slice(&dec.decrypt_chunk(&body[off..off + ct_chunk]).unwrap());
+            off += ct_chunk;
+        }
+        restored.extend_from_slice(&dec.decrypt_last(&body[off..]).unwrap());
+        assert_eq!(restored, plaintext, "decrypted bytes match the original");
+
+        // file_state carries the plaintext blake3 + the encrypted_remote_path.
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.hash_blake3, *blake3::hash(&plaintext).as_bytes());
+        assert_eq!(
+            row.encrypted_remote_path.as_deref(),
+            Some(children[0].name.as_str()),
+            "encrypted_remote_path is the (flat) ciphertext leaf name"
+        );
+    }
+
+    // --- P1-5 x Cluster-A: reconcile adopts a NESTED encrypted orphan -------
+
+    /// An encrypted file's orphan lives under a nested CIPHERTEXT folder, not
+    /// the source root. Reconcile must re-derive that encrypted parent and
+    /// `find_by_op_uuid` THERE, or it would miss the orphan and the next scan
+    /// would re-upload it as a DUPLICATE - regressing Cluster-A's no-duplicate
+    /// contract. This drives a real encrypted nested upload, simulates the
+    /// lost-commit crash, reconciles with a fresh executor, and asserts the
+    /// orphan is adopted (no duplicate).
+    #[tokio::test]
+    async fn reconcile_adopts_nested_encrypted_orphan_no_duplicate() {
+        use driven_crypto::DrivenCryptoSuite;
+
+        let h = harness().await;
+        let source_key = driven_crypto::key::SourceKey::generate();
+        let make_exec =
+            || h.executor_with_crypto(Some(Arc::new(DrivenCryptoSuite::new(source_key.clone()))));
+
+        let (rel, size) = h.write_file("a/b/c.bin", b"nested encrypted payload");
+
+        // Phase 1: a normal encrypted upload (lands under nested ciphertext
+        // folders).
+        let exec = make_exec();
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(matches!(out[0], OpOutcome::Done { .. }));
+
+        // Find the leaf object + its parent (deepest ciphertext folder) +
+        // op_uuid by walking the encrypted tree.
+        let lvl1 = &h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap()[0];
+        let lvl2 = &h.remote.list_folder(&lvl1.id).await.unwrap()[0];
+        let leaf = h.remote.list_folder(&lvl2.id).await.unwrap()[0].clone();
+        let op_uuid = leaf
+            .app_properties
+            .get(CLIENT_OP_UUID_KEY)
+            .cloned()
+            .expect("leaf carries its client_op_uuid");
+
+        // Simulate the lost commit: drop file_state + re-enqueue the create op.
+        h.state.delete_file_state(h.source.id, &rel).await.unwrap();
+        let now = h.clock.now_ms();
+        let uploaded_hex = hex::encode(blake3::hash(b"nested encrypted payload").as_bytes());
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                payload_json: serde_json::json!({
+                    "client_op_uuid": op_uuid,
+                    "drive_file_id": null,
+                    "uploaded_blake3_hex": uploaded_hex,
+                }),
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        // Phase 2: reconcile with a fresh executor. It must find the orphan
+        // under the NESTED encrypted parent (not the root) and adopt it.
+        let exec2 = make_exec();
+        exec2.reconcile(&h.source).await.unwrap();
+
+        // The SAME object was adopted: still exactly one object in the leaf
+        // folder, file_state restored Synced with that id, op drained.
+        let leaf_after = h.remote.list_folder(&lvl2.id).await.unwrap();
+        assert_eq!(
+            leaf_after.len(),
+            1,
+            "no duplicate under the encrypted folder"
+        );
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("file_state restored by adoption");
+        assert_eq!(row.status, FileStateStatus::Synced);
+        assert_eq!(
+            row.drive_file_id.as_deref(),
+            Some(leaf.id.as_str()),
+            "adopted the SAME nested object id, not a fresh upload"
+        );
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 }
