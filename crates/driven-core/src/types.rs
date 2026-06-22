@@ -311,6 +311,129 @@ pub struct Plan {
     pub ops: Vec<Op>,
 }
 
+impl Plan {
+    /// Tallies the plan into a [`PlanSummary`] for activity logging and the
+    /// orchestrator's `Planning { plan: PlanSummary }` state (SPEC s5).
+    ///
+    /// `bytes` counts only [`Op::HashThenUpload`] sizes - trashes move no
+    /// bytes. This is a pure fold over `ops`, not sync behaviour.
+    pub fn summary(&self) -> PlanSummary {
+        let mut summary = PlanSummary::default();
+        for op in &self.ops {
+            match op {
+                Op::HashThenUpload { size, .. } => {
+                    summary.uploads += 1;
+                    summary.bytes += *size;
+                }
+                Op::Trash { .. } => summary.trashes += 1,
+            }
+        }
+        summary
+    }
+}
+
+/// A counts-only digest of a [`Plan`] (SPEC s5
+/// `OrchestratorState::Planning { plan: PlanSummary }`).
+///
+/// Used for the activity-log "scan_done"/dry-run summary line and the
+/// orchestrator state without carrying the full op list across the IPC
+/// boundary.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PlanSummary {
+    /// Number of [`Op::HashThenUpload`] ops in the plan.
+    pub uploads: usize,
+    /// Number of [`Op::Trash`] ops in the plan.
+    pub trashes: usize,
+    /// Total bytes the upload ops will move (sum of their `size` fields).
+    /// Trashes contribute nothing.
+    pub bytes: u64,
+}
+
+// -----------------------------------------------------------------------------
+// Scanner surface: ScanResult, LocalEntry, ScanMode, SymlinkPolicy
+// -----------------------------------------------------------------------------
+
+/// The diff a single scan of one source produces (SPEC s6).
+///
+/// The scanner walks the local tree, compares each file against the
+/// `file_state` rows (SPEC s2) loaded for the source, and emits the set of
+/// files that need uploading plus the set whose `file_state` rows have no
+/// surviving local file. The planner (SPEC s7) turns this into a [`Plan`].
+///
+/// Paths are [`RelativePath`] (NFC-canonical, the `file_state` primary-key
+/// form per DESIGN s5.2.3), not raw `PathBuf` - the SPEC s6 pseudocode
+/// uses `PathBuf` only illustratively.
+///
+/// Note: this shape does NOT carry the walk-error / partial-success signal
+/// DESIGN s5.2 step 3 requires to gate safe deletion (a permission denial
+/// under a subtree must never cascade into trashing everything under it).
+/// That signal's channel is unresolved at this layer - see the M2 phase-1
+/// finding.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ScanResult {
+    /// Files that are new or whose `(size, mtime_ns)` (or, under
+    /// [`ScanMode::DeepVerify`], whose hash) differs from the stored
+    /// `file_state` row. Each becomes one [`Op::HashThenUpload`].
+    pub new_or_changed: Vec<LocalEntry>,
+    /// Relative paths present in `file_state` but no longer on disk. The
+    /// planner trashes the ones that reached Drive and drops the rest
+    /// (SPEC s7).
+    pub deleted: Vec<RelativePath>,
+}
+
+/// One local file the scanner observed (SPEC s6 `LocalEntry`).
+///
+/// Carries exactly the cheap stat fields the fast-path diff compares
+/// against the `file_state` row (DESIGN s5.2 step 2); the BLAKE3 hash is
+/// computed later by the executor's `HashThenUpload`, not here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct LocalEntry {
+    /// Path under the source's `local_path`, NFC-canonical.
+    pub rel: RelativePath,
+    /// File size in bytes from the entry's metadata.
+    pub size: u64,
+    /// Modification time in nanoseconds since the Unix epoch. Signed to
+    /// match `file_state.mtime_ns` (SPEC s2) and tolerate pre-epoch mtimes.
+    pub mtime_ns: i64,
+}
+
+/// How aggressively a scan decides a file changed (DESIGN s3.3, s5.2).
+///
+/// The two modes differ only in the change-detection predicate; both emit
+/// the same [`ScanResult`] shape, so a [`ScanMode::DeepVerify`] hit lands
+/// in `new_or_changed` exactly like an mtime/size change and produces one
+/// [`Op::HashThenUpload`] (ROADMAP M2 "deep-verify catches bit-rot" row).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum ScanMode {
+    /// Default per-tick scan: a file is changed iff its `(size, mtime_ns)`
+    /// differs from the stored `file_state` row. Cheap; never reads
+    /// content (DESIGN s5.2 step 2 fast path).
+    FastPath,
+    /// Periodic re-verification (default weekly per
+    /// `deep_verify_interval_secs`): re-hash every file regardless of
+    /// `(size, mtime_ns)` and treat a hash mismatch against the stored
+    /// `hash_blake3` as a change. Catches silent bit-rot and filesystem
+    /// timestamp lies (DESIGN s3.3, s5.2 step 4).
+    DeepVerify,
+}
+
+/// What the scanner does when it meets a symbolic link (DESIGN s5.2.1).
+///
+/// V1 ships only [`SymlinkPolicy::Skip`]: the link is not followed and the
+/// link itself is not backed up, because following can walk out of the
+/// configured source, can loop, and is almost never what the user
+/// intended. A per-source "follow symlinks" toggle (the `Follow` variant)
+/// is V2 - omitted here so V1 code can never accidentally follow.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Default, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum SymlinkPolicy {
+    /// Do not follow symlinks; do not back up the link itself. V1 default
+    /// and only option (DESIGN s5.2.1).
+    #[default]
+    Skip,
+}
+
 // -----------------------------------------------------------------------------
 // ErrorCode
 // -----------------------------------------------------------------------------

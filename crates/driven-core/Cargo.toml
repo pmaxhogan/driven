@@ -21,6 +21,11 @@ futures.workspace = true
 uuid.workspace = true
 hex.workspace = true
 unicode-normalization = "0.1"
+# M2 scanner: gitignore-aware tree walk (the one crate the research
+# confirmed - DESIGN s16). Pulls walkdir transitively.
+ignore = "0.4.26"
+# M2 deep-verify re-hash to catch bit-rot (DESIGN s3.3 / ROADMAP M2).
+blake3 = "1"
 sqlx = { version = "0.8", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",

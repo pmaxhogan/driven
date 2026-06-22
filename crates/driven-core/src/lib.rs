@@ -14,6 +14,9 @@
 //! [`StateRepo`](state::StateRepo) trait surface. Concrete sync-engine
 //! modules (scanner, planner, orchestrator, ...) land in later milestones.
 
+pub mod exclude;
+pub mod planner;
+pub mod scanner;
 pub mod state;
 pub mod time;
 pub mod types;
