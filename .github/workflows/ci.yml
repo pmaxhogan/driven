@@ -101,8 +101,15 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
+      # src-tauri is a member of the ROOT cargo workspace, so `cargo tauri build`
+      # writes all compile artifacts to the root `target/`, NOT `src-tauri/target`.
+      # The old `workspaces: src-tauri` cached the wrong (near-empty, ~128MB) dir, so
+      # every run was a cold ~7min rebuild. Default workspace (`.` -> ./target) caches
+      # the real artifacts. prefix-key bumped to v1 to force past the stale v0 fossil
+      # cache (a full key-match would restore it and skip the corrected save).
       - uses: Swatinem/rust-cache@v2
-        with: { workspaces: "src-tauri" }
+        with:
+          prefix-key: "v1-rust"
       - name: pnpm install
         working-directory: ui
         run: pnpm install --frozen-lockfile
