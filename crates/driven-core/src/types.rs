@@ -154,12 +154,41 @@ impl TryFrom<String> for RelativePath {
     fn try_from(value: String) -> Result<Self, Self::Error> {
         use unicode_normalization::UnicodeNormalization;
 
+        // Reject Windows-absolute / drive-relative / UNC / device paths on
+        // the RAW input, BEFORE backslash normalization. Otherwise
+        // `"C:\Users\me\file.txt"` would normalize to `"C:/Users/me/..."`
+        // and slip past the relative checks - a restore-path-breakout risk
+        // for a backup/restore tool. Order matters: these run on the raw
+        // string; the leading-`/` check runs after normalization below.
+        //
+        // Drive-absolute / drive-relative: a second char of `:` with an
+        // ascii-alphabetic first char covers `C:\x`, `C:/x`, and bare
+        // `C:x`. (A manual check; no regex dependency needed.)
+        {
+            let bytes = value.as_bytes();
+            if bytes.len() >= 2 && bytes[1] == b':' && bytes[0].is_ascii_alphabetic() {
+                return Err(RelativePathError::DriveOrUnc);
+            }
+        }
+        // UNC / device prefixes on the raw input: `\\server\share`,
+        // `\\?\C:\...`, and the forward-slash spelling `//server/share`.
+        if value.starts_with("\\\\") || value.starts_with("//") {
+            return Err(RelativePathError::DriveOrUnc);
+        }
+
         // Normalise Windows separators to forward slashes so the
         // canonical form is portable across platforms (the doc invariant
         // above and SPEC s2 `file_state.relative_path`).
         let s = value.replace('\\', "/");
         if s.is_empty() {
             return Err(RelativePathError::Empty);
+        }
+        // After backslash normalization, a UNC `\\server` becomes
+        // `//server`; the raw-input guard above already rejected both
+        // spellings, but re-check here so any path that normalizes to a
+        // `//`-prefixed form is also refused.
+        if s.starts_with("//") {
+            return Err(RelativePathError::DriveOrUnc);
         }
         if s.starts_with('/') {
             return Err(RelativePathError::NotRelative);
@@ -198,6 +227,13 @@ pub enum RelativePathError {
     /// Path is absolute or starts with a leading separator.
     #[error("path must be relative")]
     NotRelative,
+    /// Path is a Windows drive-absolute / drive-relative path (e.g.
+    /// `C:\x`, `C:/x`, `C:x`) or a UNC / device path (`\\server\share`,
+    /// `//server/share`, `\\?\C:\...`). Rejecting these prevents a
+    /// restore-path breakout on Windows (SPEC s2 `file_state.relative_path`
+    /// must stay strictly relative).
+    #[error("path must not be a Windows drive-absolute or UNC path")]
+    DriveOrUnc,
     /// Path contains a `..` parent segment.
     #[error("path must not contain `..` segments")]
     ParentSegment,
@@ -652,6 +688,38 @@ mod tests {
         ));
         // A leading "." is fine; a segment that just contains ".." is not.
         assert!(RelativePath::try_from("a/..b/c".to_string()).is_ok());
+    }
+
+    #[test]
+    fn relative_path_rejects_windows_absolute_and_unc() {
+        // Drive-absolute / drive-relative (checked on raw input, BEFORE
+        // backslash normalization would mask `C:\` as `C:/`).
+        for s in [r"C:\Users\me", "C:/Users/me", "C:x", r"d:\file"] {
+            assert!(
+                matches!(
+                    RelativePath::try_from(s.to_string()),
+                    Err(RelativePathError::DriveOrUnc)
+                ),
+                "expected DriveOrUnc for {s:?}"
+            );
+        }
+        // UNC / device prefixes in both spellings.
+        for s in [r"\\server\share\f", "//server/share/f"] {
+            assert!(
+                matches!(
+                    RelativePath::try_from(s.to_string()),
+                    Err(RelativePathError::DriveOrUnc)
+                ),
+                "expected DriveOrUnc for {s:?}"
+            );
+        }
+        // Ordinary relative paths still accepted.
+        for s in ["a/b.txt", "deep/nested/file"] {
+            assert!(
+                RelativePath::try_from(s.to_string()).is_ok(),
+                "expected Ok for {s:?}"
+            );
+        }
     }
 
     #[test]

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM pending_ops WHERE id = ?1 AND source_id = ?2 AND relative_path = ?3",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "02157110c16d6110032d50093b1e9e78fec0a0a7b33f6d5f87ff3b6e25da99de"
+}

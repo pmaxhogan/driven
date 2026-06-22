@@ -63,6 +63,18 @@ impl SqliteStateRepo {
     /// `anyhow` error carrying the `state.db_corrupt` code prefix) when
     /// `PRAGMA integrity_check` returns anything other than `ok`.
     pub async fn open(path: &Path) -> Result<Self> {
+        // `create_if_missing(true)` creates the DB FILE but not its parent
+        // DIR. On first boot `<config_dir>/driven/` may not exist yet, so
+        // create the parent tree before connecting (DESIGN s5.6 / SPEC s2).
+        // `parent()` is `Some("")` for a bare filename; `create_dir_all("")`
+        // errors, so only create when the parent is a non-empty path.
+        if let Some(parent) = path.parent() {
+            if !parent.as_os_str().is_empty() {
+                std::fs::create_dir_all(parent)
+                    .map_err(|e| anyhow!("create state dir {}: {e}", parent.display()))?;
+            }
+        }
+
         let opts = SqliteConnectOptions::new()
             .filename(path)
             .create_if_missing(true)
@@ -159,13 +171,21 @@ impl SqliteStateRepo {
         // DESIGN s5.6 step 3: the pending_op delete is the load-bearing
         // reconciliation invariant. A wrong/already-committed op_id must NOT
         // be allowed to commit `file_state` (and must not silently delete an
-        // unrelated row). Require the DELETE to affect EXACTLY one row;
-        // otherwise return an `Err` so the implicit `tx` drop rolls back the
-        // `file_state` upsert too.
-        let deleted = sqlx::query!("DELETE FROM pending_ops WHERE id = ?1", op_id_v)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
+        // unrelated row). Bind the DELETE to the EXACT file this commit is
+        // for - id AND (source_id, relative_path) - so a stale/mismatched
+        // op_id that happens to exist for a DIFFERENT file cannot delete that
+        // unrelated pending_op and commit the wrong file_state. Require the
+        // DELETE to affect EXACTLY one row; otherwise return an `Err` so the
+        // implicit `tx` drop rolls back the `file_state` upsert too.
+        let deleted = sqlx::query!(
+            "DELETE FROM pending_ops WHERE id = ?1 AND source_id = ?2 AND relative_path = ?3",
+            op_id_v,
+            source_id,
+            relative_path,
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
         if deleted != 1 {
             return Err(anyhow!(
                 "state.reconcile_op_missing: pending_op id {op_id_v} not found \
@@ -865,8 +885,16 @@ impl StateRepo for SqliteStateRepo {
         } else {
             Some(serde_json::to_string(&filter.event_types)?)
         };
-        let limit_i = page.limit as i64;
-        let offset_i = (page.page as i64) * limit_i;
+        // SPEC s18.8: bound the computed offset. Clamp `limit` to 1..=10_000
+        // (a 0 limit would return an empty page; an unbounded limit would
+        // let the offset multiplication overflow for valid u32 `page`
+        // values), then compute the offset with checked arithmetic so a
+        // large `page` surfaces a structured `internal.bad_request` rather
+        // than panicking in debug / negative-wrapping in release.
+        let limit_i = (page.limit as i64).clamp(1, 10_000);
+        let offset_i = (page.page as i64)
+            .checked_mul(limit_i)
+            .ok_or_else(|| anyhow!("internal.bad_request: activity page offset overflow"))?;
 
         let rows = sqlx::query!(
             r#"
@@ -1113,6 +1141,15 @@ impl StateRepo for SqliteStateRepo {
     ) -> Result<Vec<FileSearchHit>> {
         let source_str = source.map(|s| s.to_string());
         let limit_i = limit as i64;
+        // Escape the raw user query into a literal FTS5 string before MATCH.
+        // Passing raw text means an ordinary filename term like "foo-bar"
+        // is parsed as FTS5 syntax (the `-` is a column-filter / NOT
+        // operator) and errors instead of searching. Wrap the whole query
+        // in double quotes and double any internal double-quote so FTS5
+        // treats it as a single literal phrase. (A richer prefix/glob
+        // search is M8's job; this just stops FTS syntax errors on ordinary
+        // filenames. M8 restore search consumes this.)
+        let escaped = format!("\"{}\"", query.replace('"', "\"\""));
         let rows = sqlx::query!(
             r#"
             SELECT
@@ -1127,7 +1164,7 @@ impl StateRepo for SqliteStateRepo {
             ORDER BY rank
             LIMIT ?3
             "#,
-            query,
+            escaped,
             source_str,
             limit_i,
         )
@@ -1799,6 +1836,125 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    #[tokio::test]
+    async fn open_creates_missing_parent_dir() {
+        // P1-1: `create_if_missing(true)` makes the DB FILE but not its
+        // parent DIR. `open()` must create the parent tree first, so a
+        // first-boot path under a not-yet-existing `<config_dir>/driven/`
+        // succeeds rather than failing before migrations.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let nested = dir.path().join("does").join("not").join("exist");
+        assert!(!nested.exists(), "precondition: parent dir is absent");
+        let db_path = nested.join("state.db");
+        let repo = SqliteStateRepo::open(&db_path).await.expect("open");
+        // The DB is usable (migrations ran).
+        assert!(repo.list_accounts().await.unwrap().is_empty());
+        assert!(db_path.exists(), "db file created under fresh parent dir");
+    }
+
+    #[tokio::test]
+    async fn commit_create_result_with_mismatched_op_does_not_delete_unrelated_op() {
+        // P1-3: a stale/mismatched op_id that EXISTS but belongs to a
+        // DIFFERENT (source_id, relative_path) must NOT delete that
+        // unrelated pending_op nor commit the wrong file_state. The DELETE
+        // is now bound to id + source_id + relative_path, so it affects 0
+        // rows -> Err -> rollback.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // An unrelated pending_op for "other.txt".
+        let other_op = repo
+            .enqueue_pending_op(NewPendingOp {
+                source_id: src.id,
+                op_type: "upload".into(),
+                relative_path: rp("other.txt"),
+                payload_json: serde_json::json!({}),
+                scheduled_for: 100,
+                created_at: 50,
+            })
+            .await
+            .unwrap();
+
+        // Commit a result for "a.txt" but pass the op_id that belongs to
+        // "other.txt". The id exists, so the old id-only DELETE would have
+        // wrongly removed `other_op` and committed a.txt's file_state.
+        let f = sample_file(src.id, "a.txt", 0xAB);
+        let res = repo.commit_create_result(other_op, &f).await;
+        assert!(
+            res.is_err(),
+            "mismatched (source_id, relative_path) must Err"
+        );
+
+        // The unrelated pending_op must survive untouched.
+        let due = repo.get_pending_ops_due(i64::MAX, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, other_op);
+        // And no file_state row for a.txt landed.
+        assert!(repo
+            .get_file_state(src.id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn query_activity_huge_page_does_not_overflow() {
+        // P1-4: `page * limit` must not overflow i64. The pre-fix code
+        // multiplied `page` by the UNCLAMPED `limit`, so `page == u32::MAX`
+        // and `limit == u32::MAX` gave `(u32::MAX)^2 ~= 1.84e19 > i64::MAX`
+        // - a debug-build panic / release-build negative wrap. The fix
+        // clamps `limit` to 1..=10_000 (so the worst-case offset is
+        // u32::MAX * 10_000 ~= 4.29e13, well under i64::MAX) and uses
+        // checked arithmetic as defence-in-depth (SPEC s18.8). The clamp
+        // makes the structured-error branch mathematically unreachable via
+        // the public API, so this asserts the bounded-empty-page behaviour
+        // rather than an error: the call must not panic and must serve a
+        // well-formed empty page.
+        let (repo, _dir) = temp_repo().await;
+        let res = repo
+            .query_activity(
+                ActivityFilter::default(),
+                PageRequest {
+                    page: u32::MAX,
+                    limit: u32::MAX,
+                },
+            )
+            .await
+            .expect("clamped limit keeps offset bounded - must not overflow/panic");
+        assert!(res.rows.is_empty());
+        assert_eq!(res.total, 0);
+    }
+
+    #[tokio::test]
+    async fn search_files_escapes_fts_syntax() {
+        // P2-1: a raw filename term containing FTS5 operator characters
+        // (a hyphen, a quote) must NOT error - the query is escaped into a
+        // literal FTS5 phrase before MATCH.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        repo.upsert_file_state(&sample_file(src.id, "foo-bar.txt", 0x01))
+            .await
+            .unwrap();
+
+        // Hyphen: raw FTS5 would read `-` as a NOT operator and error /
+        // mis-search; escaped it matches the adjacent `foo`,`bar` tokens.
+        let hits = repo.search_files(None, "foo-bar", 10).await.unwrap();
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].relative_path.as_str(), "foo-bar.txt");
+
+        // An embedded double-quote must not error (it is doubled when
+        // escaped) - just assert no error and no spurious panic.
+        let with_quote = repo.search_files(None, "foo\"bar", 10).await.unwrap();
+        assert!(with_quote.len() <= 1);
     }
 
     #[tokio::test]
