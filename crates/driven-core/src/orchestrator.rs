@@ -49,19 +49,20 @@ use std::sync::Arc;
 
 use async_trait::async_trait;
 use serde::{Deserialize, Serialize};
-use tokio::sync::{broadcast, watch, Mutex, RwLock};
+use tokio::sync::{broadcast, mpsc, watch, Mutex, RwLock};
 
 use driven_power::PowerSource;
 
 use crate::executor::{Executor, OpOutcome};
 use crate::network::{NetworkProbe, NetworkState, ServiceHealth, ServiceName};
 use crate::pacer::PacerCeilings;
-use crate::state::{SourceRow, StateRepo};
+use crate::state::{ActivityLevel, NewActivity, SourceRow, StateRepo};
 use crate::time::Clock;
 use crate::types::{
     AccountId, ExecProgress, OrchestratorEvent, OrchestratorState, PauseReason, PowerEvent,
-    ScanMode, UnixMs,
+    RelativePath, ScanMode, UnixMs,
 };
+use crate::watcher::ScanTickRequest;
 
 /// Module-level tracing target (SPEC s0 logging convention).
 const TARGET: &str = "driven::core::orchestrator";
@@ -70,6 +71,12 @@ const TARGET: &str = "driven::core::orchestrator";
 /// A lagged consumer re-reads [`Orchestrator::state`] rather than treating a
 /// dropped event as data loss (see [`OrchestratorEvent`] docs).
 const EVENT_CHANNEL_CAPACITY: usize = 256;
+
+/// Capacity of the watcher scan-tick mpsc the run loop consumes (DESIGN
+/// s5.9.1). The watcher already debounces + rate-caps to one request per
+/// minute per source, so a small buffer is ample; a full buffer simply
+/// drops the surplus tick (the next scan re-derives the diff anyway).
+const WATCHER_CHANNEL_CAPACITY: usize = 64;
 
 /// The DESIGN s5.10.3 step 1 resume defer: after a wake, real-world network
 /// and keychain services are not yet ready, so the orchestrator waits this
@@ -229,6 +236,25 @@ pub struct SyncOrchestrator {
     /// to once-before-first-cycle. `Mutex` not `RwLock` because the
     /// check-and-set must be atomic.
     reconciled: Mutex<bool>,
+    /// Manual out-of-band trigger (SPEC s5 "Sync now", DESIGN s5.1).
+    /// Capacity-1 mpsc: a `try_send` that finds the buffer full means a
+    /// trigger is already pending, so the surplus is COALESCED into the one
+    /// queued follow-up (the run loop runs exactly one extra cycle no matter
+    /// how many triggers land mid-cycle). The receiver is taken once by
+    /// [`Orchestrator::run`].
+    trigger_tx: mpsc::Sender<TickSource>,
+    trigger_rx: Mutex<Option<mpsc::Receiver<TickSource>>>,
+    /// Debounced watcher scan-tick stream (DESIGN s5.9.1). The app shell
+    /// bridges the real [`SourceWatcher::subscribe`](crate::watcher::SourceWatcher::subscribe)
+    /// receiver into `watcher_tx`; tests push [`ScanTickRequest`]s directly.
+    /// The run loop owns the single consumer (taken once).
+    watcher_tx: mpsc::Sender<ScanTickRequest>,
+    watcher_rx: Mutex<Option<mpsc::Receiver<ScanTickRequest>>>,
+    /// Graceful-shutdown signal (SPEC s5 "run until cancelled"). The run loop
+    /// selects on a change; the current in-flight cycle is allowed to finish
+    /// (DESIGN s5.10.2) before the loop returns `Ok(())`.
+    shutdown_tx: watch::Sender<bool>,
+    shutdown_rx: watch::Receiver<bool>,
 }
 
 impl SyncOrchestrator {
@@ -250,6 +276,11 @@ impl SyncOrchestrator {
     ) -> Self {
         let (events, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (pause_tx, _pause_rx) = watch::channel(false);
+        // Capacity-1 manual trigger so a `try_send` coalesces a burst of
+        // mid-cycle "Sync now" clicks into exactly one queued follow-up.
+        let (trigger_tx, trigger_rx) = mpsc::channel(1);
+        let (watcher_tx, watcher_rx) = mpsc::channel(WATCHER_CHANNEL_CAPACITY);
+        let (shutdown_tx, shutdown_rx) = watch::channel(false);
         Self {
             account_id,
             state,
@@ -262,7 +293,28 @@ impl SyncOrchestrator {
             pause_tx,
             events,
             reconciled: Mutex::new(false),
+            trigger_tx,
+            trigger_rx: Mutex::new(Some(trigger_rx)),
+            watcher_tx,
+            watcher_rx: Mutex::new(Some(watcher_rx)),
+            shutdown_tx,
+            shutdown_rx,
         }
+    }
+
+    /// Returns the watcher-tick sender so the owning app shell can bridge a
+    /// real [`SourceWatcher`](crate::watcher::SourceWatcher)'s debounced
+    /// receiver into the orchestrator's run loop (DESIGN s5.9.1). Tests use it
+    /// to push a [`ScanTickRequest`] directly.
+    pub fn watcher_sender(&self) -> mpsc::Sender<ScanTickRequest> {
+        self.watcher_tx.clone()
+    }
+
+    /// Signals the run loop to shut down gracefully (SPEC s5). The current
+    /// in-flight cycle finishes (DESIGN s5.10.2); then [`Orchestrator::run`]
+    /// returns `Ok(())`.
+    pub fn shutdown(&self) {
+        let _ = self.shutdown_tx.send(true);
     }
 
     /// Subscribes to the [`OrchestratorEvent`] broadcast (SPEC s5, s11.7).
@@ -381,6 +433,39 @@ impl SyncOrchestrator {
         Ok(())
     }
 
+    /// Writes a durable `activity_log` ERROR row per NFC collision the planner
+    /// dropped (SPEC s24 `local.unicode_collision`, the M2-deferred item in
+    /// CODEX_NOTES.md).
+    ///
+    /// One row per colliding path so the Activity dashboard can list each
+    /// clash; `event_type` carries the stable code and `message` carries the
+    /// path. A failed write is logged but never aborts the cycle - the upload
+    /// pipeline must not be held hostage by an activity-log hiccup. The source
+    /// stays visibly degraded (the error row is surfaced) rather than the
+    /// collider being silently skipped.
+    async fn record_collisions(
+        &self,
+        source_id: crate::types::SourceId,
+        collisions: &[RelativePath],
+    ) {
+        let now = self.clock.now_ms();
+        for collision in collisions {
+            tracing::warn!(target: TARGET, source_id = %source_id, path = %collision, "local.unicode_collision; skipping colliding file");
+            let row = NewActivity {
+                ts: now,
+                source_id: Some(source_id),
+                level: ActivityLevel::Error,
+                event_type: "local.unicode_collision".to_string(),
+                file_count: None,
+                bytes: None,
+                message: Some(collision.as_str().to_string()),
+            };
+            if let Err(err) = self.state.write_activity(row).await {
+                tracing::warn!(target: TARGET, source_id = %source_id, path = %collision, %err, "failed to write unicode_collision activity row");
+            }
+        }
+    }
+
     /// Runs the full scan -> plan -> execute -> verify pipeline for one source
     /// (SPEC s5 `run_one_source`).
     ///
@@ -422,10 +507,13 @@ impl SyncOrchestrator {
             .await;
 
         // SPEC s24 local.unicode_collision: surface every dropped collider as
-        // an activity error; V1 policy is skip-the-colliding-file (the planner
-        // already emitted no op), not fail-closed on the whole source.
-        for collision in &plan.collisions {
-            tracing::warn!(target: TARGET, source_id = %source.id, path = %collision, "local.unicode_collision; skipping colliding file");
+        // a DURABLE activity_log ERROR row (not just a trace line) so the
+        // Activity dashboard shows the source as degraded until the user
+        // resolves the NFC-normalized name clash. V1 policy is
+        // skip-the-colliding-file (the planner already emitted no op), not
+        // fail-closed on the whole source.
+        if !plan.collisions.is_empty() {
+            self.record_collisions(source.id, &plan.collisions).await;
         }
 
         // Dry-run: stop after planning, no remote call (SPEC s5). This is the
@@ -492,8 +580,16 @@ impl SyncOrchestrator {
     /// [`OrchestratorState::Backoff`] and returns WITHOUT issuing any remote
     /// call.
     pub async fn run_cycle(&self, tick: TickSource) -> anyhow::Result<()> {
-        self.reconcile_once().await?;
-
+        // P1-6 (DESIGN s5.6, s5.7): the startup reconcile (DESIGN s5.6) is a
+        // REMOTE pass - it issues Drive find/metadata calls to adopt orphaned
+        // objects - so it MUST come AFTER the power / network / manual gates,
+        // never before. Evaluating the gates first guarantees an offline /
+        // battery / metered / paused / breaker-open cycle issues ZERO remote
+        // calls (the load-bearing "offline -> zero remote calls" invariant).
+        // The reconcile is split into a local-only phase that always runs and a
+        // remote phase gated open below; in M3 the local-only phase is empty
+        // (the executor's reconcile is entirely remote), so there is nothing to
+        // run before the gate, but the seam is here for M4's local reconcile.
         self.transition(OrchestratorState::PowerCheck).await;
         match self.evaluate_gates().await {
             GateDecision::Pause(reason) => {
@@ -508,6 +604,11 @@ impl SyncOrchestrator {
             }
             GateDecision::Proceed => {}
         }
+
+        // Remote reconcile phase (DESIGN s5.6): now that the gates are open we
+        // may safely issue Drive calls. Guarded to run at most once before the
+        // first executing cycle.
+        self.reconcile_once().await?;
 
         let sources = self.state.list_enabled_sources_for(self.account_id).await?;
         for source in &sources {
@@ -585,6 +686,46 @@ pub enum ResumePlan {
     DeferUntil(UnixMs),
 }
 
+/// Awaits the next item from an optional mpsc receiver inside a
+/// `tokio::select!` arm.
+///
+/// When the receiver is present, this resolves to whatever `recv()` returns
+/// (`Some(item)` or `None` on channel close). When the receiver is absent
+/// (already taken / a closed branch the loop set to `None`), it parks forever
+/// via [`std::future::pending`] so the select arm is inert rather than busy-
+/// resolving to `None` in a tight loop. `&mut Option<Receiver>` keeps the
+/// receiver borrowed across the await without moving it out of the loop's
+/// local state.
+async fn recv_opt<T>(rx: &mut Option<mpsc::Receiver<T>>) -> Option<T> {
+    match rx {
+        Some(rx) => rx.recv().await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Awaits the next power-state snapshot from an optional broadcast receiver
+/// inside a `tokio::select!` arm.
+///
+/// `Closed` means the [`PowerSource`] was dropped; this drops the receiver
+/// (`*rx = None`) so subsequent polls park forever via
+/// [`std::future::pending`] instead of busy-resolving `Closed` in a hot loop.
+/// `Lagged` is surfaced to the caller (a benign re-read trigger). An absent
+/// receiver parks forever, leaving the select arm inert.
+async fn power_recv_opt(
+    rx: &mut Option<broadcast::Receiver<driven_power::PowerState>>,
+) -> Result<driven_power::PowerState, broadcast::error::RecvError> {
+    match rx {
+        Some(receiver) => {
+            let result = receiver.recv().await;
+            if matches!(result, Err(broadcast::error::RecvError::Closed)) {
+                *rx = None;
+            }
+            result
+        }
+        None => std::future::pending().await,
+    }
+}
+
 /// Derives a final [`ExecProgress`] snapshot from the plan summary and the
 /// executor's per-op outcomes, for the closing Progress event.
 fn exec_progress_from(summary: &crate::types::PlanSummary, outcomes: &[OpOutcome]) -> ExecProgress {
@@ -634,23 +775,138 @@ fn log_outcomes(source: &SourceRow, outcomes: &[OpOutcome]) {
 #[async_trait]
 impl Orchestrator for SyncOrchestrator {
     async fn run(&self) -> anyhow::Result<()> {
-        // The production run loop selects over the scheduled-tick timer, the
-        // watcher channel, the power/network broadcast channels, the manual
-        // pause watch, and the trigger channel (DESIGN s5.1, s5.9.1). The
-        // channel wiring (watcher Receiver, trigger mpsc) is handed in by the
-        // owning Tauri process at spawn time; until that wiring lands in the
-        // app shell, `run` drives a single cycle so a smoke test of the spawn
-        // path has defined behaviour. The deterministic per-tick logic the
-        // tests exercise lives in `run_cycle`.
-        self.run_cycle(TickSource::Scheduled).await
+        // The real long-lived continuous-backup engine (SPEC s5, DESIGN s5.1).
+        // A SINGLE `tokio::select!` loop multiplexes every wake source:
+        //   (a) the scheduled-scan interval timer (the authoritative fallback),
+        //   (b) debounced watcher scan-ticks (DESIGN s5.9.1),
+        //   (c) the manual "Sync now" trigger (capacity-1, coalescing),
+        //   (d) OS power-state transitions (battery/AC, suspend/resume),
+        //   (e) network-state transitions (folded into the power branch for M3;
+        //       the real probe-event seam is deferred to M4 - see CODEX_NOTES),
+        //   (f) the graceful-shutdown signal.
+        //
+        // In-flight guard: there is exactly ONE `run()` task, and each selected
+        // wake runs `run_cycle(..).await` INLINE. A single task awaiting inline
+        // can never overlap two cycles - while a cycle runs, further wakes
+        // simply buffer in their channels. The capacity-1 trigger channel caps
+        // a mid-cycle burst of "Sync now" clicks to exactly ONE queued
+        // follow-up. Shutdown is graceful: it is observed only between cycles
+        // (the select arms), so the current cycle always finishes first
+        // (DESIGN s5.10.2).
+        let mut watcher_rx = self.watcher_rx.lock().await.take();
+        let mut trigger_rx = self.trigger_rx.lock().await.take();
+        let mut power_rx = Some(self.power.subscribe());
+        let mut shutdown_rx = self.shutdown_rx.clone();
+
+        // The scheduled interval reads the config at spawn time. A reconfigure
+        // takes effect on the next `run()`; within a run the cadence is fixed
+        // (re-deriving it per tick would reset the timer and could starve the
+        // scan). `Skip` (not the default `Burst`) so a cycle that overruns one
+        // period does not storm catch-up ticks afterwards.
+        let interval_secs = self.config.read().await.scan_interval_secs.max(1);
+        let mut scheduled = tokio::time::interval(std::time::Duration::from_secs(interval_secs));
+        scheduled.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        // Consume the immediate first tick so the loop does not run a cycle the
+        // instant it is spawned purely from the interval (a watcher/manual
+        // trigger or the next period drives the first real cycle).
+        scheduled.tick().await;
+
+        loop {
+            // Pick the next wake. Each arm yields an `Option<TickSource>`:
+            // `Some(tick)` runs a cycle; `None` means "loop control only"
+            // (a closed branch we drop, or shutdown which breaks below).
+            let next: Option<TickSource> = tokio::select! {
+                _ = scheduled.tick() => Some(TickSource::Scheduled),
+
+                req = recv_opt(&mut watcher_rx) => match req {
+                    Some(req) => {
+                        tracing::debug!(target: TARGET, account_id = %self.account_id, source_id = %req.source_id, reason = ?req.reason, "watcher scan-tick");
+                        Some(TickSource::Watcher)
+                    }
+                    // Watcher channel closed: drop the branch, keep running on
+                    // the scheduled fallback (DESIGN s5.9.4).
+                    None => { watcher_rx = None; None }
+                },
+
+                trig = recv_opt(&mut trigger_rx) => match trig {
+                    Some(reason) => Some(reason),
+                    None => { trigger_rx = None; None }
+                },
+
+                recvd = power_recv_opt(&mut power_rx) => match recvd {
+                    Ok(state) => {
+                        // A steady-state power/network transition (battery<->AC,
+                        // metered toggling, reachable<->offline) just asks for a
+                        // re-evaluation: run a cycle whose gate check PAUSES on
+                        // battery/offline and PROCEEDS (resumes) on AC/online.
+                        // No special-casing here - the gates are the single
+                        // source of truth (DESIGN s5.7). Genuine sleep/wake edges
+                        // arrive as `PowerEvent`s on a separate path
+                        // (`on_power_event`), not on this steady-state channel,
+                        // so we do NOT synthesize one here.
+                        tracing::debug!(target: TARGET, account_id = %self.account_id, ac = state.ac_connected, reachable = state.network_reachable, metered = state.on_metered_network, "power/network transition; re-evaluating gates");
+                        Some(TickSource::Scheduled)
+                    }
+                    // `Lagged` is benign: we missed an intermediate snapshot but
+                    // the next cycle's gate check re-reads `current()` (the
+                    // documented recovery contract), so still run a cycle.
+                    Err(broadcast::error::RecvError::Lagged(_)) => Some(TickSource::Scheduled),
+                    // Closed: the source was dropped. `power_recv_opt` has set
+                    // the receiver to `None`, so this arm is now inert and the
+                    // scheduled loop keeps running.
+                    Err(broadcast::error::RecvError::Closed) => None,
+                },
+
+                res = shutdown_rx.changed() => {
+                    // `changed()` resolves on a flip OR on sender drop; either
+                    // way, if the flag is set we exit. A sender-drop without a
+                    // set flag also means "no one can ever signal again", so we
+                    // exit cleanly rather than spin.
+                    match res {
+                        Ok(()) if *shutdown_rx.borrow() => {
+                            tracing::info!(target: TARGET, account_id = %self.account_id, "shutdown signalled; exiting run loop");
+                            break;
+                        }
+                        Ok(()) => None,
+                        Err(_) => {
+                            tracing::info!(target: TARGET, account_id = %self.account_id, "shutdown sender dropped; exiting run loop");
+                            break;
+                        }
+                    }
+                }
+            };
+
+            if let Some(tick) = next {
+                // Inline await = the in-flight guard. A failed cycle is logged,
+                // never fatal: the next tick retries and the Error surfaces via
+                // the activity log + state machine.
+                if let Err(err) = self.run_cycle(tick).await {
+                    tracing::warn!(target: TARGET, account_id = %self.account_id, ?tick, %err, "cycle failed; continuing");
+                }
+            }
+        }
+
+        Ok(())
     }
 
     async fn trigger(&self, reason: TickSource) {
-        // Out-of-band cycle. Errors are logged rather than propagated: a
-        // trigger is fire-and-forget from the IPC layer's perspective, and a
-        // failed cycle surfaces through the Error state + activity log.
-        if let Err(err) = self.run_cycle(reason).await {
-            tracing::warn!(target: TARGET, account_id = %self.account_id, ?reason, %err, "triggered cycle failed");
+        // Out-of-band cycle request. Hand it to the run loop rather than run a
+        // cycle inline here: running `run_cycle` directly from `trigger()` while
+        // the loop is already mid-cycle would start a SECOND concurrent cycle -
+        // the exact overlap the single-inflight guard exists to prevent.
+        //
+        // `try_send` into the capacity-1 channel: a full buffer means a trigger
+        // is already queued, so this one is COALESCED into that single pending
+        // follow-up (DESIGN s5.1). If the loop is not running (no receiver), the
+        // send errors and is dropped - the next scheduled tick covers it.
+        match self.trigger_tx.try_send(reason) {
+            Ok(()) => {}
+            Err(mpsc::error::TrySendError::Full(_)) => {
+                tracing::debug!(target: TARGET, account_id = %self.account_id, ?reason, "trigger coalesced into pending follow-up");
+            }
+            Err(mpsc::error::TrySendError::Closed(_)) => {
+                tracing::debug!(target: TARGET, account_id = %self.account_id, ?reason, "trigger dropped; run loop not active");
+            }
         }
     }
 
@@ -761,6 +1017,9 @@ mod tests {
     struct FakeState {
         sources: StdMutex<Vec<SourceRow>>,
         files: StdMutex<HashMap<(SourceId, RelativePath), FileStateRow>>,
+        /// Records every `write_activity` so the collision test can assert the
+        /// durable `local.unicode_collision` ERROR row was written.
+        activity: StdMutex<Vec<NewActivity>>,
     }
 
     impl FakeState {
@@ -768,7 +1027,13 @@ mod tests {
             Self {
                 sources: StdMutex::new(sources),
                 files: StdMutex::new(HashMap::new()),
+                activity: StdMutex::new(Vec::new()),
             }
+        }
+
+        /// Snapshot the recorded activity rows.
+        fn activity_rows(&self) -> Vec<NewActivity> {
+            self.activity.lock().unwrap().clone()
         }
     }
 
@@ -908,8 +1173,10 @@ mod tests {
         ) -> anyhow::Result<()> {
             unimplemented!()
         }
-        async fn write_activity(&self, _row: NewActivity) -> anyhow::Result<ActivityId> {
-            unimplemented!()
+        async fn write_activity(&self, row: NewActivity) -> anyhow::Result<ActivityId> {
+            let mut log = self.activity.lock().unwrap();
+            log.push(row);
+            Ok(ActivityId(log.len() as i64))
         }
         async fn query_activity(
             &self,
@@ -1296,6 +1563,16 @@ mod tests {
             }
         );
         assert_eq!(exec.executes.load(Ordering::SeqCst), 0);
+        // P1-6: the gate is evaluated BEFORE remote reconciliation, so an
+        // offline cycle issues ZERO remote calls - including the startup
+        // reconcile, which would otherwise hit Drive find/metadata. This is the
+        // direct proof reconcile moved behind the gate (a `live_object_count`
+        // check alone is vacuous - reconcile only reads).
+        assert_eq!(
+            exec.reconciles.load(Ordering::SeqCst),
+            0,
+            "offline must not issue the remote reconcile (zero remote calls)"
+        );
     }
 
     #[tokio::test]
@@ -1346,5 +1623,411 @@ mod tests {
             orch.on_power_event(PowerEvent::Suspending).await,
             ResumePlan::None
         );
+    }
+
+    // --- P1-8: collision -> durable activity_log ERROR row -----------------
+
+    #[tokio::test]
+    async fn collision_writes_durable_activity_error_row() {
+        // A dropped NFC collider must produce a DURABLE activity_log ERROR row
+        // with code `local.unicode_collision` and the colliding path, not just
+        // a trace line. (The two-files-on-disk walk that originates a collision
+        // is filesystem-normalization-dependent and deduped at the scanner; the
+        // P1-8 deliverable being asserted here is the orchestrator's durable
+        // surfacing of an already-detected collision.)
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let exec = Arc::new(RecordingExecutor::default());
+        let clock = Arc::new(FakeClock::new());
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec,
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock,
+            OrchestratorConfig::default(),
+        );
+
+        let collider = RelativePath::try_from("dir/caf\u{e9}.txt".to_string()).unwrap();
+        orch.record_collisions(src_id, std::slice::from_ref(&collider))
+            .await;
+
+        let rows = state.activity_rows();
+        assert_eq!(rows.len(), 1, "exactly one collision row written");
+        let row = &rows[0];
+        assert_eq!(row.level, ActivityLevel::Error, "collision is an ERROR row");
+        assert_eq!(
+            row.event_type, "local.unicode_collision",
+            "row carries the stable collision code"
+        );
+        assert_eq!(
+            row.message.as_deref(),
+            Some("dir/caf\u{e9}.txt"),
+            "row carries the colliding path"
+        );
+        assert_eq!(row.source_id, Some(src_id), "row is scoped to the source");
+    }
+
+    // --- P1-7: the real run() event loop ------------------------------------
+
+    /// An executor that blocks inside `execute` on a caller-controlled barrier
+    /// so a test can hold a cycle "in flight" while it fires further triggers -
+    /// the only way to deterministically exercise the mid-cycle coalescing +
+    /// single-inflight guard against an otherwise-instantaneous fake.
+    struct BlockingExecutor {
+        executes: Arc<AtomicU64>,
+        /// Signalled (one message per cycle) as soon as `execute` is entered.
+        entered_tx: tokio::sync::mpsc::UnboundedSender<()>,
+        /// Awaited inside `execute`; the test sends one `()` to release each
+        /// in-flight cycle.
+        release_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
+    }
+
+    #[async_trait]
+    impl Executor for BlockingExecutor {
+        async fn execute(
+            &self,
+            _source: &SourceRow,
+            _plan: &Plan,
+            _on_progress: &(dyn Fn(ExecProgress) + Send + Sync),
+        ) -> anyhow::Result<Vec<OpOutcome>> {
+            self.executes.fetch_add(1, Ordering::SeqCst);
+            let _ = self.entered_tx.send(());
+            // Block until the test releases this cycle.
+            let _ = self.release_rx.lock().await.recv().await;
+            Ok(vec![])
+        }
+
+        async fn reconcile(&self, _source: &SourceRow) -> anyhow::Result<()> {
+            Ok(())
+        }
+    }
+
+    /// Build an orchestrator with a non-empty source (so the executor runs) and
+    /// the given executor + config, returned as an `Arc` ready to spawn `run`.
+    fn build_arc(
+        exec: Arc<dyn Executor>,
+        power: Arc<FakePowerSource>,
+        config: OrchestratorConfig,
+    ) -> (Arc<SyncOrchestrator>, tempfile::TempDir) {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        // A file so the plan is non-empty and `execute` is actually called.
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let src = source_in(account, dir.path());
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let clock = Arc::new(FakeClock::new());
+        let orch = Arc::new(SyncOrchestrator::new(
+            account,
+            state,
+            exec,
+            power,
+            Arc::new(FakeNet::online()),
+            clock,
+            config,
+        ));
+        (orch, dir)
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_loop_scheduled_tick_runs_a_cycle() {
+        // With virtual time paused, `tokio::time::interval` auto-advances when
+        // the loop is otherwise idle, so the scheduled tick fires
+        // deterministically with no wall-clock wait and runs a cycle.
+        let executes = Arc::new(AtomicU64::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        let exec = Arc::new(BlockingExecutor {
+            executes: executes.clone(),
+            entered_tx,
+            release_rx: tokio::sync::Mutex::new(release_rx),
+        });
+        let cfg = OrchestratorConfig {
+            scan_interval_secs: 1,
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _dir) = build_arc(exec, Arc::new(FakePowerSource::new(power_on_ac())), cfg);
+
+        let handle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run().await })
+        };
+
+        // Wait for the scheduled tick to drive the first cycle into `execute`.
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("scheduled tick must run a cycle")
+            .expect("entered channel open");
+        let _ = release_tx.send(());
+
+        orch.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("run loop must exit after shutdown")
+            .expect("join")
+            .expect("run ok");
+        assert!(
+            executes.load(Ordering::SeqCst) >= 1,
+            "scheduled tick ran a cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_watcher_tick_triggers_a_cycle() {
+        // A debounced watcher ScanTickRequest pushed onto the orchestrator's
+        // watcher channel drives exactly one cycle.
+        let executes = Arc::new(AtomicU64::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        let exec = Arc::new(BlockingExecutor {
+            executes: executes.clone(),
+            entered_tx,
+            release_rx: tokio::sync::Mutex::new(release_rx),
+        });
+        // A long scan interval so the scheduled tick never fires during the test
+        // - the watcher tick is the only thing that can run a cycle.
+        let cfg = OrchestratorConfig {
+            scan_interval_secs: 3_600,
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _dir) = build_arc(exec, Arc::new(FakePowerSource::new(power_on_ac())), cfg);
+        let watcher = orch.watcher_sender();
+        let src_id = orch
+            .state
+            .list_enabled_sources_for(orch.account_id)
+            .await
+            .unwrap()[0]
+            .id;
+
+        let handle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run().await })
+        };
+
+        watcher
+            .send(ScanTickRequest {
+                source_id: src_id,
+                reason: crate::watcher::ScanTickReason::Edit,
+            })
+            .await
+            .unwrap();
+
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("watcher tick must run a cycle")
+            .expect("entered channel open");
+        let _ = release_tx.send(());
+
+        orch.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("run loop must exit after shutdown")
+            .expect("join")
+            .expect("run ok");
+        assert_eq!(
+            executes.load(Ordering::SeqCst),
+            1,
+            "watcher tick ran one cycle"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_manual_trigger_mid_cycle_coalesces_to_one_followup() {
+        // While a cycle is blocked in-flight, a BURST of manual triggers must
+        // coalesce into exactly ONE follow-up cycle (capacity-1 trigger
+        // channel) - never a third concurrent/extra cycle. This proves both the
+        // single-inflight guard (no overlap) and the coalescing.
+        let executes = Arc::new(AtomicU64::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        let exec = Arc::new(BlockingExecutor {
+            executes: executes.clone(),
+            entered_tx,
+            release_rx: tokio::sync::Mutex::new(release_rx),
+        });
+        let cfg = OrchestratorConfig {
+            scan_interval_secs: 3_600,
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _dir) = build_arc(exec, Arc::new(FakePowerSource::new(power_on_ac())), cfg);
+
+        let handle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run().await })
+        };
+
+        // Fire the first trigger; wait until its cycle is in flight (blocked).
+        orch.trigger(TickSource::Manual).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("first trigger must start a cycle")
+            .expect("entered open");
+
+        // Mid-cycle burst: three more triggers. The capacity-1 channel holds at
+        // most one, so these coalesce into a single follow-up.
+        orch.trigger(TickSource::Manual).await;
+        orch.trigger(TickSource::Manual).await;
+        orch.trigger(TickSource::Manual).await;
+
+        // Release the first cycle; the single coalesced follow-up then runs.
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("the coalesced trigger must run exactly one follow-up cycle")
+            .expect("entered open");
+        let _ = release_tx.send(());
+
+        orch.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("run loop must exit after shutdown")
+            .expect("join")
+            .expect("run ok");
+
+        // Exactly two cycles ran: the initial trigger + ONE coalesced follow-up,
+        // never three. (A small settle to ensure no stray third cycle is racing
+        // - executes is monotonic, so re-reading after the join is sufficient.)
+        assert_eq!(
+            executes.load(Ordering::SeqCst),
+            2,
+            "a mid-cycle burst coalesces to exactly one follow-up"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_battery_pauses_then_ac_resumes() {
+        // A power transition to battery PAUSES (gate closed); a transition back
+        // to AC RESUMES and runs a cycle. Driven entirely through the run loop's
+        // power-transition branch and asserted via the event stream (not a
+        // vacuous counter), so it genuinely tests the named loop behavior.
+        //
+        // A non-blocking RecordingExecutor (not the barrier executor) is used:
+        // the resend-until-observed pattern below can queue several power wakes,
+        // and a blocking executor would stall the loop on the 2nd buffered wake
+        // before shutdown is honored. RecordingExecutor finishes each cycle
+        // instantly, so buffered wakes drain and shutdown is processed between
+        // cycles.
+        let exec = Arc::new(RecordingExecutor::default());
+        // Long interval so only the power transitions drive cycles.
+        let cfg = OrchestratorConfig {
+            scan_interval_secs: 3_600,
+            ..OrchestratorConfig::default()
+        };
+        let power = Arc::new(FakePowerSource::new(power_on_battery()));
+        let (orch, _dir) = build_arc(exec.clone(), power.clone(), cfg);
+
+        // Subscribe BEFORE driving any transition so we observe every
+        // StateChanged the loop emits (the broadcast only delivers post-subscribe).
+        let mut events = orch.subscribe();
+
+        let handle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run().await })
+        };
+
+        // Battery: the loop's power arm re-evaluates the gates and transitions
+        // to Paused{Battery}. Drain the event stream until we SEE that pause -
+        // this proves the loop delivered the transition AND paused.
+        //
+        // The loop subscribes to the power broadcast INSIDE the spawned `run()`,
+        // so a single `set()` fired before that subscription lands would be
+        // missed (broadcast only delivers post-subscribe). To stay race-free
+        // without reaching into the loop's internals, re-send the battery
+        // snapshot on a short cadence until the pause is observed; each resend is
+        // an idempotent transition (same gate decision). Bounded by a timeout so
+        // a genuine "never pauses" regression fails instead of hanging.
+        let paused = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                power.set(power_on_battery());
+                match tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+                    .await
+                {
+                    Ok(Ok(OrchestratorEvent::StateChanged {
+                        state:
+                            OrchestratorState::Paused {
+                                reason: PauseReason::Battery,
+                            },
+                    })) => break true,
+                    Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) | Err(_) => {
+                        continue
+                    }
+                    Ok(Err(broadcast::error::RecvError::Closed)) => break false,
+                }
+            }
+        })
+        .await
+        .expect("the loop must process the battery transition and pause");
+        assert!(
+            paused,
+            "battery transition pauses the loop (Paused{{Battery}})"
+        );
+        assert_eq!(
+            exec.executes.load(Ordering::SeqCst),
+            0,
+            "on battery the gate is closed; no cycle executes"
+        );
+
+        // AC: the loop re-evaluates, PROCEEDS (resumes), and runs a cycle ending
+        // in Idle. Observe the Idle transition to prove the resume ran.
+        let resumed = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                power.set(power_on_ac());
+                match tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+                    .await
+                {
+                    Ok(Ok(OrchestratorEvent::StateChanged {
+                        state: OrchestratorState::Idle { .. },
+                    })) => break true,
+                    Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) | Err(_) => {
+                        continue
+                    }
+                    Ok(Err(broadcast::error::RecvError::Closed)) => break false,
+                }
+            }
+        })
+        .await
+        .expect("AC resume must run a cycle to Idle");
+        assert!(
+            resumed,
+            "AC transition resumes the loop and a cycle runs to Idle"
+        );
+
+        orch.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("run loop must exit after shutdown")
+            .expect("join")
+            .expect("run ok");
+        assert!(
+            exec.executes.load(Ordering::SeqCst) >= 1,
+            "AC resume ran at least one cycle after the battery pause"
+        );
+    }
+
+    #[tokio::test]
+    async fn run_loop_shutdown_exits_cleanly() {
+        // A shutdown signal makes `run()` return `Ok(())` promptly.
+        let exec = Arc::new(RecordingExecutor::default());
+        let cfg = OrchestratorConfig {
+            scan_interval_secs: 3_600,
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _dir) = build_arc(exec, Arc::new(FakePowerSource::new(power_on_ac())), cfg);
+
+        let handle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run().await })
+        };
+
+        orch.shutdown();
+        let result = tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("run loop must exit promptly on shutdown")
+            .expect("join");
+        assert!(result.is_ok(), "clean shutdown returns Ok(())");
     }
 }

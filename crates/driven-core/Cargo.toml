@@ -60,7 +60,10 @@ notify.workspace = true
 md5 = { workspace = true }
 
 [dev-dependencies]
-tokio = { workspace = true, features = ["macros", "rt-multi-thread"] }
+# `test-util` enables `#[tokio::test(start_paused = true)]` so the orchestrator
+# run-loop scheduled-tick test drives `tokio::time::interval` on virtual time
+# (no wall-clock wait) - see orchestrator.rs run_loop_scheduled_tick_runs_a_cycle.
+tokio = { workspace = true, features = ["macros", "rt-multi-thread", "test-util"] }
 tempfile = "3"
 # M2 acceptance snapshots: the tree!() temp-tree builder (DESIGN s16,
 # ROADMAP M2). Scanner + planner are remote-free, so the InMemoryRemoteStore
