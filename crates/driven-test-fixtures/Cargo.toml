@@ -13,3 +13,9 @@ anyhow.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 async-trait.workspace = true
+tempfile = "3"
+parking_lot = "0.12"
+pretty_assertions = "1"
+driven-core = { path = "../driven-core" }
+driven-drive = { path = "../driven-drive" }
+driven-power = { path = "../driven-power" }
