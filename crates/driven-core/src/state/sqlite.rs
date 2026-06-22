@@ -116,9 +116,18 @@ impl SqliteStateRepo {
     /// the `pending_ops` row, and commits. The `?` on each statement
     /// causes the implicit `tx` drop on the `Err` path to roll back both
     /// writes - DESIGN s5.6 step 3 atomicity.
+    ///
+    /// `expected_op_type` is the `pending_ops.op_type` this commit is
+    /// finalizing (both callers finalize an UPLOAD, so they pass
+    /// `"upload"`). The DELETE is bound to it so a stale/mismatched
+    /// `op_id` that happens to exist for the SAME file under a DIFFERENT
+    /// queued op (e.g. a `trash` or `verify`) cannot be deleted and have
+    /// the upload result committed in its place (silent queue/state
+    /// corruption).
     async fn commit_op_result_inner(
         &self,
         op_id: PendingOpId,
+        expected_op_type: &str,
         file_state: &FileStateRow,
     ) -> Result<()> {
         let source_id = file_state.source_id.to_string();
@@ -171,17 +180,21 @@ impl SqliteStateRepo {
         // DESIGN s5.6 step 3: the pending_op delete is the load-bearing
         // reconciliation invariant. A wrong/already-committed op_id must NOT
         // be allowed to commit `file_state` (and must not silently delete an
-        // unrelated row). Bind the DELETE to the EXACT file this commit is
-        // for - id AND (source_id, relative_path) - so a stale/mismatched
-        // op_id that happens to exist for a DIFFERENT file cannot delete that
-        // unrelated pending_op and commit the wrong file_state. Require the
-        // DELETE to affect EXACTLY one row; otherwise return an `Err` so the
-        // implicit `tx` drop rolls back the `file_state` upsert too.
+        // unrelated row). Bind the DELETE to the EXACT op this commit is
+        // for - id AND (source_id, relative_path) AND op_type - so a
+        // stale/mismatched op_id that happens to exist for a DIFFERENT file,
+        // OR for the SAME file but a DIFFERENT queued op_type (e.g. a `trash`
+        // or `verify`), cannot delete that unrelated pending_op and commit
+        // the upload result in its place. Require the DELETE to affect
+        // EXACTLY one row; otherwise return an `Err` so the implicit `tx`
+        // drop rolls back the `file_state` upsert too.
         let deleted = sqlx::query!(
-            "DELETE FROM pending_ops WHERE id = ?1 AND source_id = ?2 AND relative_path = ?3",
+            "DELETE FROM pending_ops \
+             WHERE id = ?1 AND source_id = ?2 AND relative_path = ?3 AND op_type = ?4",
             op_id_v,
             source_id,
             relative_path,
+            expected_op_type,
         )
         .execute(&mut *tx)
         .await?
@@ -291,6 +304,36 @@ fn md5_from_bytes(b: Option<Vec<u8>>) -> Result<Option<[u8; 16]>> {
 
 fn uuid_from_str(s: &str) -> Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| anyhow!("invalid uuid {s:?}: {e}"))
+}
+
+/// Build a safe FTS5 MATCH string from raw user input (see
+/// [`StateRepo::search_files`] for the rationale).
+///
+/// Splits on whitespace and, per token, emits either a quoted literal
+/// phrase (`"foo-bar"`) or - when the token ends in `*` with a non-empty
+/// stem - a quoted prefix query (`"proj"*`). Internal double-quotes are
+/// doubled so the phrase stays well-formed. A token that is only `*`
+/// (empty stem) is dropped to avoid emitting `""*`, which FTS5 rejects.
+/// Returns an empty `String` when the input has no usable tokens; the
+/// caller treats that as "match nothing".
+fn build_fts_match_query(query: &str) -> String {
+    let mut terms: Vec<String> = Vec::new();
+    for token in query.split_whitespace() {
+        if token.ends_with('*') {
+            // Trailing `*` (one or more) marks a prefix query. Collapse any
+            // run of trailing `*` to a single prefix operator; a token that
+            // is ALL `*` (e.g. `*` or `**`) has an empty stem and is dropped
+            // rather than emitting an invalid `""*` that FTS5 would reject.
+            let stem = token.trim_end_matches('*');
+            if stem.is_empty() {
+                continue;
+            }
+            terms.push(format!("\"{}\"*", stem.replace('"', "\"\"")));
+        } else {
+            terms.push(format!("\"{}\"", token.replace('"', "\"\"")));
+        }
+    }
+    terms.join(" ")
 }
 
 // -----------------------------------------------------------------------------
@@ -885,13 +928,20 @@ impl StateRepo for SqliteStateRepo {
         } else {
             Some(serde_json::to_string(&filter.event_types)?)
         };
-        // SPEC s18.8: bound the computed offset. Clamp `limit` to 1..=10_000
-        // (a 0 limit would return an empty page; an unbounded limit would
-        // let the offset multiplication overflow for valid u32 `page`
-        // values), then compute the offset with checked arithmetic so a
-        // large `page` surfaces a structured `internal.bad_request` rather
-        // than panicking in debug / negative-wrapping in release.
-        let limit_i = (page.limit as i64).clamp(1, 10_000);
+        // SPEC s18.8: `limit` must be in 1..=10_000; a value outside that
+        // range is a caller bug and is REJECTED with a structured
+        // `internal.bad_request` (the prior code silently clamped, which
+        // accepted `0` / `u32::MAX` as if valid). The bound also keeps the
+        // offset multiplication below `i64::MAX` for any valid u32 `page`;
+        // the offset is still computed with checked arithmetic as
+        // defence-in-depth.
+        if !(1..=10_000).contains(&page.limit) {
+            return Err(anyhow!(
+                "internal.bad_request: activity limit must be 1..=10000, got {}",
+                page.limit
+            ));
+        }
+        let limit_i = page.limit as i64;
         let offset_i = (page.page as i64)
             .checked_mul(limit_i)
             .ok_or_else(|| anyhow!("internal.bad_request: activity page offset overflow"))?;
@@ -1090,7 +1140,9 @@ impl StateRepo for SqliteStateRepo {
         op_id: PendingOpId,
         file_state: &FileStateRow,
     ) -> Result<()> {
-        self.commit_op_result_inner(op_id, file_state).await
+        // A create finalizes an `upload` pending_op (migration 0001).
+        self.commit_op_result_inner(op_id, "upload", file_state)
+            .await
     }
 
     async fn commit_update_result(
@@ -1098,7 +1150,9 @@ impl StateRepo for SqliteStateRepo {
         op_id: PendingOpId,
         file_state: &FileStateRow,
     ) -> Result<()> {
-        self.commit_op_result_inner(op_id, file_state).await
+        // An update also finalizes an `upload` pending_op (migration 0001).
+        self.commit_op_result_inner(op_id, "upload", file_state)
+            .await
     }
 
     // --- settings -----------------------------------------------------------
@@ -1141,15 +1195,30 @@ impl StateRepo for SqliteStateRepo {
     ) -> Result<Vec<FileSearchHit>> {
         let source_str = source.map(|s| s.to_string());
         let limit_i = limit as i64;
-        // Escape the raw user query into a literal FTS5 string before MATCH.
-        // Passing raw text means an ordinary filename term like "foo-bar"
-        // is parsed as FTS5 syntax (the `-` is a column-filter / NOT
-        // operator) and errors instead of searching. Wrap the whole query
-        // in double quotes and double any internal double-quote so FTS5
-        // treats it as a single literal phrase. (A richer prefix/glob
-        // search is M8's job; this just stops FTS syntax errors on ordinary
-        // filenames. M8 restore search consumes this.)
-        let escaped = format!("\"{}\"", query.replace('"', "\"\""));
+        // Build the FTS5 MATCH string per-token so ordinary filename terms
+        // are treated as literals (a hyphen / quote does not error as FTS5
+        // syntax) WHILE a trailing `*` still works as a prefix query (M8
+        // restore search needs `proj*` to prefix-match). Quoting the WHOLE
+        // input as one phrase would turn `proj*` into the literal phrase
+        // `"proj*"` (the `*` inside the quotes is a non-token char that the
+        // tokenizer drops), so it would match nothing.
+        //
+        // Per token (split on whitespace):
+        // - ends with `*` (and has a non-empty stem): quote the stem and
+        //   append `*` OUTSIDE the quotes -> `proj` becomes `"proj"*`, a
+        //   real FTS5 prefix query.
+        // - otherwise: quote the whole token as a literal phrase ->
+        //   `foo-bar` becomes `"foo-bar"` (no NOT-operator error).
+        // Internal double-quotes are doubled in either case. Tokens are
+        // joined with a space (FTS5 implicit AND). A bare `*` token (empty
+        // stem) is dropped so we never emit `""*`, which FTS5 rejects.
+        // Empty input (no tokens) matches nothing - return early without
+        // touching MATCH.
+        let match_query = build_fts_match_query(query);
+        if match_query.is_empty() {
+            return Ok(Vec::new());
+        }
+        let escaped = match_query;
         let rows = sqlx::query!(
             r#"
             SELECT
@@ -1903,20 +1972,90 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn query_activity_huge_page_does_not_overflow() {
-        // P1-4: `page * limit` must not overflow i64. The pre-fix code
-        // multiplied `page` by the UNCLAMPED `limit`, so `page == u32::MAX`
-        // and `limit == u32::MAX` gave `(u32::MAX)^2 ~= 1.84e19 > i64::MAX`
-        // - a debug-build panic / release-build negative wrap. The fix
-        // clamps `limit` to 1..=10_000 (so the worst-case offset is
-        // u32::MAX * 10_000 ~= 4.29e13, well under i64::MAX) and uses
-        // checked arithmetic as defence-in-depth (SPEC s18.8). The clamp
-        // makes the structured-error branch mathematically unreachable via
-        // the public API, so this asserts the bounded-empty-page behaviour
-        // rather than an error: the call must not panic and must serve a
-        // well-formed empty page.
+    async fn commit_create_result_with_wrong_op_type_does_not_delete_or_commit() {
+        // P1 r2: the pending_ops DELETE is bound to op_type so a commit that
+        // finalizes an UPLOAD cannot consume a DIFFERENT queued op for the
+        // SAME (source_id, relative_path) - e.g. a `trash` op. Without the
+        // `AND op_type = 'upload'` guard the id+path-matched DELETE would
+        // wrongly remove the trash op and commit the upload's file_state.
         let (repo, _dir) = temp_repo().await;
-        let res = repo
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // Queue a `trash` op for "a.txt" (NOT an upload).
+        let trash_op = repo
+            .enqueue_pending_op(NewPendingOp {
+                source_id: src.id,
+                op_type: "trash".into(),
+                relative_path: rp("a.txt"),
+                payload_json: serde_json::json!({}),
+                scheduled_for: 100,
+                created_at: 50,
+            })
+            .await
+            .unwrap();
+
+        // Finalize an UPLOAD result for the SAME file, passing the trash
+        // op's id. id + (source_id, relative_path) match, but op_type does
+        // not -> DELETE affects 0 rows -> Err -> rollback.
+        let f = sample_file(src.id, "a.txt", 0xAB);
+        let res = repo.commit_create_result(trash_op, &f).await;
+        assert!(
+            res.is_err(),
+            "committing an upload against a trash op must Err"
+        );
+
+        // The trash op must survive untouched.
+        let due = repo.get_pending_ops_due(i64::MAX, 10).await.unwrap();
+        assert_eq!(due.len(), 1);
+        assert_eq!(due[0].id, trash_op);
+        assert_eq!(due[0].op_type, "trash");
+
+        // And no upload file_state row for a.txt landed.
+        assert!(repo
+            .get_file_state(src.id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn query_activity_rejects_out_of_range_limit() {
+        // SPEC s18.8: `limit` must be in 1..=10_000. The pre-fix code
+        // silently CLAMPED out-of-range limits (0 -> 1, u32::MAX -> 10_000),
+        // accepting caller bugs. It now REJECTS them with a structured
+        // `internal.bad_request`. A `limit` of u32::MAX is also what made
+        // the old `page * limit` multiply overflow i64 (page == u32::MAX),
+        // so rejecting it is both the spec behaviour and the overflow guard.
+        let (repo, _dir) = temp_repo().await;
+
+        // limit = 0: below range -> Err.
+        let too_small = repo
+            .query_activity(ActivityFilter::default(), PageRequest { page: 0, limit: 0 })
+            .await;
+        assert!(too_small.is_err(), "limit=0 must be rejected");
+        assert!(too_small
+            .unwrap_err()
+            .to_string()
+            .contains("internal.bad_request"));
+
+        // limit = 20_000: above range -> Err.
+        let too_big = repo
+            .query_activity(
+                ActivityFilter::default(),
+                PageRequest {
+                    page: 0,
+                    limit: 20_000,
+                },
+            )
+            .await;
+        assert!(too_big.is_err(), "limit=20_000 must be rejected");
+
+        // limit = u32::MAX with page = u32::MAX: rejected at the limit
+        // guard BEFORE any offset multiply, so no overflow/panic.
+        let huge = repo
             .query_activity(
                 ActivityFilter::default(),
                 PageRequest {
@@ -1924,10 +2063,19 @@ mod tests {
                     limit: u32::MAX,
                 },
             )
+            .await;
+        assert!(huge.is_err(), "out-of-range limit rejected, no overflow");
+
+        // A valid in-range limit still works.
+        let ok = repo
+            .query_activity(
+                ActivityFilter::default(),
+                PageRequest { page: 0, limit: 50 },
+            )
             .await
-            .expect("clamped limit keeps offset bounded - must not overflow/panic");
-        assert!(res.rows.is_empty());
-        assert_eq!(res.total, 0);
+            .expect("in-range limit=50 must succeed");
+        assert_eq!(ok.total, 0);
+        assert!(ok.rows.is_empty());
     }
 
     #[tokio::test]
@@ -2083,6 +2231,66 @@ mod tests {
         let only_notes = repo.search_files(None, "gamma*", 10).await.unwrap();
         assert_eq!(only_notes.len(), 1);
         assert_eq!(only_notes[0].relative_path.as_str(), "notes/gamma.md");
+    }
+
+    #[tokio::test]
+    async fn search_files_prefix_literal_and_terms() {
+        // P2 r2: the per-token MATCH builder must support real prefix
+        // queries (`proj*` -> the `*` is applied OUTSIDE the quoted stem),
+        // literal terms with FTS5 operator chars (`foo-bar` does not error),
+        // and multi-token implicit-AND (`foo bar`). The pre-fix code quoted
+        // the WHOLE input as one phrase, so `proj*` became the literal
+        // `"proj*"` and matched nothing (the discriminating case the older
+        // `projects*`-as-a-whole-token test could not catch).
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        for p in [
+            "projects/alpha.md",
+            "projects/beta.md",
+            "notes/gamma.md",
+            "foo-bar.txt",
+        ] {
+            repo.upsert_file_state(&sample_file(src.id, p, 0x01))
+                .await
+                .unwrap();
+        }
+
+        // Genuine prefix: `proj*` (stem "proj" is NOT a complete token;
+        // the token is "projects") must still prefix-match both project
+        // files. This is the case the whole-query-quoting fix regressed.
+        let proj = repo.search_files(None, "proj*", 10).await.unwrap();
+        assert_eq!(proj.len(), 2, "proj* must prefix-match projects/*");
+        for h in &proj {
+            assert!(h.relative_path.as_str().starts_with("projects/"));
+        }
+
+        // Literal hyphenated term must not error (the `-` is not parsed as
+        // an FTS5 NOT operator); it matches the adjacent foo/bar tokens.
+        let foobar = repo.search_files(None, "foo-bar", 10).await.unwrap();
+        assert_eq!(foobar.len(), 1);
+        assert_eq!(foobar[0].relative_path.as_str(), "foo-bar.txt");
+
+        // Multi-token implicit AND: both tokens must be present in a hit.
+        // "foo bar" -> "foo" AND "bar" -> only foo-bar.txt has both.
+        let both = repo.search_files(None, "foo bar", 10).await.unwrap();
+        assert_eq!(both.len(), 1);
+        assert_eq!(both[0].relative_path.as_str(), "foo-bar.txt");
+
+        // An AND of two tokens that never co-occur returns nothing.
+        let none = repo.search_files(None, "alpha beta", 10).await.unwrap();
+        assert!(none.is_empty(), "alpha AND beta share no file");
+
+        // Empty / whitespace-only input matches nothing without erroring.
+        assert!(repo.search_files(None, "", 10).await.unwrap().is_empty());
+        assert!(repo.search_files(None, "   ", 10).await.unwrap().is_empty());
+        // A bare `*` token has no stem -> dropped -> empty match.
+        assert!(repo.search_files(None, "*", 10).await.unwrap().is_empty());
+        // An all-`*` token (`**`) also collapses to an empty stem -> dropped.
+        assert!(repo.search_files(None, "**", 10).await.unwrap().is_empty());
     }
 
     #[tokio::test]
