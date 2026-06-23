@@ -87,9 +87,12 @@ pub(crate) fn detect_metered_and_reachable() -> (bool, bool) {
 /// collapses to the safe `false` default rather than guessing "metered" -
 /// a wrong "metered" would stall ALL sync, a wrong "not metered" only fails
 /// to skip a rare metered link. COM is initialised per call as
-/// multi-threaded-apartment; an `RPC_E_CHANGED_MODE` (apartment already
-/// initialised differently on this thread by the host process) is tolerated
-/// because the COM call still works against the existing apartment.
+/// multi-threaded-apartment and BALANCED with `CoUninitialize` on scope exit
+/// via an RAII guard (codex C-P2-6 - the prior code leaked an apartment
+/// refcount on every 30s poll); an `RPC_E_CHANGED_MODE` (apartment already
+/// initialised differently on this thread by the host process) is tolerated -
+/// the COM call still works against the existing apartment - and is NOT
+/// balanced (we did not perform that init).
 #[cfg(target_os = "windows")]
 fn detect_metered() -> bool {
     use windows::core::HRESULT;
@@ -100,7 +103,7 @@ fn detect_metered() -> bool {
         NLM_CONNECTION_COST_VARIABLE,
     };
     use windows::Win32::System::Com::{
-        CoCreateInstance, CoInitializeEx, CLSCTX_ALL, COINIT_MULTITHREADED,
+        CoCreateInstance, CoInitializeEx, CoUninitialize, CLSCTX_ALL, COINIT_MULTITHREADED,
     };
 
     // RPC_E_CHANGED_MODE: COM already initialised on this thread with a
@@ -108,17 +111,47 @@ fn detect_metered() -> bool {
     // our in-proc call fine, so we proceed without treating it as an error.
     const RPC_E_CHANGED_MODE: HRESULT = HRESULT(0x8001_0106u32 as i32);
 
+    /// RAII guard that balances a SUCCESSFUL `CoInitializeEx` with exactly one
+    /// `CoUninitialize` on drop (codex C-P2-6: the previous code never
+    /// uninitialised, leaking a COM apartment refcount on every 30s poll).
+    ///
+    /// COM rule: every `CoInitializeEx` that returns success - `S_OK` OR
+    /// `S_FALSE` ("already initialised on this thread", still a success that
+    /// increments the per-thread refcount) - MUST be balanced by one
+    /// `CoUninitialize`. A `RPC_E_CHANGED_MODE` is a FAILURE (the thread was
+    /// already initialised with a different model) and must NOT be balanced, so
+    /// the guard is only armed when we performed a successful init.
+    struct ComInitGuard {
+        // `true` only when our CoInitializeEx returned success and therefore
+        // owes a CoUninitialize.
+        should_uninit: bool,
+    }
+    impl Drop for ComInitGuard {
+        fn drop(&mut self) {
+            if self.should_uninit {
+                // SAFETY: balanced against our own successful CoInitializeEx on
+                // this same thread (the guard is never moved across threads).
+                unsafe { CoUninitialize() };
+            }
+        }
+    }
+
     // SAFETY: standard COM init -> create-instance -> query-facet -> call
     // sequence. Each pointer is owned by the `windows` smart wrappers
-    // (refcounted), and every fallible step short-circuits to `false`.
+    // (refcounted), every fallible step short-circuits to `false`, and the
+    // ComInitGuard balances a successful init on every return path (drop runs
+    // even on the early `return false`s below).
     unsafe {
         let init = CoInitializeEx(None, COINIT_MULTITHREADED);
-        // `CoInitializeEx` returns an HRESULT-like; S_FALSE means "already
-        // initialised on this thread" (still success). Only a hard failure
-        // other than CHANGED_MODE should abort.
+        // `is_ok()` covers both S_OK and S_FALSE (>= 0). Those owe an uninit.
+        // RPC_E_CHANGED_MODE: proceed but do NOT uninit (we did not init). Any
+        // other hard failure aborts (and owes no uninit).
         if init.is_err() && init != RPC_E_CHANGED_MODE {
             return false;
         }
+        let _com_guard = ComInitGuard {
+            should_uninit: init.is_ok(),
+        };
 
         let cost_manager: windows::core::Result<INetworkCostManager> =
             CoCreateInstance(&NetworkListManager, None, CLSCTX_ALL);
