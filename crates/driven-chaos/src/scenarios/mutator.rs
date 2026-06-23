@@ -1027,17 +1027,16 @@ impl DriveMutatorScenario {
                 base.with_quota_exhausted_after(*after_bytes)
             }
             DriveKind::DailyQuota => {
-                // The fake exposes the storage-quota builder; the daily path is
-                // exercised here via the same quota builder with a 0-byte
-                // budget, but classified daily by the executor only if the fake
-                // emits a "daily" message. The fake's quota builder emits
-                // "quota_exhausted" (storage), NOT "daily" - so a faithful
-                // daily injection is NOT available on the current fake.
-                // Returning the plain remote here would silently mis-assert, so
-                // this kind is handled as a capability gap below (see
-                // run_assertions): we DO NOT fake a daily code we cannot
-                // produce.
-                base
+                // The fake's `with_daily_quota_after(n)` trips a faithful
+                // `403 dailyLimitExceeded` after `n` WriteTarget requests, then
+                // LATCHES (the daily window stays closed for the run). Its
+                // message carries "daily", so the executor's
+                // `classify_drive_error` maps it to `DriveError::DailyQuota` ->
+                // `ErrorCode::DriveDailyQuotaExhausted` (distinct from storage
+                // `quota_exhausted`). `after(4)` trips MID-run (a couple files
+                // land first), matching the sibling request-counted faults and
+                // the s9 "no data loss for files done before the failure" check.
+                base.with_daily_quota_after(4)
             }
             DriveKind::RateLimitStorm { after_requests } => {
                 base.with_rate_limit_after(*after_requests)
@@ -1067,23 +1066,12 @@ impl Scenario for DriveMutatorScenario {
         self.description
     }
     fn requires(&self) -> CapabilityRequirements {
-        // Most s4.2 scenarios run against the in-memory fake - no host
-        // capability needed. The daily-quota row is the exception: a faithful
-        // `dailyLimitExceeded` signal (distinct from `storageQuotaExceeded`)
-        // can ONLY be produced by real Drive - the InMemoryRemoteStore fault
-        // surface has no daily-vs-storage discriminator, and the executor
-        // classifies "daily" only from a message the fake does not emit. So,
-        // exactly like the sibling drive_side `daily-quota-exhausted` row, this
-        // gates on `cap:real_drive_creds` and SKIPs cleanly (with the missing
-        // capability recorded) until the live path is wired in M4. This is an
-        // honest capability-skip, NOT a faked or weakened code. Follow-up: add
-        // InMemoryRemoteStore::with_daily_quota_after to driven-drive so a fake
-        // variant becomes possible.
-        if matches!(self.kind, DriveKind::DailyQuota) {
-            CapabilityRequirements::of(vec![Capability::RealDriveCreds])
-        } else {
-            CapabilityRequirements::none()
-        }
+        // Every s4.2 scenario - including daily-quota - runs against the
+        // in-memory fake, so none need a host capability. The fake's
+        // `with_daily_quota_after` now emits a faithful `dailyLimitExceeded`
+        // (see `build_remote`), so the daily-quota row no longer gates on
+        // `cap:real_drive_creds`; it runs hermetically like its siblings.
+        CapabilityRequirements::none()
     }
 
     async fn setup(&self, ctx: &mut ScenarioContext) -> anyhow::Result<()> {
@@ -1092,26 +1080,11 @@ impl Scenario for DriveMutatorScenario {
     }
 
     async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
-        // The current InMemoryRemoteStore fault surface cannot emit a faithful
-        // `daily` (vs storage) quota signal; the executor classifies "daily"
-        // only from a message the fake does not produce. Rather than assert a
-        // weakened/faked code, this scenario records the capability gap and
-        // returns a documented-skip outcome that the driver renders SKIPPED.
-        if matches!(self.kind, DriveKind::DailyQuota) {
-            return Ok(Outcome {
-                error_codes_seen: vec![],
-                final_drive_object_count: 0,
-                final_hash_matches_local: true,
-                notes: vec![
-                    "SKIP-by-capability: InMemoryRemoteStore exposes no faithful dailyLimitExceeded injector (only storageQuotaExceeded via with_quota_exhausted_after); the executor's daily classification needs a 'daily' message the fake does not emit. Not faking the code. Follow-up: add InMemoryRemoteStore::with_daily_quota_after to driven-drive fault_injection.".to_string(),
-                    "invariants: None - this is a capability SKIP early-return; no handle/source/remote was booted, so there is no single source+folder snapshot to sweep.".to_string(),
-                ],
-                // Capability SKIP: nothing was synced, so there is no terminal
-                // source+remote state for the canonical s6.3 sweep to read.
-                invariants: None,
-            });
-        }
-
+        // Every kind - including daily-quota - now runs the same hermetic body:
+        // `build_remote` rigs the kind's fault on the fake (the daily-quota row
+        // uses the real `with_daily_quota_after` injector), and the run drives
+        // cycles, collects the surfaced codes, and sweeps the canonical s6.3
+        // invariants. No kind early-returns a capability SKIP any more.
         let state_dir = tempfile::tempdir()?;
         let root_dir = tempfile::tempdir()?;
         // A modest multi-file population so a "after N bytes / N requests"
@@ -1667,11 +1640,18 @@ mod tests {
         );
     }
 
-    /// The daily-quota scenario honestly SKIPS (capability gap) rather than
-    /// faking a code the fake cannot emit.
+    /// The daily-quota scenario now runs hermetically against the fake's
+    /// `with_daily_quota_after` injector and surfaces the real
+    /// `DriveDailyQuotaExhausted` code (distinct from storage quota). It is no
+    /// longer a capability SKIP - the injector exists.
     #[tokio::test]
-    async fn drive_daily_quota_skips_by_capability() {
+    async fn drive_daily_quota_surfaces_code() {
         let scenario = DriveMutatorScenario::daily_quota_exhausted();
+        // It runs on a stock host - no real-Drive capability required.
+        assert!(
+            scenario.requires().required.is_empty(),
+            "daily-quota row needs no host capability now"
+        );
         let state_dir = tempfile::tempdir().expect("state dir");
         let remote = Arc::new(InMemoryRemoteStore::new());
         let handle = boot_handle(state_dir.path(), remote)
@@ -1679,15 +1659,19 @@ mod tests {
             .expect("boot placeholder handle");
         let outcome = scenario.run_assertions(&handle).await.expect("runs");
         assert!(
-            outcome.error_codes_seen.is_empty(),
-            "no code faked for the unavailable daily-quota injector"
-        );
-        assert!(
             outcome
-                .notes
-                .iter()
-                .any(|n| n.contains("SKIP-by-capability")),
-            "records the capability gap reason"
+                .error_codes_seen
+                .contains(&ErrorCode::DriveDailyQuotaExhausted),
+            "drive.daily_quota_exhausted surfaced; saw {:?}",
+            outcome.error_codes_seen
+        );
+        // The daily code is classified distinctly from storage quota.
+        assert!(
+            !outcome
+                .error_codes_seen
+                .contains(&ErrorCode::DriveQuotaExhausted),
+            "daily quota is not misclassified as storage quota; saw {:?}",
+            outcome.error_codes_seen
         );
     }
 }

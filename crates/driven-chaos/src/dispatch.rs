@@ -50,6 +50,10 @@ pub enum Command {
     },
     /// `scenario run-all` - run every scenario, respecting capability gates.
     ScenarioRunAll,
+    /// `run-all --fault-injection` - run ONLY the fault-injection subset
+    /// (STRESS_HARNESS s3.7 / s4.2 / s5) the dedicated `chaos-fake-drive` CI
+    /// gate covers.
+    ScenarioRunFaultInjection,
     /// `fuzz [--seed N --duration D]` - property-style soak run.
     Fuzz {
         /// Seed for the weighted mutation distribution; `None` = `now()`.
@@ -133,14 +137,22 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
             })
         }
         Some("run-all") => {
-            // Accept and ignore a trailing `--hermetic` (the only mode there is).
+            // `--hermetic` is a no-op (the harness is hermetic by construction).
+            // `--fault-injection` narrows the run to the s3.7/s4.2/s5 fault
+            // subset the dedicated `chaos-fake-drive` CI gate runs.
+            let mut fault_injection = false;
             for flag in it {
                 match flag {
                     "--hermetic" => {}
+                    "--fault-injection" => fault_injection = true,
                     other => anyhow::bail!("unknown run-all flag: {other}"),
                 }
             }
-            Ok(Command::ScenarioRunAll)
+            if fault_injection {
+                Ok(Command::ScenarioRunFaultInjection)
+            } else {
+                Ok(Command::ScenarioRunAll)
+            }
         }
         Some("fuzz") => {
             let mut seed = None;
@@ -330,6 +342,17 @@ pub async fn run(command: Command, caps: &CapabilitySet) -> i32 {
         }
         Command::ScenarioRunAll => {
             let report = runner::run_all(registry::registry(), caps).await;
+            print!("{}", report.render_json());
+            print!("{}", report.render_human());
+            persist_last_run(&report);
+            if report.any_failed() {
+                exit_code::FAIL
+            } else {
+                exit_code::OK
+            }
+        }
+        Command::ScenarioRunFaultInjection => {
+            let report = runner::run_all(registry::fault_injection_registry(), caps).await;
             print!("{}", report.render_json());
             print!("{}", report.render_human());
             persist_last_run(&report);

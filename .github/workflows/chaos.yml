@@ -10,6 +10,13 @@ name: Chaos
 #                      the NTFS / Win32-shaped rows. None need real Drive or
 #                      elevation (the admin / VSS / real-Drive rows SKIP).
 #                      ROADMAP M3.7 acceptance: Linux + macOS + Windows.
+#   chaos-fake-drive - every PR, 3-OS matrix. The dedicated fault-injection gate
+#                      (STRESS_HARNESS s7 / ROADMAP M3.7): runs ONLY the s3.7
+#                      Drive-side hazards + s4.2/s5 drive-side mutator faults
+#                      against InMemoryRemoteStore (`run-all --fault-injection`).
+#                      These rows are also in the hermetic sweep; this focused
+#                      gate gives the separately-named, faster fault-injection
+#                      check the acceptance requires.
 #   chaos-real-drive - WIRED but SKIPPED until M4: gated on the
 #                      DRIVEN_E2E_REFRESH_TOKEN secret, which is absent until
 #                      the GoogleDriveStore (M4) lands. It skips cleanly, it
@@ -68,6 +75,31 @@ jobs:
       # Exit code: 0 = all pass/skip, 1 = any fail (STRESS_HARNESS s9).
       - name: chaos run-all (hermetic)
         run: cargo run -p driven-chaos -- run-all --hermetic
+
+  chaos-fake-drive:
+    name: chaos fake-drive (${{ matrix.os }})
+    # The dedicated fault-injection gate (ROADMAP M3.7 acceptance: a distinct
+    # chaos-fake-drive job on Linux + macOS + Windows). Runs ONLY the s3.7 /
+    # s4.2 / s5 fault-injection subset against InMemoryRemoteStore; capability
+    # gated rows (the daily-quota real-Drive path) SKIP cleanly, never red.
+    if: github.event_name != 'schedule'
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux Tauri deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
+      - uses: Swatinem/rust-cache@v2
+      - name: chaos run-all (fault-injection)
+        run: cargo run -p driven-chaos -- run-all --fault-injection
 
   chaos-real-drive:
     name: chaos real-drive (M4-gated, skipped)

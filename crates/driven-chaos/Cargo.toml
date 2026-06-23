@@ -36,6 +36,9 @@ uuid.workspace = true
 # oracle instead of buffering / downloading 10-50 GB; same md-5 crate the core
 # + fake use, imported as `md5`.
 md5.workspace = true
+# Central s6.3 content-integrity invariant: hash a synced object's retained
+# bytes to the recorded plaintext blake3 (same crate + version the core uses).
+blake3 = "1"
 # Hermetic per-scenario StateRepo files live under a throwaway tempdir.
 tempfile = "3"
 

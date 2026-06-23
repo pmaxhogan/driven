@@ -163,13 +163,17 @@ impl CapabilitySet {
     pub fn probe() -> Self {
         let real_drive_creds = std::env::var("DRIVEN_E2E_REFRESH_TOKEN").is_ok()
             && std::env::var("DRIVEN_E2E_DEST_FOLDER_ID").is_ok();
-        // The volume backing the harness temp dir is where every fixture is
-        // materialised, so free-disk + filesystem-type probes target it.
-        let temp_dir = std::env::temp_dir();
+        // Every fixture is materialised under `target/chaos-fixtures` (see
+        // runner::fixture_root_for), NOT the system temp dir, so the free-disk +
+        // filesystem-type probes must target THAT volume. On a multi-volume host
+        // `target/` and the temp dir can be different disks; a big-file gate
+        // keyed to the wrong one would mis-skip or fill the workspace volume
+        // (recheck P2-G).
+        let fixture_root = fixture_root_dir();
         let admin = driven_vss::is_elevated();
-        let free_disk_bytes = probe_free_disk_bytes(&temp_dir);
-        let ntfs_volume = probe_ntfs_volume(&temp_dir);
-        let case_sensitive_volume = probe_case_sensitive_volume(&temp_dir);
+        let free_disk_bytes = probe_free_disk_bytes(&fixture_root);
+        let ntfs_volume = probe_ntfs_volume(&fixture_root);
+        let case_sensitive_volume = probe_case_sensitive_volume(&fixture_root);
         let long_paths_enabled = probe_long_paths_enabled();
         // VSS needs Windows + elevation (driven-vss only exposes the COM
         // sequence on an elevated Windows host).
@@ -193,6 +197,21 @@ impl CapabilitySet {
             soak,
             disk_mount_allowed,
         }
+    }
+}
+
+/// The volume root every chaos fixture is materialised under - the
+/// `target/chaos-fixtures` directory that matches `runner::fixture_root_for`.
+/// The free-disk and filesystem-type capability probes target this path rather
+/// than the system temp dir, so a multi-volume host gates the big-file rows on
+/// the disk the fixtures actually land on (recheck P2-G). It is created
+/// best-effort so the probes have an existing path to stat, and falls back to
+/// the temp dir when it cannot be created (for example, a read-only checkout).
+fn fixture_root_dir() -> std::path::PathBuf {
+    let root = std::path::PathBuf::from("target/chaos-fixtures");
+    match std::fs::create_dir_all(&root) {
+        Ok(()) => root,
+        Err(_) => std::env::temp_dir(),
     }
 }
 

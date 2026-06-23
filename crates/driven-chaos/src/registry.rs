@@ -31,6 +31,20 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
     all
 }
 
+/// The fault-injection subset (STRESS_HARNESS s3.7 Drive-side hazards + s4.2/s5
+/// drive-side mutator faults) the dedicated `chaos-fake-drive` CI job runs
+/// (ROADMAP M3.7 acceptance: a distinct fake-drive gate on Linux + macOS +
+/// Windows that "adds the fault-injection scenarios" against
+/// `InMemoryRemoteStore`). These rows are ALSO covered by the full `run-all`
+/// hermetic sweep; this focused selection gives the separately-named,
+/// faster-feedback gate the acceptance requires.
+pub fn fault_injection_registry() -> Vec<Box<dyn Scenario>> {
+    let mut all: Vec<Box<dyn Scenario>> = Vec::new();
+    all.extend(scenarios::drive_side::scenarios());
+    all.extend(scenarios::mutator::scenarios());
+    all
+}
+
 /// Look one scenario up by its stable name (the `scenario run <name>` and
 /// `fixture create <name>` argument). Returns `None` if unknown.
 pub fn find(name: &str) -> Option<Box<dyn Scenario>> {

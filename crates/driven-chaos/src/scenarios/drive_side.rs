@@ -276,6 +276,18 @@ async fn check_invariants(
                 entry.size, row.size
             ));
         }
+        // md5 content integrity (s6.3): the live object's md5 must equal the
+        // recorded `drive_md5`. The central sweep (reporting::assert_invariants)
+        // additionally byte-hashes blake3 for the categories that delegate to
+        // it; the drive_side checker proves content via this md5 + the size
+        // check above (the typed fake's byte accessor is not plumbed through
+        // this per-category checker, which sees only the RemoteStore trait).
+        if let Some(drive_md5) = row.drive_md5 {
+            if entry.md5 != Some(drive_md5) {
+                no_data_loss = false;
+                notes.push(format!("data-loss: synced row {rel} drive md5 mismatch"));
+            }
+        }
         // The local file must still exist at the recorded size.
         let abs = std::path::Path::new(&source.local_path).join(rel.as_str());
         match std::fs::metadata(&abs) {
@@ -1123,6 +1135,15 @@ impl Scenario for DriveFileidRecycled {
             .collect();
         anyhow::ensure!(live.len() == 1, "exactly one live object (Y)");
         let y = &live[0];
+        // The whole point of this scenario is that Y REUSED X's trashed file_id;
+        // assert the recycle actually happened, so a regression in
+        // `with_fileid_recycle()` that hands Y a fresh id fails here instead of
+        // passing vacuously on the op-uuid check below.
+        anyhow::ensure!(
+            y.id == id_x,
+            "file_id was not recycled: Y id {} != X id {id_x}",
+            y.id
+        );
         let uuid_y = y
             .app_properties
             .get(CLIENT_OP_UUID_KEY)

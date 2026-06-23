@@ -148,6 +148,26 @@ struct OracleDigest {
     md5: [u8; 16],
 }
 
+/// The content of one stored object, for the chaos harness's central s6.3
+/// content-integrity invariant ("the bytes hash to the recorded hash_blake3").
+///
+/// `Literal` carries the retained bytes so the sweep can hash them to the
+/// recorded plaintext blake3. `Oracle` is an oracle-backed huge file whose
+/// literal bytes were never retained (P1-B); only its length + md5 verify, so
+/// the sweep relies on the md5 match for it and skips the byte-hash.
+#[derive(Debug, Clone)]
+pub enum ObjectContent {
+    /// The literal stored bytes (normal objects).
+    Literal(Vec<u8>),
+    /// An oracle-backed object: length + md5 only, bytes not retained.
+    Oracle {
+        /// Exact content length in bytes.
+        len: u64,
+        /// md5 of the full content.
+        md5: [u8; 16],
+    },
+}
+
 impl FileEntry {
     fn is_folder(&self) -> bool {
         self.mime_type == "application/vnd.google-apps.folder"
@@ -617,6 +637,26 @@ impl InMemoryRemoteStore {
     /// non-trashed object content.
     pub fn bytes_stored(&self) -> u64 {
         self.inner.lock().bytes_stored
+    }
+
+    /// The content of one object by `file_id`, for the chaos harness's central
+    /// s6.3 content-integrity invariant. Returns `None` for an unknown id or a
+    /// folder. An oracle-backed object reports its length + md5 (its literal
+    /// bytes were never retained); a normal object reports its literal bytes so
+    /// the caller can hash them to the recorded `hash_blake3`.
+    pub fn object_content(&self, file_id: &str) -> Option<ObjectContent> {
+        let guard = self.inner.lock();
+        let entry = guard.objects.get(file_id)?;
+        if entry.is_folder() {
+            return None;
+        }
+        Some(match &entry.oracle {
+            Some(d) => ObjectContent::Oracle {
+                len: d.len,
+                md5: d.md5,
+            },
+            None => ObjectContent::Literal(entry.bytes.clone()),
+        })
     }
 
     /// Arm the session-invalidated-after-N-chunks fault on a specific,
@@ -1182,7 +1222,10 @@ impl RemoteStore for InMemoryRemoteStore {
                     let was = if entry.trashed {
                         0
                     } else {
-                        entry.bytes.len() as u64
+                        // content_len() so oracle-backed (huge-file) objects,
+                        // whose literal bytes were never retained, free their
+                        // true logical size from bytes_stored, not 0.
+                        entry.content_len().unwrap_or(0)
                     };
                     // Only files recycle their id (folders never recycle).
                     if !entry.is_folder() {
@@ -1202,7 +1245,9 @@ impl RemoteStore for InMemoryRemoteStore {
                 if entry.trashed {
                     0
                 } else {
-                    let was = entry.bytes.len() as u64;
+                    // content_len() (not bytes.len()) so an oracle-backed
+                    // object frees its true logical size.
+                    let was = entry.content_len().unwrap_or(0);
                     entry.trashed = true;
                     was
                 }
@@ -1294,7 +1339,9 @@ impl RemoteStore for InMemoryRemoteStore {
             .objects
             .values()
             .filter(|e| e.trashed)
-            .map(|e| e.bytes.len() as u64)
+            // content_len() so oracle-backed huge files contribute their true
+            // logical size to trash usage, not 0.
+            .map(|e| e.content_len().unwrap_or(0))
             .sum();
         Ok(AboutInfo {
             limit: guard.about_limit,

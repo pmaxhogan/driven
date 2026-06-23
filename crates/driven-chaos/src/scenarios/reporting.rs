@@ -45,8 +45,8 @@ use driven_core::orchestrator::TickSource;
 use driven_core::state::{SourceRow, StateRepo};
 use driven_core::types::{AccountId, FileStateStatus, OrchestratorState, SourceId};
 
-use driven_drive::fake::{InMemoryRemoteStore, CLIENT_OP_UUID_KEY};
-use driven_drive::remote_store::RemoteStore;
+use driven_drive::fake::{InMemoryRemoteStore, ObjectContent, CLIENT_OP_UUID_KEY};
+use driven_drive::remote_store::{RemoteEntry, RemoteStore};
 
 use crate::capabilities::{Capability, CapabilityRequirements};
 use crate::handle::{DrivenHandle, DrivenHandleBuilder};
@@ -220,21 +220,61 @@ pub async fn assert_invariants(
         .collect();
     duplicate_op_uuids.sort();
 
-    // The set of live remote object ids, for the data-loss check.
-    let live_ids: std::collections::HashSet<&str> = live.iter().map(|e| e.id.as_str()).collect();
+    // The live remote objects indexed by id, for the data-loss + content checks.
+    let by_id: HashMap<&str, &RemoteEntry> = live.iter().map(|e| (e.id.as_str(), e)).collect();
 
-    // No data loss (s6.3): every Synced row's drive_file_id resolves to a
-    // live object. A Synced row with no drive_file_id, or one whose id is
-    // not present (trashed or gone), is data loss.
+    // Whether this source encrypts. An encrypted source stores CIPHERTEXT on
+    // Drive, whose blake3 differs from the recorded plaintext `hash_blake3`, so
+    // its content is verified by md5 only (the byte-hash check would false-fail).
+    let encryption_enabled = handle
+        .state
+        .list_sources()
+        .await?
+        .into_iter()
+        .find(|s| s.id == source_id)
+        .map(|s| s.encryption_enabled)
+        .unwrap_or(false);
+
+    // No data loss (STRESS_HARNESS s6.3): for every `status='synced'` row the
+    // recorded Drive object must (a) exist live, (b) have an md5 matching the
+    // recorded `drive_md5`, and (c) - for an unencrypted source whose literal
+    // bytes are retained - hash to the recorded plaintext `hash_blake3`. A
+    // missing object, an md5 mismatch, or a blake3 mismatch is data loss /
+    // silent remote corruption. (Oracle-backed huge files retain no literal
+    // bytes; their md5 match in (b) is the integrity proof and (c) is skipped.)
     let mut data_loss_paths: Vec<String> = Vec::new();
     let rows = handle.state.load_source_file_state(source_id).await?;
     for (rel, row) in &rows {
         if row.status != FileStateStatus::Synced {
             continue;
         }
-        match row.drive_file_id.as_deref() {
-            Some(id) if live_ids.contains(id) => {}
-            _ => data_loss_paths.push(rel.as_str().to_string()),
+        let Some(id) = row.drive_file_id.as_deref() else {
+            data_loss_paths.push(format!("{rel}: synced row has no drive_file_id"));
+            continue;
+        };
+        let Some(entry) = by_id.get(id) else {
+            data_loss_paths.push(format!("{rel}: object {id} missing/trashed"));
+            continue;
+        };
+        // (b) md5 match: the live object's md5 must equal the recorded
+        // `drive_md5` (both are the ciphertext md5 Drive computed). Holds for
+        // oracle-backed huge files too (the oracle carries the true md5).
+        if let Some(drive_md5) = row.drive_md5 {
+            if entry.md5 != Some(drive_md5) {
+                data_loss_paths.push(format!("{rel}: drive md5 mismatch"));
+                continue;
+            }
+        }
+        // (c) blake3 content match: hash the retained bytes to the recorded
+        // plaintext `hash_blake3`. Only for an unencrypted source (ciphertext
+        // hashes differ from the plaintext hash) and a retained-bytes object.
+        if !encryption_enabled {
+            if let Some(ObjectContent::Literal(bytes)) = remote.object_content(id) {
+                if *blake3::hash(&bytes).as_bytes() != row.hash_blake3 {
+                    data_loss_paths.push(format!("{rel}: blake3 content mismatch"));
+                    continue;
+                }
+            }
         }
     }
     data_loss_paths.sort();
