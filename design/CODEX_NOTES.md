@@ -290,3 +290,29 @@ the NEXT process retries the >1h sweep, and VSS_CTX_BACKUP shadows are OS-auto-r
 process death anyway. Proper fix (deferred): thread a Result through the registry read so
 the done-flag is only set after a successful read + cleanup attempt, with a retry on a
 transient DB error.
+
+## M3.7 stress-harness documented V1 behaviours (tracked, not bugs)
+
+The driven-chaos harness (M3.7) surfaces two genuine V1 behaviours as
+ExpectedOutcome::DocumentedBehaviour scenario rows (executable, run every CI -
+NOT #[ignore]'d, NOT weakened invariants). Tracked here for visibility:
+
+- rename-storm churn: a rapid continuous rename storm + M3's once-per-boot
+  reconcile (DESIGN s5.6) legitimately leaves transient stale `synced` rows for
+  paths that were renamed AWAY (the file still exists under its new name, which
+  IS backed up). It is NOT data loss and NOT a stuck pipeline - a subsequent
+  full scan's delete-detection trashes the stale remote object. The harness's
+  cross-scenario no-orphan/no-data-loss checks tolerate ONLY this renamed-away
+  case (tolerate_rename_churn, scoped to the rename-storm row), still asserting
+  no-duplicate-per-op-uuid + no-stuck-pipeline + that every still-existing file
+  is backed up. Bounded transient churn, not an unbounded leak. A future
+  improvement is more eager rename/delete reconciliation between scans.
+
+- atomic-replace platform dependence: the SPEC s8 mid-upload replace defence
+  surfaces local.file_replaced_during_upload where the platform exposes an
+  inode/file-index, but local.file_changed_during_upload on Windows-stable
+  (the file-index syscall is not on stable Rust, so fstat_identity reads inode
+  0 and the size/ctime delta is the detecting signal). The replace-via-atomic-
+  rename row injects a real upload window (with_slow_responses) + a monotonically
+  growing body so the size delta is machine-speed-independent, and accepts
+  either code - a documented platform-dependent outcome, not a faked pass.
