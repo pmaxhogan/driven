@@ -3,12 +3,13 @@ name: Chaos
 # Driven stress / chaos harness (design/STRESS_HARNESS.md s7).
 #
 # Jobs:
-#   chaos-hermetic   - every PR, ubuntu. Runs every scenario whose requires()
-#                      is satisfiable on a stock non-elevated Linux runner
-#                      (no real-Drive creds, no admin); the rest SKIP cleanly.
-#   chaos-fake-drive - every PR, windows. Adds the Windows / NTFS-shaped rows
-#                      and the s3.7 / s5 fault-injection scenarios against the
-#                      InMemoryRemoteStore. Still no real Drive, no elevation.
+#   chaos-hermetic   - every PR, 3-OS matrix [ubuntu, macos, windows]. Runs
+#                      every scenario whose requires() is satisfiable on a stock
+#                      non-elevated runner of that OS; the rest SKIP cleanly.
+#                      Linux + macOS exercise the Unix-shaped rows; Windows adds
+#                      the NTFS / Win32-shaped rows. None need real Drive or
+#                      elevation (the admin / VSS / real-Drive rows SKIP).
+#                      ROADMAP M3.7 acceptance: Linux + macOS + Windows.
 #   chaos-real-drive - WIRED but SKIPPED until M4: gated on the
 #                      DRIVEN_E2E_REFRESH_TOKEN secret, which is absent until
 #                      the GoogleDriveStore (M4) lands. It skips cleanly, it
@@ -38,38 +39,34 @@ env:
 
 jobs:
   chaos-hermetic:
-    name: chaos hermetic (ubuntu)
+    name: chaos hermetic (${{ matrix.os }})
     # Skip the PR run on the scheduled trigger; the soak job covers cron.
     if: github.event_name != 'schedule'
-    runs-on: ubuntu-latest
+    strategy:
+      fail-fast: false
+      matrix:
+        # ROADMAP M3.7 acceptance: the hermetic harness must pass on all three
+        # OS families. Each runner capability-gates its own scenario set - Linux
+        # + macOS run the Unix-shaped rows, Windows runs the NTFS / Win32 rows;
+        # the admin / VSS / real-Drive rows SKIP cleanly on every unelevated
+        # runner (recorded, never red).
+        os: [ubuntu-latest, macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux Tauri deps
+        if: runner.os == 'Linux'
         run: |
           sudo apt-get update
           sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
       - uses: Swatinem/rust-cache@v2
-      # run-all capability-gates every scenario: on a stock non-elevated Linux
-      # runner the admin / NTFS / real-Drive rows SKIP (recorded, never red);
-      # everything else runs against the headless core + InMemoryRemoteStore.
+      # run-all capability-gates every scenario: on a stock non-elevated runner
+      # the admin / NTFS / real-Drive rows SKIP (recorded, never red); the rest
+      # run against the headless core + InMemoryRemoteStore.
       # Exit code: 0 = all pass/skip, 1 = any fail (STRESS_HARNESS s9).
       - name: chaos run-all (hermetic)
-        run: cargo run -p driven-chaos -- run-all --hermetic
-
-  chaos-fake-drive:
-    name: chaos fake-drive (windows)
-    if: github.event_name != 'schedule'
-    runs-on: windows-latest
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - uses: Swatinem/rust-cache@v2
-      # On Windows the additional NTFS-shaped and fault-injection rows that the
-      # Linux job SKIPs become runnable (still against the fake remote, still
-      # unelevated - the admin/VSS rows SKIP). Same exit-code semantics.
-      - name: chaos run-all (fake-drive)
         run: cargo run -p driven-chaos -- run-all --hermetic
 
   chaos-real-drive:

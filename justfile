@@ -25,6 +25,25 @@ test-e2e-real:
 watch:
     cargo watch -x "test -p driven-core" -x "test -p driven-drive"
 
+# --- chaos / stress harness (design/STRESS_HARNESS.md, ROADMAP M3.7) ---
+
+# Run the full hermetic chaos harness: every scenario, capability-gated.
+# Rows whose requires() the host cannot satisfy (admin / VSS / real-Drive /
+# wrong-OS) SKIP cleanly; exit 0 = all pass/skip, 1 = any fail.
+chaos:
+    cargo run -p driven-chaos -- run-all --hermetic
+
+# Remove every cached chaos fixture under target/chaos-fixtures/ so the next
+# run rebuilds the big (million-files-nested / huge-file) fixtures from scratch.
+chaos-fixture-clean:
+    cargo run -p driven-chaos -- fixture clean --all
+
+# Seeded continuous-mutation fuzz soak (STRESS_HARNESS s4.3). Override the
+# default duration, e.g. `just chaos-fuzz "--seed 42 --duration 10m"`. An
+# invariant violation writes target/chaos-fuzz-failures/<seed>.json for replay.
+chaos-fuzz args="--duration 2m":
+    cargo run -p driven-chaos -- fuzz {{args}}
+
 lint:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
