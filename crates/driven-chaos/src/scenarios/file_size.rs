@@ -539,7 +539,14 @@ impl Scenario for HugeFile10Gb {
         "one 10 GB deterministic file completes via the resumable pipeline; bytes round-trip"
     }
     fn requires(&self) -> CapabilityRequirements {
-        CapabilityRequirements::of(vec![Capability::FreeDiskBytes { min: TEN_GB_FREE }])
+        // Soak-gated (STRESS_HARNESS s3.2): writing + reading a 10 GB file is
+        // soak-grade, not PR-gating work, and the 10 GB write can exhaust a CI
+        // runner's work volume. Runs in the weekly soak job; SKIPs in the PR
+        // matrix.
+        CapabilityRequirements::of(vec![
+            Capability::Soak,
+            Capability::FreeDiskBytes { min: TEN_GB_FREE },
+        ])
     }
 
     async fn setup(&self, ctx: &mut ScenarioContext) -> anyhow::Result<()> {
@@ -647,7 +654,12 @@ impl Scenario for HugeFile50GbMidRunCrash {
         "a 50 GB upload interrupted mid-stream resumes from the persisted offset; no duplicate object"
     }
     fn requires(&self) -> CapabilityRequirements {
-        CapabilityRequirements::of(vec![Capability::FreeDiskBytes { min: FIFTY_GB_FREE }])
+        // Soak-gated (STRESS_HARNESS s3.2): a 50 GB write/read is soak-grade and
+        // far exceeds a PR CI runner's disk; runs in the weekly soak job only.
+        CapabilityRequirements::of(vec![
+            Capability::Soak,
+            Capability::FreeDiskBytes { min: FIFTY_GB_FREE },
+        ])
     }
 
     async fn setup(&self, ctx: &mut ScenarioContext) -> anyhow::Result<()> {

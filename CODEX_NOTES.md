@@ -38,12 +38,19 @@ no-infinite-loop) therefore now wraps ONLY `run_assertions` (the work loop where
 bug), NOT the uncapped `setup` fixture build. `write_deterministic` was also fixed to size its
 scratch block to the file length so the many-tiny-file rows do not allocate a 1 MiB buffer per file.
 
-## P1-B huge-file content oracle
+## P1-B huge-file content oracle + soak-gate
 
 `huge-file-10gb` / `huge-file-50gb-mid-run-crash` arm `InMemoryRemoteStore::with_content_oracle()`:
 the fake records only a length + streaming md5 instead of buffering 10-50 GB in a `Vec<u8>`. The
 rows verify length + md5 (against `deterministic_md5` of the source pattern) instead of downloading.
 An oracle-stored object's `download` errors by design (the bytes are not retained).
+
+They are ALSO `Capability::Soak`-gated so they SKIP in the per-PR matrix and run only in the weekly
+soak job: the content-oracle keeps the FAKE memory bounded, but the on-disk SOURCE write is
+inherently heavy (10-50 GB). On the 3-OS matrix the ubuntu leg received a runner shutdown signal
+partway through run-all (the 10 GB source write can exhaust / preempt a CI runner's work volume), so
+these join million-files-nested + tiny-files-100k behind the soak gate - a 10-50 GB write+read is
+soak-grade, not PR-gating work.
 
 ## Scenarios newly EXERCISED by the real probe (P1-A) - fixed or documented
 
