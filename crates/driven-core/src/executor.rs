@@ -3387,9 +3387,19 @@ enum DriveError {
     /// The store's post-upload md5 verify failed (codex R-P1-1): the real
     /// `GoogleDriveStore` verifies INSIDE the store, so a checksum mismatch
     /// arrives here as a typed error rather than the executor doing its own
-    /// verify. It maps to the `drive.checksum_mismatch` code (NOT the generic
-    /// `drive.unreachable`), so the orchestrator's 3-consecutive-mismatch ->
-    /// `status='corrupt'` defence is driven by the real store too.
+    /// verify. Today (M4) it maps to the `drive.checksum_mismatch` code (NOT the
+    /// generic `drive.unreachable`) and fails the op.
+    ///
+    /// NOTE (codex R2-P1-3, honesty): the DESIGN s498-500
+    /// "3 consecutive checksum mismatches -> `status='corrupt'`" defence is NOT
+    /// present on this path - there is no per-file mismatch counter and no
+    /// transition to `FileStateStatus::Corrupt` here. A mismatch maps to
+    /// `UploadError::Failed`, deletes the pending op, and the orchestrator only
+    /// defers scan timestamps + logs activity. Implementing the persistent
+    /// per-file counter is DEFERRED to M5 (when the real `GoogleDriveStore` is
+    /// wired into the prod executor; in M4 the executor runs the fake and the CLI
+    /// bypasses the pending-op machinery). Tracked in design/CODEX_NOTES.md
+    /// "M4 recheck-2 deferrals -> M5".
     ChecksumMismatch,
     Other,
 }

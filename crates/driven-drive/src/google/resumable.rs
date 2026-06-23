@@ -283,7 +283,18 @@ fn chunk_status_outcome(status: u16) -> ChunkStatusOutcome {
 /// `Content-Range: bytes */<total>` probe) so a resumed upload knows where to
 /// continue (SPEC s3, DESIGN s5.4 resume). Returns the count of bytes Drive
 /// holds (the next offset to send from). A `200/201` means the upload already
-/// completed (returns `total`); a 4xx surfaces as a session-invalid error.
+/// completed (returns `total`).
+///
+/// Non-2xx / non-308 statuses use the SAME classification as [`push_chunk`]
+/// (codex R2-P1-2): this probe is reachable on the "308 without Range" recovery
+/// path AND the post-transient offset re-query in `push_chunk_resilient`, so a
+/// quota/auth/rate error DURING the probe must surface its stable code, not be
+/// collapsed into `ResumableSessionInvalid`. Only a genuinely session-dead 4xx
+/// (400/404/410) maps to [`DriveError::ResumableSessionInvalid`]; 401/403/429
+/// (and 5xx / any other status) read the body and return the TYPED classified
+/// error via [`DriveError::from_response`] so `drive.quota_exhausted`,
+/// `drive.daily_quota_exhausted`, `auth.invalid_grant`, and
+/// `drive.rate_limited` reach the breaker instead of looping a session restart.
 pub async fn query_offset(
     http: &reqwest::Client,
     access_token: &str,
@@ -308,7 +319,23 @@ pub async fn query_offset(
         // Already complete.
         return Ok(session.size);
     }
-    Err(anyhow::Error::new(DriveError::ResumableSessionInvalid))
+    // R2-P1-2: classify exactly like push_chunk - reserve ResumableSessionInvalid
+    // for session-dead 4xx (400/404/410); read + classify everything else
+    // (401/403/429/5xx/other) into the typed error.
+    match chunk_status_outcome(status) {
+        ChunkStatusOutcome::SessionInvalid => {
+            Err(anyhow::Error::new(DriveError::ResumableSessionInvalid))
+        }
+        ChunkStatusOutcome::Typed => {
+            let retry_after = super::parse_retry_after(&resp);
+            let body = resp.bytes().await.map_err(DriveError::from_transport)?;
+            Err(anyhow::Error::new(DriveError::from_response(
+                status,
+                &body,
+                retry_after,
+            )))
+        }
+    }
 }
 
 /// Parses Drive's resumable completion response body into a [`RemoteEntry`]
@@ -436,6 +463,69 @@ mod tests {
                 "status {s} must be read + classified (typed), not session-dead"
             );
         }
+    }
+
+    #[test]
+    fn query_offset_and_push_chunk_share_status_classification() {
+        // R2-P1-2: query_offset() (used on the "308 without Range" recovery and
+        // the post-transient offset re-query in push_chunk_resilient) must use
+        // the SAME session-dead-vs-typed split as push_chunk. Both call
+        // chunk_status_outcome, so proving that one function classifies every
+        // relevant status correctly proves the two wire paths are consistent
+        // without standing up an HTTP server for each.
+        //
+        // Session-dead 4xx -> ResumableSessionInvalid on BOTH paths.
+        for s in [400u16, 404, 410] {
+            assert_eq!(
+                chunk_status_outcome(s),
+                ChunkStatusOutcome::SessionInvalid,
+                "status {s} must be session-dead in query_offset + push_chunk"
+            );
+        }
+        // 401/403/429 + 5xx + any other -> read + classify (typed) on BOTH
+        // paths, so a quota/auth/rate error during the offset probe surfaces its
+        // stable code instead of collapsing to ResumableSessionInvalid.
+        for s in [401u16, 403, 429, 500, 502, 503, 418] {
+            assert_eq!(
+                chunk_status_outcome(s),
+                ChunkStatusOutcome::Typed,
+                "status {s} must be typed in query_offset + push_chunk"
+            );
+        }
+    }
+
+    #[test]
+    fn query_offset_typed_branch_maps_to_stable_codes() {
+        use crate::remote_store::DriveErrorClassification;
+        // R2-P1-2: the typed branch query_offset now takes for 401/403/429 hands
+        // the body to DriveError::from_response, the SAME call push_chunk's typed
+        // branch makes. Confirm the auth/quota/rate bodies map to the SPEC s24
+        // classes the breaker needs (NOT ResumableSessionInvalid / Other).
+        let invalid_grant = br#"{"error":"invalid_grant"}"#;
+        assert!(matches!(
+            DriveError::from_response(401, invalid_grant, None).classification(),
+            DriveErrorClassification::AuthInvalidGrant
+        ));
+        let storage = br#"{"error":{"errors":[{"reason":"storageQuotaExceeded"}],"code":403}}"#;
+        assert!(matches!(
+            DriveError::from_response(403, storage, None).classification(),
+            DriveErrorClassification::StorageQuota
+        ));
+        let daily = br#"{"error":{"errors":[{"reason":"dailyLimitExceeded"}],"code":403}}"#;
+        assert!(matches!(
+            DriveError::from_response(403, daily, None).classification(),
+            DriveErrorClassification::DailyQuota
+        ));
+        assert!(matches!(
+            DriveError::from_response(429, b"", None).classification(),
+            DriveErrorClassification::RateLimited { .. }
+        ));
+        // And the session-dead status query_offset reserves for
+        // ResumableSessionInvalid is NOT one of the typed classes.
+        assert_eq!(
+            chunk_status_outcome(410),
+            ChunkStatusOutcome::SessionInvalid
+        );
     }
 
     #[test]
