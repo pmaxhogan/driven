@@ -177,6 +177,15 @@ fn backoff_for(attempt: u32, retry_after_ms: Option<u64>) -> Duration {
     }
 }
 
+/// Public backoff for a transient (5xx / network) retry attempt (0-based),
+/// with full jitter, honouring an optional `Retry-After` floor. Exposed so the
+/// resumable-chunk loop (which retries against the SAME session rather than
+/// through [`with_retry`]) shares the exact DESIGN s5.4 backoff schedule
+/// (1s, 2s, 4s, 8s, ... capped 60s, jittered) instead of re-deriving it.
+pub fn transient_backoff(attempt: u32, retry_after_ms: Option<u64>) -> Duration {
+    backoff_for(attempt, retry_after_ms)
+}
+
 /// Full-jitter sample in `[0, d]` using a cheap, dependency-free RNG seeded
 /// from the wall clock + the duration. We do not need cryptographic jitter -
 /// only enough spread to de-correlate concurrent retriers.

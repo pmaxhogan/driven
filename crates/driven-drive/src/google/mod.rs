@@ -526,41 +526,81 @@ impl GoogleDriveStore {
     /// wrapping it in [`with_retry`](retry::with_retry) so the transient
     /// classes are retried. `build` re-builds the `RequestBuilder` per attempt
     /// (a fresh bearer + fresh body each time).
+    ///
+    /// SAFE FOR IDEMPOTENT requests only (GET / HEAD / PATCH-by-id / trash):
+    /// the transient classes are retried, so a non-idempotent POST that
+    /// committed before its response was lost would be re-sent and DUPLICATE
+    /// the object (codex V-E). The create POST path uses
+    /// [`Self::send_json_no_retry`] instead.
     async fn send_json<R, B>(&self, build: B) -> anyhow::Result<R>
     where
         R: serde::de::DeserializeOwned,
         B: Fn(String) -> reqwest::RequestBuilder,
     {
-        let body = retry::with_retry(|| async {
-            let token = self.bearer().await?;
-            let resp = build(token)
-                .send()
-                .await
-                .map_err(DriveError::from_transport)?;
-            let status = resp.status().as_u16();
-            let retry_after = parse_retry_after(&resp);
-            let bytes = resp.bytes().await.map_err(DriveError::from_transport)?;
-            if (200..300).contains(&status) {
-                Ok(bytes)
-            } else {
-                Err(anyhow::Error::new(DriveError::from_response(
-                    status,
-                    &bytes,
-                    retry_after,
-                )))
-            }
-        })
-        .await?;
+        let body = retry::with_retry(|| async { self.send_json_attempt(&build).await }).await?;
         serde_json::from_slice::<R>(&body)
             .map_err(|e| anyhow::anyhow!("drive: failed to parse response JSON: {e}"))
+    }
+
+    /// Like [`Self::send_json`] but WITHOUT the automatic retry wrapper. Used
+    /// for the non-idempotent create POST (multipart create / folder create):
+    /// a transient after Drive may have committed the object must NOT be
+    /// blind-retried (it would create a second live file, since Drive allows
+    /// duplicate names - codex V-E). The executor's reconcile-by-op-uuid path
+    /// adopts an ambiguous transient create instead; the CLI debug path simply
+    /// surfaces the transient as an error, which is acceptable. Idempotent
+    /// GET/HEAD/PATCH-by-id/trash keep retry via [`Self::send_json`].
+    async fn send_json_no_retry<R, B>(&self, build: B) -> anyhow::Result<R>
+    where
+        R: serde::de::DeserializeOwned,
+        B: Fn(String) -> reqwest::RequestBuilder,
+    {
+        let body = self.send_json_attempt(&build).await?;
+        serde_json::from_slice::<R>(&body)
+            .map_err(|e| anyhow::anyhow!("drive: failed to parse response JSON: {e}"))
+    }
+
+    /// One attempt of a metadata request: mint a bearer, send, and return the
+    /// body bytes on 2xx or a classified [`DriveError`] otherwise. Shared by
+    /// the retrying and non-retrying wrappers.
+    async fn send_json_attempt<B>(&self, build: &B) -> anyhow::Result<Bytes>
+    where
+        B: Fn(String) -> reqwest::RequestBuilder,
+    {
+        let token = self.bearer().await?;
+        let resp = build(token)
+            .send()
+            .await
+            .map_err(DriveError::from_transport)?;
+        let status = resp.status().as_u16();
+        let retry_after = parse_retry_after(&resp);
+        let bytes = resp.bytes().await.map_err(DriveError::from_transport)?;
+        if (200..300).contains(&status) {
+            Ok(bytes)
+        } else {
+            Err(anyhow::Error::new(DriveError::from_response(
+                status,
+                &bytes,
+                retry_after,
+            )))
+        }
     }
 
     /// Searches `parent_id`'s non-trashed children matching a Drive query and
     /// returns the parsed entries (used by `ensure_folder` /
     /// `find_by_op_uuid`).
+    ///
+    /// Routed through [`with_retry`](retry::with_retry) so a transient
+    /// 5xx/network/429 on a list page backs off and retries rather than failing
+    /// the whole lookup (codex C-P2-5 / V-C: list previously bypassed retry).
+    /// `list_all` re-runs the full pagination loop per attempt - safe because
+    /// `files.list` is idempotent and deduped by id.
     pub(crate) async fn list_query(&self, q: &str) -> anyhow::Result<Vec<RemoteEntry>> {
-        let token = self.bearer().await?;
-        pagination::list_all(&self.http, &token, q).await
+        retry::with_retry(|| async {
+            let token = self.bearer().await?;
+            pagination::list_all(&self.http, &token, q).await
+        })
+        .await
     }
 
     /// Creates a folder under `parent_id` with the Driven folder marker
@@ -574,8 +614,12 @@ impl GoogleDriveStore {
             "parents": [parent_id],
             "appProperties": app_properties,
         }))?;
+        // A folder create is a non-idempotent POST: do NOT blind-retry it (a
+        // transient after Drive committed would create a duplicate folder -
+        // codex V-E). ensure_folder's search-then-create already tolerates a
+        // racing duplicate by adopting the oldest/marked match next time.
         let file: DriveFile = self
-            .send_json(|token| {
+            .send_json_no_retry(|token| {
                 self.http
                     .post(format!("{DRIVE_API_BASE}/files"))
                     .query(&[("fields", pagination::FILE_FIELDS)])
@@ -583,7 +627,10 @@ impl GoogleDriveStore {
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body.clone())
             })
-            .await?;
+            .await
+            // The folder is created under `parent_id`; a 404 / unclassified
+            // 403 is a dest-folder condition, not a transient (codex C-P2-1).
+            .map_err(map_parent_write_error)?;
         Ok(file.into_remote_entry())
     }
 
@@ -626,40 +673,167 @@ impl GoogleDriveStore {
             None => format!("{DRIVE_UPLOAD_BASE}/files"),
         };
         let content_type = format!("multipart/related; boundary={boundary}");
+        let is_update = file_id.is_some();
 
-        let file: DriveFile = self
-            .send_json(|token| {
-                self.http
-                    .request(
-                        if file_id.is_some() {
-                            reqwest::Method::PATCH
-                        } else {
-                            reqwest::Method::POST
-                        },
-                        &url,
-                    )
-                    .query(&[
-                        ("uploadType", "multipart"),
-                        ("fields", pagination::FILE_FIELDS),
-                    ])
-                    .bearer_auth(token)
-                    .header(reqwest::header::CONTENT_TYPE, &content_type)
-                    .timeout(SIMPLE_UPLOAD_TOTAL_TIMEOUT)
-                    .body(body.clone())
-            })
-            .await?;
+        let build = |token: String| {
+            self.http
+                .request(
+                    if is_update {
+                        reqwest::Method::PATCH
+                    } else {
+                        reqwest::Method::POST
+                    },
+                    &url,
+                )
+                .query(&[
+                    ("uploadType", "multipart"),
+                    ("fields", pagination::FILE_FIELDS),
+                ])
+                .bearer_auth(token)
+                .header(reqwest::header::CONTENT_TYPE, &content_type)
+                .timeout(SIMPLE_UPLOAD_TOTAL_TIMEOUT)
+                .body(body.clone())
+        };
+
+        // An update is a PATCH-by-id (idempotent) -> safe to retry. A create is
+        // a POST (non-idempotent) -> must NOT be blind-retried (a transient
+        // after Drive committed would create a duplicate live file, codex V-E);
+        // the executor's reconcile-by-op-uuid adopts an ambiguous create.
+        let file: DriveFile = if is_update {
+            self.send_json(build).await?
+        } else {
+            self.send_json_no_retry(build).await?
+        };
 
         let entry = file.into_remote_entry();
         verify_md5(&entry, expected_md5)?;
         Ok(entry)
     }
 
+    /// Pushes one wire chunk to a resumable session, routing a transient
+    /// (5xx / network) failure through the DESIGN s5.4 retry discipline
+    /// (codex C-P2-5 / V-C): on a transient error we re-query the confirmed
+    /// offset ([`resumable::query_offset`]) and re-push the SAME session with
+    /// bounded exponential backoff up to [`retry::MAX_RETRIES`]; we restart
+    /// from offset 0 ONLY on a genuine [`ResumeProgress::SessionInvalid`] (a
+    /// 4xx). A fresh bearer is minted per attempt.
+    ///
+    /// `piece_at` yields the chunk to send for a given confirmed offset (so a
+    /// transient retry re-slices the right bytes for the buffered path). It
+    /// returns `None` when the source cannot reposition to that offset (the
+    /// non-replayable stream path), in which case the transient failure is
+    /// surfaced as an error rather than silently dropped.
+    ///
+    /// Returns the [`ResumeProgress`] of the successful (non-transient) push,
+    /// with `InProgress.received` carrying Drive's acknowledged offset.
+    async fn push_chunk_resilient<F>(
+        &self,
+        session: &ResumableSession,
+        offset: u64,
+        piece: Bytes,
+        mut piece_at: F,
+    ) -> anyhow::Result<ResumeProgress>
+    where
+        F: FnMut(u64) -> Option<Bytes>,
+    {
+        let mut transient_attempt: u32 = 0;
+        let mut cur_offset = offset;
+        let mut cur_piece = piece;
+        loop {
+            let token = self.bearer().await?;
+            match resumable::push_chunk(self.http_stream(), &token, session, cur_offset, cur_piece)
+                .await
+            {
+                Ok(progress) => return Ok(progress),
+                Err(e) => {
+                    // Only the transient classes (5xx / network) are retryable
+                    // against the same session; everything else (a 4xx already
+                    // mapped to SessionInvalid via Ok, or an unclassified bug)
+                    // surfaces as-is.
+                    let class = classification_of(&e);
+                    let transient = matches!(
+                        class,
+                        Some(
+                            DriveErrorClassification::Transient5xx
+                                | DriveErrorClassification::Network
+                                | DriveErrorClassification::RateLimited { .. }
+                        )
+                    );
+                    if !transient {
+                        return Err(e);
+                    }
+                    // Rate-limit retries indefinitely (the limit is
+                    // recoverable); 5xx / network are bounded by MAX_RETRIES.
+                    let is_rate =
+                        matches!(class, Some(DriveErrorClassification::RateLimited { .. }));
+                    if !is_rate && transient_attempt >= retry::MAX_RETRIES {
+                        return Err(e);
+                    }
+                    let retry_after = match class {
+                        Some(DriveErrorClassification::RateLimited { retry_after_ms }) => {
+                            Some(retry_after_ms)
+                        }
+                        _ => None,
+                    };
+                    let delay = retry::transient_backoff(transient_attempt, retry_after);
+                    transient_attempt = transient_attempt.saturating_add(1);
+                    tokio::time::sleep(delay).await;
+
+                    // Re-query the SAME session for the confirmed offset so we
+                    // resend only the bytes Drive is missing (DESIGN s5.4).
+                    let token = self.bearer().await?;
+                    let confirmed =
+                        resumable::query_offset(self.http_stream(), &token, session).await?;
+                    if confirmed >= session.size {
+                        // Drive has acknowledged the whole object even though
+                        // our PUT's response was lost to the transient. Re-PUT
+                        // an empty final probe against the SAME session to
+                        // retrieve the completed resource (idempotent: Drive
+                        // returns the finished `files` resource for a probe of a
+                        // fully-acked session).
+                        let token = self.bearer().await?;
+                        return resumable::push_chunk(
+                            self.http_stream(),
+                            &token,
+                            session,
+                            session.size,
+                            Bytes::new(),
+                        )
+                        .await;
+                    }
+                    match piece_at(confirmed) {
+                        Some(next_piece) => {
+                            cur_offset = confirmed;
+                            cur_piece = next_piece;
+                        }
+                        // The source cannot reposition (non-replayable stream):
+                        // surface the transient error so the op fails and the
+                        // next sync cycle re-reads from the start, rather than
+                        // hanging or corrupting the upload.
+                        None => return Err(e),
+                    }
+                }
+            }
+        }
+    }
+
     /// Resumable create/update for a streaming (`> RESUMABLE_THRESHOLD`, or
-    /// caller-requested) body (DESIGN s5.4). Opens a session, pushes
-    /// 256-KiB-multiple chunks accumulated from the source stream, and
-    /// md5-verifies the completed entry (SPEC s8). A 4xx mid-stream discards
-    /// the session and restarts from byte 0 (DESIGN s5.4), bounded so a
-    /// persistently-rejecting upload still surfaces an error.
+    /// caller-requested) body (DESIGN s5.4, s11.4.3; codex C-P1-2 / V-B).
+    ///
+    /// Streams the source one [`resumable::CHUNK_BYTES`] wire chunk at a time
+    /// (accumulating only a single 256-KiB-multiple chunk in memory, NOT the
+    /// whole body) and pushes each as it fills, computing the md5 incrementally
+    /// over the bytes actually sent. The peak footprint is one wire chunk
+    /// (default 4 MiB), matching the executor's bounded-memory streaming
+    /// contract - it does NOT buffer the file (which would OOM on large files,
+    /// reachable via CLI sync and the M5 VSS allow_resumable=false path).
+    ///
+    /// Because the source stream is single-shot (non-replayable), a transient
+    /// 5xx/network is still retried against the same session via the confirmed
+    /// offset only while the bytes are still in the current wire-chunk buffer;
+    /// a genuine session 4xx (SessionInvalid) cannot be replayed from byte 0,
+    /// so it surfaces as an op failure (the next sync cycle re-reads the file)
+    /// rather than buffering the whole body to enable replay.
     async fn resumable_upload_stream(
         &self,
         kind: ResumableKind,
@@ -668,31 +842,128 @@ impl GoogleDriveStore {
         mut stream: Box<dyn futures::Stream<Item = anyhow::Result<Bytes>> + Send + Unpin>,
     ) -> anyhow::Result<RemoteEntry> {
         use futures::StreamExt;
+        use md5::{Digest, Md5};
 
-        // We must buffer to honour the 256-KiB-multiple non-final rule AND to
-        // recompute md5 + be able to restart from 0 on a session 4xx. The
-        // executor's pipeline already bounds the source file's footprint; here
-        // we accumulate the whole content once (the stream is single-shot, so
-        // a restart cannot re-read it). For the M4 acceptance path (CLI sync,
-        // e2e) and the contract's few-hundred-KiB bodies this is bounded; the
-        // huge-file pipeline path supplies `UploadBody::Bytes` below the
-        // resumable threshold or a re-readable source in M5.
-        let mut content = Vec::new();
-        while let Some(chunk) = stream.next().await {
-            let chunk = chunk?;
-            content.extend_from_slice(&chunk);
+        let chunk_bytes = resumable::CHUNK_BYTES as usize;
+
+        // Open the session once. A streamed body cannot be replayed, so a
+        // mid-stream SessionInvalid (4xx) fails the op (see below) instead of
+        // restarting - the session is opened a single time. Route the open
+        // through retry so a transient 5xx/network on session creation backs
+        // off rather than failing the whole upload (V-C: session bypassed
+        // retry before).
+        let session = retry::with_retry(|| {
+            let kind = clone_kind(&kind);
+            async move {
+                let token = self.bearer().await?;
+                resumable::open_session(&self.http, &token, kind, mime, len).await
+            }
+        })
+        .await?;
+
+        let mut hasher = Md5::new();
+        let mut offset: u64 = 0;
+        // Accumulates wire-chunk-sized buffers; we only hold ONE at a time.
+        let mut buf: Vec<u8> = Vec::with_capacity(chunk_bytes);
+        let mut completed: Option<RemoteEntry> = None;
+
+        // Pull from the source, flushing a full wire chunk whenever `buf`
+        // reaches the chunk size. The final (short) chunk is flushed after the
+        // stream ends.
+        let mut stream_done = false;
+        while !stream_done {
+            match stream.next().await {
+                Some(chunk) => {
+                    let chunk = chunk?;
+                    buf.extend_from_slice(&chunk);
+                    // Flush every full wire chunk. A non-final chunk MUST be a
+                    // 256-KiB multiple, which CHUNK_BYTES is, so a full `buf`
+                    // is always a legal non-final chunk.
+                    while buf.len() >= chunk_bytes {
+                        // Every flush here is exactly CHUNK_BYTES, a 256-KiB
+                        // multiple, so it is always a legal NON-final chunk
+                        // (the final, possibly-short chunk is flushed after the
+                        // stream ends, below). The trailing-bytes flush handles
+                        // the exact-multiple total = the last full chunk being
+                        // final too, since `completed` short-circuits it.
+                        let piece_vec: Vec<u8> = buf.drain(..chunk_bytes).collect();
+                        hasher.update(&piece_vec);
+                        let piece = Bytes::from(piece_vec);
+                        // The streamed source cannot reposition, so `piece_at`
+                        // always returns None: a transient that the in-buffer
+                        // retry cannot cover surfaces as an op failure.
+                        let progress = self
+                            .push_chunk_resilient(&session, offset, piece, |_| None)
+                            .await?;
+                        match progress {
+                            ResumeProgress::InProgress { received } => offset = received,
+                            ResumeProgress::Completed(entry) => {
+                                completed = Some(entry);
+                                stream_done = true;
+                                break;
+                            }
+                            ResumeProgress::SessionInvalid => {
+                                // Non-replayable: cannot restart from 0.
+                                return Err(anyhow::Error::new(
+                                    DriveError::ResumableSessionInvalid,
+                                ));
+                            }
+                        }
+                    }
+                }
+                None => stream_done = true,
+            }
         }
-        if content.len() as u64 != len {
-            anyhow::bail!(
-                "drive: stream length mismatch: declared {len}, got {}",
-                content.len()
-            );
+
+        // Flush the trailing bytes (the final chunk, any size) if the stream
+        // ended without Drive having already completed.
+        if completed.is_none() {
+            let remaining = std::mem::take(&mut buf);
+            // The total sent + remaining must equal the declared length.
+            if offset + remaining.len() as u64 != len {
+                anyhow::bail!(
+                    "drive: stream length mismatch: declared {len}, sent {} + buffered {}",
+                    offset,
+                    remaining.len()
+                );
+            }
+            hasher.update(&remaining);
+            let piece = Bytes::from(remaining);
+            // Final chunk for a non-empty body, or the single empty chunk for a
+            // zero-length body.
+            let progress = self
+                .push_chunk_resilient(&session, offset, piece, |_| None)
+                .await?;
+            match progress {
+                ResumeProgress::Completed(entry) => completed = Some(entry),
+                ResumeProgress::InProgress { .. } => {
+                    // Drive did not finalize on the final chunk - treat as a
+                    // protocol failure rather than looping (the bytes are gone).
+                    return Err(anyhow::Error::new(DriveError::ResumableSessionInvalid));
+                }
+                ResumeProgress::SessionInvalid => {
+                    return Err(anyhow::Error::new(DriveError::ResumableSessionInvalid));
+                }
+            }
         }
-        let content = Bytes::from(content);
-        self.resumable_upload_bytes(kind, mime, content).await
+
+        let entry = match completed {
+            Some(e) => e,
+            None => return Err(anyhow::Error::new(DriveError::ResumableSessionInvalid)),
+        };
+        let expected_md5: [u8; 16] = hasher.finalize().into();
+        let entry = self.ensure_md5(entry, expected_md5).await?;
+        verify_md5(&entry, expected_md5)?;
+        Ok(entry)
     }
 
     /// Resumable upload of a fully-buffered body (the restart-capable path).
+    ///
+    /// Because the body is in memory it CAN be replayed, so a session 4xx
+    /// (SessionInvalid) discards the session and restarts from offset 0 (DESIGN
+    /// s5.4: NEVER resume the old URL after a 4xx), bounded by
+    /// [`retry::MAX_RETRIES`]. Transient 5xx/network within a session are
+    /// retried against the SAME session by [`Self::push_chunk_resilient`].
     async fn resumable_upload_bytes(
         &self,
         kind: ResumableKind,
@@ -708,9 +979,16 @@ impl GoogleDriveStore {
         // so a persistently-4xx upload surfaces an error instead of looping.
         let mut restart_attempts = 0u32;
         loop {
-            let token = self.bearer().await?;
-            let session =
-                resumable::open_session(&self.http, &token, clone_kind(&kind), mime, size).await?;
+            // Route session open through retry so a transient 5xx/network on
+            // session creation backs off rather than aborting (V-C).
+            let session = retry::with_retry(|| {
+                let kind = clone_kind(&kind);
+                async move {
+                    let token = self.bearer().await?;
+                    resumable::open_session(&self.http, &token, kind, mime, size).await
+                }
+            })
+            .await?;
 
             let mut offset: u64 = 0;
             let mut session_died = false;
@@ -718,10 +996,18 @@ impl GoogleDriveStore {
             while offset < size {
                 let end = (offset + chunk).min(size);
                 let piece = content.slice(offset as usize..end as usize);
-                let token = self.bearer().await?;
-                let progress =
-                    resumable::push_chunk(self.http_stream(), &token, &session, offset, piece)
-                        .await?;
+                // The buffered body CAN reposition: `piece_at` re-slices for a
+                // transient retry at the confirmed offset.
+                let content_for_slice = content.clone();
+                let progress = self
+                    .push_chunk_resilient(&session, offset, piece, move |confirmed| {
+                        if confirmed >= size {
+                            return Some(Bytes::new());
+                        }
+                        let end = (confirmed + chunk).min(size);
+                        Some(content_for_slice.slice(confirmed as usize..end as usize))
+                    })
+                    .await?;
                 match progress {
                     ResumeProgress::InProgress { received } => {
                         offset = received;
@@ -738,8 +1024,8 @@ impl GoogleDriveStore {
             }
             // The zero-length case: open + a single final empty chunk.
             if size == 0 && completed.is_none() && !session_died {
-                let token = self.bearer().await?;
-                match resumable::push_chunk(self.http_stream(), &token, &session, 0, Bytes::new())
+                match self
+                    .push_chunk_resilient(&session, 0, Bytes::new(), |_| Some(Bytes::new()))
                     .await?
                 {
                     ResumeProgress::Completed(entry) => completed = Some(entry),
@@ -749,6 +1035,7 @@ impl GoogleDriveStore {
             }
 
             if let Some(entry) = completed {
+                let entry = self.ensure_md5(entry, expected_md5).await?;
                 verify_md5(&entry, expected_md5)?;
                 return Ok(entry);
             }
@@ -770,6 +1057,28 @@ impl GoogleDriveStore {
                 return Err(anyhow::Error::new(DriveError::ResumableSessionInvalid));
             }
         }
+    }
+
+    /// Belt-and-suspenders for codex C-P1-1: if the resumable completion
+    /// response carried no `md5Checksum` (some Drive responses omit it despite
+    /// the `fields=` projection set on the session), fetch the object's
+    /// metadata by id so the post-upload [`verify_md5`] has a digest to check.
+    /// A zero-byte body legitimately has no md5 (Drive returns none); leave
+    /// that case to `verify_md5`'s empty-content special case.
+    async fn ensure_md5(
+        &self,
+        entry: RemoteEntry,
+        expected_md5: [u8; 16],
+    ) -> anyhow::Result<RemoteEntry> {
+        if entry.md5.is_some() || expected_md5 == md5_of(&[]) {
+            return Ok(entry);
+        }
+        warn!(
+            target: TARGET,
+            file_id = %entry.id,
+            "resumable completion omitted md5Checksum; fetching metadata to verify"
+        );
+        self.metadata(&entry.id).await
     }
 }
 
@@ -828,7 +1137,7 @@ impl RemoteStore for GoogleDriveStore {
         body: UploadBody,
         app_properties: HashMap<String, String>,
     ) -> anyhow::Result<RemoteEntry> {
-        match body {
+        let result = match body {
             UploadBody::Bytes(content) => {
                 if content.len() as u64 >= RESUMABLE_THRESHOLD {
                     self.resumable_upload_bytes(
@@ -866,7 +1175,10 @@ impl RemoteStore for GoogleDriveStore {
                 )
                 .await
             }
-        }
+        };
+        // A create writes into `parent_id`; a 404 / unclassified 403 is a
+        // dest-folder condition, not a transient (codex C-P2-1).
+        result.map_err(map_parent_write_error)
     }
 
     async fn update(
@@ -932,8 +1244,26 @@ impl RemoteStore for GoogleDriveStore {
         mime: &str,
         size: u64,
     ) -> anyhow::Result<ResumableSession> {
-        let token = self.bearer().await?;
-        resumable::open_session(&self.http, &token, kind, mime, size).await
+        let is_create = matches!(kind, ResumableKind::Create { .. });
+        // Route session open through retry so a transient 5xx/network on
+        // session creation backs off rather than failing the op (codex V-C).
+        let result = retry::with_retry(|| {
+            let kind = clone_kind(&kind);
+            async move {
+                let token = self.bearer().await?;
+                resumable::open_session(&self.http, &token, kind, mime, size).await
+            }
+        })
+        .await;
+        // A create-session writes into the parent folder; map a 404 /
+        // unclassified 403 to the dest-folder condition (codex C-P2-1). An
+        // update-session is keyed by file_id, so a 404 there is about the file,
+        // not the parent - leave it unmapped.
+        if is_create {
+            result.map_err(map_parent_write_error)
+        } else {
+            result
+        }
     }
 
     async fn resume_chunk(
@@ -1160,6 +1490,43 @@ fn is_not_found(err: &anyhow::Error) -> bool {
     // `DriveError::from_response` embeds `drive HTTP 404` in the source chain.
     err.chain()
         .any(|c| c.to_string().contains("drive HTTP 404"))
+}
+
+/// Promotes a write-to-parent failure to a dedicated fatal dest-folder error
+/// (codex C-P2-1). A create / folder-create / resumable-session-init against a
+/// parent folder that returns `404` (the folder was deleted) or an unclassified
+/// `403` (sharing changed to read-only for this account) must surface as
+/// [`DriveError::DestFolderMissing`] / [`DriveError::DestFolderPermissionDenied`]
+/// so the executor reacts correctly (SPEC s24), instead of falling through as
+/// `drive.unreachable` (which the executor treats as transient and retries).
+///
+/// Only an `Other`-classified 403 maps to permission-denied: a 403 that
+/// classified as rate-limit / daily-quota / storage-quota is a DIFFERENT
+/// condition and is left untouched (those carry their own SPEC s24 codes).
+fn map_parent_write_error(err: anyhow::Error) -> anyhow::Error {
+    let Some(drive_err) = err.downcast_ref::<DriveError>() else {
+        return err;
+    };
+    // Only an unclassified ("Other") HTTP failure is a candidate; rate/quota/
+    // auth 403s are already correctly classified and must stay so.
+    let is_other = matches!(
+        drive_err,
+        DriveError::Classified {
+            kind: DriveErrorClassification::Other,
+            ..
+        }
+    );
+    if !is_other {
+        return err;
+    }
+    let chain_has = |needle: &str| err.chain().any(|c| c.to_string().contains(needle));
+    if chain_has("drive HTTP 404") {
+        anyhow::Error::new(DriveError::DestFolderMissing)
+    } else if chain_has("drive HTTP 403") {
+        anyhow::Error::new(DriveError::DestFolderPermissionDenied)
+    } else {
+        err
+    }
 }
 
 /// Serializes a JSON value to a [`Bytes`] body. Used instead of reqwest's

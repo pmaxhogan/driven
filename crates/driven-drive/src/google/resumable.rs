@@ -3,9 +3,15 @@
 //!
 //! [`GoogleDriveStore`](super::GoogleDriveStore) composes these to open a
 //! resumable session (create vs update), push 256-KiB-multiple non-final
-//! chunks, and finalize. A 4xx mid-chunk kills the session
-//! ([`ResumeProgress::SessionInvalid`]); the caller restarts from offset 0
-//! (DESIGN s5.4: NEVER resume the old session URL after a 4xx).
+//! chunks, and finalize. Error handling per chunk (DESIGN s5.4):
+//! - a 4xx (other than 308) kills the session
+//!   ([`ResumeProgress::SessionInvalid`]); the caller restarts from offset 0
+//!   (NEVER resume the old session URL after a 4xx).
+//! - a 5xx / transport error is TRANSIENT at the session level: the caller's
+//!   retry wrapper re-queries the SAME session offset ([`query_offset`]) and
+//!   re-pushes with bounded exponential backoff (it does NOT restart from 0).
+//! - a 308 with no acknowledged `Range` re-queries the confirmed offset rather
+//!   than assuming the chunk landed, so a crash never persists a false offset.
 //!
 //! Protocol (Drive resumable upload):
 //! 1. `POST /upload/drive/v3/files?uploadType=resumable` (create) or
@@ -81,7 +87,18 @@ pub async fn open_session(
     let metadata_body = super::json_body(&metadata)?;
     let resp = http
         .request(method, &url)
-        .query(&[("uploadType", "resumable")])
+        // `fields=` selects the projection of the COMPLETION response (the
+        // 200/201 files resource Drive returns when the final chunk lands).
+        // Without it Drive returns its default projection, which OMITS
+        // `md5Checksum` - so the executor's post-upload verify_md5 sees a
+        // missing `entry.md5` and fails verification on EVERY resumable upload
+        // (codex C-P1-1). Requesting FILE_FIELDS makes the completion body
+        // carry md5 (a belt-and-suspenders metadata fetch in
+        // resumable_upload_bytes covers the rare case Drive still omits it).
+        .query(&[
+            ("uploadType", "resumable"),
+            ("fields", super::pagination::FILE_FIELDS),
+        ])
         .bearer_auth(access_token)
         // `X-Upload-Content-Length` / `-Type` let Drive validate the declared
         // size + type up front (Drive resumable protocol).
@@ -137,12 +154,22 @@ pub async fn open_session(
 ///
 /// Sends a `Content-Range: bytes <offset>-<end>/<total>` request. Non-final
 /// chunks MUST be a multiple of 256 KiB; the final chunk (when `offset +
-/// chunk.len() == session.size`) may be any size. A `308 Resume Incomplete`
-/// returns [`ResumeProgress::InProgress`]; a `200/201` returns
-/// [`ResumeProgress::Completed`]; any 4xx returns
-/// [`ResumeProgress::SessionInvalid`] (SPEC s24
-/// `drive.resumable_session_invalid`; DESIGN s5.4 "any 4xx other than 308
-/// terminates the session").
+/// chunk.len() == session.size`) may be any size.
+///
+/// Return mapping:
+/// - `308 Resume Incomplete` -> [`ResumeProgress::InProgress`]. Drive's `Range:
+///   bytes=0-<n>` header names the last byte it acknowledges, so `received =
+///   n + 1`. If the 308 carries NO `Range` header we do NOT assume the chunk
+///   was accepted (assuming `offset + len` would persist a FALSE acked offset
+///   and corrupt resume state after a crash - codex C-P1-3); instead we
+///   re-`PUT bytes */<total>` to ask Drive for the confirmed offset and return
+///   only that acknowledged count.
+/// - `200`/`201` -> [`ResumeProgress::Completed`].
+/// - any 4xx (other than 308) -> [`ResumeProgress::SessionInvalid`] (SPEC s24
+///   `drive.resumable_session_invalid`; DESIGN s5.4 "any 4xx other than 308
+///   terminates the session"). The caller restarts from offset 0.
+/// - 5xx / transport -> a classified [`DriveError`] so the caller's retry
+///   wrapper backs off and re-queries the SAME session.
 pub async fn push_chunk(
     http: &reqwest::Client,
     access_token: &str,
@@ -175,10 +202,20 @@ pub async fn push_chunk(
     let status = resp.status().as_u16();
     // Drive signals "more bytes needed" with 308 Resume Incomplete.
     if status == 308 {
-        let received = parse_range_end(&resp)
-            .map(|end| end + 1)
-            .unwrap_or(offset + len);
-        return Ok(ResumeProgress::InProgress { received });
+        match parse_range_end(&resp) {
+            // Drive acknowledged bytes 0..=end: the next offset is end + 1.
+            Some(end) => return Ok(ResumeProgress::InProgress { received: end + 1 }),
+            // 308 with NO acknowledged Range: do NOT assume `offset + len` was
+            // accepted (codex C-P1-3 - that false offset persisted across a
+            // crash corrupts resume state). Ask Drive for the confirmed offset
+            // and report only what it actually holds.
+            None => {
+                let confirmed = query_offset(http, access_token, session).await?;
+                return Ok(ResumeProgress::InProgress {
+                    received: confirmed,
+                });
+            }
+        }
     }
     if (200..300).contains(&status) {
         let body = resp.bytes().await.map_err(DriveError::from_transport)?;
@@ -237,9 +274,11 @@ pub async fn query_offset(
 
 /// Parses Drive's resumable completion response body into a [`RemoteEntry`]
 /// (SPEC s3). Shared by [`push_chunk`]'s final-chunk path. The completion body
-/// is a Drive `files` resource (the [`super::pagination::FILE_FIELDS`]
-/// projection is NOT applied to the resumable response, so we parse whatever
-/// fields Drive returns and tolerate missing ones).
+/// is a Drive `files` resource projected by the `fields=` query param
+/// [`open_session`] set on the session URL ([`super::pagination::FILE_FIELDS`],
+/// which includes `md5Checksum` so post-upload verification has the digest -
+/// codex C-P1-1). We still parse leniently and tolerate missing fields in case
+/// Drive ignores the projection.
 pub fn parse_completed_entry(body: &[u8]) -> anyhow::Result<RemoteEntry> {
     let file: DriveFile = serde_json::from_slice(body).map_err(|e| {
         anyhow::anyhow!("drive: failed to parse resumable completion response: {e}")
@@ -254,6 +293,15 @@ fn parse_range_end(resp: &reqwest::Response) -> Option<u64> {
         .headers()
         .get(reqwest::header::RANGE)
         .and_then(|v| v.to_str().ok())?;
+    parse_range_end_str(range)
+}
+
+/// Pure parse of a `Range: bytes=0-<end>` header value into `<end>` (the last
+/// byte index Drive acknowledges). `None` for an absent / malformed value so
+/// the caller (codex C-P1-3) re-queries the confirmed offset rather than
+/// inventing one. Split out from [`parse_range_end`] so it is unit-testable
+/// without constructing a `reqwest::Response`.
+fn parse_range_end_str(range: &str) -> Option<u64> {
     // Shape: "bytes=0-262143".
     let after_eq = range.split('=').nth(1).unwrap_or(range);
     let end = after_eq.split('-').nth(1)?;
@@ -296,6 +344,25 @@ mod tests {
                 .map(String::as_str),
             Some("s1")
         );
+    }
+
+    #[test]
+    fn parse_range_end_str_reads_acked_end() {
+        // The canonical 308 Range header.
+        assert_eq!(parse_range_end_str("bytes=0-262143"), Some(262_143));
+        // Whitespace tolerated.
+        assert_eq!(parse_range_end_str("bytes=0-100 "), Some(100));
+    }
+
+    #[test]
+    fn parse_range_end_str_none_on_malformed_or_absent() {
+        // C-P1-3: a missing / malformed Range must NOT yield a fabricated
+        // offset - it returns None so push_chunk re-queries the confirmed
+        // offset instead of persisting a false acked count.
+        assert_eq!(parse_range_end_str(""), None);
+        assert_eq!(parse_range_end_str("bytes=*/0"), None);
+        assert_eq!(parse_range_end_str("garbage"), None);
+        assert_eq!(parse_range_end_str("bytes=0-notanumber"), None);
     }
 
     #[test]
