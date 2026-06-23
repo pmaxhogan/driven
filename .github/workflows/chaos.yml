@@ -1,0 +1,129 @@
+name: Chaos
+
+# Driven stress / chaos harness (design/STRESS_HARNESS.md s7).
+#
+# Jobs:
+#   chaos-hermetic   - every PR, ubuntu. Runs every scenario whose requires()
+#                      is satisfiable on a stock non-elevated Linux runner
+#                      (no real-Drive creds, no admin); the rest SKIP cleanly.
+#   chaos-fake-drive - every PR, windows. Adds the Windows / NTFS-shaped rows
+#                      and the s3.7 / s5 fault-injection scenarios against the
+#                      InMemoryRemoteStore. Still no real Drive, no elevation.
+#   chaos-real-drive - WIRED but SKIPPED until M4: gated on the
+#                      DRIVEN_E2E_REFRESH_TOKEN secret, which is absent until
+#                      the GoogleDriveStore (M4) lands. It skips cleanly, it
+#                      does NOT fail (STRESS_HARNESS s7 "Gating on M4").
+#   chaos-soak       - weekly cron: a long seeded fuzz run. Informational.
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+  schedule:
+    # Weekly soak, Monday 06:00 UTC (STRESS_HARNESS s7 chaos-soak).
+    - cron: "0 6 * * 1"
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The harness boots the headless core whose state layer uses sqlx
+  # compile-time-checked queries; CI has no live DB, so resolve against the
+  # committed .sqlx/ cache (same as ci.yml).
+  SQLX_OFFLINE: "true"
+
+jobs:
+  chaos-hermetic:
+    name: chaos hermetic (ubuntu)
+    # Skip the PR run on the scheduled trigger; the soak job covers cron.
+    if: github.event_name != 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux Tauri deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
+      - uses: Swatinem/rust-cache@v2
+      # run-all capability-gates every scenario: on a stock non-elevated Linux
+      # runner the admin / NTFS / real-Drive rows SKIP (recorded, never red);
+      # everything else runs against the headless core + InMemoryRemoteStore.
+      # Exit code: 0 = all pass/skip, 1 = any fail (STRESS_HARNESS s9).
+      - name: chaos run-all (hermetic)
+        run: cargo run -p driven-chaos -- run-all --hermetic
+
+  chaos-fake-drive:
+    name: chaos fake-drive (windows)
+    if: github.event_name != 'schedule'
+    runs-on: windows-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      # On Windows the additional NTFS-shaped and fault-injection rows that the
+      # Linux job SKIPs become runnable (still against the fake remote, still
+      # unelevated - the admin/VSS rows SKIP). Same exit-code semantics.
+      - name: chaos run-all (fake-drive)
+        run: cargo run -p driven-chaos -- run-all --hermetic
+
+  chaos-real-drive:
+    name: chaos real-drive (M4-gated, skipped)
+    # WIRED but SKIPPED until M4 (STRESS_HARNESS s7 "Gating on M4"): the
+    # real-Drive E2E refresh token does not exist until the GoogleDriveStore
+    # (M4) lands, so this job is configured now and stays `if: false`-skipped.
+    # The `secrets` context is NOT available in a job-level `if`, so we cannot
+    # gate on the secret being present here - instead the maintainer flips this
+    # literal `false` to `true` (or to a `vars.*` flag) when the
+    # DRIVEN_E2E_REFRESH_TOKEN secret is configured at M4. Until then the job is
+    # SKIPPED, never FAILED.
+    if: ${{ false }}
+    runs-on: ubuntu-latest
+    env:
+      DRIVEN_E2E_REFRESH_TOKEN: ${{ secrets.DRIVEN_E2E_REFRESH_TOKEN }}
+      DRIVEN_E2E_DEST_FOLDER_ID: ${{ secrets.DRIVEN_E2E_DEST_FOLDER_ID }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux Tauri deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
+      - uses: Swatinem/rust-cache@v2
+      # With real creds present, the cap:real_drive_creds rows run against a
+      # throwaway Drive folder; everything else runs as in the hermetic job.
+      - name: chaos run-all (real Drive)
+        run: cargo run -p driven-chaos -- run-all --hermetic
+
+  chaos-soak:
+    name: chaos soak (weekly fuzz)
+    # Weekly cron only; informational, does not gate merges (STRESS_HARNESS s7).
+    if: github.event_name == 'schedule'
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - name: Install Linux Tauri deps
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
+      - uses: Swatinem/rust-cache@v2
+      # A long seeded fuzz run; the seed is recorded in the log and any
+      # invariant violation writes target/chaos-fuzz-failures/<seed>.json for
+      # bit-reproducible replay (STRESS_HARNESS s4.3).
+      - name: chaos fuzz (seeded soak)
+        run: cargo run -p driven-chaos -- fuzz --seed ${{ github.run_id }} --duration 30m
+      - name: upload fuzz failure replays
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: chaos-fuzz-failures
+          path: target/chaos-fuzz-failures/
+          if-no-files-found: ignore
