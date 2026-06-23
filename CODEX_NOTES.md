@@ -10,14 +10,22 @@ The core out-of-space mapping IS implemented and unit-tested: `executor::local_i
 (test `enospc_classifies_as_local_disk_full`). The earlier "core maps out-of-space to
 local.io_error" gap is CLOSED.
 
-The `disk-full-target` scenario remains capability-gated (`Capability::Admin`) and bails honestly
-in `setup`, because a V1 source is READ-ONLY: the executor reads source files and writes to Drive
-via `RemoteStore::create`/`update`; it never writes back into the source volume (verified - no
-local `File::create` on the source path in the executor). So a read-only source on a 0-free
-constrained volume produces no local write, hence no ENOSPC, hence the (now-present, now-tested)
-mapping is not reachable end-to-end through V1's source-read path. Driving this row needs a future
-write-into-source path (local staging / VSS-temp spool on the source volume) that V1 does not have.
-The scenario does not fabricate a pass or assert a code the read path cannot emit.
+The `disk-full-target` scenario is gated on `Capability::DiskMountAllowed` (env
+`DRIVEN_CHAOS_ALLOW_DISK_MOUNT=1`, never set today) so it SKIPs everywhere with a recorded reason,
+and bails honestly in `setup` if ever run, because a V1 source is READ-ONLY: the executor reads
+source files and writes to Drive via `RemoteStore::create`/`update`; it never writes back into the
+source volume (verified - no local `File::create` on the source path in the executor). So a
+read-only source on a 0-free constrained volume produces no local write, hence no ENOSPC, hence the
+(now-present, now-tested) mapping is not reachable end-to-end through V1's source-read path. Driving
+this row needs a future write-into-source path (local staging / VSS-temp spool on the source volume)
+that V1 does not have. The DiskMountAllowed gate (not bare Admin) matters because GitHub Actions
+Windows runners are ELEVATED: an Admin gate would let the row RUN there and turn its honest bail into
+a FAIL. The scenario does not fabricate a pass or assert a code the read path cannot emit.
+
+`name-path-4096-bytes` builds the deepest nested path the HOST accepts: macOS/BSD cap a whole path
+at PATH_MAX=1024 (Linux is 4096), so on macOS the deep-path build stops at ENAMETOOLONG (errno 63)
+and the row documents the host limit + asserts the floor (the deepest creatable path backs up)
+rather than erroring on a real platform constraint.
 
 ## million-files-nested + huge-file-* - wall-clock cap now wraps run_assertions only
 

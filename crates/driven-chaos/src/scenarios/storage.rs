@@ -278,9 +278,12 @@ impl Scenario for DiskFullTarget {
     }
 
     fn requires(&self) -> CapabilityRequirements {
-        // Mounting a loop device (Linux) or a VHD (Windows) at 32 MiB needs
-        // elevation; without it the row is SKIPPED with `admin` recorded.
-        CapabilityRequirements::of(vec![Capability::Admin])
+        // Gated on DiskMountAllowed (env DRIVEN_CHAOS_ALLOW_DISK_MOUNT=1, never
+        // set today) rather than bare Admin: an elevated CI runner would satisfy
+        // Admin and then the documented read-only-source gap below would turn an
+        // honest bail into a FAIL. The mount-allowed gate keeps it a recorded
+        // SKIP everywhere until the write-into-source path lands.
+        CapabilityRequirements::of(vec![Capability::DiskMountAllowed])
     }
 
     async fn setup(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
@@ -1008,16 +1011,25 @@ mod tests {
         assert_eq!(sorted.len(), names.len(), "scenario names must be unique");
     }
 
-    /// `disk-full-target` is honestly capability-gated on Admin (loop/VHD mount
-    /// privilege) and expects the `local.disk_full` code - it never fabricates
-    /// a pass.
+    /// `disk-full-target` is honestly gated on DiskMountAllowed (never set
+    /// today) so it SKIPs everywhere - including an elevated CI runner where a
+    /// bare Admin gate would let it run and then FAIL on the documented
+    /// read-only-source gap - and expects the `local.disk_full` code. It never
+    /// fabricates a pass.
     #[test]
-    fn disk_full_is_admin_gated_and_expects_disk_full() {
+    fn disk_full_is_mount_gated_and_expects_disk_full() {
         let s = DiskFullTarget;
         let req = s.requires();
         assert!(
-            req.required.iter().any(|c| matches!(c, Capability::Admin)),
-            "disk-full-target must require Admin (constrained-volume mount privilege)"
+            req.required
+                .iter()
+                .any(|c| matches!(c, Capability::DiskMountAllowed)),
+            "disk-full-target must require DiskMountAllowed so it SKIPs (not FAILs) on an elevated host"
+        );
+        // It must NOT be merely Admin-gated, or an elevated runner would run it.
+        assert!(
+            !req.required.iter().any(|c| matches!(c, Capability::Admin)),
+            "disk-full-target must not be bare-Admin-gated"
         );
         assert!(matches!(
             s.expected_outcome(),

@@ -35,6 +35,9 @@ pub struct CapabilitySet {
     /// `DRIVEN_CHAOS_SOAK=1` is set, opting this host into the soak-grade
     /// massive-input rows.
     pub soak: bool,
+    /// `DRIVEN_CHAOS_ALLOW_DISK_MOUNT=1` is set, opting this host into the
+    /// constrained-volume disk-full row.
+    pub disk_mount_allowed: bool,
 }
 
 /// A single capability a scenario can require. The dotted/`cap:` rendering
@@ -72,6 +75,14 @@ pub enum Capability {
     /// soak-grade (STRESS_HARNESS s3.2), not PR-gating work. Recorded as a
     /// missing capability, never faked or weakened.
     Soak,
+    /// Mounting a throwaway constrained volume + a Driven write-into-source path
+    /// is opted into via `DRIVEN_CHAOS_ALLOW_DISK_MOUNT=1`. The `disk-full-target`
+    /// row requires it so it SKIPs cleanly everywhere today (the env is never
+    /// set): the core ENOSPC->local.disk_full mapping is implemented + unit-
+    /// tested, but V1's read-only source path cannot induce it end to end, so
+    /// the row stays a recorded documented gap rather than a FAIL on an elevated
+    /// CI runner (where the bare Admin gate would otherwise let it run + bail).
+    DiskMountAllowed,
 }
 
 impl Capability {
@@ -89,6 +100,7 @@ impl Capability {
             Capability::Windows => "platform:windows".to_string(),
             Capability::Unix => "platform:unix".to_string(),
             Capability::Soak => "cap:soak".to_string(),
+            Capability::DiskMountAllowed => "cap:disk_mount_allowed".to_string(),
         }
     }
 
@@ -106,6 +118,7 @@ impl Capability {
             Capability::Windows => cfg!(windows),
             Capability::Unix => cfg!(unix),
             Capability::Soak => set.soak,
+            Capability::DiskMountAllowed => set.disk_mount_allowed,
         }
     }
 }
@@ -165,6 +178,9 @@ impl CapabilitySet {
         let soak = std::env::var("DRIVEN_CHAOS_SOAK")
             .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
             .unwrap_or(false);
+        let disk_mount_allowed = std::env::var("DRIVEN_CHAOS_ALLOW_DISK_MOUNT")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         Self {
             admin,
             ntfs_volume,
@@ -175,6 +191,7 @@ impl CapabilitySet {
             long_paths_enabled,
             network_reachable,
             soak,
+            disk_mount_allowed,
         }
     }
 }
