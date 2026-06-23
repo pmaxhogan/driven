@@ -19,6 +19,7 @@
 //! [`network::NetworkProbe`] traits - with no behaviour; the bodies land in
 //! the M3 implement phase.
 
+pub mod crypto_provider;
 pub mod exclude;
 pub mod executor;
 pub mod network;
@@ -30,6 +31,8 @@ pub mod state;
 pub mod time;
 pub mod types;
 pub mod watcher;
+
+pub use crypto_provider::{CryptoProvider, CryptoResolution, SingleSuiteProvider};
 
 #[cfg(test)]
 mod test_support;

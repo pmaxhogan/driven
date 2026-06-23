@@ -1211,7 +1211,12 @@ async fn encryption_on_round_trip_bytes_match() {
             remote: remote.clone(),
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
-            crypto: Some(suite),
+            // M5: ExecutorDeps.crypto is a per-source CryptoProvider; wrap the
+            // single test suite (one suite for every source) to preserve the
+            // pre-M5 executor-wide encryption behaviour this test asserts.
+            crypto: Some(Arc::new(driven_core::crypto_provider::SingleSuiteProvider::new(
+                suite,
+            )) as Arc<dyn driven_core::crypto_provider::CryptoProvider>),
             vss: None,
             network: None,
         },
@@ -1305,7 +1310,12 @@ async fn encryption_nested_remote_is_ciphertext_and_restores() {
             remote: remote.clone(),
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
-            crypto: Some(suite),
+            // M5: ExecutorDeps.crypto is a per-source CryptoProvider; wrap the
+            // single test suite (one suite for every source) to preserve the
+            // pre-M5 executor-wide encryption behaviour this test asserts.
+            crypto: Some(Arc::new(driven_core::crypto_provider::SingleSuiteProvider::new(
+                suite,
+            )) as Arc<dyn driven_core::crypto_provider::CryptoProvider>),
             vss: None,
             network: None,
         },

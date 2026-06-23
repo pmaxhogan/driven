@@ -410,9 +410,15 @@ pub struct ExecutorDeps {
     pub state: Arc<dyn StateRepo>,
     /// The per-account rate pacer (SPEC s9).
     pub pacer: Arc<dyn Pacer>,
-    /// The per-source encryption suite, or `None` when the source is
-    /// unencrypted (DESIGN s7).
-    pub crypto: Option<Arc<dyn SourceCryptoSuite>>,
+    /// The PER-SOURCE crypto resolver (M5 GA blocker, CODEX_NOTES "Per-source
+    /// crypto resolution"). `None` = no provider configured = every source is
+    /// plaintext (tests + an unencrypted-only account). When `Some`, the
+    /// executor MUST resolve the suite per source via
+    /// [`CryptoProvider::resolve`] and FAIL CLOSED on
+    /// [`CryptoResolution::Unavailable`] (an encryption-enabled source whose
+    /// key is missing must NEVER upload plaintext). Replaces the pre-M5
+    /// executor-wide `Option<Arc<dyn SourceCryptoSuite>>`.
+    pub crypto: Option<Arc<dyn crate::crypto_provider::CryptoProvider>>,
     /// The per-cycle Windows VSS snapshot provider (ROADMAP M3.5, DESIGN
     /// s5.3), or `None` to disable the VSS fallback entirely (the historical
     /// behaviour: a locked file is always skipped). The orchestrator owns the
@@ -628,6 +634,23 @@ pub struct DefaultExecutor {
     remote: Arc<dyn RemoteStore>,
     state: Arc<dyn StateRepo>,
     pacer: Arc<dyn Pacer>,
+    /// The PER-SOURCE crypto resolver (M5). The production fail-closed,
+    /// per-`source_id` resolution is agent EXEC's body work; see
+    /// [`Self::resolve_crypto`]. Read by `resolve_crypto` once EXEC wires the
+    /// per-op path; `allow(dead_code)` until then.
+    #[allow(dead_code)]
+    crypto_provider: Option<Arc<dyn crate::crypto_provider::CryptoProvider>>,
+    /// SHIM (M5 scaffold): the executor-wide suite the pre-M5 code branched on
+    /// via `self.crypto.is_some()`. Resolved ONCE at construction from
+    /// `crypto_provider` (behaviour-preserving for the single-suite test path).
+    ///
+    /// TODO(M5 EXEC): DELETE this field. The ~9 `self.crypto.*` call sites must
+    /// move to a PER-OP `self.resolve_crypto(source.id)` that returns
+    /// [`CryptoResolution`] and FAILS CLOSED on
+    /// [`CryptoResolution::Unavailable`] (an encryption-enabled source with no
+    /// key must error `crypto.key_missing`, never upload plaintext). A single
+    /// executor-wide suite is WRONG for a mixed account (CODEX_NOTES
+    /// "Per-source crypto resolution").
     crypto: Option<Arc<dyn SourceCryptoSuite>>,
     clock: Arc<dyn Clock>,
     /// Per-cycle VSS snapshot provider (ROADMAP M3.5), or `None` to disable
@@ -711,11 +734,27 @@ impl DefaultExecutor {
             }),
             None => deps.remote,
         };
+        let crypto_provider = deps.crypto;
+        // SHIM (M5 scaffold): collapse the per-source provider to one
+        // executor-wide suite so the pre-M5 `self.crypto.is_some()` call sites
+        // keep compiling and the single-suite crypto round-trip tests stay
+        // green. `SingleSuiteProvider` returns the SAME suite for every source,
+        // so `suite_for` with any id yields that suite (behaviour-preserving);
+        // a real `KeystoreCryptoProvider` returns a DISTINCT suite per source.
+        //
+        // TODO(M5 EXEC): REMOVE this collapse. Resolve crypto PER OP via
+        // `self.resolve_crypto(source.id)` at every upload call site and FAIL
+        // CLOSED on `CryptoResolution::Unavailable`. A single executor-wide
+        // suite is wrong for a mixed (encrypted + plaintext) account.
+        let crypto = crypto_provider
+            .as_ref()
+            .and_then(|p| p.suite_for(&SourceId::new_v4()));
         Self {
             remote,
             state: deps.state,
             pacer: deps.pacer,
-            crypto: deps.crypto,
+            crypto_provider,
+            crypto,
             clock,
             vss: deps.vss,
             pool,
@@ -725,6 +764,26 @@ impl DefaultExecutor {
             #[cfg(test)]
             post_upload_hook: None,
         }
+    }
+
+    /// Resolve the crypto decision for one source (M5 GA-blocking surface).
+    ///
+    /// Consults the injected [`CryptoProvider`]; `None` provider means every
+    /// source is plaintext.
+    ///
+    /// TODO(M5 EXEC): this is the per-op resolution seam the upload path must
+    /// call (replacing the `self.crypto` shim field). The body MUST:
+    /// - return [`CryptoResolution::Plaintext`] when no provider is configured
+    ///   OR the provider resolves the source as plaintext;
+    /// - return [`CryptoResolution::Suite`] for an encrypted source whose key
+    ///   resolved;
+    /// - return [`CryptoResolution::Unavailable`] for an encryption-enabled
+    ///   source whose key is missing - and the CALLER must then FAIL CLOSED
+    ///   (error `crypto.key_missing`, upload nothing). Never degrade to
+    ///   plaintext (GA-critical, CODEX_NOTES "Per-source crypto resolution").
+    #[allow(dead_code)]
+    fn resolve_crypto(&self, _source_id: SourceId) -> crate::crypto_provider::CryptoResolution {
+        todo!("M5 EXEC: per-source crypto resolution + fail-closed; see CryptoProvider::resolve")
     }
 
     /// Test-only (doc-hidden): attach a [`MemGauge`] so the streaming
@@ -3869,6 +3928,13 @@ mod tests {
             &self,
             crypto: Option<Arc<dyn SourceCryptoSuite>>,
         ) -> DefaultExecutor {
+            // M5: ExecutorDeps.crypto is now a per-source CryptoProvider. Wrap
+            // the single test suite in SingleSuiteProvider (one suite for every
+            // source) to preserve the pre-M5 executor-wide behaviour.
+            let crypto = crypto.map(|suite| {
+                Arc::new(crate::crypto_provider::SingleSuiteProvider::new(suite))
+                    as Arc<dyn crate::crypto_provider::CryptoProvider>
+            });
             DefaultExecutor::with_clock(
                 ExecutorDeps {
                     remote: Arc::new(self.remote.clone()),
