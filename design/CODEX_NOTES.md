@@ -378,8 +378,11 @@ ACCEPTED RESIDUALS (tracked, not faked-green):
   sentinel like million-files-nested). These rows are soak-gated (local
   `just chaos-soak` only, never per-PR), so the rebuild cost is bounded to the
   on-demand soak; adding the cacheable sentinel is a soak-efficiency follow-up.
-- codex also flagged a "missing design/chaos-fuzz-smoke.json"; no code references
-  such a file (the fuzz-smoke row asserts invariants inline), so none is added.
+- codex also flagged a "missing design/chaos-fuzz-smoke.json" - the ROADMAP M3.7
+  acceptance does ask for a committed reference fuzz output. Added: a `--out PATH`
+  flag on the `fuzz` CLI writes the full FuzzReport JSON (pass or fail), and
+  design/chaos-fuzz-smoke.json is a real fixed-seed (0xDEADBEEF) 200-step passing
+  run (no violation, all s6.3 invariants held).
 
 ## M3.7 CI cost policy (maintainer budget decision)
 

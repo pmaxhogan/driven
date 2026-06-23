@@ -1,0 +1,1007 @@
+{
+  "seed": 3735928559,
+  "steps": 200,
+  "log": [
+    {
+      "step_index": 0,
+      "step": "AddFile",
+      "target": "fz-0001.dat"
+    },
+    {
+      "step_index": 1,
+      "step": "TruncateFile",
+      "target": "seed-000.txt"
+    },
+    {
+      "step_index": 2,
+      "step": "AddFile",
+      "target": "fz-0002.dat"
+    },
+    {
+      "step_index": 3,
+      "step": "EditFile",
+      "target": "fz-0002.dat"
+    },
+    {
+      "step_index": 4,
+      "step": "AppendFile",
+      "target": "seed-000.txt"
+    },
+    {
+      "step_index": 5,
+      "step": "TruncateFile",
+      "target": "seed-000.txt"
+    },
+    {
+      "step_index": 6,
+      "step": "AppendFile",
+      "target": "fz-0001.dat"
+    },
+    {
+      "step_index": 7,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 8,
+      "step": "AddFile",
+      "target": "fz-0003.dat"
+    },
+    {
+      "step_index": 9,
+      "step": "AddFile",
+      "target": "fz-0004.dat"
+    },
+    {
+      "step_index": 10,
+      "step": "EditFile",
+      "target": "fz-0001.dat"
+    },
+    {
+      "step_index": 11,
+      "step": "AddFile",
+      "target": "fz-0005.dat"
+    },
+    {
+      "step_index": 12,
+      "step": "AddFile",
+      "target": "fz-0006.dat"
+    },
+    {
+      "step_index": 13,
+      "step": "AddFile",
+      "target": "fz-0007.dat"
+    },
+    {
+      "step_index": 14,
+      "step": "EditFile",
+      "target": "fz-0006.dat"
+    },
+    {
+      "step_index": 15,
+      "step": "EditFile",
+      "target": "fz-0002.dat"
+    },
+    {
+      "step_index": 16,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 17,
+      "step": "EditFile",
+      "target": "fz-0005.dat"
+    },
+    {
+      "step_index": 18,
+      "step": "EditFile",
+      "target": "fz-0004.dat"
+    },
+    {
+      "step_index": 19,
+      "step": "AddFile",
+      "target": "fz-0008.dat"
+    },
+    {
+      "step_index": 20,
+      "step": "TruncateFile",
+      "target": "seed-000.txt"
+    },
+    {
+      "step_index": 21,
+      "step": "TruncateFile",
+      "target": "fz-0003.dat"
+    },
+    {
+      "step_index": 22,
+      "step": "EditFile",
+      "target": "fz-0008.dat"
+    },
+    {
+      "step_index": 23,
+      "step": "EditFile",
+      "target": "seed-000.txt"
+    },
+    {
+      "step_index": 24,
+      "step": "EditFile",
+      "target": "fz-0001.dat"
+    },
+    {
+      "step_index": 25,
+      "step": "AppendFile",
+      "target": "fz-0008.dat"
+    },
+    {
+      "step_index": 26,
+      "step": "DeleteFile",
+      "target": "fz-0008.dat"
+    },
+    {
+      "step_index": 27,
+      "step": "AppendFile",
+      "target": "fz-0006.dat"
+    },
+    {
+      "step_index": 28,
+      "step": "AddFile",
+      "target": "fz-0009.dat"
+    },
+    {
+      "step_index": 29,
+      "step": "TruncateFile",
+      "target": "fz-0006.dat"
+    },
+    {
+      "step_index": 30,
+      "step": "AddFile",
+      "target": "fz-0010.dat"
+    },
+    {
+      "step_index": 31,
+      "step": "EditFile",
+      "target": "fz-0001.dat"
+    },
+    {
+      "step_index": 32,
+      "step": "TruncateFile",
+      "target": "fz-0004.dat"
+    },
+    {
+      "step_index": 33,
+      "step": "AddFile",
+      "target": "fz-0011.dat"
+    },
+    {
+      "step_index": 34,
+      "step": "AddFile",
+      "target": "fz-0012.dat"
+    },
+    {
+      "step_index": 35,
+      "step": "EditFile",
+      "target": "fz-0006.dat"
+    },
+    {
+      "step_index": 36,
+      "step": "AddFile",
+      "target": "fz-0013.dat"
+    },
+    {
+      "step_index": 37,
+      "step": "EditFile",
+      "target": "fz-0002.dat"
+    },
+    {
+      "step_index": 38,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 39,
+      "step": "AppendFile",
+      "target": "fz-0006.dat"
+    },
+    {
+      "step_index": 40,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 41,
+      "step": "AddFile",
+      "target": "fz-0014.dat"
+    },
+    {
+      "step_index": 42,
+      "step": "AddFile",
+      "target": "fz-0015.dat"
+    },
+    {
+      "step_index": 43,
+      "step": "EditFile",
+      "target": "fz-0003.dat"
+    },
+    {
+      "step_index": 44,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 45,
+      "step": "AddFile",
+      "target": "fz-0016.dat"
+    },
+    {
+      "step_index": 46,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 47,
+      "step": "AddFile",
+      "target": "fz-0017.dat"
+    },
+    {
+      "step_index": 48,
+      "step": "TruncateFile",
+      "target": "fz-0005.dat"
+    },
+    {
+      "step_index": 49,
+      "step": "AddFile",
+      "target": "fz-0018.dat"
+    },
+    {
+      "step_index": 50,
+      "step": "AppendFile",
+      "target": "fz-0018.dat"
+    },
+    {
+      "step_index": 51,
+      "step": "TruncateFile",
+      "target": "fz-0007.dat"
+    },
+    {
+      "step_index": 52,
+      "step": "AddFile",
+      "target": "fz-0019.dat"
+    },
+    {
+      "step_index": 53,
+      "step": "AppendFile",
+      "target": "fz-0012.dat"
+    },
+    {
+      "step_index": 54,
+      "step": "AddFile",
+      "target": "fz-0020.dat"
+    },
+    {
+      "step_index": 55,
+      "step": "TruncateFile",
+      "target": "fz-0012.dat"
+    },
+    {
+      "step_index": 56,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 57,
+      "step": "AddFile",
+      "target": "fz-0021.dat"
+    },
+    {
+      "step_index": 58,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 59,
+      "step": "EditFile",
+      "target": "fz-0012.dat"
+    },
+    {
+      "step_index": 60,
+      "step": "AddFile",
+      "target": "fz-0022.dat"
+    },
+    {
+      "step_index": 61,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 62,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 63,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 64,
+      "step": "EditFile",
+      "target": "fz-0018.dat"
+    },
+    {
+      "step_index": 65,
+      "step": "EditFile",
+      "target": "fz-0004.dat"
+    },
+    {
+      "step_index": 66,
+      "step": "EditFile",
+      "target": "fz-0013.dat"
+    },
+    {
+      "step_index": 67,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 68,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 69,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 70,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 71,
+      "step": "AddFile",
+      "target": "fz-0023.dat"
+    },
+    {
+      "step_index": 72,
+      "step": "AppendFile",
+      "target": "fz-0018.dat"
+    },
+    {
+      "step_index": 73,
+      "step": "AddFile",
+      "target": "fz-0024.dat"
+    },
+    {
+      "step_index": 74,
+      "step": "EditFile",
+      "target": "fz-0023.dat"
+    },
+    {
+      "step_index": 75,
+      "step": "DeleteFile",
+      "target": "fz-0014.dat"
+    },
+    {
+      "step_index": 76,
+      "step": "AppendFile",
+      "target": "seed-000.txt"
+    },
+    {
+      "step_index": 77,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 78,
+      "step": "EditFile",
+      "target": "fz-0001.dat"
+    },
+    {
+      "step_index": 79,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 80,
+      "step": "EditFile",
+      "target": "fz-0023.dat"
+    },
+    {
+      "step_index": 81,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 82,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 83,
+      "step": "AddFile",
+      "target": "fz-0025.dat"
+    },
+    {
+      "step_index": 84,
+      "step": "TruncateFile",
+      "target": "fz-0020.dat"
+    },
+    {
+      "step_index": 85,
+      "step": "EditFile",
+      "target": "fz-0021.dat"
+    },
+    {
+      "step_index": 86,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 87,
+      "step": "TruncateFile",
+      "target": "fz-0006.dat"
+    },
+    {
+      "step_index": 88,
+      "step": "AppendFile",
+      "target": "fz-0004.dat"
+    },
+    {
+      "step_index": 89,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 90,
+      "step": "AddFile",
+      "target": "fz-0026.dat"
+    },
+    {
+      "step_index": 91,
+      "step": "DeleteFile",
+      "target": "fz-0005.dat"
+    },
+    {
+      "step_index": 92,
+      "step": "EditFile",
+      "target": "fz-0026.dat"
+    },
+    {
+      "step_index": 93,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 94,
+      "step": "TruncateFile",
+      "target": "fz-0001.dat"
+    },
+    {
+      "step_index": 95,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 96,
+      "step": "TruncateFile",
+      "target": "fz-0009.dat"
+    },
+    {
+      "step_index": 97,
+      "step": "EditFile",
+      "target": "fz-0016.dat"
+    },
+    {
+      "step_index": 98,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 99,
+      "step": "AddFile",
+      "target": "fz-0027.dat"
+    },
+    {
+      "step_index": 100,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 101,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 102,
+      "step": "DeleteFile",
+      "target": "fz-0026.dat"
+    },
+    {
+      "step_index": 103,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 104,
+      "step": "TruncateFile",
+      "target": "fz-0003.dat"
+    },
+    {
+      "step_index": 105,
+      "step": "AddFile",
+      "target": "fz-0028.dat"
+    },
+    {
+      "step_index": 106,
+      "step": "TruncateFile",
+      "target": "fz-0012.dat"
+    },
+    {
+      "step_index": 107,
+      "step": "AddFile",
+      "target": "fz-0029.dat"
+    },
+    {
+      "step_index": 108,
+      "step": "AppendFile",
+      "target": "fz-0020.dat"
+    },
+    {
+      "step_index": 109,
+      "step": "EditFile",
+      "target": "fz-0011.dat"
+    },
+    {
+      "step_index": 110,
+      "step": "EditFile",
+      "target": "fz-0009.dat"
+    },
+    {
+      "step_index": 111,
+      "step": "EditFile",
+      "target": "fz-0013.dat"
+    },
+    {
+      "step_index": 112,
+      "step": "AppendFile",
+      "target": "fz-0016.dat"
+    },
+    {
+      "step_index": 113,
+      "step": "EditFile",
+      "target": "fz-0020.dat"
+    },
+    {
+      "step_index": 114,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 115,
+      "step": "EditFile",
+      "target": "fz-0004.dat"
+    },
+    {
+      "step_index": 116,
+      "step": "AppendFile",
+      "target": "fz-0017.dat"
+    },
+    {
+      "step_index": 117,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 118,
+      "step": "AppendFile",
+      "target": "fz-0017.dat"
+    },
+    {
+      "step_index": 119,
+      "step": "EditFile",
+      "target": "fz-0025.dat"
+    },
+    {
+      "step_index": 120,
+      "step": "DeleteFile",
+      "target": "fz-0027.dat"
+    },
+    {
+      "step_index": 121,
+      "step": "AppendFile",
+      "target": "fz-0010.dat"
+    },
+    {
+      "step_index": 122,
+      "step": "TruncateFile",
+      "target": "fz-0002.dat"
+    },
+    {
+      "step_index": 123,
+      "step": "EditFile",
+      "target": "fz-0025.dat"
+    },
+    {
+      "step_index": 124,
+      "step": "EditFile",
+      "target": "fz-0029.dat"
+    },
+    {
+      "step_index": 125,
+      "step": "TruncateFile",
+      "target": "fz-0018.dat"
+    },
+    {
+      "step_index": 126,
+      "step": "AddFile",
+      "target": "fz-0030.dat"
+    },
+    {
+      "step_index": 127,
+      "step": "EditFile",
+      "target": "fz-0015.dat"
+    },
+    {
+      "step_index": 128,
+      "step": "TruncateFile",
+      "target": "seed-000.txt"
+    },
+    {
+      "step_index": 129,
+      "step": "EditFile",
+      "target": "fz-0001.dat"
+    },
+    {
+      "step_index": 130,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 131,
+      "step": "DeleteFile",
+      "target": "seed-000.txt"
+    },
+    {
+      "step_index": 132,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 133,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 134,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 135,
+      "step": "TruncateFile",
+      "target": "fz-0016.dat"
+    },
+    {
+      "step_index": 136,
+      "step": "EditFile",
+      "target": "fz-0003.dat"
+    },
+    {
+      "step_index": 137,
+      "step": "AppendFile",
+      "target": "fz-0024.dat"
+    },
+    {
+      "step_index": 138,
+      "step": "AddFile",
+      "target": "fz-0031.dat"
+    },
+    {
+      "step_index": 139,
+      "step": "EditFile",
+      "target": "fz-0021.dat"
+    },
+    {
+      "step_index": 140,
+      "step": "AddFile",
+      "target": "fz-0032.dat"
+    },
+    {
+      "step_index": 141,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 142,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 143,
+      "step": "AppendFile",
+      "target": "fz-0001.dat"
+    },
+    {
+      "step_index": 144,
+      "step": "TruncateFile",
+      "target": "fz-0015.dat"
+    },
+    {
+      "step_index": 145,
+      "step": "DeleteFile",
+      "target": "fz-0017.dat"
+    },
+    {
+      "step_index": 146,
+      "step": "TruncateFile",
+      "target": "fz-0013.dat"
+    },
+    {
+      "step_index": 147,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 148,
+      "step": "AppendFile",
+      "target": "fz-0025.dat"
+    },
+    {
+      "step_index": 149,
+      "step": "EditFile",
+      "target": "fz-0003.dat"
+    },
+    {
+      "step_index": 150,
+      "step": "AppendFile",
+      "target": "fz-0018.dat"
+    },
+    {
+      "step_index": 151,
+      "step": "TruncateFile",
+      "target": "fz-0002.dat"
+    },
+    {
+      "step_index": 152,
+      "step": "DeleteFile",
+      "target": "fz-0012.dat"
+    },
+    {
+      "step_index": 153,
+      "step": "EditFile",
+      "target": "fz-0002.dat"
+    },
+    {
+      "step_index": 154,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 155,
+      "step": "TruncateFile",
+      "target": "fz-0031.dat"
+    },
+    {
+      "step_index": 156,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 157,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 158,
+      "step": "AddFile",
+      "target": "fz-0033.dat"
+    },
+    {
+      "step_index": 159,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 160,
+      "step": "TruncateFile",
+      "target": "fz-0006.dat"
+    },
+    {
+      "step_index": 161,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 162,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 163,
+      "step": "AppendFile",
+      "target": "fz-0030.dat"
+    },
+    {
+      "step_index": 164,
+      "step": "AppendFile",
+      "target": "fz-0022.dat"
+    },
+    {
+      "step_index": 165,
+      "step": "EditFile",
+      "target": "fz-0016.dat"
+    },
+    {
+      "step_index": 166,
+      "step": "EditFile",
+      "target": "fz-0018.dat"
+    },
+    {
+      "step_index": 167,
+      "step": "AddFile",
+      "target": "fz-0034.dat"
+    },
+    {
+      "step_index": 168,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 169,
+      "step": "EditFile",
+      "target": "fz-0009.dat"
+    },
+    {
+      "step_index": 170,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 171,
+      "step": "TruncateFile",
+      "target": "fz-0018.dat"
+    },
+    {
+      "step_index": 172,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 173,
+      "step": "AppendFile",
+      "target": "fz-0003.dat"
+    },
+    {
+      "step_index": 174,
+      "step": "AddFile",
+      "target": "fz-0035.dat"
+    },
+    {
+      "step_index": 175,
+      "step": "TruncateFile",
+      "target": "fz-0020.dat"
+    },
+    {
+      "step_index": 176,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 177,
+      "step": "TruncateFile",
+      "target": "fz-0010.dat"
+    },
+    {
+      "step_index": 178,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 179,
+      "step": "EditFile",
+      "target": "fz-0021.dat"
+    },
+    {
+      "step_index": 180,
+      "step": "AppendFile",
+      "target": "fz-0010.dat"
+    },
+    {
+      "step_index": 181,
+      "step": "AddFile",
+      "target": "fz-0036.dat"
+    },
+    {
+      "step_index": 182,
+      "step": "AddFile",
+      "target": "fz-0037.dat"
+    },
+    {
+      "step_index": 183,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 184,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 185,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 186,
+      "step": "AppendFile",
+      "target": "fz-0020.dat"
+    },
+    {
+      "step_index": 187,
+      "step": "EditFile",
+      "target": "fz-0020.dat"
+    },
+    {
+      "step_index": 188,
+      "step": "TruncateFile",
+      "target": "fz-0015.dat"
+    },
+    {
+      "step_index": 189,
+      "step": "AddFile",
+      "target": "fz-0038.dat"
+    },
+    {
+      "step_index": 190,
+      "step": "DeleteFile",
+      "target": "fz-0024.dat"
+    },
+    {
+      "step_index": 191,
+      "step": "DeleteFile",
+      "target": "fz-0025.dat"
+    },
+    {
+      "step_index": 192,
+      "step": "AddFile",
+      "target": "fz-0039.dat"
+    },
+    {
+      "step_index": 193,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 194,
+      "step": "DeleteFile",
+      "target": "fz-0010.dat"
+    },
+    {
+      "step_index": 195,
+      "step": "EditFile",
+      "target": "fz-0003.dat"
+    },
+    {
+      "step_index": 196,
+      "step": "SyncCycle",
+      "target": null
+    },
+    {
+      "step_index": 197,
+      "step": "AddFile",
+      "target": "fz-0040.dat"
+    },
+    {
+      "step_index": 198,
+      "step": "EditFile",
+      "target": "fz-0038.dat"
+    },
+    {
+      "step_index": 199,
+      "step": "EditFile",
+      "target": "fz-0022.dat"
+    }
+  ],
+  "violation": null
+}

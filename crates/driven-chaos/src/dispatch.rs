@@ -8,7 +8,7 @@
 //! driven-chaos scenario list
 //! driven-chaos scenario run <scenario>
 //! driven-chaos scenario run-all
-//! driven-chaos fuzz [--seed N --duration 1h]
+//! driven-chaos fuzz [--seed N --duration 1h --out PATH]
 //! driven-chaos mutator <fs|drive> --while-syncing --scenario <name>
 //! driven-chaos report [--format json|human]
 //! ```
@@ -54,12 +54,15 @@ pub enum Command {
     /// (STRESS_HARNESS s3.7 / s4.2 / s5) the dedicated `chaos-fake-drive` CI
     /// gate covers.
     ScenarioRunFaultInjection,
-    /// `fuzz [--seed N --duration D]` - property-style soak run.
+    /// `fuzz [--seed N --duration D --out PATH]` - property-style soak run.
     Fuzz {
         /// Seed for the weighted mutation distribution; `None` = `now()`.
         seed: Option<u64>,
         /// Soak duration in seconds; `None` = the default.
         duration_secs: Option<u64>,
+        /// Where to write the full [`FuzzReport`] JSON (pass OR fail) as a
+        /// reference / replay artifact; `None` = don't write a summary file.
+        out: Option<String>,
     },
     /// `mutator <fs|drive> --while-syncing --scenario <name>`.
     Mutator {
@@ -157,6 +160,7 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
         Some("fuzz") => {
             let mut seed = None;
             let mut duration_secs = None;
+            let mut out = None;
             while let Some(flag) = it.next() {
                 match flag {
                     "--seed" => {
@@ -172,12 +176,20 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
                                 anyhow::anyhow!("--duration needs a value")
                             })?)?);
                     }
+                    "--out" => {
+                        out = Some(
+                            it.next()
+                                .ok_or_else(|| anyhow::anyhow!("--out needs a path"))?
+                                .to_string(),
+                        );
+                    }
                     other => anyhow::bail!("unknown fuzz flag: {other}"),
                 }
             }
             Ok(Command::Fuzz {
                 seed,
                 duration_secs,
+                out,
             })
         }
         Some("mutator") => {
@@ -359,6 +371,7 @@ pub async fn run(command: Command, caps: &CapabilitySet) -> i32 {
         Command::Fuzz {
             seed,
             duration_secs,
+            out,
         } => {
             let seed = seed.unwrap_or_else(|| {
                 std::time::SystemTime::now()
@@ -381,6 +394,20 @@ pub async fn run(command: Command, caps: &CapabilitySet) -> i32 {
             );
             match mutator_scenarios::run_fuzz(seed, steps, wall_cap).await {
                 Ok(report) => {
+                    // Optionally persist the full report JSON (pass OR fail) as
+                    // a reference / replay artifact (e.g. design/chaos-fuzz-smoke.json).
+                    if let Some(path) = &out {
+                        match serde_json::to_vec_pretty(&report) {
+                            Ok(json) => {
+                                if let Err(e) = std::fs::write(path, json) {
+                                    eprintln!("driven-chaos: could not write --out {path}: {e}");
+                                } else {
+                                    println!("wrote fuzz report to {path}");
+                                }
+                            }
+                            Err(e) => eprintln!("driven-chaos: could not serialize report: {e}"),
+                        }
+                    }
                     if let Some(violation) = &report.violation {
                         match mutator_scenarios::write_fuzz_failure(&report) {
                             Ok(path) => eprintln!(
