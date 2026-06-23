@@ -273,3 +273,20 @@ requeues cleanly (transient create -> `DeferToReconcile` keeps the op; hard fail
 -> op dropped, next scan re-enqueues), so the next cycle re-snapshots + re-uploads
 from scratch. Tested cross-OS via the `FakeVss` snapshot-dir + a cumulative
 `resumable_sessions_opened` counter on the fake remote.
+
+## M3.5 recheck-2 residual (cap reached)
+
+The final M3.5 recheck (round 2) raised 1 P1 + 3 P2; three were FIXED (run_cycle applies
+the current vss_mode to the provider before any VSS path; the provider map uses a checked
+lookup instead of expect() so a concurrent end_cycle in the recorder gap degrades rather
+than panics; a locked file under vss_mode=never is classified local.file_locked, not the
+misleading local.vss_unavailable). ONE P2 is an accepted residual (cap-2 reached):
+
+`cleanup_orphan_snapshots_once` sets `orphan_cleanup_done = true` before the registry
+read/delete/write, and `read_vss_orphan_registry` swallows a DB read error as an empty
+registry. So a TRANSIENT SQLite read error at startup skips orphan cleanup for the REST of
+THIS process run. It is not a permanent leak: the flag is per-process (reset each start), so
+the NEXT process retries the >1h sweep, and VSS_CTX_BACKUP shadows are OS-auto-released on
+process death anyway. Proper fix (deferred): thread a Result through the registry read so
+the done-flag is only set after a successful read + cleanup attempt, with a retry on a
+transient DB error.

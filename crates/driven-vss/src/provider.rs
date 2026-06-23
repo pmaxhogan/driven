@@ -256,10 +256,14 @@ impl VssProvider for RealVssProvider {
             }
         }
 
-        let (snap, _created) = inner
-            .snapshots
-            .get(&volume)
-            .expect("snapshot just inserted");
+        // Checked lookup (not `expect`): the recorder hook above ran with the
+        // `inner` lock briefly dropped, so a concurrent `end_cycle` could have
+        // cleared the cache in that gap. The trait is `Send + Sync` and exposes
+        // both methods, so degrade rather than panic in non-test code.
+        let Some((snap, _created)) = inner.snapshots.get(&volume) else {
+            tracing::warn!(volume = %volume, "VSS: snapshot vanished before map (concurrent end_cycle); degrading to skip");
+            return SnapshotOutcome::Unavailable;
+        };
         match snap.map_path(live_path) {
             Ok(mapped) => SnapshotOutcome::Mapped(mapped),
             Err(err) => {

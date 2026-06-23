@@ -974,6 +974,16 @@ impl SyncOrchestrator {
         // run before the gate, but the seam is here for M4's local reconcile.
         self.transition(OrchestratorState::PowerCheck).await;
 
+        // P1 (M3.5 recheck2): apply the CURRENT vss_mode to the attached provider
+        // before any VSS path runs this cycle. `with_vss` only installs the
+        // recorder, and the provider's construction mode can differ from the
+        // persisted/reconfigured config, so without this a startup
+        // `vss_mode = never` could still create snapshots and `always` could
+        // silently behave as `auto` until the first `reconfigure`.
+        if let Some(vss) = self.vss.as_ref() {
+            vss.set_mode(self.config.read().await.vss_mode);
+        }
+
         // P1-4 (M3.5 codex): release any orphaned VSS shadow copies an unclean
         // shutdown stranded, once per process. This is a LOCAL operation (it
         // issues no Drive call), so it MUST run BEFORE the gates - a start that
@@ -1984,6 +1994,48 @@ mod tests {
         // A second cycle releases again (per-cycle lifecycle).
         orch.run_cycle(TickSource::Scheduled).await.unwrap();
         assert_eq!(vss.end_cycle_calls(), 2);
+    }
+
+    /// recheck2 P1: `with_vss` only installs the recorder, so the provider's
+    /// CONSTRUCTION mode can differ from the persisted/reconfigured config.
+    /// `run_cycle` must apply the current `config.vss_mode` to the provider
+    /// before any VSS path - otherwise a startup `vss_mode = never` would let
+    /// an `Auto`-constructed provider still snapshot.
+    #[tokio::test]
+    async fn run_cycle_applies_config_vss_mode_to_provider() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let config = OrchestratorConfig {
+            vss_mode: driven_vss::VssMode::Never,
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            config,
+        );
+        // Provider CONSTRUCTED as `Auto` - deliberately different from the
+        // config's `Never`, so the test proves run_cycle applied the config.
+        let vss = Arc::new(driven_vss::FakeVssProvider::mapped_under(
+            driven_vss::VssMode::Auto,
+            "/snap",
+        ));
+        assert_eq!(vss.mode(), driven_vss::VssMode::Auto, "constructed as Auto");
+        let orch = orch.with_vss(vss.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        assert_eq!(
+            vss.mode(),
+            driven_vss::VssMode::Never,
+            "run_cycle applies config.vss_mode (Never) to the provider"
+        );
     }
 
     /// `end_cycle` runs even when a source errors mid-loop (the RAII-on-error

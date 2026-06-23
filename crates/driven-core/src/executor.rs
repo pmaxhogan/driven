@@ -709,19 +709,21 @@ impl DefaultExecutor {
                 }
             }
             FallbackDecision::SkipLocked => {
-                // P2-6 (SPEC s24): distinguish "locked + VSS unavailable" from
-                // "locked + VSS tried and failed". `elevated` is the provider's
-                // `available()`; when VSS is unavailable (un-elevated / off
-                // Windows / `never`) a snapshot was never attempted for this
-                // locked file, so surface `local.vss_unavailable` ("would back
-                // up if Driven ran elevated"). When VSS WAS available but the
-                // snapshot/map still failed (`snapshot == Unavailable` despite
-                // elevation), it is a genuine `local.file_locked`.
-                let reason = if attempt == OpenAttempt::Locked && !elevated {
-                    SkipReason::VssUnavailable
-                } else {
-                    SkipReason::Locked
-                };
+                // P2-6 / recheck2 (SPEC s24): distinguish "locked, VSS COULD help
+                // but is not available" from "locked, VSS disabled or tried+failed".
+                // `vss.available()` (here `elevated`) is false for ALL of:
+                // un-elevated, off-Windows, AND `vss_mode = never`. Only the first
+                // two ("VSS would help if Driven ran elevated") warrant
+                // `local.vss_unavailable`; `never` is a user choice, so a locked
+                // file under `never` is a plain `local.file_locked` (NOT a
+                // misleading "needs elevation"). A genuine snapshot/map failure
+                // despite availability is also `local.file_locked`.
+                let reason =
+                    if attempt == OpenAttempt::Locked && mode != VssMode::Never && !elevated {
+                        SkipReason::VssUnavailable
+                    } else {
+                        SkipReason::Locked
+                    };
                 EffectiveOpen::Skip(reason)
             }
         }
