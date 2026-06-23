@@ -106,6 +106,22 @@ impl InvariantReport {
             && self.leaked_pending_ops == 0
     }
 
+    /// Convert this report into the runner-enforced
+    /// [`crate::scenario::InvariantOutcome`] (P1-C). The runner reads
+    /// [`crate::scenario::Outcome::invariants`] after EVERY scenario and FAILs
+    /// on any tripped invariant, so routing a scenario's terminal state through
+    /// here is what makes the s6.3 sweep central + unfakeable. `clean_shutdown`
+    /// is supplied by the caller (it owns the orchestrator state); the other
+    /// three flags are derived from the computed report.
+    pub fn to_invariant_outcome(&self, clean_shutdown: bool) -> crate::scenario::InvariantOutcome {
+        crate::scenario::InvariantOutcome {
+            no_data_loss: self.data_loss_paths.is_empty(),
+            no_duplicate_op_uuid: self.duplicate_op_uuids.is_empty(),
+            no_pending_leak: self.leaked_pending_ops == 0,
+            clean_shutdown,
+        }
+    }
+
     /// A human-readable diff for the [`crate::reporting::Verdict::Fail`]
     /// detail block when an invariant is violated.
     pub fn violation_summary(&self) -> String {
@@ -402,6 +418,11 @@ impl Scenario for NoDataLossScenario {
             final_drive_object_count: report.live_object_count,
             final_hash_matches_local: report.data_loss_paths.is_empty(),
             notes,
+            // Single-cycle clean sync driven to completion: the
+            // orchestrator's run_cycle returned, so terminal quiescence is
+            // the justified clean_shutdown arg. The other three flags are the
+            // real computed report.
+            invariants: Some(report.to_invariant_outcome(true)),
         })
     }
 
@@ -542,6 +563,12 @@ impl Scenario for NoDuplicateRemoteObjectsScenario {
             final_hash_matches_local: report.data_loss_paths.is_empty()
                 && report.duplicate_op_uuids.is_empty(),
             notes,
+            // Crash + reboot recovery drives the reopened orchestrator's
+            // run_cycle to completion (the resume/reconcile path finalizes
+            // exactly one object), so terminal quiescence holds. The report
+            // is computed AFTER recovery, so its duplicate_op_uuids /
+            // data_loss / pending flags reflect the recovered state.
+            invariants: Some(report.to_invariant_outcome(true)),
         })
     }
 
@@ -638,6 +665,10 @@ impl Scenario for NoPendingOpsLeakScenario {
             final_drive_object_count: report.live_object_count,
             final_hash_matches_local: report.data_loss_paths.is_empty(),
             notes,
+            // Two cycles driven to a settled steady state (upload then
+            // no-op); both run_cycle calls returned, so terminal quiescence
+            // is the justified clean_shutdown arg.
+            invariants: Some(report.to_invariant_outcome(true)),
         })
     }
 
@@ -749,6 +780,11 @@ impl Scenario for CleanShutdownScenario {
             final_drive_object_count: report.live_object_count,
             final_hash_matches_local: report.data_loss_paths.is_empty() && settled_idle,
             notes,
+            // This scenario computes terminal quiescence directly: the
+            // reopened orchestrator must settle to Idle after the hard stop +
+            // reboot. Feed the REAL check (not a hardcoded true) as the
+            // clean_shutdown flag.
+            invariants: Some(report.to_invariant_outcome(settled_idle)),
         })
     }
 
@@ -863,6 +899,10 @@ impl Scenario for BoundedMemoryScenario {
             final_drive_object_count: report.live_object_count,
             final_hash_matches_local: report.data_loss_paths.is_empty(),
             notes,
+            // Single-cycle fan-out driven to completion (run_cycle returned),
+            // so terminal quiescence is the justified clean_shutdown arg. The
+            // bounded-queue / no-dup / no-loss flags are the real report.
+            invariants: Some(report.to_invariant_outcome(true)),
         })
     }
 

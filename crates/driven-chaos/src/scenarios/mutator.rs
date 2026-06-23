@@ -194,6 +194,21 @@ async fn error_codes_seen(state: &Arc<dyn StateRepo>) -> anyhow::Result<Vec<Erro
     Ok(codes)
 }
 
+/// Whether the orchestrator quiesced to a non-running, non-Error terminal
+/// state (Idle / Paused / Backoff) - the s6.3 "clean shutdown" check for a
+/// soak / drive-side row. An `Error` halt or a still-running phase is NOT a
+/// clean shutdown. Read from the REAL terminal state (never hardcoded) so the
+/// runner-enforced [`crate::scenario::InvariantOutcome::clean_shutdown`] flag
+/// reflects what actually happened.
+fn quiesced_clean(state: &OrchestratorState) -> bool {
+    matches!(
+        state,
+        OrchestratorState::Idle { .. }
+            | OrchestratorState::Paused { .. }
+            | OrchestratorState::Backoff { .. }
+    )
+}
+
 /// Result of the cross-scenario invariant sweep (STRESS_HARNESS s6.3).
 struct InvariantReport {
     /// Live (non-trashed) remote object count at the end of the run.
@@ -810,6 +825,16 @@ impl Scenario for FsMutatorScenario {
         let report = assert_invariants_opts(&local, &source, &remote, true).await?;
         let codes = error_codes_seen(&local.state).await?;
 
+        // Route the terminal state through the CANONICAL s6.3 sweep so the
+        // runner-enforced invariant snapshot is computed the same way as every
+        // other category. The local `assert_invariants_opts` above already did
+        // the stronger byte-level + deferred-reconcile-aware checks (and bailed
+        // on any hard violation); this gives the central runner its snapshot.
+        let inv_report =
+            crate::scenarios::reporting::assert_invariants(&local, &remote, source.id, &folder)
+                .await?;
+        let clean_shutdown = quiesced_clean(&local.state().await);
+
         let mut notes = report.notes;
         notes.push(format!("{} mutation ticks applied", ticks));
         notes.extend(codes.iter().map(|c| format!("surfaced code: {}", c.code())));
@@ -851,6 +876,12 @@ impl Scenario for FsMutatorScenario {
             final_drive_object_count: report.final_drive_object_count,
             final_hash_matches_local: report.hash_matches_local,
             notes,
+            // s4.1 soak over a SINGLE source+remote: route the real terminal
+            // state through the canonical s6.3 sweep so the runner enforces it
+            // centrally. clean_shutdown is the real quiescence value (the loop
+            // joins the mutator thread + drains settle cycles; an Error halt
+            // would have bailed in assert_invariants_opts above).
+            invariants: Some(inv_report.to_invariant_outcome(clean_shutdown)),
         })
     }
 
@@ -1073,7 +1104,11 @@ impl Scenario for DriveMutatorScenario {
                 final_hash_matches_local: true,
                 notes: vec![
                     "SKIP-by-capability: InMemoryRemoteStore exposes no faithful dailyLimitExceeded injector (only storageQuotaExceeded via with_quota_exhausted_after); the executor's daily classification needs a 'daily' message the fake does not emit. Not faking the code. Follow-up: add InMemoryRemoteStore::with_daily_quota_after to driven-drive fault_injection.".to_string(),
+                    "invariants: None - this is a capability SKIP early-return; no handle/source/remote was booted, so there is no single source+folder snapshot to sweep.".to_string(),
                 ],
+                // Capability SKIP: nothing was synced, so there is no terminal
+                // source+remote state for the canonical s6.3 sweep to read.
+                invariants: None,
             });
         }
 
@@ -1122,6 +1157,14 @@ impl Scenario for DriveMutatorScenario {
         // a recovery handle, not a leak.
         let report = assert_invariants_opts(&handle, &source, &remote, true).await?;
 
+        // Canonical s6.3 snapshot for the central runner enforcement, computed
+        // the same way as every other category. The stronger byte-level /
+        // deferred-reconcile checks above already bailed on a hard violation.
+        let inv_report =
+            crate::scenarios::reporting::assert_invariants(&handle, &remote, source.id, &folder)
+                .await?;
+        let clean_shutdown = quiesced_clean(&handle.state().await);
+
         let mut notes = report.notes;
         notes.push(format!("first cycle errored: {first_errored}"));
         notes.push(format!("recovered on a follow-up cycle: {recovered}"));
@@ -1132,6 +1175,12 @@ impl Scenario for DriveMutatorScenario {
             final_drive_object_count: report.final_drive_object_count,
             final_hash_matches_local: report.hash_matches_local,
             notes,
+            // s4.2 fault-injection over a SINGLE source+remote: route the real
+            // terminal state through the canonical s6.3 sweep. clean_shutdown is
+            // the real quiescence value (an Error halt would have bailed in
+            // assert_invariants_opts above; a recovered/persistent fault rests
+            // in a non-running Idle/Paused/Backoff state).
+            invariants: Some(inv_report.to_invariant_outcome(clean_shutdown)),
         })
     }
 
@@ -1397,11 +1446,17 @@ async fn run_named(scenario_name: &str, expected_prefix: &str) -> anyhow::Result
             error_codes_seen: vec![],
             final_drive_object_count: 0,
             final_hash_matches_local: true,
-            notes: vec![format!(
-                "SKIP-by-capability: {} requires {} which the host lacks",
-                scenario_name,
-                missing.join(", ")
-            )],
+            notes: vec![
+                format!(
+                    "SKIP-by-capability: {} requires {} which the host lacks",
+                    scenario_name,
+                    missing.join(", ")
+                ),
+                "invariants: None - capability SKIP early-return; no handle/source/remote booted, so no source+folder snapshot to sweep.".to_string(),
+            ],
+            // Capability SKIP: nothing ran, so there is no terminal
+            // source+remote state for the canonical s6.3 sweep to read.
+            invariants: None,
         });
     }
     // Each scenario boots its own self-contained handle in run_assertions; the
@@ -1465,10 +1520,18 @@ impl Scenario for FuzzSmokeScenario {
             error_codes_seen: vec![],
             final_drive_object_count: 0,
             final_hash_matches_local: true,
-            notes: vec![format!(
-                "fuzz seed {} ran {} steps; all s6.3 invariants held",
-                report.seed, report.steps
-            )],
+            notes: vec![
+                format!(
+                    "fuzz seed {} ran {} steps; all s6.3 invariants held",
+                    report.seed, report.steps
+                ),
+                "invariants: None - this fuzz row carries its s6.3 checks INLINE: run_fuzz boots+drops its own handle/source/remote and asserts assert_invariants per run, surfacing any violation via FuzzReport.violation which bails above. No handle/source/remote is in scope here to sweep.".to_string(),
+            ],
+            // Aggregate fuzz summary: run_fuzz owns + drops the handle/source/
+            // remote internally and asserts the s6.3 invariants inline (a
+            // violation sets FuzzReport.violation, which bails above before this
+            // Outcome is built). Nothing coherent is in scope here to sweep.
+            invariants: None,
         })
     }
 

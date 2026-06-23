@@ -65,6 +65,7 @@ use driven_drive::remote_store::RemoteStore;
 use crate::capabilities::{Capability, CapabilityRequirements};
 use crate::handle::DrivenHandle;
 use crate::scenario::{ExpectedOutcome, Outcome, Scenario, ScenarioContext};
+use crate::scenarios::reporting;
 
 /// Every storage/disk scenario (STRESS_HARNESS s3.1).
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
@@ -290,25 +291,38 @@ impl Scenario for DiskFullTarget {
         // `New-VHD` + `Mount-VHD` + format). The harness does NOT fill the dev
         // machine's real disk (STRESS_HARNESS s8).
         //
-        // Beyond the mount privilege, this row also depends on a core mapping
-        // the M3 engine does not yet provide: an out-of-space failure currently
-        // classifies to `local.io_error`, not `local.disk_full` (the latter
-        // ErrorCode exists in SPEC s24 but no core path produces it). So even
-        // on an elevated host the asserted `local.disk_full` outcome cannot be
-        // honoured by the current core. Rather than weaken the assertion to the
-        // code the core happens to emit, the row stays gated behind the mount
-        // capability and this documented gap.
+        // CORE MAPPING (P1-E): the M3 core now maps an out-of-space write error
+        // to ErrorCode::LocalDiskFull (executor `local_io_error_code` /
+        // `is_disk_full`: ENOSPC=28 on Unix, ERROR_DISK_FULL=112 /
+        // ERROR_HANDLE_DISK_FULL=39 on Windows, plus ErrorKind::StorageFull),
+        // unit-tested in driven-core (`enospc_classifies_as_local_disk_full`).
+        // The earlier "core maps it to local.io_error" gap is CLOSED.
+        //
+        // REMAINING ARCHITECTURAL GAP (tracked, not fake-green): a V1 source is
+        // read-ONLY (the executor reads source files and writes to Drive; it
+        // never writes back into the source volume - confirmed: every executor
+        // write is a RemoteStore `create`/`update`, never a local `File::create`
+        // on the source path). So a read-only source on a 0-free constrained
+        // volume produces NO local write, hence no ENOSPC, hence the
+        // LocalDiskFull mapping - though now present and tested - is not
+        // reachable through V1's source-read path. Driving this row end to end
+        // needs a Driven write-into-source path (e.g. a future local staging /
+        // VSS-temp spool on the source volume) that V1 does not have. Rather
+        // than fabricate a pass or assert a code the read-only path cannot
+        // emit, the row stays an honest documented known-gap (recorded in
+        // CODEX_NOTES.md) behind the mount-privilege gate.
         anyhow::bail!(
-            "disk-full-target requires an elevated host to mount a 32 MiB constrained volume \
-             AND a core that maps out-of-space to local.disk_full (the M3 core maps it to \
-             local.io_error); gated until both land"
+            "disk-full-target: core ENOSPC->local.disk_full mapping is implemented + unit-tested, \
+             but V1's read-only source path never writes to the source volume, so a full source \
+             volume cannot induce the mapping end to end. Tracked known-gap; needs a \
+             write-into-source path (local staging/VSS spool) to drive. Not faked green."
         )
     }
 
     async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
         // Unreachable on an unprivileged runner (SKIPPED by the gate) and
-        // returns early from `setup` on an elevated one until the core gap is
-        // closed. Kept honest: it never fabricates a pass.
+        // returns early from `setup` on an elevated one (the documented
+        // read-only-source gap). Kept honest: it never fabricates a pass.
         anyhow::bail!("disk-full-target is capability-gated; see setup")
     }
 
@@ -388,10 +402,16 @@ impl Scenario for ReadonlySourceFolder {
         );
         anyhow::ensure!(pending.is_empty(), "no pending ops should leak");
 
+        // Central s6.3 sweep (P1-C): the runner enforces this after the
+        // scenario; clean_shutdown holds because the single sync cycle drained
+        // to completion (no pending ops leaked, asserted above).
+        let inv_report = reporting::assert_invariants(handle, &remote, src.id, &folder).await?;
+
         Ok(Outcome {
             error_codes_seen: failures,
             final_drive_object_count: live,
             final_hash_matches_local: intact,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -464,10 +484,15 @@ impl Scenario for ReadonlyFile {
         );
         anyhow::ensure!(pending.is_empty(), "no pending ops should leak");
 
+        // Central s6.3 sweep (P1-C); clean_shutdown holds (single cycle drained,
+        // no pending ops, asserted above).
+        let inv_report = reporting::assert_invariants(handle, &remote, src.id, &folder).await?;
+
         Ok(Outcome {
             error_codes_seen: failures,
             final_drive_object_count: live,
             final_hash_matches_local: intact,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes: vec![format!(
                 "{live} uploaded, {synced} synced, read-only leaf included"
             )],
@@ -600,10 +625,16 @@ impl Scenario for NoaccessFile {
             "an unreadable file must not cascade into trashing others; {trashed} trashed"
         );
 
+        // Central s6.3 sweep (P1-C): the unreadable file is a read failure (not
+        // synced, not trashed), so the two readable files are the only synced
+        // rows the sweep checks; clean_shutdown holds (single cycle completed).
+        let inv_report = reporting::assert_invariants(handle, &remote, src.id, &folder).await?;
+
         Ok(Outcome {
             error_codes_seen: vec![ErrorCode::LocalIoError],
             final_drive_object_count: live,
             final_hash_matches_local: intact,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes: vec![format!(
                 "{done} readable files uploaded, 1 local.io_error, 0 trashed (no cascade)"
             )],
@@ -753,10 +784,16 @@ impl Scenario for NoaccessFolder {
             "no remote object under the unreadable subtree may be trashed; {trashed_count} trashed"
         );
 
+        // Central s6.3 sweep (P1-C): all 3 phase-1 synced rows remain live
+        // (deletion was suppressed, asserted above), so no data loss / dup /
+        // pending leak; clean_shutdown holds (the executor pass completed).
+        let inv_report = reporting::assert_invariants(handle, &remote, src.id, &folder).await?;
+
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live_after,
-            final_hash_matches_local: true,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty(),
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes: vec![
                 "walk error over unreadable subtree -> deletion suppressed; 0 subtree trashes"
                     .to_string(),

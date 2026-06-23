@@ -38,14 +38,16 @@
 //! reported to the Integrate agent as the one place the s2.4 sketch and the
 //! file-size rows diverge.
 //!
-//! ## Hashing without a new dependency
+//! ## Hashing
 //!
-//! The crate intentionally carries no `blake3` / `md5` dependency. The
-//! data-loss check (`final_hash_matches_local`) is therefore done by
-//! re-reading the bytes Drive actually stored and comparing them to the
-//! local file content directly - a stronger, dependency-free equivalent of
-//! "the recorded hash still matches". For the multi-gigabyte rows the
-//! comparison streams in fixed windows so it never buffers the whole file.
+//! The small / sparse rows do their data-loss check (`final_hash_matches_local`)
+//! by re-reading the bytes Drive actually stored and comparing them to the
+//! local file content directly - a dependency-free equivalent of "the recorded
+//! hash still matches", streamed in fixed windows so it never buffers the whole
+//! file. The huge-file rows (P1-B) instead arm the fake's content oracle (which
+//! records only a length + md5, never the bytes) and verify length + md5
+//! against the deterministic source pattern via [`deterministic_md5`], so a
+//! 10-50 GB upload is proven without buffering or downloading it.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -281,11 +283,15 @@ async fn write_deterministic(path: &Path, len: u64) -> anyhow::Result<()> {
         tokio::fs::create_dir_all(parent).await?;
     }
     let mut f = tokio::fs::File::create(path).await?;
-    const BLOCK: usize = 1024 * 1024;
-    let mut block = vec![0u8; BLOCK];
+    // Cap the scratch block at the file length so the many-tiny-file rows
+    // (million-files-nested, tiny-files-100k - mostly 0-4 KiB) do not allocate
+    // a 1 MiB buffer per file; a huge file still streams in 1 MiB blocks.
+    const MAX_BLOCK: usize = 1024 * 1024;
+    let block_len = std::cmp::min(MAX_BLOCK as u64, len.max(1)) as usize;
+    let mut block = vec![0u8; block_len];
     let mut written: u64 = 0;
     while written < len {
-        let this = std::cmp::min(BLOCK as u64, len - written) as usize;
+        let this = std::cmp::min(block_len as u64, len - written) as usize;
         for (j, slot) in block[..this].iter_mut().enumerate() {
             *slot = ((written as usize + j) % 251) as u8;
         }
@@ -294,6 +300,31 @@ async fn write_deterministic(path: &Path, len: u64) -> anyhow::Result<()> {
     }
     f.flush().await?;
     Ok(())
+}
+
+/// The md5 of the first `len` bytes of the [`write_deterministic`] pattern
+/// (byte at offset `i` is `(i % 251)`), computed by STREAMING the generator
+/// through the hasher - never buffering. This is the length+digest oracle the
+/// huge-file rows (P1-B) verify against instead of downloading 10-50 GB: the
+/// fake's content oracle records the md5 of the bytes it received, and that
+/// must equal this digest of the bytes the source actually held.
+fn deterministic_md5(len: u64) -> [u8; 16] {
+    use md5::{Digest, Md5};
+    const BLOCK: usize = 1024 * 1024;
+    let mut hasher = Md5::new();
+    let mut block = vec![0u8; BLOCK];
+    let mut done: u64 = 0;
+    while done < len {
+        let this = std::cmp::min(BLOCK as u64, len - done) as usize;
+        for (j, slot) in block[..this].iter_mut().enumerate() {
+            *slot = ((done as usize + j) % 251) as u8;
+        }
+        hasher.update(&block[..this]);
+        done += this as u64;
+    }
+    let mut out = [0u8; 16];
+    out.copy_from_slice(&hasher.finalize());
+    out
 }
 
 // ---------------------------------------------------------------------------
@@ -355,10 +386,15 @@ impl Scenario for ZeroByteFile {
             "no-op re-sync kept exactly one object, got {live2}"
         );
 
+        let inv_report =
+            crate::scenarios::reporting::assert_invariants(&handle, &remote, source.id, &folder)
+                .await?;
+
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live2,
             final_hash_matches_local: matches,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes: vec!["0-byte file backed up as one empty Drive object".into()],
         })
     }
@@ -452,10 +488,15 @@ impl Scenario for SparseFileZeros {
             "the full logical content (zeros included) round-trips"
         );
 
+        let inv_report =
+            crate::scenarios::reporting::assert_invariants(&handle, &remote, source.id, &folder)
+                .await?;
+
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
             final_hash_matches_local: matches,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes: vec![format!(
                 "sparse logical content ({logical} B) uploaded as real zeros; size-on-Drive vs size-on-disk skew documented"
             )],
@@ -513,7 +554,11 @@ impl Scenario for HugeFile10Gb {
 
     async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
         let src_root = self.fixture.src()?;
-        let remote = Arc::new(InMemoryRemoteStore::new());
+        // P1-B: arm the streaming content oracle so the fake records only the
+        // length + md5 of the uploaded bytes instead of buffering 10 GB in a
+        // Vec<u8> (which OOMs / times out). The bytes still stream through the
+        // real executor pipeline; verification is by length + digest.
+        let remote = Arc::new(InMemoryRemoteStore::new().with_content_oracle());
         let (handle, source) =
             boot_and_register(self.fixture.state_db()?, remote.clone(), &src_root).await?;
         let folder = remote.root_id().to_string();
@@ -531,19 +576,34 @@ impl Scenario for HugeFile10Gb {
             "the full 10 GB landed, got size {:?}",
             entries[0].size
         );
+        // Length + digest oracle: the md5 the fake computed over the streamed
+        // bytes must equal the md5 of the deterministic source pattern. This is
+        // the no-data-loss proof for a file too large to round-trip by download.
+        let expected_md5 = deterministic_md5(Self::file_len());
+        let matches = entries[0].md5 == Some(expected_md5);
+        anyhow::ensure!(
+            matches,
+            "the 10 GB content md5 round-trips: remote {:?} vs expected {expected_md5:?}",
+            entries[0].md5
+        );
         assert_no_duplicate_op_uuid(&remote, &folder).await?;
-        let matches = synced_rows_match_remote(&handle, &remote, &source, &src_root).await?;
-        anyhow::ensure!(matches, "the 10 GB content round-trips byte-for-byte");
         anyhow::ensure!(
             remote.open_session_count() == 0,
             "the resumable session was consumed on completion"
         );
 
+        let inv_report =
+            crate::scenarios::reporting::assert_invariants(&handle, &remote, source.id, &folder)
+                .await?;
+
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
             final_hash_matches_local: matches,
-            notes: vec!["10 GB resumable upload completed; one object".into()],
+            invariants: Some(inv_report.to_invariant_outcome(true)),
+            notes: vec![
+                "10 GB resumable upload completed; one object; length+md5 verified via content oracle".into(),
+            ],
         })
     }
 
@@ -616,7 +676,15 @@ impl Scenario for HugeFile50GbMidRunCrash {
         // --- phase 1: crash mid-stream -------------------------------------
         // A network drop after the session opens + the first wire chunk acks
         // models the kill: the resumable Create never finalizes.
-        let remote = Arc::new(InMemoryRemoteStore::new().with_network_drop_after(2));
+        // P1-B: arm the content oracle so neither phase buffers 50 GB in the
+        // fake's Vec<u8>; the bytes stream through the real pipeline and the
+        // resumed object is verified by length + md5. The drop fault and the
+        // oracle compose (both are construction-time flags on the same store).
+        let remote = Arc::new(
+            InMemoryRemoteStore::new()
+                .with_network_drop_after(2)
+                .with_content_oracle(),
+        );
         let folder = remote.root_id().to_string();
         let source = {
             let (handle, source) =
@@ -675,13 +743,29 @@ impl Scenario for HugeFile50GbMidRunCrash {
             remote.open_session_count() == 0,
             "the session was consumed by the resume"
         );
-        let matches = synced_rows_match_remote(&handle, &remote, &source, &src_root).await?;
-        anyhow::ensure!(matches, "the resumed content round-trips byte-for-byte");
+        // Length + digest oracle (P1-B): the resumed object's md5 must equal
+        // the deterministic source pattern's md5 - the no-data-loss proof for a
+        // file too large to round-trip by download.
+        let expected_md5 = deterministic_md5(Self::file_len());
+        let matches = entries[0].md5 == Some(expected_md5);
+        anyhow::ensure!(
+            matches,
+            "the resumed 50 GB content md5 round-trips: remote {:?} vs expected {expected_md5:?}",
+            entries[0].md5
+        );
+
+        // The source row was re-homed onto the restart's account but keeps its
+        // original id, so the invariant sweep keys off `source.id` and reads
+        // the resumed file_state + drained pending_ops correctly.
+        let inv_report =
+            crate::scenarios::reporting::assert_invariants(&handle, &remote, source.id, &folder)
+                .await?;
 
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
             final_hash_matches_local: matches,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes: vec![
                 "50 GB upload crashed mid-stream and resumed from the persisted offset; one object, no duplicate".into(),
             ],
@@ -770,10 +854,15 @@ impl Scenario for TinyFiles100kInOneDir {
             "every file_state row is synced, got {synced}"
         );
 
+        let inv_report =
+            crate::scenarios::reporting::assert_invariants(&handle, &remote, source.id, &folder)
+                .await?;
+
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
             final_hash_matches_local: true,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes: vec![format!(
                 "{} tiny files completed; wall-clock recorded as a regression metric, not asserted",
                 Self::count()
@@ -905,10 +994,15 @@ impl Scenario for MillionFilesNested {
                 .push("RSS probe unavailable on this platform; memory bound not checked".into()),
         }
 
+        let inv_report =
+            crate::scenarios::reporting::assert_invariants(&handle, &remote, source.id, &folder)
+                .await?;
+
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
             final_hash_matches_local: true,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }

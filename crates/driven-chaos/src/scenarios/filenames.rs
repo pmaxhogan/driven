@@ -204,6 +204,31 @@ impl Fixture {
             .map(|s| s.id)
             .ok_or_else(|| anyhow::anyhow!("no source configured"))
     }
+
+    /// Compute the STRESS_HARNESS s6.3 cross-scenario invariants over this
+    /// fixture's terminal state and fold them into the runner-enforced
+    /// [`crate::scenario::InvariantOutcome`].
+    ///
+    /// Delegates to the canonical [`crate::scenarios::reporting::assert_invariants`]
+    /// so every scenario computes the sweep identically. `clean_shutdown` is the
+    /// caller's claim that the orchestrator quiesced; the filename scenarios run a
+    /// single synchronous scan -> plan -> execute cycle to completion, so they pass
+    /// `true`. The other three flags are derived from the live remote + persisted
+    /// state, never hardcoded.
+    async fn invariant_outcome(
+        &self,
+        clean_shutdown: bool,
+    ) -> anyhow::Result<crate::scenario::InvariantOutcome> {
+        let source_id = self.source_id().await?;
+        let report = crate::scenarios::reporting::assert_invariants(
+            &self.handle,
+            &self.remote,
+            source_id,
+            &self.folder_id,
+        )
+        .await?;
+        Ok(report.to_invariant_outcome(clean_shutdown))
+    }
 }
 
 /// A plaintext source rooted at `root` uploading into the fake `folder_id`.
@@ -385,10 +410,12 @@ impl Scenario for NameControlChars {
             }
         }
 
+        let invariants = fx.invariant_outcome(true).await?;
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: objects.len() as u64,
             final_hash_matches_local: hash_ok,
+            invariants: Some(invariants),
             notes: vec![format!(
                 "{} control-char names round-tripped",
                 expected.len()
@@ -458,10 +485,12 @@ impl Scenario for NameRloZwjZwnjBom {
             }
         }
 
+        let invariants = fx.invariant_outcome(true).await?;
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: objects.len() as u64,
             final_hash_matches_local: hash_ok,
+            invariants: Some(invariants),
             notes: vec!["RLO/ZWJ/ZWNJ/BOM names round-tripped".into()],
         })
     }
@@ -529,10 +558,12 @@ impl Scenario for NameIdnHomograph {
             "homographs must not collide: {collisions:?}"
         );
 
+        let invariants = fx.invariant_outcome(true).await?;
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: objects.len() as u64,
             final_hash_matches_local: true,
+            invariants: Some(invariants),
             notes: vec!["IDN homographs stored as two distinct objects".into()],
         })
     }
@@ -671,10 +702,12 @@ async fn assert_collision(name_a: &str, name_b: &str) -> anyhow::Result<Outcome>
         "the dropped form must surface local.unicode_collision"
     );
 
+    let invariants = fx.invariant_outcome(true).await?;
     Ok(Outcome {
         error_codes_seen: vec![ErrorCode::LocalUnicodeCollision],
         final_drive_object_count: objects.len() as u64,
         final_hash_matches_local: true,
+        invariants: Some(invariants),
         notes: vec![format!(
             "{} collision row(s); one NFC form uploaded",
             collisions.len()
@@ -736,10 +769,12 @@ impl Scenario for NameLeaf255Bytes {
             .ok_or_else(|| anyhow::anyhow!("255-byte name not uploaded"))?;
         let hash_ok = fx.download_bytes(&entry.id).await? == body;
 
+        let invariants = fx.invariant_outcome(true).await?;
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: objects.len() as u64,
             final_hash_matches_local: hash_ok,
+            invariants: Some(invariants),
             notes: vec!["255-byte leaf round-tripped".into()],
         })
     }
@@ -818,10 +853,12 @@ impl Scenario for NamePath4096Bytes {
         );
         anyhow::ensure!(synced >= 1, "deep-path file should be synced, got {synced}");
 
+        let invariants = fx.invariant_outcome(true).await?;
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: objects.len() as u64,
             final_hash_matches_local: true,
+            invariants: Some(invariants),
             notes: vec![format!("~{rel_len}-byte relative path backed up")],
         })
     }
@@ -893,6 +930,7 @@ impl Scenario for NameWindowsReserved {
 
         fx.run_one_cycle().await?;
         let objects = fx.live_objects().await?;
+        let invariants = fx.invariant_outcome(true).await?;
 
         if cfg!(windows) {
             // Windows reserved-name behaviour is split, and BOTH halves are
@@ -953,6 +991,7 @@ impl Scenario for NameWindowsReserved {
                 error_codes_seen: vec![],
                 final_drive_object_count: objects.len() as u64,
                 final_hash_matches_local: hash_ok,
+                invariants: Some(invariants),
                 notes: vec![note],
             })
         } else {
@@ -977,6 +1016,7 @@ impl Scenario for NameWindowsReserved {
                 error_codes_seen: vec![],
                 final_drive_object_count: objects.len() as u64,
                 final_hash_matches_local: hash_ok,
+                invariants: Some(invariants),
                 notes: vec![format!(
                     "POSIX: {} reserved-device names round-tripped (restore to Windows \
                      is a documented caveat)",
@@ -1059,10 +1099,12 @@ impl Scenario for NameTrailingSpaceAndDot {
             expected.len()
         );
 
+        let invariants = fx.invariant_outcome(true).await?;
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: objects.len() as u64,
             final_hash_matches_local: hash_ok,
+            invariants: Some(invariants),
             notes: vec!["trailing-space / trailing-dot names preserved + round-tripped".into()],
         })
     }
@@ -1161,10 +1203,12 @@ impl Scenario for NameSeparatorLookalike {
             }
         }
 
+        let invariants = fx.invariant_outcome(true).await?;
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: objects.len() as u64,
             final_hash_matches_local: hash_ok,
+            invariants: Some(invariants),
             notes: vec!["separator look-alikes stored flat, round-tripped".into()],
         })
     }
@@ -1258,6 +1302,7 @@ impl Scenario for NameUnpairedSurrogate {
         // local.invalid_filename. On the current core this is empty (the
         // scanner drops the name without an activity row), so this returns an
         // Outcome the runner reads as FAIL - the honest core-gap signal.
+        let invariants = fx.invariant_outcome(true).await?;
         Ok(Outcome {
             error_codes_seen: if invalid.is_empty() {
                 vec![]
@@ -1266,6 +1311,7 @@ impl Scenario for NameUnpairedSurrogate {
             },
             final_drive_object_count: objects.len() as u64,
             final_hash_matches_local: true,
+            invariants: Some(invariants),
             notes: vec![format!(
                 "{} local.invalid_filename row(s) observed (CORE GAP if 0: the M3 \
                  scanner skips an unrepresentable name without writing an activity \
@@ -1338,10 +1384,12 @@ impl Scenario for NameCaseOnlyDiffers {
             "case-only difference is not a unicode collision: {collisions:?}"
         );
 
+        let invariants = fx.invariant_outcome(true).await?;
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: objects.len() as u64,
             final_hash_matches_local: true,
+            invariants: Some(invariants),
             notes: vec!["case-only-distinct names stored as two objects".into()],
         })
     }

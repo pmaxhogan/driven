@@ -394,6 +394,24 @@ impl Scenario for PauseMidResumable5m {
             "a within-horizon session must not surface drive.resumable_session_invalid; saw {codes:?}"
         );
 
+        // s6.3 cross-scenario invariants, computed from the SAME hermetic state
+        // + remote the executor wrote. This row is executor-driven (no
+        // orchestrator handle), so boot a throwaway handle over the same state
+        // DB + remote purely to run the canonical checker against the terminal
+        // state; the resume already drained the queue and committed the synced
+        // row, so booting touches neither file_state, pending_ops, nor objects.
+        let inv_handle = DrivenHandleBuilder::new(dir.path().join("state.db"))
+            .remote(remote.clone())
+            .power(power_on_ac())
+            .boot()
+            .await?;
+        let report =
+            crate::scenarios::reporting::assert_invariants(&inv_handle, &remote, src.id, &folder)
+                .await?;
+        // clean_shutdown holds: reconcile ran to completion, drained the create
+        // op, and left no open session (both asserted above).
+        let invariants = Some(report.to_invariant_outcome(true));
+
         Ok(Outcome {
             error_codes_seen: codes,
             final_drive_object_count: 1,
@@ -402,6 +420,7 @@ impl Scenario for PauseMidResumable5m {
                 "5-min-old resumable session resumed byte-for-byte; one object, no duplicate"
                     .to_string(),
             ],
+            invariants,
         })
     }
 
@@ -546,6 +565,15 @@ impl Scenario for PauseMidResumable7d {
              drive.resumable_session_invalid; saw {codes:?}"
         );
 
+        // s6.3 cross-scenario invariants over the rebooted handle's terminal
+        // state (same state DB + remote the restart cycle ran on).
+        let report =
+            crate::scenarios::reporting::assert_invariants(&handle, &remote, src.id, &folder)
+                .await?;
+        // clean_shutdown holds: the orchestrator settled Idle (asserted above).
+        let clean_shutdown = matches!(handle.state().await, OrchestratorState::Idle { .. });
+        let invariants = Some(report.to_invariant_outcome(clean_shutdown));
+
         Ok(Outcome {
             error_codes_seen: codes,
             final_drive_object_count: 1,
@@ -555,6 +583,7 @@ impl Scenario for PauseMidResumable7d {
                  one object, no leaked drive.resumable_session_invalid"
                     .to_string(),
             ],
+            invariants,
         })
     }
 
@@ -763,11 +792,22 @@ impl Scenario for Kill9MidPipeline {
             );
         }
 
+        // s6.3 cross-scenario invariants over the rebooted handle's terminal
+        // state (same state DB + remote the reconciliation cycles ran on).
+        let report =
+            crate::scenarios::reporting::assert_invariants(&handle2, &remote, src.id, &folder)
+                .await?;
+        // clean_shutdown holds: the rebooted orchestrator settled Idle
+        // (asserted above).
+        let clean_shutdown = matches!(handle2.state().await, OrchestratorState::Idle { .. });
+        let invariants = Some(report.to_invariant_outcome(clean_shutdown));
+
         Ok(Outcome {
             error_codes_seen: codes,
             final_drive_object_count: live.len() as u64,
             final_hash_matches_local: hash_matches,
             notes,
+            invariants,
         })
     }
 

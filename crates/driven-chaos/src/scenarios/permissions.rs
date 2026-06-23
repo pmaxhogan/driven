@@ -36,7 +36,6 @@
 //! because they need the concrete remote. This divergence is surfaced in
 //! the M3.7 report.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -45,13 +44,14 @@ use async_trait::async_trait;
 
 use driven_core::orchestrator::TickSource;
 use driven_core::state::{ActivityFilter, ActivityLevel, PageRequest, SourceRow, StateRepo};
-use driven_core::types::{AccountId, ErrorCode, FileStateStatus, SourceId};
+use driven_core::types::{AccountId, ErrorCode, SourceId};
 
-use driven_drive::fake::{InMemoryRemoteStore, CLIENT_OP_UUID_KEY};
+use driven_drive::fake::InMemoryRemoteStore;
 
 use crate::capabilities::{Capability, CapabilityRequirements};
 use crate::handle::{DrivenHandle, DrivenHandleBuilder};
 use crate::scenario::{ExpectedOutcome, Outcome, Scenario, ScenarioContext};
+use crate::scenarios::reporting;
 
 /// Per-scenario fixture handles kept alive between `setup` and
 /// `run_assertions` / `teardown`.
@@ -147,68 +147,25 @@ async fn saw_error_code(
     Ok(!page.rows.is_empty())
 }
 
-/// The cross-scenario s6.3 invariant subset the permissions rows can check
-/// against the in-memory fake: no data loss for every `status='synced'`
-/// `file_state` row, and no two non-trashed remote objects sharing one
-/// `client_op_uuid`. Returns the human notes plus a boolean for the
-/// per-scenario `Outcome::final_hash_matches_local`.
-///
-/// The "no data loss" check confirms each synced row's `drive_file_id`
-/// still resolves to a live (non-trashed) object - the fake cannot re-hash
-/// remote bytes here, so byte-level hash equality is delegated to the
-/// `driven-core` e2e suite; this guards the harness-relevant property that
-/// a synced file is not silently trashed.
+/// The cross-scenario s6.3 invariant subset the permissions rows assert
+/// against the in-memory fake. This delegates to the canonical
+/// [`reporting::assert_invariants`] checker (the single source of truth for
+/// the s6.3 sweep) and surfaces its violation summary as a human note when
+/// any invariant trips. Returns the notes plus the computed
+/// [`reporting::InvariantReport`] so the caller can both populate
+/// `Outcome::invariants` and derive the per-scenario data-loss flag.
 async fn check_shared_invariants(
-    state: &dyn StateRepo,
+    handle: &DrivenHandle,
     remote: &InMemoryRemoteStore,
     source_id: SourceId,
     folder_id: &str,
-) -> anyhow::Result<(Vec<String>, bool)> {
+) -> anyhow::Result<(Vec<String>, reporting::InvariantReport)> {
     let mut notes = Vec::new();
-
-    let live = remote.list_folder_with_trashed(folder_id);
-    let live_ids: std::collections::HashSet<&str> = live
-        .iter()
-        .filter(|e| !e.trashed)
-        .map(|e| e.id.as_str())
-        .collect();
-
-    // No data loss: every synced row's remote object is still live.
-    let mut data_loss = false;
-    let file_state = state.load_source_file_state(source_id).await?;
-    for (rel, row) in &file_state {
-        if row.status != FileStateStatus::Synced {
-            continue;
-        }
-        match &row.drive_file_id {
-            Some(id) if live_ids.contains(id.as_str()) => {}
-            _ => {
-                data_loss = true;
-                notes.push(format!(
-                    "DATA LOSS: synced file_state '{rel}' has no live remote object"
-                ));
-            }
-        }
+    let report = reporting::assert_invariants(handle, remote, source_id, folder_id).await?;
+    if !report.ok() {
+        notes.push(report.violation_summary());
     }
-
-    // No duplicate remote objects for one client_op_uuid.
-    let mut by_uuid: HashMap<&str, u32> = HashMap::new();
-    for entry in live.iter().filter(|e| !e.trashed) {
-        if let Some(uuid) = entry.app_properties.get(CLIENT_OP_UUID_KEY) {
-            *by_uuid.entry(uuid.as_str()).or_insert(0) += 1;
-        }
-    }
-    let mut duplicate = false;
-    for (uuid, count) in &by_uuid {
-        if *count > 1 {
-            duplicate = true;
-            notes.push(format!(
-                "DUPLICATE: {count} live objects share client_op_uuid {uuid}"
-            ));
-        }
-    }
-
-    Ok((notes, !data_loss && !duplicate))
+    Ok((notes, report))
 }
 
 // ---------------------------------------------------------------------------
@@ -370,8 +327,8 @@ impl Scenario for PosixMode000 {
         let saw_io_error =
             saw_error_code(handle.state.as_ref(), source_id, ErrorCode::LocalIoError).await?;
 
-        let (mut inv_notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut inv_notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.append(&mut inv_notes);
 
         // On a non-Unix host the scenario is SKIPPED by the capability gate
@@ -393,7 +350,10 @@ impl Scenario for PosixMode000 {
         Ok(Outcome {
             error_codes_seen,
             final_drive_object_count: live as u64,
-            final_hash_matches_local: hash_ok && live == 3 && saw_io_error,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty()
+                && live == 3
+                && saw_io_error,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -506,8 +466,8 @@ impl Scenario for SetuidFiles {
             "{live} of 2 files uploaded; setuid bit not represented on Drive (V1 limitation)"
         ));
 
-        let (mut inv_notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut inv_notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.append(&mut inv_notes);
 
         if live != 2 {
@@ -517,7 +477,8 @@ impl Scenario for SetuidFiles {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live as u64,
-            final_hash_matches_local: hash_ok && live == 2,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && live == 2,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -627,8 +588,8 @@ impl Scenario for WindowsAclDenyReadFile {
         let saw_io_error =
             saw_error_code(handle.state.as_ref(), source_id, ErrorCode::LocalIoError).await?;
 
-        let (mut inv_notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut inv_notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.append(&mut inv_notes);
 
         let error_codes_seen = if saw_io_error {
@@ -646,7 +607,10 @@ impl Scenario for WindowsAclDenyReadFile {
         Ok(Outcome {
             error_codes_seen,
             final_drive_object_count: live as u64,
-            final_hash_matches_local: hash_ok && live == 3 && saw_io_error,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty()
+                && live == 3
+                && saw_io_error,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -798,8 +762,8 @@ impl Scenario for WindowsAclDenyEnumerate {
             ));
         }
 
-        let (mut inv_notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut inv_notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.append(&mut inv_notes);
 
         let suppression_held = after_cycle1 == 5 && after_cycle2 == 5 && trashed == 0;
@@ -810,7 +774,8 @@ impl Scenario for WindowsAclDenyEnumerate {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: after_cycle2 as u64,
-            final_hash_matches_local: hash_ok && suppression_held,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && suppression_held,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }

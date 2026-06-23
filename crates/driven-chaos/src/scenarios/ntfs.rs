@@ -36,12 +36,14 @@
 //! [`Outcome::notes`] - never a faked success against an unimplemented
 //! path:
 //!
-//! `local.ads_skipped` (s10) is a defined [`ErrorCode`] that NOTHING in
-//! the core emits yet (the scanner has no ADS enumeration). The
-//! `ads-alternate-data-stream` row documents that the main stream backs up
-//! and the ADS is silently lost WITHOUT a surfaced `local.ads_skipped` -
-//! the honest V1 state - rather than asserting a code that is never
-//! produced.
+//! `local.ads_skipped` (s10): the scanner now enumerates named NTFS data
+//! streams (FindFirstStreamW) and the orchestrator writes a durable
+//! `local.ads_skipped` WARNING activity row per affected file (P1-D). The
+//! `ads-alternate-data-stream` row asserts the main stream backs up AND that
+//! the named-stream skip is SURFACED as that warning - so the loss is visible
+//! rather than silent data loss. The named streams themselves are still not
+//! uploaded (a documented V1 limitation); surfacing the skip is what makes
+//! that honest.
 //!
 //! The follow-symlinks ON sub-cases (`symlink-to-directory`,
 //! `cross-volume-symlink`) need a per-source follow toggle V1 does not
@@ -59,7 +61,6 @@
 //! elevated Windows box / the `chaos-windows-admin` self-hosted runner
 //! (s7), not faked green here.
 
-use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 use std::sync::Arc;
 use std::sync::Mutex;
@@ -70,7 +71,7 @@ use driven_core::orchestrator::TickSource;
 use driven_core::state::{ActivityFilter, ActivityLevel, PageRequest, SourceRow, StateRepo};
 use driven_core::types::{AccountId, ErrorCode, FileStateStatus, RelativePath, SourceId};
 
-use driven_drive::fake::{InMemoryRemoteStore, CLIENT_OP_UUID_KEY};
+use driven_drive::fake::InMemoryRemoteStore;
 
 use crate::capabilities::{Capability, CapabilityRequirements};
 use crate::handle::{DrivenHandle, DrivenHandleBuilder};
@@ -229,66 +230,35 @@ async fn error_level_activity_count(
     Ok(page.total)
 }
 
-/// The cross-scenario s6.3 invariant subset these rows can check against
-/// the in-memory fake: no data loss for every `status='synced'` row (its
-/// recorded Drive object is still live) and no two non-trashed remote
-/// objects sharing one `client_op_uuid`. Returns the human notes plus a
-/// boolean for [`Outcome::final_hash_matches_local`].
+/// The cross-scenario s6.3 invariant subset these rows check against the
+/// in-memory fake, delegated to the canonical central helper
+/// [`crate::scenarios::reporting::assert_invariants`] so every category
+/// computes the s6.3 sweep identically (no data loss, no duplicate
+/// `client_op_uuid`, no leaked `pending_ops`). Returns the human notes plus
+/// the computed [`reporting::InvariantReport`]; callers feed the report into
+/// [`reporting::InvariantReport::to_invariant_outcome`] for the
+/// runner-enforced [`Outcome::invariants`] field and read
+/// [`reporting::InvariantReport::data_loss_paths`] for the
+/// [`Outcome::final_hash_matches_local`] semantic.
 ///
-/// The fake cannot re-hash remote bytes here, so byte-level hash equality
-/// is delegated to the `driven-core` e2e suite; this guards the
-/// harness-relevant property that a synced file is not silently trashed.
+/// The note vector carries [`reporting::InvariantReport::violation_summary`]
+/// only when the report is not clean, so a passing row stays quiet. Takes the
+/// booted [`DrivenHandle`] because the central helper needs the clock and
+/// `pending_ops` view, not just the remote.
 async fn check_shared_invariants(
-    state: &dyn StateRepo,
+    handle: &DrivenHandle,
     remote: &InMemoryRemoteStore,
     source_id: SourceId,
     folder_id: &str,
-) -> anyhow::Result<(Vec<String>, bool)> {
+) -> anyhow::Result<(Vec<String>, crate::scenarios::reporting::InvariantReport)> {
+    let report =
+        crate::scenarios::reporting::assert_invariants(handle, remote, source_id, folder_id)
+            .await?;
     let mut notes = Vec::new();
-
-    let live = remote.list_folder_with_trashed(folder_id);
-    let live_ids: std::collections::HashSet<&str> = live
-        .iter()
-        .filter(|e| !e.trashed)
-        .map(|e| e.id.as_str())
-        .collect();
-
-    // No data loss: every synced row's remote object is still live.
-    let mut data_loss = false;
-    let file_state = state.load_source_file_state(source_id).await?;
-    for (rel, row) in &file_state {
-        if row.status != FileStateStatus::Synced {
-            continue;
-        }
-        match &row.drive_file_id {
-            Some(id) if live_ids.contains(id.as_str()) => {}
-            _ => {
-                data_loss = true;
-                notes.push(format!(
-                    "DATA LOSS: synced file_state '{rel}' has no live remote object"
-                ));
-            }
-        }
+    if !report.ok() {
+        notes.push(report.violation_summary());
     }
-
-    // No duplicate remote objects for one client_op_uuid.
-    let mut by_uuid: HashMap<&str, u32> = HashMap::new();
-    for entry in live.iter().filter(|e| !e.trashed) {
-        if let Some(uuid) = entry.app_properties.get(CLIENT_OP_UUID_KEY) {
-            *by_uuid.entry(uuid.as_str()).or_insert(0) += 1;
-        }
-    }
-    let mut duplicate = false;
-    for (uuid, count) in &by_uuid {
-        if *count > 1 {
-            duplicate = true;
-            notes.push(format!(
-                "DUPLICATE: {count} live objects share client_op_uuid {uuid}"
-            ));
-        }
-    }
-
-    Ok((notes, !data_loss && !duplicate))
+    Ok((notes, report))
 }
 
 /// Pull `(src_root, state_db_path)` from a scenario's [`FixtureState`],
@@ -429,8 +399,8 @@ impl Scenario for HardlinkTwoPaths {
         handle.orchestrator.run_cycle(TickSource::Manual).await?;
 
         let live = live_object_count(&remote, &folder);
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "primary + hardlink both backed up independently (live objects={live}); DESIGN s5.2.1 documents bytes duplicated on Drive"
         ));
@@ -440,7 +410,8 @@ impl Scenario for HardlinkTwoPaths {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 2,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && live == 2,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -509,8 +480,8 @@ impl Scenario for SymlinkToFile {
         handle.orchestrator.run_cycle(TickSource::Manual).await?;
 
         let live = live_object_count(&remote, &folder);
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "symlink skipped per SymlinkPolicy::Skip; only the real target backed up (live objects={live}). Per-source follow toggle is V2."
         ));
@@ -522,7 +493,8 @@ impl Scenario for SymlinkToFile {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && live == 1,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -593,8 +565,8 @@ impl Scenario for SymlinkToDirectory {
         handle.orchestrator.run_cycle(TickSource::Manual).await?;
 
         let live = live_object_count(&remote, &folder);
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "directory symlink (-> ancestor) skipped, no infinite descent; real subtree backed up (live objects={live}). Follow-ON cycle detection is V2."
         ));
@@ -606,7 +578,8 @@ impl Scenario for SymlinkToDirectory {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && live == 1,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -680,8 +653,8 @@ impl Scenario for JunctionMklinkJ {
         handle.orchestrator.run_cycle(TickSource::Manual).await?;
 
         let live = live_object_count(&remote, &folder);
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "junction (reparse point) skipped; backing target not double-counted via the junction path (live objects={live})"
         ));
@@ -693,7 +666,8 @@ impl Scenario for JunctionMklinkJ {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && live == 1,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -773,8 +747,8 @@ impl Scenario for ReparsePointNonSymlink {
         handle.orchestrator.run_cycle(TickSource::Manual).await?;
 
         let live = live_object_count(&remote, &folder);
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "non-symlink reparse point reads transparently; file backed up (live objects={live})"
         ));
@@ -787,7 +761,8 @@ impl Scenario for ReparsePointNonSymlink {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && live == 1,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -860,8 +835,8 @@ impl Scenario for OnedrivePlaceholder {
         handle.orchestrator.run_cycle(TickSource::Manual).await?;
 
         let live = live_object_count(&remote, &folder);
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "hydrated file backed up normally (live objects={live})"
         ));
@@ -874,7 +849,8 @@ impl Scenario for OnedrivePlaceholder {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && live == 1,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -947,8 +923,8 @@ impl Scenario for RecursiveJunctionCycle {
         handle.orchestrator.run_cycle(TickSource::Manual).await?;
 
         let live = live_object_count(&remote, &folder);
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "junction cycle did not cause infinite descent; scan completed (live objects={live})"
         ));
@@ -960,7 +936,8 @@ impl Scenario for RecursiveJunctionCycle {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && live == 1,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -1035,8 +1012,8 @@ impl Scenario for CrossVolumeSymlink {
         handle.orchestrator.run_cycle(TickSource::Manual).await?;
 
         let live = live_object_count(&remote, &folder);
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "dangling cross-volume symlink skipped (not followed); real file backed up, no crash (live objects={live}). Follow-ON + unmounted-Y local.io_error path is V2."
         ));
@@ -1048,7 +1025,8 @@ impl Scenario for CrossVolumeSymlink {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && live == 1,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -1118,8 +1096,8 @@ impl Scenario for CrossVolumeLinkStaleAfterReassign {
         handle.orchestrator.run_cycle(TickSource::Manual).await?;
 
         let live = live_object_count(&remote, &folder);
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "file backed up before any reassignment (live objects={live}); identity is (source_id, relative_path), not drive letter"
         ));
@@ -1129,7 +1107,8 @@ impl Scenario for CrossVolumeLinkStaleAfterReassign {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty(),
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -1173,7 +1152,7 @@ impl Scenario for AdsAlternateDataStream {
         "ads-alternate-data-stream"
     }
     fn description(&self) -> &'static str {
-        "main stream backed up, ADS lost; local.ads_skipped not yet surfaced (V1 gap)"
+        "main stream backed up; named ADS not backed up but surfaced as a local.ads_skipped warning"
     }
     fn requires(&self) -> CapabilityRequirements {
         CapabilityRequirements::of(vec![Capability::Windows, Capability::NtfsVolume])
@@ -1185,12 +1164,13 @@ impl Scenario for AdsAlternateDataStream {
         let main = root.join("foo.txt");
         std::fs::write(&main, b"main-stream-content")?;
         // Write an alternate data stream via the `path:stream` Win32 naming
-        // (NTFS-only). A failure here is non-fatal: the gap being documented
-        // is the scanner's, not the fixture's.
+        // (NTFS-only). The scanner must detect this named stream and surface a
+        // local.ads_skipped warning; if the fixture write fails the scenario
+        // cannot exercise the detection, so surface that loudly below.
         #[cfg(windows)]
         {
             let ads_path = format!("{}:hidden", main.display());
-            let _ = std::fs::write(&ads_path, b"secret-ads-bytes");
+            std::fs::write(&ads_path, b"secret-ads-bytes")?;
         }
 
         ctx.fixture_root = root.to_path_buf();
@@ -1208,22 +1188,34 @@ impl Scenario for AdsAlternateDataStream {
         handle.orchestrator.run_cycle(TickSource::Manual).await?;
 
         let live = live_object_count(&remote, &folder);
+        // P1-D: the scanner now enumerates named NTFS data streams
+        // (FindFirstStreamW) and the orchestrator writes a durable
+        // local.ads_skipped WARNING activity row per affected file. The win
+        // condition is that the named stream loss is SURFACED, not silent.
         let saw_ads =
             saw_error_code(handle.state.as_ref(), source_id, ErrorCode::LocalAdsSkipped).await?;
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
-            "main stream backed up (live objects={live}); ADS silently lost. local.ads_skipped surfaced={saw_ads} - V1 has no ADS enumeration, so the code is defined but never emitted (documented gap)."
+            "main stream backed up (live objects={live}); named ADS not backed up but local.ads_skipped surfaced={saw_ads} (P1-D: scanner enumerates streams, orchestrator emits the warning - the loss is visible, not silent)."
         ));
-        if live < 1 {
-            notes.push("expected the main stream to be backed up".to_string());
-        }
-        // Honest: error_codes_seen stays empty - the V1 core surfaces no code
-        // for this hazard. We do NOT claim local.ads_skipped was seen.
+        anyhow::ensure!(
+            live >= 1,
+            "the main (unnamed) stream must still be backed up; got {live} live objects"
+        );
+        // The defining assertion: the named-stream skip MUST be surfaced as a
+        // local.ads_skipped warning (SPEC s24). A false here means the scanner
+        // silently dropped the ADS - exactly the silent data loss P1-D closes.
+        anyhow::ensure!(
+            saw_ads,
+            "local.ads_skipped must be surfaced for a file carrying named NTFS data streams; \
+             the scanner did not emit it (silent ADS loss regression)"
+        );
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live >= 1,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty() && live >= 1,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -1232,6 +1224,9 @@ impl Scenario for AdsAlternateDataStream {
         Ok(())
     }
     fn expected_outcome(&self) -> ExpectedOutcome {
+        // The main stream backs up cleanly and the named-stream skip is
+        // surfaced as a warning (not an error code), so the row documents the
+        // V1 ADS behaviour and asserts the warning inline above.
         ExpectedOutcome::DocumentedBehaviour
     }
 }
@@ -1296,8 +1291,8 @@ impl Scenario for SparseFile {
         let live = live_object_count(&remote, &folder);
         let synced = synced_count(handle.state.as_ref(), source_id).await?;
         let errors = error_level_activity_count(handle.state.as_ref(), source_id).await?;
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "sparse file uploaded its full logical content (synced rows={synced}, live objects={live}, error rows={errors}); size-on-Drive == logical size, larger than size-on-disk (documented skew)"
         ));
@@ -1307,7 +1302,10 @@ impl Scenario for SparseFile {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1 && errors == 0,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty()
+                && live == 1
+                && errors == 0,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -1387,8 +1385,8 @@ impl Scenario for CompressedNtfsFile {
         let live = live_object_count(&remote, &folder);
         let synced = synced_count(handle.state.as_ref(), source_id).await?;
         let errors = error_level_activity_count(handle.state.as_ref(), source_id).await?;
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "compressed file read as plaintext and uploaded decompressed (synced rows={synced}, error rows={errors})"
         ));
@@ -1398,7 +1396,10 @@ impl Scenario for CompressedNtfsFile {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1 && errors == 0,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty()
+                && live == 1
+                && errors == 0,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -1476,8 +1477,8 @@ impl Scenario for EncryptedNtfsEfs {
         let live = live_object_count(&remote, &folder);
         let synced = synced_count(handle.state.as_ref(), source_id).await?;
         let errors = error_level_activity_count(handle.state.as_ref(), source_id).await?;
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "same-user EFS file uploaded after transparent decrypt (synced rows={synced}, error rows={errors}); different-user local.io_error path needs a second principal + EncryptFile, documented not exercised"
         ));
@@ -1487,7 +1488,10 @@ impl Scenario for EncryptedNtfsEfs {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1 && errors == 0,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty()
+                && live == 1
+                && errors == 0,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -1564,8 +1568,8 @@ impl Scenario for HiddenSystemAttributes {
         let live = live_object_count(&remote, &folder);
         let synced = synced_count(handle.state.as_ref(), source_id).await?;
         let errors = error_level_activity_count(handle.state.as_ref(), source_id).await?;
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "hidden+system file backed up (synced rows={synced}, error rows={errors}); ignore honours hidden(false) per SPEC s6"
         ));
@@ -1575,7 +1579,10 @@ impl Scenario for HiddenSystemAttributes {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && live == 1 && errors == 0,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty()
+                && live == 1
+                && errors == 0,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }
@@ -1655,8 +1662,8 @@ impl Scenario for FileIdReuseAfterDefrag {
             .map_err(|e| anyhow::anyhow!("rel beta: {e}"))?;
         let both_present = rows.contains_key(&alpha) && rows.contains_key(&beta);
 
-        let (mut notes, hash_ok) =
-            check_shared_invariants(handle.state.as_ref(), &remote, source_id, &folder).await?;
+        let (mut notes, inv_report) =
+            check_shared_invariants(&handle, &remote, source_id, &folder).await?;
         notes.push(format!(
             "two distinct paths remain two distinct rows/objects (live objects={live}, both keys present={both_present}); identity is (source_id, relative_path), inode never consulted"
         ));
@@ -1666,7 +1673,10 @@ impl Scenario for FileIdReuseAfterDefrag {
         Ok(Outcome {
             error_codes_seen: vec![],
             final_drive_object_count: live,
-            final_hash_matches_local: hash_ok && both_present && live == 2,
+            final_hash_matches_local: inv_report.data_loss_paths.is_empty()
+                && both_present
+                && live == 2,
+            invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
     }

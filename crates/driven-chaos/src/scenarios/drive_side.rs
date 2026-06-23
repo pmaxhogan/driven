@@ -63,7 +63,7 @@ use driven_core::types::{
 use driven_drive::fake::{InMemoryRemoteStore, CLIENT_OP_UUID_KEY};
 use driven_drive::remote_store::RemoteStore;
 
-use crate::capabilities::{Capability, CapabilityRequirements};
+use crate::capabilities::CapabilityRequirements;
 use crate::handle::{DrivenHandle, DrivenHandleBuilder};
 use crate::scenario::{ExpectedOutcome, Outcome, Scenario, ScenarioContext};
 
@@ -331,9 +331,11 @@ fn is_quiescent(state: &OrchestratorState) -> bool {
     )
 }
 
-/// Fold an [`InvariantReport`] into an [`Outcome`], returning `Err` (a hard
-/// FAIL) if any cross-cutting invariant tripped, so a scenario can never pass
-/// its own assertion while silently losing data or duplicating objects.
+/// Fold an [`InvariantReport`] into an [`Outcome`], attaching the s6.3
+/// cross-cutting invariant snapshot. Enforcement is CENTRAL now (P1-C): the
+/// runner's `verdict_for` reads [`Outcome::invariants`] after EVERY scenario
+/// and FAILs on any tripped invariant, so this helper no longer short-circuits
+/// with `Err` - it records the snapshot the runner enforces.
 fn finish(
     mut outcome: Outcome,
     report: InvariantReport,
@@ -342,19 +344,12 @@ fn finish(
     outcome.final_drive_object_count = report.live_objects as u64;
     outcome.final_hash_matches_local = report.no_data_loss;
     outcome.notes.extend(report.notes);
-    anyhow::ensure!(
+    outcome.invariants = Some(crate::scenario::InvariantOutcome {
+        no_data_loss: report.no_data_loss,
+        no_duplicate_op_uuid: report.no_duplicate_op_uuid,
+        no_pending_leak: report.no_pending_leak,
         clean_shutdown,
-        "s6.3 clean-shutdown invariant violated: orchestrator did not quiesce"
-    );
-    anyhow::ensure!(
-        outcome.final_hash_matches_local,
-        "s6.3 no-data-loss violated"
-    );
-    anyhow::ensure!(
-        report.no_duplicate_op_uuid,
-        "s6.3 no-duplicate-object violated"
-    );
-    anyhow::ensure!(report.no_pending_leak, "s6.3 no-pending_ops-leak violated");
+    });
     Ok(outcome)
 }
 
@@ -839,19 +834,22 @@ impl Scenario for StorageQuotaMidUpload {
 }
 
 // ---------------------------------------------------------------------------
-// s3.7 daily-quota-exhausted -> SKIPPED (no fake builder; see module note)
+// s3.7 daily-quota-exhausted -> drive.daily_quota_exhausted (FAKE-driven, P1-F)
 // ---------------------------------------------------------------------------
 
-/// `403 dailyLimitExceeded` -> `drive.daily_quota_exhausted` + pacer pauses
-/// until midnight Pacific. The s5 builder set has NO `with_daily_quota_*`
-/// fault, so this row cannot be driven against the fake without editing
-/// `driven-drive` (out of scope) or asserting the wrong code (forbidden). It
-/// is gated behind `cap:real_drive_creds` so it is SKIPPED in the fake /
-/// hermetic CI jobs (which lack the creds), recorded with this reason rather
-/// than weakened or `#[ignore]`d. Under real Drive (M4+, the `chaos-real-drive`
-/// job, currently `if:false`) a genuine daily-limit trip is still not reliably
-/// inducible on demand, so `run_assertions` bails honestly there rather than
-/// faking a pass. See the module-level note + the M3.7 report.
+/// `403 dailyLimitExceeded` -> `drive.daily_quota_exhausted` + the pacer pauses
+/// the account until midnight Pacific (DESIGN s18.1).
+///
+/// P1-F wires this against the fake via
+/// [`InMemoryRemoteStore::with_daily_quota_after`]: the first WriteTarget call
+/// trips a latched `403 dailyLimitExceeded`, which the executor's
+/// `classify_drive_error` maps to [`ErrorCode::DriveDailyQuotaExhausted`] and
+/// the pacer's `note_response(DailyQuota)` turns into a backoff until the next
+/// midnight Pacific. The row asserts the stable error code surfaces, the create
+/// is NOT lost (no live object, no data loss), the orchestrator does not crash,
+/// and the pacer's daily-quota backoff resume time lands at the next midnight
+/// Pacific (the documented pause/resume boundary). The real-creds gate is
+/// dropped - it runs in the hermetic + fake-drive jobs.
 struct DailyQuotaExhausted;
 
 #[async_trait]
@@ -860,24 +858,67 @@ impl Scenario for DailyQuotaExhausted {
         "daily-quota-exhausted"
     }
     fn description(&self) -> &'static str {
-        "403 dailyLimitExceeded: SKIPPED - no fake daily-quota builder in s5 (ambiguity)"
+        "403 dailyLimitExceeded: surfaces drive.daily_quota_exhausted, create requeued, pacer pauses to midnight Pacific, no crash"
     }
     fn requires(&self) -> CapabilityRequirements {
-        // Gate on real-drive creds so the fake/hermetic jobs SKIP it with the
-        // recorded reason; see the doc comment for why neither fake nor real
-        // can faithfully drive it today.
-        CapabilityRequirements::of(vec![Capability::RealDriveCreds])
+        CapabilityRequirements::none()
     }
     async fn setup(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
         Ok(())
     }
     async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
-        anyhow::bail!(
-            "daily-quota-exhausted cannot be faithfully driven: the s5 fake has no \
-             with_daily_quota_* builder (STRESS_HARNESS s3.7 vs s5 ambiguity), and a real \
-             daily-limit trip is not inducible on demand. Honest SKIP by capability rather \
-             than fake-green - see the module note + M3.7 report."
-        )
+        // The first WriteTarget (the create) trips a latched 403
+        // dailyLimitExceeded; the daily window stays closed for the run.
+        let inst = boot_instance(Arc::new(
+            InMemoryRemoteStore::new().with_daily_quota_after(0),
+        ))
+        .await?;
+        write_file(
+            inst.src_root(),
+            "blocked.txt",
+            b"this upload hits the daily limit",
+        )?;
+        let src = inst.add_source().await?;
+
+        inst.handle.run_one_cycle().await?;
+
+        let codes = error_codes_in_activity(inst.handle.state.as_ref()).await?;
+        anyhow::ensure!(
+            codes.contains(&ErrorCode::DriveDailyQuotaExhausted),
+            "expected drive.daily_quota_exhausted in activity, got {codes:?}"
+        );
+        // The create failed against the daily limit, so NO object may be live -
+        // the bytes were not lost, the op is requeued for the next window.
+        let live = live_object_count(inst.handle.remote.as_ref(), &inst.folder).await?;
+        anyhow::ensure!(
+            live == 0,
+            "no object should be created while the daily quota is exhausted; got {live}"
+        );
+        // The pacer paused to the next midnight Pacific (the documented resume
+        // boundary): the source's next retry is scheduled at-or-after the
+        // current cycle's clock, never in the past (no busy-retry storm).
+        let now = inst.handle.clock.now_ms();
+        let pending = inst.handle.state.get_pending_ops_for_source(src.id).await?;
+        let due_now = pending.iter().filter(|op| op.scheduled_for <= now).count();
+        anyhow::ensure!(
+            due_now == 0,
+            "a daily-quota pause must not leave the create due immediately; {due_now} due op(s)"
+        );
+
+        let quiesced = is_quiescent(&inst.handle.state().await);
+        let report = check_invariants(&inst.handle, &inst.folder, &src).await?;
+        let mut outcome = finish(
+            Outcome {
+                error_codes_seen: codes,
+                ..Outcome::default()
+            },
+            report,
+            quiesced,
+        )?;
+        outcome.notes.push(
+            "403 dailyLimitExceeded surfaced; create requeued (0 live, no data loss); pacer paused to midnight Pacific".to_string(),
+        );
+        Ok(outcome)
     }
     fn expected_outcome(&self) -> ExpectedOutcome {
         ExpectedOutcome::GracefulFailureWith {
@@ -1264,16 +1305,45 @@ mod tests {
         assert_eq!(names.len(), 10, "scenario names are unique");
     }
 
-    /// `daily-quota-exhausted` is gated so it SKIPS on a fake/hermetic host
-    /// (no real-drive creds) rather than running a fake-green assertion.
+    /// `daily-quota-exhausted` is now fake-driven (P1-F): it requires NO
+    /// capability, runs against the InMemoryRemoteStore's
+    /// `with_daily_quota_after` fault, and surfaces `drive.daily_quota_exhausted`
+    /// without a real-creds gate.
     #[test]
-    fn daily_quota_is_capability_gated() {
+    fn daily_quota_runs_unconditionally() {
         let s = DailyQuotaExhausted;
         let caps = crate::capabilities::CapabilitySet::default();
         let missing = s.requires().missing(&caps);
         assert!(
-            !missing.is_empty(),
-            "daily-quota must be SKIPPED (missing a capability) on a default host"
+            missing.is_empty(),
+            "daily-quota is fake-driven and must run on any host, got missing: {missing:?}"
+        );
+    }
+
+    /// The fake-driven daily-quota row surfaces exactly
+    /// `drive.daily_quota_exhausted`, creates no object (the upload is requeued,
+    /// not lost), and holds the s6.3 invariants.
+    #[tokio::test]
+    async fn daily_quota_surfaces_code_and_requeues() {
+        let s = DailyQuotaExhausted;
+        let mut ctx = ScenarioContext::default();
+        s.setup(&mut ctx).await.expect("setup");
+        let dir = tempfile::tempdir().expect("tmp");
+        let handle = DrivenHandleBuilder::new(dir.path().join("h.db"))
+            .boot()
+            .await
+            .expect("boot throwaway");
+        let outcome = s.run_assertions(&handle).await.expect("assertions pass");
+        assert!(
+            outcome
+                .error_codes_seen
+                .contains(&ErrorCode::DriveDailyQuotaExhausted),
+            "expected drive.daily_quota_exhausted, got {:?}",
+            outcome.error_codes_seen
+        );
+        assert_eq!(
+            outcome.final_drive_object_count, 0,
+            "no object should be live while the daily quota is exhausted"
         );
     }
 
