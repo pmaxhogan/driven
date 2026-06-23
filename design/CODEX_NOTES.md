@@ -416,3 +416,49 @@ To bound GitHub Actions spend, the Chaos workflow deviates from the ROADMAP
   row still runs in the per-PR sweep.
 This is a deliberate cost/coverage trade, recorded here so the deviation from the
 locked ROADMAP acceptance is explicit and intentional, not an oversight.
+
+## M4 codex review - accepted residuals / deferrals
+
+The M4 codex xhigh review (baseline 6099da5; file
+`.claude/codex-reviews/M4-20260623-161005.md`) plus the in-workflow verify pass
+produced 12 fixes (all landed this milestone) and 3 items that are NOT bugs in
+M4 but assembly-gated seams or explicit V1 scope boundaries. The seams below are
+BUILT and unit-tested in M4; M5 (the prod-shell assembly that wires the crypto
+suite + keystore + orchestrator + executor + GoogleDriveStore into a running
+binary) ACTIVATES them. Documented here honestly so the deferral is tracked, not
+an oversight.
+
+- **V-F - `needs_reauth` account-state transition (activated M5).** The refresh
+  path classifies an `invalid_grant` as
+  `DriveErrorClassification::AuthInvalidGrant` and the executor maps that to a
+  fatal `auth.invalid_grant` op outcome (`AuthInvalidGrant`). What is NOT wired
+  yet: nothing calls `mark_account_state(NeedsReauth)` / emits
+  `account:needs_reauth`, because no production binary assembles
+  orchestrator+executor+GoogleDriveStore (src-tauri is the M0 skeleton; the CLI
+  bypasses the executor). The condition is fully SURFACED for the M5 shell to act
+  on; M5 performs the account-state transition. The token_store.rs module + type
+  docs were reworded this milestone to stop claiming the transition happens
+  today (they now say "surfaced for the M5 shell to act on").
+- **V-G - breaker-from-outcomes activation (activated M5).** The
+  `BreakerReportingStore` decorator + `ExecutorDeps.network` seam are built and
+  unit-tested (the `breaker_from_outcomes` test module drives a real
+  `StdCircuitBreaker` through the decorator). The decorator is only inserted when
+  the executor is constructed with `network = Some(probe)`, which today only the
+  executor tests pass; the M5 prod executor assembly passes
+  `network = Some(ReqwestBackend-backed probe)`. Wired-and-tested in M4,
+  activated at M5.
+- **C-P2-2 - Shared Drive destinations are V1 out-of-scope (V2).** Drive listing
+  is `corpora=user` / `spaces=drive` and the store sets no
+  `supportsAllDrives` / `includeItemsFromAllDrives` params. V1 targets the user's
+  personal My Drive ("Drive-on-My-Drive", per the `remote_store.rs` `RemoteEntry`
+  doc + DESIGN). Shared Drive destinations (threading a shared-drive id through
+  list/create/update/trash/metadata/resumable) are a deliberate V2 feature, not
+  an M4 bug. The `pagination.rs` `corpora=user` comment already notes the V1
+  scope; this records it as an explicit, accepted boundary.
+
+Note: the optional `hickory-resolver` DNS escalation (DESIGN s5.8.5 "custom
+resolution if we discover OS resolver pathologies in the field") was dropped from
+the dependency tree in M4 to clear RUSTSEC-2026-0119 (hickory-proto name
+compression). The DNS probe now uses `tokio::net::lookup_host` per DESIGN s5.8.1
+(which was always the specified primary path); hickory remains the documented V2
+escalation option if a field need arises, to be re-added behind a feature then.
