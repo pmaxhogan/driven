@@ -40,10 +40,12 @@ parking_lot = "0.12"
 md-5 = "0.10"
 
 [dev-dependencies]
-# Workspace tokio already enables the "full" feature set (macros +
-# rt-multi-thread); re-state the dep so dev-only tests link cleanly
-# even if a future refactor narrows the runtime-deps feature list.
-tokio.workspace = true
+# The retry-backoff unit tests use `#[tokio::test(start_paused = true)]` to
+# fast-forward the exponential backoff sleeps, which requires tokio's
+# `test-util` feature. Enable it explicitly here so `cargo test -p
+# driven-drive` is self-contained and does not silently rely on workspace
+# feature unification (another crate happening to turn `test-util` on).
+tokio = { workspace = true, features = ["test-util"] }
 futures.workspace = true
 bytes.workspace = true
 # The md5_mismatch contract test recomputes the real md5 of its payload
