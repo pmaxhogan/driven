@@ -3269,7 +3269,12 @@ fn filetime_to_unix_ns(filetime_100ns: u64) -> i64 {
 
 /// Error opening the source file for read.
 enum OpenError {
-    /// Sharing violation / lock (Windows) -> `local.file_locked` skip.
+    /// Sharing violation / lock (Windows) -> `local.file_locked` skip. P2-F:
+    /// constructed ONLY on Windows (a sharing/lock-violation raw OS error); off
+    /// Windows there is no such lock concept, so the variant is never built
+    /// there - but the match arms that handle it are shared cross-platform, so
+    /// the variant stays and the off-Windows dead-code lint is suppressed.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Locked,
     /// Any other IO error.
     Io(std::io::Error),
