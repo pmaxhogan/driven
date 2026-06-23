@@ -22,6 +22,7 @@
 //!   (SSRF defence via the OAuth server).
 
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
+use std::time::Duration;
 
 use oauth2::basic::BasicClient;
 use oauth2::{
@@ -44,6 +45,18 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
 /// The Drive scope Driven requests (full Drive access; SPEC s4).
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
+
+/// Connect timeout for the code-exchange client (DESIGN s5.8.4; codex V-A1).
+const EXCHANGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total-request timeout for the code-exchange client (DESIGN s5.8.4; V-A1).
+const EXCHANGE_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// Overall ceiling on waiting for the loopback redirect (codex C-P2-3). If the
+/// user never completes (or never reaches) the consent screen, the wizard must
+/// not hang forever - it surfaces a timeout error after this. Generous so a
+/// human reading the consent screen + signing in has ample time.
+const WAIT_FOR_CODE_TIMEOUT: Duration = Duration::from_secs(300);
 
 /// The loopback callback path the redirect URI registers.
 const CALLBACK_PATH: &str = "/oauth/callback";
@@ -105,9 +118,13 @@ pub async fn run_pkce_loopback_flow(
     let expected_host = format!("127.0.0.1:{port}");
 
     // A redirect-disabled reqwest client (SSRF defence via the OAuth server;
-    // SPEC s4 / oauth2 v5 upgrade notes).
+    // SPEC s4 / oauth2 v5 upgrade notes) with bounded connect/total timeouts
+    // (DESIGN s5.8.4; codex V-A1) so a hung token endpoint cannot stall the
+    // code exchange indefinitely.
     let http = reqwest::Client::builder()
         .redirect(reqwest::redirect::Policy::none())
+        .connect_timeout(EXCHANGE_CONNECT_TIMEOUT)
+        .timeout(EXCHANGE_TOTAL_TIMEOUT)
         .build()?;
 
     let client = BasicClient::new(ClientId::new(client_id.to_string()))
@@ -208,6 +225,21 @@ async fn bind_dual_loopback() -> anyhow::Result<(TcpListener, Option<TcpListener
     Ok((listener_v4, listener_v6, port))
 }
 
+/// The outcome of handling one accepted loopback connection.
+enum CallbackOutcome {
+    /// A valid callback carrying the authorization code (success page served).
+    Code(String),
+    /// A request we answered but that carried no valid code (bad
+    /// path/host/state, or a transport read glitch): keep listening for the
+    /// real redirect.
+    Retry,
+    /// The OAuth PROVIDER reported an error on the callback (e.g. the user
+    /// clicked Deny -> `error=access_denied`). This is FATAL: the flow cannot
+    /// succeed, so we stop waiting and surface it instead of looping forever
+    /// (codex C-P2-3).
+    ProviderError(String),
+}
+
 /// Runs the one-shot loopback HTTP handler on both listeners and returns the
 /// authorization code (SPEC s4).
 ///
@@ -217,54 +249,77 @@ async fn bind_dual_loopback() -> anyhow::Result<(TcpListener, Option<TcpListener
 /// `localhost:<port>` even over the v6 socket; SPEC s4 DNS-rebinding defence),
 /// serves a "you can close this tab" page, returns the code, and shuts both
 /// listeners down. Hand-rolled with plain `tokio` (no axum; SPEC s1 layout).
+///
+/// Robustness (codex C-P2-3): the whole wait is bounded by
+/// [`WAIT_FOR_CODE_TIMEOUT`] so it cannot hang regardless of input, and a
+/// PROVIDER error on the callback (the user clicked Deny ->
+/// `error=access_denied`) returns a fatal auth error immediately rather than
+/// looping. A stray probe / malformed request is still answered and ignored.
 async fn wait_for_code(
     listener_v4: TcpListener,
     listener_v6: Option<TcpListener>,
     expected_state: &str,
     expected_host: &str,
 ) -> anyhow::Result<String> {
-    // Accept connections on both sockets until one yields a valid callback.
-    // A connection that fails validation is answered with the right HTTP
-    // error and we keep waiting (a stray probe should not abort the flow).
-    loop {
-        let accepted = match &listener_v6 {
-            Some(v6) => {
-                tokio::select! {
-                    r = listener_v4.accept() => r,
-                    r = v6.accept() => r,
+    let accept_loop = async {
+        loop {
+            let accepted = match &listener_v6 {
+                Some(v6) => {
+                    tokio::select! {
+                        r = listener_v4.accept() => r,
+                        r = v6.accept() => r,
+                    }
+                }
+                None => listener_v4.accept().await,
+            };
+            let (stream, _peer) = match accepted {
+                Ok(pair) => pair,
+                Err(e) => {
+                    warn!(target: TARGET, error = %e, "loopback accept failed; retrying");
+                    continue;
+                }
+            };
+            match handle_one_connection(stream, expected_state, expected_host).await {
+                Ok(CallbackOutcome::Code(code)) => return Ok(code),
+                // A request we answered (bad state/host/path) but that did not
+                // carry a valid code: keep listening for the real redirect.
+                Ok(CallbackOutcome::Retry) => continue,
+                // The user denied consent (or the provider reported an error):
+                // fatal, stop waiting (C-P2-3).
+                Ok(CallbackOutcome::ProviderError(err)) => {
+                    return Err(anyhow::anyhow!("oauth: authorization denied: {err}"));
+                }
+                Err(e) => {
+                    warn!(target: TARGET, error = %e, "loopback connection error; retrying");
+                    continue;
                 }
             }
-            None => listener_v4.accept().await,
-        };
-        let (stream, _peer) = match accepted {
-            Ok(pair) => pair,
-            Err(e) => {
-                warn!(target: TARGET, error = %e, "loopback accept failed; retrying");
-                continue;
-            }
-        };
-        match handle_one_connection(stream, expected_state, expected_host).await {
-            Ok(Some(code)) => return Ok(code),
-            // A request we answered (bad state/host/path) but that did not
-            // carry a valid code: keep listening for the real redirect.
-            Ok(None) => continue,
-            Err(e) => {
-                warn!(target: TARGET, error = %e, "loopback connection error; retrying");
-                continue;
-            }
         }
+    };
+
+    // Bound the overall wait so a consent screen that is never completed (or a
+    // browser that never redirects back) cannot hang the wizard forever
+    // (C-P2-3).
+    match tokio::time::timeout(WAIT_FOR_CODE_TIMEOUT, accept_loop).await {
+        Ok(result) => result,
+        Err(_elapsed) => Err(anyhow::anyhow!(
+            "oauth: timed out after {WAIT_FOR_CODE_TIMEOUT:?} waiting for the browser redirect; \
+             no authorization code received"
+        )),
     }
 }
 
-/// Handles a single accepted loopback connection. Returns `Ok(Some(code))` on
-/// a valid callback (after serving the success page), `Ok(None)` when the
-/// request was answered but carried no valid code (bad path/host/state/error),
-/// or `Err` on an I/O failure reading the request.
+/// Handles a single accepted loopback connection. Returns
+/// [`CallbackOutcome::Code`] on a valid callback (after serving the success
+/// page), [`CallbackOutcome::ProviderError`] when the provider reported an
+/// error (e.g. the user clicked Deny), [`CallbackOutcome::Retry`] when the
+/// request was answered but carried no valid code (bad path/host/state), or
+/// `Err` on an I/O failure reading the request.
 async fn handle_one_connection(
     mut stream: tokio::net::TcpStream,
     expected_state: &str,
     expected_host: &str,
-) -> anyhow::Result<Option<String>> {
+) -> anyhow::Result<CallbackOutcome> {
     // Read the request head (we only need the request line + headers; the
     // callback is a GET with no body). Bound the read so a malicious client
     // cannot make us buffer unboundedly.
@@ -308,7 +363,7 @@ async fn handle_one_connection(
             "Invalid Host. This callback only accepts the registered loopback address.",
         )
         .await?;
-        return Ok(None);
+        return Ok(CallbackOutcome::Retry);
     }
 
     if method != "GET" || !path_is_callback(target) {
@@ -319,17 +374,36 @@ async fn handle_one_connection(
             "Not the OAuth callback path.",
         )
         .await?;
-        return Ok(None);
+        return Ok(CallbackOutcome::Retry);
     }
 
     let query = target.split_once('?').map(|(_, q)| q).unwrap_or("");
     let params = parse_query(query);
 
-    // An OAuth error redirect carries `error=access_denied` etc.
+    // An OAuth error redirect carries `error=access_denied` etc. This is the
+    // provider telling us the flow failed (e.g. the user clicked Deny). It is
+    // FATAL - returning Retry here would hang the wizard forever (codex
+    // C-P2-3). We still validate state first so a forged error from an
+    // attacker tab cannot abort a legitimate flow.
     if let Some(err) = params.get("error") {
+        let state = params.get("state").map(String::as_str).unwrap_or("");
+        if !constant_time_eq(state.as_bytes(), expected_state.as_bytes()) {
+            warn!(
+                target: TARGET,
+                "ignoring OAuth error callback with mismatched CSRF state"
+            );
+            write_response(
+                &mut stream,
+                400,
+                "Bad Request",
+                "State mismatch (CSRF). The authorization could not be verified.",
+            )
+            .await?;
+            return Ok(CallbackOutcome::Retry);
+        }
         let msg = format!("Authorization failed: {err}");
         write_response(&mut stream, 200, "OK", &page_html(&msg, false)).await?;
-        return Err(anyhow::anyhow!("oauth: authorization denied: {err}"));
+        return Ok(CallbackOutcome::ProviderError(err.clone()));
     }
 
     let state = params.get("state").map(String::as_str).unwrap_or("");
@@ -342,7 +416,7 @@ async fn handle_one_connection(
             "State mismatch (CSRF). The authorization could not be verified.",
         )
         .await?;
-        return Ok(None);
+        return Ok(CallbackOutcome::Retry);
     }
 
     let code = match params.get("code") {
@@ -355,7 +429,7 @@ async fn handle_one_connection(
                 "Missing authorization code.",
             )
             .await?;
-            return Ok(None);
+            return Ok(CallbackOutcome::Retry);
         }
     };
 
@@ -370,7 +444,7 @@ async fn handle_one_connection(
         ),
     )
     .await?;
-    Ok(Some(code))
+    Ok(CallbackOutcome::Code(code))
 }
 
 /// Whether the request target's path equals the callback path (ignoring the
@@ -671,6 +745,74 @@ mod tests {
         );
 
         // Then a correct-Host valid callback succeeds.
+        let mut good = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let good_req = format!(
+            "GET /oauth/callback?code=real-code&state=good-state HTTP/1.1\r\nHost: {expected_host}\r\nConnection: close\r\n\r\n"
+        );
+        good.write_all(good_req.as_bytes()).await.unwrap();
+        let mut good_resp = Vec::new();
+        good.read_to_end(&mut good_resp).await.unwrap();
+
+        let code = server.await.unwrap().unwrap();
+        assert_eq!(code, "real-code");
+    }
+
+    /// The user clicks Deny: the callback carries `error=access_denied` with a
+    /// valid state. `wait_for_code` must return an Err (fatal) rather than
+    /// hang forever (codex C-P2-3). The handler still serves a 200 error page.
+    #[tokio::test]
+    async fn wait_for_code_denied_returns_error_not_hang() {
+        let (v4, v6, port) = bind_dual_loopback().await.unwrap();
+        let expected_host = format!("127.0.0.1:{port}");
+        let host = expected_host.clone();
+
+        let server = tokio::spawn(async move { wait_for_code(v4, v6, "good-state", &host).await });
+
+        let mut deny = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let deny_req = format!(
+            "GET /oauth/callback?error=access_denied&state=good-state HTTP/1.1\r\nHost: {expected_host}\r\nConnection: close\r\n\r\n"
+        );
+        deny.write_all(deny_req.as_bytes()).await.unwrap();
+        let mut deny_resp = Vec::new();
+        deny.read_to_end(&mut deny_resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&deny_resp).contains("200 OK"));
+
+        let result = server.await.unwrap();
+        let err = result.expect_err("deny must surface a fatal error, not a code");
+        assert!(
+            err.to_string().contains("access_denied"),
+            "error must name the provider denial: {err}"
+        );
+    }
+
+    /// An `error=` callback with a MISMATCHED state is treated as a stray /
+    /// forged request: the handler answers 400 and keeps waiting, so a later
+    /// valid callback still succeeds (a forged deny cannot abort the flow).
+    #[tokio::test]
+    async fn wait_for_code_ignores_denied_with_bad_state() {
+        let (v4, v6, port) = bind_dual_loopback().await.unwrap();
+        let expected_host = format!("127.0.0.1:{port}");
+        let host = expected_host.clone();
+
+        let server = tokio::spawn(async move { wait_for_code(v4, v6, "good-state", &host).await });
+
+        // Forged error with wrong state -> 400, keep waiting.
+        let mut bad = tokio::net::TcpStream::connect(("127.0.0.1", port))
+            .await
+            .unwrap();
+        let bad_req = format!(
+            "GET /oauth/callback?error=access_denied&state=WRONG HTTP/1.1\r\nHost: {expected_host}\r\nConnection: close\r\n\r\n"
+        );
+        bad.write_all(bad_req.as_bytes()).await.unwrap();
+        let mut bad_resp = Vec::new();
+        bad.read_to_end(&mut bad_resp).await.unwrap();
+        assert!(String::from_utf8_lossy(&bad_resp).contains("400"));
+
+        // Then a valid callback still succeeds.
         let mut good = tokio::net::TcpStream::connect(("127.0.0.1", port))
             .await
             .unwrap();

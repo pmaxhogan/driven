@@ -5,8 +5,14 @@
 //! token lives in memory and is regenerated on demand. [`KeyringTokenStore`]
 //! is the keychain wrapper; [`RefreshingTokenSource`] holds the in-memory
 //! [`Tokens`] plus the OAuth client and refreshes when the access token is
-//! within 60s of expiry, marking the account `needs_reauth` on an
-//! `invalid_grant` (SPEC s24 `auth.invalid_grant`).
+//! within 60s of expiry. On an `invalid_grant` it returns a classified
+//! [`super::DriveError`] carrying
+//! [`crate::remote_store::DriveErrorClassification::AuthInvalidGrant`] (SPEC
+//! s24 `auth.invalid_grant`) - this SURFACES the condition for the M5 prod
+//! shell to act on (move the account to `needs_reauth` / emit
+//! `account:needs_reauth`); no production binary assembles the
+//! orchestrator+executor+store yet, so nothing performs that account-state
+//! transition today (codex V-F; tracked in design/CODEX_NOTES.md).
 //!
 //! ## Testability note (keyring 4.1.2 / keyring-core 1.0.0)
 //!
@@ -26,6 +32,7 @@
 //! `driven-crypto::keystore`.
 
 use std::sync::Arc;
+use std::time::Duration;
 
 use keyring::Entry;
 use serde::Deserialize;
@@ -46,6 +53,16 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 /// Refresh when the access token is within this many seconds of expiry
 /// (SPEC s4.1 "refreshes when `expires_at - now < 60s`").
 const REFRESH_SKEW_SECS: i64 = 60;
+
+/// Connect timeout for the OAuth refresh client (DESIGN s5.8.4). The refresh
+/// holds the token mutex across the await, so a black-holed token endpoint
+/// would otherwise wedge EVERY Drive request indefinitely (codex V-A1).
+const REFRESH_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
+
+/// Total-request timeout for the OAuth refresh client (DESIGN s5.8.4). Bounds
+/// the mutex-hold so a hung token endpoint cannot stall Drive traffic past
+/// this window (codex V-A1).
+const REFRESH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 
 /// Keychain wrapper for an account's Google refresh token (SPEC s4.1).
 ///
@@ -151,20 +168,32 @@ struct OAuthErrorResponse {
 /// `grant_type=refresh_token` to the Google token endpoint. An
 /// `invalid_grant` response surfaces as a [`super::DriveError::Classified`]
 /// carrying [`crate::remote_store::DriveErrorClassification::AuthInvalidGrant`]
-/// so the executor moves the account to `needs_reauth` (SPEC s24
-/// `auth.invalid_grant`). The current [`Tokens`] are held behind an async
+/// (SPEC s24 `auth.invalid_grant`); the M5 prod shell acts on it (move the
+/// account to `needs_reauth`). The current [`Tokens`] are held behind an async
 /// [`Mutex`] so concurrent Drive requests share one refresh.
+///
+/// If a [`KeyringTokenStore`] is wired (via [`Self::with_store`]) and Google
+/// ROTATES the refresh token on a refresh, the new token is persisted to the
+/// keychain BEFORE the in-memory swap so a restart reloads the live token, not
+/// the stale one (codex C-P2-4 / V-A3). When no store is wired (the CLI debug
+/// path), the rotated token is adopted in memory only - acceptable because
+/// Google does not rotate installed-app refresh tokens in practice.
 #[derive(Clone)]
 pub struct RefreshingTokenSource {
     inner: Arc<Mutex<Tokens>>,
     http: reqwest::Client,
     client_id: String,
     client_secret: String,
+    /// Optional keychain store for persisting a rotated refresh token
+    /// (C-P2-4 / V-A3). `None` on the no-store contract / CLI debug path.
+    store: Option<Arc<KeyringTokenStore>>,
 }
 
 impl RefreshingTokenSource {
     /// Builds a [`RefreshingTokenSource`] from the initial [`Tokens`], the
     /// authorized HTTP client, and the OAuth client credentials (SPEC s4.1).
+    /// No keychain store is wired (rotated tokens are adopted in memory only);
+    /// use [`Self::with_store`] to also persist rotations.
     pub fn new(
         tokens: Tokens,
         http: reqwest::Client,
@@ -176,7 +205,16 @@ impl RefreshingTokenSource {
             http,
             client_id: client_id.into(),
             client_secret: client_secret.into(),
+            store: None,
         }
+    }
+
+    /// Wires a [`KeyringTokenStore`] so a rotated refresh token is persisted to
+    /// the keychain before the in-memory swap (codex C-P2-4 / V-A3). Returns
+    /// `self` for chaining off a constructor.
+    pub fn with_store(mut self, store: Arc<KeyringTokenStore>) -> Self {
+        self.store = Some(store);
+        self
     }
 
     /// Builds a [`RefreshingTokenSource`] from a stored refresh token, with an
@@ -184,14 +222,18 @@ impl RefreshingTokenSource {
     /// `driven-cli` - need no `reqwest` dependency). The initial access token
     /// is empty and already-expired, so the first [`Self::access_token`] call
     /// performs the refresh.
+    ///
+    /// The refresh client is built with DESIGN s5.8.4 timeouts + a
+    /// redirect::none policy (codex V-A1): the refresh holds the token mutex
+    /// across its await, so a black-holed / hung token endpoint must be bounded
+    /// (otherwise it wedges every Drive request), and the credential-bearing
+    /// client must not follow redirects (SPEC s4 SSRF defence).
     pub fn from_stored_refresh_token(
         refresh_token: impl Into<String>,
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
     ) -> anyhow::Result<Self> {
-        let http = reqwest::Client::builder()
-            .build()
-            .map_err(|e| anyhow::anyhow!("drive: failed to build OAuth refresh client: {e}"))?;
+        let http = build_refresh_client()?;
         let tokens = Tokens {
             access_token: String::new(),
             refresh_token: refresh_token.into(),
@@ -207,6 +249,7 @@ impl RefreshingTokenSource {
         let mut guard = self.inner.lock().await;
         if is_expiring(guard.expires_at, now_unix()) {
             let fresh = self.refresh_locked(&guard).await?;
+            self.persist_rotation_if_changed(&guard, &fresh);
             *guard = fresh;
         }
         Ok(guard.access_token.clone())
@@ -217,8 +260,45 @@ impl RefreshingTokenSource {
     pub async fn force_refresh(&self) -> anyhow::Result<()> {
         let mut guard = self.inner.lock().await;
         let fresh = self.refresh_locked(&guard).await?;
+        self.persist_rotation_if_changed(&guard, &fresh);
         *guard = fresh;
         Ok(())
+    }
+
+    /// Persists a ROTATED refresh token to the keychain before the in-memory
+    /// swap (codex C-P2-4 / V-A3). A no-op when no store is wired or when
+    /// Google did not rotate the token (the common case). A keychain write
+    /// failure is LOGGED, not silently dropped, and does not fail the refresh
+    /// (the new token still works in memory for this run; the risk is only a
+    /// stale token after a restart, which the log surfaces).
+    fn persist_rotation_if_changed(&self, current: &Tokens, fresh: &Tokens) {
+        if fresh.refresh_token == current.refresh_token {
+            return;
+        }
+        let Some(store) = &self.store else {
+            warn!(
+                target: TARGET,
+                "Google rotated the refresh token but no keychain store is wired; \
+                 the rotation is in-memory only and will be lost on restart"
+            );
+            return;
+        };
+        match store.store_refresh_token(&fresh.refresh_token) {
+            Ok(()) => {
+                tracing::info!(
+                    target: TARGET,
+                    "persisted rotated Google refresh token to keychain"
+                );
+            }
+            Err(e) => {
+                warn!(
+                    target: TARGET,
+                    error = %e,
+                    "failed to persist rotated refresh token to keychain; \
+                     the rotation is in-memory only and may be lost on restart"
+                );
+            }
+        }
     }
 
     /// Performs the `grant_type=refresh_token` POST and returns the new
@@ -296,6 +376,20 @@ fn now_unix() -> i64 {
         .unwrap_or(0)
 }
 
+/// Builds the OAuth refresh HTTP client with DESIGN s5.8.4 timeouts and a
+/// redirect::none policy (codex V-A1 / SPEC s4). Bounding the connect/total
+/// time keeps a hung token endpoint from wedging every Drive request (the
+/// refresh holds the token mutex across the await); disabling redirects keeps
+/// the credential-bearing client from being steered to an attacker endpoint.
+fn build_refresh_client() -> anyhow::Result<reqwest::Client> {
+    reqwest::Client::builder()
+        .connect_timeout(REFRESH_CONNECT_TIMEOUT)
+        .timeout(REFRESH_TOTAL_TIMEOUT)
+        .redirect(reqwest::redirect::Policy::none())
+        .build()
+        .map_err(|e| anyhow::anyhow!("drive: failed to build OAuth refresh client: {e}"))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -366,5 +460,34 @@ mod tests {
             super::super::classification_of(&e),
             Some(DriveErrorClassification::AuthInvalidGrant)
         );
+    }
+
+    #[test]
+    fn refresh_client_builds_offline_with_timeouts() {
+        // V-A1: the refresh client must build with timeouts + redirect::none.
+        // Building it is offline (no network); a failure would be a TLS-init
+        // bug, so this is a real assertion, not a skip.
+        let client = build_refresh_client();
+        assert!(
+            client.is_ok(),
+            "refresh client must build offline: {:?}",
+            client.err()
+        );
+    }
+
+    #[test]
+    fn with_store_wires_the_keychain_store() {
+        // C-P2-4 / V-A3: with_store attaches a store; without it, none.
+        let http = build_refresh_client().unwrap();
+        let tokens = Tokens {
+            access_token: String::new(),
+            refresh_token: "rt".to_string(),
+            expires_at: 0,
+        };
+        let src = RefreshingTokenSource::new(tokens, http, "cid", "secret");
+        assert!(src.store.is_none(), "new() wires no store");
+        let store = Arc::new(KeyringTokenStore::new("acct@example.com"));
+        let src = src.with_store(store);
+        assert!(src.store.is_some(), "with_store wires the store");
     }
 }
