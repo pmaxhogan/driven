@@ -5,6 +5,7 @@ members = [
     "crates/driven-drive",
     "crates/driven-crypto",
     "crates/driven-power",
+    "crates/driven-vss",
     "crates/driven-test-fixtures",
     "crates/driven-chaos",
     "src-tauri",

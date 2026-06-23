@@ -1,0 +1,40 @@
+[package]
+name = "driven-vss"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# M3.5 Windows Volume Shadow Copy Service (VSS) backend for reading files held
+# under an exclusive write lock (Outlook PSTs, running DB files, hypervisor disk
+# images) - DESIGN s5.3, ROADMAP M3.5. The OS-independent surface (the
+# `VssProvider` seam, `VssMode`, `is_elevated`, the pure fallback-decision
+# function, and the orphan-cleanup logic) compiles everywhere; the real
+# IVssBackupComponents COM sequence is `#[cfg(windows)]` only.
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+tracing = { workspace = true }
+
+# Windows-only: the VSS COM sequence + elevation detection. `IVssBackupComponents`
+# and its `CreateVssBackupComponents` factory are NOT projected by win32metadata
+# (microsoft/win32metadata#2095), so we hand-declare the interface vtable via the
+# `windows::core::interface` macro - which expands to absolute `::windows_core`
+# paths, hence `windows-core` is a DIRECT dependency. See src/windows_vss.rs.
+[target.'cfg(windows)'.dependencies]
+windows-core = "0.62"
+windows = { version = "0.62", features = [
+    "Win32_Storage_Vss",
+    "Win32_System_Com",
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_System_Threading",
+    "Win32_System_LibraryLoader",
+] }
+
+[dev-dependencies]
+serde_json = { workspace = true }

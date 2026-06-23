@@ -34,6 +34,7 @@ use driven_crypto::{ContentEncryptor, CryptoError, SourceCryptoSuite};
 use driven_drive::remote_store::{
     RemoteEntry, RemoteStore, ResumableKind, ResumableSession, ResumeProgress, UploadBody,
 };
+use driven_vss::{fallback_decision, FallbackDecision, OpenAttempt, SnapshotOutcome, VssMode};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
@@ -401,6 +402,12 @@ pub struct ExecutorDeps {
     /// The per-source encryption suite, or `None` when the source is
     /// unencrypted (DESIGN s7).
     pub crypto: Option<Arc<dyn SourceCryptoSuite>>,
+    /// The per-cycle Windows VSS snapshot provider (ROADMAP M3.5, DESIGN
+    /// s5.3), or `None` to disable the VSS fallback entirely (the historical
+    /// behaviour: a locked file is always skipped). The orchestrator owns the
+    /// snapshot lifecycle and passes a CLONE of the same `Arc` here so the
+    /// executor's open path can read a locked file from the shadow copy.
+    pub vss: Option<Arc<dyn driven_vss::VssProvider>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -446,6 +453,9 @@ pub struct DefaultExecutor {
     pacer: Arc<dyn Pacer>,
     crypto: Option<Arc<dyn SourceCryptoSuite>>,
     clock: Arc<dyn Clock>,
+    /// Per-cycle VSS snapshot provider (ROADMAP M3.5), or `None` to disable
+    /// the locked-file fallback (then a locked file is skipped as before).
+    vss: Option<Arc<dyn driven_vss::VssProvider>>,
     /// Inter-file concurrency gate (DESIGN s11.4.2). `acquire`d per op.
     pool: Arc<Semaphore>,
     /// Test-only peak-memory gauge for the streaming pipeline (P1-4
@@ -517,6 +527,7 @@ impl DefaultExecutor {
             pacer: deps.pacer,
             crypto: deps.crypto,
             clock,
+            vss: deps.vss,
             pool,
             mem_gauge: None,
             #[cfg(test)]
@@ -565,6 +576,134 @@ impl DefaultExecutor {
         }
     }
 
+    /// Resolve the EFFECTIVE read path for `live_path` and open it, honouring
+    /// the VSS fallback (ROADMAP M3.5, DESIGN s5.3).
+    ///
+    /// Flow (all pure-decision logic lives in `driven_vss::fallback_decision`):
+    /// - No VSS provider (the historical config): open the live path; a lock
+    ///   is an unconditional skip.
+    /// - `vss_mode = always` + available: snapshot the volume even for a
+    ///   readable file and read from the shadow copy (SPEC s22 "paranoid").
+    /// - `vss_mode = auto`: open live first; only a locked file consults the
+    ///   snapshot.
+    /// - VSS unavailable (not elevated / `never` / off Windows / snapshot
+    ///   failed): a locked file is skipped, exactly as before.
+    ///
+    /// Returns the opened handle paired with the path it was opened from (the
+    /// live path or the snapshot-mapped path), so the caller threads ONE path
+    /// through every SPEC s8 identity check.
+    async fn open_effective(&self, live_path: &Path) -> EffectiveOpen {
+        let Some(vss) = self.vss.as_ref() else {
+            // No VSS configured: live open, lock => skip (historical path).
+            return match open_shared(live_path).await {
+                Ok(file) => EffectiveOpen::Opened {
+                    read_path: live_path.to_path_buf(),
+                    file,
+                },
+                Err(OpenError::Locked) => EffectiveOpen::Skip(SkipReason::Locked),
+                Err(OpenError::Io(e)) => {
+                    warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
+                    EffectiveOpen::Failed(ErrorCode::LocalIoError)
+                }
+            };
+        };
+
+        let mode = vss.mode();
+        let elevated = vss.available();
+
+        // `always` mode consults the snapshot up front even when the live open
+        // would succeed (the dead-code trap the advisor flagged: if we only
+        // hooked the Locked arm, `always` would silently behave as `auto`).
+        // `auto` / `never` open live first.
+        let attempt;
+        let mut live_file = None;
+        if mode == VssMode::Always {
+            // Do not even attempt the live open in always mode; we route reads
+            // through the snapshot. Probe lock state only to feed the decision.
+            attempt = match open_shared(live_path).await {
+                Ok(file) => {
+                    live_file = Some(file);
+                    OpenAttempt::Ok
+                }
+                Err(OpenError::Locked) => OpenAttempt::Locked,
+                Err(OpenError::Io(e)) => {
+                    warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
+                    return EffectiveOpen::Failed(ErrorCode::LocalIoError);
+                }
+            };
+        } else {
+            match open_shared(live_path).await {
+                Ok(file) => {
+                    // Live open worked; in auto/never this is the read path.
+                    return EffectiveOpen::Opened {
+                        read_path: live_path.to_path_buf(),
+                        file,
+                    };
+                }
+                Err(OpenError::Locked) => attempt = OpenAttempt::Locked,
+                Err(OpenError::Io(e)) => {
+                    warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
+                    return EffectiveOpen::Failed(ErrorCode::LocalIoError);
+                }
+            }
+        }
+
+        // Consult the provider for this file's volume only when the decision
+        // needs it (always-mode always; auto-mode only on a lock). The provider
+        // lazily creates + caches one snapshot per volume for the cycle.
+        let snapshot = if mode == VssMode::Always || attempt == OpenAttempt::Locked {
+            vss.map_for_volume(live_path)
+        } else {
+            SnapshotOutcome::Unavailable
+        };
+
+        match fallback_decision(attempt, mode, elevated, snapshot) {
+            FallbackDecision::OpenLive => {
+                // The pure decision chose the live bytes (e.g. always-mode but
+                // the snapshot failed on a readable file). Reuse the handle we
+                // already opened if we have it, else open now.
+                if let Some(file) = live_file {
+                    EffectiveOpen::Opened {
+                        read_path: live_path.to_path_buf(),
+                        file,
+                    }
+                } else {
+                    match open_shared(live_path).await {
+                        Ok(file) => EffectiveOpen::Opened {
+                            read_path: live_path.to_path_buf(),
+                            file,
+                        },
+                        Err(OpenError::Locked) => EffectiveOpen::Skip(SkipReason::Locked),
+                        Err(OpenError::Io(e)) => {
+                            warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
+                            EffectiveOpen::Failed(ErrorCode::LocalIoError)
+                        }
+                    }
+                }
+            }
+            FallbackDecision::OpenSnapshot(snapshot_path) => {
+                // Open the frozen shadow-copy path. A second sharing violation
+                // here (extremely unusual - the snapshot is read-only) degrades
+                // to skip.
+                match open_shared(&snapshot_path).await {
+                    Ok(file) => {
+                        tracing::info!(target: TARGET, live = %live_path.display(), snapshot = %snapshot_path.display(), "VSS: reading locked file from snapshot");
+                        EffectiveOpen::Opened {
+                            read_path: snapshot_path,
+                            file,
+                        }
+                    }
+                    Err(OpenError::Locked) => EffectiveOpen::Skip(SkipReason::Locked),
+                    Err(OpenError::Io(e)) => {
+                        warn!(target: TARGET, path = %snapshot_path.display(), error = %e, "VSS: snapshot open failed; degrading to skip");
+                        EffectiveOpen::Skip(SkipReason::Locked)
+                    }
+                }
+            }
+            FallbackDecision::SkipLocked => EffectiveOpen::Skip(SkipReason::Locked),
+        }
+    }
+
     // -------------------------------------------------------------------------
     // Per-op drivers.
     // -------------------------------------------------------------------------
@@ -578,29 +717,41 @@ impl DefaultExecutor {
         relative_path: &RelativePath,
         size: u64,
     ) -> anyhow::Result<OpOutcome> {
-        let full_path = join_source_path(&source.local_path, relative_path);
+        let live_path = join_source_path(&source.local_path, relative_path);
 
-        // --- pre-open lstat + open with FILE_SHARE_DELETE -------------------
-        let pre = match lstat_identity(&full_path) {
-            Ok(id) => id,
-            Err(e) => {
-                warn!(target: TARGET, path = %full_path.display(), error = %e, "lstat failed");
+        // --- resolve the EFFECTIVE read path + open it ----------------------
+        // M3.5: a locked file (ERROR_SHARING_VIOLATION) falls through to a VSS
+        // snapshot, in which case EVERY subsequent filesystem operation for
+        // this op - the pre-open lstat, the post-read fstat, and the
+        // post-upload lstat recheck (SPEC s8 change/replace defences) - must
+        // read from the FROZEN snapshot path, not the live path. Comparing a
+        // frozen stat to a live one on an actively-written file (the whole
+        // VSS use case) would spuriously trip ChangedDuringUpload and the file
+        // would never back up. So `read_path` is the single source of truth
+        // for all FS reads below; only `relative_path` / the Drive target stay
+        // logical. When VSS is off / unavailable, `read_path == live_path` and
+        // the behaviour is identical to before.
+        let (read_path, mut file) = match self.open_effective(&live_path).await {
+            EffectiveOpen::Opened { read_path, file } => (read_path, file),
+            EffectiveOpen::Skip(reason) => {
+                return Ok(OpOutcome::Skipped {
+                    relative_path: relative_path.clone(),
+                    reason,
+                });
+            }
+            EffectiveOpen::Failed(code) => {
                 return Ok(OpOutcome::Failed {
                     relative_path: relative_path.clone(),
-                    code: ErrorCode::LocalIoError,
+                    code,
                 });
             }
         };
-        let mut file = match open_shared(&full_path).await {
-            Ok(f) => f,
-            Err(OpenError::Locked) => {
-                return Ok(OpOutcome::Skipped {
-                    relative_path: relative_path.clone(),
-                    reason: SkipReason::Locked,
-                });
-            }
-            Err(OpenError::Io(e)) => {
-                warn!(target: TARGET, path = %full_path.display(), error = %e, "open failed");
+
+        // --- pre-open lstat (on the effective path) ------------------------
+        let pre = match lstat_identity(&read_path) {
+            Ok(id) => id,
+            Err(e) => {
+                warn!(target: TARGET, path = %read_path.display(), error = %e, "lstat failed");
                 return Ok(OpOutcome::Failed {
                     relative_path: relative_path.clone(),
                     code: ErrorCode::LocalIoError,
@@ -610,6 +761,8 @@ impl DefaultExecutor {
         let opened = fstat_identity(&file).await?;
         if (opened.dev, opened.inode) != (pre.dev, pre.inode) {
             // Replaced between our lstat and our open (SPEC s8 defence #1).
+            // On a snapshot read this is vacuously satisfied (the shadow copy
+            // is immutable), so it only ever fires on a live read.
             return Ok(OpOutcome::Skipped {
                 relative_path: relative_path.clone(),
                 reason: SkipReason::ReplacedBeforeOpen,
@@ -617,8 +770,11 @@ impl DefaultExecutor {
         }
 
         // Test seam: let a test mutate/replace the file now, before we read
-        // and post-fstat, so the mid-upload defences are deterministic.
-        self.fire_mid_upload_hook(&full_path);
+        // and post-fstat, so the mid-upload defences are deterministic. Fired
+        // on the LIVE path - a test that mutates the live file while we read a
+        // snapshot copy must see the op still complete (the snapshot is
+        // frozen), which is exactly the VSS contract.
+        self.fire_mid_upload_hook(&live_path);
 
         // --- decide create vs update by the stored drive_file_id -----------
         let existing = self.state.get_file_state(source.id, relative_path).await?;
@@ -652,6 +808,7 @@ impl DefaultExecutor {
             .upload_and_commit(
                 source,
                 relative_path,
+                &read_path,
                 size,
                 &mut file,
                 pre,
@@ -754,6 +911,7 @@ impl DefaultExecutor {
         &self,
         source: &SourceRow,
         relative_path: &RelativePath,
+        read_path: &Path,
         size: u64,
         file: &mut tokio::fs::File,
         pre: FileIdentity,
@@ -762,7 +920,11 @@ impl DefaultExecutor {
         mut payload: PendingOpPayload,
         app_props: HashMap<String, String>,
     ) -> Result<OpOutcome, UploadError> {
-        let full_path = join_source_path(&source.local_path, relative_path);
+        // M3.5: every FS recheck below reads the EFFECTIVE path (the VSS
+        // snapshot copy for a locked file), so a frozen-vs-live stat mismatch
+        // never trips on an actively-written source. `read_path == live` when
+        // VSS is off.
+        let full_path = read_path.to_path_buf();
         let mime = "application/octet-stream";
 
         // --- P1-5: resolve the remote target (encrypted path when the source
@@ -818,6 +980,7 @@ impl DefaultExecutor {
             self.inline_upload(
                 source,
                 relative_path,
+                &full_path,
                 size,
                 file,
                 pre,
@@ -903,8 +1066,9 @@ impl DefaultExecutor {
     #[allow(clippy::too_many_arguments)]
     async fn inline_upload(
         &self,
-        source: &SourceRow,
-        relative_path: &RelativePath,
+        _source: &SourceRow,
+        _relative_path: &RelativePath,
+        read_path: &Path,
         size: u64,
         file: &mut tokio::fs::File,
         pre: FileIdentity,
@@ -914,7 +1078,9 @@ impl DefaultExecutor {
         op_id: PendingOpId,
         payload: &mut PendingOpPayload,
     ) -> Result<UploadProduct, UploadError> {
-        let full_path = join_source_path(&source.local_path, relative_path);
+        // M3.5: the post-read identity recheck reads the EFFECTIVE path (the
+        // VSS snapshot copy for a locked file), matching the pre-open lstat.
+        let full_path = read_path.to_path_buf();
 
         let HashedBody {
             blake3,
@@ -3018,6 +3184,23 @@ enum OpenError {
     Io(std::io::Error),
 }
 
+/// The outcome of [`DefaultExecutor::open_effective`]: an opened handle plus
+/// the path it was opened from (live or VSS-snapshot), or a skip / fail.
+enum EffectiveOpen {
+    /// The file is open; `read_path` is the path EVERY SPEC s8 identity check
+    /// must re-stat (the live path, or the frozen VSS snapshot copy).
+    Opened {
+        /// The effective path the handle reads (live or snapshot).
+        read_path: PathBuf,
+        /// The open handle.
+        file: tokio::fs::File,
+    },
+    /// The file is locked and VSS could not help: skip + surface it.
+    Skip(SkipReason),
+    /// A non-lock IO error opening the file: fail the op.
+    Failed(ErrorCode),
+}
+
 /// Open the file for read with `FILE_SHARE_DELETE` on Windows so another
 /// process can atomically replace it while we read the original bytes
 /// (SPEC s8 defence #2). On Unix the default open already allows the path
@@ -3225,6 +3408,21 @@ mod tests {
                     state: self.state.clone(),
                     pacer: self.pacer.clone(),
                     crypto,
+                    vss: None,
+                },
+                self.clock.clone(),
+            )
+        }
+
+        /// An executor wired with a [`driven_vss::VssProvider`] (M3.5).
+        fn executor_with_vss(&self, vss: Arc<dyn driven_vss::VssProvider>) -> DefaultExecutor {
+            DefaultExecutor::with_clock(
+                ExecutorDeps {
+                    remote: Arc::new(self.remote.clone()),
+                    state: self.state.clone(),
+                    pacer: self.pacer.clone(),
+                    crypto: None,
+                    vss: Some(vss),
                 },
                 self.clock.clone(),
             )
@@ -3774,6 +3972,167 @@ mod tests {
             .is_empty());
         let row = h.state.get_file_state(h.source.id, &rel).await.unwrap();
         assert!(row.is_none() || row.unwrap().status != FileStateStatus::Synced);
+    }
+
+    // --- M3.5 VSS effective-read-path + degrade -----------------------------
+
+    /// Regression for the frozen-vs-live identity trap (the advisor's blocking
+    /// finding): in `always` mode the executor reads from the VSS snapshot, so
+    /// a LIVE mutation mid-op must NOT trip `ChangedDuringUpload` - the op
+    /// completes and uploads the FROZEN bytes. Without the effective-read-path
+    /// fix this would compare the frozen stat to the live stat and skip,
+    /// meaning an actively-written locked file (the whole VSS use case) would
+    /// never back up. Runs on every OS (no real lock needed; the FakeVss maps
+    /// reads to a real "snapshot" copy directory).
+    #[tokio::test]
+    async fn always_mode_reads_frozen_snapshot_despite_live_mutation() {
+        let h = harness().await;
+        let frozen = b"FROZEN-point-in-time-bytes";
+        let (rel, size) = h.write_file("db.dat", frozen);
+
+        // Build a "snapshot" copy dir holding the frozen bytes; the FakeVss
+        // maps every read to <snap_dir>/<leaf>.
+        let snap_dir = tempfile::tempdir().unwrap();
+        std::fs::write(snap_dir.path().join("db.dat"), frozen).unwrap();
+        let vss: Arc<dyn driven_vss::VssProvider> =
+            Arc::new(driven_vss::FakeVssProvider::mapped_under(
+                driven_vss::VssMode::Always,
+                snap_dir.path().to_path_buf(),
+            ));
+
+        // Mid-upload hook mutates the LIVE file (grows it) - which would trip
+        // ChangedDuringUpload if we were stat-ing the live path.
+        let src_path = h.tmp_src.path().to_path_buf();
+        let hook: MidUploadHook = Arc::new(move |_p: &Path| {
+            std::fs::write(
+                src_path.join("db.dat"),
+                b"LIVE-bytes-MUTATED-and-much-LONGER",
+            )
+            .unwrap();
+        });
+
+        let exec = h.executor_with_vss(vss).with_mid_upload_hook(hook);
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out[0], OpOutcome::Done { .. }),
+            "always-mode snapshot read must complete despite live mutation; got {:?}",
+            out[0]
+        );
+
+        // The remote got the FROZEN bytes (size of the snapshot copy), not the
+        // mutated live bytes.
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].size,
+            Some(frozen.len() as u64),
+            "uploaded the frozen snapshot bytes, not the live-mutated ones"
+        );
+    }
+
+    /// An UNAVAILABLE VSS provider must not disturb a normal (openable) file in
+    /// `auto` mode: the live open succeeds, VSS is never consulted, and the
+    /// upload commits exactly as with no provider. The degrade-to-skip path for
+    /// a genuinely LOCKED file is the Windows-elevated integration test (a real
+    /// `ERROR_SHARING_VIOLATION` cannot be produced cross-OS); the pure
+    /// decision is table-tested in `driven_vss::fallback_decision`.
+    #[tokio::test]
+    async fn auto_mode_unavailable_vss_does_not_disturb_openable_file() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("normal.txt", b"plain readable file");
+        let vss: Arc<dyn driven_vss::VssProvider> =
+            Arc::new(driven_vss::FakeVssProvider::unavailable());
+        let exec = h.executor_with_vss(vss);
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("file_state row");
+        assert_eq!(row.status, FileStateStatus::Synced);
+    }
+
+    /// REAL VSS locked-file integration test (ROADMAP M3.5 acceptance).
+    ///
+    /// Opens a file with `CREATE_NEW | GENERIC_WRITE | share=0` (NO sharing) so
+    /// a normal `open_shared` hits `ERROR_SHARING_VIOLATION`, then runs a sync
+    /// with the REAL [`driven_vss::RealVssProvider`] and asserts the bytes land
+    /// on the fake remote - read via the VSS snapshot.
+    ///
+    /// Honestly GATE-SKIPPED when the process is not elevated (VSS snapshot
+    /// creation needs Administrator): CI is non-elevated, so this prints a SKIP
+    /// reason and returns rather than failing - it is NOT `#[ignore]`-faked. A
+    /// local elevated `cargo test` exercises the real COM path end-to-end.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn locked_file_backs_up_via_real_vss_snapshot() {
+        if !driven_vss::is_elevated() {
+            eprintln!(
+                "SKIP locked_file_backs_up_via_real_vss_snapshot: process is not elevated; \
+                 VSS snapshot creation requires Administrator. Run an elevated `cargo test` \
+                 to exercise the real COM path (CI is non-elevated by design)."
+            );
+            return;
+        }
+
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let h = harness().await;
+        let contents = b"locked-outlook-pst-like-bytes-that-must-still-back-up";
+        let (rel, size) = h.write_file("locked.dat", contents);
+        let live = h.tmp_src.path().join("locked.dat");
+
+        // Open the file with NO sharing + write access so any reader gets
+        // ERROR_SHARING_VIOLATION. Hold the handle for the whole sync.
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        let _exclusive = std::fs::OpenOptions::new()
+            .access_mode(GENERIC_WRITE)
+            .share_mode(0) // no FILE_SHARE_* => exclusive lock
+            .write(true)
+            .open(&live)
+            .expect("open locked.dat exclusively");
+
+        // Sanity: a plain shared open must now fail with a lock.
+        assert!(
+            matches!(
+                super::open_shared(&live).await,
+                Err(super::OpenError::Locked)
+            ),
+            "test setup: file must be locked"
+        );
+
+        let vss: Arc<dyn driven_vss::VssProvider> =
+            Arc::new(driven_vss::RealVssProvider::new(driven_vss::VssMode::Auto));
+        assert!(vss.available(), "elevated provider should be available");
+        let exec = h.executor_with_vss(vss);
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out[0], OpOutcome::Done { .. }),
+            "locked file must back up via VSS; got {:?}",
+            out[0]
+        );
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(children[0].size, Some(size));
     }
 
     // --- resumable (large file) path ----------------------------------------

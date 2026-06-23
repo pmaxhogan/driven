@@ -1110,6 +1110,7 @@ dependencies = [
  "driven-drive",
  "driven-power",
  "driven-test-fixtures",
+ "driven-vss",
  "futures",
  "hex",
  "ignore",
@@ -1193,6 +1194,18 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "driven-vss"
+version = "0.1.0"
+dependencies = [
+ "serde",
+ "serde_json",
+ "thiserror 2.0.18",
+ "tracing",
+ "windows 0.62.2",
+ "windows-core 0.62.2",
 ]
 
 [[package]]

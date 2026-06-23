@@ -47,6 +47,12 @@ sqlx = { version = "0.8", default-features = false, features = [
 driven-drive = { path = "../driven-drive" }
 driven-crypto = { path = "../driven-crypto" }
 driven-power = { path = "../driven-power" }
+# M3.5 Windows VSS reads for exclusively-locked files (ROADMAP M3.5, DESIGN
+# s5.3). The executor consults the `VssProvider` seam on its open path; the
+# orchestrator owns the per-cycle snapshot lifecycle + orphan cleanup. The
+# crate is a no-op off Windows / un-elevated, so driven-core's degrade path is
+# unchanged there. Acyclic: driven-vss carries no driven-core dep.
+driven-vss = { path = "../driven-vss" }
 # M3 CPU-bound hashing + encryption off the tokio reactor (DESIGN s11.4.4,
 # s11.4.5). Used by the executor impl in the M3 implement phase.
 rayon.workspace = true

@@ -132,3 +132,98 @@ probes alone, not by actual upload/update failures. When the real reqwest/hickor
 backend is wired in M4 (P2-9 above), thread a request-outcome reporter into the
 executor and call `note_outcome(ServiceName::Drive, ok)` on real Drive request
 success/failure so the breaker reacts to true request health.
+
+## M3.5 Windows VSS for locked files
+
+The `driven-vss` crate (ROADMAP M3.5, DESIGN s5.3) implements VSS snapshot reads
+for exclusively-locked files (Outlook PSTs, running DB files, hypervisor disk
+images). The backend (the `VssProvider` seam, `VssMode`, `is_elevated`, the pure
+`fallback_decision`, the orphan-cleanup ledger, and the real IVssBackupComponents
+COM sequence) landed at M3.5. Below are the deliberate residuals.
+
+### IVssBackupComponents is hand-declared (windows-rs gap, NOT a stub)
+
+The task spec said to use "the `windows` 0.62 `Win32::Storage::Vss`
+IVssBackupComponents COM API". That binding DOES NOT EXIST in windows 0.62:
+`IVssBackupComponents` and its `CreateVssBackupComponents` factory were never
+projected by win32metadata (microsoft/win32metadata#2095, still open as of
+2025-06). Verified by the compiler: `use
+windows::Win32::Storage::Vss::IVssBackupComponents` fails with E0432 unresolved
+import, while the supporting types (`IVssAsync`, `VSS_SNAPSHOT_PROP`, the
+`VSS_CTX_*`/`VSS_SS_*` constants, `VSS_BACKUP_TYPE`) DO resolve.
+
+So `crates/driven-vss/src/windows_vss.rs` HAND-DECLARES the `IVssBackupComponents`
+vtable with `windows::core::interface`, using the real IID
+(`665c1d5f-c218-414d-a05d-7fef5f9d5c86`) and the full 48-method vtable in exact
+`vsbackup.h` order (the ~38 methods Driven never calls are placeholder
+`_slotNN(&self) -> HRESULT` stubs that only hold their slot offset; only the ~11
+called methods carry real signatures). The factory
+(`CreateVssBackupComponentsInternal` in `vssapi.dll`, which is what
+`CreateVssBackupComponents` resolves to) is loaded via `GetProcAddress` at
+runtime. The IID + method order were lifted from `vsbackup.h` (the winapi crate's
+RIDL declaration) and cross-checked against MS Learn - NOT reconstructed from
+memory, because a wrong slot or IID compiles green and fails only at runtime. The
+`windows-core` crate is a direct dependency because the `#[interface]` macro
+expands to absolute `::windows_core` paths.
+
+This is correct and complete, NOT a stub. The full DESIGN s5.3 COM sequence runs
+(`CoInitializeEx` -> `CreateVssBackupComponents` -> `InitializeForBackup` ->
+`SetContext(VSS_CTX_BACKUP)` -> `SetBackupState` -> `GatherWriterMetadata` (async
+Wait+QueryStatus) -> `StartSnapshotSet` -> `AddToSnapshotSet` -> `PrepareForBackup`
+-> `DoSnapshotSet` -> `GetSnapshotProperties`; `Drop` runs `BackupComplete` +
+release). CI verifies COMPILATION only: the VSS path needs Administrator
+elevation, which CI lacks, so the `locked_file_backs_up_via_real_vss_snapshot`
+integration test honestly gate-skips on `!is_elevated()` (it is NOT
+`#[ignore]`-faked) and a local elevated `cargo test` exercises the real COM path.
+
+### Task Scheduler "run elevated on login" one-click - DEFERRED to M5
+
+ROADMAP M3.5 lists a one-click "Set Driven to run elevated on login" action
+(`schtasks /create /RL HIGHEST`) plus a "Restart Driven elevated now?" prompt
+(`app.restart()` with the elevated entry point). This needs the tray / app-shell,
+which does not exist until M5. The backend hooks it wires to (`is_elevated`, the
+`VssProvider` degrade path, `vss_mode`) all landed at M3.5; M5 adds the UI action.
+
+### Settings -> Rules -> Windows vss_mode WIDGET + elevation banner - DEFERRED to M6
+
+The `vss_mode` PERSISTED field (SPEC s22 `windows.vss_mode`) and the orchestrator
+honouring it landed at M3.5: `OrchestratorConfig.vss_mode: VssMode` (default
+`auto`), threaded into the `VssProvider`. The Settings UI WIDGET that edits the
+`windows` settings key, and the DESIGN s5.3 elevation banner ("Driven needs to run
+elevated to use Volume Shadow Copy..."), need the settings UI, which does not exist
+until M6. The `windows` settings key itself is seeded at runtime by the app shell
+(per the `0002_seed_settings.sql` comment), not in the global seed.
+
+### Orphan-snapshot cleanup - WIRED end-to-end (one Windows-only edge)
+
+The orphan-cleanup is fully wired at M3.5, NOT deferred. The `OrphanRegistry`
+ledger is PERSISTED through `StateRepo::get_setting`/`set_setting` under the
+`vss.orphans` settings key (no schema change - it is a JSON value). Each cycle,
+after the source loop, the orchestrator records the provider's live shadow GUIDs
++ creation times into the registry (the crash safety net), releases them
+in-process via `end_cycle`, then forgets the released GUIDs - so a clean cycle
+leaves an empty registry and a `kill -9` between record and forget leaves a
+durable entry. On startup (once per process) `cleanup_orphan_snapshots_once`
+reads the registry, selects entries older than the >1h cutoff (`prune_orphans`),
+and releases each via `VssSnapshot::delete_by_id` (a not-found shadow is an
+idempotent no-op). Ownership is PROVEN, never guessed: only recorded GUIDs are
+eligible; we never enumerate or heuristically guess. The full round-trip
+(record -> release -> forget; pre-seeded-old-orphan selection) is tested at the
+orchestrator level on every OS.
+
+The ONE Windows-elevated edge: the actual `DeleteSnapshots` COM call only runs on
+elevated Windows. Off Windows / un-elevated, `delete_by_id` returns
+`VssError::Unavailable`, so an old recorded orphan is KEPT (never silently
+dropped) for a later elevated run to sweep - which is correct. The selection
+logic, persistence, and guard are exercised cross-OS; only the final COM deletion
+needs the elevated Windows runtime (same constraint as the integration test).
+
+### Blocking COM on a tokio worker - ACCEPTED for V1
+
+`VssProvider::map_for_volume` runs the synchronous `Wait(INFINITE)` snapshot
+creation (DESIGN s5.3 budgets up to ~10s) inline on the executor's per-op async
+task, holding the provider's `std::Mutex` (no `await` under the lock, so no
+deadlock - it just stalls that one worker while the first locked file on a volume
+snapshots). `spawn_blocking` would be the textbook fix but complicates the COM
+apartment / `Send` story; accepted as-is for V1 since a snapshot is created at most
+once per volume per cycle. Revisit if the stall is observable.

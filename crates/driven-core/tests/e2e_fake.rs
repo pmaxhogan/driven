@@ -182,10 +182,42 @@ fn orchestrator(
             state: state.clone(),
             pacer,
             crypto: None,
+            vss: None,
         },
         clock.clone(),
     ));
     SyncOrchestrator::new(account, state, executor, power, net, clock, config)
+}
+
+/// Build an orchestrator wired with a [`driven_vss::VssProvider`] (M3.5),
+/// threading the SAME provider into both the executor (snapshot reads) and the
+/// orchestrator (per-cycle release + orphan cleanup). Only the Windows degrade
+/// row uses it (a real exclusive lock is Windows-only), so cfg-gate it to keep
+/// non-Windows CI free of an unused-function warning.
+#[cfg(windows)]
+#[allow(clippy::too_many_arguments)]
+fn orchestrator_with_vss(
+    account: AccountId,
+    state: Arc<SqliteStateRepo>,
+    remote: Arc<InMemoryRemoteStore>,
+    power: Arc<dyn PowerSource>,
+    net: Arc<dyn NetworkProbe>,
+    clock: Arc<FakeClock>,
+    config: OrchestratorConfig,
+    vss: Arc<dyn driven_vss::VssProvider>,
+) -> SyncOrchestrator {
+    let pacer = test_pacer(clock.clone());
+    let executor = Arc::new(DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote,
+            state: state.clone(),
+            pacer,
+            crypto: None,
+            vss: Some(vss.clone()),
+        },
+        clock.clone(),
+    ));
+    SyncOrchestrator::new(account, state, executor, power, net, clock, config).with_vss(vss)
 }
 
 /// A non-blocking [`Pacer`] for the acceptance rows.
@@ -453,6 +485,7 @@ async fn rate_limit_on_seventh_file_retries_and_completes() {
             state: state.clone(),
             pacer,
             crypto: None,
+            vss: None,
         },
         clock.clone(),
     );
@@ -541,6 +574,7 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
             crypto: None,
+            vss: None,
         },
         clock.clone(),
     );
@@ -600,6 +634,7 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
             crypto: None,
+            vss: None,
         },
         clock.clone(),
     );
@@ -710,6 +745,7 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
             crypto: None,
+            vss: None,
         },
         clock.clone(),
     );
@@ -776,6 +812,7 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
             crypto: None,
+            vss: None,
         },
         clock.clone(),
     );
@@ -909,6 +946,7 @@ async fn reconcile_requeue_reuploads_changed_bytes_on_next_cycle() {
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
             crypto: None,
+            vss: None,
         },
         clock.clone(),
     );
@@ -1032,6 +1070,7 @@ async fn parallel_uploads_no_corruption() {
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
             crypto: None,
+            vss: None,
         },
         clock,
     );
@@ -1164,6 +1203,7 @@ async fn encryption_on_round_trip_bytes_match() {
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
             crypto: Some(suite),
+            vss: None,
         },
         clock,
     );
@@ -1256,6 +1296,7 @@ async fn encryption_nested_remote_is_ciphertext_and_restores() {
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
             crypto: Some(suite),
+            vss: None,
         },
         clock,
     );
@@ -1473,6 +1514,98 @@ async fn network_updater_down_does_not_block_sync() {
 }
 
 // ---------------------------------------------------------------------------
+// Row (M3.5): VSS unavailable -> locked file skipped + reported, rest sync.
+// ---------------------------------------------------------------------------
+
+/// ROADMAP M3.5 degrade acceptance: when VSS is UNAVAILABLE (the
+/// `FakeVssProvider::unavailable` stands in for not-elevated / `never` / off
+/// Windows), a genuinely locked file is SKIPPED and reported as
+/// `local.file_locked` in the activity log, while every other file in the same
+/// source still backs up. This is the historical degrade-gracefully contract,
+/// now asserted end-to-end through the real `DefaultExecutor` +
+/// `SyncOrchestrator` + `InMemoryRemoteStore`.
+///
+/// `#[cfg(windows)]` because only Windows produces a real
+/// `ERROR_SHARING_VIOLATION` from an exclusive open - but it is NOT
+/// elevation-gated: creating the lock needs no privilege (only VSS *snapshot
+/// creation* does), so this runs on the non-elevated Windows CI runner and
+/// pins the user's core pain-point failure mode. The cross-OS pure decision is
+/// covered by `driven_vss::fallback_decision`'s table test.
+#[cfg(windows)]
+#[tokio::test]
+async fn vss_unavailable_skips_locked_file_reports_and_continues() {
+    use driven_core::state::{ActivityFilter, PageRequest};
+    use std::os::windows::fs::OpenOptionsExt;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
+
+    // Two files: one we will lock exclusively, one that must still upload.
+    write_file(src_dir.path(), "locked.dat", b"held-exclusively");
+    write_file(src_dir.path(), "ok.txt", b"this one uploads");
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+
+    // Lock locked.dat with NO sharing for the whole cycle.
+    const GENERIC_WRITE: u32 = 0x4000_0000;
+    let _exclusive = std::fs::OpenOptions::new()
+        .access_mode(GENERIC_WRITE)
+        .share_mode(0)
+        .write(true)
+        .open(src_dir.path().join("locked.dat"))
+        .expect("lock locked.dat exclusively");
+
+    // VSS unavailable => the locked file degrades to skip.
+    let vss: Arc<dyn driven_vss::VssProvider> =
+        Arc::new(driven_vss::FakeVssProvider::unavailable());
+    let orch = orchestrator_with_vss(
+        account,
+        state.clone(),
+        remote.clone(),
+        Arc::new(FakePowerSource::new(power_on_ac())),
+        Arc::new(FakeNetProbe::online()),
+        Arc::new(FakeClock::new()),
+        OrchestratorConfig::default(),
+        vss,
+    );
+
+    orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+    // The unlocked file backed up; the locked one did not.
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        1,
+        "the unlocked file must still upload while the locked one is skipped"
+    );
+
+    // A local.file_locked activity row was written for the skipped file.
+    let page = state
+        .query_activity(
+            ActivityFilter {
+                event_types: vec!["local.file_locked".to_string()],
+                ..ActivityFilter::default()
+            },
+            PageRequest { page: 0, limit: 50 },
+        )
+        .await
+        .unwrap();
+    assert!(
+        page.rows
+            .iter()
+            .any(|r| r.event_type == "local.file_locked"),
+        "the skipped locked file must surface a local.file_locked activity row; got {:?}",
+        page.rows
+    );
+
+    // The cycle completed (Idle), not stuck.
+    assert!(matches!(orch.state().await, OrchestratorState::Idle { .. }));
+}
+
+// ---------------------------------------------------------------------------
 // Ignored rows: genuinely infeasible against the in-memory fake (documented).
 // ---------------------------------------------------------------------------
 
@@ -1561,6 +1694,7 @@ async fn pipeline_streaming_keeps_memory_bounded() {
             state: state.clone(),
             pacer: test_pacer(clock.clone()),
             crypto: None,
+            vss: None,
         },
         clock,
     )
