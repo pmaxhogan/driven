@@ -32,6 +32,9 @@ pub struct CapabilitySet {
     pub long_paths_enabled: bool,
     /// The host has real Internet (for the few scenarios that need it).
     pub network_reachable: bool,
+    /// `DRIVEN_CHAOS_SOAK=1` is set, opting this host into the soak-grade
+    /// massive-input rows.
+    pub soak: bool,
 }
 
 /// A single capability a scenario can require. The dotted/`cap:` rendering
@@ -62,6 +65,13 @@ pub enum Capability {
     Windows,
     /// The host OS family must be Unix (Linux or macOS).
     Unix,
+    /// Soak mode is opted into via `DRIVEN_CHAOS_SOAK=1`. The massive-input
+    /// rows (`million-files-nested`, `tiny-files-100k-in-one-dir`) require it so
+    /// they RUN in the weekly soak job (which sets the env) but SKIP cleanly in
+    /// the per-PR hermetic matrix - their multi-minute 100k-1M-file scan is
+    /// soak-grade (STRESS_HARNESS s3.2), not PR-gating work. Recorded as a
+    /// missing capability, never faked or weakened.
+    Soak,
 }
 
 impl Capability {
@@ -78,6 +88,7 @@ impl Capability {
             Capability::NetworkReachable => "cap:network_reachable".to_string(),
             Capability::Windows => "platform:windows".to_string(),
             Capability::Unix => "platform:unix".to_string(),
+            Capability::Soak => "cap:soak".to_string(),
         }
     }
 
@@ -94,6 +105,7 @@ impl Capability {
             Capability::NetworkReachable => set.network_reachable,
             Capability::Windows => cfg!(windows),
             Capability::Unix => cfg!(unix),
+            Capability::Soak => set.soak,
         }
     }
 }
@@ -150,6 +162,9 @@ impl CapabilitySet {
         // sequence on an elevated Windows host).
         let vss_available = cfg!(windows) && admin;
         let network_reachable = probe_network_reachable();
+        let soak = std::env::var("DRIVEN_CHAOS_SOAK")
+            .map(|v| v == "1" || v.eq_ignore_ascii_case("true"))
+            .unwrap_or(false);
         Self {
             admin,
             ntfs_volume,
@@ -159,6 +174,7 @@ impl CapabilitySet {
             vss_available,
             long_paths_enabled,
             network_reachable,
+            soak,
         }
     }
 }

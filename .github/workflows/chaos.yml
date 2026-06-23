@@ -103,6 +103,10 @@ jobs:
     # Weekly cron only; informational, does not gate merges (STRESS_HARNESS s7).
     if: github.event_name == 'schedule'
     runs-on: ubuntu-latest
+    # Opt into the soak-grade massive-input rows (million-files-nested,
+    # tiny-files-100k); they SKIP in the per-PR matrix and run here.
+    env:
+      DRIVEN_CHAOS_SOAK: "1"
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
@@ -112,9 +116,12 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
       - uses: Swatinem/rust-cache@v2
-      # A long seeded fuzz run; the seed is recorded in the log and any
-      # invariant violation writes target/chaos-fuzz-failures/<seed>.json for
-      # bit-reproducible replay (STRESS_HARNESS s4.3).
+      # First the soak-grade massive-input scenarios (skipped in PR), then the
+      # long seeded fuzz run. Any invariant violation writes
+      # target/chaos-fuzz-failures/<seed>.json for bit-reproducible replay
+      # (STRESS_HARNESS s4.3).
+      - name: chaos run-all (soak-gated rows)
+        run: cargo run -p driven-chaos -- run-all --hermetic
       - name: chaos fuzz (seeded soak)
         run: cargo run -p driven-chaos -- fuzz --seed ${{ github.run_id }} --duration 30m
       - name: upload fuzz failure replays

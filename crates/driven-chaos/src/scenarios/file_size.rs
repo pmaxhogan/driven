@@ -810,9 +810,14 @@ impl Scenario for TinyFiles100kInOneDir {
         "100k files of 0-1 KiB in one directory complete without the pacer deadlocking"
     }
     fn requires(&self) -> CapabilityRequirements {
-        CapabilityRequirements::of(vec![Capability::FreeDiskBytes {
-            min: TINY_FILES_FREE,
-        }])
+        // Soak-gated (STRESS_HARNESS s3.2): runs in the weekly soak job, SKIPs
+        // in the per-PR matrix - a 100k-file scan is not PR-gating work.
+        CapabilityRequirements::of(vec![
+            Capability::Soak,
+            Capability::FreeDiskBytes {
+                min: TINY_FILES_FREE,
+            },
+        ])
     }
     fn wall_cap(&self) -> std::time::Duration {
         // Scanning + uploading 100k real files is a deterministic, steadily-
@@ -920,9 +925,14 @@ impl Scenario for MillionFilesNested {
         "1000x1000 nested files; scanner RSS delta stays bounded and the SQLite/FTS state builds"
     }
     fn requires(&self) -> CapabilityRequirements {
-        CapabilityRequirements::of(vec![Capability::FreeDiskBytes {
-            min: MILLION_FILES_FREE,
-        }])
+        // Soak-gated (STRESS_HARNESS s3.2): runs in the weekly soak job, SKIPs
+        // in the per-PR matrix - a 1M-file scan is not PR-gating work.
+        CapabilityRequirements::of(vec![
+            Capability::Soak,
+            Capability::FreeDiskBytes {
+                min: MILLION_FILES_FREE,
+            },
+        ])
     }
     fn wall_cap(&self) -> std::time::Duration {
         // Scanning 1,000,000 real files + building the SQLite/FTS state is a
