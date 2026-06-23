@@ -64,6 +64,92 @@ static TARGET: &str = "driven::core::scanner";
 #[cfg(windows)]
 const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0040_0000;
 
+/// Whether `path` carries one or more NTFS Alternate Data Streams beyond its
+/// main unnamed `::$DATA` stream (DESIGN s5.2.1, STRESS_HARNESS s3.5
+/// `ads-alternate-data-stream`).
+///
+/// Driven backs up the main stream only; a file with named streams (e.g.
+/// `foo.txt:secret`) silently loses those streams. The scanner detects them
+/// so the orchestrator can surface a one-per-file `local.ads_skipped` warning
+/// (SPEC s24) rather than dropping them silently - silent data loss in a
+/// backup tool.
+///
+/// Windows enumerates streams via `FindFirstStreamW` / `FindNextStreamW`
+/// (`STREAM_INFO_LEVELS::FindStreamInfoStandard`). The main stream reports as
+/// `::$DATA`; any other `:<name>:$DATA` entry is an ADS. Non-Windows targets
+/// have no ADS concept and always return `false`.
+#[cfg(windows)]
+fn has_alternate_data_streams(path: &Path) -> bool {
+    use std::os::windows::ffi::OsStrExt;
+
+    // Win32 surface used here (declared locally to avoid pulling the windows
+    // crate into driven-core just for one scan-time probe). `WCHAR` is `u16`;
+    // we use `u16` directly to avoid a clippy upper-case-acronym alias.
+    #[repr(C)]
+    struct Win32FindStreamData {
+        stream_size: i64,
+        // cStreamName is WCHAR[MAX_PATH + 36]; the leading ':' + name + ':' +
+        // type. 296 = MAX_PATH(260) + 36.
+        stream_name: [u16; 296],
+    }
+    const INVALID_HANDLE_VALUE: isize = -1;
+    // FindStreamInfoStandard == 0.
+    const FIND_STREAM_INFO_STANDARD: i32 = 0;
+    extern "system" {
+        fn FindFirstStreamW(
+            file_name: *const u16,
+            info_level: i32,
+            find_stream_data: *mut Win32FindStreamData,
+            flags: u32,
+        ) -> isize;
+        fn FindNextStreamW(handle: isize, find_stream_data: *mut Win32FindStreamData) -> i32;
+        fn FindClose(handle: isize) -> i32;
+    }
+
+    // The unnamed main stream's name, as FindFirstStreamW reports it.
+    fn is_main_stream(name: &[u16]) -> bool {
+        // Compare against the literal "::$DATA" up to the first NUL.
+        let main: Vec<u16> = "::$DATA".encode_utf16().collect();
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        name[..len] == main[..]
+    }
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; `data` is a fixed-size
+    // stack buffer the API fills; the handle is closed before return on every
+    // path. All pointers are valid for the duration of each call.
+    unsafe {
+        let mut data: Win32FindStreamData = std::mem::zeroed();
+        let handle = FindFirstStreamW(
+            wide.as_ptr(),
+            FIND_STREAM_INFO_STANDARD,
+            &mut data as *mut _,
+            0,
+        );
+        if handle == INVALID_HANDLE_VALUE {
+            // No stream enumeration available (e.g. not NTFS, or access
+            // error): conservatively report no ADS rather than a false notice.
+            return false;
+        }
+        let mut found_ads = false;
+        loop {
+            if !is_main_stream(&data.stream_name) {
+                found_ads = true;
+                break;
+            }
+            if FindNextStreamW(handle, &mut data as *mut _) == 0 {
+                break;
+            }
+        }
+        FindClose(handle);
+        found_ads
+    }
+}
+
 /// Walks one source and returns the new-or-changed / deleted diff (SPEC s6).
 ///
 /// `mode` selects the change-detection predicate (see the module docs).
@@ -130,6 +216,12 @@ pub async fn scan(
     // deletion this cycle (DESIGN s5.2 step 3).
     let mut unattributed_error = false;
     let mut skipped_symlinks: u64 = 0;
+    // Files whose named NTFS Alternate Data Streams are NOT backed up
+    // (DESIGN s5.2.1, SPEC s24 `local.ads_skipped`). Populated only on
+    // Windows + NTFS; the orchestrator turns each into a one-per-file
+    // warning so the dropped stream is not silent data loss.
+    #[cfg_attr(not(windows), allow(unused_mut))]
+    let mut ads_skipped: Vec<RelativePath> = Vec::new();
 
     for result in walker {
         let entry = match result {
@@ -233,6 +325,20 @@ pub async fn scan(
             continue;
         }
 
+        // NTFS Alternate Data Stream detection (DESIGN s5.2.1, SPEC s24
+        // `local.ads_skipped`): this file is about to be backed up (main
+        // stream only), so if it carries any named data stream record the
+        // path. The orchestrator surfaces one warning per affected file; the
+        // named streams are NOT uploaded (a documented V1 limitation that
+        // must be visible, not silent). Windows-only; a no-op elsewhere.
+        #[cfg(windows)]
+        {
+            if has_alternate_data_streams(abs) {
+                tracing::warn!(target: TARGET, source_id = %source.id, path = %rel, "local.ads_skipped: file has NTFS alternate data stream(s); only the main stream is backed up");
+                ads_skipped.push(rel.clone());
+            }
+        }
+
         let stored = known.get(&rel);
         // TODO(M3): FS-granularity probe + ctime/birthtime fallback + hash-within-last-scan-window per DESIGN s5.2 step 2
         let stat_match =
@@ -311,6 +417,7 @@ pub async fn scan(
         skipped_symlinks,
         skipped_cloud_only,
         collisions = collisions.len(),
+        ads_skipped = ads_skipped.len(),
         errored_prefixes = errored_prefixes.len(),
         unattributed_error,
         "scan complete"
@@ -321,6 +428,7 @@ pub async fn scan(
         deleted,
         collisions,
         excluded_orphans,
+        ads_skipped,
     })
 }
 

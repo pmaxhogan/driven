@@ -408,6 +408,7 @@ mod tests {
             deleted: Vec::new(),
             collisions: Vec::new(),
             excluded_orphans: Vec::new(),
+            ads_skipped: Vec::new(),
         };
         let state = FakeStateRepo::default();
 
@@ -448,6 +449,7 @@ mod tests {
             deleted: Vec::new(),
             collisions: Vec::new(),
             excluded_orphans: Vec::new(),
+            ads_skipped: Vec::new(),
         };
         let state = FakeStateRepo::default();
 
@@ -479,6 +481,7 @@ mod tests {
             deleted: vec![rel("gone.txt")],
             collisions: Vec::new(),
             excluded_orphans: Vec::new(),
+            ads_skipped: Vec::new(),
         };
         let state = FakeStateRepo::with_rows(vec![row]);
 
@@ -516,6 +519,7 @@ mod tests {
             deleted: vec![rel("never-up.txt")],
             collisions: Vec::new(),
             excluded_orphans: Vec::new(),
+            ads_skipped: Vec::new(),
         };
         let state = FakeStateRepo::with_rows(vec![row]);
 
@@ -543,6 +547,7 @@ mod tests {
             deleted: vec![rel("old-name.txt")],
             collisions: Vec::new(),
             excluded_orphans: Vec::new(),
+            ads_skipped: Vec::new(),
         };
         let state = FakeStateRepo::with_rows(vec![old_row]);
 

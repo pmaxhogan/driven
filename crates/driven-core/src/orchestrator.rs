@@ -768,6 +768,37 @@ impl SyncOrchestrator {
         }
     }
 
+    /// Writes a durable `activity_log` WARNING row per file whose NTFS named
+    /// Alternate Data Streams were not backed up (SPEC s24 `local.ads_skipped`,
+    /// STRESS_HARNESS s3.5 `ads-alternate-data-stream`).
+    ///
+    /// The main (unnamed) stream still uploads; the named streams are dropped -
+    /// a documented V1 limitation. Surfacing it as a durable activity row is
+    /// what keeps that from being silent data loss in a backup tool. A failed
+    /// write is logged but never aborts the cycle (mirrors `record_collisions`).
+    async fn record_ads_skipped(
+        &self,
+        source_id: crate::types::SourceId,
+        ads_skipped: &[RelativePath],
+    ) {
+        let now = self.clock.now_ms();
+        for path in ads_skipped {
+            tracing::warn!(target: TARGET, source_id = %source_id, path = %path, "local.ads_skipped: named NTFS data stream(s) not backed up");
+            let row = NewActivity {
+                ts: now,
+                source_id: Some(source_id),
+                level: ActivityLevel::Warn,
+                event_type: "local.ads_skipped".to_string(),
+                file_count: None,
+                bytes: None,
+                message: Some(path.as_str().to_string()),
+            };
+            if let Err(err) = self.state.write_activity(row).await {
+                tracing::warn!(target: TARGET, source_id = %source_id, path = %path, %err, "failed to write ads_skipped activity row");
+            }
+        }
+    }
+
     /// Writes a durable `activity_log` row per failed / re-queued op (recheck2
     /// P2) so a production user has per-file failure evidence rather than only
     /// tracing. A `Failed` op lands an Error row keyed by its error code; a
@@ -844,6 +875,14 @@ impl SyncOrchestrator {
             {
                 tracing::warn!(target: TARGET, source_id = %source.id, %err, "failed to mark excluded orphans");
             }
+        }
+
+        // SPEC s24 local.ads_skipped: surface each file whose named NTFS data
+        // streams were not backed up as a durable WARNING row, so the dropped
+        // stream is visible rather than silent data loss. The main stream still
+        // uploads via the normal pipeline below. Non-fatal.
+        if !scan.ads_skipped.is_empty() {
+            self.record_ads_skipped(source.id, &scan.ads_skipped).await;
         }
 
         let plan = crate::planner::plan(source, &scan, self.state.as_ref()).await?;

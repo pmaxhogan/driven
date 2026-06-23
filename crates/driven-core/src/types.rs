@@ -671,6 +671,15 @@ pub struct ScanResult {
     /// At M2 this is surfaced for the later Activity-banner UI; the planner
     /// no-ops on it.
     pub excluded_orphans: Vec<RelativePath>,
+    /// Paths whose file carried one or more NTFS Alternate Data Streams that
+    /// Driven backs up the main (unnamed `::$DATA`) stream of but NOT the
+    /// named streams (DESIGN s5.2.1 / STRESS_HARNESS s3.5
+    /// `ads-alternate-data-stream`, SPEC s24 `local.ads_skipped`). The main
+    /// stream still uploads; this is a one-notice-per-affected-file warning,
+    /// never a trash and never a fatal - the named stream is silently dropped
+    /// today, so surfacing it is what stops that being silent data loss. Only
+    /// ever populated on Windows + NTFS; empty everywhere else.
+    pub ads_skipped: Vec<RelativePath>,
 }
 
 /// One local file the scanner observed (SPEC s6 `LocalEntry`).

@@ -611,7 +611,7 @@ impl DefaultExecutor {
                 Err(OpenError::Locked) => EffectiveOpen::Skip(SkipReason::Locked),
                 Err(OpenError::Io(e)) => {
                     warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
-                    EffectiveOpen::Failed(ErrorCode::LocalIoError)
+                    EffectiveOpen::Failed(local_io_error_code(&e))
                 }
             };
         };
@@ -636,7 +636,7 @@ impl DefaultExecutor {
                 Err(OpenError::Locked) => OpenAttempt::Locked,
                 Err(OpenError::Io(e)) => {
                     warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
-                    return EffectiveOpen::Failed(ErrorCode::LocalIoError);
+                    return EffectiveOpen::Failed(local_io_error_code(&e));
                 }
             };
         } else {
@@ -651,7 +651,7 @@ impl DefaultExecutor {
                 Err(OpenError::Locked) => attempt = OpenAttempt::Locked,
                 Err(OpenError::Io(e)) => {
                     warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
-                    return EffectiveOpen::Failed(ErrorCode::LocalIoError);
+                    return EffectiveOpen::Failed(local_io_error_code(&e));
                 }
             }
         }
@@ -684,7 +684,7 @@ impl DefaultExecutor {
                         Err(OpenError::Locked) => EffectiveOpen::Skip(SkipReason::Locked),
                         Err(OpenError::Io(e)) => {
                             warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
-                            EffectiveOpen::Failed(ErrorCode::LocalIoError)
+                            EffectiveOpen::Failed(local_io_error_code(&e))
                         }
                     }
                 }
@@ -2774,7 +2774,7 @@ fn stage_err_to_upload(e: StageError) -> UploadError {
         StageError::Changed => UploadError::SkipPostUpload(SkipReason::ChangedDuringUpload),
         StageError::Io(io) => {
             warn!(target: TARGET, error = %io, "streaming read IO error");
-            UploadError::Failed(ErrorCode::LocalIoError)
+            UploadError::Failed(local_io_error_code(&io))
         }
         StageError::Crypto(ce) => UploadError::Failed(crypto_error_code(&ce)),
         // Should be unreachable: the caller surfaces the uploader error
@@ -3090,7 +3090,45 @@ impl UploadError {
         {
             return UploadError::Failed(crypto_error_code(ce));
         }
-        UploadError::Failed(ErrorCode::LocalIoError)
+        UploadError::Failed(local_io_error_code(&e))
+    }
+}
+
+/// Classify a local-filesystem [`std::io::Error`] into its stable
+/// [`ErrorCode`]: an out-of-space failure maps to
+/// [`ErrorCode::LocalDiskFull`] (SPEC s24 / STRESS_HARNESS s3.1
+/// `disk-full-target`), everything else to [`ErrorCode::LocalIoError`].
+///
+/// We inspect the raw OS error number rather than [`std::io::ErrorKind`]
+/// because stable Rust does not yet surface a portable `StorageFull` kind on
+/// every target: Unix reports `ENOSPC` (errno 28); Windows reports
+/// `ERROR_DISK_FULL` (112) or `ERROR_HANDLE_DISK_FULL` (39). Mapping it to a
+/// distinct code lets the orchestrator pause the source with "disk full"
+/// rather than a generic IO error the user cannot act on.
+fn local_io_error_code(e: &std::io::Error) -> ErrorCode {
+    if is_disk_full(e) {
+        ErrorCode::LocalDiskFull
+    } else {
+        ErrorCode::LocalIoError
+    }
+}
+
+/// Whether `e` is an out-of-space (disk-full) error on this platform.
+fn is_disk_full(e: &std::io::Error) -> bool {
+    // `ErrorKind::StorageFull` is stable since Rust 1.83 and is set for both
+    // ENOSPC and the Windows disk-full codes, so prefer it; fall back to the
+    // raw OS error so older readers / unusual surfaces still classify.
+    if matches!(e.kind(), std::io::ErrorKind::StorageFull) {
+        return true;
+    }
+    match e.raw_os_error() {
+        // Unix ENOSPC.
+        #[cfg(unix)]
+        Some(28) => true,
+        // Windows ERROR_HANDLE_DISK_FULL (39) / ERROR_DISK_FULL (112).
+        #[cfg(windows)]
+        Some(39) | Some(112) => true,
+        _ => false,
     }
 }
 
@@ -3403,6 +3441,39 @@ mod tests {
 
     use crate::state::SqliteStateRepo;
     use crate::types::{AccountId, AccountState};
+
+    // --- P1-E: out-of-space classification (STRESS_HARNESS s3.1) ------------
+
+    #[test]
+    fn enospc_classifies_as_local_disk_full() {
+        // Unix ENOSPC (28) and the Windows disk-full codes (39 / 112) must map
+        // to LocalDiskFull, not the generic LocalIoError, so the orchestrator
+        // can pause the source with an actionable "disk full" rather than a
+        // catch-all IO error (SPEC s24 local.disk_full).
+        #[cfg(unix)]
+        {
+            let e = std::io::Error::from_raw_os_error(28);
+            assert!(is_disk_full(&e), "ENOSPC must read as disk-full");
+            assert_eq!(local_io_error_code(&e), ErrorCode::LocalDiskFull);
+        }
+        #[cfg(windows)]
+        {
+            for code in [39, 112] {
+                let e = std::io::Error::from_raw_os_error(code);
+                assert!(is_disk_full(&e), "Windows {code} must read as disk-full");
+                assert_eq!(local_io_error_code(&e), ErrorCode::LocalDiskFull);
+            }
+        }
+    }
+
+    #[test]
+    fn non_enospc_io_error_stays_local_io_error() {
+        // A generic IO error (permission denied) must NOT be misclassified as
+        // disk-full.
+        let e = std::io::Error::from(std::io::ErrorKind::PermissionDenied);
+        assert!(!is_disk_full(&e));
+        assert_eq!(local_io_error_code(&e), ErrorCode::LocalIoError);
+    }
 
     // --- a no-op pacer so tests don't sleep on real time --------------------
 
