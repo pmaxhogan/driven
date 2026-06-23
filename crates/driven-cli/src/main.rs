@@ -361,7 +361,13 @@ async fn run_sync(args: SyncArgs) -> anyhow::Result<()> {
 /// Builds a live [`GoogleDriveStore`] from the keychain refresh token for
 /// `account` (SPEC s4.1: refresh -> access token on demand). Shared by `sync`.
 fn build_store(account: &str, creds: &ClientCreds) -> anyhow::Result<GoogleDriveStore> {
-    let store = KeyringTokenStore::new(account.to_string());
+    // R-P2-1: wrap the keychain store in an Arc and wire it into the token
+    // source via `.with_store(...)` so a refresh-token ROTATION (Google may
+    // issue a new refresh token on a refresh) is PERSISTED back to the
+    // keychain. Without this the rotated token lived only in memory and was
+    // lost on restart, so the next `driven-cli sync` would re-use the stale
+    // (possibly revoked) token and fail to authenticate.
+    let store = std::sync::Arc::new(KeyringTokenStore::new(account.to_string()));
     let refresh_token = store.load_refresh_token()?.ok_or_else(|| {
         anyhow::anyhow!(
             "no refresh token stored for account '{account}'; run `driven-cli auth --account {account}` first"
@@ -371,7 +377,8 @@ fn build_store(account: &str, creds: &ClientCreds) -> anyhow::Result<GoogleDrive
         refresh_token,
         creds.client_id.clone(),
         creds.client_secret.clone(),
-    )?;
+    )?
+    .with_store(store);
     GoogleDriveStore::with_default_clients(token_source)
 }
 
