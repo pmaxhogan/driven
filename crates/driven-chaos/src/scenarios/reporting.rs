@@ -153,6 +153,26 @@ impl InvariantReport {
     }
 }
 
+/// Whether a due `pending_ops` row is a well-formed deferred-create reconcile
+/// op - the documented DESIGN s5.6 recovery handle a transient fault mid-first
+/// -upload leaves behind (an `upload` op carrying a `client_op_uuid` but no
+/// `drive_file_id` yet), which the next-boot startup reconcile resolves. It is
+/// a legitimate terminal state for the Drive-side transient + crash-recovery
+/// rows, NOT a pending-ops leak. Mirrors the mutator's per-row definition so the
+/// central sweep and the scenario-local check agree.
+fn is_deferred_create_reconcile(op: &driven_core::state::PendingOpRow) -> bool {
+    op.op_type.as_str() == "upload"
+        && op
+            .payload_json
+            .get("client_op_uuid")
+            .is_some_and(|v| !v.is_null())
+        && op
+            .payload_json
+            .get("drive_file_id")
+            .map(|v| v.is_null())
+            .unwrap_or(true)
+}
+
 /// Compute the STRESS_HARNESS s6.3 invariants from the handle's terminal
 /// state, against the destination `folder_id` for one `source_id`.
 ///
@@ -174,9 +194,14 @@ pub async fn assert_invariants(
 ) -> anyhow::Result<InvariantReport> {
     // Live remote objects + a map from client_op_uuid -> count of live
     // objects carrying it (the duplicate-detection key, s6.3).
+    //
+    // Use the FAULT-FREE `list_folder_with_trashed` accessor (a direct in-memory
+    // read, NOT the faulted `list_folder` trait method) so a scenario that
+    // leaves the remote in a LATCHED fault state (e.g. auth.invalid_grant, which
+    // the fake applies to read calls too) can still have its terminal-state
+    // invariants verified instead of the sweep itself erroring on the fault.
     let live: Vec<_> = remote
-        .list_folder(folder_id)
-        .await?
+        .list_folder_with_trashed(folder_id)
         .into_iter()
         .filter(|e| !e.trashed)
         .collect();
@@ -215,10 +240,21 @@ pub async fn assert_invariants(
     data_loss_paths.sort();
 
     // No pending_ops leak (s6.3): a row is a leak only if it is due now or
-    // overdue. A future-dated backoff row is legitimate.
+    // overdue. Two due-row kinds are legitimate, NOT leaks:
+    //   a future-dated backoff row (scheduled_for > now), and
+    //   a well-formed deferred-create reconcile op - an `upload` op that
+    //   carries a client_op_uuid but no drive_file_id yet, the documented
+    //   DESIGN s5.6 recovery handle a transient fault mid-first-upload leaves
+    //   for the next-boot startup reconcile to resolve. Counting it as a leak
+    //   would falsely red the Drive-side transient + crash-recovery rows, whose
+    //   correct terminal state IS one such op.
     let now = handle.clock.now_ms();
     let pending = handle.state.get_pending_ops_for_source(source_id).await?;
-    let leaked_pending_ops = pending.iter().filter(|p| p.scheduled_for <= now).count() as u64;
+    let leaked_pending_ops = pending
+        .iter()
+        .filter(|p| p.scheduled_for <= now)
+        .filter(|p| !is_deferred_create_reconcile(p))
+        .count() as u64;
 
     Ok(InvariantReport {
         data_loss_paths,
