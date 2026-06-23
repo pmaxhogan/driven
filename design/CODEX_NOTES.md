@@ -462,3 +462,41 @@ the dependency tree in M4 to clear RUSTSEC-2026-0119 (hickory-proto name
 compression). The DNS probe now uses `tokio::net::lookup_host` per DESIGN s5.8.1
 (which was always the specified primary path); hickory remains the documented V2
 escalation option if a field need arises, to be re-added behind a feature then.
+
+## M4 recheck-2 deferrals -> M5 (executor assembly)
+
+The codex recheck-2 (FINAL round, recheck cap=2) raised three P1s. One was
+reachable in M4 via `driven-cli` sync and is FIXED (R2-P1-2: `query_offset()` now
+classifies 401/403/429/5xx exactly like `push_chunk` via the shared
+`chunk_status_outcome` + `DriveError::from_response`, reserving
+`ResumableSessionInvalid` for session-dead 400/404/410). The remaining two are
+executor/state-layer work that is only REACHABLE once M5 wires the real
+`GoogleDriveStore` into the production executor: in M4 the executor runs the
+`InMemoryRemoteStore` fake and the CLI bypasses the executor's pending-op
+machinery, so neither path is exercised by delivered M4 scope. They are accepted
+residuals (recheck cap 2 reached, M4 is DONE - no recheck-3), tracked on the M5
+task, NOT bugs in M4's delivered scope.
+
+- **R2-P1-1 - durable corrupt-create cleanup (executor pending-op lifecycle).**
+  `GoogleDriveStore::verify_md5_or_trash_create` (google/mod.rs) best-effort
+  trashes its OWN corrupt create when the post-upload md5 verify fails. If that
+  `trash()` call itself fails, the store returns only `DriveError::ChecksumMismatch`;
+  the executor maps it to `UploadError::Failed` and DELETES the pending op. Result:
+  a live corrupt Drive object is stranded with no reconcile handle, and the next
+  scan can create a duplicate. The durable fix - persist the corrupt `file_id` in
+  pending state, keep the pending op UNTIL the corrupt object is confirmed
+  trashed, and retry the trash on the next cycle - is executor/state-layer work.
+  Latent in M4 (the real store is not executor-wired; the CLI bypasses the
+  executor), so it cannot occur in delivered M4 scope. It is also astronomically
+  rare (requires Drive-side upload corruption AND a trash failure). Lands at M5.
+
+- **R2-P1-3 - DESIGN s498-500 "3 consecutive checksum mismatches ->
+  status='corrupt'" per-file counter is absent on the real-store path.** The
+  per-file mismatch counter + `FileStateStatus::Corrupt` transition DESIGN s498-500
+  requires is NOT present where a real-store checksum mismatch is handled: a
+  mismatch maps to `UploadError::Failed`, deletes the pending op, and the
+  orchestrator only defers scan timestamps + logs activity. There is no per-file
+  persistent mismatch state. Implementing it needs per-file persistent mismatch
+  state in the executor/state layer = M5 work. M4 corrected the now-honest comment
+  at `crates/driven-core/src/executor.rs` (`DriveError::ChecksumMismatch`) to stop
+  claiming the defence exists today; the counter itself lands at M5.
