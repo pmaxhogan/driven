@@ -165,9 +165,18 @@ pub async fn open_session(
 ///   re-`PUT bytes */<total>` to ask Drive for the confirmed offset and return
 ///   only that acknowledged count.
 /// - `200`/`201` -> [`ResumeProgress::Completed`].
-/// - any 4xx (other than 308) -> [`ResumeProgress::SessionInvalid`] (SPEC s24
-///   `drive.resumable_session_invalid`; DESIGN s5.4 "any 4xx other than 308
-///   terminates the session"). The caller restarts from offset 0.
+/// - `401` / `403` / `429` (and any non-session-dead status) -> the body is
+///   read and classified via [`DriveError::from_response`] and the TYPED error
+///   is returned (codex R-P1-2). This surfaces `403 storageQuotaExceeded` ->
+///   `drive.quota_exhausted`, `403 dailyLimitExceeded` ->
+///   `drive.daily_quota_exhausted`, `401 invalid_grant` -> `auth.invalid_grant`,
+///   and `429 rateLimitExceeded` -> `drive.rate_limited`, instead of hiding
+///   them behind `SessionInvalid` (which would loop the session restart forever
+///   on a quota error and never let the breaker see the typed failure).
+/// - `400` / `404` / `410` (a genuinely session-dead 4xx on the session URL) ->
+///   [`ResumeProgress::SessionInvalid`] (SPEC s24 `drive.resumable_session_invalid`;
+///   DESIGN s5.4 "any 4xx other than 308 terminates the session"). The caller
+///   restarts from offset 0.
 /// - 5xx / transport -> a classified [`DriveError`] so the caller's retry
 ///   wrapper backs off and re-queries the SAME session.
 pub async fn push_chunk(
@@ -225,19 +234,49 @@ pub async fn push_chunk(
     // 5xx and network are transient at the SESSION level: the chunk push can
     // be retried against the SAME session by re-querying the offset. We map
     // 5xx to a classified error so `with_retry` (when the caller wraps the
-    // push) backs off; the resumable upload loop in mod.rs re-attempts. But a
-    // 4xx (400/401/403/404/410) is fatal to the session: SessionInvalid.
-    if (500..=599).contains(&status) {
-        let retry_after = super::parse_retry_after(&resp);
-        let body = resp.bytes().await.map_err(DriveError::from_transport)?;
-        return Err(anyhow::Error::new(DriveError::from_response(
-            status,
-            &body,
-            retry_after,
-        )));
+    // push) backs off; the resumable upload loop in mod.rs re-attempts.
+    // codex R-P1-2: 401/403/429 (and 5xx) are NOT a dead session - read the
+    // body and return the TYPED classified error so quota/auth/rate surface
+    // their stable codes; only a genuinely session-dead 4xx (400/404/410)
+    // collapses to SessionInvalid (the caller restarts from offset 0).
+    match chunk_status_outcome(status) {
+        ChunkStatusOutcome::SessionInvalid => Ok(ResumeProgress::SessionInvalid),
+        ChunkStatusOutcome::Typed => {
+            let retry_after = super::parse_retry_after(&resp);
+            let body = resp.bytes().await.map_err(DriveError::from_transport)?;
+            Err(anyhow::Error::new(DriveError::from_response(
+                status,
+                &body,
+                retry_after,
+            )))
+        }
     }
-    // Any 4xx (including 410 Gone) kills the session (DESIGN s5.4).
-    Ok(ResumeProgress::SessionInvalid)
+}
+
+/// How a non-2xx / non-308 chunk-PUT status is handled (codex R-P1-2). Split
+/// out as a pure function so the session-dead vs typed-error decision is
+/// unit-testable without standing up an HTTP server (the wire path needs a
+/// real `reqwest::Response`).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ChunkStatusOutcome {
+    /// The session URL is dead (400 bad-request / 404 / 410 Gone): restart
+    /// from offset 0 ([`ResumeProgress::SessionInvalid`]).
+    SessionInvalid,
+    /// Read the body and return the typed classified error (5xx transient,
+    /// 401 auth, 403 quota/rate, 429 rate, or any other status). NEVER hidden
+    /// behind SessionInvalid - a quota error there would loop the restart
+    /// forever and the breaker would never see the typed failure.
+    Typed,
+}
+
+/// Decides how a chunk-PUT status (already known not to be 2xx or 308) is
+/// handled. 400/404/410 are session-dead; everything else (401/403/429/5xx and
+/// any unexpected status) is read + classified into a typed error.
+fn chunk_status_outcome(status: u16) -> ChunkStatusOutcome {
+    match status {
+        400 | 404 | 410 => ChunkStatusOutcome::SessionInvalid,
+        _ => ChunkStatusOutcome::Typed,
+    }
 }
 
 /// Queries the bytes Drive has acknowledged for a session (the
@@ -369,5 +408,60 @@ mod tests {
     fn chunk_bytes_is_a_multiple_of_chunk_multiple() {
         assert_eq!(CHUNK_BYTES % CHUNK_MULTIPLE, 0);
         const { assert!(CHUNK_BYTES >= CHUNK_MULTIPLE) };
+    }
+
+    #[test]
+    fn chunk_status_outcome_session_dead_only_for_400_404_410() {
+        // R-P1-2: only a genuinely session-dead 4xx restarts the session.
+        for s in [400u16, 404, 410] {
+            assert_eq!(
+                chunk_status_outcome(s),
+                ChunkStatusOutcome::SessionInvalid,
+                "status {s} must be session-dead"
+            );
+        }
+    }
+
+    #[test]
+    fn chunk_status_outcome_auth_quota_rate_are_typed_not_session_invalid() {
+        // R-P1-2: 401 invalid_grant, 403 storageQuota/dailyLimit, 429 rate
+        // limit must surface as TYPED errors, NOT be hidden behind
+        // SessionInvalid (which would loop the session restart on a quota
+        // error and never let the breaker see the failure). 5xx and any other
+        // unexpected status are also read + classified.
+        for s in [401u16, 403, 429, 500, 502, 503, 418] {
+            assert_eq!(
+                chunk_status_outcome(s),
+                ChunkStatusOutcome::Typed,
+                "status {s} must be read + classified (typed), not session-dead"
+            );
+        }
+    }
+
+    #[test]
+    fn typed_statuses_classify_to_their_stable_codes() {
+        use crate::remote_store::DriveErrorClassification;
+        // The typed branch hands the body to DriveError::from_response; confirm
+        // the auth/quota/rate bodies map to the SPEC s24 classes the executor
+        // needs (R-P1-2 / R-P1-3 surface these on a streamed large upload).
+        let invalid_grant = br#"{"error":"invalid_grant"}"#;
+        assert!(matches!(
+            DriveError::from_response(401, invalid_grant, None).classification(),
+            DriveErrorClassification::AuthInvalidGrant
+        ));
+        let storage = br#"{"error":{"errors":[{"reason":"storageQuotaExceeded"}],"code":403}}"#;
+        assert!(matches!(
+            DriveError::from_response(403, storage, None).classification(),
+            DriveErrorClassification::StorageQuota
+        ));
+        let daily = br#"{"error":{"errors":[{"reason":"dailyLimitExceeded"}],"code":403}}"#;
+        assert!(matches!(
+            DriveError::from_response(403, daily, None).classification(),
+            DriveErrorClassification::DailyQuota
+        ));
+        assert!(matches!(
+            DriveError::from_response(429, b"", None).classification(),
+            DriveErrorClassification::RateLimited { .. }
+        ));
     }
 }

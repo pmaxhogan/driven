@@ -706,7 +706,10 @@ impl GoogleDriveStore {
         };
 
         let entry = file.into_remote_entry();
-        verify_md5(&entry, expected_md5)?;
+        // R-P1-1: on a CREATE (file_id is None) mismatch, trash the corrupt
+        // new object before returning the checksum error so none is stranded.
+        self.verify_md5_or_trash_create(&entry, expected_md5, file_id.is_none())
+            .await?;
         Ok(entry)
     }
 
@@ -953,7 +956,10 @@ impl GoogleDriveStore {
         };
         let expected_md5: [u8; 16] = hasher.finalize().into();
         let entry = self.ensure_md5(entry, expected_md5).await?;
-        verify_md5(&entry, expected_md5)?;
+        // R-P1-1: trash a corrupt CREATE before failing (never an UPDATE).
+        let is_create = matches!(kind, ResumableKind::Create { .. });
+        self.verify_md5_or_trash_create(&entry, expected_md5, is_create)
+            .await?;
         Ok(entry)
     }
 
@@ -1036,7 +1042,10 @@ impl GoogleDriveStore {
 
             if let Some(entry) = completed {
                 let entry = self.ensure_md5(entry, expected_md5).await?;
-                verify_md5(&entry, expected_md5)?;
+                // R-P1-1: trash a corrupt CREATE before failing (never an UPDATE).
+                let is_create = matches!(kind, ResumableKind::Create { .. });
+                self.verify_md5_or_trash_create(&entry, expected_md5, is_create)
+                    .await?;
                 return Ok(entry);
             }
             if session_died {
@@ -1079,6 +1088,47 @@ impl GoogleDriveStore {
             "resumable completion omitted md5Checksum; fetching metadata to verify"
         );
         self.metadata(&entry.id).await
+    }
+
+    /// Post-upload md5 verification that, on a CREATE mismatch, TRASHES the
+    /// just-created corrupt object before returning the checksum error (codex
+    /// R-P1-1). With the real store the md5 verify happens HERE, inside the
+    /// store, before the executor ever sees a `RemoteEntry` - so if we returned
+    /// the bare `ChecksumMismatch` without trashing, a corrupt brand-new object
+    /// would be left live on Drive (the executor's own `trash_corrupt_create`
+    /// only runs on the fake path where it does its own verify). `is_create`
+    /// distinguishes a brand-new orphan (safe + necessary to trash) from an
+    /// UPDATE (whose file_id is the user's pre-existing file - NEVER trash it;
+    /// the old good revision stays and reconcile re-uploads).
+    async fn verify_md5_or_trash_create(
+        &self,
+        entry: &RemoteEntry,
+        expected_md5: [u8; 16],
+        is_create: bool,
+    ) -> anyhow::Result<()> {
+        match verify_md5(entry, expected_md5) {
+            Ok(()) => Ok(()),
+            Err(e) => {
+                if is_create {
+                    warn!(
+                        target: TARGET,
+                        file_id = %entry.id,
+                        "md5 mismatch on create; trashing the corrupt new object before failing"
+                    );
+                    // Best-effort: a failed trash still surfaces the checksum
+                    // error (the executor will not commit the op), but we must
+                    // not swallow the original mismatch behind a trash error.
+                    if let Err(te) = self.trash(&entry.id).await {
+                        warn!(
+                            target: TARGET,
+                            file_id = %entry.id,
+                            "failed to trash corrupt create object after md5 mismatch: {te}"
+                        );
+                    }
+                }
+                Err(e)
+            }
+        }
     }
 }
 
