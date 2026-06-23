@@ -680,6 +680,14 @@ pub struct ScanResult {
     /// today, so surfacing it is what stops that being silent data loss. Only
     /// ever populated on Windows + NTFS; empty everywhere else.
     pub ads_skipped: Vec<RelativePath>,
+    /// Lossy display strings of local paths the scanner skipped because they
+    /// are not representable as a `RelativePath` (e.g. a Win32 name with an
+    /// unpaired UTF-16 surrogate that fails UTF-8 conversion, STRESS_HARNESS
+    /// s3.4 `name-unpaired-surrogate`, SPEC s24 `local.invalid_filename`). The
+    /// file is NOT backed up; surfacing the skip as a one-notice-per-path
+    /// warning is what keeps it from being a silent omission. Stored as a lossy
+    /// `String` because there is, by definition, no valid `RelativePath` for it.
+    pub invalid_filenames: Vec<String>,
 }
 
 /// One local file the scanner observed (SPEC s6 `LocalEntry`).

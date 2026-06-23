@@ -409,6 +409,7 @@ mod tests {
             collisions: Vec::new(),
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
+            invalid_filenames: Vec::new(),
         };
         let state = FakeStateRepo::default();
 
@@ -450,6 +451,7 @@ mod tests {
             collisions: Vec::new(),
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
+            invalid_filenames: Vec::new(),
         };
         let state = FakeStateRepo::default();
 
@@ -482,6 +484,7 @@ mod tests {
             collisions: Vec::new(),
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
+            invalid_filenames: Vec::new(),
         };
         let state = FakeStateRepo::with_rows(vec![row]);
 
@@ -520,6 +523,7 @@ mod tests {
             collisions: Vec::new(),
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
+            invalid_filenames: Vec::new(),
         };
         let state = FakeStateRepo::with_rows(vec![row]);
 
@@ -548,6 +552,7 @@ mod tests {
             collisions: Vec::new(),
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
+            invalid_filenames: Vec::new(),
         };
         let state = FakeStateRepo::with_rows(vec![old_row]);
 

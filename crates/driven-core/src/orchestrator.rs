@@ -799,6 +799,36 @@ impl SyncOrchestrator {
         }
     }
 
+    /// Writes a durable `activity_log` WARNING row per local path the scanner
+    /// skipped because it is not representable as a `RelativePath` (SPEC s24
+    /// `local.invalid_filename`, STRESS_HARNESS s3.4 `name-unpaired-surrogate`).
+    ///
+    /// The file is not backed up; surfacing the skip as a durable activity row
+    /// is what keeps it from being a silent omission. A failed write is logged
+    /// but never aborts the cycle (mirrors `record_ads_skipped`).
+    async fn record_invalid_filenames(
+        &self,
+        source_id: crate::types::SourceId,
+        invalid_filenames: &[String],
+    ) {
+        let now = self.clock.now_ms();
+        for shown in invalid_filenames {
+            tracing::warn!(target: TARGET, source_id = %source_id, path = %shown, "local.invalid_filename: path not representable as a relative path; not backed up");
+            let row = NewActivity {
+                ts: now,
+                source_id: Some(source_id),
+                level: ActivityLevel::Warn,
+                event_type: "local.invalid_filename".to_string(),
+                file_count: None,
+                bytes: None,
+                message: Some(shown.clone()),
+            };
+            if let Err(err) = self.state.write_activity(row).await {
+                tracing::warn!(target: TARGET, source_id = %source_id, path = %shown, %err, "failed to write invalid_filename activity row");
+            }
+        }
+    }
+
     /// Writes a durable `activity_log` row per failed / re-queued op (recheck2
     /// P2) so a production user has per-file failure evidence rather than only
     /// tracing. A `Failed` op lands an Error row keyed by its error code; a
@@ -883,6 +913,15 @@ impl SyncOrchestrator {
         // uploads via the normal pipeline below. Non-fatal.
         if !scan.ads_skipped.is_empty() {
             self.record_ads_skipped(source.id, &scan.ads_skipped).await;
+        }
+
+        // SPEC s24 local.invalid_filename: surface each path the scanner could
+        // not represent (e.g. an unpaired-surrogate name) as a durable WARNING
+        // row, so the skipped file is visible rather than a silent omission.
+        // Non-fatal; the scan already continued past it.
+        if !scan.invalid_filenames.is_empty() {
+            self.record_invalid_filenames(source.id, &scan.invalid_filenames)
+                .await;
         }
 
         let plan = crate::planner::plan(source, &scan, self.state.as_ref()).await?;

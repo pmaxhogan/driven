@@ -222,6 +222,11 @@ pub async fn scan(
     // warning so the dropped stream is not silent data loss.
     #[cfg_attr(not(windows), allow(unused_mut))]
     let mut ads_skipped: Vec<RelativePath> = Vec::new();
+    // Local paths skipped because they are not representable as a RelativePath
+    // (e.g. an unpaired UTF-16 surrogate name, SPEC s24 `local.invalid_filename`).
+    // The orchestrator surfaces each as a one-per-path warning so the omission
+    // is visible rather than silent.
+    let mut invalid_filenames: Vec<String> = Vec::new();
 
     for result in walker {
         let entry = match result {
@@ -263,7 +268,13 @@ pub async fn scan(
         }) {
             Some(r) => r,
             None => {
-                tracing::warn!(target: TARGET, source_id = %source.id, path = %abs.display(), "skipping path not representable as a relative path");
+                // Not representable as a RelativePath (e.g. an unpaired UTF-16
+                // surrogate that fails UTF-8 conversion). Record it so the
+                // orchestrator emits a local.invalid_filename warning (SPEC s24)
+                // rather than dropping the file silently; the scan continues.
+                let shown = abs.to_string_lossy().into_owned();
+                tracing::warn!(target: TARGET, source_id = %source.id, path = %shown, "local.invalid_filename: skipping path not representable as a relative path");
+                invalid_filenames.push(shown);
                 continue;
             }
         };
@@ -418,6 +429,7 @@ pub async fn scan(
         skipped_cloud_only,
         collisions = collisions.len(),
         ads_skipped = ads_skipped.len(),
+        invalid_filenames = invalid_filenames.len(),
         errored_prefixes = errored_prefixes.len(),
         unattributed_error,
         "scan complete"
@@ -429,6 +441,7 @@ pub async fn scan(
         collisions,
         excluded_orphans,
         ads_skipped,
+        invalid_filenames,
     })
 }
 
