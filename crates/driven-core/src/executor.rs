@@ -1713,11 +1713,47 @@ impl DefaultExecutor {
     ) -> Result<PushOne, UploadError> {
         let wire_len = wire.len() as u64;
         self.pacer.permit_request().await;
-        let progress = self
-            .remote
-            .resume_chunk(session, offset, wire)
-            .await
-            .map_err(UploadError::Fatal)?;
+        let progress = match self.remote.resume_chunk(session, offset, wire).await {
+            Ok(p) => p,
+            Err(e) => {
+                // codex R-P1-3: classify the chunk error via classify_drive_error
+                // instead of blindly aborting the whole execute cycle with a
+                // generic `Fatal`. Now that the resumable chunk PUT returns typed
+                // quota/auth/rate errors (R-P1-2), a quota/auth/rate failure on a
+                // large STREAMED upload surfaces its stable code rather than the
+                // opaque `drive.unreachable`.
+                let class = classify_drive_error(&e);
+                self.pacer.note_response(class.response_class());
+                match class {
+                    // A transient (5xx / network) or rate-limit on a streamed
+                    // chunk is RECOVERABLE by resuming the SAME persisted
+                    // session: the executor persisted the session + acked
+                    // offset, and reconcile resumes it byte-for-byte (the
+                    // streaming source cannot be re-read inline, so we abort the
+                    // cycle - Fatal keeps the op WITHOUT writing a file_state
+                    // row - and let reconcile pick the session up). Failing the
+                    // op here would DROP it and lose the resume handle.
+                    DriveError::Transient | DriveError::RateLimited => {
+                        return Err(UploadError::Fatal(e));
+                    }
+                    // Quota / daily-quota / auth / dest-folder / checksum / other
+                    // are terminal for this op: resuming the same session will
+                    // not clear them. Fail with the stable code (the streaming
+                    // resumable Create finalizes only on its final chunk, so no
+                    // object materialized - dropping the op is safe; the next
+                    // scan re-plans from scratch once the condition clears).
+                    DriveError::QuotaExhausted
+                    | DriveError::DailyQuota
+                    | DriveError::InvalidGrant
+                    | DriveError::DestFolderMissing
+                    | DriveError::DestFolderPermissionDenied
+                    | DriveError::ChecksumMismatch
+                    | DriveError::Other => {
+                        return Err(UploadError::Failed(class.error_code()));
+                    }
+                }
+            }
+        };
         // Drive accepted the chunk: it has left the in-flight buffers (test
         // instrumentation; matches the reader stage's `add`).
         if let Some(g) = self.mem_gauge.as_ref() {
@@ -2035,6 +2071,10 @@ impl DefaultExecutor {
             | DriveError::InvalidGrant
             | DriveError::DestFolderMissing
             | DriveError::DestFolderPermissionDenied
+            // A checksum mismatch is fatal for this op (the corrupt create was
+            // already trashed by the store - R-P1-1); fail with the dedicated
+            // code, never retry.
+            | DriveError::ChecksumMismatch
             | DriveError::Other => Ok(RetryDecision::Fail(class.error_code())),
         }
     }
@@ -3344,6 +3384,13 @@ enum DriveError {
     InvalidGrant,
     DestFolderMissing,
     DestFolderPermissionDenied,
+    /// The store's post-upload md5 verify failed (codex R-P1-1): the real
+    /// `GoogleDriveStore` verifies INSIDE the store, so a checksum mismatch
+    /// arrives here as a typed error rather than the executor doing its own
+    /// verify. It maps to the `drive.checksum_mismatch` code (NOT the generic
+    /// `drive.unreachable`), so the orchestrator's 3-consecutive-mismatch ->
+    /// `status='corrupt'` defence is driven by the real store too.
+    ChecksumMismatch,
     Other,
 }
 
@@ -3357,6 +3404,7 @@ impl DriveError {
             DriveError::InvalidGrant => ErrorCode::AuthInvalidGrant,
             DriveError::DestFolderMissing => ErrorCode::DriveDestFolderMissing,
             DriveError::DestFolderPermissionDenied => ErrorCode::DriveDestFolderPermissionDenied,
+            DriveError::ChecksumMismatch => ErrorCode::DriveChecksumMismatch,
             DriveError::Other => ErrorCode::DriveUnreachable,
         }
     }
@@ -3396,12 +3444,17 @@ fn classify_drive_error(e: &anyhow::Error) -> DriveError {
         return match typed {
             DriveStoreError::DestFolderMissing => DriveError::DestFolderMissing,
             DriveStoreError::DestFolderPermissionDenied => DriveError::DestFolderPermissionDenied,
-            // A dead resumable session / checksum mismatch is fatal for this
-            // op (not a transient service-health signal). Map to Other so the
-            // op fails rather than being retried as if the link were flaky.
-            DriveStoreError::ResumableSessionInvalid | DriveStoreError::ChecksumMismatch => {
-                DriveError::Other
-            }
+            // A dead resumable session is fatal for this op (not a transient
+            // service-health signal): map to Other so the op fails rather than
+            // being retried as if the link were flaky.
+            DriveStoreError::ResumableSessionInvalid => DriveError::Other,
+            // codex R-P1-1: a checksum mismatch from the REAL store (md5 verify
+            // happens inside the store, which has ALREADY trashed the corrupt
+            // create) must surface the dedicated `drive.checksum_mismatch` code,
+            // NOT the generic `drive.unreachable` - otherwise the corrupt-file
+            // failure is mis-reported and the orchestrator's consecutive-
+            // mismatch -> status='corrupt' defence never triggers.
+            DriveStoreError::ChecksumMismatch => DriveError::ChecksumMismatch,
             DriveStoreError::Classified { kind, .. } => classify_from_classification(kind),
         };
     }
