@@ -211,6 +211,9 @@ mod tests {
         async fn mark_account_state(&self, _id: AccountId, _state: AccountState) -> Result<()> {
             unimplemented!()
         }
+        async fn mark_account_synced(&self, _id: AccountId, _at: UnixMs) -> Result<()> {
+            unimplemented!()
+        }
         async fn delete_account(&self, _id: AccountId) -> Result<()> {
             unimplemented!()
         }
@@ -221,6 +224,14 @@ mod tests {
             unimplemented!()
         }
         async fn upsert_source(&self, _row: &SourceRow) -> Result<()> {
+            unimplemented!()
+        }
+        async fn mark_source_scanned(
+            &self,
+            _id: SourceId,
+            _full_scan_at: UnixMs,
+            _deep_verify_at: Option<UnixMs>,
+        ) -> Result<()> {
             unimplemented!()
         }
         async fn delete_source(&self, _id: SourceId) -> Result<()> {

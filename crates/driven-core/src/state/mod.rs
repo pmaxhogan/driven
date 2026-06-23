@@ -305,6 +305,13 @@ pub trait StateRepo: Send + Sync {
     /// Updates `accounts.state` for the given account.
     async fn mark_account_state(&self, id: AccountId, state: AccountState) -> Result<()>;
 
+    /// Stamps `accounts.last_synced_at` for the given account (P2-7).
+    ///
+    /// Called only after a source run for the account completes its
+    /// scan/execute successfully, so the "last synced" wall-time reflects a
+    /// real completed sync rather than every cycle tick.
+    async fn mark_account_synced(&self, id: AccountId, at: UnixMs) -> Result<()>;
+
     /// Deletes an `accounts` row and (via `ON DELETE CASCADE` per SPEC
     /// s2) every dependent row in `backup_sources`, `file_state`, and
     /// `pending_ops`.
@@ -321,6 +328,22 @@ pub trait StateRepo: Send + Sync {
 
     /// Inserts or replaces a `backup_sources` row by id.
     async fn upsert_source(&self, row: &SourceRow) -> Result<()>;
+
+    /// Stamps `backup_sources.last_full_scan_at` and (when `deep_verify_at`
+    /// is `Some`) `backup_sources.last_deep_verify_at` for one source (P2-7).
+    ///
+    /// A targeted column update (not a full-row replace) so it cannot clobber
+    /// any other column a concurrent settings edit may have changed. The
+    /// orchestrator calls this only AFTER a successful scan/execute (and, on a
+    /// deep-verify cycle, after the verify pass) so a `None` last timestamp
+    /// means "genuinely never completed" rather than "we forgot to persist" -
+    /// without it `verify::due` reports due every cycle forever.
+    async fn mark_source_scanned(
+        &self,
+        id: SourceId,
+        full_scan_at: UnixMs,
+        deep_verify_at: Option<UnixMs>,
+    ) -> Result<()>;
 
     /// Deletes a `backup_sources` row and (via `ON DELETE CASCADE`) every
     /// dependent `file_state` and `pending_ops` row.

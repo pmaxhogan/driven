@@ -508,15 +508,29 @@ impl<B: Backend> NetworkProbe for Prober<B> {
 
         // Probes 2 + 3 run in parallel (DESIGN s5.8.2). The captive probe
         // classifies the link; the per-service probes feed each breaker.
+        //
+        // P1-5 (DESIGN s5.8.3): a service whose breaker is Open fails fast -
+        // we do NOT probe it until its backoff `retry_at` elapses (the breaker
+        // then reads HalfOpen and is probed again). Skipping the probe is what
+        // makes "after 5 failures the next probe is deferred by backoff" real;
+        // probing every tick regardless would hammer a known-down dependency.
+        // HalfOpen and Closed breakers are probed normally.
         let captive_fut = self.backend.probe_captive();
         let service_futs = futures::future::join_all(
             Self::PROBED_SERVICES
                 .iter()
+                .filter(|&&svc| {
+                    !matches!(
+                        self.breaker(svc).health(self.clock.as_ref()),
+                        ServiceHealth::Open { .. }
+                    )
+                })
                 .map(|&svc| async move { (svc, self.backend.probe_service(svc).await) }),
         );
         let (captive, service_results) = futures::future::join(captive_fut, service_futs).await;
 
-        // Feed every service breaker with its probe outcome.
+        // Feed every probed service breaker with its outcome (the Open ones
+        // were skipped above, so their backoff timer is left untouched).
         for (svc, outcome) in service_results {
             self.record_service_outcome(svc, outcome).await;
         }
@@ -578,6 +592,10 @@ mod tests {
         os_calls: AtomicUsize,
         captive_calls: AtomicUsize,
         service_calls: AtomicUsize,
+        /// Per-service counter for [`ServiceName::Drive`] so the P1-5
+        /// breaker-skip test can assert Drive specifically was (not) probed
+        /// rather than reading it out of the aggregate `service_calls`.
+        drive_probe_calls: AtomicUsize,
         pool_drops: AtomicUsize,
         /// When `Some`, [`Backend::probe_service`] returns this for ALL
         /// services regardless of the [`FakeNetwork`] state - used to
@@ -621,6 +639,9 @@ mod tests {
 
         async fn probe_service(&self, service: ServiceName) -> ProbeOutcome {
             self.service_calls.fetch_add(1, Ordering::SeqCst);
+            if matches!(service, ServiceName::Drive) {
+                self.drive_probe_calls.fetch_add(1, Ordering::SeqCst);
+            }
             if let Some(forced) = *self.force_service.lock().unwrap() {
                 return forced;
             }
@@ -768,6 +789,68 @@ mod tests {
         );
         p.note_outcome(ServiceName::Drive, true);
         assert_eq!(p.service_health(ServiceName::Drive), ServiceHealth::Closed);
+    }
+
+    // --- P1-5 (DESIGN s5.8.3): an Open breaker DEFERS the service probe ---
+
+    #[tokio::test]
+    async fn open_breaker_defers_probe_until_retry_at() {
+        let backend = FakeBackend::new(FakeState::Online);
+        let clock = FakeClock::new();
+        let p = prober(backend.clone(), clock.clone());
+
+        // Open ONLY Drive's breaker (5 consecutive failures); the other
+        // services stay Closed. `note_outcome` does not issue a probe, so the
+        // Drive probe counter is still 0 here.
+        for _ in 0..BREAKER_OPEN_THRESHOLD {
+            p.note_outcome(ServiceName::Drive, false);
+        }
+        let retry_at = match p.service_health(ServiceName::Drive) {
+            ServiceHealth::Open { retry_at } => retry_at,
+            other => panic!("expected Drive Open, got {other:?}"),
+        };
+        assert_eq!(retry_at, BACKOFF_SCHEDULE_MS[0], "first backoff is 30s");
+        assert_eq!(
+            backend.drive_probe_calls.load(Ordering::SeqCst),
+            0,
+            "note_outcome does not probe"
+        );
+
+        // While Open (clock still before retry_at), a full probe() must SKIP
+        // the Drive service probe (fail-fast) but still probe the others.
+        let before_services = backend.service_calls.load(Ordering::SeqCst);
+        let _ = p.probe().await;
+        assert_eq!(
+            backend.drive_probe_calls.load(Ordering::SeqCst),
+            0,
+            "an Open breaker defers the Drive probe until retry_at"
+        );
+        // The two other PROBED_SERVICES (UpdateEndpoint, Github) were still
+        // probed - the skip is per-service, not a blanket halt.
+        assert_eq!(
+            backend.service_calls.load(Ordering::SeqCst) - before_services,
+            Prober::<FakeBackend>::PROBED_SERVICES.len() - 1,
+            "only the Open service is skipped; the rest are probed"
+        );
+        // Drive is still Open - skipping the probe left its backoff untouched.
+        assert!(matches!(
+            p.service_health(ServiceName::Drive),
+            ServiceHealth::Open { .. }
+        ));
+
+        // Once the backoff elapses the breaker reads HalfOpen, so the next
+        // probe() DOES probe Drive again (the deferred probe is now allowed).
+        clock.advance(Duration::from_millis(BACKOFF_SCHEDULE_MS[0] as u64));
+        assert_eq!(
+            p.service_health(ServiceName::Drive),
+            ServiceHealth::HalfOpen
+        );
+        let _ = p.probe().await;
+        assert_eq!(
+            backend.drive_probe_calls.load(Ordering::SeqCst),
+            1,
+            "after retry_at the deferred Drive probe fires (HalfOpen)"
+        );
     }
 
     // --- DESIGN s5.8.1 row: intermittent opens then closes the breaker ---

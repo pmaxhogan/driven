@@ -208,6 +208,18 @@ enum GateDecision {
 /// exercisable against the `InMemoryRemoteStore`, `FakeClock`,
 /// `FakePowerSource`, and `FakeNetwork` fixtures from `driven-test-fixtures`
 /// (DESIGN s14) with no Tauri shell, no real Drive, and no real wall clock.
+/// Tracks startup-reconcile completion per source (DESIGN s5.6, P1-1).
+///
+/// Holds the set of source ids that have reconciled SUCCESSFULLY. A source
+/// whose reconcile failed is simply absent from the set and is retried on the
+/// next cycle; the whole pass is considered complete only once every
+/// currently-enabled source id is present.
+#[derive(Debug, Default)]
+struct ReconcileProgress {
+    /// Source ids whose startup reconcile completed without error.
+    done: std::collections::HashSet<crate::types::SourceId>,
+}
+
 pub struct SyncOrchestrator {
     /// The account this orchestrator drives (DESIGN s5.1: one per account).
     account_id: AccountId,
@@ -232,10 +244,15 @@ pub struct SyncOrchestrator {
     pause_tx: watch::Sender<bool>,
     /// Broadcast sender for [`OrchestratorEvent`] (SPEC s5, s11.7).
     events: broadcast::Sender<OrchestratorEvent>,
-    /// Has the startup reconciliation pass run yet (DESIGN s5.6)? Guards it
-    /// to once-before-first-cycle. `Mutex` not `RwLock` because the
-    /// check-and-set must be atomic.
-    reconciled: Mutex<bool>,
+    /// Startup-reconcile progress (DESIGN s5.6). Tracks which sources have
+    /// been reconciled SUCCESSFULLY so the pass is idempotent and a transient
+    /// Drive/DB error on one source does not permanently disable
+    /// reconciliation (P1-1): only the sources that succeeded are skipped next
+    /// cycle, the failed ones are retried. `None` means "not yet started";
+    /// `Some(set)` accumulates the source ids that have reconciled. The pass
+    /// is fully done once every currently-enabled source is in the set.
+    /// `Mutex` not `RwLock` because the read-check-and-insert must be atomic.
+    reconciled: Mutex<ReconcileProgress>,
     /// Manual out-of-band trigger (SPEC s5 "Sync now", DESIGN s5.1).
     /// Capacity-1 mpsc: a `try_send` that finds the buffer full means a
     /// trigger is already pending, so the surplus is COALESCED into the one
@@ -292,7 +309,7 @@ impl SyncOrchestrator {
             state_machine: RwLock::new(OrchestratorState::Idle { last_run_at: None }),
             pause_tx,
             events,
-            reconciled: Mutex::new(false),
+            reconciled: Mutex::new(ReconcileProgress::default()),
             trigger_tx,
             trigger_rx: Mutex::new(Some(trigger_rx)),
             watcher_tx,
@@ -367,6 +384,14 @@ impl SyncOrchestrator {
         // battery when we are simply offline - offline is the more actionable
         // banner. A non-online probe maps to Offline (the network-resilience
         // layer renders the finer captive/no-internet/DNS substates).
+        //
+        // P1-5: `probe()` is now breaker-aware - it skips any service whose
+        // circuit breaker is Open (DESIGN s5.8.3), so this probe never hits a
+        // known-down Drive every tick. The probe-before-breaker ordering here
+        // is deliberate and unchanged: it keeps "whole network offline ->
+        // Pause(Offline)" distinct from "network up, Drive down -> Backoff"
+        // (the Drive breaker check below), preserving the DESIGN s5.7
+        // precedence offline > metered > battery > breaker.
         if !power.network_reachable || self.network.probe().await != NetworkState::Online {
             return GateDecision::Pause(PauseReason::Offline);
         }
@@ -418,19 +443,46 @@ impl SyncOrchestrator {
     /// leaves a duplicate on Drive. Idempotent + guarded to run at most once
     /// before the first normal cycle; cheap - touches only `pending_ops`.
     async fn reconcile_once(&self) -> anyhow::Result<()> {
-        {
-            let mut done = self.reconciled.lock().await;
-            if *done {
-                return Ok(());
-            }
-            *done = true;
-        }
         let sources = self.state.list_enabled_sources_for(self.account_id).await?;
+
+        // P1-1: reconcile only the sources that have NOT yet reconciled
+        // successfully. The progress set is the durable-within-process record
+        // of which sources are done; a source whose reconcile errors is left
+        // out of the set and retried next cycle, so a transient first-cycle
+        // failure never permanently disables reconciliation. Mark each source
+        // done the moment its reconcile succeeds (not at the start), and
+        // surface the first error AFTER attempting the rest.
+        let mut first_err: Option<anyhow::Error> = None;
         for source in &sources {
+            {
+                // Skip sources already reconciled this process lifetime.
+                if self.reconciled.lock().await.done.contains(&source.id) {
+                    continue;
+                }
+            }
             tracing::debug!(target: TARGET, source_id = %source.id, "startup reconcile");
-            self.executor.reconcile(source).await?;
+            match self.executor.reconcile(source).await {
+                Ok(()) => {
+                    self.reconciled.lock().await.done.insert(source.id);
+                }
+                Err(err) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        source_id = %source.id,
+                        %err,
+                        "startup reconcile failed; will retry next cycle"
+                    );
+                    if first_err.is_none() {
+                        first_err = Some(err);
+                    }
+                }
+            }
         }
-        Ok(())
+
+        match first_err {
+            Some(err) => Err(err),
+            None => Ok(()),
+        }
     }
 
     /// Writes a durable `activity_log` ERROR row per NFC collision the planner
@@ -565,6 +617,29 @@ impl SyncOrchestrator {
                 mismatches,
             })
             .await;
+        }
+
+        // P2-7: persist the completion timestamps ONLY now that the scan +
+        // execute (and, on a deep-verify cycle, the verify pass) have all
+        // succeeded for this source. The full scan always advances
+        // `last_full_scan_at`; a deep-verify cycle additionally advances
+        // `last_deep_verify_at` so `deep_verify_due` stops reporting the
+        // source as due every cycle. Reached only past the `dry_run` early
+        // return above, so a dry run never marks a source verified/scanned.
+        // A persistence hiccup is logged but never aborts the cycle - the
+        // upload pipeline already succeeded; the worst case is a redundant
+        // re-verify next cycle, never lost data.
+        let now = self.clock.now_ms();
+        let deep_verify_at = if deep_verify { Some(now) } else { None };
+        if let Err(err) = self
+            .state
+            .mark_source_scanned(source.id, now, deep_verify_at)
+            .await
+        {
+            tracing::warn!(target: TARGET, source_id = %source.id, %err, "failed to persist scan/verify timestamps");
+        }
+        if let Err(err) = self.state.mark_account_synced(self.account_id, now).await {
+            tracing::warn!(target: TARGET, account_id = %self.account_id, %err, "failed to persist account last_synced_at");
         }
 
         Ok(())
@@ -970,6 +1045,10 @@ mod tests {
         reconciles: AtomicU64,
         /// Sources passed to `reconcile`, for the orphan-adoption test.
         reconciled_sources: StdMutex<Vec<SourceId>>,
+        /// When `> 0`, the next `reconcile` call returns a transient error and
+        /// decrements this counter WITHOUT recording the source as adopted -
+        /// drives the P1-1 "first reconcile fails, retried next cycle" test.
+        reconcile_failures_remaining: AtomicU64,
     }
 
     #[async_trait]
@@ -1002,7 +1081,15 @@ mod tests {
         }
 
         async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()> {
+            // Count every attempt. A configured transient failure returns Err
+            // WITHOUT recording the source as adopted, so the P1-1 test can
+            // assert the failed source is retried on the next cycle.
             self.reconciles.fetch_add(1, Ordering::SeqCst);
+            if self.reconcile_failures_remaining.load(Ordering::SeqCst) > 0 {
+                self.reconcile_failures_remaining
+                    .fetch_sub(1, Ordering::SeqCst);
+                return Err(anyhow::anyhow!("transient reconcile error"));
+            }
             self.reconciled_sources.lock().unwrap().push(source.id);
             Ok(())
         }
@@ -1020,6 +1107,8 @@ mod tests {
         /// Records every `write_activity` so the collision test can assert the
         /// durable `local.unicode_collision` ERROR row was written.
         activity: StdMutex<Vec<NewActivity>>,
+        /// Records every `mark_account_synced` for the P2-7 assertion.
+        account_synced: StdMutex<Vec<(AccountId, UnixMs)>>,
     }
 
     impl FakeState {
@@ -1028,7 +1117,13 @@ mod tests {
                 sources: StdMutex::new(sources),
                 files: StdMutex::new(HashMap::new()),
                 activity: StdMutex::new(Vec::new()),
+                account_synced: StdMutex::new(Vec::new()),
             }
+        }
+
+        /// Snapshot the current source rows (post-persist) for the P2-7 test.
+        fn sources_snapshot(&self) -> Vec<SourceRow> {
+            self.sources.lock().unwrap().clone()
         }
 
         /// Snapshot the recorded activity rows.
@@ -1110,6 +1205,10 @@ mod tests {
         ) -> anyhow::Result<()> {
             unimplemented!()
         }
+        async fn mark_account_synced(&self, id: AccountId, at: UnixMs) -> anyhow::Result<()> {
+            self.account_synced.lock().unwrap().push((id, at));
+            Ok(())
+        }
         async fn delete_account(&self, _id: AccountId) -> anyhow::Result<()> {
             unimplemented!()
         }
@@ -1118,6 +1217,27 @@ mod tests {
         }
         async fn upsert_source(&self, _row: &SourceRow) -> anyhow::Result<()> {
             unimplemented!()
+        }
+        async fn mark_source_scanned(
+            &self,
+            id: SourceId,
+            full_scan_at: UnixMs,
+            deep_verify_at: Option<UnixMs>,
+        ) -> anyhow::Result<()> {
+            // Mutate the in-memory source rows so a subsequent
+            // `list_enabled_sources_for` observes the persisted timestamps
+            // (matching the COALESCE semantics of the sqlite impl: a `None`
+            // deep_verify_at leaves the existing value).
+            let mut sources = self.sources.lock().unwrap();
+            for source in sources.iter_mut() {
+                if source.id == id {
+                    source.last_full_scan_at = Some(full_scan_at);
+                    if let Some(v) = deep_verify_at {
+                        source.last_deep_verify_at = Some(v);
+                    }
+                }
+            }
+            Ok(())
         }
         async fn delete_source(&self, _id: SourceId) -> anyhow::Result<()> {
             unimplemented!()
@@ -1512,6 +1632,69 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn first_reconcile_error_is_retried_not_permanently_disabled() {
+        // P1-1: a transient error on the startup reconcile must NOT
+        // permanently disable reconciliation. The first cycle's reconcile
+        // fails (and the cycle surfaces the error); the source stays
+        // un-adopted, so the NEXT cycle retries the reconcile and adopts it.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        // Fail exactly the first reconcile attempt.
+        exec.reconcile_failures_remaining.store(1, Ordering::SeqCst);
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+
+        // Cycle 1: reconcile fails, so the cycle returns the error and the
+        // source is NOT marked reconciled.
+        let first = orch.run_cycle(TickSource::Scheduled).await;
+        assert!(
+            first.is_err(),
+            "a failed startup reconcile surfaces the error this cycle"
+        );
+        assert_eq!(
+            exec.reconciles.load(Ordering::SeqCst),
+            1,
+            "reconcile was attempted once"
+        );
+        assert!(
+            exec.reconciled_sources.lock().unwrap().is_empty(),
+            "a failed reconcile must not record the source as adopted"
+        );
+
+        // Cycle 2: reconciliation is still PENDING (not permanently disabled),
+        // so it is retried and now succeeds, adopting the orphan.
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.reconciles.load(Ordering::SeqCst),
+            2,
+            "the failed source's reconcile is retried on the next cycle"
+        );
+        assert_eq!(
+            exec.reconciled_sources.lock().unwrap().as_slice(),
+            &[src_id],
+            "the retried reconcile adopts the orphan"
+        );
+
+        // Cycle 3: now that it succeeded, the once-before-first-cycle guard
+        // holds - no further reconcile.
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.reconciles.load(Ordering::SeqCst),
+            2,
+            "a succeeded reconcile is not re-run"
+        );
+    }
+
+    #[tokio::test]
     async fn drive_breaker_open_backs_off() {
         // A Drive circuit breaker open past `now` => Backoff{until}, no execute.
         let account = AccountId::new_v4();
@@ -1535,6 +1718,77 @@ mod tests {
             OrchestratorState::Backoff { until: 60_000 }
         );
         assert_eq!(exec.executes.load(Ordering::SeqCst), 0);
+    }
+
+    #[tokio::test]
+    async fn deep_verify_timestamp_persisted_so_next_cycle_not_due() {
+        // P2-7: a source that has never deep-verified is due, so the cycle
+        // runs a deep-verify. After the cycle the completion timestamp must be
+        // PERSISTED (last_deep_verify_at + last_full_scan_at on the source,
+        // last_synced_at on the account) so `deep_verify_due` no longer
+        // reports the source as due - i.e. it does NOT re-verify every cycle.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        // A never-deep-verified source: `None` => due now (FakeClock at 0).
+        let mut src = source_in(account, dir.path());
+        src.last_deep_verify_at = None;
+        src.last_full_scan_at = None;
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = Arc::new(FakeState::with_sources(vec![src.clone()]));
+        let clock = Arc::new(FakeClock::new());
+        // Advance the clock so the persisted timestamps are a recognizable
+        // non-zero value distinct from the source's `None` start.
+        clock.advance(std::time::Duration::from_millis(5_000));
+        let now = clock.now_ms();
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec.clone(),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock.clone(),
+            OrchestratorConfig::default(),
+        );
+
+        // Pre-condition: the source IS due for a deep-verify.
+        assert!(
+            orch.deep_verify_due(&src),
+            "a never-deep-verified source is due"
+        );
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert!(matches!(orch.state().await, OrchestratorState::Idle { .. }));
+
+        // The persisted source row now carries both completion timestamps.
+        let persisted = state
+            .sources_snapshot()
+            .into_iter()
+            .find(|s| s.id == src_id)
+            .expect("source still present");
+        assert_eq!(
+            persisted.last_deep_verify_at,
+            Some(now),
+            "deep-verify completion is persisted"
+        );
+        assert_eq!(
+            persisted.last_full_scan_at,
+            Some(now),
+            "full-scan completion is persisted"
+        );
+
+        // The account's last_synced_at is stamped exactly once.
+        assert_eq!(
+            state.account_synced.lock().unwrap().as_slice(),
+            &[(account, now)],
+            "account last_synced_at is stamped on a successful source run"
+        );
+
+        // The whole point: the NEXT cycle is NOT immediately due again.
+        assert!(
+            !orch.deep_verify_due(&persisted),
+            "after a deep-verify cycle the source is no longer due"
+        );
     }
 
     #[tokio::test]

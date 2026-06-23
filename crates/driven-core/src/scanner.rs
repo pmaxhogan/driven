@@ -517,6 +517,9 @@ mod tests {
         ) -> anyhow::Result<()> {
             unimplemented!()
         }
+        async fn mark_account_synced(&self, _id: AccountId, _at: i64) -> anyhow::Result<()> {
+            unimplemented!()
+        }
         async fn delete_account(&self, _id: AccountId) -> anyhow::Result<()> {
             unimplemented!()
         }
@@ -530,6 +533,14 @@ mod tests {
             unimplemented!()
         }
         async fn upsert_source(&self, _row: &SourceRow) -> anyhow::Result<()> {
+            unimplemented!()
+        }
+        async fn mark_source_scanned(
+            &self,
+            _id: SourceId,
+            _full_scan_at: i64,
+            _deep_verify_at: Option<i64>,
+        ) -> anyhow::Result<()> {
             unimplemented!()
         }
         async fn delete_source(&self, _id: SourceId) -> anyhow::Result<()> {

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            UPDATE backup_sources\n            SET last_full_scan_at   = ?1,\n                last_deep_verify_at = COALESCE(?2, last_deep_verify_at)\n            WHERE id = ?3\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "ff205753da06c18c7b6ee203459718c2ab9d26815aee8aba6897336f5bc15476"
+}

@@ -437,6 +437,18 @@ impl StateRepo for SqliteStateRepo {
         Ok(())
     }
 
+    async fn mark_account_synced(&self, id: AccountId, at: UnixMs) -> Result<()> {
+        let id_str = id.to_string();
+        sqlx::query!(
+            "UPDATE accounts SET last_synced_at = ?1 WHERE id = ?2",
+            at,
+            id_str,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn delete_account(&self, id: AccountId) -> Result<()> {
         let id_str = id.to_string();
         sqlx::query!("DELETE FROM accounts WHERE id = ?1", id_str)
@@ -621,6 +633,33 @@ impl StateRepo for SqliteStateRepo {
             row.last_full_scan_at,
             row.last_deep_verify_at,
             row.created_at,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn mark_source_scanned(
+        &self,
+        id: SourceId,
+        full_scan_at: UnixMs,
+        deep_verify_at: Option<UnixMs>,
+    ) -> Result<()> {
+        let id_str = id.to_string();
+        // `last_full_scan_at` is always advanced; `last_deep_verify_at` is only
+        // bumped when this was a deep-verify cycle (`deep_verify_at` is `Some`)
+        // - a `None` bind leaves the existing value via COALESCE so a plain
+        // fast-path scan never resets the verify cadence.
+        sqlx::query!(
+            r#"
+            UPDATE backup_sources
+            SET last_full_scan_at   = ?1,
+                last_deep_verify_at = COALESCE(?2, last_deep_verify_at)
+            WHERE id = ?3
+            "#,
+            full_scan_at,
+            deep_verify_at,
+            id_str,
         )
         .execute(&self.pool)
         .await?;
