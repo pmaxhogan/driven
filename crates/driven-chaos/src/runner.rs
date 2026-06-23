@@ -24,15 +24,6 @@ use crate::handle::DrivenHandleBuilder;
 use crate::reporting::{RunReport, ScenarioReport, Verdict};
 use crate::scenario::{ExpectedOutcome, Outcome, Scenario, ScenarioContext};
 
-/// Hard per-scenario wall-clock cap (STRESS_HARNESS s6.3 "no infinite loop":
-/// each scenario has a hard cap; exceeded -> FAIL with `harness.timeout`).
-///
-/// Generous because the cacheable big-fixture rows (`million-files-nested`,
-/// `huge-file-10gb`) materialise real bytes on first run. Deterministic
-/// `FakeClock`-driven cycles are fast, so a scenario that hits this cap is a
-/// genuine hang, not slowness.
-const SCENARIO_WALL_CAP: Duration = Duration::from_secs(300);
-
 /// Where cacheable / throwaway fixtures live (STRESS_HARNESS s2.2):
 /// `target/chaos-fixtures/<scenario>/` so `cargo clean` blows them away.
 fn fixture_root_for(name: &str) -> PathBuf {
@@ -85,20 +76,17 @@ pub async fn run_one(scenario: &dyn Scenario, caps: &CapabilitySet) -> Verdict {
     let started = Instant::now();
     match execute(scenario).await {
         Ok(outcome) => verdict_for(scenario, outcome, started.elapsed()),
-        Err(ExecuteError::Timeout) => Verdict::Fail {
+        Err(ExecuteError::Timeout(cap)) => Verdict::Fail {
             duration: started.elapsed(),
             observed_outcome: Outcome {
                 notes: vec![format!(
                     "harness.timeout: run_assertions exceeded the {}s wall-clock cap (s6.3 no-infinite-loop)",
-                    SCENARIO_WALL_CAP.as_secs()
+                    cap.as_secs()
                 )],
                 ..Outcome::default()
             },
             expected_outcome: scenario.expected_outcome(),
-            diff: format!(
-                "harness.timeout: exceeded {}s cap",
-                SCENARIO_WALL_CAP.as_secs()
-            ),
+            diff: format!("harness.timeout: exceeded {}s cap", cap.as_secs()),
         },
         Err(ExecuteError::Errored(e)) => Verdict::Fail {
             duration: started.elapsed(),
@@ -114,8 +102,9 @@ pub async fn run_one(scenario: &dyn Scenario, caps: &CapabilitySet) -> Verdict {
 
 /// How `execute` can fail: a hard error, or the `run_assertions` wall-clock cap.
 enum ExecuteError {
-    /// `run_assertions` exceeded [`SCENARIO_WALL_CAP`] (s6.3 no-infinite-loop).
-    Timeout,
+    /// `run_assertions` exceeded the scenario's wall-clock cap (s6.3
+    /// no-infinite-loop); carries the cap that was exceeded for the report.
+    Timeout(Duration),
     /// A setup / assertion / teardown error before a usable outcome.
     Errored(anyhow::Error),
 }
@@ -166,10 +155,11 @@ async fn execute(scenario: &dyn Scenario) -> Result<Outcome, ExecuteError> {
         .boot()
         .await?;
 
-    // The wall-clock cap wraps ONLY the work loop. Compute the budget remaining
-    // after the (uncapped) fixture build so a scenario whose setup already ran
-    // long still gets the full assertion budget.
-    let timed = tokio::time::timeout(SCENARIO_WALL_CAP, scenario.run_assertions(&handle)).await;
+    // The wall-clock cap wraps ONLY the work loop, using the scenario's own cap
+    // (the massive-input rows raise it - their deterministic large-tree scan is
+    // not a hang). The (uncapped) fixture build above does not eat this budget.
+    let cap = scenario.wall_cap();
+    let timed = tokio::time::timeout(cap, scenario.run_assertions(&handle)).await;
 
     // teardown ALWAYS runs (STRESS_HARNESS s2.3), even on assertion failure or
     // an assertion-phase timeout.
@@ -188,7 +178,7 @@ async fn execute(scenario: &dyn Scenario) -> Result<Outcome, ExecuteError> {
 
     let result = match timed {
         Ok(r) => r,
-        Err(_elapsed) => return Err(ExecuteError::Timeout),
+        Err(_elapsed) => return Err(ExecuteError::Timeout(cap)),
     };
     let outcome = result?;
     teardown?;

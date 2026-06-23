@@ -164,4 +164,22 @@ pub trait Scenario: Send + Sync {
     /// What the harness expects to observe. Drives the PASS / FAIL
     /// decision after `run_assertions` returns.
     fn expected_outcome(&self) -> ExpectedOutcome;
+
+    /// The wall-clock cap the runner applies to `run_assertions` (the s6.3
+    /// "no infinite loop" guard). Defaults to [`DEFAULT_WALL_CAP`]. The
+    /// massive-input rows (`million-files-nested`, `tiny-files-100k-in-one-dir`)
+    /// override it: scanning hundreds of thousands to a million real files is a
+    /// deterministic, steadily-progressing workload that legitimately takes
+    /// longer than the default in a debug build - it is not a hang, so it gets
+    /// a larger finite cap rather than a false `harness.timeout`. The guarantee
+    /// stays intact: every scenario still has a HARD finite cap.
+    fn wall_cap(&self) -> std::time::Duration {
+        DEFAULT_WALL_CAP
+    }
 }
+
+/// Default per-scenario `run_assertions` wall-clock cap (STRESS_HARNESS s6.3
+/// "no infinite loop"). Generous because deterministic `FakeClock`-driven
+/// cycles are fast, so a scenario that hits this is a genuine hang. The
+/// massive-input rows raise it via [`Scenario::wall_cap`].
+pub const DEFAULT_WALL_CAP: std::time::Duration = std::time::Duration::from_secs(300);

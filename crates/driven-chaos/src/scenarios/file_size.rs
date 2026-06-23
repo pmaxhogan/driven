@@ -814,6 +814,12 @@ impl Scenario for TinyFiles100kInOneDir {
             min: TINY_FILES_FREE,
         }])
     }
+    fn wall_cap(&self) -> std::time::Duration {
+        // Scanning + uploading 100k real files is a deterministic, steadily-
+        // progressing workload that can run past the 300s default on a slower
+        // CI runner in a debug build - not a hang. Larger finite cap.
+        std::time::Duration::from_secs(900)
+    }
 
     async fn setup(&self, ctx: &mut ScenarioContext) -> anyhow::Result<()> {
         self.fixture.set(ctx.fixture_root.clone());
@@ -917,6 +923,13 @@ impl Scenario for MillionFilesNested {
         CapabilityRequirements::of(vec![Capability::FreeDiskBytes {
             min: MILLION_FILES_FREE,
         }])
+    }
+    fn wall_cap(&self) -> std::time::Duration {
+        // Scanning 1,000,000 real files + building the SQLite/FTS state is a
+        // deterministic, steadily-progressing workload that legitimately runs
+        // well past the 300s default in a debug build - it is not a hang. Give
+        // it a large finite cap so a genuine infinite loop is still caught.
+        std::time::Duration::from_secs(1800)
     }
 
     async fn setup(&self, ctx: &mut ScenarioContext) -> anyhow::Result<()> {
