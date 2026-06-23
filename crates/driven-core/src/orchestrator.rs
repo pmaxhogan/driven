@@ -518,6 +518,49 @@ impl SyncOrchestrator {
         }
     }
 
+    /// Writes a durable `activity_log` row per failed / re-queued op (recheck2
+    /// P2) so a production user has per-file failure evidence rather than only
+    /// tracing. A `Failed` op lands an Error row keyed by its error code; a
+    /// `Skipped` op (re-queued, retries next cycle) lands a Warn row. `Done`
+    /// ops are not recorded. Mirrors `record_collisions`; a write hiccup is
+    /// logged but never aborts the cycle.
+    async fn record_outcome_activity(
+        &self,
+        source_id: crate::types::SourceId,
+        outcomes: &[OpOutcome],
+    ) {
+        let now = self.clock.now_ms();
+        for outcome in outcomes {
+            let (level, event_type, path) = match outcome {
+                OpOutcome::Done { .. } => continue,
+                OpOutcome::Failed {
+                    relative_path,
+                    code,
+                } => (ActivityLevel::Error, code.to_string(), relative_path),
+                OpOutcome::Skipped {
+                    relative_path,
+                    reason,
+                } => (
+                    ActivityLevel::Warn,
+                    reason.error_code().to_string(),
+                    relative_path,
+                ),
+            };
+            let row = NewActivity {
+                ts: now,
+                source_id: Some(source_id),
+                level,
+                event_type,
+                file_count: None,
+                bytes: None,
+                message: Some(path.as_str().to_string()),
+            };
+            if let Err(err) = self.state.write_activity(row).await {
+                tracing::warn!(target: TARGET, source_id = %source_id, %err, "failed to write outcome activity row");
+            }
+        }
+    }
+
     /// Runs the full scan -> plan -> execute -> verify pipeline for one source
     /// (SPEC s5 `run_one_source`).
     ///
@@ -600,6 +643,7 @@ impl SyncOrchestrator {
         };
         let outcomes = self.executor.execute(source, &plan, &on_progress).await?;
         log_outcomes(source, &outcomes);
+        self.record_outcome_activity(source.id, &outcomes).await;
         // Emit a final progress snapshot so a consumer that missed the
         // throttled ticks still sees the completed counts.
         self.emit_progress(source.id, exec_progress_from(&summary, &outcomes));
@@ -619,16 +663,29 @@ impl SyncOrchestrator {
             .await;
         }
 
-        // P2-7: persist the completion timestamps ONLY now that the scan +
-        // execute (and, on a deep-verify cycle, the verify pass) have all
-        // succeeded for this source. The full scan always advances
-        // `last_full_scan_at`; a deep-verify cycle additionally advances
-        // `last_deep_verify_at` so `deep_verify_due` stops reporting the
-        // source as due every cycle. Reached only past the `dry_run` early
-        // return above, so a dry run never marks a source verified/scanned.
-        // A persistence hiccup is logged but never aborts the cycle - the
-        // upload pipeline already succeeded; the worst case is a redundant
-        // re-verify next cycle, never lost data.
+        // P2-7 / recheck2 P1: persist the completion timestamps ONLY when the
+        // scan + execute (and, on a deep-verify cycle, the verify pass) ALL
+        // succeeded for this source. Advancing `last_full_scan_at` /
+        // `last_deep_verify_at` while an op failed is a data-loss trap: a
+        // deep-verify re-hash mismatch whose re-upload then failed leaves the
+        // old `file_state` (matching size+mtime) intact, so the fast-scan path
+        // skips the file, while an advanced `last_deep_verify_at` stops
+        // `deep_verify_due` from re-checking it for a whole interval - the
+        // changed/corrupt bytes would not retry for days. So if ANY op failed
+        // we leave the timestamps unadvanced: the source stays scan/verify-due
+        // and retries next cycle, and the durable activity-log error rows
+        // (recorded above) surface it. A dry run already returned early.
+        let any_failed = outcomes
+            .iter()
+            .any(|o| matches!(o, OpOutcome::Failed { .. }));
+        if any_failed {
+            let failed = outcomes
+                .iter()
+                .filter(|o| matches!(o, OpOutcome::Failed { .. }))
+                .count();
+            tracing::warn!(target: TARGET, source_id = %source.id, failed, "deferring scan/verify timestamp advance: failed op(s) keep the source due so the next cycle retries them");
+            return Ok(());
+        }
         let now = self.clock.now_ms();
         let deep_verify_at = if deep_verify { Some(now) } else { None };
         if let Err(err) = self
@@ -1049,6 +1106,10 @@ mod tests {
         /// decrements this counter WITHOUT recording the source as adopted -
         /// drives the P1-1 "first reconcile fails, retried next cycle" test.
         reconcile_failures_remaining: AtomicU64,
+        /// When `> 0`, every `execute` op returns `OpOutcome::Failed` (a
+        /// `DriveChecksumMismatch`) instead of `Done` - drives the recheck2
+        /// "failed op defers the timestamp advance + records activity" test.
+        fail_ops: AtomicU64,
     }
 
     #[async_trait]
@@ -1065,16 +1126,25 @@ mod tests {
                 files_total: plan.ops.len() as u64,
                 ..ExecProgress::zero()
             });
+            let fail = self.fail_ops.load(Ordering::SeqCst) > 0;
             let outcomes = plan
                 .ops
                 .iter()
-                .map(|op| match op {
-                    crate::types::Op::HashThenUpload { relative_path, .. } => OpOutcome::Done {
-                        relative_path: relative_path.clone(),
-                    },
-                    crate::types::Op::Trash { relative_path, .. } => OpOutcome::Done {
-                        relative_path: relative_path.clone(),
-                    },
+                .map(|op| {
+                    let relative_path = match op {
+                        crate::types::Op::HashThenUpload { relative_path, .. } => {
+                            relative_path.clone()
+                        }
+                        crate::types::Op::Trash { relative_path, .. } => relative_path.clone(),
+                    };
+                    if fail {
+                        OpOutcome::Failed {
+                            relative_path,
+                            code: crate::types::ErrorCode::DriveChecksumMismatch,
+                        }
+                    } else {
+                        OpOutcome::Done { relative_path }
+                    }
                 })
                 .collect();
             Ok(outcomes)
@@ -1788,6 +1858,75 @@ mod tests {
         assert!(
             !orch.deep_verify_due(&persisted),
             "after a deep-verify cycle the source is no longer due"
+        );
+    }
+
+    #[tokio::test]
+    async fn failed_op_defers_timestamp_advance_and_records_activity() {
+        // recheck2 P1/P2: a failed op (e.g. a deep-verify hash mismatch whose
+        // re-upload failed) must NOT advance the scan/verify timestamps - else
+        // the fast-scan path skips the file (size+mtime unchanged) while
+        // `deep_verify_due` won't re-check it for a whole interval, so the
+        // changed/corrupt bytes never retry - and it must leave a durable
+        // activity_log Error row so the failure is user-visible.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        // A file in the source so the scan yields an op the executor can fail
+        // (an empty dir would plan zero ops -> zero failures -> timestamps
+        // would advance, which is correct but not what this test exercises).
+        std::fs::write(dir.path().join("changed.bin"), b"new bytes").unwrap();
+        let mut src = source_in(account, dir.path());
+        src.last_deep_verify_at = None;
+        src.last_full_scan_at = None;
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        exec.fail_ops.store(1, Ordering::SeqCst);
+        let state = Arc::new(FakeState::with_sources(vec![src.clone()]));
+        let clock = Arc::new(FakeClock::new());
+        clock.advance(std::time::Duration::from_millis(5_000));
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec.clone(),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock.clone(),
+            OrchestratorConfig::default(),
+        );
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        // The timestamps were NOT advanced -> the source stays due and retries.
+        let persisted = state
+            .sources_snapshot()
+            .into_iter()
+            .find(|s| s.id == src_id)
+            .expect("source still present");
+        assert_eq!(
+            persisted.last_deep_verify_at, None,
+            "a failed op must NOT advance last_deep_verify_at (the source stays due)"
+        );
+        assert_eq!(
+            persisted.last_full_scan_at, None,
+            "a failed op must NOT advance last_full_scan_at"
+        );
+        assert!(
+            state.account_synced.lock().unwrap().is_empty(),
+            "a failed op must NOT stamp account last_synced_at"
+        );
+        assert!(
+            orch.deep_verify_due(&persisted),
+            "the source is still deep-verify-due after a failed cycle"
+        );
+
+        // A durable activity Error row surfaces the failed op.
+        let expected_code = crate::types::ErrorCode::DriveChecksumMismatch.to_string();
+        let rows = state.activity_rows();
+        assert!(
+            rows.iter()
+                .any(|r| matches!(r.level, crate::state::ActivityLevel::Error)
+                    && r.event_type == expected_code),
+            "a durable activity Error row records the failed op: {rows:?}"
         );
     }
 

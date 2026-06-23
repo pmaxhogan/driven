@@ -103,3 +103,32 @@ latency stress harness:
 - `dns_fail_no_hang` - DNS-failure no-hang needs a real transport timeout.
 - `lossy_and_intermittent_breaker_cycles` - breaker open/half-open/close cycles
   under real packet loss / intermittent connectivity.
+
+## M3 recheck-2 deferrals
+
+The final M3 codex recheck (round 2) raised two findings folded into existing
+deferrals (the real data-loss P1 - timestamps advanced on a failed op - and the
+durable per-file failure activity rows were both FIXED in the same commit; these
+two are the genuine deferrals):
+
+### Per-source crypto resolution (folds into CRYPTO SUITE PRODUCTION WIRING, M5/M6)
+
+The executor models crypto as one executor-wide `Option<Arc<dyn SourceCryptoSuite>>`
+and branches on `self.crypto.is_some()`, but `encryption_enabled` is a PER-SOURCE
+setting. A mixed account must not upload an encrypted source plaintext (suite
+`None`) nor an unencrypted source as ciphertext (suite `Some`). This cannot
+misfire today because no production path constructs the executor with a suite
+(encryption is inert until the M5/M6 wiring above). When that wiring lands it MUST
+resolve the suite per `SourceRow`/`source_id` (a `CryptoProvider` keyed by source
+id), FAIL CLOSED when `encryption_enabled` is true but no key/suite is available,
+and force plaintext when it is false. Tracked as part of the same GA-blocking
+crypto-wiring task, not a separate fix.
+
+### Drive circuit breaker driven by real request outcomes (folds into P2-9, M4)
+
+`network::CircuitBreaker::note_outcome()` exists but the executor / remote-store
+path never calls it, so the Drive breaker (read in `evaluate_gates`) is driven by
+probes alone, not by actual upload/update failures. When the real reqwest/hickory
+backend is wired in M4 (P2-9 above), thread a request-outcome reporter into the
+executor and call `note_outcome(ServiceName::Drive, ok)` on real Drive request
+success/failure so the breaker reacts to true request health.
