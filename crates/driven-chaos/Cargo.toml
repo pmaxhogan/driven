@@ -20,6 +20,9 @@ driven-drive = { path = "../driven-drive" }
 driven-crypto = { path = "../driven-crypto" }
 driven-power = { path = "../driven-power" }
 driven-test-fixtures = { path = "../driven-test-fixtures" }
+# Host capability probe (P1-A): reuse the elevation-token check rather than
+# re-deriving it. driven-vss carries no driven-core dep, so this stays acyclic.
+driven-vss = { path = "../driven-vss" }
 
 anyhow.workspace = true
 async-trait.workspace = true
@@ -29,5 +32,20 @@ tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 uuid.workspace = true
+# The huge-file rows (P1-B) verify by length + md5 against the fake's content
+# oracle instead of buffering / downloading 10-50 GB; same md-5 crate the core
+# + fake use, imported as `md5`.
+md5.workspace = true
 # Hermetic per-scenario StateRepo files live under a throwaway tempdir.
 tempfile = "3"
+
+# Capability probe (P1-A) free-disk + NTFS volume detection.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Storage_FileSystem",
+    "Win32_Foundation",
+] }
+
+# Capability probe (P1-A) free-disk via statvfs on Unix.
+[target.'cfg(unix)'.dependencies]
+libc = "0.2"

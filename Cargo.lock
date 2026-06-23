@@ -1097,6 +1097,9 @@ dependencies = [
  "driven-drive",
  "driven-power",
  "driven-test-fixtures",
+ "driven-vss",
+ "libc",
+ "md-5",
  "serde",
  "serde_json",
  "tempfile",
@@ -1104,6 +1107,7 @@ dependencies = [
  "tracing",
  "tracing-subscriber",
  "uuid",
+ "windows 0.62.2",
 ]
 
 [[package]]

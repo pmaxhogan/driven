@@ -279,13 +279,32 @@ pub async fn run(command: Command, caps: &CapabilitySet) -> i32 {
     match command {
         Command::ScenarioList => {
             for s in registry::registry() {
-                let missing = s.requires().missing(caps);
-                let gate = if missing.is_empty() {
+                let reqs = s.requires();
+                // The DECLARED requires() set - what STRESS_HARNESS acceptance
+                // asks of the host, independent of THIS host (P2-H). Rendered
+                // from the capability labels so the column lines up with the
+                // s3 catalogue's privilege column.
+                let declared: Vec<String> = reqs.required.iter().map(|c| c.label()).collect();
+                let requires = if declared.is_empty() {
+                    String::from("-")
+                } else {
+                    declared.join(",")
+                };
+                // Whether THIS host can run it (a separate column): runnable, or
+                // the subset of declared caps the host is missing.
+                let missing = reqs.missing(caps);
+                let host = if missing.is_empty() {
                     String::from("runnable")
                 } else {
-                    format!("requires {}", missing.join(", "))
+                    format!("missing {}", missing.join(","))
                 };
-                println!("{:<40} {:<10} {}", s.name(), gate, s.description());
+                println!(
+                    "{:<40} {:<32} {:<22} {}",
+                    s.name(),
+                    requires,
+                    host,
+                    s.description()
+                );
             }
             exit_code::OK
         }

@@ -133,22 +133,206 @@ impl CapabilitySet {
     ///
     /// Conservative by construction: a check that cannot be performed
     /// safely reports the capability absent so the dependent scenario is
-    /// SKIPPED rather than run against an unsuitable host. Phase-2 fills in
-    /// the per-OS probes (elevation token, NTFS volume enumeration, VSS,
-    /// `LongPathsEnabled` registry read); the interface fixes the shape and
-    /// the env-driven bits that are platform-agnostic.
+    /// SKIPPED rather than run against an unsuitable host (a capability gap
+    /// never turns a run red, STRESS_HARNESS s1.1).
     pub fn probe() -> Self {
         let real_drive_creds = std::env::var("DRIVEN_E2E_REFRESH_TOKEN").is_ok()
             && std::env::var("DRIVEN_E2E_DEST_FOLDER_ID").is_ok();
+        // The volume backing the harness temp dir is where every fixture is
+        // materialised, so free-disk + filesystem-type probes target it.
+        let temp_dir = std::env::temp_dir();
+        let admin = driven_vss::is_elevated();
+        let free_disk_bytes = probe_free_disk_bytes(&temp_dir);
+        let ntfs_volume = probe_ntfs_volume(&temp_dir);
+        let case_sensitive_volume = probe_case_sensitive_volume(&temp_dir);
+        let long_paths_enabled = probe_long_paths_enabled();
+        // VSS needs Windows + elevation (driven-vss only exposes the COM
+        // sequence on an elevated Windows host).
+        let vss_available = cfg!(windows) && admin;
+        let network_reachable = probe_network_reachable();
         Self {
-            admin: false,
-            ntfs_volume: None,
-            case_sensitive_volume: None,
-            free_disk_bytes: 0,
+            admin,
+            ntfs_volume,
+            case_sensitive_volume,
+            free_disk_bytes,
             real_drive_creds,
-            vss_available: false,
-            long_paths_enabled: false,
-            network_reachable: false,
+            vss_available,
+            long_paths_enabled,
+            network_reachable,
         }
     }
+}
+
+/// Free bytes available to the current user on the volume backing `path`.
+/// Returns 0 (the conservative "no space" reading) on any probe failure.
+#[cfg(windows)]
+fn probe_free_disk_bytes(path: &std::path::Path) -> u64 {
+    use std::os::windows::ffi::OsStrExt;
+    use windows::core::PCWSTR;
+    use windows::Win32::Storage::FileSystem::GetDiskFreeSpaceExW;
+
+    let wide: Vec<u16> = path
+        .as_os_str()
+        .encode_wide()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut free_to_caller: u64 = 0;
+    // SAFETY: `wide` is a NUL-terminated UTF-16 path; the out-param is a valid
+    // local. We pass null for the other two out-params (allowed by the API).
+    let ok = unsafe {
+        GetDiskFreeSpaceExW(
+            PCWSTR(wide.as_ptr()),
+            Some(&mut free_to_caller as *mut u64),
+            None,
+            None,
+        )
+    };
+    if ok.is_ok() {
+        free_to_caller
+    } else {
+        0
+    }
+}
+
+/// Free bytes available on the filesystem backing `path` via `statvfs`.
+/// Returns 0 on any probe failure.
+#[cfg(unix)]
+fn probe_free_disk_bytes(path: &std::path::Path) -> u64 {
+    use std::os::unix::ffi::OsStrExt;
+    let mut cpath: Vec<u8> = path.as_os_str().as_bytes().to_vec();
+    cpath.push(0);
+    // SAFETY: `cpath` is a NUL-terminated C string; `stat` is zeroed and valid
+    // for the duration of the call. We read fields only on a 0 return.
+    unsafe {
+        let mut stat: libc::statvfs = std::mem::zeroed();
+        if libc::statvfs(cpath.as_ptr() as *const libc::c_char, &mut stat) == 0 {
+            (stat.f_bavail as u64).saturating_mul(stat.f_frsize as u64)
+        } else {
+            0
+        }
+    }
+}
+
+/// Neither Windows nor Unix: no portable free-disk probe.
+#[cfg(not(any(windows, unix)))]
+fn probe_free_disk_bytes(_path: &std::path::Path) -> u64 {
+    0
+}
+
+/// The drive letter of `path`'s volume if that volume's filesystem is NTFS
+/// (Windows only). `None` off Windows or when the filesystem cannot be read.
+#[cfg(windows)]
+fn probe_ntfs_volume(path: &std::path::Path) -> Option<char> {
+    use windows::Win32::Storage::FileSystem::GetVolumeInformationW;
+
+    // The volume root, e.g. `C:\`. Derive it from the path's first component.
+    let s = path.to_string_lossy();
+    let drive = s.chars().next()?;
+    if !drive.is_ascii_alphabetic() {
+        return None;
+    }
+    let root: Vec<u16> = format!("{drive}:\\")
+        .encode_utf16()
+        .chain(std::iter::once(0))
+        .collect();
+    let mut fs_name = [0u16; 32];
+    // SAFETY: `root` is a NUL-terminated UTF-16 volume root; `fs_name` is a
+    // local buffer the API fills with the filesystem name. All other out-params
+    // are null (permitted).
+    let ok = unsafe {
+        GetVolumeInformationW(
+            windows::core::PCWSTR(root.as_ptr()),
+            None,
+            None,
+            None,
+            None,
+            Some(&mut fs_name),
+        )
+    };
+    if ok.is_err() {
+        return None;
+    }
+    let len = fs_name
+        .iter()
+        .position(|&c| c == 0)
+        .unwrap_or(fs_name.len());
+    let name = String::from_utf16_lossy(&fs_name[..len]);
+    if name.eq_ignore_ascii_case("NTFS") {
+        Some(drive.to_ascii_uppercase())
+    } else {
+        None
+    }
+}
+
+/// Off Windows there is no NTFS volume concept.
+#[cfg(not(windows))]
+fn probe_ntfs_volume(_path: &std::path::Path) -> Option<char> {
+    None
+}
+
+/// A case-sensitive mountpoint, detected empirically by creating two paths
+/// that differ only in case under a temp dir and checking they are distinct.
+/// Returns the probed directory on success, `None` otherwise.
+fn probe_case_sensitive_volume(temp_dir: &std::path::Path) -> Option<std::path::PathBuf> {
+    let probe_dir = temp_dir.join(format!("driven-chaos-case-probe-{}", std::process::id()));
+    if std::fs::create_dir_all(&probe_dir).is_err() {
+        return None;
+    }
+    let lower = probe_dir.join("casetest");
+    let upper = probe_dir.join("CASETEST");
+    let result = (|| {
+        std::fs::write(&lower, b"l").ok()?;
+        // If writing the upper-case name reads back the lower-case content, the
+        // filesystem folded the case (case-insensitive). A case-sensitive FS
+        // keeps them distinct.
+        std::fs::write(&upper, b"upper").ok()?;
+        let lower_bytes = std::fs::read(&lower).ok()?;
+        if lower_bytes == b"l" {
+            // `lower` still holds its own content -> the two names are distinct
+            // -> the volume is case-sensitive.
+            Some(temp_dir.to_path_buf())
+        } else {
+            None
+        }
+    })();
+    let _ = std::fs::remove_dir_all(&probe_dir);
+    result
+}
+
+/// Whether Windows long-path support is enabled
+/// (`HKLM\SYSTEM\CurrentControlSet\Control\FileSystem\LongPathsEnabled == 1`).
+/// Probed empirically by attempting to create a directory whose path exceeds
+/// the legacy `MAX_PATH` (260) limit under the temp dir: success implies long
+/// paths are usable. `false` off Windows (the legacy limit is Windows-only).
+#[cfg(windows)]
+fn probe_long_paths_enabled() -> bool {
+    let base = std::env::temp_dir().join(format!("driven-chaos-lp-{}", std::process::id()));
+    // Build a path comfortably over MAX_PATH using nested 50-char segments,
+    // WITHOUT the \\?\ prefix (which would bypass the very limit we test).
+    let mut deep = base.clone();
+    for _ in 0..6 {
+        deep.push("x".repeat(50));
+    }
+    let enabled = std::fs::create_dir_all(&deep).is_ok();
+    let _ = std::fs::remove_dir_all(&base);
+    enabled
+}
+
+/// Off Windows the legacy MAX_PATH limit does not apply, so the capability is
+/// not meaningful; report it absent (no Windows-only scenario should run).
+#[cfg(not(windows))]
+fn probe_long_paths_enabled() -> bool {
+    false
+}
+
+/// Whether the host has real outbound Internet, probed by a short-timeout TCP
+/// connect to a well-known resolver (no DNS dependency: dial the IP directly).
+/// `false` on any failure so a network scenario SKIPs rather than flaking.
+fn probe_network_reachable() -> bool {
+    use std::net::{SocketAddr, TcpStream};
+    use std::time::Duration;
+    // 8.8.8.8:53 (Google DNS) - reachable from any host with real Internet,
+    // dialled by IP so a broken local resolver does not mask connectivity.
+    let addr: SocketAddr = ([8, 8, 8, 8], 53).into();
+    TcpStream::connect_timeout(&addr, Duration::from_millis(800)).is_ok()
 }

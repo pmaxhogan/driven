@@ -64,8 +64,16 @@ fn remove_dir_all_with_retry(dir: &std::path::Path) {
 ///
 /// Lifecycle (STRESS_HARNESS s2.3): capability-gate -> `setup` -> boot a
 /// hermetic [`crate::handle::DrivenHandle`] -> `run_assertions` -> ALWAYS
-/// `teardown` -> compare observed vs expected. The whole run is wrapped in a
-/// [`SCENARIO_WALL_CAP`] timeout (s6.3 no-infinite-loop).
+/// `teardown` -> compare observed vs expected.
+///
+/// The [`SCENARIO_WALL_CAP`] timeout (s6.3 no-infinite-loop) wraps ONLY
+/// `run_assertions` - the scenario's actual work, where a hang is a real bug.
+/// It deliberately does NOT wrap `setup`: the cacheable big-fixture rows
+/// (`million-files-nested` documents ~15 min on an SSD, `huge-file-*`)
+/// materialise their fixture in `setup`, and STRESS_HARNESS s8 treats that
+/// one-time cached build as a separate slow step, not part of the per-cycle
+/// hang budget. A genuinely stuck `setup` still surfaces as the process /
+/// outer-CI timeout; the per-scenario cap is for the work loop.
 pub async fn run_one(scenario: &dyn Scenario, caps: &CapabilitySet) -> Verdict {
     let missing = scenario.requires().missing(caps);
     if !missing.is_empty() {
@@ -75,22 +83,13 @@ pub async fn run_one(scenario: &dyn Scenario, caps: &CapabilitySet) -> Verdict {
     }
 
     let started = Instant::now();
-    match tokio::time::timeout(SCENARIO_WALL_CAP, execute(scenario)).await {
-        Ok(Ok(outcome)) => verdict_for(scenario, outcome, started.elapsed()),
-        Ok(Err(e)) => Verdict::Fail {
-            duration: started.elapsed(),
-            observed_outcome: Outcome {
-                notes: vec![format!("scenario errored: {e:#}")],
-                ..Outcome::default()
-            },
-            expected_outcome: scenario.expected_outcome(),
-            diff: format!("scenario run errored before producing an outcome: {e:#}"),
-        },
-        Err(_elapsed) => Verdict::Fail {
+    match execute(scenario).await {
+        Ok(outcome) => verdict_for(scenario, outcome, started.elapsed()),
+        Err(ExecuteError::Timeout) => Verdict::Fail {
             duration: started.elapsed(),
             observed_outcome: Outcome {
                 notes: vec![format!(
-                    "harness.timeout: scenario exceeded the {}s wall-clock cap (s6.3 no-infinite-loop)",
+                    "harness.timeout: run_assertions exceeded the {}s wall-clock cap (s6.3 no-infinite-loop)",
                     SCENARIO_WALL_CAP.as_secs()
                 )],
                 ..Outcome::default()
@@ -101,15 +100,40 @@ pub async fn run_one(scenario: &dyn Scenario, caps: &CapabilitySet) -> Verdict {
                 SCENARIO_WALL_CAP.as_secs()
             ),
         },
+        Err(ExecuteError::Errored(e)) => Verdict::Fail {
+            duration: started.elapsed(),
+            observed_outcome: Outcome {
+                notes: vec![format!("scenario errored: {e:#}")],
+                ..Outcome::default()
+            },
+            expected_outcome: scenario.expected_outcome(),
+            diff: format!("scenario run errored before producing an outcome: {e:#}"),
+        },
+    }
+}
+
+/// How `execute` can fail: a hard error, or the `run_assertions` wall-clock cap.
+enum ExecuteError {
+    /// `run_assertions` exceeded [`SCENARIO_WALL_CAP`] (s6.3 no-infinite-loop).
+    Timeout,
+    /// A setup / assertion / teardown error before a usable outcome.
+    Errored(anyhow::Error),
+}
+
+impl From<anyhow::Error> for ExecuteError {
+    fn from(e: anyhow::Error) -> Self {
+        ExecuteError::Errored(e)
     }
 }
 
 /// Drive `setup -> run_assertions -> teardown`, guaranteeing teardown runs
-/// even when an assertion fails (STRESS_HARNESS s2.3). Returns the observed
-/// [`Outcome`], or the first hard error encountered.
-async fn execute(scenario: &dyn Scenario) -> anyhow::Result<Outcome> {
+/// even when an assertion fails (STRESS_HARNESS s2.3). The wall-clock cap wraps
+/// only `run_assertions`; `setup` (the cacheable big-fixture build) and
+/// `teardown` are uncapped. Returns the observed [`Outcome`], or the first hard
+/// error / the assertion-phase timeout.
+async fn execute(scenario: &dyn Scenario) -> Result<Outcome, ExecuteError> {
     let fixture_root = fixture_root_for(scenario.name());
-    std::fs::create_dir_all(&fixture_root)?;
+    std::fs::create_dir_all(&fixture_root).map_err(anyhow::Error::from)?;
 
     // Hermetic-state guard: a scenario's SQLite state DB must be fresh every
     // run, but some rows (the file-size category) place `state.db` INSIDE the
@@ -129,19 +153,26 @@ async fn execute(scenario: &dyn Scenario) -> anyhow::Result<Outcome> {
         cacheable: false,
     };
 
+    // setup is UNCAPPED: the cacheable big-fixture build (million-files-nested
+    // ~15 min, huge-file-*) is a one-time slow step (STRESS_HARNESS s8), not
+    // part of the per-cycle no-infinite-loop budget.
     scenario.setup(&mut ctx).await?;
 
     // A hermetic handle for scenarios that use the provided one. Most rows
     // boot their own custom-remote handle internally; this generic handle is
     // the default the trait requires (Phase-1 `_handle` contract).
-    let state_dir = tempfile::tempdir()?;
+    let state_dir = tempfile::tempdir().map_err(anyhow::Error::from)?;
     let handle = DrivenHandleBuilder::new(state_dir.path().join("state.db"))
         .boot()
         .await?;
 
-    let result = scenario.run_assertions(&handle).await;
+    // The wall-clock cap wraps ONLY the work loop. Compute the budget remaining
+    // after the (uncapped) fixture build so a scenario whose setup already ran
+    // long still gets the full assertion budget.
+    let timed = tokio::time::timeout(SCENARIO_WALL_CAP, scenario.run_assertions(&handle)).await;
 
-    // teardown ALWAYS runs (STRESS_HARNESS s2.3), even on assertion failure.
+    // teardown ALWAYS runs (STRESS_HARNESS s2.3), even on assertion failure or
+    // an assertion-phase timeout.
     let teardown = scenario.teardown(&mut ctx).await;
 
     // A throwaway fixture is cleaned; a cacheable one survives for the next
@@ -155,6 +186,10 @@ async fn execute(scenario: &dyn Scenario) -> anyhow::Result<Outcome> {
         remove_dir_all_with_retry(&fixture_root);
     }
 
+    let result = match timed {
+        Ok(r) => r,
+        Err(_elapsed) => return Err(ExecuteError::Timeout),
+    };
     let outcome = result?;
     teardown?;
     Ok(outcome)
@@ -164,6 +199,25 @@ async fn execute(scenario: &dyn Scenario) -> anyhow::Result<Outcome> {
 /// [`ExpectedOutcome`] into a PASS / FAIL [`Verdict`] (STRESS_HARNESS s9).
 fn verdict_for(scenario: &dyn Scenario, observed: Outcome, duration: Duration) -> Verdict {
     let expected = scenario.expected_outcome();
+
+    // CENTRAL s6.3 invariant sweep (P1-C): the runner enforces the
+    // cross-cutting invariants after EVERY scenario - including
+    // DocumentedBehaviour rows - so a scenario can never pass while silently
+    // losing data, duplicating remote objects per client_op_uuid, leaking
+    // due pending ops, or failing to quiesce. A tripped invariant is a hard
+    // FAIL regardless of the scenario's own ExpectedOutcome.
+    if let Some(inv) = observed.invariants {
+        if !inv.all_held() {
+            let violations = inv.violations().join(", ");
+            return Verdict::Fail {
+                duration,
+                observed_outcome: observed,
+                expected_outcome: expected,
+                diff: format!("s6.3 cross-cutting invariant(s) violated: {violations}"),
+            };
+        }
+    }
+
     let passed = match &expected {
         // Success: the scenario completed with no surfaced error code.
         ExpectedOutcome::Success => observed.error_codes_seen.is_empty(),

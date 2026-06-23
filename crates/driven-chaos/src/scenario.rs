@@ -54,8 +54,64 @@ pub struct Outcome {
     /// recorded local hash (a per-scenario data-loss check separate from
     /// the cross-cutting invariant in STRESS_HARNESS s6.3).
     pub final_hash_matches_local: bool,
+    /// The cross-cutting STRESS_HARNESS s6.3 invariant snapshot, when the
+    /// scenario captured it. The RUNNER enforces this centrally after EVERY
+    /// scenario (P1-C): any tripped invariant flips the verdict to FAIL
+    /// regardless of the scenario's own [`ExpectedOutcome`], so a scenario can
+    /// never pass while silently losing data, duplicating objects, leaking
+    /// pending ops, or failing to quiesce. `None` only for the pure-fuzz /
+    /// metadata rows that have no single source+remote to sweep; those carry
+    /// their invariant checks inline (see the mutator driver).
+    pub invariants: Option<InvariantOutcome>,
     /// Free-form notes a scenario wants surfaced in the human report.
     pub notes: Vec<String>,
+}
+
+/// The cross-cutting STRESS_HARNESS s6.3 invariant snapshot the runner
+/// enforces after EVERY scenario (P1-C). Every flag must hold; a `false`
+/// anywhere is a hard FAIL no matter what the scenario's own
+/// [`ExpectedOutcome`] expected.
+#[derive(Debug, Clone, Copy)]
+pub struct InvariantOutcome {
+    /// Every `status='synced'` row still resolves to a live remote object of
+    /// the recorded size AND its local file still exists at that size.
+    pub no_data_loss: bool,
+    /// No two non-trashed remote objects share one `client_op_uuid`.
+    pub no_duplicate_op_uuid: bool,
+    /// No `pending_ops` row is due-or-past at the end of the run (only
+    /// future-scheduled backoff is allowed).
+    pub no_pending_leak: bool,
+    /// The orchestrator quiesced to a non-running terminal state (no work left
+    /// mid-flight, no panic) - the s6.3 clean-shutdown check.
+    pub clean_shutdown: bool,
+}
+
+impl InvariantOutcome {
+    /// Whether every cross-cutting invariant held.
+    pub fn all_held(&self) -> bool {
+        self.no_data_loss
+            && self.no_duplicate_op_uuid
+            && self.no_pending_leak
+            && self.clean_shutdown
+    }
+
+    /// The labels of the invariants that were VIOLATED (for the FAIL diff).
+    pub fn violations(&self) -> Vec<&'static str> {
+        let mut v = Vec::new();
+        if !self.no_data_loss {
+            v.push("no-data-loss");
+        }
+        if !self.no_duplicate_op_uuid {
+            v.push("no-duplicate-remote-object-per-op-uuid");
+        }
+        if !self.no_pending_leak {
+            v.push("no-pending_ops-leak");
+        }
+        if !self.clean_shutdown {
+            v.push("clean-shutdown");
+        }
+        v
+    }
 }
 
 /// What the harness expects to observe, driving the PASS / FAIL decision
