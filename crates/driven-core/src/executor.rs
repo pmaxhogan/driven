@@ -31,7 +31,7 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use driven_crypto::{ContentEncryptor, CryptoError, SourceCryptoSuite};
-use driven_drive::google::classification_of;
+use driven_drive::google::{classification_of, DriveError as DriveStoreError};
 use driven_drive::remote_store::{
     AboutInfo, DownloadStream, DriveErrorClassification, RemoteEntry, RemoteStore, ResumableKind,
     ResumableSession, ResumeProgress, UploadBody,
@@ -3326,12 +3326,15 @@ fn crypto_error_code(e: &CryptoError) -> ErrorCode {
 
 /// The executor's classification of a Drive-side `anyhow` error.
 ///
-/// `RemoteStore` returns `anyhow::Result`; the production `GoogleDriveStore`
-/// will (M4) carry a typed/downcastable error, but today both it and the
-/// `InMemoryRemoteStore` surface `anyhow` with a format-string message. We
-/// isolate the string-matching of the fake's messages here so there is ONE
-/// place to swap in a typed `DriveErrorClassification` downcast when the
-/// real store lands. See the M3 report's "error classification" note.
+/// `RemoteStore` returns `anyhow::Result`. The production `GoogleDriveStore`
+/// (M4) carries a typed, downcastable [`DriveStoreError`] whose
+/// [`DriveErrorClassification`] is the authoritative verdict; the
+/// `InMemoryRemoteStore` fake still surfaces `anyhow` with a format-string
+/// message. [`classify_drive_error`] therefore downcasts to the typed error
+/// FIRST (real store) and falls back to substring-matching the fake's messages
+/// only when the error is not a typed `DriveStoreError`. This fixes the V-D /
+/// C-P2-1 collision where `Transient5xx` and `Other` both render
+/// `drive.unreachable`, which the old pure-substring matcher wrongly retried.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum DriveError {
     RateLimited,
@@ -3374,10 +3377,35 @@ impl DriveError {
     }
 }
 
-/// Classify a Drive-side `anyhow` error by matching the fake's message
-/// substrings (see the type doc on [`DriveError`] for why this is
-/// string-based today).
+/// Classify a Drive-side `anyhow` error into the executor's retry verdict.
+///
+/// Prefers the TYPED downcast (the production `GoogleDriveStore` surfaces a
+/// [`DriveStoreError`]): its [`DriveErrorClassification`] maps directly, and
+/// the dedicated fatal variants (dest-folder / session-invalid / checksum) map
+/// to their precise codes. This avoids the V-D / C-P2-1 collision where
+/// `Transient5xx` and `Other` share the `drive.unreachable` Display string -
+/// the typed path distinguishes them so a fatal `Other` is NOT retried.
+///
+/// Falls back to substring-matching ONLY when the error is not a typed
+/// `DriveStoreError` (the `InMemoryRemoteStore` fake, which uses plain
+/// `anyhow::bail!` strings). That keeps every fake-based test green.
 fn classify_drive_error(e: &anyhow::Error) -> DriveError {
+    // Typed path: the real GoogleDriveStore. Map the dedicated fatal variants
+    // by their own discriminant, and the Classified ones by classification.
+    if let Some(typed) = e.downcast_ref::<DriveStoreError>() {
+        return match typed {
+            DriveStoreError::DestFolderMissing => DriveError::DestFolderMissing,
+            DriveStoreError::DestFolderPermissionDenied => DriveError::DestFolderPermissionDenied,
+            // A dead resumable session / checksum mismatch is fatal for this
+            // op (not a transient service-health signal). Map to Other so the
+            // op fails rather than being retried as if the link were flaky.
+            DriveStoreError::ResumableSessionInvalid | DriveStoreError::ChecksumMismatch => {
+                DriveError::Other
+            }
+            DriveStoreError::Classified { kind, .. } => classify_from_classification(kind),
+        };
+    }
+    // String fallback for the fake's plain anyhow messages.
     let msg = e.to_string();
     if msg.contains("rate_limited") {
         DriveError::RateLimited
@@ -3400,6 +3428,22 @@ fn classify_drive_error(e: &anyhow::Error) -> DriveError {
         DriveError::Transient
     } else {
         DriveError::Other
+    }
+}
+
+/// Maps a typed [`DriveErrorClassification`] to the executor's retry verdict
+/// (the V-D typed path). `Transient5xx` and `Network` are the retryable
+/// transient class; `Other` is fatal-for-this-op (NOT retried).
+fn classify_from_classification(kind: &DriveErrorClassification) -> DriveError {
+    match kind {
+        DriveErrorClassification::RateLimited { .. } => DriveError::RateLimited,
+        DriveErrorClassification::Transient5xx | DriveErrorClassification::Network => {
+            DriveError::Transient
+        }
+        DriveErrorClassification::AuthInvalidGrant => DriveError::InvalidGrant,
+        DriveErrorClassification::DailyQuota => DriveError::DailyQuota,
+        DriveErrorClassification::StorageQuota => DriveError::QuotaExhausted,
+        DriveErrorClassification::Other => DriveError::Other,
     }
 }
 
@@ -4573,6 +4617,68 @@ mod tests {
                 "no Windows lock concept off Windows: raw 33 is a plain IO error"
             );
         }
+    }
+
+    /// V-D / C-P2-1: `classify_drive_error` must use the TYPED downcast for the
+    /// real store so `Transient5xx` (retry) and `Other` (fatal) are
+    /// distinguished even though both render the `drive.unreachable` Display
+    /// string. The pure-substring matcher would wrongly map a fatal `Other`
+    /// to `Transient`; the typed path must not.
+    #[test]
+    fn classify_drive_error_typed_distinguishes_transient_from_other() {
+        use driven_drive::google::DriveError as DriveStoreError;
+        use driven_drive::remote_store::DriveErrorClassification;
+
+        // A typed Transient5xx -> Transient (retryable).
+        let t5 = anyhow::Error::new(DriveStoreError::Classified {
+            kind: DriveErrorClassification::Transient5xx,
+            source: anyhow::anyhow!("503"),
+        });
+        assert_eq!(
+            super::classify_drive_error(&t5),
+            super::DriveError::Transient
+        );
+
+        // A typed Other -> Other (fatal). Both Display as "drive.unreachable",
+        // so a substring matcher would have wrongly retried this.
+        let other = anyhow::Error::new(DriveStoreError::Classified {
+            kind: DriveErrorClassification::Other,
+            source: anyhow::anyhow!("404 unexpected"),
+        });
+        assert_eq!(
+            super::classify_drive_error(&other),
+            super::DriveError::Other
+        );
+
+        // The dedicated fatal variants map precisely.
+        assert_eq!(
+            super::classify_drive_error(&anyhow::Error::new(DriveStoreError::DestFolderMissing)),
+            super::DriveError::DestFolderMissing
+        );
+        assert_eq!(
+            super::classify_drive_error(&anyhow::Error::new(
+                DriveStoreError::DestFolderPermissionDenied
+            )),
+            super::DriveError::DestFolderPermissionDenied
+        );
+        assert_eq!(
+            super::classify_drive_error(&anyhow::Error::new(
+                DriveStoreError::ResumableSessionInvalid
+            )),
+            super::DriveError::Other
+        );
+
+        // The string fallback still classifies the fake's plain messages.
+        let fake_5xx = anyhow::anyhow!("fake: drive.unreachable (5xx)");
+        assert_eq!(
+            super::classify_drive_error(&fake_5xx),
+            super::DriveError::Transient
+        );
+        let fake_rl = anyhow::anyhow!("fake: drive.rate_limited");
+        assert_eq!(
+            super::classify_drive_error(&fake_rl),
+            super::DriveError::RateLimited
+        );
     }
 
     /// An UNAVAILABLE VSS provider must not disturb a normal (openable) file in
