@@ -22,12 +22,16 @@ async-trait.workspace = true
 [target.'cfg(windows)'.dependencies]
 # GetSystemPowerStatus (Win32_System_Power) for AC/battery (DESIGN s5.7).
 # Win32_Foundation pulls the shared BOOL/handle types its signature uses.
-# INetworkCostManager (metered) and the WM_POWERBROADCAST message pump
-# (sleep/wake) are TODO seams in network.rs / windows.rs; their feature
-# flags widen this list when those hooks are wired (DESIGN s5.7, s5.10.1).
+# Win32_Networking_NetworkListManager + Win32_System_Com back the real
+# metered-network read in network.rs (INetworkListManager ->
+# INetworkCostManager::GetCost, instantiated via CoCreateInstance after
+# CoInitializeEx) - DESIGN s5.7, CODEX_NOTES P2-10. The WM_POWERBROADCAST
+# message pump (sleep/wake) remains a TODO seam in windows.rs (s5.10.1).
 windows = { version = "0.62", features = [
     "Win32_Foundation",
     "Win32_System_Power",
+    "Win32_System_Com",
+    "Win32_Networking_NetworkListManager",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]

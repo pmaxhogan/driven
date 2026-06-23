@@ -72,12 +72,30 @@ abstraction is in place.
 
 ### P2-10 per-OS metered detection + reachability (M4)
 
-`driven-power`'s real metered detection is stubbed (always `false`) and
-reachability is stubbed (always `true`), so `skip_on_metered` is a NO-OP in
-production today (it is exercised at M3 only via `FakePowerSource`). M4 wires the
-per-OS backends: Windows `INetworkCostManager`, macOS `NWPath.isExpensive`,
-Linux NetworkManager `Metered`. Until then, treat `skip_on_metered` as inert in
-a real build.
+M4 status:
+- **Windows metered detection is now REAL** (`crates/driven-power/src/network.rs`,
+  `detect_metered` Windows arm). It instantiates the `NetworkListManager` COM
+  object, queries `INetworkCostManager::GetCost`, and maps the
+  `NLM_CONNECTION_COST` bitmask (FIXED / VARIABLE / CONGESTED / OVERDATALIMIT /
+  APPROACHINGDATALIMIT / ROAMING -> metered; UNRESTRICTED / UNKNOWN / any COM
+  failure -> the safe `false`). The `windows` crate features
+  `Win32_Networking_NetworkListManager` + `Win32_System_Com` were added to
+  `crates/driven-power/Cargo.toml` to back it.
+- **macOS + Linux metered detection remain documented conservative defaults
+  (`false`)** - ACCEPTED RESIDUALS. macOS `NWPath.isExpensive` needs a live
+  `NWPathMonitor` on a dispatch queue (no one-shot synchronous read); Linux
+  NetworkManager's per-connection `Metered` property is DBus-only internal NM
+  state with no cheap synchronous `/sys`/`/proc` read, which does not fit the
+  synchronous 30 s-cadence probe. Both keep `false` (safe direction: a false
+  "not metered" only fails to skip a rare metered link; a false "metered" would
+  stall ALL sync) until a monitor-backed / DBus-backed async reader lands.
+- **Reachability** is still the coarse `true` hint in `PowerState`; the
+  authoritative classification is owned by the network-resilience subsystem
+  (DESIGN s5.8), which `driven-net`'s `ReqwestBackend` now implements for real
+  (three-probe topology, hickory DNS re-resolution per probe).
+
+Net effect: `skip_on_metered` is now LIVE on Windows; on macOS/Linux it stays
+inert until those two arms are wired.
 
 ### CRYPTO SUITE PRODUCTION WIRING (M5/M6 - BEFORE GA)
 
