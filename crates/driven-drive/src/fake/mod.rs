@@ -130,6 +130,22 @@ struct FileEntry {
     /// over the freshly-computed md5 so the executor's checksum-mismatch
     /// retry path (SPEC s8) fires consistently across read calls.
     corrupted_md5: Option<[u8; 16]>,
+    /// Content oracle (P1-B): when `Some`, this entry was written under the
+    /// streaming oracle so `bytes` is EMPTY (the literal content was never
+    /// retained) and the true content length + md5 live here instead. Lets a
+    /// 10-50 GB upload be verified by length + digest without buffering the
+    /// bytes. `None` for every normally-stored object.
+    oracle: Option<OracleDigest>,
+}
+
+/// Length + md5 digest of an object's content, recorded by the streaming
+/// content oracle (P1-B) instead of the literal bytes.
+#[derive(Debug, Clone, Copy)]
+struct OracleDigest {
+    /// Exact content length in bytes.
+    len: u64,
+    /// md5 of the full content (computed incrementally as it streamed).
+    md5: [u8; 16],
 }
 
 impl FileEntry {
@@ -141,6 +157,11 @@ impl FileEntry {
         if self.is_folder() {
             return None;
         }
+        // Oracle-stored entries carry the true md5 computed while the content
+        // streamed; the literal bytes are absent so recompute is impossible.
+        if let Some(d) = &self.oracle {
+            return Some(d.md5);
+        }
         use md5::{Digest, Md5};
         let mut hasher = Md5::new();
         hasher.update(&self.bytes);
@@ -150,14 +171,28 @@ impl FileEntry {
         Some(bytes)
     }
 
+    /// The content length in bytes (oracle length when oracle-stored, else the
+    /// retained byte count). `None` for folders.
+    fn content_len(&self) -> Option<u64> {
+        if self.is_folder() {
+            return None;
+        }
+        Some(
+            self.oracle
+                .map(|d| d.len)
+                .unwrap_or(self.bytes.len() as u64),
+        )
+    }
+
     /// Build a [`RemoteEntry`] from this entry. The md5 returned is
     /// `corrupted_md5` if the md5-mismatch fault has latched on this
-    /// entry, otherwise the freshly-computed md5 of the stored bytes.
+    /// entry, otherwise the freshly-computed md5 of the stored bytes (or the
+    /// oracle md5 when the bytes were not retained).
     fn to_remote_entry(&self) -> RemoteEntry {
         let size = if self.is_folder() {
             None
         } else {
-            Some(self.bytes.len() as u64)
+            self.content_len()
         };
         RemoteEntry {
             id: self.file_id.clone(),
@@ -173,21 +208,84 @@ impl FileEntry {
     }
 }
 
+/// Bytes a resumable session has accepted so far.
+///
+/// Normal mode keeps the literal bytes (committed verbatim on the final
+/// chunk). Oracle mode (P1-B) keeps only a running length + md5 hasher so a
+/// 10-50 GB resumable upload never buffers the whole content - the huge-file
+/// rows verify by length + digest instead of byte round-trip.
+enum Received {
+    /// Literal accepted bytes, grown one chunk at a time.
+    Bytes(Vec<u8>),
+    /// Streaming digest: accepted length + an incremental md5 hasher.
+    Digest { len: u64, hasher: md5::Md5 },
+}
+
+impl std::fmt::Debug for Received {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            Received::Bytes(b) => f.debug_struct("Bytes").field("len", &b.len()).finish(),
+            Received::Digest { len, .. } => f.debug_struct("Digest").field("len", len).finish(),
+        }
+    }
+}
+
+impl Received {
+    /// Bytes accepted so far (the resumable offset bookkeeping).
+    fn len(&self) -> u64 {
+        match self {
+            Received::Bytes(b) => b.len() as u64,
+            Received::Digest { len, .. } => *len,
+        }
+    }
+
+    /// Accept one validated chunk: append bytes (normal) or fold them into the
+    /// length + md5 digest (oracle), never buffering in oracle mode.
+    fn accept(&mut self, chunk: &[u8]) {
+        use md5::Digest;
+        match self {
+            Received::Bytes(b) => b.extend_from_slice(chunk),
+            Received::Digest { len, hasher } => {
+                hasher.update(chunk);
+                *len += chunk.len() as u64;
+            }
+        }
+    }
+
+    /// Finalize the committed content into `(bytes, oracle, len)` for storing
+    /// in a [`FileEntry`]: literal bytes yield `(bytes, None, bytes.len())`; an
+    /// oracle digest yields `(empty, Some(digest), len)` so the huge-file rows
+    /// commit by length+md5 without retaining the content.
+    fn finish(self) -> (Vec<u8>, Option<OracleDigest>, u64) {
+        use md5::Digest;
+        match self {
+            Received::Bytes(b) => {
+                let len = b.len() as u64;
+                (b, None, len)
+            }
+            Received::Digest { len, hasher } => {
+                let mut md5 = [0u8; 16];
+                md5.copy_from_slice(&hasher.finalize());
+                (Vec::new(), Some(OracleDigest { len, md5 }), len)
+            }
+        }
+    }
+}
+
 /// State of an open resumable upload session.
 ///
-/// The fake stores a buffer of received bytes; on the final chunk it
-/// commits the buffer as the underlying file's content (create) or
-/// replaces the existing file's content (update). Mid-session 4xx (the
-/// fault injectors flip `invalid = true`) leaves the session marked
-/// dead - every subsequent `resume_chunk` returns
-/// [`ResumeProgress::SessionInvalid`] regardless of fault counters,
-/// matching SPEC s3's "session is dead" rule.
+/// The fake stores received content; on the final chunk it commits it as the
+/// underlying file's content (create) or replaces the existing file's content
+/// (update). Mid-session 4xx (the fault injectors flip `invalid = true`)
+/// leaves the session marked dead - every subsequent `resume_chunk` returns
+/// [`ResumeProgress::SessionInvalid`] regardless of fault counters, matching
+/// SPEC s3's "session is dead" rule.
 #[derive(Debug)]
 struct ResumableSessionState {
     /// Total content length the session was opened for.
     size: u64,
-    /// Bytes received so far. Grows by one accepted chunk.
-    received: Vec<u8>,
+    /// Content received so far (literal bytes, or a streaming oracle digest).
+    received: Received,
     /// MIME type the session was opened for.
     mime: String,
     /// Create-or-update target metadata.
@@ -220,7 +318,7 @@ impl ResumableSessionState {
     /// calls still return [`ResumeProgress::SessionInvalid`].
     fn invalidate(&mut self) {
         self.invalid = true;
-        self.received = Vec::new();
+        self.received = Received::Bytes(Vec::new());
     }
 }
 
@@ -369,6 +467,19 @@ pub(crate) struct Faults {
     pub(crate) session_invalidated_after_chunks: AtomicU64,
     pub(crate) md5_mismatch_after: AtomicU64,
     pub(crate) quota_exhausted_after_bytes: AtomicU64,
+    /// Trip a `403 dailyLimitExceeded` after this many WriteTarget requests
+    /// (STRESS_HARNESS s3.7 `daily-quota-exhausted`, P1-F). Distinct from the
+    /// per-10-minute `rate_limit_after` and the total-bytes
+    /// `quota_exhausted_after_bytes`: a daily-limit trip pauses the account
+    /// until midnight Pacific. LATCHES once tripped (the daily window stays
+    /// closed for the rest of the run), so every subsequent write keeps
+    /// returning the daily-limit error - modelling a quota that does not reset
+    /// within a single harness run. `u64::MAX` (the default) never trips. Set
+    /// by [`fault_injection::with_daily_quota_after`].
+    pub(crate) daily_quota_after: AtomicU64,
+    /// Latched true once `daily_quota_after` trips, so the daily window stays
+    /// closed for every later write in the run.
+    pub(crate) daily_quota_latched: std::sync::atomic::AtomicBool,
     /// Artificial per-request latency in nanoseconds, injected by
     /// [`fault_injection::with_slow_responses`]. `0` (the default) means
     /// no delay. Every trait method awaits this before doing its work
@@ -393,6 +504,19 @@ pub(crate) struct Faults {
     /// file_id recycling (STRESS_HARNESS s3.7 `drive-fileid-recycled`). Set
     /// by [`fault_injection::with_fileid_recycle`].
     pub(crate) fileid_recycle: std::sync::atomic::AtomicBool,
+    /// When true, write paths (`create`, `update`, resumable `resume_chunk`
+    /// commit) do NOT retain the literal uploaded bytes - they record only the
+    /// content LENGTH and a streaming md5 digest of the bytes as they pass
+    /// through. This is the streaming/sparse content oracle (STRESS_HARNESS
+    /// s3.2 `huge-file-10gb` / `huge-file-50gb-mid-run-crash`, P1-B): a 10-50 GB
+    /// upload can be verified by length + md5 without ever buffering tens of
+    /// gigabytes in a `Vec<u8>` and OOMing. An oracle-stored object's
+    /// [`RemoteEntry::size`] / [`RemoteEntry::md5`] are exact; [`download`]
+    /// cannot reproduce the bytes (it errors), so the oracle is for
+    /// length+digest assertions, not byte-streaming round-trips. Default off:
+    /// every other scenario keeps storing literal bytes. Set by
+    /// [`fault_injection::with_content_oracle`].
+    pub(crate) content_oracle: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Faults {
@@ -406,12 +530,15 @@ impl Default for Faults {
             session_invalidated_after_chunks: AtomicU64::new(u64::MAX),
             md5_mismatch_after: AtomicU64::new(u64::MAX),
             quota_exhausted_after_bytes: AtomicU64::new(u64::MAX),
+            daily_quota_after: AtomicU64::new(u64::MAX),
+            daily_quota_latched: AtomicBool::new(false),
             response_delay_nanos: AtomicU64::new(0),
             invalid_grant_latched: AtomicBool::new(false),
             dest_folder_missing: AtomicBool::new(false),
             dest_folder_readonly: AtomicBool::new(false),
             trashed_visible_in_find: AtomicBool::new(false),
             fileid_recycle: AtomicBool::new(false),
+            content_oracle: AtomicBool::new(false),
         }
     }
 }
@@ -433,6 +560,7 @@ impl InMemoryRemoteStore {
             trashed: false,
             seq: 0,
             corrupted_md5: None,
+            oracle: None,
         };
         let inner = Inner {
             objects: HashMap::from([(root_id.clone(), root)]),
@@ -530,6 +658,12 @@ impl InMemoryRemoteStore {
     /// the single insertion point at the top of every trait method, BEFORE
     /// any `self.inner.lock()` - so the `.await` never spans a held
     /// `parking_lot` guard (DESIGN s5.8.1).
+    /// Whether the streaming content oracle (P1-B) is armed: write paths keep
+    /// only a length+md5 digest instead of buffering the literal bytes.
+    fn oracle_on(&self) -> bool {
+        self.faults.content_oracle.load(Ordering::Acquire)
+    }
+
     async fn check_request_faults(&self, path_kind: RequestKind) -> anyhow::Result<()> {
         self.maybe_delay().await;
         // auth.invalid_grant is latched: once tripped it stays broken.
@@ -550,6 +684,25 @@ impl InMemoryRemoteStore {
         }
         if decrement_to_zero(&self.faults.rate_limit_after) {
             anyhow::bail!("fake: drive.rate_limited");
+        }
+        // drive.daily_quota_exhausted (403 dailyLimitExceeded, P1-F): trips on
+        // a WriteTarget call and LATCHES so the daily window stays closed for
+        // the rest of the run. The message carries "daily" + "dailyLimitExceeded"
+        // so the executor's `classify_drive_error` maps it to
+        // `DriveError::DailyQuota` -> `ErrorCode::DriveDailyQuotaExhausted` and
+        // the pacer pauses the account until midnight Pacific.
+        if matches!(path_kind, RequestKind::WriteTarget) {
+            if self.faults.daily_quota_latched.load(Ordering::Acquire) {
+                anyhow::bail!(
+                    "fake: drive.daily_quota_exhausted (403 dailyLimitExceeded, latched)"
+                );
+            }
+            if decrement_to_zero(&self.faults.daily_quota_after) {
+                self.faults
+                    .daily_quota_latched
+                    .store(true, Ordering::Release);
+                anyhow::bail!("fake: drive.daily_quota_exhausted (403 dailyLimitExceeded)");
+            }
         }
         if matches!(path_kind, RequestKind::WriteTarget)
             && self.faults.dest_folder_missing.load(Ordering::Acquire)
@@ -674,6 +827,7 @@ impl RemoteStore for InMemoryRemoteStore {
             trashed: false,
             seq,
             corrupted_md5: None,
+            oracle: None,
         };
         let out = entry.to_remote_entry();
         guard.objects.insert(file_id, entry);
@@ -704,19 +858,22 @@ impl RemoteStore for InMemoryRemoteStore {
     ) -> anyhow::Result<RemoteEntry> {
         self.check_request_faults(RequestKind::WriteTarget).await?;
         // Drain stream BEFORE locking (advisor finding #3): never hold
-        // a parking_lot::Mutex guard across an .await.
-        let bytes = collect_body(body).await?;
+        // a parking_lot::Mutex guard across an .await. Under the content
+        // oracle (P1-B) the bytes are digested, not buffered.
+        let body = collect_body(body, self.oracle_on()).await?;
+        let content_len = body.len();
 
         // Quota check.
         if let Some(remaining) =
-            try_consume_bytes(&self.faults.quota_exhausted_after_bytes, bytes.len() as u64)
+            try_consume_bytes(&self.faults.quota_exhausted_after_bytes, content_len)
         {
             anyhow::bail!(
                 "fake: drive.quota_exhausted (over budget by {}B)",
-                bytes.len() as u64 - remaining
+                content_len - remaining
             );
         }
 
+        let (bytes, oracle) = body_into_entry_fields(body);
         let mut guard = self.inner.lock();
         // Parent must be an existing FOLDER (not a file, not missing).
         guard.ensure_folder_parent(parent_id)?;
@@ -736,8 +893,9 @@ impl RemoteStore for InMemoryRemoteStore {
             trashed: false,
             seq,
             corrupted_md5: None,
+            oracle,
         };
-        guard.bytes_stored = guard.bytes_stored.saturating_add(entry.bytes.len() as u64);
+        guard.bytes_stored = guard.bytes_stored.saturating_add(content_len);
         // Latch the md5 fault on the entry itself so every subsequent
         // read (metadata, list_folder, find_by_op_uuid, ...) returns the
         // bad md5 until the file is rewritten.
@@ -754,17 +912,19 @@ impl RemoteStore for InMemoryRemoteStore {
         app_properties_patch: HashMap<String, String>,
     ) -> anyhow::Result<RemoteEntry> {
         self.check_request_faults(RequestKind::WriteTarget).await?;
-        let bytes = collect_body(body).await?;
+        let body = collect_body(body, self.oracle_on()).await?;
 
-        let new_len = bytes.len() as u64;
+        let new_len = body.len();
+        let (bytes, oracle) = body_into_entry_fields(body);
         let mut guard = self.inner.lock();
         let new_now = guard.tick();
         let entry = guard
             .objects
             .get_mut(file_id)
             .ok_or_else(|| anyhow::anyhow!("fake: no object with file_id {file_id}"))?;
-        let old_len = entry.bytes.len() as u64;
+        let old_len = entry.content_len().unwrap_or(0);
         entry.bytes = bytes;
+        entry.oracle = oracle;
         for (k, v) in app_properties_patch {
             entry.app_properties.insert(k, v);
         }
@@ -829,8 +989,18 @@ impl RemoteStore for InMemoryRemoteStore {
                 size,
                 // Do NOT preallocate `size`: a 1 GiB declared upload must not
                 // commit 1 GiB up front (M3's memory-ceiling acceptance test
-                // would otherwise fail inside the fake). Grow per chunk.
-                received: Vec::new(),
+                // would otherwise fail inside the fake). Grow per chunk. Under
+                // the content oracle (P1-B) accepted chunks fold into a
+                // length+md5 digest, never buffered, so a 10-50 GB resumable
+                // upload verifies by length+digest without OOMing.
+                received: if self.oracle_on() {
+                    Received::Digest {
+                        len: 0,
+                        hasher: <md5::Md5 as md5::Digest>::new(),
+                    }
+                } else {
+                    Received::Bytes(Vec::new())
+                },
                 mime: mime.to_string(),
                 kind: clone_kind(&kind),
                 issued_at,
@@ -864,7 +1034,7 @@ impl RemoteStore for InMemoryRemoteStore {
             return Ok(ResumeProgress::SessionInvalid);
         }
 
-        if offset != state.received.len() as u64 {
+        if offset != state.received.len() {
             // Drive responds with 308 + Range header to request the
             // bytes it actually has. The trait does not surface that
             // back-channel; treat as a session-invalidating client bug.
@@ -901,10 +1071,10 @@ impl RemoteStore for InMemoryRemoteStore {
             }
         }
 
-        state.received.extend_from_slice(&chunk);
+        state.received.accept(&chunk);
         if !is_final {
             return Ok(ResumeProgress::InProgress {
-                received: state.received.len() as u64,
+                received: state.received.len(),
             });
         }
 
@@ -918,19 +1088,18 @@ impl RemoteStore for InMemoryRemoteStore {
             .sessions
             .remove(&session.url)
             .expect("session existed under the same lock");
-        let received = removed.received;
+        let (received_bytes, received_oracle, received_len) = removed.received.finish();
         let mime = removed.mime;
         let kind = removed.kind;
 
         // Quota check (charged at commit time, mirroring how Drive only
         // bills you for the persisted bytes).
-        if let Some(remaining) = try_consume_bytes(
-            &self.faults.quota_exhausted_after_bytes,
-            received.len() as u64,
-        ) {
+        if let Some(remaining) =
+            try_consume_bytes(&self.faults.quota_exhausted_after_bytes, received_len)
+        {
             anyhow::bail!(
                 "fake: drive.quota_exhausted (over budget by {}B)",
-                received.len() as u64 - remaining
+                received_len - remaining
             );
         }
 
@@ -956,27 +1125,29 @@ impl RemoteStore for InMemoryRemoteStore {
                     name,
                     parent_id,
                     mime_type: mime,
-                    bytes: received,
+                    bytes: received_bytes,
                     app_properties,
                     modified_time_ms,
                     trashed: false,
                     seq,
                     corrupted_md5: None,
+                    oracle: received_oracle,
                 };
-                guard.bytes_stored = guard.bytes_stored.saturating_add(entry.bytes.len() as u64);
+                guard.bytes_stored = guard.bytes_stored.saturating_add(received_len);
                 maybe_latch_md5_mismatch(&self.faults, &mut entry);
                 let out = entry.to_remote_entry();
                 guard.objects.insert(file_id, entry);
                 out
             }
             ResumableKind::Update { file_id } => {
-                let new_len = received.len() as u64;
+                let new_len = received_len;
                 let new_now = guard.tick();
                 let entry = guard.objects.get_mut(&file_id).ok_or_else(|| {
                     anyhow::anyhow!("fake: file {file_id} disappeared mid-upload")
                 })?;
-                let old_len = entry.bytes.len() as u64;
-                entry.bytes = received;
+                let old_len = entry.content_len().unwrap_or(0);
+                entry.bytes = received_bytes;
+                entry.oracle = received_oracle;
                 entry.modified_time_ms = new_now;
                 // Re-upload clears any prior md5 latch (see `update`).
                 entry.corrupted_md5 = None;
@@ -1060,6 +1231,15 @@ impl RemoteStore for InMemoryRemoteStore {
         if entry.is_folder() {
             anyhow::bail!("fake: cannot download folder {file_id}");
         }
+        if entry.oracle.is_some() {
+            // Oracle-stored object (P1-B): the literal bytes were never
+            // retained, only the length + md5. The huge-file rows verify by
+            // length+digest, not byte round-trip; error rather than hand back
+            // empty bytes that would masquerade as valid content.
+            anyhow::bail!(
+                "fake: object {file_id} was stored under the content oracle; its bytes are not retained (length+md5 only)"
+            );
+        }
         let bytes = entry.bytes.clone();
         drop(guard);
         Ok(DownloadStream(Box::new(InMemoryReader::new(bytes))))
@@ -1129,31 +1309,97 @@ impl RemoteStore for InMemoryRemoteStore {
 // Helpers shared by the trait methods.
 // ---------------------------------------------------------------------------
 
-/// Drain an [`UploadBody`] into an in-memory `Vec<u8>`. Done before any
-/// lock is acquired so we never hold a parking_lot guard across an
-/// `.await` (advisor finding #3).
-async fn collect_body(body: UploadBody) -> anyhow::Result<Vec<u8>> {
-    match body {
-        UploadBody::Bytes(b) => Ok(b.to_vec()),
-        UploadBody::Stream { len, mut stream } => {
-            // Do NOT preallocate `len` here - a large declared upload would
-            // commit that memory up front. Let the buffer grow per chunk.
-            let mut buf = Vec::new();
-            while let Some(chunk) = stream.next().await {
-                let chunk = chunk?;
-                buf.extend_from_slice(&chunk);
-            }
-            // The fake is the test oracle for a backup tool: a truncated (or
-            // over-long) stream must NOT be silently accepted with a valid
-            // MD5 of the wrong bytes. Reject any length mismatch against the
-            // declared `len` so a corrupt/incomplete backup can never pass
-            // here when it would fail in production.
-            let actual = buf.len() as u64;
-            if actual != len {
-                anyhow::bail!("fake: stream length mismatch: declared {len}, got {actual}");
-            }
-            Ok(buf)
+/// The content collected from an [`UploadBody`]: either the literal bytes
+/// (normal mode) or a streaming length+md5 digest (oracle mode, P1-B - so a
+/// 10-50 GB upload never buffers the whole content in a `Vec<u8>`).
+enum CollectedBody {
+    /// The full literal bytes were retained.
+    Bytes(Vec<u8>),
+    /// Only the length + md5 digest were retained (content oracle).
+    Digest(OracleDigest),
+}
+
+impl CollectedBody {
+    /// The content length in bytes, regardless of mode.
+    fn len(&self) -> u64 {
+        match self {
+            CollectedBody::Bytes(b) => b.len() as u64,
+            CollectedBody::Digest(d) => d.len,
         }
+    }
+}
+
+/// Drain an [`UploadBody`]. In normal mode the bytes are buffered into a
+/// `Vec<u8>`; when `oracle` is true the bytes are STREAMED through an md5
+/// hasher and only the length + digest are kept (P1-B), so a multi-gigabyte
+/// upload never holds the whole content in memory. Done before any lock is
+/// acquired so we never hold a parking_lot guard across an `.await` (advisor
+/// finding #3).
+async fn collect_body(body: UploadBody, oracle: bool) -> anyhow::Result<CollectedBody> {
+    use md5::{Digest, Md5};
+    match body {
+        UploadBody::Bytes(b) => {
+            if oracle {
+                let mut hasher = Md5::new();
+                hasher.update(&b);
+                let mut md5 = [0u8; 16];
+                md5.copy_from_slice(&hasher.finalize());
+                Ok(CollectedBody::Digest(OracleDigest {
+                    len: b.len() as u64,
+                    md5,
+                }))
+            } else {
+                Ok(CollectedBody::Bytes(b.to_vec()))
+            }
+        }
+        UploadBody::Stream { len, mut stream } => {
+            if oracle {
+                // Stream through an md5 hasher + byte counter; never buffer the
+                // content. This is what lets the huge-file rows verify by
+                // length+digest without OOMing on 10-50 GB.
+                let mut hasher = Md5::new();
+                let mut count: u64 = 0;
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    hasher.update(&chunk);
+                    count += chunk.len() as u64;
+                }
+                if count != len {
+                    anyhow::bail!("fake: stream length mismatch: declared {len}, got {count}");
+                }
+                let mut md5 = [0u8; 16];
+                md5.copy_from_slice(&hasher.finalize());
+                Ok(CollectedBody::Digest(OracleDigest { len, md5 }))
+            } else {
+                // Do NOT preallocate `len` here - a large declared upload would
+                // commit that memory up front. Let the buffer grow per chunk.
+                let mut buf = Vec::new();
+                while let Some(chunk) = stream.next().await {
+                    let chunk = chunk?;
+                    buf.extend_from_slice(&chunk);
+                }
+                // The fake is the test oracle for a backup tool: a truncated (or
+                // over-long) stream must NOT be silently accepted with a valid
+                // MD5 of the wrong bytes. Reject any length mismatch against the
+                // declared `len` so a corrupt/incomplete backup can never pass
+                // here when it would fail in production.
+                let actual = buf.len() as u64;
+                if actual != len {
+                    anyhow::bail!("fake: stream length mismatch: declared {len}, got {actual}");
+                }
+                Ok(CollectedBody::Bytes(buf))
+            }
+        }
+    }
+}
+
+/// Split a [`CollectedBody`] into `(bytes, oracle)` for storing in a
+/// [`FileEntry`]: a literal body yields the bytes + `oracle: None`; a digest
+/// body yields an empty byte vec + the digest.
+fn body_into_entry_fields(body: CollectedBody) -> (Vec<u8>, Option<OracleDigest>) {
+    match body {
+        CollectedBody::Bytes(b) => (b, None),
+        CollectedBody::Digest(d) => (Vec::new(), Some(d)),
     }
 }
 

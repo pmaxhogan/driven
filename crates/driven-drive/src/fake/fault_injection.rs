@@ -219,4 +219,35 @@ impl InMemoryRemoteStore {
         self.faults.fileid_recycle.store(true, Ordering::Release);
         self
     }
+
+    /// Arms the streaming content oracle (STRESS_HARNESS s3.2
+    /// `huge-file-10gb` / `huge-file-50gb-mid-run-crash`, P1-B): every write
+    /// path (`create`, `update`, resumable commit) records only the content
+    /// LENGTH and a streaming md5 digest instead of buffering the literal
+    /// bytes, so a 10-50 GB upload verifies by length+md5 without ever holding
+    /// tens of gigabytes in a `Vec<u8>` and OOMing. An oracle-stored object's
+    /// `RemoteEntry::size` / `RemoteEntry::md5` are exact; `download` errors
+    /// (the bytes are not retained), so this is for length+digest assertions,
+    /// not byte round-trips. Off by default - every other scenario keeps
+    /// storing literal bytes.
+    pub fn with_content_oracle(self) -> Self {
+        self.faults.content_oracle.store(true, Ordering::Release);
+        self
+    }
+
+    /// Trips a `403 dailyLimitExceeded` after `n` more WriteTarget requests
+    /// (create / update / ensure_folder / resumable session + chunks) have
+    /// gone through, then LATCHES: every subsequent write keeps returning the
+    /// daily-limit error for the rest of the run (the daily quota window does
+    /// not reset within one harness run). The executor maps this to
+    /// `ErrorCode::DriveDailyQuotaExhausted` and the pacer pauses the account
+    /// until midnight Pacific (STRESS_HARNESS s3.7 `daily-quota-exhausted`,
+    /// P1-F). Only WriteTarget calls are counted, so `with_daily_quota_after(0)`
+    /// trips on the very first write.
+    pub fn with_daily_quota_after(self, n: u64) -> Self {
+        self.faults
+            .daily_quota_after
+            .store(n.saturating_add(1), Ordering::Release);
+        self
+    }
 }
