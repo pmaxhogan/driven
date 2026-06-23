@@ -182,17 +182,29 @@ fn read_client_secret_file(path: &Path) -> anyhow::Result<Option<(String, String
     }
 }
 
-/// Opens `url` in the system browser. Best-effort: a failure to launch is an
-/// error (the caller surfaces it) so the user is not left waiting on a tab
-/// that never opened. Uses the per-OS launcher (`cmd /c start`, `open`,
-/// `xdg-open`) without an extra dependency.
+/// Opens `url` in the system browser. Always prints the URL first as a
+/// copy-paste fallback, then launches via a NO-SHELL per-OS launcher so the
+/// URL's `&` query separators are never parsed by a command shell.
+///
+/// History: the previous Windows launcher used `cmd /C start "" <url>`. Despite
+/// the empty title arg, `cmd.exe` parses `&` as a command separator BEFORE
+/// `start` runs (Rust quotes args per the MSVCRT rules, which do NOT escape
+/// `&` for cmd), so the browser only ever received the URL up to the first `&`
+/// (dropping `scope`, `state`, `code_challenge`, ...) and Google returned
+/// "Missing required parameter: scope". `rundll32` invokes no shell, so the
+/// full URL (every `&`) reaches the default browser intact.
 fn open_system_browser(url: &str) -> anyhow::Result<()> {
+    // Surface the URL unconditionally so the user can always proceed by hand if
+    // the auto-launch fails or opens the wrong application.
+    println!("If your browser does not open, copy this URL into it:\n{url}\n");
+
     #[cfg(target_os = "windows")]
     let result = {
-        // `start` is a cmd builtin; the empty "" is the window-title arg so a
-        // URL containing `&` is not split. We pass the URL as a single arg.
-        std::process::Command::new("cmd")
-            .args(["/C", "start", "", url])
+        // `rundll32 url.dll,FileProtocolHandler <url>` opens the default browser
+        // without a command shell, so the URL's `&` separators pass through
+        // literally (no cmd `&` command-splitting).
+        std::process::Command::new("rundll32")
+            .args(["url.dll,FileProtocolHandler", url])
             .spawn()
     };
     #[cfg(target_os = "macos")]
@@ -203,7 +215,7 @@ fn open_system_browser(url: &str) -> anyhow::Result<()> {
     match result {
         Ok(_child) => Ok(()),
         Err(e) => Err(anyhow::anyhow!(
-            "could not launch a browser ({e}). Open this URL manually:\n{url}"
+            "could not launch a browser ({e}). Open the URL above manually."
         )),
     }
 }
