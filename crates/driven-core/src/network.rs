@@ -9,9 +9,9 @@
 //! real I/O is funnelled through the [`Backend`] seam, whose production
 //! implementation lives in an implementer crate and uses `reqwest` (0.12,
 //! rustls) for the captive-portal / per-service HTTP probes with the
-//! per-service timeouts of DESIGN s5.8.4, `hickory-resolver` (0.24) for
-//! DNS re-resolution, and the OS connectivity APIs (DESIGN s5.8.2) for the
-//! cheapest first probe. Tests back the seam with an in-memory
+//! per-service timeouts of DESIGN s5.8.4, `tokio::net::lookup_host` for
+//! DNS re-resolution (DESIGN s5.8.1), and the OS connectivity APIs (DESIGN
+//! s5.8.2) for the cheapest first probe. Tests back the seam with an in-memory
 //! [`Backend`] driven by `driven-test-fixtures`'
 //! [`FakeNetwork`](../../driven_test_fixtures/network/struct.FakeNetwork.html)
 //! and a `FakeClock`, exercising every DESIGN s5.8.1 failure mode without
@@ -183,7 +183,7 @@ pub trait CircuitBreaker: Send + Sync {
 // Everything below is I/O-free. It implements the committed `NetworkProbe`
 // and `CircuitBreaker` traits above and depends only on the injected
 // `Clock` plus the `Backend` seam, which the production implementer crate
-// fills with reqwest / hickory / OS-connectivity calls.
+// fills with reqwest / tokio lookup_host / OS-connectivity calls.
 // ---------------------------------------------------------------------------
 
 /// Number of consecutive failures that trips a service's breaker
@@ -268,8 +268,8 @@ impl ProbeOutcome {
 ///   [`ProbeOutcome::CaptivePortal`].
 /// - [`Backend::probe_service`] - the per-service health request (DESIGN
 ///   s5.8.2 list) on a per-service `reqwest::Client` carrying that
-///   service's timeouts (DESIGN s5.8.4), with `hickory-resolver`
-///   re-resolving DNS each call.
+///   service's timeouts (DESIGN s5.8.4), with `tokio::net::lookup_host`
+///   re-resolving DNS each call (DESIGN s5.8.1).
 ///
 /// Tests implement this with an in-memory backend reading a
 /// `FakeNetwork`, counting calls so the "offline => no further probes"
@@ -431,7 +431,7 @@ impl StdCircuitBreaker {
 ///
 /// Owns one [`StdCircuitBreaker`] per probed service and runs the topology
 /// over an injected [`Backend`] + [`Clock`]. It is transport-agnostic: the
-/// production wiring constructs it with a reqwest/hickory/OS backend, and
+/// production wiring constructs it with a reqwest/lookup_host/OS backend, and
 /// tests construct it with an in-memory backend over a `FakeNetwork`.
 ///
 /// Topology (DESIGN s5.8.2):

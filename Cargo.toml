@@ -44,10 +44,12 @@ rayon = "1.10"
 # DESIGN s5.9.1). Wired into the watcher impl crate; driven-core stays
 # I/O-free and holds only the trait surface.
 notify = "8"
-# M3 network-resilience layer (DESIGN s5.8): DNS re-resolution probes and
-# the HTTP client for the three-probe topology + Drive traffic. rustls so
-# we use the OS trust store via rustls-native-certs (DESIGN s5.8.7).
-hickory-resolver = "0.24"
+# M3 network-resilience layer (DESIGN s5.8): the HTTP client for the
+# three-probe topology + Drive traffic. rustls so we use the OS trust store
+# via rustls-native-certs (DESIGN s5.8.7). The DNS re-resolution probe
+# (DESIGN s5.8.1) uses `tokio::net::lookup_host`, not a resolver crate;
+# `hickory-resolver` was the optional s5.8.5 escalation and is not wired in V1
+# (dropped to clear RUSTSEC-2026-0119 in hickory-proto's name compression).
 reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls",
     "http2",

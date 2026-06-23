@@ -5,7 +5,7 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Driven production network-probe Backend (reqwest + hickory) for the NetworkProbe topology"
+description = "Driven production network-probe Backend (reqwest + tokio lookup_host) for the NetworkProbe topology"
 publish = false
 
 [dependencies]
@@ -20,7 +20,8 @@ tokio.workspace = true
 async-trait.workspace = true
 futures.workspace = true
 # The three-probe topology (DESIGN s5.8.2): an HTTP client for the
-# captive-portal / per-service probes + Drive traffic, and a DNS resolver for
-# the DNS re-resolution probe (DESIGN s5.8.1).
+# captive-portal / per-service probes + Drive traffic. The DNS re-resolution
+# probe (DESIGN s5.8.1) uses `tokio::net::lookup_host` (already in `tokio`),
+# not a dedicated resolver crate; `hickory-resolver` is only the optional
+# s5.8.5 escalation and is not wired in V1.
 reqwest.workspace = true
-hickory-resolver.workspace = true

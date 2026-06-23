@@ -20,9 +20,12 @@
 //!   [`ProbeOutcome::CaptivePortal`].
 //! - [`Backend::probe_service`] - the per-service health request on a
 //!   per-service `reqwest::Client` carrying that service's DESIGN s5.8.4
-//!   timeouts, with `hickory-resolver` re-resolving DNS each call (never
-//!   caching a failed resolve) so a DNS failure is surfaced as
-//!   [`ProbeOutcome::DnsFailed`] distinctly from a connect failure.
+//!   timeouts, with `tokio::net::lookup_host` re-resolving DNS each call
+//!   (never caching a failed resolve) so a DNS failure is surfaced as
+//!   [`ProbeOutcome::DnsFailed`] distinctly from a connect failure (DESIGN
+//!   s5.8.1: the DNS probe is `tokio::net::lookup_host` within the 3s budget;
+//!   `hickory-resolver` is only the optional s5.8.5 escalation "if we discover
+//!   OS resolver pathologies in the field", not wired in V1).
 //! - [`Backend::drop_pool`] - rebuilds the per-service `reqwest::Client`
 //!   (discarding its pooled connections) after the pool-teardown threshold
 //!   (DESIGN s5.8.5).
@@ -39,9 +42,6 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use driven_core::network::{Backend, ProbeOutcome, ServiceName};
-use hickory_resolver::config::{LookupIpStrategy, ResolverConfig, ResolverOpts};
-use hickory_resolver::error::{ResolveError, ResolveErrorKind};
-use hickory_resolver::TokioAsyncResolver;
 
 /// Tracing target for the production network backend.
 const TARGET: &str = "driven::net::backend";
@@ -79,6 +79,12 @@ const GITHUB_PROBE_URL: &str = "https://api.github.com/";
 
 /// Authority of [`GITHUB_PROBE_URL`] for DNS re-resolution.
 const GITHUB_HOST: &str = "api.github.com";
+
+/// The port we pair with a host for the [`tokio::net::lookup_host`] DNS probe.
+/// `lookup_host` resolves a `(host, port)` pair; the port is irrelevant to the
+/// name-resolution we are testing (we never connect this socket), so we use
+/// the HTTPS port the probed services actually listen on.
+const DNS_PROBE_PORT: u16 = 443;
 
 /// `User-Agent` sent on every probe so server-side logs/ratelimits can
 /// attribute the traffic (GitHub in particular rejects request with no UA).
@@ -135,7 +141,8 @@ const OS_ONLINE_ENDPOINTS: [&str; 4] = [
 
 /// The production [`Backend`] for the [`NetworkProbe`](driven_core::network)
 /// topology, backed by `reqwest` (rustls) for the HTTP probes + Drive traffic
-/// and `hickory-resolver` for DNS re-resolution (DESIGN s5.8.2).
+/// and `tokio::net::lookup_host` for DNS re-resolution (DESIGN s5.8.1 /
+/// s5.8.2).
 ///
 /// Holds one `reqwest::Client` per probed service (behind a recoverable
 /// [`Mutex`]) so a per-service pool teardown (DESIGN s5.8.5) rebuilds only
@@ -150,30 +157,25 @@ pub struct ReqwestBackend {
     drive: Mutex<reqwest::Client>,
     update_endpoint: Mutex<reqwest::Client>,
     github: Mutex<reqwest::Client>,
-    /// System-configured DNS resolver with the application-layer cache
-    /// DISABLED (DESIGN s5.8.5: never cache resolved IPs at the app layer;
-    /// re-resolve every call, DESIGN s5.8.1 "do not cache failed resolves").
-    resolver: TokioAsyncResolver,
 }
 
 impl ReqwestBackend {
     /// Builds a [`ReqwestBackend`], constructing the per-service `reqwest`
     /// clients with their DESIGN s5.8.4 timeouts (redirect-disabled for the
-    /// captive probe so a portal's 30x is observable rather than followed)
-    /// and the `hickory-resolver` used for the DNS re-resolution probe.
+    /// captive probe so a portal's 30x is observable rather than followed).
+    /// DNS re-resolution uses `tokio::net::lookup_host` directly (DESIGN
+    /// s5.8.1), so there is no resolver object to build.
     ///
-    /// Returns an error if a client (TLS backend init) or the resolver
-    /// (from-system-conf) cannot be constructed.
+    /// Returns an error if a client (TLS backend init) cannot be constructed.
     pub fn new() -> anyhow::Result<Self> {
         let captive = build_captive_client()?;
         let drive = build_service_client(ServiceName::Drive)?;
         let update_endpoint = build_service_client(ServiceName::UpdateEndpoint)?;
         let github = build_service_client(ServiceName::Github)?;
-        let resolver = build_resolver()?;
 
         tracing::debug!(
             target: TARGET,
-            "ReqwestBackend constructed (per-service clients + non-caching resolver)"
+            "ReqwestBackend constructed (per-service clients + lookup_host DNS probe)"
         );
 
         Ok(Self {
@@ -181,7 +183,6 @@ impl ReqwestBackend {
             drive: Mutex::new(drive),
             update_endpoint: Mutex::new(update_endpoint),
             github: Mutex::new(github),
-            resolver,
         })
     }
 
@@ -211,24 +212,27 @@ impl ReqwestBackend {
         self.service_client(service).map(|m| Self::lock(m).clone())
     }
 
-    /// Re-resolves `host` via `hickory` with the cache disabled (DESIGN
-    /// s5.8.1: re-resolve every call, never cache a failed resolve).
+    /// Re-resolves `host` via `tokio::net::lookup_host` with no application-
+    /// layer cache (DESIGN s5.8.1: re-resolve every call, never cache a failed
+    /// resolve - `lookup_host` defers to the OS resolver, whose own
+    /// TTL-honouring cache is the only cache, DESIGN s5.8.5).
     ///
     /// Returns:
-    /// - `Ok(())` when at least one A/AAAA record came back (name resolves).
-    /// - `Err(ProbeOutcome::DnsFailed)` for any resolve failure - NXDOMAIN,
-    ///   empty answer, resolver "no connections", resolver timeout, or a
-    ///   resolver transport (Io/Proto) error. Every one blocks the probe at
-    ///   the DNS step and is the DESIGN s5.8.1 "DNS broken" condition (see
-    ///   [`classify_resolve_error`]). This is deliberately kept distinct from
-    ///   a *connect* failure to an already-resolved IP, which the HTTP layer
-    ///   classifies as [`ProbeOutcome::NetworkError`].
+    /// - `Ok(())` when at least one address came back (name resolves).
+    /// - `Err(ProbeOutcome::DnsFailed)` for any resolve failure - an
+    ///   `io::Error` from `lookup_host` (NXDOMAIN / SERVFAIL / no nameserver /
+    ///   transport error), an empty answer, or the 3s budget elapsing. Every
+    ///   one blocks the probe at the DNS step and is the DESIGN s5.8.1 "DNS
+    ///   broken" condition. This is deliberately kept distinct from a *connect*
+    ///   failure to an already-resolved IP, which the HTTP layer classifies as
+    ///   [`ProbeOutcome::NetworkError`].
     ///
-    /// The whole resolve is additionally bounded by [`DNS_TIMEOUT`] so a
-    /// black-holed resolver cannot exceed the 3s DNS budget (the resolver's
-    /// own `timeout`/`attempts` are also set, this is belt-and-suspenders).
+    /// The whole resolve is bounded by [`DNS_TIMEOUT`] so a black-holed
+    /// resolver cannot exceed the 3s DNS budget.
     async fn resolve(&self, host: &str) -> Result<(), ProbeOutcome> {
-        let lookup = tokio::time::timeout(DNS_TIMEOUT, self.resolver.lookup_ip(host)).await;
+        let lookup =
+            tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((host, DNS_PROBE_PORT)))
+                .await;
         match lookup {
             // Bounding timeout elapsed: the resolver black-holed. The DNS
             // budget is exceeded -> treat as DNS failure (DESIGN s5.8.1).
@@ -236,18 +240,26 @@ impl ReqwestBackend {
                 tracing::warn!(target: TARGET, host, "DNS resolve exceeded {DNS_TIMEOUT:?}");
                 Err(ProbeOutcome::DnsFailed)
             }
-            Ok(Ok(ips)) => {
-                if ips.iter().next().is_some() {
+            Ok(Ok(mut addrs)) => {
+                if addrs.next().is_some() {
                     Ok(())
                 } else {
-                    // hickory normally raises NoRecordsFound rather than an
-                    // empty success, but guard the empty case explicitly so a
-                    // zero-record answer is never mistaken for "resolves".
+                    // An empty answer (no A/AAAA records) is the DESIGN s5.8.1
+                    // "DNS broken" condition just like an error.
                     tracing::warn!(target: TARGET, host, "DNS resolve returned no records");
                     Err(ProbeOutcome::DnsFailed)
                 }
             }
-            Ok(Err(err)) => Err(classify_resolve_error(host, &err)),
+            Ok(Err(err)) => {
+                // `lookup_host` surfaces NXDOMAIN / SERVFAIL / no-nameserver /
+                // transport failures uniformly as an `io::Error`; all are the
+                // DESIGN s5.8.1 "DNS broken" condition (distinct from a connect
+                // failure to a resolved IP, which the HTTP layer surfaces as
+                // NetworkError so the orchestrator can use the 60s DNS re-probe
+                // cadence vs the 30s no-Internet cadence).
+                tracing::warn!(target: TARGET, host, error = %err, "DNS resolve failed");
+                Err(ProbeOutcome::DnsFailed)
+            }
         }
     }
 }
@@ -442,74 +454,6 @@ impl Backend for ReqwestBackend {
     }
 }
 
-/// Maps a `hickory` [`ResolveError`] to a [`ProbeOutcome`].
-///
-/// Every resolver failure - a name that does not resolve (NXDOMAIN / empty
-/// answer), no usable nameserver connection, a resolver timeout, or a
-/// resolver transport (Io/Proto) error - blocks the probe at the DNS step and
-/// is the DESIGN s5.8.1 "DNS broken" condition, so all map to
-/// [`ProbeOutcome::DnsFailed`]. This is deliberately distinct from a
-/// *connect* failure to a resolved IP (which the HTTP layer surfaces as
-/// [`ProbeOutcome::NetworkError`]) so the orchestrator can use the 60s DNS
-/// re-probe cadence vs the 30s no-Internet cadence (DESIGN s5.8.1).
-fn classify_resolve_error(host: &str, err: &ResolveError) -> ProbeOutcome {
-    // `ResolveErrorKind` is `#[non_exhaustive]`; the design's "DNS broken"
-    // classification covers every resolve failure, so we map uniformly rather
-    // than branch. Matching the kind keeps the intent legible and survives
-    // new variants.
-    let outcome = match err.kind() {
-        ResolveErrorKind::NoRecordsFound { .. }
-        | ResolveErrorKind::NoConnections
-        | ResolveErrorKind::Message(_)
-        | ResolveErrorKind::Msg(_)
-        | ResolveErrorKind::Timeout
-        | ResolveErrorKind::Io(_)
-        | ResolveErrorKind::Proto(_) => ProbeOutcome::DnsFailed,
-        _ => ProbeOutcome::DnsFailed,
-    };
-    tracing::warn!(target: TARGET, host, error = %err, ?outcome, "DNS resolve failed");
-    outcome
-}
-
-/// Builds the system-configured non-caching `hickory` resolver (DESIGN
-/// s5.8.5: never cache at the app layer; DESIGN s5.8.1: re-resolve each call).
-fn build_resolver() -> anyhow::Result<TokioAsyncResolver> {
-    // Prefer the OS resolver configuration so corporate / split-horizon DNS
-    // works; fall back to a public config only if the system conf cannot be
-    // read (e.g. a locked-down container with no resolv.conf).
-    let mut opts = ResolverOpts::default();
-    // DESIGN s5.8.5: NEVER cache resolved IPs at the application layer - the
-    // OS resolver's TTL-honouring cache is the only cache. cache_size = 0
-    // disables hickory's in-process positive+negative cache.
-    opts.cache_size = 0;
-    // DESIGN s5.8.1: bound a single resolve attempt; the overall 3s budget is
-    // additionally enforced by the tokio timeout in `resolve`.
-    opts.timeout = DNS_TIMEOUT;
-    opts.attempts = 2;
-    // Dual-stack (DESIGN s5.8.1 "No IPv4 / no IPv6"): accept either family so
-    // a single-stack outage still resolves.
-    opts.ip_strategy = LookupIpStrategy::Ipv4AndIpv6;
-
-    // Read the system DNS config for its nameserver list (so corporate /
-    // split-horizon DNS works), but pair it with OUR cache-disabled `opts`
-    // rather than the system opts. Fall back to a public resolver config only
-    // if the system conf cannot be read (e.g. a locked-down container).
-    match hickory_resolver::system_conf::read_system_conf() {
-        Ok((config, _system_opts)) => Ok(TokioAsyncResolver::tokio(config, opts)),
-        Err(sys_err) => {
-            tracing::warn!(
-                target: TARGET,
-                error = %sys_err,
-                "could not read system DNS config; falling back to public resolvers"
-            );
-            Ok(TokioAsyncResolver::tokio(
-                ResolverConfig::cloudflare(),
-                opts,
-            ))
-        }
-    }
-}
-
 /// Builds the redirect-disabled captive-portal probe client (DESIGN s5.8.4
 /// captive row: 3s connect / 5s total).
 fn build_captive_client() -> anyhow::Result<reqwest::Client> {
@@ -578,9 +522,8 @@ mod tests {
 
     // --- construction is infallible in a normal environment ---
     //
-    // Building the clients (rustls init) and the resolver
-    // (from-system-conf, with a public fallback) must succeed offline: none
-    // of it touches the network. This is a real assertion, not a skip.
+    // Building the clients (rustls init) must succeed offline: none of it
+    // touches the network. This is a real assertion, not a skip.
     #[test]
     fn backend_constructs_offline() {
         let backend = ReqwestBackend::new();
@@ -621,35 +564,14 @@ mod tests {
         assert!(v6 >= 1, "need at least one IPv6 reachability endpoint");
     }
 
-    // --- DNS-error classification (offline; constructs hickory errors) ---
-
-    #[test]
-    fn no_records_found_is_dns_failed() {
-        // A NoRecordsFound error (NXDOMAIN / empty answer) is the canonical
-        // "DNS broken" classification (DESIGN s5.8.1).
-        let err: ResolveError = ResolveErrorKind::Message("no records").into();
-        assert_eq!(
-            classify_resolve_error("example.invalid", &err),
-            ProbeOutcome::DnsFailed
-        );
-    }
-
-    #[test]
-    fn resolver_timeout_is_dns_failed() {
-        let err: ResolveError = ResolveErrorKind::Timeout.into();
-        assert_eq!(
-            classify_resolve_error("example.invalid", &err),
-            ProbeOutcome::DnsFailed
-        );
-    }
-
     // --- DNS probe re-resolution is bounded (no hang) ---
     //
     // `.invalid` is reserved (RFC 6761) and never resolves, so this exercises
-    // the failure path deterministically. It MUST complete within the DNS
-    // budget and classify as DnsFailed (DESIGN s5.8.1 "must not hang"). This
-    // touches the local resolver only (an NXDOMAIN/SERVFAIL answer), not a
-    // remote service, so it is a real offline-safe test.
+    // the failure path deterministically through `tokio::net::lookup_host`. It
+    // MUST complete within the DNS budget and classify as DnsFailed (DESIGN
+    // s5.8.1 "must not hang"). This touches the local OS resolver only (an
+    // NXDOMAIN/SERVFAIL answer), not a remote service, so it is a real
+    // offline-safe test.
     #[tokio::test]
     async fn resolve_invalid_tld_is_dns_failed_and_bounded() {
         let backend = ReqwestBackend::new().expect("construct backend");
@@ -663,5 +585,18 @@ mod tests {
             elapsed < DNS_TIMEOUT + Duration::from_secs(2),
             "resolve must be bounded by the DNS budget, took {elapsed:?}"
         );
+    }
+
+    // --- localhost resolves: the success path of the lookup_host probe ---
+    //
+    // `localhost` always resolves on a sane host (no network egress: it hits
+    // the OS resolver / hosts file). This exercises the Ok(()) arm so the
+    // success path is not left untested after the hickory -> lookup_host
+    // switch.
+    #[tokio::test]
+    async fn resolve_localhost_succeeds() {
+        let backend = ReqwestBackend::new().expect("construct backend");
+        let outcome = backend.resolve("localhost").await;
+        assert_eq!(outcome, Ok(()), "localhost must resolve via lookup_host");
     }
 }
