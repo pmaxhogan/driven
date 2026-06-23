@@ -51,10 +51,23 @@ use windows::Win32::System::Threading::{GetCurrentProcess, OpenProcessToken};
 
 use crate::{SnapshotHandle, VssError};
 
-/// Wait timeout for each async VSS step. `INFINITE` (`u32::MAX`): VSS async
-/// ops are bounded by the OS, and a hung writer is rare enough that blocking
-/// the per-op task (already a blocking-friendly path) is acceptable for V1.
-const WAIT_INFINITE: u32 = u32::MAX;
+/// Per-call timeout (ms) handed to each `IVssAsync::Wait`. The async step is
+/// re-waited in a loop until the overall [`ASYNC_STEP_DEADLINE_MS`] is reached,
+/// so a hung writer/provider can never pin the per-op task forever (P1-C).
+/// A few seconds keeps the busy-loop count low while staying responsive.
+const ASYNC_WAIT_SLICE_MS: u32 = 5_000;
+
+/// Overall deadline (ms) for a single async VSS step. `DoSnapshotSet` can
+/// legitimately take ~10s on an SSD (ROADMAP M3.5), so ~60s gives a wide margin
+/// before we give up and degrade to skip rather than hang (P1-C).
+const ASYNC_STEP_DEADLINE_MS: u64 = 60_000;
+
+/// Bounded wait (ms) for the worker thread to report the create result back to
+/// [`VssSnapshot::create`]. The full COM create sequence is itself bounded by
+/// the per-step deadline above (plus a margin), so if the worker has not
+/// reported within this window something is wedged and we degrade rather than
+/// block end_cycle / pause / shutdown (P1-C).
+const CREATE_READY_TIMEOUT_MS: u64 = 90_000;
 
 // The hand-declared `IVssBackupComponents` vtable lives in its own module so a
 // module-level `#![allow(non_snake_case)]` can keep the method names matching
@@ -292,13 +305,31 @@ impl VssSnapshot {
             .map_err(|e| VssError::Init(format!("spawn VSS worker thread: {e}")))?;
 
         // Block until the worker finishes the create sequence (success or
-        // failure). A disconnected channel means the worker panicked before
-        // reporting - treat as an init failure rather than hang.
-        let created = match ready_rx.recv() {
-            Ok(result) => result,
-            Err(_) => Err(VssError::Init(
-                "VSS worker thread exited before reporting".to_string(),
-            )),
+        // failure), but NEVER forever (P1-C): a hung writer/provider must not
+        // pin the executor task, hold the provider mutex, or block end_cycle /
+        // pause / shutdown. A disconnected channel means the worker panicked
+        // before reporting - treat as an init failure rather than hang. A
+        // timeout means the worker is wedged: degrade to Unavailable (skip).
+        // `timed_out` distinguishes a wedged worker (do NOT join - joining a
+        // hung thread re-blocks forever, the exact hang we are eliminating)
+        // from a worker that already exited (join is safe + tears its apartment
+        // down cleanly).
+        let (created, timed_out) = match ready_rx
+            .recv_timeout(std::time::Duration::from_millis(CREATE_READY_TIMEOUT_MS))
+        {
+            Ok(result) => (result, false),
+            Err(std::sync::mpsc::RecvTimeoutError::Timeout) => (
+                Err(VssError::Unavailable(
+                    "VSS worker thread did not report within the create deadline",
+                )),
+                true,
+            ),
+            Err(std::sync::mpsc::RecvTimeoutError::Disconnected) => (
+                Err(VssError::Init(
+                    "VSS worker thread exited before reporting".to_string(),
+                )),
+                false,
+            ),
         };
 
         match created {
@@ -310,11 +341,22 @@ impl VssSnapshot {
                 volume_label,
             }),
             Err(err) => {
-                // The worker already released on the failure path and is exiting;
-                // drop our sender (disconnect) and join so its apartment fully
-                // tears down before we return the error.
+                // Drop our sender so the worker's `cmd_rx.recv()` unblocks if it
+                // is idling. On the failure/disconnect path the worker already
+                // released on its own thread and is exiting, so join to tear the
+                // apartment down. On a TIMEOUT the worker is wedged inside a COM
+                // call; joining would re-introduce the unbounded hang, so we
+                // DETACH it (leak the thread) and degrade - the wedged COM call
+                // will unwind or the process exits, and the OS reclaims the
+                // VSS_CTX_BACKUP shadow when the process dies.
                 drop(cmd_tx);
-                let _ = worker.join();
+                if timed_out {
+                    tracing::warn!(
+                        "VSS: worker wedged past the create deadline; detaching and degrading to skip"
+                    );
+                } else {
+                    let _ = worker.join();
+                }
                 Err(err)
             }
         }
@@ -656,9 +698,14 @@ fn create_backup_components() -> Result<IVssBackupComponents, VssError> {
     }
 }
 
-/// Run a VSS async op: call the producer, then `Wait(INFINITE)` and
-/// `QueryStatus`, mapping a non-`S_OK` (and non-`VSS_S_ASYNC_FINISHED`) status
-/// to a [`VssError::Com`].
+/// Run a VSS async op: call the producer, then drive the async object to
+/// completion with a BOUNDED, deadline-capped wait loop (P1-C). Each
+/// `IVssAsync::Wait` is given a finite [`ASYNC_WAIT_SLICE_MS`] slice and
+/// re-issued while the status stays `VSS_S_ASYNC_PENDING`, until either the op
+/// finishes or [`ASYNC_STEP_DEADLINE_MS`] elapses. A non-`S_OK` /
+/// non-`VSS_S_ASYNC_FINISHED` terminal status maps to a [`VssError::Com`]; a
+/// blown deadline (a hung writer/provider) maps to [`VssError::Unavailable`] so
+/// the caller degrades to skip rather than hang forever.
 ///
 /// # Safety
 /// `components` must be a live `IVssBackupComponents`; `op` must dispatch a
@@ -668,6 +715,11 @@ unsafe fn gather_async(
     step: &'static str,
     op: impl Fn(&IVssBackupComponents, *mut *mut c_void) -> HRESULT,
 ) -> Result<(), VssError> {
+    // VSS async status codes (vss.h): PENDING while running, FINISHED on clean
+    // completion. `S_OK` is also accepted as terminal-success.
+    const VSS_S_ASYNC_PENDING: i32 = 0x0004_2309;
+    const VSS_S_ASYNC_FINISHED: i32 = 0x0004_230A;
+
     let mut raw: *mut c_void = std::ptr::null_mut();
     // SAFETY: caller guarantees a live object + valid async-producing slot.
     let hr = op(components, &mut raw);
@@ -678,29 +730,47 @@ unsafe fn gather_async(
     }
     // SAFETY: a non-null async pointer is an IVssAsync we now own.
     let async_obj = unsafe { IVssAsync::from_raw(raw) };
-    // SAFETY: live IVssAsync; Wait/QueryStatus take stack-local out-params.
-    unsafe {
-        async_obj
-            .Wait(WAIT_INFINITE)
-            .map_err(|e| com_err(step, e))?;
-    }
-    let mut hr_result = HRESULT(0);
-    let mut reserved = 0i32;
-    // SAFETY: live IVssAsync; out-params are stack locals valid for the call.
-    unsafe {
-        async_obj
-            .QueryStatus(&mut hr_result, &mut reserved)
-            .map_err(|e| com_err(step, e))?;
-    }
-    // VSS_S_ASYNC_FINISHED == 0x4230A; S_OK also acceptable.
-    const VSS_S_ASYNC_FINISHED: i32 = 0x0004_230A;
-    if hr_result == S_OK || hr_result.0 == VSS_S_ASYNC_FINISHED {
-        Ok(())
-    } else {
-        Err(VssError::Com {
+
+    let deadline =
+        std::time::Instant::now() + std::time::Duration::from_millis(ASYNC_STEP_DEADLINE_MS);
+    loop {
+        // SAFETY: live IVssAsync; Wait takes a plain timeout, no out-params.
+        // A finite slice means a wedged writer cannot pin this thread forever.
+        unsafe {
+            async_obj
+                .Wait(ASYNC_WAIT_SLICE_MS)
+                .map_err(|e| com_err(step, e))?;
+        }
+        let mut hr_result = HRESULT(0);
+        let mut reserved = 0i32;
+        // SAFETY: live IVssAsync; out-params are stack locals valid for the call.
+        unsafe {
+            async_obj
+                .QueryStatus(&mut hr_result, &mut reserved)
+                .map_err(|e| com_err(step, e))?;
+        }
+        if hr_result == S_OK || hr_result.0 == VSS_S_ASYNC_FINISHED {
+            return Ok(());
+        }
+        if hr_result.0 == VSS_S_ASYNC_PENDING {
+            // Still running: keep waiting until the deadline, then give up.
+            if std::time::Instant::now() >= deadline {
+                tracing::warn!(
+                    step,
+                    deadline_ms = ASYNC_STEP_DEADLINE_MS,
+                    "VSS: async step exceeded deadline; degrading to skip"
+                );
+                return Err(VssError::Unavailable(
+                    "VSS async step exceeded its bounded deadline",
+                ));
+            }
+            continue;
+        }
+        // Any other status is a terminal COM failure for this step.
+        return Err(VssError::Com {
             step,
             detail: format!("async status hr=0x{:08x}", hr_result.0),
-        })
+        });
     }
 }
 

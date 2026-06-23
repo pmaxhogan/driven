@@ -90,6 +90,51 @@ const RESUME_DEFER_MS: i64 = 30_000;
 /// bookkeeping value the orchestrator owns end-to-end.
 const VSS_ORPHAN_SETTING_KEY: &str = "vss.orphans";
 
+/// Process-wide lock serializing the `vss.orphans` registry read-modify-write
+/// (P2-D). Two account orchestrators in one process share ONE settings store;
+/// without serialization their concurrent read -> merge -> write races and one
+/// account's snapshot record is lost (last writer wins over a STALE read). A
+/// `tokio::sync::Mutex` (held across the `.await`s of the DB read + write) makes
+/// each account's whole RMW atomic with respect to the others. `OnceLock` so
+/// every orchestrator in the process shares the same instance.
+fn orphan_registry_lock() -> &'static tokio::sync::Mutex<()> {
+    static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
+    LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
+}
+
+/// A per-orchestrator in-memory ledger of shadow copies recorded SYNCHRONOUSLY
+/// at create time (P1-A). The provider's record-at-create hook pushes a
+/// `(guid -> created_ms)` entry here the instant a shadow is created - before
+/// the (possibly long) locked-file upload - so the next `record_vss_orphans`
+/// flushes it to the durable registry even if a crash falls between create and
+/// the per-source record. Drained (not just read) on flush so it never grows
+/// unbounded. `std::sync::Mutex` because the hook is SYNC (it runs inline on the
+/// executor's blocking-friendly map path and must not await). Owned per
+/// orchestrator (not a process-wide static) so concurrent accounts - and tests
+/// running in parallel - never drain each other's entries; the DURABLE
+/// `vss.orphans` registry is the only shared, cross-account state (serialized by
+/// [`orphan_registry_lock`]).
+type OrphanCreateLedger = Arc<std::sync::Mutex<std::collections::HashMap<String, i64>>>;
+
+/// Push a freshly-created shadow GUID into `ledger` (P1-A). Sync + cheap;
+/// called from the provider's record-at-create hook.
+fn record_orphan_at_create(ledger: &OrphanCreateLedger, guid: &str, created_ms: i64) {
+    let mut ledger = match ledger.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    ledger.entry(guid.to_string()).or_insert(created_ms);
+}
+
+/// Drain + return every entry `ledger` holds (P1-A flush).
+fn drain_orphan_create_ledger(ledger: &OrphanCreateLedger) -> Vec<(String, i64)> {
+    let mut ledger = match ledger.lock() {
+        Ok(g) => g,
+        Err(poisoned) => poisoned.into_inner(),
+    };
+    ledger.drain().collect()
+}
+
 /// Runtime configuration the orchestrator reads each cycle (SPEC s5
 /// `config: Arc<RwLock<OrchestratorConfig>>`).
 ///
@@ -296,6 +341,12 @@ pub struct SyncOrchestrator {
     /// path), and the executor (holding a CLONE of this same `Arc`) reads
     /// locked files from the snapshots in between. Set via [`Self::with_vss`].
     vss: Option<Arc<dyn VssProvider>>,
+    /// Per-orchestrator record-at-create ledger (P1-A). The recorder hook wired
+    /// into the provider by [`Self::with_vss`] pushes each freshly-created
+    /// shadow GUID here synchronously; `record_vss_orphans` drains it into the
+    /// durable registry. Owned (not global) so concurrent accounts do not drain
+    /// each other's entries.
+    vss_create_ledger: OrphanCreateLedger,
     /// Guards the startup orphan-snapshot cleanup so it runs at most once per
     /// process (ROADMAP M3.5: release Driven-created shadows >1h old that an
     /// unclean shutdown stranded). `Mutex<bool>` not an atomic so the
@@ -346,6 +397,7 @@ impl SyncOrchestrator {
             shutdown_tx,
             shutdown_rx,
             vss: None,
+            vss_create_ledger: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             orphan_cleanup_done: Mutex::new(false),
         }
     }
@@ -358,6 +410,16 @@ impl SyncOrchestrator {
     /// share one provider. Off Windows / when un-elevated the provider reports
     /// unavailable and every cycle degrades exactly as the no-VSS path does.
     pub fn with_vss(mut self, vss: Arc<dyn VssProvider>) -> Self {
+        // P1-A: wire the record-at-create hook so a shadow's GUID lands in this
+        // orchestrator's create-ledger the instant it is created (before the
+        // ensuing locked-file upload), then flush to the durable registry on the
+        // next per-source record. The hook is sync (the provider calls it inline
+        // on its blocking-friendly map path), so it only touches the in-memory
+        // ledger - never the async settings store.
+        let ledger = self.vss_create_ledger.clone();
+        vss.set_recorder(Arc::new(move |guid: &str, created_ms: i64| {
+            record_orphan_at_create(&ledger, guid, created_ms);
+        }));
         self.vss = Some(vss);
         self
     }
@@ -381,6 +443,10 @@ impl SyncOrchestrator {
             }
             *done = true;
         }
+        // P2-D: serialize the whole read -> delete -> write against any
+        // concurrent account orchestrator's registry RMW so neither clobbers the
+        // other's view with a stale write.
+        let _guard = orphan_registry_lock().lock().await;
         // Read the persisted registry (empty when absent / malformed).
         let mut registry = self.read_vss_orphan_registry().await;
         if registry.snapshots.is_empty() {
@@ -425,17 +491,34 @@ impl SyncOrchestrator {
     /// Returns the GUIDs recorded (for the post-release `forget`).
     async fn record_vss_orphans(&self) -> Vec<String> {
         let Some(vss) = self.vss.as_ref() else {
+            // No provider: still drain the create-ledger so a stray entry never
+            // accumulates (in practice empty without a provider).
+            drain_orphan_create_ledger(&self.vss_create_ledger);
             return Vec::new();
         };
-        let recorded = vss.recorded_snapshots();
-        if recorded.is_empty() {
+        // P1-A: merge the snapshots the provider currently holds with any the
+        // record-at-create hook captured (drained so they are recorded exactly
+        // once). A shadow that was created and then released within the same
+        // source - leaving `recorded_snapshots` empty - is still caught here.
+        let mut to_record: std::collections::HashMap<String, i64> =
+            drain_orphan_create_ledger(&self.vss_create_ledger)
+                .into_iter()
+                .collect();
+        for snap in vss.recorded_snapshots() {
+            to_record
+                .entry(snap.snapshot_id)
+                .or_insert(snap.created_at_ms);
+        }
+        if to_record.is_empty() {
             return Vec::new();
         }
+        // P2-D: serialize the read-modify-write against concurrent accounts.
+        let _guard = orphan_registry_lock().lock().await;
         let mut registry = self.read_vss_orphan_registry().await;
-        let mut ids = Vec::with_capacity(recorded.len());
-        for snap in recorded {
-            ids.push(snap.snapshot_id.clone());
-            registry.record(snap.snapshot_id, snap.created_at_ms);
+        let mut ids = Vec::with_capacity(to_record.len());
+        for (id, created) in to_record {
+            ids.push(id.clone());
+            registry.record(id, created);
         }
         self.write_vss_orphan_registry(&registry).await;
         ids
@@ -448,6 +531,8 @@ impl SyncOrchestrator {
         if ids.is_empty() {
             return;
         }
+        // P2-D: serialize the read-modify-write against concurrent accounts.
+        let _guard = orphan_registry_lock().lock().await;
         let mut registry = self.read_vss_orphan_registry().await;
         for id in ids {
             registry.forget(id);
@@ -933,6 +1018,18 @@ impl SyncOrchestrator {
                 // snapshot created so far this cycle. `record_vss_orphans` is a
                 // no-op when no provider is attached or none are held.
                 self.record_vss_orphans().await;
+
+                // P2-E: if a manual pause was signalled mid-cycle, stop AT THIS
+                // safe boundary (current op done + recorded, before the next
+                // source) so a held shadow copy is released promptly by the
+                // post-loop `end_vss_cycle` rather than lingering for the rest
+                // of a long multi-source / huge-locked-file cycle. The gate
+                // check already keeps the NEXT cycle paused; this only shortens
+                // how long the CURRENT cycle holds snapshots.
+                if *self.pause_tx.borrow() {
+                    tracing::info!(target: TARGET, account_id = %self.account_id, "manual pause mid-cycle; releasing VSS snapshots at source boundary");
+                    break;
+                }
             }
             Ok(())
         }
@@ -2016,6 +2113,70 @@ mod tests {
         );
     }
 
+    /// P1-A: a shadow recorded SYNCHRONOUSLY at create time (via the recorder
+    /// hook the orchestrator wires into the provider) is flushed to the durable
+    /// `vss.orphans` registry by the per-source `record_vss_orphans` - so a
+    /// crash DURING the source's (long) locked-file upload still leaves the GUID
+    /// recorded. We simulate the create by invoking the wired provider's
+    /// `map_for_volume` (which fires the recorder into the process-wide
+    /// create-ledger), then run a cycle and assert the GUID landed in the
+    /// registry. The per-source record drains the ledger; the post-loop record
+    /// + forget never sees that GUID, so it survives the clean cycle as the
+    /// crash safety net.
+    #[tokio::test]
+    async fn vss_record_at_create_flushes_to_registry() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let clock = Arc::new(FakeClock::new());
+        let power = Arc::new(FakePowerSource::new(power_on_ac()));
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec,
+            power,
+            Arc::new(FakeNet::online()),
+            clock,
+            OrchestratorConfig::default(),
+        );
+        // A mapping provider: its `map_for_volume` simulates a created shadow
+        // and fires the recorder the orchestrator wired in `with_vss`. It holds
+        // NO `recorded_snapshots`, so ONLY the record-at-create path can put a
+        // GUID in the registry.
+        let snap_dir = tempfile::tempdir().unwrap();
+        let vss = Arc::new(driven_vss::FakeVssProvider::mapped_under(
+            driven_vss::VssMode::Always,
+            snap_dir.path().to_path_buf(),
+        ));
+        let orch = orch.with_vss(vss.clone());
+
+        // Simulate the executor consulting the provider for a locked file: this
+        // fires the record-at-create hook synchronously into the ledger.
+        let mapped = vss.map_for_volume(std::path::Path::new("C:/live/locked.pst"));
+        assert!(matches!(mapped, driven_vss::SnapshotOutcome::Mapped(_)));
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        // The create-recorded GUID must be durably in the registry after the
+        // clean cycle (it was recorded per-source and never forgotten).
+        let stored = state
+            .get_setting(VSS_ORPHAN_SETTING_KEY)
+            .await
+            .unwrap()
+            .expect("registry persisted");
+        let reg: driven_vss::OrphanRegistry = serde_json::from_value(stored).unwrap();
+        assert!(
+            reg.snapshots
+                .iter()
+                .any(|s| s.snapshot_id == "{fake-snapshot-guid}"),
+            "the record-at-create GUID must be flushed to the registry; got {:?}",
+            reg.snapshots
+        );
+    }
+
     /// Startup orphan cleanup releases recorded shadows older than the 1h
     /// cutoff. Off Windows / un-elevated `delete_by_id` returns `Unavailable`,
     /// so the old entry is KEPT for an elevated run (never silently dropped),
@@ -2075,6 +2236,90 @@ mod tests {
                 .iter()
                 .any(|s| s.snapshot_id == "{fresh}"),
             "the fresh (sub-1h) orphan must never be selected for release"
+        );
+    }
+
+    /// P2-E: a manual pause SIGNALLED MID-CYCLE releases the VSS snapshots at
+    /// the next safe source boundary (after the current op, before the next
+    /// source) - not only at full cycle end. With two sources and a pause
+    /// flipped while source #1 is in flight, source #2 must NOT run and the
+    /// cycle must still release VSS (`end_cycle`), so a huge locked-file cycle
+    /// does not pin a shadow copy for its whole remaining length.
+    #[tokio::test]
+    async fn pause_mid_cycle_releases_vss_at_source_boundary() {
+        let account = AccountId::new_v4();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(dir_a.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir_b.path().join("b.txt"), b"b").unwrap();
+        let sources = vec![
+            source_in(account, dir_a.path()),
+            source_in(account, dir_b.path()),
+        ];
+
+        let executes = Arc::new(AtomicU64::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        let exec = Arc::new(BlockingExecutor {
+            executes: executes.clone(),
+            entered_tx,
+            release_rx: tokio::sync::Mutex::new(release_rx),
+        });
+
+        let state = Arc::new(FakeState::with_sources(sources));
+        let clock = Arc::new(FakeClock::new());
+        let power = Arc::new(FakePowerSource::new(power_on_ac()));
+        // Keep a typed clone so we can assert `end_cycle` was called.
+        let vss = Arc::new(driven_vss::FakeVssProvider::unavailable());
+        let orch = Arc::new(
+            SyncOrchestrator::new(
+                account,
+                state,
+                exec,
+                power,
+                Arc::new(FakeNet::online()),
+                clock,
+                OrchestratorConfig::default(),
+            )
+            .with_vss(vss.clone()),
+        );
+
+        // Run the cycle concurrently so the test can flip pause mid-flight.
+        let cycle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run_cycle(TickSource::Scheduled).await })
+        };
+
+        // Source #1 enters `execute`; pause now, then release it.
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("source #1 must enter execute")
+            .expect("entered channel open");
+        orch.set_paused(true).await;
+        let _ = release_tx.send(());
+
+        // The cycle must finish (the pause check breaks the loop after source
+        // #1) without source #2 ever entering `execute`.
+        tokio::time::timeout(std::time::Duration::from_secs(30), cycle)
+            .await
+            .expect("cycle must finish promptly after the mid-cycle pause")
+            .expect("join")
+            .expect("run_cycle ok");
+
+        assert_eq!(
+            executes.load(Ordering::SeqCst),
+            1,
+            "the second source must NOT run after a mid-cycle pause"
+        );
+        assert!(
+            entered_rx.try_recv().is_err(),
+            "source #2 must not have entered execute"
+        );
+        // VSS was released this cycle despite the early break (the post-loop
+        // `end_vss_cycle` ran), so a held shadow does not linger.
+        assert!(
+            vss.end_cycle_calls() >= 1,
+            "the mid-cycle pause must still release VSS at cycle exit"
         );
     }
 

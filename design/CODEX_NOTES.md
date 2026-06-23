@@ -220,10 +220,56 @@ needs the elevated Windows runtime (same constraint as the integration test).
 
 ### Blocking COM on a tokio worker - ACCEPTED for V1
 
-`VssProvider::map_for_volume` runs the synchronous `Wait(INFINITE)` snapshot
-creation (DESIGN s5.3 budgets up to ~10s) inline on the executor's per-op async
-task, holding the provider's `std::Mutex` (no `await` under the lock, so no
-deadlock - it just stalls that one worker while the first locked file on a volume
-snapshots). `spawn_blocking` would be the textbook fix but complicates the COM
-apartment / `Send` story; accepted as-is for V1 since a snapshot is created at most
-once per volume per cycle. Revisit if the stall is observable.
+`VssProvider::map_for_volume` runs the synchronous snapshot creation (DESIGN s5.3
+budgets up to ~10s) inline on the executor's per-op async task, holding the
+provider's `std::Mutex` (no `await` under the lock, so no deadlock - it just
+stalls that one worker while the first locked file on a volume snapshots).
+`spawn_blocking` would be the textbook fix but complicates the COM apartment /
+`Send` story; accepted as-is for V1 since a snapshot is created at most once per
+volume per cycle. Revisit if the stall is observable. (The waits are now BOUNDED
+- see M3.5 recheck2 P1-C below - so a hung writer can no longer stall it forever.)
+
+## M3.5 recheck2 (round 2) - VSS robustness
+
+### P1-C bounded VSS waits - DONE
+
+`gather_async` now drives each `IVssAsync` with a finite `Wait(5s)` slice looped
+to a 60s deadline (`VSS_S_ASYNC_PENDING` -> keep waiting; deadline blown ->
+`VssError::Unavailable`, degrade to skip). `VssSnapshot::create` waits for the
+worker's ready report with `recv_timeout(90s)`; on timeout it DETACHES the wedged
+worker (does not `join`, which would re-block) and degrades. A detached worker
+leaks one thread until process exit; the `VSS_CTX_BACKUP` shadow it may hold is
+auto-released by the OS when the process dies. Accepted (a wedged VSS writer is
+rare and the alternative is an unbounded hang).
+
+### P1-A record-at-create - residual kill-9 window (benign)
+
+A shadow's GUID is recorded into a per-orchestrator in-memory ledger SYNCHRONOUSLY
+at create time (recorder hook), then flushed to the durable `vss.orphans` registry
+by the per-source `record_vss_orphans`. The remaining window is a `kill -9` STRICTLY
+between `VssSnapshot::create` returning and the enclosing source's
+`record_vss_orphans` - the in-memory ledger is lost, so that GUID is not in the
+durable registry. This is BENIGN: a `VSS_CTX_BACKUP` shadow is non-persistent and
+the OS auto-releases it when the creating process dies, so a kill-9 orphan is
+reclaimed by VSS itself; the registry is the belt-and-suspenders for the rare case
+it is not, and the >1h startup sweep remains the backstop. A fully synchronous
+durable record would need a blocking DB write from the sync hook (which runs on a
+tokio worker, where `block_on` is unsound) or a second sync SQLite connection -
+deferred as not worth the complexity for a benign window.
+
+The DURABLE `vss.orphans` registry is process-global (one settings row, shared by
+all account orchestrators); its read-modify-write is now serialized process-wide by
+`orphan_registry_lock` (a `OnceLock<tokio::Mutex>`) so concurrent accounts cannot
+clobber each other (P2-D). The create-LEDGER is per-orchestrator (not global) so
+parallel accounts/tests never drain each other's pending records.
+
+### P1-B VSS uploads non-resumable - DONE
+
+A read served from a VSS snapshot (`read_path != live_path`) forces the simple
+(non-resumable) upload path at every size: no resumable session is opened, no
+`resume_identity` is stamped, so reconcile's resume-precedence block is never
+entered for a VSS op and never reopens the live file. A failed VSS op preserves +
+requeues cleanly (transient create -> `DeferToReconcile` keeps the op; hard failure
+-> op dropped, next scan re-enqueues), so the next cycle re-snapshots + re-uploads
+from scratch. Tested cross-OS via the `FakeVss` snapshot-dir + a cumulative
+`resumable_sessions_opened` counter on the fake remote.

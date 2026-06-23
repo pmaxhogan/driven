@@ -826,6 +826,15 @@ impl DefaultExecutor {
             .await?;
 
         // --- read + hash + (encrypt) + upload, verify md5, commit ----------
+        // P1-B: a read served from a VSS snapshot (read_path != live_path) is
+        // NON-RESUMABLE. The per-cycle shadow is released at cycle end, so a
+        // crash mid-resumable could not resume against the same frozen bytes
+        // next cycle (the snapshot is gone), and reconcile reopening the LIVE
+        // file would splice a different/locked byte stream. So force the simple
+        // (non-resumable) upload path and never persist a resumable session for
+        // a snapshot read; on failure the op is preserved + requeued clean so
+        // the next cycle re-snapshots + re-uploads from scratch.
+        let from_vss = read_path != live_path;
         let app_props = self.app_properties(source.id, relative_path, &op_uuid);
         let outcome = self
             .upload_and_commit(
@@ -839,6 +848,7 @@ impl DefaultExecutor {
                 op_id,
                 payload,
                 app_props,
+                from_vss,
             )
             .await;
 
@@ -945,6 +955,10 @@ impl DefaultExecutor {
         op_id: PendingOpId,
         mut payload: PendingOpPayload,
         app_props: HashMap<String, String>,
+        // P1-B: false when the bytes are read from a VSS snapshot - then NO
+        // resumable session is opened/persisted (the per-cycle shadow is gone
+        // by next cycle, so a resume could not re-read the same frozen bytes).
+        from_vss: bool,
     ) -> Result<OpOutcome, UploadError> {
         // M3.5: every FS recheck below reads the EFFECTIVE path (the VSS
         // snapshot copy for a locked file), so a frozen-vs-live stat mismatch
@@ -952,6 +966,9 @@ impl DefaultExecutor {
         // VSS is off.
         let full_path = read_path.to_path_buf();
         let mime = "application/octet-stream";
+        // P1-B: resumable is allowed only for a live read. A snapshot read uses
+        // the simple (single-shot) upload path regardless of size.
+        let allow_resumable = !from_vss;
 
         // P1-3 (M3.5 codex): size ALL of the upload off the EFFECTIVE (snapshot)
         // stat, not the scanner's live `size`. The scanner measured the LIVE
@@ -986,8 +1003,10 @@ impl DefaultExecutor {
         // without the (still-unknown) content hash. The plaintext blake3 is
         // re-derived over the full re-read stream on resume (final integrity
         // check vs Drive's md5). For sub-resumable uploads there is no resume,
-        // so we skip the extra write.
-        if size >= RESUMABLE_THRESHOLD {
+        // so we skip the extra write. P1-B: a snapshot read is never resumable,
+        // so it never stamps a resume identity either - reconcile must not try
+        // to resume a VSS op against the (gone) snapshot or the live file.
+        if allow_resumable && size >= RESUMABLE_THRESHOLD {
             payload.resume_identity = Some(ResumeIdentity::from_file_identity(pre));
             self.state
                 .update_pending_op_payload(op_id, &payload.to_value())
@@ -1014,6 +1033,7 @@ impl DefaultExecutor {
                 &target,
                 op_id,
                 &mut payload,
+                allow_resumable,
             )
             .await?
         } else {
@@ -1029,6 +1049,7 @@ impl DefaultExecutor {
                 &target,
                 op_id,
                 &mut payload,
+                allow_resumable,
             )
             .await?
         };
@@ -1117,6 +1138,8 @@ impl DefaultExecutor {
         target: &RemoteTarget,
         op_id: PendingOpId,
         payload: &mut PendingOpPayload,
+        // P1-B: false for a VSS-snapshot read - force the non-resumable path.
+        allow_resumable: bool,
     ) -> Result<UploadProduct, UploadError> {
         // M3.5: the post-read identity recheck reads the EFFECTIVE path (the
         // VSS snapshot copy for a locked file), matching the pre-open lstat.
@@ -1160,7 +1183,15 @@ impl DefaultExecutor {
             .map_err(UploadError::Fatal)?;
 
         let entry = self
-            .upload_bytes(target, existing_file_id, sent_bytes, mime, op_id, payload)
+            .upload_bytes(
+                target,
+                existing_file_id,
+                sent_bytes,
+                mime,
+                op_id,
+                payload,
+                allow_resumable,
+            )
             .await?;
         Ok(UploadProduct { blake3, entry })
     }
@@ -1196,6 +1227,8 @@ impl DefaultExecutor {
         target: &RemoteTarget,
         op_id: PendingOpId,
         payload: &mut PendingOpPayload,
+        // P1-B: false for a VSS-snapshot read - force the simple streaming path.
+        allow_resumable: bool,
     ) -> Result<UploadProduct, UploadError> {
         // Predict the exact number of bytes that will be sent to Drive.
         let total = predicted_sent_len(size, self.crypto.is_some());
@@ -1230,6 +1263,7 @@ impl DefaultExecutor {
             out_rx,
             op_id,
             payload,
+            allow_resumable,
         );
 
         // Run all three concurrently. The cpu stage returns (blake3, md5);
@@ -1304,8 +1338,11 @@ impl DefaultExecutor {
         out_rx: tokio::sync::mpsc::Receiver<Bytes>,
         op_id: PendingOpId,
         payload: &mut PendingOpPayload,
+        // P1-B: false for a VSS-snapshot read - never open a resumable session,
+        // stream as a single simple upload even above RESUMABLE_THRESHOLD.
+        allow_resumable: bool,
     ) -> Result<RemoteEntry, UploadError> {
-        if total >= RESUMABLE_THRESHOLD {
+        if allow_resumable && total >= RESUMABLE_THRESHOLD {
             self.upload_stage_resumable(
                 target,
                 existing_file_id,
@@ -1549,6 +1586,7 @@ impl DefaultExecutor {
     /// resumable protocol at or above it. Uploads to `target` (the resolved
     /// parent folder + name; the encrypted ciphertext path for an encrypted
     /// source, the flat plaintext name otherwise - P1-5).
+    #[allow(clippy::too_many_arguments)]
     async fn upload_bytes(
         &self,
         target: &RemoteTarget,
@@ -1557,8 +1595,12 @@ impl DefaultExecutor {
         mime: &str,
         op_id: PendingOpId,
         payload: &mut PendingOpPayload,
+        // P1-B: false for a VSS-snapshot read - never open a resumable session,
+        // upload as a single simple multipart even above RESUMABLE_THRESHOLD.
+        allow_resumable: bool,
     ) -> Result<RemoteEntry, UploadError> {
         let total = sent.bytes.len() as u64;
+        let use_resumable = allow_resumable && total >= RESUMABLE_THRESHOLD;
         let mut transient_retries = 0u32;
         loop {
             // A simple-multipart CREATE is the one ambiguous case: a single
@@ -1567,9 +1609,11 @@ impl DefaultExecutor {
             // orphan, and an inline re-POST would duplicate it (P1-3). The
             // resumable CREATE path finalizes only on its final chunk, so a
             // mid-stream transient leaves no object - safe to retry inline.
-            // Updates are idempotent (same file_id) - safe either way.
-            let ambiguous_simple_create = total < RESUMABLE_THRESHOLD && existing_file_id.is_none();
-            let result = if total >= RESUMABLE_THRESHOLD {
+            // Updates are idempotent (same file_id) - safe either way. A VSS
+            // (non-resumable) read above the threshold is a simple create too,
+            // so it is ambiguous in the same way - keep the op for reconcile.
+            let ambiguous_simple_create = !use_resumable && existing_file_id.is_none();
+            let result = if use_resumable {
                 self.upload_resumable(target, existing_file_id, &sent, mime, op_id, payload)
                     .await
             } else {
@@ -2215,6 +2259,13 @@ impl Executor for DefaultExecutor {
             // create, which `find_by_op_uuid` cannot even see). On success
             // we adopt the resulting entry; on a stale/invalid session we
             // fall through to the adopt-or-requeue path below.
+            //
+            // P1-B: a VSS-snapshot read NEVER persists `payload.resumable` (it
+            // is forced down the simple, non-resumable path), so this block is
+            // skipped for it - reconcile never tries to resume a VSS op against
+            // the live file (the snapshot's frozen bytes are already gone). It
+            // falls straight to adopt-or-requeue, which cleanly re-enqueues a
+            // fresh op the next cycle re-snapshots + re-uploads from scratch.
             if let Some(resumable) = payload.resumable.clone() {
                 match self
                     .resume_persisted(source, &op, &payload, resumable)
@@ -3267,17 +3318,26 @@ async fn open_shared(path: &Path) -> Result<tokio::fs::File, OpenError> {
     }
 }
 
-/// Classify an open error: a sharing violation / permission lock becomes a
-/// `Locked` skip; everything else is a plain IO error.
+/// Classify an open error (P2-F): ONLY a Windows sharing/lock violation is a
+/// "locked file" (the VSS / `local.file_locked` path). An ACL / access-denied
+/// failure is NOT a lock - it is a permission problem the user must fix - so it
+/// maps to a plain IO error (`local.io_error`), never `local.vss_unavailable`.
+/// We inspect the raw OS error, not just [`std::io::ErrorKind`], because both a
+/// sharing violation and an access-denial surface as `PermissionDenied` on
+/// Windows, yet only the former is a lock VSS can read around.
 fn classify_open_error(e: std::io::Error) -> OpenError {
-    // ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION (33) on Windows.
+    // ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION (33): the file is
+    // open exclusively by another process - the genuine "locked" case VSS
+    // exists to read around.
     #[cfg(windows)]
     if matches!(e.raw_os_error(), Some(32) | Some(33)) {
         return OpenError::Locked;
     }
-    if e.kind() == std::io::ErrorKind::PermissionDenied {
-        return OpenError::Locked;
-    }
+    // Everything else - including ERROR_ACCESS_DENIED (5) / an ACL denial that
+    // surfaces as `PermissionDenied` - is a plain IO error. Routing an ACL
+    // failure through the locked-file/VSS path would mislead the user with
+    // `local.vss_unavailable` ("would back up if elevated") when elevation
+    // would not help, and conflicts with the stress harness's expectations.
     OpenError::Io(e)
 }
 
@@ -4075,6 +4135,182 @@ mod tests {
             Some(frozen.len() as u64),
             "uploaded the frozen snapshot bytes, not the live-mutated ones"
         );
+    }
+
+    /// P1-B: a read served from a VSS snapshot is NON-RESUMABLE even when the
+    /// file is large enough (>= [`RESUMABLE_THRESHOLD`]) that a live read would
+    /// open a resumable session. The per-cycle shadow is released at cycle end,
+    /// so a resumable session persisted against the frozen bytes could not be
+    /// resumed next cycle (the snapshot is gone) and reconcile must not resume
+    /// it against the live file. So the executor forces the simple upload path
+    /// and opens ZERO resumable sessions. A live-read CONTROL on the same size
+    /// proves the threshold WOULD otherwise trip the resumable path.
+    #[tokio::test]
+    async fn vss_snapshot_read_is_non_resumable() {
+        // A file comfortably above the 5 MiB resumable threshold.
+        let big = vec![0xABu8; (RESUMABLE_THRESHOLD + 512 * 1024) as usize];
+
+        // --- CONTROL: a LIVE read of this size DOES open a resumable session.
+        {
+            let h = harness().await;
+            let (rel, size) = h.write_file("big-live.dat", &big);
+            let exec = h.executor(); // no VSS => live read
+            let out = exec
+                .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+                .await
+                .unwrap();
+            assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
+            assert!(
+                h.remote.resumable_sessions_opened() >= 1,
+                "control: a live read above the threshold must use the resumable path"
+            );
+        }
+
+        // --- VSS snapshot read of the SAME size opens NO resumable session.
+        let h = harness().await;
+        let (rel, size) = h.write_file("big.dat", &big);
+        // The FakeVss maps every read to <snap_dir>/<leaf>; put a frozen copy
+        // there so `always` mode reads the snapshot path.
+        let snap_dir = tempfile::tempdir().unwrap();
+        std::fs::write(snap_dir.path().join("big.dat"), &big).unwrap();
+        let vss: Arc<dyn driven_vss::VssProvider> =
+            Arc::new(driven_vss::FakeVssProvider::mapped_under(
+                driven_vss::VssMode::Always,
+                snap_dir.path().to_path_buf(),
+            ));
+        let exec = h.executor_with_vss(vss);
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(
+            matches!(out[0], OpOutcome::Done { .. }),
+            "VSS snapshot read must still complete; got {:?}",
+            out[0]
+        );
+        assert_eq!(
+            h.remote.resumable_sessions_opened(),
+            0,
+            "a VSS snapshot read must NOT open a resumable session (P1-B)"
+        );
+        // And it committed cleanly (op deleted, row Synced) - no stranded
+        // pending op that reconcile could try to resume against the live file.
+        let pending = h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap();
+        assert!(
+            pending.is_empty(),
+            "a clean VSS upload must leave no pending op to resume"
+        );
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("file_state row");
+        assert_eq!(row.status, FileStateStatus::Synced);
+    }
+
+    /// P1-B: when a VSS-snapshot upload FAILS after enqueue, the pending op is
+    /// preserved + requeued CLEANLY (no resumable session, no resume identity),
+    /// so the next cycle re-snapshots + re-uploads from scratch rather than
+    /// trying to resume against bytes that are gone. We drive a checksum
+    /// mismatch (a hard create failure) and assert the op carries no resumable
+    /// state and the row is not Synced.
+    #[tokio::test]
+    async fn vss_snapshot_read_failure_requeues_clean() {
+        let remote = InMemoryRemoteStore::new().with_md5_mismatch_after(0);
+        let h = harness_with_remote(remote).await;
+        let big = vec![0x5Au8; (RESUMABLE_THRESHOLD + 256 * 1024) as usize];
+        let (rel, size) = h.write_file("big.dat", &big);
+        let snap_dir = tempfile::tempdir().unwrap();
+        std::fs::write(snap_dir.path().join("big.dat"), &big).unwrap();
+        let vss: Arc<dyn driven_vss::VssProvider> =
+            Arc::new(driven_vss::FakeVssProvider::mapped_under(
+                driven_vss::VssMode::Always,
+                snap_dir.path().to_path_buf(),
+            ));
+        let exec = h.executor_with_vss(vss);
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        // The op did not succeed.
+        assert!(
+            !matches!(out[0], OpOutcome::Done { .. }),
+            "a checksum-mismatch VSS upload must not report Done; got {:?}",
+            out[0]
+        );
+        // No resumable session was ever opened for the snapshot read.
+        assert_eq!(
+            h.remote.resumable_sessions_opened(),
+            0,
+            "a failed VSS read must not have opened a resumable session"
+        );
+        // The row is not committed Synced - the next cycle re-uploads clean.
+        let row = h.state.get_file_state(h.source.id, &rel).await.unwrap();
+        assert!(
+            row.is_none() || row.unwrap().status != FileStateStatus::Synced,
+            "a failed VSS upload must not commit the row as Synced"
+        );
+    }
+
+    /// P2-F: an ACL / access-denied open error is an IO error
+    /// (`local.io_error`), NOT a locked file. Only a Windows sharing/lock
+    /// violation (ERROR_SHARING_VIOLATION 32 / ERROR_LOCK_VIOLATION 33) is a
+    /// lock VSS can read around. We inspect the raw OS error, not just the
+    /// `ErrorKind`, because both surface as `PermissionDenied` on Windows.
+    #[test]
+    fn classify_open_error_distinguishes_lock_from_acl() {
+        use std::io::{Error, ErrorKind};
+
+        // A generic PermissionDenied with no lock raw-code => IO error, not a
+        // lock. (On Windows an ACL denial is ERROR_ACCESS_DENIED == 5.)
+        let acl = Error::new(ErrorKind::PermissionDenied, "access denied");
+        assert!(
+            matches!(super::classify_open_error(acl), super::OpenError::Io(_)),
+            "an ACL/permission-denied open must map to an IO error, not Locked"
+        );
+
+        // Explicit ERROR_ACCESS_DENIED (5) => IO error.
+        let eacces = Error::from_raw_os_error(5);
+        assert!(
+            matches!(super::classify_open_error(eacces), super::OpenError::Io(_)),
+            "ERROR_ACCESS_DENIED (5) must map to an IO error, not Locked"
+        );
+
+        // A sharing/lock violation IS a lock - but only on Windows, where the
+        // raw OS error carries that meaning. Off Windows there is no such
+        // concept, so the same numeric code is just an IO error.
+        let sharing = Error::from_raw_os_error(32);
+        let lock = Error::from_raw_os_error(33);
+        #[cfg(windows)]
+        {
+            assert!(
+                matches!(
+                    super::classify_open_error(sharing),
+                    super::OpenError::Locked
+                ),
+                "ERROR_SHARING_VIOLATION (32) is a locked file on Windows"
+            );
+            assert!(
+                matches!(super::classify_open_error(lock), super::OpenError::Locked),
+                "ERROR_LOCK_VIOLATION (33) is a locked file on Windows"
+            );
+        }
+        #[cfg(not(windows))]
+        {
+            assert!(
+                matches!(super::classify_open_error(sharing), super::OpenError::Io(_)),
+                "no Windows lock concept off Windows: raw 32 is a plain IO error"
+            );
+            assert!(
+                matches!(super::classify_open_error(lock), super::OpenError::Io(_)),
+                "no Windows lock concept off Windows: raw 33 is a plain IO error"
+            );
+        }
     }
 
     /// An UNAVAILABLE VSS provider must not disturb a normal (openable) file in

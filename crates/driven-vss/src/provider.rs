@@ -23,9 +23,18 @@
 //! then turns into an open instruction.
 
 use std::path::Path;
-use std::sync::Mutex;
+use std::sync::{Arc, Mutex};
 
 use crate::{RecordedSnapshot, SnapshotOutcome, VssMode};
+
+/// A synchronous recorder the orchestrator injects so a freshly-created shadow
+/// copy's GUID is durably noted the instant it exists (P1-A), before
+/// [`VssProvider::map_for_volume`] returns the mapped path. Called with the
+/// snapshot GUID string and its creation time (Unix epoch ms). It runs inline
+/// on the provider's (blocking-friendly) map path, so it must be cheap and must
+/// not block on async I/O - the orchestrator's wiring pushes into an in-memory
+/// process-wide ledger it later flushes to the durable registry under its lock.
+pub type SnapshotRecorder = Arc<dyn Fn(&str, i64) + Send + Sync>;
 
 /// The per-cycle snapshot provider the executor's open path consults.
 ///
@@ -59,6 +68,16 @@ pub trait VssProvider: Send + Sync {
     /// Whether VSS is fundamentally available this run (elevated + Windows).
     /// Cheap; the executor reads it to short-circuit the open path.
     fn available(&self) -> bool;
+
+    /// Install the record-at-create hook (P1-A): a synchronous callback the
+    /// provider invokes the instant it creates a shadow copy (GUID + creation
+    /// ms), before returning the mapped path, so a crash during the ensuing
+    /// locked-file upload still leaves the shadow recorded. The orchestrator
+    /// wires this to push into its process-wide in-memory ledger. Default is a
+    /// no-op for providers that do not create real shadows.
+    fn set_recorder(&self, recorder: SnapshotRecorder) {
+        let _ = recorder;
+    }
 
     /// Release every snapshot created this cycle (RAII drop). Called by the
     /// orchestrator after the per-source loop, on all exit paths. Idempotent.
@@ -96,6 +115,14 @@ pub struct RealVssProvider {
     /// `Mutex` (not `RwLock`) because the check-then-create must be atomic so
     /// two concurrent locked files on one volume create exactly one snapshot.
     inner: Mutex<ProviderInner>,
+    /// Optional record-at-create hook (P1-A). When set, it is called
+    /// SYNCHRONOUSLY the moment a shadow copy is created - before the mapped
+    /// path is returned - so a crash during the ensuing (possibly long) locked
+    /// file upload still leaves the GUID recorded. `None` => no hook (the
+    /// historical behaviour: the orchestrator records via `recorded_snapshots`
+    /// after each source). Held behind a `Mutex` only to keep the struct
+    /// `Sync` with an interior-settable closure; read briefly under the lock.
+    recorder: Mutex<Option<SnapshotRecorder>>,
 }
 
 #[derive(Default)]
@@ -128,6 +155,21 @@ impl RealVssProvider {
             mode: Mutex::new(mode),
             elevated,
             inner: Mutex::new(ProviderInner::default()),
+            recorder: Mutex::new(None),
+        }
+    }
+
+    /// Invoke the record-at-create hook, if one is installed. Cheap; runs under
+    /// no other lock (the caller releases `inner` is NOT required - this only
+    /// touches `recorder`).
+    #[cfg(windows)]
+    fn record_at_create(&self, guid: &str, created_ms: i64) {
+        let hook = match self.recorder.lock() {
+            Ok(g) => g.clone(),
+            Err(poisoned) => poisoned.into_inner().clone(),
+        };
+        if let Some(hook) = hook {
+            hook(guid, created_ms);
         }
     }
 
@@ -161,6 +203,13 @@ impl VssProvider for RealVssProvider {
         self.is_available()
     }
 
+    fn set_recorder(&self, recorder: SnapshotRecorder) {
+        match self.recorder.lock() {
+            Ok(mut g) => *g = Some(recorder),
+            Err(poisoned) => *poisoned.into_inner() = Some(recorder),
+        }
+    }
+
     #[cfg(windows)]
     fn map_for_volume(&self, live_path: &Path) -> SnapshotOutcome {
         if !self.is_available() {
@@ -180,8 +229,25 @@ impl VssProvider for RealVssProvider {
         if !inner.snapshots.contains_key(&volume) {
             match crate::VssSnapshot::create(&volume) {
                 Ok(snap) => {
+                    // P1-A: record the GUID SYNCHRONOUSLY at create time, before
+                    // returning the mapped path, so a crash during the ensuing
+                    // (possibly long) locked-file upload still leaves the shadow
+                    // recorded for the next run's orphan sweep. Capture the
+                    // identity now while we still own the handle.
+                    let created = now_ms();
+                    let guid = snap.snapshot_id_string();
                     tracing::info!(volume = %volume, "VSS: created per-cycle snapshot");
-                    inner.snapshots.insert(volume.clone(), (snap, now_ms()));
+                    inner.snapshots.insert(volume.clone(), (snap, created));
+                    // Drop the `inner` lock before running the hook so the
+                    // recorder (which may take its own locks) never nests under
+                    // the provider's snapshot mutex.
+                    drop(inner);
+                    self.record_at_create(&guid, created);
+                    // Re-acquire to map the path below.
+                    inner = match self.inner.lock() {
+                        Ok(g) => g,
+                        Err(poisoned) => poisoned.into_inner(),
+                    };
                 }
                 Err(err) => {
                     tracing::warn!(volume = %volume, %err, "VSS: snapshot creation failed; degrading to skip");
@@ -302,6 +368,14 @@ pub struct FakeVssProvider {
     /// orchestrator records orphans PER SOURCE (P1-2), not only once after the
     /// loop.
     recorded_calls: std::sync::atomic::AtomicUsize,
+    /// Optional record-at-create spy (P1-A). When set, a successful
+    /// `map_for_volume` (one that returns `Mapped`, simulating a created
+    /// shadow) invokes it with a synthetic GUID + creation time, so an
+    /// orchestrator test can assert the GUID is recorded SYNCHRONOUSLY at
+    /// create time without real COM.
+    recorder: Mutex<Option<SnapshotRecorder>>,
+    /// A deterministic GUID the fake hands the recorder on create.
+    recorder_guid: String,
 }
 
 impl FakeVssProvider {
@@ -316,6 +390,8 @@ impl FakeVssProvider {
             end_cycle_calls: std::sync::atomic::AtomicUsize::new(0),
             map_calls: std::sync::atomic::AtomicUsize::new(0),
             recorded_calls: std::sync::atomic::AtomicUsize::new(0),
+            recorder: Mutex::new(None),
+            recorder_guid: "{fake-snapshot-guid}".to_string(),
         }
     }
 
@@ -331,6 +407,8 @@ impl FakeVssProvider {
             end_cycle_calls: std::sync::atomic::AtomicUsize::new(0),
             map_calls: std::sync::atomic::AtomicUsize::new(0),
             recorded_calls: std::sync::atomic::AtomicUsize::new(0),
+            recorder: Mutex::new(None),
+            recorder_guid: "{fake-snapshot-guid}".to_string(),
         }
     }
 
@@ -368,6 +446,16 @@ impl VssProvider for FakeVssProvider {
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         match &self.mapped_root {
             Some(root) => {
+                // P1-A: a successful map simulates a created shadow, so fire the
+                // record-at-create spy synchronously here (before returning the
+                // mapped path) exactly as the real provider does at create time.
+                let hook = match self.recorder.lock() {
+                    Ok(g) => g.clone(),
+                    Err(poisoned) => poisoned.into_inner().clone(),
+                };
+                if let Some(hook) = hook {
+                    hook(&self.recorder_guid, 0);
+                }
                 let name = live_path
                     .file_name()
                     .map(std::path::PathBuf::from)
@@ -375,6 +463,13 @@ impl VssProvider for FakeVssProvider {
                 SnapshotOutcome::Mapped(root.join(name))
             }
             None => SnapshotOutcome::Unavailable,
+        }
+    }
+
+    fn set_recorder(&self, recorder: SnapshotRecorder) {
+        match self.recorder.lock() {
+            Ok(mut g) => *g = Some(recorder),
+            Err(poisoned) => *poisoned.into_inner() = Some(recorder),
         }
     }
 
@@ -439,6 +534,57 @@ mod tests {
         assert_eq!(
             p.map_for_volume(Path::new("/live/dir/outlook.pst")),
             SnapshotOutcome::Mapped(PathBuf::from("/snap/root/outlook.pst"))
+        );
+    }
+
+    /// P1-A: a record-at-create hook installed via `set_recorder` fires
+    /// SYNCHRONOUSLY when `map_for_volume` produces a snapshot (the fake's
+    /// `Mapped` outcome simulates a created shadow), BEFORE the mapped path is
+    /// returned - so the GUID is recorded the instant the shadow exists. An
+    /// `Unavailable` provider (no shadow created) never fires it.
+    #[test]
+    fn recorder_fires_synchronously_at_create() {
+        use std::sync::atomic::{AtomicUsize, Ordering};
+
+        let calls = Arc::new(AtomicUsize::new(0));
+        let seen_guid = Arc::new(Mutex::new(String::new()));
+
+        // Available provider that maps (= creates) a shadow.
+        let p = FakeVssProvider::mapped_under(VssMode::Always, "/snap/root");
+        let calls_c = calls.clone();
+        let guid_c = seen_guid.clone();
+        p.set_recorder(Arc::new(move |guid: &str, _created: i64| {
+            calls_c.fetch_add(1, Ordering::SeqCst);
+            *guid_c.lock().unwrap() = guid.to_string();
+        }));
+
+        let out = p.map_for_volume(Path::new("/live/dir/outlook.pst"));
+        assert!(matches!(out, SnapshotOutcome::Mapped(_)));
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            1,
+            "the recorder must fire exactly once at create time"
+        );
+        assert!(
+            !seen_guid.lock().unwrap().is_empty(),
+            "the recorder must receive the snapshot GUID"
+        );
+
+        // An UNAVAILABLE provider creates no shadow, so the recorder is silent.
+        let calls2 = Arc::new(AtomicUsize::new(0));
+        let u = FakeVssProvider::unavailable();
+        let calls2_c = calls2.clone();
+        u.set_recorder(Arc::new(move |_g: &str, _c: i64| {
+            calls2_c.fetch_add(1, Ordering::SeqCst);
+        }));
+        assert_eq!(
+            u.map_for_volume(Path::new("/some/file.pst")),
+            SnapshotOutcome::Unavailable
+        );
+        assert_eq!(
+            calls2.load(Ordering::SeqCst),
+            0,
+            "no shadow created => recorder must not fire"
         );
     }
 

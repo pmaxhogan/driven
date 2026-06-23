@@ -55,7 +55,7 @@ mod provider;
 
 pub use mode::VssMode;
 pub use orphan::{prune_orphans, OrphanRegistry, RecordedSnapshot, DEFAULT_ORPHAN_MAX_AGE_MS};
-pub use provider::{FakeVssProvider, RealVssProvider, VssProvider};
+pub use provider::{FakeVssProvider, RealVssProvider, SnapshotRecorder, VssProvider};
 
 // The real COM sequence (Windows) and the no-op stub (everything else) are
 // each behind a cfg. Exactly one defines `VssSnapshot`.

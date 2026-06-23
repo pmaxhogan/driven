@@ -233,6 +233,12 @@ struct Inner {
     objects: HashMap<String, FileEntry>,
     /// Open resumable sessions keyed by their session URL.
     sessions: HashMap<String, ResumableSessionState>,
+    /// Cumulative count of resumable sessions EVER opened (monotonic; never
+    /// decremented when a session completes/invalidates). Lets a test assert
+    /// that an upload did NOT take the resumable path at all - e.g. a VSS
+    /// snapshot read, which is forced non-resumable (P1-B). Distinct from
+    /// `sessions.len()` (currently-open) which is 0 once an upload finishes.
+    resumable_sessions_opened: u64,
     /// Monotonic insertion counter (assigned to every new
     /// [`FileEntry`]).
     seq: u64,
@@ -407,6 +413,7 @@ impl InMemoryRemoteStore {
         let inner = Inner {
             objects: HashMap::from([(root_id.clone(), root)]),
             sessions: HashMap::new(),
+            resumable_sessions_opened: 0,
             seq: 0,
             now_ms: 0,
             bytes_stored: 0,
@@ -444,6 +451,13 @@ impl InMemoryRemoteStore {
     /// are released.
     pub fn open_session_count(&self) -> usize {
         self.inner.lock().sessions.len()
+    }
+
+    /// Internal test hook: cumulative count of resumable sessions EVER opened
+    /// (monotonic). Lets a test assert an upload never used the resumable path
+    /// - e.g. a VSS snapshot read forced non-resumable (P1-B).
+    pub fn resumable_sessions_opened(&self) -> u64 {
+        self.inner.lock().resumable_sessions_opened
     }
 
     /// Internal test hook: total bytes of content currently stored in
@@ -781,6 +795,7 @@ impl RemoteStore for InMemoryRemoteStore {
             .faults
             .session_invalidated_after_chunks
             .swap(u64::MAX, Ordering::AcqRel);
+        guard.resumable_sessions_opened = guard.resumable_sessions_opened.saturating_add(1);
         guard.sessions.insert(
             url.clone(),
             ResumableSessionState {
