@@ -2,35 +2,39 @@ name: Chaos
 
 # Driven stress / chaos harness (design/STRESS_HARNESS.md s7).
 #
+# COST POLICY (maintainer budget): the chaos jobs run WINDOWS-ONLY on every PR
+# and push to main (Windows is the primary target platform). The full 3-OS
+# matrix [ubuntu, macos, windows] runs ONLY on `v*` tag pushes (release gates),
+# where the extra macOS/Windows runner cost is worth the release-time coverage.
+# The weekly 6-hour fuzz soak is NOT run in CI - it is a local/on-demand task
+# (`just chaos-fuzz` / `just chaos-soak`); the bounded `fuzz-smoke` row still
+# runs in the per-PR sweep. Unix-shaped rows (POSIX perms, case-sensitive FS)
+# are exercised on the ubuntu leg of the tag-push 3-OS run and locally on Linux.
+#
 # Jobs:
-#   chaos-hermetic   - every PR, 3-OS matrix [ubuntu, macos, windows]. Runs
-#                      every scenario whose requires() is satisfiable on a stock
-#                      non-elevated runner of that OS; the rest SKIP cleanly.
-#                      Linux + macOS exercise the Unix-shaped rows; Windows adds
-#                      the NTFS / Win32-shaped rows. None need real Drive or
-#                      elevation (the admin / VSS / real-Drive rows SKIP).
-#                      ROADMAP M3.7 acceptance: Linux + macOS + Windows.
-#   chaos-fake-drive - every PR, 3-OS matrix. The dedicated fault-injection gate
-#                      (STRESS_HARNESS s7 / ROADMAP M3.7): runs ONLY the s3.7
-#                      Drive-side hazards + s4.2/s5 drive-side mutator faults
-#                      against InMemoryRemoteStore (`run-all --fault-injection`).
-#                      These rows are also in the hermetic sweep; this focused
-#                      gate gives the separately-named, faster fault-injection
-#                      check the acceptance requires.
+#   chaos-hermetic   - every PR/push: windows-only; on a `v*` tag: 3-OS matrix.
+#                      Runs every scenario whose requires() is satisfiable on a
+#                      stock non-elevated runner; the rest SKIP cleanly.
+#   chaos-fake-drive - every PR/push: windows-only; on a `v*` tag: 3-OS matrix.
+#                      The dedicated fault-injection gate (STRESS_HARNESS s7):
+#                      runs ONLY the s3.7 Drive-side hazards + s4.2/s5 drive-side
+#                      mutator faults against InMemoryRemoteStore
+#                      (`run-all --fault-injection`).
 #   chaos-real-drive - WIRED but SKIPPED until M4: gated on the
 #                      DRIVEN_E2E_REFRESH_TOKEN secret, which is absent until
 #                      the GoogleDriveStore (M4) lands. It skips cleanly, it
 #                      does NOT fail (STRESS_HARNESS s7 "Gating on M4").
-#   chaos-soak       - weekly cron: a long seeded fuzz run. Informational.
+#
+# The long fuzz soak + soak-gated massive-input rows (million-files-nested,
+# tiny-files-100k) run LOCALLY via the justfile (`just chaos-soak`,
+# `just chaos-fuzz`), not in CI.
 
 on:
   push:
     branches: [main]
+    tags: ["v*"]
   pull_request:
     branches: [main]
-  schedule:
-    # Weekly soak, Monday 06:00 UTC (STRESS_HARNESS s7 chaos-soak).
-    - cron: "0 6 * * 1"
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
@@ -47,17 +51,14 @@ env:
 jobs:
   chaos-hermetic:
     name: chaos hermetic (${{ matrix.os }})
-    # Skip the PR run on the scheduled trigger; the soak job covers cron.
-    if: github.event_name != 'schedule'
     strategy:
       fail-fast: false
       matrix:
-        # ROADMAP M3.7 acceptance: the hermetic harness must pass on all three
-        # OS families. Each runner capability-gates its own scenario set - Linux
-        # + macOS run the Unix-shaped rows, Windows runs the NTFS / Win32 rows;
-        # the admin / VSS / real-Drive rows SKIP cleanly on every unelevated
-        # runner (recorded, never red).
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        # WINDOWS-ONLY on a normal PR/push (the primary platform, cheapest
+        # coverage); the FULL 3-OS matrix only on a `v*` tag push, where Linux +
+        # macOS add the Unix-shaped rows for the release gate. The admin / VSS /
+        # real-Drive rows SKIP cleanly on every unelevated runner (never red).
+        os: ${{ startsWith(github.ref, 'refs/tags/') && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') || fromJSON('["windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -70,23 +71,22 @@ jobs:
             libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
       - uses: Swatinem/rust-cache@v2
       # run-all capability-gates every scenario: on a stock non-elevated runner
-      # the admin / NTFS / real-Drive rows SKIP (recorded, never red); the rest
-      # run against the headless core + InMemoryRemoteStore.
+      # the admin / real-Drive rows SKIP (recorded, never red); the rest run
+      # against the headless core + InMemoryRemoteStore.
       # Exit code: 0 = all pass/skip, 1 = any fail (STRESS_HARNESS s9).
       - name: chaos run-all (hermetic)
         run: cargo run -p driven-chaos -- run-all --hermetic
 
   chaos-fake-drive:
     name: chaos fake-drive (${{ matrix.os }})
-    # The dedicated fault-injection gate (ROADMAP M3.7 acceptance: a distinct
-    # chaos-fake-drive job on Linux + macOS + Windows). Runs ONLY the s3.7 /
-    # s4.2 / s5 fault-injection subset against InMemoryRemoteStore; capability
-    # gated rows (the daily-quota real-Drive path) SKIP cleanly, never red.
-    if: github.event_name != 'schedule'
+    # The dedicated fault-injection gate (STRESS_HARNESS s7). Runs ONLY the
+    # s3.7 / s4.2 / s5 fault-injection subset against InMemoryRemoteStore;
+    # capability-gated rows SKIP cleanly, never red. Same cost policy as
+    # hermetic: windows-only normally, 3-OS on a `v*` tag.
     strategy:
       fail-fast: false
       matrix:
-        os: [ubuntu-latest, macos-latest, windows-latest]
+        os: ${{ startsWith(github.ref, 'refs/tags/') && fromJSON('["ubuntu-latest","macos-latest","windows-latest"]') || fromJSON('["windows-latest"]') }}
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
@@ -129,37 +129,3 @@ jobs:
       # throwaway Drive folder; everything else runs as in the hermetic job.
       - name: chaos run-all (real Drive)
         run: cargo run -p driven-chaos -- run-all --hermetic
-
-  chaos-soak:
-    name: chaos soak (weekly fuzz)
-    # Weekly cron only; informational, does not gate merges (STRESS_HARNESS s7).
-    if: github.event_name == 'schedule'
-    runs-on: ubuntu-latest
-    # Opt into the soak-grade massive-input rows (million-files-nested,
-    # tiny-files-100k); they SKIP in the per-PR matrix and run here.
-    env:
-      DRIVEN_CHAOS_SOAK: "1"
-    steps:
-      - uses: actions/checkout@v4
-      - uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux Tauri deps
-        run: |
-          sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
-            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
-      - uses: Swatinem/rust-cache@v2
-      # First the soak-grade massive-input scenarios (skipped in PR), then the
-      # long seeded fuzz run. Any invariant violation writes
-      # target/chaos-fuzz-failures/<seed>.json for bit-reproducible replay
-      # (STRESS_HARNESS s4.3).
-      - name: chaos run-all (soak-gated rows)
-        run: cargo run -p driven-chaos -- run-all --hermetic
-      - name: chaos fuzz (seeded soak)
-        run: cargo run -p driven-chaos -- fuzz --seed ${{ github.run_id }} --duration 30m
-      - name: upload fuzz failure replays
-        if: failure()
-        uses: actions/upload-artifact@v4
-        with:
-          name: chaos-fuzz-failures
-          path: target/chaos-fuzz-failures/
-          if-no-files-found: ignore

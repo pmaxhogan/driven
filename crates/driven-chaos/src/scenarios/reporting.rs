@@ -200,15 +200,19 @@ pub async fn assert_invariants(
     // leaves the remote in a LATCHED fault state (e.g. auth.invalid_grant, which
     // the fake applies to read calls too) can still have its terminal-state
     // invariants verified instead of the sweep itself erroring on the fault.
-    let live: Vec<_> = remote
-        .list_folder_with_trashed(folder_id)
-        .into_iter()
-        .filter(|e| !e.trashed)
-        .collect();
+    let all: Vec<_> = remote.list_folder_with_trashed(folder_id);
+    let live: Vec<_> = all.iter().filter(|e| !e.trashed).cloned().collect();
     let live_object_count = live.len() as u64;
 
+    // No duplicate Drive objects per client_op_uuid (s6.3). Count over ALL
+    // objects INCLUDING trashed ones: "two objects created for one op, then one
+    // trashed" is still evidence of a duplicate-create bug, so filtering trashed
+    // out before counting would hide it. Each upload op stamps a FRESH
+    // client_op_uuid, so a legitimate trash-then-recreate carries two distinct
+    // uuids and never collides here; only a genuine duplicate create does.
+    // (Mirrors the mutator checker, which already counts with-trashed.)
     let mut uuid_counts: HashMap<String, u64> = HashMap::new();
-    for entry in &live {
+    for entry in &all {
         if let Some(uuid) = entry.app_properties.get(CLIENT_OP_UUID_KEY) {
             *uuid_counts.entry(uuid.clone()).or_insert(0) += 1;
         }

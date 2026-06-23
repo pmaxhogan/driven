@@ -257,17 +257,11 @@ pub mod exit_code {
 /// subcommand can re-print it (STRESS_HARNESS s2.2 / s6.2).
 const LAST_RUN_JSON: &str = "target/chaos-runs/last-run.json";
 
-/// A default fuzz step budget for a CLI `fuzz` invocation with no
-/// `--duration`. The weekly soak (s7) drives a much larger budget via the
-/// `--duration` -> step-budget mapping below.
+/// A default fuzz step budget for a CLI `fuzz` invocation with no `--duration`
+/// (a bare `fuzz` stays quick: this many steps under the 60s safety cap). A
+/// `fuzz --duration D` instead soaks by wall-clock for D with a very large step
+/// budget (see the `Fuzz` arm in [`run`]).
 const DEFAULT_FUZZ_STEPS: u64 = 200;
-
-/// Map a `--duration` in seconds onto a fuzz step budget. Each second of
-/// requested soak buys a fixed number of mutation steps; the run's wall-clock
-/// cap inside `run_fuzz` still bounds an over-long request.
-fn steps_for_duration(secs: u64) -> u64 {
-    secs.saturating_mul(50).max(DEFAULT_FUZZ_STEPS)
-}
 
 /// Persist a finished run so `report` can re-print it. Best-effort: a write
 /// failure must not flip an otherwise-green run red, so it only warns.
@@ -372,11 +366,20 @@ pub async fn run(command: Command, caps: &CapabilitySet) -> i32 {
                     .map(|d| d.as_secs())
                     .unwrap_or(0)
             });
-            let steps = duration_secs
-                .map(steps_for_duration)
-                .unwrap_or(DEFAULT_FUZZ_STEPS);
-            println!("driven-chaos fuzz: seed={seed} steps={steps}");
-            match mutator_scenarios::run_fuzz(seed, steps).await {
+            // `--duration D` governs the run by WALL-CLOCK: soak for D with a
+            // very large step budget so the duration is the binding bound (a
+            // local `fuzz --duration 6h` actually soaks 6h). Without a duration,
+            // the run is bounded by a small default step budget + the 60s safety
+            // cap so a bare `fuzz` invocation stays quick.
+            let (steps, wall_cap) = match duration_secs {
+                Some(secs) => (u64::MAX, std::time::Duration::from_secs(secs)),
+                None => (DEFAULT_FUZZ_STEPS, mutator_scenarios::SCENARIO_WALL_CAP),
+            };
+            println!(
+                "driven-chaos fuzz: seed={seed} step_budget={steps} wall_cap={}s",
+                wall_cap.as_secs()
+            );
+            match mutator_scenarios::run_fuzz(seed, steps, wall_cap).await {
                 Ok(report) => {
                     if let Some(violation) = &report.violation {
                         match mutator_scenarios::write_fuzz_failure(&report) {

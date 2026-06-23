@@ -33,15 +33,29 @@ watch:
 chaos:
     cargo run -p driven-chaos -- run-all --hermetic
 
+# The dedicated fault-injection subset (s3.7 / s4.2 / s5) - the same set the
+# CI `chaos-fake-drive` gate runs. Faster than the full hermetic sweep.
+chaos-fake-drive:
+    cargo run -p driven-chaos -- run-all --fault-injection
+
 # Remove every cached chaos fixture under target/chaos-fixtures/ so the next
 # run rebuilds the big (million-files-nested / huge-file) fixtures from scratch.
 chaos-fixture-clean:
     cargo run -p driven-chaos -- fixture clean --all
 
-# Seeded continuous-mutation fuzz soak (STRESS_HARNESS s4.3). Override the
-# default duration, e.g. `just chaos-fuzz "--seed 42 --duration 10m"`. An
-# invariant violation writes target/chaos-fuzz-failures/<seed>.json for replay.
+# Seeded continuous-mutation fuzz soak (STRESS_HARNESS s4.3). `--duration` now
+# governs by WALL-CLOCK, so the run actually soaks for the whole duration.
+# Override it, e.g. `just chaos-fuzz "--seed 42 --duration 30m"`. An invariant
+# violation writes target/chaos-fuzz-failures/<seed>.json for replay.
 chaos-fuzz args="--duration 2m":
+    cargo run -p driven-chaos -- fuzz {{args}}
+
+# Full local soak - the heavy run the CI cron used to do, now local-only to
+# save Actions budget: the soak-gated massive-input rows (million-files-nested,
+# tiny-files-100k) plus a long seeded fuzz. Override the fuzz duration via the
+# arg, e.g. `just chaos-soak "--duration 6h"`.
+chaos-soak args="--duration 30m":
+    $env:DRIVEN_CHAOS_SOAK="1"; cargo run -p driven-chaos -- run-all --hermetic
     cargo run -p driven-chaos -- fuzz {{args}}
 
 lint:

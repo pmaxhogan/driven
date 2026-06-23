@@ -316,3 +316,82 @@ NOT #[ignore]'d, NOT weakened invariants). Tracked here for visibility:
   rename row injects a real upload window (with_slow_responses) + a monotonically
   growing body so the size delta is machine-speed-independent, and accepts
   either code - a documented platform-dependent outcome, not a faked pass.
+
+## M3.7 recheck rounds (codex) - closures + accepted residuals (cap reached)
+
+Two codex recheck rounds ran on M3.7 (baseline 60d3a1c). Round 1 (7 findings):
+finding 1 (disk-full-target) was resolved as an honest documented known-gap
+(re-gated to `DiskMountAllowed`, a never-set env, because V1's read-only source
+path cannot induce ENOSPC end to end - see the disk-full section's setup note);
+F2-F7 were FIXED in commit 9abb3bd:
+- F2 central s6.3 no-data-loss now enforces the FULL spec: object exists, md5
+  matches drive_md5, and (unencrypted + retained-bytes) bytes hash to
+  hash_blake3 (added blake3 dep + InMemoryRemoteStore::object_content).
+- F3 drive-fileid-recycled asserts y.id == id_x; F4 distinct chaos-fake-drive
+  gate; F5 fake trash/about use content_len(); F6 mutator-drive-daily-quota runs
+  hermetically via with_daily_quota_after; F7 capability probes target the
+  fixture-root volume.
+
+Round 2 (FINAL, cap reached) raised 4 P1 + 2 P2. Two were FIXED; the rest are
+ACCEPTED residuals (recheck cap reached, and none are regressions or affect the
+green per-PR gates):
+
+FIXED:
+- fuzz `--duration` was silently capped at the 60s SCENARIO_WALL_CAP. `run_fuzz`
+  now takes an explicit `wall_cap`: the registered `fuzz-smoke` stays bounded by
+  a small step budget + 60s, while `fuzz --duration D` soaks by wall-clock for D
+  (a local `fuzz --duration 6h` actually soaks 6h). Verified: `--duration 8s`
+  ran 2038 steps over 8.6s.
+- central duplicate-`client_op_uuid` check now counts over
+  `list_folder_with_trashed` (including trashed), so "create two objects for one
+  op, then trash one" is caught (matches the mutator checker). Safe: each upload
+  op stamps a fresh uuid, so legitimate trash-then-recreate never collides.
+
+ACCEPTED RESIDUALS (tracked, not faked-green):
+- **Deferred-create pending-op exemption (reporting.rs assert_invariants).** The
+  central s6.3 pending-op check exempts a due `upload` op carrying a
+  client_op_uuid but no drive_file_id - the documented DESIGN s5.6 recovery
+  handle a transient mid-first-upload fault leaves for the next-boot reconcile.
+  Strictly, §6.3 calls any due row a leak; the exemption was added deliberately
+  (M3 recheck) so the Drive-side transient + crash-recovery rows, whose CORRECT
+  terminal state IS one such op, are not falsely red. The Drive-side fault rows
+  ALSO route through the stricter `assert_invariants_opts` (byte-level +
+  deferred-reconcile checks). Tightening this properly (persistent-fault ops
+  should be backoff-scheduled, or scenarios should reboot+reconcile before
+  asserting) is a cross-subsystem change best done with M4's pacer/backoff prod
+  wiring; tracked as an M4 follow-up.
+- **daily-quota midnight-resume not asserted (drive_side daily-quota-exhausted +
+  mutator-drive-daily-quota).** Both rows assert the real
+  `DriveDailyQuotaExhausted` code surfaces (hermetically, via the fake injector),
+  but NOT the pacer's pause-until-midnight-Pacific + FakeClock resume - the chaos
+  handle wires a NoopPacer. The scenario descriptions already state midnight-
+  resume is M4. Injecting the real AIMD pacer + FakeClock control lands with M4's
+  pacer prod wiring (the pacer is exercised by unit tests in driven-core today).
+- **setup() is not wall-clock-capped (runner.rs).** The s6.3 no-infinite-loop cap
+  wraps only run_assertions; setup is deliberately uncapped so the cacheable
+  big-fixture builds (million-files-nested ~15 min, huge-file-*) are not killed.
+  A truly-hung setup would hang until the outer CI job timeout. A future generous
+  setup cap (well above the longest fixture build) that reports harness.timeout
+  is a tracked robustness follow-up; no current scenario hangs setup.
+- **huge-file fixtures not marked cacheable (file_size.rs).** huge-file-10gb /
+  -50gb rebuild their 10/50 GB source every setup (no ctx.cacheable + versioned
+  sentinel like million-files-nested). These rows are soak-gated (local
+  `just chaos-soak` only, never per-PR), so the rebuild cost is bounded to the
+  on-demand soak; adding the cacheable sentinel is a soak-efficiency follow-up.
+- codex also flagged a "missing design/chaos-fuzz-smoke.json"; no code references
+  such a file (the fuzz-smoke row asserts invariants inline), so none is added.
+
+## M3.7 CI cost policy (maintainer budget decision)
+
+To bound GitHub Actions spend, the Chaos workflow deviates from the ROADMAP
+"hermetic + fake-drive 3-OS PR-gating" acceptance by maintainer choice:
+- chaos-hermetic + chaos-fake-drive run **windows-only** on every PR / main push
+  (Windows is the primary target), and the **full 3-OS matrix only on `v*` tag
+  pushes** (release gates) via a `startsWith(github.ref,'refs/tags/')` matrix
+  switch. Unix-shaped rows run on the tag-push ubuntu leg + locally on Linux.
+- The weekly 6h fuzz **soak cron is removed** from CI; the long fuzz + the
+  soak-gated massive-input rows (million-files-nested, tiny-files-100k) run
+  LOCALLY via `just chaos-soak` / `just chaos-fuzz`. The bounded `fuzz-smoke`
+  row still runs in the per-PR sweep.
+This is a deliberate cost/coverage trade, recorded here so the deviation from the
+locked ROADMAP acceptance is explicit and intentional, not an oversight.

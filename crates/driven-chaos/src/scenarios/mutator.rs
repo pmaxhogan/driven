@@ -108,7 +108,7 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 /// bounded ITERATION count + tiny intervals rather than the 5-minute soak
 /// default (which is reserved for the `fuzz --duration` CLI path). This cap is
 /// a backstop the driver can enforce; exceeding it is `harness.timeout`.
-const SCENARIO_WALL_CAP: Duration = Duration::from_secs(60);
+pub const SCENARIO_WALL_CAP: Duration = Duration::from_secs(60);
 
 /// Cycles a registered soak scenario interleaves with mutation (small, fast,
 /// deterministic - not the 5-min soak).
@@ -1260,12 +1260,19 @@ pub struct FuzzReport {
 /// sequence of filesystem mutations interleaved with sync cycles against a
 /// synthesised source tree, then assert the s6.3 post-condition invariants.
 ///
-/// `step_budget` bounds the run (the CLI maps `--duration` onto a step budget
-/// so a registered run stays fast and a soak run goes long). On any invariant
-/// violation the returned report carries `violation = Some(..)` and the full
-/// mutation log, which the caller writes to
+/// `step_budget` and `wall_cap` BOTH bound the run, whichever is hit first: the
+/// registered `fuzz-smoke` row passes a small step budget + the 60s
+/// [`SCENARIO_WALL_CAP`] so it stays fast, while the `fuzz --duration D` CLI
+/// path passes a very large step budget + `wall_cap = D` so a local soak
+/// actually runs for the requested wall-clock (`--duration 6h` soaks 6h, not
+/// 60s). On any invariant violation the returned report carries
+/// `violation = Some(..)` and the full mutation log, which the caller writes to
 /// `target/chaos-fuzz-failures/<seed>.json` for bit-reproducible replay.
-pub async fn run_fuzz(seed: u64, step_budget: u64) -> anyhow::Result<FuzzReport> {
+pub async fn run_fuzz(
+    seed: u64,
+    step_budget: u64,
+    wall_cap: Duration,
+) -> anyhow::Result<FuzzReport> {
     let mut rng = Rng::new(seed);
     let state_dir = tempfile::tempdir()?;
     let root_dir = tempfile::tempdir()?;
@@ -1283,7 +1290,7 @@ pub async fn run_fuzz(seed: u64, step_budget: u64) -> anyhow::Result<FuzzReport>
 
     let started = std::time::Instant::now();
     for step_index in 0..step_budget {
-        if started.elapsed() > SCENARIO_WALL_CAP {
+        if started.elapsed() > wall_cap {
             break;
         }
         let step = pick_step(&mut rng);
@@ -1478,7 +1485,9 @@ impl Scenario for FuzzSmokeScenario {
     }
 
     async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
-        let report = run_fuzz(self.seed, self.steps).await?;
+        // The registered smoke row stays bounded by BOTH a small step budget
+        // and the 60s wall cap, so it can never balloon into a long CI step.
+        let report = run_fuzz(self.seed, self.steps, SCENARIO_WALL_CAP).await?;
         if let Some(reason) = &report.violation {
             // Persist the failure for bit-reproducible replay, then fail.
             let path = write_fuzz_failure(&report)?;
@@ -1584,7 +1593,11 @@ mod tests {
     /// real headless core).
     #[tokio::test]
     async fn fuzz_smoke_holds_invariants() {
-        let report = run_fuzz(0xABCD_1234, 80).await.expect("fuzz run");
+        // 80 steps complete in well under the 60s wall cap, so the step budget
+        // is the binding bound and the full budget runs.
+        let report = run_fuzz(0xABCD_1234, 80, SCENARIO_WALL_CAP)
+            .await
+            .expect("fuzz run");
         assert_eq!(report.steps, 80, "ran the full budget");
         assert!(
             report.violation.is_none(),
