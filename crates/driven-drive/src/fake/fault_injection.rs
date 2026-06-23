@@ -200,4 +200,23 @@ impl InMemoryRemoteStore {
             .store(true, Ordering::Release);
         self
     }
+
+    /// Latches genuine Drive file_id recycling: after this store trashes an
+    /// object, the NEXT `create` (direct or resumable-commit) reuses that
+    /// trashed object's `file_id` instead of minting a fresh UUID. Trashed
+    /// ids are recycled FIFO, modelling the synthetic fake-only hazard in
+    /// STRESS_HARNESS s3.7 `drive-fileid-recycled`: a freshly-created object
+    /// inherits a previously-trashed object's id, so any Driven code that
+    /// keyed cross-file identity on the bare `file_id` (rather than on
+    /// `appProperties.driven.client_op_uuid`) would bleed metadata across
+    /// the two files. The harness asserts Driven detects the reuse via the
+    /// op-uuid mismatch and treats the recycled id as foreign.
+    ///
+    /// Distinct from [`Self::with_trashed_visible_in_find_by_op_uuid`],
+    /// which only surfaces trashed children in `find_by_op_uuid` and does
+    /// NOT actually reuse ids.
+    pub fn with_fileid_recycle(self) -> Self {
+        self.faults.fileid_recycle.store(true, Ordering::Release);
+        self
+    }
 }

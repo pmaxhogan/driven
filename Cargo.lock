@@ -1091,11 +1091,19 @@ name = "driven-chaos"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
+ "driven-core",
+ "driven-crypto",
+ "driven-drive",
+ "driven-power",
+ "driven-test-fixtures",
  "serde",
  "serde_json",
+ "tempfile",
  "tokio",
  "tracing",
  "tracing-subscriber",
+ "uuid",
 ]
 
 [[package]]

@@ -13,9 +13,21 @@ name = "driven-chaos"
 path = "src/main.rs"
 
 [dependencies]
+# Headless core + seams. The harness boots the core directly (DESIGN s4.2
+# thick-core / thin-shell split); it does NOT depend on src-tauri.
+driven-core = { path = "../driven-core" }
+driven-drive = { path = "../driven-drive" }
+driven-crypto = { path = "../driven-crypto" }
+driven-power = { path = "../driven-power" }
+driven-test-fixtures = { path = "../driven-test-fixtures" }
+
 anyhow.workspace = true
+async-trait.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+uuid.workspace = true
+# Hermetic per-scenario StateRepo files live under a throwaway tempdir.
+tempfile = "3"

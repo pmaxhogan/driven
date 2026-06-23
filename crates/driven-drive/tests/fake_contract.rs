@@ -1117,3 +1117,61 @@ async fn fake_with_slow_responses_delays_each_call() {
         "expected >= ~40ms latency, got {elapsed:?}"
     );
 }
+
+#[tokio::test]
+async fn fake_with_fileid_recycle_reuses_trashed_id() {
+    // STRESS_HARNESS s3.7 `drive-fileid-recycled`: after a trash, the next
+    // create reuses the trashed object's file_id, and the op-uuid carried in
+    // app_properties is the ONLY thing that distinguishes the two files.
+    let store = InMemoryRemoteStore::new().with_fileid_recycle();
+    let root = store.root_id().to_string();
+
+    let first = store
+        .create(
+            &root,
+            "a.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"first")),
+            props(&[(CLIENT_OP_UUID_KEY, "op-1")]),
+        )
+        .await
+        .expect("first create");
+
+    store.trash(&first.id).await.expect("trash frees the id");
+
+    let second = store
+        .create(
+            &root,
+            "b.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"second")),
+            props(&[(CLIENT_OP_UUID_KEY, "op-2")]),
+        )
+        .await
+        .expect("second create reuses the recycled id");
+
+    // The recycled id is genuinely reused...
+    assert_eq!(
+        second.id, first.id,
+        "the second create must reuse the trashed file_id"
+    );
+    // ...but the content + op-uuid are the SECOND file's (no metadata bleed).
+    assert_eq!(second.name, "b.txt");
+    assert_eq!(
+        second
+            .app_properties
+            .get(CLIENT_OP_UUID_KEY)
+            .map(String::as_str),
+        Some("op-2")
+    );
+    let bytes = download_to_bytes(&store, &second.id).await;
+    assert_eq!(bytes, b"second");
+
+    // The original object is gone (recycled = emptied from trash).
+    let listing = store.list_folder(&root).await.expect("list root");
+    assert_eq!(
+        listing.iter().filter(|e| e.id == first.id).count(),
+        1,
+        "exactly one live object now holds the recycled id"
+    );
+}

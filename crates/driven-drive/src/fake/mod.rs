@@ -256,6 +256,12 @@ struct Inner {
     /// generous `Some(1 << 50)` limit (1 PiB) to keep tests realistic
     /// without becoming a quota-enforcement engine.
     about_limit: Option<u64>,
+    /// FIFO pool of `file_id`s freed by `trash()` while the
+    /// `fileid_recycle` fault is latched. The next `create` pops from the
+    /// front instead of minting a fresh UUID, reproducing genuine Drive
+    /// file_id recycling (STRESS_HARNESS s3.7 `drive-fileid-recycled`).
+    /// Empty (and unused) unless the fault is armed.
+    recycle_pool: std::collections::VecDeque<String>,
 }
 
 impl Inner {
@@ -267,6 +273,17 @@ impl Inner {
     fn tick(&mut self) -> i64 {
         self.now_ms = self.now_ms.saturating_add(1);
         self.now_ms
+    }
+
+    /// Allocate a `file_id` for a new FILE object. Pops a recycled id from
+    /// [`Inner::recycle_pool`] (FIFO) when the `fileid_recycle` fault has
+    /// queued one; otherwise mints a fresh UUID. Folders never recycle -
+    /// `ensure_folder` always mints fresh so the marker-folder identity
+    /// stays stable.
+    fn alloc_file_id(&mut self) -> String {
+        self.recycle_pool
+            .pop_front()
+            .unwrap_or_else(|| Uuid::new_v4().to_string())
     }
 
     fn children(&self, parent_id: &str) -> Vec<&FileEntry> {
@@ -370,6 +387,12 @@ pub(crate) struct Faults {
     /// Not actual Drive file_id recycling - that would need a separate
     /// id-pool flag and is out of M1 scope.
     pub(crate) trashed_visible_in_find: std::sync::atomic::AtomicBool,
+    /// When true, `trash()` pushes the trashed object's `file_id` into the
+    /// inner recycle pool and the next `create` (direct or resumable-commit)
+    /// pops it instead of minting a fresh UUID, modelling genuine Drive
+    /// file_id recycling (STRESS_HARNESS s3.7 `drive-fileid-recycled`). Set
+    /// by [`fault_injection::with_fileid_recycle`].
+    pub(crate) fileid_recycle: std::sync::atomic::AtomicBool,
 }
 
 impl Default for Faults {
@@ -388,6 +411,7 @@ impl Default for Faults {
             dest_folder_missing: AtomicBool::new(false),
             dest_folder_readonly: AtomicBool::new(false),
             trashed_visible_in_find: AtomicBool::new(false),
+            fileid_recycle: AtomicBool::new(false),
         }
     }
 }
@@ -418,6 +442,7 @@ impl InMemoryRemoteStore {
             now_ms: 0,
             bytes_stored: 0,
             about_limit: Some(1u64 << 50),
+            recycle_pool: std::collections::VecDeque::new(),
         };
         Self {
             inner: Arc::new(Mutex::new(inner)),
@@ -695,7 +720,9 @@ impl RemoteStore for InMemoryRemoteStore {
         let mut guard = self.inner.lock();
         // Parent must be an existing FOLDER (not a file, not missing).
         guard.ensure_folder_parent(parent_id)?;
-        let file_id = Uuid::new_v4().to_string();
+        // Reuse a recycled id if the fileid_recycle fault has queued one
+        // (STRESS_HARNESS s3.7); otherwise mint fresh.
+        let file_id = guard.alloc_file_id();
         let seq = guard.next_seq();
         let modified_time_ms = guard.tick();
         let mut entry = FileEntry {
@@ -920,7 +947,8 @@ impl RemoteStore for InMemoryRemoteStore {
                         "fake: parent folder {parent_id} missing or not a folder mid-upload"
                     );
                 }
-                let file_id = Uuid::new_v4().to_string();
+                // Reuse a recycled id if armed (STRESS_HARNESS s3.7).
+                let file_id = guard.alloc_file_id();
                 let seq = guard.next_seq();
                 let modified_time_ms = guard.tick();
                 let mut entry = FileEntry {
@@ -970,7 +998,33 @@ impl RemoteStore for InMemoryRemoteStore {
 
     async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
         self.check_request_faults(RequestKind::WriteTarget).await?;
+        // When file_id recycling is armed, a trash REMOVES the object (as if
+        // the user emptied it from trash) and queues its id for reuse by the
+        // next `create`, reproducing genuine Drive id recycling
+        // (STRESS_HARNESS s3.7 `drive-fileid-recycled`). Otherwise trash is
+        // the normal soft-delete: flip the `trashed` flag in place.
+        let recycle = self.faults.fileid_recycle.load(Ordering::Acquire);
         let mut guard = self.inner.lock();
+        if recycle {
+            let freed = match guard.objects.remove(file_id) {
+                Some(entry) => {
+                    let was = if entry.trashed {
+                        0
+                    } else {
+                        entry.bytes.len() as u64
+                    };
+                    // Only files recycle their id (folders never recycle).
+                    if !entry.is_folder() {
+                        guard.recycle_pool.push_back(entry.file_id);
+                    }
+                    was
+                }
+                // 404 is treated as success (SPEC s3 `trash`).
+                None => 0,
+            };
+            guard.bytes_stored = guard.bytes_stored.saturating_sub(freed);
+            return Ok(());
+        }
         let freed = match guard.objects.get_mut(file_id) {
             // Idempotent: trashing an already-trashed file succeeds.
             Some(entry) => {
