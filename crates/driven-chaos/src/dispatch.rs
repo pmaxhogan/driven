@@ -22,7 +22,9 @@
 
 use crate::capabilities::CapabilitySet;
 use crate::registry;
-use crate::reporting::ReportFormat;
+use crate::reporting::{ReportFormat, RunReport};
+use crate::runner;
+use crate::scenarios::mutator as mutator_scenarios;
 
 /// The parsed CLI command (STRESS_HARNESS s2.2).
 #[derive(Debug, Clone, PartialEq, Eq)]
@@ -116,6 +118,30 @@ pub fn parse(args: &[String]) -> anyhow::Result<Command> {
             Some("run-all") => Ok(Command::ScenarioRunAll),
             other => anyhow::bail!("unknown scenario subcommand: {other:?}"),
         },
+        // Top-level aliases for the `scenario` subcommands. The harness is
+        // hermetic by construction (each scenario boots its own tempdir-backed
+        // state + fake remote), so `--hermetic` is accepted and is a no-op -
+        // it documents intent and matches the CI / smoke invocation
+        // `driven-chaos run-all --hermetic`.
+        Some("list") => Ok(Command::ScenarioList),
+        Some("run") => {
+            let scenario = it
+                .next()
+                .ok_or_else(|| anyhow::anyhow!("run needs a <scenario>"))?;
+            Ok(Command::ScenarioRun {
+                scenario: scenario.to_string(),
+            })
+        }
+        Some("run-all") => {
+            // Accept and ignore a trailing `--hermetic` (the only mode there is).
+            for flag in it {
+                match flag {
+                    "--hermetic" => {}
+                    other => anyhow::bail!("unknown run-all flag: {other}"),
+                }
+            }
+            Ok(Command::ScenarioRunAll)
+        }
         Some("fuzz") => {
             let mut seed = None;
             let mut duration_secs = None;
@@ -215,14 +241,40 @@ pub mod exit_code {
     pub const HARNESS_ERROR: i32 = 2;
 }
 
+/// Where the most-recent run's report is persisted so the `report`
+/// subcommand can re-print it (STRESS_HARNESS s2.2 / s6.2).
+const LAST_RUN_JSON: &str = "target/chaos-runs/last-run.json";
+
+/// A default fuzz step budget for a CLI `fuzz` invocation with no
+/// `--duration`. The weekly soak (s7) drives a much larger budget via the
+/// `--duration` -> step-budget mapping below.
+const DEFAULT_FUZZ_STEPS: u64 = 200;
+
+/// Map a `--duration` in seconds onto a fuzz step budget. Each second of
+/// requested soak buys a fixed number of mutation steps; the run's wall-clock
+/// cap inside `run_fuzz` still bounds an over-long request.
+fn steps_for_duration(secs: u64) -> u64 {
+    secs.saturating_mul(50).max(DEFAULT_FUZZ_STEPS)
+}
+
+/// Persist a finished run so `report` can re-print it. Best-effort: a write
+/// failure must not flip an otherwise-green run red, so it only warns.
+fn persist_last_run(report: &RunReport) {
+    let json = report.render_json();
+    if let Some(parent) = std::path::Path::new(LAST_RUN_JSON).parent() {
+        if let Err(e) = std::fs::create_dir_all(parent) {
+            tracing::warn!("could not create chaos-runs dir: {e}");
+            return;
+        }
+    }
+    if let Err(e) = std::fs::write(LAST_RUN_JSON, json) {
+        tracing::warn!("could not persist last-run report: {e}");
+    }
+}
+
 /// Route a parsed [`Command`]. Returns the process exit code
-/// (STRESS_HARNESS s9).
-///
-/// The Phase-1 interface implements `scenario list` (registry-only) and the
-/// capability banner; the bodies that execute scenarios return a
-/// harness-error exit code with a clear "not yet implemented (M3.7 Phase-2)"
-/// message so a partial harness fails loudly rather than reporting a false
-/// green. Phase-2 replaces each placeholder with the real runner.
+/// (STRESS_HARNESS s9): 0 = all pass/skip, 1 = any fail, 2 = harness
+/// self-error.
 pub async fn run(command: Command, caps: &CapabilitySet) -> i32 {
     match command {
         Command::ScenarioList => {
@@ -237,11 +289,174 @@ pub async fn run(command: Command, caps: &CapabilitySet) -> i32 {
             }
             exit_code::OK
         }
-        other => {
-            eprintln!(
-                "driven-chaos: `{other:?}` not yet implemented (M3.7 Phase-2 fills the runner)"
-            );
-            exit_code::HARNESS_ERROR
+        Command::ScenarioRun { scenario } => {
+            let Some(s) = registry::find(&scenario) else {
+                eprintln!("driven-chaos: unknown scenario {scenario:?}");
+                return exit_code::HARNESS_ERROR;
+            };
+            let verdict = runner::run_one(s.as_ref(), caps).await;
+            let mut report = RunReport::default();
+            report.scenarios.push(crate::reporting::ScenarioReport {
+                scenario: s.name(),
+                verdict,
+            });
+            print!("{}", report.render_json());
+            print!("{}", report.render_human());
+            persist_last_run(&report);
+            if report.any_failed() {
+                exit_code::FAIL
+            } else {
+                exit_code::OK
+            }
+        }
+        Command::ScenarioRunAll => {
+            let report = runner::run_all(registry::registry(), caps).await;
+            print!("{}", report.render_json());
+            print!("{}", report.render_human());
+            persist_last_run(&report);
+            if report.any_failed() {
+                exit_code::FAIL
+            } else {
+                exit_code::OK
+            }
+        }
+        Command::Fuzz {
+            seed,
+            duration_secs,
+        } => {
+            let seed = seed.unwrap_or_else(|| {
+                std::time::SystemTime::now()
+                    .duration_since(std::time::UNIX_EPOCH)
+                    .map(|d| d.as_secs())
+                    .unwrap_or(0)
+            });
+            let steps = duration_secs
+                .map(steps_for_duration)
+                .unwrap_or(DEFAULT_FUZZ_STEPS);
+            println!("driven-chaos fuzz: seed={seed} steps={steps}");
+            match mutator_scenarios::run_fuzz(seed, steps).await {
+                Ok(report) => {
+                    if let Some(violation) = &report.violation {
+                        match mutator_scenarios::write_fuzz_failure(&report) {
+                            Ok(path) => eprintln!(
+                                "FUZZ FAIL seed={seed}: {violation} (replay log: {})",
+                                path.display()
+                            ),
+                            Err(e) => eprintln!(
+                                "FUZZ FAIL seed={seed}: {violation} (could not write replay log: {e})"
+                            ),
+                        }
+                        exit_code::FAIL
+                    } else {
+                        println!("FUZZ PASS seed={seed} steps={}", report.steps);
+                        exit_code::OK
+                    }
+                }
+                Err(e) => {
+                    eprintln!("driven-chaos: fuzz harness error: {e:#}");
+                    exit_code::HARNESS_ERROR
+                }
+            }
+        }
+        Command::Mutator { flavour, scenario } => {
+            let result = match flavour {
+                MutatorFlavour::Fs => mutator_scenarios::run_fs_mutator(&scenario).await,
+                MutatorFlavour::Drive => mutator_scenarios::run_drive_mutator(&scenario).await,
+            };
+            match result {
+                Ok(outcome) => {
+                    println!(
+                        "mutator {scenario}: {} object(s), hash_ok={}, notes={:?}",
+                        outcome.final_drive_object_count,
+                        outcome.final_hash_matches_local,
+                        outcome.notes
+                    );
+                    exit_code::OK
+                }
+                Err(e) => {
+                    eprintln!("driven-chaos: mutator error: {e:#}");
+                    exit_code::HARNESS_ERROR
+                }
+            }
+        }
+        Command::Report { format } => match std::fs::read_to_string(LAST_RUN_JSON) {
+            Ok(contents) => {
+                // The persisted form is already the JSON projection. For
+                // `--format json` echo it; for `human` we cannot re-derive the
+                // full human block from JSON alone, so point at the run.
+                match format {
+                    ReportFormat::Json => print!("{contents}"),
+                    ReportFormat::Human => {
+                        println!("last run report (JSON projection):\n{contents}");
+                    }
+                }
+                exit_code::OK
+            }
+            Err(e) => {
+                eprintln!(
+                    "driven-chaos: no persisted run at {LAST_RUN_JSON} ({e}); run `run-all` first"
+                );
+                exit_code::HARNESS_ERROR
+            }
+        },
+        Command::FixtureCreate { scenario } => {
+            let Some(s) = registry::find(&scenario) else {
+                eprintln!("driven-chaos: unknown scenario {scenario:?}");
+                return exit_code::HARNESS_ERROR;
+            };
+            let root = std::path::PathBuf::from("target/chaos-fixtures").join(s.name());
+            if let Err(e) = std::fs::create_dir_all(&root) {
+                eprintln!("driven-chaos: could not create fixture root: {e}");
+                return exit_code::HARNESS_ERROR;
+            }
+            let mut ctx = crate::scenario::ScenarioContext {
+                fixture_root: root.clone(),
+                cacheable: false,
+            };
+            match s.setup(&mut ctx).await {
+                Ok(()) => {
+                    println!("fixture for {scenario} materialised at {}", root.display());
+                    exit_code::OK
+                }
+                Err(e) => {
+                    eprintln!("driven-chaos: fixture create failed: {e:#}");
+                    exit_code::HARNESS_ERROR
+                }
+            }
+        }
+        Command::FixtureClean { scenario } => {
+            let root = std::path::PathBuf::from("target/chaos-fixtures").join(&scenario);
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => {
+                    println!("removed fixture {}", root.display());
+                    exit_code::OK
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("no fixture at {} (already clean)", root.display());
+                    exit_code::OK
+                }
+                Err(e) => {
+                    eprintln!("driven-chaos: fixture clean failed: {e}");
+                    exit_code::HARNESS_ERROR
+                }
+            }
+        }
+        Command::FixtureCleanAll => {
+            let root = std::path::PathBuf::from("target/chaos-fixtures");
+            match std::fs::remove_dir_all(&root) {
+                Ok(()) => {
+                    println!("removed all fixtures under {}", root.display());
+                    exit_code::OK
+                }
+                Err(e) if e.kind() == std::io::ErrorKind::NotFound => {
+                    println!("no fixtures to clean");
+                    exit_code::OK
+                }
+                Err(e) => {
+                    eprintln!("driven-chaos: fixture clean --all failed: {e}");
+                    exit_code::HARNESS_ERROR
+                }
+            }
         }
     }
 }

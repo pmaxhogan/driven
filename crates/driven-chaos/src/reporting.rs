@@ -93,4 +93,188 @@ impl RunReport {
     pub fn any_failed(&self) -> bool {
         self.scenarios.iter().any(|s| s.verdict.is_failure())
     }
+
+    /// Counts of `(pass, skip, fail, flaky, total)` for the human banner.
+    fn tallies(&self) -> (usize, usize, usize, usize) {
+        let mut pass = 0;
+        let mut skip = 0;
+        let mut fail = 0;
+        let mut flaky = 0;
+        for s in &self.scenarios {
+            match &s.verdict {
+                Verdict::Pass { .. } => pass += 1,
+                Verdict::Skipped { .. } => skip += 1,
+                Verdict::Fail { .. } => fail += 1,
+                Verdict::Flaky { eventual, .. } => {
+                    flaky += 1;
+                    if eventual.is_failure() {
+                        fail += 1;
+                    } else {
+                        pass += 1;
+                    }
+                }
+            }
+        }
+        (pass, skip, fail, flaky)
+    }
+
+    /// Render the report in the requested format (STRESS_HARNESS s6.2).
+    pub fn render(&self, format: ReportFormat) -> String {
+        match format {
+            ReportFormat::Json => self.render_json(),
+            ReportFormat::Human => self.render_human(),
+        }
+    }
+
+    /// JSON, one object per scenario, newline-delimited (STRESS_HARNESS s6.2).
+    pub fn render_json(&self) -> String {
+        let mut out = String::new();
+        for s in &self.scenarios {
+            out.push_str(&serde_json::to_string(&s.to_json()).unwrap_or_else(|e| {
+                format!(
+                    "{{\"scenario\":\"{}\",\"render_error\":\"{e}\"}}",
+                    s.scenario
+                )
+            }));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// The collapsed human summary (STRESS_HARNESS s6.2): a count banner, the
+    /// SKIPPED list with reasons, then a detail block per FAIL.
+    pub fn render_human(&self) -> String {
+        let (pass, skip, fail, flaky) = self.tallies();
+        let total = self.scenarios.len();
+        let mut out = String::new();
+        out.push_str(&format!(
+            "\n {pass} PASS    {skip} SKIP    {fail} FAIL    {flaky} FLAKY    of {total} total\n"
+        ));
+
+        let skipped: Vec<&ScenarioReport> = self
+            .scenarios
+            .iter()
+            .filter(|s| matches!(s.verdict, Verdict::Skipped { .. }))
+            .collect();
+        if !skipped.is_empty() {
+            out.push_str(&format!("\n SKIPPED ({}):\n", skipped.len()));
+            for s in skipped {
+                if let Verdict::Skipped {
+                    missing_capabilities,
+                } = &s.verdict
+                {
+                    out.push_str(&format!(
+                        "   {:<34} (missing: {})\n",
+                        s.scenario,
+                        missing_capabilities.join(", ")
+                    ));
+                }
+            }
+        }
+
+        let failed: Vec<&ScenarioReport> = self
+            .scenarios
+            .iter()
+            .filter(|s| s.verdict.is_failure())
+            .collect();
+        if !failed.is_empty() {
+            out.push_str(&format!("\n FAILED ({}):\n", failed.len()));
+            for s in failed {
+                if let Verdict::Fail { diff, .. } = unwrap_eventual(&s.verdict) {
+                    out.push_str(&format!("   {}\n     {diff}\n", s.scenario));
+                }
+            }
+        }
+        out
+    }
+}
+
+/// Peel a `Flaky` wrapper down to its eventual verdict for rendering.
+fn unwrap_eventual(v: &Verdict) -> &Verdict {
+    match v {
+        Verdict::Flaky { eventual, .. } => unwrap_eventual(eventual),
+        other => other,
+    }
+}
+
+/// A render-friendly, serializable view of one scenario's verdict
+/// (STRESS_HARNESS s6.2). The Phase-1 [`Verdict`] / [`Outcome`] types stay
+/// non-`Serialize` (the canonical surface); this is the JSON projection.
+#[derive(serde::Serialize)]
+struct ScenarioJson {
+    scenario: &'static str,
+    verdict: &'static str,
+    duration_ms: u64,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    missing_capabilities: Vec<String>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    observed: Option<ObservedJson>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    diff: Option<String>,
+}
+
+#[derive(serde::Serialize)]
+struct ObservedJson {
+    error_codes_seen: Vec<String>,
+    final_drive_object_count: u64,
+    final_hash_matches_local: bool,
+    #[serde(skip_serializing_if = "Vec::is_empty")]
+    notes: Vec<String>,
+}
+
+impl ScenarioReport {
+    fn to_json(&self) -> ScenarioJson {
+        let observed_json = |o: &Outcome| ObservedJson {
+            error_codes_seen: o
+                .error_codes_seen
+                .iter()
+                .map(|c| c.code().to_string())
+                .collect(),
+            final_drive_object_count: o.final_drive_object_count,
+            final_hash_matches_local: o.final_hash_matches_local,
+            notes: o.notes.clone(),
+        };
+        match unwrap_eventual(&self.verdict) {
+            Verdict::Pass { duration } => ScenarioJson {
+                scenario: self.scenario,
+                verdict: "pass",
+                duration_ms: duration.as_millis() as u64,
+                missing_capabilities: vec![],
+                observed: None,
+                diff: None,
+            },
+            Verdict::Skipped {
+                missing_capabilities,
+            } => ScenarioJson {
+                scenario: self.scenario,
+                verdict: "skipped",
+                duration_ms: 0,
+                missing_capabilities: missing_capabilities.clone(),
+                observed: None,
+                diff: None,
+            },
+            Verdict::Fail {
+                duration,
+                observed_outcome,
+                diff,
+                ..
+            } => ScenarioJson {
+                scenario: self.scenario,
+                verdict: "fail",
+                duration_ms: duration.as_millis() as u64,
+                missing_capabilities: vec![],
+                observed: Some(observed_json(observed_outcome)),
+                diff: Some(diff.clone()),
+            },
+            // unwrap_eventual guarantees we never see Flaky here.
+            Verdict::Flaky { .. } => ScenarioJson {
+                scenario: self.scenario,
+                verdict: "flaky",
+                duration_ms: 0,
+                missing_capabilities: vec![],
+                observed: None,
+                diff: None,
+            },
+        }
+    }
 }

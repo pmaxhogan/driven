@@ -184,21 +184,31 @@ impl DrivenHandleBuilder {
         let state: Arc<SqliteStateRepo> =
             Arc::new(SqliteStateRepo::open(&self.state_db_path).await?);
 
-        // Seed an account on a fresh DB. A reopened (crash-recovery) DB
-        // already has its account; `upsert_account` is idempotent so this
-        // is safe either way.
-        let account_id = AccountId::new_v4();
-        state
-            .upsert_account(&AccountRow {
-                id: account_id,
-                email: "chaos@example.com".into(),
-                display_name: None,
-                state: AccountState::Ok,
-                encryption_master_key_id: None,
-                created_at: 0,
-                last_synced_at: None,
-            })
-            .await?;
+        // Adopt the existing account on a reopened (crash-recovery) DB so the
+        // booted orchestrator drives the SAME account the pre-crash run did;
+        // only seed a fresh account when the DB is brand new. Seeding a new
+        // random `account_id` unconditionally would leave the reopened
+        // orchestrator pointed at an empty account (no sources) and silently
+        // upload nothing - which is exactly what broke the kill-9 /
+        // pause-mid-resumable crash-recovery scenarios.
+        let account_id = match state.list_accounts().await?.into_iter().next() {
+            Some(existing) => existing.id,
+            None => {
+                let id = AccountId::new_v4();
+                state
+                    .upsert_account(&AccountRow {
+                        id,
+                        email: "chaos@example.com".into(),
+                        display_name: None,
+                        state: AccountState::Ok,
+                        encryption_master_key_id: None,
+                        created_at: 0,
+                        last_synced_at: None,
+                    })
+                    .await?;
+                id
+            }
+        };
 
         let remote: Arc<dyn RemoteStore> = self
             .remote

@@ -23,6 +23,11 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
     all.extend(scenarios::mutation::scenarios());
     all.extend(scenarios::drive_side::scenarios());
     all.extend(scenarios::concurrency::scenarios());
+    // s4 continuous-mutation soak / fuzz scenarios and s6.3 cross-scenario
+    // invariant scenarios are registered alongside the s3 catalogue so
+    // `scenario list` / `run` / `run-all` see them too.
+    all.extend(scenarios::mutator::scenarios());
+    all.extend(scenarios::reporting::scenarios());
     all
 }
 

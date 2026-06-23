@@ -25,5 +25,6 @@ pub mod handle;
 pub mod mutator;
 pub mod registry;
 pub mod reporting;
+pub mod runner;
 pub mod scenario;
 pub mod scenarios;
