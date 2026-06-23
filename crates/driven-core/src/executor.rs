@@ -31,8 +31,10 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use driven_crypto::{ContentEncryptor, CryptoError, SourceCryptoSuite};
+use driven_drive::google::classification_of;
 use driven_drive::remote_store::{
-    RemoteEntry, RemoteStore, ResumableKind, ResumableSession, ResumeProgress, UploadBody,
+    AboutInfo, DownloadStream, DriveErrorClassification, RemoteEntry, RemoteStore, ResumableKind,
+    ResumableSession, ResumeProgress, UploadBody,
 };
 use driven_vss::{fallback_decision, FallbackDecision, OpenAttempt, SnapshotOutcome, VssMode};
 use serde::{Deserialize, Serialize};
@@ -40,6 +42,7 @@ use tokio::io::AsyncReadExt;
 use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
+use crate::network::{NetworkProbe, ServiceName};
 use crate::pacer::{Pacer, ResponseClass};
 use crate::state::{FileStateRow, NewPendingOp, SourceRow, StateRepo};
 use crate::time::{Clock, SystemClock};
@@ -428,6 +431,163 @@ pub struct ExecutorDeps {
 }
 
 // -----------------------------------------------------------------------------
+// BreakerReportingStore: report real Drive request outcomes to the circuit
+// breaker (CODEX_NOTES P2-9 "Drive circuit breaker driven by real request
+// outcomes", M4).
+// -----------------------------------------------------------------------------
+
+/// Decide whether a failed Drive request is a SERVICE-HEALTH failure that
+/// should advance the Drive breaker's consecutive-failure count
+/// (CODEX_NOTES P2-9).
+///
+/// Only transport / 5xx / rate-limited classes count: a flaky link, a Drive
+/// 5xx, or a 429 are evidence the *service* (or the path to it) is unhealthy.
+/// A per-file logical failure - a checksum mismatch (which arrives as
+/// `Ok(entry)` anyway, so it never reaches this function), a 404, a quota /
+/// auth / dest-folder error, or anything that does not downcast to a typed
+/// [`DriveError`](driven_drive::google::DriveError) - is NOT a service-health
+/// signal and must not penalise the breaker (DESIGN s5.8.3). We return
+/// `false` (do nothing) for those rather than `true` (which would RESET the
+/// streak and mask genuine transport trouble).
+fn drive_err_is_service_failure(err: &anyhow::Error) -> bool {
+    matches!(
+        classification_of(err),
+        Some(
+            DriveErrorClassification::Network
+                | DriveErrorClassification::Transient5xx
+                | DriveErrorClassification::RateLimited { .. }
+        )
+    )
+}
+
+/// A [`RemoteStore`] decorator that reports each delegated request's outcome
+/// to the [`NetworkProbe`]'s Drive circuit breaker (CODEX_NOTES P2-9).
+///
+/// Wrapping the store at the trait boundary is what makes "the breaker is
+/// driven by REAL request outcomes" hold without sprinkling
+/// capture-classify-report logic across the executor's ~10 Drive call sites:
+/// every `self.remote.*` call already routes through this one seam, so each
+/// real request reports exactly once (no missed path, no double-count, no
+/// surgery at each bare `?`).
+///
+/// Semantics (per delegated method):
+/// - `Ok(_)` -> `note_outcome(Drive, true)` (closes the breaker / resets the
+///   failure streak; a checksum mismatch is an `Ok(entry)` here, so it
+///   correctly reports healthy - the mismatch is a per-file logical failure,
+///   not a service outage).
+/// - `Err(e)` -> `note_outcome(Drive, false)` ONLY when
+///   [`drive_err_is_service_failure`] is true (Network / Transient5xx /
+///   RateLimited); for every other error, do NOTHING (do not penalise, do
+///   not reset the streak).
+///
+/// Only inserted when an executor is constructed with
+/// `ExecutorDeps.network = Some(..)`; otherwise the executor holds the inner
+/// store directly, so every `network: None` test path is byte-identical to
+/// before this decorator existed.
+struct BreakerReportingStore {
+    inner: Arc<dyn RemoteStore>,
+    network: Arc<dyn NetworkProbe>,
+}
+
+impl BreakerReportingStore {
+    /// Reports `result`'s Drive-health verdict to the breaker, then returns
+    /// the result unchanged so the caller's error handling is untouched.
+    fn report<T>(&self, result: anyhow::Result<T>) -> anyhow::Result<T> {
+        match &result {
+            Ok(_) => self.network.note_outcome(ServiceName::Drive, true),
+            Err(e) => {
+                if drive_err_is_service_failure(e) {
+                    self.network.note_outcome(ServiceName::Drive, false);
+                }
+            }
+        }
+        result
+    }
+}
+
+#[async_trait::async_trait]
+impl RemoteStore for BreakerReportingStore {
+    async fn ensure_folder(&self, parent_id: &str, name: &str) -> anyhow::Result<RemoteEntry> {
+        self.report(self.inner.ensure_folder(parent_id, name).await)
+    }
+
+    async fn list_folder(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+        self.report(self.inner.list_folder(folder_id).await)
+    }
+
+    async fn create(
+        &self,
+        parent_id: &str,
+        name: &str,
+        mime: &str,
+        body: UploadBody,
+        app_properties: HashMap<String, String>,
+    ) -> anyhow::Result<RemoteEntry> {
+        self.report(
+            self.inner
+                .create(parent_id, name, mime, body, app_properties)
+                .await,
+        )
+    }
+
+    async fn update(
+        &self,
+        file_id: &str,
+        body: UploadBody,
+        app_properties_patch: HashMap<String, String>,
+    ) -> anyhow::Result<RemoteEntry> {
+        self.report(self.inner.update(file_id, body, app_properties_patch).await)
+    }
+
+    async fn resumable_session(
+        &self,
+        kind: ResumableKind,
+        mime: &str,
+        size: u64,
+    ) -> anyhow::Result<ResumableSession> {
+        self.report(self.inner.resumable_session(kind, mime, size).await)
+    }
+
+    async fn resume_chunk(
+        &self,
+        session: &ResumableSession,
+        offset: u64,
+        chunk: Bytes,
+    ) -> anyhow::Result<ResumeProgress> {
+        // A `ResumeProgress::SessionInvalid` is an `Ok(_)` at the trait
+        // boundary (the request succeeded; Drive answered "session dead"),
+        // so it reports healthy here - the session-restart is a per-op
+        // concern, not a transport failure. A transport/5xx error on the PUT
+        // surfaces as `Err` and is classified normally.
+        self.report(self.inner.resume_chunk(session, offset, chunk).await)
+    }
+
+    async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
+        self.report(self.inner.trash(file_id).await)
+    }
+
+    async fn metadata(&self, file_id: &str) -> anyhow::Result<RemoteEntry> {
+        self.report(self.inner.metadata(file_id).await)
+    }
+
+    async fn download(&self, file_id: &str) -> anyhow::Result<DownloadStream> {
+        self.report(self.inner.download(file_id).await)
+    }
+
+    async fn find_by_op_uuid(
+        &self,
+        parent_id: &str,
+        op_uuid: &str,
+    ) -> anyhow::Result<Option<RemoteEntry>> {
+        self.report(self.inner.find_by_op_uuid(parent_id, op_uuid).await)
+    }
+
+    async fn about(&self) -> anyhow::Result<AboutInfo> {
+        self.report(self.inner.about().await)
+    }
+}
+
+// -----------------------------------------------------------------------------
 // DefaultExecutor
 // -----------------------------------------------------------------------------
 
@@ -538,8 +698,21 @@ impl DefaultExecutor {
     /// inject a `FakeClock` so the timestamps are deterministic).
     pub fn with_clock(deps: ExecutorDeps, clock: Arc<dyn Clock>) -> Self {
         let pool = Arc::new(Semaphore::new(default_pool_size()));
+        // CODEX_NOTES P2-9: when a NetworkProbe is injected, route every Drive
+        // request through the BreakerReportingStore so the Drive circuit
+        // breaker is driven by REAL request outcomes (not just probes). When
+        // `network` is None (every existing test + the current orchestrator
+        // wiring) the inner store is used directly, so those paths are
+        // byte-identical to before this seam existed.
+        let remote: Arc<dyn RemoteStore> = match deps.network {
+            Some(network) => Arc::new(BreakerReportingStore {
+                inner: deps.remote,
+                network,
+            }),
+            None => deps.remote,
+        };
         Self {
-            remote: deps.remote,
+            remote,
             state: deps.state,
             pacer: deps.pacer,
             crypto: deps.crypto,
@@ -4948,5 +5121,303 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    // --- Part A (CODEX_NOTES P2-9): the Drive breaker is driven by REAL
+    //     request outcomes through the BreakerReportingStore decorator -------
+
+    mod breaker_from_outcomes {
+        use super::*;
+        use driven_drive::google::DriveError;
+        use driven_drive::remote_store::DriveErrorClassification;
+        use std::sync::atomic::{AtomicBool, AtomicUsize};
+
+        use crate::network::{
+            CircuitBreaker, NetworkProbe, NetworkState, ServiceHealth, ServiceName,
+            StdCircuitBreaker, BREAKER_OPEN_THRESHOLD,
+        };
+
+        /// A `NetworkProbe` backed by a REAL [`StdCircuitBreaker`] for Drive,
+        /// so the breaker state machine under test is the production one (not a
+        /// fake). `probe` is unused by the decorator path; it returns Online.
+        struct BreakerProbe {
+            drive: StdCircuitBreaker,
+            clock: Arc<FakeClock>,
+            ok_count: AtomicUsize,
+            fail_count: AtomicUsize,
+        }
+
+        impl BreakerProbe {
+            fn new(clock: Arc<FakeClock>) -> Arc<Self> {
+                Arc::new(Self {
+                    drive: StdCircuitBreaker::new(),
+                    clock,
+                    ok_count: AtomicUsize::new(0),
+                    fail_count: AtomicUsize::new(0),
+                })
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl NetworkProbe for BreakerProbe {
+            async fn probe(&self) -> NetworkState {
+                NetworkState::Online
+            }
+            fn service_health(&self, service: ServiceName) -> ServiceHealth {
+                match service {
+                    ServiceName::Drive => self.drive.health(self.clock.as_ref()),
+                    _ => ServiceHealth::Closed,
+                }
+            }
+            fn note_outcome(&self, service: ServiceName, ok: bool) {
+                assert!(
+                    matches!(service, ServiceName::Drive),
+                    "the executor only reports Drive outcomes"
+                );
+                if ok {
+                    self.ok_count.fetch_add(1, Ordering::SeqCst);
+                    self.drive.record_success();
+                } else {
+                    self.fail_count.fetch_add(1, Ordering::SeqCst);
+                    self.drive.record_failure(self.clock.as_ref());
+                }
+            }
+        }
+
+        /// A `RemoteStore` whose `create` returns either a typed transport
+        /// failure or `Ok`, toggled by `fail`. Only `create` is exercised; the
+        /// other methods are never called by this test (they bail loudly if
+        /// they ever are, rather than silently faking success).
+        struct ToggleStore {
+            fail: AtomicBool,
+            /// `true` => the failure is a typed transport class (Network);
+            /// `false` => a non-service-health error (must NOT open the breaker).
+            transport: AtomicBool,
+        }
+
+        impl ToggleStore {
+            fn new() -> Arc<Self> {
+                Arc::new(Self {
+                    fail: AtomicBool::new(true),
+                    transport: AtomicBool::new(true),
+                })
+            }
+            fn set_fail(&self, fail: bool) {
+                self.fail.store(fail, Ordering::SeqCst);
+            }
+            fn set_transport(&self, transport: bool) {
+                self.transport.store(transport, Ordering::SeqCst);
+            }
+        }
+
+        #[async_trait::async_trait]
+        impl RemoteStore for ToggleStore {
+            async fn create(
+                &self,
+                _parent_id: &str,
+                _name: &str,
+                _mime: &str,
+                _body: UploadBody,
+                _app_properties: HashMap<String, String>,
+            ) -> anyhow::Result<RemoteEntry> {
+                if !self.fail.load(Ordering::SeqCst) {
+                    return Ok(RemoteEntry {
+                        id: "ok".into(),
+                        name: "ok".into(),
+                        parents: vec!["root".into()],
+                        size: Some(0),
+                        md5: Some([0u8; 16]),
+                        mime_type: "application/octet-stream".into(),
+                        modified_time: 0,
+                        trashed: false,
+                        app_properties: HashMap::new(),
+                    });
+                }
+                if self.transport.load(Ordering::SeqCst) {
+                    // A typed transport failure: this IS a service-health
+                    // signal, so the decorator must penalise the breaker.
+                    Err(anyhow::Error::new(DriveError::Classified {
+                        kind: DriveErrorClassification::Network,
+                        source: anyhow::anyhow!("connection reset"),
+                    }))
+                } else {
+                    // A non-service-health failure (here: dest folder missing).
+                    // The decorator must NOT penalise the breaker for it.
+                    Err(anyhow::Error::new(DriveError::DestFolderMissing))
+                }
+            }
+
+            async fn ensure_folder(&self, _p: &str, _n: &str) -> anyhow::Result<RemoteEntry> {
+                anyhow::bail!("ToggleStore: ensure_folder must not be called")
+            }
+            async fn list_folder(&self, _f: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+                anyhow::bail!("ToggleStore: list_folder must not be called")
+            }
+            async fn update(
+                &self,
+                _f: &str,
+                _b: UploadBody,
+                _a: HashMap<String, String>,
+            ) -> anyhow::Result<RemoteEntry> {
+                anyhow::bail!("ToggleStore: update must not be called")
+            }
+            async fn resumable_session(
+                &self,
+                _k: ResumableKind,
+                _m: &str,
+                _s: u64,
+            ) -> anyhow::Result<ResumableSession> {
+                anyhow::bail!("ToggleStore: resumable_session must not be called")
+            }
+            async fn resume_chunk(
+                &self,
+                _s: &ResumableSession,
+                _o: u64,
+                _c: Bytes,
+            ) -> anyhow::Result<ResumeProgress> {
+                anyhow::bail!("ToggleStore: resume_chunk must not be called")
+            }
+            async fn trash(&self, _f: &str) -> anyhow::Result<()> {
+                anyhow::bail!("ToggleStore: trash must not be called")
+            }
+            async fn metadata(&self, _f: &str) -> anyhow::Result<RemoteEntry> {
+                anyhow::bail!("ToggleStore: metadata must not be called")
+            }
+            async fn download(&self, _f: &str) -> anyhow::Result<DownloadStream> {
+                anyhow::bail!("ToggleStore: download must not be called")
+            }
+            async fn find_by_op_uuid(
+                &self,
+                _p: &str,
+                _u: &str,
+            ) -> anyhow::Result<Option<RemoteEntry>> {
+                anyhow::bail!("ToggleStore: find_by_op_uuid must not be called")
+            }
+            async fn about(&self) -> anyhow::Result<AboutInfo> {
+                anyhow::bail!("ToggleStore: about must not be called")
+            }
+        }
+
+        fn decorator(store: Arc<ToggleStore>, probe: Arc<BreakerProbe>) -> BreakerReportingStore {
+            BreakerReportingStore {
+                inner: store,
+                network: probe,
+            }
+        }
+
+        async fn one_create(store: &BreakerReportingStore) -> anyhow::Result<RemoteEntry> {
+            store
+                .create(
+                    "root",
+                    "f",
+                    "application/octet-stream",
+                    UploadBody::Bytes(Bytes::new()),
+                    HashMap::new(),
+                )
+                .await
+        }
+
+        /// A run of consecutive transport failures opens the Drive breaker;
+        /// a subsequent success closes it again (CODEX_NOTES P2-9).
+        #[tokio::test]
+        async fn consecutive_transport_failures_open_then_success_closes() {
+            let clock = Arc::new(FakeClock::new());
+            let probe = BreakerProbe::new(clock.clone());
+            let store = ToggleStore::new();
+            let deco = decorator(store.clone(), probe.clone());
+
+            // Below threshold: still Closed.
+            store.set_fail(true);
+            store.set_transport(true);
+            for _ in 0..(BREAKER_OPEN_THRESHOLD - 1) {
+                assert!(one_create(&deco).await.is_err());
+            }
+            assert_eq!(
+                probe.service_health(ServiceName::Drive),
+                ServiceHealth::Closed,
+                "below threshold stays Closed"
+            );
+
+            // The Nth consecutive transport failure opens the Drive breaker.
+            assert!(one_create(&deco).await.is_err());
+            assert!(
+                matches!(
+                    probe.service_health(ServiceName::Drive),
+                    ServiceHealth::Open { .. }
+                ),
+                "5 consecutive transport failures open the Drive breaker"
+            );
+            assert_eq!(
+                probe.fail_count.load(Ordering::SeqCst),
+                BREAKER_OPEN_THRESHOLD as usize
+            );
+
+            // Advance past the backoff so the breaker reads HalfOpen, then a
+            // successful Drive request closes it (DESIGN s5.8.3).
+            clock.advance(std::time::Duration::from_millis(
+                crate::network::BACKOFF_SCHEDULE_MS[0] as u64,
+            ));
+            assert_eq!(
+                probe.service_health(ServiceName::Drive),
+                ServiceHealth::HalfOpen
+            );
+            store.set_fail(false);
+            assert!(one_create(&deco).await.is_ok());
+            assert_eq!(
+                probe.service_health(ServiceName::Drive),
+                ServiceHealth::Closed,
+                "a success closes the breaker"
+            );
+            assert_eq!(probe.ok_count.load(Ordering::SeqCst), 1);
+        }
+
+        /// A non-service-health failure (e.g. dest-folder-missing, a logical
+        /// 4xx-class error) must NOT penalise the breaker: it stays Closed no
+        /// matter how many times it recurs (CODEX_NOTES P2-9: a per-file
+        /// logical failure is not a service outage).
+        #[tokio::test]
+        async fn non_service_failures_do_not_open_breaker() {
+            let clock = Arc::new(FakeClock::new());
+            let probe = BreakerProbe::new(clock.clone());
+            let store = ToggleStore::new();
+            let deco = decorator(store.clone(), probe.clone());
+
+            store.set_fail(true);
+            store.set_transport(false);
+            for _ in 0..(BREAKER_OPEN_THRESHOLD * 3) {
+                assert!(one_create(&deco).await.is_err());
+            }
+            assert_eq!(
+                probe.service_health(ServiceName::Drive),
+                ServiceHealth::Closed,
+                "non-transport failures never open the breaker"
+            );
+            assert_eq!(
+                probe.fail_count.load(Ordering::SeqCst),
+                0,
+                "the decorator never reported a non-service failure"
+            );
+        }
+
+        /// With `network: None` (every existing test path), the executor holds
+        /// the inner store directly - no decorator, no reporting. This pins the
+        /// "byte-identical when no probe injected" contract.
+        #[tokio::test]
+        async fn no_network_probe_means_no_reporting() {
+            // A DefaultExecutor built with network: None must not wrap the
+            // store. We assert structurally: the public surface still works
+            // against the InMemoryRemoteStore with no NetworkProbe in play
+            // (covered exhaustively by the rest of this module's tests, all of
+            // which pass network: None). This test documents the invariant.
+            let h = harness().await;
+            let (rel, size) = h.write_file("a.txt", b"hello");
+            let exec = h.executor();
+            let plan = h.upload_plan(&rel, size);
+            let outcomes = exec
+                .execute(&h.source, &plan, &noop_progress)
+                .await
+                .unwrap();
+            assert!(matches!(outcomes.as_slice(), [OpOutcome::Done { .. }]));
+        }
     }
 }

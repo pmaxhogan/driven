@@ -631,19 +631,31 @@ impl SyncOrchestrator {
         let power = self.power.current().await;
 
         // Network reachability first (DESIGN s5.8): no point pausing for
-        // battery when we are simply offline - offline is the more actionable
-        // banner. A non-online probe maps to Offline (the network-resilience
-        // layer renders the finer captive/no-internet/DNS substates).
+        // battery when we are simply offline - the network banner is the more
+        // actionable one.
         //
-        // P1-5: `probe()` is now breaker-aware - it skips any service whose
-        // circuit breaker is Open (DESIGN s5.8.3), so this probe never hits a
-        // known-down Drive every tick. The probe-before-breaker ordering here
-        // is deliberate and unchanged: it keeps "whole network offline ->
-        // Pause(Offline)" distinct from "network up, Drive down -> Backoff"
-        // (the Drive breaker check below), preserving the DESIGN s5.7
-        // precedence offline > metered > battery > breaker.
-        if !power.network_reachable || self.network.probe().await != NetworkState::Online {
+        // P2-9 (CODEX_NOTES): preserve the DISTINCT non-online states end to
+        // end rather than collapsing them all to Offline. Each NetworkState the
+        // probe returns maps to its matching PauseReason (Offline / NoInternet /
+        // CaptivePortal / DnsFailed) so the tray can surface the captive-portal
+        // sign-in action, the DNS-broken hint, etc. (DESIGN s5.8.1, s5.8.6). The
+        // coarse `power.network_reachable == false` hint (DESIGN s5.7) still
+        // maps to Offline - it is the airplane-mode / no-interface signal and
+        // carries no finer classification.
+        //
+        // P1-5: `probe()` is breaker-aware - it skips any service whose circuit
+        // breaker is Open (DESIGN s5.8.3), so this probe never hits a known-down
+        // Drive every tick. The probe-before-breaker ordering is deliberate: it
+        // keeps "whole network not-online -> Pause(network reason)" distinct
+        // from "network up, Drive down -> Backoff" (the Drive breaker check
+        // below), preserving the DESIGN s5.7 precedence
+        // manual > network > metered > battery > breaker.
+        if !power.network_reachable {
             return GateDecision::Pause(PauseReason::Offline);
+        }
+        let net = self.network.probe().await;
+        if net != NetworkState::Online {
+            return GateDecision::Pause(pause_reason_for_network(net));
         }
 
         // Metered network (DESIGN s5.7): pause if configured.
@@ -1186,16 +1198,20 @@ impl SyncOrchestrator {
     /// elapsed (the clock has reached the [`ResumePlan::DeferUntil`] deadline).
     ///
     /// Re-probes the network (step 2) and, when the OS-connectivity probe is
-    /// green, runs a fresh [`TickSource::Wake`] cycle (steps 5-6). If still
-    /// offline it pauses rather than push work through a dead link.
+    /// green, runs a fresh [`TickSource::Wake`] cycle (steps 5-6). If the
+    /// re-probe is not Online it pauses rather than push work through a dead
+    /// link, PRESERVING the distinct non-online state (P2-9): a resume into a
+    /// captive portal / no-internet / DNS-broken link surfaces that specific
+    /// reason, not a flattened Offline.
     pub async fn complete_resume(&self) -> anyhow::Result<()> {
-        // Step 2: re-probe; do not proceed until connectivity is green.
-        if self.network.probe().await != NetworkState::Online {
-            tracing::info!(target: TARGET, account_id = %self.account_id, "resume: network not yet online; staying paused");
-            self.transition(OrchestratorState::Paused {
-                reason: PauseReason::Offline,
-            })
-            .await;
+        // Step 2: re-probe; do not proceed until connectivity is green. Map the
+        // observed state to its distinct PauseReason (DESIGN s5.8.1, s5.8.6) so
+        // a wake into a degraded link shows the actionable banner.
+        let net = self.network.probe().await;
+        if net != NetworkState::Online {
+            let reason = pause_reason_for_network(net);
+            tracing::info!(target: TARGET, account_id = %self.account_id, ?reason, "resume: network not yet online; staying paused");
+            self.transition(OrchestratorState::Paused { reason }).await;
             return Ok(());
         }
         // Steps 5-6: re-scan from scratch and resume normal ticks.
@@ -1251,6 +1267,26 @@ async fn power_recv_opt(
             result
         }
         None => std::future::pending().await,
+    }
+}
+
+/// Map a non-online [`NetworkState`] to the matching [`PauseReason`] so the
+/// orchestrator preserves the distinct network substates end to end instead
+/// of collapsing them to a single Offline banner (CODEX_NOTES P2-9; DESIGN
+/// s5.8.1 failure modes, s5.8.6 substates).
+///
+/// Called only after the caller has already established the probe is NOT
+/// [`NetworkState::Online`]; the `Online` arm is defensive (it never fires on
+/// the live path) and maps to [`PauseReason::Offline`] rather than inventing a
+/// non-pause reason - a pause caller must always get a pause reason.
+fn pause_reason_for_network(state: NetworkState) -> PauseReason {
+    match state {
+        NetworkState::Offline => PauseReason::Offline,
+        NetworkState::NoInternet => PauseReason::NoInternet,
+        NetworkState::CaptivePortal => PauseReason::CaptivePortal,
+        NetworkState::DnsFailed => PauseReason::DnsFailed,
+        // Unreachable on the live path (callers guard `!= Online`); keep total.
+        NetworkState::Online => PauseReason::Offline,
     }
 }
 
@@ -1837,6 +1873,14 @@ mod tests {
             Self {
                 state: StdMutex::new(NetworkState::Online),
                 drive_health: StdMutex::new(ServiceHealth::Open { retry_at }),
+            }
+        }
+        /// A fake whose `probe()` returns `state` and whose Drive breaker is
+        /// Closed (P2-9 distinct-state tests).
+        fn with_state(state: NetworkState) -> Self {
+            Self {
+                state: StdMutex::new(state),
+                drive_health: StdMutex::new(ServiceHealth::Closed),
             }
         }
     }
@@ -2798,6 +2842,81 @@ mod tests {
             0,
             "offline must not issue the remote reconcile (zero remote calls)"
         );
+    }
+
+    // --- Part B (CODEX_NOTES P2-9): distinct non-online states map to distinct
+    //     PauseReasons end to end - NOT collapsed to Offline -----------------
+
+    #[tokio::test]
+    async fn distinct_network_states_map_to_distinct_pause_reasons() {
+        // Each non-online NetworkState the probe returns must surface its own
+        // PauseReason through evaluate_gates (DESIGN s5.8.1, s5.8.6), so the
+        // tray can show the captive-portal sign-in action, the DNS hint, etc.
+        let cases = [
+            (NetworkState::Offline, PauseReason::Offline),
+            (NetworkState::NoInternet, PauseReason::NoInternet),
+            (NetworkState::CaptivePortal, PauseReason::CaptivePortal),
+            (NetworkState::DnsFailed, PauseReason::DnsFailed),
+        ];
+        for (state, expected) in cases {
+            let account = AccountId::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let src = source_in(account, dir.path());
+            let exec = Arc::new(RecordingExecutor::default());
+            let (orch, _clock) = build(
+                account,
+                vec![src],
+                exec.clone(),
+                power_on_ac(),
+                Arc::new(FakeNet::with_state(state)),
+                OrchestratorConfig::default(),
+            );
+
+            orch.run_cycle(TickSource::Scheduled).await.unwrap();
+            assert_eq!(
+                orch.state().await,
+                OrchestratorState::Paused { reason: expected },
+                "{state:?} must map to Paused{{{expected:?}}}, not a flattened Offline"
+            );
+            // Still zero remote calls on a closed network gate (P1-6).
+            assert_eq!(exec.executes.load(Ordering::SeqCst), 0);
+            assert_eq!(exec.reconciles.load(Ordering::SeqCst), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn resume_into_degraded_link_preserves_distinct_reason() {
+        // complete_resume (the other non-online mapping site) must ALSO surface
+        // the distinct reason, not Offline, when a wake lands on a captive
+        // portal / no-internet / DNS-broken link (P2-9).
+        let cases = [
+            (NetworkState::NoInternet, PauseReason::NoInternet),
+            (NetworkState::CaptivePortal, PauseReason::CaptivePortal),
+            (NetworkState::DnsFailed, PauseReason::DnsFailed),
+        ];
+        for (state, expected) in cases {
+            let account = AccountId::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let src = source_in(account, dir.path());
+            let exec = Arc::new(RecordingExecutor::default());
+            let (orch, _clock) = build(
+                account,
+                vec![src],
+                exec.clone(),
+                power_on_ac(),
+                Arc::new(FakeNet::with_state(state)),
+                OrchestratorConfig::default(),
+            );
+
+            orch.complete_resume().await.unwrap();
+            assert_eq!(
+                orch.state().await,
+                OrchestratorState::Paused { reason: expected },
+                "resume into {state:?} must surface {expected:?}, not Offline"
+            );
+            // A degraded re-probe must not push work through a dead link.
+            assert_eq!(exec.executes.load(Ordering::SeqCst), 0);
+        }
     }
 
     #[tokio::test]
