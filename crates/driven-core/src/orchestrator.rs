@@ -888,6 +888,14 @@ impl SyncOrchestrator {
         // (the executor's reconcile is entirely remote), so there is nothing to
         // run before the gate, but the seam is here for M4's local reconcile.
         self.transition(OrchestratorState::PowerCheck).await;
+
+        // P1-4 (M3.5 codex): release any orphaned VSS shadow copies an unclean
+        // shutdown stranded, once per process. This is a LOCAL operation (it
+        // issues no Drive call), so it MUST run BEFORE the gates - a start that
+        // is offline / paused / metered / on-battery must still sweep stale
+        // shadows, or a leaked snapshot survives until the next gates-open run.
+        self.cleanup_orphan_snapshots_once().await;
+
         match self.evaluate_gates().await {
             GateDecision::Pause(reason) => {
                 tracing::info!(target: TARGET, account_id = %self.account_id, ?reason, ?tick, "gate closed; pausing");
@@ -907,10 +915,6 @@ impl SyncOrchestrator {
         // first executing cycle.
         self.reconcile_once().await?;
 
-        // M3.5: release any orphaned VSS shadow copies an unclean shutdown
-        // stranded, once per process, before this cycle creates any new ones.
-        self.cleanup_orphan_snapshots_once().await;
-
         // Run every enabled source, then ALWAYS release this cycle's VSS
         // snapshots (RAII via `end_cycle`) - even when a source errored
         // mid-loop. The cycle owns the snapshot lifecycle (ROADMAP M3.5): one
@@ -923,6 +927,12 @@ impl SyncOrchestrator {
             for source in &sources {
                 let deep_verify = self.deep_verify_due(source);
                 self.run_one_source(source, deep_verify).await?;
+                // P1-2 (M3.5 codex): durably record any shadow copy this source
+                // just created BEFORE moving to the next source, so a crash
+                // strands at most one source's snapshot rather than every
+                // snapshot created so far this cycle. `record_vss_orphans` is a
+                // no-op when no provider is attached or none are held.
+                self.record_vss_orphans().await;
             }
             Ok(())
         }
@@ -1266,6 +1276,13 @@ impl Orchestrator for SyncOrchestrator {
     }
 
     async fn reconfigure(&self, config: OrchestratorConfig) {
+        // P1-5 (M3.5 codex): thread the (possibly changed) VSS mode to the
+        // attached provider so `vss_mode = never` actually disables snapshots
+        // and `always` actually forces them - the setting was previously inert
+        // because the provider froze its mode at construction.
+        if let Some(vss) = self.vss.as_ref() {
+            vss.set_mode(config.vss_mode);
+        }
         *self.config.write().await = config;
     }
 }
@@ -1951,6 +1968,52 @@ mod tests {
                 reg.snapshots
             );
         }
+    }
+
+    /// P1-2 (M3.5 codex): orphans are recorded PER SOURCE inside the loop, not
+    /// only once after it, so a crash strands at most one source's just-created
+    /// snapshot. Observable via `recorded_snapshots` call count: with N sources
+    /// the orchestrator calls it once per source PLUS once after the loop =
+    /// N + 1 (before the fix it was called exactly once). Two sources here, so
+    /// the count must be 3.
+    #[tokio::test]
+    async fn vss_records_orphans_per_source_not_only_after_loop() {
+        let account = AccountId::new_v4();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        std::fs::write(dir_a.path().join("a.txt"), b"a").unwrap();
+        std::fs::write(dir_b.path().join("b.txt"), b"b").unwrap();
+        let sources = vec![
+            source_in(account, dir_a.path()),
+            source_in(account, dir_b.path()),
+        ];
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = Arc::new(FakeState::with_sources(sources));
+        let clock = Arc::new(FakeClock::new());
+        let power = Arc::new(FakePowerSource::new(power_on_ac()));
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec,
+            power,
+            Arc::new(FakeNet::online()),
+            clock,
+            OrchestratorConfig::default(),
+        );
+        let recorded = vec![driven_vss::RecordedSnapshot {
+            snapshot_id: "{deadbeef-0000-0000-0000-000000000002}".to_string(),
+            created_at_ms: 0,
+        }];
+        let vss = Arc::new(driven_vss::FakeVssProvider::unavailable().with_recorded(recorded));
+        let orch = orch.with_vss(vss.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        assert_eq!(
+            vss.recorded_calls(),
+            3,
+            "two sources must record orphans per-source (2) plus once after the loop (1)"
+        );
     }
 
     /// Startup orphan cleanup releases recorded shadows older than the 1h

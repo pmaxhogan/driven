@@ -209,32 +209,62 @@ impl Drop for ComApartment {
     }
 }
 
+/// A message to the snapshot's dedicated COM worker thread.
+///
+/// Only `Stop` exists: `map_path` is pure string math over cached data and
+/// never touches COM, so it needs no round-trip. The worker also releases on
+/// channel DISCONNECT (all senders dropped), so an explicit `Stop` is belt-and
+/// -braces - either path drives `BackupComplete` + release on the CREATING
+/// thread.
+enum VssCommand {
+    /// Run `BackupComplete` + release the components object, then exit.
+    Stop,
+}
+
 /// An RAII handle around one Volume Shadow Copy (DESIGN s5.3).
 ///
 /// Created by [`VssSnapshot::create`]; reading a locked file goes through
-/// [`VssSnapshot::map_path`]. [`Drop`] runs `BackupComplete` and releases the
-/// `IVssBackupComponents`; under the `VSS_CTX_BACKUP` context the shadow copy
-/// auto-releases, and the recorded GUID lets a later run delete a leak.
+/// [`VssSnapshot::map_path`]. [`Drop`] signals the worker thread to run
+/// `BackupComplete` and release the `IVssBackupComponents`; under the
+/// `VSS_CTX_BACKUP` context the shadow copy auto-releases, and the recorded
+/// GUID lets a later run delete a leak.
+///
+/// # COM thread affinity (P1-1)
+///
+/// `IVssBackupComponents` and its `ComApartment` (`CoInitializeEx`) are
+/// single-threaded-affine: they MUST be created, used, and released on ONE
+/// thread. The orchestrator owns the provider behind an `Arc` shared across
+/// Tokio worker threads, and `Drop` can run on a DIFFERENT worker than
+/// `create` did - so the COM object can NEVER live directly in this handle.
+/// Instead a dedicated [`std::thread`] owns the components object for its whole
+/// lifetime: it creates the snapshot, then idles until this handle drops (or
+/// the channel disconnects), at which point it releases - always on its own
+/// thread. This handle holds only naturally-`Send` plain data (the channel
+/// sender, the join handle, and the cached device root / GUID / volume label),
+/// so it is `Send` WITHOUT any `unsafe impl Send` - the COM object is never
+/// moved across threads.
 pub struct VssSnapshot {
-    /// The live backup-components COM object. `Some` until dropped.
-    components: Option<IVssBackupComponents>,
-    /// The shadow-copy GUID (`VSS_SNAPSHOT_PROP::m_SnapshotId`).
+    /// Sends [`VssCommand`] to the worker; dropping it disconnects the channel
+    /// and triggers release.
+    tx: Option<std::sync::mpsc::Sender<VssCommand>>,
+    /// The worker thread that owns the COM object; joined on drop so release
+    /// runs to completion on the creating thread.
+    worker: Option<std::thread::JoinHandle<()>>,
+    /// The shadow-copy GUID (`VSS_SNAPSHOT_PROP::m_SnapshotId`). Cached plain
+    /// data - reading it never touches the COM object.
     snapshot_id: GUID,
-    /// `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN` device root.
+    /// `\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopyN` device root. Cached
+    /// plain data; `map_path` is pure string math over it.
     device_root: String,
     /// The original volume label (`C:`) this snapshot covers, used to map a
     /// live path to its snapshot-relative remainder.
     volume_label: String,
-    /// Keeps COM initialised for the lifetime of the components object.
-    _com: ComApartment,
 }
 
-// The COM object is single-threaded-affine in general, but our usage pins one
-// VssSnapshot to one volume and access is serialised behind the provider's
-// Mutex. We mark it Send so the provider cache (Mutex<HashMap<.., VssSnapshot>>)
-// can live behind an Arc shared across the executor's tasks; all real method
-// calls happen under the provider lock, never concurrently.
-unsafe impl Send for VssSnapshot {}
+// No `unsafe impl Send`: every field is already `Send` (an mpsc `Sender`, a
+// `JoinHandle`, a `GUID`, and two `String`s). The COM object lives only on the
+// worker thread and is never named by this handle, so thread affinity is
+// structurally enforced rather than asserted.
 
 impl VssSnapshot {
     /// Create a shadow copy of the volume named by `volume_letter` (`"C:"` or
@@ -248,94 +278,45 @@ impl VssSnapshot {
         // VSS wants the volume as a mount point with a trailing backslash.
         let volume_mount = format!("{volume_label}\\");
 
-        let com = ComApartment::enter();
-        let components = create_backup_components()?;
+        // P1-1: the ENTIRE COM lifecycle (CoInitializeEx, create, and the
+        // matching release) must happen on ONE thread. Spawn a dedicated worker
+        // that owns the apartment + components object, runs the create sequence,
+        // reports the result back, then idles until this handle drops (or the
+        // command channel disconnects) and releases - all on the same thread.
+        let (cmd_tx, cmd_rx) = std::sync::mpsc::channel::<VssCommand>();
+        let (ready_tx, ready_rx) = std::sync::mpsc::channel::<Result<(GUID, String), VssError>>();
 
-        // SAFETY: every call below dispatches a real vtable slot on a live COM
-        // object we just created; pointers are stack locals valid for the call.
-        unsafe {
-            components
-                .InitializeForBackup(PCWSTR::null())
-                .ok()
-                .map_err(|e| com_err("InitializeForBackup", e))?;
+        let worker = std::thread::Builder::new()
+            .name("driven-vss".to_string())
+            .spawn(move || vss_worker_main(volume_mount, cmd_rx, ready_tx))
+            .map_err(|e| VssError::Init(format!("spawn VSS worker thread: {e}")))?;
 
-            components
-                .SetContext(VSS_CTX_BACKUP.0)
-                .ok()
-                .map_err(|e| com_err("SetContext", e))?;
+        // Block until the worker finishes the create sequence (success or
+        // failure). A disconnected channel means the worker panicked before
+        // reporting - treat as an init failure rather than hang.
+        let created = match ready_rx.recv() {
+            Ok(result) => result,
+            Err(_) => Err(VssError::Init(
+                "VSS worker thread exited before reporting".to_string(),
+            )),
+        };
 
-            components
-                .SetBackupState(false, false, VSS_BT_FULL, false)
-                .ok()
-                .map_err(|e| com_err("SetBackupState", e))?;
-
-            // GatherWriterMetadata is required before PrepareForBackup even for
-            // a writer-less volume snapshot.
-            gather_async(&components, "GatherWriterMetadata", |c, p| {
-                c.GatherWriterMetadata(p)
-            })?;
-
-            // StartSnapshotSet -> AddToSnapshotSet(volume) -> PrepareForBackup
-            // -> DoSnapshotSet.
-            let mut snapshot_set_id = GUID::zeroed();
-            components
-                .StartSnapshotSet(&mut snapshot_set_id)
-                .ok()
-                .map_err(|e| com_err("StartSnapshotSet", e))?;
-
-            let mut snapshot_id = GUID::zeroed();
-            let vol_wide = to_wide(&volume_mount);
-            components
-                .AddToSnapshotSet(
-                    PCWSTR(vol_wide.as_ptr()),
-                    // GUID_NULL = "let VSS pick the default provider".
-                    GUID::zeroed(),
-                    &mut snapshot_id,
-                )
-                .ok()
-                .map_err(|e| com_err("AddToSnapshotSet", e))?;
-
-            gather_async(&components, "PrepareForBackup", |c, p| {
-                c.PrepareForBackup(p)
-            })?;
-            gather_async(&components, "DoSnapshotSet", |c, p| c.DoSnapshotSet(p))?;
-
-            // Pull the device object path for the committed snapshot.
-            let mut prop = VSS_SNAPSHOT_PROP::default();
-            components
-                .GetSnapshotProperties(snapshot_id, &mut prop)
-                .ok()
-                .map_err(|e| com_err("GetSnapshotProperties", e))?;
-
-            let device_root = pwstr_to_string(prop.m_pwszSnapshotDeviceObject);
-            // Free the allocated string members. There is no projected
-            // `VssFreeSnapshotProperties`, so free the individual `CoTaskMem`
-            // strings VSS allocated (it uses the COM task allocator).
-            free_snapshot_prop_strings(&prop);
-
-            if device_root.is_empty() {
-                // No device path => unusable snapshot; release and degrade.
-                let snap = Self {
-                    components: Some(components),
-                    snapshot_id,
-                    device_root: String::new(),
-                    volume_label: volume_label.clone(),
-                    _com: com,
-                };
-                drop(snap);
-                return Err(VssError::Com {
-                    step: "GetSnapshotProperties",
-                    detail: "empty device object path".to_string(),
-                });
-            }
-
-            Ok(Self {
-                components: Some(components),
+        match created {
+            Ok((snapshot_id, device_root)) => Ok(Self {
+                tx: Some(cmd_tx),
+                worker: Some(worker),
                 snapshot_id,
                 device_root,
                 volume_label,
-                _com: com,
-            })
+            }),
+            Err(err) => {
+                // The worker already released on the failure path and is exiting;
+                // drop our sender (disconnect) and join so its apartment fully
+                // tears down before we return the error.
+                drop(cmd_tx);
+                let _ = worker.join();
+                Err(err)
+            }
         }
     }
 
@@ -436,23 +417,173 @@ impl VssSnapshot {
 
 impl Drop for VssSnapshot {
     fn drop(&mut self) {
-        if let Some(components) = self.components.take() {
-            // SAFETY: live components object; BackupComplete is an async op we
-            // wait on. Errors here are logged, never propagated (Drop).
-            unsafe {
-                if let Err(err) =
-                    gather_async(&components, "BackupComplete", |c, p| c.BackupComplete(p))
-                {
-                    tracing::warn!(%err, "VSS: BackupComplete during release failed");
-                }
+        // P1-1: the COM object lives on the worker thread. Signal it to release
+        // (it runs BackupComplete + drops the components object on ITS thread,
+        // honouring COM apartment affinity), then JOIN so release completes
+        // before this handle is gone. Sending may fail only if the worker
+        // already exited; dropping the sender below still disconnects the
+        // channel, which the worker also treats as Stop.
+        if let Some(tx) = self.tx.take() {
+            let _ = tx.send(VssCommand::Stop);
+            drop(tx);
+        }
+        if let Some(worker) = self.worker.take() {
+            if worker.join().is_err() {
+                tracing::warn!(
+                    snapshot = %guid_to_braced(&self.snapshot_id),
+                    "VSS: worker thread panicked during release"
+                );
+            } else {
+                tracing::debug!(
+                    snapshot = %guid_to_braced(&self.snapshot_id),
+                    "VSS: snapshot released"
+                );
             }
-            // Releasing the components object (and the VSS_CTX_BACKUP context's
-            // auto-release) drops the shadow copy. The explicit `drop` makes the
-            // ordering clear; `_com` (CoUninitialize) drops after.
-            drop(components);
-            tracing::debug!(snapshot = %guid_to_braced(&self.snapshot_id), "VSS: snapshot released");
         }
     }
+}
+
+/// The body of the dedicated VSS worker thread (P1-1). Owns the COM apartment
+/// and the `IVssBackupComponents` for its entire lifetime: it runs the create
+/// sequence, reports the `(snapshot_id, device_root)` (or the failure) back
+/// over `ready_tx`, and on success idles until a [`VssCommand::Stop`] (or the
+/// command channel disconnects) before running `BackupComplete` + releasing.
+/// Every COM call - create AND release - therefore runs on this one thread,
+/// which is the whole point of the restructure.
+fn vss_worker_main(
+    volume_mount: String,
+    cmd_rx: std::sync::mpsc::Receiver<VssCommand>,
+    ready_tx: std::sync::mpsc::Sender<Result<(GUID, String), VssError>>,
+) {
+    // The apartment is entered here and dropped when this function returns, so
+    // CoInitializeEx / CoUninitialize are balanced on this single thread.
+    let _com = ComApartment::enter();
+    let components = match create_backup_components() {
+        Ok(c) => c,
+        Err(err) => {
+            let _ = ready_tx.send(Err(err));
+            return;
+        }
+    };
+
+    match run_create_sequence(&components, &volume_mount) {
+        Ok((snapshot_id, device_root)) => {
+            // Report success FIRST so the caller can build its handle, then
+            // idle. If the caller already dropped its sender (the recv on the
+            // other side errored), `recv` below returns immediately and we
+            // release.
+            if ready_tx.send(Ok((snapshot_id, device_root))).is_err() {
+                // Caller is gone; fall through to release.
+            }
+            drop(ready_tx);
+            // Wait for Stop or channel disconnect; either drives release.
+            let _ = cmd_rx.recv();
+            release_components(components, &snapshot_id);
+        }
+        Err(err) => {
+            // Release the half-built components object on THIS thread before
+            // reporting the error (the caller will not get a handle).
+            release_components(components, &GUID::zeroed());
+            let _ = ready_tx.send(Err(err));
+        }
+    }
+}
+
+/// Run the DESIGN s5.3 create sequence on a live components object and return
+/// the committed `(snapshot_id, device_root)`. Runs entirely on the worker
+/// thread. Any COM failure maps to a [`VssError`] the caller degrades on.
+fn run_create_sequence(
+    components: &IVssBackupComponents,
+    volume_mount: &str,
+) -> Result<(GUID, String), VssError> {
+    // SAFETY: every call below dispatches a real vtable slot on a live COM
+    // object created on THIS thread; pointers are stack locals valid for the
+    // call.
+    unsafe {
+        components
+            .InitializeForBackup(PCWSTR::null())
+            .ok()
+            .map_err(|e| com_err("InitializeForBackup", e))?;
+
+        components
+            .SetContext(VSS_CTX_BACKUP.0)
+            .ok()
+            .map_err(|e| com_err("SetContext", e))?;
+
+        components
+            .SetBackupState(false, false, VSS_BT_FULL, false)
+            .ok()
+            .map_err(|e| com_err("SetBackupState", e))?;
+
+        // GatherWriterMetadata is required before PrepareForBackup even for a
+        // writer-less volume snapshot.
+        gather_async(components, "GatherWriterMetadata", |c, p| {
+            c.GatherWriterMetadata(p)
+        })?;
+
+        // StartSnapshotSet -> AddToSnapshotSet(volume) -> PrepareForBackup ->
+        // DoSnapshotSet.
+        let mut snapshot_set_id = GUID::zeroed();
+        components
+            .StartSnapshotSet(&mut snapshot_set_id)
+            .ok()
+            .map_err(|e| com_err("StartSnapshotSet", e))?;
+
+        let mut snapshot_id = GUID::zeroed();
+        let vol_wide = to_wide(volume_mount);
+        components
+            .AddToSnapshotSet(
+                PCWSTR(vol_wide.as_ptr()),
+                // GUID_NULL = "let VSS pick the default provider".
+                GUID::zeroed(),
+                &mut snapshot_id,
+            )
+            .ok()
+            .map_err(|e| com_err("AddToSnapshotSet", e))?;
+
+        gather_async(components, "PrepareForBackup", |c, p| c.PrepareForBackup(p))?;
+        gather_async(components, "DoSnapshotSet", |c, p| c.DoSnapshotSet(p))?;
+
+        // Pull the device object path for the committed snapshot.
+        let mut prop = VSS_SNAPSHOT_PROP::default();
+        components
+            .GetSnapshotProperties(snapshot_id, &mut prop)
+            .ok()
+            .map_err(|e| com_err("GetSnapshotProperties", e))?;
+
+        let device_root = pwstr_to_string(prop.m_pwszSnapshotDeviceObject);
+        // Free the allocated string members. There is no projected
+        // `VssFreeSnapshotProperties`, so free the individual `CoTaskMem`
+        // strings VSS allocated (it uses the COM task allocator).
+        free_snapshot_prop_strings(&prop);
+
+        if device_root.is_empty() {
+            return Err(VssError::Com {
+                step: "GetSnapshotProperties",
+                detail: "empty device object path".to_string(),
+            });
+        }
+
+        Ok((snapshot_id, device_root))
+    }
+}
+
+/// Release a components object on the worker thread: run `BackupComplete`
+/// (best-effort) then drop the object, which - under `VSS_CTX_BACKUP` -
+/// auto-releases the shadow copy. Errors are logged, never propagated (this is
+/// the release path).
+fn release_components(components: IVssBackupComponents, snapshot_id: &GUID) {
+    // SAFETY: live components object owned by this thread; BackupComplete is an
+    // async op we wait on.
+    unsafe {
+        if let Err(err) = gather_async(&components, "BackupComplete", |c, p| c.BackupComplete(p)) {
+            tracing::warn!(%err, "VSS: BackupComplete during release failed");
+        }
+    }
+    // Releasing the components object (and the VSS_CTX_BACKUP context's
+    // auto-release) drops the shadow copy.
+    drop(components);
+    let _ = snapshot_id;
 }
 
 // -----------------------------------------------------------------------------
@@ -684,13 +815,16 @@ mod tests {
 
     #[test]
     fn map_path_joins_remainder_under_device_root() {
-        // Build a snapshot by hand (no COM) to test pure path mapping.
+        // Build a snapshot by hand (no COM, no worker thread) to test pure path
+        // mapping. `tx`/`worker` are `None` so `Drop` is a no-op - map_path is
+        // pure string math over the cached device root + volume label and never
+        // touches the (absent) COM object.
         let snap = VssSnapshot {
-            components: None,
+            tx: None,
+            worker: None,
             snapshot_id: GUID::zeroed(),
             device_root: r"\\?\GLOBALROOT\Device\HarddiskVolumeShadowCopy1".to_string(),
             volume_label: "C:".to_string(),
-            _com: ComApartment { owned: false },
         };
         let mapped = snap
             .map_path(Path::new(r"C:\Users\me\Outlook.pst"))
@@ -701,8 +835,16 @@ mod tests {
         );
         // A path on a different volume errors.
         assert!(snap.map_path(Path::new(r"D:\other\f.txt")).is_err());
-        // Don't run Drop's BackupComplete on this synthetic (no components).
-        std::mem::forget(snap);
+    }
+
+    #[test]
+    fn vss_snapshot_handle_is_send() {
+        // P1-1 static guard: the handle is `Send` purely from its fields (mpsc
+        // Sender + JoinHandle + GUID + Strings), with NO `unsafe impl Send`. If
+        // a future change re-adds a `!Send` COM field directly to the handle,
+        // this fails to compile - the COM object must stay on the worker thread.
+        fn assert_send<T: Send>() {}
+        assert_send::<VssSnapshot>();
     }
 
     #[test]

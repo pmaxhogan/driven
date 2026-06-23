@@ -48,6 +48,14 @@ pub trait VssProvider: Send + Sync {
     /// at all before calling [`Self::map_for_volume`]).
     fn mode(&self) -> VssMode;
 
+    /// Apply a (possibly changed) mode for the next cycle. The orchestrator
+    /// calls this from `reconfigure` so a `vss_mode` setting change actually
+    /// takes effect instead of being frozen at provider construction. The
+    /// default is a no-op for providers whose mode is immutable.
+    fn set_mode(&self, mode: VssMode) {
+        let _ = mode;
+    }
+
     /// Whether VSS is fundamentally available this run (elevated + Windows).
     /// Cheap; the executor reads it to short-circuit the open path.
     fn available(&self) -> bool;
@@ -80,7 +88,9 @@ pub trait VssProvider: Send + Sync {
 /// unavailable and every `map_for_volume` returns `Unavailable`, so the
 /// executor degrades exactly as the no-VSS path does today.
 pub struct RealVssProvider {
-    mode: VssMode,
+    /// Interior-mutable so `reconfigure` can apply a changed `vss_mode` between
+    /// cycles (P1-5); read under the lock on every `mode`/`available` check.
+    mode: Mutex<VssMode>,
     elevated: bool,
     /// Per-cycle snapshot cache, keyed by uppercased volume label (`C:`).
     /// `Mutex` (not `RwLock`) because the check-then-create must be atomic so
@@ -115,21 +125,36 @@ impl RealVssProvider {
     pub fn new(mode: VssMode) -> Self {
         let elevated = crate::is_elevated();
         Self {
-            mode,
+            mode: Mutex::new(mode),
             elevated,
             inner: Mutex::new(ProviderInner::default()),
         }
     }
 
+    /// Read the current mode under the lock (recovering from poisoning).
+    fn current_mode(&self) -> VssMode {
+        match self.mode.lock() {
+            Ok(g) => *g,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
     /// `true` when VSS could actually run: a usable mode, elevated, on Windows.
     fn is_available(&self) -> bool {
-        cfg!(windows) && self.elevated && self.mode != VssMode::Never
+        cfg!(windows) && self.elevated && self.current_mode() != VssMode::Never
     }
 }
 
 impl VssProvider for RealVssProvider {
     fn mode(&self) -> VssMode {
-        self.mode
+        self.current_mode()
+    }
+
+    fn set_mode(&self, mode: VssMode) {
+        match self.mode.lock() {
+            Ok(mut g) => *g = mode,
+            Err(poisoned) => *poisoned.into_inner() = mode,
+        }
     }
 
     fn available(&self) -> bool {
@@ -258,8 +283,11 @@ fn volume_label(path: &Path) -> Option<String> {
 /// the degrade-gracefully contract (locked file -> skipped + reported) is the
 /// path under test on every OS, including CI.
 pub struct FakeVssProvider {
-    mode: VssMode,
-    available: bool,
+    /// Interior-mutable so a test can exercise the P1-5 `set_mode` seam and
+    /// assert that switching to [`VssMode::Never`] makes the provider report
+    /// unavailable.
+    mode: Mutex<VssMode>,
+    available: std::sync::atomic::AtomicBool,
     /// What `map_for_volume` returns. `None` => `Unavailable`; `Some(root)` =>
     /// `Mapped(root.join(<file name>))` so a test can assert a plausible
     /// mapped path.
@@ -270,6 +298,10 @@ pub struct FakeVssProvider {
     recorded: Vec<RecordedSnapshot>,
     end_cycle_calls: std::sync::atomic::AtomicUsize,
     map_calls: std::sync::atomic::AtomicUsize,
+    /// How many times `recorded_snapshots` was called, so a test can assert the
+    /// orchestrator records orphans PER SOURCE (P1-2), not only once after the
+    /// loop.
+    recorded_calls: std::sync::atomic::AtomicUsize,
 }
 
 impl FakeVssProvider {
@@ -277,12 +309,13 @@ impl FakeVssProvider {
     /// Mode defaults to [`VssMode::Auto`].
     pub fn unavailable() -> Self {
         Self {
-            mode: VssMode::Auto,
-            available: false,
+            mode: Mutex::new(VssMode::Auto),
+            available: std::sync::atomic::AtomicBool::new(false),
             mapped_root: None,
             recorded: Vec::new(),
             end_cycle_calls: std::sync::atomic::AtomicUsize::new(0),
             map_calls: std::sync::atomic::AtomicUsize::new(0),
+            recorded_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -291,12 +324,13 @@ impl FakeVssProvider {
     /// the `OpenSnapshot` branch without real COM.
     pub fn mapped_under(mode: VssMode, mapped_root: impl Into<std::path::PathBuf>) -> Self {
         Self {
-            mode,
-            available: true,
+            mode: Mutex::new(mode),
+            available: std::sync::atomic::AtomicBool::new(true),
             mapped_root: Some(mapped_root.into()),
             recorded: Vec::new(),
             end_cycle_calls: std::sync::atomic::AtomicUsize::new(0),
             map_calls: std::sync::atomic::AtomicUsize::new(0),
+            recorded_calls: std::sync::atomic::AtomicUsize::new(0),
         }
     }
 
@@ -304,7 +338,8 @@ impl FakeVssProvider {
     /// [`VssProvider::recorded_snapshots`] (for the orphan-registry test).
     pub fn with_recorded(mut self, recorded: Vec<RecordedSnapshot>) -> Self {
         self.recorded = recorded;
-        self.available = true;
+        self.available
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         self
     }
 
@@ -317,6 +352,13 @@ impl FakeVssProvider {
     /// How many times `map_for_volume` was called.
     pub fn map_calls(&self) -> usize {
         self.map_calls.load(std::sync::atomic::Ordering::SeqCst)
+    }
+
+    /// How many times `recorded_snapshots` was called (P1-2 per-source record
+    /// accounting).
+    pub fn recorded_calls(&self) -> usize {
+        self.recorded_calls
+            .load(std::sync::atomic::Ordering::SeqCst)
     }
 }
 
@@ -337,11 +379,24 @@ impl VssProvider for FakeVssProvider {
     }
 
     fn mode(&self) -> VssMode {
-        self.mode
+        match self.mode.lock() {
+            Ok(g) => *g,
+            Err(poisoned) => *poisoned.into_inner(),
+        }
+    }
+
+    fn set_mode(&self, mode: VssMode) {
+        match self.mode.lock() {
+            Ok(mut g) => *g = mode,
+            Err(poisoned) => *poisoned.into_inner() = mode,
+        }
     }
 
     fn available(&self) -> bool {
-        self.available
+        // Mirror the real provider: `never` is never available, regardless of
+        // the constructed `available` flag, so the P1-5 `set_mode(Never)` test
+        // observes the same short-circuit the executor relies on.
+        self.mode() != VssMode::Never && self.available.load(std::sync::atomic::Ordering::SeqCst)
     }
 
     fn end_cycle(&self) {
@@ -350,6 +405,8 @@ impl VssProvider for FakeVssProvider {
     }
 
     fn recorded_snapshots(&self) -> Vec<RecordedSnapshot> {
+        self.recorded_calls
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
         self.recorded.clone()
     }
 }
@@ -406,5 +463,35 @@ mod tests {
         let p = RealVssProvider::new(VssMode::Never);
         assert!(!p.available(), "never mode is never available");
         p.end_cycle();
+    }
+
+    #[test]
+    fn real_provider_set_mode_never_disables_and_back_restores() {
+        // P1-5: applying `never` via set_mode must make the provider report
+        // unavailable even when it was constructed in another mode; restoring
+        // a non-never mode lets `available` follow elevation/OS again.
+        let p = RealVssProvider::new(VssMode::Auto);
+        p.set_mode(VssMode::Never);
+        assert_eq!(p.mode(), VssMode::Never);
+        assert!(!p.available(), "set_mode(Never) must disable the provider");
+        p.set_mode(VssMode::Always);
+        assert_eq!(p.mode(), VssMode::Always);
+        // On a non-Windows / un-elevated runner this is still unavailable for
+        // OTHER reasons; the invariant we assert is only "never -> unavailable".
+        let _ = p.available();
+    }
+
+    #[test]
+    fn fake_provider_set_mode_never_reports_unavailable() {
+        // P1-5: the fake mirrors the real provider so an orchestrator test can
+        // drive `set_mode(Never) -> available() == false` without real COM.
+        let p = FakeVssProvider::mapped_under(VssMode::Always, "/snap/root");
+        assert!(p.available());
+        p.set_mode(VssMode::Never);
+        assert_eq!(p.mode(), VssMode::Never);
+        assert!(
+            !p.available(),
+            "set_mode(Never) on the fake must report unavailable"
+        );
     }
 }

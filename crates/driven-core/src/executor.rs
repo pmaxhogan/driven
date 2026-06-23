@@ -299,6 +299,13 @@ pub enum SkipReason {
     /// `FILE_SHARE_DELETE` (and the VSS fallback failed too)
     /// (`local.file_locked`).
     Locked,
+    /// The file is locked and VSS could not help because it is UNAVAILABLE -
+    /// the process is not elevated (or off Windows / `vss_mode = never`), so a
+    /// shadow copy was never attempted. Distinct from [`SkipReason::Locked`]
+    /// (where VSS WAS tried and still failed) so the user can tell "would back
+    /// up if Driven ran elevated" from "genuinely unreadable"
+    /// (`local.vss_unavailable`, SPEC s24).
+    VssUnavailable,
 }
 
 impl SkipReason {
@@ -311,6 +318,7 @@ impl SkipReason {
             }
             SkipReason::ChangedDuringUpload => ErrorCode::LocalFileChangedDuringUpload,
             SkipReason::Locked => ErrorCode::LocalFileLocked,
+            SkipReason::VssUnavailable => ErrorCode::LocalVssUnavailable,
         }
     }
 }
@@ -700,7 +708,22 @@ impl DefaultExecutor {
                     }
                 }
             }
-            FallbackDecision::SkipLocked => EffectiveOpen::Skip(SkipReason::Locked),
+            FallbackDecision::SkipLocked => {
+                // P2-6 (SPEC s24): distinguish "locked + VSS unavailable" from
+                // "locked + VSS tried and failed". `elevated` is the provider's
+                // `available()`; when VSS is unavailable (un-elevated / off
+                // Windows / `never`) a snapshot was never attempted for this
+                // locked file, so surface `local.vss_unavailable` ("would back
+                // up if Driven ran elevated"). When VSS WAS available but the
+                // snapshot/map still failed (`snapshot == Unavailable` despite
+                // elevation), it is a genuine `local.file_locked`.
+                let reason = if attempt == OpenAttempt::Locked && !elevated {
+                    SkipReason::VssUnavailable
+                } else {
+                    SkipReason::Locked
+                };
+                EffectiveOpen::Skip(reason)
+            }
         }
     }
 
@@ -912,7 +935,10 @@ impl DefaultExecutor {
         source: &SourceRow,
         relative_path: &RelativePath,
         read_path: &Path,
-        size: u64,
+        // The scanner's LIVE size, deliberately ignored below in favour of the
+        // EFFECTIVE (snapshot) size from `pre` (P1-3). Kept in the signature so
+        // the caller's plumbing is unchanged and the intent is explicit.
+        _scanner_size: u64,
         file: &mut tokio::fs::File,
         pre: FileIdentity,
         existing_file_id: Option<&str>,
@@ -926,6 +952,20 @@ impl DefaultExecutor {
         // VSS is off.
         let full_path = read_path.to_path_buf();
         let mime = "application/octet-stream";
+
+        // P1-3 (M3.5 codex): size ALL of the upload off the EFFECTIVE (snapshot)
+        // stat, not the scanner's live `size`. The scanner measured the LIVE
+        // file before the snapshot froze it; on a locked DB/PST that keeps
+        // changing, the coherent snapshot byte count can differ. Using the live
+        // size here would make the read-stage length check, the resumable /
+        // pipeline threshold decisions, the resume identity, and progress
+        // accounting all disagree with the bytes we actually read - tripping a
+        // spurious ChangedDuringUpload on exactly the file VSS exists to back
+        // up. `pre` is the lstat of `read_path` (the snapshot path when VSS is
+        // engaged, else the live path), so `pre.size` is the effective size.
+        // When VSS is off this equals the scanner's live size and behaviour is
+        // unchanged.
+        let size = pre.size;
 
         // --- P1-5: resolve the remote target (encrypted path when the source
         // is encrypted; flat plaintext name otherwise). This ensure_folders

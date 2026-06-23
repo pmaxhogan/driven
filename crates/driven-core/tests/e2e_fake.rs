@@ -1520,10 +1520,12 @@ async fn network_updater_down_does_not_block_sync() {
 /// ROADMAP M3.5 degrade acceptance: when VSS is UNAVAILABLE (the
 /// `FakeVssProvider::unavailable` stands in for not-elevated / `never` / off
 /// Windows), a genuinely locked file is SKIPPED and reported as
-/// `local.file_locked` in the activity log, while every other file in the same
-/// source still backs up. This is the historical degrade-gracefully contract,
-/// now asserted end-to-end through the real `DefaultExecutor` +
-/// `SyncOrchestrator` + `InMemoryRemoteStore`.
+/// `local.vss_unavailable` in the activity log (P2-6: distinct from
+/// `local.file_locked`, so the user can tell "would back up if Driven ran
+/// elevated" from "VSS tried and still failed"), while every other file in the
+/// same source still backs up. This is the degrade-gracefully contract, now
+/// asserted end-to-end through the real `DefaultExecutor` + `SyncOrchestrator`
+/// + `InMemoryRemoteStore`.
 ///
 /// `#[cfg(windows)]` because only Windows produces a real
 /// `ERROR_SHARING_VIOLATION` from an exclusive open - but it is NOT
@@ -1582,8 +1584,29 @@ async fn vss_unavailable_skips_locked_file_reports_and_continues() {
         "the unlocked file must still upload while the locked one is skipped"
     );
 
-    // A local.file_locked activity row was written for the skipped file.
+    // P2-6: a local.vss_unavailable activity row was written for the skipped
+    // file (VSS was unavailable, so a snapshot was never attempted), DISTINCT
+    // from local.file_locked (which would mean VSS was tried and still failed).
     let page = state
+        .query_activity(
+            ActivityFilter {
+                event_types: vec!["local.vss_unavailable".to_string()],
+                ..ActivityFilter::default()
+            },
+            PageRequest { page: 0, limit: 50 },
+        )
+        .await
+        .unwrap();
+    assert!(
+        page.rows
+            .iter()
+            .any(|r| r.event_type == "local.vss_unavailable"),
+        "the skipped locked file must surface a local.vss_unavailable activity row; got {:?}",
+        page.rows
+    );
+
+    // And it must NOT be mislabelled as local.file_locked.
+    let locked_page = state
         .query_activity(
             ActivityFilter {
                 event_types: vec!["local.file_locked".to_string()],
@@ -1594,14 +1617,93 @@ async fn vss_unavailable_skips_locked_file_reports_and_continues() {
         .await
         .unwrap();
     assert!(
-        page.rows
-            .iter()
-            .any(|r| r.event_type == "local.file_locked"),
-        "the skipped locked file must surface a local.file_locked activity row; got {:?}",
-        page.rows
+        locked_page.rows.is_empty(),
+        "an unavailable-VSS lock must not be reported as local.file_locked; got {:?}",
+        locked_page.rows
     );
 
     // The cycle completed (Idle), not stuck.
+    assert!(matches!(orch.state().await, OrchestratorState::Idle { .. }));
+}
+
+/// P1-3 (M3.5 codex): a coherent VSS snapshot read must size the upload off the
+/// FROZEN snapshot bytes, not the scanner's stale live size. The scanner
+/// records the live file's size; by the time the (paranoid `always`-mode)
+/// snapshot is read, the live file has a DIFFERENT size, but the snapshot copy
+/// is frozen at its own size. Before the fix the upload predicted the live
+/// length and the read-stage `read_total != size` check tripped a spurious
+/// `ChangedDuringUpload`, skipping exactly the locked-changing file VSS exists
+/// to back up. After the fix the upload uses the effective (snapshot) size, so
+/// the snapshot bytes upload cleanly and the stored object's size equals the
+/// snapshot's, NOT the live file's.
+///
+/// `#[cfg(windows)]` only because `orchestrator_with_vss` is Windows-gated;
+/// the size logic itself is OS-independent (the fake maps to a real directory).
+#[cfg(windows)]
+#[tokio::test]
+async fn vss_frozen_snapshot_uses_effective_size_no_false_changed() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let snap_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
+
+    // LIVE file the scanner measures (200 bytes). The SNAPSHOT copy is frozen
+    // at a DIFFERENT size (100 bytes) - the coherent point-in-time the shadow
+    // copy captured before the live file kept growing.
+    let live_bytes = vec![b'L'; 200];
+    let snap_bytes = vec![b'S'; 100];
+    write_file(src_dir.path(), "db.dat", &live_bytes);
+    write_file(snap_dir.path(), "db.dat", &snap_bytes);
+
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+
+    // Paranoid `always` mode routes EVERY read through the snapshot dir, so the
+    // executor reads the frozen 100-byte copy while the scanner recorded 200.
+    let vss: Arc<dyn driven_vss::VssProvider> = Arc::new(
+        driven_vss::FakeVssProvider::mapped_under(driven_vss::VssMode::Always, snap_dir.path()),
+    );
+    let config = OrchestratorConfig {
+        vss_mode: driven_vss::VssMode::Always,
+        ..OrchestratorConfig::default()
+    };
+    let orch = orchestrator_with_vss(
+        account,
+        state.clone(),
+        remote.clone(),
+        Arc::new(FakePowerSource::new(power_on_ac())),
+        Arc::new(FakeNetProbe::online()),
+        Arc::new(FakeClock::new()),
+        config,
+        vss,
+    );
+
+    orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+    // The file uploaded (no false ChangedDuringUpload skip) ...
+    let entries = remote.list_folder(&folder).await.unwrap();
+    let live: Vec<_> = entries.iter().filter(|e| !e.trashed).collect();
+    assert_eq!(
+        live.len(),
+        1,
+        "the frozen-snapshot file must upload, not be skipped as changed; got {live:?}"
+    );
+    // ... and the stored object is the SNAPSHOT's 100 bytes, proving the upload
+    // was sized off the effective (snapshot) stat, not the live 200.
+    assert_eq!(
+        live[0].size,
+        Some(snap_bytes.len() as u64),
+        "uploaded object must be the snapshot's effective size, not the live size"
+    );
+    assert_ne!(
+        live[0].size,
+        Some(live_bytes.len() as u64),
+        "uploaded object must NOT be the scanner's stale live size"
+    );
+
     assert!(matches!(orch.state().await, OrchestratorState::Idle { .. }));
 }
 
