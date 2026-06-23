@@ -140,6 +140,7 @@ fn executor_over(handle: &DrivenHandle, remote: Arc<InMemoryRemoteStore>) -> Def
             pacer: Arc::new(NoopPacer),
             crypto: None,
             vss: None,
+            network: None,
         },
         handle.clock.clone(),
     )

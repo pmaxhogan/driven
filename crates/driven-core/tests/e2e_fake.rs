@@ -183,6 +183,7 @@ fn orchestrator(
             pacer,
             crypto: None,
             vss: None,
+            network: None,
         },
         clock.clone(),
     ));
@@ -214,6 +215,7 @@ fn orchestrator_with_vss(
             pacer,
             crypto: None,
             vss: Some(vss.clone()),
+            network: None,
         },
         clock.clone(),
     ));
@@ -486,6 +488,7 @@ async fn rate_limit_on_seventh_file_retries_and_completes() {
             pacer,
             crypto: None,
             vss: None,
+            network: None,
         },
         clock.clone(),
     );
@@ -575,6 +578,7 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
             pacer: test_pacer(clock.clone()),
             crypto: None,
             vss: None,
+            network: None,
         },
         clock.clone(),
     );
@@ -635,6 +639,7 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
             pacer: test_pacer(clock.clone()),
             crypto: None,
             vss: None,
+            network: None,
         },
         clock.clone(),
     );
@@ -746,6 +751,7 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
             pacer: test_pacer(clock.clone()),
             crypto: None,
             vss: None,
+            network: None,
         },
         clock.clone(),
     );
@@ -813,6 +819,7 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
             pacer: test_pacer(clock.clone()),
             crypto: None,
             vss: None,
+            network: None,
         },
         clock.clone(),
     );
@@ -947,6 +954,7 @@ async fn reconcile_requeue_reuploads_changed_bytes_on_next_cycle() {
             pacer: test_pacer(clock.clone()),
             crypto: None,
             vss: None,
+            network: None,
         },
         clock.clone(),
     );
@@ -1071,6 +1079,7 @@ async fn parallel_uploads_no_corruption() {
             pacer: test_pacer(clock.clone()),
             crypto: None,
             vss: None,
+            network: None,
         },
         clock,
     );
@@ -1204,6 +1213,7 @@ async fn encryption_on_round_trip_bytes_match() {
             pacer: test_pacer(clock.clone()),
             crypto: Some(suite),
             vss: None,
+            network: None,
         },
         clock,
     );
@@ -1297,6 +1307,7 @@ async fn encryption_nested_remote_is_ciphertext_and_restores() {
             pacer: test_pacer(clock.clone()),
             crypto: Some(suite),
             vss: None,
+            network: None,
         },
         clock,
     );
@@ -1797,6 +1808,7 @@ async fn pipeline_streaming_keeps_memory_bounded() {
             pacer: test_pacer(clock.clone()),
             crypto: None,
             vss: None,
+            network: None,
         },
         clock,
     )

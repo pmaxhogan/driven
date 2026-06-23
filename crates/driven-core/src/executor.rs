@@ -416,6 +416,15 @@ pub struct ExecutorDeps {
     /// snapshot lifecycle and passes a CLONE of the same `Arc` here so the
     /// executor's open path can read a locked file from the shadow copy.
     pub vss: Option<Arc<dyn driven_vss::VssProvider>>,
+    /// The real-outcome reporter seam (CODEX_NOTES P2-9 "Drive circuit
+    /// breaker driven by real request outcomes", M4): the
+    /// [`NetworkProbe`](crate::network::NetworkProbe) the executor will call
+    /// `note_outcome(ServiceName::Drive, ok)` on after each real Drive request
+    /// so the breaker reacts to true request health, not just probes. `None`
+    /// disables outcome reporting (every test + the current orchestrator wiring
+    /// pass `None`; the call sites are agent P's body work, deliberately not
+    /// added yet).
+    pub network: Option<Arc<dyn crate::network::NetworkProbe>>,
 }
 
 // -----------------------------------------------------------------------------
@@ -3587,6 +3596,7 @@ mod tests {
                     pacer: self.pacer.clone(),
                     crypto,
                     vss: None,
+                    network: None,
                 },
                 self.clock.clone(),
             )
@@ -3601,6 +3611,7 @@ mod tests {
                     pacer: self.pacer.clone(),
                     crypto: None,
                     vss: Some(vss),
+                    network: None,
                 },
                 self.clock.clone(),
             )

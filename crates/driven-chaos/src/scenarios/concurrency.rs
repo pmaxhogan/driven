@@ -172,6 +172,7 @@ fn executor(
             pacer: Arc::new(NoopPacer),
             crypto: None,
             vss: None,
+            network: None,
         },
         clock,
     )

@@ -19,10 +19,23 @@ async-trait.workspace = true
 bytes.workspace = true
 futures.workspace = true
 uuid.workspace = true
+# M4 Google Drive client surface (the `google` module):
+# - oauth2 for the SPEC s4 PKCE loopback flow.
+# - keyring for the SPEC s4.1 refresh-token storage.
+# - reqwest for the Drive REST + resumable-upload traffic.
+# - url for building the Drive endpoints + the loopback redirect URI.
+# - hex for app_property / hash hex encoding.
+# - serde_json for the Drive JSON request/response shapes.
+oauth2.workspace = true
+keyring.workspace = true
+reqwest.workspace = true
+url.workspace = true
+hex.workspace = true
 # Direct deps (not yet in workspace.dependencies). parking_lot for an
 # await-free Mutex over the fake's in-memory state; md-5 for the
 # `RemoteEntry.md5` field the fake faithfully computes (and the
-# `with_md5_mismatch_after` fault injector tampers with).
+# `with_md5_mismatch_after` fault injector tampers with), and for the M4
+# Google store's md5-verify-on-upload (SPEC s8).
 parking_lot = "0.12"
 md-5 = "0.10"
 
@@ -37,3 +50,7 @@ bytes.workspace = true
 # to verify the fault injector returns a different value (and that
 # re-uploading clears the latch).
 md-5 = "0.10"
+# M4 token_store unit tests bind keyring to an in-memory mock store so they
+# do not touch a real OS keychain in CI (the implementer wires the mock via
+# keyring 4.x's test store API).
+keyring.workspace = true

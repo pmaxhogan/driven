@@ -313,6 +313,19 @@ pub enum PauseReason {
     /// A specific dependent service (Drive, OAuth, etc.) is down per the
     /// network-resilience probes (DESIGN s5.8).
     ServiceDown,
+    /// Connected to a network but the `generate_204` probe fails - no Internet
+    /// (DESIGN s5.8.1; SPEC s24 `net.no_internet`). Distinct from [`Offline`]
+    /// so the orchestrator preserves the non-online state end-to-end
+    /// (CODEX_NOTES P2-9, M4); additive per SPEC s24 (codes are add-only).
+    NoInternet,
+    /// A captive portal intercepted the connectivity probe; user action is
+    /// required (DESIGN s5.8.1; SPEC s24 `net.captive_portal`). Kept distinct
+    /// from [`Offline`] per CODEX_NOTES P2-9 (M4).
+    CaptivePortal,
+    /// The resolver returned no answer for a known-good domain (DESIGN s5.8.1
+    /// DNS broken; SPEC s24 `net.dns_failed`). Kept distinct from [`Offline`]
+    /// per CODEX_NOTES P2-9 (M4).
+    DnsFailed,
 }
 
 // -----------------------------------------------------------------------------

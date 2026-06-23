@@ -225,6 +225,7 @@ impl DrivenHandleBuilder {
                 pacer,
                 crypto: None,
                 vss: None,
+                network: None,
             },
             clock.clone(),
         ));

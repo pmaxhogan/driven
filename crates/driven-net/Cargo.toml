@@ -1,0 +1,26 @@
+[package]
+name = "driven-net"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven production network-probe Backend (reqwest + hickory) for the NetworkProbe topology"
+publish = false
+
+[dependencies]
+# The Backend / NetworkProbe / ProbeOutcome / ServiceName seam this crate
+# implements lives in driven-core::network (CODEX_NOTES P2-9: this is the
+# production "implementer crate" behind that seam).
+driven-core = { path = "../driven-core" }
+anyhow.workspace = true
+thiserror.workspace = true
+tracing.workspace = true
+tokio.workspace = true
+async-trait.workspace = true
+futures.workspace = true
+# The three-probe topology (DESIGN s5.8.2): an HTTP client for the
+# captive-portal / per-service probes + Drive traffic, and a DNS resolver for
+# the DNS re-resolution probe (DESIGN s5.8.1).
+reqwest.workspace = true
+hickory-resolver.workspace = true

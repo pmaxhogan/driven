@@ -1471,6 +1471,7 @@ async fn drive_executor_until_skip(
             pacer,
             crypto: None,
             vss: None,
+            network: None,
         },
         clock,
     );

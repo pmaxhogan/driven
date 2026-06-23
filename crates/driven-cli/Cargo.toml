@@ -1,0 +1,25 @@
+[package]
+name = "driven-cli"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven debugging CLI - auth / dump-refresh-token / sync without the GUI (ROADMAP M4)"
+publish = false
+
+[[bin]]
+name = "driven-cli"
+path = "src/main.rs"
+
+[dependencies]
+driven-core = { path = "../driven-core" }
+driven-drive = { path = "../driven-drive" }
+driven-net = { path = "../driven-net" }
+driven-crypto = { path = "../driven-crypto" }
+driven-power = { path = "../driven-power" }
+tokio.workspace = true
+anyhow.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+clap.workspace = true

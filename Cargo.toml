@@ -6,6 +6,8 @@ members = [
     "crates/driven-crypto",
     "crates/driven-power",
     "crates/driven-vss",
+    "crates/driven-net",
+    "crates/driven-cli",
     "crates/driven-test-fixtures",
     "crates/driven-chaos",
     "src-tauri",
@@ -62,6 +64,30 @@ zeroize = { version = "1", features = ["derive"] }
 # content encryptor and the executor's plaintext-path hasher both compute it
 # (the RustCrypto `md-5` crate, imported as `md_5`).
 md5 = { version = "0.10", package = "md-5" }
+# M4 Google OAuth (SPEC s4): PKCE loopback installed-app flow. oauth2 v5
+# declares its `reqwest` dep with default-features=false and gates TLS behind
+# its own feature flags, so `default-features=false` + the `reqwest` +
+# `rustls-tls` features bring in reqwest 0.12 with rustls ONLY - it never
+# pulls native-tls/openssl (SPEC s4: bring-your-own reqwest client, no
+# native-tls). The flow hands oauth2 our own redirect-disabled
+# `reqwest::Client` (SSRF defence per SPEC s4 / the oauth2 v5 upgrade notes).
+oauth2 = { version = "5", default-features = false, features = [
+    "reqwest",
+    "rustls-tls",
+] }
+# M4 OS keychain (SPEC s4.1): refresh tokens persist in the keychain only.
+# Promoted from driven-crypto's direct dep to a workspace dep so both crates
+# share one version; keyring 4.x's default `v1` feature bundles the per-OS
+# native stores.
+keyring = "4"
+# M4 URL building for the Drive REST endpoints + the loopback redirect URI
+# (SPEC s4).
+url = "2"
+# M4 base64url for PKCE / token plumbing and any binary-in-JSON Drive fields.
+base64 = "0.22"
+# M4 CLI surface (ROADMAP M4 acceptance: `cargo run --bin driven-cli auth`).
+# `derive` for the `#[derive(Parser)]` command tree.
+clap = { version = "4", features = ["derive", "env"] }
 
 [profile.dev]
 opt-level = 1
