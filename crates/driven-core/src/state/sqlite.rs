@@ -653,6 +653,111 @@ impl StateRepo for SqliteStateRepo {
         Ok(())
     }
 
+    async fn insert_source_with_optional_master_key_stamp(
+        &self,
+        source: &SourceRow,
+        stamp_master_key_id: Option<(AccountId, String)>,
+    ) -> Result<()> {
+        // R1-P1-1: do the (optional) account master-key stamp AND the source
+        // insert in ONE transaction so a source-insert failure cannot leave the
+        // account stamped-but-phraseless (an unrestorable encrypted backup).
+        let mut tx = self.pool.begin().await?;
+
+        if let Some((account_id, master_key_id)) = stamp_master_key_id.as_ref() {
+            let account_id = account_id.to_string();
+            // A targeted column update (not a full-row replace) so the stamp
+            // cannot clobber any other account column. Affecting zero rows means
+            // the account vanished mid-flight - roll back rather than insert a
+            // phantom-keyed orphan.
+            let affected = sqlx::query!(
+                "UPDATE accounts SET encryption_master_key_id = ?1 WHERE id = ?2",
+                master_key_id,
+                account_id,
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+            if affected == 0 {
+                // Dropping `tx` without commit rolls back automatically; be
+                // explicit for clarity.
+                tx.rollback().await?;
+                return Err(anyhow!(
+                    "account not found for master-key stamp; transaction rolled back"
+                ));
+            }
+        }
+
+        // Insert/replace the source row inside the same transaction.
+        let id = source.id.to_string();
+        let account_id = source.account_id.to_string();
+        let enabled = source.enabled as i64;
+        let encryption_enabled = source.encryption_enabled as i64;
+        let respect_gitignore = source.respect_gitignore as i64;
+        let include_patterns = serde_json::to_string(&source.include_patterns)?;
+        let exclude_patterns = serde_json::to_string(&source.exclude_patterns)?;
+        let wrapped: Option<&[u8]> = source.wrapped_source_key.as_deref();
+        let deep_verify_interval_secs = source.deep_verify_interval_secs as i64;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO backup_sources (
+                id, account_id, display_name, enabled,
+                local_path, drive_folder_id, drive_folder_path,
+                encryption_enabled, wrapped_source_key, respect_gitignore,
+                include_patterns, exclude_patterns, schedule_json_v2_reserved,
+                deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
+                created_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, ?6, ?7,
+                ?8, ?9, ?10,
+                ?11, ?12, ?13,
+                ?14, ?15, ?16,
+                ?17
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                account_id                = excluded.account_id,
+                display_name              = excluded.display_name,
+                enabled                   = excluded.enabled,
+                local_path                = excluded.local_path,
+                drive_folder_id           = excluded.drive_folder_id,
+                drive_folder_path         = excluded.drive_folder_path,
+                encryption_enabled        = excluded.encryption_enabled,
+                wrapped_source_key        = excluded.wrapped_source_key,
+                respect_gitignore         = excluded.respect_gitignore,
+                include_patterns          = excluded.include_patterns,
+                exclude_patterns          = excluded.exclude_patterns,
+                schedule_json_v2_reserved = excluded.schedule_json_v2_reserved,
+                deep_verify_interval_secs = excluded.deep_verify_interval_secs,
+                last_full_scan_at         = excluded.last_full_scan_at,
+                last_deep_verify_at       = excluded.last_deep_verify_at,
+                created_at                = excluded.created_at
+            "#,
+            id,
+            account_id,
+            source.display_name,
+            enabled,
+            source.local_path,
+            source.drive_folder_id,
+            source.drive_folder_path,
+            encryption_enabled,
+            wrapped,
+            respect_gitignore,
+            include_patterns,
+            exclude_patterns,
+            source.schedule_json_v2_reserved,
+            deep_verify_interval_secs,
+            source.last_full_scan_at,
+            source.last_deep_verify_at,
+            source.created_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn mark_source_scanned(
         &self,
         id: SourceId,
@@ -1578,6 +1683,113 @@ mod tests {
 
         repo.delete_source(src.id).await.unwrap();
         assert!(repo.list_sources().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn atomic_stamp_and_insert_commits_both_on_success() {
+        // R1-P1-1: the happy path stamps the account's master-key id AND inserts
+        // the source in one transaction; both land.
+        let (repo, _dir) = temp_repo().await;
+        let mut acct = sample_account();
+        acct.encryption_master_key_id = None; // start unprovisioned
+        repo.upsert_account(&acct).await.unwrap();
+
+        let mut src = sample_source(acct.id);
+        src.encryption_enabled = true;
+        repo.insert_source_with_optional_master_key_stamp(
+            &src,
+            Some((acct.id, "kc:alice-master".into())),
+        )
+        .await
+        .unwrap();
+
+        // Account is now provisioned AND the source exists.
+        let after = repo.list_accounts().await.unwrap();
+        assert_eq!(
+            after[0].encryption_master_key_id.as_deref(),
+            Some("kc:alice-master"),
+            "the account master-key id must be stamped on success"
+        );
+        let sources = repo.list_sources().await.unwrap();
+        assert_eq!(sources, vec![src]);
+    }
+
+    #[tokio::test]
+    async fn atomic_stamp_and_insert_rolls_back_account_stamp_on_source_failure() {
+        // R1-P1-1 (data-safety): if the source insert fails, the account
+        // master-key stamp MUST roll back too - so the account is NEVER left
+        // "provisioned" without the source/phrase (an unrestorable encrypted
+        // backup). Force the source insert to fail with a foreign-key violation
+        // (a source whose account_id points at NO account row).
+        let (repo, _dir) = temp_repo().await;
+        let mut acct = sample_account();
+        acct.encryption_master_key_id = None;
+        repo.upsert_account(&acct).await.unwrap();
+
+        // A source row referencing a non-existent account -> FK violation on
+        // insert (foreign_keys = ON).
+        let mut bad_src = sample_source(AccountId::new_v4());
+        bad_src.encryption_enabled = true;
+
+        let err = repo
+            .insert_source_with_optional_master_key_stamp(
+                &bad_src,
+                Some((acct.id, "kc:alice-master".into())),
+            )
+            .await
+            .expect_err("source insert must fail on the FK violation");
+        assert!(
+            format!("{err:#}").to_lowercase().contains("foreign")
+                || format!("{err:#}").to_lowercase().contains("constraint"),
+            "expected a foreign-key/constraint error, got: {err:#}"
+        );
+
+        // The account stamp rolled back: still unprovisioned, and NO source row.
+        let after = repo.list_accounts().await.unwrap();
+        assert_eq!(
+            after[0].encryption_master_key_id, None,
+            "the account must NOT be marked provisioned after a rolled-back insert"
+        );
+        assert!(
+            repo.list_sources().await.unwrap().is_empty(),
+            "no source row may persist after a rolled-back insert"
+        );
+
+        // A RETRY against a valid source now succeeds and stamps the account.
+        let mut good_src = sample_source(acct.id);
+        good_src.encryption_enabled = true;
+        repo.insert_source_with_optional_master_key_stamp(
+            &good_src,
+            Some((acct.id, "kc:alice-master".into())),
+        )
+        .await
+        .expect("retry must succeed");
+        let after = repo.list_accounts().await.unwrap();
+        assert_eq!(
+            after[0].encryption_master_key_id.as_deref(),
+            Some("kc:alice-master")
+        );
+        assert_eq!(repo.list_sources().await.unwrap().len(), 1);
+    }
+
+    #[tokio::test]
+    async fn atomic_insert_without_stamp_just_inserts_the_source() {
+        // R1-P1-1: a subsequent encrypted source (or an unencrypted one) passes
+        // `None` for the stamp - the account row is untouched, only the source
+        // is inserted.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account(); // already provisioned in the sample
+        repo.upsert_account(&acct).await.unwrap();
+        let original_key = acct.encryption_master_key_id.clone();
+
+        let src = sample_source(acct.id);
+        repo.insert_source_with_optional_master_key_stamp(&src, None)
+            .await
+            .unwrap();
+
+        let after = repo.list_accounts().await.unwrap();
+        assert_eq!(after[0].encryption_master_key_id, original_key);
+        assert_eq!(repo.list_sources().await.unwrap(), vec![src]);
     }
 
     #[tokio::test]

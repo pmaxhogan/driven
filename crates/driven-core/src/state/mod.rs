@@ -337,6 +337,44 @@ pub trait StateRepo: Send + Sync {
     /// Inserts or replaces a `backup_sources` row by id.
     async fn upsert_source(&self, row: &SourceRow) -> Result<()>;
 
+    /// R1-P1-1 (data-safety): ATOMICALLY stamp an account's
+    /// `encryption_master_key_id` (when `stamp_master_key_id` is `Some`) AND
+    /// insert/replace the given `backup_sources` row, in ONE transaction.
+    ///
+    /// The encrypted-source add flow (DESIGN s7.1) generates the account master
+    /// key + recovery phrase on the FIRST encrypted source. If the account stamp
+    /// and the source insert are two separate writes and the source insert fails
+    /// AFTER the stamp committed, the account looks "provisioned" but the user
+    /// never received the phrase - an unrestorable encrypted backup (the B3 class
+    /// this guards). Doing both writes in one transaction makes the outcome
+    /// all-or-nothing: either the account is stamped AND the source exists, or
+    /// neither change persists and a retry re-reveals the phrase.
+    ///
+    /// `stamp_master_key_id` is `None` for an unencrypted source or a SUBSEQUENT
+    /// encrypted source (the account is already provisioned), in which case this
+    /// is just the source insert in a (trivially atomic) transaction.
+    ///
+    /// The default implementation performs the two writes sequentially (adequate
+    /// for in-memory test doubles); the SQLite implementation overrides it with a
+    /// real `BEGIN`/`COMMIT` transaction so a failure rolls BOTH back.
+    async fn insert_source_with_optional_master_key_stamp(
+        &self,
+        source: &SourceRow,
+        stamp_master_key_id: Option<(AccountId, String)>,
+    ) -> Result<()> {
+        if let Some((account_id, master_key_id)) = stamp_master_key_id {
+            let mut accounts = self.list_accounts().await?;
+            let row = accounts
+                .iter_mut()
+                .find(|r| r.id == account_id)
+                .ok_or_else(|| anyhow::anyhow!("account not found for master-key stamp"))?;
+            row.encryption_master_key_id = Some(master_key_id);
+            let row = row.clone();
+            self.upsert_account(&row).await?;
+        }
+        self.upsert_source(source).await
+    }
+
     /// Stamps `backup_sources.last_full_scan_at` and (when `deep_verify_at`
     /// is `Some`) `backup_sources.last_deep_verify_at` for one source (P2-7).
     ///
