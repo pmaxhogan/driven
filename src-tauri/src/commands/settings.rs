@@ -196,9 +196,28 @@ pub async fn update_settings(
             cur.auto_start_on_login = v;
         }
         if let Some(v) = g.default_concurrent_uploads {
+            // `Some(None)` = reset to auto (valid); `Some(Some(n))` = override in
+            // the SPEC s22 1..=32 range.
+            if let Some(n) = v {
+                check_range(
+                    "default_concurrent_uploads",
+                    n,
+                    CONCURRENCY_MIN,
+                    CONCURRENCY_MAX,
+                )?;
+            }
             cur.default_concurrent_uploads = v;
         }
         if let Some(v) = g.bandwidth_cap_mbps {
+            // `None` = unlimited (valid); `Some(n)` must be in range.
+            if let Some(n) = v {
+                check_range(
+                    "bandwidth_cap_mbps",
+                    n,
+                    BANDWIDTH_CAP_MIN,
+                    BANDWIDTH_CAP_MAX,
+                )?;
+            }
             cur.bandwidth_cap_mbps = v;
             orchestrator_affecting = true;
         }
@@ -211,18 +230,32 @@ pub async fn update_settings(
             orchestrator_affecting = true;
         }
         if let Some(v) = g.scan_interval_secs {
+            check_range(
+                "scan_interval_secs",
+                v,
+                SCAN_INTERVAL_MIN,
+                SCAN_INTERVAL_MAX,
+            )?;
             cur.scan_interval_secs = v;
             orchestrator_affecting = true;
         }
         if let Some(v) = g.deep_verify_interval_secs {
+            check_range(
+                "deep_verify_interval_secs",
+                v,
+                DEEP_VERIFY_MIN,
+                DEEP_VERIFY_MAX,
+            )?;
             cur.deep_verify_interval_secs = v;
             // Per-source cadence feeds the orchestrator's deep-verify schedule.
             orchestrator_affecting = true;
         }
         if let Some(v) = g.io_priority {
+            check_enum("io_priority", &v, IO_PRIORITIES)?;
             cur.io_priority = v;
         }
         if let Some(v) = g.log_level {
+            check_enum("log_level", &v, LOG_LEVELS)?;
             if v != cur.log_level {
                 new_log_level = Some(v.clone());
             }
@@ -250,9 +283,11 @@ pub async fn update_settings(
             .map(Into::into)
             .unwrap_or_else(default_updater);
         if let Some(v) = u.channel {
+            check_enum("channel", &v, UPDATE_CHANNELS)?;
             cur.channel = v;
         }
         if let Some(v) = u.check_interval_secs {
+            check_range("check_interval_secs", v, UPDATE_CHECK_MIN, UPDATE_CHECK_MAX)?;
             cur.check_interval_secs = v;
         }
         store_group(repo, KEY_UPDATER, &storage::Updater::from(cur)).await?;
@@ -265,15 +300,18 @@ pub async fn update_settings(
             .map(Into::into)
             .unwrap_or_else(default_ui);
         if let Some(v) = ui.tray_left_click_opens {
+            check_enum("tray_left_click_opens", &v, TRAY_TARGETS)?;
             cur.tray_left_click_opens = v;
         }
         if let Some(v) = ui.locale {
+            check_locale(&v)?;
             if v != cur.locale {
                 new_locale = Some(v.clone());
             }
             cur.locale = v;
         }
         if let Some(v) = ui.color_mode {
+            check_enum("color_mode", &v, COLOR_MODES)?;
             cur.color_mode = v;
         }
         store_group(repo, KEY_UI, &storage::Ui::from(cur)).await?;
@@ -289,6 +327,7 @@ pub async fn update_settings(
             .map(Into::into)
             .unwrap_or_else(default_windows);
         if let Some(v) = w.vss_mode {
+            check_enum("vss_mode", &v, VSS_MODES)?;
             cur.vss_mode = v;
             if cfg!(windows) {
                 orchestrator_affecting = true;
@@ -324,6 +363,91 @@ pub async fn update_settings(
 
     // Return the full, freshly-stored settings document.
     load_settings_dto(repo).await
+}
+
+// ---------------------------------------------------------------------------
+// R2-P2-3: backend settings validation (SPEC s22 limits + enums)
+// ---------------------------------------------------------------------------
+//
+// The settings IPC accepts numeric + enum values from the (untrusted) renderer.
+// A buggy or compromised UI could persist a zero/huge scan interval, an invalid
+// log level / channel / locale / VSS mode, etc. These validators run BEFORE
+// `store_group`, rejecting an out-of-range / invalid value with the stable
+// `internal.invalid_input` SPEC s24 code so nothing bad reaches the DB.
+
+/// Min/max scan cadence (seconds): 30s..7 days. The SPEC s22 default is 600.
+const SCAN_INTERVAL_MIN: u32 = 30;
+const SCAN_INTERVAL_MAX: u32 = 604_800;
+/// Min/max deep-verify cadence (seconds): 1 hour .. 1 year (default 7 days).
+const DEEP_VERIFY_MIN: u32 = 3_600;
+const DEEP_VERIFY_MAX: u32 = 31_536_000;
+/// Min/max bandwidth cap (Mbps) when set (`None` = unlimited): 1 .. 100_000.
+const BANDWIDTH_CAP_MIN: u32 = 1;
+const BANDWIDTH_CAP_MAX: u32 = 100_000;
+/// Concurrency override range when set (SPEC s22: user may override 1..=32).
+const CONCURRENCY_MIN: u32 = 1;
+const CONCURRENCY_MAX: u32 = 32;
+/// Min/max update-check cadence (seconds): 5 minutes .. 7 days.
+const UPDATE_CHECK_MIN: u32 = 300;
+const UPDATE_CHECK_MAX: u32 = 604_800;
+
+/// Valid `io_priority` values (SPEC s22).
+const IO_PRIORITIES: &[&str] = &["normal", "low", "idle"];
+/// Valid `log_level` values (the `tracing` levels).
+const LOG_LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace"];
+/// Valid updater `channel` values (SPEC s22).
+const UPDATE_CHANNELS: &[&str] = &["stable", "dev"];
+/// Valid `color_mode` values (SPEC s22).
+const COLOR_MODES: &[&str] = &["system", "light", "dark"];
+/// Valid `tray_left_click_opens` targets (the tray's window routes).
+const TRAY_TARGETS: &[&str] = &["activity", "settings", "restore"];
+/// Valid `vss_mode` values (SPEC s22, Windows-only).
+const VSS_MODES: &[&str] = &["auto", "always", "never"];
+
+/// An invalid settings value -> the stable `internal.invalid_input` SPEC s24
+/// error (so the webview shows a "check your input" message).
+fn invalid_setting(msg: impl Into<String>) -> CommandError {
+    CommandError::with_code(ErrorCode::InvalidInput, msg.into())
+}
+
+/// Bound a numeric setting to `min..=max`, else reject (R2-P2-3).
+fn check_range(field: &str, value: u32, min: u32, max: u32) -> CommandResult<()> {
+    if value < min || value > max {
+        return Err(invalid_setting(format!(
+            "{field} must be between {min} and {max} (got {value})"
+        )));
+    }
+    Ok(())
+}
+
+/// Require `value` to be one of `allowed`, else reject (R2-P2-3).
+fn check_enum(field: &str, value: &str, allowed: &[&str]) -> CommandResult<()> {
+    if !allowed.contains(&value) {
+        return Err(invalid_setting(format!(
+            "{field} must be one of [{}] (got `{value}`)",
+            allowed.join(", ")
+        )));
+    }
+    Ok(())
+}
+
+/// Validate a locale tag (R2-P2-3): non-empty, ASCII, and BCP-47-shaped
+/// (alphanumeric subtags separated by single hyphens, e.g. `en`, `en-US`,
+/// `zh-Hant-TW`). Rejects a malformed / injected locale string without
+/// hard-coding the (currently single) bundled locale set, so a future locale
+/// does not require a code change while a garbage value is still rejected.
+fn check_locale(value: &str) -> CommandResult<()> {
+    let ok = !value.is_empty()
+        && value.len() <= 35
+        && value
+            .split('-')
+            .all(|sub| !sub.is_empty() && sub.chars().all(|c| c.is_ascii_alphanumeric()));
+    if !ok {
+        return Err(invalid_setting(format!(
+            "locale must be a well-formed BCP-47 tag (got `{value}`)"
+        )));
+    }
+    Ok(())
 }
 
 /// Serialize + persist one settings KV group, mapping a serialization failure to
@@ -682,6 +806,11 @@ pub async fn export_diagnostic_bundle(
 async fn build_diagnostic_zip(app: &AppHandle, state: &dyn StateRepo) -> CommandResult<Vec<u8>> {
     let mut zip = ZipWriter::new();
 
+    // R2-P1-4: build the context-rich redactor ONCE (source roots + home +
+    // username) so every log / crash / activity message is scrubbed of the user's
+    // actual paths, not just absolute-path-prefixed tokens.
+    let redactor = Redactor::for_bundle(state).await;
+
     // version.txt + os.txt (SPEC s18).
     zip.add_file(
         "version.txt",
@@ -709,12 +838,12 @@ async fn build_diagnostic_zip(app: &AppHandle, state: &dyn StateRepo) -> Command
     // activity_last_30d.csv (SPEC s18): the activity_log for the last 30 days,
     // with the free-text message column passed through the redaction pipeline
     // (paths / drive ids / emails / tokens become stable per-bundle hashes).
-    let activity_csv = build_activity_csv(state).await;
+    let activity_csv = build_activity_csv(state, &redactor).await;
     zip.add_file("activity_last_30d.csv", activity_csv.as_bytes());
 
     // logs/ + crashes/ (SPEC s18): the recent tracing output + crash dumps from
     // <config_dir>/driven/logs/, each passed through the redaction pipeline.
-    add_logs_and_crashes(app, &mut zip);
+    add_logs_and_crashes(app, &mut zip, &redactor);
 
     // redaction-policy.txt (SPEC s18): tell the recipient the bundle's threat
     // model + exactly what was redacted.
@@ -731,11 +860,11 @@ const MAX_LOG_BYTES: u64 = 50 * 1024 * 1024;
 /// Build `activity_last_30d.csv` from the `activity_log` (SPEC s18).
 ///
 /// Columns: `ts,event_type,level,source_id,file_count,bytes,message`. The
-/// free-text `message` is passed through [`redact_log_text`] (paths / drive ids /
+/// free-text `message` is passed through the [`Redactor`] (paths / drive ids /
 /// emails / tokens -> stable per-bundle hashes); the `source_id` is hashed too
 /// (it correlates to a local source). Best-effort: a query failure yields a
 /// header-only CSV with an error note rather than failing the whole bundle.
-async fn build_activity_csv(state: &dyn StateRepo) -> String {
+async fn build_activity_csv(state: &dyn StateRepo, redactor: &Redactor) -> String {
     use driven_core::state::{ActivityFilter, PageRequest};
     use driven_core::time::{Clock, SystemClock};
 
@@ -768,7 +897,7 @@ async fn build_activity_csv(state: &dyn StateRepo) -> String {
                 let message = row
                     .message
                     .as_deref()
-                    .map(redact_log_text)
+                    .map(|m| redactor.redact_text(m))
                     .unwrap_or_default();
                 out.push_str(&format!(
                     "{},{},{},{},{},{},{}\n",
@@ -806,7 +935,7 @@ fn csv_field(s: &str) -> String {
 /// partial bundle is still useful). `crash-*.txt` files go under `crashes/`;
 /// every other file goes under `logs/`. The cumulative log bytes are bounded by
 /// [`MAX_LOG_BYTES`], newest-first.
-fn add_logs_and_crashes(app: &AppHandle, zip: &mut ZipWriter) {
+fn add_logs_and_crashes(app: &AppHandle, zip: &mut ZipWriter, redactor: &Redactor) {
     use tauri::Manager;
     let log_dir = match app.path().app_config_dir() {
         Ok(dir) => dir.join("driven").join("logs"),
@@ -863,7 +992,7 @@ fn add_logs_and_crashes(app: &AppHandle, zip: &mut ZipWriter) {
             }
             log_bytes_used = log_bytes_used.saturating_add(len);
         }
-        let redacted = redact_log_text(&raw);
+        let redacted = redactor.redact_text(&raw);
         let arcname = if is_crash {
             format!("crashes/{name}")
         } else {
@@ -873,42 +1002,326 @@ fn add_logs_and_crashes(app: &AppHandle, zip: &mut ZipWriter) {
     }
 }
 
-/// SPEC s18 redaction pipeline for log / activity free-text. Replaces, in order:
-/// OAuth tokens, `Authorization: Bearer ...` headers, email addresses, Windows +
-/// Unix absolute paths, and long Drive-id-looking tokens, each with a STABLE
-/// per-value hashed placeholder so occurrences correlate within the bundle
-/// without exposing the original value.
+/// R2-P1-4: the SPEC s18 redaction engine for log / activity / crash free-text.
 ///
-/// This is a best-effort scrubber (the SPEC s18 caveat: incidental free-text may
-/// survive); it errs toward over-redaction of anything that looks secret.
-fn redact_log_text(input: &str) -> String {
-    let mut out = String::with_capacity(input.len());
-    for line in input.lines() {
-        out.push_str(&redact_log_line(line));
-        out.push('\n');
+/// Whereas the old implementation only redacted whitespace-delimited tokens that
+/// START with an absolute path (so a `path=C:\Users\Pat Smith\f.pdf` field, a
+/// quoted path, a path WITH SPACES, or a UNC path leaked), this redactor scrubs
+/// over the WHOLE line and in ALL path shapes, plus the user's home dir,
+/// username, and known source-root substrings. Order per line:
+///
+/// 1. EXACT known-substring replacement (longest-first): every backup source
+///    root, the user home dir, and the username - each replaced wherever it
+///    appears, INCLUDING inside a longer path or one with spaces.
+/// 2. ABSOLUTE-PATH-RUN scrub: a positional scan that finds an absolute path
+///    start (`X:\` / `X:/` Windows drive, `\\server\share` UNC, or a `/abs`
+///    Unix path at a left boundary) and replaces the whole run - consuming
+///    embedded SPACES (a `key=path with spaces` value, a quoted path) up to the
+///    field / quote / line boundary - with a stable `<path:hash>`.
+/// 3. TOKEN scrub of the residual: OAuth tokens, emails, and long Drive-id-shaped
+///    opaque ids, each -> a stable hashed placeholder.
+///
+/// Each placeholder is a stable per-value hash so occurrences correlate WITHIN a
+/// bundle without exposing the original. Best-effort (SPEC s18 caveat) but errs
+/// toward OVER-redaction of anything path- or secret-shaped.
+struct Redactor {
+    /// Known backup source roots (from `backup_sources.local_path`), longest
+    /// first, each lower-cased once for case-insensitive matching.
+    source_roots: Vec<String>,
+    /// The user's home dir (e.g. `C:\Users\Pat Smith`), if resolvable.
+    home: Option<String>,
+    /// The OS username, if resolvable.
+    username: Option<String>,
+}
+
+impl Redactor {
+    /// Build a context-rich redactor for the diagnostic bundle: load every
+    /// source root from the state DB and resolve the home dir + username from the
+    /// environment, so those exact substrings (which may contain spaces) are
+    /// scrubbed even when a path scan would miss them. Best-effort: a source-list
+    /// read failure yields an empty root set (the path-run + token scrubs still
+    /// run); the home / username come from `HOME` / `USERPROFILE` / `USERNAME`.
+    async fn for_bundle(state: &dyn StateRepo) -> Self {
+        let mut source_roots: Vec<String> = match state.list_sources().await {
+            Ok(rows) => rows
+                .into_iter()
+                .map(|s| s.local_path.to_lowercase())
+                .filter(|p| !p.trim().is_empty())
+                .collect(),
+            Err(e) => {
+                tracing::debug!(target: TARGET, error = %e, "redactor: could not load source roots; path-run + token scrub still apply");
+                Vec::new()
+            }
+        };
+        // Longest first so a nested root is replaced before its prefix.
+        source_roots.sort_by_key(|b| std::cmp::Reverse(b.len()));
+        source_roots.dedup();
+
+        let home = std::env::var("USERPROFILE")
+            .ok()
+            .or_else(|| std::env::var("HOME").ok())
+            .filter(|h| !h.trim().is_empty());
+        let username = std::env::var("USERNAME")
+            .ok()
+            .or_else(|| std::env::var("USER").ok())
+            .filter(|u| u.trim().len() >= 3); // avoid scrubbing 1-2 char noise
+
+        Self {
+            source_roots,
+            home,
+            username,
+        }
+    }
+
+    /// A context-free redactor (no source roots / home / username) for callers
+    /// without DB / env context. The path-run + token scrubs still apply. Used by
+    /// the redaction unit tests; the bundle path always uses
+    /// [`Self::for_bundle`].
+    #[cfg(test)]
+    fn context_free() -> Self {
+        Self {
+            source_roots: Vec::new(),
+            home: None,
+            username: None,
+        }
+    }
+
+    /// Redact every line of `input` (newline-joined).
+    fn redact_text(&self, input: &str) -> String {
+        let mut out = String::with_capacity(input.len());
+        for line in input.lines() {
+            out.push_str(&self.redact_line(line));
+            out.push('\n');
+        }
+        out
+    }
+
+    /// Redact one line across all shapes (see [`Redactor`] doc): known
+    /// substrings, then absolute-path runs, then residual tokens.
+    fn redact_line(&self, line: &str) -> String {
+        // 1) Known substrings (home dir + source roots), case-insensitive, longest
+        //    first. The home dir is a prefix of many source roots, so source roots
+        //    (already longest-first) are tried before the home dir.
+        let mut work = line.to_string();
+        for root in &self.source_roots {
+            work = replace_ci(&work, root, &format!("<path:{}>", stable_hash(root)));
+        }
+        if let Some(home) = &self.home {
+            work = replace_ci(&work, &home.to_lowercase(), "<home-redacted>");
+        }
+        if let Some(user) = &self.username {
+            // Username scrubbed only as a whole word-ish run to avoid mangling
+            // unrelated text; replace_ci is substring, so guard on length above.
+            work = replace_ci(&work, &user.to_lowercase(), "<user-redacted>");
+        }
+
+        // 2) Absolute-path runs (handles spaces, quotes, key=value, UNC).
+        let work = redact_absolute_path_runs(&work);
+
+        // 3) Residual token scrub (tokens / emails / drive ids), over the
+        //    whitespace-delimited tokens that survived the path-run pass.
+        work.split_inclusive(char::is_whitespace)
+            .map(|chunk| {
+                let trail_ws: String = chunk
+                    .chars()
+                    .rev()
+                    .take_while(|c| c.is_whitespace())
+                    .collect();
+                let core = &chunk[..chunk.len() - trail_ws.len()];
+                let redacted = redact_token(core);
+                format!("{redacted}{}", trail_ws.chars().rev().collect::<String>())
+            })
+            .collect()
+    }
+}
+
+/// Case-insensitive substring replace of EVERY occurrence of `needle` in
+/// `haystack` with `replacement`. Used for the known home / source-root scrub so
+/// a path with spaces (which the path-run scanner could under-consume) is removed
+/// wherever it appears. Empty `needle` is a no-op.
+fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
+    if needle.is_empty() {
+        return haystack.to_string();
+    }
+    let lower_hay = haystack.to_lowercase();
+    let mut out = String::with_capacity(haystack.len());
+    let mut last = 0usize;
+    let mut search_from = 0usize;
+    while let Some(rel) = lower_hay[search_from..].find(needle) {
+        let start = search_from + rel;
+        let end = start + needle.len();
+        // Push the un-matched slice from the ORIGINAL (case-preserving) string.
+        out.push_str(&haystack[last..start]);
+        out.push_str(replacement);
+        last = end;
+        search_from = end;
+    }
+    out.push_str(&haystack[last..]);
+    out
+}
+
+/// R2-P1-4: scan `line` for ABSOLUTE PATH RUNS and replace each with a stable
+/// `<path:hash>`.
+///
+/// A path run starts at a Windows drive (`X:\`/`X:/`), a UNC prefix (`\\`), or a
+/// Unix absolute (`/...`) appearing at a LEFT BOUNDARY (line start, whitespace,
+/// `=`, a quote, `(`/`[`/`<`/`:`) so a mid-URL `/` or a `C:` not at a boundary is
+/// not mis-detected.
+///
+/// Embedded SPACES are consumed ONLY when the run is delimited so the end is
+/// unambiguous - i.e. the path is QUOTED (ends at the matching quote) or it
+/// follows a `key=` (ends at the next whitespace token that looks like a new
+/// `key=value` field). This handles the `path=C:\Users\Pat Smith\f.pdf` and
+/// `"C:\Users\Pat Smith\f.pdf"` leaks WITHOUT swallowing trailing prose for a
+/// bare unquoted path (which stops at the first whitespace). A configured source
+/// root WITH spaces is handled separately by the known-substring scrub, so a bare
+/// spaced path is rare; over-consuming prose would be worse than stopping early.
+fn redact_absolute_path_runs(line: &str) -> String {
+    let bytes = line.as_bytes();
+    let n = bytes.len();
+    let mut out = String::with_capacity(n);
+    let mut i = 0usize;
+    while i < n {
+        let prev = if i > 0 { Some(bytes[i - 1]) } else { None };
+        let opened_quote = matches!(prev, Some(b'"') | Some(b'\''));
+        let after_equals = prev == Some(b'=');
+        let left_boundary = i == 0
+            || matches!(
+                prev,
+                Some(b' ' | b'\t' | b'=' | b'"' | b'\'' | b'(' | b'[' | b'<' | b':')
+            );
+        if left_boundary {
+            if let Some(run_len) = path_run_len(&bytes[i..], opened_quote, after_equals) {
+                let run = &line[i..i + run_len];
+                out.push_str(&format!("<path:{}>", stable_hash(run)));
+                i += run_len;
+                continue;
+            }
+        }
+        // Not a path start here: copy this byte. `line` is UTF-8; copy whole char.
+        let ch_len = utf8_char_len(bytes[i]);
+        out.push_str(&line[i..(i + ch_len).min(n)]);
+        i += ch_len;
     }
     out
 }
 
-/// Redact one log line (token-by-token over whitespace), so a path / email /
-/// token embedded in a message is replaced regardless of surrounding text.
-fn redact_log_line(line: &str) -> String {
-    line.split_inclusive(char::is_whitespace)
-        .map(|chunk| {
-            let trail_ws: String = chunk
-                .chars()
-                .rev()
-                .take_while(|c| c.is_whitespace())
-                .collect();
-            let core = &chunk[..chunk.len() - trail_ws.len()];
-            let redacted = redact_token(core);
-            format!("{redacted}{}", trail_ws.chars().rev().collect::<String>())
-        })
-        .collect()
+/// If `s` begins with an absolute path, return the byte length of the path run,
+/// else `None`.
+///
+/// - `inside_quote`: the slice begins right after an opening quote -> the run
+///   ends at the matching closing quote and INCLUDES embedded spaces.
+/// - `after_equals`: the slice begins right after `=` (a `key=path` value) -> the
+///   run INCLUDES embedded spaces, ending at the next whitespace token that
+///   contains `=` (a new field) or at end-of-line.
+/// - otherwise (a bare unquoted path): the run stops at the FIRST whitespace, so
+///   trailing prose / an adjacent email token is not swallowed.
+fn path_run_len(s: &[u8], inside_quote: bool, after_equals: bool) -> Option<usize> {
+    let n = s.len();
+    // Detect the start shape.
+    let is_win_abs =
+        n >= 3 && s[0].is_ascii_alphabetic() && s[1] == b':' && (s[2] == b'\\' || s[2] == b'/');
+    let is_unc = n >= 2 && s[0] == b'\\' && s[1] == b'\\';
+    // A bare `/` is a Unix absolute path only if followed by a path segment char
+    // (so a lone `/` or ` / ` is not redacted).
+    let is_unix_abs = n >= 2 && s[0] == b'/' && is_path_char(s[1]);
+    if !(is_win_abs || is_unc || is_unix_abs) {
+        return None;
+    }
+    // Spaces are only consumed when the run has a clear end delimiter.
+    let consume_spaces = inside_quote || after_equals;
+
+    let mut i = 0usize;
+    while i < n {
+        let b = s[i];
+        if inside_quote && (b == b'"' || b == b'\'') {
+            break; // closing quote ends the run.
+        }
+        if b == b' ' || b == b'\t' {
+            if !consume_spaces {
+                break; // bare path: stop at the first whitespace.
+            }
+            if inside_quote {
+                // Inside quotes a space is always part of the path (the closing
+                // quote, handled above, is the only terminator).
+                i += 1;
+                continue;
+            }
+            // after_equals: include the space only if the next whitespace token
+            // is NOT a new `key=value` field (and is non-empty).
+            let rest = &s[i + 1..];
+            let mut j = 0usize;
+            while j < rest.len() && (rest[j] == b' ' || rest[j] == b'\t') {
+                j += 1;
+            }
+            let mut k = j;
+            while k < rest.len() && rest[k] != b' ' && rest[k] != b'\t' {
+                k += 1;
+            }
+            let next_tok = &rest[j..k];
+            if next_tok.is_empty() || next_tok.contains(&b'=') {
+                break; // path value ended (new field / trailing space).
+            }
+            i += 1;
+            continue;
+        }
+        // A comma / closing bracket / angle ends an unquoted run.
+        if !inside_quote && matches!(b, b',' | b')' | b']' | b'>') {
+            break;
+        }
+        i += 1;
+    }
+    if i == 0 {
+        None
+    } else {
+        Some(i)
+    }
 }
 
-/// Redact one whitespace-delimited token if it looks secret (token / email /
-/// path / long opaque id), else return it unchanged.
+/// Whether `b` is plausibly part of a path segment (not a separator we use to
+/// bound a run). Conservative: alnum, common filename punctuation, and the path
+/// separators themselves.
+fn is_path_char(b: u8) -> bool {
+    b.is_ascii_alphanumeric()
+        || matches!(
+            b,
+            b'/' | b'\\'
+                | b'.'
+                | b'_'
+                | b'-'
+                | b'~'
+                | b'$'
+                | b'%'
+                | b'+'
+                | b'@'
+                | b'#'
+                | b'&'
+                | b'('
+                | b')'
+        )
+}
+
+/// UTF-8 leading-byte -> char byte length (1..=4); defaults to 1 for a stray
+/// continuation byte (we only copy bytes, never split a char incorrectly because
+/// path detection only triggers on ASCII path markers).
+fn utf8_char_len(lead: u8) -> usize {
+    if lead < 0x80 {
+        1
+    } else if lead >> 5 == 0b110 {
+        2
+    } else if lead >> 4 == 0b1110 {
+        3
+    } else if lead >> 3 == 0b11110 {
+        4
+    } else {
+        1
+    }
+}
+
+/// Redact one whitespace-delimited token if it looks secret (OAuth token /
+/// email / long opaque drive id), else return it unchanged. Absolute paths are
+/// handled by the whole-line path-run scrub (R2-P1-4) before this runs, so this
+/// no longer needs the bare-path token rule.
 fn redact_token(tok: &str) -> String {
     if tok.is_empty() {
         return tok.to_string();
@@ -922,16 +1335,6 @@ fn redact_token(tok: &str) -> String {
     // OAuth tokens: Google access tokens start `ya29.`; refresh tokens `1//`.
     if tok.starts_with("ya29.") || tok.starts_with("1//") {
         return "<token-redacted>".to_string();
-    }
-    // Absolute paths: Windows drive (`C:\`/`C:/`) or Unix (`/...`) or UNC.
-    let is_win_abs = tok.len() >= 3
-        && tok.as_bytes()[0].is_ascii_alphabetic()
-        && tok.as_bytes()[1] == b':'
-        && (tok.as_bytes()[2] == b'\\' || tok.as_bytes()[2] == b'/');
-    let is_unix_abs = tok.starts_with('/') && tok.len() > 1;
-    let is_unc = tok.starts_with("\\\\");
-    if is_win_abs || is_unix_abs || is_unc {
-        return format!("<path:{}>", stable_hash(tok));
     }
     // Long opaque ids (Drive file ids are ~28-44 url-safe chars): redact a long
     // run of id-shaped characters with no spaces.
@@ -1024,13 +1427,15 @@ async fn build_schema_summary(state: &dyn StateRepo) -> String {
         Ok(v) => out.push_str(&format!("user_version={v}\n")),
         Err(e) => out.push_str(&format!("user_version=? ({e})\n")),
     }
-    match state.list_accounts().await {
-        Ok(rows) => out.push_str(&format!("accounts={}\n", rows.len())),
-        Err(e) => out.push_str(&format!("accounts=? ({e})\n")),
-    }
-    match state.list_sources().await {
-        Ok(rows) => out.push_str(&format!("backup_sources={}\n", rows.len())),
-        Err(e) => out.push_str(&format!("backup_sources=? ({e})\n")),
+    // R2-P2-4: count EVERY known state table (not just accounts + backup_sources)
+    // so the bundle is useful for corruption / debug cases. The list is the
+    // migration-defined authoritative set; a table whose count cannot be read is
+    // rendered `?` rather than failing the whole bundle.
+    for table in driven_core::state::KNOWN_STATE_TABLES {
+        match state.table_row_count(table).await {
+            Ok(n) => out.push_str(&format!("{table}={n}\n")),
+            Err(e) => out.push_str(&format!("{table}=? ({e})\n")),
+        }
     }
     out
 }
@@ -1728,7 +2133,7 @@ mod tests {
         .await
         .unwrap();
 
-        let csv = build_activity_csv(&repo).await;
+        let csv = build_activity_csv(&repo, &Redactor::context_free()).await;
         assert!(
             csv.starts_with("ts,event_type,level,source_id,file_count,bytes,message\n"),
             "CSV must start with the SPEC s18 header"
@@ -1754,7 +2159,7 @@ mod tests {
         // C3 (SPEC s18): the log/crash redaction pipeline.
         let input = "refresh 1//0gAbCdEf access ya29.aBcDeF path C:\\Users\\me\\secret.txt \
                      email alice@example.com id 1A2b3C4d5E6f7G8h9I0jKlMnOpQr";
-        let out = redact_log_text(input);
+        let out = Redactor::context_free().redact_text(input);
         assert!(!out.contains("1//0gAbCdEf"), "refresh token redacted");
         assert!(!out.contains("ya29.aBcDeF"), "access token redacted");
         assert!(
@@ -1784,8 +2189,196 @@ mod tests {
     #[test]
     fn redact_log_text_leaves_ordinary_text_alone() {
         let input = "scan complete 12 files 3 dirs ok";
-        let out = redact_log_text(input);
+        let out = Redactor::context_free().redact_text(input);
         assert_eq!(out.trim_end(), input, "ordinary log text is unchanged");
+    }
+
+    // R2-P1-4: whole-line / all-path-shape redaction tests (Windows shapes).
+
+    #[test]
+    fn redact_key_equals_path_with_spaces_is_scrubbed() {
+        // The exact leak the finding cites: `key=C:\Users\Pat Smith\Taxes\f.pdf`.
+        // The whole path (INCLUDING the spaces) must be redacted, and an adjacent
+        // log field must survive.
+        let input = "uploading path=C:\\Users\\Pat Smith\\Taxes\\file.pdf op=upload";
+        let out = Redactor::context_free().redact_line(input);
+        assert!(
+            !out.contains("Pat Smith"),
+            "the path with spaces must be fully redacted: {out}"
+        );
+        assert!(
+            !out.contains("file.pdf"),
+            "the filename must be redacted: {out}"
+        );
+        assert!(
+            out.contains("<path:"),
+            "becomes a hashed placeholder: {out}"
+        );
+        assert!(
+            out.contains("op=upload"),
+            "the adjacent field must survive: {out}"
+        );
+    }
+
+    #[test]
+    fn redact_quoted_path_with_spaces_is_scrubbed() {
+        let input = "file \"C:\\Users\\Pat Smith\\My Docs\\taxes.xlsx\" done";
+        let out = Redactor::context_free().redact_line(input);
+        assert!(!out.contains("Pat Smith"), "quoted path redacted: {out}");
+        assert!(
+            !out.contains("taxes.xlsx"),
+            "quoted filename redacted: {out}"
+        );
+        assert!(out.contains("<path:"), "hashed placeholder: {out}");
+        // The closing context survives.
+        assert!(out.contains("done"), "trailing text survives: {out}");
+    }
+
+    #[test]
+    fn redact_unc_path_is_scrubbed() {
+        let input = "share \\\\server\\share\\private\\report.docx end";
+        let out = Redactor::context_free().redact_line(input);
+        assert!(!out.contains("server"), "UNC host redacted: {out}");
+        assert!(!out.contains("report.docx"), "UNC filename redacted: {out}");
+        assert!(out.contains("<path:"), "hashed placeholder: {out}");
+        assert!(out.contains("end"), "trailing text survives: {out}");
+    }
+
+    #[tokio::test]
+    async fn redact_known_source_root_substring_is_scrubbed() {
+        // R2-P1-4: a configured source root (with spaces) is scrubbed wherever it
+        // appears, even embedded in a longer string the path scanner might miss.
+        use driven_core::state::{AccountRow, SourceRow};
+        use driven_core::types::{AccountId, AccountState, SourceId};
+        let (repo, dir) = seeded_repo().await;
+        let account_id = AccountId::new_v4();
+        repo.upsert_account(&AccountRow {
+            id: account_id,
+            email: "u@example.com".to_string(),
+            display_name: None,
+            state: AccountState::Ok,
+            encryption_master_key_id: None,
+            created_at: 0,
+            last_synced_at: None,
+        })
+        .await
+        .unwrap();
+        let root = "D:\\Backups\\Family Photos";
+        repo.upsert_source(&SourceRow {
+            id: SourceId::new_v4(),
+            account_id,
+            display_name: "photos".to_string(),
+            enabled: true,
+            local_path: root.to_string(),
+            drive_folder_id: String::new(),
+            drive_folder_path: String::new(),
+            encryption_enabled: false,
+            wrapped_source_key: None,
+            respect_gitignore: true,
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: 604_800,
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            created_at: 0,
+        })
+        .await
+        .unwrap();
+
+        let redactor = Redactor::for_bundle(&repo).await;
+        // The source root appears mid-message (the path scanner alone, without a
+        // left boundary at line start, still works, but this also proves the
+        // known-substring scrub catches the exact configured root with spaces).
+        let out = redactor.redact_line("scanning D:\\Backups\\Family Photos for changes");
+        assert!(
+            !out.contains("Family Photos"),
+            "the configured source root must be redacted: {out}"
+        );
+        assert!(out.contains("<path:"), "hashed placeholder: {out}");
+        cleanup(dir);
+    }
+
+    #[test]
+    fn settings_validators_reject_out_of_range_and_invalid_enum() {
+        // R2-P2-3: the backend bounds numeric settings and validates enums,
+        // returning the stable `internal.invalid_input` code.
+        // Numeric out-of-range.
+        let err = check_range(
+            "scan_interval_secs",
+            0,
+            SCAN_INTERVAL_MIN,
+            SCAN_INTERVAL_MAX,
+        )
+        .expect_err("zero scan interval must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err = check_range(
+            "bandwidth_cap_mbps",
+            BANDWIDTH_CAP_MAX + 1,
+            BANDWIDTH_CAP_MIN,
+            BANDWIDTH_CAP_MAX,
+        )
+        .expect_err("huge bandwidth cap must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        // In-range is accepted.
+        check_range(
+            "scan_interval_secs",
+            600,
+            SCAN_INTERVAL_MIN,
+            SCAN_INTERVAL_MAX,
+        )
+        .expect("default scan interval is valid");
+
+        // Invalid enum.
+        let err = check_enum("log_level", "verbose", LOG_LEVELS)
+            .expect_err("an invalid log level must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err = check_enum("channel", "nightly", UPDATE_CHANNELS)
+            .expect_err("an invalid channel must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err =
+            check_enum("vss_mode", "sometimes", VSS_MODES).expect_err("invalid vss_mode rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        // Valid enums accepted.
+        check_enum("log_level", "info", LOG_LEVELS).expect("info is a valid level");
+        check_enum("channel", "dev", UPDATE_CHANNELS).expect("dev is a valid channel");
+
+        // Locale: well-formed accepted, garbage rejected.
+        check_locale("en-US").expect("en-US is well formed");
+        check_locale("zh-Hant-TW").expect("multi-subtag is well formed");
+        let err = check_locale("../etc/passwd").expect_err("a path-shaped locale is rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err = check_locale("").expect_err("an empty locale is rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[tokio::test]
+    async fn schema_summary_counts_every_known_state_table() {
+        // R2-P2-4: schema.txt must carry a count line for EVERY migration-defined
+        // table, not just accounts + backup_sources.
+        let (repo, dir) = seeded_repo().await;
+        let summary = build_schema_summary(&repo).await;
+        for table in driven_core::state::KNOWN_STATE_TABLES {
+            assert!(
+                summary.contains(&format!("{table}=")),
+                "schema.txt must count table `{table}`; got:\n{summary}"
+            );
+        }
+        // A specific non-trivial table beyond the old two must be present.
+        assert!(
+            summary.contains("file_state=") && summary.contains("pending_ops="),
+            "core tables file_state + pending_ops must be counted"
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn redact_leaves_non_path_text_unchanged() {
+        // R2-P1-4: ordinary non-path text (incl. relative-looking tokens and a
+        // bare `/`) must be untouched.
+        let input = "scan complete 12 files / 3 dirs ratio=0.5 ok";
+        let out = Redactor::context_free().redact_line(input);
+        assert_eq!(out, input, "ordinary text with a lone / is unchanged");
     }
 
     #[test]
