@@ -6,7 +6,7 @@
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-import type { GlobalSyncStatus, UpdateInfo } from "./types";
+import type { ActivityEntry, GlobalSyncStatus, UpdateInfo } from "./types";
 
 /** `sync:status_changed` payload: GlobalSyncStatus (SPEC s11.7). */
 export function onSyncStatusChanged(
@@ -31,11 +31,12 @@ export function onSyncSourceProgress(
   );
 }
 
-/** `activity:new` payload: ActivityEntry (typed in M7) (SPEC s11.7). */
+/** `activity:new` payload: ActivityEntry (SPEC s11.7). The Activity dashboard's
+ * live tail subscribes to this and prepends new entries (deduped by id). */
 export function onActivityNew(
-  handler: (entry: unknown) => void,
+  handler: (entry: ActivityEntry) => void,
 ): Promise<UnlistenFn> {
-  return listen<unknown>("activity:new", (e) => handler(e.payload));
+  return listen<ActivityEntry>("activity:new", (e) => handler(e.payload));
 }
 
 /** `account:needs_reauth` payload: { account_id, email } (SPEC s11.7). */

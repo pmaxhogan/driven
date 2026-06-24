@@ -195,7 +195,39 @@
   },
   "activity": {
     "title": "Activity",
-    "placeholder": "The activity dashboard arrives in a later release."
+    "subtitle": "Live feed and history of every backup event.",
+    "empty": "No activity yet. Events appear here as Driven backs up your files.",
+    "loadMore": "Load older events",
+    "loadingMore": "Loading more...",
+    "allLoaded": "You have reached the start of the activity log.",
+    "countSummary": "Showing {shown} of {total} events",
+    "filters": {
+      "title": "Filters",
+      "source": "Source",
+      "allSources": "All sources",
+      "level": "Minimum level",
+      "allLevels": "All levels",
+      "eventType": "Event type",
+      "allEventTypes": "All event types",
+      "clear": "Clear filters"
+    },
+    "level": {
+      "info": "Info",
+      "warn": "Warning",
+      "error": "Error"
+    },
+    "column": {
+      "time": "Time",
+      "level": "Level",
+      "event": "Event",
+      "source": "Source",
+      "details": "Details"
+    },
+    "noSource": "Global",
+    "files": "{count} files",
+    "exportBundleButton": "Export diagnostic bundle",
+    "exporting": "Exporting...",
+    "exportedTo": "Saved diagnostic bundle to {path}"
   },
   "restore": {
     "title": "Restore",

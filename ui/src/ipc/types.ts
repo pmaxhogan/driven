@@ -236,6 +236,51 @@ export interface ReleaseDto {
   url: string;
 }
 
+// --- Activity (SPEC s11.4) - mirrors driven-core ActivityEntry + the
+// src-tauri activity DTOs ---
+
+/** `activity_log.level` serialized form (mirrors driven_core ActivityLevel). */
+export type ActivityLevel = "info" | "warn" | "error";
+
+/** One activity-log entry: the per-row element of an ActivityPage AND the
+ * `activity:new` event payload (mirrors driven_core::types::ActivityEntry). */
+export interface ActivityEntry {
+  id: number;
+  ts: number;
+  sourceId: string | null;
+  level: ActivityLevel;
+  eventType: string;
+  fileCount: number | null;
+  bytes: number | null;
+  message: string | null;
+}
+
+/** Filter body for `query_activity` (mirrors src-tauri ActivityFilterDto). All
+ * fields optional; present fields combine with AND. */
+export interface ActivityFilterDto {
+  sourceId?: string | null;
+  sinceMs?: number | null;
+  beforeMs?: number | null;
+  minLevel?: ActivityLevel | null;
+  eventTypes?: string[];
+}
+
+/** Page selector for `query_activity` (mirrors src-tauri PageRequestDto). */
+export interface PageRequestDto {
+  page: number;
+  limit: number;
+}
+
+/** One page of activity returned by `query_activity` (mirrors src-tauri
+ * ActivityPageDto): newest-first entries + paging metadata. */
+export interface ActivityPageDto {
+  entries: ActivityEntry[];
+  total: number;
+  page: number;
+  limit: number;
+  hasMore: boolean;
+}
+
 // --- Sync (SPEC s11.3) - mirrors src-tauri/src/commands/sync.rs ---
 
 /** Mirrors the Rust `OrchestratorState` (driven_core::types). Carried as an

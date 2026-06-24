@@ -8,6 +8,8 @@ import { invoke } from "@tauri-apps/api/core";
 
 import type {
   AccountDto,
+  ActivityFilterDto,
+  ActivityPageDto,
   AddAccountWizardSessionId,
   AddSourceRequest,
   AddSourceResult,
@@ -17,6 +19,7 @@ import type {
   GlobalSyncStatus,
   OAuthAuthUrl,
   OAuthStatus,
+  PageRequestDto,
   PickedPath,
   ReauthSession,
   ReleaseDto,
@@ -166,4 +169,22 @@ export function checkForUpdates(): Promise<UpdateInfo | null> {
 
 export function listReleases(page: number): Promise<ReleaseDto[]> {
   return invoke("list_releases", { page });
+}
+
+// --- Activity (SPEC s11.4) ---
+
+/** Query a paginated, filtered page of the activity log (SPEC s11.4). The
+ * frontend accumulates pages client-side for the history view; the live tail is
+ * event-driven via `onActivityNew` (SPEC s11.7), not polled here. */
+export function queryActivity(
+  filter: ActivityFilterDto,
+  page: PageRequestDto,
+): Promise<ActivityPageDto> {
+  return invoke("query_activity", { filter, page });
+}
+
+/** Prune activity-log rows older than `beforeTs` (Unix ms); returns the count
+ * deleted (SPEC s11.4). */
+export function clearActivityOlderThan(beforeTs: number): Promise<number> {
+  return invoke("clear_activity_older_than", { beforeTs });
 }
