@@ -56,6 +56,12 @@ export const useSetupStore = defineStore("setup", () => {
   // B3: the user has acknowledged saving the recovery phrase. Finish is gated
   // on this whenever a phrase was actually displayed.
   const phraseAcknowledged = ref(false);
+  // R3-P1-1: the user has actually REVEALED the phrase at least once. Finish is
+  // gated on reveal AND acknowledge so a user can never attest "I saved it" while
+  // the phrase was still hidden (which would risk starting unrecoverable
+  // encrypted backups). Reset alongside `phraseAcknowledged` whenever the phrase
+  // changes/clears.
+  const phraseRevealed = ref(false);
   const sourceId = ref<string | null>(null);
 
   // Transient UX flags surfaced by the view.
@@ -76,10 +82,14 @@ export const useSetupStore = defineStore("setup", () => {
     () => (recoveryPhrase.value?.length ?? 0) > 0,
   );
 
-  /** B3: the wizard may Finish only once any displayed recovery phrase has been
-   * acknowledged. With no phrase (unencrypted), Finish is always allowed. */
+  /** B3 + R3-P1-1: the wizard may Finish only once any displayed recovery phrase
+   * has been REVEALED and acknowledged. With no phrase (unencrypted), Finish is
+   * always allowed. Gating on reveal (not just acknowledge) blocks a user from
+   * ticking the confirm box while the phrase is still hidden. */
   const canFinish = computed(
-    () => !hasRecoveryPhrase.value || phraseAcknowledged.value,
+    () =>
+      !hasRecoveryPhrase.value ||
+      (phraseRevealed.value && phraseAcknowledged.value),
   );
 
   /** B3: the source has been created (so the confirm step can show the phrase
@@ -233,6 +243,8 @@ export const useSetupStore = defineStore("setup", () => {
       // gates Finish until the user attests they saved the words.
       recoveryPhrase.value = result.recoveryPhrase;
       phraseAcknowledged.value = false;
+      // R3-P1-1: a fresh phrase must be revealed before it can be acknowledged.
+      phraseRevealed.value = false;
     } catch (e) {
       errorCode.value = toErrorCode(e);
       throw e;
@@ -245,6 +257,16 @@ export const useSetupStore = defineStore("setup", () => {
    * (gates Finish on the confirm step). */
   function acknowledgePhrase(value: boolean): void {
     phraseAcknowledged.value = value;
+  }
+
+  /** R3-P1-1: record that the user has revealed the phrase (or that the reveal
+   * was re-locked because the phrase changed). When the reveal is cleared, the
+   * acknowledgement is force-cleared too so Finish cannot stay enabled. */
+  function markPhraseRevealed(value: boolean): void {
+    phraseRevealed.value = value;
+    if (!value) {
+      phraseAcknowledged.value = false;
+    }
   }
 
   /**
@@ -282,6 +304,7 @@ export const useSetupStore = defineStore("setup", () => {
     encryptionEnabled.value = false;
     recoveryPhrase.value = null;
     phraseAcknowledged.value = false;
+    phraseRevealed.value = false;
     sourceId.value = null;
     busy.value = false;
     errorCode.value = null;
@@ -309,6 +332,7 @@ export const useSetupStore = defineStore("setup", () => {
     encryptionEnabled,
     recoveryPhrase,
     phraseAcknowledged,
+    phraseRevealed,
     sourceId,
     busy,
     errorCode,
@@ -330,6 +354,7 @@ export const useSetupStore = defineStore("setup", () => {
     checkSigninComplete,
     createFirstSource,
     acknowledgePhrase,
+    markPhraseRevealed,
     startInitialSync,
     reset,
   };

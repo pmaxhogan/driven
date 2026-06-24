@@ -179,12 +179,21 @@ describe("setup store OAuth sequence (SPEC s11.1)", () => {
     // C1: the dialog token rides along so the backend can prove the path.
     expect(sentReq.localPathToken).toBe("tok-folder");
     expect(setup.sourceId).toBe("src-1");
-    // B3: the one-time recovery phrase was captured + Finish is gated until ack.
+    // B3 + R3-P1-1: the one-time recovery phrase was captured + Finish is gated
+    // until the phrase is REVEALED and acknowledged.
     expect(setup.recoveryPhrase).toEqual(["alpha", "bravo", "charlie"]);
     expect(setup.hasRecoveryPhrase).toBe(true);
     expect(setup.canFinish).toBe(false);
+    // Acknowledging WITHOUT revealing must NOT enable Finish (the regression).
     setup.acknowledgePhrase(true);
+    expect(setup.canFinish).toBe(false);
+    // Revealing then acknowledging enables Finish.
+    setup.markPhraseRevealed(true);
     expect(setup.canFinish).toBe(true);
+    // Re-locking (phrase changed) clears both reveal + ack -> Finish disabled.
+    setup.markPhraseRevealed(false);
+    expect(setup.phraseAcknowledged).toBe(false);
+    expect(setup.canFinish).toBe(false);
     // Reuses the sources store list (refresh fired after add).
     const sources = useSourcesStore();
     expect(sources.sources).toHaveLength(1);
@@ -335,19 +344,34 @@ describe("SetupWizard walks all five steps (DESIGN s8.5)", () => {
     );
     expect(setup.step).toBe("confirm");
 
-    // B3: the recovery phrase is now displayed; Finish is GATED until the user
-    // acknowledges they saved it. The Finish button must start disabled.
+    // B3 + R3-P1-1: the recovery phrase is now displayed; Finish is GATED until
+    // the user REVEALS and acknowledges they saved it. The Finish button must
+    // start disabled.
     expect(setup.hasRecoveryPhrase).toBe(true);
     const finishBtn = () => wrapper.get("footer button:last-child");
     expect(finishBtn().attributes("disabled")).toBeDefined();
 
-    // Acknowledge the phrase via the reveal's confirm checkbox (the only
-    // checkbox on the confirm step), then Finish.
-    const ackBox = wrapper.find('input[type="checkbox"]');
-    expect(ackBox.exists()).toBe(true);
-    await ackBox.setValue(true);
+    // R3-P1-1: the acknowledge checkbox is DISABLED until the phrase is revealed,
+    // so a user cannot confirm "I saved it" while it is still hidden.
+    const ackBox = () => wrapper.get('[data-testid="phrase-ack"]');
+    expect(ackBox().attributes("disabled")).toBeDefined();
+    expect(setup.phraseRevealed).toBe(false);
+
+    // Reveal the phrase (the first button in the reveal component).
+    const revealBtn = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("recoveryPhrase.revealButton"));
+    expect(revealBtn).toBeTruthy();
+    await revealBtn!.trigger("click");
+    await flushPromises();
+    expect(setup.phraseRevealed).toBe(true);
+
+    // Now the checkbox is enabled; acknowledge and Finish becomes enabled.
+    expect(ackBox().attributes("disabled")).toBeUndefined();
+    await ackBox().setValue(true);
     await flushPromises();
     expect(setup.phraseAcknowledged).toBe(true);
+    expect(setup.canFinish).toBe(true);
     expect(finishBtn().attributes("disabled")).toBeUndefined();
 
     // Step 5: finish -> initial sync -> navigate to /activity.

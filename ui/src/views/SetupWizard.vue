@@ -154,6 +154,12 @@ function onPhraseAck(value: boolean): void {
   setup.acknowledgePhrase(value);
 }
 
+// R3-P1-1: the reveal component signals when the phrase has been revealed (or
+// re-locked because it changed). Finish gates on reveal AND acknowledge.
+function onPhraseRevealed(value: boolean): void {
+  setup.markPhraseRevealed(value);
+}
+
 function baseName(p: string): string {
   const parts = p.split(/[\\/]/).filter(Boolean);
   return parts.length > 0 ? parts[parts.length - 1] : p;
@@ -295,6 +301,7 @@ function baseName(p: string): string {
         :phrase="setup.recoveryPhrase ?? undefined"
         :confirmed="setup.phraseAcknowledged"
         @update:confirmed="onPhraseAck"
+        @update:revealed="onPhraseRevealed"
       />
     </div>
 

@@ -66,6 +66,10 @@ const includePatternsText = ref("");
 const excludePatternsText = ref("");
 const encryptionEnabled = ref(false);
 const phraseConfirmed = ref(false);
+// R3-P1-1: the user has actually REVEALED the phrase at least once. The reveal
+// step's Done button gates on reveal AND acknowledge so the phrase can never be
+// confirmed-without-seeing-it. Reset whenever the phrase changes/clears.
+const phraseRevealed = ref(false);
 // B3: the BIP39 phrase the backend RETURNS from add_source on the first
 // encrypted source. Empty until then; shown once on the reveal step.
 const recoveryPhrase = ref<string[]>([]);
@@ -142,6 +146,7 @@ function reset(): void {
   excludePatternsText.value = "";
   encryptionEnabled.value = false;
   phraseConfirmed.value = false;
+  phraseRevealed.value = false;
   recoveryPhrase.value = [];
   createdSource.value = null;
   crumbs.value = [];
@@ -271,6 +276,8 @@ async function confirm(): Promise<void> {
     if (result.recoveryPhrase && result.recoveryPhrase.length > 0) {
       recoveryPhrase.value = result.recoveryPhrase;
       phraseConfirmed.value = false;
+      // R3-P1-1: a fresh phrase must be revealed before it can be acknowledged.
+      phraseRevealed.value = false;
       revealing.value = true;
     } else {
       emit("created", result.source);
@@ -286,10 +293,19 @@ async function confirm(): Promise<void> {
 /** B3: leave the reveal step once the user acknowledged the phrase - emit the
  * created source + close. Guarded so it cannot fire without acknowledgement. */
 function finishReveal(): void {
-  if (!phraseConfirmed.value) return;
+  // R3-P1-1: never leave the reveal step unless the phrase was revealed AND
+  // acknowledged.
+  if (!phraseConfirmed.value || !phraseRevealed.value) return;
   const created = createdSource.value;
   if (created) emit("created", created);
   close();
+}
+
+// R3-P1-1: the reveal component signals when the phrase has been revealed (or
+// re-locked because it changed). When re-locked, also clear the acknowledgement.
+function onPhraseRevealed(value: boolean): void {
+  phraseRevealed.value = value;
+  if (!value) phraseConfirmed.value = false;
 }
 
 defineExpose({ start });
@@ -529,6 +545,7 @@ defineExpose({ start });
         <RecoveryPhraseReveal
           v-model:confirmed="phraseConfirmed"
           :phrase="recoveryPhrase"
+          @update:revealed="onPhraseRevealed"
         />
       </div>
 
@@ -572,7 +589,7 @@ defineExpose({ start });
             v-if="step === 'reveal'"
             type="button"
             class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
-            :disabled="!phraseConfirmed"
+            :disabled="!phraseConfirmed || !phraseRevealed"
             data-testid="reveal-done"
             @click="finishReveal"
           >

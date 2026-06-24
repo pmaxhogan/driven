@@ -190,7 +190,8 @@
     "revealButton": "Reveal recovery phrase",
     "hideButton": "Hide",
     "copyButton": "Copy",
-    "confirmedLabel": "I have saved my recovery phrase"
+    "confirmedLabel": "I have saved my recovery phrase",
+    "revealFirstHint": "Reveal your recovery phrase before confirming you have saved it."
   },
   "activity": {
     "title": "Activity",
