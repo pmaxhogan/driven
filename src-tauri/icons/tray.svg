@@ -1,0 +1,14 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="32" height="32" viewBox="0 0 32 32">
+  <!-- Driven tray glyph: simplified monochrome template (cloud + up chevron). -->
+  <!-- Single solid black on transparent; tauri trayIcon iconAsTemplate recolors it per-OS. -->
+  <g fill="#000000">
+    <!-- Bold cloud silhouette built from fused circles + flat base. -->
+    <circle cx="11" cy="12" r="4.4"/>
+    <circle cx="16" cy="9.5" r="5.4"/>
+    <circle cx="21" cy="11.5" r="4.6"/>
+    <circle cx="23.5" cy="13.5" r="3"/>
+    <rect x="11" y="12" width="12.5" height="4.4"/>
+    <!-- Up chevron beneath the cloud (data driving up). -->
+    <path d="M 16 18 L 22 25 L 18.6 25 L 16 22 L 13.4 25 L 10 25 Z"/>
+  </g>
+</svg>

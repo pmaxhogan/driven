@@ -1,0 +1,33 @@
+<svg xmlns="http://www.w3.org/2000/svg" width="1024" height="1024" viewBox="0 0 1024 1024">
+  <!-- Driven app icon: road-to-cloud (concept C2). Flat two-color: white glyph on deep teal. -->
+  <rect width="1024" height="1024" fill="#0F766E"/>
+
+  <!-- White road: wide at bottom-center, gentle S-curve narrowing with perspective up into the cloud base. -->
+  <path fill="#FFFFFF" d="
+    M 372 838
+    C 386 720, 470 660, 476 558
+    C 480 502, 470 470, 488 442
+    L 536 442
+    C 554 470, 544 502, 548 558
+    C 554 660, 638 720, 652 838
+    Z"/>
+
+  <!-- Dashed centerline: teal gaps painted over the white road, narrowing toward the top. -->
+  <g fill="#0F766E">
+    <polygon points="500,800 524,800 521,748 503,748"/>
+    <polygon points="504,710 520,710 518,666 506,666"/>
+    <polygon points="507,632 517,632 516,594 508,594"/>
+    <polygon points="509,564 515,564 514,532 510,532"/>
+    <polygon points="510,506 514,506 513,480 511,480"/>
+  </g>
+
+  <!-- White cloud: classic multi-bump silhouette built from fused circles + a flat base. -->
+  <g fill="#FFFFFF">
+    <circle cx="408" cy="372" r="76"/>
+    <circle cx="512" cy="316" r="104"/>
+    <circle cx="624" cy="356" r="88"/>
+    <circle cx="688" cy="404" r="60"/>
+    <circle cx="356" cy="416" r="56"/>
+    <rect x="356" y="404" width="332" height="64" rx="0"/>
+  </g>
+</svg>
