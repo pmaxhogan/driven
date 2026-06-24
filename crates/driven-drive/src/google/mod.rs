@@ -186,7 +186,20 @@ pub enum DriveError {
     ResumableSessionInvalid,
     /// Verification of the uploaded bytes failed: Drive's `md5Checksum` did
     /// not match the bytes Driven sent (SPEC s24 `drive.checksum_mismatch`).
-    ChecksumMismatch,
+    ///
+    /// `stranded_file_id` is `Some(file_id)` ONLY when this was a CREATE whose
+    /// corrupt new object was materialized on Drive AND the store's best-effort
+    /// `trash()` of it ALSO failed - so a live corrupt object may still be on
+    /// Drive (codex C5-P1-4). The executor persists that id (`corrupt_file_id`)
+    /// and KEEPS the pending op so reconcile retries the trash. `None` means
+    /// the corrupt object is confirmed gone (trash succeeded), or it was an
+    /// UPDATE (whose file_id is the user's pre-existing good file - never
+    /// trashed), or no object materialized (a streamed-session mismatch).
+    ChecksumMismatch {
+        /// `Some` when a corrupt CREATE object may still be live on Drive
+        /// (its trash failed) and the executor must keep the op to retry it.
+        stranded_file_id: Option<String>,
+    },
 }
 
 impl std::fmt::Display for DriveError {
@@ -204,9 +217,13 @@ impl std::fmt::Display for DriveError {
                 f,
                 "drive.resumable_session_invalid: resumable session is invalid; restart required"
             ),
-            DriveError::ChecksumMismatch => {
-                write!(f, "drive.checksum_mismatch: md5 mismatch after upload")
-            }
+            DriveError::ChecksumMismatch { stranded_file_id } => match stranded_file_id {
+                Some(id) => write!(
+                    f,
+                    "drive.checksum_mismatch: md5 mismatch after upload; corrupt object {id} could not be trashed"
+                ),
+                None => write!(f, "drive.checksum_mismatch: md5 mismatch after upload"),
+            },
         }
     }
 }
@@ -271,7 +288,7 @@ impl DriveError {
             DriveError::DestFolderMissing
             | DriveError::DestFolderPermissionDenied
             | DriveError::ResumableSessionInvalid
-            | DriveError::ChecksumMismatch => DriveErrorClassification::Other,
+            | DriveError::ChecksumMismatch { .. } => DriveErrorClassification::Other,
         }
     }
 
@@ -1115,15 +1132,22 @@ impl GoogleDriveStore {
                         file_id = %entry.id,
                         "md5 mismatch on create; trashing the corrupt new object before failing"
                     );
-                    // Best-effort: a failed trash still surfaces the checksum
-                    // error (the executor will not commit the op), but we must
-                    // not swallow the original mismatch behind a trash error.
+                    // Best-effort trash. On SUCCESS the corrupt object is gone -
+                    // surface the bare mismatch (executor drops the op). On
+                    // FAILURE a live corrupt object may still be on Drive, so
+                    // surface its file_id in the error (codex C5-P1-4): the
+                    // executor persists it as `corrupt_file_id` and KEEPS the op
+                    // so reconcile retries the trash. We must not swallow the
+                    // original mismatch behind a trash error either way.
                     if let Err(te) = self.trash(&entry.id).await {
                         warn!(
                             target: TARGET,
                             file_id = %entry.id,
-                            "failed to trash corrupt create object after md5 mismatch: {te}"
+                            "failed to trash corrupt create object after md5 mismatch; surfacing stranded id so reconcile retries: {te}"
                         );
+                        return Err(anyhow::Error::new(DriveError::ChecksumMismatch {
+                            stranded_file_id: Some(entry.id.clone()),
+                        }));
                     }
                 }
                 Err(e)
@@ -1607,14 +1631,18 @@ pub(crate) fn md5_of(bytes: &[u8]) -> [u8; 16] {
 pub(crate) fn verify_md5(entry: &RemoteEntry, expected: [u8; 16]) -> anyhow::Result<()> {
     match entry.md5 {
         Some(actual) if actual == expected => Ok(()),
-        Some(_) => Err(anyhow::Error::new(DriveError::ChecksumMismatch)),
+        Some(_) => Err(anyhow::Error::new(DriveError::ChecksumMismatch {
+            stranded_file_id: None,
+        })),
         None => {
             // Drive returns no md5 for a 0-byte file; the empty-content md5 is
             // d41d8cd98f00b204e9800998ecf8427e. Accept only that case.
             if expected == md5_of(&[]) {
                 Ok(())
             } else {
-                Err(anyhow::Error::new(DriveError::ChecksumMismatch))
+                Err(anyhow::Error::new(DriveError::ChecksumMismatch {
+                    stranded_file_id: None,
+                }))
             }
         }
     }
