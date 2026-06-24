@@ -257,7 +257,43 @@
   },
   "restore": {
     "title": "Restore",
-    "placeholder": "The restore browser arrives in a later release."
+    "source": "Source",
+    "loading": "Loading...",
+    "search": {
+      "label": "Search",
+      "placeholder": "Filename or glob (e.g. *.pdf)",
+      "submit": "Search",
+      "clear": "Clear"
+    },
+    "breadcrumb": {
+      "label": "Folder path",
+      "root": "Home"
+    },
+    "empty": {
+      "tree": "No backed-up files in this folder yet.",
+      "search": "No files match your search."
+    },
+    "node": {
+      "folder": "Folder",
+      "select": "Select file to restore",
+      "notUploaded": "Not yet uploaded"
+    },
+    "selectedCount": "{count} selected",
+    "clearSelection": "Clear selection",
+    "pickDestination": "Choose destination...",
+    "start": "Restore selected",
+    "progress": {
+      "running": "Restoring...",
+      "done": "Restore complete",
+      "summary": "{completed} of {total} done, {failed} failed",
+      "current": "Restoring: {file}"
+    },
+    "file": {
+      "pending": "Pending",
+      "restoring": "Restoring",
+      "done": "Done",
+      "failed": "Failed"
+    }
   },
   "errors": {
     "auth": {

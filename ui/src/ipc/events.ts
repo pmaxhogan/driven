@@ -6,7 +6,12 @@
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-import type { ActivityEntry, GlobalSyncStatus, UpdateInfo } from "./types";
+import type {
+  ActivityEntry,
+  GlobalSyncStatus,
+  RestoreJobStatus,
+  UpdateInfo,
+} from "./types";
 
 /** `sync:status_changed` payload: GlobalSyncStatus (SPEC s11.7). */
 export function onSyncStatusChanged(
@@ -100,9 +105,11 @@ export function onUpdaterDownloaded(
   return listen<UpdateInfo>("updater:downloaded", (e) => handler(e.payload));
 }
 
-/** `restore:progress` payload: RestoreJobStatus (typed in M8) (SPEC s11.7). */
+/** `restore:progress` payload: RestoreJobStatus (SPEC s11.7). The Restore view's
+ * store subscribes to this for live per-file + overall progress, errors, and the
+ * terminal `done` state. */
 export function onRestoreProgress(
-  handler: (status: unknown) => void,
+  handler: (status: RestoreJobStatus) => void,
 ): Promise<UnlistenFn> {
-  return listen<unknown>("restore:progress", (e) => handler(e.payload));
+  return listen<RestoreJobStatus>("restore:progress", (e) => handler(e.payload));
 }

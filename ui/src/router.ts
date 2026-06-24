@@ -2,9 +2,8 @@ import { createRouter, createWebHistory, type RouteRecordRaw } from "vue-router"
 
 // SPEC s25 route map. The Settings view hosts the Accounts / Sources / Rules
 // tabs (DESIGN s8.2); each tab has its own path so the tray menu + deep links
-// can target a specific tab directly. Activity (M7) and Restore (M8) are
-// placeholder views in M6 (the "coming in M7/M8" shells), so the routes exist
-// and resolve but render a placeholder until those milestones.
+// can target a specific tab directly. Activity (M7) and Restore (M8) are now
+// fully implemented views; /restore/:sourceId scopes the browser to one source.
 const routes: RouteRecordRaw[] = [
   {
     path: "/setup",

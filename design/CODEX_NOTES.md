@@ -1159,3 +1159,101 @@ extra empty fetch, never a skipped row). The per-op activity sink runs one write
 per op (correctness: no mid-plan audit loss + per-file visibility); DESIGN s18.4's
 1-second batched activity writer remains a future optimization, not required for
 the correctness fix.
+
+## M8 - Restore browser (ROADMAP M8)
+
+Restore flow (SPEC s11.5, DESIGN s8.4): browse what is backed up, search by
+filename/glob, and restore selected files to a local folder - INCLUDING the
+encrypted path (decrypt filename for display + STREAM-decrypt content to disk).
+
+### What landed
+
+- **State layer (driven-core).** Two new `StateRepo` methods, each with a default
+  impl (so the test fakes need no per-fake stub) overridden by `SqliteStateRepo`:
+  - `list_file_state_under_prefix(source, prefix, limit)` -> `Vec<RestoreFileRow>`:
+    an INDEXED range scan over the `(source_id, relative_path)` PK
+    (`relative_path = prefix OR (>= 'prefix/' AND < 'prefix0')`), so a folder open
+    is one range query, not a Drive call (ROADMAP M8 navigation reads file_state).
+    Returns `limit + 1` rows so the caller detects truncation without a COUNT.
+  - `search_files_glob(source, pattern, limit)`: a `relative_path GLOB ?` scan for
+    wildcard queries the FTS5 tokenizer cannot express (`*.rs`, `src/*`). The
+    existing FTS5 `search_files` keeps serving prefix/term queries.
+  - New `RestoreFileRow` row type. Tests: subtree range scan (incl. the
+    `prefix0` upper bound excluding a sibling like `srcfoo.txt`), limit+1
+    truncation, glob wildcard match. sqlx-prepare ran; 0 drift.
+
+- **Restore IPC (src-tauri `commands/restore.rs`).** Four real `#[tauri::command]`s:
+  - `list_remote_tree(source_id, prefix)`: derives the IMMEDIATE children
+    (sub-folders + files) of a validated plaintext prefix from the range-scan rows.
+    Folders sort before files. Names are plaintext (file_state stores the plaintext
+    path even for encrypted sources, SPEC s2), so the browser shows decrypted names
+    with no keystore touch for display.
+  - `search_files(source_id?, query, limit)`: routes a glob-metachar query to the
+    GLOB path, else FTS5.
+  - `restore_files(items, dest_token)`: validates + resolves each selection to its
+    authoritative file_state row, builds the per-account remote store + crypto
+    verdict UP FRONT, then SPAWNS a background job that streams `restore:progress`.
+  - `get_restore_job(job)`: serves the latest snapshot from an AppState registry
+    for a late subscriber.
+
+- **Streaming decrypt (DATA-SAFETY + PERF).** `stream_to_disk` reads the 40-byte
+  header, opens a `ContentDecryptor`, and decrypts ONE 64-KiB+tag ciphertext frame
+  at a time using a rolling buffer: it `decrypt_chunk`s a leading frame only while
+  STRICTLY MORE than one frame is buffered (so the frame is provably non-final),
+  and `decrypt_last`s whatever <= one frame remains at EOF. RSS stays ~2 frames
+  (~128 KiB) regardless of file size, so a 1 GiB encrypted file never sits whole in
+  RAM. The restored plaintext is BLAKE3-verified against `file_state.hash_blake3`
+  (a wrong decrypt / corrupted object is refused, not written) and the length is
+  cross-checked, then placed via temp + fsync + atomic rename. Tests: multi-chunk
+  (~5.3 MiB) round-trip, empty/small, exact-frame-multiple edge case, plaintext
+  passthrough, wrong-key failure, blake3-mismatch refusal, filename decrypt
+  round-trip.
+
+### Path-validation approach (SPEC s11.6.1)
+
+The restore destination is the untrusted input. The webview never sends a raw
+path: it calls `pick_folder_dialog` (backend-owned native picker) which mints a
+one-shot dialog TOKEN; `restore_files` CONSUMES the token to the approved root,
+then a new `validate_restore_dest(token, relative_path)` confines every per-file
+write under that root. It reuses `RelativePath::try_from` (rejecting `..`,
+absolute, drive/UNC, NUL), canonicalises the dialog root, joins the relative tree,
+`create_dir_all`s the parent chain, RE-canonicalises the parent and re-confirms it
+is still under the root (catches a pre-existing symlinked-directory escape), and
+refuses a symlink-at-leaf. The `list_remote_tree` prefix is validated as a
+printable, `/`-separated, length-bounded plaintext path (NOT a local path). Tests
+in `commands/mod.rs`: nested-dir creation + confinement, traversal rejected,
+absolute rejected, symlink-at-leaf rejected, symlinked-parent-escape rejected
+(unix).
+
+### Frontend
+
+`Restore.vue` (replacing the M6 placeholder): source selector, search box,
+breadcrumb tree (lazy per folder), multi-select with checkboxes, backend folder
+dialog for the destination, restore button, and a live progress panel (overall
+bar + per-file states) driven by the `restore` Pinia store subscribing to
+`restore:progress`. Typed IPC wrappers + `RestoreJobStatus`/`RemoteEntryDto`/...
+DTO types mirror the Rust serde shapes (camelCase). vitest drives the whole
+browse -> search -> select -> restore flow against mocked `invoke` + a mocked
+`restore:progress` stream (progress accumulates to a terminal `done`).
+
+### Deviations / residuals
+
+- **`restore_files` takes a dialog `dest_token`, not the SPEC s11.5 raw
+  `dest_dir: PathBuf`.** This is the SAME deviation s11.6.1 MANDATES and the M6
+  surface already adopted for `export_diagnostic_bundle`/`add_source`: a raw
+  webview path is forbidden, so the signature carries the one-shot token the
+  backend resolves to the approved directory. The contract is documented on the
+  command + the typed wrapper.
+- **No mid-job cancel command.** ROADMAP M8 lists "cancel mid-restore cleans up the
+  partial file"; partial-file cleanup IS implemented (every per-file write is a
+  temp file removed on any error, and only renamed into place after blake3
+  verification, so a failed/aborted file never leaves a partial under the final
+  name). A USER-driven cancel IPC is not wired in this pass - the background job
+  runs to completion. The data-safety half of the acceptance (no partial final
+  files) holds; an explicit cancel button is a follow-up (honest residual, not a
+  fake-green).
+- **ICU plural not used for `restore.selectedCount`.** vue-i18n's default message
+  compiler in this repo is not configured for ICU MessageFormat (DESIGN s8.7 names
+  it as the V1 target but it is not wired; no existing key uses it). Used a plain
+  `{count} selected` interpolation rather than introduce an unparseable ICU string
+  that breaks the build. Wiring ICU is a cross-cutting i18n change, out of M8 scope.

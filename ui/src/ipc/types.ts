@@ -335,3 +335,67 @@ export interface AccountSyncStatus {
 export interface GlobalSyncStatus {
   accounts: AccountSyncStatus[];
 }
+
+// --- Restore (SPEC s11.5; DESIGN s8.4) - mirrors src-tauri restore DTOs ---
+
+/** One node in the Restore browser tree (mirrors src-tauri RemoteEntryDto):
+ * either a folder (descendable) or a restorable file. Derived from file_state;
+ * the name is plaintext even for encrypted sources (file_state stores the
+ * plaintext path). */
+export interface RemoteEntryDto {
+  relativePath: string;
+  name: string;
+  isDir: boolean;
+  size: number;
+  status: FileStateStatus | null;
+  restorable: boolean;
+}
+
+/** One Restore search hit (mirrors src-tauri FileSearchHitDto). */
+export interface FileSearchHitDto {
+  sourceId: string;
+  relativePath: string;
+  status: FileStateStatus;
+  restorable: boolean;
+}
+
+/** One file selected to restore (mirrors src-tauri RestoreItem): the
+ * (sourceId, relativePath) file_state key. The backend re-reads the Drive id +
+ * size from SQLite; the webview never supplies a local path. */
+export interface RestoreItem {
+  sourceId: string;
+  relativePath: string;
+}
+
+/** The opaque id of a spawned restore job (mirrors src-tauri RestoreJobId). */
+export type RestoreJobId = string;
+
+/** Per-file lifecycle state within a restore job (mirrors src-tauri
+ * RestoreFileState). */
+export type RestoreFileState = "pending" | "restoring" | "done" | "failed";
+
+/** Per-file progress within a restore job (mirrors src-tauri
+ * RestoreFileProgress). `errorCode` is a stable SPEC s24 i18n key when failed. */
+export interface RestoreFileProgress {
+  relativePath: string;
+  state: RestoreFileState;
+  bytesDone: number;
+  bytesTotal: number;
+  errorCode: string | null;
+}
+
+/** The full status of a restore job (mirrors src-tauri RestoreJobStatus): the
+ * `restore:progress` event payload AND the `getRestoreJob` result. Carries
+ * overall progress, the current file, the per-file breakdown, and a terminal
+ * `done` flag. */
+export interface RestoreJobStatus {
+  jobId: string;
+  totalFiles: number;
+  completedFiles: number;
+  failedFiles: number;
+  totalBytes: number;
+  bytesDone: number;
+  currentFile: string | null;
+  done: boolean;
+  files: RestoreFileProgress[];
+}

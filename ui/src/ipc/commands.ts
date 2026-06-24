@@ -17,6 +17,7 @@ import type {
   DriveFolderListing,
   ExclusionPreview,
   ExclusionPreviewRequest,
+  FileSearchHitDto,
   GlobalSyncStatus,
   OAuthAuthUrl,
   OAuthStatus,
@@ -24,6 +25,10 @@ import type {
   PickedPath,
   ReauthSession,
   ReleaseDto,
+  RemoteEntryDto,
+  RestoreItem,
+  RestoreJobId,
+  RestoreJobStatus,
   SessionId,
   SettingsDto,
   SettingsPatch,
@@ -211,4 +216,45 @@ export function activitySummary(
     weekStartMs,
     throughputWindowMs,
   });
+}
+
+// --- Restore (SPEC s11.5; DESIGN s8.4) ---
+
+/** List the immediate children (sub-folders + files) of `prefix` in the backed-up
+ * tree (SPEC s11.5). Reads file_state (local metadata), never Drive; names are
+ * plaintext even for encrypted sources. `prefix` is a Drive-relative plaintext
+ * path (empty string = the source root). */
+export function listRemoteTree(
+  sourceId: string,
+  prefix: string,
+): Promise<RemoteEntryDto[]> {
+  return invoke("list_remote_tree", { sourceId, prefix });
+}
+
+/** Search backed-up files by filename / glob (SPEC s11.5). A query with a glob
+ * metacharacter (`*`, `?`, `[`) routes to the wildcard path; otherwise to the
+ * FTS5 prefix/term path. `sourceId === null` searches across all sources. */
+export function searchFiles(
+  sourceId: string | null,
+  query: string,
+  limit: number,
+): Promise<FileSearchHitDto[]> {
+  return invoke("search_files", { sourceId, query, limit });
+}
+
+/** Restore selected files to the dialog-approved destination folder (SPEC s11.5).
+ * `destToken` is a one-shot token from `pickFolderDialog` (the webview never
+ * supplies a raw path). Returns the spawned job id; progress arrives on
+ * `restore:progress` (subscribe via `onRestoreProgress`). */
+export function restoreFiles(
+  items: RestoreItem[],
+  destToken: string,
+): Promise<RestoreJobId> {
+  return invoke("restore_files", { items, destToken });
+}
+
+/** The current status snapshot of a restore job (SPEC s11.5), for a late /
+ * reconnected subscriber that missed the live `restore:progress` stream. */
+export function getRestoreJob(job: RestoreJobId): Promise<RestoreJobStatus> {
+  return invoke("get_restore_job", { job });
 }
