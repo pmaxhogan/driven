@@ -1298,3 +1298,57 @@ All findings from `.claude/codex-reviews/M8-20260624-161042.md` fixed. The prior
   net.intermittent / drive.unreachable for 404/unclassified), reusing the same
   typed `classification_of` downcast + string fallback the executor uses. The
   specific code is stored on the per-file restore failure.
+
+## M8 codex recheck-1 fixes (2 P1 + 2 P2; baseline 1a7ad60 @ dc428fb)
+
+All findings from `.claude/codex-reviews/M8-recheck1-20260624-165457.md` fixed.
+
+- **R1-P1-1 - confine the parent chain BEFORE creating it (symlink escape).**
+  `validate_restore_dest` (`commands/mod.rs`) previously called
+  `std::fs::create_dir_all(parent)` BEFORE the symlink/confinement check, so a
+  pre-existing symlink directory component in the restore root (`escape ->
+  C:\outside`) let `create_dir_all` create directories OUTSIDE the approved root
+  (`C:\outside\new`) before the post-hoc canonicalise-and-reject ran (SPEC s11.6.1
+  violation). Now it WALKS the destination directory components ONE AT A TIME from
+  the canonical root: at each existing component it rejects a SYMLINK (and re-confirms
+  the canonical form is still under the root) BEFORE descending, and for a missing
+  component it creates ONLY that one level (`std::fs::create_dir`, never
+  `create_dir_all`) once the current parent is verified real + confined. No directory
+  is ever created outside the canonical root. Test (`validate_restore_dest_symlink_
+  component_creates_no_dir_outside_root`, Unix): restoring `escape/new/file.txt`
+  through a symlinked `escape` is rejected AND `outside/new` is NOT created.
+- **R1-P1-2 - UI cancel must not orphan the task.** `cancel_restore_job` (the IPC)
+  called `AppState::cancel_restore_job`, which TAKES the spawned `JoinHandle` out of
+  the job entry; the IPC then `let _ = ...` DROPPED it, detaching/orphaning the
+  tokio task (after a UI cancel the task was no longer drainable on shutdown and
+  could run on until its next read). Added `AppState::signal_cancel_restore_job`,
+  which ONLY sets the cancel flag and LEAVES the handle tracked; the IPC now uses it.
+  The task still observes the flag, cleans its temp, emits CANCELLED, and clears its
+  own handle on exit (`finish_restore_job_handle`); the M5-style shutdown drain
+  (`cancel_all_restore_jobs`) still finds + awaits/aborts the handle, so a UI cancel
+  never detaches the task. The handle-taking `cancel_restore_job` is retained as
+  public API for an owning caller. Test (`ui_cancel_sets_flag_but_keeps_handle_for_
+  shutdown_drain`): after a UI cancel the handle is STILL tracked and joinable by the
+  shutdown drain (not orphaned).
+- **R1-P2-1 - classify mid-stream download read errors.** Mid-stream Drive download
+  (`AsyncRead`) read errors were mapped through `map_io_err`, so a network/timeout
+  became `local.io_error` (the user was told the DISK failed when DRIVE/network
+  failed). Added `driven_drive::google::classify_stream_read_error(&io::Error)`,
+  which walks the io error's source chain for the wrapped `DriveError` / raw
+  `reqwest::Error` (the real `StreamingDownloadReader` wraps the transport error via
+  `io::Error::other`) and returns its `DriveErrorClassification`. `restore.rs`'s new
+  `map_download_read_err` routes every download-stream READ error (the plaintext +
+  encrypted read loops, and the encrypted header `read_exact` except a genuine
+  `UnexpectedEof`, which stays `crypto.decrypt_failed` for a truncated object) to the
+  right s24 code (net.intermittent / drive.rate_limited / auth / quota / ...), never
+  `local.io_error`; disk WRITE errors still use `map_io_err`. Tests: a mid-stream
+  read break maps to net.intermittent (unclassified) / drive.rate_limited (dotted-
+  code message), and the mapper never returns local.io_error.
+- **R1-P2-2 - atomic replace-over-existing on Windows.** `tokio::fs::rename(&tmp,
+  &dest)` is not a portable atomic REPLACE: restoring OVER an existing file can fail
+  on Windows. Added `atomic_replace` (`restore.rs`) using the platform primitive on
+  a blocking thread - Windows `MoveFileExW(MOVEFILE_REPLACE_EXISTING |
+  MOVEFILE_WRITE_THROUGH)` (new Windows-only `windows-sys` dep, `cfg(windows)`-gated
+  so the 3-OS CI stays green), Unix `std::fs::rename` (already replaces). Tests:
+  `atomic_replace` overwrites an existing file (temp gone after), and a full
+  `restore_one_file` over a pre-existing dest succeeds + leaves no temp.
