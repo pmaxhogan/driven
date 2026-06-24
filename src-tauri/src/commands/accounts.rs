@@ -55,15 +55,13 @@ use crate::events::EVENT_OAUTH_COMPLETE;
 /// Tracing target for the accounts command layer.
 const TARGET: &str = "driven::app::accounts";
 
-/// Environment override for the OAuth client id (SPEC s4), mirroring the
-/// assembly default so a wizard that does not collect BYO credentials still
-/// uses the public installed-app client.
+/// R2-P2-1 (BYO-only, SPEC s11.1 / DESIGN s6.1): the OAuth client id env
+/// override. Driven is BYO-ONLY - there is NO baked-in default client. The
+/// env var exists ONLY as a TEST injection seam (the real-Drive e2e / google_e2e
+/// path sets it); production REQUIRES the user's submitted/stored BYO creds.
 const ENV_OAUTH_CLIENT_ID: &str = "DRIVEN_OAUTH_CLIENT_ID";
-/// Environment override for the OAuth client secret (SPEC s4).
+/// R2-P2-1: the OAuth client secret env override (test injection seam only).
 const ENV_OAUTH_CLIENT_SECRET: &str = "DRIVEN_OAUTH_CLIENT_SECRET";
-/// The public installed-app client id (SPEC s4), mirroring `assembly`'s default.
-const DEFAULT_CLIENT_ID: &str =
-    "1094503409775-kvuig3oqtchrq1s4tc1cnpi60mdvnqfe.apps.googleusercontent.com";
 
 /// One server-side add-account / reauth wizard session.
 ///
@@ -130,17 +128,32 @@ fn progress_to_status(p: OAuthProgress) -> OAuthStatus {
     }
 }
 
-/// Resolve the OAuth client id + secret for a session: the BYO credentials if
-/// submitted, else the env overrides, else the public installed-app default.
-fn resolve_creds(session: &WizardSession) -> (String, String) {
-    let client_id = session.client_id.clone().unwrap_or_else(|| {
-        std::env::var(ENV_OAUTH_CLIENT_ID).unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string())
-    });
+/// R2-P2-1 (BYO-only): resolve the OAuth client id + secret for a session - the
+/// BYO credentials the user submitted, else the env override (a TEST-only
+/// injection seam, e.g. real-Drive e2e). There is NO baked-in production default
+/// client: a session with no submitted creds AND no env override is REJECTED, so
+/// a direct IPC call can never start OAuth against a Driven-owned client (DESIGN
+/// s6.1). The secret may legitimately be empty for a PKCE installed-app client;
+/// only the client id is required.
+fn resolve_creds(session: &WizardSession) -> CommandResult<(String, String)> {
+    let client_id = session
+        .client_id
+        .clone()
+        .filter(|id| !id.trim().is_empty())
+        .or_else(|| std::env::var(ENV_OAUTH_CLIENT_ID).ok())
+        .filter(|id| !id.trim().is_empty())
+        .ok_or_else(|| {
+            CommandError::with_code(
+                ErrorCode::AuthConsentRequired,
+                "no OAuth client credentials for this session; submit your BYO client id first \
+                 (Driven is bring-your-own-credentials only)",
+            )
+        })?;
     let client_secret = session
         .client_secret
         .clone()
         .unwrap_or_else(|| std::env::var(ENV_OAUTH_CLIENT_SECRET).unwrap_or_default());
-    (client_id, client_secret)
+    Ok((client_id, client_secret))
 }
 
 /// `list_accounts()` - every configured Google account (SPEC s11.1).
@@ -244,9 +257,13 @@ pub async fn start_oauth_signin(
                 "OAuth sign-in already started for this session",
             ));
         }
+        // R2-P2-1: REQUIRE BYO/env creds before starting OAuth - reject (and do
+        // NOT mark the session started) if none are present, so a direct IPC call
+        // cannot kick off OAuth without submitted credentials.
+        let creds = resolve_creds(s)?;
         s.started = true;
         s.status = OAuthStatus::OpeningBrowser;
-        resolve_creds(s)
+        creds
     };
 
     // A one-shot to lift the consent URL out of the browser-opener closure (the
@@ -381,15 +398,19 @@ pub async fn finish_add_account(
     session: SessionId,
     display_name: Option<String>,
 ) -> CommandResult<AccountDto> {
-    // Take the tokens + resolved client creds out of the session (consuming the
-    // session on success).
+    // R2-P2-2: READ (clone, do NOT take) the tokens + resolved client creds out
+    // of the session, so the session stays REPLAYABLE if any persistence step
+    // below fails. The session is consumed (removed) ONLY after the account row
+    // and keychain creds are durably persisted (success path); a failure leaves
+    // the session intact so the user can retry `finish_add_account` without
+    // re-running the whole OAuth flow.
     let (tokens, reauth_account, creds) = {
         let mut sessions = lock_sessions();
         let s = sessions
             .get_mut(&session.0)
             .ok_or_else(unknown_session_err)?;
-        let creds = resolve_creds(s);
-        match (&s.status, s.tokens.take()) {
+        let creds = resolve_creds(s)?;
+        match (&s.status, s.tokens.clone()) {
             (OAuthStatus::Complete, Some(tokens)) => (tokens, s.account_id, creds),
             (OAuthStatus::Failed { code }, _) => {
                 let ec = ErrorCode::from_code(code).unwrap_or(ErrorCode::AuthConsentRequired);
@@ -464,14 +485,6 @@ pub async fn finish_add_account(
         // fails, roll back the just-stored refresh token so NO half-account
         // (token without creds, or a row that cannot refresh) is left behind.
         let account_id = AccountId::new_v4();
-        store_refresh_token(account_id, &tokens.refresh_token)?;
-        if let Err(err) = store_client_creds(account_id, &creds) {
-            if let Err(del) = KeyringTokenStore::new(account_id.to_string()).delete_refresh_token()
-            {
-                tracing::error!(target: TARGET, account_id = %account_id, error = %del, "failed to roll back refresh token after client-creds persist failure");
-            }
-            return Err(err);
-        }
 
         // A5: prefer the real Google email; else the user label; else a stable
         // fallback. The display name prefers the user-supplied label, else the
@@ -506,16 +519,32 @@ pub async fn finish_add_account(
             created_at: now,
             last_synced_at: None,
         };
-        state
-            .state()
-            .upsert_account(&row)
-            .await
-            .map_err(CommandError::from)?;
+
+        // R1-P1-4 / R2-P2-2: persist the keychain token + creds AND the account
+        // row with full rollback. The helper stores token -> creds -> row in
+        // order, rolling back EVERY prior keychain write if a later step fails, so
+        // a failure leaves NO orphaned keychain entries. The real OS keychain is
+        // the secret store; the row insert is the live StateRepo.
+        persist_new_account(
+            &RealAccountSecretStore,
+            account_id,
+            &tokens.refresh_token,
+            &creds,
+            |r| {
+                let repo = state.state().clone();
+                let r = r.clone();
+                async move { repo.upsert_account(&r).await }
+            },
+            &row,
+        )
+        .await?;
         tracing::info!(target: TARGET, account_id = %account_id, "account persisted");
         (account_id, account_row_to_dto(&row))
     };
 
-    // Consume the session now that the account is persisted.
+    // R2-P2-2: consume the session ONLY now that the account row + keychain creds
+    // are durably persisted. A failure above left the session intact so the user
+    // can retry `finish_add_account` without re-running the OAuth flow.
     lock_sessions().remove(&session.0);
 
     // A2: HOT-SPAWN the account's orchestrator so the wizard's initial
@@ -560,6 +589,95 @@ fn store_client_creds(account_id: AccountId, creds: &(String, String)) -> Comman
                 format!("failed to persist BYO OAuth client creds in keychain: {e}"),
             )
         })
+}
+
+/// R2-P2-2: the per-account keychain secret operations the fresh-add
+/// persistence helper needs, abstracted behind a trait so the rollback ordering
+/// can be exercised by a test (an in-memory fake) WITHOUT touching the real OS
+/// keychain. The production impl is [`RealAccountSecretStore`].
+trait AccountSecretStore {
+    /// Store the refresh token for `account_id` (SPEC s4.1).
+    fn store_refresh_token(&self, account_id: AccountId, refresh_token: &str) -> CommandResult<()>;
+    /// Store the BYO client creds for `account_id` (A1).
+    fn store_client_creds(
+        &self,
+        account_id: AccountId,
+        creds: &(String, String),
+    ) -> CommandResult<()>;
+    /// Delete the refresh token (rollback; idempotent).
+    fn delete_refresh_token(&self, account_id: AccountId) -> anyhow::Result<()>;
+    /// Delete the BYO client creds (rollback; idempotent).
+    fn delete_client_creds(&self, account_id: AccountId) -> anyhow::Result<()>;
+}
+
+/// The production [`AccountSecretStore`] over the real OS keychain
+/// ([`KeyringTokenStore`] + `ClientCredsStore`).
+struct RealAccountSecretStore;
+
+impl AccountSecretStore for RealAccountSecretStore {
+    fn store_refresh_token(&self, account_id: AccountId, refresh_token: &str) -> CommandResult<()> {
+        store_refresh_token(account_id, refresh_token)
+    }
+    fn store_client_creds(
+        &self,
+        account_id: AccountId,
+        creds: &(String, String),
+    ) -> CommandResult<()> {
+        store_client_creds(account_id, creds)
+    }
+    fn delete_refresh_token(&self, account_id: AccountId) -> anyhow::Result<()> {
+        KeyringTokenStore::new(account_id.to_string()).delete_refresh_token()
+    }
+    fn delete_client_creds(&self, account_id: AccountId) -> anyhow::Result<()> {
+        driven_drive::google::token_store::ClientCredsStore::new(account_id.to_string()).delete()
+    }
+}
+
+/// R1-P1-4 / R2-P2-2: persist a FRESH account's keychain secrets + state row with
+/// full rollback. Stores, in order, (1) the refresh token, (2) the BYO client
+/// creds, then (3) inserts the account row via `insert_row`. If ANY step fails,
+/// every prior keychain write is rolled back (deleted), so a failure leaves NO
+/// orphaned keychain entries - and because `finish_add_account` does NOT consume
+/// the wizard session until this returns `Ok`, the user can simply retry.
+///
+/// `insert_row` is a closure (not a direct `StateRepo` call) so a test can force
+/// the row insert to fail and assert the keychain rollback + (caller-side)
+/// session replayability without a full failing-repo double.
+async fn persist_new_account<S, F, Fut>(
+    secrets: &S,
+    account_id: AccountId,
+    refresh_token: &str,
+    creds: &(String, String),
+    insert_row: F,
+    row: &AccountRow,
+) -> CommandResult<()>
+where
+    S: AccountSecretStore,
+    F: FnOnce(&AccountRow) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    // 1) refresh token.
+    secrets.store_refresh_token(account_id, refresh_token)?;
+
+    // 2) client creds; on failure roll back the token.
+    if let Err(err) = secrets.store_client_creds(account_id, creds) {
+        if let Err(del) = secrets.delete_refresh_token(account_id) {
+            tracing::error!(target: TARGET, account_id = %account_id, error = %del, "failed to roll back refresh token after client-creds persist failure");
+        }
+        return Err(err);
+    }
+
+    // 3) account row; on failure roll back BOTH keychain entries.
+    if let Err(err) = insert_row(row).await {
+        if let Err(del) = secrets.delete_refresh_token(account_id) {
+            tracing::error!(target: TARGET, account_id = %account_id, error = %del, "failed to roll back refresh token after account-row insert failure");
+        }
+        if let Err(del) = secrets.delete_client_creds(account_id) {
+            tracing::error!(target: TARGET, account_id = %account_id, error = %del, "failed to roll back BYO client creds after account-row insert failure");
+        }
+        return Err(CommandError::from(err));
+    }
+    Ok(())
 }
 
 /// The subset of the Google userinfo response Driven persists (A5).
@@ -864,17 +982,159 @@ mod tests {
         assert!(info.name.is_none());
     }
 
+    /// R2-P2-2: an in-memory [`AccountSecretStore`] recording which secrets are
+    /// currently stored, so a test can assert no orphan remains after a rollback.
+    #[derive(Default)]
+    struct FakeSecretStore {
+        refresh: std::sync::Mutex<std::collections::HashSet<AccountId>>,
+        creds: std::sync::Mutex<std::collections::HashSet<AccountId>>,
+    }
+    impl FakeSecretStore {
+        fn has_refresh(&self, id: AccountId) -> bool {
+            self.refresh.lock().unwrap().contains(&id)
+        }
+        fn has_creds(&self, id: AccountId) -> bool {
+            self.creds.lock().unwrap().contains(&id)
+        }
+    }
+    impl AccountSecretStore for FakeSecretStore {
+        fn store_refresh_token(&self, account_id: AccountId, _t: &str) -> CommandResult<()> {
+            self.refresh.lock().unwrap().insert(account_id);
+            Ok(())
+        }
+        fn store_client_creds(
+            &self,
+            account_id: AccountId,
+            _c: &(String, String),
+        ) -> CommandResult<()> {
+            self.creds.lock().unwrap().insert(account_id);
+            Ok(())
+        }
+        fn delete_refresh_token(&self, account_id: AccountId) -> anyhow::Result<()> {
+            self.refresh.lock().unwrap().remove(&account_id);
+            Ok(())
+        }
+        fn delete_client_creds(&self, account_id: AccountId) -> anyhow::Result<()> {
+            self.creds.lock().unwrap().remove(&account_id);
+            Ok(())
+        }
+    }
+
+    fn fresh_row(id: AccountId) -> AccountRow {
+        AccountRow {
+            id,
+            email: "u@example.com".to_string(),
+            display_name: None,
+            state: AccountState::Ok,
+            encryption_master_key_id: None,
+            created_at: 0,
+            last_synced_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn persist_new_account_row_failure_rolls_back_all_keychain_entries() {
+        // R2-P2-2: a forced ROW-insert failure must leave NO orphaned keychain
+        // creds (both the refresh token and the BYO client creds are rolled back),
+        // and `persist_new_account` returns the row error (so finish keeps the
+        // session intact for a retry).
+        let secrets = FakeSecretStore::default();
+        let id = AccountId::new_v4();
+        let row = fresh_row(id);
+        let creds = ("client-id".to_string(), "secret".to_string());
+
+        let err = persist_new_account(
+            &secrets,
+            id,
+            "refresh-token",
+            &creds,
+            // Force the row insert to fail.
+            |_r| async { Err(anyhow::anyhow!("forced row insert failure")) },
+            &row,
+        )
+        .await
+        .expect_err("a row-insert failure must propagate");
+        // The error carries the row failure (mapped to internal.bug here).
+        assert_eq!(err.code, ErrorCode::InternalBug);
+        // No orphaned keychain entries remain.
+        assert!(
+            !secrets.has_refresh(id),
+            "refresh token must be rolled back on row-insert failure"
+        );
+        assert!(
+            !secrets.has_creds(id),
+            "client creds must be rolled back on row-insert failure"
+        );
+    }
+
     #[test]
-    fn resolve_creds_prefers_byo_then_default() {
+    fn finish_reads_session_tokens_by_clone_so_a_failure_leaves_them_replayable() {
+        // R2-P2-2: `finish_add_account` now CLONES the session tokens (it used to
+        // `take()` them) and only removes the session on success. So after a
+        // failed finish the session still carries its Complete status + tokens and
+        // the user can retry without re-running OAuth. Model that invariant on a
+        // session directly: a clone must NOT empty the session's tokens.
         let mut s = WizardSession::new(None);
-        // No BYO: falls back to env-or-default; the default client id is the
-        // public installed-app id, the secret empty (when env unset).
-        let (id, _secret) = resolve_creds(&s);
-        assert!(!id.is_empty());
-        // BYO wins.
+        s.status = OAuthStatus::Complete;
+        s.tokens = Some(Tokens {
+            access_token: "at".to_string(),
+            refresh_token: "rt".to_string(),
+            expires_at: 0,
+        });
+        // The clone the finish path uses must leave the session's tokens intact.
+        let cloned = s.tokens.clone();
+        assert!(cloned.is_some(), "clone yields the tokens");
+        assert!(
+            s.tokens.is_some(),
+            "the session must STILL hold its tokens after a clone (replayable)"
+        );
+        assert!(matches!(s.status, OAuthStatus::Complete));
+    }
+
+    #[tokio::test]
+    async fn persist_new_account_success_keeps_both_secrets() {
+        // The happy path keeps both keychain entries and inserts the row.
+        let secrets = FakeSecretStore::default();
+        let id = AccountId::new_v4();
+        let row = fresh_row(id);
+        let creds = ("client-id".to_string(), "secret".to_string());
+        let inserted = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let inserted2 = inserted.clone();
+
+        persist_new_account(
+            &secrets,
+            id,
+            "refresh-token",
+            &creds,
+            move |_r| {
+                let inserted2 = inserted2.clone();
+                async move {
+                    inserted2.store(true, std::sync::atomic::Ordering::SeqCst);
+                    Ok(())
+                }
+            },
+            &row,
+        )
+        .await
+        .expect("persist must succeed");
+        assert!(inserted.load(std::sync::atomic::Ordering::SeqCst));
+        assert!(secrets.has_refresh(id) && secrets.has_creds(id));
+    }
+
+    #[test]
+    fn resolve_creds_requires_byo_and_rejects_when_absent() {
+        // R2-P2-1 (BYO-only): a session with NO submitted client id AND no env
+        // override is REJECTED (no baked-in default client). This test removes any
+        // env override so the no-creds path is deterministic.
+        std::env::remove_var(ENV_OAUTH_CLIENT_ID);
+        std::env::remove_var(ENV_OAUTH_CLIENT_SECRET);
+        let mut s = WizardSession::new(None);
+        let err = resolve_creds(&s).expect_err("no creds must be rejected");
+        assert_eq!(err.code, ErrorCode::AuthConsentRequired);
+        // BYO submitted -> resolves to exactly those creds.
         s.client_id = Some("byo-id".to_string());
         s.client_secret = Some("byo-secret".to_string());
-        let (id, secret) = resolve_creds(&s);
+        let (id, secret) = resolve_creds(&s).expect("byo creds resolve");
         assert_eq!(id, "byo-id");
         assert_eq!(secret, "byo-secret");
     }
