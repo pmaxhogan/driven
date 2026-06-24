@@ -239,6 +239,12 @@ pub trait Orchestrator: Send + Sync {
     /// Applies a new [`OrchestratorConfig`], taking effect on the next
     /// cycle (the `Arc<RwLock<OrchestratorConfig>>` swap, SPEC s5).
     async fn reconfigure(&self, config: OrchestratorConfig);
+
+    /// Signals the run loop to shut down GRACEFULLY (SPEC s5, DESIGN s5.10.2):
+    /// the CURRENT in-flight cycle finishes, then [`Orchestrator::run`] returns
+    /// `Ok(())`. Idempotent. The app shell calls this on an explicit Quit so an
+    /// in-flight backup cycle drains rather than being aborted mid-upload.
+    fn shutdown(&self);
 }
 
 /// Why the orchestrator's gate check refused to start a batch this cycle
@@ -352,6 +358,14 @@ pub struct SyncOrchestrator {
     /// unclean shutdown stranded). `Mutex<bool>` not an atomic so the
     /// check-then-set is a single critical section.
     orphan_cleanup_done: Mutex<bool>,
+    /// codex C5-P1-2: set once this account transitions to
+    /// [`AccountState::NeedsReauth`] (the V-F `auth.invalid_grant` path). Gates
+    /// every subsequent cycle to ZERO remote calls AND makes [`Orchestrator::run`]
+    /// EXIT its loop (not just stop the current cycle) - the account stays
+    /// suspended until the M6 reauth flow rebuilds the orchestrator with a fresh
+    /// token. An atomic so the cycle path can set it and the run loop can read it
+    /// without holding a lock across the select.
+    suspended: std::sync::atomic::AtomicBool,
 }
 
 impl SyncOrchestrator {
@@ -399,6 +413,7 @@ impl SyncOrchestrator {
             vss: None,
             vss_create_ledger: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             orphan_cleanup_done: Mutex::new(false),
+            suspended: std::sync::atomic::AtomicBool::new(false),
         }
     }
 
@@ -575,13 +590,6 @@ impl SyncOrchestrator {
     /// to push a [`ScanTickRequest`] directly.
     pub fn watcher_sender(&self) -> mpsc::Sender<ScanTickRequest> {
         self.watcher_tx.clone()
-    }
-
-    /// Signals the run loop to shut down gracefully (SPEC s5). The current
-    /// in-flight cycle finishes (DESIGN s5.10.2); then [`Orchestrator::run`]
-    /// returns `Ok(())`.
-    pub fn shutdown(&self) {
-        let _ = self.shutdown_tx.send(true);
     }
 
     /// Subscribes to the [`OrchestratorEvent`] broadcast (SPEC s5, s11.7).
@@ -884,6 +892,41 @@ impl SyncOrchestrator {
         }
     }
 
+    /// `true` when this account may run a cycle (codex C5-P1-2): NOT suspended
+    /// in-process by the V-F transition AND its persisted `accounts.state` is
+    /// [`AccountState::Ok`]. A `NeedsReauth` / `Disabled` account, a deleted
+    /// account (no row), or a suspended one returns `false` so the cycle is
+    /// skipped without any remote call.
+    ///
+    /// The in-memory `suspended` flag is checked first (cheap, set the instant a
+    /// V-F transition happens this process). A transient DB read error is
+    /// treated as runnable=false (fail-safe: do not push work through an
+    /// indeterminate state) but is logged and retried next cycle.
+    async fn account_is_runnable(&self) -> bool {
+        if self.suspended.load(std::sync::atomic::Ordering::SeqCst) {
+            return false;
+        }
+        match self.state.account_state(self.account_id).await {
+            Ok(Some(crate::types::AccountState::Ok)) => true,
+            Ok(Some(other)) => {
+                tracing::debug!(target: TARGET, account_id = %self.account_id, ?other, "account state is not Ok; cycle gated");
+                // A persisted non-Ok state (e.g. set by another path) should also
+                // suspend the loop so we stop ticking, mirroring the V-F path.
+                self.suspended
+                    .store(true, std::sync::atomic::Ordering::SeqCst);
+                false
+            }
+            Ok(None) => {
+                tracing::warn!(target: TARGET, account_id = %self.account_id, "account row missing; gating cycle");
+                false
+            }
+            Err(err) => {
+                tracing::warn!(target: TARGET, account_id = %self.account_id, %err, "failed to read account state; gating this cycle (retry next)");
+                false
+            }
+        }
+    }
+
     /// V-F (DESIGN s5.4): if ANY op failed with [`ErrorCode::AuthInvalidGrant`]
     /// (the refresh token returned `invalid_grant`), move the account to
     /// [`AccountState::NeedsReauth`], emit the `account:needs_reauth`
@@ -924,6 +967,12 @@ impl SyncOrchestrator {
         let _ = self.events.send(OrchestratorEvent::AccountNeedsReauth {
             account_id: self.account_id,
         });
+        // C5-P1-2: SUSPEND this account's orchestrator loop, not just the current
+        // cycle. The run loop observes this flag after the cycle and EXITS; every
+        // gate check in the meantime issues zero remote calls. The account stays
+        // suspended until the M6 reauth flow rebuilds it with a fresh token.
+        self.suspended
+            .store(true, std::sync::atomic::Ordering::SeqCst);
         true
     }
 
@@ -1112,6 +1161,21 @@ impl SyncOrchestrator {
     /// [`OrchestratorState::Backoff`] and returns WITHOUT issuing any remote
     /// call.
     pub async fn run_cycle(&self, tick: TickSource) -> anyhow::Result<()> {
+        // C5-P1-2: gate EVERY cycle on the current account state BEFORE any
+        // gate/reconcile/remote work. A `NeedsReauth` / `Disabled` account (or
+        // one suspended in-process by the V-F transition) must issue ZERO remote
+        // calls. This is checked first so a stale scheduled tick, a manual "Sync
+        // now", or a watcher tick cannot push work through a dead credential.
+        if !self.account_is_runnable().await {
+            tracing::info!(
+                target: TARGET,
+                account_id = %self.account_id,
+                ?tick,
+                "account not in a runnable state (needs_reauth / disabled / suspended); skipping cycle"
+            );
+            return Ok(());
+        }
+
         // P1-6 (DESIGN s5.6, s5.7): the startup reconcile (DESIGN s5.6) is a
         // REMOTE pass - it issues Drive find/metadata calls to adopt orphaned
         // objects - so it MUST come AFTER the power / network / manual gates,
@@ -1517,6 +1581,14 @@ impl Orchestrator for SyncOrchestrator {
                 if let Err(err) = self.run_cycle(tick).await {
                     tracing::warn!(target: TARGET, account_id = %self.account_id, ?tick, %err, "cycle failed; continuing");
                 }
+                // C5-P1-2: a V-F `auth.invalid_grant` during the cycle SUSPENDS
+                // this account. STOP the loop entirely (not just the current
+                // cycle) so we never tick a dead credential again; the account
+                // resumes only when the M6 reauth flow rebuilds the orchestrator.
+                if self.suspended.load(std::sync::atomic::Ordering::SeqCst) {
+                    tracing::info!(target: TARGET, account_id = %self.account_id, "account suspended (needs_reauth); exiting run loop until reauth");
+                    break;
+                }
             }
         }
 
@@ -1575,6 +1647,13 @@ impl Orchestrator for SyncOrchestrator {
             vss.set_mode(config.vss_mode);
         }
         *self.config.write().await = config;
+    }
+
+    fn shutdown(&self) {
+        // Graceful: flip the watch signal; the run loop observes it between
+        // cycles (the select arms), so the in-flight cycle finishes first
+        // (DESIGN s5.10.2) and then `run()` returns `Ok(())`.
+        let _ = self.shutdown_tx.send(true);
     }
 }
 
@@ -1829,6 +1908,21 @@ mod tests {
         ) -> anyhow::Result<()> {
             self.account_state.lock().unwrap().push((id, state));
             Ok(())
+        }
+        async fn account_state(&self, id: AccountId) -> anyhow::Result<Option<AccountState>> {
+            // The LAST recorded state for this account (so a cycle run after a
+            // V-F needs_reauth transition observes the gate); defaults to `Ok`
+            // when nothing has been recorded yet.
+            Ok(Some(
+                self.account_state
+                    .lock()
+                    .unwrap()
+                    .iter()
+                    .rev()
+                    .find(|(aid, _)| *aid == id)
+                    .map(|(_, st)| *st)
+                    .unwrap_or(AccountState::Ok),
+            ))
         }
         async fn mark_account_synced(&self, id: AccountId, at: UnixMs) -> anyhow::Result<()> {
             self.account_synced.lock().unwrap().push((id, at));
@@ -3000,6 +3094,65 @@ mod tests {
             state.account_synced.lock().unwrap().is_empty(),
             "an auth failure must NOT stamp account last_synced_at"
         );
+    }
+
+    #[tokio::test]
+    async fn needs_reauth_suspends_loop_and_gates_subsequent_cycles() {
+        // C5-P1-2: after a V-F `auth.invalid_grant` transition the account is
+        // SUSPENDED. (a) A subsequent `run_cycle` must issue ZERO execute calls
+        // (gated on the account state), and (b) the `run()` loop must EXIT rather
+        // than keep ticking a dead credential.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"src a bytes").unwrap();
+        let mut src = source_in(account, dir.path());
+        src.last_deep_verify_at = None;
+        src.last_full_scan_at = None;
+
+        let exec = Arc::new(RecordingExecutor::default());
+        exec.auth_fail.store(true, Ordering::SeqCst);
+        let state = Arc::new(FakeState::with_sources(vec![src.clone()]));
+        let clock = Arc::new(FakeClock::new());
+        clock.advance(std::time::Duration::from_millis(5_000));
+        let orch = Arc::new(SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec.clone(),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock.clone(),
+            OrchestratorConfig::default(),
+        ));
+
+        // First cycle: the auth failure fires, marking needs_reauth + suspending.
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        let after_first = exec.executes.load(Ordering::SeqCst);
+        assert_eq!(after_first, 1, "the first cycle executed the source once");
+
+        // (a) A second cycle is GATED - no further execute call.
+        orch.run_cycle(TickSource::Manual).await.unwrap();
+        assert_eq!(
+            exec.executes.load(Ordering::SeqCst),
+            after_first,
+            "a suspended (needs_reauth) account must issue ZERO execute calls on later cycles"
+        );
+
+        // (b) The run loop EXITS once suspended. Spawn it, fire a manual trigger
+        // to drive one cycle, and assert it returns (rather than looping
+        // forever). The first cycle inside `run()` will execute, hit the auth
+        // failure (already suspended, but `run_one_source` still re-detects it),
+        // then the loop sees `suspended` and breaks.
+        let run_orch = orch.clone();
+        let handle = tokio::spawn(async move { run_orch.run().await });
+        orch.trigger(TickSource::Manual).await;
+        // The loop must terminate; bound the wait so a regression (loop never
+        // exits) fails the test instead of hanging the suite.
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        let joined =
+            res.expect("run() must EXIT after the account is suspended (did not within 5s)");
+        joined
+            .expect("run task panicked")
+            .expect("run() returned Ok on suspend");
     }
 
     #[tokio::test]

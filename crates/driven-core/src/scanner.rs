@@ -638,6 +638,9 @@ mod tests {
         ) -> anyhow::Result<()> {
             unimplemented!()
         }
+        async fn account_state(&self, _id: AccountId) -> anyhow::Result<Option<AccountState>> {
+            unimplemented!()
+        }
         async fn mark_account_synced(&self, _id: AccountId, _at: i64) -> anyhow::Result<()> {
             unimplemented!()
         }

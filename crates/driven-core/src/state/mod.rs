@@ -305,6 +305,14 @@ pub trait StateRepo: Send + Sync {
     /// Updates `accounts.state` for the given account.
     async fn mark_account_state(&self, id: AccountId, state: AccountState) -> Result<()>;
 
+    /// Reads `accounts.state` for the given account, if the row exists.
+    ///
+    /// Used by the orchestrator to gate every cycle on the CURRENT account
+    /// state (codex C5-P1-2): a `NeedsReauth` / `Disabled` account must issue
+    /// ZERO remote calls. Returns `None` when the account row is absent (e.g.
+    /// deleted while the orchestrator was mid-flight).
+    async fn account_state(&self, id: AccountId) -> Result<Option<AccountState>>;
+
     /// Stamps `accounts.last_synced_at` for the given account (P2-7).
     ///
     /// Called only after a source run for the account completes its

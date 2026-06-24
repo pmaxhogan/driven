@@ -437,6 +437,20 @@ impl StateRepo for SqliteStateRepo {
         Ok(())
     }
 
+    async fn account_state(&self, id: AccountId) -> Result<Option<AccountState>> {
+        let id_str = id.to_string();
+        // Runtime `sqlx::query_as` (NOT the compile-checked `query!` macro) so
+        // this additive read needs NO `.sqlx` cache regeneration.
+        let row: Option<(String,)> = sqlx::query_as("SELECT state FROM accounts WHERE id = ?1")
+            .bind(id_str.as_str())
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            Some((state,)) => Ok(Some(account_state_from_str(&state)?)),
+            None => Ok(None),
+        }
+    }
+
     async fn mark_account_synced(&self, id: AccountId, at: UnixMs) -> Result<()> {
         let id_str = id.to_string();
         sqlx::query!(

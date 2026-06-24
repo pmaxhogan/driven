@@ -1725,6 +1725,19 @@ impl DefaultExecutor {
         result.map_err(|e| {
             let class = classify_drive_error(&e);
             self.pacer.note_response(class.response_class());
+            // C5-P1-3: a post-upload checksum mismatch on the simple-band
+            // (4-5 MiB CREATE/UPDATE + VSS large reads forced through simple
+            // upload) must route through the SAME durable 3-consecutive-mismatch
+            // -> corrupt policy + corrupt-create cleanup as the resumable path -
+            // NOT collapse into a generic `Failed`. Surface it distinctly so
+            // `hash_then_upload` runs `handle_checksum_mismatch`, and carry the
+            // stranded corrupt-create id (C5-P1-4) when the store's trash failed
+            // so the op is kept for reconcile to retry the trash.
+            if matches!(class, DriveError::ChecksumMismatch) {
+                return UploadError::ChecksumMismatch {
+                    stranded_file_id: stranded_file_id_from_error(&e),
+                };
+            }
             // P1-3: the simple-band (4-5 MiB) CREATE is also a single POST -
             // an ambiguous transient (network/5xx) may have committed the
             // object before the response was lost. Defer to reconcile (keep
@@ -2034,12 +2047,16 @@ impl DefaultExecutor {
                     RetryDecision::Retry => continue,
                     RetryDecision::Fail(ErrorCode::DriveChecksumMismatch) => {
                         // The REAL GoogleDriveStore verifies md5 INSIDE the store
-                        // and has ALREADY best-effort-trashed its own corrupt
-                        // create (R-P1-1); we have no file_id here to retry the
-                        // trash against, so route through the 3-mismatch policy
-                        // with no stranded id (the store owns its cleanup).
+                        // and best-effort-trashes its own corrupt create (R-P1-1).
+                        // When that trash SUCCEEDED the object is gone (no
+                        // stranded id) and we route through the 3-mismatch policy
+                        // and drop the op. When the store's trash FAILED it now
+                        // surfaces the live object's id (C5-P1-4): carry it so the
+                        // executor persists `corrupt_file_id` and KEEPS the op for
+                        // reconcile to retry the trash, rather than dropping it and
+                        // stranding a live corrupt object.
                         return Err(UploadError::ChecksumMismatch {
-                            stranded_file_id: None,
+                            stranded_file_id: stranded_file_id_from_error(&e),
                         });
                     }
                     RetryDecision::Fail(code) => return Err(UploadError::Failed(code)),
@@ -2803,39 +2820,20 @@ impl Executor for DefaultExecutor {
     }
 
     async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()> {
-        // M5 per-source crypto (resolved ONCE for this source, FAIL-CLOSED).
-        // Reconcile re-derives the encrypted parent chain / encrypted_remote_path
-        // and re-reads the local file - all of which need the SAME suite the
-        // upload used. An `encryption_enabled` source whose key is unavailable
-        // must NOT reconcile its ops with plaintext crypto (that would search the
-        // wrong - root - folder and could re-upload a duplicate next scan, or
-        // adopt a row with a blanked encrypted_remote_path). So if the suite
-        // resolution fails closed, leave this source's pending ops untouched
-        // (they retry next cycle once the key is available) and surface it.
-        let crypto = match self.resolve_source_crypto(source) {
-            Ok(crypto) => crypto,
-            Err(()) => {
-                warn!(
-                    target: TARGET,
-                    source = %source.id,
-                    "skipping reconcile for encryption-enabled source with no resolvable key (crypto.key_missing); ops kept for retry"
-                );
-                return Ok(());
-            }
-        };
-        let crypto = crypto.as_deref();
-
         let pending = self.state.get_pending_ops_for_source(source.id).await?;
+
+        // --- V5-P2-4: suite-FREE corrupt-create cleanup FIRST --------------
+        // An op carrying a `corrupt_file_id` is the recovery handle for a corrupt
+        // CREATE object whose post-upload trash FAILED (it may still be live on
+        // Drive). Retrying the trash needs NO crypto (it is a `remote.trash` by
+        // id). It MUST run even when the per-source crypto gate below fails
+        // closed - otherwise a stranded corrupt object on an encryption-enabled
+        // source with a temporarily-missing key would never get its trash
+        // retried until the key returns. So process these BEFORE the crypto
+        // gate's early-return.
+        let mut remaining: Vec<crate::state::PendingOpRow> = Vec::with_capacity(pending.len());
         for op in pending {
             let payload = PendingOpPayload::from_value(&op.payload_json);
-
-            // --- R2-P1-1: durable corrupt-create cleanup -------------------
-            // An op carrying a `corrupt_file_id` is the recovery handle for a
-            // corrupt CREATE object whose post-upload trash FAILED (it may still
-            // be live on Drive). Retry the trash; on success (or an idempotent
-            // already-gone) drop the op, else KEEP it for the next cycle. This
-            // op carries no `client_op_uuid` (it is not a pending upload), so it
-            // must be handled BEFORE the uuid guard below.
             if let Some(corrupt_file_id) = payload.corrupt_file_id.clone() {
                 if self
                     .retry_trash_corrupt(&corrupt_file_id, op.relative_path.as_str())
@@ -2843,10 +2841,38 @@ impl Executor for DefaultExecutor {
                 {
                     self.state.delete_pending_op(op.id).await?;
                 }
-                // Either way, this op is fully handled; do not fall through to
-                // the upload-recovery paths below.
+                // Either way, this op is fully handled; never falls through to
+                // the crypto-dependent upload-recovery paths.
                 continue;
             }
+            remaining.push(op);
+        }
+
+        // M5 per-source crypto (resolved ONCE for this source, FAIL-CLOSED).
+        // Reconcile re-derives the encrypted parent chain / encrypted_remote_path
+        // and re-reads the local file - all of which need the SAME suite the
+        // upload used. An `encryption_enabled` source whose key is unavailable
+        // must NOT reconcile its ops with plaintext crypto (that would search the
+        // wrong - root - folder and could re-upload a duplicate next scan, or
+        // adopt a row with a blanked encrypted_remote_path). So if the suite
+        // resolution fails closed, leave this source's REMAINING (crypto-
+        // dependent) pending ops untouched (they retry next cycle once the key is
+        // available) and surface it. The corrupt-cleanup above already ran.
+        let crypto = match self.resolve_source_crypto(source) {
+            Ok(crypto) => crypto,
+            Err(()) => {
+                warn!(
+                    target: TARGET,
+                    source = %source.id,
+                    "skipping crypto-dependent reconcile for encryption-enabled source with no resolvable key (crypto.key_missing); ops kept for retry (corrupt-cleanup already ran)"
+                );
+                return Ok(());
+            }
+        };
+        let crypto = crypto.as_deref();
+
+        for op in remaining {
+            let payload = PendingOpPayload::from_value(&op.payload_json);
 
             let Some(uuid) = payload.client_op_uuid.clone() else {
                 // No UUID carried (older row): leave it for the normal queue.
@@ -3462,33 +3488,47 @@ async fn read_stage(
     raw_tx: tokio::sync::mpsc::Sender<Bytes>,
     mem_gauge: Option<Arc<MemGauge>>,
 ) -> Result<(), StageError> {
+    // V5-P1-2: emit DETERMINISTIC fixed-READ_BUF (64 KiB) plaintext chunks,
+    // INDEPENDENT of what a single `read()` returns. The cpu stage encrypts
+    // each chunk it receives as one AEAD frame, so a short read here would
+    // otherwise emit a sub-64KiB frame and a fixed-65552-byte decryptor (M8
+    // restore) would mis-align - making the encrypted backup un-restorable, and
+    // also breaking `predicted_sent_len` (the declared Content-Length, which
+    // assumes ceil(size/64K) frames) -> the streaming upload is rejected. We
+    // accumulate reads (read_exact-style) into a full READ_BUF before sending a
+    // chunk downstream; only the FINAL chunk (at EOF) may be short.
     let mut buf = vec![0u8; READ_BUF];
     let mut read_total: u64 = 0;
     loop {
-        let n = file.read(&mut buf).await.map_err(StageError::Io)?;
-        if n == 0 {
+        let chunk = read_full_chunk(file, &mut buf)
+            .await
+            .map_err(StageError::Io)?;
+        if chunk.is_empty() {
             break;
         }
-        read_total += n as u64;
+        let n = chunk.len() as u64;
+        read_total += n;
         if read_total > size {
             // The file grew mid-read; the declared length would be wrong.
             return Err(StageError::Changed);
         }
-        pacer.permit_bytes(n as u64).await;
+        pacer.permit_bytes(n).await;
         // Record the bytes entering the pipeline (test instrumentation; the
         // matching `sub` happens once Drive accepts the wire chunk).
         if let Some(g) = mem_gauge.as_ref() {
-            g.add(n as u64);
+            g.add(n);
         }
-        if raw_tx
-            .send(Bytes::copy_from_slice(&buf[..n]))
-            .await
-            .is_err()
-        {
+        let is_final = chunk.len() < READ_BUF;
+        if raw_tx.send(Bytes::from(chunk)).await.is_err() {
             // Downstream (cpu/uploader) gone - a downstream error aborted the
             // pipeline. The real error surfaces from that stage; this is just
             // an artifact (the caller surfaces the uploader error first).
             return Err(StageError::DownstreamGone);
+        }
+        // A short chunk means `read_full_chunk` hit EOF while filling, so this
+        // was the last chunk - stop without an extra empty read.
+        if is_final {
+            break;
         }
     }
     if read_total != size {
@@ -3618,22 +3658,35 @@ async fn read_hash_encrypt(
         let mut out = Vec::new();
         out.extend_from_slice(&header);
 
-        // We must know which chunk is the last to set the STREAM last-chunk
-        // flag, so read one chunk ahead.
+        // V5-P1-2: the AEAD chunk boundary MUST be a deterministic fixed
+        // READ_BUF (64 KiB) plaintext frame, INDEPENDENT of what a single
+        // `read()` returns - a short read on a network/FUSE/SMB mount must NOT
+        // emit a sub-64KiB frame, or the spec-conforming fixed-65552-byte
+        // decryptor (M8 restore) mis-aligns and the encrypted backup is
+        // SILENTLY un-restorable (DESIGN s7.1: "64 KiB plaintext chunks").
+        // Accumulate reads (read_exact-style) into a full READ_BUF chunk before
+        // emitting it; only the FINAL chunk (at EOF) may be short. We read one
+        // FULL chunk ahead so the last chunk can be `finalize_last`-flagged.
         let mut pending: Option<Vec<u8>> = None;
         loop {
-            let n = file.read(&mut read_buf).await?;
-            if n == 0 {
+            let chunk = read_full_chunk(file, &mut read_buf).await?;
+            if chunk.is_empty() {
                 break;
             }
-            hasher_blake3.update(&read_buf[..n]);
-            plaintext_len += n as u64;
+            hasher_blake3.update(&chunk);
+            plaintext_len += chunk.len() as u64;
+            let was_full = chunk.len() == READ_BUF;
             if let Some(prev) = pending.take() {
                 let ct = enc.encrypt_chunk(&prev).map_err(crypto_to_io)?;
                 md5.update(&ct);
                 out.extend_from_slice(&ct);
             }
-            pending = Some(read_buf[..n].to_vec());
+            pending = Some(chunk);
+            // A short chunk can only be the final one (EOF reached inside
+            // `read_full_chunk`); stop so it is finalized below.
+            if !was_full {
+                break;
+            }
         }
         // Finalize the last chunk (or an empty final chunk for an empty file).
         let last = pending.unwrap_or_default();
@@ -3684,6 +3737,36 @@ async fn read_hash_encrypt(
 /// `crypto.*` [`ErrorCode`] at the boundary.
 fn crypto_to_io(e: CryptoError) -> std::io::Error {
     std::io::Error::other(e)
+}
+
+/// Read up to `buf.len()` (== [`READ_BUF`], 64 KiB) bytes into a fresh `Vec`,
+/// looping over short reads until the buffer is full OR EOF is reached
+/// (read_exact-style). This makes the encryptor's chunk boundary DETERMINISTIC
+/// and INDEPENDENT of the per-`read()` size (V5-P1-2): a short read on a
+/// network / FUSE / SMB mount no longer collapses into a sub-64KiB AEAD frame.
+///
+/// Returns:
+/// - a full `READ_BUF`-length `Vec` for every non-final chunk;
+/// - a SHORT (`< READ_BUF`, possibly empty) `Vec` ONLY when EOF was hit while
+///   filling - this is the final chunk;
+/// - an EMPTY `Vec` when the stream is already at EOF (nothing more to read).
+///
+/// The caller treats an empty return (or any `< READ_BUF` return) as "this is
+/// the last chunk" and finalizes the STREAM. `buf` is reused across calls as
+/// scratch (its contents are copied into the returned `Vec`).
+async fn read_full_chunk<R: tokio::io::AsyncRead + Unpin>(
+    reader: &mut R,
+    buf: &mut [u8],
+) -> Result<Vec<u8>, std::io::Error> {
+    let mut filled = 0usize;
+    while filled < buf.len() {
+        let n = reader.read(&mut buf[filled..]).await?;
+        if n == 0 {
+            break; // EOF
+        }
+        filled += n;
+    }
+    Ok(buf[..filled].to_vec())
 }
 
 // -----------------------------------------------------------------------------
@@ -3898,7 +3981,7 @@ fn classify_drive_error(e: &anyhow::Error) -> DriveError {
             // NOT the generic `drive.unreachable` - otherwise the corrupt-file
             // failure is mis-reported and the orchestrator's consecutive-
             // mismatch -> status='corrupt' defence never triggers.
-            DriveStoreError::ChecksumMismatch => DriveError::ChecksumMismatch,
+            DriveStoreError::ChecksumMismatch { .. } => DriveError::ChecksumMismatch,
             DriveStoreError::Classified { kind, .. } => classify_from_classification(kind),
         };
     }
@@ -3941,6 +4024,25 @@ fn classify_from_classification(kind: &DriveErrorClassification) -> DriveError {
         DriveErrorClassification::DailyQuota => DriveError::DailyQuota,
         DriveErrorClassification::StorageQuota => DriveError::QuotaExhausted,
         DriveErrorClassification::Other => DriveError::Other,
+    }
+}
+
+/// Extract the stranded corrupt-create file id from a Drive-side error, if it
+/// carries one (codex C5-P1-4).
+///
+/// The real [`GoogleDriveStore`] verifies the post-upload md5 INSIDE the store
+/// and best-effort-trashes a corrupt CREATE object. When that trash FAILS the
+/// store surfaces the live object's id in
+/// [`DriveStoreError::ChecksumMismatch { stranded_file_id: Some(..) }`]. This
+/// helper pulls that id back out so the executor can persist it
+/// (`corrupt_file_id`) and KEEP the op for reconcile to retry the trash, rather
+/// than dropping the op and stranding a live corrupt object. Returns `None`
+/// for the fake (string-message) path and for a mismatch with no stranded
+/// object (trash succeeded / update / streamed-session mismatch).
+fn stranded_file_id_from_error(e: &anyhow::Error) -> Option<String> {
+    match e.downcast_ref::<DriveStoreError>() {
+        Some(DriveStoreError::ChecksumMismatch { stranded_file_id }) => stranded_file_id.clone(),
+        _ => None,
     }
 }
 
@@ -6121,6 +6223,153 @@ mod tests {
                 predicted_sent_len(plaintext_len as u64, true),
                 "framing mismatch for plaintext_len={plaintext_len}"
             );
+        }
+    }
+
+    // --- V5-P1-2: fixed-64KiB encrypt framing survives a SHORT read ---------
+
+    /// A reader that returns AT MOST `cap` bytes per `poll_read`, simulating a
+    /// short read on a network / FUSE / SMB mount. Drives the V5-P1-2 path:
+    /// `read_full_chunk` must accumulate these into full READ_BUF chunks so the
+    /// AEAD frame boundary stays at 64 KiB regardless of read() granularity.
+    struct ShortReader {
+        data: Vec<u8>,
+        pos: usize,
+        cap: usize,
+    }
+
+    impl tokio::io::AsyncRead for ShortReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let remaining = self.data.len() - self.pos;
+            let want = buf.remaining().min(self.cap).min(remaining);
+            if want > 0 {
+                let start = self.pos;
+                let end = start + want;
+                // Copy the slice out first to avoid an aliased borrow of `self`.
+                let slice = self.data[start..end].to_vec();
+                buf.put_slice(&slice);
+                self.pos = end;
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Replays exactly what the cpu stage / `read_hash_encrypt` do over chunks
+    /// `read_full_chunk` yields from `reader`: header, `encrypt_chunk` for each
+    /// non-final chunk, `finalize_last` for the last. Returns the full
+    /// ciphertext (header + frames) and the plaintext blake3, proving the
+    /// encrypt side uses the SAME deterministic 64 KiB framing for any reader
+    /// granularity.
+    async fn encrypt_via_read_full_chunk(
+        reader: &mut ShortReader,
+        suite: &driven_crypto::DrivenCryptoSuite,
+    ) -> (Vec<u8>, [u8; 32]) {
+        use driven_crypto::SourceCryptoSuite as _;
+        let mut enc = suite.content_encryptor();
+        let mut out = Vec::new();
+        out.extend_from_slice(&enc.header());
+        let mut hasher = blake3::Hasher::new();
+        let mut buf = vec![0u8; READ_BUF];
+        let mut pending: Option<Vec<u8>> = None;
+        loop {
+            let chunk = read_full_chunk(reader, &mut buf).await.unwrap();
+            if chunk.is_empty() {
+                break;
+            }
+            hasher.update(&chunk);
+            let was_full = chunk.len() == READ_BUF;
+            if let Some(prev) = pending.take() {
+                out.extend_from_slice(&enc.encrypt_chunk(&prev).unwrap());
+            }
+            pending = Some(chunk);
+            if !was_full {
+                break;
+            }
+        }
+        let last = pending.unwrap_or_default();
+        let (ct, _md5) = enc.finalize_last(&last).unwrap();
+        out.extend_from_slice(&ct);
+        (out, hasher.finalize().into())
+    }
+
+    /// V5-P1-2: a SHORT read mid-file must NOT change the AEAD framing. With the
+    /// pre-fix code a sub-64KiB read emitted a sub-64KiB frame, so the
+    /// spec-conforming fixed-65552-byte decryptor (the M8 restore model) would
+    /// mis-align and the encrypted backup would be SILENTLY un-restorable.
+    /// Asserts: (a) the fixed-frame decryptor round-trips the plaintext exactly,
+    /// and (b) the bytes produced equal `predicted_sent_len` exactly (the
+    /// streaming Content-Length contract).
+    #[tokio::test]
+    async fn short_read_keeps_fixed_64kib_framing_and_round_trips() {
+        use driven_crypto::{
+            ContentDecryptor, DrivenCryptoSuite, SourceCryptoSuite as _, HEADER_LEN,
+        };
+
+        let key = driven_crypto::key::SourceKey::generate();
+        let suite = DrivenCryptoSuite::new(key);
+
+        // The ciphertext frame size the M8 restore decryptor splits on: a full
+        // 64 KiB plaintext chunk + the 16-byte Poly1305 tag.
+        const CIPHER_FRAME: usize = READ_BUF + TAG_LEN;
+
+        // Cover boundaries; `cap` (1, 7, 1000) forces many short reads per
+        // 64 KiB chunk so the accumulation path is exercised hard.
+        for &plaintext_len in &[
+            0usize,
+            1,
+            5,
+            READ_BUF,
+            READ_BUF + 1,
+            2 * READ_BUF,
+            3 * READ_BUF + 777,
+        ] {
+            for &cap in &[1usize, 7, 1000, READ_BUF, READ_BUF + 5] {
+                let plaintext: Vec<u8> = (0..plaintext_len).map(|i| (i % 251) as u8).collect();
+                let mut reader = ShortReader {
+                    data: plaintext.clone(),
+                    pos: 0,
+                    cap,
+                };
+                let (ciphertext, blake3_pt) =
+                    encrypt_via_read_full_chunk(&mut reader, &suite).await;
+
+                // (b) The byte count MUST equal the declared Content-Length.
+                assert_eq!(
+                    ciphertext.len() as u64,
+                    predicted_sent_len(plaintext_len as u64, true),
+                    "predicted_sent_len mismatch (plaintext_len={plaintext_len}, cap={cap})"
+                );
+
+                // (a) Decrypt by SPLITTING the ciphertext on FIXED 65552-byte
+                // frame boundaries (the M8 restore model), proving the frames
+                // are exactly 64 KiB plaintext each (last may be short).
+                let header = &ciphertext[..HEADER_LEN];
+                let body = &ciphertext[HEADER_LEN..];
+                let mut dec: Box<dyn ContentDecryptor> = suite.content_decryptor(header).unwrap();
+                let mut frames: Vec<&[u8]> = Vec::new();
+                let mut off = 0usize;
+                while body.len() - off > CIPHER_FRAME {
+                    frames.push(&body[off..off + CIPHER_FRAME]);
+                    off += CIPHER_FRAME;
+                }
+                let last_frame = &body[off..]; // the final (possibly short) frame
+                let mut restored = Vec::new();
+                for f in &frames {
+                    restored.extend_from_slice(&dec.decrypt_chunk(f).unwrap());
+                }
+                restored.extend_from_slice(&dec.decrypt_last(last_frame).unwrap());
+
+                assert_eq!(
+                    restored, plaintext,
+                    "short-read round-trip failed (plaintext_len={plaintext_len}, cap={cap})"
+                );
+                let expect_blake3: [u8; 32] = blake3::hash(&plaintext).into();
+                assert_eq!(blake3_pt, expect_blake3, "plaintext blake3 mismatch");
+            }
         }
     }
 

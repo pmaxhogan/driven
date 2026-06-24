@@ -226,6 +226,9 @@ mod tests {
         async fn mark_account_state(&self, _id: AccountId, _state: AccountState) -> Result<()> {
             unimplemented!()
         }
+        async fn account_state(&self, _id: AccountId) -> Result<Option<AccountState>> {
+            unimplemented!()
+        }
         async fn mark_account_synced(&self, _id: AccountId, _at: UnixMs) -> Result<()> {
             unimplemented!()
         }
