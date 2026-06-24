@@ -309,6 +309,85 @@ fn with_notify_state<R>(account: AccountId, f: impl FnOnce(&mut NotifyState) -> 
 }
 
 // -----------------------------------------------------------------------------
+// R-P2-1: app-level aggregate tray state across accounts
+// -----------------------------------------------------------------------------
+
+/// Process-global map of the LAST KNOWN [`OrchestratorState`] per account
+/// (R-P2-1). The single process tray icon serves ALL accounts, so it must be
+/// derived from the AGGREGATE of every account's state by SEVERITY - not from
+/// whichever account most recently emitted a `StateChanged`. Without this,
+/// account A entering `Error` (red) then account B emitting `Idle` would
+/// last-writer-wins overwrite the red and HIDE a live backup error.
+///
+/// Keyed by [`AccountId`]; updated in [`apply_state`] on every transition and
+/// reduced to one icon/tooltip via [`aggregate_state`].
+static TRAY_STATES: Mutex<Option<HashMap<AccountId, OrchestratorState>>> = Mutex::new(None);
+
+/// The severity rank of an [`OrchestratorState`] for the aggregate tray icon
+/// (R-P2-1, DESIGN s8.1 icon precedence). HIGHER = more urgent; the aggregate
+/// shows the icon of the highest-ranked account so a live error is never masked
+/// by another account going idle.
+///
+/// Ordering (most -> least severe):
+/// 1. `Error` (red / needs-reauth / decrypt / disk-full) - always wins;
+/// 2. `Backoff` (Drive breaker open / rate-limit) and a network/service-down
+///    pause (the yellow-with-`!` reachability cases);
+/// 3. `Paused` (plain user/auto pause - battery / metered / manual);
+/// 4. the working states (`PowerCheck` / `Scanning` / `Planning` /
+///    `Executing` / `Verifying`) - "syncing";
+/// 5. `Idle` (last sync OK) - the floor.
+fn state_severity(state: &OrchestratorState) -> u8 {
+    match state {
+        OrchestratorState::Error { .. } => 4,
+        OrchestratorState::Backoff { .. } => 3,
+        OrchestratorState::Paused { reason } => {
+            if pause_reason_is_network(*reason) {
+                3
+            } else {
+                2
+            }
+        }
+        OrchestratorState::PowerCheck
+        | OrchestratorState::Scanning { .. }
+        | OrchestratorState::Planning { .. }
+        | OrchestratorState::Executing { .. }
+        | OrchestratorState::Verifying { .. } => 1,
+        OrchestratorState::Idle { .. } => 0,
+    }
+}
+
+/// Update the aggregate tray-state map with `account`'s new `state`, then return
+/// the single most-severe [`OrchestratorState`] across ALL known accounts
+/// (R-P2-1). The returned state drives the one process tray icon + tooltip.
+///
+/// Ties (equal severity) keep the INCOMING state so the tooltip tracks the most
+/// recent transition at that severity (e.g. the account that just errored shows
+/// its own error tooltip). Recovers a poisoned lock instead of panicking.
+fn aggregate_state(account: AccountId, state: OrchestratorState) -> OrchestratorState {
+    let mut guard = TRAY_STATES.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let incoming_sev = state_severity(&state);
+    map.insert(account, state.clone());
+
+    // Pick the most-severe state across all accounts. Start from the incoming
+    // one (so a single-account app, and the tie case, both keep it) and only
+    // replace it with a STRICTLY more severe peer.
+    let mut best = state;
+    let mut best_sev = incoming_sev;
+    for (id, candidate) in map.iter() {
+        if *id == account {
+            continue;
+        }
+        let sev = state_severity(candidate);
+        if sev > best_sev {
+            best = candidate.clone();
+            best_sev = sev;
+        }
+    }
+    best
+}
+
+// -----------------------------------------------------------------------------
 // build
 // -----------------------------------------------------------------------------
 
@@ -481,7 +560,13 @@ fn navigate_hint(app: &AppHandle, route: &str) {
 /// panicked. `apply_state` returns `()` (the committed signature) so all
 /// errors are swallowed with a `tracing` line.
 pub fn apply_state(app: &AppHandle, account_id: AccountId, state: OrchestratorState) {
-    let icon = TrayIcon::for_state(&state);
+    // R-P2-1: the single process tray icon serves ALL accounts. Update the
+    // app-level per-account state map and derive ONE aggregate state by
+    // severity, so a live error on account A is NOT masked when account B goes
+    // idle (the old last-writer-wins bug). The icon + tooltip reflect the
+    // aggregate; the notification below stays PER ACCOUNT (dedup is per-account).
+    let aggregate = aggregate_state(account_id, state.clone());
+    let icon = TrayIcon::for_state(&aggregate);
 
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
         if let Err(err) = tray.set_icon(Some(icon.image())) {
@@ -491,13 +576,15 @@ pub fn apply_state(app: &AppHandle, account_id: AccountId, state: OrchestratorSt
         if let Err(err) = tray.set_icon_as_template(false) {
             tracing::debug!(target: TARGET, "set_icon_as_template(false) failed: {err}");
         }
-        if let Err(err) = tray.set_tooltip(Some(tooltip_for(&state))) {
+        if let Err(err) = tray.set_tooltip(Some(tooltip_for(&aggregate))) {
             tracing::warn!(target: TARGET, "set tray tooltip failed: {err}");
         }
     } else {
         tracing::warn!(target: TARGET, "tray {TRAY_ID} not found; cannot apply state");
     }
 
+    // Per-account notification (first-sync-complete / red error), keyed +
+    // deduped by THIS account - independent of the aggregate icon above.
     notify_for_state(app, account_id, &state);
 }
 
@@ -659,6 +746,74 @@ mod tests {
         OrchestratorState::Error {
             detail: ErrorDetail::new(code, "test"),
         }
+    }
+
+    /// Reset the process-global aggregate map so the R-P2-1 test is isolated
+    /// from any state other tests left behind (the static is shared in-process).
+    fn reset_tray_states() {
+        let mut guard = TRAY_STATES.lock().unwrap_or_else(|e| e.into_inner());
+        *guard = Some(HashMap::new());
+    }
+
+    #[test]
+    fn aggregate_tray_icon_is_error_when_any_account_errors() {
+        // R-P2-1: with account A in Error and account B in Idle, the single
+        // process tray icon must be the AGGREGATE = Error (severity wins), even
+        // though B's Idle was the most RECENT transition. The old last-writer-
+        // wins behaviour would have shown Idle and hidden A's live error.
+        reset_tray_states();
+        let account_a = AccountId::new_v4();
+        let account_b = AccountId::new_v4();
+
+        // A errors first.
+        let agg_a = aggregate_state(account_a, err_state(ErrorCode::LocalDiskFull));
+        assert_eq!(
+            TrayIcon::for_state(&agg_a),
+            TrayIcon::Error,
+            "A alone in Error -> Error"
+        );
+
+        // B then goes Idle (the more-recent event). The aggregate must STAY
+        // Error because A is still errored - B's Idle must not mask it.
+        let agg_b = aggregate_state(account_b, OrchestratorState::Idle { last_run_at: None });
+        assert_eq!(
+            TrayIcon::for_state(&agg_b),
+            TrayIcon::Error,
+            "B going Idle must NOT overwrite A's live Error (aggregate stays Error)"
+        );
+
+        // When A recovers to Idle too, the aggregate finally drops to Idle.
+        let agg_a2 = aggregate_state(account_a, OrchestratorState::Idle { last_run_at: None });
+        assert_eq!(
+            TrayIcon::for_state(&agg_a2),
+            TrayIcon::Idle,
+            "once every account is Idle the aggregate is Idle"
+        );
+    }
+
+    #[test]
+    fn aggregate_severity_orders_error_over_backoff_over_paused_over_syncing_over_idle() {
+        // R-P2-1: the severity ladder Error > backoff/network-pause > paused >
+        // syncing > idle is what the aggregate uses to pick the tray icon.
+        let idle = OrchestratorState::Idle { last_run_at: None };
+        let syncing = OrchestratorState::Executing {
+            progress: ExecProgress::zero(),
+        };
+        let paused = OrchestratorState::Paused {
+            reason: PauseReason::Battery,
+        };
+        let net_paused = OrchestratorState::Paused {
+            reason: PauseReason::ServiceDown,
+        };
+        let backoff = OrchestratorState::Backoff { until: 0 };
+        let error = err_state(ErrorCode::CryptoDecryptFailed);
+
+        assert!(state_severity(&error) > state_severity(&backoff));
+        assert!(state_severity(&error) > state_severity(&net_paused));
+        assert_eq!(state_severity(&backoff), state_severity(&net_paused));
+        assert!(state_severity(&backoff) > state_severity(&paused));
+        assert!(state_severity(&paused) > state_severity(&syncing));
+        assert!(state_severity(&syncing) > state_severity(&idle));
     }
 
     #[test]
