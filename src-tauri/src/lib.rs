@@ -36,7 +36,7 @@ mod tray;
 
 use std::path::PathBuf;
 
-use tauri::{Manager, RunEvent};
+use tauri::{Manager, RunEvent, WindowEvent};
 use tauri_plugin_deep_link::DeepLinkExt;
 
 pub use app_state::{AccountHandle, AppState, RemoteMode};
@@ -55,6 +55,12 @@ const ARG_QUIT: &str = "--quit";
 /// exists hidden at boot and we show it for a normal (non-`--minimized`)
 /// launch.
 const MAIN_WINDOW: &str = "main";
+
+/// Upper bound on how long an explicit Quit waits for ONE account's in-flight
+/// cycle to drain before aborting its run loop (DESIGN s5.10.2 graceful drain
+/// vs ROADMAP M5 "no orphaned tasks"). A normal cycle finishes well within
+/// this; a wedged cycle is aborted rather than hanging quit forever.
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
 
 /// `<config_dir>/driven/state.db` (SPEC s2), resolved from Tauri's
 /// `app_config_dir()` (`config_dir() + identifier`). `app.driven` is the
@@ -117,26 +123,43 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: &[String]) {
     show_main_window(app);
 }
 
-/// Abort every per-account orchestrator run loop so quit leaves no orphaned
-/// tokio tasks (ROADMAP M5 acceptance; the committed [`AccountHandle`]
-/// contract is abort-on-shutdown - app_state.rs documents the run loop as
-/// "aborted on shutdown").
+/// GRACEFULLY drain every per-account orchestrator on an explicit Quit
+/// (DESIGN s5.10.2): signal `Orchestrator::shutdown()` so each loop finishes its
+/// in-flight cycle, then AWAIT the run-loop `JoinHandle` (bounded by a timeout
+/// so a wedged cycle cannot hang quit forever - it falls back to abort). This
+/// leaves no orphaned tokio tasks (ROADMAP M5 acceptance) AND lets an in-flight
+/// backup cycle complete rather than being killed mid-upload.
 ///
-/// The committed [`Orchestrator`](driven_core::orchestrator::Orchestrator)
-/// trait object does not expose the concrete `SyncOrchestrator::shutdown()`
-/// watch-signal (the between-cycles graceful drain of DESIGN s5.10.2 lives on
-/// the concrete type, not the trait), so the shell tears the loops down via
-/// the public `run_loop` `JoinHandle::abort()`. Abort schedules cancellation
-/// of each task; combined with process exit this guarantees no run loop
-/// outlives the app.
+/// Runs on the Tauri async runtime via `block_on` because the Tauri event-loop
+/// callback (`RunEvent`) is synchronous. The per-loop drain is bounded by
+/// [`SHUTDOWN_DRAIN_TIMEOUT`]; on timeout the loop is aborted (never orphaned).
 fn shutdown_orchestrators(app: &tauri::AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
+    // Signal every orchestrator to stop AFTER its current cycle, then await each
+    // loop. Signalling all first lets the drains overlap rather than serialise.
     for (account_id, handle) in state.accounts() {
-        tracing::info!(target: "driven::app", account_id = %account_id, "aborting orchestrator run loop on quit");
-        handle.run_loop.abort();
+        tracing::info!(target: "driven::app", account_id = %account_id, "signalling graceful shutdown on quit");
+        handle.orchestrator.shutdown();
     }
+    tauri::async_runtime::block_on(async move {
+        for (account_id, handle) in state.accounts() {
+            // Abort handle for the timeout fallback (does not consume the loop).
+            let abort = handle.run_loop_abort_handle().await;
+            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.run_loop_drain()).await {
+                Ok(()) => {
+                    tracing::info!(target: "driven::app", account_id = %account_id, "orchestrator run loop drained cleanly");
+                }
+                Err(_) => {
+                    tracing::warn!(target: "driven::app", account_id = %account_id, "graceful drain timed out; aborting run loop (no orphaned task)");
+                    if let Some(abort) = abort {
+                        abort.abort();
+                    }
+                }
+            }
+        }
+    });
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -169,6 +192,22 @@ pub fn run() {
         ))
         // SPEC s11.7 / M5: OS notifications (first-sync-done, error states).
         .plugin(tauri_plugin_notification::init())
+        // V5-P1-1 / DESIGN s8.1: closing the main window HIDES it to the tray;
+        // it does NOT quit the app or stop sync. The app keeps running in the
+        // background; Quit is reachable only via the tray menu / `--quit`.
+        .on_window_event(|window, event| {
+            if window.label() == MAIN_WINDOW {
+                if let WindowEvent::CloseRequested { api, .. } = event {
+                    // Prevent the close, hide to tray (sync keeps running).
+                    api.prevent_close();
+                    if let Err(err) = window.hide() {
+                        tracing::warn!(target: "driven::app", %err, "hide-to-tray on window close failed");
+                    } else {
+                        tracing::debug!(target: "driven::app", "main window close hidden to tray (sync continues)");
+                    }
+                }
+            }
+        })
         .setup(|app| {
             let handle = app.handle().clone();
             // Boot path (SPEC s11): migrations -> assemble + spawn
@@ -194,6 +233,22 @@ pub fn run() {
                     handle_deep_link(&dl_handle, url.as_str());
                 }
             });
+
+            // C5-P2-3: drain any COLD-START deep link (a URL that launched the
+            // app, before `on_open_url` was wired). The scheme is declared in
+            // tauri.conf.json `plugins.deep-link.desktop.schemes`. Best-effort:
+            // a plugin error or the no-URL case is logged, never fatal.
+            match app.deep_link().get_current() {
+                Ok(Some(urls)) => {
+                    for url in urls {
+                        handle_deep_link(app.handle(), url.as_str());
+                    }
+                }
+                Ok(None) => {}
+                Err(err) => {
+                    tracing::debug!(target: "driven::app", %err, "deep_link().get_current() cold-start drain failed");
+                }
+            }
 
             // SPEC s13 / s20: the main window is declared hidden in
             // tauri.conf.json. Show it for a normal launch; keep it hidden
@@ -230,13 +285,26 @@ pub fn run() {
         }
     };
 
-    // Drive the event loop ourselves so quit tears the orchestrator run loops
-    // down cleanly (ROADMAP M5 "Quit cleanly shuts down the runtime, no
-    // orphaned tokio tasks"). On the exit request we abort every run loop
-    // before letting the process exit.
+    // Drive the event loop ourselves so an EXPLICIT quit drains the orchestrator
+    // run loops gracefully (DESIGN s5.10.2) and an INCIDENTAL last-window-close
+    // does NOT kill the background sync (V5-P1-1, DESIGN s8.1).
+    //
+    // `RunEvent::ExitRequested.code`:
+    //   - `Some(_)` => an explicit exit (`app.exit(code)` from the tray Quit /
+    //     `--quit`). Drain + let the process exit.
+    //   - `None`    => an incidental exit (the last window was closed). Since the
+    //     app is a background tray daemon, `prevent_exit()` keeps it alive so
+    //     sync survives. (The window-close handler already hid the window, but
+    //     this guards the path where the platform still raises ExitRequested.)
     app.run(|app_handle, event| {
-        if let RunEvent::ExitRequested { .. } = &event {
-            shutdown_orchestrators(app_handle);
+        if let RunEvent::ExitRequested { code, api, .. } = &event {
+            if code.is_none() {
+                tracing::debug!(target: "driven::app", "incidental exit (last window closed); staying alive in tray");
+                api.prevent_exit();
+            } else {
+                tracing::info!(target: "driven::app", "explicit quit; draining orchestrators");
+                shutdown_orchestrators(app_handle);
+            }
         }
     });
 }
