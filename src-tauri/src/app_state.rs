@@ -83,10 +83,12 @@ const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
 /// give it the FULL drain window - not the short [`TASK_DRAIN_TIMEOUT`] the
 /// signal-only bridges use. Before this fix the run loop shared the 5s bridge
 /// budget, so a >5s in-flight upload was aborted on explicit Quit even though
-/// the outer `SHUTDOWN_DRAIN_TIMEOUT` in `lib.rs` intended ~20s of drain.
+/// the intended drain window was ~20s.
 ///
-/// `lib.rs`'s outer sweep guard is derived from this (run-loop budget + a margin
-/// for the short auxiliary drains) so the two never contradict each other.
+/// R3-P1-1: `lib.rs`'s quit sweep no longer wraps the per-account drains in an
+/// outer timeout (that could drop a cancellation-unsafe drain mid-abort and
+/// orphan a task); instead it runs every account's `shutdown()` concurrently and
+/// lets each self-bound by this budget (plus the short auxiliary one).
 pub const RUN_LOOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The collected per-account task handles + the bridge shutdown sender, returned
@@ -579,5 +581,120 @@ mod tests {
             "the run loop must drain CLEANLY (finish its in-flight cycle), not be aborted at the 5s bridge budget (R2-P2-1)"
         );
         assert!(run_loop_abort.is_finished(), "run loop must be finished");
+    }
+
+    /// One account's tracked task set plus the abort handles needed to assert
+    /// every task finished after shutdown - built to the EXACT shapes assembly
+    /// spawns (slow-draining run loop + forever-looping power poller).
+    struct BuiltAccount {
+        handle: AccountHandle,
+        run_loop_abort: tokio::task::AbortHandle,
+        poller_abort: tokio::task::AbortHandle,
+    }
+
+    /// Build a slow account: a run loop that needs `drain` to wind down after the
+    /// stop signal (modelling a large in-flight upload) and a power poller that
+    /// loops forever (only abort can stop it). Mirrors the per-account task set
+    /// in `assembly::build_account` so the R3-P1-1 concurrent-drain test is real.
+    fn build_slow_account(drain: Duration) -> BuiltAccount {
+        let finished_cleanly = Arc::new(AtomicBool::new(false));
+        let orchestrator: Arc<dyn Orchestrator> =
+            Arc::new(SlowDrainOrchestrator::new(drain, finished_cleanly));
+        let (bridge_shutdown, _rx0) = watch::channel(false);
+
+        let run_loop = {
+            let orch = orchestrator.clone();
+            tokio::spawn(async move {
+                let _ = orch.run().await;
+            })
+        };
+        let run_loop_abort = run_loop.abort_handle();
+
+        // Power poller: loops FOREVER with no shutdown path (only abort stops it).
+        let power_poller = tokio::spawn(async move {
+            let mut ticker = tokio::time::interval(Duration::from_millis(10));
+            loop {
+                ticker.tick().await;
+            }
+        });
+        let poller_abort = power_poller.abort_handle();
+
+        let event_bridge = tokio::spawn(async {});
+
+        let handle = AccountHandle::new(
+            orchestrator,
+            AccountTasks {
+                run_loop,
+                watcher_bridge: None,
+                event_bridge,
+                power_poller,
+                bridge_shutdown,
+            },
+        );
+        BuiltAccount {
+            handle,
+            run_loop_abort,
+            poller_abort,
+        }
+    }
+
+    /// R3-P1-1: shutting down MULTIPLE accounts must run their `shutdown()`
+    /// futures CONCURRENTLY (as `lib.rs::shutdown_orchestrators` now does via
+    /// `futures::future::join_all`) and leave ZERO orphaned tasks - even when
+    /// every run loop is slow AND every poller would run forever. The bug this
+    /// guards: a serial drain under one outer timeout could fire MID-drain and
+    /// drop a cancellation-unsafe `drain_or_abort` (whose `JoinHandle` is already
+    /// taken), detaching the aborted task. Uses paused virtual time so the long
+    /// per-account drains are instant, and asserts the WHOLE concurrent sweep
+    /// finishes well under the SUM of the two accounts' budgets.
+    #[tokio::test]
+    async fn concurrent_shutdown_of_multiple_slow_accounts_leaves_no_orphans() {
+        tokio::time::pause();
+        // Each run loop needs ~15s to wind down (inside the 20s run-loop budget),
+        // and each poller loops forever (always aborted). Two accounts.
+        let drain = Duration::from_secs(15);
+        assert!(
+            drain < RUN_LOOP_DRAIN_TIMEOUT,
+            "each account's drain must fit inside its own run-loop budget"
+        );
+
+        let a = build_slow_account(drain);
+        let b = build_slow_account(drain);
+
+        // Let both pollers actually start before shutting down.
+        tokio::time::sleep(Duration::from_millis(50)).await;
+
+        // Drive BOTH accounts' shutdown CONCURRENTLY, exactly like the quit sweep.
+        // If they ran serially the elapsed virtual time would be ~2x the run-loop
+        // drain; concurrently it is ~1x. Bound the whole sweep by ONE run-loop
+        // budget + margin (which is LESS than two serial drains would need), so a
+        // regression to serial draining fails this timeout.
+        tokio::time::timeout(
+            RUN_LOOP_DRAIN_TIMEOUT + Duration::from_secs(5),
+            futures::future::join_all([a.handle.shutdown(), b.handle.shutdown()]),
+        )
+        .await
+        .expect(
+            "concurrent multi-account shutdown must complete (no task orphaned, drains overlap)",
+        );
+
+        // EVERY task across BOTH accounts is finished (joined or aborted-and-
+        // awaited) - no orphans.
+        assert!(
+            a.run_loop_abort.is_finished(),
+            "account A run loop must be finished"
+        );
+        assert!(
+            a.poller_abort.is_finished(),
+            "account A poller must be finished (aborted, not orphaned)"
+        );
+        assert!(
+            b.run_loop_abort.is_finished(),
+            "account B run loop must be finished"
+        );
+        assert!(
+            b.poller_abort.is_finished(),
+            "account B poller must be finished (aborted, not orphaned)"
+        );
     }
 }

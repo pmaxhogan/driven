@@ -1928,6 +1928,17 @@ mod tests {
             Ok(())
         }
 
+        async fn clear_file_state_drive_file_id(
+            &self,
+            source: SourceId,
+            path: &RelativePath,
+        ) -> anyhow::Result<()> {
+            if let Some(row) = self.files.lock().unwrap().get_mut(&(source, path.clone())) {
+                row.drive_file_id = None;
+            }
+            Ok(())
+        }
+
         async fn bump_checksum_mismatch_count(
             &self,
             _source: SourceId,

@@ -687,6 +687,13 @@ mod tests {
         ) -> anyhow::Result<()> {
             unimplemented!()
         }
+        async fn clear_file_state_drive_file_id(
+            &self,
+            _source: SourceId,
+            _path: &RelativePath,
+        ) -> anyhow::Result<()> {
+            unimplemented!()
+        }
         async fn bump_checksum_mismatch_count(
             &self,
             _source: SourceId,

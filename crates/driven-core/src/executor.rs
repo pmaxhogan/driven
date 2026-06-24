@@ -2986,22 +2986,42 @@ impl Executor for DefaultExecutor {
                         self.state.delete_pending_op(op.id).await?;
                     }
                     Err(e) => {
-                        // R2-P1-1: a metadata ERROR proves NOTHING about whether
-                        // the update committed - it may have (a transient/auth
-                        // failure on the read). NEVER delete the op on an error
-                        // (that would lose the reconcile handle for a possibly-
-                        // committed op). KEEP the op and surface the error so the
-                        // source retries next cycle; an invalid_grant maps to
-                        // needs_reauth via reconcile_once.
+                        // R2-P1-1 / R3-P1-2: a metadata ERROR proves NOTHING
+                        // about whether the update committed. For a TRANSIENT /
+                        // rate-limited / auth failure the read may succeed later,
+                        // so KEEP the op and surface the error (an invalid_grant
+                        // maps to needs_reauth via reconcile_once) - NEVER delete
+                        // it (that would lose the reconcile handle for a possibly-
+                        // committed op).
+                        //
+                        // R3-P1-2: but a DEFINITIVE 404 / not-found / non-retryable
+                        // 4xx means the recorded `drive_file_id` is permanently
+                        // gone and can NEVER be updated. recheck-2's keep+retry-on-
+                        // any-error would then retry this dead op every cycle - and
+                        // because reconcile runs before scan/execute, it WEDGES the
+                        // whole account. Instead clear the stale id so the next scan
+                        // re-plans a fresh CREATE (re-upload), and drop this op.
                         let class = classify_drive_error(&e);
                         self.pacer.note_response(class.response_class());
+                        if reconcile_metadata_error_is_retryable(class) {
+                            warn!(
+                                target: TARGET,
+                                source = %source.id,
+                                path = %op.relative_path,
+                                "reconcile: metadata read failed transiently; keeping the pending op for retry next cycle (R2-P1-1): {e}"
+                            );
+                            return Err(to_reconcile_err(e));
+                        }
                         warn!(
                             target: TARGET,
                             source = %source.id,
                             path = %op.relative_path,
-                            "reconcile: metadata read failed; keeping the pending op for retry next cycle (R2-P1-1): {e}"
+                            "reconcile: metadata read returned a definitive not-found for the recorded drive_file_id; clearing the stale id and dropping the op so the next scan re-uploads (R3-P1-2): {e}"
                         );
-                        return Err(to_reconcile_err(e));
+                        self.state
+                            .clear_file_state_drive_file_id(source.id, &op.relative_path)
+                            .await?;
+                        self.state.delete_pending_op(op.id).await?;
                     }
                 }
             } else {
@@ -3026,18 +3046,38 @@ impl Executor for DefaultExecutor {
                         found
                     }
                     Err(e) => {
-                        // R2-P1-1: a lookup ERROR proves nothing about whether the
-                        // create committed; KEEP the op (do not delete) and surface
-                        // the error so it retries next cycle / maps to needs_reauth.
+                        // R2-P1-1 / R3-P1-2: a lookup ERROR proves nothing about
+                        // whether the create committed. For a TRANSIENT / rate-
+                        // limited / auth failure KEEP the op (do not delete) and
+                        // surface the error so it retries next cycle / maps to
+                        // needs_reauth.
+                        //
+                        // R3-P1-2: but a DEFINITIVE not-found / non-retryable 4xx
+                        // (e.g. the parent folder is permanently gone for this
+                        // lookup) can never be made to succeed by retrying, and
+                        // because reconcile runs before scan/execute it would WEDGE
+                        // the account. The create path carries no recorded
+                        // drive_file_id to clear, so drop the op; the next scan
+                        // re-plans a fresh CREATE from the live file.
                         let class = classify_drive_error(&e);
                         self.pacer.note_response(class.response_class());
+                        if reconcile_metadata_error_is_retryable(class) {
+                            warn!(
+                                target: TARGET,
+                                source = %source.id,
+                                path = %op.relative_path,
+                                "reconcile: find_by_op_uuid failed transiently; keeping the pending op for retry next cycle (R2-P1-1): {e}"
+                            );
+                            return Err(to_reconcile_err(e));
+                        }
                         warn!(
                             target: TARGET,
                             source = %source.id,
                             path = %op.relative_path,
-                            "reconcile: find_by_op_uuid failed; keeping the pending op for retry next cycle (R2-P1-1): {e}"
+                            "reconcile: find_by_op_uuid returned a definitive not-found; dropping the op so the next scan re-creates the object (R3-P1-2): {e}"
                         );
-                        return Err(to_reconcile_err(e));
+                        self.state.delete_pending_op(op.id).await?;
+                        continue;
                     }
                 };
                 match found {
@@ -4176,6 +4216,43 @@ fn to_reconcile_err(err: anyhow::Error) -> anyhow::Error {
     err
 }
 
+/// R3-P1-2: should reconcile KEEP+RETRY this Drive error (return `Err`, retry
+/// next cycle) on a metadata/lookup read, or treat it as a DEFINITIVE failure
+/// (clear the stale id / drop the op so the account is not wedged)?
+///
+/// reconcile_once runs BEFORE scan/execute, so an op that keeps returning `Err`
+/// every cycle stops ALL backups for the account. recheck-2 made the
+/// metadata/lookup arms keep+retry on ANY error, which WEDGES the account when
+/// the recorded Drive file id is permanently gone: a stale/missing id returns a
+/// definitive 404 (real store: `DriveErrorClassification::Other` ->
+/// [`DriveError::Other`]; fake: a `"no object..."` message -> [`DriveError::Other`])
+/// that no amount of retrying can fix.
+///
+/// Retryable (keep+retry) ONLY for errors that MIGHT succeed later:
+/// - [`DriveError::RateLimited`] / [`DriveError::Transient`] - transient service
+///   health; the read may succeed next cycle.
+/// - [`DriveError::QuotaExhausted`] / [`DriveError::DailyQuota`] - clears in time.
+/// - [`DriveError::InvalidGrant`] - auth; mapped to `needs_reauth` by
+///   [`to_reconcile_err`] (recheck-2), NOT a per-op retry forever.
+///
+/// Everything else ([`DriveError::Other`] = definitive 404 / not-found /
+/// non-retryable 4xx, plus `ChecksumMismatch` / dest-folder faults) is a fatal
+/// verdict for this op: the recorded id can never be read/updated, so the caller
+/// clears the stale id and drops the op rather than retrying forever.
+fn reconcile_metadata_error_is_retryable(class: DriveError) -> bool {
+    match class {
+        DriveError::RateLimited
+        | DriveError::Transient
+        | DriveError::QuotaExhausted
+        | DriveError::DailyQuota
+        | DriveError::InvalidGrant => true,
+        DriveError::Other
+        | DriveError::ChecksumMismatch
+        | DriveError::DestFolderMissing
+        | DriveError::DestFolderPermissionDenied => false,
+    }
+}
+
 /// Extract the stranded corrupt-create file id from a Drive-side error, if it
 /// carries one (codex C5-P1-4).
 ///
@@ -5003,6 +5080,91 @@ mod tests {
                 .unwrap()
                 .is_none(),
             "no file_state row should be written on a failed metadata reconcile"
+        );
+    }
+
+    /// R3-P1-2 (account-not-wedged): a DEFINITIVE not-found / 404 on the UPDATE
+    /// reconcile's `metadata()` read (the recorded `drive_file_id` is gone) is
+    /// NOT retryable - the recheck-2 keep+retry-on-any-error would retry it every
+    /// cycle, and because reconcile runs BEFORE scan/execute it would WEDGE the
+    /// whole account. Instead reconcile must CLEAR the stale `drive_file_id` (so
+    /// the next scan re-uploads as a fresh CREATE) and DROP the op, letting the
+    /// account proceed.
+    #[tokio::test]
+    async fn reconcile_metadata_not_found_clears_stale_id_and_drops_op() {
+        // A plain fake (no fault injection): `metadata("missing-id")` returns the
+        // not-found message "fake: no object with file_id ..." which classifies as
+        // DriveError::Other (real store: DriveErrorClassification::Other) - the
+        // definitive, NON-retryable 404 shape.
+        let h = harness().await;
+        let (rel, _size) = h.write_file("stale-update.txt", b"local bytes");
+
+        let stale_id = "missing-id-permanently-gone";
+        // Seed a file_state row that recorded this (now-gone) Drive id, so we can
+        // assert reconcile CLEARS it.
+        h.state
+            .upsert_file_state(&FileStateRow {
+                source_id: h.source.id,
+                relative_path: rel.clone(),
+                size: 11,
+                mtime_ns: 123,
+                hash_blake3: *blake3::hash(b"local bytes").as_bytes(),
+                drive_file_id: Some(stale_id.to_string()),
+                drive_md5: None,
+                encrypted_remote_path: None,
+                status: FileStateStatus::Synced,
+                last_uploaded_at: Some(h.clock.now_ms()),
+                last_verified_at: None,
+            })
+            .await
+            .unwrap();
+
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let now = h.clock.now_ms();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                // drive_file_id present => the UPDATE reconcile path (metadata).
+                payload_json: serde_json::json!({
+                    "client_op_uuid": op_uuid,
+                    "drive_file_id": stale_id,
+                }),
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let exec = h.executor();
+        // The account is NOT wedged: reconcile returns Ok (not a forever-Err).
+        exec.reconcile(&h.source)
+            .await
+            .expect("a definitive 404 must NOT wedge the account; reconcile returns Ok");
+
+        // The dead op is dropped (no forever-retry).
+        assert_eq!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .len(),
+            0,
+            "a definitive not-found must DROP the stale update op (R3-P1-2)"
+        );
+
+        // The stale drive_file_id is cleared so the next scan re-uploads as a
+        // fresh CREATE rather than re-attempting the dead update.
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("the file_state row must still exist (only the id is cleared)");
+        assert!(
+            row.drive_file_id.is_none(),
+            "the stale drive_file_id must be CLEARED so the next scan re-creates the object (R3-P1-2)"
         );
     }
 

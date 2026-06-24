@@ -846,6 +846,29 @@ impl StateRepo for SqliteStateRepo {
         Ok(())
     }
 
+    async fn clear_file_state_drive_file_id(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+    ) -> Result<()> {
+        let source_str = source.to_string();
+        let path_str = path.as_str().to_string();
+        // Runtime `sqlx::query` (NOT the compile-checked `query!` macro) so this
+        // additive method needs NO `.sqlx` cache regeneration (R3-P1-2). A
+        // targeted single-column UPDATE: it cannot clobber any other column a
+        // concurrent edit may have changed, and a missing row updates 0 rows
+        // (idempotent no-op).
+        sqlx::query(
+            "UPDATE file_state SET drive_file_id = NULL \
+             WHERE source_id = ?1 AND relative_path = ?2",
+        )
+        .bind(source_str.as_str())
+        .bind(path_str.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn bump_checksum_mismatch_count(
         &self,
         source: SourceId,

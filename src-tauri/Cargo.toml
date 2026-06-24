@@ -30,6 +30,10 @@ tracing-subscriber.workspace = true
 anyhow.workspace = true
 # M5 app-shell async runtime (orchestrator run-loop spawn, build_and_spawn).
 tokio.workspace = true
+# R3-P1-1: drain every per-account shutdown future CONCURRENTLY on quit
+# (futures::future::join_all) so two slow accounts do not serialise and risk an
+# outer-timeout abort mid-drain (which would orphan a task).
+futures.workspace = true
 rust-i18n = "3"
 sys-locale = "0.3"
 

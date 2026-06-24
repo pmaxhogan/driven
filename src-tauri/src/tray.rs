@@ -600,6 +600,93 @@ pub fn apply_state(app: &AppHandle, account_id: AccountId, state: OrchestratorSt
     notify_for_state(app, account_id, &state);
 }
 
+/// The notification a state transition asks for, decided by the PURE
+/// [`decide_notify`] state machine so the firing logic is unit-testable without
+/// an `AppHandle`. [`notify_for_state`] turns it into an actual OS toast.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum NotifyOutcome {
+    /// No toast for this transition (icon+tooltip only).
+    None,
+    /// The first-sync-complete toast (DESIGN s117).
+    FirstSyncComplete,
+    /// A red-error toast for `code` (DESIGN s247).
+    Error(ErrorCode),
+}
+
+/// PURE notification state machine (R3-P2-1): mutate the per-account dedup
+/// [`NotifyState`] for `state` and return which toast (if any) to fire.
+///
+/// Extracted from [`notify_for_state`] so the firing decision can be tested
+/// without an `AppHandle`.
+///
+/// Active-cycle group (R3-P2-1): ONLY the real scan/plan/execute/verify states
+/// (plus the `PowerCheck` that gates them) mark `saw_active_cycle`. `Backoff` is
+/// DELIBERATELY EXCLUDED: it was remapped to a network-attention condition
+/// (R2-P2-2, the Drive breaker open / rate-limited "Drive unreachable" case), so
+/// a startup that only ever hits Drive backoff has NOT completed a real sync
+/// cycle and must NOT later fire a bogus "first sync complete" toast on the next
+/// `Idle`. `Backoff` therefore behaves like a `Paused` blip here: it clears the
+/// error dedup latch but does not arm first-sync.
+fn decide_notify(s: &mut NotifyState, state: &OrchestratorState) -> NotifyOutcome {
+    match state {
+        OrchestratorState::PowerCheck
+        | OrchestratorState::Scanning { .. }
+        | OrchestratorState::Planning { .. }
+        | OrchestratorState::Executing { .. }
+        | OrchestratorState::Verifying { .. } => {
+            // A real cycle is underway; the next Idle is a genuine completion.
+            s.saw_active_cycle = true;
+            // Leaving any error state clears the dedup latch so a recurrence
+            // notifies again.
+            s.last_error_code = None;
+            NotifyOutcome::None
+        }
+        OrchestratorState::Backoff { .. } => {
+            // R3-P2-1: Drive backoff is a network-attention blip, NOT an active
+            // sync cycle - it must NOT arm the first-sync toast. Treated like a
+            // pause: clear the error dedup latch only.
+            s.last_error_code = None;
+            NotifyOutcome::None
+        }
+        OrchestratorState::Idle { .. } => {
+            s.last_error_code = None;
+            let fire = s.saw_active_cycle && !s.first_sync_notified;
+            if fire {
+                s.first_sync_notified = true;
+                NotifyOutcome::FirstSyncComplete
+            } else {
+                NotifyOutcome::None
+            }
+        }
+        OrchestratorState::Paused { .. } => {
+            // Pauses (battery / metered / network) are icon+tooltip only, no
+            // toast on every blip (DESIGN s117/s247).
+            s.last_error_code = None;
+            NotifyOutcome::None
+        }
+        OrchestratorState::Error { detail } => {
+            // Reauth is handled by notify_needs_reauth (needs account/email).
+            if matches!(
+                detail.code,
+                ErrorCode::AuthInvalidGrant | ErrorCode::AuthConsentRequired
+            ) {
+                return NotifyOutcome::None;
+            }
+            // Only the red error visual toasts; yellow-bang network errors are
+            // icon+tooltip only.
+            if TrayIcon::for_state(state) != TrayIcon::Error {
+                return NotifyOutcome::None;
+            }
+            if s.last_error_code == Some(detail.code) {
+                NotifyOutcome::None // already toasted this error; suppress replay
+            } else {
+                s.last_error_code = Some(detail.code);
+                NotifyOutcome::Error(detail.code)
+            }
+        }
+    }
+}
+
 /// Raise the DESIGN s117/s247 OS notifications for a state transition.
 ///
 /// Two triggers only (the rest of the state machine is icon+tooltip only):
@@ -610,74 +697,23 @@ pub fn apply_state(app: &AppHandle, account_id: AccountId, state: OrchestratorSt
 ///   skipped here - it is covered by [`notify_needs_reauth`], which the shell
 ///   calls with the account + email the state cannot carry.
 fn notify_for_state(app: &AppHandle, account_id: AccountId, state: &OrchestratorState) {
-    match state {
-        OrchestratorState::PowerCheck
-        | OrchestratorState::Scanning { .. }
-        | OrchestratorState::Planning { .. }
-        | OrchestratorState::Executing { .. }
-        | OrchestratorState::Verifying { .. }
-        | OrchestratorState::Backoff { .. } => {
-            // A cycle is underway; the next Idle is a genuine completion.
-            with_notify_state(account_id, |s| {
-                s.saw_active_cycle = true;
-                // Leaving any error state clears the dedup latch so a recurrence
-                // notifies again.
-                s.last_error_code = None;
-            });
+    let outcome = with_notify_state(account_id, |s| decide_notify(s, state));
+    match outcome {
+        NotifyOutcome::None => {}
+        NotifyOutcome::FirstSyncComplete => {
+            show_notification(
+                app,
+                rust_i18n::t!("notifications.first_sync_complete.title").into_owned(),
+                rust_i18n::t!("notifications.first_sync_complete.body").into_owned(),
+            );
         }
-        OrchestratorState::Idle { .. } => {
-            let should_fire = with_notify_state(account_id, |s| {
-                s.last_error_code = None;
-                let fire = s.saw_active_cycle && !s.first_sync_notified;
-                if fire {
-                    s.first_sync_notified = true;
-                }
-                fire
-            });
-            if should_fire {
-                show_notification(
-                    app,
-                    rust_i18n::t!("notifications.first_sync_complete.title").into_owned(),
-                    rust_i18n::t!("notifications.first_sync_complete.body").into_owned(),
-                );
-            }
-        }
-        OrchestratorState::Paused { .. } => {
-            // Pauses (battery / metered / network) are icon+tooltip only, no
-            // toast on every blip (DESIGN s117/s247).
-            with_notify_state(account_id, |s| {
-                s.last_error_code = None;
-            });
-        }
-        OrchestratorState::Error { detail } => {
-            // Reauth is handled by notify_needs_reauth (needs account/email).
-            if matches!(
-                detail.code,
-                ErrorCode::AuthInvalidGrant | ErrorCode::AuthConsentRequired
-            ) {
-                return;
-            }
-            // Only the red error visual toasts; yellow-bang network errors are
-            // icon+tooltip only.
-            if TrayIcon::for_state(state) != TrayIcon::Error {
-                return;
-            }
-            let should_fire = with_notify_state(account_id, |s| {
-                if s.last_error_code == Some(detail.code) {
-                    false // already toasted this error; suppress the replay
-                } else {
-                    s.last_error_code = Some(detail.code);
-                    true
-                }
-            });
-            if should_fire {
-                let body = error_notification_body(detail.code);
-                show_notification(
-                    app,
-                    rust_i18n::t!("notifications.error.title").into_owned(),
-                    body,
-                );
-            }
+        NotifyOutcome::Error(code) => {
+            let body = error_notification_body(code);
+            show_notification(
+                app,
+                rust_i18n::t!("notifications.error.title").into_owned(),
+                body,
+            );
         }
     }
 }
@@ -765,6 +801,61 @@ mod tests {
     fn reset_tray_states() {
         let mut guard = TRAY_STATES.lock().unwrap_or_else(|e| e.into_inner());
         *guard = Some(HashMap::new());
+    }
+
+    #[test]
+    fn backoff_then_idle_does_not_fire_first_sync_complete() {
+        // R3-P2-1: `Backoff` (Drive breaker open / rate-limited) is a network-
+        // attention condition, NOT a real sync cycle. A startup that only ever
+        // hits Drive backoff before settling to Idle has completed no scan/plan/
+        // execute/verify, so the next `Idle` must NOT fire the bogus
+        // "first sync complete" toast. Drives the PURE `decide_notify` state
+        // machine directly (no AppHandle needed).
+        let mut s = NotifyState::default();
+
+        // Only ever saw Backoff: it must NOT arm the active-cycle latch.
+        let out = decide_notify(&mut s, &OrchestratorState::Backoff { until: 0 });
+        assert_eq!(out, NotifyOutcome::None, "Backoff itself toasts nothing");
+        assert!(
+            !s.saw_active_cycle,
+            "Backoff must NOT count as an active sync cycle (R3-P2-1)"
+        );
+
+        // Reaching Idle after only-Backoff must NOT fire first-sync-complete.
+        let out = decide_notify(&mut s, &OrchestratorState::Idle { last_run_at: None });
+        assert_eq!(
+            out,
+            NotifyOutcome::None,
+            "Backoff-then-Idle must NOT fire the first-sync-complete toast (R3-P2-1)"
+        );
+        assert!(
+            !s.first_sync_notified,
+            "first-sync must stay unarmed after a Backoff-only startup"
+        );
+
+        // Sanity: a REAL cycle (e.g. Executing) DOES arm it, so the next Idle
+        // fires exactly once - proving we only removed Backoff, not the feature.
+        let out = decide_notify(
+            &mut s,
+            &OrchestratorState::Executing {
+                progress: ExecProgress::zero(),
+            },
+        );
+        assert_eq!(out, NotifyOutcome::None);
+        assert!(s.saw_active_cycle, "a real Executing cycle arms first-sync");
+        let out = decide_notify(&mut s, &OrchestratorState::Idle { last_run_at: None });
+        assert_eq!(
+            out,
+            NotifyOutcome::FirstSyncComplete,
+            "a real cycle then Idle DOES fire first-sync-complete (feature intact)"
+        );
+        // Idempotent: a second Idle does not re-fire.
+        let out = decide_notify(&mut s, &OrchestratorState::Idle { last_run_at: None });
+        assert_eq!(
+            out,
+            NotifyOutcome::None,
+            "first-sync-complete fires exactly once"
+        );
     }
 
     #[test]

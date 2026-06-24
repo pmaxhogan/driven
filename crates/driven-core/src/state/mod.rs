@@ -379,6 +379,21 @@ pub trait StateRepo: Send + Sync {
     /// Deletes a `file_state` row by primary key.
     async fn delete_file_state(&self, source: SourceId, path: &RelativePath) -> Result<()>;
 
+    /// R3-P1-2: NULL out a `file_state` row's `drive_file_id` by primary key.
+    ///
+    /// Called by reconcile when an UPDATE op's recorded Drive file id is
+    /// definitively gone (a non-retryable 404 / not-found on `metadata()`): the
+    /// stale id can never be updated, so it is cleared so the NEXT scan plans a
+    /// fresh CREATE (re-upload) rather than the executor retrying the dead update
+    /// every cycle and WEDGING the account (reconcile runs before scan/execute).
+    /// A missing row is an idempotent no-op (the row may have been deleted while
+    /// the op was queued; the next scan re-creates it from scratch anyway).
+    async fn clear_file_state_drive_file_id(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+    ) -> Result<()>;
+
     /// R2-P1-3 (DESIGN s5.4): increment the CONSECUTIVE checksum-mismatch
     /// counter for `(source, path)` by one and return the NEW count. After the
     /// 3rd consecutive mismatch the executor marks the file

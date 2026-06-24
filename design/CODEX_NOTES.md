@@ -501,11 +501,70 @@ task, NOT bugs in M4's delivered scope.
   at `crates/driven-core/src/executor.rs` (`DriveError::ChecksumMismatch`) to stop
   claiming the defence exists today; the counter itself lands at M5.
 
-## M5 recheck rounds (codex) - cap (2) REACHED, M5 DONE
+## M5 recheck rounds (codex) - recheck-3 ran (one-time exception), M5 CLOSED
 
-Two codex recheck rounds ran on M5. Recheck-1 (zero-orphan-task shutdown P1 +
+THREE codex recheck rounds ran on M5. Recheck-1 + recheck-2 are summarised below;
+recheck-3 was a ONE-TIME exception past the normal cap=2 because recheck-2's two
+fixes (reconcile keep+retry, concurrent-ish shutdown) each introduced a follow-on
+correctness gap. Recheck-3 raised 2 P1 + 1 P2, ALL FIXED in one push, and **M5
+review is now CLOSED (no recheck-4):**
+
+- **R3-P1-1 (FIXED) - shutdown drained accounts SERIALLY under one outer timeout
+  -> could orphan a task.** `lib.rs::shutdown_orchestrators` ran each account's
+  `AccountHandle::shutdown()` in a serial `for` loop wrapped in ONE outer
+  `tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, ..)`. With two accounts (each run
+  loop up to ~20s + each poller the 5s abort budget) the outer timeout could fire
+  MID-drain; because `drain_or_abort` has already TAKEN the `JoinHandle` out of its
+  slot, dropping that future detaches (orphans) the in-flight aborted task -
+  violating the M5 no-orphans acceptance. Fixed by running ALL per-account
+  `shutdown()` futures CONCURRENTLY via `futures::future::join_all` and REMOVING the
+  outer timeout entirely (each `drain_or_abort` already self-bounds: await up to its
+  budget, then `abort()` AND await the aborted handle). The now-unused
+  `SHUTDOWN_DRAIN_TIMEOUT` constant was deleted. Test:
+  `concurrent_shutdown_of_multiple_slow_accounts_leaves_no_orphans` (2 accounts,
+  both run loops slow + forever pollers, paused virtual time; asserts every handle
+  `is_finished()` and that the concurrent sweep completes inside ONE run-loop budget,
+  which a serial drain could not). `shutdown_joins_every_per_account_task_no_orphans`
+  + `run_loop_gets_full_drain_budget_not_the_short_bridge_timeout` still pass.
+
+- **R3-P1-2 (FIXED) - reconcile update path retried a 404 FOREVER -> wedged the
+  account.** recheck-2's R2-P1-1 made the update-`metadata` and create-`find_by_op_uuid`
+  reconcile arms keep+retry (return `Err`) on ANY error. But a stale/missing Drive
+  file id returns a DEFINITIVE 404 (real store: `DriveErrorClassification::Other` ->
+  `DriveError::Other`; fake: a `"no object..."` message -> `DriveError::Other`), which
+  then retried every cycle - and because `reconcile_once` runs BEFORE scan/execute,
+  one stale update op stopped ALL backups for the account. Fixed by
+  `reconcile_metadata_error_is_retryable(class)`: keep+retry (return `Err`) ONLY for
+  transient / rate-limited / quota / `InvalidGrant` (auth still maps to needs_reauth
+  via `to_reconcile_err`); for a definitive not-found / non-retryable error CLEAR the
+  stale `file_state.drive_file_id` (new `StateRepo::clear_file_state_drive_file_id`,
+  runtime `sqlx::query` so no `.sqlx` cache change) so the next scan re-creates the
+  object as a fresh CREATE, and DROP the op so the account is NOT wedged (the create
+  path has no recorded id to clear, so it just drops + continues). Tests:
+  `reconcile_metadata_not_found_clears_stale_id_and_drops_op` (404 -> id cleared, op
+  dropped, account proceeds), and the recheck-2 behaviour is PRESERVED -
+  `reconcile_metadata_transient_error_keeps_the_pending_op` +
+  `reconcile_invalid_grant_on_{create_lookup,update_metadata}_maps_to_needs_reauth`
+  all still pass.
+
+- **R3-P2-1 (FIXED) - Backoff still counted as an active sync cycle in
+  notifications.** recheck-2 (R2-P2-2) remapped `Backoff` to NetworkAttention, but
+  `tray::notify_for_state` still set `saw_active_cycle = true` for `Backoff`, so a
+  startup that only ever hit Drive backoff before settling to `Idle` would fire a
+  bogus "first sync complete" toast. Fixed by removing `Backoff` from the
+  active-cycle group (it now behaves like a `Paused` blip: clears the error dedup
+  latch only); `saw_active_cycle` is set ONLY by a real scan/plan/execute/verify
+  (+ the gating `PowerCheck`). The firing decision was extracted into a PURE
+  `decide_notify(&mut NotifyState, &OrchestratorState) -> NotifyOutcome` so it is
+  unit-testable without an `AppHandle`. Test:
+  `backoff_then_idle_does_not_fire_first_sync_complete` (also asserts a REAL cycle
+  then `Idle` STILL fires exactly once - the feature is intact).
+
+### Recheck-1 + recheck-2 (history)
+
+Recheck-1 (zero-orphan-task shutdown P1 +
 aggregate tray severity P2 + reconcile `invalid_grant` -> needs_reauth P2) were
-all FIXED. Recheck-2 (FINAL, recheck cap=2 - NO recheck-3) raised 1 P1 + 2 P2,
+all FIXED. Recheck-2 raised 1 P1 + 2 P2,
 ALL FIXED in the same push:
 
 - **R2-P1-1 (FIXED) - reconcile `invalid_grant` swallow + dangerous pending-op

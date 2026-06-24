@@ -192,6 +192,22 @@ mod tests {
             Ok(())
         }
 
+        async fn clear_file_state_drive_file_id(
+            &self,
+            source: SourceId,
+            path: &RelativePath,
+        ) -> Result<()> {
+            if let Some(row) = self
+                .rows
+                .lock()
+                .expect("lock")
+                .get_mut(&(source, path.clone()))
+            {
+                row.drive_file_id = None;
+            }
+            Ok(())
+        }
+
         async fn mark_excluded_orphans(
             &self,
             _source: SourceId,
