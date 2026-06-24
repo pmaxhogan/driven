@@ -452,6 +452,25 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
     Ok(())
 }
 
+/// Re-render the tray after a locale change (SPEC s22 `ui.locale`, DESIGN s8.7).
+///
+/// The tray menu labels + tooltip are built from `rust_i18n::t!` at
+/// [`build`]-time, so a locale switch needs the tray rebuilt to pick up the new
+/// strings. This removes the live `"driven-main"` tray and rebuilds it; the
+/// caller must have already called `rust_i18n::set_locale(..)`. Best-effort: if
+/// no tray exists yet (assembly still running) [`build`] just creates it.
+///
+/// Note the aggregate per-account icon state ([`TRAY_STATES`]) is process-global
+/// and survives the rebuild, so the next `apply_state` (or the existing state)
+/// restores the correct icon; the rebuilt tray starts on the idle icon until
+/// then, which is the same as a fresh boot.
+pub fn rebuild(app: &AppHandle) -> tauri::Result<()> {
+    if app.remove_tray_by_id(TRAY_ID).is_none() {
+        tracing::debug!(target: TARGET, "no live tray {TRAY_ID} to remove before rebuild; building fresh");
+    }
+    build(app)
+}
+
 /// Build the DESIGN s8.1 flat tray menu (every action is a menu item so Linux
 /// users are never stuck on a non-firing left-click). `MenuBuilder` cleanly
 /// mixes id'd items with separators without slice-coercion ambiguity.

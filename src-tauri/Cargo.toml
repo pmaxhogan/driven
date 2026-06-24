@@ -43,6 +43,17 @@ tokio.workspace = true
 futures.workspace = true
 rust-i18n = "3"
 sys-locale = "0.3"
+# M6 (SPEC s11.1): the accounts wizard mints opaque server-side session ids.
+uuid.workspace = true
+# M6 (SPEC s11.6 / s15): check_for_updates + list_releases query the GitHub
+# releases API over the shared workspace reqwest (rustls, no `json` feature -
+# bodies are read as text + parsed with serde_json). semver compares the latest
+# release tag against the current version for the channel.
+reqwest.workspace = true
+semver = "1"
+# M6 (SPEC s18): export_diagnostic_bundle writes a STORED (no-compression) ZIP by
+# hand; crc32fast computes the per-entry CRC32 the ZIP format requires.
+crc32fast = "1"
 
 driven-core = { path = "../crates/driven-core" }
 driven-drive = { path = "../crates/driven-drive" }

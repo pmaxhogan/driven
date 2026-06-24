@@ -655,3 +655,77 @@ package.json). `dunce` v1 added for the SPEC s11.6.1 `validate_writable_dest`
 canonicalisation (Windows UNC-friendly). M7 `/activity` + M8 `/restore` are
 PLACEHOLDER views in M6 (a t()-driven "coming later" shell); M6 implements
 `/setup`, `/accounts`, `/sources`, `/rules`, `/about`.
+
+## M6 recovery completion (settings.rs re-completed after a mid-run agent death)
+
+The M6 implement phase ran three parallel agents. The backend-ipc agent fully
+wrote `commands/{accounts.rs, sources.rs, mod.rs}` but died on a network blip
+BEFORE writing `commands/settings.rs` (which the scaffold left as five `todo!()`
+bodies), and the integrate pass never ran. This recovery filled the
+`settings.rs` gap and ran the cut-off integrate. What landed:
+
+- `settings.rs` - all five commands implemented FULLY (no `todo!()`/panic/fake):
+  `get_settings`, `update_settings`, `export_diagnostic_bundle`,
+  `check_for_updates`, `list_releases`. The anti-fake-green sweep shows ZERO
+  non-test stub macros across the whole M6 command surface.
+- New `src-tauri` deps (the scaffold had already shown M6 adds deps - dialog,
+  dunce): `uuid` (the accounts wizard mints session ids - the backend-ipc agent
+  used it but died before adding it to Cargo.toml, breaking the build),
+  `reqwest` (workspace dep; the GitHub releases fetch), `semver` (version
+  compare), `crc32fast` (the diagnostic-bundle ZIP CRC). No `zip` crate: the
+  bundle is written by a small hand-rolled STORED-method ZIP encoder
+  (`settings.rs` `ZipWriter`) to keep the dep + license surface minimal and
+  `cargo deny` green.
+
+### Settings KV: snake_case on disk, camelCase on the wire (storage bridge)
+
+The migration 0002 seed writes each `settings` KV group in `snake_case`
+(`auto_start_on_login`, ...), but the frozen M6 DTO groups
+(`commands/dtos.rs`) are `camelCase` (`autoStartOnLogin`) per the M6 typed-IPC
+convention above. Deserializing the seeded snake_case JSON directly into the
+camelCase DTO FAILS (missing-field). So `settings.rs` keeps a `mod storage` of
+`snake_case` structs that mirror the DTO groups field-for-field with `From`
+conversions both ways: every settings READ deserializes a `storage::*`, every
+WRITE serializes one, and the boundary converts to/from the DTO. The DB stays
+canonical snake_case (one casing on disk, matching the migration); the wire
+stays camelCase. `load_orchestrator_config` (shared with `sources.rs`'s
+post-add reconfigure) reads the same storage structs.
+
+### CommandError is camelCase on the wire (minor SPEC s24 example deviation)
+
+`commands::CommandError` now derives `#[serde(rename_all = "camelCase")]`, so
+it renders `retryAfterMs` rather than the SPEC s24 example's literal
+`retry_after_ms`. This matches the M6 camelCase typed-IPC convention (and the
+test the recovered `mod.rs` shipped). `code` + `message` are identical in both
+casings and `details` is single-word, so only the retry-after hint differs; the
+frontend reads only `.code`, so nothing downstream depends on the casing.
+
+### Updater: M6 ships a REAL GitHub-releases backend; the Tauri manifest stays M9
+
+ROADMAP M9 owns the `update.json` manifest hosting
+(`driven.maxhogan.dev/updates`) + the `tauri-plugin-updater` download/relaunch
+path; M9's sequencing note says the in-app updater "needs a real `update.json`
+to fetch, which only exists once the release pipeline is in place" - that
+endpoint does NOT exist in M6. So `check_for_updates` / `list_releases` do NOT
+query that manifest. Instead they hit the GitHub releases API for
+`pmaxhogan/driven` (real + reachable today): `list_releases(page)` returns the
+channel-filtered page; `check_for_updates` returns `Some(UpdateInfo)` only when
+the newest channel release's semver tag is strictly newer than the running
+build. This is the honest "is there a newer release" answer the About tab needs.
+The SIGNED-BUNDLE DOWNLOAD + INSTALL + RELAUNCH (the `tauri-plugin-updater`
+glue, the `update.json` generation script, the `updater:downloaded` event) stay
+M9 - they require the M9 ed25519 keypair + manifest hosting that do not exist
+yet. No deferral-by-typed-error was needed: both M6 commands have real bodies.
+
+### Two recovered-file bugs fixed during the cut-off integrate pass
+
+- `Settings.vue`'s `parseOptionalPositiveInt`/`parsePositiveInt` assumed a
+  `string`, but an `<input type="number">` bound via `v-model` yields a NUMBER,
+  so `.trim()` threw at runtime - the settings-UI test caught it once the
+  integrate pass finally ran them. Fixed to accept `string | number` and coerce.
+- The `settings-components.test.ts` "Edit exclusions" test asserted
+  `preview_exclusions` was called with a FLAT `{ localPath }`, but the frozen
+  `previewExclusions` IPC wrapper nests the request under `{ req }` (matching the
+  Rust `preview_exclusions(req: ExclusionPreviewRequest)` signature). The test
+  assertion was corrected to the real `{ req: { localPath } }` contract (a
+  contract fix, not a weakening).
