@@ -326,15 +326,25 @@ pub fn validate_writable_dest(path: &Path, dialog_token: &DialogToken) -> Comman
 /// 1. the relative path is strictly relative (no `..`, no leading `/`, no
 ///    Windows drive / UNC prefix, no NUL) - reused via [`RelativePath`] parsing
 ///    so the SAME canonical-path rules the backup side uses apply on restore;
-/// 2. confine to the dialog-approved root: canonicalise the root, join the
-///    relative path, and verify the result is under the canonical root (defence
-///    in depth on top of (1));
-/// 3. create the parent directory chain INSIDE the root (so a nested file
-///    restores), then reject a SYMLINK at any newly-relevant component / the leaf
-///    (no write THROUGH a symlink): if the leaf already exists as a symlink, or
-///    any parent component is a symlink that escapes the root, refuse.
+/// 2. confine to the dialog-approved root by WALKING the destination components
+///    ONE AT A TIME from the canonical root: at each existing component, reject it
+///    if it is a SYMLINK (or canonicalises outside the root) BEFORE descending,
+///    and create only the NEXT missing directory after the current parent is
+///    verified confined - NEVER `create_dir_all` the whole chain up front (a
+///    symlink component in the chain would otherwise let `create_dir_all` create
+///    directories OUTSIDE the approved root before any later check ran);
+/// 3. reject a SYMLINK at the leaf (no write THROUGH a symlink): if the leaf
+///    already exists as a symlink, refuse.
 ///
 /// Returns the confined leaf [`PathBuf`] the caller writes to atomically.
+///
+/// R1-P1-1: the old implementation called `std::fs::create_dir_all(parent)` BEFORE
+/// the symlink/confinement check, so a pre-existing symlink directory component in
+/// the restore root (`escape -> C:\outside`) let `create_dir_all` create
+/// directories outside the root (e.g. `C:\outside\new`) before the post-hoc
+/// canonicalise-and-reject ran. The component-at-a-time walk below confines the
+/// parent chain BEFORE creating any directory, so no directory is ever created
+/// outside the canonical root.
 pub fn validate_restore_dest(
     dialog_token: &DialogToken,
     relative_path: &str,
@@ -367,47 +377,95 @@ pub fn validate_restore_dest(
         )
     })?;
 
-    // Build the target by joining each component (the RelativePath is `/`-joined
-    // and validated above, so each component is a plain name, never `..` / a root).
-    let mut dest = canon_root.clone();
-    for component in rel.split('/') {
-        if component.is_empty() {
-            continue;
-        }
-        dest.push(component);
-    }
-
-    // 3: create the parent directory chain inside the root.
-    if let Some(parent) = dest.parent() {
-        std::fs::create_dir_all(parent).map_err(|e| {
-            CommandError::with_code(
-                ErrorCode::LocalIoError,
-                format!("failed to create restore destination directory: {e}"),
-            )
-        })?;
-        // Re-canonicalise the (now-existing) parent and re-confine: a pre-existing
-        // SYMLINK component could redirect the parent outside the root even though
-        // the joined logical path looked confined. After canonicalisation it must
-        // STILL be under the canonical root, or we refuse.
-        let canon_parent = dunce::canonicalize(parent).map_err(|e| {
-            CommandError::with_code(
-                ErrorCode::LocalIoError,
-                format!("restore destination directory is unreadable: {e}"),
-            )
-        })?;
-        if !canon_parent.starts_with(&canon_root) {
+    // Split into the directory components (all but the last) and the leaf file
+    // name. The RelativePath is `/`-joined and validated above, so each segment is
+    // a plain name (never `..` / a root / empty after this filter).
+    let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+    let (file_name, dir_segments) = match segments.split_last() {
+        Some((leaf, dirs)) => (*leaf, dirs),
+        None => {
             return Err(CommandError::with_code(
                 ErrorCode::LocalIoError,
-                "restore destination escapes the approved folder via a symlink",
-            ));
+                "restore relative path must not be empty",
+            ))
         }
-        // Recompose the confined leaf against the canonical parent.
-        if let Some(file_name) = dest.file_name() {
-            dest = canon_parent.join(file_name);
+    };
+
+    // Walk the directory chain ONE LEVEL AT A TIME, starting from the canonical
+    // root (R1-P1-1). `current` is always a real (non-symlink) directory proven to
+    // sit inside the canonical root; we extend it by exactly one component per
+    // step.
+    let mut current = canon_root.clone();
+    for segment in dir_segments {
+        let candidate = current.join(segment);
+        match std::fs::symlink_metadata(&candidate) {
+            Ok(meta) => {
+                // The component already exists. Reject a SYMLINK BEFORE descending
+                // (it could redirect the chain outside the root - do not follow it,
+                // and do not create anything beneath it).
+                if meta.file_type().is_symlink() {
+                    return Err(CommandError::with_code(
+                        ErrorCode::LocalIoError,
+                        "restore destination escapes the approved folder via a symlink",
+                    ));
+                }
+                if !meta.file_type().is_dir() {
+                    return Err(CommandError::with_code(
+                        ErrorCode::LocalIoError,
+                        "restore destination path component is not a directory",
+                    ));
+                }
+                // A real directory: descend. Canonicalise it and re-confirm it is
+                // still under the canonical root (defence in depth on top of the
+                // symlink check - a mount/junction could also redirect it).
+                let canon = dunce::canonicalize(&candidate).map_err(|e| {
+                    CommandError::with_code(
+                        ErrorCode::LocalIoError,
+                        format!("restore destination directory is unreadable: {e}"),
+                    )
+                })?;
+                if !canon.starts_with(&canon_root) {
+                    return Err(CommandError::with_code(
+                        ErrorCode::LocalIoError,
+                        "restore destination escapes the approved folder via a symlink",
+                    ));
+                }
+                current = canon;
+            }
+            Err(_) => {
+                // The component does not exist: the PARENT (`current`) is already a
+                // verified real directory inside the root, so creating exactly this
+                // one level cannot follow a symlink out of the root. Create only
+                // this directory (NOT the whole remaining chain).
+                std::fs::create_dir(&candidate).map_err(|e| {
+                    CommandError::with_code(
+                        ErrorCode::LocalIoError,
+                        format!("failed to create restore destination directory: {e}"),
+                    )
+                })?;
+                // Canonicalise the just-created directory and confirm confinement
+                // before descending into it on the next iteration.
+                let canon = dunce::canonicalize(&candidate).map_err(|e| {
+                    CommandError::with_code(
+                        ErrorCode::LocalIoError,
+                        format!("restore destination directory is unreadable: {e}"),
+                    )
+                })?;
+                if !canon.starts_with(&canon_root) {
+                    return Err(CommandError::with_code(
+                        ErrorCode::LocalIoError,
+                        "restore destination escapes the approved folder via a symlink",
+                    ));
+                }
+                current = canon;
+            }
         }
     }
 
-    // Reject a SYMLINK at the leaf when it already exists (no write through it).
+    // `current` is now the confined, real parent directory. Compose the leaf.
+    let dest = current.join(file_name);
+
+    // 3: reject a SYMLINK at the leaf when it already exists (no write through it).
     match std::fs::symlink_metadata(&dest) {
         Ok(meta) if meta.file_type().is_symlink() => {
             return Err(CommandError::with_code(
@@ -679,6 +737,35 @@ mod tests {
         let err = validate_restore_dest(&token, "escape/file.txt")
             .expect_err("symlinked parent escape rejected");
         assert_eq!(err.code, ErrorCode::LocalIoError);
+        cleanup(root);
+        cleanup(outside);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_restore_dest_symlink_component_creates_no_dir_outside_root() {
+        // R1-P1-1: with `escape -> outside` a SYMLINK in the restore root and a
+        // backed-up path `escape/new/file.txt`, validation must be REJECTED AND
+        // must NOT create `outside/new` - the old create_dir_all-before-confine
+        // bug created directories outside the approved root before rejecting.
+        use std::os::unix::fs::symlink;
+        let root = tempdir();
+        let outside = tempdir();
+        let token = DialogToken::for_root(root.to_string_lossy().to_string());
+        // root/escape -> outside (a directory symlink escaping the root).
+        let link_dir = root.join("escape");
+        symlink(&outside, &link_dir).unwrap();
+
+        let err = validate_restore_dest(&token, "escape/new/file.txt")
+            .expect_err("a symlink component in the chain must be rejected");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
+
+        // The key invariant: NOTHING was created outside the root via the symlink.
+        let escaped = outside.join("new");
+        assert!(
+            !escaped.exists(),
+            "no directory may be created OUTSIDE the approved root via a symlink component: {escaped:?}"
+        );
         cleanup(root);
         cleanup(outside);
     }

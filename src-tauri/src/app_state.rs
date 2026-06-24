@@ -479,12 +479,38 @@ impl AppState {
             .map(|e| e.status.clone())
     }
 
-    /// M8 (P1-1): request cancellation of a running restore job. Sets the shared
-    /// cancel flag (the spawned task observes it between frames, deletes any
-    /// in-flight temp, and emits a terminal CANCELLED status) and returns the
-    /// spawned [`JoinHandle`] if the job is still tracked + running, so the caller
-    /// can await it. `None` for an unknown / already-finished id - cancellation is
-    /// idempotent (a second call, or a call after the job ended, is a no-op).
+    /// M8 (R1-P1-2): request cancellation of a running restore job FROM THE UI
+    /// WITHOUT detaching it. Sets the shared cancel flag (the spawned task observes
+    /// it between frames, deletes any in-flight temp, and emits a terminal
+    /// CANCELLED status) but LEAVES the task handle tracked on the job entry, so
+    /// the M5-style app-shutdown drain ([`Self::cancel_all_restore_jobs`]) still
+    /// awaits/aborts it - a UI cancel never orphans the task. The task clears its
+    /// own handle on exit via [`Self::finish_restore_job_handle`]. Returns `true`
+    /// if a tracked job's flag was set, `false` for an unknown / already-finished
+    /// id (cancellation is idempotent).
+    pub fn signal_cancel_restore_job(&self, job_id: &str) -> bool {
+        let map = self.lock_restore_jobs();
+        match map.get(job_id) {
+            Some(entry) => {
+                entry.cancel.store(true, Ordering::SeqCst);
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// M8 (P1-1): request cancellation of a running restore job AND TAKE its task
+    /// handle. Sets the shared cancel flag (the spawned task observes it between
+    /// frames, deletes any in-flight temp, and emits a terminal CANCELLED status)
+    /// and returns the spawned [`JoinHandle`] if the job is still tracked +
+    /// running, so the CALLER can await it. `None` for an unknown / already-
+    /// finished id - cancellation is idempotent (a second call, or a call after
+    /// the job ended, is a no-op).
+    ///
+    /// R1-P1-2: this is reserved for callers that take ownership of draining the
+    /// handle (e.g. a dedicated shutdown sweep). The UI cancel path must use
+    /// [`Self::signal_cancel_restore_job`] instead so the handle stays tracked for
+    /// the shutdown drain - taking + dropping the handle would DETACH the task.
     #[must_use]
     pub fn cancel_restore_job(&self, job_id: &str) -> Option<JoinHandle<()>> {
         let map = self.lock_restore_jobs();
@@ -1319,6 +1345,69 @@ mod tests {
         assert!(app_state.cancel_restore_job("job-1").is_none());
         // Unknown id: None.
         assert!(app_state.cancel_restore_job("nope").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn ui_cancel_sets_flag_but_keeps_handle_for_shutdown_drain() {
+        // R1-P1-2: the UI cancel path (`signal_cancel_restore_job`) must ONLY set
+        // the cancel flag and LEAVE the handle tracked, so the M5-style shutdown
+        // drain still awaits/aborts the task - a UI cancel never orphans it. This
+        // models the exact sequence: UI cancel signals the flag, the task is still
+        // tracked, then the shutdown drain (`cancel_all_restore_jobs`) takes the
+        // handle and joins it (no orphan).
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+
+        let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
+        let observed_cancel = cancel.clone();
+        // A task that loops until the cancel flag is set (models the stream loop).
+        let handle = tokio::spawn(async move {
+            loop {
+                if observed_cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        let task_finished = handle.abort_handle();
+        app_state.seed_restore_job(restore_status("ui-job", false), cancel.clone());
+        app_state.set_restore_job_handle("ui-job", handle);
+
+        // UI cancel: flag set, but the handle is LEFT tracked (not taken/dropped).
+        assert!(
+            app_state.signal_cancel_restore_job("ui-job"),
+            "signalling a tracked job returns true"
+        );
+        assert!(cancel.load(Ordering::SeqCst), "cancel flag must be set");
+
+        // The shutdown drain still finds the handle (it was NOT detached by the UI
+        // cancel) and can await it - i.e. the task is accounted-for, not orphaned.
+        let handles = app_state.cancel_all_restore_jobs();
+        assert_eq!(
+            handles.len(),
+            1,
+            "the UI-cancelled job's handle must STILL be tracked for the shutdown drain"
+        );
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(2), h)
+                .await
+                .expect("the UI-cancelled task must be joinable on shutdown (not orphaned)")
+                .expect("joined cleanly");
+        }
+        assert!(
+            task_finished.is_finished(),
+            "the task must have actually finished (cancel flag observed)"
+        );
+
+        // Idempotent: signalling an unknown id is a benign false.
+        assert!(!app_state.signal_cancel_restore_job("nope"));
 
         let _ = std::fs::remove_dir_all(dir);
     }
