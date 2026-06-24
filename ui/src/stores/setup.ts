@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 
 import * as ipc from "../ipc/commands";
+import { toErrorCode } from "../ipc/errors";
 import { useSourcesStore } from "./sources";
 import type {
   AddAccountWizardSessionId,
@@ -371,17 +372,3 @@ function defaultOpenUrl(url: string): void {
   }
 }
 
-/**
- * Map a rejected IPC error onto a stable SPEC s24 code. Tauri serializes the
- * `{ code, message, ... }` shape (SPEC s24); we read `.code` when present and
- * fall back to `internal.bug` so the view always has a translatable key.
- */
-function toErrorCode(e: unknown): string {
-  if (e && typeof e === "object" && "code" in e) {
-    const code = (e as { code: unknown }).code;
-    if (typeof code === "string" && code.length > 0) {
-      return code;
-    }
-  }
-  return "internal.bug";
-}

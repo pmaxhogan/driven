@@ -10,6 +10,7 @@ import type {
   AccountDto,
   ActivityFilterDto,
   ActivityPageDto,
+  ActivitySummaryDto,
   AddAccountWizardSessionId,
   AddSourceRequest,
   AddSourceResult,
@@ -187,4 +188,27 @@ export function queryActivity(
  * deleted (SPEC s11.4). */
 export function clearActivityOlderThan(beforeTs: number): Promise<number> {
   return invoke("clear_activity_older_than", { beforeTs });
+}
+
+/** The DISTINCT set of activity event types in the durable log, sorted (M7-P2-4).
+ * Backs the event-type filter dropdown so the user can filter for a type present
+ * in history but not in the currently-loaded rows. */
+export function distinctActivityEventTypes(): Promise<string[]> {
+  return invoke("distinct_activity_event_types");
+}
+
+/** The Activity dashboard header aggregates (M7-P2-5; DESIGN s8.3). The day /
+ * week boundaries are computed by the caller from the LOCAL `Date` (so the day
+ * boundary honours the user's timezone); the backend derives the throughput
+ * window start from `now - throughputWindowMs`. */
+export function activitySummary(
+  dayStartMs: number,
+  weekStartMs: number,
+  throughputWindowMs: number,
+): Promise<ActivitySummaryDto> {
+  return invoke("activity_summary", {
+    dayStartMs,
+    weekStartMs,
+    throughputWindowMs,
+  });
 }

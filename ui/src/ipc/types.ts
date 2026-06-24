@@ -281,6 +281,34 @@ export interface ActivityPageDto {
   hasMore: boolean;
 }
 
+/** `file_state.status` serialized form (mirrors driven_core FileStateStatus). */
+export type FileStateStatus =
+  | "synced"
+  | "pending"
+  | "corrupt"
+  | "locked"
+  | "error"
+  | "excluded_orphan";
+
+/** One per-status file count for the Activity header (M7-P2-5; mirrors src-tauri
+ * FileStatusCountDto / DESIGN s8.3 "file count by status"). */
+export interface FileStatusCountDto {
+  status: FileStateStatus;
+  count: number;
+}
+
+/** The Activity dashboard header aggregates (M7-P2-5; mirrors src-tauri
+ * ActivitySummaryDto / DESIGN s8.3): bytes uploaded today / this week, file
+ * count by status, and the current throughput window (bytes + window length, so
+ * the UI derives a bytes/sec rate). */
+export interface ActivitySummaryDto {
+  bytesToday: number;
+  bytesWeek: number;
+  fileStatusCounts: FileStatusCountDto[];
+  throughputWindowBytes: number;
+  throughputWindowMs: number;
+}
+
 // --- Sync (SPEC s11.3) - mirrors src-tauri/src/commands/sync.rs ---
 
 /** Mirrors the Rust `OrchestratorState` (driven_core::types). Carried as an

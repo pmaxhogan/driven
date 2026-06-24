@@ -39,6 +39,15 @@ export function onActivityNew(
   return listen<ActivityEntry>("activity:new", (e) => handler(e.payload));
 }
 
+/** `activity:lagged` - the live-tail broadcast lagged and dropped one or more
+ * `activity:new` events (M7-P1-1, SPEC s11.7). A pure gap signal (the payload
+ * carries only a diagnostic `skipped` count): the activity store reconciles by
+ * re-querying the durable `activity_log` and dedup-merging, so no durable row is
+ * lost. The handler takes no args; the dropped rows come from the re-query. */
+export function onActivityLagged(handler: () => void): Promise<UnlistenFn> {
+  return listen<unknown>("activity:lagged", () => handler());
+}
+
 /** `account:needs_reauth` payload: { account_id, email } (SPEC s11.7). */
 export interface NeedsReauthPayload {
   account_id: string;

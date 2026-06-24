@@ -3,9 +3,14 @@ import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
 import * as ipc from "../ipc/commands";
+import { toErrorCode } from "../ipc/errors";
 import { useActivityStore } from "../stores/activity";
 import { useSourcesStore } from "../stores/sources";
-import type { ActivityEntry, ActivityLevel } from "../ipc/types";
+import type {
+  ActivityEntry,
+  ActivityLevel,
+  FileStateStatus,
+} from "../ipc/types";
 
 // Activity dashboard (SPEC s11.4; DESIGN s8.3). A live tail (subscribes to
 // `activity:new` and prepends new rows, deduped by id) over a paginated history
@@ -22,9 +27,11 @@ const filterLevel = ref<string>("");
 const filterEventType = ref<string>("");
 
 // Diagnostic-bundle export state (ROADMAP M7 / DESIGN s8.3 "Export diagnostic
-// bundle" button; backed by the M6 export_diagnostic_bundle command).
+// bundle" button; backed by the M6 export_diagnostic_bundle command). M7-P2-6:
+// the error is held as a stable SPEC s24 code and localized via t(), never the
+// raw `String(e)` (which can be `[object Object]` / backend English).
 const exporting = ref(false);
-const exportError = ref<string | null>(null);
+const exportErrorCode = ref<string | null>(null);
 const exportedPath = ref<string | null>(null);
 
 // Locale-aware formatters (DESIGN s8.7: never hand-rolled English formatters).
@@ -37,14 +44,47 @@ const dateTimeFormatter = computed(
 );
 const numberFormatter = computed(() => new Intl.NumberFormat(locale.value));
 
-// The set of event types present in the loaded rows, for the event-type filter
-// options (the backend has no enumerate endpoint; the loaded rows are the source
-// of truth for what the user has actually seen).
-const eventTypeOptions = computed<string[]>(() => {
-  const seen = new Set<string>();
-  for (const e of activity.entries) seen.add(e.eventType);
-  return Array.from(seen).sort();
+// M7-P2-5 (DESIGN s8.3 header aggregates). Locale-aware byte + rate formatting
+// via Intl.NumberFormat (DESIGN s8.7: never a hand-rolled English formatter).
+const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"] as const;
+
+function formatBytes(bytes: number): string {
+  if (bytes <= 0) return `${numberFormatter.value.format(0)} ${BYTE_UNITS[0]}`;
+  const exponent = Math.min(
+    Math.floor(Math.log(bytes) / Math.log(1024)),
+    BYTE_UNITS.length - 1,
+  );
+  const value = bytes / Math.pow(1024, exponent);
+  const fmt = new Intl.NumberFormat(locale.value, {
+    maximumFractionDigits: exponent === 0 ? 0 : 1,
+  });
+  return `${fmt.format(value)} ${BYTE_UNITS[exponent]}`;
+}
+
+// Header aggregate view model (M7-P2-5). Null until the summary loads.
+const bytesToday = computed(() =>
+  activity.summary ? formatBytes(activity.summary.bytesToday) : null,
+);
+const bytesWeek = computed(() =>
+  activity.summary ? formatBytes(activity.summary.bytesWeek) : null,
+);
+const throughput = computed(() => {
+  const s = activity.summary;
+  if (!s || s.throughputWindowMs <= 0) return null;
+  const perSec = s.throughputWindowBytes / (s.throughputWindowMs / 1000);
+  return formatBytes(perSec);
 });
+const statusCounts = computed(() => activity.summary?.fileStatusCounts ?? []);
+
+function statusLabel(status: FileStateStatus): string {
+  return t(`activity.status.${status}`);
+}
+
+// M7-P2-4: the event-type filter options come from the backend's DISTINCT query
+// (the store's `eventTypeOptions`), so the user can filter for a type present in
+// history but not in the currently-loaded rows - the loaded-rows-only derivation
+// made the backend event-type filter unreachable for older types.
+const eventTypeOptions = computed<string[]>(() => activity.eventTypeOptions);
 
 const sourceNameById = computed<Record<string, string>>(() => {
   const map: Record<string, string> = {};
@@ -103,7 +143,7 @@ async function clearFilters(): Promise<void> {
 // save-file dialog and returns a concrete `.zip` path + one-shot token; the
 // webview never supplies a write target (SPEC s11.6.1).
 async function exportBundle(): Promise<void> {
-  exportError.value = null;
+  exportErrorCode.value = null;
   exportedPath.value = null;
   let token: string;
   try {
@@ -117,7 +157,8 @@ async function exportBundle(): Promise<void> {
   try {
     exportedPath.value = await ipc.exportDiagnosticBundle(token);
   } catch (e) {
-    exportError.value = String(e);
+    // M7-P2-6: normalize to the stable SPEC s24 code and localize via t().
+    exportErrorCode.value = toErrorCode(e);
   } finally {
     exporting.value = false;
   }
@@ -126,8 +167,15 @@ async function exportBundle(): Promise<void> {
 onMounted(async () => {
   // Subscribe to the live tail BEFORE the first history load so no event that
   // fires during the load is missed (it dedups against the paged rows by id).
+  // The subscription also reconciles from the durable log on `activity:lagged`
+  // (M7-P1-1), so a broadcast-lag burst loses no rows.
   await activity.subscribeLive();
-  await Promise.all([sources.refresh(), activity.loadInitial()]);
+  await Promise.all([
+    sources.refresh(),
+    activity.loadInitial(),
+    activity.loadEventTypeOptions(),
+    activity.loadSummary(),
+  ]);
 });
 
 onUnmounted(() => {
@@ -162,10 +210,11 @@ onUnmounted(() => {
         </button>
       </div>
       <p
-        v-if="exportError"
+        v-if="exportErrorCode"
         class="text-sm text-red-600"
+        data-testid="activity-export-error"
       >
-        {{ exportError }}
+        {{ t(`errors.${exportErrorCode}.long`) }}
       </p>
       <p
         v-else-if="exportedPath"
@@ -173,6 +222,59 @@ onUnmounted(() => {
       >
         {{ t("activity.exportedTo", { path: exportedPath }) }}
       </p>
+
+      <!-- M7-P2-5 (DESIGN s8.3): header aggregate stats. -->
+      <dl
+        v-if="activity.summary"
+        class="grid grid-cols-2 gap-3 pt-2 sm:grid-cols-4"
+        data-testid="activity-summary"
+      >
+        <div class="rounded border p-3">
+          <dt class="text-xs text-zinc-500">
+            {{ t("activity.summary.bytesToday") }}
+          </dt>
+          <dd class="text-lg font-semibold">
+            {{ bytesToday }}
+          </dd>
+        </div>
+        <div class="rounded border p-3">
+          <dt class="text-xs text-zinc-500">
+            {{ t("activity.summary.bytesWeek") }}
+          </dt>
+          <dd class="text-lg font-semibold">
+            {{ bytesWeek }}
+          </dd>
+        </div>
+        <div class="rounded border p-3">
+          <dt class="text-xs text-zinc-500">
+            {{ t("activity.summary.throughput") }}
+          </dt>
+          <dd class="text-lg font-semibold">
+            {{ t("activity.summary.perSecond", { rate: throughput }) }}
+          </dd>
+        </div>
+        <div class="rounded border p-3">
+          <dt class="text-xs text-zinc-500">
+            {{ t("activity.summary.byStatus") }}
+          </dt>
+          <dd class="text-sm">
+            <span
+              v-if="statusCounts.length === 0"
+              class="text-zinc-400"
+            >
+              {{ t("activity.summary.noFiles") }}
+            </span>
+            <span
+              v-for="sc in statusCounts"
+              :key="sc.status"
+              class="mr-2 inline-block whitespace-nowrap"
+            >
+              {{ statusLabel(sc.status) }}:
+              {{ numberFormatter.format(sc.count) }}
+            </span>
+          </dd>
+        </div>
+      </dl>
     </header>
 
     <div
@@ -257,14 +359,15 @@ onUnmounted(() => {
     </div>
 
     <p
-      v-if="activity.error"
+      v-if="activity.errorCode"
       class="text-sm text-red-600"
+      data-testid="activity-error"
     >
-      {{ activity.error }}
+      {{ t(`errors.${activity.errorCode}.long`) }}
     </p>
 
     <p
-      v-if="!activity.error"
+      v-if="!activity.errorCode"
       class="text-sm text-zinc-500"
       data-testid="activity-count"
     >

@@ -227,7 +227,23 @@
     "files": "{count} files",
     "exportBundleButton": "Export diagnostic bundle",
     "exporting": "Exporting...",
-    "exportedTo": "Saved diagnostic bundle to {path}"
+    "exportedTo": "Saved diagnostic bundle to {path}",
+    "summary": {
+      "bytesToday": "Uploaded today",
+      "bytesWeek": "Uploaded this week",
+      "throughput": "Current throughput",
+      "perSecond": "{rate}/s",
+      "byStatus": "Files by status",
+      "noFiles": "No files tracked yet"
+    },
+    "status": {
+      "synced": "Synced",
+      "pending": "Pending",
+      "corrupt": "Corrupt",
+      "locked": "Locked",
+      "error": "Error",
+      "excluded_orphan": "Excluded"
+    }
   },
   "restore": {
     "title": "Restore",

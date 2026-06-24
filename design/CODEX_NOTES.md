@@ -915,3 +915,79 @@ unchanged), `pnpm lint/test:unit (54 passed, 11 new activity-store)/build`
 (`src-tauri/src` + orchestrator.rs/types.rs): zero `todo!`/`unimplemented!`/
 `unreachable!` in non-test code (the orchestrator `unimplemented!()` are
 pre-existing `#[cfg(test)]` Fake doubles).
+
+## M7 codex review round-1 fixes (1 P1 + 6 P2)
+
+The codex round-1 review (`.claude/codex-reviews/M7-20260624-103442.md`, baseline
+f9fb164, M7 @ 9771d53; CI + Chaos GREEN on 3 OS, vue-tsc + eslint clean) raised 1
+P1 + 6 P2 - all verified legitimate and all fixed. No spec deviations; the fixes
+are additive (two new IPC commands + one new event + store hardening).
+
+- **M7-P1-1 (live tail drops events on broadcast lag).** The per-account
+  `OrchestratorEvent` broadcast is bounded (cap 256); the event bridge previously
+  only LOGGED `RecvError::Lagged`, so an error storm permanently dropped
+  `activity:new` rows from the live tail (violates DESIGN s8.3 last-1000 + ROADMAP
+  M7 <500ms). Fix: on lag the bridge emits a new typed `activity:lagged` gap
+  signal (SPEC s11.7, `events::emit_activity_lagged`); the webview store
+  RECONCILES by re-querying `query_activity` page 0 for the current filter and
+  dedup-merging the rows into the live tail (the durable `activity_log` is the
+  source of truth), so no durable row is lost. The 500ms-typical path stays
+  event-driven via `activity:new`. The bridge's per-event decision was factored
+  into a pure `classify_bridge_event -> BridgeAction` so the Lagged->reconcile
+  mapping is unit-testable WITHOUT a Tauri `AppHandle` (3 new assembly tests);
+  the store side has a lag-reconcile merge test.
+- **M7-P2-1 (stale-response race).** `loadInitial`/`loadMore`/`applyFilter` had no
+  generation guard. Fix: a `requestToken` (bumped per load) + a filter snapshot;
+  a response commits ONLY if the token + filter still match (`sameFilter`). New
+  store test: a filter change mid-flight discards the stale response.
+- **M7-P2-2 (unbounded live tail).** Live events grew `entries`/`seenIds` forever.
+  Fix: the live tail is now a SEPARATE `liveEntries` list capped to
+  `LIVE_TAIL_CAP` (1000, DESIGN s8.3) by evicting the oldest live entry on
+  overflow; the rendered `entries` is `liveEntries` (deduped) ++ paged
+  `historyEntries`, so an error storm is bounded while LOADED history pages are
+  preserved. Two new store tests (cap holds; history not evicted).
+- **M7-P2-3 (subscribe-before-unmount listener leak).** `subscribeLive` now tracks
+  a `desiredSubscribed` flag; if `unsubscribeLive` runs before `listen()`
+  resolves, the resolved unlisten fns are invoked immediately on arrival. New
+  store test drives the unsubscribe-before-resolve race.
+- **M7-P2-4 (event-type filter unreachable for history).** The dropdown was
+  derived only from loaded rows. Fix: new backend `distinct_activity_event_types`
+  IPC + `StateRepo::distinct_activity_event_types` (`SELECT DISTINCT ... ORDER
+  BY`); the store loads it into `eventTypeOptions` and the view binds the dropdown
+  to it. New backend repo test (sorted-unique set).
+- **M7-P2-5 (missing DESIGN s8.3 header aggregates).** New backend
+  `activity_summary` IPC + `StateRepo::activity_summary` returning bytes uploaded
+  today / this week (summed `activity_log.bytes` over caller-supplied LOCAL day /
+  week boundaries - so "today" honours the user's timezone with NO backend
+  timezone crate), file count by `file_state.status`, and a recent-throughput
+  window (bytes + window-ms, the UI derives bytes/sec). The view renders the
+  header; bytes/rate via `Intl.NumberFormat` (DESIGN s8.7). New backend repo test
+  (boundary-correct sums + status grouping) + the `file_state_status_str` mapping
+  test.
+- **M7-P2-6 (errors rendered via `String(e)`).** Activity load + diagnostic-export
+  errors now normalize to the stable `{ code }` shape (SPEC s24) via a new shared
+  `ui/src/ipc/errors.ts#toErrorCode` (promoted from `stores/setup.ts`, which now
+  imports it) and render via `t(\`errors.${code}.long\`)` (the M6 pattern). The
+  store exposes `errorCode` (was `error`); the view localizes it. New store test:
+  a Tauri object error surfaces its code.
+
+Cross-cutting: backend/frontend contracts stayed in sync (new DTOs
+`ActivitySummaryDto`/`FileStatusCountDto` in both `dtos.rs` + `ipc/types.ts`; new
+command wrappers + the `onActivityLagged` event helper). New i18n keys:
+`activity.summary.*`, `activity.status.*` (en-US). Two new `sqlx::query!`
+(DISTINCT + the summary aggregate) regenerated the `.sqlx` offline cache (0
+drift). The two new `StateRepo` methods have trait DEFAULT impls (empty / zeroed)
+so the `#[cfg(test)]` Fake doubles compile unchanged; the SQLite repo overrides
+both with the real SQL. All gates green: `cargo build/clippy(-D warnings)/test
+--workspace` (driven-core 189 incl. 2 new + driven-app 98 incl. 4 new; e2e_fake
+20 pass/5 gate-skip), `build -p driven-app`, `deny check`, `fmt --check`; `pnpm
+install` (lockfile unchanged), `pnpm lint/test:unit (62 passed, 8 new)/build`
+(vue-tsc clean). Anti-fake-green stub sweep on the touched surface: zero
+`todo!`/`unimplemented!`/`unreachable!` in non-test code.
+
+### Residual / not-fixed
+None. All 1 P1 + 6 P2 are fully fixed with exercising tests. One acceptable known
+limitation (not a review finding): the M7-P2-3 fix covers unsubscribe-before-
+resolve; a pathological re-subscribe DURING a not-yet-resolved subscribe could
+orphan the second listener set, but that path does not occur in the Activity
+view's mount/unmount lifecycle (V1 scope).
