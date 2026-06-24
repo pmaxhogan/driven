@@ -1397,6 +1397,13 @@ impl StateRepo for SqliteStateRepo {
         // into i64. A negative byte count is impossible (only non-negative
         // upload sizes are written), but the decode below clamps via `max(0)`
         // as defence-in-depth before the lossless cast to u64.
+        //
+        // R1-P2-2: the outer row filter MUST cover the EARLIEST of the three
+        // window starts, not just `week_start`. Near the start of a week the
+        // throughput window (e.g. last 60 min) can begin BEFORE `week_start`;
+        // an outer `WHERE ts >= week_start` would drop those rows before the
+        // per-sum CASE ran, undercounting throughput at week boundaries. Gate
+        // by `MIN(day, week, throughput)` so every CASE owns its own window.
         let byte_sums = sqlx::query!(
             r#"
             SELECT
@@ -1404,7 +1411,7 @@ impl StateRepo for SqliteStateRepo {
                 COALESCE(SUM(CASE WHEN ts >= ?2 THEN bytes ELSE 0 END), 0) AS "week!: i64",
                 COALESCE(SUM(CASE WHEN ts >= ?3 THEN bytes ELSE 0 END), 0) AS "window!: i64"
             FROM activity_log
-            WHERE ts >= ?2
+            WHERE ts >= MIN(?1, ?2, ?3)
             "#,
             day_start_ms,
             week_start_ms,
@@ -2393,6 +2400,62 @@ mod tests {
                 },
             ]
         );
+    }
+
+    #[tokio::test]
+    async fn activity_summary_throughput_counts_rows_before_week_start() {
+        // R1-P2-2: near the START of a week the throughput window can begin
+        // BEFORE week_start. The old outer `WHERE ts >= week_start` dropped
+        // those rows before the per-sum CASE ran, so throughput undercounted at
+        // week boundaries. With the fix the outer filter is MIN(day, week,
+        // throughput), so a row inside the throughput window but before
+        // week_start is still counted in throughput (and excluded from
+        // today/week, which it correctly precedes).
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // The throughput window starts BEFORE the week boundary (week just rolled
+        // over): throughput_window_start (500) < week_start (1000) < day_start.
+        let day_start = 2000;
+        let week_start = 1000;
+        let window_start = 500;
+        let window_ms = 60_000;
+
+        // A row at ts=600: inside the throughput window (>=500), but BEFORE the
+        // week boundary (<1000). The bug excluded it from throughput entirely.
+        // A second row at ts=1500 is inside week + throughput (control).
+        for (ts, bytes) in [(600_i64, 70_u64), (1500, 30)] {
+            repo.write_activity(NewActivity {
+                ts,
+                source_id: Some(src.id),
+                level: ActivityLevel::Info,
+                event_type: "upload_done".into(),
+                file_count: Some(1),
+                bytes: Some(bytes),
+                message: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let summary = repo
+            .activity_summary(day_start, week_start, window_start, window_ms)
+            .await
+            .unwrap();
+
+        // throughput window = rows with ts >= 500: 70 + 30 = 100 (the pre-week
+        // row is now counted; the bug would have reported only 30).
+        assert_eq!(
+            summary.throughput_window_bytes, 100,
+            "throughput counts the row inside the window but before week_start"
+        );
+        // today = rows with ts >= 2000: none.
+        assert_eq!(summary.bytes_today, 0);
+        // week = rows with ts >= 1000: only the ts=1500 row -> 30.
+        assert_eq!(summary.bytes_week, 30);
     }
 
     #[test]

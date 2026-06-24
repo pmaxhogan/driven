@@ -907,12 +907,22 @@ impl SyncOrchestrator {
         }
     }
 
-    /// Writes a durable `activity_log` row per failed / re-queued op (recheck2
-    /// P2) so a production user has per-file failure evidence rather than only
-    /// tracing. A `Failed` op lands an Error row keyed by its error code; a
-    /// `Skipped` op (re-queued, retries next cycle) lands a Warn row. `Done`
-    /// ops are not recorded. Mirrors `record_collisions`; a write hiccup is
-    /// logged but never aborts the cycle.
+    /// Writes a durable `activity_log` row per op outcome (R1-P1-1 + recheck2
+    /// P2) so a production user has per-file evidence rather than only tracing.
+    ///
+    /// - A `Done` UPLOAD lands an Info `upload_done` row carrying its byte count
+    ///   (R1-P1-1) - this is what feeds the DESIGN s8.3 "Uploaded today / this
+    ///   week" + throughput aggregates, which were otherwise always zero because
+    ///   the happy path recorded nothing.
+    /// - A `Done` TRASH lands an Info `trash_done` row (no bytes).
+    /// - A `Failed` op lands an Error row keyed by its error code.
+    /// - A `Skipped` op (re-queued, retries next cycle) lands a Warn row.
+    ///
+    /// Every row routes through the [`Self::record_activity`] chokepoint, so the
+    /// `activity:new` live tail broadcasts for successful uploads/trashes too,
+    /// and the existing activity retention (prune / row cap) applies unchanged
+    /// (these are ordinary `activity_log` rows). Mirrors `record_collisions`; a
+    /// write hiccup is logged but never aborts the cycle.
     async fn record_outcome_activity(
         &self,
         source_id: crate::types::SourceId,
@@ -920,18 +930,38 @@ impl SyncOrchestrator {
     ) {
         let now = self.clock.now_ms();
         for outcome in outcomes {
-            let (level, event_type, path) = match outcome {
-                OpOutcome::Done { .. } => continue,
+            let (level, event_type, bytes, path) = match outcome {
+                OpOutcome::Done {
+                    relative_path,
+                    kind: crate::executor::DoneKind::Upload,
+                    bytes,
+                } => (
+                    ActivityLevel::Info,
+                    "upload_done".to_string(),
+                    *bytes,
+                    relative_path,
+                ),
+                OpOutcome::Done {
+                    relative_path,
+                    kind: crate::executor::DoneKind::Trash,
+                    ..
+                } => (
+                    ActivityLevel::Info,
+                    "trash_done".to_string(),
+                    None,
+                    relative_path,
+                ),
                 OpOutcome::Failed {
                     relative_path,
                     code,
-                } => (ActivityLevel::Error, code.to_string(), relative_path),
+                } => (ActivityLevel::Error, code.to_string(), None, relative_path),
                 OpOutcome::Skipped {
                     relative_path,
                     reason,
                 } => (
                     ActivityLevel::Warn,
                     reason.error_code().to_string(),
+                    None,
                     relative_path,
                 ),
             };
@@ -941,7 +971,7 @@ impl SyncOrchestrator {
                 level,
                 event_type,
                 file_count: None,
-                bytes: None,
+                bytes,
                 message: Some(path.as_str().to_string()),
             };
             self.record_activity(row).await;
@@ -1525,7 +1555,7 @@ fn exec_progress_from(summary: &crate::types::PlanSummary, outcomes: &[OpOutcome
 fn log_outcomes(source: &SourceRow, outcomes: &[OpOutcome]) {
     for outcome in outcomes {
         match outcome {
-            OpOutcome::Done { relative_path } => {
+            OpOutcome::Done { relative_path, .. } => {
                 tracing::debug!(target: TARGET, source_id = %source.id, path = %relative_path, "op done");
             }
             OpOutcome::Skipped {
@@ -1811,11 +1841,21 @@ mod tests {
                 .ops
                 .iter()
                 .map(|op| {
-                    let relative_path = match op {
-                        crate::types::Op::HashThenUpload { relative_path, .. } => {
-                            relative_path.clone()
-                        }
-                        crate::types::Op::Trash { relative_path, .. } => relative_path.clone(),
+                    let (relative_path, done_kind, bytes) = match op {
+                        crate::types::Op::HashThenUpload {
+                            relative_path,
+                            size,
+                            ..
+                        } => (
+                            relative_path.clone(),
+                            crate::executor::DoneKind::Upload,
+                            Some(*size),
+                        ),
+                        crate::types::Op::Trash { relative_path, .. } => (
+                            relative_path.clone(),
+                            crate::executor::DoneKind::Trash,
+                            None,
+                        ),
                     };
                     if auth_fail {
                         OpOutcome::Failed {
@@ -1828,7 +1868,11 @@ mod tests {
                             code: crate::types::ErrorCode::DriveChecksumMismatch,
                         }
                     } else {
-                        OpOutcome::Done { relative_path }
+                        OpOutcome::Done {
+                            relative_path,
+                            kind: done_kind,
+                            bytes,
+                        }
                     }
                 })
                 .collect();
@@ -3587,6 +3631,105 @@ mod tests {
         assert_eq!(entry.event_type, "local.unicode_collision");
         assert_eq!(entry.message.as_deref(), Some("dir/caf\u{e9}.txt"));
         assert_eq!(entry.source_id, Some(src_id.to_string()));
+    }
+
+    // --- R1-P1-1: successful upload / trash -> durable activity rows ---------
+
+    #[tokio::test]
+    async fn successful_upload_writes_and_broadcasts_activity_with_bytes() {
+        // R1-P1-1: a successful upload must land a durable `upload_done`
+        // activity_log row carrying its byte count AND broadcast it as
+        // ActivityWritten (so the live tail + the DESIGN s8.3 byte aggregates
+        // are not empty on the happy path). A successful trash lands a
+        // `trash_done` row (no bytes). Both route through record_activity.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let exec = Arc::new(RecordingExecutor::default());
+        let clock = Arc::new(FakeClock::new());
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec,
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock,
+            OrchestratorConfig::default(),
+        );
+
+        let mut events = orch.subscribe();
+
+        let up_path = RelativePath::try_from("docs/report.pdf".to_string()).unwrap();
+        let trash_path = RelativePath::try_from("docs/old.tmp".to_string()).unwrap();
+        let outcomes = vec![
+            OpOutcome::Done {
+                relative_path: up_path.clone(),
+                kind: crate::executor::DoneKind::Upload,
+                bytes: Some(4096),
+            },
+            OpOutcome::Done {
+                relative_path: trash_path.clone(),
+                kind: crate::executor::DoneKind::Trash,
+                bytes: None,
+            },
+        ];
+        orch.record_outcome_activity(src_id, &outcomes).await;
+
+        let rows = state.activity_rows();
+        assert_eq!(rows.len(), 2, "one row per successful op");
+
+        let upload = rows
+            .iter()
+            .find(|r| r.event_type == "upload_done")
+            .expect("upload_done row written");
+        assert_eq!(
+            upload.level,
+            ActivityLevel::Info,
+            "upload_done is an Info row"
+        );
+        assert_eq!(
+            upload.bytes,
+            Some(4096),
+            "upload_done carries its byte count"
+        );
+        assert_eq!(upload.message.as_deref(), Some("docs/report.pdf"));
+        assert_eq!(upload.source_id, Some(src_id));
+
+        let trash = rows
+            .iter()
+            .find(|r| r.event_type == "trash_done")
+            .expect("trash_done row written");
+        assert_eq!(
+            trash.level,
+            ActivityLevel::Info,
+            "trash_done is an Info row"
+        );
+        assert_eq!(trash.bytes, None, "a trash carries no byte count");
+        assert_eq!(trash.message.as_deref(), Some("docs/old.tmp"));
+
+        // Both rows broadcast as ActivityWritten for the live tail.
+        let mut saw_upload = false;
+        let mut saw_trash = false;
+        while let Ok(ev) = events.try_recv() {
+            if let OrchestratorEvent::ActivityWritten { entry } = ev {
+                if entry.event_type == "upload_done" {
+                    saw_upload = true;
+                    assert_eq!(entry.bytes, Some(4096), "broadcast carries bytes");
+                } else if entry.event_type == "trash_done" {
+                    saw_trash = true;
+                }
+            }
+        }
+        assert!(
+            saw_upload,
+            "ActivityWritten broadcast for the upload_done row"
+        );
+        assert!(
+            saw_trash,
+            "ActivityWritten broadcast for the trash_done row"
+        );
     }
 
     // --- P1-7: the real run() event loop ------------------------------------

@@ -340,6 +340,22 @@ impl SkipReason {
     }
 }
 
+/// The kind of work a successful [`OpOutcome::Done`] completed (R1-P1-1).
+///
+/// Distinguishes an upload (carries its byte count for the DESIGN s8.3
+/// "Uploaded today/this week" + throughput aggregates) from a trash, so the
+/// orchestrator records the correct `upload_done` / `trash_done` activity row
+/// (SPEC s24 schema comment) without re-matching the outcome against the plan.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum DoneKind {
+    /// A successful upload (create or update); the byte count is carried in
+    /// [`OpOutcome::Done::bytes`].
+    Upload,
+    /// A successful trash (remote delete).
+    Trash,
+}
+
 /// The outcome of executing one [`Op`] (SPEC s8).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case", tag = "outcome")]
@@ -349,6 +365,12 @@ pub enum OpOutcome {
     Done {
         /// The path the op acted on.
         relative_path: RelativePath,
+        /// Whether this was an upload or a trash (R1-P1-1), so the
+        /// orchestrator records `upload_done` vs `trash_done`.
+        kind: DoneKind,
+        /// The uploaded byte count for an [`DoneKind::Upload`] (feeds the
+        /// DESIGN s8.3 byte aggregates); `None` for a trash.
+        bytes: Option<u64>,
     },
     /// The op was skipped and re-queued (not an error); see [`SkipReason`].
     Skipped {
@@ -371,7 +393,7 @@ impl OpOutcome {
     /// The relative path this outcome acted on (every variant carries one).
     fn relative_path(&self) -> &RelativePath {
         match self {
-            OpOutcome::Done { relative_path }
+            OpOutcome::Done { relative_path, .. }
             | OpOutcome::Skipped { relative_path, .. }
             | OpOutcome::Failed { relative_path, .. } => relative_path,
         }
@@ -1437,6 +1459,8 @@ impl DefaultExecutor {
         );
         Ok(OpOutcome::Done {
             relative_path: relative_path.clone(),
+            kind: DoneKind::Upload,
+            bytes: Some(post.size),
         })
     }
 
@@ -2754,6 +2778,8 @@ impl DefaultExecutor {
                     .await?;
                 Ok(OpOutcome::Done {
                     relative_path: relative_path.clone(),
+                    kind: DoneKind::Trash,
+                    bytes: None,
                 })
             }
             Err(e) => {
