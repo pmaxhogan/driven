@@ -281,16 +281,17 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
     })
 }
 
-/// Max number of include OR exclude patterns a single source may carry
-/// (R2-P1-3). A backup source's rule list is small in practice; an unbounded
-/// list from a compromised renderer would bloat the matcher build + every scan
-/// decision, so it is capped here (per side: includes and excludes each).
-pub const MAX_PATTERNS_PER_SIDE: usize = 1000;
+/// Max TOTAL number of include + exclude patterns a single source may carry
+/// (R3-P2-1, DESIGN 18.8: "per-source max 256 patterns total"). A backup
+/// source's rule list is small in practice; an unbounded list from a compromised
+/// renderer would bloat the matcher build + every scan decision, so the COMBINED
+/// include + exclude count is capped here.
+pub const MAX_PATTERNS_TOTAL: usize = 256;
 
-/// Max length (in bytes) of a single include / exclude glob pattern (R2-P1-3).
-/// A real glob is short; a pathologically long one is rejected before it can
-/// reach the matcher / SQLite.
-pub const MAX_PATTERN_LEN: usize = 4096;
+/// Max length (in CHARS) of a single include / exclude glob pattern (R3-P2-1,
+/// DESIGN 18.8: "per-pattern max 512 chars"). A real glob is short; a
+/// pathologically long one is rejected before it can reach the matcher / SQLite.
+pub const MAX_PATTERN_LEN: usize = 512;
 
 /// An invalid include / exclude pattern rejected by [`validate_patterns`]
 /// (R2-P1-3). Carries a human-readable reason; the IPC layer maps it to the
@@ -304,9 +305,9 @@ pub struct PatternValidationError(pub String);
 /// `update_source` so an invalid / oversized glob can never reach SQLite and
 /// then break the next scan's matcher build.
 ///
-/// Enforces, per side (includes, excludes):
-/// 1. at most [`MAX_PATTERNS_PER_SIDE`] patterns;
-/// 2. each pattern at most [`MAX_PATTERN_LEN`] bytes, and non-empty after trim;
+/// Enforces (DESIGN 18.8):
+/// 1. the COMBINED include + exclude count is at most [`MAX_PATTERNS_TOTAL`];
+/// 2. each pattern at most [`MAX_PATTERN_LEN`] chars, and non-empty after trim;
 /// 3. each pattern COMPILES under the SAME [`GitignoreBuilder::add_line`] the
 ///    scanner uses in [`build_source_matcher`] (an `exclude` verbatim, an
 ///    `include` as its `!`-re-include form) - so a glob the scanner would later
@@ -318,16 +319,10 @@ pub fn validate_patterns(
     include_patterns: &[String],
     exclude_patterns: &[String],
 ) -> Result<(), PatternValidationError> {
-    if include_patterns.len() > MAX_PATTERNS_PER_SIDE {
+    let total = include_patterns.len() + exclude_patterns.len();
+    if total > MAX_PATTERNS_TOTAL {
         return Err(PatternValidationError(format!(
-            "too many include patterns ({}, max {MAX_PATTERNS_PER_SIDE})",
-            include_patterns.len()
-        )));
-    }
-    if exclude_patterns.len() > MAX_PATTERNS_PER_SIDE {
-        return Err(PatternValidationError(format!(
-            "too many exclude patterns ({}, max {MAX_PATTERNS_PER_SIDE})",
-            exclude_patterns.len()
+            "too many patterns ({total} include+exclude, max {MAX_PATTERNS_TOTAL})"
         )));
     }
 
@@ -358,17 +353,18 @@ pub fn validate_patterns(
 }
 
 /// Per-pattern shape checks shared by both sides of [`validate_patterns`]:
-/// reject an empty / whitespace-only pattern and one over [`MAX_PATTERN_LEN`].
+/// reject an empty / whitespace-only pattern and one over [`MAX_PATTERN_LEN`]
+/// chars (DESIGN 18.8 caps the length in CHARS, not bytes).
 fn check_one_pattern(pat: &str) -> Result<(), PatternValidationError> {
     if pat.trim().is_empty() {
         return Err(PatternValidationError(
             "pattern must not be empty or whitespace-only".to_string(),
         ));
     }
-    if pat.len() > MAX_PATTERN_LEN {
+    let char_len = pat.chars().count();
+    if char_len > MAX_PATTERN_LEN {
         return Err(PatternValidationError(format!(
-            "pattern is too long ({} bytes, max {MAX_PATTERN_LEN})",
-            pat.len()
+            "pattern is too long ({char_len} chars, max {MAX_PATTERN_LEN})"
         )));
     }
     Ok(())
@@ -624,15 +620,29 @@ mod tests {
         .expect("valid include/exclude globs accepted");
         validate_patterns(&[], &[]).expect("empty rule sets are valid");
 
-        // Over-count (one past the per-side cap) is rejected.
-        let too_many: Vec<String> = (0..=MAX_PATTERNS_PER_SIDE)
-            .map(|i| format!("f{i}"))
-            .collect();
-        assert_eq!(too_many.len(), MAX_PATTERNS_PER_SIDE + 1);
+        // R3-P2-1 (DESIGN 18.8): the TOTAL include+exclude count is capped at
+        // MAX_PATTERNS_TOTAL. Exactly at the cap is allowed; one past is rejected.
+        let at_cap: Vec<String> = (0..MAX_PATTERNS_TOTAL).map(|i| format!("f{i}")).collect();
+        assert_eq!(at_cap.len(), MAX_PATTERNS_TOTAL);
+        validate_patterns(&[], &at_cap).expect("exactly the total cap is allowed");
+
+        // One past the total (split across both sides) is rejected - proving the
+        // cap is COMBINED, not per-side.
+        let half = MAX_PATTERNS_TOTAL / 2;
+        let inc: Vec<String> = (0..=half).map(|i| format!("i{i}")).collect();
+        let exc: Vec<String> = (0..=half).map(|i| format!("e{i}")).collect();
+        assert!(inc.len() + exc.len() > MAX_PATTERNS_TOTAL);
+        validate_patterns(&inc, &exc).expect_err("over-count combined include+exclude rejected");
+        let too_many: Vec<String> = (0..=MAX_PATTERNS_TOTAL).map(|i| format!("f{i}")).collect();
+        assert_eq!(too_many.len(), MAX_PATTERNS_TOTAL + 1);
         validate_patterns(&[], &too_many).expect_err("over-count excludes rejected");
         validate_patterns(&too_many, &[]).expect_err("over-count includes rejected");
 
-        // Over-length (one past the per-pattern byte cap) is rejected.
+        // Over-length (one past the per-pattern CHAR cap) is rejected; exactly at
+        // the cap is allowed.
+        let at_len = "a".repeat(MAX_PATTERN_LEN);
+        validate_patterns(&[], std::slice::from_ref(&at_len))
+            .expect("exactly the length cap is allowed");
         let too_long = "a".repeat(MAX_PATTERN_LEN + 1);
         validate_patterns(&[], std::slice::from_ref(&too_long))
             .expect_err("over-length exclude rejected");

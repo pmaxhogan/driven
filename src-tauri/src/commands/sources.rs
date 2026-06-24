@@ -287,6 +287,11 @@ pub async fn update_source(
         row.exclude_patterns = exclude_patterns;
     }
     if let Some(secs) = patch.deep_verify_interval_secs {
+        // R3-P2-2: a direct IPC patch must not set 0 (constant deep-verify churn)
+        // or u32::MAX (suppress deep verify for decades). Validate against the
+        // SAME duration cap the global settings validator uses (R2-P2-3) before
+        // persisting, returning the stable `internal.invalid_input` s24 code.
+        crate::commands::settings::validate_deep_verify_interval(secs)?;
         row.deep_verify_interval_secs = secs;
     }
 
