@@ -1244,16 +1244,57 @@ browse -> search -> select -> restore flow against mocked `invoke` + a mocked
   webview path is forbidden, so the signature carries the one-shot token the
   backend resolves to the approved directory. The contract is documented on the
   command + the typed wrapper.
-- **No mid-job cancel command.** ROADMAP M8 lists "cancel mid-restore cleans up the
-  partial file"; partial-file cleanup IS implemented (every per-file write is a
-  temp file removed on any error, and only renamed into place after blake3
-  verification, so a failed/aborted file never leaves a partial under the final
-  name). A USER-driven cancel IPC is not wired in this pass - the background job
-  runs to completion. The data-safety half of the acceptance (no partial final
-  files) holds; an explicit cancel button is a follow-up (honest residual, not a
-  fake-green).
 - **ICU plural not used for `restore.selectedCount`.** vue-i18n's default message
   compiler in this repo is not configured for ICU MessageFormat (DESIGN s8.7 names
   it as the V1 target but it is not wired; no existing key uses it). Used a plain
   `{count} selected` interpolation rather than introduce an unparseable ICU string
   that breaks the build. Wiring ICU is a cross-cutting i18n change, out of M8 scope.
+
+## M8 codex round-1 fixes (2 P1 + 5 P2; baseline 1a7ad60 @ 887aaab)
+
+All findings from `.claude/codex-reviews/M8-20260624-161042.md` fixed. The prior
+"no mid-job cancel command" residual is now RESOLVED (P1-1).
+
+- **M8-P1-1 - cancellable restore + cleanup + shutdown drain.** Each restore job
+  now holds a shared cancel flag (`Arc<AtomicBool>`) + its spawned `tokio`
+  `JoinHandle`, tracked on `AppState` (`seed_restore_job` / `set_restore_job_handle`
+  / `cancel_restore_job` / `cancel_all_restore_jobs` / `finish_restore_job_handle`).
+  New `cancel_restore_job(jobId)` IPC sets the flag; `stream_to_disk` checks it
+  BEFORE each file and between frames, and on cancel returns `Cancelled` so
+  `restore_one_file` DELETES the temp (no partial, nothing renamed into place). The
+  job emits a terminal CANCELLED `RestoreJobStatus` (`cancelled: true`,
+  `RestoreFileState::Cancelled` for the unfinished files). App shutdown
+  (`lib.rs::shutdown_orchestrators`) now `cancel_all_restore_jobs()` + joins every
+  restore handle alongside the M5 account drain, so quit leaves no orphaned restore
+  task and no partial files. UI: a Cancel button (gated by a `cancelling` flag), a
+  `cancelled` terminal label, and a per-file Cancelled state.
+- **M8-P1-2 - no-follow, non-truncating, race-safe temp write.** The temp is now a
+  RANDOM name (`.driven-restore-tmp.<uuid>`, not timestamp-derived) opened via
+  `open_temp_no_follow`: `create_new(true)` (O_EXCL - fails if the path exists,
+  killing a pre-place / race-to-the-path attack) PLUS platform no-follow flags
+  (Unix `O_NOFOLLOW`; Windows `FILE_FLAG_OPEN_REPARSE_POINT`) so a symlinked temp
+  leaf cannot redirect the write outside the approved root. After the stream the
+  rename target is RE-validated via `validate_restore_dest` (catches a TOCTOU leaf
+  swap) before renaming. Tests: O_EXCL rejects an existing path; a pre-placed
+  symlink at the temp path is refused and the victim target is not overwritten.
+- **M8-P2-1 - surface tree truncation.** `list_remote_tree` now returns
+  `RemoteTreeDto { entries, truncated }` instead of a bare `Vec`; `truncated` is set
+  when the folder has more immediate children than the cap (or the scan hit its row
+  cap). Restore.vue shows a "showing the first N items" notice. The cap itself is
+  unchanged.
+- **M8-P2-2 - search input limits per DESIGN s18.8.** `MAX_QUERY_LEN` tightened
+  from 1024 to 256 (counted in CHARS), and `search_files` now rejects `\0`, `\r`,
+  `\n`, and any other control char before the FTS/GLOB path.
+- **M8-P2-3 - bounded restore-job snapshot memory.** Terminal restore-job records
+  are TTL-pruned (1h) and count-capped (32, oldest-terminal first) by
+  `prune_terminal_jobs` on every register/put; active jobs are never pruned.
+- **M8-P2-4 - persist active job id + reconcile on remount.** The store keeps the
+  returned `jobId` and calls `getRestoreJob(jobId)` after start AND on
+  (re)subscription, so a remount / missed terminal event recovers current state
+  instead of going stale.
+- **M8-P2-5 - classify remote download failures.** `classify_download_error` maps
+  the Drive `download` error into the specific SPEC s24 code (auth.invalid_grant /
+  drive.rate_limited / drive.daily_quota_exhausted / drive.quota_exhausted /
+  net.intermittent / drive.unreachable for 404/unclassified), reusing the same
+  typed `classification_of` downcast + string fallback the executor uses. The
+  specific code is stored on the per-file restore failure.
