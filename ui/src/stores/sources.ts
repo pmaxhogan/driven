@@ -5,9 +5,9 @@ import * as ipc from "../ipc/commands";
 import type { AddSourceRequest, SourceDto, SourcePatch } from "../ipc/types";
 
 // Sources store (SPEC s11.2; DESIGN s8.2 Sources tab). Holds the source list +
-// loading/error flags. M6 scaffold: action SIGNATURES frozen; the sources
-// implementer enriches the add-source wizard flow (folder picker + exclusion
-// preview live in the AddSourceWizard component via the IPC wrappers directly).
+// loading/error flags and the full CRUD over the typed IPC wrappers. The
+// add-source wizard (folder pickers + exclusion preview) drives `add`; the
+// SourceTable rows drive `update` (enabled toggle), `remove`, and `syncNow`.
 export const useSourcesStore = defineStore("sources", () => {
   const sources = ref<SourceDto[]>([]);
   const loading = ref(false);
@@ -31,7 +31,10 @@ export const useSourcesStore = defineStore("sources", () => {
     return created;
   }
 
-  async function update(sourceId: string, patch: SourcePatch): Promise<SourceDto> {
+  async function update(
+    sourceId: string,
+    patch: SourcePatch,
+  ): Promise<SourceDto> {
     const updated = await ipc.updateSource(sourceId, patch);
     await refresh();
     return updated;
@@ -42,6 +45,7 @@ export const useSourcesStore = defineStore("sources", () => {
     await refresh();
   }
 
+  /** Trigger a one-shot sync of a single source (SPEC s11.3 sync_now). */
   async function syncNow(sourceId: string): Promise<void> {
     await ipc.syncNow(sourceId);
   }

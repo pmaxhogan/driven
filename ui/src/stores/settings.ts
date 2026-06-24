@@ -5,8 +5,11 @@ import * as ipc from "../ipc/commands";
 import type { SettingsDto, SettingsPatch } from "../ipc/types";
 
 // Settings store (SPEC s11.6, s22; DESIGN s8.2 Rules + About tabs). Holds the
-// settings snapshot + loading/error flags. M6 scaffold: action SIGNATURES
-// frozen; the settings implementer enriches per-field patch helpers as needed.
+// settings snapshot + loading/error flags. `refresh` loads via get_settings;
+// `patch` round-trips a partial update through update_settings and replaces the
+// snapshot with the authoritative result the backend returns (so derived /
+// clamped values - e.g. an out-of-range concurrent-uploads override - reflect
+// what was actually stored).
 export const useSettingsStore = defineStore("settings", () => {
   const settings = ref<SettingsDto | null>(null);
   const loading = ref(false);
@@ -25,7 +28,13 @@ export const useSettingsStore = defineStore("settings", () => {
   }
 
   async function patch(p: SettingsPatch): Promise<void> {
-    settings.value = await ipc.updateSettings(p);
+    error.value = null;
+    try {
+      settings.value = await ipc.updateSettings(p);
+    } catch (e) {
+      error.value = String(e);
+      throw e;
+    }
   }
 
   return { settings, loading, error, refresh, patch };
