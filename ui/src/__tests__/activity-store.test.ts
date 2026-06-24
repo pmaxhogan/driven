@@ -19,7 +19,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 // `listen` returns an unlisten fn. M7-P2-3: each `listen` call resolves to a
 // DISTINCT unlisten so the unsubscribe-before-resolve test can assert teardown.
 let liveHandler: ((payload: unknown) => void) | null = null;
-let laggedHandler: (() => void) | null = null;
+let laggedHandler: ((payload: { skipped: number }) => void) | null = null;
 const unlistenNewMock = vi.fn();
 const unlistenLaggedMock = vi.fn();
 // Allows a test to defer `listen` resolution (the leak-on-unmount race). Each
@@ -44,7 +44,7 @@ vi.mock("@tauri-apps/api/event", () => ({
         return unlistenNewMock;
       }
       if (event === "activity:lagged") {
-        laggedHandler = () => cb({ payload: null });
+        laggedHandler = (payload: { skipped: number }) => cb({ payload });
         return unlistenLaggedMock;
       }
       return vi.fn();
@@ -255,6 +255,7 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
     // A burst happened and the live broadcast lagged: the durable log now also
     // has rows 7 and 6 (dropped from the live tail). The reconcile re-query
     // returns the newest page including the already-present 5 + the new 7, 6.
+    // A small lag (2 dropped) still fits in page 0, so only ONE page is queried.
     invokeMock.mockResolvedValueOnce(
       makePage(
         [
@@ -266,7 +267,7 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
         4,
       ),
     );
-    laggedHandler?.();
+    laggedHandler?.({ skipped: 2 });
     // Let the async reconcile settle.
     await Promise.resolve();
     await Promise.resolve();
@@ -275,6 +276,49 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
     // No duplicate of id 5; the dropped 7 + 6 are recovered, newest-first.
     expect(ids).toEqual([7, 6, 5, 4]);
     expect(ids.filter((i) => i === 5)).toHaveLength(1);
+  });
+
+  // R1-P1-2: a lag with skipped > ACTIVITY_PAGE_SIZE must reconcile MULTIPLE
+  // pages (up to LIVE_TAIL_CAP), not just page 0, so every missing durable row
+  // lands in the visible tail with no duplicates.
+  it("recovers ALL dropped rows across pages when skipped exceeds one page", async () => {
+    // Seed an empty tail (no history loaded; subscribe only).
+    const store = useActivityStore();
+    await store.subscribeLive();
+
+    // The durable log holds 250 rows (ids 250..1, newest-first). A burst dropped
+    // ~150 events from the live broadcast (skipped > ACTIVITY_PAGE_SIZE = 100),
+    // so the reconcile must walk enough pages to cover the gap.
+    const allRows: ActivityEntry[] = [];
+    for (let id = 250; id >= 1; id--) {
+      allRows.push(makeEntry({ id, ts: id }));
+    }
+    const pageOf = (p: number) =>
+      makePage(
+        allRows.slice(p * ACTIVITY_PAGE_SIZE, (p + 1) * ACTIVITY_PAGE_SIZE),
+        p,
+        allRows.length,
+      );
+    // Queue page 0, 1, 2 in order (the reconcile pages forward until the gap is
+    // covered / history exhausted).
+    invokeMock.mockResolvedValueOnce(pageOf(0));
+    invokeMock.mockResolvedValueOnce(pageOf(1));
+    invokeMock.mockResolvedValueOnce(pageOf(2));
+
+    // Call the reconcile directly (the lagged handler fires it as fire-and-
+    // forget; awaiting it keeps the multi-page walk deterministic in the test).
+    await store.reconcileFromHistory(150);
+
+    const ids = store.entries.map((e) => e.id);
+    // All 250 durable rows recovered, newest-first, no duplicates.
+    expect(ids).toHaveLength(250);
+    expect(new Set(ids).size).toBe(250);
+    expect(ids[0]).toBe(250);
+    expect(ids[ids.length - 1]).toBe(1);
+    expect(store.total).toBe(250);
+    // The reconcile queried at least 3 pages (skipped 150 -> target 250 rows).
+    expect(invokeMock.mock.calls.filter((c) => c[0] === "query_activity").length)
+      .toBeGreaterThanOrEqual(3);
   });
 });
 
@@ -434,5 +478,72 @@ describe("activity store: backend facets + summary (M7-P2-4, P2-5)", () => {
       expect.objectContaining({ throughputWindowMs: 60000 }),
     );
     expect(store.summary).toEqual(summary);
+  });
+
+  // R1-P2-1: a byte-carrying live event (an upload) refreshes the header
+  // aggregates (debounced), so "Uploaded today / this week" + throughput do not
+  // go stale while actively backing up. A burst coalesces into ONE reload.
+  it("refreshes the summary (debounced) on a byte-carrying live event", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = useActivityStore();
+      await store.subscribeLive();
+
+      const summary = {
+        bytesToday: 2048,
+        bytesWeek: 2048,
+        fileStatusCounts: [],
+        throughputWindowBytes: 2048,
+        throughputWindowMs: 60000,
+      };
+      // Every activity_summary call resolves with the same summary.
+      invokeMock.mockImplementation((cmd: string) =>
+        cmd === "activity_summary"
+          ? Promise.resolve(summary)
+          : Promise.resolve(undefined),
+      );
+
+      // Fire a burst of byte-carrying upload events.
+      for (let i = 1; i <= 5; i++) {
+        liveHandler?.(makeEntry({ id: i, ts: i, eventType: "upload_done", bytes: 512 }));
+      }
+      // No summary call yet (debounce pending).
+      expect(
+        invokeMock.mock.calls.filter((c) => c[0] === "activity_summary").length,
+      ).toBe(0);
+
+      // Advance past the debounce window: exactly ONE summary reload fires.
+      await vi.advanceTimersByTimeAsync(1000);
+      await Promise.resolve();
+      const summaryCalls = invokeMock.mock.calls.filter(
+        (c) => c[0] === "activity_summary",
+      ).length;
+      expect(summaryCalls).toBe(1);
+      expect(store.summary).toEqual(summary);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  // R1-P2-1: a NON-byte live event (e.g. an error row) must NOT trigger a
+  // summary refresh (it does not change the byte aggregates).
+  it("does NOT refresh the summary on a live event without bytes", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = useActivityStore();
+      await store.subscribeLive();
+      invokeMock.mockResolvedValue(undefined);
+
+      liveHandler?.(
+        makeEntry({ id: 1, ts: 1, eventType: "drive.checksum_mismatch", bytes: null }),
+      );
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(
+        invokeMock.mock.calls.filter((c) => c[0] === "activity_summary").length,
+      ).toBe(0);
+      void store;
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

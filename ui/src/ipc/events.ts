@@ -39,13 +39,23 @@ export function onActivityNew(
   return listen<ActivityEntry>("activity:new", (e) => handler(e.payload));
 }
 
+/** `activity:lagged` payload (mirrors src-tauri `emit_activity_lagged`): the
+ * number of `activity:new` events the bounded broadcast dropped. */
+export interface ActivityLaggedPayload {
+  skipped: number;
+}
+
 /** `activity:lagged` - the live-tail broadcast lagged and dropped one or more
- * `activity:new` events (M7-P1-1, SPEC s11.7). A pure gap signal (the payload
- * carries only a diagnostic `skipped` count): the activity store reconciles by
- * re-querying the durable `activity_log` and dedup-merging, so no durable row is
- * lost. The handler takes no args; the dropped rows come from the re-query. */
-export function onActivityLagged(handler: () => void): Promise<UnlistenFn> {
-  return listen<unknown>("activity:lagged", () => handler());
+ * `activity:new` events (M7-P1-1 / R1-P1-2, SPEC s11.7). The payload carries the
+ * dropped `skipped` count so the store can reconcile ENOUGH pages to cover the
+ * gap (not just page 0): the activity store reconciles by re-querying the
+ * durable `activity_log` and dedup-merging, so no durable row is lost. */
+export function onActivityLagged(
+  handler: (payload: ActivityLaggedPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<ActivityLaggedPayload>("activity:lagged", (e) =>
+    handler(e.payload),
+  );
 }
 
 /** `account:needs_reauth` payload: { account_id, email } (SPEC s11.7). */

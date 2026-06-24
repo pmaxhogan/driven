@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
+import { activityEventLabel } from "../stores/activityEventLabel";
 import { useActivityStore } from "../stores/activity";
 import { useSourcesStore } from "../stores/sources";
 import type {
@@ -17,7 +18,7 @@ import type {
 // (query_activity, pages accumulated client-side so scrolling back through
 // 1000+ events never re-queries earlier pages), with filter controls (source,
 // minimum level, event type) that re-query, and an empty state.
-const { t, locale } = useI18n();
+const { t, te, locale } = useI18n();
 const activity = useActivityStore();
 const sources = useSourcesStore();
 
@@ -100,6 +101,14 @@ function formatTime(entry: ActivityEntry): string {
 
 function levelLabel(level: ActivityLevel): string {
   return t(`activity.level.${level}`);
+}
+
+/** R1-P2-3: render a localized label for an activity event type instead of the
+ * raw backend code. Delegates to the shared `activityEventLabel` helper (the
+ * `te()` existence check uses the active locale with the i18n fallbackLocale).
+ */
+function eventLabel(eventType: string): string {
+  return activityEventLabel(eventType, t, te);
 }
 
 function levelClass(level: ActivityLevel): string {
@@ -426,8 +435,11 @@ onUnmounted(() => {
           >
             {{ levelLabel(entry.level) }}
           </td>
-          <td class="break-all py-2">
-            {{ entry.eventType }}
+          <td
+            class="break-all py-2"
+            :title="entry.eventType"
+          >
+            {{ eventLabel(entry.eventType) }}
           </td>
           <td class="break-all py-2">
             {{ sourceLabel(entry) }}

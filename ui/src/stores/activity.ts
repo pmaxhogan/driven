@@ -28,6 +28,11 @@ export const LIVE_TAIL_CAP = 1000;
  * window seconds for a current bytes/sec rate. */
 export const THROUGHPUT_WINDOW_MS = 60_000;
 
+/** R1-P2-1: a byte-carrying live event refreshes the DESIGN s8.3 header
+ * aggregates, debounced by this many ms so an upload burst fires ONE reload
+ * (its trailing edge) rather than one query per row. */
+export const SUMMARY_REFRESH_DEBOUNCE_MS = 750;
+
 /** Severity rank for the `minLevel` client-side filter applied to live events
  * (info < warn < error), mirroring the backend `activity_level_rank`. */
 const LEVEL_RANK: Record<ActivityLevel, number> = {
@@ -221,46 +226,105 @@ export const useActivityStore = defineStore("activity", () => {
 
   /** Ingest a live `activity:new` entry: prepend it (newest-first) if it matches
    * the active filter and is not already present. Bumps `total` so the count
-   * stays accurate for the live tail. */
+   * stays accurate for the live tail.
+   *
+   * R1-P2-1: a byte-carrying live event (an upload) feeds the DESIGN s8.3 header
+   * aggregates, which would otherwise go stale while actively backing up. Such
+   * an event schedules a debounced `loadSummary()` so "Uploaded today / this
+   * week" + throughput refresh without a query per row. Done regardless of the
+   * filter match (the summary aggregates ALL rows, not the filtered view). */
   function onLiveEvent(entry: ActivityEntry): void {
+    if (entry.bytes != null && entry.bytes > 0) {
+      scheduleSummaryRefresh();
+    }
     if (seenIds.has(entry.id)) return;
     if (!matchesFilter(entry)) return;
     pushLive(entry);
     total.value += 1;
   }
 
-  /** M7-P1-1: reconcile from the durable `activity_log` after a broadcast lag.
-   * Re-query page 0 for the CURRENT filter and merge each NEW row into the live
-   * tail (dedup by id), so rows dropped by the bounded broadcast are recovered.
+  /** M7-P1-1 / R1-P1-2: reconcile from the durable `activity_log` after a
+   * broadcast lag. Re-query the durable history for the CURRENT filter and merge
+   * each NEW row into the live tail (dedup by id), so rows dropped by the bounded
+   * broadcast are recovered into the visible tail.
+   *
+   * R1-P1-2: the old code re-queried only page 0 (`ACTIVITY_PAGE_SIZE` = 100),
+   * but the live-tail contract is the last `LIVE_TAIL_CAP` (1000) events and the
+   * backend broadcast buffer is 256, so a burst > 100 permanently left recent
+   * durable rows out of the tail until manual pagination. Now we page forward,
+   * covering AT LEAST the dropped `skipped` rows (plus the page already merged),
+   * capped at `LIVE_TAIL_CAP`, and stop early once a page yields no NEW row in
+   * range (the gap is closed) or the history is exhausted. Dedup is by id so a
+   * row already present (live or history) is never double-counted.
+   *
    * This does not disturb the paged history below; it only backfills the tail.
    * `total` is re-synced from the authoritative page total (NOT per-row bumped),
-   * so reconciling rows that were already counted does not inflate the count. */
-  async function reconcileFromHistory(): Promise<void> {
+   * so reconciling rows that were already counted does not inflate the count.
+   * R1-P2-1: a reconcile also refreshes the header aggregates, which can have
+   * drifted during the lag burst. */
+  async function reconcileFromHistory(skipped = 0): Promise<void> {
     const snapshot = { ...filter.value };
-    let pageDto;
-    try {
-      pageDto = await ipc.queryActivity(
-        { ...snapshot },
-        { page: 0, limit: ACTIVITY_PAGE_SIZE },
-      );
-    } catch {
-      // A failed reconcile is non-fatal: the next live event or a manual reload
-      // re-syncs. Do not surface it as a page-load error.
-      return;
+    // How many durable rows we aim to (re-)scan: enough to cover the dropped
+    // burst plus one page of overlap, never more than the live-tail cap. The
+    // backend per-page cap is 10_000; ACTIVITY_PAGE_SIZE keeps each query small.
+    const target = Math.min(
+      LIVE_TAIL_CAP,
+      Math.max(ACTIVITY_PAGE_SIZE, skipped + ACTIVITY_PAGE_SIZE),
+    );
+    const maxPages = Math.ceil(target / ACTIVITY_PAGE_SIZE);
+
+    // Collect all NEW (not-yet-held, filter-matching) rows across the pages
+    // FIRST, preserving global newest-first order (page 0 is newest; each page's
+    // own rows are newest-first). They are pushed at the end in reverse (oldest
+    // first) so the newest overall lands at the FRONT of the live tail - pushLive
+    // prepends, so pushing oldest-first yields newest-first.
+    const recovered: ActivityEntry[] = [];
+    let lastTotal: number | null = null;
+    for (let page = 0; page < maxPages; page++) {
+      let pageDto;
+      try {
+        pageDto = await ipc.queryActivity(
+          { ...snapshot },
+          { page, limit: ACTIVITY_PAGE_SIZE },
+        );
+      } catch {
+        // A failed reconcile is non-fatal: the next live event or a manual
+        // reload re-syncs. Do not surface it as a page-load error.
+        break;
+      }
+      // Drop the result if the filter changed while the reconcile was in flight.
+      if (!sameFilter(snapshot, filter.value)) return;
+      lastTotal = pageDto.total;
+
+      // Page rows are newest-first; keep that order in `recovered`.
+      let recoveredThisPage = 0;
+      for (const entry of pageDto.entries) {
+        // Skip rows already held (live or history) and rows already staged this
+        // reconcile, and rows outside the active filter.
+        if (seenIds.has(entry.id)) continue;
+        if (recovered.some((r) => r.id === entry.id)) continue;
+        if (!matchesFilter(entry)) continue;
+        recovered.push(entry);
+        recoveredThisPage++;
+      }
+
+      // Stop once the durable history is exhausted (a short/empty page) OR this
+      // page recovered nothing new (the gap is already closed and we are now
+      // re-walking rows we already hold) - paging further only churns.
+      if (!pageDto.hasMore || pageDto.entries.length === 0) break;
+      if (recoveredThisPage === 0) break;
     }
-    // Drop the result if the filter changed while the reconcile was in flight.
-    if (!sameFilter(snapshot, filter.value)) return;
-    // Merge oldest-first so the relative order of recovered rows is preserved
-    // when each is prepended (newest ends up at the front). Prepend directly
-    // (not via onLiveEvent) so `total` is not per-row bumped here.
-    for (let i = pageDto.entries.length - 1; i >= 0; i--) {
-      const entry = pageDto.entries[i];
-      if (seenIds.has(entry.id)) continue;
-      if (!matchesFilter(entry)) continue;
-      pushLive(entry);
+
+    // Push oldest-first so the newest overall ends at the FRONT of the tail.
+    for (let i = recovered.length - 1; i >= 0; i--) {
+      pushLive(recovered[i]);
     }
-    // Re-sync the count from the authoritative page total.
-    total.value = pageDto.total;
+
+    // Re-sync the count from the authoritative page total (page 0's total is the
+    // full match count and does not change across pages).
+    if (lastTotal != null) total.value = lastTotal;
+    // R1-P2-1: refresh the header aggregates after a lag burst (best-effort).
+    if (recovered.length > 0) void loadSummary();
   }
 
   /** M7-P2-4: load the DISTINCT event-type set from the backend (filter facets),
@@ -298,6 +362,20 @@ export const useActivityStore = defineStore("activity", () => {
     }
   }
 
+  // --- R1-P2-1: debounced header-aggregate refresh on live byte events ------
+  // A burst of uploads must not fire one `loadSummary()` per row. Coalesce them
+  // into a single trailing refresh `SUMMARY_REFRESH_DEBOUNCE_MS` after the last
+  // byte-carrying live event.
+  let summaryRefreshTimer: ReturnType<typeof setTimeout> | null = null;
+
+  function scheduleSummaryRefresh(): void {
+    if (summaryRefreshTimer != null) clearTimeout(summaryRefreshTimer);
+    summaryRefreshTimer = setTimeout(() => {
+      summaryRefreshTimer = null;
+      void loadSummary();
+    }, SUMMARY_REFRESH_DEBOUNCE_MS);
+  }
+
   // --- live-tail subscription (M7-P2-3: no listener leak) -------------------
   // The unlisten handles; held so the view can stop the subscriptions on
   // unmount. `desiredSubscribed` tracks intent so an unsubscribe that races a
@@ -315,8 +393,9 @@ export const useActivityStore = defineStore("activity", () => {
     desiredSubscribed = true;
     const [newUnlisten, laggedUnlisten] = await Promise.all([
       onActivityNew((entry) => onLiveEvent(entry)),
-      onActivityLagged(() => {
-        void reconcileFromHistory();
+      onActivityLagged((payload) => {
+        // R1-P1-2: pass the dropped count so the reconcile covers the gap.
+        void reconcileFromHistory(payload.skipped);
       }),
     ]);
     if (!desiredSubscribed) {
@@ -340,6 +419,11 @@ export const useActivityStore = defineStore("activity", () => {
     if (unlistenLagged) {
       unlistenLagged();
       unlistenLagged = null;
+    }
+    // R1-P2-1: cancel any pending debounced summary refresh on teardown.
+    if (summaryRefreshTimer != null) {
+      clearTimeout(summaryRefreshTimer);
+      summaryRefreshTimer = null;
     }
   }
 

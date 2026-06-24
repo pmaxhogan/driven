@@ -216,6 +216,16 @@
       "warn": "Warning",
       "error": "Error"
     },
+    "events": {
+      "upload_done": "Uploaded",
+      "trash_done": "Removed",
+      "scan_done": "Scan complete",
+      "paused": "Paused",
+      "error": "Error",
+      "local.unicode_collision": "Name collision",
+      "local.ads_skipped": "Stream skipped",
+      "local.invalid_filename": "Invalid name"
+    },
     "column": {
       "time": "Time",
       "level": "Level",
