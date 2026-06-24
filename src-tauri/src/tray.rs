@@ -26,9 +26,10 @@
 //! APPROXIMATES the yellow-with-`!` badge - no glyph is drawn into the tile.
 //! The state machine, tooltip text, and notification routing are all real.
 
+use std::collections::HashMap;
 use std::sync::Mutex;
 
-use driven_core::types::{ErrorCode, OrchestratorState, PauseReason};
+use driven_core::types::{AccountId, ErrorCode, OrchestratorState, PauseReason};
 use tauri::image::Image;
 use tauri::menu::{Menu, MenuBuilder, MenuItem};
 use tauri::tray::{MouseButton, MouseButtonState, TrayIconBuilder, TrayIconEvent};
@@ -274,10 +275,15 @@ fn tooltip_for_error(code: ErrorCode) -> String {
 // Notification dedup state
 // -----------------------------------------------------------------------------
 
-/// Module-level notification dedup state (DESIGN s117/s247): fire the
-/// first-sync-complete toast exactly once, and fire one error toast per
-/// ENTRY into an error code (not once per `StateChanged` event - the
-/// orchestrator broadcast can replay the current state after a `Lagged`).
+/// Per-account notification dedup state (DESIGN s117/s247): fire the
+/// first-sync-complete toast exactly once PER ACCOUNT, and fire one error toast
+/// per ENTRY into an error code PER ACCOUNT (not once per `StateChanged` event -
+/// the orchestrator broadcast can replay the current state after a `Lagged`).
+///
+/// V5-P2-2 / C5-P2-4: keyed per account so one account's first-sync toast does
+/// not silence another's, and an error on account B is not suppressed by the
+/// same code already toasted for account A.
+#[derive(Default)]
 struct NotifyState {
     /// True once a sync cycle has been observed running this process (so the
     /// next `Idle` transition is a genuine completion, not the boot `Idle`).
@@ -289,22 +295,17 @@ struct NotifyState {
     last_error_code: Option<ErrorCode>,
 }
 
-impl NotifyState {
-    const fn new() -> Self {
-        Self {
-            saw_active_cycle: false,
-            first_sync_notified: false,
-            last_error_code: None,
-        }
-    }
-}
+/// Process-global map of per-account dedup state. Keyed by [`AccountId`] so the
+/// dedup latches are independent across accounts (V5-P2-2).
+static NOTIFY: Mutex<Option<HashMap<AccountId, NotifyState>>> = Mutex::new(None);
 
-static NOTIFY: Mutex<NotifyState> = Mutex::new(NotifyState::new());
-
-/// Lock the dedup state, recovering a poisoned lock (HARD RULE: no panic on
-/// a poisoned mutex).
-fn notify_state() -> std::sync::MutexGuard<'static, NotifyState> {
-    NOTIFY.lock().unwrap_or_else(|e| e.into_inner())
+/// Run `f` against the dedup state for `account`, creating it on first use.
+/// Recovers a poisoned lock instead of panicking (HARD RULE).
+fn with_notify_state<R>(account: AccountId, f: impl FnOnce(&mut NotifyState) -> R) -> R {
+    let mut guard = NOTIFY.lock().unwrap_or_else(|e| e.into_inner());
+    let map = guard.get_or_insert_with(HashMap::new);
+    let entry = map.entry(account).or_default();
+    f(entry)
 }
 
 // -----------------------------------------------------------------------------
@@ -396,7 +397,7 @@ fn on_menu_event(app: &AppHandle, id: &str) {
             let Some(state) = app.try_state::<crate::app_state::AppState>() else {
                 return missing_state_err();
             };
-            crate::commands::sync::pause_sync(state, Some(30 * 60)).await
+            crate::commands::sync::pause_sync(app.clone(), state, Some(30 * 60)).await
         }),
         menu_id::RESUME => spawn_command(app, |app| async move {
             let Some(state) = app.try_state::<crate::app_state::AppState>() else {
@@ -479,7 +480,7 @@ fn navigate_hint(app: &AppHandle, route: &str) {
 /// Best-effort: a missing tray or a failed icon/tooltip set is logged, never
 /// panicked. `apply_state` returns `()` (the committed signature) so all
 /// errors are swallowed with a `tracing` line.
-pub fn apply_state(app: &AppHandle, state: OrchestratorState) {
+pub fn apply_state(app: &AppHandle, account_id: AccountId, state: OrchestratorState) {
     let icon = TrayIcon::for_state(&state);
 
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
@@ -497,7 +498,7 @@ pub fn apply_state(app: &AppHandle, state: OrchestratorState) {
         tracing::warn!(target: TARGET, "tray {TRAY_ID} not found; cannot apply state");
     }
 
-    notify_for_state(app, &state);
+    notify_for_state(app, account_id, &state);
 }
 
 /// Raise the DESIGN s117/s247 OS notifications for a state transition.
@@ -509,7 +510,7 @@ pub fn apply_state(app: &AppHandle, state: OrchestratorState) {
 ///   case (`auth.invalid_grant` / `auth.consent_required`) is deliberately
 ///   skipped here - it is covered by [`notify_needs_reauth`], which the shell
 ///   calls with the account + email the state cannot carry.
-fn notify_for_state(app: &AppHandle, state: &OrchestratorState) {
+fn notify_for_state(app: &AppHandle, account_id: AccountId, state: &OrchestratorState) {
     match state {
         OrchestratorState::PowerCheck
         | OrchestratorState::Scanning { .. }
@@ -518,19 +519,23 @@ fn notify_for_state(app: &AppHandle, state: &OrchestratorState) {
         | OrchestratorState::Verifying { .. }
         | OrchestratorState::Backoff { .. } => {
             // A cycle is underway; the next Idle is a genuine completion.
-            let mut s = notify_state();
-            s.saw_active_cycle = true;
-            // Leaving any error state clears the dedup latch so a recurrence
-            // notifies again.
-            s.last_error_code = None;
+            with_notify_state(account_id, |s| {
+                s.saw_active_cycle = true;
+                // Leaving any error state clears the dedup latch so a recurrence
+                // notifies again.
+                s.last_error_code = None;
+            });
         }
         OrchestratorState::Idle { .. } => {
-            let mut s = notify_state();
-            s.last_error_code = None;
-            let should_fire = s.saw_active_cycle && !s.first_sync_notified;
+            let should_fire = with_notify_state(account_id, |s| {
+                s.last_error_code = None;
+                let fire = s.saw_active_cycle && !s.first_sync_notified;
+                if fire {
+                    s.first_sync_notified = true;
+                }
+                fire
+            });
             if should_fire {
-                s.first_sync_notified = true;
-                drop(s);
                 show_notification(
                     app,
                     rust_i18n::t!("notifications.first_sync_complete.title").into_owned(),
@@ -541,8 +546,9 @@ fn notify_for_state(app: &AppHandle, state: &OrchestratorState) {
         OrchestratorState::Paused { .. } => {
             // Pauses (battery / metered / network) are icon+tooltip only, no
             // toast on every blip (DESIGN s117/s247).
-            let mut s = notify_state();
-            s.last_error_code = None;
+            with_notify_state(account_id, |s| {
+                s.last_error_code = None;
+            });
         }
         OrchestratorState::Error { detail } => {
             // Reauth is handled by notify_needs_reauth (needs account/email).
@@ -557,18 +563,22 @@ fn notify_for_state(app: &AppHandle, state: &OrchestratorState) {
             if TrayIcon::for_state(state) != TrayIcon::Error {
                 return;
             }
-            let mut s = notify_state();
-            if s.last_error_code == Some(detail.code) {
-                return; // already toasted this error; suppress the replay
+            let should_fire = with_notify_state(account_id, |s| {
+                if s.last_error_code == Some(detail.code) {
+                    false // already toasted this error; suppress the replay
+                } else {
+                    s.last_error_code = Some(detail.code);
+                    true
+                }
+            });
+            if should_fire {
+                let body = error_notification_body(detail.code);
+                show_notification(
+                    app,
+                    rust_i18n::t!("notifications.error.title").into_owned(),
+                    body,
+                );
             }
-            s.last_error_code = Some(detail.code);
-            drop(s);
-            let body = error_notification_body(detail.code);
-            show_notification(
-                app,
-                rust_i18n::t!("notifications.error.title").into_owned(),
-                body,
-            );
         }
     }
 }

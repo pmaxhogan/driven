@@ -10,10 +10,10 @@ use std::sync::Arc;
 use std::time::Duration;
 
 use serde::{Deserialize, Serialize};
-use tauri::State;
+use tauri::{AppHandle, Manager, State};
 
 use driven_core::orchestrator::{Orchestrator, TickSource};
-use driven_core::types::{OrchestratorState, SourceId};
+use driven_core::types::{AccountId, OrchestratorState, SourceId};
 
 use crate::app_state::AppState;
 use crate::commands::{CommandError, CommandResult};
@@ -90,38 +90,56 @@ pub async fn sync_now(
 /// `duration_secs = Some` is a timed pause (e.g. the tray "Pause for 30m");
 /// `None` is pause-until-manual-resume. Sets the manual-pause signal on every
 /// account orchestrator (DESIGN s5.7: manual pause persists across restarts).
-/// For a timed pause, a detached timer flips the pause back off after the
-/// window. If the user manually resumes (or re-pauses) before the timer fires,
-/// the timer's `set_paused(false)` is a harmless idempotent re-assert of the
-/// already-cleared signal; a fresh `pause_sync(None)` after the timer is armed
-/// is NOT auto-cancelled here (an accepted V1 simplicity - the rare
-/// timed-then-indefinite race re-pauses on the next user action / restart,
-/// which loads the persisted manual-pause).
+///
+/// C5-P2-1: a timed pause spawns a CANCELLABLE auto-resume timer. Each
+/// pause/resume bumps a per-account pause "generation"; the timer captures the
+/// generation at arm time and only auto-resumes if it STILL matches when it
+/// wakes. So a later `pause_sync(None)` (indefinite) issued before the old
+/// timer fires bumps the generation and CANCELS the stale timer's auto-resume -
+/// the indefinite pause is no longer clobbered.
 #[tauri::command]
 pub async fn pause_sync(
+    app: AppHandle,
     state: State<'_, AppState>,
     duration_secs: Option<u64>,
 ) -> CommandResult<()> {
-    // Snapshot the orchestrator handles up front so the resume timer does not
-    // need to borrow `State` (which is not `'static`).
-    let orchestrators: Vec<Arc<dyn Orchestrator>> = state
+    // Snapshot (account_id, orchestrator) so the resume timer does not need to
+    // borrow `State` (which is not `'static`); bump each account's pause
+    // generation so any in-flight timer is superseded.
+    let entries: Vec<(AccountId, Arc<dyn Orchestrator>)> = state
         .accounts()
-        .map(|(_id, handle)| handle.orchestrator.clone())
+        .map(|(id, handle)| (*id, handle.orchestrator.clone()))
         .collect();
 
-    for orch in &orchestrators {
+    let mut tokens: Vec<(AccountId, Arc<dyn Orchestrator>, u64)> =
+        Vec::with_capacity(entries.len());
+    for (id, orch) in entries {
         orch.set_paused(true).await;
+        let token = state.bump_pause_generation(id);
+        tokens.push((id, orch, token));
     }
 
     if let Some(secs) = duration_secs {
         // Detached timed-resume: sleep the window, then clear the manual pause
-        // on each account. `tokio::time::sleep` (no FakeClock here - this is a
-        // real wall-clock UI affordance) keeps the task off the IPC path so the
+        // ONLY for accounts whose pause generation is unchanged (no newer
+        // pause/resume superseded this timer). `tokio::time::sleep` (real
+        // wall-clock UI affordance) keeps the task off the IPC path so the
         // command returns immediately.
         tauri::async_runtime::spawn(async move {
             tokio::time::sleep(Duration::from_secs(secs)).await;
-            for orch in &orchestrators {
-                orch.set_paused(false).await;
+            let Some(state) = app.try_state::<AppState>() else {
+                return;
+            };
+            for (id, orch, token) in &tokens {
+                if state.pause_generation_matches(*id, *token) {
+                    orch.set_paused(false).await;
+                } else {
+                    tracing::debug!(
+                        target: "driven::app::sync",
+                        account_id = %id,
+                        "timed-resume superseded by a newer pause/resume; not auto-resuming"
+                    );
+                }
             }
         });
     }
@@ -130,10 +148,15 @@ pub async fn pause_sync(
 }
 
 /// `resume_sync()` - clear the manual pause on every account (SPEC s11.3).
+///
+/// C5-P2-1: bumps each account's pause generation too, so an outstanding timed
+/// auto-resume timer for that account is cancelled (the manual resume already
+/// did its job; the stale timer must not later re-resume a fresh pause).
 #[tauri::command]
 pub async fn resume_sync(state: State<'_, AppState>) -> CommandResult<()> {
-    for (_id, handle) in state.accounts() {
+    for (id, handle) in state.accounts() {
         handle.orchestrator.set_paused(false).await;
+        let _ = state.bump_pause_generation(*id);
     }
     Ok(())
 }

@@ -114,6 +114,17 @@ impl KeystoreCryptoProvider {
 
         let resolution = Arc::new(self.resolve_uncached(source_id));
 
+        // V5-P2-1 / C5-P2-2: cache ONLY the STABLE verdicts (Plaintext, Suite).
+        // Do NOT memoize `Unavailable`: it is a TRANSIENT condition (keychain /
+        // Secret-Service locked at autostart, a temporarily missing key). Caching
+        // it would strand an encrypted source as un-backupable until the app
+        // restarts, even after the keychain unlocks. Returning it WITHOUT caching
+        // makes the next op re-attempt the unwrap (fail-closed is preserved -
+        // the op still errors `crypto.key_missing` until the key is available).
+        if matches!(*resolution, CachedResolution::Unavailable) {
+            return resolution;
+        }
+
         // Store under the lock. A concurrent resolver for the same id may have
         // raced us; keep whichever landed first (both compute the same verdict
         // from the same immutable row + keystore, so either is correct).

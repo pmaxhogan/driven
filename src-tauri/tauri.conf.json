@@ -31,6 +31,13 @@
       "csp": "default-src 'self'; img-src 'self' data:; connect-src 'self' ipc: tauri:"
     }
   },
+  "plugins": {
+    "deep-link": {
+      "desktop": {
+        "schemes": ["driven"]
+      }
+    }
+  },
   "bundle": {
     "active": true,
     "createUpdaterArtifacts": true,
