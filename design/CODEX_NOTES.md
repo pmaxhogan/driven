@@ -1069,3 +1069,93 @@ None. All 2 P1 + 4 P2 are fully fixed with exercising tests. The R1-P2-1 debounc
 (750ms) means the header aggregate can lag a live upload by up to that window -
 intentional (coalesces a burst into one query); the live tail itself is still
 sub-500ms via `activity:new`.
+
+## M7 codex recheck-2 fixes (round 3: 2 P1 + 4 P2, USER-APPROVED past the cap-2)
+
+The codex recheck-2 (`.claude/codex-reviews/M7-recheck2-20260624-140630.md`,
+baseline f9fb164, M7 @ 1da5b59; CI + Chaos GREEN on 3 OS) raised 2 P1 + 4 P2 -
+all activity-dashboard correctness/validation (not data-safety). The user
+explicitly approved a round-3 to fix ALL SIX (past the normal cap-2, analogous to
+the M6 exception); codex recheck-3 runs next and M7 closes after it. No spec
+deviations. Fix spec: `.claude/m7-codex-fix-spec-r3.md`.
+
+- **R2-P1-2 (offset pagination over a live-prepended table) -> KEYSET.** The two
+  P1s share one root: `query_activity` was OFFSET-based over `activity_log`, which
+  is actively PREPENDED to, so rows inserted between `loadInitial` and `loadMore`
+  shifted every later page (skip/underload while still advancing). Fix: switched
+  `query_activity` to KEYSET pagination. `state::PageRequest` is now a `(before_ts,
+  before_id)` cursor + `limit` (with `::first(limit)` / `::after_cursor(ts,id,
+  limit)` ctors); the SQL pages `WHERE ... AND (?6 IS NULL OR ts < ?6 OR (ts = ?6
+  AND id < ?7)) ORDER BY ts DESC, id DESC LIMIT n` so ties on `ts` are stable.
+  `ActivityPage` gained `has_more` (a full page MAY have more older rows). The DTOs
+  (`PageRequestDto` -> `beforeTs`/`beforeId`, `ActivityPageDto` -> `nextBeforeTs`/
+  `nextBeforeId`/`hasMore`, dropped `page`) + `ipc/types.ts` + the store + the
+  Activity.vue caller were updated in the same pass. The store carries the oldest
+  loaded `(ts,id)` as `oldestCursor` and pages by it. One sqlx re-prepare (0 drift:
+  one offset query removed, one keyset query added). Tests: `sqlite.rs`
+  `query_activity_keyset_is_stable_under_inserts` (newer prepended rows never shift
+  an older keyset page) + the rewritten `..._paginates_correctly` (cursor walk);
+  store `loadMore pages by the oldest (ts,id) CURSOR`.
+
+- **R2-P1-1 (lag reconcile early-stops before the gap is covered).** The reconcile
+  broke on `recoveredThisPage === 0`, which could stop at an already-seen newest
+  page while the dropped rows sat DEEPER (a ring-buffer broadcast evicts the OLDEST
+  of a burst, so dropped rows are below the latest delivered). Fix: the reconcile
+  now walks by the keyset cursor over a bounded SCAN BUDGET (`min(LIVE_TAIL_CAP,
+  max(PAGE_SIZE, skipped + PAGE_SIZE))` rows) and does NOT stop on a zero-new page;
+  it stops only on history-exhausted or budget-spent. Recovered rows can be older
+  than rows already in the tail, so they are merged in SORTED (newest-first) order
+  via the new `mergeRecoveredLive` (not blindly prepended), then capped. Tests:
+  store `recovers DEEPER dropped rows even when the newest page is already seen`
+  (the exact recheck-2 P1 shape) + the existing multi-page recovery test.
+
+- **R2-P2-1 (per-op activity lost on a mid-plan crash).** Successful upload/trash
+  activity was written in a POST-PASS after `executor.execute()` finished the whole
+  source plan, so a crash/shutdown mid-plan lost the audit rows + byte aggregates,
+  and a large initial backup showed no per-file activity until completion. Fix:
+  streamed per-op activity. `Executor::execute` takes a new `on_outcome:
+  &OutcomeSink<'_>` (a boxed-future per-op sink); the DefaultExecutor invokes it
+  INSIDE `ExecOne::run` right after the op's durable commit (and BEFORE returning),
+  so the activity DB write runs as part of the in-flight future polled by the
+  FuturesUnordered drain loop. (Doing it in the drain loop's select arm instead
+  deadlocked the single-connection pool against a concurrent op holding the
+  connection - found via 4 chaos tests timing out at 120s; the in-`run` placement
+  fixes it.) The orchestrator's `on_outcome` builds the `NewActivity` synchronously
+  from the borrowed outcome and the future borrows only `self` (satisfies the sink
+  bound). Routes through `record_activity` so `activity:new` still broadcasts per
+  op. `noop_outcome_sink` is exposed for the chaos harness + tests. Test:
+  `orchestrator.rs` `per_op_activity_survives_a_mid_plan_stop` (RecordingExecutor
+  streams N outcomes then errors; the committed op's row persists).
+
+- **R2-P2-2 (unbounded `before_ts` wipes the log).** `clear_activity_older_than`
+  accepted any `before_ts` (an `i64::MAX` prunes to the hard cap). Fix: a shared
+  `validate_timestamp_bound` (>= 0 and <= now + 1 day, stable
+  `internal.invalid_input`) gates `clear_activity_older_than` AND the
+  `query_activity` `sinceMs`/`beforeMs` filters AND the keyset `beforeTs`. Tests:
+  `activity.rs` `validate_timestamp_bound_rejects_out_of_range`,
+  `validate_filter_rejects_out_of_range_time_filters`,
+  `validate_page_rejects_out_of_range_before_ts`.
+
+- **R2-P2-3 (silent u64<->i64 wrap on counts).** `activity_log.file_count` /
+  `bytes` were cast `u64 -> i64` and back with `as`, so a value > `i64::MAX` wrapped
+  negative and summaries clamped to 0. Fix: `write_activity` uses `i64::try_from`
+  and REJECTS an over-range value (`internal.bad_request`); the read path decodes
+  via a new `decode_nonneg_u64` (`u64::try_from`, rejects a negative stored value).
+  Test: `sqlite.rs` `write_activity_rejects_counts_above_i64_max` (over-cap
+  rejected, `i64::MAX` boundary round-trips).
+
+- **R2-P2-4 (raw event codes in the filter dropdown).** The event-type filter
+  rendered raw backend codes (`{{ et }}`) while the table localized them. Fix: the
+  dropdown option text now uses the shared `activityEventLabel` helper (via
+  Activity.vue's `eventLabel(et)`), keeping the raw code as the option value +
+  `title`. Test: `activity-filter-dropdown.test.ts` (mounts Activity.vue, asserts a
+  known code renders its localized label while value/title stay the raw code, and
+  an unknown code falls back to the raw code).
+
+### Residual / not-fixed (recheck-2)
+None. All 2 P1 + 4 P2 are fully fixed with exercising tests. Keyset `has_more` is a
+conservative "a full page MAY have more" (an exactly-full final page costs one
+extra empty fetch, never a skipped row). The per-op activity sink runs one write
+per op (correctness: no mid-plan audit loss + per-file visibility); DESIGN s18.4's
+1-second batched activity writer remains a future optimization, not required for
+the correctness fix.
