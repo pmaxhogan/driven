@@ -379,8 +379,10 @@ pub async fn update_settings(
 const SCAN_INTERVAL_MIN: u32 = 30;
 const SCAN_INTERVAL_MAX: u32 = 604_800;
 /// Min/max deep-verify cadence (seconds): 1 hour .. 1 year (default 7 days).
-const DEEP_VERIFY_MIN: u32 = 3_600;
-const DEEP_VERIFY_MAX: u32 = 31_536_000;
+/// `pub(crate)` so the per-source `update_source` IPC (sources.rs) validates a
+/// patched `deep_verify_interval_secs` against the SAME duration cap (R3-P2-2).
+pub(crate) const DEEP_VERIFY_MIN: u32 = 3_600;
+pub(crate) const DEEP_VERIFY_MAX: u32 = 31_536_000;
 /// Min/max bandwidth cap (Mbps) when set (`None` = unlimited): 1 .. 100_000.
 const BANDWIDTH_CAP_MIN: u32 = 1;
 const BANDWIDTH_CAP_MAX: u32 = 100_000;
@@ -418,6 +420,20 @@ fn check_range(field: &str, value: u32, min: u32, max: u32) -> CommandResult<()>
         )));
     }
     Ok(())
+}
+
+/// R3-P2-2: validate a per-source `deep_verify_interval_secs` against the SAME
+/// `DEEP_VERIFY_MIN..=DEEP_VERIFY_MAX` bound the global settings validator uses,
+/// returning the stable `internal.invalid_input` SPEC s24 code. Shared with
+/// `update_source` (sources.rs) so a direct IPC patch cannot set `0` (constant
+/// deep-verify churn) or `u32::MAX` (suppress deep verify for decades).
+pub(crate) fn validate_deep_verify_interval(value: u32) -> CommandResult<()> {
+    check_range(
+        "deep_verify_interval_secs",
+        value,
+        DEEP_VERIFY_MIN,
+        DEEP_VERIFY_MAX,
+    )
 }
 
 /// Require `value` to be one of `allowed`, else reject (R2-P2-3).
@@ -1139,25 +1155,93 @@ impl Redactor {
 /// `haystack` with `replacement`. Used for the known home / source-root scrub so
 /// a path with spaces (which the path-run scanner could under-consume) is removed
 /// wherever it appears. Empty `needle` is a no-op.
+///
+/// R3-P1-3: this MUST return spans in the ORIGINAL `haystack`, NOT in
+/// `haystack.to_lowercase()`. Unicode case folding can change a string's byte
+/// length (e.g. some characters lowercase to a multi-byte sequence), so offsets
+/// found in the lowercased haystack do not line up with the original bytes -
+/// slicing the original with them mis-redacts or PANICS on a non-char boundary.
+/// Instead we walk the ORIGINAL char boundaries and, at each one, attempt a
+/// case-insensitive char-by-char match of the (already-lowercased) `needle`. The
+/// returned spans are therefore always valid original-string byte ranges.
+///
+/// CONTRACT: `needle` MUST be pre-lowercased by the caller (every call site
+/// passes a `.to_lowercase()`d string - source roots are stored lowercased,
+/// home/username are lowercased at the call site). The haystack is lowercased on
+/// the fly, char by char.
 fn replace_ci(haystack: &str, needle: &str, replacement: &str) -> String {
     if needle.is_empty() {
         return haystack.to_string();
     }
-    let lower_hay = haystack.to_lowercase();
+    // Original char boundaries (byte offsets) plus the end sentinel, so a match
+    // span is always sliced on a real char boundary of `haystack`.
+    let starts: Vec<usize> = haystack
+        .char_indices()
+        .map(|(i, _)| i)
+        .chain(std::iter::once(haystack.len()))
+        .collect();
+
     let mut out = String::with_capacity(haystack.len());
-    let mut last = 0usize;
-    let mut search_from = 0usize;
-    while let Some(rel) = lower_hay[search_from..].find(needle) {
-        let start = search_from + rel;
-        let end = start + needle.len();
-        // Push the un-matched slice from the ORIGINAL (case-preserving) string.
-        out.push_str(&haystack[last..start]);
-        out.push_str(replacement);
-        last = end;
-        search_from = end;
+    let mut last = 0usize; // byte offset (original) of unflushed text start
+    let mut idx = 0usize; // index into `starts` (current scan position)
+    while idx + 1 < starts.len() {
+        let start = starts[idx];
+        if let Some(end) = ci_match_at(haystack, start, needle) {
+            // Flush the un-matched original text, then the replacement.
+            out.push_str(&haystack[last..start]);
+            out.push_str(replacement);
+            last = end;
+            // Resume scanning at the original char boundary == `end`. `end` is a
+            // valid char boundary (it is the start of some char or the string
+            // end), so it appears in `starts`; advance `idx` to it.
+            while idx + 1 < starts.len() && starts[idx] < end {
+                idx += 1;
+            }
+        } else {
+            idx += 1;
+        }
     }
     out.push_str(&haystack[last..]);
     out
+}
+
+/// If a case-insensitive occurrence of `needle` (which the caller has ALREADY
+/// lowercased) begins at byte offset `start` (a char boundary) of `haystack`,
+/// return the ORIGINAL-string byte offset just past the match; else `None`.
+///
+/// Compares char-by-char on lowercased chars so a case difference (and a
+/// length-changing case fold) never produces a wrong byte span: we advance
+/// through `haystack`'s real char boundaries and through `needle`'s chars in
+/// lockstep, lowercasing each haystack char on the fly. The `needle` may be
+/// shorter or longer in bytes than the matched original run; the returned end is
+/// always a valid `haystack` char boundary.
+fn ci_match_at(haystack: &str, start: usize, needle: &str) -> Option<usize> {
+    let mut hay_chars = haystack[start..].chars();
+    let mut needle_chars = needle.chars();
+    let mut consumed = 0usize; // bytes of `haystack` matched so far
+
+    loop {
+        let nc = match needle_chars.next() {
+            None => return Some(start + consumed), // needle fully matched
+            Some(c) => c,
+        };
+        let hc = hay_chars.next()?; // haystack exhausted mid-needle -> no match
+                                    // Lowercase each haystack char and compare against the (pre-lowercased)
+                                    // needle char run. `to_lowercase` can yield >1 char; compare the full
+                                    // expansion, pulling extra needle chars as needed.
+        let mut hc_lower = hc.to_lowercase();
+        let first = hc_lower.next()?;
+        if first != nc {
+            return None;
+        }
+        for extra in hc_lower {
+            match needle_chars.next() {
+                Some(n) if n == extra => {}
+                _ => return None,
+            }
+        }
+        consumed += hc.len_utf8();
+    }
 }
 
 /// R2-P1-4: scan `line` for ABSOLUTE PATH RUNS and replace each with a stable
@@ -1318,34 +1402,81 @@ fn utf8_char_len(lead: u8) -> usize {
     }
 }
 
-/// Redact one whitespace-delimited token if it looks secret (OAuth token /
-/// email / long opaque drive id), else return it unchanged. Absolute paths are
-/// handled by the whole-line path-run scrub (R2-P1-4) before this runs, so this
-/// no longer needs the bare-path token rule.
+/// Separators that delimit a VALUE inside a single whitespace token, so a secret
+/// embedded in a `key=value`, `"key":"value"`, or `key:value` shape can be
+/// isolated and redacted (R3-P1-2). The token has already been split on
+/// whitespace, so whitespace is not in this set.
+const VALUE_SEPARATORS: &[char] = &[
+    '=', ':', '"', '\'', ',', '{', '}', '[', ']', '(', ')', '<', '>', ';', '&', '?',
+];
+
+/// Redact one whitespace-delimited token. Absolute paths are handled by the
+/// whole-line path-run scrub (R2-P1-4) before this runs, so this no longer needs
+/// the bare-path token rule.
+///
+/// R3-P1-2: a secret often rides INSIDE a `key=value` / JSON shape - e.g.
+/// `refresh_token=1//abc`, `"access_token":"ya29.xyz"`, `file_id=<long-id>` -
+/// where the WHOLE whitespace token does NOT start with `ya29.` / `1//`, so a
+/// prefix-anchored check on the token would leak the value into the (shareable)
+/// diagnostic bundle. This therefore splits the token on value separators
+/// (`=`, `:`, quotes, brackets, ...) and redacts each VALUE segment that matches
+/// a secret pattern, re-emitting the separators verbatim so the surrounding
+/// structure (the `key=` part) is preserved for debugging.
 fn redact_token(tok: &str) -> String {
     if tok.is_empty() {
         return tok.to_string();
     }
+    let mut out = String::with_capacity(tok.len());
+    let mut segment = String::new();
+    for ch in tok.chars() {
+        if VALUE_SEPARATORS.contains(&ch) {
+            if !segment.is_empty() {
+                out.push_str(&redact_value(&segment));
+                segment.clear();
+            }
+            out.push(ch);
+        } else {
+            segment.push(ch);
+        }
+    }
+    if !segment.is_empty() {
+        out.push_str(&redact_value(&segment));
+    }
+    out
+}
+
+/// Redact a single VALUE segment (already isolated from its `key=` / quoting by
+/// [`redact_token`]) if it looks secret, else return it unchanged.
+///
+/// Handles: emails (`@` + a later `.`), OAuth access tokens (`ya29.` prefix),
+/// OAuth refresh tokens (`1//` prefix), and long opaque Drive file/object ids
+/// (>= 24 url-safe chars). The token prefixes are checked at the START of the
+/// SEGMENT (not the whole whitespace token), so `refresh_token=1//abc` redacts
+/// the `1//abc` segment while leaving `refresh_token=` intact.
+fn redact_value(seg: &str) -> String {
+    if seg.is_empty() {
+        return seg.to_string();
+    }
     // Email: contains '@' and a '.' after it.
-    if let Some(at) = tok.find('@') {
-        if tok[at + 1..].contains('.') {
-            return format!("<email:{}>", stable_hash(tok));
+    if let Some(at) = seg.find('@') {
+        if seg[at + 1..].contains('.') {
+            return format!("<email:{}>", stable_hash(seg));
         }
     }
     // OAuth tokens: Google access tokens start `ya29.`; refresh tokens `1//`.
-    if tok.starts_with("ya29.") || tok.starts_with("1//") {
+    if seg.starts_with("ya29.") || seg.starts_with("1//") {
         return "<token-redacted>".to_string();
     }
     // Long opaque ids (Drive file ids are ~28-44 url-safe chars): redact a long
-    // run of id-shaped characters with no spaces.
-    if tok.len() >= 24
-        && tok
+    // run of id-shaped characters.
+    if seg.len() >= 24
+        && seg
             .chars()
             .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
     {
-        return format!("<fileid:{}>", stable_hash(tok));
+        return format!("<fileid:{}>", stable_hash(seg));
     }
-    tok.to_string()
+    seg.to_string()
 }
 
 /// A short OS descriptor for `os.txt` (SPEC s18). Compile-time `OS`/`ARCH`
@@ -2191,6 +2322,137 @@ mod tests {
         let input = "scan complete 12 files 3 dirs ok";
         let out = Redactor::context_free().redact_text(input);
         assert_eq!(out.trim_end(), input, "ordinary log text is unchanged");
+    }
+
+    #[test]
+    fn redact_tokens_inside_key_equals_and_json_values() {
+        // R3-P1-2: a secret riding INSIDE a key=value / JSON value leaks if only
+        // the WHOLE whitespace token is checked for the `ya29.` / `1//` prefix.
+        // key=value shape (refresh token, access token, drive file id).
+        let kv = "refresh_token=1//0gAbCdEfGh access_token=ya29.aBcDeFgHiJ \
+                  file_id=1A2b3C4d5E6f7G8h9I0jKlMnOpQr op=upload";
+        let out = Redactor::context_free().redact_line(kv);
+        assert!(
+            !out.contains("1//0gAbCdEfGh"),
+            "kv refresh token redacted: {out}"
+        );
+        assert!(
+            !out.contains("ya29.aBcDeFgHiJ"),
+            "kv access token redacted: {out}"
+        );
+        assert!(
+            !out.contains("1A2b3C4d5E6f7G8h9I0jKlMnOpQr"),
+            "kv drive file id redacted: {out}"
+        );
+        assert!(
+            out.contains("<token-redacted>"),
+            "token placeholder present: {out}"
+        );
+        assert!(
+            out.contains("<fileid:"),
+            "fileid placeholder present: {out}"
+        );
+        // The key names + the adjacent op field survive (structure preserved).
+        assert!(out.contains("refresh_token="), "key name preserved: {out}");
+        assert!(out.contains("op=upload"), "adjacent field survives: {out}");
+
+        // JSON-like shape: quoted keys + quoted values.
+        let json = r#"{"access_token":"ya29.JsOnAcCeSs","refresh_token":"1//jSoNrEfReSh"}"#;
+        let out = Redactor::context_free().redact_line(json);
+        assert!(
+            !out.contains("ya29.JsOnAcCeSs"),
+            "json access token redacted: {out}"
+        );
+        assert!(
+            !out.contains("1//jSoNrEfReSh"),
+            "json refresh token redacted: {out}"
+        );
+        assert!(
+            out.contains("<token-redacted>"),
+            "json token placeholder present: {out}"
+        );
+        // The structural keys survive.
+        assert!(out.contains("access_token"), "json key preserved: {out}");
+        assert!(out.contains("refresh_token"), "json key preserved: {out}");
+    }
+
+    #[test]
+    fn redact_non_ascii_path_and_needle_never_panics_and_redacts() {
+        // R3-P1-3: a needle / haystack whose case fold changes byte length must
+        // not mis-slice or PANIC. The dotted-capital-I and German sharp-s are
+        // classic length-changing case folds. The known-substring scrub
+        // (replace_ci) must find the needle on a real CHAR boundary. Non-ASCII
+        // chars are written as \u{} escapes so this source file stays ASCII;
+        // they decode to e=U+00E9, E=U+00C9 (accented e), and sharp-s=U+00DF.
+        // jose_lower = "jos\u{e9}" (jose with accented e); strasse = "stra\u{df}e".
+        let jose_lower = "jos\u{e9}";
+        let jose_upper = "JOS\u{c9}";
+        let strasse = "stra\u{df}e";
+        // Needle is pre-lowercased by the call site; emulate that here.
+        let needle = format!("c:\\users\\{jose_lower}\\{strasse}").to_lowercase();
+        let r = Redactor {
+            source_roots: vec![needle.clone()],
+            home: None,
+            username: None,
+        };
+        // The haystack uses MIXED case (incl. the upper-case forms) so the CI
+        // matcher is exercised; the original (case-preserving) bytes are sliced.
+        let line = format!("scanning C:\\Users\\{jose_upper}\\STRASSE for changes");
+        // First prove the legacy-bug input does not panic and yields a result.
+        let out = r.redact_line(&line);
+        // STRASSE upper-cases the sharp-s differently, so that run may not match;
+        // assert only no-panic + a sane (non-empty) result here.
+        assert!(!out.is_empty(), "redaction produced output: {out}");
+
+        // An exact-case occurrence MUST be redacted to a <path:...> placeholder.
+        let exact = format!("path C:\\Users\\{jose_lower}\\{strasse} end");
+        let out = r.redact_line(&exact);
+        assert!(
+            !out.contains(jose_lower),
+            "non-ascii source root redacted (no panic): {out}"
+        );
+        assert!(out.contains("<path:"), "hashed placeholder present: {out}");
+        assert!(out.contains("end"), "trailing text survives: {out}");
+
+        // replace_ci directly: a length-changing case fold (dotted capital I,
+        // U+0130, lowercases to two chars) on a non-char boundary must never
+        // panic and must return original-span slices.
+        let hay = "PRE_\u{130}stanbul_POST"; // dotted capital I (multi-byte fold)
+        let result = replace_ci(hay, &"_istanbul_".to_lowercase(), "<X>");
+        assert!(
+            result.contains("PRE") && result.contains("POST"),
+            "no panic: {result}"
+        );
+
+        // A plain ASCII case-insensitive match still works on original spans.
+        let result = replace_ci("Hello WORLD hello", "hello", "<H>");
+        assert_eq!(
+            result, "<H> WORLD <H>",
+            "ASCII CI replace on original spans"
+        );
+    }
+
+    #[test]
+    fn deep_verify_interval_validator_rejects_zero_and_over_cap_accepts_valid() {
+        // R3-P2-2: the per-source deep_verify_interval validator (shared with
+        // update_source) rejects 0 (constant churn) and an over-cap value, and
+        // accepts a value within the duration cap.
+        let err = validate_deep_verify_interval(0)
+            .expect_err("zero deep-verify interval must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err = validate_deep_verify_interval(u32::MAX)
+            .expect_err("u32::MAX deep-verify interval must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err = validate_deep_verify_interval(DEEP_VERIFY_MIN - 1)
+            .expect_err("just-below-min must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err = validate_deep_verify_interval(DEEP_VERIFY_MAX + 1)
+            .expect_err("just-above-max must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        // A valid value (the 7-day default) is accepted; the bounds are inclusive.
+        validate_deep_verify_interval(604_800).expect("7-day default is valid");
+        validate_deep_verify_interval(DEEP_VERIFY_MIN).expect("min bound is valid");
+        validate_deep_verify_interval(DEEP_VERIFY_MAX).expect("max bound is valid");
     }
 
     // R2-P1-4: whole-line / all-path-shape redaction tests (Windows shapes).
