@@ -330,6 +330,35 @@ pub fn classification_of(err: &anyhow::Error) -> Option<DriveErrorClassification
         .map(DriveError::classification)
 }
 
+/// R1-P2-1: classify a MID-STREAM download READ error surfaced as a
+/// [`std::io::Error`]. The streaming download reader ([`StreamingDownloadReader`])
+/// wraps a transport failure that occurs WHILE the body is being read via
+/// `std::io::Error::other(reqwest_error)` - so the real cause (a network drop /
+/// timeout / connection reset mid-body) is preserved as the io error's inner
+/// source rather than as a classified [`DriveError`]. The restore sink must NOT
+/// report such a failure as `local.io_error` (the DISK is fine; DRIVE/network
+/// failed). This walks the io error's source chain looking for either a
+/// [`DriveError`] (if a future path wraps one) or a raw `reqwest::Error`, and
+/// returns its [`DriveErrorClassification`]; `None` if the io error is a genuine
+/// LOCAL disk error with no Drive/network cause (the caller then keeps the local
+/// classification).
+#[must_use]
+pub fn classify_stream_read_error(err: &std::io::Error) -> Option<DriveErrorClassification> {
+    // The reader wraps the cause with `io::Error::other(e)`, so the inner error is
+    // reachable via `get_ref()` (and any deeper cause via its `source()` chain).
+    let mut cause: Option<&(dyn std::error::Error + 'static)> = err.get_ref().map(|e| e as _);
+    while let Some(c) = cause {
+        if let Some(drive) = c.downcast_ref::<DriveError>() {
+            return Some(drive.classification());
+        }
+        if let Some(req) = c.downcast_ref::<reqwest::Error>() {
+            return Some(retry::classify_transport_error(req));
+        }
+        cause = c.source();
+    }
+    None
+}
+
 // ---------------------------------------------------------------------------
 // Drive JSON shapes.
 // ---------------------------------------------------------------------------

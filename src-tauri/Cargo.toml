@@ -67,6 +67,17 @@ driven-power = { path = "../crates/driven-power" }
 driven-net = { path = "../crates/driven-net" }
 driven-vss = { path = "../crates/driven-vss" }
 
+# R1-P2-2 (SPEC s11.6.1 step 5): atomic restore-over-existing on Windows.
+# `std::fs::rename` is not a guaranteed atomic REPLACE over an existing file on
+# Windows, so the restore sink uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING |
+# MOVEFILE_WRITE_THROUGH)`. Windows-only so the 3-OS CI build/clippy stays green
+# on Linux + macOS (the Unix path uses std::fs::rename, which replaces).
+[target.'cfg(windows)'.dependencies]
+windows-sys = { version = "0.59", features = [
+    "Win32_Foundation",
+    "Win32_Storage_FileSystem",
+] }
+
 [dev-dependencies]
 # R-P1-1 shutdown test: a no-op `Orchestrator` impl to build an `AccountHandle`
 # and assert every per-account task is joined after `shutdown()`.

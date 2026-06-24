@@ -405,21 +405,29 @@ pub async fn restore_files(
 }
 
 /// `cancel_restore_job(job)` - request cancellation of a running restore job
-/// (SPEC s11.5 / s11.7; M8-P1-1). Sets the job's cancel flag so the background
-/// task stops between frames, DELETES any in-flight temp file (no partial left),
-/// and emits a terminal CANCELLED [`RestoreJobStatus`]. Idempotent: cancelling an
-/// unknown / already-finished job is a benign no-op (the job may have completed
-/// or its terminal record been pruned). The command returns once the cancel is
-/// SIGNALLED; the terminal CANCELLED status arrives on `restore:progress`.
+/// (SPEC s11.5 / s11.7; M8-P1-1 / R1-P1-2). Sets the job's cancel flag so the
+/// background task stops between frames, DELETES any in-flight temp file (no
+/// partial left), and emits a terminal CANCELLED [`RestoreJobStatus`]. Idempotent:
+/// cancelling an unknown / already-finished job is a benign no-op (the job may
+/// have completed or its terminal record been pruned). The command returns once
+/// the cancel is SIGNALLED; the terminal CANCELLED status arrives on
+/// `restore:progress`.
+///
+/// R1-P1-2: this ONLY sets the cancel flag and LEAVES the task handle tracked on
+/// the job entry. It deliberately does NOT take the handle - taking + dropping a
+/// tokio `JoinHandle` would DETACH the task, so after a UI cancel the task would
+/// no longer be drainable on shutdown and could run on until its next read (an
+/// orphan, violating the no-orphan/no-partial cancel acceptance). The task
+/// observes the flag, cleans up its temp, emits CANCELLED, and clears its own
+/// handle on exit (`finish_restore_job_handle`); the app-shutdown drain
+/// (`cancel_all_restore_jobs`) still awaits/aborts the handle if the task is
+/// somehow still running at quit.
 #[tauri::command]
 pub async fn cancel_restore_job(
     state: State<'_, AppState>,
     job: RestoreJobId,
 ) -> CommandResult<()> {
-    // Set the flag + take the task handle (if still running). We do NOT await the
-    // handle here (the command should return promptly); the task observes the flag,
-    // cleans up its temp, emits CANCELLED, and exits on its own.
-    let _ = state.cancel_restore_job(&job.0);
+    let _ = state.signal_cancel_restore_job(&job.0);
     Ok(())
 }
 
@@ -702,10 +710,12 @@ async fn restore_one_file<F: FnMut(u64)>(
                 let _ = tokio::fs::remove_file(&tmp).await;
                 return FileOutcome::Failed(e.code);
             }
-            // Atomically place the verified plaintext at its final name.
-            if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
+            // Atomically place the verified plaintext at its final name. R1-P2-2:
+            // use a platform atomic REPLACE so restoring OVER an existing file
+            // succeeds on Windows (plain rename is not a guaranteed replace there).
+            if let Err(e) = atomic_replace(&tmp, &dest).await {
                 let _ = tokio::fs::remove_file(&tmp).await;
-                tracing::warn!(target: TARGET, file = %file.relative_path, %e, "restore atomic rename failed");
+                tracing::warn!(target: TARGET, file = %file.relative_path, %e, "restore atomic replace failed");
                 return FileOutcome::Failed(ErrorCode::LocalIoError);
             }
             FileOutcome::Done
@@ -838,7 +848,9 @@ where
                 if cancel.load(Ordering::SeqCst) {
                     return Ok(StreamOutcome::Cancelled);
                 }
-                let n = reader.read(&mut buf).await.map_err(map_io_err)?;
+                // R1-P2-1: a read error here is a DRIVE/network failure, not a
+                // local disk failure - classify it accordingly.
+                let n = reader.read(&mut buf).await.map_err(map_download_read_err)?;
                 if n == 0 {
                     break;
                 }
@@ -851,12 +863,18 @@ where
         // --- encrypted source: STREAM-decrypt frame by frame -------------------
         Some(suite) => {
             // 1) Read the fixed 40-byte header (magic || nonce) to open the
-            //    decryptor. A short read here means a truncated / non-Driven object.
+            //    decryptor. A short read (UnexpectedEof) means a truncated /
+            //    non-Driven object -> crypto.decrypt_failed; any OTHER read error
+            //    is a DRIVE/network mid-stream failure (R1-P2-1), classified as
+            //    such rather than collapsed to a crypto/local error.
             let mut header = [0u8; HEADER_LEN];
-            reader
-                .read_exact(&mut header)
-                .await
-                .map_err(|_| ErrorCode::CryptoDecryptFailed)?;
+            reader.read_exact(&mut header).await.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    ErrorCode::CryptoDecryptFailed
+                } else {
+                    map_download_read_err(e)
+                }
+            })?;
             let mut dec: Box<dyn ContentDecryptor> = suite
                 .content_decryptor(&header)
                 .map_err(|_| ErrorCode::CryptoDecryptFailed)?;
@@ -879,7 +897,11 @@ where
                 }
                 // Fill the buffer until it holds > one frame or we hit EOF.
                 while buf.len() <= CIPHERTEXT_FRAME && !eof {
-                    let n = reader.read(&mut read_chunk).await.map_err(map_io_err)?;
+                    // R1-P2-1: a mid-stream read error is a DRIVE/network failure.
+                    let n = reader
+                        .read(&mut read_chunk)
+                        .await
+                        .map_err(map_download_read_err)?;
                     if n == 0 {
                         eof = true;
                     } else {
@@ -972,6 +994,110 @@ fn open_temp_no_follow(tmp: &std::path::Path) -> std::io::Result<std::fs::File> 
         opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
     }
     opts.open(tmp)
+}
+
+/// R1-P2-2 (SPEC s11.6.1 step 5): atomically REPLACE `dest` with `src` (the
+/// streamed + fsynced temp). `dest` may or may not already exist - a restore over
+/// an EXISTING file must atomically swap it, never fail. `tokio::fs::rename`
+/// (-> `std::fs::rename`) is NOT a portable atomic replace: on Windows it can fail
+/// when the target exists, so we use the platform primitive:
+/// - Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` -
+///   an atomic replace that also flushes the rename through to disk.
+/// - Unix: `std::fs::rename` already atomically replaces an existing file.
+///
+/// Runs on a blocking thread (the syscall is synchronous) so the async runtime is
+/// not blocked.
+async fn atomic_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    let src = src.to_path_buf();
+    let dest = dest.to_path_buf();
+    tokio::task::spawn_blocking(move || atomic_replace_blocking(&src, &dest))
+        .await
+        .map_err(|e| std::io::Error::other(format!("atomic replace task join failed: {e}")))?
+}
+
+/// The synchronous platform-specific atomic replace behind [`atomic_replace`].
+#[cfg(windows)]
+fn atomic_replace_blocking(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    use std::os::windows::ffi::OsStrExt;
+    use windows_sys::Win32::Storage::FileSystem::{
+        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
+    };
+
+    // Win32 wants NUL-terminated wide strings.
+    let to_wide = |p: &std::path::Path| -> Vec<u16> {
+        p.as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect()
+    };
+    let src_w = to_wide(src);
+    let dest_w = to_wide(dest);
+    // SAFETY: both pointers are valid NUL-terminated wide strings that outlive the
+    // call; MoveFileExW does not retain them. Returns 0 on failure (GetLastError).
+    let ok = unsafe {
+        MoveFileExW(
+            src_w.as_ptr(),
+            dest_w.as_ptr(),
+            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
+        )
+    };
+    if ok == 0 {
+        return Err(std::io::Error::last_os_error());
+    }
+    Ok(())
+}
+
+/// The synchronous platform-specific atomic replace behind [`atomic_replace`].
+/// On Unix `std::fs::rename` already atomically replaces an existing destination.
+#[cfg(not(windows))]
+fn atomic_replace_blocking(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
+    std::fs::rename(src, dest)
+}
+
+/// R1-P2-1: map a MID-STREAM download READ error to the SPEC s24 code. A read
+/// error on the Drive download stream is a DRIVE/NETWORK failure, NOT a local
+/// disk failure, so it must NOT be reported as `local.io_error` (which would tell
+/// the user the DISK failed when DRIVE/network failed). This first asks
+/// [`driven_drive::google::classify_stream_read_error`] for the wrapped Drive /
+/// transport classification (the real `GoogleDriveStore`'s streaming reader wraps
+/// the reqwest transport error via `io::Error::other`); failing that it falls back
+/// to the dotted-code substring scan used by [`classify_download_error`] (so the
+/// `InMemoryRemoteStore` fake's mid-stream injected errors, whose messages embed
+/// the dotted code, still classify). A read failure with no recognisable
+/// Drive/network cause maps to `net.intermittent` - the closest "the download
+/// stream broke" code - rather than `local.io_error`.
+fn map_download_read_err(e: std::io::Error) -> ErrorCode {
+    use driven_drive::remote_store::DriveErrorClassification as C;
+    if let Some(class) = driven_drive::google::classify_stream_read_error(&e) {
+        return match class {
+            C::RateLimited { .. } => ErrorCode::DriveRateLimited,
+            C::Transient5xx => ErrorCode::DriveUnreachable,
+            C::Network => ErrorCode::NetIntermittent,
+            C::AuthInvalidGrant => ErrorCode::AuthInvalidGrant,
+            C::DailyQuota => ErrorCode::DriveDailyQuotaExhausted,
+            C::StorageQuota => ErrorCode::DriveQuotaExhausted,
+            C::Other => ErrorCode::DriveUnreachable,
+        };
+    }
+    // String fallback: a mid-stream io error whose message embeds a dotted code
+    // (the fake's injected mid-stream faults, or a wrapped Display). Mirrors
+    // classify_download_error's ordering (daily before quota_exhausted).
+    let msg = e.to_string();
+    if msg.contains("rate_limited") {
+        ErrorCode::DriveRateLimited
+    } else if msg.contains("daily") {
+        ErrorCode::DriveDailyQuotaExhausted
+    } else if msg.contains("quota_exhausted") {
+        ErrorCode::DriveQuotaExhausted
+    } else if msg.contains("invalid_grant") {
+        ErrorCode::AuthInvalidGrant
+    } else if msg.contains("net.intermittent") || msg.contains("network drop") {
+        ErrorCode::NetIntermittent
+    } else {
+        // A broken download stream with no recognisable local-disk cause: this is
+        // a DRIVE/network failure, not a local IO error.
+        ErrorCode::NetIntermittent
+    }
 }
 
 /// Map a disk write error to the SPEC s24 code: out-of-space -> `local.disk_full`,
@@ -1408,6 +1534,200 @@ mod tests {
         assert!(matches!(res, StreamOutcome::Done));
         assert_eq!(std::fs::read(&out).unwrap(), plaintext);
         let _ = std::fs::remove_file(&out);
+    }
+
+    // --- R1-P2-1: mid-stream download read errors classify as Drive/network ---
+
+    /// A test [`AsyncRead`] that yields `prefix` bytes, then fails the NEXT read
+    /// with an `io::Error` carrying `msg` - modelling a Drive download stream that
+    /// breaks MID-BODY (the real `StreamingDownloadReader` wraps the transport
+    /// error via `io::Error::other`; the fake's injected faults embed the dotted
+    /// code in the message). Used to prove a mid-stream read error maps to a
+    /// DRIVE/network SPEC s24 code, NOT `local.io_error`.
+    struct FailMidStreamReader {
+        prefix: Vec<u8>,
+        pos: usize,
+        msg: &'static str,
+        failed: bool,
+    }
+
+    impl FailMidStreamReader {
+        fn new(prefix: Vec<u8>, msg: &'static str) -> Self {
+            Self {
+                prefix,
+                pos: 0,
+                msg,
+                failed: false,
+            }
+        }
+    }
+
+    impl tokio::io::AsyncRead for FailMidStreamReader {
+        fn poll_read(
+            self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let this = self.get_mut();
+            if this.pos < this.prefix.len() {
+                let n = (this.prefix.len() - this.pos).min(buf.remaining());
+                buf.put_slice(&this.prefix[this.pos..this.pos + n]);
+                this.pos += n;
+                return std::task::Poll::Ready(Ok(()));
+            }
+            if !this.failed {
+                this.failed = true;
+                // Mirror the real reader's wrapping: io::Error::other(cause).
+                return std::task::Poll::Ready(Err(std::io::Error::other(this.msg)));
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    #[tokio::test]
+    async fn midstream_read_error_maps_to_drive_network_not_local_io() {
+        // R1-P2-1: a read error on the Drive download stream is a DRIVE/network
+        // failure, so the file must fail with a Drive/network code (here
+        // net.intermittent / drive.rate_limited), NEVER local.io_error.
+        // Case 1: an unclassified mid-stream break -> net.intermittent (the
+        // download stream broke; the disk is fine).
+        let plaintext: Vec<u8> = (0..(2 * CIPHERTEXT_FRAME))
+            .map(|i| (i % 250) as u8)
+            .collect();
+        let file = resolved_for(&plaintext, "broken.bin");
+        let out = rand_tmp("midstream-net");
+        let mut reader = FailMidStreamReader::new(plaintext.clone(), "connection reset by peer");
+        let res = stream_to_disk(&mut reader, &out, None, &file, &no_cancel(), &mut |_| {}).await;
+        match res {
+            StreamOutcome::Failed(code) => {
+                assert_eq!(
+                    code,
+                    ErrorCode::NetIntermittent,
+                    "an unclassified mid-stream read break must map to net.intermittent, not local.io_error"
+                );
+                assert_ne!(code, ErrorCode::LocalIoError);
+            }
+            other => panic!("expected Failed, got {:?}", std::mem::discriminant(&other)),
+        }
+        let _ = std::fs::remove_file(&out);
+
+        // Case 2: a mid-stream break whose message embeds a dotted Drive code
+        // (the fake's injected fault shape) classifies to that specific code.
+        let out2 = rand_tmp("midstream-rl");
+        let mut reader2 =
+            FailMidStreamReader::new(plaintext.clone(), "fake: drive.rate_limited mid-stream");
+        let res2 =
+            stream_to_disk(&mut reader2, &out2, None, &file, &no_cancel(), &mut |_| {}).await;
+        match res2 {
+            StreamOutcome::Failed(code) => {
+                assert_eq!(code, ErrorCode::DriveRateLimited);
+            }
+            other => panic!("expected Failed, got {:?}", std::mem::discriminant(&other)),
+        }
+        let _ = std::fs::remove_file(&out2);
+    }
+
+    #[test]
+    fn map_download_read_err_never_returns_local_io() {
+        // R1-P2-1: the read-error mapper must never collapse a download read
+        // failure to local.io_error - even a plain io error with no recognisable
+        // cause is a broken DOWNLOAD stream (net.intermittent), not a disk fault.
+        let plain = std::io::Error::other("some opaque stream failure");
+        assert_eq!(map_download_read_err(plain), ErrorCode::NetIntermittent);
+        let eof = std::io::Error::new(std::io::ErrorKind::UnexpectedEof, "short");
+        assert_ne!(map_download_read_err(eof), ErrorCode::LocalIoError);
+    }
+
+    // --- R1-P2-2: atomic replace over an existing file ------------------------
+
+    #[tokio::test]
+    async fn atomic_replace_overwrites_existing_file() {
+        // R1-P2-2: restoring OVER an existing file must succeed (atomic replace),
+        // not fail - this is the Windows MoveFileExW(REPLACE_EXISTING) path; on
+        // Unix std::fs::rename already replaces. The dest must end up with the new
+        // bytes and the temp must be gone.
+        let dir = rand_tmp("atomic-replace");
+        std::fs::create_dir_all(&dir).unwrap();
+        let dest = dir.join("existing.bin");
+        std::fs::write(&dest, b"OLD CONTENT that must be replaced").unwrap();
+        let tmp = dir.join(".driven-restore-tmp.replace");
+        std::fs::write(&tmp, b"NEW").unwrap();
+
+        atomic_replace(&tmp, &dest)
+            .await
+            .expect("atomic replace over an existing file must succeed");
+        assert_eq!(
+            std::fs::read(&dest).unwrap(),
+            b"NEW",
+            "dest must hold the new bytes"
+        );
+        assert!(!tmp.exists(), "the temp must be moved (gone) after replace");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restore_one_file_overwrites_existing_dest_on_all_platforms() {
+        // R1-P2-2 end-to-end: a full restore_one_file run whose dest already
+        // exists must REPLACE it (not fail). Exercises the real download -> stream
+        // -> atomic_replace path via the InMemoryRemoteStore.
+        use driven_drive::remote_store::UploadBody;
+        let dir = rand_tmp("restore-overwrite");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let plaintext = b"freshly restored bytes".to_vec();
+
+        // Pre-place an EXISTING file at the dest leaf (a regular file, not a link).
+        let existing = dir.join("d.bin");
+        std::fs::write(&existing, b"stale bytes to overwrite").unwrap();
+
+        let store = driven_drive::fake::InMemoryRemoteStore::new();
+        let parent = store.root_id().to_string();
+        let entry = store
+            .create(
+                &parent,
+                "d.bin",
+                "application/octet-stream",
+                UploadBody::Bytes(bytes::Bytes::from(plaintext.clone())),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let mut file = resolved_for(&plaintext, "d.bin");
+        file.drive_file_id = Some(entry.id.clone());
+
+        let outcome = restore_one_file(
+            &file,
+            &store,
+            &SuiteVerdict::Plaintext,
+            &token,
+            &no_cancel(),
+            |_| {},
+        )
+        .await;
+        assert!(
+            matches!(outcome, FileOutcome::Done),
+            "restoring over an existing file must succeed (atomic replace)"
+        );
+        assert_eq!(
+            std::fs::read(&existing).unwrap(),
+            plaintext,
+            "the existing file must be replaced with the restored bytes"
+        );
+        // No leftover temp in the dest dir.
+        let temps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".driven-restore-tmp.")
+            })
+            .collect();
+        assert!(
+            temps.is_empty(),
+            "no temp must be left after replace: {temps:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
