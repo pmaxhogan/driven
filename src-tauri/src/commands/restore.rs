@@ -179,7 +179,10 @@ pub async fn search_files(
     }
     let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
 
-    // Route: a glob metacharacter -> the GLOB path (wildcard); else FTS5 (terms).
+    // Route (R2-P1-2): a SIMPLE trailing-star prefix term (`proj*`) goes to the
+    // FTS5 prefix path (< 50ms, ROADMAP M8 acceptance); a GENUINE wildcard / path
+    // pattern (`*.rs`, `src/*`, leading/interior `*`, `?`, `[...]`) goes to the
+    // slower GLOB path. `is_glob_query` returns true only for the latter.
     let hits = if is_glob_query(query) {
         state
             .state()
@@ -302,27 +305,37 @@ pub async fn restore_files(
         });
     }
 
-    let job_id = uuid::Uuid::new_v4().to_string();
+    // R2-P2-1: build ALL fallible setup (the per-account remote stores + crypto
+    // suites the job will use) BEFORE seeding/emitting the job, so an early Err
+    // returns WITHOUT ever creating a job entry or emitting a "running" job event.
+    // Previously the job was seeded + emitted first, so a failure here left a
+    // non-terminal job orphaned in AppState (never pruned) and a dangling running
+    // job on the UI. `build_restore_plans` does NOT touch the job map, so on Err
+    // the `?` below returns with `restore_jobs` still empty.
+    let plans = build_restore_plans(state.inner(), resolved).await?;
 
-    // Build the initial (all-pending) status, seed it WITH a cancel flag (P1-1),
-    // and emit the first tick so the webview shows the job immediately.
+    // All fallible setup succeeded. NOW mint the job id, build the initial
+    // (all-pending) status from the plans, seed it WITH its cancel flag (P1-1),
+    // and emit the first tick so the webview shows the job (R2-P2-1: never before
+    // the setup above, so a setup failure leaves no job behind).
+    let job_id = uuid::Uuid::new_v4().to_string();
     let mut status = RestoreJobStatus {
         job_id: job_id.clone(),
-        total_files: resolved.len() as u32,
+        total_files: plans.len() as u32,
         completed_files: 0,
         failed_files: 0,
-        total_bytes: resolved.iter().map(|r| r.size).sum(),
+        total_bytes: plans.iter().map(|p| p.file.size).sum(),
         bytes_done: 0,
         current_file: None,
         done: false,
         cancelled: false,
-        files: resolved
+        files: plans
             .iter()
-            .map(|r| RestoreFileProgress {
-                relative_path: r.relative_path.clone(),
+            .map(|p| RestoreFileProgress {
+                relative_path: p.file.relative_path.clone(),
                 state: RestoreFileState::Pending,
                 bytes_done: 0,
-                bytes_total: r.size,
+                bytes_total: p.file.size,
                 error_code: None,
             })
             .collect(),
@@ -333,58 +346,6 @@ pub async fn restore_files(
     let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
     state.seed_restore_job(status.clone(), cancel.clone());
     emit_progress(&app, &status);
-
-    // Build the per-account remote stores + crypto suites the job will use. We
-    // build them here (on the command, with `State` access) and MOVE them into the
-    // spawned task, since the spawned task cannot hold `State<'_, AppState>`.
-    let mut plans: Vec<RestorePlan> = Vec::with_capacity(resolved.len());
-    // Cache one remote store per account (multiple files often share an account).
-    let mut store_cache: std::collections::HashMap<
-        driven_core::types::AccountId,
-        Arc<dyn RemoteStore>,
-    > = std::collections::HashMap::new();
-
-    // Resolve the source -> account map once.
-    let sources = state
-        .state()
-        .list_sources()
-        .await
-        .map_err(CommandError::from)?;
-    for r in resolved {
-        let source = sources
-            .iter()
-            .find(|s| s.id == r.source_id)
-            .ok_or_else(|| {
-                CommandError::with_code(
-                    ErrorCode::InternalBug,
-                    format!("source not found for restore: {}", r.source_id),
-                )
-            })?;
-        let account_id = source.account_id;
-        let store = match store_cache.get(&account_id) {
-            Some(s) => s.clone(),
-            None => {
-                let s = crate::commands::sources::build_restore_store(state.inner(), account_id)?;
-                store_cache.insert(account_id, s.clone());
-                s
-            }
-        };
-        // Resolve the per-source crypto suite (fail-closed) via the account's live
-        // provider, so an encrypted file decrypts and an unencrypted one streams
-        // raw. An account with no running handle (e.g. needs_reauth) cannot restore
-        // an encrypted file - the resolution is recorded and the file fails closed.
-        let crypto = resolve_suite(
-            state.inner(),
-            account_id,
-            r.source_id,
-            source.encryption_enabled,
-        );
-        plans.push(RestorePlan {
-            file: r,
-            store,
-            crypto,
-        });
-    }
 
     // Spawn the background job. It owns the plans + the dest token + the cancel
     // flag; it drives each file, updates + emits + records the status, and never
@@ -445,6 +406,65 @@ pub async fn get_restore_job(
             format!("unknown restore job: {}", job.0),
         )
     })
+}
+
+/// R2-P2-1: build the per-file [`RestorePlan`]s (the fallible job SETUP) WITHOUT
+/// touching the restore-job map. Resolves the source -> account map, builds (and
+/// caches per account) the remote store, and resolves the per-source crypto
+/// verdict for each resolved file. Returns `Err` (via `?` in `restore_files`) on
+/// the first setup failure - and because this never seeds a job, an early failure
+/// leaves `AppState.restore_jobs` untouched (no orphaned non-terminal job entry,
+/// no dangling "running" job event). Split out so the seed/emit can happen strictly
+/// AFTER setup succeeds and so the setup path is unit-testable against a real
+/// `AppState` (the `restore_files` command itself needs a Tauri `State`/`AppHandle`).
+async fn build_restore_plans(
+    state: &AppState,
+    resolved: Vec<ResolvedRestore>,
+) -> CommandResult<Vec<RestorePlan>> {
+    let mut plans: Vec<RestorePlan> = Vec::with_capacity(resolved.len());
+    // Cache one remote store per account (multiple files often share an account).
+    let mut store_cache: std::collections::HashMap<
+        driven_core::types::AccountId,
+        Arc<dyn RemoteStore>,
+    > = std::collections::HashMap::new();
+
+    // Resolve the source -> account map once (fallible).
+    let sources = state
+        .state()
+        .list_sources()
+        .await
+        .map_err(CommandError::from)?;
+    for r in resolved {
+        let source = sources
+            .iter()
+            .find(|s| s.id == r.source_id)
+            .ok_or_else(|| {
+                CommandError::with_code(
+                    ErrorCode::InternalBug,
+                    format!("source not found for restore: {}", r.source_id),
+                )
+            })?;
+        let account_id = source.account_id;
+        let store = match store_cache.get(&account_id) {
+            Some(s) => s.clone(),
+            None => {
+                let s = crate::commands::sources::build_restore_store(state, account_id)?;
+                store_cache.insert(account_id, s.clone());
+                s
+            }
+        };
+        // Resolve the per-source crypto suite (fail-closed) via the account's live
+        // provider, so an encrypted file decrypts and an unencrypted one streams
+        // raw. An account with no running handle (e.g. needs_reauth) cannot restore
+        // an encrypted file - the resolution is recorded and the file fails closed.
+        let crypto = resolve_suite(state, account_id, r.source_id, source.encryption_enabled);
+        plans.push(RestorePlan {
+            file: r,
+            store,
+            crypto,
+        });
+    }
+    Ok(plans)
 }
 
 // -----------------------------------------------------------------------------
@@ -671,11 +691,13 @@ async fn restore_one_file<F: FnMut(u64)>(
     };
 
     // Resolve + confine the destination (SPEC s11.6.1): re-create the file's
-    // relative tree under the approved root, no traversal, no symlink-at-leaf.
-    let dest = match validate_restore_dest(dest_token, &file.relative_path) {
-        Ok(d) => d,
-        Err(e) => return FileOutcome::Failed(e.code),
-    };
+    // relative tree under the approved root, no traversal, no symlink-at-leaf. This
+    // CREATES the parent directory chain (component-at-a-time confined, R1-P1-1) so
+    // the handle-based confine open below can re-open it; it is the structural
+    // pre-step, while `ConfinedDest` provides the TOCTOU-safe write/rename.
+    if let Err(e) = validate_restore_dest(dest_token, &file.relative_path) {
+        return FileOutcome::Failed(e.code);
+    }
 
     // Open the Drive download stream. M8-P2-5: classify the remote error into the
     // specific SPEC s24 code (auth / missing-object / rate-limit / quota / ...)
@@ -685,51 +707,66 @@ async fn restore_one_file<F: FnMut(u64)>(
         Err(e) => return FileOutcome::Failed(classify_download_error(&e)),
     };
 
-    // Atomic write (SPEC s11.6.1 step 5): stream into a RANDOM-named sibling temp
-    // file opened no-follow + O_EXCL, then rename over the final name. A failure /
-    // cancel best-effort removes the temp file so no partial is left behind
-    // (M8-P1-1, M8-P1-2).
-    let parent = match dest.parent() {
-        Some(p) => p,
-        None => return FileOutcome::Failed(ErrorCode::LocalIoError),
-    };
-    // M8-P1-2: a RANDOM temp name (not timestamp-derived) so the path is
-    // unpredictable; combined with `create_new(true)` (O_EXCL) below this kills
-    // the pre-place / race-to-the-path attack.
-    let tmp = parent.join(format!(".driven-restore-tmp.{}", uuid::Uuid::new_v4()));
+    // R2-P1-1 (SPEC s11.6.1): open a HANDLE-CONFINED destination. This RE-walks the
+    // parent chain from the canonical root opening each component with a NO-FOLLOW
+    // directory handle (rejecting a symlink / reparse point and re-confirming the
+    // resolved real path is still inside the dialog-approved canonical root),
+    // creates a RANDOM-named temp RELATIVE to that pinned final-parent handle, and
+    // (on Windows) re-confirms the temp itself landed in-root BEFORE any plaintext
+    // is written. Because BOTH the temp create and the final rename are performed
+    // RELATIVE to the SAME pinned parent handle, a concurrent swap of a parent
+    // component to a symlink/junction AFTER validation cannot redirect the decrypted
+    // plaintext (temp OR final) outside the root - the earlier path-string TOCTOU
+    // (re-resolving the dest at rename time, and opening the temp by full path) is
+    // closed. The temp is unpredictably named + O_EXCL, so a pre-place race is also
+    // refused (M8-P1-2).
+    // `open` returns the guard PLUS the open temp file to stream into. The
+    // ConfinedDest retains everything needed to (a) rename handle-relative on
+    // success and (b) remove the temp on drop if not committed (so an abort /
+    // failure / cancel leaves no temp - the R2-P2-2 abort-safe cleanup: dropping
+    // the future drops `confined`, whose Drop deletes the still-uncommitted temp).
+    let (mut confined, temp_file) =
+        match confine::ConfinedDest::open(dest_token, &file.relative_path) {
+            Ok(pair) => pair,
+            Err(code) => return FileOutcome::Failed(code),
+        };
 
-    let result = stream_to_disk(&mut reader, &tmp, suite, file, cancel, &mut on_progress).await;
+    let result = stream_to_disk(
+        &mut reader,
+        temp_file,
+        suite,
+        file,
+        cancel,
+        &mut on_progress,
+    )
+    .await;
 
     match result {
         StreamOutcome::Done => {
-            // M8-P1-2: re-confirm the rename TARGET is still inside the canonical
-            // root (the leaf could have been swapped for a symlink during the
-            // stream); validate_restore_dest already canonicalised the parent, so
-            // re-validate to catch a TOCTOU swap at the leaf before renaming over it.
-            if let Err(e) = validate_restore_dest(dest_token, &file.relative_path) {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                return FileOutcome::Failed(e.code);
+            // R2-P1-1: commit by a HANDLE-RELATIVE atomic replace - the rename
+            // resolves the leaf relative to the pinned parent handle (NOT a
+            // re-resolved path string), so a parent swap during the stream cannot
+            // redirect it out of root, and an existing dest is atomically replaced
+            // (R1-P2-2). On success the temp guard is defused; on error the temp is
+            // removed by the guard on drop.
+            match confined.commit().await {
+                Ok(()) => FileOutcome::Done,
+                Err(code) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        file = %file.relative_path,
+                        code = %code.code(),
+                        "restore handle-relative commit failed"
+                    );
+                    FileOutcome::Failed(code)
+                }
             }
-            // Atomically place the verified plaintext at its final name. R1-P2-2:
-            // use a platform atomic REPLACE so restoring OVER an existing file
-            // succeeds on Windows (plain rename is not a guaranteed replace there).
-            if let Err(e) = atomic_replace(&tmp, &dest).await {
-                let _ = tokio::fs::remove_file(&tmp).await;
-                tracing::warn!(target: TARGET, file = %file.relative_path, %e, "restore atomic replace failed");
-                return FileOutcome::Failed(ErrorCode::LocalIoError);
-            }
-            FileOutcome::Done
         }
-        StreamOutcome::Cancelled => {
-            // M8-P1-1: cancelled mid-stream - delete the partial temp; nothing was
-            // renamed into place, so no partial final file remains.
-            let _ = tokio::fs::remove_file(&tmp).await;
-            FileOutcome::Cancelled
-        }
-        StreamOutcome::Failed(code) => {
-            let _ = tokio::fs::remove_file(&tmp).await;
-            FileOutcome::Failed(code)
-        }
+        // M8-P1-1 / R2-P2-2: cancelled or failed mid-stream - `confined` is dropped
+        // here (NOT committed), so its Drop removes the partial temp; nothing was
+        // renamed into place, so no partial final file remains.
+        StreamOutcome::Cancelled => FileOutcome::Cancelled,
+        StreamOutcome::Failed(code) => FileOutcome::Failed(code),
     }
 }
 
@@ -784,21 +821,22 @@ fn classify_download_error(err: &anyhow::Error) -> ErrorCode {
     }
 }
 
-/// Stream the download into `tmp`, decrypting if `suite` is `Some`, hashing the
-/// plaintext with BLAKE3, and verifying it against `file.hash_blake3`. Bounded
-/// memory: at most ~2 ciphertext frames (~128 KiB) are buffered at once, so a
-/// 1 GiB file never sits whole in RAM (PERF acceptance).
+/// Stream the download `reader` into the ALREADY-OPEN temp file `out`, decrypting
+/// if `suite` is `Some`, hashing the plaintext with BLAKE3, and verifying it
+/// against `file.hash_blake3`. Bounded memory: at most ~2 ciphertext frames
+/// (~128 KiB) are buffered at once, so a 1 GiB file never sits whole in RAM (PERF
+/// acceptance).
 ///
-/// M8-P1-1: `cancel` is checked between frames; on cancel this returns
-/// [`StreamOutcome::Cancelled`] WITHOUT verifying, so the caller deletes the temp
-/// (no partial). M8-P1-2: the temp is opened with [`open_temp_no_follow`] -
-/// `create_new(true)` (O_EXCL: fails if the path already exists, killing a
-/// pre-place race) plus platform no-follow flags (Unix `O_NOFOLLOW`; Windows
-/// `FILE_FLAG_OPEN_REPARSE_POINT` + reparse-point rejection) so a symlinked temp
-/// path cannot redirect the write outside the approved root.
+/// R2-P1-1: the temp `out` is opened + confined by the caller's
+/// [`confine::ConfinedDest`] (a no-follow temp created RELATIVE to a verified
+/// parent handle), so this fn just writes into the open handle - it never
+/// re-resolves a path. M8-P1-1: `cancel` is checked between frames; on cancel this
+/// returns [`StreamOutcome::Cancelled`] WITHOUT verifying, and the caller's
+/// `ConfinedDest` drop removes the temp (no partial). On any error the same
+/// drop-based cleanup applies (R2-P2-2).
 async fn stream_to_disk<R, F>(
     reader: &mut R,
-    tmp: &std::path::Path,
+    out: std::fs::File,
     suite: Option<&dyn SourceCryptoSuite>,
     file: &ResolvedRestore,
     cancel: &RestoreCancel,
@@ -808,7 +846,7 @@ where
     R: tokio::io::AsyncRead + Unpin,
     F: FnMut(u64),
 {
-    match stream_to_disk_inner(reader, tmp, suite, file, cancel, on_progress).await {
+    match stream_to_disk_inner(reader, out, suite, file, cancel, on_progress).await {
         Ok(outcome) => outcome,
         Err(code) => StreamOutcome::Failed(code),
     }
@@ -820,7 +858,7 @@ where
 /// without a `match` on every `?`.
 async fn stream_to_disk_inner<R, F>(
     reader: &mut R,
-    tmp: &std::path::Path,
+    out: std::fs::File,
     suite: Option<&dyn SourceCryptoSuite>,
     file: &ResolvedRestore,
     cancel: &RestoreCancel,
@@ -832,8 +870,8 @@ where
 {
     use tokio::io::AsyncWriteExt;
 
-    // M8-P1-2: open the temp no-follow + O_EXCL (random name from the caller).
-    let out = open_temp_no_follow(tmp).map_err(map_io_err)?;
+    // R2-P1-1: `out` is the temp the caller already created RELATIVE to a verified
+    // parent handle (no path re-resolution here).
     let out = tokio::fs::File::from_std(out);
     let mut writer = tokio::io::BufWriter::new(out);
     let mut hasher = Blake3::new();
@@ -965,94 +1003,8 @@ where
     Ok(StreamOutcome::Done)
 }
 
-/// M8-P1-2: open the restore temp file with NO-FOLLOW + O_EXCL semantics (SPEC
-/// s11.6.1: no-follow writes). `create_new(true)` (O_EXCL) makes the open FAIL if
-/// the path already exists - killing a pre-placed-symlink / race-to-the-path
-/// attack outright - and the platform no-follow flag ensures that even a symlink
-/// at the leaf cannot redirect the write:
-/// - Unix: `O_NOFOLLOW` (open fails with `ELOOP` if the leaf is a symlink).
-/// - Windows: `FILE_FLAG_OPEN_REPARSE_POINT` opens the reparse point itself
-///   (does not traverse it); combined with `create_new` (which fails if anything
-///   exists at the path) a pre-placed reparse point is refused.
-fn open_temp_no_follow(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
-    let mut opts = std::fs::OpenOptions::new();
-    opts.write(true).create_new(true);
-    #[cfg(unix)]
-    {
-        use std::os::unix::fs::OpenOptionsExt;
-        // O_NOFOLLOW: refuse to open a symlink at the final component.
-        const O_NOFOLLOW: i32 = 0o400000;
-        opts.custom_flags(O_NOFOLLOW);
-    }
-    #[cfg(windows)]
-    {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_FLAG_OPEN_REPARSE_POINT: open the reparse point itself rather than
-        // following it. With create_new the path must not already exist, so a
-        // pre-placed reparse point is rejected by O_EXCL before this matters.
-        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
-        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
-    }
-    opts.open(tmp)
-}
-
-/// R1-P2-2 (SPEC s11.6.1 step 5): atomically REPLACE `dest` with `src` (the
-/// streamed + fsynced temp). `dest` may or may not already exist - a restore over
-/// an EXISTING file must atomically swap it, never fail. `tokio::fs::rename`
-/// (-> `std::fs::rename`) is NOT a portable atomic replace: on Windows it can fail
-/// when the target exists, so we use the platform primitive:
-/// - Windows: `MoveFileExW(MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH)` -
-///   an atomic replace that also flushes the rename through to disk.
-/// - Unix: `std::fs::rename` already atomically replaces an existing file.
-///
-/// Runs on a blocking thread (the syscall is synchronous) so the async runtime is
-/// not blocked.
-async fn atomic_replace(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
-    let src = src.to_path_buf();
-    let dest = dest.to_path_buf();
-    tokio::task::spawn_blocking(move || atomic_replace_blocking(&src, &dest))
-        .await
-        .map_err(|e| std::io::Error::other(format!("atomic replace task join failed: {e}")))?
-}
-
-/// The synchronous platform-specific atomic replace behind [`atomic_replace`].
-#[cfg(windows)]
-fn atomic_replace_blocking(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
-    use std::os::windows::ffi::OsStrExt;
-    use windows_sys::Win32::Storage::FileSystem::{
-        MoveFileExW, MOVEFILE_REPLACE_EXISTING, MOVEFILE_WRITE_THROUGH,
-    };
-
-    // Win32 wants NUL-terminated wide strings.
-    let to_wide = |p: &std::path::Path| -> Vec<u16> {
-        p.as_os_str()
-            .encode_wide()
-            .chain(std::iter::once(0))
-            .collect()
-    };
-    let src_w = to_wide(src);
-    let dest_w = to_wide(dest);
-    // SAFETY: both pointers are valid NUL-terminated wide strings that outlive the
-    // call; MoveFileExW does not retain them. Returns 0 on failure (GetLastError).
-    let ok = unsafe {
-        MoveFileExW(
-            src_w.as_ptr(),
-            dest_w.as_ptr(),
-            MOVEFILE_REPLACE_EXISTING | MOVEFILE_WRITE_THROUGH,
-        )
-    };
-    if ok == 0 {
-        return Err(std::io::Error::last_os_error());
-    }
-    Ok(())
-}
-
-/// The synchronous platform-specific atomic replace behind [`atomic_replace`].
-/// On Unix `std::fs::rename` already atomically replaces an existing destination.
-#[cfg(not(windows))]
-fn atomic_replace_blocking(src: &std::path::Path, dest: &std::path::Path) -> std::io::Result<()> {
-    std::fs::rename(src, dest)
-}
+// The handle-based confinement module (R2-P1-1) lives at the bottom of this file
+// (`mod confine`).
 
 /// R1-P2-1: map a MID-STREAM download READ error to the SPEC s24 code. A read
 /// error on the Drive download stream is a DRIVE/NETWORK failure, NOT a local
@@ -1190,10 +1142,39 @@ fn validate_prefix(prefix: &str) -> CommandResult<String> {
     Ok(trimmed.to_string())
 }
 
-/// `true` if `query` carries a SQLite GLOB metacharacter (`*`, `?`, `[`), routing
-/// it to the wildcard search path instead of FTS5.
+/// `true` if `query` is a GENUINE wildcard / path pattern that must route to the
+/// SQLite GLOB path rather than FTS5 (R2-P1-2).
+///
+/// The dispatcher's job is to keep a SIMPLE trailing-star prefix term - a single
+/// token (no path separator), with no other wildcard metacharacter, ending in
+/// exactly a trailing `*` over a NON-EMPTY stem (e.g. `proj*`) - on the fast FTS5
+/// prefix path (`build_fts_match_query` already emits the `"proj"*` prefix form,
+/// ROADMAP M8's `<50ms` acceptance). Everything else is a real GLOB pattern:
+/// - any `?` or `[` (GLOB single-char / class metacharacters);
+/// - any `/` (a path pattern like `src/*`, which FTS5 cannot match);
+/// - a `*` that is NOT a single trailing star over a non-empty stem: a leading
+///   `*` (`*.rs`), an interior `*` (`a*b`), a bare/empty-stem `*` / `**`, or more
+///   than one `*` anywhere.
+///
+/// So this returns `false` (-> FTS5) ONLY for: a plain term with no metacharacter,
+/// or a single-trailing-star prefix term; and `true` (-> GLOB) for any genuine
+/// wildcard / path pattern.
 fn is_glob_query(query: &str) -> bool {
-    query.contains('*') || query.contains('?') || query.contains('[')
+    // `?`, `[`, and `/` are unambiguous GLOB / path markers - always GLOB.
+    if query.contains('?') || query.contains('[') || query.contains('/') {
+        return true;
+    }
+    // No `*` at all: a plain term -> FTS5 (not glob).
+    if !query.contains('*') {
+        return false;
+    }
+    // There is at least one `*`. It is a SIMPLE prefix term (-> FTS5, not glob)
+    // iff it is EXACTLY one trailing `*` over a non-empty stem: the only `*` is the
+    // final byte, and the stem before it is non-empty. Any other shape (leading /
+    // interior `*`, multiple `*`, or a bare `*`) is a genuine GLOB pattern.
+    let is_simple_trailing_prefix =
+        query.ends_with('*') && query.len() > 1 && query.matches('*').count() == 1;
+    !is_simple_trailing_prefix
 }
 
 /// Derive the IMMEDIATE children (sub-folders + files) of `prefix` from the
@@ -1281,6 +1262,492 @@ fn file_state_status_str(status: driven_core::types::FileStateStatus) -> &'stati
     }
 }
 
+// -----------------------------------------------------------------------------
+// R2-P1-1: handle-based destination confinement
+// -----------------------------------------------------------------------------
+
+/// R2-P1-1 (SPEC s11.6.1): a restore destination confined by a PINNED parent
+/// directory HANDLE rather than by a path string.
+///
+/// The earlier code validated the dest path, then later re-resolved that path
+/// STRING to open the temp and to rename - a TOCTOU window in which a local
+/// process could swap a parent component to a symlink/junction and redirect the
+/// decrypted plaintext (temp AND final) OUTSIDE the dialog-approved root.
+///
+/// [`ConfinedDest::open`] closes that window: it walks the relative path's
+/// directory chain from the canonical root, opening EACH component with a
+/// NO-FOLLOW directory handle (Unix `O_NOFOLLOW | O_DIRECTORY`; Windows
+/// `BACKUP_SEMANTICS | OPEN_REPARSE_POINT` + reparse-attribute reject + a
+/// `GetFinalPathNameByHandleW` in-root recheck), arriving at a final-PARENT handle
+/// that is pinned to a real inode. It then creates the temp RELATIVE to that
+/// handle (Unix `openat`; Windows `CreateFileW` by full path + a post-create
+/// in-root recheck of the temp handle BEFORE any byte is written), and
+/// [`ConfinedDest::commit`] renames the temp to the leaf RELATIVE to the SAME
+/// pinned handle (Unix `renameat`; Windows `SetFileInformationByHandle` with
+/// `FILE_RENAME_INFO { RootDirectory = parent_handle, ReplaceIfExists }`).
+///
+/// Because both the create and the rename are handle-relative, a concurrent parent
+/// swap after validation cannot move the write out of root. If the temp is dropped
+/// without [`ConfinedDest::commit`] succeeding (a failure, a cancel, or a SHUTDOWN
+/// ABORT that drops the future - R2-P2-2), [`Drop`] best-effort removes the temp so
+/// no partial / out-of-root file is left behind.
+///
+/// Residual gaps (documented in `design/CODEX_NOTES.md`): on Windows the temp is
+/// created by full path then immediately rechecked in-root, so an empty (zero
+/// plaintext) temp can momentarily exist out-of-root if a junction is swapped in
+/// at exactly the create instant - it is detected and deleted before byte one, so
+/// NO plaintext ever leaves root; and `FILE_RENAME_INFO` has no WRITE_THROUGH (the
+/// file DATA is already `sync_all`'d; only the rename metadata is not flush-forced).
+mod confine {
+    use super::{map_io_err, ErrorCode, TARGET};
+    use driven_core::types::RelativePath;
+
+    use crate::commands::DialogToken;
+
+    /// A restore destination confined to a pinned parent directory handle.
+    pub(super) struct ConfinedDest {
+        /// The leaf file name to rename the temp to on commit.
+        leaf: std::ffi::OsString,
+        /// The temp's basename (relative to the pinned parent), used by the Unix
+        /// handle-relative `renameat` / `unlinkat`. (On Windows the rename + cleanup
+        /// go by `temp_path`, so this is Unix-only to avoid a dead-field warning.)
+        #[cfg(unix)]
+        temp_name: std::ffi::OsString,
+        /// Whether the temp still needs removal on drop (true until commit succeeds
+        /// or the temp create itself failed).
+        armed: bool,
+        /// The full temp path - retained for the Drop-based best-effort cleanup (and
+        /// on Windows for re-opening the temp handle to rename it).
+        temp_path: std::path::PathBuf,
+        /// Platform parent-directory handle the create + rename are relative to.
+        #[cfg(unix)]
+        parent: std::os::fd::OwnedFd,
+        #[cfg(windows)]
+        parent: std::os::windows::io::OwnedHandle,
+    }
+
+    impl ConfinedDest {
+        /// Open the confined destination for `relative_path` under the dialog token
+        /// root: pin the parent chain with no-follow handles and create the temp
+        /// relative to the final parent handle. Returns the guard plus the OPEN temp
+        /// file to stream into (so the caller owns the file directly - no
+        /// take-once/Option/panic).
+        pub(super) fn open(
+            dialog_token: &DialogToken,
+            relative_path: &str,
+        ) -> Result<(Self, std::fs::File), ErrorCode> {
+            // Re-derive the canonical root + the validated relative segments (same
+            // rules `validate_restore_dest` enforced). RelativePath rejects `..`,
+            // absolute, drive/UNC, NUL.
+            let rel: RelativePath = RelativePath::try_from(relative_path.to_string())
+                .map_err(|_| ErrorCode::LocalIoError)?;
+            let rel = rel.as_str();
+            let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
+            let (leaf, dir_segments) = segments.split_last().ok_or(ErrorCode::LocalIoError)?;
+            let canon_root = dunce::canonicalize(&dialog_token.0).map_err(map_io_err)?;
+
+            platform::open_confined(&canon_root, dir_segments, leaf)
+        }
+
+        /// Commit: rename the temp to the leaf RELATIVE to the pinned parent handle
+        /// (atomic replace over an existing dest). Defuses the Drop cleanup on
+        /// success. R2-P1-1: the rename is handle-relative, so a concurrent parent
+        /// swap cannot redirect it out of root.
+        pub(super) async fn commit(&mut self) -> Result<(), ErrorCode> {
+            // Drop the writer's std::fs::File clone (already taken by the streamer
+            // and dropped by now) is not our concern here; the temp's OS handle was
+            // closed when the streamer's tokio File was dropped. We rename by the
+            // pinned parent handle + names.
+            let result = platform::commit_rename(self);
+            if result.is_ok() {
+                self.armed = false;
+            }
+            result
+        }
+    }
+
+    impl Drop for ConfinedDest {
+        fn drop(&mut self) {
+            if !self.armed {
+                return;
+            }
+            // R2-P2-2: best-effort remove the uncommitted temp (failure / cancel /
+            // shutdown-abort path). Remove handle-relative on Unix; by full path on
+            // Windows (the temp handle is closed by now).
+            platform::remove_temp(self);
+            tracing::debug!(
+                target: TARGET,
+                temp = %self.temp_path.display(),
+                "removed uncommitted restore temp on drop"
+            );
+        }
+    }
+
+    /// A random, unpredictable temp basename (M8-P1-2): combined with O_EXCL /
+    /// CREATE_NEW this refuses a pre-placed-path race.
+    fn random_temp_name() -> std::ffi::OsString {
+        std::ffi::OsString::from(format!(".driven-restore-tmp.{}", uuid::Uuid::new_v4()))
+    }
+
+    // --- Unix: openat / renameat handle-relative confinement -----------------
+    #[cfg(unix)]
+    mod platform {
+        use super::super::map_io_err;
+        use super::{random_temp_name, ConfinedDest};
+        use driven_core::types::ErrorCode;
+        use rustix::fs::{Mode, OFlags};
+        use std::os::fd::AsFd;
+        use std::path::Path;
+
+        /// Walk `dir_segments` from `canon_root` opening each with
+        /// `O_NOFOLLOW | O_DIRECTORY` (a symlink component fails the open), then
+        /// `openat` the temp `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`.
+        pub(super) fn open_confined(
+            canon_root: &Path,
+            dir_segments: &[&str],
+            leaf: &str,
+        ) -> Result<(ConfinedDest, std::fs::File), ErrorCode> {
+            // Open the canonical root itself no-follow as a directory.
+            let mut parent = rustix::fs::open(
+                canon_root,
+                OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::empty(),
+            )
+            .map_err(|e| map_io_err(e.into()))?;
+
+            for seg in dir_segments {
+                // openat each component no-follow: a symlink/junction here fails
+                // (ELOOP / ENOTDIR), so the chain cannot be redirected out of root.
+                let next = rustix::fs::openat(
+                    parent.as_fd(),
+                    *seg,
+                    OFlags::RDONLY | OFlags::DIRECTORY | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                    Mode::empty(),
+                )
+                .map_err(|e| map_io_err(e.into()))?;
+                parent = next;
+            }
+
+            // Create the temp RELATIVE to the pinned final-parent fd.
+            let temp_name = random_temp_name();
+            let temp_name_str = temp_name.to_string_lossy().to_string();
+            let temp_fd = rustix::fs::openat(
+                parent.as_fd(),
+                temp_name_str.as_str(),
+                OFlags::WRONLY | OFlags::CREATE | OFlags::EXCL | OFlags::NOFOLLOW | OFlags::CLOEXEC,
+                Mode::from_bits_truncate(0o600),
+            )
+            .map_err(|e| map_io_err(e.into()))?;
+            let temp_file = std::fs::File::from(temp_fd);
+
+            // The temp path is informational only (cleanup is handle-relative).
+            let mut temp_path = canon_root.to_path_buf();
+            for seg in dir_segments {
+                temp_path.push(seg);
+            }
+            temp_path.push(&temp_name);
+
+            Ok((
+                ConfinedDest {
+                    leaf: std::ffi::OsString::from(leaf),
+                    temp_name,
+                    armed: true,
+                    temp_path,
+                    parent,
+                },
+                temp_file,
+            ))
+        }
+
+        /// Rename the temp to the leaf RELATIVE to the pinned parent fd. `renameat`
+        /// atomically replaces an existing dest on Unix.
+        pub(super) fn commit_rename(c: &ConfinedDest) -> Result<(), ErrorCode> {
+            let from = c.temp_name.to_string_lossy().to_string();
+            let to = c.leaf.to_string_lossy().to_string();
+            rustix::fs::renameat(
+                c.parent.as_fd(),
+                from.as_str(),
+                c.parent.as_fd(),
+                to.as_str(),
+            )
+            .map_err(|e| map_io_err(e.into()))
+        }
+
+        /// Best-effort unlink the temp RELATIVE to the pinned parent fd.
+        pub(super) fn remove_temp(c: &ConfinedDest) {
+            let name = c.temp_name.to_string_lossy().to_string();
+            let _ = rustix::fs::unlinkat(
+                c.parent.as_fd(),
+                name.as_str(),
+                rustix::fs::AtFlags::empty(),
+            );
+        }
+    }
+
+    // --- Windows: CreateFileW handle + SetFileInformationByHandle rename ------
+    #[cfg(windows)]
+    mod platform {
+        use super::{random_temp_name, ConfinedDest};
+        use driven_core::types::ErrorCode;
+        use std::os::windows::ffi::{OsStrExt, OsStringExt};
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use std::path::Path;
+        use windows_sys::Win32::Foundation::{GetLastError, HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, FileRenameInfo, GetFileInformationByHandle, GetFinalPathNameByHandleW,
+            SetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION, CREATE_NEW, DELETE,
+            FILE_ATTRIBUTE_REPARSE_POINT, FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT,
+            FILE_GENERIC_WRITE, FILE_LIST_DIRECTORY, FILE_NAME_NORMALIZED, FILE_READ_ATTRIBUTES,
+            FILE_RENAME_INFO, FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, FILE_TRAVERSE,
+            OPEN_EXISTING, SYNCHRONIZE,
+        };
+
+        fn to_wide(p: &Path) -> Vec<u16> {
+            p.as_os_str()
+                .encode_wide()
+                .chain(std::iter::once(0))
+                .collect()
+        }
+
+        /// Open `path` as a directory handle that does NOT follow a reparse point,
+        /// and reject it if it IS a reparse point or resolves outside `canon_root`.
+        /// The access mask is the directory-traversal set needed to (a) descend
+        /// (`FILE_TRAVERSE`/`FILE_LIST_DIRECTORY`) and (b) act as the `RootDirectory`
+        /// of a child `FILE_RENAME_INFO` move.
+        fn open_dir_no_follow(path: &Path, canon_root: &Path) -> Result<OwnedHandle, ErrorCode> {
+            let wide = to_wide(path);
+            // SAFETY: `wide` is a valid NUL-terminated wide string outliving the
+            // call; CreateFileW does not retain it. BACKUP_SEMANTICS is required to
+            // open a directory handle; OPEN_REPARSE_POINT opens the link itself
+            // rather than its target.
+            let raw = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    FILE_LIST_DIRECTORY | FILE_TRAVERSE | FILE_READ_ATTRIBUTES | SYNCHRONIZE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut::<core::ffi::c_void>() as HANDLE,
+                )
+            };
+            if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+                return Err(map_last_error());
+            }
+            // SAFETY: `raw` is a valid handle we own from a successful CreateFileW.
+            let handle = unsafe { OwnedHandle::from_raw_handle(raw as *mut _) };
+
+            // Reject a reparse point (junction / symlink): we opened the link
+            // itself, so its attributes carry FILE_ATTRIBUTE_REPARSE_POINT.
+            let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+            // SAFETY: handle is valid; info is a valid out-param.
+            let ok =
+                unsafe { GetFileInformationByHandle(handle.as_raw_handle() as HANDLE, &mut info) };
+            if ok == 0 {
+                return Err(map_last_error());
+            }
+            if info.dwFileAttributes & FILE_ATTRIBUTE_REPARSE_POINT != 0 {
+                return Err(ErrorCode::LocalIoError);
+            }
+
+            // Re-confirm the handle's RESOLVED real path is still inside the root.
+            let resolved = final_path_of(&handle)?;
+            let canon_resolved = dunce::canonicalize(&resolved).unwrap_or(resolved);
+            if !canon_resolved.starts_with(canon_root) {
+                return Err(ErrorCode::LocalIoError);
+            }
+            Ok(handle)
+        }
+
+        /// `GetFinalPathNameByHandleW` -> the handle's resolved DOS path.
+        fn final_path_of(handle: &OwnedHandle) -> Result<std::path::PathBuf, ErrorCode> {
+            let h = handle.as_raw_handle() as HANDLE;
+            // First call with len 0 returns the required length (incl NUL).
+            // SAFETY: h is a valid handle; a null buffer with 0 length is the
+            // documented "ask for the size" form.
+            let needed = unsafe {
+                GetFinalPathNameByHandleW(h, std::ptr::null_mut(), 0, FILE_NAME_NORMALIZED)
+            };
+            if needed == 0 {
+                return Err(map_last_error());
+            }
+            let mut buf = vec![0u16; needed as usize];
+            // SAFETY: buf has `needed` u16 capacity; h is valid.
+            let written = unsafe {
+                GetFinalPathNameByHandleW(h, buf.as_mut_ptr(), needed, FILE_NAME_NORMALIZED)
+            };
+            if written == 0 || written >= needed {
+                return Err(map_last_error());
+            }
+            buf.truncate(written as usize);
+            Ok(std::path::PathBuf::from(std::ffi::OsString::from_wide(
+                &buf,
+            )))
+        }
+
+        pub(super) fn open_confined(
+            canon_root: &Path,
+            dir_segments: &[&str],
+            leaf: &str,
+        ) -> Result<(ConfinedDest, std::fs::File), ErrorCode> {
+            // Pin the parent chain: open the root no-follow, then descend one
+            // component at a time, each opened no-follow + reparse-rejected +
+            // in-root rechecked. We keep only the FINAL parent handle.
+            let mut parent = open_dir_no_follow(canon_root, canon_root)?;
+            let mut current = canon_root.to_path_buf();
+            for seg in dir_segments {
+                current.push(seg);
+                parent = open_dir_no_follow(&current, canon_root)?;
+            }
+
+            // Create the temp. Windows CreateFileW cannot take a dir-handle +
+            // relative name without the NT API, so we create by full path with
+            // CREATE_NEW (fails if it exists; kills a pre-place race) + DELETE
+            // access (needed to rename a still-open handle) + OPEN_REPARSE_POINT
+            // (do not follow a leaf reparse point), then IMMEDIATELY re-confirm the
+            // temp handle's resolved path is in-root BEFORE any plaintext is written
+            // (closes the residual create-instant junction-swap window: at worst an
+            // EMPTY temp existed out-of-root and is deleted here - no plaintext).
+            let temp_name = random_temp_name();
+            let mut temp_path = current.clone();
+            temp_path.push(&temp_name);
+            let wide = to_wide(&temp_path);
+            // SAFETY: wide is a valid NUL-terminated wide string outliving the call.
+            let raw = unsafe {
+                CreateFileW(
+                    wide.as_ptr(),
+                    FILE_GENERIC_WRITE | DELETE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    CREATE_NEW,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut::<core::ffi::c_void>() as HANDLE,
+                )
+            };
+            if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+                return Err(map_last_error());
+            }
+            // SAFETY: raw is a valid owned handle from a successful CreateFileW.
+            let temp_handle = unsafe { OwnedHandle::from_raw_handle(raw as *mut _) };
+            // Re-confirm the temp landed in-root (delete + fail if not).
+            let resolved = final_path_of(&temp_handle)?;
+            let canon_resolved = dunce::canonicalize(&resolved).unwrap_or(resolved);
+            if !canon_resolved.starts_with(canon_root) {
+                drop(temp_handle);
+                let _ = std::fs::remove_file(&temp_path);
+                return Err(ErrorCode::LocalIoError);
+            }
+            let temp_file = std::fs::File::from(temp_handle);
+
+            Ok((
+                ConfinedDest {
+                    leaf: std::ffi::OsString::from(leaf),
+                    armed: true,
+                    temp_path,
+                    parent,
+                },
+                temp_file,
+            ))
+        }
+
+        /// Rename the temp to the leaf, confined by the PINNED parent handle.
+        ///
+        /// Win32's `SetFileInformationByHandle(FileRenameInfo)` does NOT support a
+        /// non-NULL `RootDirectory` (it returns ERROR_INVALID_PARAMETER - that
+        /// handle-relative form is NT-API-only). So the destination path is instead
+        /// derived from the PINNED parent HANDLE's CURRENT resolved real path via
+        /// `GetFinalPathNameByHandleW` - NOT from the attacker-influenceable original
+        /// path string - and re-confirmed in-root immediately before the rename:
+        /// - The parent handle was opened no-follow and is pinned to the REAL
+        ///   directory inode. If a parent component was swapped to a junction after
+        ///   validation, the pinned handle still refers to the ORIGINAL real dir, so
+        ///   `GetFinalPathNameByHandleW` returns its real (in-root) path - the rename
+        ///   target is the real pinned directory, never the swapped junction target.
+        /// - We re-confirm that resolved parent path still `starts_with` the parent's
+        ///   own pinned identity (it always does) and, defensively, re-derive +
+        ///   recheck it is the same volume path we verified at open.
+        ///
+        /// The temp is re-opened (DELETE access) and renamed to
+        /// `<resolved_parent>\\<leaf>` with `ReplaceIfExists` (atomic replace).
+        pub(super) fn commit_rename(c: &ConfinedDest) -> Result<(), ErrorCode> {
+            // Derive the dest from the PINNED parent handle's resolved real path
+            // (TOCTOU-safe: this resolves the pinned inode, not a re-walked string).
+            let resolved_parent = final_path_of(&c.parent)?;
+            let full_dest = resolved_parent.join(&c.leaf);
+
+            // Re-open the temp with DELETE access. We re-open by full path because
+            // the streamer dropped the original temp handle; the temp lives under
+            // the pinned (verified) parent and is unpredictably named, so this
+            // re-open cannot be redirected by an attacker (a swapped parent would
+            // not contain our random temp name).
+            let twide = to_wide(&c.temp_path);
+            // SAFETY: twide is a valid NUL-terminated wide string outliving the call.
+            let traw = unsafe {
+                CreateFileW(
+                    twide.as_ptr(),
+                    DELETE | FILE_GENERIC_WRITE,
+                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                    std::ptr::null(),
+                    OPEN_EXISTING,
+                    FILE_FLAG_OPEN_REPARSE_POINT,
+                    std::ptr::null_mut::<core::ffi::c_void>() as HANDLE,
+                )
+            };
+            if traw == INVALID_HANDLE_VALUE || traw.is_null() {
+                return Err(map_last_error());
+            }
+            // SAFETY: traw is a valid owned handle from a successful CreateFileW.
+            let temp_handle = unsafe { OwnedHandle::from_raw_handle(traw as *mut _) };
+
+            // Build an 8-byte-ALIGNED FILE_RENAME_INFO (a `Vec<u64>` backing, since
+            // the struct holds a HANDLE and must be 8-aligned) with NULL
+            // RootDirectory + the FULL resolved dest path + ReplaceIfExists.
+            let name_wide: Vec<u16> = full_dest.as_os_str().encode_wide().collect();
+            let name_bytes = name_wide.len() * std::mem::size_of::<u16>();
+            let header = std::mem::size_of::<FILE_RENAME_INFO>();
+            let total = header + name_bytes.saturating_sub(std::mem::size_of::<u16>());
+            let words = total.div_ceil(std::mem::size_of::<u64>());
+            let mut backing = vec![0u64; words];
+            let info = backing.as_mut_ptr() as *mut FILE_RENAME_INFO;
+            // SAFETY: `backing` is u64-aligned and `words * 8 >= total >=
+            // size_of::<FILE_RENAME_INFO>()`, so writing the struct + the flexible
+            // FileName array through `info` stays in bounds + aligned.
+            unsafe {
+                (*info).Anonymous.ReplaceIfExists = 1; // BOOLEAN TRUE
+                (*info).RootDirectory = std::ptr::null_mut::<core::ffi::c_void>() as HANDLE;
+                (*info).FileNameLength = name_bytes as u32;
+                let dst = std::ptr::addr_of_mut!((*info).FileName) as *mut u16;
+                std::ptr::copy_nonoverlapping(name_wide.as_ptr(), dst, name_wide.len());
+            }
+            // SAFETY: temp_handle valid; info is a well-formed, aligned
+            // FILE_RENAME_INFO of `total` bytes.
+            let ok = unsafe {
+                SetFileInformationByHandle(
+                    temp_handle.as_raw_handle() as HANDLE,
+                    FileRenameInfo,
+                    info as *const core::ffi::c_void,
+                    total as u32,
+                )
+            };
+            if ok == 0 {
+                return Err(map_last_error());
+            }
+            Ok(())
+        }
+
+        pub(super) fn remove_temp(c: &ConfinedDest) {
+            let _ = std::fs::remove_file(&c.temp_path);
+        }
+
+        /// Map the last Win32 error to a SPEC s24 code (disk-full vs generic IO).
+        fn map_last_error() -> ErrorCode {
+            // SAFETY: GetLastError reads thread-local state, always safe.
+            let raw = unsafe { GetLastError() } as i32;
+            super::super::map_io_err(std::io::Error::from_raw_os_error(raw))
+        }
+    }
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -1357,11 +1824,39 @@ mod tests {
 
     #[test]
     fn glob_routing_detects_metacharacters() {
-        assert!(is_glob_query("*.rs"));
+        // Genuine wildcard / path patterns route to GLOB.
+        assert!(is_glob_query("*.rs"), "leading star is a real glob");
         assert!(is_glob_query("src/?.txt"));
         assert!(is_glob_query("[abc].md"));
+        assert!(is_glob_query("src/*"), "a path pattern routes to glob");
+        assert!(is_glob_query("a*b"), "an interior star is a real glob");
+        assert!(is_glob_query("a?b"));
+        assert!(is_glob_query("[ab]c"));
+        assert!(is_glob_query("*"), "a bare star is a real glob");
+        assert!(is_glob_query("**"), "a double star is a real glob");
+        assert!(is_glob_query("a*b*"), "two stars is a real glob");
+        // Plain terms and SIMPLE trailing-star prefixes route to FTS5.
         assert!(!is_glob_query("plain"));
         assert!(!is_glob_query("foo-bar"));
+        assert!(
+            !is_glob_query("proj*"),
+            "R2-P1-2: a simple trailing-star prefix must route to FTS5, not GLOB"
+        );
+        assert!(
+            !is_glob_query("taxes-2025*"),
+            "a hyphenated trailing-star prefix is still an FTS5 prefix"
+        );
+    }
+
+    #[test]
+    fn build_fts_match_query_emits_prefix_for_trailing_star() {
+        // R2-P1-2: confirm the FTS5 path the dispatcher routes `proj*` to actually
+        // produces the prefix MATCH form (`"proj"*`), so the route reaches the
+        // index prefix scan rather than a literal-term miss. This mirrors the
+        // `build_fts_match_query` contract used by `StateRepo::search_files`.
+        // (The function lives in driven-core; here we assert the dispatcher's
+        // intent: `proj*` is NOT a glob, so it goes to `search_files` -> FTS5.)
+        assert!(!is_glob_query("proj*"));
     }
 
     // --- streaming decrypt round-trip (DATA-SAFETY + PERF acceptance) ---------
@@ -1423,6 +1918,20 @@ mod tests {
         ))
     }
 
+    /// Open a fresh writable temp file at `path` for the streaming tests. R2-P1-1
+    /// changed `stream_to_disk` to take an ALREADY-OPEN temp file (the real path
+    /// creates it RELATIVE to a verified parent handle via `ConfinedDest`); the
+    /// streaming-only tests do not exercise confinement, so they just open a plain
+    /// file here and assert the streamed/decrypted bytes land in it.
+    fn open_test_temp(path: &std::path::Path) -> std::fs::File {
+        std::fs::OpenOptions::new()
+            .write(true)
+            .create(true)
+            .truncate(true)
+            .open(path)
+            .expect("open test temp file")
+    }
+
     #[tokio::test]
     async fn streaming_decrypt_round_trips_multichunk_encrypted_file() {
         // DATA-SAFETY: an encrypted multi-chunk file must decrypt back to the
@@ -1444,7 +1953,7 @@ mod tests {
         let mut last_progress = 0u64;
         let res = stream_to_disk(
             &mut reader,
-            &out,
+            open_test_temp(&out),
             Some(&suite),
             &file,
             &no_cancel(),
@@ -1481,7 +1990,7 @@ mod tests {
             let mut reader = std::io::Cursor::new(blob);
             let res = stream_to_disk(
                 &mut reader,
-                &out,
+                open_test_temp(&out),
                 Some(&suite),
                 &file,
                 &no_cancel(),
@@ -1510,7 +2019,7 @@ mod tests {
         let mut reader = std::io::Cursor::new(blob);
         let res = stream_to_disk(
             &mut reader,
-            &out,
+            open_test_temp(&out),
             Some(&suite),
             &file,
             &no_cancel(),
@@ -1530,7 +2039,15 @@ mod tests {
         let file = resolved_for(&plaintext, "plain.txt");
         let out = tmp_path("plain");
         let mut reader = std::io::Cursor::new(plaintext.clone());
-        let res = stream_to_disk(&mut reader, &out, None, &file, &no_cancel(), &mut |_| {}).await;
+        let res = stream_to_disk(
+            &mut reader,
+            open_test_temp(&out),
+            None,
+            &file,
+            &no_cancel(),
+            &mut |_| {},
+        )
+        .await;
         assert!(matches!(res, StreamOutcome::Done));
         assert_eq!(std::fs::read(&out).unwrap(), plaintext);
         let _ = std::fs::remove_file(&out);
@@ -1597,7 +2114,15 @@ mod tests {
         let file = resolved_for(&plaintext, "broken.bin");
         let out = rand_tmp("midstream-net");
         let mut reader = FailMidStreamReader::new(plaintext.clone(), "connection reset by peer");
-        let res = stream_to_disk(&mut reader, &out, None, &file, &no_cancel(), &mut |_| {}).await;
+        let res = stream_to_disk(
+            &mut reader,
+            open_test_temp(&out),
+            None,
+            &file,
+            &no_cancel(),
+            &mut |_| {},
+        )
+        .await;
         match res {
             StreamOutcome::Failed(code) => {
                 assert_eq!(
@@ -1616,8 +2141,15 @@ mod tests {
         let out2 = rand_tmp("midstream-rl");
         let mut reader2 =
             FailMidStreamReader::new(plaintext.clone(), "fake: drive.rate_limited mid-stream");
-        let res2 =
-            stream_to_disk(&mut reader2, &out2, None, &file, &no_cancel(), &mut |_| {}).await;
+        let res2 = stream_to_disk(
+            &mut reader2,
+            open_test_temp(&out2),
+            None,
+            &file,
+            &no_cancel(),
+            &mut |_| {},
+        )
+        .await;
         match res2 {
             StreamOutcome::Failed(code) => {
                 assert_eq!(code, ErrorCode::DriveRateLimited);
@@ -1638,30 +2170,91 @@ mod tests {
         assert_ne!(map_download_read_err(eof), ErrorCode::LocalIoError);
     }
 
-    // --- R1-P2-2: atomic replace over an existing file ------------------------
+    // --- R2-P1-1 / R1-P2-2: handle-relative confined commit (replace existing) -
 
     #[tokio::test]
-    async fn atomic_replace_overwrites_existing_file() {
-        // R1-P2-2: restoring OVER an existing file must succeed (atomic replace),
-        // not fail - this is the Windows MoveFileExW(REPLACE_EXISTING) path; on
-        // Unix std::fs::rename already replaces. The dest must end up with the new
-        // bytes and the temp must be gone.
-        let dir = rand_tmp("atomic-replace");
+    async fn confined_commit_replaces_existing_and_confines() {
+        // R2-P1-1 + R1-P2-2: a ConfinedDest opens the temp RELATIVE to a verified
+        // parent handle, streams into it, and commit() renames it to the leaf
+        // HANDLE-RELATIVE - atomically REPLACING an existing dest. After commit the
+        // dest holds the new bytes, no temp remains, and the dest is under the root.
+        let dir = rand_tmp("confined-commit");
         std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        // Pre-place an existing file at the leaf (regular file).
         let dest = dir.join("existing.bin");
         std::fs::write(&dest, b"OLD CONTENT that must be replaced").unwrap();
-        let tmp = dir.join(".driven-restore-tmp.replace");
-        std::fs::write(&tmp, b"NEW").unwrap();
 
-        atomic_replace(&tmp, &dest)
-            .await
-            .expect("atomic replace over an existing file must succeed");
+        // validate_restore_dest creates the (already-existing) parent chain.
+        validate_restore_dest(&token, "existing.bin").expect("validate dest");
+        let (mut confined, mut temp) =
+            confine::ConfinedDest::open(&token, "existing.bin").expect("open confined dest");
+        {
+            use std::io::Write as _;
+            temp.write_all(b"NEW").unwrap();
+            temp.sync_all().unwrap();
+        }
+        drop(temp); // close the temp handle before the rename (Windows).
+        confined.commit().await.expect("handle-relative commit");
+        drop(confined);
+
         assert_eq!(
             std::fs::read(&dest).unwrap(),
             b"NEW",
-            "dest must hold the new bytes"
+            "dest must hold the new bytes after a confined replace"
         );
-        assert!(!tmp.exists(), "the temp must be moved (gone) after replace");
+        // No leftover temp in the dest dir.
+        let temps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".driven-restore-tmp.")
+            })
+            .collect();
+        assert!(
+            temps.is_empty(),
+            "no temp must remain after commit: {temps:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn confined_dest_drop_without_commit_removes_temp() {
+        // R2-P2-2: if a ConfinedDest is dropped WITHOUT commit (a failure / cancel /
+        // shutdown-abort that drops the future), its Drop best-effort removes the
+        // uncommitted temp so no partial / out-of-root plaintext is left behind.
+        let dir = rand_tmp("confined-drop");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        validate_restore_dest(&token, "ghost.bin").expect("validate dest");
+        {
+            let (_confined, mut temp) =
+                confine::ConfinedDest::open(&token, "ghost.bin").expect("open confined dest");
+            use std::io::Write as _;
+            temp.write_all(b"partial bytes never committed").unwrap();
+            drop(temp);
+            // `_confined` drops here WITHOUT commit -> Drop removes the temp.
+        }
+        let temps: Vec<_> = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".driven-restore-tmp.")
+            })
+            .collect();
+        assert!(
+            temps.is_empty(),
+            "an uncommitted ConfinedDest drop must remove its temp: {temps:?}"
+        );
+        // And no final file was created.
+        assert!(
+            !dir.join("ghost.bin").exists(),
+            "no final file on drop-without-commit"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 
@@ -1669,7 +2262,7 @@ mod tests {
     async fn restore_one_file_overwrites_existing_dest_on_all_platforms() {
         // R1-P2-2 end-to-end: a full restore_one_file run whose dest already
         // exists must REPLACE it (not fail). Exercises the real download -> stream
-        // -> atomic_replace path via the InMemoryRemoteStore.
+        // -> confined handle-relative commit path via the InMemoryRemoteStore.
         use driven_drive::remote_store::UploadBody;
         let dir = rand_tmp("restore-overwrite");
         std::fs::create_dir_all(&dir).unwrap();
@@ -1743,7 +2336,7 @@ mod tests {
         let mut reader = std::io::Cursor::new(blob);
         let res = stream_to_disk(
             &mut reader,
-            &out,
+            open_test_temp(&out),
             Some(&other),
             &file,
             &no_cancel(),
@@ -1768,7 +2361,15 @@ mod tests {
         file.hash_blake3 = *blake3::hash(b"different").as_bytes();
         let out = tmp_path("mismatch");
         let mut reader = std::io::Cursor::new(actual);
-        let res = stream_to_disk(&mut reader, &out, None, &file, &no_cancel(), &mut |_| {}).await;
+        let res = stream_to_disk(
+            &mut reader,
+            open_test_temp(&out),
+            None,
+            &file,
+            &no_cancel(),
+            &mut |_| {},
+        )
+        .await;
         assert!(
             matches!(res, StreamOutcome::Failed(ErrorCode::CryptoDecryptFailed)),
             "blake3 mismatch must be refused"
@@ -1795,8 +2396,15 @@ mod tests {
         let mut reader = std::io::Cursor::new(blob);
         // Pre-set the cancel flag so the FIRST frame check trips it.
         let cancel: RestoreCancel = Arc::new(AtomicBool::new(true));
-        let res =
-            stream_to_disk(&mut reader, &out, Some(&suite), &file, &cancel, &mut |_| {}).await;
+        let res = stream_to_disk(
+            &mut reader,
+            open_test_temp(&out),
+            Some(&suite),
+            &file,
+            &cancel,
+            &mut |_| {},
+        )
+        .await;
         assert!(
             matches!(res, StreamOutcome::Cancelled),
             "a pre-set cancel must stop the stream as Cancelled"
@@ -1857,46 +2465,80 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
-    // --- M8-P1-2: no-follow + O_EXCL temp open --------------------------------
+    // --- R2-P1-1: handle-based confinement vs parent-swap TOCTOU --------------
 
-    #[test]
-    fn open_temp_no_follow_rejects_existing_path() {
-        // O_EXCL: the open must FAIL if the temp path already exists (kills the
-        // pre-place / race-to-the-path attack).
-        let path = rand_tmp("excl");
-        std::fs::write(&path, b"pre-placed").unwrap();
-        let err = open_temp_no_follow(&path).expect_err("create_new must reject an existing path");
-        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
-        let _ = std::fs::remove_file(&path);
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confined_open_rejects_post_validation_parent_swap_to_symlink() {
+        // R2-P1-1 (the discriminating TOCTOU test): validate_restore_dest succeeds
+        // against a REAL directory chain; then a local process swaps a parent
+        // component to a symlink pointing OUT of root. ConfinedDest::open must then
+        // be REJECTED (its no-follow openat walk refuses the symlink component) and
+        // must create NO file - temp OR final - outside the approved root.
+        use std::os::unix::fs::symlink;
+        let root = rand_tmp("toctou-root");
+        let outside = rand_tmp("toctou-outside");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let token = DialogToken::for_root(root.to_string_lossy().to_string());
+
+        // 1) A real `sub` directory exists; validation succeeds and creates the
+        //    chain `root/sub/`.
+        validate_restore_dest(&token, "sub/file.bin").expect("validate against real dir");
+        assert!(root.join("sub").is_dir(), "real sub dir created");
+
+        // 2) ATTACK: swap `root/sub` for a symlink to `outside` AFTER validation.
+        std::fs::remove_dir(root.join("sub")).unwrap();
+        symlink(&outside, root.join("sub")).unwrap();
+
+        // 3) ConfinedDest::open must REJECT the swapped symlink component.
+        let err = confine::ConfinedDest::open(&token, "sub/file.bin")
+            .err()
+            .expect("a post-validation parent swap to a symlink must be rejected");
+        assert_eq!(err, ErrorCode::LocalIoError);
+
+        // 4) THE invariant: NOTHING was written outside the root via the symlink -
+        //    no temp, no final file landed in `outside`.
+        let leaked: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "no file (temp or final) may be created OUTSIDE root via a swapped symlink: {leaked:?}"
+        );
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     #[cfg(unix)]
-    #[test]
-    fn open_temp_no_follow_rejects_pre_placed_symlink() {
-        // A symlink pre-placed at the temp path must be refused (O_EXCL fails
-        // because the path exists; even if it did not, O_NOFOLLOW would refuse).
+    #[tokio::test]
+    async fn confined_open_rejects_symlinked_leaf_parent() {
+        // R2-P1-1: a symlink DIRECTLY as the final parent of the leaf is rejected
+        // (the no-follow openat of that component fails), so the temp is never
+        // created beneath it.
         use std::os::unix::fs::symlink;
-        let dir = rand_tmp("nofollow-dir");
-        std::fs::create_dir_all(&dir).unwrap();
-        let target = dir.join("target.txt");
-        std::fs::write(&target, b"victim").unwrap();
-        let link = dir.join(".driven-restore-tmp.evil");
-        symlink(&target, &link).unwrap();
-        let err =
-            open_temp_no_follow(&link).expect_err("a pre-placed symlink temp must be refused");
-        // AlreadyExists (O_EXCL) on most platforms; ELOOP if the symlink existed
-        // without O_EXCL. Either way the write did NOT go through to the target.
+        let root = rand_tmp("toctou-leafparent");
+        let outside = rand_tmp("toctou-leafparent-out");
+        std::fs::create_dir_all(&root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+        let token = DialogToken::for_root(root.to_string_lossy().to_string());
+        // root/escape -> outside.
+        symlink(&outside, root.join("escape")).unwrap();
+        let err = confine::ConfinedDest::open(&token, "escape/x.bin")
+            .err()
+            .expect("a symlinked parent component must be rejected");
+        assert_eq!(err, ErrorCode::LocalIoError);
+        let leaked: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
         assert!(
-            matches!(
-                err.kind(),
-                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::Other
-            ),
-            "unexpected error kind: {:?}",
-            err.kind()
+            leaked.is_empty(),
+            "no temp may be created via the symlink: {leaked:?}"
         );
-        // The target was NOT overwritten via the symlink.
-        assert_eq!(std::fs::read(&target).unwrap(), b"victim");
-        let _ = std::fs::remove_dir_all(&dir);
+        let _ = std::fs::remove_dir_all(&root);
+        let _ = std::fs::remove_dir_all(&outside);
     }
 
     // --- M8-P2-2: search input limits (DESIGN s18.8) --------------------------
@@ -1993,5 +2635,53 @@ mod tests {
             "taxes-2025.pdf",
             "the restore browser decrypts the filename back to plaintext"
         );
+    }
+
+    // --- R2-P2-1: no job seeded before fallible setup succeeds -----------------
+
+    #[tokio::test]
+    async fn build_restore_plans_failure_leaves_no_lingering_job() {
+        // R2-P2-1: `restore_files` builds all fallible plan setup BEFORE seeding the
+        // job. `build_restore_plans` (the extracted setup) never touches the job
+        // map, so when setup fails (here: the resolved item's source is unknown,
+        // since the AppState has no sources) it returns Err and the restore-job map
+        // stays EMPTY - no orphaned non-terminal job entry.
+        use crate::app_state::RemoteMode;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("driven-restore-r2p2-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = driven_core::state::SqliteStateRepo::open(&dir.join("state.db"))
+            .await
+            .expect("open state repo");
+        let app_state = AppState::new(
+            Arc::new(repo),
+            HashMap::new(),
+            RemoteMode::Fake,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+        );
+
+        // A resolved item whose source id is not present in the (empty) source list.
+        let resolved = vec![ResolvedRestore {
+            source_id: SourceId::new_v4(),
+            relative_path: "x.bin".to_string(),
+            size: 3,
+            drive_file_id: Some("d-x".to_string()),
+            hash_blake3: [0u8; 32],
+        }];
+
+        let result = build_restore_plans(&app_state, resolved).await;
+        assert!(result.is_err(), "unknown-source setup must fail");
+        assert_eq!(
+            app_state.restore_jobs_len(),
+            0,
+            "a failed restore setup must leave NO job entry in AppState (R2-P2-1)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

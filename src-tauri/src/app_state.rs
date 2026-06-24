@@ -537,6 +537,15 @@ impl AppState {
         }
     }
 
+    /// Test-only: number of restore-job records currently tracked (live +
+    /// terminal). R2-P2-1 uses this to assert that a `restore_files` whose fallible
+    /// setup fails leaves NO lingering job entry.
+    #[cfg(test)]
+    #[must_use]
+    pub(crate) fn restore_jobs_len(&self) -> usize {
+        self.lock_restore_jobs().len()
+    }
+
     /// M8 (P1-1): signal-cancel EVERY in-flight restore job and TAKE their task
     /// handles, so the app-shutdown drain can await them (mirrors the M5 no-orphan
     /// AccountHandle drain). Sets each job's cancel flag, so each task deletes its

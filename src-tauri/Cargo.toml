@@ -67,15 +67,32 @@ driven-power = { path = "../crates/driven-power" }
 driven-net = { path = "../crates/driven-net" }
 driven-vss = { path = "../crates/driven-vss" }
 
-# R1-P2-2 (SPEC s11.6.1 step 5): atomic restore-over-existing on Windows.
-# `std::fs::rename` is not a guaranteed atomic REPLACE over an existing file on
-# Windows, so the restore sink uses `MoveFileExW(MOVEFILE_REPLACE_EXISTING |
-# MOVEFILE_WRITE_THROUGH)`. Windows-only so the 3-OS CI build/clippy stays green
-# on Linux + macOS (the Unix path uses std::fs::rename, which replaces).
+# R2-P1-1 (SPEC s11.6.1): handle-based restore confinement on Unix. The restore
+# sink opens a verified no-follow parent-directory fd and does BOTH the temp
+# create (`openat`) and the final move (`renameat`) RELATIVE to that fd, so a
+# concurrent parent-component swap to a symlink cannot redirect the decrypted
+# plaintext outside the dialog-approved root. Unix-only (the Windows path uses
+# CreateFileW + SetFileInformationByHandle FILE_RENAME_INFO), so the 3-OS CI
+# build/clippy stays green without rustix on Windows.
+[target.'cfg(unix)'.dependencies]
+rustix = { version = "1.1.4", features = ["fs"] }
+
+# R1-P2-2 / R2-P1-1 (SPEC s11.6.1 step 5): atomic restore-over-existing + handle-
+# based confinement on Windows. The restore sink opens a verified no-follow parent
+# directory handle (`CreateFileW` with BACKUP_SEMANTICS | OPEN_REPARSE_POINT,
+# rejecting a reparse point + re-confirming the resolved path is in-root via
+# `GetFinalPathNameByHandleW`) and renames the temp HANDLE-RELATIVE to it via
+# `SetFileInformationByHandle(FileRenameInfo { RootDirectory, ReplaceIfExists })`,
+# so a concurrent parent swap cannot escape the root and an existing dest is
+# atomically replaced. Windows-only so the 3-OS CI build/clippy stays green on
+# Linux + macOS.
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.59", features = [
     "Win32_Foundation",
     "Win32_Storage_FileSystem",
+    # `CreateFileW` (and the other handle-open APIs) take a `SECURITY_ATTRIBUTES`
+    # pointer and are gated behind `Win32_Security` in windows-sys 0.59.
+    "Win32_Security",
 ] }
 
 [dev-dependencies]

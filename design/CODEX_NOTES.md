@@ -1352,3 +1352,109 @@ All findings from `.claude/codex-reviews/M8-recheck1-20260624-165457.md` fixed.
   so the 3-OS CI stays green), Unix `std::fs::rename` (already replaces). Tests:
   `atomic_replace` overwrites an existing file (temp gone after), and a full
   `restore_one_file` over a pre-existing dest succeeds + leaves no temp.
+
+  > Superseded by R2-P1-1 (recheck-3): `atomic_replace` + the by-path
+  > `open_temp_no_follow` were REPLACED by the handle-confined `confine::ConfinedDest`
+  > (the temp create + the rename are now performed against a PINNED no-follow
+  > parent handle). The replace-existing semantics are preserved (Unix `renameat`
+  > replaces; Windows `FILE_RENAME_INFO { ReplaceIfExists }`).
+
+## M8 codex recheck-2 fixes (2 P1 + 2 P2; baseline 1a7ad60 @ e2e84b4)
+
+All findings from `.claude/codex-reviews/M8-recheck2-20260624-173857.md` fixed.
+
+- **R2-P1-1 - final restore confinement was a path-string TOCTOU; now HANDLE-based.**
+  `restore_one_file` (`commands/restore.rs`) validated the dest path, then DISCARDED
+  the verified path and re-resolved the dest STRING to (a) open the temp by full path
+  and (b) `atomic_replace(&tmp, &dest)` at rename time. A local process could swap a
+  parent directory component to a symlink/junction AFTER validation and BEFORE the
+  open/rename, redirecting the decrypted restore plaintext (temp AND final) OUTSIDE
+  the dialog-approved root (SPEC s11.6.1 data-safety violation). Note the temp itself
+  - not just the rename - held out-of-root plaintext for the WHOLE stream, a far
+  bigger window than the rename alone.
+
+  Fixed with a new `mod confine` (`ConfinedDest`) that pins the parent chain with a
+  no-follow directory HANDLE and performs BOTH the temp create and the final rename
+  against that pinned handle (NOT a re-resolved string):
+  - **Unix (`rustix`, new `cfg(unix)` dep):** `open` the canonical root no-follow as a
+    directory fd, then `openat` each directory component with `O_NOFOLLOW | O_DIRECTORY`
+    (a swapped symlink component fails the open with ELOOP/ENOTDIR), arriving at a
+    pinned final-parent fd. The temp is created via `openat(parent_fd,
+    O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC)` and the commit is
+    `renameat(parent_fd, temp, parent_fd, leaf)` (atomic replace). Both are
+    handle-relative, so a parent swap after validation cannot move the write out of
+    root. Tests (`#[cfg(unix)]`): a post-validation parent swap to an out-of-root
+    symlink, and a directly-symlinked leaf-parent, are BOTH rejected and create NO
+    file (temp or final) outside root.
+  - **Windows (`windows-sys`, existing `cfg(windows)` dep + `Win32_Security` feature):**
+    open the parent chain no-follow via `CreateFileW(BACKUP_SEMANTICS |
+    OPEN_REPARSE_POINT)`, rejecting any component whose handle reports
+    `FILE_ATTRIBUTE_REPARSE_POINT` (a junction/symlink) and re-confirming each
+    handle's `GetFinalPathNameByHandleW` resolved path stays in-root. The temp is
+    created `CREATE_NEW` (O_EXCL: refuses a pre-place race) + `DELETE` access +
+    `OPEN_REPARSE_POINT`, then its handle's resolved path is re-checked in-root BEFORE
+    any plaintext is written. The commit derives the dest path from the PINNED PARENT
+    HANDLE's CURRENT `GetFinalPathNameByHandleW` resolved real path (NOT the original
+    attacker-influenceable string) and renames via `SetFileInformationByHandle(
+    FileRenameInfo { RootDirectory: NULL, FileName: <resolved_parent>\\<leaf>,
+    ReplaceIfExists: TRUE })` on an 8-byte-aligned buffer. Because the parent handle
+    is pinned to the REAL directory inode, a swapped-in junction does not move the
+    rename target: the resolved path is the real pinned dir, never the junction's
+    target.
+
+  **Documented Windows residuals (strongest achievable without the NT API, per the
+  fix-spec):**
+  1. Win32's `SetFileInformationByHandle(FileRenameInfo)` does NOT support a non-NULL
+     `RootDirectory` (it returns ERROR_INVALID_PARAMETER - the handle-relative form is
+     `NtSetInformationFile`-only). So the Windows rename is confined by RESOLVING the
+     pinned parent handle (not by a RootDirectory-relative move). This is TOCTOU-safe
+     (the pinned handle resolves the real inode), but is not the literal
+     RootDirectory-relative primitive the Unix path uses. Closing this gap would
+     require ntdll plumbing, deliberately avoided as itself a data-safety risk.
+  2. The Windows temp is created by full path then IMMEDIATELY re-checked in-root, so
+     a junction swapped in at the exact create instant could momentarily produce an
+     EMPTY (zero-plaintext) temp out-of-root; it is detected and deleted BEFORE byte
+     one, so NO plaintext ever leaves root.
+  3. `FILE_RENAME_INFO` has no `WRITE_THROUGH` (the file DATA is already `sync_all`'d
+     by the streamer; only the rename METADATA is not flush-forced - a crash
+     immediately after rename could lose the rename, never corrupt data).
+
+  Abort-safety (ties into R2-P2-2): `ConfinedDest` removes its temp on `Drop` if not
+  committed (Unix `unlinkat` handle-relative; Windows `remove_file` by path), so a
+  failure, a cancel, OR a shutdown ABORT that drops the streaming future leaves no
+  temp / out-of-root plaintext. `commit()` defuses the guard only after the rename
+  succeeds. Tests: `confined_commit_replaces_existing_and_confines` (handle-confined
+  replace over an existing dest, no temp left) and `confined_dest_drop_without_commit_
+  removes_temp` (drop-without-commit removes the temp, no final file).
+
+- **R2-P1-2 - route simple trailing-star prefix searches to FTS5, not GLOB.**
+  `is_glob_query` (`restore.rs`) treated ANY `*` as a glob, so a plain trailing-star
+  prefix term like `proj*` was sent to the slow SQLite `GLOB` scan and never reached
+  the FTS5 prefix logic already in `build_fts_match_query` (which emits the `"proj"*`
+  prefix form) - missing ROADMAP M8's `<50ms` prefix acceptance. The dispatcher now
+  routes to GLOB only for GENUINE wildcard / path patterns (any `?`/`[`/`/`, a leading
+  or interior `*`, a bare/empty-stem `*`/`**`, or multiple `*`), and routes a SINGLE
+  trailing-star term over a non-empty stem (and plain terms) to FTS5. Tests:
+  `proj*`/`taxes-2025*` route to FTS5; `*.rs`, `src/*`, `a*b`, `a?b`, `[ab]c`, `*`,
+  `**`, `a*b*` route to GLOB. (The FTS5 prefix machinery itself is already covered by
+  `driven-core`'s `search_files_prefix_*` tests.)
+
+- **R2-P2-1 - do not seed/emit a restore job before fallible setup succeeds.**
+  `restore_files` seeded + emitted the job BEFORE the fallible plan construction
+  (`list_sources`, `build_restore_store`, source lookup); an early `Err` returned but
+  left a non-terminal job with no handle in `AppState` (never pruned) + a dangling
+  "running" job event. The fallible setup is now extracted to `build_restore_plans`
+  (which NEVER touches the job map) and runs BEFORE `seed_restore_job` + the first
+  emit, so a setup failure returns `Err` with no job created. Test
+  (`build_restore_plans_failure_leaves_no_lingering_job`): an unknown-source setup
+  fails and `AppState.restore_jobs` stays empty (new test-only `restore_jobs_len`).
+
+- **R2-P2-2 - bounded, abort-capable shutdown drain for restore jobs.** `lib.rs`'s
+  quit sweep awaited every restore `JoinHandle` with NO timeout/abort, so a job stuck
+  BEFORE it observed its cancel flag hung an explicit Quit forever. Added
+  `drain_restore_handle` (bounded `RESTORE_JOB_DRAIN_TIMEOUT` = 5s): await each handle
+  up to the budget, then `abort()` + await the aborted handle so the task is truly
+  gone - mirroring the M5 per-account `drain_or_abort`. Temp cleanup is abort-safe via
+  the `ConfinedDest` Drop guard above (dropping the aborted future removes the temp).
+  Tests (virtual-time `start_paused`): a stuck task is aborted within the budget (not
+  allowed to finish its long sleep); a prompt task is joined cleanly without abort.

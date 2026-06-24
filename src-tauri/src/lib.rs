@@ -59,6 +59,15 @@ const ARG_QUIT: &str = "--quit";
 /// launch.
 const MAIN_WINDOW: &str = "main";
 
+/// R2-P2-2: the per-restore-job graceful-drain budget on explicit Quit. After the
+/// job's cancel flag is set, a healthy task observes it between frames and exits
+/// near-instantly (it only needs to finish the current ~64 KiB frame). A task
+/// blocked BEFORE its next flag check (e.g. on a slow/stalled download read) is
+/// given this budget to wind down, then is aborted-and-awaited so Quit never
+/// hangs. Kept short - a restore is interruptible by design (the temp is deleted),
+/// unlike an in-flight UPLOAD which gets the longer run-loop drain budget.
+const RESTORE_JOB_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(5);
+
 /// `<config_dir>/driven/state.db` (SPEC s2), resolved from Tauri's
 /// `app_config_dir()` (`config_dir() + identifier`). `app.driven` is the
 /// `tauri.conf.json` identifier, so this is `<config_dir>/app.driven/...`;
@@ -174,17 +183,53 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
         });
         futures::future::join_all(drains).await;
 
-        // M8-P1-1: join every cancelled restore task so quit waits for each to
-        // observe its cancel flag, delete its temp, and exit (no orphaned restore
-        // task / partial file). A task that already finished is simply joined
-        // immediately; a JoinError (panicked) is swallowed - the post-condition is
-        // "the restore task is no longer running".
-        let restore_drains = restore_handles.into_iter().map(|h| async move {
-            let _ = h.await;
-        });
+        // M8-P1-1 / R2-P2-2: drain every cancelled restore task with a BOUNDED,
+        // abort-capable budget. Each task observes its cancel flag between frames,
+        // deletes its in-flight temp, and exits - normally well within the budget.
+        // But a task stuck BEFORE it next checks the flag (e.g. blocked on a slow
+        // download read) would hang an explicit Quit forever if we awaited it
+        // unconditionally. So we await each handle up to RESTORE_JOB_DRAIN_TIMEOUT
+        // and, on timeout, `abort()` it and AWAIT the aborted handle so the task is
+        // genuinely GONE before quit proceeds (no orphan). The task's temp is
+        // cleaned even on the abort path because the restore writer holds a
+        // Drop-based temp guard (see `restore.rs` TempFileGuard), so dropping the
+        // aborted future removes any in-flight temp. Mirrors the M5 per-account
+        // `drain_or_abort` shape. The drains run concurrently so two stuck jobs do
+        // not sum their budgets.
+        let restore_drains = restore_handles
+            .into_iter()
+            .map(|h| async move { drain_restore_handle(h).await });
         futures::future::join_all(restore_drains).await;
         tracing::info!(target: "driven::app", "all in-flight restore jobs cancelled + drained (no orphans)");
     });
+}
+
+/// R2-P2-2: drive ONE cancelled restore task to a true stop with a bounded budget.
+/// Await the handle up to [`RESTORE_JOB_DRAIN_TIMEOUT`]; on timeout `abort()` it
+/// and AWAIT the aborted handle so the task is genuinely finished (not merely
+/// abort-requested) before returning - so an explicit Quit cannot hang on a task
+/// stuck before it observes its cancel flag. A task's in-flight temp is removed
+/// even on the abort path via the restore writer's Drop-based temp guard (dropping
+/// the aborted future runs the guard). Mirrors `app_state::drain_or_abort`.
+///
+/// `tokio::time::timeout` would MOVE the handle and DROP it on elapse (a dropped
+/// `JoinHandle` only DETACHES the task, it does not cancel it), so we instead
+/// `select!` so the handle stays in scope and can be aborted + re-awaited.
+async fn drain_restore_handle(mut handle: tokio::task::JoinHandle<()>) {
+    let abort = handle.abort_handle();
+    tokio::select! {
+        biased;
+        _ = &mut handle => {
+            // Joined cleanly (observed the cancel flag, cleaned its temp, exited)
+            // or panicked - either way it is gone.
+        }
+        () = tokio::time::sleep(RESTORE_JOB_DRAIN_TIMEOUT) => {
+            // Stuck before its next flag check: abort and AWAIT so the task is
+            // truly finished (its dropped future runs the temp guard) before quit.
+            abort.abort();
+            let _ = handle.await;
+        }
+    }
 }
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
@@ -375,4 +420,55 @@ pub fn run() {
             }
         }
     });
+}
+
+#[cfg(test)]
+mod tests {
+    use super::{drain_restore_handle, RESTORE_JOB_DRAIN_TIMEOUT};
+    use std::sync::atomic::{AtomicBool, Ordering};
+    use std::sync::Arc;
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn drain_restore_handle_aborts_a_stuck_task_within_budget() {
+        // R2-P2-2: a restore task stuck BEFORE it observes its cancel flag (here a
+        // task that just sleeps "forever") must be ABORTED and awaited within the
+        // bounded budget, so an explicit Quit cannot hang. With virtual time
+        // (start_paused) the budget elapses deterministically; the task never sets
+        // its "finished cleanly" flag because it is aborted mid-sleep.
+        let finished_cleanly = Arc::new(AtomicBool::new(false));
+        let flag = finished_cleanly.clone();
+        let handle = tokio::task::spawn(async move {
+            // Sleep far beyond the drain budget - models a task blocked before its
+            // next cancel-flag check.
+            tokio::time::sleep(RESTORE_JOB_DRAIN_TIMEOUT * 100).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+
+        // The drain must RETURN (not hang) - on the paused clock the budget elapses
+        // and the task is aborted + awaited.
+        drain_restore_handle(handle).await;
+
+        assert!(
+            !finished_cleanly.load(Ordering::SeqCst),
+            "the stuck task must have been aborted (not allowed to finish its long sleep)"
+        );
+    }
+
+    #[tokio::test(flavor = "current_thread", start_paused = true)]
+    async fn drain_restore_handle_joins_a_prompt_task_without_abort() {
+        // A task that finishes promptly (observed its cancel flag, cleaned up,
+        // exited) is JOINED cleanly within the budget - the abort arm is not taken.
+        let finished_cleanly = Arc::new(AtomicBool::new(false));
+        let flag = finished_cleanly.clone();
+        let handle = tokio::task::spawn(async move {
+            // Returns well inside the budget.
+            tokio::time::sleep(RESTORE_JOB_DRAIN_TIMEOUT / 10).await;
+            flag.store(true, Ordering::SeqCst);
+        });
+        drain_restore_handle(handle).await;
+        assert!(
+            finished_cleanly.load(Ordering::SeqCst),
+            "a prompt task must finish cleanly (joined, not aborted)"
+        );
+    }
 }
