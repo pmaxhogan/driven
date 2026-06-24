@@ -10,16 +10,18 @@
 use std::path::Path;
 use std::sync::Arc;
 
-use driven_core::state::StateRepo;
+use driven_core::state::{SqliteStateRepo, StateRepo};
 
 /// Open the state DB at `db_path`, running every embedded migration and the
 /// integrity check, and return the shared [`StateRepo`] handle the rest of
 /// the shell (assembly, IPC) uses.
 ///
-/// TODO(M5): call `SqliteStateRepo::open(db_path).await?`, wrap it
-/// `Arc::new(repo) as Arc<dyn StateRepo>`, and return it. Surface a
-/// `state.db_corrupt` error verbatim (open already emits it).
+/// Delegates to [`SqliteStateRepo::open`], which already applies the embedded
+/// `sqlx` migrations and runs `PRAGMA integrity_check` on open (SPEC s2) - the
+/// SAME migration source the chaos / handle path uses, so no SQL is duplicated
+/// here. A corrupt DB surfaces verbatim as the open error (`state.db_corrupt`),
+/// aborting startup rather than syncing against a damaged ledger.
 pub async fn run(db_path: &Path) -> anyhow::Result<Arc<dyn StateRepo>> {
-    let _ = db_path;
-    todo!("M5: SqliteStateRepo::open(db_path) -> run migrations + integrity check -> Arc<dyn StateRepo>")
+    let repo = SqliteStateRepo::open(db_path).await?;
+    Ok(Arc::new(repo) as Arc<dyn StateRepo>)
 }

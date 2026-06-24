@@ -6,66 +6,482 @@
 //! 1. constructs the [`RemoteStore`](driven_drive::remote_store::RemoteStore) -
 //!    a real `GoogleDriveStore` from the keyring refresh token via
 //!    `RefreshingTokenSource` (the `driven-cli` `build_store` pattern), OR an
-//!    `InMemoryRemoteStore` when `DRIVEN_USE_FAKE_REMOTE=1` (dev / e2e);
+//!    `InMemoryRemoteStore` when `DRIVEN_USE_FAKE_REMOTE=1` (dev / e2e) or the
+//!    account has not authenticated yet;
 //! 2. builds the real `Pacer`, `RealPowerSource`, a `ReqwestBackend`-backed
 //!    `NetworkProbe` (`Some`, so the Drive breaker is driven by REAL request
-//!    outcomes - CODEX_NOTES P2-9), the Windows `VssProvider` (M3.5), and a
-//!    [`KeystoreCryptoProvider`](crate::crypto_provider_impl::KeystoreCryptoProvider)
+//!    outcomes - CODEX_NOTES P2-9 / V-G), the Windows `VssProvider` (M3.5), and
+//!    a [`KeystoreCryptoProvider`](crate::crypto_provider_impl::KeystoreCryptoProvider)
 //!    (per-source crypto, GA blocker);
 //! 3. assembles [`ExecutorDeps`] -> `DefaultExecutor`, builds the
 //!    [`SyncOrchestrator`] (`.with_vss(..)` on Windows), spawns
-//!    [`Orchestrator::run`], and bridges the watcher + power-subscribe;
+//!    [`Orchestrator::run`], and bridges the watcher + the orchestrator event
+//!    stream;
 //! 4. collects the per-account handles into an [`AppState`].
+//!
+//! Robustness: one account failing to build (a broken keychain entry, an
+//! un-spawnable watcher) is logged and SKIPPED - it must never abort the other
+//! accounts' sync.
 
 use std::collections::HashMap;
 use std::sync::Arc;
 
 use tauri::AppHandle;
 
-use driven_core::state::StateRepo;
+use driven_core::executor::{DefaultExecutor, Executor, ExecutorDeps};
+use driven_core::network::{NetworkProbe, Prober};
+use driven_core::orchestrator::{Orchestrator, OrchestratorConfig, SyncOrchestrator};
+use driven_core::pacer::{AimdPacer, Pacer};
+use driven_core::state::{AccountRow, SourceRow, StateRepo};
+use driven_core::time::{Clock, SystemClock};
+use driven_core::types::{AccountId, OrchestratorEvent};
+use driven_core::watcher::{NotifyWatcher, SourceWatcher};
 
-use crate::app_state::AppState;
+use driven_drive::fake::InMemoryRemoteStore;
+use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
+use driven_drive::google::GoogleDriveStore;
+use driven_drive::remote_store::RemoteStore;
+
+use driven_net::ReqwestBackend;
+
+use driven_power::RealPowerSource;
+
+use crate::app_state::{AccountHandle, AppState, RemoteMode};
+use crate::crypto_provider_impl::KeystoreCryptoProvider;
+use crate::{events, tray};
+
+/// Tracing target for the app-shell assembly.
+const TARGET: &str = "driven::app::assembly";
 
 /// Environment flag selecting the in-memory fake remote (dev / e2e) instead of
 /// a real `GoogleDriveStore`. Mirrors the assembly contract in the task spec.
 pub const ENV_USE_FAKE_REMOTE: &str = "DRIVEN_USE_FAKE_REMOTE";
 
+/// Environment override for the OAuth client id (SPEC s4). Falls back to the
+/// public installed-app default when unset.
+const ENV_OAUTH_CLIENT_ID: &str = "DRIVEN_OAUTH_CLIENT_ID";
+
+/// Environment override for the OAuth client secret (SPEC s4). An installed-app
+/// PKCE client has no real secret, so the default is empty.
+const ENV_OAUTH_CLIENT_SECRET: &str = "DRIVEN_OAUTH_CLIENT_SECRET";
+
+/// The public installed-app client id (SPEC s4; mirrors `driven-cli`'s
+/// `DEFAULT_CLIENT_ID`). Used when `DRIVEN_OAUTH_CLIENT_ID` is unset.
+const DEFAULT_CLIENT_ID: &str =
+    "1094503409775-kvuig3oqtchrq1s4tc1cnpi60mdvnqfe.apps.googleusercontent.com";
+
 /// Build every account's orchestrator over the real seams and spawn its run
 /// loop, returning the [`AppState`] for `.manage(..)` (SPEC s5).
 ///
 /// `app` is the Tauri handle (for the orchestrator-event -> tray/IPC bridge);
-/// `state` is the already-migrated [`StateRepo`] from
-/// [`crate::migrations::run`].
-///
-/// TODO(M5): implement the per-account assembly described in the module docs.
-/// Concretely, for each `state.list_accounts().await?`:
-/// - remote: if `std::env::var(ENV_USE_FAKE_REMOTE) == Ok("1")` ->
-///   `Arc::new(InMemoryRemoteStore::new())`; else build a `GoogleDriveStore`
-///   from `KeyringTokenStore` + `RefreshingTokenSource::from_stored_refresh_token`
-///   (the `driven-cli::build_store` pattern) and `Arc` it;
-/// - pacer: the real `Pacer` impl seeded from the account's settings;
-/// - power: `Arc::new(RealPowerSource::new()?)` (+ `spawn_poller`);
-/// - network: `Arc::new(Prober::new(Arc::new(ReqwestBackend::new()?), clock))`
-///   - pass `Some(..)` into `ExecutorDeps.network` so the breaker sees real
-///   Drive outcomes (CODEX_NOTES P2-9);
-/// - vss (Windows): `Arc::new(RealVssProvider::new(config.vss_mode))`, threaded
-///   into BOTH `ExecutorDeps.vss` and `SyncOrchestrator::with_vss` (the SAME
-///   Arc, DESIGN s5.3);
-/// - crypto: `Arc::new(KeystoreCryptoProvider::new(account.id, sources))` into
-///   `ExecutorDeps.crypto` (per-source, FAIL CLOSED - GA blocker);
-/// - executor: `Arc::new(DefaultExecutor::new(deps))`;
-/// - orchestrator: `SyncOrchestrator::new(account.id, state, executor, power,
-///   network, clock, config)` (`.with_vss(vss)` on Windows), `Arc` it, spawn
-///   `tokio::spawn(orch.clone().run())`, and store the `JoinHandle` +
-///   `Arc<dyn Orchestrator>` in an `AccountHandle`;
-/// - bridge: subscribe to the orchestrator's event broadcast and call
-///   `tray::apply_state` + the SPEC s11.7 emit helpers; bridge the watcher
-///   ticks + power subscribe.
-/// Then assemble `AppState::new(state, handles, remote_mode)`.
+/// `state` is the already-migrated [`StateRepo`] from [`crate::migrations::run`].
 pub async fn build_and_spawn(
     app: &AppHandle,
     state: Arc<dyn StateRepo>,
 ) -> anyhow::Result<AppState> {
-    let _ = (app, state, ENV_USE_FAKE_REMOTE, HashMap::<(), ()>::new());
-    todo!("M5: per-account real-seam assembly + orchestrator spawn + event bridge -> AppState")
+    let use_fake = use_fake_remote();
+    // The recorded global mode reflects INTENT: `Fake` iff the env forces it.
+    // A real-mode account with no token yet still falls back to the in-memory
+    // store (logged per-account) but does not flip the global verdict.
+    let remote_mode = if use_fake {
+        RemoteMode::Fake
+    } else {
+        RemoteMode::RealGoogleDrive
+    };
+
+    let accounts = state.list_accounts().await?;
+    let all_sources = state.list_sources().await?;
+
+    tracing::info!(
+        target: TARGET,
+        accounts = accounts.len(),
+        sources = all_sources.len(),
+        fake_remote = use_fake,
+        "assembling per-account orchestrators"
+    );
+
+    let mut handles: HashMap<AccountId, AccountHandle> = HashMap::new();
+
+    for account in &accounts {
+        // Every account's sources (the watcher + crypto provider need the full
+        // set, including disabled ones, so a later enable does not require a
+        // rebuild of the crypto cache key space).
+        let sources: Vec<SourceRow> = all_sources
+            .iter()
+            .filter(|s| s.account_id == account.id)
+            .cloned()
+            .collect();
+
+        match build_account(app, &state, account, sources, use_fake).await {
+            Ok(handle) => {
+                handles.insert(account.id, handle);
+                tracing::info!(
+                    target: TARGET,
+                    account_id = %account.id,
+                    email = %account.email,
+                    "orchestrator assembled + spawned"
+                );
+            }
+            Err(err) => {
+                // One account failing must NOT abort the others (task spec).
+                tracing::error!(
+                    target: TARGET,
+                    account_id = %account.id,
+                    email = %account.email,
+                    %err,
+                    "failed to assemble account; skipping (other accounts continue)"
+                );
+            }
+        }
+    }
+
+    Ok(AppState::new(state, handles, remote_mode))
+}
+
+/// `true` when `DRIVEN_USE_FAKE_REMOTE=1` selects the in-memory fake remote.
+fn use_fake_remote() -> bool {
+    std::env::var(ENV_USE_FAKE_REMOTE)
+        .map(|v| v == "1")
+        .unwrap_or(false)
+}
+
+/// Build + spawn ONE account's orchestrator over the real seams. Returns the
+/// [`AccountHandle`] (control surface + run-loop join handle) or an error that
+/// the caller logs + skips.
+async fn build_account(
+    app: &AppHandle,
+    state: &Arc<dyn StateRepo>,
+    account: &AccountRow,
+    sources: Vec<SourceRow>,
+    use_fake: bool,
+) -> anyhow::Result<AccountHandle> {
+    let clock: Arc<dyn Clock> = Arc::new(SystemClock);
+
+    // --- remote: real GoogleDriveStore or the in-memory fake -----------------
+    let remote = build_remote(account, use_fake)?;
+
+    // --- pacer: real AIMD pacer seeded from the account's config -------------
+    // M5 uses the default orchestrator config (the persisted per-account
+    // settings UI is M6); the bandwidth cap is therefore unset here.
+    let config = OrchestratorConfig::default();
+    let pacer: Arc<dyn Pacer> = Arc::new(AimdPacer::with_ceilings(
+        clock.clone(),
+        config.bandwidth_cap_mbps.map(f64::from),
+        config.pacer_ceilings,
+    ));
+
+    // --- power: real OS power source + its background poller ------------------
+    let power = Arc::new(RealPowerSource::new()?);
+    // Spawn the 30s poller so `current()` / `subscribe()` reflect live OS power
+    // transitions (battery<->AC, metered, reachability). The orchestrator's run
+    // loop subscribes to this internally (DESIGN s5.7 gate re-evaluation); the
+    // sleep/wake suspend/resume EDGES (DESIGN s5.10) arrive on a separate OS
+    // message-pump seam that does not exist yet, so they are not bridged here.
+    let _power_poller = power.spawn_poller();
+    let power: Arc<dyn driven_power::PowerSource> = power;
+
+    // --- network: real ReqwestBackend-backed prober (Some, V-G) --------------
+    // Passing `Some(..)` into `ExecutorDeps.network` routes every Drive request
+    // through the breaker-reporting decorator so the Drive circuit breaker is
+    // driven by REAL request outcomes, not probes alone (CODEX_NOTES P2-9 / V-G).
+    let backend = Arc::new(ReqwestBackend::new()?);
+    let network: Arc<dyn NetworkProbe> = Arc::new(Prober::new(backend, clock.clone()));
+
+    // --- VSS provider (Windows): SAME Arc into executor + orchestrator --------
+    let vss = build_vss(&config);
+
+    // --- crypto: per-source keystore resolver (FAIL CLOSED - GA blocker) -----
+    let crypto: Arc<dyn driven_core::crypto_provider::CryptoProvider> =
+        Arc::new(KeystoreCryptoProvider::new(account.id, sources.clone()));
+
+    // --- executor -----------------------------------------------------------
+    let executor: Arc<dyn Executor> = Arc::new(DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote,
+            state: state.clone(),
+            pacer,
+            crypto: Some(crypto),
+            vss: vss.clone(),
+            network: Some(network.clone()),
+        },
+        clock.clone(),
+    ));
+
+    // --- orchestrator -------------------------------------------------------
+    // Held as the CONCRETE `Arc<SyncOrchestrator>` (not `Arc<dyn Orchestrator>`)
+    // so the assembly can call its INHERENT bridging methods (`subscribe`,
+    // `watcher_sender`) that the object-safe `Orchestrator` trait does not
+    // expose. It coerces to `Arc<dyn Orchestrator>` for the stored handle.
+    let mut orchestrator = SyncOrchestrator::new(
+        account.id,
+        state.clone(),
+        executor,
+        power,
+        network,
+        clock,
+        config,
+    );
+    if let Some(vss) = vss {
+        // The SAME provider Arc the executor's snapshot reads use, so the
+        // orchestrator's per-cycle release + orphan cleanup share one provider
+        // (DESIGN s5.3).
+        orchestrator = orchestrator.with_vss(vss);
+    }
+    let orchestrator = Arc::new(orchestrator);
+
+    // --- watcher bridge (DESIGN s5.9.1) -------------------------------------
+    // The real `NotifyWatcher` emits debounced scan-ticks; forward them into the
+    // orchestrator's watcher channel. A watcher that cannot be built / watched
+    // is NON-FATAL: the scheduled scan is the authoritative fallback (DESIGN
+    // s5.9.4), so the account still backs up, just without the latency win.
+    spawn_watcher_bridge(account.id, orchestrator.watcher_sender(), &sources);
+
+    // --- event bridge: orchestrator broadcast -> tray + IPC events -----------
+    spawn_event_bridge(
+        app,
+        account.id,
+        account.email.clone(),
+        orchestrator.subscribe(),
+    );
+
+    // --- spawn the run loop --------------------------------------------------
+    // `tokio::spawn` (not `tauri::async_runtime::spawn`) so the returned handle
+    // is the `tokio::task::JoinHandle<()>` `AccountHandle` stores (the Tauri
+    // async runtime is tokio-backed, and `.setup()` runs us inside it). The
+    // handle is held so a clean shutdown can abort the loop.
+    let run_loop = {
+        let orchestrator = orchestrator.clone();
+        tokio::spawn(async move {
+            if let Err(err) = orchestrator.run().await {
+                tracing::error!(target: TARGET, %err, "orchestrator run loop exited with error");
+            }
+        })
+    };
+
+    // Coerce the concrete Arc into the trait object the handle + IPC use.
+    let orchestrator: Arc<dyn Orchestrator> = orchestrator;
+    Ok(AccountHandle {
+        orchestrator,
+        run_loop,
+    })
+}
+
+/// Construct the [`RemoteStore`] for one account: the in-memory fake when
+/// `DRIVEN_USE_FAKE_REMOTE=1` OR the account has no stored refresh token yet,
+/// otherwise a real `GoogleDriveStore` from the keyring token (the `driven-cli`
+/// `build_store` pattern). Logs which path was taken.
+fn build_remote(account: &AccountRow, use_fake: bool) -> anyhow::Result<Arc<dyn RemoteStore>> {
+    if use_fake {
+        tracing::info!(
+            target: TARGET,
+            account_id = %account.id,
+            "remote: in-memory fake (DRIVEN_USE_FAKE_REMOTE=1)"
+        );
+        return Ok(Arc::new(InMemoryRemoteStore::new()));
+    }
+
+    // The keychain token store is keyed by account id (the same key the auth
+    // flow stores under). Wrap it in an Arc so a refresh-token ROTATION is
+    // persisted back to the keychain (codex C-P2-4 / V-A3).
+    let token_store = Arc::new(KeyringTokenStore::new(account.id.to_string()));
+    let refresh_token = match token_store.load_refresh_token() {
+        Ok(Some(token)) => token,
+        Ok(None) => {
+            // Not authenticated yet: fall back to the in-memory store so the
+            // orchestrator still spins (it will surface needs-auth when the
+            // account is wired through the OAuth wizard in M6).
+            tracing::warn!(
+                target: TARGET,
+                account_id = %account.id,
+                "remote: no stored refresh token; using in-memory fake until authenticated"
+            );
+            return Ok(Arc::new(InMemoryRemoteStore::new()));
+        }
+        Err(err) => return Err(err),
+    };
+
+    let (client_id, client_secret) = resolve_oauth_creds();
+    let token_source =
+        RefreshingTokenSource::from_stored_refresh_token(refresh_token, client_id, client_secret)?
+            .with_store(token_store);
+    let store = GoogleDriveStore::with_default_clients(token_source)?;
+    tracing::info!(
+        target: TARGET,
+        account_id = %account.id,
+        "remote: real GoogleDriveStore (keyring refresh token)"
+    );
+    Ok(Arc::new(store))
+}
+
+/// Resolve the OAuth client id + secret for the real Drive store: env overrides
+/// first, then the public installed-app default id (the secret defaults to empty
+/// for a PKCE installed-app client).
+fn resolve_oauth_creds() -> (String, String) {
+    let client_id =
+        std::env::var(ENV_OAUTH_CLIENT_ID).unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
+    let client_secret = std::env::var(ENV_OAUTH_CLIENT_SECRET).unwrap_or_default();
+    (client_id, client_secret)
+}
+
+/// Build the Windows VSS snapshot provider (ROADMAP M3.5), or `None` off
+/// Windows. The returned `Arc` is threaded into BOTH the executor (snapshot
+/// reads) and the orchestrator (per-cycle release + orphan cleanup).
+#[cfg(windows)]
+fn build_vss(config: &OrchestratorConfig) -> Option<Arc<dyn driven_vss::VssProvider>> {
+    Some(Arc::new(driven_vss::RealVssProvider::new(config.vss_mode)))
+}
+
+/// Off Windows there is no VSS; the executor's locked-file path skips as before.
+#[cfg(not(windows))]
+fn build_vss(_config: &OrchestratorConfig) -> Option<Arc<dyn driven_vss::VssProvider>> {
+    None
+}
+
+/// Bridge the real [`NotifyWatcher`] for `account`'s sources into the
+/// orchestrator's watcher channel (DESIGN s5.9.1). Establishes a watch per
+/// enabled source, then forwards each debounced `ScanTickRequest` into the
+/// orchestrator's `sender` (its `watcher_sender()`). Best-effort: a watcher
+/// that cannot be built / watched is logged and the source relies on the
+/// scheduled scan fallback.
+fn spawn_watcher_bridge(
+    account_id: AccountId,
+    sender: tokio::sync::mpsc::Sender<driven_core::watcher::ScanTickRequest>,
+    sources: &[SourceRow],
+) {
+    let enabled: Vec<SourceRow> = sources.iter().filter(|s| s.enabled).cloned().collect();
+    if enabled.is_empty() {
+        return;
+    }
+
+    let watcher = NotifyWatcher::new(enabled.clone());
+    let Some(mut rx) = watcher.subscribe() else {
+        tracing::warn!(
+            target: TARGET,
+            account_id = %account_id,
+            "watcher subscribe returned no receiver; relying on scheduled scan"
+        );
+        return;
+    };
+
+    for source in &enabled {
+        if let Err(err) = watcher.watch(source.id) {
+            tracing::warn!(
+                target: TARGET,
+                account_id = %account_id,
+                source_id = %source.id,
+                %err,
+                "failed to establish filesystem watch; scheduled scan covers this source"
+            );
+        }
+    }
+
+    // Move the watcher into the task so its OS handles + debounce tasks stay
+    // alive for the run's lifetime (dropping `NotifyWatcher` tears down every
+    // watch). The forwarding loop ends when the watcher channel closes.
+    tokio::spawn(async move {
+        let _watcher = watcher;
+        while let Some(tick) = rx.recv().await {
+            // `send` (not `try_send`): apply backpressure rather than drop a
+            // scan-tick. The orchestrator's watcher channel is bounded; a closed
+            // receiver means the orchestrator stopped, so end the bridge.
+            if sender.send(tick).await.is_err() {
+                tracing::debug!(
+                    target: TARGET,
+                    account_id = %account_id,
+                    "orchestrator watcher channel closed; ending watcher bridge"
+                );
+                break;
+            }
+        }
+    });
+}
+
+/// Forward one orchestrator's [`OrchestratorEvent`] broadcast (`rx`, from its
+/// `subscribe()`) to the tray + the SPEC s11.7 webview events. A `StateChanged`
+/// drives `tray::apply_state` and emits `sync:status_changed`; a `Lagged`
+/// receiver re-reads nothing (the next event re-syncs the tray). The bridge
+/// ends when the broadcast closes (orchestrator dropped).
+fn spawn_event_bridge(
+    app: &AppHandle,
+    account_id: AccountId,
+    email: String,
+    mut rx: tokio::sync::broadcast::Receiver<OrchestratorEvent>,
+) {
+    let app = app.clone();
+    tokio::spawn(async move {
+        loop {
+            match rx.recv().await {
+                Ok(OrchestratorEvent::StateChanged { state }) => {
+                    // Reflect the new state on the tray icon (SPEC s12).
+                    tray::apply_state(&app, state.clone());
+                    // Push a global-status refresh to the webview (SPEC s11.7).
+                    // M5 carries a single-account snapshot in the payload; M6
+                    // aggregates across accounts into the full DTO.
+                    let payload = AccountSyncStatusEvent {
+                        account_id: account_id.to_string(),
+                        state,
+                    };
+                    if let Err(err) = events::emit_sync_status_changed(&app, &payload) {
+                        tracing::debug!(
+                            target: TARGET,
+                            account_id = %account_id,
+                            %err,
+                            "emit sync:status_changed failed"
+                        );
+                    }
+                }
+                Ok(OrchestratorEvent::AccountNeedsReauth { account_id: acct }) => {
+                    // V-F: a refresh token was revoked. Surface the re-consent
+                    // banner to the webview (SPEC s11.7 `account:needs_reauth`)
+                    // and raise the OS notification (DESIGN s8.1) - the
+                    // `OrchestratorState` cannot carry the email, so this is the
+                    // one place that has both the account id and its email.
+                    if let Err(err) =
+                        events::emit_account_needs_reauth(&app, &acct.to_string(), &email)
+                    {
+                        tracing::debug!(
+                            target: TARGET,
+                            account_id = %acct,
+                            %err,
+                            "emit account:needs_reauth failed"
+                        );
+                    }
+                    tray::notify_needs_reauth(&app, &email);
+                }
+                Ok(_) => {
+                    // Progress / Power / Network events: not bridged to the
+                    // webview in M5 (the progress + activity DTOs land with the
+                    // M6 IPC layer). The tray's coarse state is driven by
+                    // StateChanged above.
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+                    tracing::debug!(
+                        target: TARGET,
+                        account_id = %account_id,
+                        skipped,
+                        "event bridge lagged; continuing from next event"
+                    );
+                }
+                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                    tracing::debug!(
+                        target: TARGET,
+                        account_id = %account_id,
+                        email = %email,
+                        "orchestrator event stream closed; ending event bridge"
+                    );
+                    break;
+                }
+            }
+        }
+    });
+}
+
+/// The per-event `sync:status_changed` payload bridged from one orchestrator's
+/// state change (SPEC s11.7). A minimal-but-real shape mirroring
+/// `commands::sync::AccountSyncStatus` so the webview sees a concrete account +
+/// state; M6 swaps this for the aggregated `GlobalSyncStatus`.
+#[derive(serde::Serialize, Clone)]
+struct AccountSyncStatusEvent {
+    account_id: String,
+    state: driven_core::types::OrchestratorState,
 }

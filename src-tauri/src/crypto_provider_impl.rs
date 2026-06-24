@@ -27,12 +27,16 @@
 
 use std::collections::HashMap;
 use std::sync::Arc;
+use std::sync::Mutex;
 
 use driven_core::crypto_provider::{CryptoProvider, CryptoResolution};
 use driven_core::state::SourceRow;
 use driven_core::types::{AccountId, SourceId};
-use driven_crypto::SourceCryptoSuite;
-use std::sync::Mutex;
+use driven_crypto::{DrivenCryptoSuite, Keystore, MasterKey, SourceCryptoSuite, WrappedSourceKey};
+use tracing::warn;
+
+/// Tracing target for the keystore crypto provider.
+const TARGET: &str = "driven::app::crypto";
 
 /// The resolved-suite cache value for one source.
 ///
@@ -83,22 +87,131 @@ impl KeystoreCryptoProvider {
 
     /// Resolve (and cache) one source's crypto decision.
     ///
-    /// TODO(M5 CRYPTO): implement per CODEX_NOTES "Per-source crypto
-    /// resolution":
-    /// - look up the [`SourceRow`] in `self.sources`; unknown id -> Plaintext
-    ///   (no such encrypted source);
-    /// - `encryption_enabled = false` -> cache + return Plaintext;
-    /// - else open `Keystore::open(account_id)` + `load_master_key()`, take the
-    ///   row's `wrapped_source_key`, `WrappedSourceKey::from_bytes` +
-    ///   `MasterKey::unwrap_source_key`, build `DrivenCryptoSuite::new` -> cache
-    ///   + return Suite;
-    /// - ANY failure on the encrypted path (no master key, absent/short wrapped
-    ///   key, unwrap/AEAD failure) -> cache + return Unavailable (FAIL CLOSED;
-    ///   never Plaintext). Cache the verdict so the keystore is touched at most
-    ///   once per source.
-    fn resolve_cached(&self, _source_id: SourceId) -> Arc<CachedResolution> {
-        let _ = (&self.account_id, &self.sources, &self.cache);
-        todo!("M5 CRYPTO: open keystore -> load master key -> unwrap per-source key -> DrivenCryptoSuite; FAIL CLOSED on missing key; cache by source_id")
+    /// Implements the CODEX_NOTES "Per-source crypto resolution" contract:
+    /// - look up the [`SourceRow`] in `self.sources`; an unknown id resolves to
+    ///   `Plaintext` (Driven does not own / encrypt it, so there is nothing to
+    ///   fail closed over);
+    /// - `encryption_enabled = false` -> `Plaintext`;
+    /// - else open [`Keystore::open`] + [`Keystore::load_master_key`], parse the
+    ///   row's `wrapped_source_key` ([`WrappedSourceKey::from_bytes`]), unwrap
+    ///   the per-source key ([`MasterKey::unwrap_source_key`], DESIGN s7.1), and
+    ///   build a [`DrivenCryptoSuite`] -> `Suite`;
+    /// - ANY failure on the encrypted path (keychain unavailable, no master key,
+    ///   absent / malformed wrapped key, unwrap / AEAD failure) -> `Unavailable`
+    ///   (FAIL CLOSED; NEVER `Plaintext`). The executor then errors the op
+    ///   `crypto.key_missing` and uploads nothing.
+    ///
+    /// The resolved verdict is cached by `source_id` so the keychain is touched
+    /// at most once per source for the process lifetime.
+    fn resolve_cached(&self, source_id: SourceId) -> Arc<CachedResolution> {
+        // Fast path: return the already-resolved verdict if present.
+        {
+            let cache = self.lock_cache();
+            if let Some(hit) = cache.get(&source_id) {
+                return hit.clone();
+            }
+        }
+
+        let resolution = Arc::new(self.resolve_uncached(source_id));
+
+        // Store under the lock. A concurrent resolver for the same id may have
+        // raced us; keep whichever landed first (both compute the same verdict
+        // from the same immutable row + keystore, so either is correct).
+        let mut cache = self.lock_cache();
+        cache
+            .entry(source_id)
+            .or_insert_with(|| resolution.clone())
+            .clone()
+    }
+
+    /// Lock the cache, recovering a poisoned lock instead of panicking (house
+    /// rule: no `unwrap`/`expect`/`panic!` in non-test code).
+    fn lock_cache(&self) -> std::sync::MutexGuard<'_, HashMap<SourceId, Arc<CachedResolution>>> {
+        self.cache.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Compute the crypto verdict for `source_id` WITHOUT consulting / writing
+    /// the cache (the keystore-touching core of [`Self::resolve_cached`]).
+    fn resolve_uncached(&self, source_id: SourceId) -> CachedResolution {
+        let Some(row) = self.sources.get(&source_id) else {
+            // Driven does not know this source -> nothing encrypted to protect.
+            return CachedResolution::Plaintext;
+        };
+
+        if !row.encryption_enabled {
+            return CachedResolution::Plaintext;
+        }
+
+        // Encryption-enabled from here on: every failure FAILS CLOSED.
+        let Some(wrapped_bytes) = row.wrapped_source_key.as_ref() else {
+            warn!(
+                target: TARGET,
+                account_id = %self.account_id,
+                %source_id,
+                "encryption enabled but wrapped_source_key is absent; failing closed"
+            );
+            return CachedResolution::Unavailable;
+        };
+
+        let keystore = match Keystore::open(&self.account_id.to_string()) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(
+                    target: TARGET,
+                    account_id = %self.account_id,
+                    %source_id,
+                    error = %e,
+                    "keystore open failed; failing closed"
+                );
+                return CachedResolution::Unavailable;
+            }
+        };
+
+        let master_key: MasterKey = match keystore.load_master_key() {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(
+                    target: TARGET,
+                    account_id = %self.account_id,
+                    %source_id,
+                    error = %e,
+                    "master key unavailable; failing closed (no plaintext fallback)"
+                );
+                return CachedResolution::Unavailable;
+            }
+        };
+
+        let wrapped = match WrappedSourceKey::from_bytes(wrapped_bytes) {
+            Ok(w) => w,
+            Err(e) => {
+                warn!(
+                    target: TARGET,
+                    account_id = %self.account_id,
+                    %source_id,
+                    error = %e,
+                    "wrapped source key malformed; failing closed"
+                );
+                return CachedResolution::Unavailable;
+            }
+        };
+
+        let source_key = match master_key.unwrap_source_key(&wrapped) {
+            Ok(k) => k,
+            Err(e) => {
+                warn!(
+                    target: TARGET,
+                    account_id = %self.account_id,
+                    %source_id,
+                    error = %e,
+                    "source key unwrap failed; failing closed"
+                );
+                return CachedResolution::Unavailable;
+            }
+        };
+
+        // The suite owns the source key + derived filename sub-keys and zeroizes
+        // all key material on drop (DESIGN s7.1).
+        CachedResolution::Suite(Arc::new(DrivenCryptoSuite::new(source_key)))
     }
 }
 

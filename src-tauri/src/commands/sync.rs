@@ -6,13 +6,17 @@
 //! control surface (`trigger` / `set_paused` / `state`). The richer
 //! account/source/restore/settings IPC (SPEC s11.1/s11.2/s11.5/s11.6) is M6.
 
+use std::sync::Arc;
+use std::time::Duration;
+
 use serde::{Deserialize, Serialize};
 use tauri::State;
 
+use driven_core::orchestrator::{Orchestrator, TickSource};
 use driven_core::types::{OrchestratorState, SourceId};
 
 use crate::app_state::AppState;
-use crate::commands::CommandResult;
+use crate::commands::{CommandError, CommandResult};
 
 /// The global sync status returned by [`get_sync_status`] (SPEC s11.3 /
 /// s11.7 `GlobalSyncStatus`).
@@ -39,18 +43,46 @@ pub struct AccountSyncStatus {
 /// `sync_now(source_id?)` - trigger an out-of-band cycle now (SPEC s11.3).
 ///
 /// `source_id = None` triggers every account's orchestrator; `Some` scopes to
-/// the owning account (the orchestrator ticks all its enabled sources -
-/// per-source scoping is an M6 refinement).
+/// the OWNING account (the orchestrator ticks all its enabled sources -
+/// per-source scoping is an M6 refinement). The owning account is resolved
+/// from the state DB; an unknown source id is a command error rather than a
+/// silent no-op (so a stale webview surfaces the problem).
 ///
-/// TODO(M5): resolve the target orchestrator(s) from `state` and call
-/// `orchestrator.trigger(TickSource::Manual).await` on each.
+/// Each [`Orchestrator::trigger`] coalesces into the run loop's capacity-1
+/// trigger channel, so spamming "Sync now" never stacks concurrent cycles.
 #[tauri::command]
 pub async fn sync_now(
     state: State<'_, AppState>,
     source_id: Option<SourceId>,
 ) -> CommandResult<()> {
-    let _ = (state, source_id);
-    todo!("M5: trigger(TickSource::Manual) on the target account orchestrator(s)")
+    match source_id {
+        None => {
+            for (_id, handle) in state.accounts() {
+                handle.orchestrator.trigger(TickSource::Manual).await;
+            }
+            Ok(())
+        }
+        Some(source_id) => {
+            // Resolve the source's owning account from the state DB. Read by
+            // id from the strongly-consistent `backup_sources` table, not a
+            // search, so a just-added source is visible.
+            let sources = state
+                .state()
+                .list_sources()
+                .await
+                .map_err(CommandError::from)?;
+            let account_id = sources
+                .iter()
+                .find(|s| s.id == source_id)
+                .map(|s| s.account_id)
+                .ok_or_else(|| CommandError::new(format!("unknown source id: {source_id}")))?;
+            let handle = state.account(account_id).ok_or_else(|| {
+                CommandError::new(format!("no running orchestrator for account {account_id}"))
+            })?;
+            handle.orchestrator.trigger(TickSource::Manual).await;
+            Ok(())
+        }
+    }
 }
 
 /// `pause_sync(duration_secs?)` - pause sync (SPEC s11.3).
@@ -58,33 +90,66 @@ pub async fn sync_now(
 /// `duration_secs = Some` is a timed pause (e.g. the tray "Pause for 30m");
 /// `None` is pause-until-manual-resume. Sets the manual-pause signal on every
 /// account orchestrator (DESIGN s5.7: manual pause persists across restarts).
-///
-/// TODO(M5): call `orchestrator.set_paused(true).await` on each account; for a
-/// timed pause, schedule a resume after `duration_secs` (clock-driven).
+/// For a timed pause, a detached timer flips the pause back off after the
+/// window. If the user manually resumes (or re-pauses) before the timer fires,
+/// the timer's `set_paused(false)` is a harmless idempotent re-assert of the
+/// already-cleared signal; a fresh `pause_sync(None)` after the timer is armed
+/// is NOT auto-cancelled here (an accepted V1 simplicity - the rare
+/// timed-then-indefinite race re-pauses on the next user action / restart,
+/// which loads the persisted manual-pause).
 #[tauri::command]
 pub async fn pause_sync(
     state: State<'_, AppState>,
     duration_secs: Option<u64>,
 ) -> CommandResult<()> {
-    let _ = (state, duration_secs);
-    todo!("M5: set_paused(true) on every account orchestrator; arm timed resume if duration_secs")
+    // Snapshot the orchestrator handles up front so the resume timer does not
+    // need to borrow `State` (which is not `'static`).
+    let orchestrators: Vec<Arc<dyn Orchestrator>> = state
+        .accounts()
+        .map(|(_id, handle)| handle.orchestrator.clone())
+        .collect();
+
+    for orch in &orchestrators {
+        orch.set_paused(true).await;
+    }
+
+    if let Some(secs) = duration_secs {
+        // Detached timed-resume: sleep the window, then clear the manual pause
+        // on each account. `tokio::time::sleep` (no FakeClock here - this is a
+        // real wall-clock UI affordance) keeps the task off the IPC path so the
+        // command returns immediately.
+        tauri::async_runtime::spawn(async move {
+            tokio::time::sleep(Duration::from_secs(secs)).await;
+            for orch in &orchestrators {
+                orch.set_paused(false).await;
+            }
+        });
+    }
+
+    Ok(())
 }
 
 /// `resume_sync()` - clear the manual pause on every account (SPEC s11.3).
-///
-/// TODO(M5): call `orchestrator.set_paused(false).await` on each account.
 #[tauri::command]
 pub async fn resume_sync(state: State<'_, AppState>) -> CommandResult<()> {
-    let _ = state;
-    todo!("M5: set_paused(false) on every account orchestrator")
+    for (_id, handle) in state.accounts() {
+        handle.orchestrator.set_paused(false).await;
+    }
+    Ok(())
 }
 
 /// `get_sync_status()` - snapshot the aggregate sync state (SPEC s11.3).
 ///
-/// TODO(M5): for each account, read `orchestrator.state().await` and assemble
-/// a [`GlobalSyncStatus`].
+/// Reads each account orchestrator's current [`OrchestratorState`] into the
+/// [`GlobalSyncStatus`] DTO (one [`AccountSyncStatus`] per account).
 #[tauri::command]
 pub async fn get_sync_status(state: State<'_, AppState>) -> CommandResult<GlobalSyncStatus> {
-    let _ = state;
-    todo!("M5: collect orchestrator.state() per account into GlobalSyncStatus")
+    let mut accounts = Vec::new();
+    for (id, handle) in state.accounts() {
+        accounts.push(AccountSyncStatus {
+            account_id: id.to_string(),
+            state: handle.orchestrator.state().await,
+        });
+    }
+    Ok(GlobalSyncStatus { accounts })
 }

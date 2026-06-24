@@ -9,16 +9,24 @@
 //! DTO crate existing yet.
 
 use serde::Serialize;
-use tauri::AppHandle;
+use tauri::{AppHandle, Emitter};
 
 /// `sync:status_changed` - global sync status changed (payload:
 /// `GlobalSyncStatus`, SPEC s11.7).
 pub const EVENT_SYNC_STATUS_CHANGED: &str = "sync:status_changed";
 /// `sync:source_progress` - per-source progress (payload:
 /// `{ source_id, progress }`, SPEC s11.7).
+///
+/// Reserved for M6: the per-source progress DTO + the bridge that emits it land
+/// with the M6 IPC layer (the M5 event bridge only forwards `StateChanged`).
+#[allow(dead_code)]
 pub const EVENT_SYNC_SOURCE_PROGRESS: &str = "sync:source_progress";
 /// `activity:new` - a new activity-log entry (payload: `ActivityEntry`,
 /// SPEC s11.7).
+///
+/// Reserved for M7 (activity dashboard): the `ActivityEntry` DTO does not exist
+/// in M5, so the channel constant + its emit helper are defined but uncalled.
+#[allow(dead_code)]
 pub const EVENT_ACTIVITY_NEW: &str = "activity:new";
 /// `account:needs_reauth` - a refresh token was revoked (payload:
 /// `{ account_id, email }`, SPEC s11.7).
@@ -26,32 +34,38 @@ pub const EVENT_ACCOUNT_NEEDS_REAUTH: &str = "account:needs_reauth";
 
 /// Broadcast `sync:status_changed` with the global status payload (SPEC s11.7).
 ///
-/// TODO(M5): `app.emit(EVENT_SYNC_STATUS_CHANGED, &status)` and map the error.
+/// Thin wrapper over the v2 [`Emitter::emit`] so the orchestrator-event bridge
+/// cannot typo the channel name. The payload is whatever the IPC layer hands
+/// in (`GlobalSyncStatus` in production); kept generic so the bridge can emit
+/// before the concrete DTO crate exists.
 pub fn emit_sync_status_changed<P: Serialize + Clone>(
     app: &AppHandle,
     status: &P,
 ) -> tauri::Result<()> {
-    let _ = (app, status);
-    todo!("M5: app.emit(EVENT_SYNC_STATUS_CHANGED, status)")
+    app.emit(EVENT_SYNC_STATUS_CHANGED, status)
 }
 
 /// Broadcast `activity:new` with the new activity entry (SPEC s11.7).
 ///
-/// TODO(M5): `app.emit(EVENT_ACTIVITY_NEW, &entry)`.
+/// Reserved for M7 (activity dashboard): no M5 caller emits activity entries
+/// yet (the `ActivityEntry` DTO lands with that milestone).
+#[allow(dead_code)]
 pub fn emit_activity_new<P: Serialize + Clone>(app: &AppHandle, entry: &P) -> tauri::Result<()> {
-    let _ = (app, entry);
-    todo!("M5: app.emit(EVENT_ACTIVITY_NEW, entry)")
+    app.emit(EVENT_ACTIVITY_NEW, entry)
 }
 
 /// Broadcast `account:needs_reauth` for `account_id` / `email` (SPEC s11.7).
 ///
-/// TODO(M5): emit the `{ account_id, email }` payload via
-/// `app.emit(EVENT_ACCOUNT_NEEDS_REAUTH, serde_json::json!(...))`.
+/// Emits the `{ account_id, email }` payload the webview's re-consent banner
+/// subscribes to (SPEC s11.7 table). Built as an inline JSON object so the
+/// shape matches the spec without a dedicated DTO type.
 pub fn emit_account_needs_reauth(
     app: &AppHandle,
     account_id: &str,
     email: &str,
 ) -> tauri::Result<()> {
-    let _ = (app, account_id, email);
-    todo!("M5: app.emit(EVENT_ACCOUNT_NEEDS_REAUTH, account_id + email payload)")
+    app.emit(
+        EVENT_ACCOUNT_NEEDS_REAUTH,
+        serde_json::json!({ "account_id": account_id, "email": email }),
+    )
 }
