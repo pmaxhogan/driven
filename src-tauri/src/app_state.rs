@@ -69,12 +69,25 @@ pub struct AccountHandle {
     bridge_shutdown: watch::Sender<bool>,
 }
 
-/// The per-task graceful-drain budget on quit (DESIGN s5.10.2): await each task
-/// this long before aborting it. The run loop's own in-flight cycle is bounded
-/// by the larger `SHUTDOWN_DRAIN_TIMEOUT` in `lib.rs` (which calls
-/// [`AccountHandle::shutdown`] inside its own outer timeout); this per-task
-/// budget keeps a single wedged bridge from holding the join indefinitely.
+/// The SHORT per-task graceful-drain budget on quit (DESIGN s5.10.2) for the
+/// AUXILIARY tasks (watcher bridge, event bridge, power poller): await each this
+/// long before aborting it. These tasks carry no in-flight upload work - they
+/// only forward signals or poll - so they should stop near-instantly once the
+/// run loop has exited; the short budget keeps a single wedged bridge/poller
+/// from holding the join indefinitely.
 const TASK_DRAIN_TIMEOUT: Duration = Duration::from_secs(5);
+
+/// R2-P2-1: the run loop's OWN graceful-drain budget on quit. The run loop is
+/// the ONLY per-account task that may be mid-`execute` (a large in-flight
+/// upload), so DESIGN s5.10.2's "let the current cycle finish" guarantee must
+/// give it the FULL drain window - not the short [`TASK_DRAIN_TIMEOUT`] the
+/// signal-only bridges use. Before this fix the run loop shared the 5s bridge
+/// budget, so a >5s in-flight upload was aborted on explicit Quit even though
+/// the outer `SHUTDOWN_DRAIN_TIMEOUT` in `lib.rs` intended ~20s of drain.
+///
+/// `lib.rs`'s outer sweep guard is derived from this (run-loop budget + a margin
+/// for the short auxiliary drains) so the two never contradict each other.
+pub const RUN_LOOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 
 /// The collected per-account task handles + the bridge shutdown sender, returned
 /// by `assembly::build_account` and stored on [`AccountHandle`]. Groups the four
@@ -110,15 +123,23 @@ impl AccountHandle {
     /// Stop + JOIN every per-account task so quit leaves NO orphaned tokio task
     /// (R-P1-1, ROADMAP M5 acceptance; DESIGN s5.10.2 graceful drain).
     ///
-    /// Order:
+    /// Order (R2-P2-1):
     /// 1. signal the orchestrator to stop after its in-flight cycle
     ///    (`Orchestrator::shutdown()`), and signal the bridges via
     ///    [`Self::bridge_shutdown`] (the watcher bridge's source never closes on
     ///    its own);
-    /// 2. for EVERY tracked handle: await-with-timeout, and on timeout abort
-    ///    the task AND AWAIT the aborted handle - so the task is truly GONE, not
-    ///    merely abort-requested. The power poller loops forever, so it always
-    ///    takes the abort path; the others normally drain cleanly.
+    /// 2. drain the RUN LOOP FIRST with its OWN full [`RUN_LOOP_DRAIN_TIMEOUT`]
+    ///    budget - it is the only task that may be mid-upload, so DESIGN s5.10.2's
+    ///    "let the current cycle finish" applies to it and it must NOT be cut off
+    ///    by the short bridge budget;
+    /// 3. ONLY AFTER the run loop has exited, drain the auxiliary tasks (watcher
+    ///    bridge, event bridge, power poller) with the short [`TASK_DRAIN_TIMEOUT`]
+    ///    - they carry no upload work and stop promptly once the loop is gone.
+    ///
+    /// For EVERY tracked handle: await-with-timeout, and on timeout abort the
+    /// task AND AWAIT the aborted handle - so the task is truly GONE, not merely
+    /// abort-requested. The power poller loops forever, so it always takes the
+    /// abort path; the others normally drain cleanly.
     ///
     /// Idempotent: a second call finds every handle already taken and returns
     /// immediately. Errors awaiting a task (cancelled / panicked) are swallowed -
@@ -131,19 +152,25 @@ impl AccountHandle {
         // gone) - benign.
         let _ = self.bridge_shutdown.send(true);
 
-        // 2) Drain each tracked task: cleanly within the budget, else abort +
-        //    await so it cannot outlive quit.
-        drain_or_abort(&self.run_loop).await;
-        drain_or_abort(&self.watcher_bridge).await;
-        drain_or_abort(&self.event_bridge).await;
-        drain_or_abort(&self.power_poller).await;
+        // 2) Drain the run loop FIRST with the FULL in-flight budget (R2-P2-1):
+        //    a large upload mid-`execute` gets the intended ~20s to finish
+        //    rather than being aborted at the 5s bridge budget.
+        drain_or_abort(&self.run_loop, RUN_LOOP_DRAIN_TIMEOUT).await;
+
+        // 3) THEN drain the signal-only auxiliary tasks with the SHORT budget.
+        //    With the run loop already gone they should stop near-instantly.
+        drain_or_abort(&self.watcher_bridge, TASK_DRAIN_TIMEOUT).await;
+        drain_or_abort(&self.event_bridge, TASK_DRAIN_TIMEOUT).await;
+        drain_or_abort(&self.power_poller, TASK_DRAIN_TIMEOUT).await;
     }
 }
 
 /// Take the handle out of `slot` and drive it to a true stop: await it up to
-/// [`TASK_DRAIN_TIMEOUT`]; on timeout `abort()` it and AWAIT the aborted handle
-/// so the task is genuinely finished before this returns (R-P1-1). A `None`
-/// slot (already drained / never spawned) is a no-op.
+/// `budget`; on timeout `abort()` it and AWAIT the aborted handle so the task is
+/// genuinely finished before this returns (R-P1-1). A `None` slot (already
+/// drained / never spawned) is a no-op. R2-P2-1: the budget is a parameter so
+/// the run loop gets the full [`RUN_LOOP_DRAIN_TIMEOUT`] while the auxiliary
+/// tasks use the short [`TASK_DRAIN_TIMEOUT`].
 ///
 /// `tokio::time::timeout` MOVES the `JoinHandle` into itself and, on elapse,
 /// DROPS it - and a dropped `JoinHandle` does NOT cancel its task (it merely
@@ -152,7 +179,7 @@ impl AccountHandle {
 /// `JoinHandle` we also kept... which `timeout` consumed. To avoid that, we do
 /// not hand the original handle to `timeout`; we `select!` between the handle and
 /// a sleep so the handle stays in scope and can be re-awaited after an abort.
-async fn drain_or_abort(slot: &Mutex<Option<JoinHandle<()>>>) {
+async fn drain_or_abort(slot: &Mutex<Option<JoinHandle<()>>>, budget: Duration) {
     let Some(mut handle) = slot.lock().await.take() else {
         return;
     };
@@ -164,7 +191,7 @@ async fn drain_or_abort(slot: &Mutex<Option<JoinHandle<()>>>) {
         _join_result = &mut handle => {
             // Joined cleanly (or the task panicked - either way it is gone).
         }
-        () = tokio::time::sleep(TASK_DRAIN_TIMEOUT) => {
+        () = tokio::time::sleep(budget) => {
             // Budget elapsed: request cancellation, then AWAIT the same handle
             // so the task is genuinely finished (a JoinError::cancelled is the
             // expected, swallowed result) before we return.
@@ -436,5 +463,121 @@ mod tests {
         tokio::time::timeout(Duration::from_secs(2), handle.shutdown())
             .await
             .expect("second shutdown is an immediate no-op");
+    }
+
+    /// An [`Orchestrator`] whose `run()` keeps working for `drain` AFTER the
+    /// shutdown signal (modelling an in-flight upload that needs time to finish
+    /// the current cycle), setting `finished_cleanly` only when it returns of
+    /// its OWN accord (never if it was aborted mid-sleep).
+    struct SlowDrainOrchestrator {
+        shutdown: watch::Sender<bool>,
+        shutdown_rx: watch::Receiver<bool>,
+        drain: Duration,
+        finished_cleanly: Arc<AtomicBool>,
+    }
+
+    impl SlowDrainOrchestrator {
+        fn new(drain: Duration, finished_cleanly: Arc<AtomicBool>) -> Self {
+            let (shutdown, shutdown_rx) = watch::channel(false);
+            Self {
+                shutdown,
+                shutdown_rx,
+                drain,
+                finished_cleanly,
+            }
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl Orchestrator for SlowDrainOrchestrator {
+        async fn run(&self) -> anyhow::Result<()> {
+            let mut rx = self.shutdown_rx.clone();
+            // Wait for the shutdown signal, then "finish the in-flight cycle"
+            // (sleep `drain`) before returning. If aborted during the sleep,
+            // `finished_cleanly` stays false.
+            while !*rx.borrow() {
+                if rx.changed().await.is_err() {
+                    break;
+                }
+            }
+            tokio::time::sleep(self.drain).await;
+            self.finished_cleanly.store(true, Ordering::SeqCst);
+            Ok(())
+        }
+        async fn trigger(&self, _reason: TickSource) {}
+        async fn set_paused(&self, _paused: bool) {}
+        async fn state(&self) -> OrchestratorState {
+            OrchestratorState::Idle { last_run_at: None }
+        }
+        async fn reconfigure(&self, _config: OrchestratorConfig) {}
+        fn shutdown(&self) {
+            let _ = self.shutdown.send(true);
+        }
+    }
+
+    /// R2-P2-1: a run loop that needs LONGER than the short 5s
+    /// [`TASK_DRAIN_TIMEOUT`] to finish its in-flight cycle - but less than the
+    /// full [`RUN_LOOP_DRAIN_TIMEOUT`] - must drain CLEANLY (DESIGN s5.10.2),
+    /// NOT be aborted at the bridge budget. Uses paused time so the long drain
+    /// is instant.
+    #[tokio::test]
+    async fn run_loop_gets_full_drain_budget_not_the_short_bridge_timeout() {
+        // Paused virtual time so the long in-flight drain is instant (no real
+        // multi-second sleep). `tokio::time::pause` auto-advances when every
+        // task is waiting on a timer.
+        tokio::time::pause();
+        // The in-flight cycle takes ~12s to wind down: well past the 5s short
+        // budget, comfortably inside the 20s run-loop budget.
+        let drain = Duration::from_secs(12);
+        assert!(
+            drain > TASK_DRAIN_TIMEOUT && drain < RUN_LOOP_DRAIN_TIMEOUT,
+            "test fixture must straddle the two budgets"
+        );
+
+        let finished_cleanly = Arc::new(AtomicBool::new(false));
+        let orchestrator: Arc<dyn Orchestrator> =
+            Arc::new(SlowDrainOrchestrator::new(drain, finished_cleanly.clone()));
+
+        let (bridge_shutdown, _rx0) = watch::channel(false);
+        let run_loop = {
+            let orch = orchestrator.clone();
+            tokio::spawn(async move {
+                let _ = orch.run().await;
+            })
+        };
+        let run_loop_abort = run_loop.abort_handle();
+
+        // No watcher/event/poller for this focused test: the run loop is what
+        // matters. `None` slots are drained as no-ops.
+        let (_evt_tx, evt_rx) = tokio::sync::broadcast::channel::<u32>(4);
+        drop(evt_rx);
+        let event_bridge = tokio::spawn(async {});
+        let power_poller = tokio::spawn(async {});
+
+        let handle = AccountHandle::new(
+            orchestrator,
+            AccountTasks {
+                run_loop,
+                watcher_bridge: None,
+                event_bridge,
+                power_poller,
+                bridge_shutdown,
+            },
+        );
+
+        // Bound by the full run-loop budget + a margin: the run loop must finish
+        // by draining cleanly (not by being aborted at 5s).
+        tokio::time::timeout(
+            RUN_LOOP_DRAIN_TIMEOUT + Duration::from_secs(5),
+            handle.shutdown(),
+        )
+        .await
+        .expect("shutdown must complete within the full run-loop budget");
+
+        assert!(
+            finished_cleanly.load(Ordering::SeqCst),
+            "the run loop must drain CLEANLY (finish its in-flight cycle), not be aborted at the 5s bridge budget (R2-P2-1)"
+        );
+        assert!(run_loop_abort.is_finished(), "run loop must be finished");
     }
 }

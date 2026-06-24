@@ -500,3 +500,56 @@ task, NOT bugs in M4's delivered scope.
   state in the executor/state layer = M5 work. M4 corrected the now-honest comment
   at `crates/driven-core/src/executor.rs` (`DriveError::ChecksumMismatch`) to stop
   claiming the defence exists today; the counter itself lands at M5.
+
+## M5 recheck rounds (codex) - cap (2) REACHED, M5 DONE
+
+Two codex recheck rounds ran on M5. Recheck-1 (zero-orphan-task shutdown P1 +
+aggregate tray severity P2 + reconcile `invalid_grant` -> needs_reauth P2) were
+all FIXED. Recheck-2 (FINAL, recheck cap=2 - NO recheck-3) raised 1 P1 + 2 P2,
+ALL FIXED in the same push:
+
+- **R2-P1-1 (FIXED) - reconcile `invalid_grant` swallow + dangerous pending-op
+  delete.** recheck-1 only mapped `invalid_grant` -> `ReconcileError::AuthInvalidGrant`
+  for the corrupt-trash retry; the OTHER reconcile remote awaits (resumable
+  resume, encrypted-parent `ensure_folder`, update `metadata`, create
+  `find_by_op_uuid`, adopt) propagated plain `anyhow` Drive errors, so a revoked
+  token during a NORMAL create/update reconcile was retried forever instead of
+  marking `needs_reauth`. WORSE: the update-metadata branch's catch-all
+  `_ => delete_pending_op` deleted the op on ANY metadata error (incl. auth /
+  transient), losing the reconcile handle for an op that may have committed. Fixed
+  by `to_reconcile_err` (maps `classify_drive_error == InvalidGrant` ->
+  `ReconcileError::AuthInvalidGrant`) wrapping EVERY reconcile remote await, and by
+  deleting the pending op ONLY on a SUCCESSFUL metadata/lookup result that PROVES
+  the UUID absent/not-applicable - on error the op is KEPT (retry next cycle).
+  Tests: `reconcile_invalid_grant_on_{create_lookup,update_metadata}_maps_to_needs_reauth`
+  + `reconcile_metadata_transient_error_keeps_the_pending_op`.
+
+- **R2-P2-1 (FIXED) - run loop drained with the short 5s bridge budget.** The run
+  loop (the only task that can be mid-upload) shared the 5s `TASK_DRAIN_TIMEOUT`
+  with the signal-only bridges, so a >5s in-flight upload was aborted on explicit
+  Quit and the outer ~20s budget never applied to it. Fixed by giving the run loop
+  its own `RUN_LOOP_DRAIN_TIMEOUT` (full ~20s) drained FIRST, then draining the
+  auxiliary tasks with the short 5s budget; the lib.rs outer sweep guard is now
+  derived from the run-loop budget + a margin. Test:
+  `run_loop_gets_full_drain_budget_not_the_short_bridge_timeout` (paused virtual
+  time). The zero-orphan guarantee is preserved (every handle aborted+awaited on
+  timeout); `shutdown_joins_every_per_account_task_no_orphans` still passes.
+
+- **R2-P2-2 (FIXED) - Backoff rendered the blue syncing icon despite aggregating
+  as network-attention.** `state_severity` ranked `Backoff` as network-attention
+  (rank 3) but `TrayIcon::for_state` / `tooltip_for` mapped it to Syncing, so
+  `Backoff + Idle` showed a blue syncing icon instead of the DESIGN s8.1 yellow
+  "Drive unreachable" attention state. Fixed by mapping `Backoff` ->
+  `TrayIcon::NetworkAttention` + the service-down tooltip. Test:
+  `backoff_is_network_attention`.
+
+Accepted residuals (cap reached, M5 DONE - none are regressions):
+
+- **Power suspend/resume seam (`apply_suspending` uncalled).** No
+  `WM_POWERBROADCAST` hook is wired, so the suspend/resume apply path is present
+  but not driven by an OS event. Pre-existing; deferred.
+- **Flat-tile tray icons.** The generated tray tiles are solid-colour squares,
+  not the final designed glyphs (`Syncing` is a static blue tile, not an animated
+  spinner). Pre-existing; cosmetic.
+- **Elevation live test gate-skips off-elevation.** The real-VSS elevation test
+  honestly SKIPs when the runner is not elevated (CI lacks elevation). Pre-existing.

@@ -87,9 +87,14 @@ impl TrayIcon {
     /// Pick the icon for `state` (DESIGN s8.1 state machine).
     ///
     /// - `Idle` -> [`TrayIcon::Idle`];
-    /// - `PowerCheck` / `Scanning` / `Planning` / `Executing` / `Verifying` /
-    ///   `Backoff` -> [`TrayIcon::Syncing`] (`Backoff` is a transient retry,
-    ///   not an error - per the committed scaffold note);
+    /// - `PowerCheck` / `Scanning` / `Planning` / `Executing` / `Verifying`
+    ///   -> [`TrayIcon::Syncing`];
+    /// - `Backoff` -> [`TrayIcon::NetworkAttention`] (R2-P2-2): the Drive
+    ///   circuit breaker is open / rate-limited, i.e. "Drive unreachable"
+    ///   (DESIGN s8.1 yellow-with-`!`), NOT an active sync. This MUST match the
+    ///   aggregate severity ranking, which ranks `Backoff` as a network-attention
+    ///   condition - otherwise `Backoff + Idle` would aggregate to `Backoff` yet
+    ///   render the blue syncing icon;
     /// - `Paused { reason }` -> [`TrayIcon::NetworkAttention`] when the reason
     ///   is a network condition (offline / no-internet / captive / DNS /
     ///   service-down), else [`TrayIcon::Paused`];
@@ -103,8 +108,10 @@ impl TrayIcon {
             | OrchestratorState::Scanning { .. }
             | OrchestratorState::Planning { .. }
             | OrchestratorState::Executing { .. }
-            | OrchestratorState::Verifying { .. }
-            | OrchestratorState::Backoff { .. } => TrayIcon::Syncing,
+            | OrchestratorState::Verifying { .. } => TrayIcon::Syncing,
+            // R2-P2-2: Backoff = Drive breaker open / rate-limited = "Drive
+            // unreachable" attention (consistent with `state_severity`).
+            OrchestratorState::Backoff { .. } => TrayIcon::NetworkAttention,
             OrchestratorState::Paused { reason } => {
                 if pause_reason_is_network(*reason) {
                     TrayIcon::NetworkAttention
@@ -236,8 +243,13 @@ fn tooltip_for(state: &OrchestratorState) -> String {
         | OrchestratorState::Scanning { .. }
         | OrchestratorState::Planning { .. }
         | OrchestratorState::Executing { .. }
-        | OrchestratorState::Verifying { .. }
-        | OrchestratorState::Backoff { .. } => rust_i18n::t!("tray.tooltip.syncing").into_owned(),
+        | OrchestratorState::Verifying { .. } => rust_i18n::t!("tray.tooltip.syncing").into_owned(),
+        // R2-P2-2: Backoff is the "Drive unreachable / retrying" attention
+        // state, not an active sync - use the service-down tooltip so the
+        // tooltip matches the NetworkAttention icon and the aggregate ranking.
+        OrchestratorState::Backoff { .. } => {
+            rust_i18n::t!("tray.tooltip.service_down").into_owned()
+        }
         OrchestratorState::Paused { reason } => tooltip_for_pause(*reason),
         OrchestratorState::Error { detail } => tooltip_for_error(detail.code),
     }
@@ -842,11 +854,54 @@ mod tests {
                 sampled: 0,
                 mismatches: 0,
             },
-            OrchestratorState::Backoff { until: 0 },
+            // R2-P2-2: Backoff is NO LONGER a "working/syncing" state - it maps
+            // to NetworkAttention (covered by `backoff_is_network_attention`).
         ];
         for s in working {
             assert_eq!(TrayIcon::for_state(&s), TrayIcon::Syncing, "{s:?}");
         }
+    }
+
+    /// R2-P2-2: `Backoff` (Drive breaker open / rate-limited = "Drive
+    /// unreachable") must render the yellow NetworkAttention icon + the
+    /// service-down tooltip - NOT the blue syncing icon - so it agrees with the
+    /// aggregate severity ranking (`state_severity(Backoff) == 3`, the
+    /// network-attention rank). Before the fix `Backoff + Idle` aggregated to
+    /// `Backoff` yet showed the syncing icon.
+    #[test]
+    fn backoff_is_network_attention() {
+        let backoff = OrchestratorState::Backoff { until: 0 };
+        assert_eq!(
+            TrayIcon::for_state(&backoff),
+            TrayIcon::NetworkAttention,
+            "Backoff must render the NetworkAttention icon, not Syncing"
+        );
+        // The tooltip must be the service-down (Drive unreachable) string, not
+        // the generic syncing tooltip.
+        assert_eq!(
+            tooltip_for(&backoff),
+            rust_i18n::t!("tray.tooltip.service_down").into_owned(),
+            "Backoff tooltip must be the service-down/Drive-unreachable string"
+        );
+
+        // And the AGGREGATE of Backoff + Idle is Backoff (severity 3 > 0) which
+        // now correctly renders NetworkAttention end-to-end.
+        let a = AccountId::new_v4();
+        let b = AccountId::new_v4();
+        reset_tray_states();
+        let agg_idle = aggregate_state(a, OrchestratorState::Idle { last_run_at: None });
+        assert_eq!(TrayIcon::for_state(&agg_idle), TrayIcon::Idle);
+        let agg = aggregate_state(b, OrchestratorState::Backoff { until: 0 });
+        assert_eq!(
+            TrayIcon::for_state(&agg),
+            TrayIcon::NetworkAttention,
+            "Backoff + Idle must aggregate to the NetworkAttention icon, not blue syncing"
+        );
+        assert_eq!(
+            tooltip_for(&agg),
+            rust_i18n::t!("tray.tooltip.service_down").into_owned(),
+            "the aggregated Backoff tooltip must be the service-down string"
+        );
     }
 
     #[test]

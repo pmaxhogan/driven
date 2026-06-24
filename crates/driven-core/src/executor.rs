@@ -2920,10 +2920,16 @@ impl Executor for DefaultExecutor {
             // falls straight to adopt-or-requeue, which cleanly re-enqueues a
             // fresh op the next cycle re-snapshots + re-uploads from scratch.
             if let Some(resumable) = payload.resumable.clone() {
-                match self
+                // R2-P1-1: a revoked token during the resume's remote awaits
+                // must mark the account needs_reauth (NOT be retried forever as
+                // a transient reconcile failure). Map an invalid_grant-classified
+                // error to ReconcileError::AuthInvalidGrant so reconcile_once's
+                // enter_needs_reauth fires.
+                let resumed = self
                     .resume_persisted(source, &op, &payload, resumable, crypto)
-                    .await?
-                {
+                    .await
+                    .map_err(to_reconcile_err)?;
+                match resumed {
                     Some((entry, resumed_blake3)) => {
                         // P1-2 trap: the streaming-crash payload carries no
                         // `uploaded_blake3_hex`, so adopt would otherwise hit
@@ -2935,8 +2941,11 @@ impl Executor for DefaultExecutor {
                         // the real hash, not a placeholder.
                         let mut adopted = payload.clone();
                         adopted.uploaded_blake3_hex = Some(hex::encode(resumed_blake3));
+                        // adopt_reconciled re-derives the encrypted parent chain
+                        // (remote ensure_folder) - map an invalid_grant there too.
                         self.adopt_reconciled(source, &op, &adopted, entry, crypto)
-                            .await?;
+                            .await
+                            .map_err(to_reconcile_err)?;
                         continue;
                     }
                     None => {
@@ -2949,7 +2958,9 @@ impl Executor for DefaultExecutor {
 
             if let Some(file_id) = payload.drive_file_id.clone() {
                 // Update path: compare the existing object's appProperties.
+                self.pacer.permit_request().await;
                 match self.remote.metadata(&file_id).await {
+                    // R2-P1-1: a SUCCESSFUL metadata read decides the op's fate.
                     Ok(entry)
                         if entry
                             .app_properties
@@ -2957,15 +2968,40 @@ impl Executor for DefaultExecutor {
                             .map(|v| v == &uuid)
                             .unwrap_or(false) =>
                     {
+                        self.pacer.note_response(ResponseClass::Ok);
                         // Already committed remotely; re-hash + finish.
+                        // adopt_reconciled re-derives the encrypted parent chain
+                        // (remote ensure_folder) - map an invalid_grant there.
                         self.adopt_reconciled(source, &op, &payload, entry, crypto)
-                            .await?;
+                            .await
+                            .map_err(to_reconcile_err)?;
                     }
-                    _ => {
-                        // Not committed; drop the stale op so the next scan
-                        // re-enqueues it cleanly (the prior file_state row
-                        // keeps the existing drive_file_id for the update).
+                    Ok(_) => {
+                        // R2-P1-1: the object EXISTS but does NOT carry this op's
+                        // uuid - a SUCCESSFUL result that PROVES this update never
+                        // committed. Only THEN drop the stale op so the next scan
+                        // re-enqueues it cleanly (the prior file_state row keeps
+                        // the existing drive_file_id for the update).
+                        self.pacer.note_response(ResponseClass::Ok);
                         self.state.delete_pending_op(op.id).await?;
+                    }
+                    Err(e) => {
+                        // R2-P1-1: a metadata ERROR proves NOTHING about whether
+                        // the update committed - it may have (a transient/auth
+                        // failure on the read). NEVER delete the op on an error
+                        // (that would lose the reconcile handle for a possibly-
+                        // committed op). KEEP the op and surface the error so the
+                        // source retries next cycle; an invalid_grant maps to
+                        // needs_reauth via reconcile_once.
+                        let class = classify_drive_error(&e);
+                        self.pacer.note_response(class.response_class());
+                        warn!(
+                            target: TARGET,
+                            source = %source.id,
+                            path = %op.relative_path,
+                            "reconcile: metadata read failed; keeping the pending op for retry next cycle (R2-P1-1): {e}"
+                        );
+                        return Err(to_reconcile_err(e));
                     }
                 }
             } else {
@@ -2976,15 +3012,42 @@ impl Executor for DefaultExecutor {
                 // duplicate on the next scan (P1-5 must not regress the
                 // Cluster-A no-duplicate contract). Re-derive the parent
                 // (idempotent `ensure_folder` for the encrypted dir chain).
+                //
+                // R2-P1-1: reconcile_parent_id + find_by_op_uuid + adopt each
+                // do remote awaits; map an invalid_grant to needs_reauth.
                 let parent_id = self
                     .reconcile_parent_id(source, &op.relative_path, crypto)
-                    .await?;
-                match self.remote.find_by_op_uuid(&parent_id, &uuid).await? {
-                    Some(entry) => {
-                        self.adopt_reconciled(source, &op, &payload, entry, crypto)
-                            .await?
+                    .await
+                    .map_err(to_reconcile_err)?;
+                self.pacer.permit_request().await;
+                let found = match self.remote.find_by_op_uuid(&parent_id, &uuid).await {
+                    Ok(found) => {
+                        self.pacer.note_response(ResponseClass::Ok);
+                        found
                     }
+                    Err(e) => {
+                        // R2-P1-1: a lookup ERROR proves nothing about whether the
+                        // create committed; KEEP the op (do not delete) and surface
+                        // the error so it retries next cycle / maps to needs_reauth.
+                        let class = classify_drive_error(&e);
+                        self.pacer.note_response(class.response_class());
+                        warn!(
+                            target: TARGET,
+                            source = %source.id,
+                            path = %op.relative_path,
+                            "reconcile: find_by_op_uuid failed; keeping the pending op for retry next cycle (R2-P1-1): {e}"
+                        );
+                        return Err(to_reconcile_err(e));
+                    }
+                };
+                match found {
+                    Some(entry) => self
+                        .adopt_reconciled(source, &op, &payload, entry, crypto)
+                        .await
+                        .map_err(to_reconcile_err)?,
                     None => {
+                        // R2-P1-1: a SUCCESSFUL lookup that found NO orphan proves
+                        // the create never landed - only THEN drop the op.
                         self.state.delete_pending_op(op.id).await?;
                     }
                 }
@@ -4089,6 +4152,30 @@ pub fn reconcile_error_is_invalid_grant(err: &anyhow::Error) -> bool {
     )
 }
 
+/// R2-P1-1: map a reconcile remote-await error so a revoked token surfaces as a
+/// typed [`ReconcileError::AuthInvalidGrant`] the orchestrator acts on.
+///
+/// recheck-1 only converted `invalid_grant` for the corrupt-trash retry; EVERY
+/// other reconcile remote await (resumable resume, encrypted-parent
+/// `ensure_folder`, update `metadata`, create `find_by_op_uuid`, adopt) used to
+/// propagate a plain `anyhow` Drive error, so a revoked token during a NORMAL
+/// create/update reconcile was treated as a transient reconcile failure and
+/// retried forever instead of marking the account `needs_reauth`. Wrapping each
+/// such await with this helper routes `classify_drive_error(&err) ==
+/// InvalidGrant` into `reconcile_once`'s `enter_needs_reauth` path; any other
+/// error (transient Drive fault, DB hiccup) passes through unchanged and is
+/// retried next cycle. An error that is ALREADY a `ReconcileError` (e.g. from a
+/// nested helper) is passed through unchanged so the typed signal is preserved.
+fn to_reconcile_err(err: anyhow::Error) -> anyhow::Error {
+    if err.downcast_ref::<ReconcileError>().is_some() {
+        return err;
+    }
+    if classify_drive_error(&err) == DriveError::InvalidGrant {
+        return ReconcileError::AuthInvalidGrant.into();
+    }
+    err
+}
+
 /// Extract the stranded corrupt-create file id from a Drive-side error, if it
 /// carries one (codex C5-P1-4).
 ///
@@ -4748,6 +4835,175 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    // --- R2-P1-1: invalid_grant during a NORMAL reconcile -> needs_reauth ----
+
+    /// R2-P1-1: a revoked token observed during the CREATE-path reconcile
+    /// lookup (`find_by_op_uuid`) - NOT the corrupt-trash retry - must surface
+    /// as a typed `ReconcileError::AuthInvalidGrant` so the orchestrator runs
+    /// the SAME needs-reauth transition (DESIGN s5.4). Before the fix this path
+    /// propagated a plain anyhow Drive error and was retried forever.
+    #[tokio::test]
+    async fn reconcile_invalid_grant_on_create_lookup_maps_to_needs_reauth() {
+        // First remote request (planting the orphan create) succeeds; the
+        // SECOND (reconcile's find_by_op_uuid) trips invalid_grant + latches.
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_invalid_grant_after(1)).await;
+        let (rel, _size) = h.write_file("auth-create.txt", b"committed pre-revoke");
+
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let mut app = HashMap::new();
+        app.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.clone());
+        // Request #1: plant the orphaned create (token still valid).
+        h.remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "auth-create.txt",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from_static(b"committed pre-revoke")),
+                app,
+            )
+            .await
+            .unwrap();
+        let now = h.clock.now_ms();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                payload_json: serde_json::json!({ "client_op_uuid": op_uuid, "drive_file_id": null }),
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let exec = h.executor();
+        let err = exec
+            .reconcile(&h.source)
+            .await
+            .expect_err("invalid_grant on the create lookup must fail the reconcile");
+        assert!(
+            reconcile_error_is_invalid_grant(&err),
+            "a revoked token during the normal create reconcile must surface ReconcileError::AuthInvalidGrant (drives needs_reauth + suspend), got: {err:?}"
+        );
+        // The op is KEPT (never dropped) so it retries once the user re-links.
+        assert_eq!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an auth failure must KEEP the pending op (no data-loss drop)"
+        );
+    }
+
+    /// R2-P1-1: a revoked token observed during the UPDATE-path reconcile
+    /// (`metadata`) must likewise map to `ReconcileError::AuthInvalidGrant`
+    /// (not be swallowed by the catch-all delete-op arm).
+    #[tokio::test]
+    async fn reconcile_invalid_grant_on_update_metadata_maps_to_needs_reauth() {
+        // The metadata read is the FIRST remote request on the update path, so
+        // trip invalid_grant on request #1.
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_invalid_grant_after(0)).await;
+        let (rel, _size) = h.write_file("auth-update.txt", b"existing object");
+
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let now = h.clock.now_ms();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                // drive_file_id present => the UPDATE reconcile path (metadata).
+                payload_json: serde_json::json!({
+                    "client_op_uuid": op_uuid,
+                    "drive_file_id": "some-existing-id",
+                }),
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let exec = h.executor();
+        let err = exec
+            .reconcile(&h.source)
+            .await
+            .expect_err("invalid_grant on the metadata read must fail the reconcile");
+        assert!(
+            reconcile_error_is_invalid_grant(&err),
+            "a revoked token during the normal update reconcile must surface ReconcileError::AuthInvalidGrant, got: {err:?}"
+        );
+        assert_eq!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an auth failure on metadata must KEEP the op, never delete it"
+        );
+    }
+
+    /// R2-P1-1 (data-safety): a NON-auth (transient) metadata ERROR proves
+    /// nothing about whether the update committed, so the reconcile must KEEP
+    /// the pending op (retry next cycle) rather than delete it via the old
+    /// catch-all `_ => delete_pending_op` arm - which would lose the reconcile
+    /// handle for an op that may have committed remotely.
+    #[tokio::test]
+    async fn reconcile_metadata_transient_error_keeps_the_pending_op() {
+        // First remote request (the metadata read) drops the network.
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_network_drop_after(0)).await;
+        let (rel, _size) = h.write_file("keep-on-error.txt", b"maybe-committed");
+
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let now = h.clock.now_ms();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                payload_json: serde_json::json!({
+                    "client_op_uuid": op_uuid,
+                    "drive_file_id": "maybe-committed-id",
+                }),
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let exec = h.executor();
+        let err = exec
+            .reconcile(&h.source)
+            .await
+            .expect_err("a transient metadata error must fail the reconcile (retry next cycle)");
+        // A plain transient error - NOT an auth one (so the orchestrator simply
+        // retries the source next cycle instead of marking needs_reauth).
+        assert!(
+            !reconcile_error_is_invalid_grant(&err),
+            "a transient metadata error must NOT be classified as invalid_grant, got: {err:?}"
+        );
+        // CRITICAL: the op survives - never dropped on a metadata error.
+        assert_eq!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a metadata ERROR must KEEP the pending op (an op that may have committed must not lose its reconcile handle)"
+        );
+        assert!(
+            h.state
+                .get_file_state(h.source.id, &rel)
+                .await
+                .unwrap()
+                .is_none(),
+            "no file_state row should be written on a failed metadata reconcile"
+        );
     }
 
     // --- P1-2: orphan whose local bytes CHANGED post-upload requeues --------

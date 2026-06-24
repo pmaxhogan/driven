@@ -45,3 +45,6 @@ driven-vss = { path = "../crates/driven-vss" }
 # R-P1-1 shutdown test: a no-op `Orchestrator` impl to build an `AccountHandle`
 # and assert every per-account task is joined after `shutdown()`.
 async-trait.workspace = true
+# R2-P2-1 run-loop drain-budget test: `tokio::time::pause` for virtual time so
+# the long in-flight drain is instant (test-util is NOT part of tokio `full`).
+tokio = { workspace = true, features = ["test-util"] }

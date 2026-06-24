@@ -56,11 +56,16 @@ const ARG_QUIT: &str = "--quit";
 /// launch.
 const MAIN_WINDOW: &str = "main";
 
-/// Upper bound on how long an explicit Quit waits for ONE account's in-flight
-/// cycle to drain before aborting its run loop (DESIGN s5.10.2 graceful drain
-/// vs ROADMAP M5 "no orphaned tasks"). A normal cycle finishes well within
-/// this; a wedged cycle is aborted rather than hanging quit forever.
-const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from_secs(20);
+/// Outer belt-and-suspenders cap on the WHOLE quit sweep (all accounts). The
+/// real per-account in-flight drain window lives in
+/// [`app_state::RUN_LOOP_DRAIN_TIMEOUT`] (R2-P2-1: the run loop, the only task
+/// that can be mid-upload, gets that full budget); this outer guard sits a
+/// margin ABOVE it so it never cuts the run-loop drain short, while still
+/// guaranteeing quit cannot hang forever if a wedged account's per-task aborts
+/// somehow stall. `AccountHandle::shutdown` already aborts-and-awaits each task,
+/// so reaching this cap means something is badly stuck.
+const SHUTDOWN_DRAIN_TIMEOUT: std::time::Duration =
+    app_state::RUN_LOOP_DRAIN_TIMEOUT.saturating_add(std::time::Duration::from_secs(10));
 
 /// `<config_dir>/driven/state.db` (SPEC s2), resolved from Tauri's
 /// `app_config_dir()` (`config_dir() + identifier`). `app.driven` is the
