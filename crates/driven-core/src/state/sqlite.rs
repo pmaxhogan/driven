@@ -665,12 +665,15 @@ impl StateRepo for SqliteStateRepo {
 
         if let Some((account_id, master_key_id)) = stamp_master_key_id.as_ref() {
             let account_id = account_id.to_string();
-            // A targeted column update (not a full-row replace) so the stamp
-            // cannot clobber any other account column. Affecting zero rows means
-            // the account vanished mid-flight - roll back rather than insert a
-            // phantom-keyed orphan.
+            // R2-P1-1: a COMPARE-AND-SET stamp - update the master-key column ONLY
+            // when it is still NULL. A targeted column update (not a full-row
+            // replace) so the stamp cannot clobber any other account column, AND
+            // the `IS NULL` guard means a concurrent writer that already stamped a
+            // (possibly different) key is NEVER overwritten. Affecting one row =
+            // we won the stamp; affecting zero needs disambiguation below.
             let affected = sqlx::query!(
-                "UPDATE accounts SET encryption_master_key_id = ?1 WHERE id = ?2",
+                "UPDATE accounts SET encryption_master_key_id = ?1 \
+                 WHERE id = ?2 AND encryption_master_key_id IS NULL",
                 master_key_id,
                 account_id,
             )
@@ -678,12 +681,40 @@ impl StateRepo for SqliteStateRepo {
             .await?
             .rows_affected();
             if affected == 0 {
-                // Dropping `tx` without commit rolls back automatically; be
-                // explicit for clarity.
-                tx.rollback().await?;
-                return Err(anyhow!(
-                    "account not found for master-key stamp; transaction rolled back"
-                ));
+                // Zero rows updated: either the account vanished, or its
+                // master-key column was ALREADY set by a concurrent stamp (the
+                // CAS lost the race). Read the current value to decide.
+                let current = sqlx::query!(
+                    r#"SELECT encryption_master_key_id AS "mk: String" FROM accounts WHERE id = ?1"#,
+                    account_id,
+                )
+                .fetch_optional(&mut *tx)
+                .await?;
+                match current {
+                    // Account gone: roll back rather than insert a phantom-keyed
+                    // orphan.
+                    None => {
+                        tx.rollback().await?;
+                        return Err(anyhow!(
+                            "account not found for master-key stamp; transaction rolled back"
+                        ));
+                    }
+                    // Already stamped with the SAME key id: idempotent, proceed
+                    // (the source row still needs inserting under this key).
+                    Some(row) if row.mk.as_deref() == Some(master_key_id.as_str()) => {}
+                    // Already stamped with a DIFFERENT key id: the caller generated
+                    // a divergent master key (a lost CAS race WITHOUT the per-
+                    // account lock). Refuse - committing would wrap this source
+                    // under a key the account does not record, leaving it
+                    // unrestorable. Roll back so the caller rolls back its key.
+                    Some(_) => {
+                        tx.rollback().await?;
+                        return Err(anyhow!(
+                            "account master key already set by a concurrent writer; \
+                             refusing to stamp a divergent key (transaction rolled back)"
+                        ));
+                    }
+                }
             }
         }
 
@@ -1463,6 +1494,21 @@ impl StateRepo for SqliteStateRepo {
         Ok(row.0)
     }
 
+    async fn table_row_count(&self, table: &str) -> Result<i64> {
+        // R2-P2-4: a table name cannot be a bound parameter, so guard against
+        // injection by ONLY accepting a name from the migration-defined
+        // allow-list and building the (constant, no-user-substring) query from
+        // the matched &'static str - never from the caller's raw input.
+        let safe: &'static str = crate::state::KNOWN_STATE_TABLES
+            .iter()
+            .copied()
+            .find(|t| *t == table)
+            .ok_or_else(|| anyhow!("unknown state table for row count: {table}"))?;
+        let sql = format!("SELECT COUNT(*) FROM {safe}");
+        let count: i64 = sqlx::query_scalar(&sql).fetch_one(&self.pool).await?;
+        Ok(count)
+    }
+
     // --- settings -----------------------------------------------------------
 
     async fn get_setting(&self, key: &str) -> Result<Option<Value>> {
@@ -1790,6 +1836,89 @@ mod tests {
         let after = repo.list_accounts().await.unwrap();
         assert_eq!(after[0].encryption_master_key_id, original_key);
         assert_eq!(repo.list_sources().await.unwrap(), vec![src]);
+    }
+
+    #[tokio::test]
+    async fn cas_stamp_rejects_a_divergent_concurrent_key() {
+        // R2-P1-1 (data-safety): the master-key stamp is a COMPARE-AND-SET. Once
+        // the account is stamped with one key id, a later insert that tries to
+        // stamp a DIFFERENT key id (a lost race WITHOUT the per-account lock) is
+        // REFUSED and its source row is NOT inserted - so a source can never be
+        // committed under a master key the account does not record (which would be
+        // unrestorable). The first key id is preserved.
+        let (repo, _dir) = temp_repo().await;
+        let mut acct = sample_account();
+        acct.encryption_master_key_id = None;
+        repo.upsert_account(&acct).await.unwrap();
+
+        // First add wins the stamp.
+        let mut first = sample_source(acct.id);
+        first.encryption_enabled = true;
+        repo.insert_source_with_optional_master_key_stamp(&first, Some((acct.id, "key-A".into())))
+            .await
+            .expect("first stamp wins");
+
+        // Second add tries to stamp a DIFFERENT key id -> rejected.
+        let mut second = sample_source(acct.id);
+        second.encryption_enabled = true;
+        let err = repo
+            .insert_source_with_optional_master_key_stamp(
+                &second,
+                Some((acct.id, "key-B-divergent".into())),
+            )
+            .await
+            .expect_err("a divergent concurrent stamp must be rejected");
+        assert!(
+            format!("{err:#}").contains("concurrent"),
+            "error must explain the concurrent-stamp refusal: {err:#}"
+        );
+
+        // The account keeps key-A and ONLY the first source persisted.
+        let after = repo.list_accounts().await.unwrap();
+        assert_eq!(
+            after[0].encryption_master_key_id.as_deref(),
+            Some("key-A"),
+            "the first key id must be preserved (never overwritten)"
+        );
+        let sources = repo.list_sources().await.unwrap();
+        assert_eq!(
+            sources.len(),
+            1,
+            "the divergent-key source must NOT persist"
+        );
+        assert_eq!(sources[0].id, first.id);
+    }
+
+    #[tokio::test]
+    async fn cas_stamp_is_idempotent_for_the_same_key() {
+        // R2-P1-1: a second add that stamps the SAME key id (the per-account lock
+        // makes the loser load the existing key and pass it again) is idempotent -
+        // the stamp is unchanged and the second source IS inserted.
+        let (repo, _dir) = temp_repo().await;
+        let mut acct = sample_account();
+        acct.encryption_master_key_id = None;
+        repo.upsert_account(&acct).await.unwrap();
+
+        let mut first = sample_source(acct.id);
+        first.encryption_enabled = true;
+        repo.insert_source_with_optional_master_key_stamp(&first, Some((acct.id, "key-A".into())))
+            .await
+            .expect("first stamp");
+
+        // Second add stamps the SAME key id -> idempotent success, source inserted.
+        let mut second = sample_source(acct.id);
+        second.encryption_enabled = true;
+        repo.insert_source_with_optional_master_key_stamp(&second, Some((acct.id, "key-A".into())))
+            .await
+            .expect("same-key stamp is idempotent");
+
+        let after = repo.list_accounts().await.unwrap();
+        assert_eq!(after[0].encryption_master_key_id.as_deref(), Some("key-A"));
+        assert_eq!(
+            repo.list_sources().await.unwrap().len(),
+            2,
+            "both sources persist under the single shared key"
+        );
     }
 
     #[tokio::test]

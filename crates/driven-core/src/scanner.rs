@@ -787,6 +787,9 @@ mod tests {
         async fn schema_version(&self) -> anyhow::Result<i64> {
             unimplemented!()
         }
+        async fn table_row_count(&self, _table: &str) -> anyhow::Result<i64> {
+            unimplemented!()
+        }
         async fn get_setting(&self, _key: &str) -> anyhow::Result<Option<serde_json::Value>> {
             unimplemented!()
         }

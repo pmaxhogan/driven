@@ -2099,6 +2099,9 @@ mod tests {
         async fn schema_version(&self) -> anyhow::Result<i64> {
             Ok(0)
         }
+        async fn table_row_count(&self, _table: &str) -> anyhow::Result<i64> {
+            Ok(0)
+        }
         async fn get_setting(&self, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
             Ok(self.settings.lock().unwrap().get(key).cloned())
         }

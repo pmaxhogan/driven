@@ -882,6 +882,13 @@ pub enum ErrorCode {
     HarnessTimeout,
     /// `internal.bug` - programming error; please report.
     InternalBug,
+    /// `internal.invalid_input` - a value the (untrusted) webview / renderer
+    /// submitted failed backend validation (an out-of-range setting, an invalid
+    /// enum, or an invalid / over-count / over-length glob pattern). Distinct
+    /// from [`Self::InternalBug`]: this is bad INPUT crossing the IPC boundary,
+    /// not an internal programming error, so the UI shows a "check your input"
+    /// message rather than "please report a bug".
+    InvalidInput,
 }
 
 impl ErrorCode {
@@ -928,6 +935,7 @@ impl ErrorCode {
             ErrorCode::StateReconcileOrphan => "state.reconcile_orphan",
             ErrorCode::HarnessTimeout => "harness.timeout",
             ErrorCode::InternalBug => "internal.bug",
+            ErrorCode::InvalidInput => "internal.invalid_input",
         }
     }
 
@@ -978,6 +986,7 @@ impl ErrorCode {
             "state.reconcile_orphan" => ErrorCode::StateReconcileOrphan,
             "harness.timeout" => ErrorCode::HarnessTimeout,
             "internal.bug" => ErrorCode::InternalBug,
+            "internal.invalid_input" => ErrorCode::InvalidInput,
             _ => return None,
         })
     }

@@ -285,6 +285,23 @@ pub struct FileSearchHit {
 // The trait surface.
 // -----------------------------------------------------------------------------
 
+/// R2-P2-4: every state-DB table the migrations define (SPEC s2; migrations
+/// `0001_initial`, `0002_seed_settings` (data only), `0003_checksum_mismatch`).
+/// The diagnostic-bundle `schema.txt` counts EVERY one of these so the bundle is
+/// useful for corruption / debug cases, and [`StateRepo::table_row_count`] only
+/// accepts a name from THIS list (table names cannot be bound parameters, so the
+/// allow-list is the injection guard). Keep in lockstep with the migrations.
+pub const KNOWN_STATE_TABLES: &[&str] = &[
+    "accounts",
+    "backup_sources",
+    "file_state",
+    "file_state_fts",
+    "pending_ops",
+    "activity_log",
+    "settings",
+    "file_checksum_mismatch",
+];
+
 /// Storage contract for the SQLite-backed state at
 /// `<config_dir>/driven/state.db` (SPEC s2).
 ///
@@ -593,6 +610,14 @@ pub trait StateRepo: Send + Sync {
     /// trait so the diagnostic-bundle command (which holds only `dyn StateRepo`)
     /// can record the REAL schema version rather than "not exposed".
     async fn schema_version(&self) -> Result<i64>;
+
+    /// R2-P2-4: the row count of one known state table (SPEC s18 diagnostic
+    /// bundle `schema.txt`). `table` MUST be one of the migration-defined table
+    /// names ([`KNOWN_STATE_TABLES`]); the implementation rejects any other name
+    /// (a SQL-injection / typo guard, since a table name cannot be a bound
+    /// parameter). Exposed on the object-safe trait so the diagnostic-bundle
+    /// command (which holds only `dyn StateRepo`) can count EVERY table.
+    async fn table_row_count(&self, table: &str) -> Result<i64>;
 
     /// Reads a setting value (SPEC s22). Returns `None` if the key is
     /// absent. Values are JSON-typed per the schema's TEXT column.

@@ -281,6 +281,99 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
     })
 }
 
+/// Max number of include OR exclude patterns a single source may carry
+/// (R2-P1-3). A backup source's rule list is small in practice; an unbounded
+/// list from a compromised renderer would bloat the matcher build + every scan
+/// decision, so it is capped here (per side: includes and excludes each).
+pub const MAX_PATTERNS_PER_SIDE: usize = 1000;
+
+/// Max length (in bytes) of a single include / exclude glob pattern (R2-P1-3).
+/// A real glob is short; a pathologically long one is rejected before it can
+/// reach the matcher / SQLite.
+pub const MAX_PATTERN_LEN: usize = 4096;
+
+/// An invalid include / exclude pattern rejected by [`validate_patterns`]
+/// (R2-P1-3). Carries a human-readable reason; the IPC layer maps it to the
+/// stable `internal.invalid_input` SPEC s24 code.
+#[derive(Debug, thiserror::Error)]
+#[error("invalid backup pattern: {0}")]
+pub struct PatternValidationError(pub String);
+
+/// Validate a source's candidate include + exclude glob patterns BEFORE they
+/// are persisted (R2-P1-3, DESIGN s5.2). Called by `add_source` AND
+/// `update_source` so an invalid / oversized glob can never reach SQLite and
+/// then break the next scan's matcher build.
+///
+/// Enforces, per side (includes, excludes):
+/// 1. at most [`MAX_PATTERNS_PER_SIDE`] patterns;
+/// 2. each pattern at most [`MAX_PATTERN_LEN`] bytes, and non-empty after trim;
+/// 3. each pattern COMPILES under the SAME [`GitignoreBuilder::add_line`] the
+///    scanner uses in [`build_source_matcher`] (an `exclude` verbatim, an
+///    `include` as its `!`-re-include form) - so a glob the scanner would later
+///    reject is rejected up front instead.
+///
+/// Returns `Ok(())` when every pattern is valid, else the first
+/// [`PatternValidationError`].
+pub fn validate_patterns(
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> Result<(), PatternValidationError> {
+    if include_patterns.len() > MAX_PATTERNS_PER_SIDE {
+        return Err(PatternValidationError(format!(
+            "too many include patterns ({}, max {MAX_PATTERNS_PER_SIDE})",
+            include_patterns.len()
+        )));
+    }
+    if exclude_patterns.len() > MAX_PATTERNS_PER_SIDE {
+        return Err(PatternValidationError(format!(
+            "too many exclude patterns ({}, max {MAX_PATTERNS_PER_SIDE})",
+            exclude_patterns.len()
+        )));
+    }
+
+    // Compile each candidate with the SAME builder the scanner uses, rooted at a
+    // neutral path (pattern syntax validity does not depend on the root). An
+    // `exclude` is added verbatim; an `include` is added as `!<pat>` (the
+    // re-include form `build_source_matcher` uses), so the validation matches the
+    // exact line each side will produce later.
+    let mut builder = GitignoreBuilder::new(Path::new("/"));
+    for exc in exclude_patterns {
+        check_one_pattern(exc)?;
+        builder
+            .add_line(None, exc)
+            .map_err(|e| PatternValidationError(format!("exclude pattern `{exc}`: {e}")))?;
+    }
+    for inc in include_patterns {
+        check_one_pattern(inc)?;
+        let reinclude = format!("!{inc}");
+        builder
+            .add_line(None, &reinclude)
+            .map_err(|e| PatternValidationError(format!("include pattern `{inc}`: {e}")))?;
+    }
+    // Build once to surface any defect the per-line add did not catch.
+    builder.build().map_err(|e| {
+        PatternValidationError(format!("patterns do not form a valid matcher: {e}"))
+    })?;
+    Ok(())
+}
+
+/// Per-pattern shape checks shared by both sides of [`validate_patterns`]:
+/// reject an empty / whitespace-only pattern and one over [`MAX_PATTERN_LEN`].
+fn check_one_pattern(pat: &str) -> Result<(), PatternValidationError> {
+    if pat.trim().is_empty() {
+        return Err(PatternValidationError(
+            "pattern must not be empty or whitespace-only".to_string(),
+        ));
+    }
+    if pat.len() > MAX_PATTERN_LEN {
+        return Err(PatternValidationError(format!(
+            "pattern is too long ({} bytes, max {MAX_PATTERN_LEN})",
+            pat.len()
+        )));
+    }
+    Ok(())
+}
+
 /// Collects every file named `filename` (e.g. `.gitignore` or `.ignore`)
 /// under `root`, root-first (shallowest first), so [`build_source_matcher`]
 /// can add them in last-match-wins order where a deeper file's rule overrides
@@ -516,6 +609,49 @@ mod tests {
             fs::create_dir_all(parent).expect("mkdir");
         }
         fs::write(path, contents).expect("write");
+    }
+
+    #[test]
+    fn validate_patterns_accepts_valid_and_rejects_count_length_and_invalid() {
+        // R2-P1-3: the matcher-backed pattern validator the IPC layer calls on
+        // both add_source and update_source.
+
+        // Valid globs (the kind the scanner compiles) are accepted.
+        validate_patterns(
+            &["*.md".to_string()],
+            &["*.log".to_string(), "build/".to_string()],
+        )
+        .expect("valid include/exclude globs accepted");
+        validate_patterns(&[], &[]).expect("empty rule sets are valid");
+
+        // Over-count (one past the per-side cap) is rejected.
+        let too_many: Vec<String> = (0..=MAX_PATTERNS_PER_SIDE)
+            .map(|i| format!("f{i}"))
+            .collect();
+        assert_eq!(too_many.len(), MAX_PATTERNS_PER_SIDE + 1);
+        validate_patterns(&[], &too_many).expect_err("over-count excludes rejected");
+        validate_patterns(&too_many, &[]).expect_err("over-count includes rejected");
+
+        // Over-length (one past the per-pattern byte cap) is rejected.
+        let too_long = "a".repeat(MAX_PATTERN_LEN + 1);
+        validate_patterns(&[], std::slice::from_ref(&too_long))
+            .expect_err("over-length exclude rejected");
+        validate_patterns(std::slice::from_ref(&too_long), &[])
+            .expect_err("over-length include rejected");
+
+        // Empty / whitespace-only patterns are rejected (they would be a no-op or
+        // a footgun in the matcher).
+        validate_patterns(&[], &["   ".to_string()]).expect_err("blank pattern rejected");
+
+        // An invalid glob the matcher cannot compile is rejected. The gitignore
+        // builder rejects a pattern ending in an unescaped trailing backslash
+        // (a dangling escape), which is exactly the kind of glob that would later
+        // fail the scanner's matcher build - caught here up front instead.
+        let bad = "abc\\".to_string();
+        validate_patterns(&[], std::slice::from_ref(&bad))
+            .expect_err("an uncompilable glob must be rejected");
+        validate_patterns(std::slice::from_ref(&bad), &[])
+            .expect_err("an uncompilable include glob must be rejected");
     }
 
     /// A `SourceRow` rooted at `root` with the given rule knobs; the fields
