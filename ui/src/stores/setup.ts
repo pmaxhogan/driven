@@ -2,17 +2,25 @@ import { defineStore } from "pinia";
 import { computed, ref } from "vue";
 
 import * as ipc from "../ipc/commands";
+import { useSourcesStore } from "./sources";
 import type {
   AddAccountWizardSessionId,
+  AddSourceRequest,
   OAuthStatus,
   SessionId,
 } from "../ipc/types";
 
 // Setup-wizard store (DESIGN s8.5 5-step wizard; SPEC s11.1 OAuth flow). Holds
-// the wizard step cursor + the in-flight OAuth session/state. M6 scaffold: the
-// step model + action SIGNATURES are frozen; the accounts implementer fills in
-// the richer flow (polling cadence, error surfacing, encryption opt-in handoff
-// to the recovery-phrase reveal).
+// the wizard step cursor + the in-flight OAuth session/state + the staged
+// first-source inputs + the encryption opt-in. The view drives the OAuth IPC
+// sequence (begin -> submitCredentials -> startSignin -> open auth URL ->
+// poll/await oauth:complete -> finish) through these actions; the store keeps
+// the cross-step state so back/next never loses the user's input.
+//
+// Polling note: we never spin a busy until-loop. The view drives completion via
+// the `oauth:complete` event (one-shot `poll()` on fire) plus a manual "I'm
+// done signing in" poll button mirroring SPEC s6.1 step 7's "Done - continue"
+// affordance. Both paths funnel through the single `poll()` action below.
 
 /** DESIGN s8.5 wizard steps, 1-indexed to match the design. */
 export const WIZARD_STEPS = [
@@ -29,9 +37,31 @@ export const useSetupStore = defineStore("setup", () => {
   const session = ref<AddAccountWizardSessionId | null>(null);
   const oauthStatus = ref<OAuthStatus | null>(null);
 
+  // Cross-step staged inputs. Kept here (not component-local) so navigating
+  // back/forward preserves what the user already entered.
+  const accountId = ref<string | null>(null);
+  const accountEmail = ref<string | null>(null);
+  const localPath = ref<string | null>(null);
+  const driveFolderId = ref<string | null>(null);
+  const driveFolderPath = ref<string>("");
+  const sourceDisplayName = ref<string>("");
+  const encryptionEnabled = ref(false);
+  // The 24-word BIP39 phrase the backend returns on encryption opt-in. Held
+  // only in memory; revealed once via RecoveryPhraseReveal, never persisted.
+  const recoveryPhrase = ref<string[] | null>(null);
+  const sourceId = ref<string | null>(null);
+
+  // Transient UX flags surfaced by the view.
+  const busy = ref(false);
+  // Stable error code (SPEC s24) the view maps via t(`errors.${code}.long`).
+  const errorCode = ref<string | null>(null);
+
   const step = computed<WizardStep>(() => WIZARD_STEPS[stepIndex.value]);
   const canGoBack = computed(() => stepIndex.value > 0);
   const canGoNext = computed(() => stepIndex.value < WIZARD_STEPS.length - 1);
+
+  /** True once the OAuth sign-in has resolved to `complete`. */
+  const signedIn = computed(() => oauthStatus.value?.kind === "complete");
 
   function next(): void {
     if (canGoNext.value) stepIndex.value += 1;
@@ -39,6 +69,10 @@ export const useSetupStore = defineStore("setup", () => {
 
   function back(): void {
     if (canGoBack.value) stepIndex.value -= 1;
+  }
+
+  function clearError(): void {
+    errorCode.value = null;
   }
 
   async function begin(): Promise<void> {
@@ -68,13 +102,143 @@ export const useSetupStore = defineStore("setup", () => {
 
   async function finish(displayName: string | null): Promise<void> {
     const s = requireSession();
-    await ipc.finishAddAccount(s, displayName);
+    const account = await ipc.finishAddAccount(s, displayName);
+    accountId.value = account.id;
+    accountEmail.value = account.email;
+  }
+
+  /**
+   * Drive the full credential -> sign-in handoff for the credentials step:
+   * submit the pasted client id/secret, start the loopback OAuth flow, and hand
+   * the returned auth URL to `openUrl` (defaults to the webview `window.open`,
+   * overridable for tests). The browser round-trip then resolves via the
+   * `oauth:complete` event or a manual `poll()`.
+   */
+  async function connectAccount(
+    clientId: string,
+    clientSecret: string,
+    openUrl: (url: string) => void = defaultOpenUrl,
+  ): Promise<void> {
+    busy.value = true;
+    errorCode.value = null;
+    try {
+      if (!session.value) {
+        await begin();
+      }
+      await submitCredentials(clientId, clientSecret);
+      const authUrl = await startSignin();
+      openUrl(authUrl);
+      oauthStatus.value = { kind: "awaitingCallback" };
+    } catch (e) {
+      errorCode.value = toErrorCode(e);
+      throw e;
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  /**
+   * One-shot completion check used by both the `oauth:complete` event handler
+   * and the manual "I'm done" button. Refreshes status, records any failure
+   * code, and advances to the source step on success. Returns whether sign-in
+   * is now complete. No looping - the caller decides when to re-check.
+   */
+  async function checkSigninComplete(): Promise<boolean> {
+    busy.value = true;
+    try {
+      const status = await poll();
+      if (status.kind === "complete") {
+        await finish(null);
+        return true;
+      }
+      if (status.kind === "failed") {
+        errorCode.value = status.code;
+      }
+      return false;
+    } catch (e) {
+      errorCode.value = toErrorCode(e);
+      return false;
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  /**
+   * Create the first backup source from the staged inputs (DESIGN s8.5 step 3).
+   * Reuses the sources store so the new source lands in the same reactive list
+   * the Sources tab renders. The encryption flag rides along; the backend
+   * returns the recovery phrase out-of-band on opt-in (surfaced in step 4 via
+   * RecoveryPhraseReveal). Requires a chosen account + dialog-derived local
+   * path + a picked Drive destination.
+   */
+  async function createFirstSource(): Promise<void> {
+    busy.value = true;
+    errorCode.value = null;
+    try {
+      const acct = accountId.value;
+      const local = localPath.value;
+      const drive = driveFolderId.value;
+      if (!acct || !local || !drive) {
+        throw new Error("source step is incomplete");
+      }
+      const req: AddSourceRequest = {
+        accountId: acct,
+        displayName: sourceDisplayName.value || driveFolderPath.value || local,
+        localPath: local,
+        driveFolderId: drive,
+        driveFolderPath: driveFolderPath.value,
+        encryptionEnabled: encryptionEnabled.value,
+        respectGitignore: true,
+        includePatterns: [],
+        excludePatterns: [],
+      };
+      const sources = useSourcesStore();
+      const created = await sources.add(req);
+      sourceId.value = created.id;
+    } catch (e) {
+      errorCode.value = toErrorCode(e);
+      throw e;
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  /**
+   * Kick off the initial sync for the just-created source (DESIGN s8.5 step 5).
+   * Scoped to the new source so the wizard never triggers a global sweep.
+   */
+  async function startInitialSync(): Promise<void> {
+    busy.value = true;
+    errorCode.value = null;
+    try {
+      const sid = sourceId.value;
+      if (!sid) {
+        throw new Error("no source to sync");
+      }
+      await ipc.syncNow(sid);
+    } catch (e) {
+      errorCode.value = toErrorCode(e);
+      throw e;
+    } finally {
+      busy.value = false;
+    }
   }
 
   function reset(): void {
     stepIndex.value = 0;
     session.value = null;
     oauthStatus.value = null;
+    accountId.value = null;
+    accountEmail.value = null;
+    localPath.value = null;
+    driveFolderId.value = null;
+    driveFolderPath.value = "";
+    sourceDisplayName.value = "";
+    encryptionEnabled.value = false;
+    recoveryPhrase.value = null;
+    sourceId.value = null;
+    busy.value = false;
+    errorCode.value = null;
   }
 
   function requireSession(): SessionId {
@@ -89,15 +253,58 @@ export const useSetupStore = defineStore("setup", () => {
     step,
     session,
     oauthStatus,
+    accountId,
+    accountEmail,
+    localPath,
+    driveFolderId,
+    driveFolderPath,
+    sourceDisplayName,
+    encryptionEnabled,
+    recoveryPhrase,
+    sourceId,
+    busy,
+    errorCode,
     canGoBack,
     canGoNext,
+    signedIn,
     next,
     back,
+    clearError,
     begin,
     submitCredentials,
     startSignin,
     poll,
     finish,
+    connectAccount,
+    checkSigninComplete,
+    createFirstSource,
+    startInitialSync,
     reset,
   };
 });
+
+/**
+ * Default browser opener. In a Tauri webview `window.open` is intercepted and
+ * routed to the system browser; this is the dependency the credentials step
+ * overrides in tests so no real window is opened.
+ */
+function defaultOpenUrl(url: string): void {
+  if (typeof window !== "undefined" && typeof window.open === "function") {
+    window.open(url, "_blank");
+  }
+}
+
+/**
+ * Map a rejected IPC error onto a stable SPEC s24 code. Tauri serializes the
+ * `{ code, message, ... }` shape (SPEC s24); we read `.code` when present and
+ * fall back to `internal.bug` so the view always has a translatable key.
+ */
+function toErrorCode(e: unknown): string {
+  if (e && typeof e === "object" && "code" in e) {
+    const code = (e as { code: unknown }).code;
+    if (typeof code === "string" && code.length > 0) {
+      return code;
+    }
+  }
+  return "internal.bug";
+}
