@@ -31,6 +31,28 @@ pub const EVENT_ACTIVITY_NEW: &str = "activity:new";
 /// `account:needs_reauth` - a refresh token was revoked (payload:
 /// `{ account_id, email }`, SPEC s11.7).
 pub const EVENT_ACCOUNT_NEEDS_REAUTH: &str = "account:needs_reauth";
+/// `oauth:complete` - an in-flight add-account / reauth OAuth flow reached a
+/// terminal state (payload: `{ session_id, status }`, SPEC s11.7).
+///
+/// M6: the wizard subscribes so it can advance past the OAuth step without
+/// polling. Emitted by the accounts command layer once
+/// [`driven_drive::google::oauth::run_pkce_loopback_flow`] resolves; the
+/// emit helper lands with that implementer, so the constant is defined-but-
+/// uncalled in the M6 scaffold.
+#[allow(dead_code)]
+pub const EVENT_OAUTH_COMPLETE: &str = "oauth:complete";
+/// `updater:available` - a newer release is available (payload: `UpdateInfo`,
+/// SPEC s11.7).
+///
+/// M6: the About tab + in-app banner subscribe. The periodic updater check
+/// emits it; the emit helper lands with the settings implementer, so the
+/// constant is defined-but-uncalled in the M6 scaffold.
+#[allow(dead_code)]
+pub const EVENT_UPDATER_AVAILABLE: &str = "updater:available";
+/// `updater:downloaded` - the available update finished downloading and is
+/// ready to install (payload: `UpdateInfo`, SPEC s11.7).
+#[allow(dead_code)]
+pub const EVENT_UPDATER_DOWNLOADED: &str = "updater:downloaded";
 
 /// Broadcast `sync:status_changed` with the global status payload (SPEC s11.7).
 ///

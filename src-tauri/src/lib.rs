@@ -196,6 +196,11 @@ pub fn run() {
         ))
         // SPEC s11.7 / M5: OS notifications (first-sync-done, error states).
         .plugin(tauri_plugin_notification::init())
+        // SPEC s11.6.1 / M6: native folder + file dialogs. The add-source
+        // wizard, restore destination picker, and diagnostic-bundle export all
+        // round-trip a dialog-derived path so the webview can never inject an
+        // arbitrary local path (the untrusted-webview path-confinement rule).
+        .plugin(tauri_plugin_dialog::init())
         // V5-P1-1 / DESIGN s8.1: closing the main window HIDES it to the tray;
         // it does NOT quit the app or stop sync. The app keeps running in the
         // background; Quit is reachable only via the tray menu / `--quit`.
@@ -270,10 +275,33 @@ pub fn run() {
             Ok(())
         })
         .invoke_handler(tauri::generate_handler![
+            // SPEC s11.3 sync (M5).
             commands::sync::sync_now,
             commands::sync::pause_sync,
             commands::sync::resume_sync,
             commands::sync::get_sync_status,
+            // SPEC s11.1 accounts (M6).
+            commands::accounts::list_accounts,
+            commands::accounts::begin_add_account_wizard,
+            commands::accounts::submit_oauth_credentials,
+            commands::accounts::start_oauth_signin,
+            commands::accounts::poll_oauth_status,
+            commands::accounts::finish_add_account,
+            commands::accounts::remove_account,
+            commands::accounts::reauth_account,
+            // SPEC s11.2 sources (M6).
+            commands::sources::list_sources,
+            commands::sources::add_source,
+            commands::sources::update_source,
+            commands::sources::remove_source,
+            commands::sources::pick_drive_folder,
+            commands::sources::preview_exclusions,
+            // SPEC s11.6 settings & misc (M6).
+            commands::settings::get_settings,
+            commands::settings::update_settings,
+            commands::settings::export_diagnostic_bundle,
+            commands::settings::check_for_updates,
+            commands::settings::list_releases,
         ])
         .build(tauri::generate_context!());
 

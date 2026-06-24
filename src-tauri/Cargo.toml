@@ -23,6 +23,13 @@ tauri-plugin-notification = "2"
 tauri-plugin-single-instance = "2"
 tauri-plugin-autostart = "2"
 tauri-plugin-deep-link = "2"
+# M6 (SPEC s11.6.1): native folder + file dialogs so add-source / restore /
+# diagnostic-export round-trip a dialog-derived path (the webview never injects
+# a raw local path).
+tauri-plugin-dialog = "2"
+# M6 (SPEC s11.6.1): Windows-friendly canonicalisation (no \\?\ UNC prefix) for
+# validate_writable_dest path confinement.
+dunce = "1"
 serde.workspace = true
 serde_json.workspace = true
 tracing.workspace = true

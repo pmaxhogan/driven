@@ -4,7 +4,375 @@
     "welcome": "Driven",
     "tagline": "One-way local-folder backup to Google Drive.",
     "boot": {
-      "bootstrap": "Bootstrapping in progress. Setup wizard arrives in M6."
+      "bootstrap": "Bootstrapping in progress."
+    }
+  },
+  "nav": {
+    "activity": "Activity",
+    "accounts": "Accounts",
+    "sources": "Sources",
+    "rules": "Rules",
+    "restore": "Restore",
+    "about": "About"
+  },
+  "common": {
+    "next": "Next",
+    "back": "Back",
+    "cancel": "Cancel",
+    "finish": "Finish",
+    "save": "Save",
+    "remove": "Remove",
+    "edit": "Edit",
+    "add": "Add",
+    "close": "Close",
+    "loading": "Loading...",
+    "retry": "Retry",
+    "confirm": "Confirm",
+    "enabled": "Enabled",
+    "disabled": "Disabled",
+    "yes": "Yes",
+    "no": "No",
+    "none": "None"
+  },
+  "wizard": {
+    "title": "Set up Driven",
+    "stepLabel": "Step {current} of {total}",
+    "step1": {
+      "title": "Welcome to Driven",
+      "body": "Driven backs up your local folders to Google Drive - one way, fast, with optional encryption, scheduling, and battery awareness."
+    },
+    "step2": {
+      "title": "Connect your Google account",
+      "body": "Driven uses your own Google OAuth credentials so your data never passes through anyone else's servers.",
+      "clientIdLabel": "Client ID",
+      "clientIdPlaceholder": "Your OAuth client ID",
+      "clientSecretLabel": "Client secret",
+      "clientSecretPlaceholder": "Your OAuth client secret",
+      "signInButton": "Sign in with Google",
+      "openingBrowser": "Opening your browser...",
+      "awaitingCallback": "Waiting for you to finish signing in...",
+      "exchangingCode": "Completing sign-in...",
+      "complete": "Signed in."
+    },
+    "step3": {
+      "title": "Pick your first backup source",
+      "body": "Choose a local folder to back up and the Google Drive destination it syncs to.",
+      "chooseFolderButton": "Choose folder...",
+      "driveDestinationLabel": "Drive destination"
+    },
+    "step4": {
+      "title": "Encryption",
+      "body": "Turn on end-to-end encryption for this source. Driven encrypts file contents and names before upload; only you can read them.",
+      "enableLabel": "Encrypt this source",
+      "recoveryWarning": "Save your recovery phrase. If you lose it and your device, your backup cannot be decrypted."
+    },
+    "step5": {
+      "title": "Start your first sync",
+      "body": "Driven is ready. Your first backup will start now and continue in the background.",
+      "startButton": "Start backup"
+    }
+  },
+  "settings": {
+    "title": "Settings",
+    "tabs": {
+      "accounts": "Accounts",
+      "sources": "Sources",
+      "rules": "Rules",
+      "about": "About"
+    },
+    "accounts": {
+      "title": "Connected accounts",
+      "empty": "No accounts connected yet.",
+      "addButton": "Add account",
+      "removeButton": "Remove",
+      "reauthButton": "Reconnect",
+      "deleteRemoteLabel": "Also delete backed-up files from Drive",
+      "lastSynced": "Last synced {when}",
+      "neverSynced": "Never synced",
+      "state": {
+        "ok": "Connected",
+        "needs_reauth": "Reconnect required",
+        "disabled": "Disabled"
+      }
+    },
+    "sources": {
+      "title": "Backup sources",
+      "empty": "No backup sources yet.",
+      "addButton": "Add source",
+      "column": {
+        "name": "Name",
+        "enabled": "Enabled",
+        "localPath": "Local path",
+        "driveDestination": "Drive destination",
+        "account": "Account",
+        "encryption": "Encryption",
+        "actions": "Actions"
+      },
+      "editExclusionsButton": "Edit exclusions",
+      "runNowButton": "Run now",
+      "removeButton": "Remove",
+      "deleteRemoteLabel": "Also delete backed-up files from Drive"
+    },
+    "addSource": {
+      "title": "Add backup source",
+      "step": {
+        "localFolder": "Local folder",
+        "driveFolder": "Drive folder",
+        "exclusions": "Exclusions",
+        "encryption": "Encryption",
+        "confirm": "Confirm"
+      },
+      "chooseLocalButton": "Choose local folder...",
+      "chooseDriveButton": "Choose Drive folder...",
+      "respectGitignoreLabel": "Respect .gitignore files",
+      "includePatternsLabel": "Include patterns",
+      "excludePatternsLabel": "Exclude patterns",
+      "preview": {
+        "included": "{count} files included",
+        "excluded": "{count} files excluded",
+        "includedBytes": "{size} to back up",
+        "truncated": "Showing a sample; more files match."
+      }
+    },
+    "rules": {
+      "title": "Global rules",
+      "skipOnBatteryLabel": "Pause backups while on battery",
+      "skipOnMeteredLabel": "Pause backups on metered networks",
+      "bandwidthCapLabel": "Bandwidth cap (Mbps)",
+      "bandwidthCapUnlimited": "Unlimited",
+      "concurrentUploadsLabel": "Concurrent uploads",
+      "concurrentUploadsAuto": "Auto",
+      "scanIntervalLabel": "Scan interval (seconds)",
+      "deepVerifyIntervalLabel": "Deep-verify interval (seconds)",
+      "ioPriorityLabel": "I/O priority",
+      "ioPriority": {
+        "normal": "Normal",
+        "low": "Low",
+        "idle": "Idle"
+      },
+      "vssModeLabel": "Volume Shadow Copy (Windows)",
+      "vssMode": {
+        "auto": "Automatic",
+        "always": "Always",
+        "never": "Never"
+      }
+    }
+  },
+  "about": {
+    "title": "About Driven",
+    "version": "Version {version}",
+    "channelLabel": "Update channel",
+    "channel": {
+      "stable": "Stable",
+      "dev": "Developer (pre-release)"
+    },
+    "checkForUpdatesButton": "Check for updates",
+    "updateAvailable": "Update available: {version}",
+    "upToDate": "You are up to date.",
+    "installUpdateButton": "Install update",
+    "licenseLabel": "License",
+    "releaseNotesTitle": "Release notes",
+    "displayLanguageLabel": "Display language",
+    "moreLanguagesComing": "More languages coming soon.",
+    "telemetryLabel": "Send anonymous usage stats",
+    "exportDiagnosticsButton": "Export diagnostic bundle"
+  },
+  "accountList": {
+    "title": "Accounts"
+  },
+  "sourceTable": {
+    "title": "Sources"
+  },
+  "recoveryPhrase": {
+    "title": "Your recovery phrase",
+    "instructions": "Write down these 24 words in order and keep them somewhere safe. They are the only way to recover an encrypted backup if you lose this device.",
+    "revealButton": "Reveal recovery phrase",
+    "hideButton": "Hide",
+    "copyButton": "Copy",
+    "confirmedLabel": "I have saved my recovery phrase"
+  },
+  "activity": {
+    "title": "Activity",
+    "placeholder": "The activity dashboard arrives in a later release."
+  },
+  "restore": {
+    "title": "Restore",
+    "placeholder": "The restore browser arrives in a later release."
+  },
+  "errors": {
+    "auth": {
+      "invalid_grant": {
+        "short": "Reconnect required",
+        "long": "Your Google sign-in expired or was revoked. Reconnect the account to continue backing up."
+      },
+      "consent_required": {
+        "short": "Sign-in needed",
+        "long": "Google needs you to grant access. Complete the sign-in to continue."
+      },
+      "network_unreachable": {
+        "short": "Cannot reach Google",
+        "long": "Driven could not reach accounts.google.com. Check your internet connection and try again."
+      }
+    },
+    "drive": {
+      "rate_limited": {
+        "short": "Slowing down",
+        "long": "Google Drive asked Driven to slow down. Driven is backing off and will retry automatically."
+      },
+      "daily_quota_exhausted": {
+        "short": "Daily limit reached",
+        "long": "Drive's daily request limit was reached. Driven will resume after the limit resets."
+      },
+      "quota_exhausted": {
+        "short": "Drive is full",
+        "long": "Your Google Drive storage is full. Free up space or upgrade your plan to continue backing up."
+      },
+      "upload_size_limit": {
+        "short": "File too large",
+        "long": "This file exceeds Google Drive's maximum file size and cannot be uploaded."
+      },
+      "checksum_mismatch": {
+        "short": "Verification failed",
+        "long": "The uploaded file did not match its checksum. Driven will re-upload it."
+      },
+      "unreachable": {
+        "short": "Drive unavailable",
+        "long": "Google Drive is unreachable right now. Driven will keep retrying."
+      },
+      "resumable_session_invalid": {
+        "short": "Upload interrupted",
+        "long": "A resumable upload session expired. Driven will restart the upload."
+      },
+      "dest_folder_missing": {
+        "short": "Destination missing",
+        "long": "The Drive destination folder was deleted. Pick a new destination to resume backups."
+      },
+      "dest_folder_permission_denied": {
+        "short": "No write access",
+        "long": "The Drive destination folder is no longer writable by this account. Check its sharing settings."
+      }
+    },
+    "local": {
+      "file_locked": {
+        "short": "File in use",
+        "long": "A file could not be read because another program has it locked. Driven will retry later."
+      },
+      "vss_unavailable": {
+        "short": "Elevation needed",
+        "long": "Backing up locked files needs Volume Shadow Copy, which requires running Driven elevated."
+      },
+      "file_changed_during_upload": {
+        "short": "File changed",
+        "long": "A file changed while it was being uploaded. Driven re-queued it for the next cycle."
+      },
+      "file_replaced_during_upload": {
+        "short": "File replaced",
+        "long": "A file was replaced while it was being uploaded. Driven re-queued it for the next cycle."
+      },
+      "io_error": {
+        "short": "Disk error",
+        "long": "Driven hit a disk error reading a file. Check the drive and try again."
+      },
+      "path_too_long": {
+        "short": "Path too long",
+        "long": "A file path exceeds the operating system's length limit and was skipped."
+      },
+      "unicode_collision": {
+        "short": "Name collision",
+        "long": "Two files have names that normalize to the same text. Rename one to back both up."
+      },
+      "disk_full": {
+        "short": "Disk full",
+        "long": "The disk ran out of space during a read or restore. Free up space and try again."
+      },
+      "invalid_filename": {
+        "short": "Invalid name",
+        "long": "A file has a name Google Drive will not accept (a reserved name or trailing dot/space) and was skipped."
+      },
+      "ads_skipped": {
+        "short": "Stream skipped",
+        "long": "An NTFS alternate data stream was skipped; the file's main contents were backed up."
+      }
+    },
+    "net": {
+      "offline": {
+        "short": "Offline",
+        "long": "Your device reports no network connection. Backups will resume when you are back online."
+      },
+      "no_internet": {
+        "short": "No internet",
+        "long": "You are connected to a network but the internet is unreachable."
+      },
+      "dns_failed": {
+        "short": "DNS error",
+        "long": "Driven could not resolve a known-good domain. Check your DNS settings."
+      },
+      "captive_portal": {
+        "short": "Sign-in required",
+        "long": "A captive portal is blocking access. Sign in to the network and try again."
+      },
+      "timeout": {
+        "short": "Timed out",
+        "long": "A request took too long and timed out. Driven will retry."
+      },
+      "intermittent": {
+        "short": "Unstable connection",
+        "long": "The connection is unstable. Driven paused requests and will retry shortly."
+      },
+      "proxy_required": {
+        "short": "Proxy auth needed",
+        "long": "An HTTP proxy requires authentication. Update your proxy settings."
+      }
+    },
+    "update": {
+      "endpoint_unreachable": {
+        "short": "Update check failed",
+        "long": "Driven could not reach the update server. Try again later."
+      },
+      "signature_invalid": {
+        "short": "Update rejected",
+        "long": "The update's signature could not be verified and was rejected for your safety."
+      }
+    },
+    "crypto": {
+      "key_missing": {
+        "short": "Key not found",
+        "long": "The encryption key for this source was not found in the keychain."
+      },
+      "decrypt_failed": {
+        "short": "Decryption failed",
+        "long": "A file could not be decrypted. The data may be corrupt or the key is wrong."
+      },
+      "recovery_phrase_invalid": {
+        "short": "Invalid phrase",
+        "long": "That recovery phrase failed its checksum. Check the words and their order."
+      }
+    },
+    "state": {
+      "db_locked": {
+        "short": "Database busy",
+        "long": "Driven's database is briefly locked. This usually clears on its own."
+      },
+      "db_corrupt": {
+        "short": "Database damaged",
+        "long": "Driven's database failed an integrity check. Rebuilding from your Drive backup is advised."
+      },
+      "reconcile_orphan": {
+        "short": "Orphan cleaned up",
+        "long": "Driven found a remote file with no local record and reconciled it during startup."
+      }
+    },
+    "harness": {
+      "timeout": {
+        "short": "Test timed out",
+        "long": "A stress-test scenario exceeded its time budget."
+      }
+    },
+    "internal": {
+      "bug": {
+        "short": "Something went wrong",
+        "long": "Driven hit an unexpected error. Please export a diagnostic bundle and report it."
+      }
     }
   }
 }

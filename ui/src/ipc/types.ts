@@ -1,0 +1,221 @@
+// DTO interfaces mirroring the Rust serde DTOs in
+// `src-tauri/src/commands/dtos.rs` (SPEC s11.1 / s11.2 / s11.6). Per the M6
+// decision (design/CODEX_NOTES.md M6 section) these are hand-written rather than
+// generated with tauri-specta. The Rust side renders camelCase
+// (`#[serde(rename_all = "camelCase")]`), so these interfaces use camelCase and
+// must be kept in sync with the Rust shapes by convention.
+
+// --- Accounts (SPEC s11.1) ---
+
+/** `accounts.state` serialized form. */
+export type AccountState = "ok" | "needs_reauth" | "disabled";
+
+export interface AccountDto {
+  id: string;
+  email: string;
+  displayName: string | null;
+  state: AccountState;
+  encryptionEnabled: boolean;
+  createdAt: number;
+  lastSyncedAt: number | null;
+}
+
+/** Opaque add-account wizard session id (transparent string newtype). */
+export type AddAccountWizardSessionId = string;
+
+/** Alias matching the SPEC s11.1 `SessionId` argument on the OAuth steps. */
+export type SessionId = AddAccountWizardSessionId;
+
+export interface OAuthAuthUrl {
+  authUrl: string;
+}
+
+/** Mirrors the Rust `OAuthStatus` (internally tagged on `kind`). */
+export type OAuthStatus =
+  | { kind: "openingBrowser" }
+  | { kind: "awaitingCallback" }
+  | { kind: "exchangingCode" }
+  | { kind: "complete" }
+  | { kind: "failed"; code: string };
+
+// --- Sources (SPEC s11.2) ---
+
+export interface SourceDto {
+  id: string;
+  accountId: string;
+  displayName: string;
+  enabled: boolean;
+  localPath: string;
+  driveFolderId: string;
+  driveFolderPath: string;
+  encryptionEnabled: boolean;
+  respectGitignore: boolean;
+  includePatterns: string[];
+  excludePatterns: string[];
+  deepVerifyIntervalSecs: number;
+  lastFullScanAt: number | null;
+  createdAt: number;
+}
+
+export interface AddSourceRequest {
+  accountId: string;
+  displayName: string;
+  localPath: string;
+  driveFolderId: string;
+  driveFolderPath: string;
+  encryptionEnabled: boolean;
+  respectGitignore: boolean;
+  includePatterns: string[];
+  excludePatterns: string[];
+}
+
+export interface SourcePatch {
+  displayName?: string | null;
+  enabled?: boolean | null;
+  respectGitignore?: boolean | null;
+  includePatterns?: string[] | null;
+  excludePatterns?: string[] | null;
+  deepVerifyIntervalSecs?: number | null;
+}
+
+export interface DriveFolderEntry {
+  id: string;
+  name: string;
+}
+
+export interface DriveFolderListing {
+  currentFolderId: string | null;
+  currentFolderPath: string;
+  folders: DriveFolderEntry[];
+}
+
+export interface ExclusionPreviewRequest {
+  localPath: string;
+  respectGitignore: boolean;
+  includePatterns: string[];
+  excludePatterns: string[];
+}
+
+export interface ExclusionPreview {
+  includedCount: number;
+  excludedCount: number;
+  includedBytes: number;
+  includedSample: string[];
+  excludedSample: string[];
+  truncated: boolean;
+}
+
+// --- Settings & misc (SPEC s11.6, s22) ---
+
+export interface GlobalSettings {
+  autoStartOnLogin: boolean;
+  defaultConcurrentUploads: number | null;
+  bandwidthCapMbps: number | null;
+  skipOnBattery: boolean;
+  skipOnMetered: boolean;
+  scanIntervalSecs: number;
+  deepVerifyIntervalSecs: number;
+  ioPriority: string;
+  logLevel: string;
+}
+
+export interface TelemetrySettings {
+  enabled: boolean;
+  installId: string;
+  endpoint: string;
+}
+
+export interface UpdaterSettings {
+  channel: string;
+  checkIntervalSecs: number;
+}
+
+export interface UiSettings {
+  trayLeftClickOpens: string;
+  locale: string;
+  colorMode: string;
+}
+
+export interface WindowsSettings {
+  vssMode: string;
+}
+
+export interface SettingsDto {
+  global: GlobalSettings;
+  telemetry: TelemetrySettings;
+  updater: UpdaterSettings;
+  ui: UiSettings;
+  windows: WindowsSettings | null;
+}
+
+export interface GlobalSettingsPatch {
+  autoStartOnLogin?: boolean;
+  defaultConcurrentUploads?: number | null;
+  bandwidthCapMbps?: number | null;
+  skipOnBattery?: boolean;
+  skipOnMetered?: boolean;
+  scanIntervalSecs?: number;
+  deepVerifyIntervalSecs?: number;
+  ioPriority?: string;
+  logLevel?: string;
+}
+
+export interface TelemetrySettingsPatch {
+  enabled?: boolean;
+}
+
+export interface UpdaterSettingsPatch {
+  channel?: string;
+  checkIntervalSecs?: number;
+}
+
+export interface UiSettingsPatch {
+  trayLeftClickOpens?: string;
+  locale?: string;
+  colorMode?: string;
+}
+
+export interface WindowsSettingsPatch {
+  vssMode?: string;
+}
+
+export interface SettingsPatch {
+  global?: GlobalSettingsPatch;
+  telemetry?: TelemetrySettingsPatch;
+  updater?: UpdaterSettingsPatch;
+  ui?: UiSettingsPatch;
+  windows?: WindowsSettingsPatch;
+}
+
+export interface UpdateInfo {
+  version: string;
+  notes: string | null;
+  publishedAt: string | null;
+  channel: string;
+}
+
+export interface ReleaseDto {
+  version: string;
+  name: string;
+  notes: string;
+  publishedAt: string;
+  url: string;
+}
+
+// --- Sync (SPEC s11.3) - mirrors src-tauri/src/commands/sync.rs ---
+
+/** Mirrors the Rust `OrchestratorState` (driven_core::types). Carried as an
+ * opaque tagged object; the UI reads the discriminant for the status pill. */
+export type OrchestratorState = Record<string, unknown>;
+
+// NOTE: the Rust GlobalSyncStatus / AccountSyncStatus (M5, sync.rs) do NOT use
+// `rename_all = "camelCase"`, so this DTO is snake_case on the wire (unlike the
+// M6 DTOs above). Kept faithful to the existing M5 shape.
+export interface AccountSyncStatus {
+  account_id: string;
+  state: OrchestratorState;
+}
+
+export interface GlobalSyncStatus {
+  accounts: AccountSyncStatus[];
+}
