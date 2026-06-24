@@ -230,7 +230,10 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         | ErrorCode::StateDbCorrupt
         | ErrorCode::StateReconcileOrphan
         | ErrorCode::HarnessTimeout
-        | ErrorCode::InternalBug => false,
+        | ErrorCode::InternalBug
+        // Invalid input crossing the IPC boundary is a user/renderer error,
+        // not a network condition -> red error (not yellow-bang).
+        | ErrorCode::InvalidInput => false,
     }
 }
 

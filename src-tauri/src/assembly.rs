@@ -37,7 +37,6 @@ use driven_core::time::{Clock, SystemClock};
 use driven_core::types::{AccountId, AccountState, OrchestratorEvent};
 use driven_core::watcher::{NotifyWatcher, SourceWatcher};
 
-use driven_drive::fake::InMemoryRemoteStore;
 use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
 use driven_drive::google::GoogleDriveStore;
 use driven_drive::remote_store::RemoteStore;
@@ -46,7 +45,9 @@ use driven_net::ReqwestBackend;
 
 use driven_power::RealPowerSource;
 
-use crate::app_state::{AccountHandle, AccountTasks, AppState, RemoteMode};
+use crate::app_state::{
+    fake_remote_store_in, AccountHandle, AccountTasks, AppState, FakeRemoteStores, RemoteMode,
+};
 use crate::crypto_provider_impl::KeystoreCryptoProvider;
 use crate::{events, tray};
 
@@ -57,18 +58,15 @@ const TARGET: &str = "driven::app::assembly";
 /// a real `GoogleDriveStore`. Mirrors the assembly contract in the task spec.
 pub const ENV_USE_FAKE_REMOTE: &str = "DRIVEN_USE_FAKE_REMOTE";
 
-/// Environment override for the OAuth client id (SPEC s4). Falls back to the
-/// public installed-app default when unset.
+/// R2-P2-1 (BYO-only, SPEC s11.1 / DESIGN s6.1): the OAuth client id env
+/// override. Driven is BYO-ONLY - there is NO baked-in default client. This env
+/// var exists ONLY as a TEST injection seam (real-Drive e2e); a production
+/// account refreshes against its PERSISTED BYO client creds.
 const ENV_OAUTH_CLIENT_ID: &str = "DRIVEN_OAUTH_CLIENT_ID";
 
-/// Environment override for the OAuth client secret (SPEC s4). An installed-app
-/// PKCE client has no real secret, so the default is empty.
+/// R2-P2-1: the OAuth client secret env override (test injection seam only). An
+/// installed-app PKCE client has no real secret, so this defaults to empty.
 const ENV_OAUTH_CLIENT_SECRET: &str = "DRIVEN_OAUTH_CLIENT_SECRET";
-
-/// The public installed-app client id (SPEC s4; mirrors `driven-cli`'s
-/// `DEFAULT_CLIENT_ID`). Used when `DRIVEN_OAUTH_CLIENT_ID` is unset.
-const DEFAULT_CLIENT_ID: &str =
-    "1094503409775-kvuig3oqtchrq1s4tc1cnpi60mdvnqfe.apps.googleusercontent.com";
 
 /// Build every account's orchestrator over the real seams and spawn its run
 /// loop, returning the [`AppState`] for `.manage(..)` (SPEC s5).
@@ -99,6 +97,13 @@ pub async fn build_and_spawn(
         fake_remote = use_fake,
         "assembling per-account orchestrators"
     );
+
+    // R2-P1-2: the shared per-account fake-remote-store registry. Built HERE
+    // (before the account loop) and threaded into `build_account` so the
+    // orchestrator's fake store comes from it; the SAME registry is then moved
+    // into `AppState`, so the Drive-folder picker reads the SAME instance per
+    // account. A picker-minted folder id is therefore visible to the uploader.
+    let fake_remote_stores: FakeRemoteStores = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
     let mut handles: HashMap<AccountId, AccountHandle> = HashMap::new();
 
@@ -134,7 +139,7 @@ pub async fn build_and_spawn(
             .cloned()
             .collect();
 
-        match build_account(app, &state, account, sources, use_fake).await {
+        match build_account(app, &state, account, sources, use_fake, &fake_remote_stores).await {
             Ok(BuildOutcome::Spawned(handle)) => {
                 handles.insert(account.id, *handle);
                 tracing::info!(
@@ -169,7 +174,12 @@ pub async fn build_and_spawn(
         }
     }
 
-    Ok(AppState::new(state, handles, remote_mode))
+    Ok(AppState::new(
+        state,
+        handles,
+        remote_mode,
+        fake_remote_stores,
+    ))
 }
 
 /// `true` when `DRIVEN_USE_FAKE_REMOTE=1` selects the in-memory fake remote.
@@ -228,7 +238,22 @@ pub async fn spawn_account(
         .filter(|s| s.account_id == account.id)
         .collect();
 
-    match build_account(app, &state, &account, sources, use_fake).await? {
+    // R2-P1-2: hot-spawn builds the orchestrator store from the SAME shared
+    // fake-remote registry the running AppState (and the picker) uses, so a
+    // folder the wizard's picker minted in fake mode is the same instance the
+    // new orchestrator uploads into.
+    let fake_remote_stores = app_state.fake_remote_stores();
+
+    match build_account(
+        app,
+        &state,
+        &account,
+        sources,
+        use_fake,
+        &fake_remote_stores,
+    )
+    .await?
+    {
         BuildOutcome::Spawned(handle) => {
             // Replace any prior handle for this id, shutting the old one down so
             // its tasks are not orphaned (defensive: a fresh add has none).
@@ -289,11 +314,12 @@ async fn build_account(
     account: &AccountRow,
     sources: Vec<SourceRow>,
     use_fake: bool,
+    fake_remote_stores: &FakeRemoteStores,
 ) -> anyhow::Result<BuildOutcome> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
     // --- remote: real GoogleDriveStore or the in-memory fake -----------------
-    let remote = match build_remote(account, use_fake)? {
+    let remote = match build_remote(account, use_fake, fake_remote_stores)? {
         RemoteOutcome::Store(store) => store,
         RemoteOutcome::NeedsReauth => {
             // C5-P1-1: persist needs_reauth + emit the banner; do NOT build a
@@ -465,14 +491,22 @@ async fn build_account(
 /// files `synced` against EPHEMERAL fake Drive ids and then lose the actual
 /// bytes on process exit - catastrophic for a backup tool. The ONLY way to get a
 /// fake remote is the explicit `DRIVEN_USE_FAKE_REMOTE=1` opt-in.
-fn build_remote(account: &AccountRow, use_fake: bool) -> anyhow::Result<RemoteOutcome> {
+fn build_remote(
+    account: &AccountRow,
+    use_fake: bool,
+    fake_remote_stores: &FakeRemoteStores,
+) -> anyhow::Result<RemoteOutcome> {
     if use_fake {
         tracing::info!(
             target: TARGET,
             account_id = %account.id,
             "remote: in-memory fake (DRIVEN_USE_FAKE_REMOTE=1)"
         );
-        return Ok(RemoteOutcome::Store(Arc::new(InMemoryRemoteStore::new())));
+        // R2-P1-2: pull the account's fake store from the SHARED registry (the
+        // same one the picker reads via `AppState::fake_remote_store`), so a
+        // folder id the picker minted is visible to this uploader.
+        let store = fake_remote_store_in(fake_remote_stores, account.id);
+        return Ok(RemoteOutcome::Store(Arc::new(store)));
     }
 
     // The keychain token store is keyed by account id (the same key the auth
@@ -530,12 +564,15 @@ fn emit_needs_reauth(app: &AppHandle, account: &AccountRow) {
     tray::notify_needs_reauth(app, &account.email);
 }
 
-/// Resolve the OAuth client id + secret for the real Drive store: env overrides
-/// first, then the public installed-app default id (the secret defaults to empty
-/// for a PKCE installed-app client).
+/// R2-P2-1 (BYO-only): resolve the OAuth client creds from the ENV override only
+/// (a TEST injection seam). There is NO baked-in production default client, so
+/// this returns whatever the env carries (an empty client id when unset). A
+/// production account always reaches [`resolve_account_oauth_creds`] with its
+/// PERSISTED BYO creds; this env-only path is the fallback for the e2e seam, and
+/// an empty client id surfaces a clear `invalid_client` rather than silently
+/// using a Driven-owned client.
 fn resolve_oauth_creds() -> (String, String) {
-    let client_id =
-        std::env::var(ENV_OAUTH_CLIENT_ID).unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
+    let client_id = std::env::var(ENV_OAUTH_CLIENT_ID).unwrap_or_default();
     let client_secret = std::env::var(ENV_OAUTH_CLIENT_SECRET).unwrap_or_default();
     (client_id, client_secret)
 }

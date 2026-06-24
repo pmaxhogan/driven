@@ -14,6 +14,7 @@ use std::time::Duration;
 use driven_core::orchestrator::Orchestrator;
 use driven_core::state::StateRepo;
 use driven_core::types::AccountId;
+use driven_drive::fake::InMemoryRemoteStore;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
@@ -244,6 +245,49 @@ pub struct AppState {
     /// leaked token cannot be replayed later. Behind a sync `Mutex` (only ever
     /// held for a quick insert / take, never across an await).
     dialog_tokens: std::sync::Mutex<HashMap<String, DialogTokenBinding>>,
+    /// R2-P1-1: per-account ASYNC lock serialising the FIRST-encrypted-source
+    /// critical section (ensure-master-key -> stamp -> insert source). Without
+    /// it two concurrent `add_source` calls on an account whose
+    /// `encryption_master_key_id` is still NULL could BOTH generate DIFFERENT
+    /// master keys into the same keychain slot and wrap different source keys -
+    /// leaving one source permanently unrestorable. The lock (a `tokio::Mutex`
+    /// so it can be held across the awaited DB write) makes the second add see
+    /// the master key the first installed and wrap under the SAME key. Keyed by
+    /// account; the inner map is behind a sync `Mutex` only to hand out the
+    /// per-account `Arc<tokio::Mutex<()>>` (never held across an await).
+    ensure_master_key_locks: std::sync::Mutex<HashMap<AccountId, Arc<Mutex<()>>>>,
+    /// R2-P1-2: per-account in-memory fake remote store, shared between the
+    /// Drive-folder picker (`pick_drive_folder`) and the orchestrator's
+    /// uploader (assembly `build_remote`) so a folder id the picker mints in
+    /// fake mode is visible to the uploader. Created on demand, one instance per
+    /// account ([`InMemoryRemoteStore`] is `Clone` over a shared `Arc<Mutex>`, so
+    /// every clone sees the same backing objects). Only ever populated in
+    /// [`RemoteMode::Fake`]; in real mode it stays empty.
+    fake_remote_stores: FakeRemoteStores,
+}
+
+/// R2-P1-2: the shared per-account fake-remote-store registry. An `Arc` so
+/// assembly (which builds the orchestrator's store BEFORE [`AppState`] exists)
+/// and [`AppState`] hold the SAME map - the orchestrator's fake store and the
+/// picker's fake store are then guaranteed to be the same instance per account.
+pub type FakeRemoteStores = Arc<std::sync::Mutex<HashMap<AccountId, InMemoryRemoteStore>>>;
+
+/// R2-P1-2: get-or-create the fake remote store for `account` in `registry`.
+/// A free function (not a method) so assembly's pre-[`AppState`] boot phase -
+/// which builds the orchestrator's store before `AppState` exists - shares the
+/// SAME registry the picker later reads via [`AppState::fake_remote_store`].
+/// Returns a clone (the store wraps a shared `Arc<Mutex>`).
+#[must_use]
+pub fn fake_remote_store_in(
+    registry: &FakeRemoteStores,
+    account: AccountId,
+) -> InMemoryRemoteStore {
+    registry
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .entry(account)
+        .or_default()
+        .clone()
 }
 
 /// C1: one backend-minted dialog-token binding - the path the user chose via a
@@ -264,12 +308,17 @@ const DIALOG_TOKEN_TTL: Duration = Duration::from_secs(300);
 
 impl AppState {
     /// Build the managed state from the state repo, the per-account handles,
-    /// and the remote-construction mode (called by `assembly::build_and_spawn`).
+    /// the remote-construction mode, and the shared fake-remote-store registry
+    /// (called by `assembly::build_and_spawn`). The `fake_remote_stores` map is
+    /// the SAME one assembly threaded into `build_remote`, so the orchestrator's
+    /// fake store and the picker's fake store are one instance per account
+    /// (R2-P1-2).
     #[must_use]
     pub fn new(
         state: Arc<dyn StateRepo>,
         accounts: HashMap<AccountId, AccountHandle>,
         remote_mode: RemoteMode,
+        fake_remote_stores: FakeRemoteStores,
     ) -> Self {
         let accounts = accounts
             .into_iter()
@@ -281,6 +330,8 @@ impl AppState {
             remote_mode,
             pause_generations: std::sync::Mutex::new(HashMap::new()),
             dialog_tokens: std::sync::Mutex::new(HashMap::new()),
+            ensure_master_key_locks: std::sync::Mutex::new(HashMap::new()),
+            fake_remote_stores,
         }
     }
 
@@ -418,6 +469,40 @@ impl AppState {
     #[must_use]
     pub fn remote_mode(&self) -> RemoteMode {
         self.remote_mode
+    }
+
+    /// R2-P1-1: the per-account ensure-master-key async lock (get-or-create).
+    /// `add_source` holds this across the ENTIRE first-encrypted-source critical
+    /// section (prepare master key -> stamp -> insert) so two concurrent adds
+    /// serialise and the second wraps under the master key the first installed.
+    /// Returns a cloned `Arc` so the caller can `.lock().await` after releasing
+    /// the (sync) map lock.
+    #[must_use]
+    pub fn ensure_master_key_lock(&self, account: AccountId) -> Arc<Mutex<()>> {
+        self.ensure_master_key_locks
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .entry(account)
+            .or_insert_with(|| Arc::new(Mutex::new(())))
+            .clone()
+    }
+
+    /// R2-P1-2: the per-account fake remote store (get-or-create). Shared
+    /// between the Drive-folder picker and the orchestrator's uploader so a
+    /// folder id minted by the picker in fake mode is visible to the uploader.
+    /// Returns a clone (the store wraps a shared `Arc<Mutex>`, so the clone sees
+    /// the same backing objects). Only meaningful in [`RemoteMode::Fake`].
+    #[must_use]
+    pub fn fake_remote_store(&self, account: AccountId) -> InMemoryRemoteStore {
+        fake_remote_store_in(&self.fake_remote_stores, account)
+    }
+
+    /// R2-P1-2: a clone of the shared fake-remote-store registry handle, so the
+    /// wizard hot-spawn path (`assembly::spawn_account`) builds the new account's
+    /// orchestrator store FROM the same registry the picker reads.
+    #[must_use]
+    pub fn fake_remote_stores(&self) -> FakeRemoteStores {
+        self.fake_remote_stores.clone()
     }
 }
 
@@ -858,13 +943,23 @@ mod tests {
         (Arc::new(repo), dir)
     }
 
+    /// An empty fake-remote-store registry for the AppState tests.
+    fn default_fake_registry() -> super::FakeRemoteStores {
+        Arc::new(std::sync::Mutex::new(HashMap::new()))
+    }
+
     #[tokio::test]
     async fn dialog_token_round_trips_and_is_single_use() {
         // C1 (SPEC s11.6.1): a minted token maps to its path exactly once; a
         // second take (or an unknown token) returns None so a leaked / replayed
         // token cannot authorise a second write.
         let (state, dir) = temp_state().await;
-        let app_state = AppState::new(state, HashMap::new(), RemoteMode::Fake);
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
         let path = std::path::PathBuf::from("/home/u/backups");
         let token = app_state.mint_dialog_token(path.clone());
 
@@ -886,7 +981,12 @@ mod tests {
         // taking once must all resolve the same path; a take after that is
         // rejected.
         let (state, dir) = temp_state().await;
-        let app_state = AppState::new(state, HashMap::new(), RemoteMode::Fake);
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
         let path = std::path::PathBuf::from("/home/u/preview-root");
         let token = app_state.mint_dialog_token(path.clone());
 
@@ -905,10 +1005,73 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn ensure_master_key_lock_is_shared_per_account_and_serialises() {
+        // R2-P1-1: two `add_source` calls for the SAME account must get the SAME
+        // lock (so they serialise); different accounts get DISTINCT locks (so they
+        // do not block each other). Also prove the lock actually serialises a
+        // critical section (no overlap).
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        let (state, dir) = temp_state().await;
+        let app_state = Arc::new(AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        ));
+        let acct_a = AccountId::new_v4();
+        let acct_b = AccountId::new_v4();
+
+        // Same account -> same Arc; different account -> different Arc.
+        let l1 = app_state.ensure_master_key_lock(acct_a);
+        let l2 = app_state.ensure_master_key_lock(acct_a);
+        let l3 = app_state.ensure_master_key_lock(acct_b);
+        assert!(Arc::ptr_eq(&l1, &l2), "same account shares one lock");
+        assert!(
+            !Arc::ptr_eq(&l1, &l3),
+            "different accounts get distinct locks"
+        );
+
+        // Serialisation: two tasks contend on acct_a's lock; the in-section
+        // counter must never exceed 1 (no overlap).
+        let max_in_section = Arc::new(AtomicUsize::new(0));
+        let in_section = Arc::new(AtomicUsize::new(0));
+        let mut handles = Vec::new();
+        for _ in 0..8 {
+            let app_state = app_state.clone();
+            let in_section = in_section.clone();
+            let max_in_section = max_in_section.clone();
+            handles.push(tokio::spawn(async move {
+                let lock = app_state.ensure_master_key_lock(acct_a);
+                let _guard = lock.lock().await;
+                let now = in_section.fetch_add(1, Ordering::SeqCst) + 1;
+                max_in_section.fetch_max(now, Ordering::SeqCst);
+                // Yield so an overlapping task would be observed if the lock
+                // failed to serialise.
+                tokio::task::yield_now().await;
+                in_section.fetch_sub(1, Ordering::SeqCst);
+            }));
+        }
+        for h in handles {
+            h.await.unwrap();
+        }
+        assert_eq!(
+            max_in_section.load(Ordering::SeqCst),
+            1,
+            "the per-account lock must serialise the critical section (no overlap)"
+        );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn dialog_tokens_are_distinct_per_mint() {
         // Two mints yield distinct tokens each bound to its own path.
         let (state, dir) = temp_state().await;
-        let app_state = AppState::new(state, HashMap::new(), RemoteMode::Fake);
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
         let a = app_state.mint_dialog_token(std::path::PathBuf::from("/a"));
         let b = app_state.mint_dialog_token(std::path::PathBuf::from("/b"));
         assert_ne!(a, b);

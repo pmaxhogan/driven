@@ -373,6 +373,10 @@
       "bug": {
         "short": "Something went wrong",
         "long": "Driven hit an unexpected error. Please export a diagnostic bundle and report it."
+      },
+      "invalid_input": {
+        "short": "Invalid input",
+        "long": "One of the values you entered is not valid. Check the highlighted field and try again."
       }
     }
   }

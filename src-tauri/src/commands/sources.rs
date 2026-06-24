@@ -23,14 +23,13 @@ use std::sync::Arc;
 
 use tauri::State;
 
-use driven_core::exclude::build_source_matcher;
+use driven_core::exclude::{build_source_matcher, validate_patterns};
 use driven_core::state::{AccountRow, SourceRow, StateRepo};
 use driven_core::time::{Clock, SystemClock};
 use driven_core::types::{AccountId, ErrorCode, SourceId};
 
 use driven_crypto::{master_key_to_phrase, Keystore, MasterKey};
 
-use driven_drive::fake::InMemoryRemoteStore;
 use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
 use driven_drive::google::GoogleDriveStore;
 use driven_drive::remote_store::RemoteStore;
@@ -99,8 +98,10 @@ pub async fn add_source(
     state: State<'_, AppState>,
     req: AddSourceRequest,
 ) -> CommandResult<AddSourceResult> {
-    // The owning account must exist.
-    let account = find_account(state.state().as_ref(), req.account_id).await?;
+    // The owning account must exist (a stale webview id surfaces an error). The
+    // master-key state is re-read INSIDE the per-account lock below (R2-P1-1), so
+    // only the existence check matters here.
+    let _ = find_account(state.state().as_ref(), req.account_id).await?;
 
     // C1 (SPEC s11.6.1): resolve the local path from the backend-minted dialog
     // token (single-use) - NOT the webview-supplied `local_path` string. Reject
@@ -124,8 +125,37 @@ pub async fn add_source(
     // master-key generation so an overlap never provisions a key.
     reject_overlapping_root(state.state().as_ref(), &canon).await?;
 
+    // R2-P1-3 (DESIGN s5.2): validate the candidate include / exclude globs
+    // BEFORE any master-key generation or persistence - max count, max length
+    // per pattern, and compile each with the SAME matcher the scanner uses. An
+    // invalid / oversized glob is rejected up front (a stable s24 code) rather
+    // than slipping into SQLite and breaking the next scan's matcher build.
+    validate_source_patterns(&req.include_patterns, &req.exclude_patterns)?;
+
     let now = SystemClock.now_ms();
     let source_id = SourceId::new_v4();
+
+    // R2-P1-1: serialise the FIRST-encrypted-source critical section per account.
+    // Two concurrent encrypted adds on an account whose
+    // `encryption_master_key_id` is still NULL could otherwise BOTH generate
+    // DIFFERENT master keys into the same keychain slot and wrap different source
+    // keys - leaving one source permanently unrestorable. The per-account async
+    // lock (held across the awaited DB insert) makes the second add observe the
+    // master key the first installed and wrap under the SAME key. Only encrypted
+    // adds take the lock; unencrypted adds stay fully parallel.
+    //
+    // Defense in depth: the prepare re-reads the account's CURRENT master-key
+    // state INSIDE the lock (so a stale pre-lock read cannot cause a re-generate),
+    // and the stamp is a COMPARE-AND-SET (stamp only if still NULL).
+    let lock = if req.encryption_enabled {
+        Some(state.ensure_master_key_lock(req.account_id))
+    } else {
+        None
+    };
+    let _guard = match &lock {
+        Some(l) => Some(l.lock().await),
+        None => None,
+    };
 
     // Encryption opt-in (DESIGN s7.1): prepare the account master key (generating
     // it + encoding the recovery phrase on the FIRST encrypted source), then wrap
@@ -135,12 +165,17 @@ pub async fn add_source(
     // atomic DB write below knows it must (a) stamp the account row and (b) on a
     // DB failure ROLL BACK the keychain entry so a retry re-reveals (R1-P1-1).
     let (wrapped_source_key, recovery_phrase, newly_generated_key) = if req.encryption_enabled {
-        let prepared = prepare_master_key(&account)?;
+        // R2-P1-1: re-read the account INSIDE the lock so the master-key state is
+        // current. A losing-race second add sees the key the first add just
+        // stamped and loads it (newly_generated = false) rather than generating a
+        // second, divergent key.
+        let fresh = find_account(state.state().as_ref(), req.account_id).await?;
+        let prepared = prepare_master_key(&fresh)?;
         let (_source_key, wrapped) = prepared.master.wrap_new_source_key().map_err(|e| {
             // The key may have just been stored in the keychain but no DB row
             // exists yet; roll it back so a retry starts clean (R1-P1-1).
             if prepared.newly_generated {
-                let _ = delete_master_key(&account.id);
+                let _ = delete_master_key(&req.account_id);
             }
             CommandError::with_code(
                 ErrorCode::CryptoKeyMissing,
@@ -176,12 +211,14 @@ pub async fn add_source(
         created_at: now,
     };
 
-    // R1-P1-1: ATOMIC account-stamp + source-insert. On the FIRST encrypted
-    // source the account's `encryption_master_key_id` is stamped IN THE SAME
-    // transaction as the source insert, so the two can never diverge. The phrase
-    // (and the keychain key) is only "kept" once this commits; if it fails AND we
-    // just generated a key, delete the keychain entry so the account is left
-    // unprovisioned and a retry re-reveals the phrase.
+    // R1-P1-1 / R2-P1-1: ATOMIC account-stamp + source-insert. On the FIRST
+    // encrypted source the account's `encryption_master_key_id` is stamped IN THE
+    // SAME transaction as the source insert (a COMPARE-AND-SET: it only stamps
+    // when the column is still NULL, so a concurrent stamp can never be
+    // overwritten), so the two can never diverge. The phrase (and the keychain
+    // key) is only "kept" once this commits; if it fails AND we just generated a
+    // key, delete the keychain entry so the account is left unprovisioned and a
+    // retry re-reveals the phrase.
     let stamp = if newly_generated_key {
         Some((req.account_id, req.account_id.to_string()))
     } else {
@@ -195,7 +232,7 @@ pub async fn add_source(
         if newly_generated_key {
             // Roll back the just-stored master key so the account is NOT left
             // provisioned-without-a-revealed-phrase (R1-P1-1).
-            if let Err(del) = delete_master_key(&account.id) {
+            if let Err(del) = delete_master_key(&req.account_id) {
                 tracing::error!(target: TARGET, account_id = %req.account_id, error = %del, "failed to roll back orphaned master key after atomic source-insert failure");
             } else {
                 tracing::warn!(target: TARGET, account_id = %req.account_id, "rolled back master key after atomic source-insert failure; retry will re-reveal the phrase");
@@ -203,6 +240,11 @@ pub async fn add_source(
         }
         return Err(CommandError::from(err));
     }
+
+    // R2-P1-1: the per-account critical section is complete; release the lock
+    // before the (best-effort) reconfigure so a slow reconfigure does not
+    // serialise unrelated adds.
+    drop(_guard);
 
     // Reconfigure the owning orchestrator so the new source is picked up without
     // a restart (best-effort: the account may not have a running orchestrator -
@@ -247,6 +289,12 @@ pub async fn update_source(
     if let Some(secs) = patch.deep_verify_interval_secs {
         row.deep_verify_interval_secs = secs;
     }
+
+    // R2-P1-3 (DESIGN s5.2): validate the EFFECTIVE include / exclude globs
+    // (after the patch is applied) before persisting, so a later patch cannot
+    // sneak an invalid / oversized glob past the add-time check and break the
+    // next scan's matcher build.
+    validate_source_patterns(&row.include_patterns, &row.exclude_patterns)?;
 
     state
         .state()
@@ -321,7 +369,7 @@ pub async fn pick_drive_folder(
     // refresh token. The fake's root id is its synthetic root (not the literal
     // "root" alias), so `None` resolves to that; in real mode `None` resolves to
     // Drive's "root" alias (My Drive root).
-    let (store, default_folder_id) = select_picker_store(state.remote_mode(), account_id)?;
+    let (store, default_folder_id) = select_picker_store(state.inner(), account_id)?;
 
     // B1: We resolve `None` to the mode-appropriate root for the listing AND echo
     // it back as the `current_folder_id`, so the user can SELECT the current
@@ -546,6 +594,23 @@ fn default_deep_verify_secs() -> u32 {
     604_800
 }
 
+/// R2-P1-3: validate a source's candidate include / exclude glob patterns,
+/// mapping a [`driven_core::exclude::PatternValidationError`] to the stable
+/// `internal.invalid_input` SPEC s24 code so the webview shows a "check your
+/// input" message (not a "report a bug" one). Shared by `add_source` (the
+/// request's patterns) and `update_source` (the post-patch effective patterns).
+fn validate_source_patterns(
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> CommandResult<()> {
+    validate_patterns(include_patterns, exclude_patterns).map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::InvalidInput,
+            format!("invalid backup rules: {e}"),
+        )
+    })
+}
+
 /// Look up an account by id from the strongly-consistent state DB, erroring if
 /// absent (so a stale webview surfaces the problem rather than silently no-op).
 async fn find_account(state: &dyn StateRepo, id: AccountId) -> CommandResult<AccountRow> {
@@ -722,21 +787,25 @@ async fn reconfigure_account(state: &State<'_, AppState>, account_id: AccountId)
     tracing::debug!(target: TARGET, account_id = %account_id, "orchestrator reconfigured after source change");
 }
 
-/// R1-P1-3: select the Drive-folder-picker store + its root id for `remote_mode`.
+/// R1-P1-3 / R2-P1-2: select the Drive-folder-picker store + its root id.
 ///
-/// - [`RemoteMode::Fake`] (dev / e2e / fake-remote wizard acceptance): build an
-///   in-memory [`InMemoryRemoteStore`] and use its synthetic root id. NO real
+/// - [`RemoteMode::Fake`] (dev / e2e / fake-remote wizard acceptance): return
+///   the account's SHARED [`InMemoryRemoteStore`] from [`AppState`] (R2-P1-2),
+///   NOT a throwaway instance - so a folder id this picker mints is visible to
+///   the orchestrator's uploader, which holds the SAME shared store. NO real
 ///   Google store is built and NO keychain creds are read - the fake-remote
 ///   wizard completes end-to-end without real credentials.
 /// - [`RemoteMode::RealGoogleDrive`]: build the live [`GoogleDriveStore`] from
 ///   the account's keychain refresh token and use Drive's `"root"` alias.
 fn select_picker_store(
-    remote_mode: RemoteMode,
+    state: &AppState,
     account_id: AccountId,
 ) -> CommandResult<(Arc<dyn RemoteStore>, String)> {
-    match remote_mode {
+    match state.remote_mode() {
         RemoteMode::Fake => {
-            let fake = InMemoryRemoteStore::new();
+            // R2-P1-2: the SAME per-account fake store the orchestrator uploads
+            // into (the picker and the uploader must agree on folder ids).
+            let fake = state.fake_remote_store(account_id);
             let root = fake.root_id().to_string();
             Ok((Arc::new(fake), root))
         }
@@ -994,15 +1063,31 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// Build a Fake-mode [`AppState`] with no running orchestrators, backed by a
+    /// temp state repo, for the picker-store tests. Returns the temp dir so the
+    /// caller can clean it up.
+    async fn fake_app_state() -> (AppState, std::path::PathBuf) {
+        use std::collections::HashMap;
+        let (repo, dir) = temp_repo().await;
+        let state: Arc<dyn StateRepo> = Arc::new(repo);
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+        );
+        (app_state, dir)
+    }
+
     #[tokio::test]
     async fn select_picker_store_fake_mode_lists_without_real_creds() {
         // R1-P1-3: under RemoteMode::Fake the picker store is the in-memory fake
         // (no keychain creds touched) and lists its root successfully. A random
         // account id with NO keychain entry would FAIL build_account_store in
         // real mode; here it must succeed because the fake path is taken.
+        let (app_state, dir) = fake_app_state().await;
         let account_id = AccountId::new_v4();
-        let (store, root) =
-            select_picker_store(RemoteMode::Fake, account_id).expect("fake store builds");
+        let (store, root) = select_picker_store(&app_state, account_id).expect("fake store builds");
         assert!(!root.is_empty(), "fake root id must be non-empty");
         // The fresh fake root lists (zero child folders) without error / creds.
         let children = store.list_folder(&root).await.expect("fake list_folder");
@@ -1010,5 +1095,53 @@ mod tests {
             children.is_empty(),
             "a fresh fake remote has no child folders"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn fake_picker_and_uploader_share_one_store_round_trips_parent_id() {
+        // R2-P1-2: the picker's fake store and the orchestrator's fake store must
+        // be the SAME instance per account, so a folder id the picker resolves is
+        // visible to the uploader. Model that here: the picker store
+        // (`select_picker_store`) and the orchestrator store
+        // (`AppState::fake_remote_store`) for the same account must share backing
+        // objects - a folder created via one is listed via the other, and the
+        // picker's root id is the same id the uploader would target.
+        let (app_state, dir) = fake_app_state().await;
+        let account_id = AccountId::new_v4();
+
+        // The picker resolves the account's fake store + root.
+        let (picker_store, picker_root) =
+            select_picker_store(&app_state, account_id).expect("picker store");
+
+        // The orchestrator (uploader) holds the SAME shared store for the account.
+        let uploader_store = app_state.fake_remote_store(account_id);
+
+        // The picker's root id is the uploader store's root id (one instance).
+        assert_eq!(
+            picker_root,
+            uploader_store.root_id(),
+            "picker root id must equal the shared uploader store's root id"
+        );
+
+        // Create a folder via the UPLOADER store under the picker's root id; the
+        // PICKER store must see it (same backing objects) - proving the parent id
+        // the picker minted round-trips to the uploader and back.
+        let created = uploader_store
+            .ensure_folder(&picker_root, "uploaded-folder")
+            .await
+            .expect("uploader create under picker root");
+
+        // The picker store, listing the SAME root, sees the created object.
+        let listed = picker_store
+            .list_folder(&picker_root)
+            .await
+            .expect("picker list shared root");
+        assert!(
+            listed.iter().any(|e| e.id == created.id),
+            "the picker must see the object the uploader created (shared store, R2-P1-2)"
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

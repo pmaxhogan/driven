@@ -183,6 +183,7 @@ fn code_from_message(msg: &str) -> Option<ErrorCode> {
         "net.offline",
         "update.signature_invalid",
         "update.endpoint_unreachable",
+        "internal.invalid_input",
     ];
     CANDIDATES
         .iter()
