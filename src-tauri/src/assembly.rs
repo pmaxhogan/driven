@@ -34,7 +34,7 @@ use driven_core::orchestrator::{Orchestrator, OrchestratorConfig, SyncOrchestrat
 use driven_core::pacer::{AimdPacer, Pacer};
 use driven_core::state::{AccountRow, SourceRow, StateRepo};
 use driven_core::time::{Clock, SystemClock};
-use driven_core::types::{AccountId, OrchestratorEvent};
+use driven_core::types::{AccountId, AccountState, OrchestratorEvent};
 use driven_core::watcher::{NotifyWatcher, SourceWatcher};
 
 use driven_drive::fake::InMemoryRemoteStore;
@@ -103,6 +103,28 @@ pub async fn build_and_spawn(
     let mut handles: HashMap<AccountId, AccountHandle> = HashMap::new();
 
     for account in &accounts {
+        // C5-P1-2: only spawn an orchestrator for an `AccountState::Ok` account.
+        // A `NeedsReauth` account is waiting on re-consent (it must issue ZERO
+        // remote calls until the M6 reauth flow rebuilds it); a `Disabled`
+        // account was explicitly turned off by the user. Spawning either would
+        // tick a dead / unwanted credential.
+        if account.state != AccountState::Ok {
+            tracing::info!(
+                target: TARGET,
+                account_id = %account.id,
+                email = %account.email,
+                state = ?account.state,
+                "account is not Ok; not spawning its orchestrator"
+            );
+            // Surface a needs-reauth account to the webview so the re-consent
+            // banner shows on boot (the orchestrator that would normally emit
+            // this is never spawned for a non-Ok account).
+            if account.state == AccountState::NeedsReauth {
+                emit_needs_reauth(app, account);
+            }
+            continue;
+        }
+
         // Every account's sources (the watcher + crypto provider need the full
         // set, including disabled ones, so a later enable does not require a
         // rebuild of the crypto cache key space).
@@ -113,13 +135,25 @@ pub async fn build_and_spawn(
             .collect();
 
         match build_account(app, &state, account, sources, use_fake).await {
-            Ok(handle) => {
+            Ok(BuildOutcome::Spawned(handle)) => {
                 handles.insert(account.id, handle);
                 tracing::info!(
                     target: TARGET,
                     account_id = %account.id,
                     email = %account.email,
                     "orchestrator assembled + spawned"
+                );
+            }
+            Ok(BuildOutcome::NeedsReauth) => {
+                // C5-P1-1: real mode, no/invalid stored token. We did NOT build a
+                // fake remote (that would mark files synced against fake Drive
+                // ids and silently lose the bytes on exit). The account was moved
+                // to NeedsReauth + the banner emitted; do not spawn its loop.
+                tracing::warn!(
+                    target: TARGET,
+                    account_id = %account.id,
+                    email = %account.email,
+                    "real remote has no valid token; account marked needs_reauth, orchestrator NOT spawned"
                 );
             }
             Err(err) => {
@@ -145,20 +179,59 @@ fn use_fake_remote() -> bool {
         .unwrap_or(false)
 }
 
-/// Build + spawn ONE account's orchestrator over the real seams. Returns the
-/// [`AccountHandle`] (control surface + run-loop join handle) or an error that
-/// the caller logs + skips.
+/// The result of attempting to build + spawn one account's orchestrator.
+enum BuildOutcome {
+    /// The orchestrator was assembled and its run loop spawned.
+    Spawned(AccountHandle),
+    /// C5-P1-1: real remote mode with no/invalid stored token. The account was
+    /// moved to [`AccountState::NeedsReauth`] and the banner emitted; NO fake
+    /// fallback was constructed and NO orchestrator was spawned.
+    NeedsReauth,
+}
+
+/// What [`build_remote`] resolved for one account.
+enum RemoteOutcome {
+    /// A live [`RemoteStore`] (real `GoogleDriveStore` or the in-memory fake).
+    Store(Arc<dyn RemoteStore>),
+    /// C5-P1-1: real mode, no/invalid token. Do NOT fall back to a fake remote
+    /// (that silently loses bytes); the account needs re-consent.
+    NeedsReauth,
+}
+
+/// Build + spawn ONE account's orchestrator over the real seams. Returns a
+/// [`BuildOutcome`] (spawned, or needs-reauth) or an error that the caller
+/// logs + skips.
 async fn build_account(
     app: &AppHandle,
     state: &Arc<dyn StateRepo>,
     account: &AccountRow,
     sources: Vec<SourceRow>,
     use_fake: bool,
-) -> anyhow::Result<AccountHandle> {
+) -> anyhow::Result<BuildOutcome> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
     // --- remote: real GoogleDriveStore or the in-memory fake -----------------
-    let remote = build_remote(account, use_fake)?;
+    let remote = match build_remote(account, use_fake)? {
+        RemoteOutcome::Store(store) => store,
+        RemoteOutcome::NeedsReauth => {
+            // C5-P1-1: persist needs_reauth + emit the banner; do NOT build a
+            // fake remote and do NOT spawn the orchestrator (silent-data-loss
+            // guard for a backup tool).
+            if let Err(err) = state
+                .mark_account_state(account.id, AccountState::NeedsReauth)
+                .await
+            {
+                tracing::error!(
+                    target: TARGET,
+                    account_id = %account.id,
+                    %err,
+                    "failed to persist needs_reauth account state"
+                );
+            }
+            emit_needs_reauth(app, account);
+            return Ok(BuildOutcome::NeedsReauth);
+        }
+    };
 
     // --- pacer: real AIMD pacer seeded from the account's config -------------
     // M5 uses the default orchestrator config (the persisted per-account
@@ -260,24 +333,32 @@ async fn build_account(
 
     // Coerce the concrete Arc into the trait object the handle + IPC use.
     let orchestrator: Arc<dyn Orchestrator> = orchestrator;
-    Ok(AccountHandle {
+    Ok(BuildOutcome::Spawned(AccountHandle::new(
         orchestrator,
         run_loop,
-    })
+    )))
 }
 
-/// Construct the [`RemoteStore`] for one account: the in-memory fake when
-/// `DRIVEN_USE_FAKE_REMOTE=1` OR the account has no stored refresh token yet,
-/// otherwise a real `GoogleDriveStore` from the keyring token (the `driven-cli`
-/// `build_store` pattern). Logs which path was taken.
-fn build_remote(account: &AccountRow, use_fake: bool) -> anyhow::Result<Arc<dyn RemoteStore>> {
+/// Construct the [`RemoteStore`] for one account.
+///
+/// - `DRIVEN_USE_FAKE_REMOTE=1`: the in-memory fake (dev / e2e ONLY).
+/// - Real mode with a valid stored refresh token: a real `GoogleDriveStore`
+///   (the `driven-cli` `build_store` pattern).
+/// - Real mode with NO stored refresh token: [`RemoteOutcome::NeedsReauth`].
+///
+/// C5-P1-1 (silent-data-loss guard): in REAL mode a missing/invalid token does
+/// NOT fall back to the in-memory fake. Doing so would let the orchestrator mark
+/// files `synced` against EPHEMERAL fake Drive ids and then lose the actual
+/// bytes on process exit - catastrophic for a backup tool. The ONLY way to get a
+/// fake remote is the explicit `DRIVEN_USE_FAKE_REMOTE=1` opt-in.
+fn build_remote(account: &AccountRow, use_fake: bool) -> anyhow::Result<RemoteOutcome> {
     if use_fake {
         tracing::info!(
             target: TARGET,
             account_id = %account.id,
             "remote: in-memory fake (DRIVEN_USE_FAKE_REMOTE=1)"
         );
-        return Ok(Arc::new(InMemoryRemoteStore::new()));
+        return Ok(RemoteOutcome::Store(Arc::new(InMemoryRemoteStore::new())));
     }
 
     // The keychain token store is keyed by account id (the same key the auth
@@ -287,15 +368,15 @@ fn build_remote(account: &AccountRow, use_fake: bool) -> anyhow::Result<Arc<dyn 
     let refresh_token = match token_store.load_refresh_token() {
         Ok(Some(token)) => token,
         Ok(None) => {
-            // Not authenticated yet: fall back to the in-memory store so the
-            // orchestrator still spins (it will surface needs-auth when the
-            // account is wired through the OAuth wizard in M6).
+            // C5-P1-1: NO fake fallback in real mode. The account needs
+            // re-consent; the caller persists needs_reauth + emits the banner
+            // and does NOT spawn the orchestrator (no fake-id silent data loss).
             tracing::warn!(
                 target: TARGET,
                 account_id = %account.id,
-                "remote: no stored refresh token; using in-memory fake until authenticated"
+                "remote: no stored refresh token in real mode; needs reauth (NOT falling back to fake)"
             );
-            return Ok(Arc::new(InMemoryRemoteStore::new()));
+            return Ok(RemoteOutcome::NeedsReauth);
         }
         Err(err) => return Err(err),
     };
@@ -310,7 +391,25 @@ fn build_remote(account: &AccountRow, use_fake: bool) -> anyhow::Result<Arc<dyn 
         account_id = %account.id,
         "remote: real GoogleDriveStore (keyring refresh token)"
     );
-    Ok(Arc::new(store))
+    Ok(RemoteOutcome::Store(Arc::new(store)))
+}
+
+/// Emit the `account:needs_reauth` webview banner + raise the OS notification
+/// for an account that requires re-consent at assembly time (C5-P1-1 /
+/// C5-P1-2). Mirrors the orchestrator-event bridge's reauth handling for the
+/// case where the orchestrator is never spawned.
+fn emit_needs_reauth(app: &AppHandle, account: &AccountRow) {
+    if let Err(err) =
+        events::emit_account_needs_reauth(app, &account.id.to_string(), &account.email)
+    {
+        tracing::debug!(
+            target: TARGET,
+            account_id = %account.id,
+            %err,
+            "emit account:needs_reauth (assembly) failed"
+        );
+    }
+    tray::notify_needs_reauth(app, &account.email);
 }
 
 /// Resolve the OAuth client id + secret for the real Drive store: env overrides
@@ -413,7 +512,7 @@ fn spawn_event_bridge(
             match rx.recv().await {
                 Ok(OrchestratorEvent::StateChanged { state }) => {
                     // Reflect the new state on the tray icon (SPEC s12).
-                    tray::apply_state(&app, state.clone());
+                    tray::apply_state(&app, account_id, state.clone());
                     // Push a global-status refresh to the webview (SPEC s11.7).
                     // M5 carries a single-account snapshot in the payload; M6
                     // aggregates across accounts into the full DTO.
