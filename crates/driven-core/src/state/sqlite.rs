@@ -35,7 +35,7 @@ use uuid::Uuid;
 use super::{
     AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
     FileSearchHit, FileStateRow, FileStatusCount, NewActivity, NewPendingOp, PageRequest,
-    PendingOpRow, SourceRow, StateRepo,
+    PendingOpRow, RestoreFileRow, SourceRow, StateRepo,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -1743,6 +1743,162 @@ impl StateRepo for SqliteStateRepo {
             })
             .collect()
     }
+
+    async fn list_file_state_under_prefix(
+        &self,
+        source: SourceId,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<RestoreFileRow>> {
+        let source_str = source.to_string();
+        // Fetch limit + 1 so the caller can detect truncation without a COUNT.
+        let fetch = (u64::from(limit).saturating_add(1)).min(i64::MAX as u64) as i64;
+
+        // The Restore tree shows files at/under `prefix`. An empty prefix is the
+        // source root (every row). A non-empty prefix matches the directory
+        // `prefix` itself: rows whose path is exactly `prefix` (a file with that
+        // name) OR start with `prefix/` (anything inside the directory). We do
+        // this as an INDEXED RANGE SCAN over the `(source_id, relative_path)`
+        // primary key, not a `LIKE 'prefix/%'` (which cannot use the index for a
+        // leading-literal-then-wildcard on all SQLite builds and risks a full
+        // scan): `relative_path >= 'prefix/' AND relative_path < 'prefix0'` where
+        // '0' is the byte after '/'. We additionally OR in the exact `prefix`
+        // match (a file named exactly `prefix`). For an empty prefix the bounds
+        // collapse to "all rows for the source".
+        let rows = if prefix.is_empty() {
+            sqlx::query!(
+                r#"
+                SELECT
+                    source_id     AS "source_id!: String",
+                    relative_path AS "relative_path!: String",
+                    size          AS "size!: i64",
+                    status        AS "status!: String",
+                    drive_file_id AS "drive_file_id: String"
+                FROM file_state
+                WHERE source_id = ?1
+                ORDER BY relative_path ASC
+                LIMIT ?2
+                "#,
+                source_str,
+                fetch,
+            )
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.source_id,
+                    r.relative_path,
+                    r.size,
+                    r.status,
+                    r.drive_file_id,
+                )
+            })
+            .collect::<Vec<_>>()
+        } else {
+            // Lower bound inclusive: "prefix/"; upper bound exclusive: "prefix0"
+            // ('0' == 0x30 is the next byte after '/' == 0x2F), so the range
+            // covers exactly the descendants of the `prefix` directory.
+            let lower = format!("{prefix}/");
+            let upper = format!("{prefix}0");
+            let exact = prefix.to_string();
+            sqlx::query!(
+                r#"
+                SELECT
+                    source_id     AS "source_id!: String",
+                    relative_path AS "relative_path!: String",
+                    size          AS "size!: i64",
+                    status        AS "status!: String",
+                    drive_file_id AS "drive_file_id: String"
+                FROM file_state
+                WHERE source_id = ?1
+                  AND (
+                    relative_path = ?2
+                    OR (relative_path >= ?3 AND relative_path < ?4)
+                  )
+                ORDER BY relative_path ASC
+                LIMIT ?5
+                "#,
+                source_str,
+                exact,
+                lower,
+                upper,
+                fetch,
+            )
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.source_id,
+                    r.relative_path,
+                    r.size,
+                    r.status,
+                    r.drive_file_id,
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+
+        rows.into_iter()
+            .map(|(source_id, relative_path, size, status, drive_file_id)| {
+                Ok(RestoreFileRow {
+                    source_id: SourceId(uuid_from_str(&source_id)?),
+                    relative_path: relative_path_from_string(relative_path)?,
+                    size: size as u64,
+                    status: file_state_status_from_str(&status)?,
+                    drive_file_id,
+                })
+            })
+            .collect()
+    }
+
+    async fn search_files_glob(
+        &self,
+        source: Option<SourceId>,
+        pattern: &str,
+        limit: u32,
+    ) -> Result<Vec<FileSearchHit>> {
+        let source_str = source.map(|s| s.to_string());
+        let limit_i = limit as i64;
+        // SQLite GLOB is case-sensitive and uses `*` / `?` / `[...]` wildcards -
+        // exactly the glob grammar the Restore search box exposes (e.g. `*.rs`).
+        // The pattern is passed straight through as a bound parameter (no SQL
+        // injection risk - it is a value, not concatenated SQL); GLOB has no
+        // ESCAPE clause, so a literal `*`/`?` cannot be searched for, which is
+        // acceptable for filename glob search.
+        let glob = pattern.to_string();
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                source_id     AS "source_id!: String",
+                relative_path AS "relative_path!: String",
+                status        AS "status!: String",
+                drive_file_id AS "drive_file_id: String"
+            FROM file_state
+            WHERE relative_path GLOB ?1
+              AND (?2 IS NULL OR source_id = ?2)
+            ORDER BY relative_path ASC
+            LIMIT ?3
+            "#,
+            glob,
+            source_str,
+            limit_i,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(FileSearchHit {
+                    source_id: SourceId(uuid_from_str(&r.source_id)?),
+                    relative_path: relative_path_from_string(r.relative_path)?,
+                    status: file_state_status_from_str(&r.status)?,
+                    drive_file_id: r.drive_file_id,
+                })
+            })
+            .collect()
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -3119,6 +3275,101 @@ mod tests {
         // escaped) - just assert no error and no spurious panic.
         let with_quote = repo.search_files(None, "foo\"bar", 10).await.unwrap();
         assert!(with_quote.len() <= 1);
+    }
+
+    #[tokio::test]
+    async fn list_file_state_under_prefix_returns_subtree() {
+        // M8: the Restore tree range-scans file_state under a plaintext prefix.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        for p in [
+            "a.txt",
+            "src/main.rs",
+            "src/lib.rs",
+            "src/nested/deep.rs",
+            "srcfoo.txt", // NOT under "src/" - the range upper bound must exclude it
+            "docs/readme.md",
+        ] {
+            repo.upsert_file_state(&sample_file(src.id, p, 0x01))
+                .await
+                .unwrap();
+        }
+
+        // Root (empty prefix) sees every file.
+        let root = repo
+            .list_file_state_under_prefix(src.id, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(root.len(), 6);
+
+        // The "src" subtree sees only the three under src/, NOT "srcfoo.txt".
+        let under_src = repo
+            .list_file_state_under_prefix(src.id, "src", 100)
+            .await
+            .unwrap();
+        let paths: Vec<&str> = under_src.iter().map(|r| r.relative_path.as_str()).collect();
+        assert_eq!(paths, ["src/lib.rs", "src/main.rs", "src/nested/deep.rs"]);
+
+        // The deeper "src/nested" prefix narrows further.
+        let nested = repo
+            .list_file_state_under_prefix(src.id, "src/nested", 100)
+            .await
+            .unwrap();
+        assert_eq!(nested.len(), 1);
+        assert_eq!(nested[0].relative_path.as_str(), "src/nested/deep.rs");
+    }
+
+    #[tokio::test]
+    async fn list_file_state_under_prefix_caps_at_limit_plus_one() {
+        // The +1 over the limit lets the caller detect truncation.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        for i in 0..10 {
+            repo.upsert_file_state(&sample_file(src.id, &format!("d/f{i:02}.txt"), 0x01))
+                .await
+                .unwrap();
+        }
+        let rows = repo
+            .list_file_state_under_prefix(src.id, "d", 3)
+            .await
+            .unwrap();
+        // limit 3 -> at most 4 rows fetched (3 + 1 truncation sentinel).
+        assert_eq!(rows.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn search_files_glob_matches_wildcards() {
+        // M8: the glob search path matches `*.rs` style patterns FTS5 cannot.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        for p in ["a.rs", "b.rs", "c.txt", "src/d.rs"] {
+            repo.upsert_file_state(&sample_file(src.id, p, 0x01))
+                .await
+                .unwrap();
+        }
+
+        // `*.rs` matches every .rs path (GLOB `*` spans `/`).
+        let rs = repo.search_files_glob(None, "*.rs", 100).await.unwrap();
+        let mut paths: Vec<&str> = rs.iter().map(|h| h.relative_path.as_str()).collect();
+        paths.sort_unstable();
+        assert_eq!(paths, ["a.rs", "b.rs", "src/d.rs"]);
+
+        // A source-scoped glob still works; a non-matching glob returns nothing.
+        let none = repo
+            .search_files_glob(Some(src.id), "*.md", 100)
+            .await
+            .unwrap();
+        assert!(none.is_empty());
     }
 
     #[tokio::test]

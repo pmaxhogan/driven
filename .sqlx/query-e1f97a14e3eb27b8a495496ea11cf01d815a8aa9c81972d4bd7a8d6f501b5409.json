@@ -1,0 +1,44 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                SELECT\n                    source_id     AS \"source_id!: String\",\n                    relative_path AS \"relative_path!: String\",\n                    size          AS \"size!: i64\",\n                    status        AS \"status!: String\",\n                    drive_file_id AS \"drive_file_id: String\"\n                FROM file_state\n                WHERE source_id = ?1\n                ORDER BY relative_path ASC\n                LIMIT ?2\n                ",
+  "describe": {
+    "columns": [
+      {
+        "name": "source_id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "relative_path!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "size!: i64",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "status!: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      },
+      {
+        "name": "drive_file_id: String",
+        "ordinal": 4,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "e1f97a14e3eb27b8a495496ea11cf01d815a8aa9c81972d4bd7a8d6f501b5409"
+}

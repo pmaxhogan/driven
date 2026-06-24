@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                source_id     AS \"source_id!: String\",\n                relative_path AS \"relative_path!: String\",\n                status        AS \"status!: String\",\n                drive_file_id AS \"drive_file_id: String\"\n            FROM file_state\n            WHERE relative_path GLOB ?1\n              AND (?2 IS NULL OR source_id = ?2)\n            ORDER BY relative_path ASC\n            LIMIT ?3\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "source_id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "relative_path!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "status!: String",
+        "ordinal": 2,
+        "type_info": "Text"
+      },
+      {
+        "name": "drive_file_id: String",
+        "ordinal": 3,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      true
+    ]
+  },
+  "hash": "611f8fe5888958c8410adf0ff9c66a164819b8d8f49cb7bbb2dd7759e3a8a70c"
+}

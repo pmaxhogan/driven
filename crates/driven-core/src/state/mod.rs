@@ -354,6 +354,26 @@ pub struct FileSearchHit {
     pub drive_file_id: Option<String>,
 }
 
+/// M8: one `file_state` FILE row the Restore browser can restore (SPEC s11.5,
+/// DESIGN s8.4). The restore tree / search surface needs the file's identity (to
+/// download from Drive) plus its plaintext size for the progress UI; the
+/// plaintext `relative_path` is the LOCAL authoritative key (SPEC s2: file_state
+/// stores the PLAINTEXT relative path even for encrypted sources), so the browser
+/// shows decrypted names without touching the keystore for display.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RestoreFileRow {
+    /// Source the file belongs to.
+    pub source_id: SourceId,
+    /// Plaintext relative path under the source root (the display + restore key).
+    pub relative_path: RelativePath,
+    /// Plaintext size in bytes (for the restore progress UI).
+    pub size: u64,
+    /// Current sync status.
+    pub status: FileStateStatus,
+    /// Drive `file_id`; `None` if never uploaded (not restorable yet).
+    pub drive_file_id: Option<String>,
+}
+
 // -----------------------------------------------------------------------------
 // The trait surface.
 // -----------------------------------------------------------------------------
@@ -755,4 +775,49 @@ pub trait StateRepo: Send + Sync {
         query: &str,
         limit: u32,
     ) -> Result<Vec<FileSearchHit>>;
+
+    // --- restore (M8, SPEC s11.5) ------------------------------------------
+
+    /// M8: list the `file_state` FILE rows for `source` whose plaintext
+    /// `relative_path` is directly OR transitively under `prefix` (a
+    /// Drive-relative, `/`-separated plaintext prefix; empty = the source root),
+    /// newest-path-first, capped at `limit + 1` (the caller uses the +1 to detect
+    /// truncation). Backs the Restore browser tree (SPEC s11.5, DESIGN s8.4):
+    /// the command derives the immediate children (sub-folders + files) from this
+    /// range scan, so a folder open is a single indexed `relative_path` range
+    /// query over the `(source_id, relative_path)` primary key, never a Drive call
+    /// (ROADMAP M8: avoid hitting Drive for navigation, 10k-file tree < 100ms per
+    /// folder open).
+    ///
+    /// `prefix` MUST already be validated by the caller (printable, `/`-separated,
+    /// no `..`, length-bounded - SPEC s11.6.1); this method treats it as an opaque
+    /// path prefix and does NOT re-validate. The default impl returns an empty
+    /// list (the test fakes never call it); the SQLite repo overrides it.
+    async fn list_file_state_under_prefix(
+        &self,
+        source: SourceId,
+        prefix: &str,
+        limit: u32,
+    ) -> Result<Vec<RestoreFileRow>> {
+        let _ = (source, prefix, limit);
+        Ok(Vec::new())
+    }
+
+    /// M8: GLOB-search `file_state.relative_path` (SPEC s11.5 the `search_files`
+    /// glob path). `pattern` is a SQLite `GLOB` pattern (`*`, `?`, `[...]`) matched
+    /// case-sensitively against the plaintext relative path; when `source` is
+    /// `Some` the search is scoped to that source. Capped at `limit`. The FTS5
+    /// path ([`Self::search_files`]) serves prefix/term queries (< 50ms); this
+    /// glob path serves wildcard queries (< 200ms) the tokenizer cannot express
+    /// (e.g. `*.rs`, `src/**`). The default impl returns an empty list; the SQLite
+    /// repo overrides it with a `relative_path GLOB ?` range-free scan.
+    async fn search_files_glob(
+        &self,
+        source: Option<SourceId>,
+        pattern: &str,
+        limit: u32,
+    ) -> Result<Vec<FileSearchHit>> {
+        let _ = (source, pattern, limit);
+        Ok(Vec::new())
+    }
 }
