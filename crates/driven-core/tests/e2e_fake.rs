@@ -512,7 +512,10 @@ async fn rate_limit_on_seventh_file_retries_and_completes() {
         collisions: vec![],
     };
 
-    let out = exec.execute(&src, &plan, &noop_progress).await.unwrap();
+    let out = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
     assert_eq!(out.len(), 10);
     assert!(
         out.iter().all(|o| matches!(o, OpOutcome::Done { .. })),
@@ -582,7 +585,10 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
         },
         clock.clone(),
     );
-    let out = exec.execute(&src, &plan, &noop_progress).await.unwrap();
+    let out = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
     assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
 
     // The object landed with its create-op UUID stamped in appProperties
@@ -766,7 +772,9 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
     // The dropped chunk is a fatal Drive error -> `execute` returns Err and the
     // pending op is KEPT (the SkipPostUpload/Fatal contract never deletes a
     // create op mid-stream).
-    let phase1 = exec.execute(&src, &plan, &noop_progress).await;
+    let phase1 = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await;
     assert!(
         phase1.is_err(),
         "the mid-stream network drop aborts the upload: {phase1:?}"
@@ -1083,7 +1091,10 @@ async fn parallel_uploads_no_corruption() {
         },
         clock,
     );
-    let out = exec.execute(&src, &plan, &noop_progress).await.unwrap();
+    let out = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
     assert_eq!(out.len(), 40);
     assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
 
@@ -1240,7 +1251,10 @@ async fn encryption_on_round_trip_bytes_match() {
         }],
         collisions: vec![],
     };
-    let out = exec.execute(&src, &plan, &noop_progress).await.unwrap();
+    let out = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
     assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
 
     // The stored object is ciphertext, NOT plaintext.
@@ -1346,7 +1360,10 @@ async fn encryption_nested_remote_is_ciphertext_and_restores() {
         }],
         collisions: vec![],
     };
-    let out = exec.execute(&src, &plan, &noop_progress).await.unwrap();
+    let out = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
     assert!(
         out.iter().all(|o| matches!(o, OpOutcome::Done { .. })),
         "got {out:?}"
@@ -1629,7 +1646,7 @@ async fn vss_unavailable_skips_locked_file_reports_and_continues() {
                 event_types: vec!["local.vss_unavailable".to_string()],
                 ..ActivityFilter::default()
             },
-            PageRequest { page: 0, limit: 50 },
+            PageRequest::first(50),
         )
         .await
         .unwrap();
@@ -1648,7 +1665,7 @@ async fn vss_unavailable_skips_locked_file_reports_and_continues() {
                 event_types: vec!["local.file_locked".to_string()],
                 ..ActivityFilter::default()
             },
-            PageRequest { page: 0, limit: 50 },
+            PageRequest::first(50),
         )
         .await
         .unwrap();
@@ -1839,7 +1856,10 @@ async fn pipeline_streaming_keeps_memory_bounded() {
     )
     .with_mem_gauge(gauge.clone());
 
-    let out = exec.execute(&src, &plan, &noop_progress).await.unwrap();
+    let out = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
     assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
     assert_eq!(
         live_object_count(&remote, &folder).await,
@@ -1904,3 +1924,8 @@ async fn lossy_and_intermittent_breaker_cycles() {}
 // ---------------------------------------------------------------------------
 
 fn noop_progress(_p: driven_core::types::ExecProgress) {}
+
+/// R2-P2-1: a no-op per-op outcome sink for the e2e fakes.
+fn noop_outcome(_o: &OpOutcome) -> futures::future::BoxFuture<'static, ()> {
+    Box::pin(async {})
+}

@@ -907,75 +907,80 @@ impl SyncOrchestrator {
         }
     }
 
-    /// Writes a durable `activity_log` row per op outcome (R1-P1-1 + recheck2
-    /// P2) so a production user has per-file evidence rather than only tracing.
+    /// Builds the durable `activity_log` row for a SINGLE op outcome (R1-P1-1 +
+    /// recheck2 P2-1) so a production user has per-file evidence rather than only
+    /// tracing.
     ///
-    /// - A `Done` UPLOAD lands an Info `upload_done` row carrying its byte count
-    ///   (R1-P1-1) - this is what feeds the DESIGN s8.3 "Uploaded today / this
-    ///   week" + throughput aggregates, which were otherwise always zero because
-    ///   the happy path recorded nothing.
-    /// - A `Done` TRASH lands an Info `trash_done` row (no bytes).
-    /// - A `Failed` op lands an Error row keyed by its error code.
-    /// - A `Skipped` op (re-queued, retries next cycle) lands a Warn row.
-    ///
-    /// Every row routes through the [`Self::record_activity`] chokepoint, so the
-    /// `activity:new` live tail broadcasts for successful uploads/trashes too,
-    /// and the existing activity retention (prune / row cap) applies unchanged
-    /// (these are ordinary `activity_log` rows). Mirrors `record_collisions`; a
-    /// write hiccup is logged but never aborts the cycle.
-    async fn record_outcome_activity(
-        &self,
+    /// - A `Done` UPLOAD -> Info `upload_done` row carrying its byte count
+    ///   (R1-P1-1) - this feeds the DESIGN s8.3 "Uploaded today / this week" +
+    ///   throughput aggregates, which were otherwise always zero because the
+    ///   happy path recorded nothing.
+    /// - A `Done` TRASH -> Info `trash_done` row (no bytes).
+    /// - A `Failed` op -> Error row keyed by its error code.
+    /// - A `Skipped` op (re-queued, retries next cycle) -> Warn row.
+    fn outcome_activity_row(
         source_id: crate::types::SourceId,
-        outcomes: &[OpOutcome],
-    ) {
-        let now = self.clock.now_ms();
-        for outcome in outcomes {
-            let (level, event_type, bytes, path) = match outcome {
-                OpOutcome::Done {
-                    relative_path,
-                    kind: crate::executor::DoneKind::Upload,
-                    bytes,
-                } => (
-                    ActivityLevel::Info,
-                    "upload_done".to_string(),
-                    *bytes,
-                    relative_path,
-                ),
-                OpOutcome::Done {
-                    relative_path,
-                    kind: crate::executor::DoneKind::Trash,
-                    ..
-                } => (
-                    ActivityLevel::Info,
-                    "trash_done".to_string(),
-                    None,
-                    relative_path,
-                ),
-                OpOutcome::Failed {
-                    relative_path,
-                    code,
-                } => (ActivityLevel::Error, code.to_string(), None, relative_path),
-                OpOutcome::Skipped {
-                    relative_path,
-                    reason,
-                } => (
-                    ActivityLevel::Warn,
-                    reason.error_code().to_string(),
-                    None,
-                    relative_path,
-                ),
-            };
-            let row = NewActivity {
-                ts: now,
-                source_id: Some(source_id),
-                level,
-                event_type,
-                file_count: None,
+        now: crate::types::UnixMs,
+        outcome: &OpOutcome,
+    ) -> NewActivity {
+        let (level, event_type, bytes, path) = match outcome {
+            OpOutcome::Done {
+                relative_path,
+                kind: crate::executor::DoneKind::Upload,
                 bytes,
-                message: Some(path.as_str().to_string()),
-            };
-            self.record_activity(row).await;
+            } => (
+                ActivityLevel::Info,
+                "upload_done".to_string(),
+                *bytes,
+                relative_path,
+            ),
+            OpOutcome::Done {
+                relative_path,
+                kind: crate::executor::DoneKind::Trash,
+                ..
+            } => (
+                ActivityLevel::Info,
+                "trash_done".to_string(),
+                None,
+                relative_path,
+            ),
+            OpOutcome::Failed {
+                relative_path,
+                code,
+            } => (ActivityLevel::Error, code.to_string(), None, relative_path),
+            OpOutcome::Skipped {
+                relative_path,
+                reason,
+            } => (
+                ActivityLevel::Warn,
+                reason.error_code().to_string(),
+                None,
+                relative_path,
+            ),
+        };
+        NewActivity {
+            ts: now,
+            source_id: Some(source_id),
+            level,
+            event_type,
+            file_count: None,
+            bytes,
+            message: Some(path.as_str().to_string()),
         }
+    }
+
+    /// R2-P2-1: persist ONE op outcome's pre-built activity `row` IMMEDIATELY
+    /// after that op committed (called by the executor's per-op `on_outcome`
+    /// sink). Routes through the [`Self::record_activity`] chokepoint, so the
+    /// `activity:new` live tail broadcasts per op and the existing retention
+    /// (prune / row cap) applies unchanged. A write hiccup is logged but never
+    /// aborts the cycle (mirrors `record_collisions`).
+    ///
+    /// Takes the row by value (the caller builds it synchronously from the
+    /// borrowed outcome) so the returned future borrows only `self`, not the
+    /// outcome - which lets it satisfy the executor's `OutcomeSink` bound.
+    async fn record_one_outcome_activity(&self, row: NewActivity) {
+        self.record_activity(row).await;
     }
 
     /// `true` when this account may run a cycle (codex C5-P1-2): NOT suspended
@@ -1182,9 +1187,25 @@ impl SyncOrchestrator {
                 progress,
             });
         };
-        let outcomes = self.executor.execute(source, &plan, &on_progress).await?;
+        // R2-P2-1: stream per-op activity. The executor awaits this sink for
+        // each op the instant it commits (in completion order), so activity
+        // rows persist + `activity:new` broadcasts per file - a crash mid-plan
+        // keeps every committed op's audit row, and a large initial backup shows
+        // per-file activity as it runs. (The previous post-pass after the whole
+        // plan lost all of it on a mid-plan stop.)
+        let on_outcome = move |outcome: &OpOutcome| -> futures::future::BoxFuture<'_, ()> {
+            // Build the row synchronously from the borrowed outcome, then the
+            // future borrows only `self` (satisfies the OutcomeSink bound; the
+            // future cannot outlive `outcome`'s borrow otherwise).
+            let now = self.clock.now_ms();
+            let row = Self::outcome_activity_row(source_id, now, outcome);
+            Box::pin(self.record_one_outcome_activity(row))
+        };
+        let outcomes = self
+            .executor
+            .execute(source, &plan, &on_progress, &on_outcome)
+            .await?;
         log_outcomes(source, &outcomes);
-        self.record_outcome_activity(source.id, &outcomes).await;
         // Emit a final progress snapshot so a consumer that missed the
         // throttled ticks still sees the completed counts.
         self.emit_progress(source.id, exec_progress_from(&summary, &outcomes));
@@ -1816,6 +1837,12 @@ mod tests {
         /// "reconcile invalid_grant -> needs_reauth + suspend" test can assert
         /// the orchestrator runs the V-F transition off the reconcile path.
         reconcile_auth_fail: std::sync::atomic::AtomicBool,
+        /// R2-P2-1: when `> 0`, `execute` STREAMS this many op outcomes through
+        /// the per-op `on_outcome` sink (so their activity is persisted) and
+        /// THEN returns `Err` - simulating a crash/shutdown PART-WAY through a
+        /// plan. Used to assert the committed ops' activity survives a mid-plan
+        /// stop (rather than being lost in a post-pass).
+        stream_then_fail_after: AtomicU64,
     }
 
     #[async_trait]
@@ -1825,6 +1852,7 @@ mod tests {
             _source: &SourceRow,
             plan: &Plan,
             on_progress: &(dyn Fn(ExecProgress) + Send + Sync),
+            on_outcome: &crate::executor::OutcomeSink<'_>,
         ) -> anyhow::Result<Vec<OpOutcome>> {
             self.executes.fetch_add(1, Ordering::SeqCst);
             if self.execute_returns_err.load(Ordering::SeqCst) {
@@ -1875,7 +1903,26 @@ mod tests {
                         }
                     }
                 })
-                .collect();
+                .collect::<Vec<_>>();
+            // R2-P2-1: stream each outcome through the per-op sink (in order),
+            // mirroring the real executor, so the orchestrator persists per-op
+            // activity as ops "commit" rather than in a post-pass.
+            let stop_after = self.stream_then_fail_after.load(Ordering::SeqCst);
+            if stop_after > 0 {
+                // Stream only the first `stop_after` outcomes (they "committed"),
+                // then return Err WITHOUT streaming the rest - simulating a crash
+                // part-way through the plan. The orchestrator must already have
+                // persisted those streamed ops' activity.
+                for outcome in outcomes.iter().take(stop_after as usize) {
+                    on_outcome(outcome).await;
+                }
+                return Err(anyhow::anyhow!(
+                    "simulated mid-plan stop after {stop_after} op(s)"
+                ));
+            }
+            for outcome in &outcomes {
+                on_outcome(outcome).await;
+            }
             Ok(outcomes)
         }
 
@@ -3675,7 +3722,13 @@ mod tests {
                 bytes: None,
             },
         ];
-        orch.record_outcome_activity(src_id, &outcomes).await;
+        // R2-P2-1: persist each outcome via the per-op streaming path (the
+        // executor now calls this per op as it commits, not in a post-pass).
+        let now = orch.clock.now_ms();
+        for outcome in &outcomes {
+            let row = SyncOrchestrator::outcome_activity_row(src_id, now, outcome);
+            orch.record_one_outcome_activity(row).await;
+        }
 
         let rows = state.activity_rows();
         assert_eq!(rows.len(), 2, "one row per successful op");
@@ -3732,6 +3785,57 @@ mod tests {
         );
     }
 
+    #[tokio::test]
+    async fn per_op_activity_survives_a_mid_plan_stop() {
+        // R2-P2-1: activity is streamed PER OP (persisted immediately after each
+        // op commits) rather than in a post-pass after the whole plan. So when a
+        // crash / shutdown stops the plan part-way, the ops that already
+        // committed MUST still have their durable activity rows - the audit trail
+        // is not all-or-nothing. The RecordingExecutor streams the first N
+        // outcomes' activity then returns Err (a simulated mid-plan stop).
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        // Two files -> a 2-op plan; the executor commits op 1 then "crashes".
+        std::fs::write(dir.path().join("a.txt"), b"first").unwrap();
+        std::fs::write(dir.path().join("b.txt"), b"second").unwrap();
+        let mut src = source_in(account, dir.path());
+        src.last_full_scan_at = None;
+        src.last_deep_verify_at = None;
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let exec = Arc::new(RecordingExecutor::default());
+        // Stream exactly ONE op's activity, then fail before the rest.
+        exec.stream_then_fail_after.store(1, Ordering::SeqCst);
+        let clock = Arc::new(FakeClock::new());
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec,
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock,
+            OrchestratorConfig::default(),
+        );
+
+        // The cycle errors out (the executor returned Err mid-plan).
+        let result = orch.run_cycle(TickSource::Scheduled).await;
+        assert!(
+            result.is_err(),
+            "the mid-plan executor error propagates from the cycle"
+        );
+
+        // The op that committed BEFORE the stop still has its durable activity
+        // row - it was persisted streaming, not in a lost post-pass.
+        let rows = state.activity_rows();
+        let committed = rows
+            .iter()
+            .filter(|r| r.event_type == "upload_done")
+            .count();
+        assert_eq!(
+            committed, 1,
+            "the one committed op's activity persisted despite the mid-plan stop: {rows:?}"
+        );
+    }
+
     // --- P1-7: the real run() event loop ------------------------------------
 
     /// An executor that blocks inside `execute` on a caller-controlled barrier
@@ -3754,6 +3858,7 @@ mod tests {
             _source: &SourceRow,
             _plan: &Plan,
             _on_progress: &(dyn Fn(ExecProgress) + Send + Sync),
+            _on_outcome: &crate::executor::OutcomeSink<'_>,
         ) -> anyhow::Result<Vec<OpOutcome>> {
             self.executes.fetch_add(1, Ordering::SeqCst);
             let _ = self.entered_tx.send(());

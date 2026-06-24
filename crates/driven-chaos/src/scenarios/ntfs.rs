@@ -198,10 +198,7 @@ async fn saw_error_code(
                 event_types: vec![code.code().to_string()],
                 ..ActivityFilter::default()
             },
-            PageRequest {
-                page: 0,
-                limit: 10_000,
-            },
+            PageRequest::first(10_000),
         )
         .await?;
     Ok(!page.rows.is_empty())
@@ -221,10 +218,7 @@ async fn error_level_activity_count(
                 min_level: Some(ActivityLevel::Error),
                 ..ActivityFilter::default()
             },
-            PageRequest {
-                page: 0,
-                limit: 10_000,
-            },
+            PageRequest::first(10_000),
         )
         .await?;
     Ok(page.total)

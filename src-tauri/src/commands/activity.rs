@@ -80,31 +80,34 @@ pub async fn query_activity(
         .map_err(CommandError::from)?;
 
     let entries: Vec<ActivityEntry> = result.rows.iter().map(ActivityEntry::from).collect();
-    // `has_more` is true when rows AFTER this page still match: the count
-    // consumed up to and including this page is `(page + 1) * limit`; more
-    // remain when `total` exceeds that. Computed with saturating/checked
-    // arithmetic so a large page index can never panic or wrap.
-    let consumed = (core_page.page as u64)
-        .saturating_add(1)
-        .saturating_mul(core_page.limit as u64);
-    let has_more = result.total > consumed;
+    // R2-P1-2: the KEYSET cursor for the NEXT page is the (ts, id) of the LAST
+    // (oldest) row in this page. `has_more` comes from the StateRepo (a full
+    // page implies more older rows may exist). An empty page advances no cursor.
+    let (next_before_ts, next_before_id) = result
+        .rows
+        .last()
+        .map(|r| (Some(r.ts), Some(r.id.0)))
+        .unwrap_or((None, None));
+    let has_more = result.has_more;
 
     tracing::debug!(
         target: TARGET,
-        page = core_page.page,
         limit = core_page.limit,
         returned = entries.len(),
         total = result.total,
         has_more,
-        "query_activity page served"
+        next_before_ts,
+        next_before_id,
+        "query_activity keyset page served"
     );
 
     Ok(ActivityPageDto {
         entries,
         total: result.total,
-        page: core_page.page,
         limit: core_page.limit,
         has_more,
+        next_before_ts,
+        next_before_id,
     })
 }
 
@@ -121,6 +124,11 @@ pub async fn clear_activity_older_than(
     state: State<'_, AppState>,
     before_ts: i64,
 ) -> CommandResult<u64> {
+    // R2-P2-2: bound the webview-supplied cutoff (SPEC s11.6.1 / s24
+    // internal.invalid_input). An `i64::MAX` would prune the whole log up to the
+    // hard cap; a negative value is nonsense. Allow up to now + 1 day to tolerate
+    // a small client clock skew.
+    validate_timestamp_bound(before_ts, "clear_activity_older_than before_ts")?;
     let deleted = state
         .state()
         .prune_activity_older_than(before_ts, CLEAR_ACTIVITY_HARD_CAP, None)
@@ -128,6 +136,26 @@ pub async fn clear_activity_older_than(
         .map_err(CommandError::from)?;
     tracing::debug!(target: TARGET, before_ts, deleted, "clear_activity_older_than");
     Ok(deleted)
+}
+
+/// Max future skew (ms) a webview-supplied activity timestamp may carry beyond
+/// `now` before it is rejected (R2-P2-2): 1 day, to tolerate a small client
+/// clock skew without accepting an effectively-unbounded `i64::MAX`.
+const MAX_TIMESTAMP_FUTURE_SKEW_MS: i64 = 86_400_000;
+
+/// Validate a webview-supplied Unix-ms timestamp bound (R2-P2-2, SPEC s24
+/// internal.invalid_input): it must be `>= 0` and `<= now + 1 day`. `label`
+/// names the field for the error message.
+fn validate_timestamp_bound(ts: i64, label: &str) -> CommandResult<()> {
+    let now = SystemClock.now_ms();
+    let max = now.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS);
+    if ts < 0 || ts > max {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            format!("{label} must be 0..={max} (now + 1 day), got {ts}"),
+        ));
+    }
+    Ok(())
 }
 
 /// Max throughput window the webview may request for `activity_summary`
@@ -293,6 +321,16 @@ fn validate_filter(dto: ActivityFilterDto) -> CommandResult<ActivityFilter> {
         }
     }
 
+    // R2-P2-2: bound the time-filter scalars to the same sane window as the
+    // prune cutoff (>= 0 and <= now + 1 day) so a hostile/buggy renderer cannot
+    // pass `i64::MAX` / a negative ts.
+    if let Some(since) = dto.since_ms {
+        validate_timestamp_bound(since, "activity filter sinceMs")?;
+    }
+    if let Some(before) = dto.before_ms {
+        validate_timestamp_bound(before, "activity filter beforeMs")?;
+    }
+
     // An inverted window (since >= before) can only match nothing; reject it as
     // a caller bug rather than silently returning an empty page.
     if let (Some(since), Some(before)) = (dto.since_ms, dto.before_ms) {
@@ -313,10 +351,13 @@ fn validate_filter(dto: ActivityFilterDto) -> CommandResult<ActivityFilter> {
     })
 }
 
-/// Validate + bound the webview page DTO to the core [`PageRequest`]
-/// (SPEC s11.6.1). The `limit` MUST be `1..=MAX_ACTIVITY_PAGE_LIMIT`; a `0` or
-/// over-cap value is rejected (not silently clamped, mirroring the StateRepo's
-/// own bound) so a buggy caller learns its page request is wrong.
+/// Validate + bound the webview KEYSET page DTO to the core [`PageRequest`]
+/// (SPEC s11.6.1, R2-P1-2). The `limit` MUST be `1..=MAX_ACTIVITY_PAGE_LIMIT`; a
+/// `0` or over-cap value is rejected (not silently clamped, mirroring the
+/// StateRepo's own bound) so a buggy caller learns its page request is wrong.
+/// `beforeTs` / `beforeId` must be set together (both `Some` = a continuation
+/// page, both `None` = the first page) and `beforeTs`, when present, is bounded
+/// to the same sane timestamp window as the filters.
 fn validate_page(dto: PageRequestDto) -> CommandResult<PageRequest> {
     if !(1..=MAX_ACTIVITY_PAGE_LIMIT).contains(&dto.limit) {
         return Err(CommandError::with_code(
@@ -327,8 +368,18 @@ fn validate_page(dto: PageRequestDto) -> CommandResult<PageRequest> {
             ),
         ));
     }
+    if dto.before_ts.is_some() != dto.before_id.is_some() {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "activity page beforeTs and beforeId must be set together",
+        ));
+    }
+    if let Some(before_ts) = dto.before_ts {
+        validate_timestamp_bound(before_ts, "activity page beforeTs")?;
+    }
     Ok(PageRequest {
-        page: dto.page,
+        before_ts: dto.before_ts,
+        before_id: dto.before_id,
         limit: dto.limit,
     })
 }
@@ -339,11 +390,16 @@ mod tests {
 
     #[test]
     fn validate_page_rejects_zero_and_over_cap() {
-        let err = validate_page(PageRequestDto { page: 0, limit: 0 })
-            .expect_err("zero limit must be rejected");
+        let err = validate_page(PageRequestDto {
+            before_ts: None,
+            before_id: None,
+            limit: 0,
+        })
+        .expect_err("zero limit must be rejected");
         assert_eq!(err.code, ErrorCode::InvalidInput);
         let err = validate_page(PageRequestDto {
-            page: 0,
+            before_ts: None,
+            before_id: None,
             limit: MAX_ACTIVITY_PAGE_LIMIT + 1,
         })
         .expect_err("over-cap limit must be rejected");
@@ -352,15 +408,107 @@ mod tests {
 
     #[test]
     fn validate_page_accepts_inclusive_bounds() {
-        let p = validate_page(PageRequestDto { page: 3, limit: 1 }).expect("min limit");
-        assert_eq!(p.page, 3);
+        let p = validate_page(PageRequestDto {
+            before_ts: None,
+            before_id: None,
+            limit: 1,
+        })
+        .expect("min limit");
+        assert_eq!(p.before_ts, None);
         assert_eq!(p.limit, 1);
         let p = validate_page(PageRequestDto {
-            page: 0,
+            before_ts: None,
+            before_id: None,
             limit: MAX_ACTIVITY_PAGE_LIMIT,
         })
         .expect("max limit");
         assert_eq!(p.limit, MAX_ACTIVITY_PAGE_LIMIT);
+    }
+
+    #[test]
+    fn validate_page_accepts_full_cursor() {
+        let p = validate_page(PageRequestDto {
+            before_ts: Some(1000),
+            before_id: Some(42),
+            limit: 100,
+        })
+        .expect("full cursor");
+        assert_eq!(p.before_ts, Some(1000));
+        assert_eq!(p.before_id, Some(42));
+    }
+
+    #[test]
+    fn validate_page_rejects_half_cursor() {
+        let err = validate_page(PageRequestDto {
+            before_ts: Some(1000),
+            before_id: None,
+            limit: 100,
+        })
+        .expect_err("half cursor (ts only) rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err = validate_page(PageRequestDto {
+            before_ts: None,
+            before_id: Some(42),
+            limit: 100,
+        })
+        .expect_err("half cursor (id only) rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn validate_page_rejects_out_of_range_before_ts() {
+        // R2-P2-2: an i64::MAX cursor ts is rejected (would otherwise be a valid
+        // SQL bound but is a nonsense timestamp).
+        let err = validate_page(PageRequestDto {
+            before_ts: Some(i64::MAX),
+            before_id: Some(1),
+            limit: 100,
+        })
+        .expect_err("i64::MAX before_ts rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err = validate_page(PageRequestDto {
+            before_ts: Some(-1),
+            before_id: Some(1),
+            limit: 100,
+        })
+        .expect_err("negative before_ts rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn validate_timestamp_bound_rejects_out_of_range() {
+        // R2-P2-2: the clear_activity_older_than / filter timestamp guard.
+        validate_timestamp_bound(0, "t").expect("zero is allowed");
+        let now = SystemClock.now_ms();
+        validate_timestamp_bound(now, "t").expect("now is allowed");
+        let err =
+            validate_timestamp_bound(i64::MAX, "t").expect_err("i64::MAX rejected (wipes log)");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err = validate_timestamp_bound(-1, "t").expect_err("negative rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let err = validate_timestamp_bound(
+            now.saturating_add(MAX_TIMESTAMP_FUTURE_SKEW_MS)
+                .saturating_add(60_000),
+            "t",
+        )
+        .expect_err("beyond now + 1 day rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn validate_filter_rejects_out_of_range_time_filters() {
+        let dto = ActivityFilterDto {
+            since_ms: Some(i64::MAX),
+            ..Default::default()
+        };
+        let err = validate_filter(dto).expect_err("i64::MAX sinceMs rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let dto = ActivityFilterDto {
+            before_ms: Some(-5),
+            ..Default::default()
+        };
+        let err = validate_filter(dto).expect_err("negative beforeMs rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
     }
 
     #[test]

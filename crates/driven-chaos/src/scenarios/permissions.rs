@@ -138,10 +138,7 @@ async fn saw_error_code(
                 min_level: Some(ActivityLevel::Error),
                 ..ActivityFilter::default()
             },
-            PageRequest {
-                page: 0,
-                limit: 10_000,
-            },
+            PageRequest::first(10_000),
         )
         .await?;
     Ok(!page.rows.is_empty())

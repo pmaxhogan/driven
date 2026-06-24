@@ -218,10 +218,7 @@ async fn activity_error_codes(
                 source_id: Some(source),
                 ..ActivityFilter::default()
             },
-            PageRequest {
-                page: 0,
-                limit: 500,
-            },
+            PageRequest::first(500),
         )
         .await?;
     let mut codes = Vec::new();
@@ -277,7 +274,14 @@ async fn crash_mid_resumable(
     };
     // The dropped chunk is a fatal Drive error: execute returns Err and the
     // op is kept (the create op is never deleted mid-stream).
-    let result = exec.execute(src, &plan, &noop_progress).await;
+    let result = exec
+        .execute(
+            src,
+            &plan,
+            &noop_progress,
+            &driven_core::executor::noop_outcome_sink,
+        )
+        .await;
     anyhow::ensure!(
         result.is_err(),
         "expected the mid-stream network drop to abort the upload, got {result:?}"

@@ -169,13 +169,7 @@ impl Fixture {
         let page = self
             .handle
             .state
-            .query_activity(
-                ActivityFilter::default(),
-                PageRequest {
-                    page: 0,
-                    limit: 10_000,
-                },
-            )
+            .query_activity(ActivityFilter::default(), PageRequest::first(10_000))
             .await?;
         Ok(page
             .rows

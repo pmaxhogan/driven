@@ -894,12 +894,10 @@ async fn build_activity_csv(state: &dyn StateRepo, redactor: &Redactor) -> Strin
         since_ms: Some(since),
         ..Default::default()
     };
-    // Bounded page (SPEC s18.8 caps at 10_000 rows/page); a 30-day window of a
-    // single-user backup tool fits comfortably.
-    let page = PageRequest {
-        page: 0,
-        limit: 10_000,
-    };
+    // Bounded first page (SPEC s18.8 caps at 10_000 rows/page); a 30-day window
+    // of a single-user backup tool fits comfortably (R2-P1-2 keyset: the
+    // newest-first page with no cursor).
+    let page = PageRequest::first(10_000);
     match state.query_activity(filter, page).await {
         Ok(activity) => {
             for row in &activity.rows {

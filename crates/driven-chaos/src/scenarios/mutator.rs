@@ -176,13 +176,7 @@ async fn boot_handle(
 /// (STRESS_HARNESS s9).
 async fn error_codes_seen(state: &Arc<dyn StateRepo>) -> anyhow::Result<Vec<ErrorCode>> {
     let page = state
-        .query_activity(
-            ActivityFilter::default(),
-            PageRequest {
-                page: 0,
-                limit: 10_000,
-            },
-        )
+        .query_activity(ActivityFilter::default(), PageRequest::first(10_000))
         .await?;
     let mut codes: Vec<ErrorCode> = page
         .rows

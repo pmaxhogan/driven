@@ -544,38 +544,52 @@ pub struct ActivityFilterDto {
     pub event_types: Vec<String>,
 }
 
-/// Page selector for `query_activity` (SPEC s11.4 `PageRequest`), mirroring
-/// [`driven_core::state::PageRequest`]. Zero-based `page`, `limit` rows per page;
-/// the command bounds `limit` to `1..=MAX_ACTIVITY_PAGE_LIMIT` before the query.
+/// KEYSET page selector for `query_activity` (SPEC s11.4 `PageRequest`,
+/// R2-P1-2), mirroring [`driven_core::state::PageRequest`]. The activity_log is
+/// actively prepended to, so the webview pages by CURSOR (the oldest loaded
+/// `(ts, id)`) instead of a shifting OFFSET. `beforeTs` / `beforeId` are both
+/// present (a continuation page) or both absent (the first, newest page). The
+/// command bounds `limit` to `1..=MAX_ACTIVITY_PAGE_LIMIT` before the query.
 #[derive(Debug, Clone, Copy, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct PageRequestDto {
-    /// Zero-based page index.
-    pub page: u32,
+    /// Exclusive upper-bound timestamp (the oldest loaded row's `ts`), or
+    /// `None` for the first page. Must be set together with `beforeId`.
+    pub before_ts: Option<i64>,
+    /// Exclusive upper-bound id (the oldest loaded row's `id`), breaking `ts`
+    /// ties. Must be set together with `beforeTs`.
+    pub before_id: Option<i64>,
     /// Max rows per page (bounded by the command, SPEC s11.6.1).
     pub limit: u32,
 }
 
-/// One page of activity returned by `query_activity` (SPEC s11.4
-/// `ActivityPage`): newest-first rows plus paging metadata so the webview can
-/// accumulate pages client-side and know whether more remain.
+/// One KEYSET page of activity returned by `query_activity` (SPEC s11.4
+/// `ActivityPage`, R2-P1-2): newest-first rows plus the cursor metadata so the
+/// webview can accumulate pages client-side and know whether more remain.
 ///
-/// `has_more` is derived from `total` + the requested page so the frontend
-/// pager does not have to re-derive the arithmetic; the live tail dedups
-/// prepended `activity:new` entries against the accumulated pages by row id.
+/// `has_more` is `true` when rows older than this page's last row still match;
+/// `next_before_ts` / `next_before_id` carry the `(ts, id)` of the LAST (oldest)
+/// row in this page, which the webview passes as the cursor for the next page.
+/// Both are `None` when the page is empty (no cursor to advance). The live tail
+/// dedups prepended `activity:new` entries against the accumulated pages by id.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ActivityPageDto {
     /// The matching entries for this page, newest-first.
     pub entries: Vec<driven_core::types::ActivityEntry>,
-    /// Total matching rows across all pages (for the pager + `has_more`).
+    /// Total matching rows across the whole filter (for the "shown of total"
+    /// count); independent of the cursor.
     pub total: u64,
-    /// The zero-based page index these rows correspond to.
-    pub page: u32,
     /// The page size used for this query (the bounded limit).
     pub limit: u32,
-    /// `true` if at least one more page exists after this one.
+    /// `true` if at least one more (older) page exists after this one.
     pub has_more: bool,
+    /// The `ts` of the LAST (oldest) row in this page - the cursor for the next
+    /// page. `None` for an empty page.
+    pub next_before_ts: Option<i64>,
+    /// The `id` of the LAST (oldest) row in this page - the cursor for the next
+    /// page. `None` for an empty page.
+    pub next_before_id: Option<i64>,
 }
 
 /// One per-status file count for the Activity header (M7-P2-5; DESIGN s8.3

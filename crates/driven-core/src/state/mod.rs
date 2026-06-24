@@ -248,24 +248,61 @@ pub struct ActivityFilter {
     pub event_types: Vec<String>,
 }
 
-/// Page selector for `query_*` methods (SPEC s18.8 bounds: `limit
-/// 1..=10_000`, `page 0..=u32::MAX`).
+/// KEYSET page selector for `query_activity` (R2-P1-2). The `activity_log` is
+/// actively PREPENDED to while the dashboard scrolls, so OFFSET paging would
+/// shift / skip rows between fetches. Instead the caller carries the `(ts, id)`
+/// of the OLDEST row it has loaded as a cursor; the next page is the rows
+/// strictly older than that cursor in `(ts DESC, id DESC)` order. A first page
+/// passes `before_ts = None` / `before_id = None` (newest rows). The composite
+/// `(ts, id)` cursor makes ties on `ts` stable (rows inserted in the same ms
+/// keep a total order by `id`).
+///
+/// SPEC s18.8 bound: `limit` must be `1..=10_000`.
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 pub struct PageRequest {
-    /// Zero-based page index. `offset = page * limit`.
-    pub page: u32,
+    /// Exclusive upper-bound timestamp of the cursor (the oldest loaded row's
+    /// `ts`), or `None` for the first page. MUST be set together with
+    /// `before_id` (both `Some` or both `None`).
+    pub before_ts: Option<UnixMs>,
+    /// Exclusive upper-bound id of the cursor (the oldest loaded row's `id`),
+    /// used to break `ts` ties. MUST be set together with `before_ts`.
+    pub before_id: Option<i64>,
     /// Max rows per page.
     pub limit: u32,
 }
 
-/// One page of activity rows.
+impl PageRequest {
+    /// The first (newest) page of `limit` rows (no cursor).
+    pub fn first(limit: u32) -> Self {
+        Self {
+            before_ts: None,
+            before_id: None,
+            limit,
+        }
+    }
+
+    /// A page strictly older than the `(ts, id)` cursor.
+    pub fn after_cursor(before_ts: UnixMs, before_id: i64, limit: u32) -> Self {
+        Self {
+            before_ts: Some(before_ts),
+            before_id: Some(before_id),
+            limit,
+        }
+    }
+}
+
+/// One KEYSET page of activity rows (R2-P1-2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct ActivityPage {
     /// Rows in newest-first order (SPEC s2 `idx_activity_ts ON
-    /// activity_log(ts DESC)`).
+    /// activity_log(ts DESC)`), strictly older than the request cursor.
     pub rows: Vec<ActivityRow>,
-    /// Total matching rows across all pages (for UI paging widgets).
+    /// Total matching rows across the whole filter (NOT cursor-scoped), for the
+    /// "shown of total" count display. Independent of the cursor.
     pub total: u64,
+    /// `true` when rows OLDER than this page's last row still match the filter
+    /// (i.e. another keyset page can be fetched with the last row as cursor).
+    pub has_more: bool,
 }
 
 /// A per-status file count for the Activity dashboard header (DESIGN s8.3
@@ -604,7 +641,11 @@ pub trait StateRepo: Send + Sync {
     /// Appends an `activity_log` row. Returns the new auto-increment id.
     async fn write_activity(&self, row: NewActivity) -> Result<ActivityId>;
 
-    /// Returns a page of activity rows matching `filter`, newest-first.
+    /// Returns a KEYSET page of activity rows matching `filter`, newest-first
+    /// (R2-P1-2). `page` carries the `(ts, id)` cursor of the oldest row the
+    /// caller holds (or no cursor for the first page); the returned rows are
+    /// strictly older than that cursor, so a row prepended to `activity_log`
+    /// between page fetches can never shift or skip an already-paged row.
     async fn query_activity(
         &self,
         filter: ActivityFilter,

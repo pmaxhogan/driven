@@ -158,7 +158,13 @@ async fn scan_plan_execute(
     let scan = scanner::scan(source, handle.state.as_ref(), ScanMode::FastPath).await?;
     let plan = planner::plan(source, &scan, handle.state.as_ref()).await?;
     let exec = executor_over(handle, remote.clone());
-    exec.execute(source, &plan, &noop_progress).await
+    exec.execute(
+        source,
+        &plan,
+        &noop_progress,
+        &driven_core::executor::noop_outcome_sink,
+    )
+    .await
 }
 
 /// Count every non-trashed object reachable under `folder_id`, recursing into
@@ -770,7 +776,14 @@ impl Scenario for NoaccessFolder {
         // Execute whatever plan was produced (should be an effective no-op for
         // the subtree) and confirm nothing under locked/ got trashed remotely.
         let exec = executor_over(handle, remote.clone());
-        let _ = exec.execute(&src, &plan, &noop_progress).await?;
+        let _ = exec
+            .execute(
+                &src,
+                &plan,
+                &noop_progress,
+                &driven_core::executor::noop_outcome_sink,
+            )
+            .await?;
 
         let live_after = live_object_count(&remote, &folder).await?;
         let trashed_count = subtree_trashed_count(&remote, &folder).await?;

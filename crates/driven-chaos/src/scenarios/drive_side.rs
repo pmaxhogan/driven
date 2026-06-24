@@ -128,10 +128,7 @@ async fn error_codes_in_activity(state: &dyn StateRepo) -> anyhow::Result<Vec<Er
                 min_level: Some(ActivityLevel::Error),
                 ..ActivityFilter::default()
             },
-            PageRequest {
-                page: 0,
-                limit: 10_000,
-            },
+            PageRequest::first(10_000),
         )
         .await?;
     let mut codes: Vec<ErrorCode> = Vec::new();

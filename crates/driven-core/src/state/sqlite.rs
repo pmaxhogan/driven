@@ -307,6 +307,17 @@ fn activity_level_rank(l: ActivityLevel) -> i64 {
     }
 }
 
+/// R2-P2-3: decode a SQLite INTEGER column that holds a logically-unsigned
+/// count (`activity_log.file_count` / `bytes`) into a `u64`, rejecting a
+/// negative stored value with a structured error instead of wrapping it with
+/// `as`. A negative value is impossible from the (now `try_from`-guarded) write
+/// path, so this only fires on external tampering or a row written before the
+/// fix; rejecting it keeps a corrupt row from silently becoming a huge u64.
+fn decode_nonneg_u64(v: i64) -> Result<u64> {
+    u64::try_from(v)
+        .map_err(|_| anyhow!("internal.bug: activity count column stored a negative value {v}"))
+}
+
 fn hash32_from_bytes(b: Vec<u8>) -> Result<[u8; 32]> {
     <[u8; 32]>::try_from(b.as_slice()).map_err(|_| anyhow!("hash_blake3 must be 32 bytes"))
 }
@@ -1210,8 +1221,23 @@ impl StateRepo for SqliteStateRepo {
     async fn write_activity(&self, row: NewActivity) -> Result<ActivityId> {
         let source_id = row.source_id.map(|s| s.to_string());
         let level = activity_level_to_str(row.level);
-        let file_count: Option<i64> = row.file_count.map(|v| v as i64);
-        let bytes: Option<i64> = row.bytes.map(|v| v as i64);
+        // R2-P2-3: encode `file_count` / `bytes` with `i64::try_from` (not `as`).
+        // SQLite has no unsigned ints; a u64 above `i64::MAX` would wrap negative
+        // with `as`, then summaries would clamp it to 0 (silent corruption). A
+        // value that large is not a real backup count, so REJECT it with a
+        // structured `internal.bad_request` rather than store a wrapped row.
+        let file_count: Option<i64> = match row.file_count {
+            None => None,
+            Some(v) => Some(i64::try_from(v).map_err(|_| {
+                anyhow!("internal.bad_request: activity file_count {v} exceeds i64::MAX")
+            })?),
+        };
+        let bytes: Option<i64> = match row.bytes {
+            None => None,
+            Some(v) => Some(i64::try_from(v).map_err(|_| {
+                anyhow!("internal.bad_request: activity bytes {v} exceeds i64::MAX")
+            })?),
+        };
         let result = sqlx::query!(
             r#"
             INSERT INTO activity_log (
@@ -1261,10 +1287,7 @@ impl StateRepo for SqliteStateRepo {
         // SPEC s18.8: `limit` must be in 1..=10_000; a value outside that
         // range is a caller bug and is REJECTED with a structured
         // `internal.bad_request` (the prior code silently clamped, which
-        // accepted `0` / `u32::MAX` as if valid). The bound also keeps the
-        // offset multiplication below `i64::MAX` for any valid u32 `page`;
-        // the offset is still computed with checked arithmetic as
-        // defence-in-depth.
+        // accepted `0` / `u32::MAX` as if valid).
         if !(1..=10_000).contains(&page.limit) {
             return Err(anyhow!(
                 "internal.bad_request: activity limit must be 1..=10000, got {}",
@@ -1272,9 +1295,21 @@ impl StateRepo for SqliteStateRepo {
             ));
         }
         let limit_i = page.limit as i64;
-        let offset_i = (page.page as i64)
-            .checked_mul(limit_i)
-            .ok_or_else(|| anyhow!("internal.bad_request: activity page offset overflow"))?;
+        // R2-P1-2: KEYSET cursor. The cursor `(before_ts, before_id)` is the
+        // OLDEST `(ts, id)` the caller already holds; this page is the rows
+        // STRICTLY older than it in `(ts DESC, id DESC)` order, so a row
+        // prepended to `activity_log` between page fetches can never shift /
+        // skip an already-paged row. `before_ts` / `before_id` are both `Some`
+        // (a continuation page) or both `None` (the first page). The composite
+        // predicate is `ts < before_ts OR (ts = before_ts AND id < before_id)`,
+        // pushed into SQL so the `(ts, id)` total order is honoured at the DB.
+        if page.before_ts.is_some() != page.before_id.is_some() {
+            return Err(anyhow!(
+                "internal.bad_request: activity cursor before_ts and before_id must be set together"
+            ));
+        }
+        let before_ts = page.before_ts;
+        let before_id = page.before_id;
 
         let rows = sqlx::query!(
             r#"
@@ -1299,19 +1334,28 @@ impl StateRepo for SqliteStateRepo {
                                  END >= ?4)
               AND (?5 IS NULL
                    OR event_type IN (SELECT value FROM json_each(?5)))
+              AND (?6 IS NULL
+                   OR ts < ?6
+                   OR (ts = ?6 AND id < ?7))
             ORDER BY ts DESC, id DESC
-            LIMIT ?6 OFFSET ?7
+            LIMIT ?8
             "#,
             source_id,
             since,
             before,
             min_rank,
             event_types_json,
+            before_ts,
+            before_id,
             limit_i,
-            offset_i,
         )
         .fetch_all(&self.pool)
         .await?;
+        // KEYSET `has_more`: a full page MAY have more older rows; a short page
+        // is the tail. The store re-queries with the last row as cursor, so a
+        // false-positive (an exactly-full final page) costs only one extra
+        // empty fetch, never a skipped row.
+        let has_more = rows.len() as i64 == limit_i;
 
         let total = sqlx::query!(
             r#"
@@ -1346,21 +1390,28 @@ impl StateRepo for SqliteStateRepo {
                 Some(s) => Some(SourceId(uuid_from_str(&s)?)),
             };
             let event_type = r.event_type;
+            // R2-P2-3: decode `file_count` / `bytes` with `try_from` (not `as`).
+            // A negative stored value (only possible via external tampering or a
+            // pre-fix wrapped write) is rejected with a structured error rather
+            // than wrapping to a huge u64.
+            let file_count = r.file_count.map(decode_nonneg_u64).transpose()?;
+            let bytes = r.bytes.map(decode_nonneg_u64).transpose()?;
             decoded.push(ActivityRow {
                 id: ActivityId(r.id),
                 ts: r.ts,
                 source_id: parsed_source,
                 level: activity_level_from_str(&r.level)?,
                 event_type,
-                file_count: r.file_count.map(|v| v as u64),
-                bytes: r.bytes.map(|v| v as u64),
+                file_count,
+                bytes,
                 message: r.message,
             });
         }
 
         Ok(ActivityPage {
             rows: decoded,
-            total: total as u64,
+            total: u64::try_from(total).unwrap_or(0),
+            has_more,
         })
     }
 
@@ -2181,10 +2232,7 @@ mod tests {
         }
 
         let page = repo
-            .query_activity(
-                ActivityFilter::default(),
-                PageRequest { page: 0, limit: 10 },
-            )
+            .query_activity(ActivityFilter::default(), PageRequest::first(10))
             .await
             .unwrap();
         assert_eq!(page.total, 3);
@@ -2199,7 +2247,7 @@ mod tests {
                     min_level: Some(ActivityLevel::Warn),
                     ..Default::default()
                 },
-                PageRequest { page: 0, limit: 10 },
+                PageRequest::first(10),
             )
             .await
             .unwrap();
@@ -2212,7 +2260,7 @@ mod tests {
                     event_types: vec!["paused".into()],
                     ..Default::default()
                 },
-                PageRequest { page: 0, limit: 10 },
+                PageRequest::first(10),
             )
             .await
             .unwrap();
@@ -2225,7 +2273,7 @@ mod tests {
                     since_ms: Some(200),
                     ..Default::default()
                 },
-                PageRequest { page: 0, limit: 10 },
+                PageRequest::first(10),
             )
             .await
             .unwrap();
@@ -2267,7 +2315,7 @@ mod tests {
         };
 
         let p0 = repo
-            .query_activity(filter(), PageRequest { page: 0, limit: 2 })
+            .query_activity(filter(), PageRequest::first(2))
             .await
             .unwrap();
         // total must reflect ONLY the filtered type, not all 10 rows.
@@ -2277,18 +2325,170 @@ mod tests {
         // newest-first: ts 10 then ts 8.
         assert_eq!(p0.rows[0].ts, 10);
         assert_eq!(p0.rows[1].ts, 8);
+        assert!(p0.has_more, "more keep rows remain after page 0");
 
-        // Page 2 (offset past several "skip" rows in raw order) must still
-        // return matching rows - the old client-side filter could yield an
-        // empty page here.
+        // R2-P1-2: page on via the KEYSET cursor (the oldest row of each page).
+        // The filtered "keep" rows must all surface in order even though "skip"
+        // rows interleave them - the old client-side filter could yield an empty
+        // page here, and offset paging would skip rows under live prepends.
+        let cursor1 = p0.rows.last().map(|r| (r.ts, r.id.0)).unwrap();
+        let p1 = repo
+            .query_activity(filter(), PageRequest::after_cursor(cursor1.0, cursor1.1, 2))
+            .await
+            .unwrap();
+        assert_eq!(p1.total, 5);
+        assert_eq!(p1.rows.len(), 2);
+        assert_eq!(p1.rows[0].ts, 6);
+        assert_eq!(p1.rows[1].ts, 4);
+        assert!(p1.has_more, "the 5th keep row remains");
+
+        let cursor2 = p1.rows.last().map(|r| (r.ts, r.id.0)).unwrap();
         let p2 = repo
-            .query_activity(filter(), PageRequest { page: 2, limit: 2 })
+            .query_activity(filter(), PageRequest::after_cursor(cursor2.0, cursor2.1, 2))
             .await
             .unwrap();
         assert_eq!(p2.total, 5);
         assert_eq!(p2.rows.len(), 1, "last page holds the 5th match");
         assert_eq!(p2.rows[0].ts, 2);
         assert_eq!(p2.rows[0].event_type, "keep");
+        assert!(!p2.has_more, "no keep rows after the 5th");
+    }
+
+    #[tokio::test]
+    async fn query_activity_keyset_is_stable_under_inserts() {
+        // R2-P1-2: a keyset page must NOT skip or duplicate rows when new rows
+        // are PREPENDED to activity_log between page fetches (the live-prepend
+        // case that offset paging mishandled). Walk all rows by cursor while
+        // inserting newer rows mid-walk; the original rows must all appear
+        // exactly once with no gaps.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let mk = |ts: i64| NewActivity {
+            ts,
+            source_id: Some(src.id),
+            level: ActivityLevel::Info,
+            event_type: "e".into(),
+            file_count: None,
+            bytes: None,
+            message: None,
+        };
+        // Original rows ts 10..=15 (6 rows).
+        for ts in 10..=15 {
+            repo.write_activity(mk(ts)).await.unwrap();
+        }
+
+        // Page 1 (newest 2: ts 15, 14).
+        let p0 = repo
+            .query_activity(ActivityFilter::default(), PageRequest::first(2))
+            .await
+            .unwrap();
+        assert_eq!(
+            p0.rows.iter().map(|r| r.ts).collect::<Vec<_>>(),
+            vec![15, 14]
+        );
+
+        // Simulate live prepends: 3 NEWER rows (ts 100, 101, 102) arrive between
+        // page 1 and page 2. Under OFFSET paging these would shift page 2 and
+        // skip the original ts-13 row; under keyset the cursor pins the walk.
+        for ts in [100, 101, 102] {
+            repo.write_activity(mk(ts)).await.unwrap();
+        }
+
+        let cursor = p0.rows.last().map(|r| (r.ts, r.id.0)).unwrap();
+        let p1 = repo
+            .query_activity(
+                ActivityFilter::default(),
+                PageRequest::after_cursor(cursor.0, cursor.1, 2),
+            )
+            .await
+            .unwrap();
+        // Strictly older than (14, id) -> ts 13, 12. The 3 prepended rows are
+        // NEWER than the cursor, so they NEVER appear in this older page.
+        assert_eq!(
+            p1.rows.iter().map(|r| r.ts).collect::<Vec<_>>(),
+            vec![13, 12],
+            "keyset page is unaffected by newer prepended rows"
+        );
+
+        let cursor = p1.rows.last().map(|r| (r.ts, r.id.0)).unwrap();
+        let p2 = repo
+            .query_activity(
+                ActivityFilter::default(),
+                PageRequest::after_cursor(cursor.0, cursor.1, 2),
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            p2.rows.iter().map(|r| r.ts).collect::<Vec<_>>(),
+            vec![11, 10],
+            "the final original rows surface with no skip/dup"
+        );
+        // p2 was an exactly-full page, so keyset `has_more` is true (a false
+        // positive that costs only one extra empty fetch). The next page IS
+        // empty - the original history is fully walked with no skip / dup.
+        let cursor = p2.rows.last().map(|r| (r.ts, r.id.0)).unwrap();
+        let p3 = repo
+            .query_activity(
+                ActivityFilter::default(),
+                PageRequest::after_cursor(cursor.0, cursor.1, 2),
+            )
+            .await
+            .unwrap();
+        assert!(p3.rows.is_empty(), "original history exhausted");
+        assert!(!p3.has_more, "an empty page reports no more");
+    }
+
+    #[tokio::test]
+    async fn write_activity_rejects_counts_above_i64_max() {
+        // R2-P2-3: a u64 file_count / bytes above i64::MAX must be REJECTED on
+        // write (not silently wrapped negative via `as`). The boundary value
+        // i64::MAX itself is accepted and round-trips losslessly.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let base = |bytes: Option<u64>, file_count: Option<u64>| NewActivity {
+            ts: 1,
+            source_id: Some(src.id),
+            level: ActivityLevel::Info,
+            event_type: "upload_done".into(),
+            file_count,
+            bytes,
+            message: None,
+        };
+
+        // bytes just over i64::MAX -> rejected.
+        let over = (i64::MAX as u64) + 1;
+        let err = repo
+            .write_activity(base(Some(over), None))
+            .await
+            .expect_err("bytes > i64::MAX must be rejected");
+        assert!(err.to_string().contains("internal.bad_request"));
+        // file_count just over i64::MAX -> rejected.
+        let err = repo
+            .write_activity(base(None, Some(over)))
+            .await
+            .expect_err("file_count > i64::MAX must be rejected");
+        assert!(err.to_string().contains("internal.bad_request"));
+
+        // The exact i64::MAX boundary is accepted and decodes back losslessly.
+        let boundary = i64::MAX as u64;
+        repo.write_activity(base(Some(boundary), Some(boundary)))
+            .await
+            .expect("i64::MAX boundary must be accepted");
+        let page = repo
+            .query_activity(ActivityFilter::default(), PageRequest::first(10))
+            .await
+            .unwrap();
+        assert_eq!(page.rows.len(), 1);
+        assert_eq!(page.rows[0].bytes, Some(boundary));
+        assert_eq!(page.rows[0].file_count, Some(boundary));
     }
 
     #[tokio::test]
@@ -2559,7 +2759,7 @@ mod tests {
         assert_eq!(deleted, 150);
 
         let page = repo
-            .query_activity(ActivityFilter::default(), PageRequest { page: 0, limit: 1 })
+            .query_activity(ActivityFilter::default(), PageRequest::first(1))
             .await
             .unwrap();
         assert_eq!(page.total, 50);
@@ -2591,7 +2791,7 @@ mod tests {
             .unwrap();
         assert_eq!(deleted, 123);
         let page = repo
-            .query_activity(ActivityFilter::default(), PageRequest { page: 0, limit: 1 })
+            .query_activity(ActivityFilter::default(), PageRequest::first(1))
             .await
             .unwrap();
         assert_eq!(page.total, 0);
@@ -2620,13 +2820,7 @@ mod tests {
             .unwrap();
         assert_eq!(deleted, 20);
         let page = repo
-            .query_activity(
-                ActivityFilter::default(),
-                PageRequest {
-                    page: 0,
-                    limit: 100,
-                },
-            )
+            .query_activity(ActivityFilter::default(), PageRequest::first(100))
             .await
             .unwrap();
         assert_eq!(page.total, 30);
@@ -2871,7 +3065,7 @@ mod tests {
 
         // limit = 0: below range -> Err.
         let too_small = repo
-            .query_activity(ActivityFilter::default(), PageRequest { page: 0, limit: 0 })
+            .query_activity(ActivityFilter::default(), PageRequest::first(0))
             .await;
         assert!(too_small.is_err(), "limit=0 must be rejected");
         assert!(too_small
@@ -2881,35 +3075,19 @@ mod tests {
 
         // limit = 20_000: above range -> Err.
         let too_big = repo
-            .query_activity(
-                ActivityFilter::default(),
-                PageRequest {
-                    page: 0,
-                    limit: 20_000,
-                },
-            )
+            .query_activity(ActivityFilter::default(), PageRequest::first(20_000))
             .await;
         assert!(too_big.is_err(), "limit=20_000 must be rejected");
 
-        // limit = u32::MAX with page = u32::MAX: rejected at the limit
-        // guard BEFORE any offset multiply, so no overflow/panic.
+        // limit = u32::MAX: rejected at the limit guard, so no overflow/panic.
         let huge = repo
-            .query_activity(
-                ActivityFilter::default(),
-                PageRequest {
-                    page: u32::MAX,
-                    limit: u32::MAX,
-                },
-            )
+            .query_activity(ActivityFilter::default(), PageRequest::first(u32::MAX))
             .await;
         assert!(huge.is_err(), "out-of-range limit rejected, no overflow");
 
         // A valid in-range limit still works.
         let ok = repo
-            .query_activity(
-                ActivityFilter::default(),
-                PageRequest { page: 0, limit: 50 },
-            )
+            .query_activity(ActivityFilter::default(), PageRequest::first(50))
             .await
             .expect("in-range limit=50 must succeed");
         assert_eq!(ok.total, 0);
@@ -3033,13 +3211,7 @@ mod tests {
 
         // Rows are still present, just with source_id NULL.
         let page = repo
-            .query_activity(
-                ActivityFilter::default(),
-                PageRequest {
-                    page: 0,
-                    limit: 100,
-                },
-            )
+            .query_activity(ActivityFilter::default(), PageRequest::first(100))
             .await
             .unwrap();
         assert_eq!(page.total, 4);

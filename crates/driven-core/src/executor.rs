@@ -400,6 +400,24 @@ impl OpOutcome {
     }
 }
 
+/// R2-P2-1: the per-op outcome sink the executor calls IMMEDIATELY after each
+/// op's durable `file_state` commit, so the orchestrator can persist that op's
+/// `activity_log` row + broadcast `activity:new` per file (rather than in a
+/// post-pass that a mid-plan crash would lose). Returns a boxed future so the
+/// sink can do an async DB write; the borrow is tied to the call so the closure
+/// may capture `&self` / the source without a `'static` bound.
+pub type OutcomeSink<'a> =
+    dyn Fn(&OpOutcome) -> futures::future::BoxFuture<'a, ()> + Send + Sync + 'a;
+
+/// A no-op [`OutcomeSink`] for callers that drive [`Executor::execute`] WITHOUT
+/// the orchestrator's per-op activity wiring (the chaos harness + e2e/unit tests
+/// that only assert on the returned outcomes). Returns an immediately-ready
+/// future so it adds no latency. Exposed so those callers do not each need a
+/// `futures` dependency to construct the boxed future.
+pub fn noop_outcome_sink(_outcome: &OpOutcome) -> futures::future::BoxFuture<'static, ()> {
+    Box::pin(async {})
+}
+
 /// The plan-execution contract the orchestrator drives (SPEC s8).
 ///
 /// Mirrors the SPEC s8 `execute(plan, remote, state, pacer, crypto,
@@ -417,11 +435,19 @@ pub trait Executor: Send + Sync {
     /// `on_progress`, called (throttled) as ops finish so the orchestrator
     /// can update [`ExecProgress`] without the executor knowing about the
     /// state machine.
+    ///
+    /// R2-P2-1: `on_outcome` is AWAITED for each op's outcome the instant that
+    /// op completes (after its durable `file_state` commit, in completion
+    /// order), so the orchestrator persists per-op activity immediately. A
+    /// crash mid-plan therefore keeps the audit rows for every op that already
+    /// committed, and a large initial backup shows per-file activity as it runs
+    /// rather than only at the end.
     async fn execute(
         &self,
         source: &SourceRow,
         plan: &Plan,
         on_progress: &(dyn Fn(ExecProgress) + Send + Sync),
+        on_outcome: &OutcomeSink<'_>,
     ) -> anyhow::Result<Vec<OpOutcome>>;
 
     /// Runs the startup reconciliation pass (DESIGN s5.6): for every
@@ -2801,6 +2827,7 @@ impl Executor for DefaultExecutor {
         source: &SourceRow,
         plan: &Plan,
         on_progress: &(dyn Fn(ExecProgress) + Send + Sync),
+        on_outcome: &OutcomeSink<'_>,
     ) -> anyhow::Result<Vec<OpOutcome>> {
         // Snapshot the plan totals for the progress denominator.
         let summary = plan.summary();
@@ -2851,7 +2878,13 @@ impl Executor for DefaultExecutor {
                     permit = permit.acquire_owned() => {
                         let permit = permit
                             .map_err(|e| anyhow::anyhow!("upload pool closed: {e}"))?;
-                        in_flight.push(exec.run(op, permit));
+                        // R2-P2-1: `run` persists this op's activity itself (via
+                        // on_outcome) right after the op's durable commit, INSIDE
+                        // the in_flight future - so the activity DB write is
+                        // polled together with the other in-flight ops by
+                        // FuturesUnordered and cannot deadlock the drain loop
+                        // against the single-connection pool.
+                        in_flight.push(exec.run(op, permit, on_outcome));
                         next_op = ops.next();
                     }
                 }
@@ -3413,10 +3446,18 @@ struct ExecOne<'a> {
 
 impl<'a> ExecOne<'a> {
     /// Run a single op, holding the concurrency permit until it completes.
+    ///
+    /// R2-P2-1: on success the op's outcome is reported to `on_outcome` (awaited)
+    /// right after its durable `file_state` commit and BEFORE the permit is
+    /// dropped / the outcome returned, so the orchestrator persists per-op
+    /// activity immediately. This runs INSIDE the in-flight future (polled by the
+    /// caller's FuturesUnordered), so the activity DB write is interleaved with
+    /// the other in-flight ops and cannot deadlock the single-connection pool.
     async fn run(
         &self,
         op: &Op,
         permit: tokio::sync::OwnedSemaphorePermit,
+        on_outcome: &OutcomeSink<'_>,
     ) -> anyhow::Result<OpOutcome> {
         let out = match op {
             Op::HashThenUpload {
@@ -3440,6 +3481,12 @@ impl<'a> ExecOne<'a> {
                     .await
             }
         };
+        // Stream the per-op activity for a produced outcome (the op's durable
+        // file-state commit already happened inside hash_then_upload / trash_op).
+        // A hard error (Err) carries no OpOutcome and is handled by the caller.
+        if let Ok(outcome) = &out {
+            on_outcome(outcome).await;
+        }
         drop(permit);
         out
     }
@@ -4731,6 +4778,12 @@ mod tests {
 
     fn noop_progress(_p: ExecProgress) {}
 
+    /// R2-P2-1: a no-op per-op outcome sink for tests that do not assert on the
+    /// streamed activity (returns an immediately-ready future).
+    fn noop_outcome(_o: &OpOutcome) -> futures::future::BoxFuture<'static, ()> {
+        Box::pin(async {})
+    }
+
     // --- fresh upload -------------------------------------------------------
 
     #[tokio::test]
@@ -4739,7 +4792,12 @@ mod tests {
         let (rel, size) = h.write_file("hello.txt", b"hello world");
         let exec = h.executor();
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert_eq!(out.len(), 1);
@@ -4778,9 +4836,14 @@ mod tests {
         let h = harness().await;
         let (rel, size) = h.write_file("a.txt", b"first");
         let exec = h.executor();
-        exec.execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
-            .await
-            .unwrap();
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel, size),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
         let first_id = h
             .state
             .get_file_state(h.source.id, &rel)
@@ -4793,9 +4856,14 @@ mod tests {
         // Change the file and re-run; must UPDATE the same file_id, not create.
         let (rel2, size2) = h.write_file("a.txt", b"second-longer");
         assert_eq!(rel, rel2);
-        exec.execute(&h.source, &h.upload_plan(&rel2, size2), &noop_progress)
-            .await
-            .unwrap();
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel2, size2),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
         let second_id = h
             .state
             .get_file_state(h.source.id, &rel)
@@ -4828,7 +4896,12 @@ mod tests {
         let (rel, size) = h.write_file("r.txt", b"retry me");
         let exec = h.executor();
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
@@ -5303,7 +5376,12 @@ mod tests {
         });
         let exec = h.executor().with_post_upload_hook(hook);
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -5389,7 +5467,7 @@ mod tests {
         };
         let exec = h.executor();
         let out = exec
-            .execute(&h.source, &plan, &noop_progress)
+            .execute(&h.source, &plan, &noop_progress, &noop_outcome)
             .await
             .unwrap();
         assert_eq!(out.len(), 20);
@@ -5419,7 +5497,12 @@ mod tests {
         let (rel, size) = h.write_file("m.txt", b"checksum me");
         let exec = h.executor();
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -5480,7 +5563,12 @@ mod tests {
         });
         let exec = h.executor().with_mid_upload_hook(hook);
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -5544,7 +5632,12 @@ mod tests {
 
         let exec = h.executor_with_vss(vss).with_mid_upload_hook(hook);
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -5587,7 +5680,12 @@ mod tests {
             let (rel, size) = h.write_file("big-live.dat", &big);
             let exec = h.executor(); // no VSS => live read
             let out = exec
-                .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+                .execute(
+                    &h.source,
+                    &h.upload_plan(&rel, size),
+                    &noop_progress,
+                    &noop_outcome,
+                )
                 .await
                 .unwrap();
             assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
@@ -5611,7 +5709,12 @@ mod tests {
             ));
         let exec = h.executor_with_vss(vss);
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -5665,7 +5768,12 @@ mod tests {
             ));
         let exec = h.executor_with_vss(vss);
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         // The op did not succeed.
@@ -5820,7 +5928,12 @@ mod tests {
             Arc::new(driven_vss::FakeVssProvider::unavailable());
         let exec = h.executor_with_vss(vss);
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
@@ -5887,7 +6000,12 @@ mod tests {
         assert!(vss.available(), "elevated provider should be available");
         let exec = h.executor_with_vss(vss);
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -5914,7 +6032,12 @@ mod tests {
         let (rel, size) = h.write_file("big.bin", &big);
         let exec = h.executor();
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
@@ -5996,7 +6119,12 @@ mod tests {
         let source = h.encrypted_source();
         let exec = h.executor_with_crypto(Some(Arc::new(FakeSuite)));
         let out = exec
-            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -6111,7 +6239,12 @@ mod tests {
             crate::crypto_provider::CryptoResolution::Suite(Arc::new(FakeSuite)),
         );
         let out = exec
-            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
@@ -6162,7 +6295,12 @@ mod tests {
             crate::crypto_provider::CryptoResolution::Suite(Arc::new(FakeSuite)),
         );
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
@@ -6207,7 +6345,12 @@ mod tests {
             crate::crypto_provider::CryptoResolution::Unavailable,
         );
         let out = exec
-            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -6262,7 +6405,12 @@ mod tests {
             crate::crypto_provider::CryptoResolution::Plaintext,
         );
         let out = exec
-            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -6293,7 +6441,12 @@ mod tests {
         let (rel, size) = h.write_file("secret3.txt", b"no provider, no plaintext leak");
         let exec = h.executor(); // crypto provider: None
         let out = exec
-            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -6453,7 +6606,12 @@ mod tests {
         // Attempts 1 and 2: a mismatch each, but NOT yet corrupt.
         for attempt in 1..=2u32 {
             let out = exec
-                .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+                .execute(
+                    &h.source,
+                    &h.upload_plan(&rel, size),
+                    &noop_progress,
+                    &noop_outcome,
+                )
                 .await
                 .unwrap();
             assert!(
@@ -6476,7 +6634,12 @@ mod tests {
 
         // Attempt 3: the 3rd consecutive mismatch marks the file Corrupt.
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -6533,7 +6696,12 @@ mod tests {
         let bad = MismatchStore::new(false);
         let exec_bad = exec_with_store(&h, bad);
         let out = exec_bad
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(matches!(
@@ -6547,7 +6715,12 @@ mod tests {
         // Now a healthy store: the upload succeeds and must RESET the counter.
         let exec_ok = h.executor();
         let out = exec_ok
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
@@ -6578,7 +6751,12 @@ mod tests {
 
         // The create mismatches AND its trash fails -> the op must be KEPT.
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -6650,9 +6828,14 @@ mod tests {
         let store = MismatchStore::new(true); // trash always FAILS
         let exec = exec_with_store(&h, store.clone());
 
-        exec.execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
-            .await
-            .unwrap();
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel, size),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
         assert_eq!(
             h.state
                 .get_pending_ops_for_source(h.source.id)
@@ -6897,7 +7080,12 @@ mod tests {
         let gauge = Arc::new(MemGauge::default());
         let exec = h.executor().with_mem_gauge(gauge.clone());
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
@@ -6955,7 +7143,12 @@ mod tests {
         let exec = h.executor();
         let out = tokio::time::timeout(
             std::time::Duration::from_secs(30),
-            exec.execute(&h.source, &h.upload_plan(&rel, size), &noop_progress),
+            exec.execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            ),
         )
         .await
         .expect("streaming must not hang on a mid-stream session failure")
@@ -6996,7 +7189,12 @@ mod tests {
             .collect();
         let (rel, size) = h.write_file("big-secret.bin", &plaintext);
         let out = exec
-            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(
@@ -7083,7 +7281,12 @@ mod tests {
         // folders).
         let exec = make_exec();
         let out = exec
-            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(
+                &source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
             .await
             .unwrap();
         assert!(matches!(out[0], OpOutcome::Done { .. }));
@@ -7447,7 +7650,7 @@ mod tests {
             let exec = h.executor();
             let plan = h.upload_plan(&rel, size);
             let outcomes = exec
-                .execute(&h.source, &plan, &noop_progress)
+                .execute(&h.source, &plan, &noop_progress, &noop_outcome)
                 .await
                 .unwrap();
             assert!(matches!(outcomes.as_slice(), [OpOutcome::Done { .. }]));

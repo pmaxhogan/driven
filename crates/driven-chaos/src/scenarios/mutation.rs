@@ -1493,7 +1493,15 @@ async fn drive_executor_until_skip(
             }],
             collisions: vec![],
         };
-        let outcomes = match exec.execute(&h.source, &plan, &noop_progress).await {
+        let outcomes = match exec
+            .execute(
+                &h.source,
+                &plan,
+                &noop_progress,
+                &driven_core::executor::noop_outcome_sink,
+            )
+            .await
+        {
             Ok(o) => o,
             // A fatal error from the slow/raced upload is not what this row
             // asserts; keep trying until a skip-reason lands or the cap hits.
