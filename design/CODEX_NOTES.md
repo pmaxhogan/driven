@@ -991,3 +991,81 @@ limitation (not a review finding): the M7-P2-3 fix covers unsubscribe-before-
 resolve; a pathological re-subscribe DURING a not-yet-resolved subscribe could
 orphan the second listener set, but that path does not occur in the Activity
 view's mount/unmount lifecycle (V1 scope).
+
+## M7 codex recheck-1 fixes (round 2: 2 P1 + 4 P2)
+
+The codex recheck-1 (`.claude/codex-reviews/M7-recheck1-20260624-111403.md`,
+baseline f9fb164, M7 @ 2e32870; CI + Chaos GREEN on 3 OS) raised 2 P1 + 4 P2 -
+all verified legitimate and all fixed. This is the final fix round (recheck cap =
+2); codex recheck-2 runs next and M7 closes after it. No spec deviations; the
+core fix (R1-P1-1) is what makes the dashboard non-empty on the happy path.
+
+- **R1-P1-1 (successful uploads/trashes recorded NO activity row).** The happy
+  path was silently invisible: `record_outcome_activity` did `OpOutcome::Done {
+  .. } => continue`, and the executor committed successful uploads without writing
+  any `activity_log` row. So a healthy backup showed "No activity yet", emitted no
+  live `activity:new`, and every DESIGN s8.3 byte aggregate ("Uploaded today /
+  this week" + throughput) was zero - the dashboard's whole purpose was broken.
+  Fix: `OpOutcome::Done` now carries `kind: DoneKind { Upload | Trash }` + `bytes:
+  Option<u64>` (set at the two executor commit sites from the verified `post.size`
+  for uploads, `None` for trashes). `record_outcome_activity` records an Info
+  `upload_done` row WITH its byte count and an Info `trash_done` row (SPEC s24
+  schema vocabulary), routed through the SAME `record_activity` chokepoint so
+  `activity:new` broadcasts for success too and the existing prune / row-cap
+  retention applies unchanged (ordinary `activity_log` rows). New orchestrator
+  test: a successful upload writes + broadcasts an `upload_done` row carrying its
+  bytes (and a `trash_done` row); the existing sqlite `activity_summary` test
+  proves those bytes feed the header aggregates.
+- **R1-P1-2 (lag reconcile only covered page 0).** `activity:lagged` recovery
+  re-queried only page 0 (100 rows), but the live-tail contract is the last 1000
+  and the broadcast buffer is 256, so a burst > 100 permanently left recent
+  durable rows out of the visible tail until manual pagination; `events.ts` also
+  discarded the `skipped` count. Fix: the `activity:lagged` payload is now typed
+  (`ActivityLaggedPayload { skipped }`) and threaded through; the store's
+  `reconcileFromHistory(skipped)` pages FORWARD covering `max(page, skipped +
+  page)` rows capped at `LIVE_TAIL_CAP` (1000), collecting new (deduped) rows
+  newest-first across pages and pushing them oldest-first so global order is
+  preserved, stopping early once a page yields nothing new or history is
+  exhausted. New store test: a lag with `skipped` > page size recovers all 250
+  missing rows into the tail, in order, no dups.
+- **R1-P2-1 (header aggregates went stale during active backup).** The summary
+  loaded once on mount and never refreshed on live activity. Fix: a byte-carrying
+  live event (an upload) schedules a debounced `loadSummary()`
+  (`SUMMARY_REFRESH_DEBOUNCE_MS` = 750, so an upload burst fires ONE trailing
+  reload), and a lag reconcile that recovered rows also refreshes the summary; the
+  debounce timer is cleared on `unsubscribeLive`. Two new store tests: a
+  byte-carrying live event triggers exactly one debounced reload; a non-byte event
+  does not.
+- **R1-P2-2 (throughput undercounted at week boundary).** `activity_summary`
+  gated all three sums with an outer `WHERE ts >= week_start`, so near the start
+  of a week any throughput-window row before `week_start` was dropped before the
+  per-sum CASE ran. Fix: outer filter is now `WHERE ts >= MIN(?1, ?2, ?3)` (day /
+  week / throughput starts) so each CASE owns its own window. Regenerated the
+  `.sqlx` offline cache (one query hash changed, 0 drift). New sqlite test: a row
+  inside the throughput window but before `week_start` is counted in throughput
+  (and correctly excluded from today/week).
+- **R1-P2-3 (raw event-type codes rendered).** The table showed the backend
+  `eventType` verbatim. Fix: a shared pure `activityEventLabel(eventType, t, te)`
+  helper localizes via `activity.events.<eventType>`, falling back to
+  `errors.<eventType>.short` (error/skip codes already localized), then to the raw
+  code as a SAFE fallback (forward-compatible / unknown types never blank or
+  throw); the cell keeps the raw code as a `title` tooltip. New `activity.events.*`
+  i18n keys for every curated type incl. the new `upload_done` / `trash_done`. New
+  unit test exercises all three branches of the lookup chain.
+- **R1-P2-4 (blank line at EOF).** Removed the trailing blank line in
+  `stores/setup.ts` (`git diff --check` clean).
+
+Cross-cutting: backend/frontend contracts stayed in sync (`OpOutcome::Done` +
+`DoneKind` <-> the activity event vocabulary; typed `activity:lagged` payload in
+`events.ts`). All gates green: `cargo build/clippy(-D warnings)/test --workspace`
+(driven-core incl. the new upload-activity + throughput-boundary tests; e2e_fake +
+elevation honest gate-skip), `build -p driven-app`, `deny check`, `fmt --check`,
+`git diff --check`; `pnpm lint/test:unit (8 new across activity-store +
+activity-event-label)/build` (vue-tsc clean). Anti-fake-green stub sweep on the
+touched surface: zero `todo!`/`unimplemented!`/`unreachable!` in non-test code.
+
+### Residual / not-fixed (recheck-1)
+None. All 2 P1 + 4 P2 are fully fixed with exercising tests. The R1-P2-1 debounce
+(750ms) means the header aggregate can lag a live upload by up to that window -
+intentional (coalesces a burst into one query); the live tail itself is still
+sub-500ms via `activity:new`.
