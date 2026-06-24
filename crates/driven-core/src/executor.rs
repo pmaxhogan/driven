@@ -130,6 +130,13 @@ const OP_TYPE_UPLOAD: &str = "upload";
 /// exponential backoff, max 6 retries").
 const MAX_TRANSIENT_RETRIES: u32 = 6;
 
+/// Number of CONSECUTIVE verified checksum mismatches on the SAME file that
+/// trips the DESIGN s5.4 (lines 498-500) corrupt defence: "Three consecutive
+/// mismatches on the same file -> mark `status='corrupt'`, log, surface to
+/// user." After the Nth the executor marks the `file_state` row
+/// [`FileStateStatus::Corrupt`] and stops retrying it (R2-P1-3).
+const MAX_CHECKSUM_MISMATCHES: u32 = 3;
+
 /// Max times a single resumable session is restarted from offset 0 after a
 /// session-invalidating 4xx before the op fails (DESIGN s5.4 "any 4xx ->
 /// recreate from scratch"). Bounded so a permanently-broken session does
@@ -187,6 +194,13 @@ struct PendingOpPayload {
     /// the last offset Drive acknowledged.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     resumable: Option<PersistedResumable>,
+    /// R2-P1-1: the Drive file id of a corrupt CREATE object whose post-upload
+    /// best-effort trash FAILED, so it may still be live on Drive. Persisted so
+    /// the reconcile pass can RETRY the trash (the durable corrupt-create
+    /// cleanup); the op is KEPT (not dropped) while this is set. Cleared once the
+    /// object is confirmed gone.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    corrupt_file_id: Option<String>,
     /// The resume-safe file IDENTITY captured at session start (P1-2). The
     /// streaming upload produces the plaintext blake3 only DURING the upload,
     /// so a crash mid-stream leaves no `uploaded_blake3_hex` to validate a
@@ -634,24 +648,15 @@ pub struct DefaultExecutor {
     remote: Arc<dyn RemoteStore>,
     state: Arc<dyn StateRepo>,
     pacer: Arc<dyn Pacer>,
-    /// The PER-SOURCE crypto resolver (M5). The production fail-closed,
-    /// per-`source_id` resolution is agent EXEC's body work; see
-    /// [`Self::resolve_crypto`]. Read by `resolve_crypto` once EXEC wires the
-    /// per-op path; `allow(dead_code)` until then.
-    #[allow(dead_code)]
+    /// The PER-SOURCE crypto resolver (M5 GA blocker, CODEX_NOTES "Per-source
+    /// crypto resolution"). `None` = no provider configured = every source is
+    /// plaintext (tests + an unencrypted-only account). When `Some`, the
+    /// executor resolves the suite PER `SourceRow` via [`Self::resolve_crypto`]
+    /// and FAILS CLOSED on a missing key for an `encryption_enabled` source -
+    /// it never uploads plaintext for an encrypted source nor ciphertext for an
+    /// unencrypted one. Threaded through every upload + reconcile call site as a
+    /// per-op `Option<Arc<dyn SourceCryptoSuite>>`, never read executor-wide.
     crypto_provider: Option<Arc<dyn crate::crypto_provider::CryptoProvider>>,
-    /// SHIM (M5 scaffold): the executor-wide suite the pre-M5 code branched on
-    /// via `self.crypto.is_some()`. Resolved ONCE at construction from
-    /// `crypto_provider` (behaviour-preserving for the single-suite test path).
-    ///
-    /// TODO(M5 EXEC): DELETE this field. The ~9 `self.crypto.*` call sites must
-    /// move to a PER-OP `self.resolve_crypto(source.id)` that returns
-    /// [`CryptoResolution`] and FAILS CLOSED on
-    /// [`CryptoResolution::Unavailable`] (an encryption-enabled source with no
-    /// key must error `crypto.key_missing`, never upload plaintext). A single
-    /// executor-wide suite is WRONG for a mixed account (CODEX_NOTES
-    /// "Per-source crypto resolution").
-    crypto: Option<Arc<dyn SourceCryptoSuite>>,
     clock: Arc<dyn Clock>,
     /// Per-cycle VSS snapshot provider (ROADMAP M3.5), or `None` to disable
     /// the locked-file fallback (then a locked file is skipped as before).
@@ -735,26 +740,11 @@ impl DefaultExecutor {
             None => deps.remote,
         };
         let crypto_provider = deps.crypto;
-        // SHIM (M5 scaffold): collapse the per-source provider to one
-        // executor-wide suite so the pre-M5 `self.crypto.is_some()` call sites
-        // keep compiling and the single-suite crypto round-trip tests stay
-        // green. `SingleSuiteProvider` returns the SAME suite for every source,
-        // so `suite_for` with any id yields that suite (behaviour-preserving);
-        // a real `KeystoreCryptoProvider` returns a DISTINCT suite per source.
-        //
-        // TODO(M5 EXEC): REMOVE this collapse. Resolve crypto PER OP via
-        // `self.resolve_crypto(source.id)` at every upload call site and FAIL
-        // CLOSED on `CryptoResolution::Unavailable`. A single executor-wide
-        // suite is wrong for a mixed (encrypted + plaintext) account.
-        let crypto = crypto_provider
-            .as_ref()
-            .and_then(|p| p.suite_for(&SourceId::new_v4()));
         Self {
             remote,
             state: deps.state,
             pacer: deps.pacer,
             crypto_provider,
-            crypto,
             clock,
             vss: deps.vss,
             pool,
@@ -768,22 +758,63 @@ impl DefaultExecutor {
 
     /// Resolve the crypto decision for one source (M5 GA-blocking surface).
     ///
-    /// Consults the injected [`CryptoProvider`]; `None` provider means every
-    /// source is plaintext.
+    /// Consults the injected [`CryptoProvider`]; a `None` provider means every
+    /// source is plaintext (the test / unencrypted-only path). Returns the raw
+    /// [`CryptoResolution`] from the provider; the FAIL-CLOSED policy keyed on
+    /// the [`SourceRow`]'s `encryption_enabled` is applied in
+    /// [`Self::resolve_source_crypto`] (the actual per-op call site).
+    fn resolve_crypto(&self, source_id: SourceId) -> crate::crypto_provider::CryptoResolution {
+        match self.crypto_provider.as_ref() {
+            Some(provider) => provider.resolve(&source_id),
+            // No provider configured: every source is plaintext (tests +
+            // an unencrypted-only account).
+            None => crate::crypto_provider::CryptoResolution::Plaintext,
+        }
+    }
+
+    /// Resolve the effective per-source content/filename suite, applying the
+    /// GA-critical FAIL-CLOSED policy keyed on the [`SourceRow`]'s
+    /// `encryption_enabled` (CODEX_NOTES "Per-source crypto resolution",
+    /// DESIGN s7). The executor - not the provider - is the fail-closed
+    /// authority, so a buggy or absent provider can never leak plaintext for an
+    /// encrypted source nor ciphertext for an unencrypted one:
     ///
-    /// TODO(M5 EXEC): this is the per-op resolution seam the upload path must
-    /// call (replacing the `self.crypto` shim field). The body MUST:
-    /// - return [`CryptoResolution::Plaintext`] when no provider is configured
-    ///   OR the provider resolves the source as plaintext;
-    /// - return [`CryptoResolution::Suite`] for an encrypted source whose key
-    ///   resolved;
-    /// - return [`CryptoResolution::Unavailable`] for an encryption-enabled
-    ///   source whose key is missing - and the CALLER must then FAIL CLOSED
-    ///   (error `crypto.key_missing`, upload nothing). Never degrade to
-    ///   plaintext (GA-critical, CODEX_NOTES "Per-source crypto resolution").
-    #[allow(dead_code)]
-    fn resolve_crypto(&self, _source_id: SourceId) -> crate::crypto_provider::CryptoResolution {
-        todo!("M5 EXEC: per-source crypto resolution + fail-closed; see CryptoProvider::resolve")
+    /// - **`encryption_enabled == false`**: returns `Ok(None)` -> upload
+    ///   PLAINTEXT, ignoring ANY suite the provider returns (branch (c)). An
+    ///   unencrypted source must NEVER upload ciphertext.
+    /// - **`encryption_enabled == true` AND a suite resolved**: returns
+    ///   `Ok(Some(suite))` -> upload CIPHERTEXT through that source's suite
+    ///   (branch (a)).
+    /// - **`encryption_enabled == true` AND no suite** (provider absent, or it
+    ///   resolved [`CryptoResolution::Plaintext`] / [`CryptoResolution::Unavailable`]):
+    ///   returns `Err(())` -> the caller MUST FAIL CLOSED with
+    ///   [`ErrorCode::CryptoKeyMissing`] and upload NOTHING (branch (b)). Never
+    ///   degrade to plaintext.
+    ///
+    /// `Err(())` is the fail-closed signal; the caller maps it to a
+    /// `crypto.key_missing` op failure (SPEC s24).
+    fn resolve_source_crypto(
+        &self,
+        source: &SourceRow,
+    ) -> Result<Option<Arc<dyn SourceCryptoSuite>>, ()> {
+        if !source.encryption_enabled {
+            // Branch (c): unencrypted source - plaintext, ignore any suite.
+            return Ok(None);
+        }
+        // Branch (a)/(b): encryption is on. Only an actually-resolved suite
+        // permits a (ciphertext) upload; anything else fails closed.
+        match self.resolve_crypto(source.id) {
+            crate::crypto_provider::CryptoResolution::Suite(suite) => Ok(Some(suite)),
+            crate::crypto_provider::CryptoResolution::Plaintext
+            | crate::crypto_provider::CryptoResolution::Unavailable => {
+                warn!(
+                    target: TARGET,
+                    source = %source.id,
+                    "encryption-enabled source has no resolvable key; failing closed (crypto.key_missing) - NEVER uploading plaintext"
+                );
+                Err(())
+            }
+        }
     }
 
     /// Test-only (doc-hidden): attach a [`MemGauge`] so the streaming
@@ -983,6 +1014,22 @@ impl DefaultExecutor {
         relative_path: &RelativePath,
         size: u64,
     ) -> anyhow::Result<OpOutcome> {
+        // --- GA-critical FAIL-CLOSED crypto resolution (M5, DESIGN s7) ------
+        // Resolve this source's suite FIRST, before opening the file or
+        // touching state/Drive: an `encryption_enabled` source whose key is
+        // unavailable must error `crypto.key_missing` and upload NOTHING, never
+        // plaintext (CODEX_NOTES "Per-source crypto resolution"). An unencrypted
+        // source resolves to `None` (plaintext) and ignores any suite.
+        let crypto = match self.resolve_source_crypto(source) {
+            Ok(crypto) => crypto,
+            Err(()) => {
+                return Ok(OpOutcome::Failed {
+                    relative_path: relative_path.clone(),
+                    code: ErrorCode::CryptoKeyMissing,
+                });
+            }
+        };
+
         let live_path = join_source_path(&source.local_path, relative_path);
 
         // --- resolve the EFFECTIVE read path + open it ----------------------
@@ -1092,6 +1139,7 @@ impl DefaultExecutor {
                 payload,
                 app_props,
                 from_vss,
+                crypto,
             )
             .await;
 
@@ -1134,6 +1182,17 @@ impl DefaultExecutor {
                     relative_path: relative_path.clone(),
                     code,
                 })
+            }
+            Err(UploadError::ChecksumMismatch { stranded_file_id }) => {
+                self.handle_checksum_mismatch(
+                    source,
+                    relative_path,
+                    &live_path,
+                    op_id,
+                    existing_file_id.as_deref(),
+                    stranded_file_id,
+                )
+                .await
             }
             Err(UploadError::DeferToReconcile(code)) => {
                 // P1-3: ambiguous create failure. KEEP the pending op (do NOT
@@ -1202,6 +1261,11 @@ impl DefaultExecutor {
         // resumable session is opened/persisted (the per-cycle shadow is gone
         // by next cycle, so a resume could not re-read the same frozen bytes).
         from_vss: bool,
+        // M5 per-source crypto: the suite resolved (FAIL-CLOSED) for THIS
+        // source - `Some` => encrypt content + filename, `None` => plaintext.
+        // Resolved per op in `hash_then_upload`, never executor-wide. Owned
+        // (cheap `Arc`) so the streaming cpu stage can clone it.
+        crypto: Option<Arc<dyn SourceCryptoSuite>>,
     ) -> Result<OpOutcome, UploadError> {
         // M3.5: every FS recheck below reads the EFFECTIVE path (the VSS
         // snapshot copy for a locked file), so a frozen-vs-live stat mismatch
@@ -1232,7 +1296,7 @@ impl DefaultExecutor {
         // the encrypted parent directory components up front so the upload
         // lands under the ciphertext path, not a leaked plaintext name.
         let target = self
-            .resolve_remote_target(source, relative_path, app_props)
+            .resolve_remote_target(source, relative_path, app_props, crypto.as_deref())
             .await
             .map_err(UploadError::Fatal)?;
 
@@ -1277,6 +1341,7 @@ impl DefaultExecutor {
                 op_id,
                 &mut payload,
                 allow_resumable,
+                crypto.clone(),
             )
             .await?
         } else {
@@ -1293,6 +1358,7 @@ impl DefaultExecutor {
                 op_id,
                 &mut payload,
                 allow_resumable,
+                crypto.as_deref(),
             )
             .await?
         };
@@ -1351,6 +1417,17 @@ impl DefaultExecutor {
                 .await
                 .map_err(UploadError::Fatal)?;
         }
+        // R2-P1-3: a successful upload BREAKS any consecutive-mismatch streak,
+        // so reset the durable counter (best-effort - a stale counter would only
+        // make a FUTURE mismatch trip the corrupt threshold one attempt early,
+        // never lose data, so a clear failure is logged, not fatal).
+        if let Err(err) = self
+            .state
+            .clear_checksum_mismatch_count(source.id, relative_path)
+            .await
+        {
+            warn!(target: TARGET, source = %source.id, path = %relative_path, %err, "failed to clear checksum-mismatch counter after a successful upload");
+        }
         debug!(
             target: TARGET,
             source = %source.id,
@@ -1383,6 +1460,9 @@ impl DefaultExecutor {
         payload: &mut PendingOpPayload,
         // P1-B: false for a VSS-snapshot read - force the non-resumable path.
         allow_resumable: bool,
+        // M5 per-source crypto: `Some` => encrypt this source, `None` =>
+        // plaintext. Resolved (FAIL-CLOSED) per op by the caller.
+        crypto: Option<&dyn SourceCryptoSuite>,
     ) -> Result<UploadProduct, UploadError> {
         // M3.5: the post-read identity recheck reads the EFFECTIVE path (the
         // VSS snapshot copy for a locked file), matching the pre-open lstat.
@@ -1392,7 +1472,7 @@ impl DefaultExecutor {
             blake3,
             sent_bytes,
             plaintext_len,
-        } = read_hash_encrypt(file, self.crypto.as_deref())
+        } = read_hash_encrypt(file, crypto)
             .await
             .map_err(UploadError::from_read)?;
 
@@ -1414,7 +1494,7 @@ impl DefaultExecutor {
         // grow/shrink is the changed-during-upload case the fstat check above
         // already catches, but guard explicitly so the declared upload length
         // is never wrong for an unencrypted body.
-        if self.crypto.is_none() && plaintext_len != size {
+        if crypto.is_none() && plaintext_len != size {
             return Err(UploadError::Skip(SkipReason::ChangedDuringUpload));
         }
 
@@ -1472,10 +1552,14 @@ impl DefaultExecutor {
         payload: &mut PendingOpPayload,
         // P1-B: false for a VSS-snapshot read - force the simple streaming path.
         allow_resumable: bool,
+        // M5 per-source crypto: `Some` => encrypt this source, `None` =>
+        // plaintext. Resolved (FAIL-CLOSED) per op by the caller; owned so the
+        // cpu stage can move it.
+        crypto: Option<Arc<dyn SourceCryptoSuite>>,
     ) -> Result<UploadProduct, UploadError> {
         // Predict the exact number of bytes that will be sent to Drive.
-        let total = predicted_sent_len(size, self.crypto.is_some());
-        let encrypted = self.crypto.is_some();
+        let encrypted = crypto.is_some();
+        let total = predicted_sent_len(size, encrypted);
 
         // P1-2: persist the uploaded blake3 once it is known. With streaming
         // the hash is produced DURING the upload, so we persist it after the
@@ -1496,7 +1580,7 @@ impl DefaultExecutor {
         // the source of the data flow (SPEC s8 / DESIGN s5.4).
         let pacer = self.pacer.clone();
         let reader = read_stage(file, size, pacer, raw_tx, self.mem_gauge.clone());
-        let cpu = cpu_stage(raw_rx, out_tx, self.crypto.clone(), size);
+        let cpu = cpu_stage(raw_rx, out_tx, crypto, size);
         let uploader = self.upload_stage(
             target,
             existing_file_id,
@@ -1547,9 +1631,12 @@ impl DefaultExecutor {
                 // uploads a second copy. Trash it before failing so the
                 // failure leaves NO object behind. Never trash on an UPDATE -
                 // that id is the user's pre-existing file.
-                self.trash_corrupt_create(existing_file_id, &entry.id, relative_path.as_str())
+                let cleanup = self
+                    .trash_corrupt_create(existing_file_id, &entry.id, relative_path.as_str())
                     .await;
-                return Err(UploadError::Failed(ErrorCode::DriveChecksumMismatch));
+                return Err(UploadError::ChecksumMismatch {
+                    stranded_file_id: cleanup.stranded_file_id(),
+                });
             }
         }
 
@@ -1795,18 +1882,26 @@ impl DefaultExecutor {
                     DriveError::Transient | DriveError::RateLimited => {
                         return Err(UploadError::Fatal(e));
                     }
-                    // Quota / daily-quota / auth / dest-folder / checksum / other
-                    // are terminal for this op: resuming the same session will
-                    // not clear them. Fail with the stable code (the streaming
-                    // resumable Create finalizes only on its final chunk, so no
-                    // object materialized - dropping the op is safe; the next
-                    // scan re-plans from scratch once the condition clears).
+                    // A checksum mismatch on a streamed chunk routes through the
+                    // 3-consecutive-mismatch policy (R2-P1-3). The streaming
+                    // resumable Create finalizes only on its FINAL chunk, so no
+                    // object materialized here - nothing to retry-trash
+                    // (`stranded_file_id: None`).
+                    DriveError::ChecksumMismatch => {
+                        return Err(UploadError::ChecksumMismatch {
+                            stranded_file_id: None,
+                        });
+                    }
+                    // Quota / daily-quota / auth / dest-folder / other are
+                    // terminal for this op: resuming the same session will not
+                    // clear them. Fail with the stable code (no object
+                    // materialized - dropping the op is safe; the next scan
+                    // re-plans from scratch once the condition clears).
                     DriveError::QuotaExhausted
                     | DriveError::DailyQuota
                     | DriveError::InvalidGrant
                     | DriveError::DestFolderMissing
                     | DriveError::DestFolderPermissionDenied
-                    | DriveError::ChecksumMismatch
                     | DriveError::Other => {
                         return Err(UploadError::Failed(class.error_code()));
                     }
@@ -1917,12 +2012,17 @@ impl DefaultExecutor {
                                 entry.md5,
                                 sent.md5
                             );
-                            // P1-4: trash a corrupt CREATE before failing so
-                            // no bad object is stranded (see
-                            // `trash_corrupt_create`). Never on an UPDATE.
-                            self.trash_corrupt_create(existing_file_id, &entry.id, &target.name)
+                            // P1-4 / R2-P1-1: trash a corrupt CREATE before
+                            // failing so no bad object is stranded (see
+                            // `trash_corrupt_create`). Never on an UPDATE. A
+                            // FAILED trash strands the object -> keep the op so
+                            // reconcile retries the trash.
+                            let cleanup = self
+                                .trash_corrupt_create(existing_file_id, &entry.id, &target.name)
                                 .await;
-                            return Err(UploadError::Failed(ErrorCode::DriveChecksumMismatch));
+                            return Err(UploadError::ChecksumMismatch {
+                                stranded_file_id: cleanup.stranded_file_id(),
+                            });
                         }
                     }
                 }
@@ -1932,6 +2032,16 @@ impl DefaultExecutor {
                     ambiguous_simple_create,
                 )? {
                     RetryDecision::Retry => continue,
+                    RetryDecision::Fail(ErrorCode::DriveChecksumMismatch) => {
+                        // The REAL GoogleDriveStore verifies md5 INSIDE the store
+                        // and has ALREADY best-effort-trashed its own corrupt
+                        // create (R-P1-1); we have no file_id here to retry the
+                        // trash against, so route through the 3-mismatch policy
+                        // with no stranded id (the store owns its cleanup).
+                        return Err(UploadError::ChecksumMismatch {
+                            stranded_file_id: None,
+                        });
+                    }
                     RetryDecision::Fail(code) => return Err(UploadError::Failed(code)),
                     RetryDecision::DeferCreate(code) => {
                         return Err(UploadError::DeferToReconcile(code))
@@ -2220,8 +2330,11 @@ impl DefaultExecutor {
         source: &SourceRow,
         relative_path: &RelativePath,
         app_props: HashMap<String, String>,
+        // M5 per-source crypto (resolved FAIL-CLOSED by the caller): `Some` =>
+        // encrypt the path components; `None` => flat plaintext name.
+        crypto: Option<&dyn SourceCryptoSuite>,
     ) -> anyhow::Result<RemoteTarget> {
-        let Some(crypto) = self.crypto.as_deref() else {
+        let Some(crypto) = crypto else {
             // Plaintext: flat under the source root with the plaintext name.
             return Ok(RemoteTarget {
                 parent_id: source.drive_folder_id.clone(),
@@ -2266,8 +2379,10 @@ impl DefaultExecutor {
         &self,
         source: &SourceRow,
         relative_path: &RelativePath,
+        // M5 per-source crypto (resolved FAIL-CLOSED by the caller).
+        crypto: Option<&dyn SourceCryptoSuite>,
     ) -> anyhow::Result<String> {
-        match self.crypto.as_deref() {
+        match crypto {
             None => Ok(source.drive_folder_id.clone()),
             Some(crypto) => {
                 let EncryptedParents { parent_id, .. } = self
@@ -2290,8 +2405,10 @@ impl DefaultExecutor {
         &self,
         source: &SourceRow,
         relative_path: &RelativePath,
+        // M5 per-source crypto (resolved FAIL-CLOSED by the caller).
+        crypto: Option<&dyn SourceCryptoSuite>,
     ) -> anyhow::Result<Option<String>> {
-        let Some(crypto) = self.crypto.as_deref() else {
+        let Some(crypto) = crypto else {
             return Ok(None);
         };
         let EncryptedParents {
@@ -2376,27 +2493,32 @@ impl DefaultExecutor {
         m
     }
 
-    /// P1-4: trash a corrupt object that a CREATE upload just finalized with
-    /// a checksum mismatch, so the failure leaves NOTHING behind on Drive.
+    /// P1-4 / R2-P1-1: trash a corrupt object that a CREATE upload just
+    /// finalized with a checksum mismatch, so the failure leaves NOTHING behind
+    /// on Drive - and report whether the trash actually succeeded so the caller
+    /// can DURABLY retry it (R2-P1-1).
     ///
     /// Scoped to creates: `existing_file_id.is_none()`. For an UPDATE the
-    /// returned `file_id` is the user's PRE-EXISTING object - we must never
-    /// trash it on a mismatch (the prior good bytes stay put; the op is
-    /// dropped and the next scan retries the update). For a CREATE the object
-    /// is a brand-new orphan carrying this op's uuid; if left in place,
-    /// reconcile would adopt it as Synced (local-vs-uploaded blake3 still
-    /// agrees - only the on-wire md5 disagreed) and corrupt bytes would
-    /// persist while the next scan uploads a duplicate. Trashing it is
-    /// best-effort: a failure here is logged, not propagated (the upload has
-    /// already failed; a left-behind orphan is caught by a later reconcile).
+    /// `file_id` is the user's PRE-EXISTING object - we must never trash it on a
+    /// mismatch (the prior good bytes stay put; the op is dropped and the next
+    /// scan retries the update), so this returns [`CorruptCreateCleanup::NotACreate`].
+    /// For a CREATE the object is a brand-new orphan carrying this op's uuid; if
+    /// left in place, reconcile would adopt it as Synced (local-vs-uploaded
+    /// blake3 still agrees - only the on-wire md5 disagreed) and corrupt bytes
+    /// would persist while the next scan uploads a duplicate.
+    ///
+    /// R2-P1-1 durability: a FAILED trash returns [`CorruptCreateCleanup::Stranded`]
+    /// carrying the corrupt `file_id` so the caller can persist it and KEEP the
+    /// pending op, retrying the trash next cycle - rather than dropping the op
+    /// and stranding a live corrupt object with no recovery handle.
     async fn trash_corrupt_create(
         &self,
         existing_file_id: Option<&str>,
         file_id: &str,
         context: &str,
-    ) {
+    ) -> CorruptCreateCleanup {
         if existing_file_id.is_some() {
-            return;
+            return CorruptCreateCleanup::NotACreate;
         }
         self.pacer.permit_request().await;
         match self.remote.trash(file_id).await {
@@ -2408,6 +2530,7 @@ impl DefaultExecutor {
                     file_id = %file_id,
                     "trashed the corrupt create object after md5 mismatch"
                 );
+                CorruptCreateCleanup::Trashed
             }
             Err(e) => {
                 let class = classify_drive_error(&e);
@@ -2416,10 +2539,163 @@ impl DefaultExecutor {
                     target: TARGET,
                     name = %context,
                     file_id = %file_id,
-                    "failed to trash corrupt create object after md5 mismatch: {e}"
+                    "failed to trash corrupt create object after md5 mismatch; keeping the op to retry the trash next cycle: {e}"
                 );
+                CorruptCreateCleanup::Stranded {
+                    file_id: file_id.to_string(),
+                }
             }
         }
+    }
+
+    /// R2-P1-1: retry trashing a corrupt CREATE object whose earlier trash
+    /// failed (the durable cleanup the reconcile pass drives). Returns `true`
+    /// when the object is confirmed gone (trashed now, or already trashed/gone -
+    /// an idempotent no-op), so the caller can drop the pending op; `false` when
+    /// the trash failed again and the op must be kept for the next cycle.
+    async fn retry_trash_corrupt(&self, file_id: &str, context: &str) -> bool {
+        self.pacer.permit_request().await;
+        match self.remote.trash(file_id).await {
+            Ok(()) => {
+                self.pacer.note_response(ResponseClass::Ok);
+                warn!(
+                    target: TARGET,
+                    name = %context,
+                    file_id = %file_id,
+                    "reconcile: trashed the previously-stranded corrupt create object"
+                );
+                true
+            }
+            Err(e) => {
+                let class = classify_drive_error(&e);
+                self.pacer.note_response(class.response_class());
+                warn!(
+                    target: TARGET,
+                    name = %context,
+                    file_id = %file_id,
+                    "reconcile: re-trash of the stranded corrupt object failed again; keeping the op: {e}"
+                );
+                false
+            }
+        }
+    }
+
+    /// R2-P1-3 (DESIGN s5.4 lines 498-500) + R2-P1-1: handle a verified
+    /// post-upload checksum mismatch for `(source, relative_path)`.
+    ///
+    /// 1. **3-consecutive-mismatch counter (R2-P1-3):** bump the durable
+    ///    per-(source, path) counter; on the 3rd consecutive mismatch mark the
+    ///    `file_state` row [`FileStateStatus::Corrupt`] (stamped with the LIVE
+    ///    file's current `(size, mtime_ns)` so the FastPath scanner stops
+    ///    re-emitting it - "stop retrying that file"), clear the counter (so a
+    ///    later user edit, which changes `(size, mtime)`, gets a fresh budget),
+    ///    log, and surface it. Below the threshold the file stays retryable.
+    /// 2. **Durable corrupt-create cleanup (R2-P1-1):** when `stranded_file_id`
+    ///    is `Some` (a corrupt CREATE whose trash FAILED), persist that id into
+    ///    the op payload and KEEP the pending op so the reconcile pass retries
+    ///    the trash next cycle - rather than dropping the op and stranding a
+    ///    live corrupt object. When `None`, the corrupt object is confirmed gone
+    ///    (or it was an update / the real store already trashed it), so the op is
+    ///    dropped as before.
+    ///
+    /// Always returns `OpOutcome::Failed { DriveChecksumMismatch }` (the
+    /// orchestrator records a durable activity Error row + leaves the source
+    /// scan/verify-due).
+    async fn handle_checksum_mismatch(
+        &self,
+        source: &SourceRow,
+        relative_path: &RelativePath,
+        live_path: &Path,
+        op_id: PendingOpId,
+        existing_file_id: Option<&str>,
+        stranded_file_id: Option<String>,
+    ) -> anyhow::Result<OpOutcome> {
+        // R2-P1-3: advance the consecutive-mismatch streak.
+        let count = self
+            .state
+            .bump_checksum_mismatch_count(source.id, relative_path)
+            .await?;
+        warn!(
+            target: TARGET,
+            source = %source.id,
+            path = %relative_path,
+            consecutive = count,
+            threshold = MAX_CHECKSUM_MISMATCHES,
+            "drive.checksum_mismatch on this file (consecutive count vs the corrupt threshold)"
+        );
+
+        let reached_corrupt = count >= MAX_CHECKSUM_MISMATCHES;
+
+        // R2-P1-1: a stranded corrupt CREATE object keeps the op alive so
+        // reconcile retries the trash; persist its id. Otherwise drop the op.
+        if let Some(file_id) = stranded_file_id {
+            warn!(
+                target: TARGET,
+                source = %source.id,
+                path = %relative_path,
+                corrupt_file_id = %file_id,
+                "corrupt create object could not be trashed; keeping the op so reconcile retries the trash (R2-P1-1)"
+            );
+            let payload = PendingOpPayload {
+                corrupt_file_id: Some(file_id),
+                ..PendingOpPayload::default()
+            };
+            // Best-effort persist; a state write error aborts the cycle via `?`.
+            self.state
+                .update_pending_op_payload(op_id, &payload.to_value())
+                .await?;
+        } else {
+            self.state.delete_pending_op(op_id).await?;
+        }
+
+        if reached_corrupt {
+            // DESIGN s5.4: 3 consecutive mismatches -> mark corrupt, stop
+            // retrying, surface to the user. Stamp the row with the LIVE file's
+            // current (size, mtime) so the FastPath scanner (which keys
+            // "unchanged" off (size, mtime)) treats it as already-handled and
+            // does NOT re-emit it - until the user edits the file (changing
+            // (size, mtime)), which both re-detects it AND clears the counter
+            // below, giving a fresh attempt.
+            let (size, mtime_ns) = match lstat_identity(live_path) {
+                Ok(id) => (id.size, id.mtime_ns),
+                // The file vanished mid-cycle: a sentinel mtime forces the next
+                // scan to re-evaluate (it will be a delete if still gone).
+                Err(_) => (0, REQUEUE_FORCE_RESCAN_MTIME_NS),
+            };
+            let row = FileStateRow {
+                source_id: source.id,
+                relative_path: relative_path.clone(),
+                size,
+                mtime_ns,
+                // No proven plaintext hash for a corrupt upload; the row exists
+                // to record the Corrupt status + freeze the (size, mtime) the
+                // scanner compares against, not to assert content identity.
+                hash_blake3: [0u8; 32],
+                drive_file_id: existing_file_id.map(|s| s.to_string()),
+                drive_md5: None,
+                encrypted_remote_path: None,
+                status: FileStateStatus::Corrupt,
+                last_uploaded_at: None,
+                last_verified_at: None,
+            };
+            self.state.upsert_file_state(&row).await?;
+            // Reset the streak so a later user edit gets a fresh budget.
+            self.state
+                .clear_checksum_mismatch_count(source.id, relative_path)
+                .await?;
+            warn!(
+                target: TARGET,
+                source = %source.id,
+                path = %relative_path,
+                threshold = MAX_CHECKSUM_MISMATCHES,
+                "marked file_state status=corrupt after the consecutive checksum-mismatch threshold (DESIGN s5.4); halting retries until the file changes"
+            );
+        }
+
+        Ok(OpOutcome::Failed {
+            relative_path: relative_path.clone(),
+            code: ErrorCode::DriveChecksumMismatch,
+        })
     }
 
     /// Execute one [`Op::Trash`]: idempotently trash the remote object and
@@ -2527,9 +2803,51 @@ impl Executor for DefaultExecutor {
     }
 
     async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()> {
+        // M5 per-source crypto (resolved ONCE for this source, FAIL-CLOSED).
+        // Reconcile re-derives the encrypted parent chain / encrypted_remote_path
+        // and re-reads the local file - all of which need the SAME suite the
+        // upload used. An `encryption_enabled` source whose key is unavailable
+        // must NOT reconcile its ops with plaintext crypto (that would search the
+        // wrong - root - folder and could re-upload a duplicate next scan, or
+        // adopt a row with a blanked encrypted_remote_path). So if the suite
+        // resolution fails closed, leave this source's pending ops untouched
+        // (they retry next cycle once the key is available) and surface it.
+        let crypto = match self.resolve_source_crypto(source) {
+            Ok(crypto) => crypto,
+            Err(()) => {
+                warn!(
+                    target: TARGET,
+                    source = %source.id,
+                    "skipping reconcile for encryption-enabled source with no resolvable key (crypto.key_missing); ops kept for retry"
+                );
+                return Ok(());
+            }
+        };
+        let crypto = crypto.as_deref();
+
         let pending = self.state.get_pending_ops_for_source(source.id).await?;
         for op in pending {
             let payload = PendingOpPayload::from_value(&op.payload_json);
+
+            // --- R2-P1-1: durable corrupt-create cleanup -------------------
+            // An op carrying a `corrupt_file_id` is the recovery handle for a
+            // corrupt CREATE object whose post-upload trash FAILED (it may still
+            // be live on Drive). Retry the trash; on success (or an idempotent
+            // already-gone) drop the op, else KEEP it for the next cycle. This
+            // op carries no `client_op_uuid` (it is not a pending upload), so it
+            // must be handled BEFORE the uuid guard below.
+            if let Some(corrupt_file_id) = payload.corrupt_file_id.clone() {
+                if self
+                    .retry_trash_corrupt(&corrupt_file_id, op.relative_path.as_str())
+                    .await
+                {
+                    self.state.delete_pending_op(op.id).await?;
+                }
+                // Either way, this op is fully handled; do not fall through to
+                // the upload-recovery paths below.
+                continue;
+            }
+
             let Some(uuid) = payload.client_op_uuid.clone() else {
                 // No UUID carried (older row): leave it for the normal queue.
                 continue;
@@ -2551,7 +2869,7 @@ impl Executor for DefaultExecutor {
             // fresh op the next cycle re-snapshots + re-uploads from scratch.
             if let Some(resumable) = payload.resumable.clone() {
                 match self
-                    .resume_persisted(source, &op, &payload, resumable)
+                    .resume_persisted(source, &op, &payload, resumable, crypto)
                     .await?
                 {
                     Some((entry, resumed_blake3)) => {
@@ -2565,7 +2883,8 @@ impl Executor for DefaultExecutor {
                         // the real hash, not a placeholder.
                         let mut adopted = payload.clone();
                         adopted.uploaded_blake3_hex = Some(hex::encode(resumed_blake3));
-                        self.adopt_reconciled(source, &op, &adopted, entry).await?;
+                        self.adopt_reconciled(source, &op, &adopted, entry, crypto)
+                            .await?;
                         continue;
                     }
                     None => {
@@ -2587,7 +2906,8 @@ impl Executor for DefaultExecutor {
                             .unwrap_or(false) =>
                     {
                         // Already committed remotely; re-hash + finish.
-                        self.adopt_reconciled(source, &op, &payload, entry).await?;
+                        self.adopt_reconciled(source, &op, &payload, entry, crypto)
+                            .await?;
                     }
                     _ => {
                         // Not committed; drop the stale op so the next scan
@@ -2604,9 +2924,14 @@ impl Executor for DefaultExecutor {
                 // duplicate on the next scan (P1-5 must not regress the
                 // Cluster-A no-duplicate contract). Re-derive the parent
                 // (idempotent `ensure_folder` for the encrypted dir chain).
-                let parent_id = self.reconcile_parent_id(source, &op.relative_path).await?;
+                let parent_id = self
+                    .reconcile_parent_id(source, &op.relative_path, crypto)
+                    .await?;
                 match self.remote.find_by_op_uuid(&parent_id, &uuid).await? {
-                    Some(entry) => self.adopt_reconciled(source, &op, &payload, entry).await?,
+                    Some(entry) => {
+                        self.adopt_reconciled(source, &op, &payload, entry, crypto)
+                            .await?
+                    }
                     None => {
                         self.state.delete_pending_op(op.id).await?;
                     }
@@ -2650,6 +2975,8 @@ impl DefaultExecutor {
         op: &crate::state::PendingOpRow,
         payload: &PendingOpPayload,
         resumable: PersistedResumable,
+        // M5 per-source crypto (resolved FAIL-CLOSED by the caller).
+        crypto: Option<&dyn SourceCryptoSuite>,
     ) -> anyhow::Result<Option<(RemoteEntry, [u8; 32])>> {
         // Byte-level resume is only sound when re-reading the local file
         // reproduces the EXACT bytes already pushed. For an ENCRYPTED source
@@ -2662,7 +2989,7 @@ impl DefaultExecutor {
         // offset 0, which DESIGN s5.4 already sanctions ("any 4xx -> recreate
         // from scratch"). True encrypted resume (persisting the crypto
         // header) is an M4 follow-up.
-        if self.crypto.is_some() {
+        if crypto.is_some() {
             return Ok(None);
         }
         let now = self.clock.now_ms();
@@ -2713,7 +3040,7 @@ impl DefaultExecutor {
         // blake3 over the full re-read stream (the final integrity check).
         let HashedBody {
             blake3, sent_bytes, ..
-        } = match read_hash_encrypt(&mut file, self.crypto.as_deref()).await {
+        } = match read_hash_encrypt(&mut file, crypto).await {
             Ok(h) => h,
             Err(_) => return Ok(None),
         };
@@ -2792,6 +3119,8 @@ impl DefaultExecutor {
         op: &crate::state::PendingOpRow,
         payload: &PendingOpPayload,
         entry: RemoteEntry,
+        // M5 per-source crypto (resolved FAIL-CLOSED by the caller).
+        crypto: Option<&dyn SourceCryptoSuite>,
     ) -> anyhow::Result<()> {
         let full_path = join_source_path(&source.local_path, &op.relative_path);
 
@@ -2800,7 +3129,7 @@ impl DefaultExecutor {
         // for a plaintext source). Crash recovery must preserve it - restore +
         // listing look the object up by this path.
         let encrypted_remote_path = self
-            .reconcile_encrypted_remote_path(source, &op.relative_path)
+            .reconcile_encrypted_remote_path(source, &op.relative_path, crypto)
             .await?;
 
         // Re-hash the current local file (plaintext). On any read failure we
@@ -3015,6 +3344,37 @@ enum RetryDecision {
     /// the reconcile pass (keep the op) so a later cycle adopts-or-requeues
     /// without risking a duplicate.
     DeferCreate(ErrorCode),
+}
+
+/// R2-P1-1: the outcome of [`DefaultExecutor::trash_corrupt_create`] - whether
+/// the corrupt CREATE object the checksum-mismatch upload finalized was
+/// successfully removed, so the caller can decide whether to durably retry.
+enum CorruptCreateCleanup {
+    /// Not a create (an UPDATE mismatch): there is no fresh orphan to trash -
+    /// the user's pre-existing object is left untouched.
+    NotACreate,
+    /// The corrupt create object was trashed (confirmed gone).
+    Trashed,
+    /// The trash FAILED: a live corrupt object may still be on Drive under this
+    /// `file_id`. The caller persists it + keeps the pending op so the trash is
+    /// retried next cycle, rather than dropping the op and stranding it.
+    Stranded {
+        /// The corrupt object's Drive file id, to retry the trash against.
+        file_id: String,
+    },
+}
+
+impl CorruptCreateCleanup {
+    /// The corrupt-create `file_id` that may be stranded (its trash failed), or
+    /// `None` when the object is confirmed gone / not a fresh create. Threaded
+    /// into [`UploadError::ChecksumMismatch`] so `hash_then_upload` keeps the op
+    /// for a durable re-trash (R2-P1-1) only when something is actually stranded.
+    fn stranded_file_id(self) -> Option<String> {
+        match self {
+            CorruptCreateCleanup::Stranded { file_id } => Some(file_id),
+            CorruptCreateCleanup::NotACreate | CorruptCreateCleanup::Trashed => None,
+        }
+    }
 }
 
 /// Result of pushing one wire chunk to a resumable session.
@@ -3346,6 +3706,21 @@ enum UploadError {
     /// the id, so the op is safe to drop.
     SkipPostUpload(SkipReason),
     Failed(ErrorCode),
+    /// R2-P1-3 / R2-P1-1: a post-upload checksum mismatch (the bytes on Drive
+    /// do not match what we sent). Carried distinctly from the generic
+    /// [`UploadError::Failed`] so `hash_then_upload` can run the DESIGN s5.4
+    /// 3-consecutive-mismatch policy (bump the counter; on the 3rd, mark the
+    /// file [`FileStateStatus::Corrupt`]) AND the R2-P1-1 durable corrupt-create
+    /// cleanup. `stranded_file_id` is `Some` ONLY when this op CREATED a corrupt
+    /// object whose best-effort trash FAILED - then the op is KEPT (not dropped)
+    /// so reconcile retries the trash; otherwise (`None`) the corrupt object is
+    /// confirmed gone (or it was an update / the real store already trashed it)
+    /// and the op is dropped as before.
+    ChecksumMismatch {
+        /// `Some(file_id)` when a corrupt CREATE object may be stranded on Drive
+        /// (its trash failed) and the op must be kept to retry the trash.
+        stranded_file_id: Option<String>,
+    },
     /// P1-3: an AMBIGUOUS create failure - a network drop / timeout on a
     /// CREATE POST where Drive MIGHT have created the object even though the
     /// response was lost. Re-POSTing inline would risk a duplicate (and the
@@ -3983,6 +4358,19 @@ mod tests {
                     size,
                 }],
                 collisions: vec![],
+            }
+        }
+
+        /// A clone of `self.source` (SAME id, so `file_state`/`pending_ops`
+        /// lookups by `h.source.id` still resolve) but with
+        /// `encryption_enabled = true`. M5 per-source crypto FAILS CLOSED on
+        /// `encryption_enabled`: a suite only encrypts when the SourceRow says
+        /// the source is encrypted, so the encryption tests pass THIS source to
+        /// `execute`/`reconcile` (the suite is wired via `executor_with_crypto`).
+        fn encrypted_source(&self) -> SourceRow {
+            SourceRow {
+                encryption_enabled: true,
+                ..self.source.clone()
             }
         }
     }
@@ -4997,9 +5385,10 @@ mod tests {
         // Multi-chunk plaintext so encrypt_chunk + finalize_last both run.
         let plaintext = vec![0x11u8; READ_BUF + 1234];
         let (rel, size) = h.write_file("enc.bin", &plaintext);
+        let source = h.encrypted_source();
         let exec = h.executor_with_crypto(Some(Arc::new(FakeSuite)));
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
             .await
             .unwrap();
         assert!(
@@ -5029,6 +5418,658 @@ mod tests {
             .unwrap();
         let expect_blake3: [u8; 32] = blake3::hash(&plaintext).into();
         assert_eq!(row.hash_blake3, expect_blake3);
+    }
+
+    // --- M5 GA blocker: per-source crypto resolution + FAIL-CLOSED policy ----
+    //
+    // The executor holds an `Option<Arc<dyn CryptoProvider>>` and resolves the
+    // suite PER source, keyed on the SourceRow's `encryption_enabled` (CODEX_NOTES
+    // "Per-source crypto resolution", DESIGN s7). The three branches:
+    //   (a) encryption_enabled=true + suite resolved -> CIPHERTEXT on the fake;
+    //   (b) encryption_enabled=true + NO key         -> FAIL CLOSED (no object);
+    //   (c) encryption_enabled=false                 -> PLAINTEXT, suite ignored.
+    // These prove the executor never uploads plaintext for an encrypted source
+    // nor ciphertext for an unencrypted one, in a mixed account.
+
+    /// Read one object's retained literal bytes off the fake (the fake keeps
+    /// the literal bytes unless its content oracle is armed, which these tests
+    /// never do).
+    fn literal_object_bytes(h: &Harness, file_id: &str) -> Vec<u8> {
+        match h.remote.object_content(file_id).expect("object content") {
+            driven_drive::fake::ObjectContent::Literal(bytes) => bytes,
+            driven_drive::fake::ObjectContent::Oracle { .. } => {
+                panic!("test object should retain literal bytes (oracle not armed)")
+            }
+        }
+    }
+
+    /// A [`CryptoProvider`] that returns a DISTINCT decision per source id, so
+    /// one provider can model a mixed (encrypted + plaintext + key-missing)
+    /// account - exactly what the executor must resolve PER source.
+    struct PerSourceProvider {
+        decisions: std::collections::HashMap<SourceId, crate::crypto_provider::CryptoResolution>,
+    }
+    impl crate::crypto_provider::CryptoProvider for PerSourceProvider {
+        fn resolve(&self, source_id: &SourceId) -> crate::crypto_provider::CryptoResolution {
+            match self.decisions.get(source_id) {
+                Some(crate::crypto_provider::CryptoResolution::Suite(s)) => {
+                    crate::crypto_provider::CryptoResolution::Suite(s.clone())
+                }
+                Some(crate::crypto_provider::CryptoResolution::Unavailable) => {
+                    crate::crypto_provider::CryptoResolution::Unavailable
+                }
+                // Default (and explicit Plaintext): plaintext.
+                _ => crate::crypto_provider::CryptoResolution::Plaintext,
+            }
+        }
+    }
+
+    /// Build an executor over a provider that hands `resolution` for `source_id`.
+    fn exec_with_provider(
+        h: &Harness,
+        source_id: SourceId,
+        resolution: crate::crypto_provider::CryptoResolution,
+    ) -> DefaultExecutor {
+        let mut decisions = std::collections::HashMap::new();
+        decisions.insert(source_id, resolution);
+        let provider: Arc<dyn crate::crypto_provider::CryptoProvider> =
+            Arc::new(PerSourceProvider { decisions });
+        DefaultExecutor::with_clock(
+            ExecutorDeps {
+                remote: Arc::new(h.remote.clone()),
+                state: h.state.clone(),
+                pacer: h.pacer.clone(),
+                crypto: Some(provider),
+                vss: None,
+                network: None,
+            },
+            h.clock.clone(),
+        )
+    }
+
+    /// Branch (a): an encryption_enabled source whose suite resolves uploads
+    /// CIPHERTEXT (the stored object is larger than the plaintext + the bytes on
+    /// the fake are not the plaintext), and file_state carries the plaintext
+    /// blake3 + an encrypted_remote_path.
+    #[tokio::test]
+    async fn per_source_encrypted_uploads_ciphertext() {
+        let h = harness().await;
+        let source = h.encrypted_source();
+        let plaintext = b"per-source encrypted content".to_vec();
+        let (rel, size) = h.write_file("enc.txt", &plaintext);
+        let exec = exec_with_provider(
+            &h,
+            source.id,
+            crate::crypto_provider::CryptoResolution::Suite(Arc::new(FakeSuite)),
+        );
+        let out = exec
+            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
+
+        let children = h
+            .remote
+            .list_folder(source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "exactly one object on the fake");
+        assert!(
+            children[0].size.unwrap() > size,
+            "encrypted source must upload CIPHERTEXT (header + tags exceed plaintext)"
+        );
+        // The stored bytes are NOT the plaintext.
+        let stored = literal_object_bytes(&h, &children[0].id);
+        assert_ne!(stored, plaintext, "stored bytes must be ciphertext");
+        let row = h
+            .state
+            .get_file_state(source.id, &rel)
+            .await
+            .unwrap()
+            .expect("file_state row");
+        assert_eq!(
+            row.hash_blake3,
+            *blake3::hash(&plaintext).as_bytes(),
+            "file_state blake3 is over the PLAINTEXT"
+        );
+        assert!(
+            row.encrypted_remote_path.is_some(),
+            "an encrypted source records the ciphertext remote path"
+        );
+    }
+
+    /// Branch (c): an unencrypted source (encryption_enabled=false) uploads
+    /// PLAINTEXT and IGNORES any suite the provider hands out - it must NEVER
+    /// upload ciphertext. We deliberately wire a `Suite` decision for its id to
+    /// prove the executor keys off `encryption_enabled`, not the provider alone.
+    #[tokio::test]
+    async fn per_source_unencrypted_uploads_plaintext_ignoring_suite() {
+        let h = harness().await; // h.source.encryption_enabled == false
+        let plaintext = b"plaintext content for an unencrypted source".to_vec();
+        let (rel, size) = h.write_file("plain.txt", &plaintext);
+        // Provider would hand a suite, but encryption_enabled=false MUST win.
+        let exec = exec_with_provider(
+            &h,
+            h.source.id,
+            crate::crypto_provider::CryptoResolution::Suite(Arc::new(FakeSuite)),
+        );
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
+
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        assert_eq!(
+            children[0].size,
+            Some(size),
+            "an unencrypted source must upload PLAINTEXT (exact size), never ciphertext"
+        );
+        let stored = literal_object_bytes(&h, &children[0].id);
+        assert_eq!(stored, plaintext, "stored bytes are the plaintext");
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("file_state row");
+        assert!(
+            row.encrypted_remote_path.is_none(),
+            "an unencrypted source records NO encrypted remote path"
+        );
+    }
+
+    /// Branch (b) - the GA-critical FAIL-CLOSED path: an encryption_enabled
+    /// source whose key is UNAVAILABLE must FAIL the op with `crypto.key_missing`
+    /// and upload NOTHING (never plaintext). No object is created on the fake.
+    #[tokio::test]
+    async fn per_source_encrypted_no_key_fails_closed_no_object() {
+        let h = harness().await;
+        let source = h.encrypted_source();
+        let secret = b"this must NEVER reach Drive as plaintext".to_vec();
+        let (rel, size) = h.write_file("secret.txt", &secret);
+        let exec = exec_with_provider(
+            &h,
+            source.id,
+            crate::crypto_provider::CryptoResolution::Unavailable,
+        );
+        let out = exec
+            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out[0],
+                OpOutcome::Failed {
+                    code: ErrorCode::CryptoKeyMissing,
+                    ..
+                }
+            ),
+            "an encryption-enabled source with no key must FAIL CLOSED (crypto.key_missing); got {:?}",
+            out[0]
+        );
+        // FAIL CLOSED: absolutely NO object on Drive - not plaintext, not
+        // ciphertext, not even a trashed orphan.
+        let with_trashed = h
+            .remote
+            .list_folder_with_trashed(h.source.drive_folder_id.as_str());
+        assert!(
+            with_trashed.is_empty(),
+            "fail-closed must upload NOTHING (no plaintext leak); got {with_trashed:?}"
+        );
+        // No file_state row marked Synced.
+        let row = h.state.get_file_state(source.id, &rel).await.unwrap();
+        assert!(
+            row.is_none() || row.unwrap().status != FileStateStatus::Synced,
+            "a fail-closed op must not commit a Synced row"
+        );
+        // No pending op stranded (the op failed before enqueueing anything).
+        assert!(
+            h.state
+                .get_pending_ops_for_source(source.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "fail-closed must not leave a pending op"
+        );
+    }
+
+    /// A buggy provider that returns `Plaintext` for an encryption_enabled
+    /// source must ALSO fail closed: the executor - not the provider - is the
+    /// authority. `Plaintext` for an encrypted source is never a license to
+    /// upload plaintext.
+    #[tokio::test]
+    async fn per_source_encrypted_provider_says_plaintext_still_fails_closed() {
+        let h = harness().await;
+        let source = h.encrypted_source();
+        let (rel, size) = h.write_file("secret2.txt", b"must not leak");
+        let exec = exec_with_provider(
+            &h,
+            source.id,
+            crate::crypto_provider::CryptoResolution::Plaintext,
+        );
+        let out = exec
+            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out[0],
+                OpOutcome::Failed {
+                    code: ErrorCode::CryptoKeyMissing,
+                    ..
+                }
+            ),
+            "encryption-enabled + provider Plaintext must STILL fail closed; got {:?}",
+            out[0]
+        );
+        assert!(
+            h.remote
+                .list_folder_with_trashed(h.source.drive_folder_id.as_str())
+                .is_empty(),
+            "no object may be created when failing closed"
+        );
+    }
+
+    /// An encryption_enabled source with NO provider at all (the `crypto: None`
+    /// executor) must fail closed too - a missing provider is a missing key.
+    #[tokio::test]
+    async fn per_source_encrypted_no_provider_fails_closed() {
+        let h = harness().await;
+        let source = h.encrypted_source();
+        let (rel, size) = h.write_file("secret3.txt", b"no provider, no plaintext leak");
+        let exec = h.executor(); // crypto provider: None
+        let out = exec
+            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out[0],
+                OpOutcome::Failed {
+                    code: ErrorCode::CryptoKeyMissing,
+                    ..
+                }
+            ),
+            "encryption-enabled with no provider must fail closed; got {:?}",
+            out[0]
+        );
+        assert!(
+            h.remote
+                .list_folder_with_trashed(h.source.drive_folder_id.as_str())
+                .is_empty(),
+            "no object may be created when failing closed"
+        );
+    }
+
+    // --- R2-P1-3 (3-consecutive-mismatch -> corrupt) + R2-P1-1 (durable
+    //     corrupt-create cleanup) -----------------------------------------------
+
+    /// A [`RemoteStore`] whose `create` ALWAYS finalizes with a deliberately
+    /// WRONG md5 (so the executor's post-upload verify trips a checksum mismatch
+    /// every time), and whose `trash` can be toggled to FAIL (so the corrupt
+    /// object is "stranded" - R2-P1-1). Records every created id + every trash
+    /// attempt so a test can assert the durable-cleanup retry. Only `create` /
+    /// `trash` are exercised; the rest bail loudly rather than fake success.
+    struct MismatchStore {
+        next_id: AtomicU64,
+        created_ids: std::sync::Mutex<Vec<String>>,
+        trash_calls: AtomicU64,
+        /// When `true`, `trash` returns an error (the object stays "live").
+        trash_fails: std::sync::atomic::AtomicBool,
+    }
+    impl MismatchStore {
+        fn new(trash_fails: bool) -> Arc<Self> {
+            Arc::new(Self {
+                next_id: AtomicU64::new(0),
+                created_ids: std::sync::Mutex::new(Vec::new()),
+                trash_calls: AtomicU64::new(0),
+                trash_fails: std::sync::atomic::AtomicBool::new(trash_fails),
+            })
+        }
+        fn created_ids(&self) -> Vec<String> {
+            self.created_ids.lock().unwrap().clone()
+        }
+    }
+    #[async_trait::async_trait]
+    impl RemoteStore for MismatchStore {
+        async fn create(
+            &self,
+            _parent_id: &str,
+            name: &str,
+            mime: &str,
+            _body: UploadBody,
+            app_properties: HashMap<String, String>,
+        ) -> anyhow::Result<RemoteEntry> {
+            let id = format!("mm-{}", self.next_id.fetch_add(1, Ordering::SeqCst));
+            self.created_ids.lock().unwrap().push(id.clone());
+            // A deliberately wrong md5 (never matches the local md5 of any body).
+            Ok(RemoteEntry {
+                id,
+                name: name.to_string(),
+                parents: vec![],
+                size: Some(0),
+                md5: Some([0xABu8; 16]),
+                mime_type: mime.to_string(),
+                modified_time: 0,
+                trashed: false,
+                app_properties,
+            })
+        }
+        async fn trash(&self, _file_id: &str) -> anyhow::Result<()> {
+            self.trash_calls.fetch_add(1, Ordering::SeqCst);
+            if self.trash_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("MismatchStore: forced trash failure")
+            }
+            Ok(())
+        }
+        async fn ensure_folder(&self, _p: &str, _n: &str) -> anyhow::Result<RemoteEntry> {
+            anyhow::bail!("MismatchStore: ensure_folder must not be called")
+        }
+        async fn list_folder(&self, _f: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+            anyhow::bail!("MismatchStore: list_folder must not be called")
+        }
+        async fn update(
+            &self,
+            _f: &str,
+            _b: UploadBody,
+            _a: HashMap<String, String>,
+        ) -> anyhow::Result<RemoteEntry> {
+            anyhow::bail!("MismatchStore: update must not be called")
+        }
+        async fn resumable_session(
+            &self,
+            _k: ResumableKind,
+            _m: &str,
+            _s: u64,
+        ) -> anyhow::Result<ResumableSession> {
+            anyhow::bail!("MismatchStore: resumable_session must not be called")
+        }
+        async fn resume_chunk(
+            &self,
+            _s: &ResumableSession,
+            _o: u64,
+            _c: Bytes,
+        ) -> anyhow::Result<ResumeProgress> {
+            anyhow::bail!("MismatchStore: resume_chunk must not be called")
+        }
+        async fn metadata(&self, _f: &str) -> anyhow::Result<RemoteEntry> {
+            anyhow::bail!("MismatchStore: metadata must not be called")
+        }
+        async fn download(&self, _f: &str) -> anyhow::Result<DownloadStream> {
+            anyhow::bail!("MismatchStore: download must not be called")
+        }
+        async fn find_by_op_uuid(&self, _p: &str, _u: &str) -> anyhow::Result<Option<RemoteEntry>> {
+            anyhow::bail!("MismatchStore: find_by_op_uuid must not be called")
+        }
+        async fn about(&self) -> anyhow::Result<AboutInfo> {
+            anyhow::bail!("MismatchStore: about must not be called")
+        }
+    }
+
+    /// Build an executor over `store` + the harness's state/pacer/clock.
+    fn exec_with_store(h: &Harness, store: Arc<dyn RemoteStore>) -> DefaultExecutor {
+        DefaultExecutor::with_clock(
+            ExecutorDeps {
+                remote: store,
+                state: h.state.clone(),
+                pacer: h.pacer.clone(),
+                crypto: None,
+                vss: None,
+                network: None,
+            },
+            h.clock.clone(),
+        )
+    }
+
+    /// R2-P1-3 (DESIGN s5.4 lines 498-500): three CONSECUTIVE checksum
+    /// mismatches on the same file mark its `file_state` row Corrupt and stop
+    /// retrying. The first two mismatches leave the file retryable (no row /
+    /// not Corrupt); the 3rd flips it to Corrupt with the live (size, mtime)
+    /// stamped, and the counter resets so a later edit gets a fresh budget.
+    #[tokio::test]
+    async fn three_consecutive_checksum_mismatches_mark_corrupt() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("corrupt-me.bin", b"deterministic corrupt content");
+        // trash succeeds (so each attempt's create object is cleanly removed and
+        // the op is dropped -> each cycle is a fresh CREATE attempt against the
+        // same path; the counter is what persists).
+        let store = MismatchStore::new(false);
+        let exec = exec_with_store(&h, store.clone());
+
+        // Attempts 1 and 2: a mismatch each, but NOT yet corrupt.
+        for attempt in 1..=2u32 {
+            let out = exec
+                .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+                .await
+                .unwrap();
+            assert!(
+                matches!(
+                    out[0],
+                    OpOutcome::Failed {
+                        code: ErrorCode::DriveChecksumMismatch,
+                        ..
+                    }
+                ),
+                "attempt {attempt} must surface a checksum mismatch; got {:?}",
+                out[0]
+            );
+            let row = h.state.get_file_state(h.source.id, &rel).await.unwrap();
+            assert!(
+                row.is_none() || row.unwrap().status != FileStateStatus::Corrupt,
+                "below the threshold the file must NOT yet be Corrupt (attempt {attempt})"
+            );
+        }
+
+        // Attempt 3: the 3rd consecutive mismatch marks the file Corrupt.
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out[0],
+                OpOutcome::Failed {
+                    code: ErrorCode::DriveChecksumMismatch,
+                    ..
+                }
+            ),
+            "got {:?}",
+            out[0]
+        );
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("a Corrupt file_state row is written on the 3rd mismatch");
+        assert_eq!(
+            row.status,
+            FileStateStatus::Corrupt,
+            "3 consecutive mismatches must mark the file_state status=corrupt (DESIGN s5.4)"
+        );
+        // The row is stamped with the LIVE (size, mtime) so the FastPath scanner
+        // treats it as unchanged and STOPS re-emitting it (the file is the same
+        // size we wrote).
+        assert_eq!(
+            row.size, size,
+            "the Corrupt row carries the live file size so the scanner stops retrying"
+        );
+
+        // The counter was reset (a later user edit gets a fresh budget).
+        let n = h
+            .state
+            .bump_checksum_mismatch_count(h.source.id, &rel)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "the consecutive-mismatch counter resets after the corrupt transition"
+        );
+    }
+
+    /// R2-P1-3: a SUCCESSFUL upload breaks the consecutive-mismatch streak (the
+    /// counter resets), so a mismatch -> success -> mismatch does NOT accumulate
+    /// toward the corrupt threshold.
+    #[tokio::test]
+    async fn successful_upload_resets_mismatch_counter() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("recovers.bin", b"content that will recover");
+
+        // One mismatch (counter -> 1) via the always-mismatch store.
+        let bad = MismatchStore::new(false);
+        let exec_bad = exec_with_store(&h, bad);
+        let out = exec_bad
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(matches!(
+            out[0],
+            OpOutcome::Failed {
+                code: ErrorCode::DriveChecksumMismatch,
+                ..
+            }
+        ));
+
+        // Now a healthy store: the upload succeeds and must RESET the counter.
+        let exec_ok = h.executor();
+        let out = exec_ok
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
+
+        // The counter is back to 1 on the next bump (was cleared by success),
+        // proving the streak did not carry the earlier mismatch forward.
+        let n = h
+            .state
+            .bump_checksum_mismatch_count(h.source.id, &rel)
+            .await
+            .unwrap();
+        assert_eq!(
+            n, 1,
+            "a successful upload must reset the consecutive counter"
+        );
+    }
+
+    /// R2-P1-1: when a corrupt CREATE object's trash FAILS, the executor keeps
+    /// the pending op (persisting the corrupt `file_id`) instead of dropping it
+    /// and stranding a live corrupt object - and the reconcile pass RETRIES the
+    /// trash, dropping the op only once the object is confirmed gone.
+    #[tokio::test]
+    async fn corrupt_create_with_failed_trash_is_durably_cleaned_via_reconcile() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("stranded.bin", b"corrupt + trash fails");
+        let store = MismatchStore::new(true); // trash FAILS
+        let exec = exec_with_store(&h, store.clone());
+
+        // The create mismatches AND its trash fails -> the op must be KEPT.
+        let out = exec
+            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out[0],
+                OpOutcome::Failed {
+                    code: ErrorCode::DriveChecksumMismatch,
+                    ..
+                }
+            ),
+            "got {:?}",
+            out[0]
+        );
+        // One create + one (failed) trash so far.
+        assert_eq!(store.created_ids().len(), 1, "exactly one create attempt");
+        assert_eq!(
+            store.trash_calls.load(Ordering::SeqCst),
+            1,
+            "the post-upload trash was attempted once and failed"
+        );
+
+        // The op is KEPT (not dropped) with the corrupt file_id persisted, so a
+        // live corrupt object is not stranded without a recovery handle.
+        let pending = h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "a failed-trash corrupt create must KEEP its op for durable cleanup (R2-P1-1)"
+        );
+        let corrupt_id = pending[0]
+            .payload_json
+            .get("corrupt_file_id")
+            .and_then(|v| v.as_str())
+            .expect("the kept op persists the corrupt file_id");
+        assert_eq!(
+            corrupt_id,
+            store.created_ids()[0].as_str(),
+            "the persisted corrupt_file_id is the corrupt object's id"
+        );
+
+        // --- reconcile with the trash now SUCCEEDING -> the op is dropped ----
+        store.trash_fails.store(false, Ordering::SeqCst);
+        exec.reconcile(&h.source).await.unwrap();
+        assert_eq!(
+            store.trash_calls.load(Ordering::SeqCst),
+            2,
+            "reconcile retries the trash of the stranded corrupt object"
+        );
+        assert!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "once the corrupt object is confirmed trashed, the op is dropped"
+        );
+    }
+
+    /// R2-P1-1: if reconcile's re-trash STILL fails, the op is KEPT for the next
+    /// cycle (never dropped while the corrupt object may be live).
+    #[tokio::test]
+    async fn corrupt_create_reconcile_keeps_op_when_retrash_fails_again() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("still-stranded.bin", b"corrupt + trash keeps failing");
+        let store = MismatchStore::new(true); // trash always FAILS
+        let exec = exec_with_store(&h, store.clone());
+
+        exec.execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .await
+            .unwrap();
+        assert_eq!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+
+        // Reconcile re-trashes, fails again -> op KEPT.
+        exec.reconcile(&h.source).await.unwrap();
+        assert_eq!(
+            store.trash_calls.load(Ordering::SeqCst),
+            2,
+            "reconcile attempted the re-trash"
+        );
+        assert_eq!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a still-failing re-trash must KEEP the op (never strand the corrupt object)"
+        );
     }
 
     // --- P1-4: predicted_sent_len must match the REAL crypto framing --------
@@ -5189,6 +6230,7 @@ mod tests {
         use tokio::io::AsyncReadExt;
 
         let h = harness().await;
+        let source = h.encrypted_source();
         let source_key = driven_crypto::key::SourceKey::generate();
         let suite = Arc::new(DrivenCryptoSuite::new(source_key.clone()));
         let exec = h.executor_with_crypto(Some(suite));
@@ -5199,7 +6241,7 @@ mod tests {
             .collect();
         let (rel, size) = h.write_file("big-secret.bin", &plaintext);
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
             .await
             .unwrap();
         assert!(
@@ -5275,6 +6317,7 @@ mod tests {
         use driven_crypto::DrivenCryptoSuite;
 
         let h = harness().await;
+        let source = h.encrypted_source();
         let source_key = driven_crypto::key::SourceKey::generate();
         let make_exec =
             || h.executor_with_crypto(Some(Arc::new(DrivenCryptoSuite::new(source_key.clone()))));
@@ -5285,7 +6328,7 @@ mod tests {
         // folders).
         let exec = make_exec();
         let out = exec
-            .execute(&h.source, &h.upload_plan(&rel, size), &noop_progress)
+            .execute(&source, &h.upload_plan(&rel, size), &noop_progress)
             .await
             .unwrap();
         assert!(matches!(out[0], OpOutcome::Done { .. }));
@@ -5328,7 +6371,7 @@ mod tests {
         // Phase 2: reconcile with a fresh executor. It must find the orphan
         // under the NESTED encrypted parent (not the root) and adopt it.
         let exec2 = make_exec();
-        exec2.reconcile(&h.source).await.unwrap();
+        exec2.reconcile(&source).await.unwrap();
 
         // The SAME object was adopted: still exactly one object in the leaf
         // folder, file_state restored Synced with that id, op drained.

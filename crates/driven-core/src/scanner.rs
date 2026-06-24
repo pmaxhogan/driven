@@ -684,6 +684,20 @@ mod tests {
         ) -> anyhow::Result<()> {
             unimplemented!()
         }
+        async fn bump_checksum_mismatch_count(
+            &self,
+            _source: SourceId,
+            _path: &RelativePath,
+        ) -> anyhow::Result<u32> {
+            unimplemented!("not used by scanner tests")
+        }
+        async fn clear_checksum_mismatch_count(
+            &self,
+            _source: SourceId,
+            _path: &RelativePath,
+        ) -> anyhow::Result<()> {
+            unimplemented!("not used by scanner tests")
+        }
         async fn mark_excluded_orphans(
             &self,
             _source: SourceId,

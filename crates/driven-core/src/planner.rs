@@ -200,6 +200,21 @@ mod tests {
             unimplemented!()
         }
 
+        async fn bump_checksum_mismatch_count(
+            &self,
+            _source: SourceId,
+            _path: &RelativePath,
+        ) -> Result<u32> {
+            unimplemented!("not used by planner tests")
+        }
+        async fn clear_checksum_mismatch_count(
+            &self,
+            _source: SourceId,
+            _path: &RelativePath,
+        ) -> Result<()> {
+            unimplemented!("not used by planner tests")
+        }
+
         // --- everything below is untouched by plan(); test-only stubs. -------
 
         async fn list_accounts(&self) -> Result<Vec<AccountRow>> {

@@ -371,6 +371,30 @@ pub trait StateRepo: Send + Sync {
     /// Deletes a `file_state` row by primary key.
     async fn delete_file_state(&self, source: SourceId, path: &RelativePath) -> Result<()>;
 
+    /// R2-P1-3 (DESIGN s5.4): increment the CONSECUTIVE checksum-mismatch
+    /// counter for `(source, path)` by one and return the NEW count. After the
+    /// 3rd consecutive mismatch the executor marks the file
+    /// [`FileStateStatus::Corrupt`](crate::types::FileStateStatus) and stops
+    /// retrying it (DESIGN: "Three consecutive mismatches on the same file ->
+    /// mark status='corrupt', log, surface to user"). Persisted in its own
+    /// `file_checksum_mismatch` table so the count survives the per-attempt
+    /// `pending_ops` lifecycle.
+    async fn bump_checksum_mismatch_count(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+    ) -> Result<u32>;
+
+    /// R2-P1-3: reset the CONSECUTIVE checksum-mismatch counter for
+    /// `(source, path)` (the streak is broken). Called on any SUCCESSFUL upload
+    /// and once the corrupt threshold has been recorded (so a later user edit
+    /// gets a fresh retry budget). A missing row is an idempotent no-op.
+    async fn clear_checksum_mismatch_count(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+    ) -> Result<()>;
+
     /// Marks the given `(source, relative_path)` rows `status =
     /// 'excluded_orphan'` (DESIGN s5.5), transactionally, returning the number
     /// of rows updated.

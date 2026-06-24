@@ -519,6 +519,16 @@ pub enum OrchestratorEvent {
         /// The network event.
         event: crate::network::NetworkEvent,
     },
+    /// An account's refresh token returned `invalid_grant`: the account was
+    /// moved to [`AccountState::NeedsReauth`] and its sync cycle stopped (V-F,
+    /// DESIGN s5.4 "400 invalidGrant / 401 invalidCredentials -> mark account
+    /// `needs_reauth`, stop the orchestrator for this account, OS notify"). The
+    /// app shell surfaces a reauth prompt + OS notification on this event
+    /// (`account:needs_reauth`).
+    AccountNeedsReauth {
+        /// The account that needs re-consent.
+        account_id: AccountId,
+    },
 }
 
 // -----------------------------------------------------------------------------

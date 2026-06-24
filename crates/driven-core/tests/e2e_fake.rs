@@ -1198,7 +1198,13 @@ async fn encryption_on_round_trip_bytes_match() {
     // `header || finalize_last(ciphertext)`.
     let plaintext = b"the quick brown fox encrypts over the lazy dog".to_vec();
     write_file(src_dir.path(), "secret.txt", &plaintext);
-    let src = source_in(account, src_dir.path(), &folder);
+    // M5 per-source crypto FAILS CLOSED on `encryption_enabled`: a wired suite
+    // only encrypts when the SourceRow says the source is encrypted. Flip it on
+    // so the executor takes the ciphertext path this test asserts.
+    let src = SourceRow {
+        encryption_enabled: true,
+        ..source_in(account, src_dir.path(), &folder)
+    };
     state.upsert_source(&src).await.unwrap();
 
     // Wire the executor with a real per-source crypto suite.
@@ -1214,9 +1220,11 @@ async fn encryption_on_round_trip_bytes_match() {
             // M5: ExecutorDeps.crypto is a per-source CryptoProvider; wrap the
             // single test suite (one suite for every source) to preserve the
             // pre-M5 executor-wide encryption behaviour this test asserts.
-            crypto: Some(Arc::new(driven_core::crypto_provider::SingleSuiteProvider::new(
-                suite,
-            )) as Arc<dyn driven_core::crypto_provider::CryptoProvider>),
+            crypto: Some(
+                Arc::new(driven_core::crypto_provider::SingleSuiteProvider::new(
+                    suite,
+                )) as Arc<dyn driven_core::crypto_provider::CryptoProvider>,
+            ),
             vss: None,
             network: None,
         },
@@ -1298,7 +1306,12 @@ async fn encryption_nested_remote_is_ciphertext_and_restores() {
         .map(|i| (i % 247) as u8)
         .collect();
     write_file(src_dir.path(), rel_str, &plaintext);
-    let src = source_in(account, src_dir.path(), &folder);
+    // M5 per-source crypto FAILS CLOSED on `encryption_enabled` - flip it on so
+    // the wired suite actually encrypts (else the executor uploads plaintext).
+    let src = SourceRow {
+        encryption_enabled: true,
+        ..source_in(account, src_dir.path(), &folder)
+    };
     state.upsert_source(&src).await.unwrap();
 
     let source_key = SourceKey::generate();
@@ -1313,9 +1326,11 @@ async fn encryption_nested_remote_is_ciphertext_and_restores() {
             // M5: ExecutorDeps.crypto is a per-source CryptoProvider; wrap the
             // single test suite (one suite for every source) to preserve the
             // pre-M5 executor-wide encryption behaviour this test asserts.
-            crypto: Some(Arc::new(driven_core::crypto_provider::SingleSuiteProvider::new(
-                suite,
-            )) as Arc<dyn driven_core::crypto_provider::CryptoProvider>),
+            crypto: Some(
+                Arc::new(driven_core::crypto_provider::SingleSuiteProvider::new(
+                    suite,
+                )) as Arc<dyn driven_core::crypto_provider::CryptoProvider>,
+            ),
             vss: None,
             network: None,
         },

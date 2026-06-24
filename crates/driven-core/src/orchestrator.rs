@@ -884,6 +884,49 @@ impl SyncOrchestrator {
         }
     }
 
+    /// V-F (DESIGN s5.4): if ANY op failed with [`ErrorCode::AuthInvalidGrant`]
+    /// (the refresh token returned `invalid_grant`), move the account to
+    /// [`AccountState::NeedsReauth`], emit the `account:needs_reauth`
+    /// [`OrchestratorEvent::AccountNeedsReauth`] (the app shell turns it into a
+    /// reauth prompt + OS notification), and signal the caller to STOP this
+    /// account's cycle - there is no point pushing more work through a dead
+    /// credential. Returns `true` when reauth was triggered.
+    ///
+    /// The state write is best-effort logged (a transient DB hiccup must not
+    /// abort the cycle), but the in-memory event + the "stop the cycle" signal
+    /// fire regardless, so a credential failure is always surfaced and never
+    /// hammered.
+    async fn handle_auth_failure(&self, outcomes: &[OpOutcome]) -> bool {
+        let invalid_grant = outcomes.iter().any(|o| {
+            matches!(
+                o,
+                OpOutcome::Failed {
+                    code: crate::types::ErrorCode::AuthInvalidGrant,
+                    ..
+                }
+            )
+        });
+        if !invalid_grant {
+            return false;
+        }
+        tracing::warn!(
+            target: TARGET,
+            account_id = %self.account_id,
+            "auth.invalid_grant: marking account needs_reauth and stopping its cycle (DESIGN s5.4)"
+        );
+        if let Err(err) = self
+            .state
+            .mark_account_state(self.account_id, crate::types::AccountState::NeedsReauth)
+            .await
+        {
+            tracing::warn!(target: TARGET, account_id = %self.account_id, %err, "failed to persist needs_reauth account state");
+        }
+        let _ = self.events.send(OrchestratorEvent::AccountNeedsReauth {
+            account_id: self.account_id,
+        });
+        true
+    }
+
     /// Runs the full scan -> plan -> execute -> verify pipeline for one source
     /// (SPEC s5 `run_one_source`).
     ///
@@ -892,7 +935,12 @@ impl SyncOrchestrator {
     /// transitions through [`OrchestratorState::Verifying`] for the tray.
     /// On `dry_run` the pipeline stops after planning and issues no remote
     /// call (SPEC s5).
-    async fn run_one_source(&self, source: &SourceRow, deep_verify: bool) -> anyhow::Result<()> {
+    ///
+    /// Returns `Ok(true)` to signal the caller to STOP this account's cycle:
+    /// the only such case is V-F (`auth.invalid_grant` -> the account was moved
+    /// to `needs_reauth`), where pushing further sources through a dead
+    /// credential is pointless (DESIGN s5.4). `Ok(false)` on the normal path.
+    async fn run_one_source(&self, source: &SourceRow, deep_verify: bool) -> anyhow::Result<bool> {
         let mode = if deep_verify {
             ScanMode::DeepVerify
         } else {
@@ -963,7 +1011,7 @@ impl SyncOrchestrator {
                 bytes = summary.bytes,
                 "dry-run: plan computed, skipping execution"
             );
-            return Ok(());
+            return Ok(false);
         }
 
         self.transition(OrchestratorState::Executing {
@@ -987,6 +1035,18 @@ impl SyncOrchestrator {
         // Emit a final progress snapshot so a consumer that missed the
         // throttled ticks still sees the completed counts.
         self.emit_progress(source.id, exec_progress_from(&summary, &outcomes));
+
+        // V-F (DESIGN s5.4): an `auth.invalid_grant` op failure means this
+        // account's refresh token is revoked. Mark the account `needs_reauth`,
+        // emit `account:needs_reauth`, and STOP the account's cycle - pushing
+        // further sources through a dead credential is pointless and only
+        // produces a storm of identical auth errors. Checked BEFORE the
+        // timestamp-advance + deep-verify transition: a credential failure must
+        // never advance scan/verify timestamps (the source must stay due so it
+        // retries once the user re-consents).
+        if self.handle_auth_failure(&outcomes).await {
+            return Ok(true);
+        }
 
         // Deep-verify (DESIGN s3.3): the verify *mode* already re-hashed via
         // the DeepVerify scan above and any mismatch was re-uploaded by the
@@ -1024,7 +1084,7 @@ impl SyncOrchestrator {
                 .filter(|o| matches!(o, OpOutcome::Failed { .. }))
                 .count();
             tracing::warn!(target: TARGET, source_id = %source.id, failed, "deferring scan/verify timestamp advance: failed op(s) keep the source due so the next cycle retries them");
-            return Ok(());
+            return Ok(false);
         }
         let now = self.clock.now_ms();
         let deep_verify_at = if deep_verify { Some(now) } else { None };
@@ -1039,7 +1099,7 @@ impl SyncOrchestrator {
             tracing::warn!(target: TARGET, account_id = %self.account_id, %err, "failed to persist account last_synced_at");
         }
 
-        Ok(())
+        Ok(false)
     }
 
     /// Runs exactly one orchestrator cycle (SPEC s5 one loop iteration).
@@ -1111,13 +1171,23 @@ impl SyncOrchestrator {
         let loop_result: anyhow::Result<()> = async {
             for source in &sources {
                 let deep_verify = self.deep_verify_due(source);
-                self.run_one_source(source, deep_verify).await?;
+                let stop_account = self.run_one_source(source, deep_verify).await?;
                 // P1-2 (M3.5 codex): durably record any shadow copy this source
                 // just created BEFORE moving to the next source, so a crash
                 // strands at most one source's snapshot rather than every
                 // snapshot created so far this cycle. `record_vss_orphans` is a
                 // no-op when no provider is attached or none are held.
                 self.record_vss_orphans().await;
+
+                // V-F (DESIGN s5.4): an `auth.invalid_grant` moved the account
+                // to needs_reauth. STOP the account's cycle at this safe
+                // boundary (current source done + recorded) rather than driving
+                // the remaining sources through a dead credential. The VSS
+                // snapshots are released by the post-loop `end_vss_cycle`.
+                if stop_account {
+                    tracing::info!(target: TARGET, account_id = %self.account_id, "needs_reauth: stopping the account's cycle at the source boundary");
+                    break;
+                }
 
                 // P2-E: if a manual pause was signalled mid-cycle, stop AT THIS
                 // safe boundary (current op done + recorded, before the next
@@ -1549,6 +1619,10 @@ mod tests {
         /// `DriveChecksumMismatch`) instead of `Done` - drives the recheck2
         /// "failed op defers the timestamp advance + records activity" test.
         fail_ops: AtomicU64,
+        /// When `true`, the FIRST op of each `execute` returns
+        /// `OpOutcome::Failed { AuthInvalidGrant }` - drives the V-F
+        /// needs_reauth transition test.
+        auth_fail: std::sync::atomic::AtomicBool,
         /// When `true`, `execute` returns `Err` (a hard error that the cycle's
         /// `?` propagates) - drives the M3.5 "VSS released even on a mid-loop
         /// error" test.
@@ -1573,6 +1647,7 @@ mod tests {
                 ..ExecProgress::zero()
             });
             let fail = self.fail_ops.load(Ordering::SeqCst) > 0;
+            let auth_fail = self.auth_fail.load(Ordering::SeqCst);
             let outcomes = plan
                 .ops
                 .iter()
@@ -1583,7 +1658,12 @@ mod tests {
                         }
                         crate::types::Op::Trash { relative_path, .. } => relative_path.clone(),
                     };
-                    if fail {
+                    if auth_fail {
+                        OpOutcome::Failed {
+                            relative_path,
+                            code: crate::types::ErrorCode::AuthInvalidGrant,
+                        }
+                    } else if fail {
                         OpOutcome::Failed {
                             relative_path,
                             code: crate::types::ErrorCode::DriveChecksumMismatch,
@@ -1625,6 +1705,8 @@ mod tests {
         activity: StdMutex<Vec<NewActivity>>,
         /// Records every `mark_account_synced` for the P2-7 assertion.
         account_synced: StdMutex<Vec<(AccountId, UnixMs)>>,
+        /// Records every `mark_account_state` for the V-F needs_reauth test.
+        account_state: StdMutex<Vec<(AccountId, AccountState)>>,
         /// In-memory settings k/v (used by the M3.5 VSS orphan-registry tests).
         settings: StdMutex<HashMap<String, serde_json::Value>>,
     }
@@ -1636,8 +1718,14 @@ mod tests {
                 files: StdMutex::new(HashMap::new()),
                 activity: StdMutex::new(Vec::new()),
                 account_synced: StdMutex::new(Vec::new()),
+                account_state: StdMutex::new(Vec::new()),
                 settings: StdMutex::new(HashMap::new()),
             }
+        }
+
+        /// Snapshot the recorded `mark_account_state` calls (V-F test).
+        fn account_state_changes(&self) -> Vec<(AccountId, AccountState)> {
+            self.account_state.lock().unwrap().clone()
         }
 
         /// Snapshot the current source rows (post-persist) for the P2-7 test.
@@ -1711,6 +1799,23 @@ mod tests {
             Ok(())
         }
 
+        async fn bump_checksum_mismatch_count(
+            &self,
+            _source: SourceId,
+            _path: &RelativePath,
+        ) -> anyhow::Result<u32> {
+            // The orchestrator never drives the executor's checksum path; the
+            // executor's own tests exercise the counter against SqliteStateRepo.
+            Ok(0)
+        }
+        async fn clear_checksum_mismatch_count(
+            &self,
+            _source: SourceId,
+            _path: &RelativePath,
+        ) -> anyhow::Result<()> {
+            Ok(())
+        }
+
         async fn list_accounts(&self) -> anyhow::Result<Vec<AccountRow>> {
             unimplemented!()
         }
@@ -1719,10 +1824,11 @@ mod tests {
         }
         async fn mark_account_state(
             &self,
-            _id: AccountId,
-            _state: AccountState,
+            id: AccountId,
+            state: AccountState,
         ) -> anyhow::Result<()> {
-            unimplemented!()
+            self.account_state.lock().unwrap().push((id, state));
+            Ok(())
         }
         async fn mark_account_synced(&self, id: AccountId, at: UnixMs) -> anyhow::Result<()> {
             self.account_synced.lock().unwrap().push((id, at));
@@ -2803,6 +2909,96 @@ mod tests {
                 .any(|r| matches!(r.level, crate::state::ActivityLevel::Error)
                     && r.event_type == expected_code),
             "a durable activity Error row records the failed op: {rows:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn auth_invalid_grant_marks_needs_reauth_emits_event_and_stops_cycle() {
+        // V-F (DESIGN s5.4): an op failing with `auth.invalid_grant` must move
+        // the account to NeedsReauth, emit the `account:needs_reauth` event, and
+        // STOP the account's cycle - the remaining sources must NOT be executed
+        // (no point pushing through a dead credential), and the failed source's
+        // scan/verify timestamps must NOT advance (it stays due so it retries
+        // once the user re-consents).
+        let account = AccountId::new_v4();
+        let dir_a = tempfile::tempdir().unwrap();
+        let dir_b = tempfile::tempdir().unwrap();
+        // A file in each source so the scan yields an op the executor can fail.
+        std::fs::write(dir_a.path().join("a.bin"), b"src a bytes").unwrap();
+        std::fs::write(dir_b.path().join("b.bin"), b"src b bytes").unwrap();
+        let mut src_a = source_in(account, dir_a.path());
+        src_a.last_deep_verify_at = None;
+        src_a.last_full_scan_at = None;
+        let src_a_id = src_a.id;
+        let mut src_b = source_in(account, dir_b.path());
+        src_b.last_deep_verify_at = None;
+        src_b.last_full_scan_at = None;
+
+        let exec = Arc::new(RecordingExecutor::default());
+        exec.auth_fail.store(true, Ordering::SeqCst);
+        let state = Arc::new(FakeState::with_sources(vec![src_a.clone(), src_b.clone()]));
+        let clock = Arc::new(FakeClock::new());
+        clock.advance(std::time::Duration::from_millis(5_000));
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec.clone(),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock.clone(),
+            OrchestratorConfig::default(),
+        );
+
+        // Subscribe BEFORE the cycle so we capture the emitted event.
+        let mut events = orch.subscribe();
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        // The account was moved to NeedsReauth.
+        assert!(
+            state
+                .account_state_changes()
+                .iter()
+                .any(|(id, st)| *id == account && *st == AccountState::NeedsReauth),
+            "auth.invalid_grant must mark the account needs_reauth; got {:?}",
+            state.account_state_changes()
+        );
+
+        // The `account:needs_reauth` event was broadcast.
+        let mut saw_event = false;
+        while let Ok(ev) = events.try_recv() {
+            if let OrchestratorEvent::AccountNeedsReauth { account_id } = ev {
+                assert_eq!(account_id, account);
+                saw_event = true;
+            }
+        }
+        assert!(
+            saw_event,
+            "an OrchestratorEvent::AccountNeedsReauth must be emitted"
+        );
+
+        // The cycle STOPPED at the first source: the SECOND source was never
+        // executed (exactly ONE execute call across the two sources).
+        assert_eq!(
+            exec.executes.load(Ordering::SeqCst),
+            1,
+            "the account's cycle must stop after the auth failure (the 2nd source is not executed)"
+        );
+
+        // The first source's timestamps were NOT advanced (it stays due so it
+        // retries after re-consent).
+        let persisted = state
+            .sources_snapshot()
+            .into_iter()
+            .find(|s| s.id == src_a_id)
+            .expect("source still present");
+        assert_eq!(
+            persisted.last_full_scan_at, None,
+            "an auth failure must NOT advance the source's scan timestamp"
+        );
+        assert!(
+            state.account_synced.lock().unwrap().is_empty(),
+            "an auth failure must NOT stamp account last_synced_at"
         );
     }
 

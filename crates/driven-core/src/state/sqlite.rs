@@ -832,6 +832,59 @@ impl StateRepo for SqliteStateRepo {
         Ok(())
     }
 
+    async fn bump_checksum_mismatch_count(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+    ) -> Result<u32> {
+        let source_str = source.to_string();
+        let path_str = path.as_str().to_string();
+        // One transaction: upsert-increment, then read the new count back. Two
+        // statements (no `RETURNING`) so the query shapes match the rest of this
+        // module's proven patterns; the transaction makes the RMW atomic against
+        // any concurrent bump. Runtime `sqlx::query` / `sqlx::query_as` (NOT the
+        // compile-checked `query!` macro) so the new table needs NO `.sqlx` cache
+        // regeneration - only the additive 0003 migration.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO file_checksum_mismatch (source_id, relative_path, count) \
+             VALUES (?1, ?2, 1) \
+             ON CONFLICT(source_id, relative_path) \
+             DO UPDATE SET count = count + 1",
+        )
+        .bind(source_str.as_str())
+        .bind(path_str.as_str())
+        .execute(&mut *tx)
+        .await?;
+        let (count,): (i64,) = sqlx::query_as(
+            "SELECT count FROM file_checksum_mismatch \
+             WHERE source_id = ?1 AND relative_path = ?2",
+        )
+        .bind(source_str.as_str())
+        .bind(path_str.as_str())
+        .fetch_one(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(u32::try_from(count.max(0)).unwrap_or(u32::MAX))
+    }
+
+    async fn clear_checksum_mismatch_count(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+    ) -> Result<()> {
+        let source_str = source.to_string();
+        let path_str = path.as_str().to_string();
+        sqlx::query(
+            "DELETE FROM file_checksum_mismatch WHERE source_id = ?1 AND relative_path = ?2",
+        )
+        .bind(source_str.as_str())
+        .bind(path_str.as_str())
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
     async fn mark_excluded_orphans(&self, source: SourceId, paths: &[RelativePath]) -> Result<u64> {
         if paths.is_empty() {
             return Ok(0);
