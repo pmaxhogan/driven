@@ -709,9 +709,12 @@ fn spawn_watcher_bridge(
 
 /// Forward one orchestrator's [`OrchestratorEvent`] broadcast (`rx`, from its
 /// `subscribe()`) to the tray + the SPEC s11.7 webview events. A `StateChanged`
-/// drives `tray::apply_state` and emits `sync:status_changed`; a `Lagged`
-/// receiver re-reads nothing (the next event re-syncs the tray). The bridge
-/// ends when the broadcast closes (orchestrator dropped).
+/// drives `tray::apply_state` and emits `sync:status_changed`; an
+/// `ActivityWritten` re-emits `activity:new` for the live tail; a `Lagged`
+/// receiver emits `activity:lagged` so the webview reconciles the dropped rows
+/// from the durable `activity_log` (M7-P1-1), and the next `StateChanged`
+/// re-syncs the tray. The bridge ends when the broadcast closes (orchestrator
+/// dropped).
 fn spawn_event_bridge(
     app: &AppHandle,
     account_id: AccountId,
@@ -743,8 +746,12 @@ fn spawn_event_bridge(
                 }
                 event = rx.recv() => event,
             };
-            match event {
-                Ok(OrchestratorEvent::StateChanged { state }) => {
+            // M7-P1-1: route every received event (or recv error) through the
+            // pure `classify_bridge_event` decision so the side-effecting arms
+            // below stay a thin dispatch and the Lagged-reconcile decision is
+            // unit-testable without an `AppHandle`.
+            match classify_bridge_event(event) {
+                BridgeAction::SyncStatus { state } => {
                     // Reflect the new state on the tray icon (SPEC s12).
                     tray::apply_state(&app, account_id, state.clone());
                     // Push a global-status refresh to the webview (SPEC s11.7).
@@ -763,7 +770,7 @@ fn spawn_event_bridge(
                         );
                     }
                 }
-                Ok(OrchestratorEvent::AccountNeedsReauth { account_id: acct }) => {
+                BridgeAction::NeedsReauth { account_id: acct } => {
                     // V-F: a refresh token was revoked. Surface the re-consent
                     // banner to the webview (SPEC s11.7 `account:needs_reauth`)
                     // and raise the OS notification (DESIGN s8.1) - the
@@ -781,7 +788,7 @@ fn spawn_event_bridge(
                     }
                     tray::notify_needs_reauth(&app, &email);
                 }
-                Ok(OrchestratorEvent::ActivityWritten { entry }) => {
+                BridgeAction::ActivityNew { entry } => {
                     // M7: forward every durable activity row to the webview as
                     // `activity:new` (SPEC s11.7) so the Activity dashboard's
                     // live tail updates within 500ms - event-driven, no polling.
@@ -796,21 +803,37 @@ fn spawn_event_bridge(
                         );
                     }
                 }
-                Ok(_) => {
+                BridgeAction::ActivityReconcile { skipped } => {
+                    // M7-P1-1: the bounded broadcast dropped `skipped` events, so
+                    // the dropped `activity:new` rows are gone from this stream.
+                    // Rather than silently lose them from the live tail (DESIGN
+                    // s8.3 last-1000 tail; ROADMAP M7 <500ms), emit a typed gap
+                    // signal so the webview store reconciles from the durable
+                    // `activity_log` (the source of truth) via a `query_activity`
+                    // page-0 re-fetch + dedup merge - no durable row is missed.
+                    // The StateChanged tray sync still re-syncs on the next event.
+                    tracing::debug!(
+                        target: TARGET,
+                        account_id = %account_id,
+                        skipped,
+                        "event bridge lagged; emitting activity:lagged reconcile signal"
+                    );
+                    if let Err(err) = events::emit_activity_lagged(&app, skipped) {
+                        tracing::debug!(
+                            target: TARGET,
+                            account_id = %account_id,
+                            %err,
+                            "emit activity:lagged failed"
+                        );
+                    }
+                }
+                BridgeAction::Ignore => {
                     // Progress / Power / Network events: not bridged to the
                     // webview in M5 (the progress DTO lands with a later
                     // milestone). The tray's coarse state is driven by
                     // StateChanged above.
                 }
-                Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
-                    tracing::debug!(
-                        target: TARGET,
-                        account_id = %account_id,
-                        skipped,
-                        "event bridge lagged; continuing from next event"
-                    );
-                }
-                Err(tokio::sync::broadcast::error::RecvError::Closed) => {
+                BridgeAction::Stop => {
                     tracing::debug!(
                         target: TARGET,
                         account_id = %account_id,
@@ -822,6 +845,52 @@ fn spawn_event_bridge(
             }
         }
     })
+}
+
+/// The decision the event bridge takes for one received [`OrchestratorEvent`]
+/// (or a broadcast recv error). Factored out of [`spawn_event_bridge`] as a pure
+/// value so the M7-P1-1 lag-reconcile decision (and every other arm) is
+/// unit-testable WITHOUT a Tauri `AppHandle` / spawned task.
+enum BridgeAction {
+    /// Apply the new state to the tray and emit `sync:status_changed`.
+    SyncStatus {
+        state: driven_core::types::OrchestratorState,
+    },
+    /// Emit `account:needs_reauth` + raise the OS notification.
+    NeedsReauth { account_id: AccountId },
+    /// Re-emit the durable activity row as `activity:new` (live tail).
+    ActivityNew {
+        entry: driven_core::types::ActivityEntry,
+    },
+    /// M7-P1-1: the broadcast lagged and dropped `skipped` events; emit
+    /// `activity:lagged` so the webview reconciles from the durable
+    /// `activity_log`. No durable row is lost.
+    ActivityReconcile { skipped: u64 },
+    /// A non-bridged event (progress / power / network); do nothing.
+    Ignore,
+    /// The broadcast closed (orchestrator dropped); end the bridge.
+    Stop,
+}
+
+/// Pure classification of a broadcast `recv()` result into the [`BridgeAction`]
+/// the bridge should take (M7-P1-1). Keeping this side-effect-free lets the
+/// Lagged -> reconcile mapping be asserted in a unit test (see this module's
+/// `tests`) rather than only through a live Tauri runtime.
+fn classify_bridge_event(
+    event: Result<OrchestratorEvent, tokio::sync::broadcast::error::RecvError>,
+) -> BridgeAction {
+    match event {
+        Ok(OrchestratorEvent::StateChanged { state }) => BridgeAction::SyncStatus { state },
+        Ok(OrchestratorEvent::AccountNeedsReauth { account_id }) => {
+            BridgeAction::NeedsReauth { account_id }
+        }
+        Ok(OrchestratorEvent::ActivityWritten { entry }) => BridgeAction::ActivityNew { entry },
+        Ok(_) => BridgeAction::Ignore,
+        Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
+            BridgeAction::ActivityReconcile { skipped }
+        }
+        Err(tokio::sync::broadcast::error::RecvError::Closed) => BridgeAction::Stop,
+    }
 }
 
 /// The per-event `sync:status_changed` payload bridged from one orchestrator's
@@ -836,9 +905,93 @@ struct AccountSyncStatusEvent {
 
 #[cfg(test)]
 mod tests {
+    use super::{classify_bridge_event, BridgeAction};
     use driven_core::orchestrator::OrchestratorConfig;
     use driven_core::state::sqlite::SqliteStateRepo;
     use driven_core::state::StateRepo;
+    use driven_core::types::{ActivityEntry, OrchestratorEvent};
+    use tokio::sync::broadcast::error::RecvError;
+
+    /// M7-P1-1: a broadcast `Lagged` MUST classify as an `ActivityReconcile`
+    /// (carrying the dropped count) so the bridge emits `activity:lagged` and the
+    /// webview reconciles the dropped rows from the durable `activity_log` -
+    /// never silently drops them from the live tail.
+    #[test]
+    fn lagged_classifies_as_activity_reconcile() {
+        match classify_bridge_event(Err(RecvError::Lagged(42))) {
+            BridgeAction::ActivityReconcile { skipped } => assert_eq!(skipped, 42),
+            other => panic!(
+                "Lagged must reconcile, got {:?}",
+                BridgeActionKind::of(&other)
+            ),
+        }
+    }
+
+    /// A normal `ActivityWritten` classifies as `ActivityNew` (the 500ms live
+    /// path), carrying the entry unchanged - so the typical path stays
+    /// event-driven and only the rare lag triggers a reconcile.
+    #[test]
+    fn activity_written_classifies_as_activity_new() {
+        let entry = ActivityEntry {
+            id: 7,
+            ts: 1000,
+            source_id: None,
+            level: driven_core::state::ActivityLevel::Info,
+            event_type: "upload_done".to_string(),
+            file_count: None,
+            bytes: None,
+            message: None,
+        };
+        match classify_bridge_event(Ok(OrchestratorEvent::ActivityWritten {
+            entry: entry.clone(),
+        })) {
+            BridgeAction::ActivityNew { entry: got } => assert_eq!(got, entry),
+            other => panic!(
+                "ActivityWritten must emit new, got {:?}",
+                BridgeActionKind::of(&other)
+            ),
+        }
+    }
+
+    /// A closed broadcast classifies as `Stop` so the bridge ends (no orphaned
+    /// task); a non-bridged event (`Power`) classifies as `Ignore`.
+    #[test]
+    fn closed_stops_and_unbridged_is_ignored() {
+        assert!(matches!(
+            classify_bridge_event(Err(RecvError::Closed)),
+            BridgeAction::Stop
+        ));
+        assert!(matches!(
+            classify_bridge_event(Ok(OrchestratorEvent::Power {
+                event: driven_core::types::PowerEvent::Resumed,
+            })),
+            BridgeAction::Ignore
+        ));
+    }
+
+    /// Test-only stringifier so a failing classification assertion prints which
+    /// variant it actually got (the `BridgeAction` payloads are not all `Debug`).
+    #[derive(Debug)]
+    enum BridgeActionKind {
+        SyncStatus,
+        NeedsReauth,
+        ActivityNew,
+        ActivityReconcile,
+        Ignore,
+        Stop,
+    }
+    impl BridgeActionKind {
+        fn of(a: &BridgeAction) -> Self {
+            match a {
+                BridgeAction::SyncStatus { .. } => Self::SyncStatus,
+                BridgeAction::NeedsReauth { .. } => Self::NeedsReauth,
+                BridgeAction::ActivityNew { .. } => Self::ActivityNew,
+                BridgeAction::ActivityReconcile { .. } => Self::ActivityReconcile,
+                BridgeAction::Ignore => Self::Ignore,
+                BridgeAction::Stop => Self::Stop,
+            }
+        }
+    }
 
     /// R1-P2-1: cold-start orchestrators must build their [`OrchestratorConfig`]
     /// from the PERSISTED SPEC s22 settings, not the hard defaults. `build_account`
