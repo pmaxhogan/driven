@@ -25,7 +25,7 @@ import type {
   PickedPath,
   ReauthSession,
   ReleaseDto,
-  RemoteEntryDto,
+  RemoteTreeDto,
   RestoreItem,
   RestoreJobId,
   RestoreJobStatus,
@@ -227,7 +227,7 @@ export function activitySummary(
 export function listRemoteTree(
   sourceId: string,
   prefix: string,
-): Promise<RemoteEntryDto[]> {
+): Promise<RemoteTreeDto> {
   return invoke("list_remote_tree", { sourceId, prefix });
 }
 
@@ -257,4 +257,12 @@ export function restoreFiles(
  * reconnected subscriber that missed the live `restore:progress` stream. */
 export function getRestoreJob(job: RestoreJobId): Promise<RestoreJobStatus> {
   return invoke("get_restore_job", { job });
+}
+
+/** Cancel a running restore job (SPEC s11.5; M8-P1-1). The backend stops the job
+ * between frames, DELETES any in-flight temp file (no partial left), and emits a
+ * terminal CANCELLED status on `restore:progress`. Idempotent: cancelling an
+ * unknown / already-finished job is a no-op. */
+export function cancelRestoreJob(job: RestoreJobId): Promise<void> {
+  return invoke("cancel_restore_job", { job });
 }

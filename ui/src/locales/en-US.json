@@ -273,6 +273,7 @@
       "tree": "No backed-up files in this folder yet.",
       "search": "No files match your search."
     },
+    "truncated": "Showing the first {count} items in this folder. Use search to find more.",
     "node": {
       "folder": "Folder",
       "select": "Select file to restore",
@@ -282,9 +283,12 @@
     "clearSelection": "Clear selection",
     "pickDestination": "Choose destination...",
     "start": "Restore selected",
+    "cancel": "Cancel restore",
+    "cancelling": "Cancelling...",
     "progress": {
       "running": "Restoring...",
       "done": "Restore complete",
+      "cancelled": "Restore cancelled",
       "summary": "{completed} of {total} done, {failed} failed",
       "current": "Restoring: {file}"
     },
@@ -292,7 +296,8 @@
       "pending": "Pending",
       "restoring": "Restoring",
       "done": "Done",
-      "failed": "Failed"
+      "failed": "Failed",
+      "cancelled": "Cancelled"
     }
   },
   "errors": {

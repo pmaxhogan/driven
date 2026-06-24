@@ -35,9 +35,15 @@ import { useRestoreStore } from "../stores/restore";
 import type {
   FileSearchHitDto,
   RemoteEntryDto,
+  RemoteTreeDto,
   RestoreJobStatus,
   SourceDto,
 } from "../ipc/types";
+
+/** Wrap entries as the RemoteTreeDto the backend now returns (M8-P2-1). */
+function tree(entries: RemoteEntryDto[], truncated = false): RemoteTreeDto {
+  return { entries, truncated };
+}
 
 function source(id: string, name: string): SourceDto {
   return {
@@ -98,7 +104,7 @@ describe("restore store", () => {
       if (cmd === "list_sources")
         return Promise.resolve([source("s1", "Documents")]);
       if (cmd === "list_remote_tree")
-        return Promise.resolve([folder("src"), file("a.txt")]);
+        return Promise.resolve(tree([folder("src"), file("a.txt")]));
       return Promise.resolve([]);
     });
 
@@ -127,10 +133,10 @@ describe("restore store", () => {
         return Promise.resolve([source("s1", "Documents")]);
       if (cmd === "list_remote_tree") {
         const prefix = (args as { prefix: string }).prefix;
-        if (prefix === "") return Promise.resolve([folder("src")]);
+        if (prefix === "") return Promise.resolve(tree([folder("src")]));
         if (prefix === "src")
-          return Promise.resolve([file("main.rs", "src")]);
-        return Promise.resolve([]);
+          return Promise.resolve(tree([file("main.rs", "src")]));
+        return Promise.resolve(tree([]));
       }
       return Promise.resolve([]);
     });
@@ -160,7 +166,7 @@ describe("restore store", () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources")
         return Promise.resolve([source("s1", "Documents")]);
-      if (cmd === "list_remote_tree") return Promise.resolve([]);
+      if (cmd === "list_remote_tree") return Promise.resolve(tree([]));
       if (cmd === "search_files") return Promise.resolve(hits);
       return Promise.resolve([]);
     });
@@ -186,7 +192,7 @@ describe("restore store", () => {
       if (cmd === "list_sources")
         return Promise.resolve([source("s1", "Documents")]);
       if (cmd === "list_remote_tree")
-        return Promise.resolve([file("a.txt"), file("b.txt")]);
+        return Promise.resolve(tree([file("a.txt"), file("b.txt")]));
       return Promise.resolve([]);
     });
     const store = useRestoreStore();
@@ -210,12 +216,35 @@ describe("restore store", () => {
   });
 
   it("restores selected files with a dialog token and accumulates progress to done", async () => {
+    // The seeded snapshot getRestoreJob returns right after start (before any
+    // live tick) - the reconcile path (M8-P2-4).
+    const seeded: RestoreJobStatus = {
+      jobId: "job-1",
+      totalFiles: 1,
+      completedFiles: 0,
+      failedFiles: 0,
+      totalBytes: 100,
+      bytesDone: 0,
+      currentFile: null,
+      done: false,
+      cancelled: false,
+      files: [
+        {
+          relativePath: "secret.bin",
+          state: "pending",
+          bytesDone: 0,
+          bytesTotal: 100,
+          errorCode: null,
+        },
+      ],
+    };
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources")
         return Promise.resolve([source("s1", "Documents")]);
       if (cmd === "list_remote_tree")
-        return Promise.resolve([file("secret.bin")]);
+        return Promise.resolve(tree([file("secret.bin")]));
       if (cmd === "restore_files") return Promise.resolve("job-1");
+      if (cmd === "get_restore_job") return Promise.resolve(seeded);
       return Promise.resolve([]);
     });
 
@@ -250,6 +279,7 @@ describe("restore store", () => {
       bytesDone: 50,
       currentFile: "secret.bin",
       done: false,
+      cancelled: false,
       files: [
         {
           relativePath: "secret.bin",
@@ -296,5 +326,135 @@ describe("restore store", () => {
     await store.subscribeProgress();
     store.unsubscribeProgress();
     expect(unlistenMock).toHaveBeenCalledTimes(1);
+  });
+
+  it("reconciles the active job by id on (re)subscription after a remount (M8-P2-4)", async () => {
+    // Simulate: a restore was started (activeJobId set), then the view remounts
+    // and re-subscribes. subscribeProgress must fetch getRestoreJob(jobId) so the
+    // current state is recovered even if a terminal event was missed.
+    const terminal: RestoreJobStatus = {
+      jobId: "job-9",
+      totalFiles: 1,
+      completedFiles: 1,
+      failedFiles: 0,
+      totalBytes: 100,
+      bytesDone: 100,
+      currentFile: null,
+      done: true,
+      cancelled: false,
+      files: [
+        {
+          relativePath: "a.bin",
+          state: "done",
+          bytesDone: 100,
+          bytesTotal: 100,
+          errorCode: null,
+        },
+      ],
+    };
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources")
+        return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree")
+        return Promise.resolve(tree([file("a.bin")]));
+      if (cmd === "restore_files") return Promise.resolve("job-9");
+      if (cmd === "get_restore_job") return Promise.resolve(terminal);
+      return Promise.resolve([]);
+    });
+
+    const store = useRestoreStore();
+    await store.loadSources();
+    store.toggleSelect("s1", "a.bin");
+    store.setDestination("/home/u/restored", "tok-1");
+    await store.startRestore();
+    expect(store.activeJobId).toBe("job-9");
+
+    // Remount: unsubscribe then re-subscribe; the re-subscribe reconciles by id.
+    store.unsubscribeProgress();
+    await store.subscribeProgress();
+
+    const getCall = invokeMock.mock.calls.find(
+      (c) => c[0] === "get_restore_job",
+    );
+    expect(getCall?.[1]).toMatchObject({ job: "job-9" });
+    // The reconciled terminal state is reflected (controls re-enabled).
+    expect(store.job?.done).toBe(true);
+    expect(store.restoring).toBe(false);
+  });
+
+  it("cancels the active job and reflects a terminal cancelled status (M8-P1-1)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources")
+        return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree")
+        return Promise.resolve(tree([file("big.bin")]));
+      if (cmd === "restore_files") return Promise.resolve("job-c");
+      if (cmd === "cancel_restore_job") return Promise.resolve(null);
+      if (cmd === "get_restore_job")
+        return Promise.resolve({
+          jobId: "job-c",
+          totalFiles: 1,
+          completedFiles: 0,
+          failedFiles: 0,
+          totalBytes: 100,
+          bytesDone: 0,
+          currentFile: "big.bin",
+          done: false,
+          cancelled: false,
+          files: [
+            {
+              relativePath: "big.bin",
+              state: "restoring",
+              bytesDone: 0,
+              bytesTotal: 100,
+              errorCode: null,
+            },
+          ],
+        } as RestoreJobStatus);
+      return Promise.resolve([]);
+    });
+
+    const store = useRestoreStore();
+    await store.subscribeProgress();
+    await store.loadSources();
+    store.toggleSelect("s1", "big.bin");
+    store.setDestination("/home/u/restored", "tok-c");
+    await store.startRestore();
+    expect(store.activeJobId).toBe("job-c");
+
+    // Request cancel: the cancel IPC is invoked with the job id; cancelling gates.
+    await store.cancelRestore();
+    const cancelCall = invokeMock.mock.calls.find(
+      (c) => c[0] === "cancel_restore_job",
+    );
+    expect(cancelCall?.[1]).toMatchObject({ job: "job-c" });
+    expect(store.cancelling).toBe(true);
+
+    // The backend emits a terminal CANCELLED status; the store clears the flags.
+    const cancelled: RestoreJobStatus = {
+      jobId: "job-c",
+      totalFiles: 1,
+      completedFiles: 0,
+      failedFiles: 0,
+      totalBytes: 100,
+      bytesDone: 30,
+      currentFile: null,
+      done: true,
+      cancelled: true,
+      files: [
+        {
+          relativePath: "big.bin",
+          state: "cancelled",
+          bytesDone: 30,
+          bytesTotal: 100,
+          errorCode: null,
+        },
+      ],
+    };
+    progressHandler?.(cancelled);
+    expect(store.job?.cancelled).toBe(true);
+    expect(store.job?.done).toBe(true);
+    expect(store.restoring).toBe(false);
+    expect(store.cancelling).toBe(false);
   });
 });

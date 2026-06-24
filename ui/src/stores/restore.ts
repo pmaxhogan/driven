@@ -46,6 +46,10 @@ export const useRestoreStore = defineStore("restore", () => {
   const prefix = ref("");
   // The immediate children of the current prefix.
   const nodes = ref<RemoteEntryDto[]>([]);
+  // M8-P2-1: true when the current folder's listing was CAPPED (more immediate
+  // children than the backend's cap), so the view can show a "showing first N"
+  // notice instead of implying the folder is complete.
+  const treeTruncated = ref(false);
   // The active search query ("" = browsing, not searching).
   const query = ref("");
   // The current search results (only meaningful while `query` is non-empty).
@@ -58,8 +62,15 @@ export const useRestoreStore = defineStore("restore", () => {
   const destToken = ref<string | null>(null);
   // The active restore job status (null until a restore starts).
   const job = ref<RestoreJobStatus | null>(null);
+  // M8-P2-4: the active restore job id, persisted so a view remount / missed
+  // terminal event can reconcile current state via getRestoreJob(jobId) instead
+  // of relying solely on the live `restore:progress` stream.
+  const activeJobId = ref<string | null>(null);
   const loading = ref(false);
   const restoring = ref(false);
+  // M8-P1-1: true while a cancel has been requested but the terminal CANCELLED
+  // status has not yet arrived (so the UI can disable the cancel button).
+  const cancelling = ref(false);
   // Stable SPEC s24 code (null = no error); the view maps it via t().
   const errorCode = ref<string | null>(null);
 
@@ -134,7 +145,8 @@ export const useRestoreStore = defineStore("restore", () => {
       const result = await ipc.listRemoteTree(src, nextPrefix);
       // Discard a stale response (a newer navigation started).
       if (token !== requestToken) return;
-      nodes.value = result;
+      nodes.value = result.entries;
+      treeTruncated.value = result.truncated;
     } catch (e) {
       if (token !== requestToken) return;
       errorCode.value = toErrorCode(e);
@@ -240,32 +252,75 @@ export const useRestoreStore = defineStore("restore", () => {
     const items = selectedItems();
     if (items.length === 0) return;
     restoring.value = true;
+    cancelling.value = false;
     errorCode.value = null;
     job.value = null;
     try {
-      await ipc.restoreFiles(items, destToken.value);
+      // M8-P2-4: keep the returned job id so a remount / missed terminal event
+      // can reconcile current state via getRestoreJob(jobId).
+      const jobId = await ipc.restoreFiles(items, destToken.value);
+      activeJobId.value = jobId;
       // The backend consumes the one-shot token; require a fresh pick for a
       // subsequent restore.
       destToken.value = null;
       destPath.value = null;
+      // Reconcile immediately so the panel shows the seeded job even if the first
+      // live tick was missed (e.g. subscription raced the spawn).
+      await reconcileJob();
     } catch (e) {
       errorCode.value = toErrorCode(e);
       restoring.value = false;
     }
   }
 
-  /** Ingest a `restore:progress` event: store the latest snapshot and, on a
-   * terminal `done`, clear the restoring flag so the UI re-enables the controls. */
+  /** Request cancellation of the active restore job (M8-P1-1). The backend stops
+   * the job, deletes any in-flight temp (no partial), and emits a terminal
+   * CANCELLED status; `cancelling` gates the button until that arrives. */
+  async function cancelRestore(): Promise<void> {
+    if (activeJobId.value === null) return;
+    cancelling.value = true;
+    try {
+      await ipc.cancelRestoreJob(activeJobId.value);
+    } catch (e) {
+      // A cancel that races completion is benign; surface other errors.
+      cancelling.value = false;
+      errorCode.value = toErrorCode(e);
+    }
+  }
+
+  /** M8-P2-4: reconcile the active job's current state from the backend by id, so
+   * a view remount or a missed terminal event does not leave progress stale.
+   * Called after start + on (re)subscription. A no-op if no job is active. */
+  async function reconcileJob(): Promise<void> {
+    if (activeJobId.value === null) return;
+    try {
+      const status = await ipc.getRestoreJob(activeJobId.value);
+      onProgress(status);
+    } catch {
+      // The job id may have been pruned (terminal long ago); leave state as is.
+    }
+  }
+
+  /** Ingest a `restore:progress` event (or a reconcile snapshot): store the
+   * latest status and, on a terminal state (done / cancelled), clear the
+   * restoring + cancelling flags so the UI re-enables the controls. */
   function onProgress(status: RestoreJobStatus): void {
+    // Ignore a snapshot for a different (stale) job than the one we track.
+    if (activeJobId.value !== null && status.jobId !== activeJobId.value) return;
     job.value = status;
-    if (status.done) restoring.value = false;
+    if (status.done) {
+      restoring.value = false;
+      cancelling.value = false;
+    }
   }
 
   // --- restore:progress subscription (no listener leak) ---------------------
   let unlistenProgress: UnlistenFn | null = null;
   let desiredSubscribed = false;
 
-  /** Subscribe to the `restore:progress` live stream (idempotent). */
+  /** Subscribe to the `restore:progress` live stream (idempotent). On
+   * (re)subscription it ALSO reconciles the active job by id (M8-P2-4), so a view
+   * remount that missed a terminal event recovers the current state. */
   async function subscribeProgress(): Promise<void> {
     if (desiredSubscribed) return;
     desiredSubscribed = true;
@@ -276,6 +331,8 @@ export const useRestoreStore = defineStore("restore", () => {
       return;
     }
     unlistenProgress = un;
+    // M8-P2-4: reconcile after (re)subscribing so a remount recovers state.
+    await reconcileJob();
   }
 
   /** Stop the `restore:progress` subscription. */
@@ -292,14 +349,17 @@ export const useRestoreStore = defineStore("restore", () => {
     sourceId,
     prefix,
     nodes,
+    treeTruncated,
     query,
     searchResults,
     selectedKeys,
     destPath,
     destToken,
     job,
+    activeJobId,
     loading,
     restoring,
+    cancelling,
     errorCode,
     breadcrumbs,
     isSearching,
@@ -320,6 +380,8 @@ export const useRestoreStore = defineStore("restore", () => {
     pickDestination,
     selectedItems,
     startRestore,
+    cancelRestore,
+    reconcileJob,
     onProgress,
     subscribeProgress,
     unsubscribeProgress,

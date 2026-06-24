@@ -351,6 +351,14 @@ export interface RemoteEntryDto {
   restorable: boolean;
 }
 
+/** The result of `listRemoteTree` (mirrors src-tauri RemoteTreeDto, M8-P2-1):
+ * the immediate children plus a `truncated` flag so the UI can tell the user the
+ * listing was capped (rather than silently dropping children past the cap). */
+export interface RemoteTreeDto {
+  entries: RemoteEntryDto[];
+  truncated: boolean;
+}
+
 /** One Restore search hit (mirrors src-tauri FileSearchHitDto). */
 export interface FileSearchHitDto {
   sourceId: string;
@@ -371,8 +379,14 @@ export interface RestoreItem {
 export type RestoreJobId = string;
 
 /** Per-file lifecycle state within a restore job (mirrors src-tauri
- * RestoreFileState). */
-export type RestoreFileState = "pending" | "restoring" | "done" | "failed";
+ * RestoreFileState). `cancelled` (M8-P1-1) means the user cancelled before this
+ * file finished; any partial temp was deleted (no half-written file). */
+export type RestoreFileState =
+  | "pending"
+  | "restoring"
+  | "done"
+  | "failed"
+  | "cancelled";
 
 /** Per-file progress within a restore job (mirrors src-tauri
  * RestoreFileProgress). `errorCode` is a stable SPEC s24 i18n key when failed. */
@@ -397,5 +411,9 @@ export interface RestoreJobStatus {
   bytesDone: number;
   currentFile: string | null;
   done: boolean;
+  /** `true` when the job's terminal state is a user CANCELLATION (M8-P1-1).
+   * `done && !cancelled` is a normal finish; `done && cancelled` means the job
+   * was stopped early and any in-flight temp file was deleted (no partial). */
+  cancelled: boolean;
   files: RestoreFileProgress[];
 }

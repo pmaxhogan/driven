@@ -189,9 +189,18 @@ async function onClearSearch(): Promise<void> {
       {{ restore.isSearching ? t("restore.empty.search") : t("restore.empty.tree") }}
     </p>
 
+    <!-- Truncation notice (M8-P2-1): the folder listing was capped. Shown above
+         the list (not part of the loading/empty v-if chain). -->
+    <p
+      v-if="!restore.loading && !restore.isSearching && restore.treeTruncated"
+      class="rounded border border-amber-300 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-800 dark:bg-amber-950 dark:text-amber-300"
+    >
+      {{ t("restore.truncated", { count: restore.nodes.length }) }}
+    </p>
+
     <!-- File / folder list -->
     <ul
-      v-else
+      v-if="!restore.loading && !restore.isEmpty"
       class="divide-y divide-zinc-200 rounded border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-800"
     >
       <li
@@ -296,6 +305,17 @@ async function onClearSearch(): Promise<void> {
       >
         {{ t("restore.start") }}
       </button>
+      <!-- Cancel (M8-P1-1): shown while a job is running; disabled once a cancel
+           is requested until the terminal CANCELLED status arrives. -->
+      <button
+        v-if="restore.restoring && restore.job && !restore.job.done"
+        type="button"
+        class="rounded bg-red-600 px-4 py-1 text-sm font-medium text-white hover:bg-red-700 disabled:cursor-not-allowed disabled:opacity-50"
+        :disabled="restore.cancelling"
+        @click="restore.cancelRestore"
+      >
+        {{ restore.cancelling ? t("restore.cancelling") : t("restore.cancel") }}
+      </button>
     </div>
 
     <!-- Live restore progress -->
@@ -305,9 +325,11 @@ async function onClearSearch(): Promise<void> {
     >
       <div class="flex items-center justify-between text-sm">
         <span class="font-medium">{{
-          restore.job.done
-            ? t("restore.progress.done")
-            : t("restore.progress.running")
+          restore.job.cancelled
+            ? t("restore.progress.cancelled")
+            : restore.job.done
+              ? t("restore.progress.done")
+              : t("restore.progress.running")
         }}</span>
         <span class="text-zinc-500">{{
           t("restore.progress.summary", {
@@ -363,6 +385,12 @@ async function onClearSearch(): Promise<void> {
             class="text-zinc-500"
           >{{
             t("restore.file.restoring")
+          }}</span>
+          <span
+            v-else-if="f.state === 'cancelled'"
+            class="text-zinc-500"
+          >{{
+            t("restore.file.cancelled")
           }}</span>
           <span
             v-else
