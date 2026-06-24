@@ -195,6 +195,14 @@ export const useSetupStore = defineStore("setup", () => {
    * path + a picked Drive destination.
    */
   async function createFirstSource(): Promise<void> {
+    // R1-P2-3: idempotent. The one-shot folder dialog token is CONSUMED by the
+    // backend on the first add_source, so re-entering the encryption step (Back
+    // from confirm, then Next again) must NOT re-call add_source - it would fail
+    // with a stale/consumed token and wedge the wizard. If the source already
+    // exists, this is a no-op (the staged phrase + ack state are preserved).
+    if (sourceId.value !== null) {
+      return;
+    }
     busy.value = true;
     errorCode.value = null;
     try {

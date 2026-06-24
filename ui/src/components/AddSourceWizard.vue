@@ -205,12 +205,14 @@ async function goToCrumb(index: number): Promise<void> {
 }
 
 async function loadPreview(): Promise<void> {
-  if (localPath.value === null) return;
+  // R1-P1-2: preview by the backend-minted dialog TOKEN (not a raw path). The
+  // token is peeked non-consumingly, so add_source still gets its single use.
+  if (localPathToken.value === null) return;
   previewLoading.value = true;
   errorMessage.value = null;
   try {
     preview.value = await ipc.previewExclusions({
-      localPath: localPath.value,
+      localPathToken: localPathToken.value,
       respectGitignore: respectGitignore.value,
       includePatterns: includePatterns.value,
       excludePatterns: excludePatterns.value,

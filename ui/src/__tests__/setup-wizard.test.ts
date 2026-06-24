@@ -34,6 +34,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import { i18n } from "../i18n";
 import SetupWizard from "../views/SetupWizard.vue";
+import CredentialsWalkthrough from "../components/CredentialsWalkthrough.vue";
 import { useSetupStore } from "../stores/setup";
 import { useSourcesStore } from "../stores/sources";
 
@@ -189,6 +190,36 @@ describe("setup store OAuth sequence (SPEC s11.1)", () => {
     expect(sources.sources).toHaveLength(1);
   });
 
+  it("createFirstSource is idempotent - re-entry does not re-call add_source (R1-P2-3)", async () => {
+    // The one-shot folder dialog token is CONSUMED by the backend on the first
+    // add_source. Re-entering the encryption step (Back from confirm, then Next
+    // again) must NOT re-call add_source - it would fail with a stale token and
+    // wedge the wizard. Assert the second createFirstSource is a no-op.
+    const setup = useSetupStore();
+    setup.accountId = "acct-1";
+    setup.localPath = "/home/user/Docs";
+    setup.localPathToken = "tok-folder";
+    setup.driveFolderId = "drive-folder-1";
+    setup.driveFolderPath = "/Backups/Docs";
+    setup.encryptionEnabled = true;
+
+    await setup.createFirstSource();
+    expect(setup.sourceId).toBe("src-1");
+    const addCallsAfterFirst = invokeMock.mock.calls.filter(
+      (c) => c[0] === "add_source",
+    ).length;
+    expect(addCallsAfterFirst).toBe(1);
+
+    // Re-enter the step: createFirstSource must short-circuit (no second add).
+    await setup.createFirstSource();
+    const addCallsAfterSecond = invokeMock.mock.calls.filter(
+      (c) => c[0] === "add_source",
+    ).length;
+    expect(addCallsAfterSecond).toBe(1);
+    expect(setup.errorCode).toBeNull();
+    expect(setup.sourceId).toBe("src-1");
+  });
+
   it("startInitialSync scopes sync_now to the new source", async () => {
     const setup = useSetupStore();
     setup.sourceId = "src-1";
@@ -333,5 +364,56 @@ describe("SetupWizard walks all five steps (DESIGN s8.5)", () => {
       "poll_oauth_status",
       "finish_add_account",
     ]);
+  });
+});
+
+describe("CredentialsWalkthrough empty-secret (R1-P2-4, DESIGN s6.1)", () => {
+  it("allows submit with a client ID and an EMPTY client secret", async () => {
+    // A PKCE installed-app client legitimately has no secret. The sign-in button
+    // must enable on a non-empty client ID ALONE, and submitting must pass the
+    // (empty) secret straight through to the backend.
+    installFakeBackend();
+    const wrapper = mount(CredentialsWalkthrough, {
+      global: { plugins: [i18n] },
+    });
+    await flushPromises();
+
+    const inputs = wrapper.findAll("input");
+    // Client ID only; leave the secret EMPTY.
+    await inputs[0].setValue("my-installed-app-client-id");
+    await flushPromises();
+
+    const signInBtn = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("wizard.step2.signInButton"));
+    expect(signInBtn).toBeTruthy();
+    // R1-P2-4: enabled despite the empty secret.
+    expect(signInBtn!.attributes("disabled")).toBeUndefined();
+
+    await signInBtn!.trigger("click");
+    await flushPromises();
+
+    // The empty secret was forwarded as-is (trimmed empty string).
+    expect(invokeMock).toHaveBeenCalledWith("submit_oauth_credentials", {
+      session: FAKE_SESSION,
+      clientId: "my-installed-app-client-id",
+      clientSecret: "",
+    });
+  });
+
+  it("still blocks submit when the client ID is empty", async () => {
+    installFakeBackend();
+    const wrapper = mount(CredentialsWalkthrough, {
+      global: { plugins: [i18n] },
+    });
+    await flushPromises();
+    const inputs = wrapper.findAll("input");
+    // Secret present but NO client ID -> still blocked.
+    await inputs[1].setValue("some-secret");
+    await flushPromises();
+    const signInBtn = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("wizard.step2.signInButton"));
+    expect(signInBtn!.attributes("disabled")).toBeDefined();
   });
 });

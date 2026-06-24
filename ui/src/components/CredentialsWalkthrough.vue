@@ -29,11 +29,11 @@ const clientSecret = ref("");
 
 let unlisten: UnlistenFn | null = null;
 
+// R1-P2-4 (DESIGN s6.1): a PKCE installed-app client legitimately has an EMPTY
+// secret, so only a non-empty client ID is required to submit. The secret is
+// passed through as-is (possibly empty).
 const canSubmit = computed(
-  () =>
-    clientId.value.trim().length > 0 &&
-    clientSecret.value.trim().length > 0 &&
-    !setup.busy,
+  () => clientId.value.trim().length > 0 && !setup.busy,
 );
 
 /** Human-facing status line for the in-flight OAuth handshake. */

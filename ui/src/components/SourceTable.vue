@@ -82,8 +82,10 @@ function cancelEdit(): void {
 async function loadEditPreview(source: SourceDto): Promise<void> {
   editPreviewLoading.value = true;
   try {
+    // R1-P1-2 (SPEC s11.6.1): preview an EXISTING source by its id - the backend
+    // resolves the local path from SQLite, never from a webview-supplied string.
     editPreview.value = await ipc.previewExclusions({
-      localPath: source.localPath,
+      sourceId: source.id,
       respectGitignore: editRespectGitignore.value,
       includePatterns: splitPatterns(editIncludeText.value),
       excludePatterns: splitPatterns(editExcludeText.value),

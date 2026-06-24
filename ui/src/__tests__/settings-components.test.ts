@@ -209,11 +209,11 @@ describe("SourceTable", () => {
     const editor = wrapper.get('[data-testid="exclusion-editor"]');
     expect(invokeMock).toHaveBeenCalledWith(
       "preview_exclusions",
-      // The `previewExclusions` IPC wrapper nests the request under `req`
-      // (matching the Rust `preview_exclusions(req: ExclusionPreviewRequest)`
-      // signature), so the localPath lives at `req.localPath`.
+      // R1-P1-2: an EXISTING source is previewed by its id (the backend resolves
+      // the local path from SQLite), NEVER a raw webview path. The wrapper nests
+      // the request under `req` (matching the Rust signature).
       expect.objectContaining({
-        req: expect.objectContaining({ localPath: "/home/u/docs" }),
+        req: expect.objectContaining({ sourceId: "src-1" }),
       }),
     );
     const excludeArea = editor.findAll("textarea")[1];

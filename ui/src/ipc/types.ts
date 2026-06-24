@@ -119,7 +119,12 @@ export interface DriveFolderListing {
 }
 
 export interface ExclusionPreviewRequest {
-  localPath: string;
+  // R1-P1-2 (SPEC s11.6.1): the preview root is NEVER a raw webview path. Pass
+  // EITHER the one-shot dialog token (a NEW candidate folder, from
+  // pickFolderDialog) OR an existing source id; the backend resolves the path
+  // from the token binding / SQLite. Exactly one must be set.
+  localPathToken?: string | null;
+  sourceId?: string | null;
   respectGitignore: boolean;
   includePatterns: string[];
   excludePatterns: string[];
