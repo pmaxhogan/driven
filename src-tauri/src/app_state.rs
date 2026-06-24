@@ -264,6 +264,14 @@ pub struct AppState {
     /// every clone sees the same backing objects). Only ever populated in
     /// [`RemoteMode::Fake`]; in real mode it stays empty.
     fake_remote_stores: FakeRemoteStores,
+    /// M8: live restore-job status snapshots, keyed by job id. The background
+    /// restore task writes the latest [`RestoreJobStatus`](crate::commands::dtos::RestoreJobStatus)
+    /// here on every progress tick (in addition to emitting it on
+    /// `restore:progress`), so `get_restore_job` can serve the current snapshot to
+    /// a webview that subscribed late / missed an event. Behind a sync `Mutex`
+    /// (only ever held for a quick insert / clone-out, never across an await). A
+    /// terminal (done) status is retained so a late poll still sees the result.
+    restore_jobs: std::sync::Mutex<HashMap<String, crate::commands::dtos::RestoreJobStatus>>,
 }
 
 /// R2-P1-2: the shared per-account fake-remote-store registry. An `Arc` so
@@ -332,7 +340,29 @@ impl AppState {
             dialog_tokens: std::sync::Mutex::new(HashMap::new()),
             ensure_master_key_locks: std::sync::Mutex::new(HashMap::new()),
             fake_remote_stores,
+            restore_jobs: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// M8: record the latest status snapshot for a restore job (the background
+    /// task calls this on every progress tick). `get_restore_job` reads it back.
+    pub fn put_restore_job(&self, status: crate::commands::dtos::RestoreJobStatus) {
+        self.restore_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .insert(status.job_id.clone(), status);
+    }
+
+    /// M8: the current status snapshot for `job_id`, if the job exists (live or
+    /// terminal). `None` for an unknown / forged id so `get_restore_job` surfaces
+    /// an error rather than fabricating a status.
+    #[must_use]
+    pub fn restore_job(&self, job_id: &str) -> Option<crate::commands::dtos::RestoreJobStatus> {
+        self.restore_jobs
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .get(job_id)
+            .cloned()
     }
 
     /// C1: mint a one-shot dialog token bound to `path` (the path a native

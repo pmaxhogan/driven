@@ -11,6 +11,7 @@ pub mod accounts;
 pub mod activity;
 pub mod dialogs;
 pub mod dtos;
+pub mod restore;
 pub mod settings;
 pub mod sources;
 pub mod sync;
@@ -312,6 +313,114 @@ pub fn validate_writable_dest(path: &Path, dialog_token: &DialogToken) -> Comman
     Ok(dest)
 }
 
+/// M8 (SPEC s11.5 / s11.6.1): resolve + confine a RESTORE destination for one
+/// file. `dialog_token` is the dialog-approved destination DIRECTORY (the user
+/// picked it via `pick_folder_dialog`); `relative_path` is the file's plaintext
+/// relative path (the `file_state` key) under which it is reconstructed inside the
+/// dest dir. Unlike [`validate_writable_dest`] (a single leaf in the root), a
+/// restore re-creates the source's directory tree under the dest, so this helper
+/// validates a MULTI-COMPONENT relative path and creates the parent directories -
+/// while still confining every write inside the dialog-approved root.
+///
+/// Enforces (SPEC s11.6.1):
+/// 1. the relative path is strictly relative (no `..`, no leading `/`, no
+///    Windows drive / UNC prefix, no NUL) - reused via [`RelativePath`] parsing
+///    so the SAME canonical-path rules the backup side uses apply on restore;
+/// 2. confine to the dialog-approved root: canonicalise the root, join the
+///    relative path, and verify the result is under the canonical root (defence
+///    in depth on top of (1));
+/// 3. create the parent directory chain INSIDE the root (so a nested file
+///    restores), then reject a SYMLINK at any newly-relevant component / the leaf
+///    (no write THROUGH a symlink): if the leaf already exists as a symlink, or
+///    any parent component is a symlink that escapes the root, refuse.
+///
+/// Returns the confined leaf [`PathBuf`] the caller writes to atomically.
+pub fn validate_restore_dest(
+    dialog_token: &DialogToken,
+    relative_path: &str,
+) -> CommandResult<PathBuf> {
+    use driven_core::types::RelativePath;
+
+    // 1: the relative path must satisfy the SAME canonical relative-path rules the
+    // backup side enforces (rejects `..`, absolute, drive/UNC, NUL). This is the
+    // primary traversal guard - a path that parses as a RelativePath cannot
+    // contain a `..` segment or escape upward.
+    let rel: RelativePath = RelativePath::try_from(relative_path.to_string()).map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::LocalIoError,
+            format!("restore relative path is not a safe relative path: {e}"),
+        )
+    })?;
+    let rel = rel.as_str();
+    if rel.is_empty() {
+        return Err(CommandError::with_code(
+            ErrorCode::LocalIoError,
+            "restore relative path must not be empty",
+        ));
+    }
+
+    // 2: canonicalise the dialog-approved root (it exists - the user picked it).
+    let canon_root = dunce::canonicalize(&dialog_token.0).map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::LocalIoError,
+            format!("restore destination directory is not valid: {e}"),
+        )
+    })?;
+
+    // Build the target by joining each component (the RelativePath is `/`-joined
+    // and validated above, so each component is a plain name, never `..` / a root).
+    let mut dest = canon_root.clone();
+    for component in rel.split('/') {
+        if component.is_empty() {
+            continue;
+        }
+        dest.push(component);
+    }
+
+    // 3: create the parent directory chain inside the root.
+    if let Some(parent) = dest.parent() {
+        std::fs::create_dir_all(parent).map_err(|e| {
+            CommandError::with_code(
+                ErrorCode::LocalIoError,
+                format!("failed to create restore destination directory: {e}"),
+            )
+        })?;
+        // Re-canonicalise the (now-existing) parent and re-confine: a pre-existing
+        // SYMLINK component could redirect the parent outside the root even though
+        // the joined logical path looked confined. After canonicalisation it must
+        // STILL be under the canonical root, or we refuse.
+        let canon_parent = dunce::canonicalize(parent).map_err(|e| {
+            CommandError::with_code(
+                ErrorCode::LocalIoError,
+                format!("restore destination directory is unreadable: {e}"),
+            )
+        })?;
+        if !canon_parent.starts_with(&canon_root) {
+            return Err(CommandError::with_code(
+                ErrorCode::LocalIoError,
+                "restore destination escapes the approved folder via a symlink",
+            ));
+        }
+        // Recompose the confined leaf against the canonical parent.
+        if let Some(file_name) = dest.file_name() {
+            dest = canon_parent.join(file_name);
+        }
+    }
+
+    // Reject a SYMLINK at the leaf when it already exists (no write through it).
+    match std::fs::symlink_metadata(&dest) {
+        Ok(meta) if meta.file_type().is_symlink() => {
+            return Err(CommandError::with_code(
+                ErrorCode::LocalIoError,
+                "restore destination file is a symlink; refusing to write through it",
+            ));
+        }
+        Ok(_) | Err(_) => {}
+    }
+
+    Ok(dest)
+}
+
 /// Atomically write `bytes` to `dest` (SPEC s11.6.1 step 5): write to a
 /// sibling `<dest>.driven-tmp.<nonce>`, flush + fsync, then `rename` over the
 /// final name so a crash never leaves a half-written file under the final name.
@@ -509,6 +618,69 @@ mod tests {
             .collect();
         assert!(temps.is_empty(), "atomic write must leave no temp files");
         cleanup(dir);
+    }
+
+    #[test]
+    fn validate_restore_dest_creates_nested_dirs_and_confines() {
+        // M8: a restore re-creates the source tree under the dest dir; the helper
+        // must create the parent chain and return a leaf inside the approved root.
+        let dir = tempdir();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let ok = validate_restore_dest(&token, "src/nested/file.rs").expect("nested ok");
+        let canon_root = dunce::canonicalize(&dir).unwrap();
+        assert!(ok.starts_with(&canon_root), "dest must be under the root");
+        assert_eq!(ok.file_name().unwrap(), std::ffi::OsStr::new("file.rs"));
+        // The parent chain was created.
+        assert!(ok.parent().unwrap().is_dir());
+        cleanup(dir);
+    }
+
+    #[test]
+    fn validate_restore_dest_rejects_traversal() {
+        let dir = tempdir();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        // A `..` segment must be rejected by the RelativePath parse.
+        let err = validate_restore_dest(&token, "../escape.txt").expect_err("traversal rejected");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
+        // An absolute path must be rejected too.
+        let err2 = validate_restore_dest(&token, "/etc/passwd").expect_err("absolute rejected");
+        assert_eq!(err2.code, ErrorCode::LocalIoError);
+        cleanup(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_restore_dest_rejects_symlink_at_leaf() {
+        use std::os::unix::fs::symlink;
+        let dir = tempdir();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let target = dir.join("real-target");
+        std::fs::write(&target, b"x").unwrap();
+        let link = dir.join("link.txt");
+        symlink(&target, &link).unwrap();
+        let err = validate_restore_dest(&token, "link.txt").expect_err("symlink leaf rejected");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
+        assert!(err.message.contains("symlink"));
+        cleanup(dir);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn validate_restore_dest_rejects_symlinked_parent_escape() {
+        // A pre-existing symlink DIRECTORY component that points outside the root
+        // must be refused even though the joined logical path looked confined.
+        use std::os::unix::fs::symlink;
+        let root = tempdir();
+        let outside = tempdir();
+        let token = DialogToken::for_root(root.to_string_lossy().to_string());
+        // root/escape -> outside (a directory symlink escaping the root).
+        let link_dir = root.join("escape");
+        symlink(&outside, &link_dir).unwrap();
+        let err = validate_restore_dest(&token, "escape/file.txt")
+            .expect_err("symlinked parent escape rejected");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
+        cleanup(root);
+        cleanup(outside);
     }
 
     #[test]

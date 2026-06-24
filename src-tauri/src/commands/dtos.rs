@@ -624,3 +624,128 @@ pub struct ActivitySummaryDto {
     /// bytes/sec rate).
     pub throughput_window_ms: u64,
 }
+
+// -----------------------------------------------------------------------------
+// Restore (SPEC s11.5; DESIGN s8.4)
+// -----------------------------------------------------------------------------
+
+/// One node in the Restore browser tree (SPEC s11.5 `RemoteEntryDto`; DESIGN
+/// s8.4). Either a FOLDER the user can descend into or a FILE they can restore.
+/// Derived from `file_state` (the LOCAL authoritative metadata) under a plaintext
+/// prefix - never a Drive call (ROADMAP M8: avoid hitting Drive for navigation).
+/// For an encrypted source the name shown here is already the DECRYPTED plaintext
+/// component, because `file_state.relative_path` stores the plaintext path (SPEC
+/// s2); the ciphertext path never reaches the webview.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteEntryDto {
+    /// The plaintext relative path of this node under the source root (the stable
+    /// id the webview passes back as the next prefix / restore selection).
+    pub relative_path: String,
+    /// The display name (the last path component).
+    pub name: String,
+    /// `true` for a folder (descendable), `false` for a restorable file.
+    pub is_dir: bool,
+    /// File size in bytes; `0` for a folder.
+    pub size: u64,
+    /// `file_state.status` discriminant for a file (`synced` | `pending` | ...);
+    /// `None` for a folder.
+    pub status: Option<String>,
+    /// `true` if this file has been uploaded (has a `drive_file_id`) and is
+    /// therefore restorable; always `false` for a folder.
+    pub restorable: bool,
+}
+
+/// One Restore search hit (SPEC s11.5 `FileSearchHit`; DESIGN s8.4). Mirrors
+/// [`driven_core::state::FileSearchHit`] over the camelCase wire. The path is the
+/// plaintext relative path (decrypted display for encrypted sources, per SPEC s2).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileSearchHitDto {
+    /// The source the match belongs to (UUID string).
+    pub source_id: String,
+    /// The matched plaintext relative path.
+    pub relative_path: String,
+    /// The file's `file_state.status` discriminant.
+    pub status: String,
+    /// `true` if the file is uploaded (restorable).
+    pub restorable: bool,
+}
+
+/// One file the webview selected to restore (SPEC s11.5 `RestoreItem`). The
+/// `(source_id, relative_path)` pair is the `file_state` primary key; the backend
+/// re-reads the authoritative row (drive id, size, encryption) from SQLite - the
+/// webview never supplies the Drive id or a local path (SPEC s11.6.1).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreItem {
+    /// The source the file belongs to (UUID string).
+    pub source_id: String,
+    /// The plaintext relative path under the source root (the file_state key).
+    pub relative_path: String,
+}
+
+/// The opaque id of a spawned restore job (SPEC s11.5 `RestoreJobId`). A
+/// transparent UUID-string newtype so a stale / forged id surfaces as a command
+/// error rather than resolving the wrong job.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(transparent)]
+pub struct RestoreJobId(pub String);
+
+/// Terminal / in-progress state of one file within a restore job (SPEC s11.7).
+#[derive(Debug, Clone, Copy, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "snake_case")]
+pub enum RestoreFileState {
+    /// Queued, not started.
+    Pending,
+    /// Downloading + (for encrypted sources) stream-decrypting to disk.
+    Restoring,
+    /// Written to disk + verified (blake3 matched the stored plaintext hash).
+    Done,
+    /// Failed; `error_code` on the file entry carries the SPEC s24 code.
+    Failed,
+}
+
+/// Per-file progress within a restore job (SPEC s11.7 `RestoreJobStatus`).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreFileProgress {
+    /// The plaintext relative path being restored (the display + identity).
+    pub relative_path: String,
+    /// This file's lifecycle state.
+    pub state: RestoreFileState,
+    /// Plaintext bytes written to disk so far.
+    pub bytes_done: u64,
+    /// Total plaintext bytes expected (the file_state size).
+    pub bytes_total: u64,
+    /// The stable SPEC s24 error code (i18n key) when `state == Failed`; `None`
+    /// otherwise.
+    pub error_code: Option<String>,
+}
+
+/// The full status of a restore job, streamed on `restore:progress` and returned
+/// by `get_restore_job` (SPEC s11.5 / s11.7 `RestoreJobStatus`). Carries overall
+/// progress (bytes + file counts), the current file, a per-file breakdown, and a
+/// terminal `done` flag so the webview can render live progress + a done state.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RestoreJobStatus {
+    /// The job id this status belongs to.
+    pub job_id: String,
+    /// Total files in the job.
+    pub total_files: u32,
+    /// Files that have finished successfully.
+    pub completed_files: u32,
+    /// Files that have failed.
+    pub failed_files: u32,
+    /// Total plaintext bytes expected across every file.
+    pub total_bytes: u64,
+    /// Total plaintext bytes written to disk so far.
+    pub bytes_done: u64,
+    /// The relative path of the file currently being restored, if any.
+    pub current_file: Option<String>,
+    /// `true` once every file has reached a terminal state (done or failed).
+    pub done: bool,
+    /// Per-file progress entries.
+    pub files: Vec<RestoreFileProgress>,
+}

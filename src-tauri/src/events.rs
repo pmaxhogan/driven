@@ -67,6 +67,15 @@ pub const EVENT_UPDATER_AVAILABLE: &str = "updater:available";
 /// ready to install (payload: `UpdateInfo`, SPEC s11.7).
 #[allow(dead_code)]
 pub const EVENT_UPDATER_DOWNLOADED: &str = "updater:downloaded";
+/// `restore:progress` - a restore job advanced (payload: `RestoreJobStatus`,
+/// SPEC s11.7).
+///
+/// M8 (restore browser): the background restore job emits this on every per-file
+/// progress tick + every file/job state transition so the Restore view renders
+/// live progress (per-file + overall, with errors + a terminal `done` state). The
+/// same snapshot is recorded on `AppState` so `get_restore_job` can serve a late
+/// subscriber.
+pub const EVENT_RESTORE_PROGRESS: &str = "restore:progress";
 
 /// Broadcast `sync:status_changed` with the global status payload (SPEC s11.7).
 ///

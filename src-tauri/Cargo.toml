@@ -54,6 +54,10 @@ semver = "1"
 # M6 (SPEC s18): export_diagnostic_bundle writes a STORED (no-compression) ZIP by
 # hand; crc32fast computes the per-entry CRC32 the ZIP format requires.
 crc32fast = "1"
+# M8 (SPEC s11.5): the restore sink hashes the restored plaintext with BLAKE3 and
+# verifies it against the stored `file_state.hash_blake3` (data-safety: a wrong
+# decrypt / corrupted object is refused). Same crate the executor hashes with.
+blake3 = "1"
 
 driven-core = { path = "../crates/driven-core" }
 driven-drive = { path = "../crates/driven-drive" }

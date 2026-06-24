@@ -792,6 +792,22 @@ async fn reconfigure_account(state: &State<'_, AppState>, account_id: AccountId)
     tracing::debug!(target: TARGET, account_id = %account_id, "orchestrator reconfigured after source change");
 }
 
+/// Build a [`RemoteStore`] for `account_id` to DOWNLOAD from on restore (M8).
+///
+/// The mode-aware store is exactly the one the picker / uploader use (via
+/// [`select_picker_store`]). In fake mode it is the account's SHARED
+/// [`InMemoryRemoteStore`] so restore reads the same objects the orchestrator
+/// uploaded; in real mode it is a live `GoogleDriveStore` from the account's
+/// keychain refresh token. Restore only needs the store handle (it downloads by
+/// the Drive file id carried in `file_state`), so the root id the picker also
+/// returns is dropped.
+pub(crate) fn build_restore_store(
+    state: &AppState,
+    account_id: AccountId,
+) -> CommandResult<Arc<dyn RemoteStore>> {
+    select_picker_store(state, account_id).map(|(store, _root)| store)
+}
+
 /// R1-P1-3 / R2-P1-2: select the Drive-folder-picker store + its root id.
 ///
 /// - [`RemoteMode::Fake`] (dev / e2e / fake-remote wizard acceptance): return
