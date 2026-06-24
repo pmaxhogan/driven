@@ -39,6 +39,7 @@
 //! Drive-relative PLAINTEXT path, validated as a printable, `/`-separated,
 //! length-bounded string (NOT a local path).
 
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use blake3::Hasher as Blake3;
@@ -51,10 +52,10 @@ use driven_core::types::{ErrorCode, SourceId};
 use driven_crypto::{ContentDecryptor, SourceCryptoSuite, HEADER_LEN};
 use driven_drive::remote_store::RemoteStore;
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, RestoreCancel};
 use crate::commands::dtos::{
-    FileSearchHitDto, RemoteEntryDto, RestoreFileProgress, RestoreFileState, RestoreItem,
-    RestoreJobId, RestoreJobStatus,
+    FileSearchHitDto, RemoteEntryDto, RemoteTreeDto, RestoreFileProgress, RestoreFileState,
+    RestoreItem, RestoreJobId, RestoreJobStatus,
 };
 use crate::commands::{validate_restore_dest, CommandError, CommandResult, DialogToken};
 use crate::events::EVENT_RESTORE_PROGRESS;
@@ -63,9 +64,10 @@ use crate::events::EVENT_RESTORE_PROGRESS;
 const TARGET: &str = "driven::app::restore";
 
 /// Max nodes `list_remote_tree` returns for one folder open. A folder with more
-/// immediate children than this is truncated (the UI shows the first page); the
-/// underlying range scan is bounded so a pathological tree cannot blow up the IPC.
-const MAX_TREE_NODES: u32 = 5_000;
+/// immediate children than this is truncated (the UI shows the first page + a
+/// `truncated` flag so the user knows, M8-P2-1); the underlying range scan is
+/// bounded so a pathological tree cannot blow up the IPC.
+pub(crate) const MAX_TREE_NODES: u32 = 5_000;
 
 /// Underlying `file_state` row cap for one tree open. A folder's range scan can
 /// touch the whole subtree (to derive immediate sub-folders), so this bounds the
@@ -79,8 +81,10 @@ const MAX_SEARCH_LIMIT: u32 = 1_000;
 /// Drive-relative path well under any real depth.
 const MAX_PREFIX_LEN: usize = 4_096;
 
-/// Max length (bytes) of a `search_files` query (SPEC s11.6.1 bound).
-const MAX_QUERY_LEN: usize = 1_024;
+/// Max length (chars) of a `search_files` query (DESIGN s18.8: 256 chars, no raw
+/// newlines / NUL / control chars). M8-P2-2 tightened this from 1024 + added the
+/// control-char rejection below to match DESIGN s18.8 exactly.
+const MAX_QUERY_LEN: usize = 256;
 
 /// Max files one `restore_files` call may select (SPEC s11.6.1 bound), so a
 /// hostile / buggy renderer cannot queue an unbounded job.
@@ -109,7 +113,7 @@ pub async fn list_remote_tree(
     state: State<'_, AppState>,
     source_id: SourceId,
     prefix: String,
-) -> CommandResult<Vec<RemoteEntryDto>> {
+) -> CommandResult<RemoteTreeDto> {
     let prefix = validate_prefix(&prefix)?;
 
     let rows = state
@@ -119,19 +123,23 @@ pub async fn list_remote_tree(
         .map_err(CommandError::from)?;
 
     let nodes = derive_immediate_children(&prefix, &rows);
-    let truncated = nodes.len() as u32 > MAX_TREE_NODES;
-    let nodes: Vec<RemoteEntryDto> = nodes.into_iter().take(MAX_TREE_NODES as usize).collect();
+    // M8-P2-1: SURFACE the cap instead of silently dropping children. `truncated`
+    // is true when the folder has more immediate children than the returned cap
+    // (or the underlying scan itself hit its row cap, in which case deeper folders
+    // may also be incomplete), so the UI can tell the user the listing is partial.
+    let truncated = nodes.len() as u32 > MAX_TREE_NODES || rows.len() as u32 >= MAX_TREE_SCAN_ROWS;
+    let entries: Vec<RemoteEntryDto> = nodes.into_iter().take(MAX_TREE_NODES as usize).collect();
 
     tracing::debug!(
         target: TARGET,
         %source_id,
         prefix = %prefix,
         scanned = rows.len(),
-        returned = nodes.len(),
+        returned = entries.len(),
         truncated,
         "list_remote_tree served from file_state"
     );
-    Ok(nodes)
+    Ok(RemoteTreeDto { entries, truncated })
 }
 
 /// `search_files(source_id?, query, limit)` - search backed-up files by filename /
@@ -153,10 +161,20 @@ pub async fn search_files(
     if query.is_empty() {
         return Ok(Vec::new());
     }
-    if query.len() > MAX_QUERY_LEN {
+    // M8-P2-2 / DESIGN s18.8: cap at 256 CHARS (not bytes) and reject raw
+    // newlines, NUL, and other control chars BEFORE the FTS/GLOB path. A query
+    // that carries a control char is rejected outright (a hostile renderer cannot
+    // smuggle a newline / NUL into the FTS or GLOB matcher).
+    if query.chars().count() > MAX_QUERY_LEN {
         return Err(CommandError::with_code(
             ErrorCode::InvalidInput,
             "search query is too long",
+        ));
+    }
+    if query.contains('\0') || query.chars().any(|c| c.is_control()) {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "search query contains control characters",
         ));
     }
     let limit = limit.clamp(1, MAX_SEARCH_LIMIT);
@@ -286,8 +304,8 @@ pub async fn restore_files(
 
     let job_id = uuid::Uuid::new_v4().to_string();
 
-    // Build the initial (all-pending) status, seed it, and emit the first tick so
-    // the webview shows the job immediately.
+    // Build the initial (all-pending) status, seed it WITH a cancel flag (P1-1),
+    // and emit the first tick so the webview shows the job immediately.
     let mut status = RestoreJobStatus {
         job_id: job_id.clone(),
         total_files: resolved.len() as u32,
@@ -297,6 +315,7 @@ pub async fn restore_files(
         bytes_done: 0,
         current_file: None,
         done: false,
+        cancelled: false,
         files: resolved
             .iter()
             .map(|r| RestoreFileProgress {
@@ -308,7 +327,11 @@ pub async fn restore_files(
             })
             .collect(),
     };
-    state.put_restore_job(status.clone());
+    // M8-P1-1: the per-job cancel flag the spawned task observes between frames;
+    // `cancel_restore_job` + the shutdown drain set it. Seed the job so a cancel /
+    // late poll resolves it immediately, before the task handle is attached.
+    let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
+    state.seed_restore_job(status.clone(), cancel.clone());
     emit_progress(&app, &status);
 
     // Build the per-account remote stores + crypto suites the job will use. We
@@ -363,14 +386,41 @@ pub async fn restore_files(
         });
     }
 
-    // Spawn the background job. It owns the plans + the dest token; it drives each
-    // file, updates + emits + records the status, and never blocks the IPC.
+    // Spawn the background job. It owns the plans + the dest token + the cancel
+    // flag; it drives each file, updates + emits + records the status, and never
+    // blocks the IPC. On exit it clears its own handle so the shutdown drain does
+    // not await an already-finished task.
     let app_for_job = app.clone();
-    tauri::async_runtime::spawn(async move {
-        run_restore_job(app_for_job, plans, dest_token, &mut status).await;
+    let job_cancel = cancel.clone();
+    // tokio::spawn (not tauri::async_runtime::spawn) so the returned handle is a
+    // tokio JoinHandle the AppState tracks + the shutdown drain awaits, matching
+    // the per-account task handles (the command already runs on the tokio runtime).
+    let handle = tokio::task::spawn(async move {
+        run_restore_job(app_for_job, plans, dest_token, &mut status, job_cancel).await;
     });
+    // Attach the handle so cancel / shutdown can await it (P1-1).
+    state.set_restore_job_handle(&job_id, handle);
 
     Ok(RestoreJobId(job_id))
+}
+
+/// `cancel_restore_job(job)` - request cancellation of a running restore job
+/// (SPEC s11.5 / s11.7; M8-P1-1). Sets the job's cancel flag so the background
+/// task stops between frames, DELETES any in-flight temp file (no partial left),
+/// and emits a terminal CANCELLED [`RestoreJobStatus`]. Idempotent: cancelling an
+/// unknown / already-finished job is a benign no-op (the job may have completed
+/// or its terminal record been pruned). The command returns once the cancel is
+/// SIGNALLED; the terminal CANCELLED status arrives on `restore:progress`.
+#[tauri::command]
+pub async fn cancel_restore_job(
+    state: State<'_, AppState>,
+    job: RestoreJobId,
+) -> CommandResult<()> {
+    // Set the flag + take the task handle (if still running). We do NOT await the
+    // handle here (the command should return promptly); the task observes the flag,
+    // cleans up its temp, emits CANCELLED, and exits on its own.
+    let _ = state.cancel_restore_job(&job.0);
+    Ok(())
 }
 
 /// `get_restore_job(job)` - the current status snapshot of a restore job (SPEC
@@ -421,15 +471,40 @@ enum SuiteVerdict {
     Unavailable,
 }
 
-/// Drive the restore job to completion: for each file, restore it, then update +
-/// emit + record the job status. Always emits a final `done` status.
+/// One file's terminal outcome within the job.
+enum FileOutcome {
+    /// Restored + verified.
+    Done,
+    /// Failed with the SPEC s24 error code.
+    Failed(ErrorCode),
+    /// Cancelled mid-stream (M8-P1-1): the temp file was deleted, so no partial
+    /// final file remains.
+    Cancelled,
+}
+
+/// Drive the restore job to completion (or cancellation): for each file, restore
+/// it, then update + emit + record the job status. Always emits a final terminal
+/// status (`done`, with `cancelled` set if the user cancelled). M8-P1-1: the
+/// `cancel` flag is checked BEFORE each file AND between frames inside
+/// `stream_to_disk`; on cancel the in-flight temp is deleted and a CANCELLED
+/// terminal status is emitted, then the job clears its own handle so the shutdown
+/// drain does not await an already-finished task.
 async fn run_restore_job(
     app: AppHandle,
     plans: Vec<RestorePlan>,
     dest_token: DialogToken,
     status: &mut RestoreJobStatus,
+    cancel: RestoreCancel,
 ) {
+    let mut cancelled = false;
     for (idx, plan) in plans.iter().enumerate() {
+        // M8-P1-1: cancel observed BEFORE starting this file -> stop the loop; the
+        // remaining (and this) files stay Pending -> marked Cancelled below.
+        if cancel.load(Ordering::SeqCst) {
+            cancelled = true;
+            break;
+        }
+
         // Mark this file as restoring + set it as the current file.
         status.current_file = Some(plan.file.relative_path.clone());
         if let Some(f) = status.files.get_mut(idx) {
@@ -442,6 +517,7 @@ async fn run_restore_job(
             plan.store.as_ref(),
             &plan.crypto,
             &dest_token,
+            &cancel,
             |bytes_done| {
                 // Per-file streamed progress: update this file's bytes + the overall
                 // bytes-done, then emit so the UI advances the bar mid-file.
@@ -457,7 +533,7 @@ async fn run_restore_job(
         .await;
 
         match outcome {
-            Ok(()) => {
+            FileOutcome::Done => {
                 if let Some(f) = status.files.get_mut(idx) {
                     // Ensure the file's bytes-done reflects the full size on success.
                     let remaining = f.bytes_total.saturating_sub(f.bytes_done);
@@ -467,7 +543,7 @@ async fn run_restore_job(
                 }
                 status.completed_files = status.completed_files.saturating_add(1);
             }
-            Err(code) => {
+            FileOutcome::Failed(code) => {
                 if let Some(f) = status.files.get_mut(idx) {
                     f.state = RestoreFileState::Failed;
                     f.error_code = Some(code.code().to_string());
@@ -480,20 +556,60 @@ async fn run_restore_job(
                     "restore file failed"
                 );
             }
+            FileOutcome::Cancelled => {
+                // The temp was already deleted in restore_one_file; mark this file
+                // cancelled and stop the loop (remaining files marked below).
+                if let Some(f) = status.files.get_mut(idx) {
+                    f.state = RestoreFileState::Cancelled;
+                }
+                cancelled = true;
+                break;
+            }
         }
         push_status(&app, status);
     }
 
-    status.current_file = None;
-    status.done = true;
-    push_status(&app, status);
-    tracing::info!(
-        target: TARGET,
-        job_id = %status.job_id,
-        completed = status.completed_files,
-        failed = status.failed_files,
-        "restore job done"
-    );
+    if cancelled {
+        // M8-P1-1: mark every not-yet-terminal file Cancelled (the current file is
+        // already cancelled; the rest were still Pending), then emit the terminal
+        // CANCELLED status.
+        for f in status.files.iter_mut() {
+            if matches!(
+                f.state,
+                RestoreFileState::Pending | RestoreFileState::Restoring
+            ) {
+                f.state = RestoreFileState::Cancelled;
+            }
+        }
+        status.current_file = None;
+        status.cancelled = true;
+        status.done = true;
+        push_status(&app, status);
+        tracing::info!(
+            target: TARGET,
+            job_id = %status.job_id,
+            completed = status.completed_files,
+            failed = status.failed_files,
+            "restore job cancelled"
+        );
+    } else {
+        status.current_file = None;
+        status.done = true;
+        push_status(&app, status);
+        tracing::info!(
+            target: TARGET,
+            job_id = %status.job_id,
+            completed = status.completed_files,
+            failed = status.failed_files,
+            "restore job done"
+        );
+    }
+
+    // M8-P1-1: clear this job's handle so the app-shutdown drain does not try to
+    // await an already-finished task.
+    if let Some(state) = app.try_state::<AppState>() {
+        state.finish_restore_job_handle(&status.job_id);
+    }
 }
 
 /// Record + emit a status snapshot (records on AppState via the app-managed state
@@ -521,68 +637,140 @@ fn emit_progress(app: &AppHandle, status: &RestoreJobStatus) {
 /// Restore ONE file: download from Drive, (for encrypted sources) STREAM-decrypt,
 /// verify the plaintext BLAKE3, and write atomically into the dest dir.
 /// `on_progress` is called with the cumulative plaintext bytes written so far so
-/// the caller can advance the UI mid-file. Returns the SPEC s24 error code on
-/// failure (mapped to a translatable key on the file's progress entry).
+/// the caller can advance the UI mid-file. `cancel` is checked between frames
+/// inside [`stream_to_disk`]; on cancel the temp is deleted and [`FileOutcome::Cancelled`]
+/// is returned (no partial). Returns the SPEC s24 error code on failure (mapped
+/// to a translatable key on the file's progress entry).
 async fn restore_one_file<F: FnMut(u64)>(
     file: &ResolvedRestore,
     store: &dyn RemoteStore,
     crypto: &SuiteVerdict,
     dest_token: &DialogToken,
+    cancel: &RestoreCancel,
     mut on_progress: F,
-) -> Result<(), ErrorCode> {
+) -> FileOutcome {
     // A file never uploaded has no Drive object to restore.
-    let drive_file_id = file
-        .drive_file_id
-        .as_deref()
-        .ok_or(ErrorCode::InternalBug)?;
+    let drive_file_id = match file.drive_file_id.as_deref() {
+        Some(id) => id,
+        None => return FileOutcome::Failed(ErrorCode::InternalBug),
+    };
 
     // Fail closed: an encrypted source whose key is unavailable cannot decrypt.
     let suite: Option<&dyn SourceCryptoSuite> = match crypto {
         SuiteVerdict::Plaintext => None,
         SuiteVerdict::Suite(s) => Some(s.as_ref()),
-        SuiteVerdict::Unavailable => return Err(ErrorCode::CryptoKeyMissing),
+        SuiteVerdict::Unavailable => return FileOutcome::Failed(ErrorCode::CryptoKeyMissing),
     };
 
     // Resolve + confine the destination (SPEC s11.6.1): re-create the file's
     // relative tree under the approved root, no traversal, no symlink-at-leaf.
-    let dest = validate_restore_dest(dest_token, &file.relative_path).map_err(|e| e.code)?;
+    let dest = match validate_restore_dest(dest_token, &file.relative_path) {
+        Ok(d) => d,
+        Err(e) => return FileOutcome::Failed(e.code),
+    };
 
-    // Open the Drive download stream.
-    let mut reader = store
-        .download(drive_file_id)
-        .await
-        .map_err(|_| ErrorCode::DriveUnreachable)?
-        .0;
+    // Open the Drive download stream. M8-P2-5: classify the remote error into the
+    // specific SPEC s24 code (auth / missing-object / rate-limit / quota / ...)
+    // instead of collapsing every failure to `drive.unreachable`.
+    let mut reader = match store.download(drive_file_id).await {
+        Ok(stream) => stream.0,
+        Err(e) => return FileOutcome::Failed(classify_download_error(&e)),
+    };
 
-    // Atomic write: stream into a sibling temp file, then rename over the final
-    // name. A failure best-effort removes the temp file (SPEC s11.6.1 step 5).
-    let parent = dest.parent().ok_or(ErrorCode::LocalIoError)?;
-    let nonce = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_nanos())
-        .unwrap_or(0);
-    let leaf = dest
-        .file_name()
-        .and_then(|n| n.to_str())
-        .unwrap_or("restore");
-    let tmp = parent.join(format!(".driven-restore-tmp.{leaf}.{nonce}"));
+    // Atomic write (SPEC s11.6.1 step 5): stream into a RANDOM-named sibling temp
+    // file opened no-follow + O_EXCL, then rename over the final name. A failure /
+    // cancel best-effort removes the temp file so no partial is left behind
+    // (M8-P1-1, M8-P1-2).
+    let parent = match dest.parent() {
+        Some(p) => p,
+        None => return FileOutcome::Failed(ErrorCode::LocalIoError),
+    };
+    // M8-P1-2: a RANDOM temp name (not timestamp-derived) so the path is
+    // unpredictable; combined with `create_new(true)` (O_EXCL) below this kills
+    // the pre-place / race-to-the-path attack.
+    let tmp = parent.join(format!(".driven-restore-tmp.{}", uuid::Uuid::new_v4()));
 
-    let result = stream_to_disk(&mut reader, &tmp, suite, file, &mut on_progress).await;
+    let result = stream_to_disk(&mut reader, &tmp, suite, file, cancel, &mut on_progress).await;
 
     match result {
-        Ok(()) => {
+        StreamOutcome::Done => {
+            // M8-P1-2: re-confirm the rename TARGET is still inside the canonical
+            // root (the leaf could have been swapped for a symlink during the
+            // stream); validate_restore_dest already canonicalised the parent, so
+            // re-validate to catch a TOCTOU swap at the leaf before renaming over it.
+            if let Err(e) = validate_restore_dest(dest_token, &file.relative_path) {
+                let _ = tokio::fs::remove_file(&tmp).await;
+                return FileOutcome::Failed(e.code);
+            }
             // Atomically place the verified plaintext at its final name.
             if let Err(e) = tokio::fs::rename(&tmp, &dest).await {
                 let _ = tokio::fs::remove_file(&tmp).await;
                 tracing::warn!(target: TARGET, file = %file.relative_path, %e, "restore atomic rename failed");
-                return Err(ErrorCode::LocalIoError);
+                return FileOutcome::Failed(ErrorCode::LocalIoError);
             }
-            Ok(())
+            FileOutcome::Done
         }
-        Err(code) => {
+        StreamOutcome::Cancelled => {
+            // M8-P1-1: cancelled mid-stream - delete the partial temp; nothing was
+            // renamed into place, so no partial final file remains.
             let _ = tokio::fs::remove_file(&tmp).await;
-            Err(code)
+            FileOutcome::Cancelled
         }
+        StreamOutcome::Failed(code) => {
+            let _ = tokio::fs::remove_file(&tmp).await;
+            FileOutcome::Failed(code)
+        }
+    }
+}
+
+/// The outcome of streaming one file to disk: completed + verified, cancelled
+/// mid-stream (M8-P1-1), or failed with a SPEC s24 code.
+enum StreamOutcome {
+    Done,
+    Cancelled,
+    Failed(ErrorCode),
+}
+
+/// M8-P2-5: classify a Drive `download` error into the specific SPEC s24
+/// [`ErrorCode`], so a per-file restore failure reports invalid auth / a missing
+/// remote object / rate-limit / quota distinctly rather than a generic
+/// `drive.unreachable`. Reuses the SAME classification the executor / reconcile
+/// path uses: the typed `DriveError` downcast (the real `GoogleDriveStore`) via
+/// [`driven_drive::google::classification_of`], falling back to substring matching
+/// on the message for the `InMemoryRemoteStore` fake (whose fault injection embeds
+/// the dotted code in its `anyhow` message). A 404 / not-found / unclassified
+/// error maps to `drive.unreachable` (the closest existing code for "the object
+/// could not be fetched").
+fn classify_download_error(err: &anyhow::Error) -> ErrorCode {
+    use driven_drive::remote_store::DriveErrorClassification as C;
+    // Typed path (real store): map the classification to its SPEC s24 code.
+    if let Some(class) = driven_drive::google::classification_of(err) {
+        return match class {
+            C::RateLimited { .. } => ErrorCode::DriveRateLimited,
+            C::Transient5xx => ErrorCode::DriveUnreachable,
+            C::Network => ErrorCode::NetIntermittent,
+            C::AuthInvalidGrant => ErrorCode::AuthInvalidGrant,
+            C::DailyQuota => ErrorCode::DriveDailyQuotaExhausted,
+            C::StorageQuota => ErrorCode::DriveQuotaExhausted,
+            C::Other => ErrorCode::DriveUnreachable,
+        };
+    }
+    // String fallback for the fake's plain anyhow messages (mirrors the
+    // executor's classify_drive_error ordering: `daily` before `quota_exhausted`).
+    let msg = err.to_string();
+    if msg.contains("rate_limited") {
+        ErrorCode::DriveRateLimited
+    } else if msg.contains("daily") {
+        ErrorCode::DriveDailyQuotaExhausted
+    } else if msg.contains("quota_exhausted") {
+        ErrorCode::DriveQuotaExhausted
+    } else if msg.contains("invalid_grant") {
+        ErrorCode::AuthInvalidGrant
+    } else if msg.contains("net.intermittent") || msg.contains("network drop") {
+        ErrorCode::NetIntermittent
+    } else {
+        // 404 / not-found / unclassified: the object could not be fetched.
+        ErrorCode::DriveUnreachable
     }
 }
 
@@ -590,20 +778,53 @@ async fn restore_one_file<F: FnMut(u64)>(
 /// plaintext with BLAKE3, and verifying it against `file.hash_blake3`. Bounded
 /// memory: at most ~2 ciphertext frames (~128 KiB) are buffered at once, so a
 /// 1 GiB file never sits whole in RAM (PERF acceptance).
+///
+/// M8-P1-1: `cancel` is checked between frames; on cancel this returns
+/// [`StreamOutcome::Cancelled`] WITHOUT verifying, so the caller deletes the temp
+/// (no partial). M8-P1-2: the temp is opened with [`open_temp_no_follow`] -
+/// `create_new(true)` (O_EXCL: fails if the path already exists, killing a
+/// pre-place race) plus platform no-follow flags (Unix `O_NOFOLLOW`; Windows
+/// `FILE_FLAG_OPEN_REPARSE_POINT` + reparse-point rejection) so a symlinked temp
+/// path cannot redirect the write outside the approved root.
 async fn stream_to_disk<R, F>(
     reader: &mut R,
     tmp: &std::path::Path,
     suite: Option<&dyn SourceCryptoSuite>,
     file: &ResolvedRestore,
+    cancel: &RestoreCancel,
     on_progress: &mut F,
-) -> Result<(), ErrorCode>
+) -> StreamOutcome
+where
+    R: tokio::io::AsyncRead + Unpin,
+    F: FnMut(u64),
+{
+    match stream_to_disk_inner(reader, tmp, suite, file, cancel, on_progress).await {
+        Ok(outcome) => outcome,
+        Err(code) => StreamOutcome::Failed(code),
+    }
+}
+
+/// The fallible body of [`stream_to_disk`]: `?`-propagates IO / crypto errors as
+/// the SPEC s24 code, returning the terminal [`StreamOutcome`] on success or
+/// cancel. Split out so the outer fn can map an `Err` to [`StreamOutcome::Failed`]
+/// without a `match` on every `?`.
+async fn stream_to_disk_inner<R, F>(
+    reader: &mut R,
+    tmp: &std::path::Path,
+    suite: Option<&dyn SourceCryptoSuite>,
+    file: &ResolvedRestore,
+    cancel: &RestoreCancel,
+    on_progress: &mut F,
+) -> Result<StreamOutcome, ErrorCode>
 where
     R: tokio::io::AsyncRead + Unpin,
     F: FnMut(u64),
 {
     use tokio::io::AsyncWriteExt;
 
-    let out = tokio::fs::File::create(tmp).await.map_err(map_io_err)?;
+    // M8-P1-2: open the temp no-follow + O_EXCL (random name from the caller).
+    let out = open_temp_no_follow(tmp).map_err(map_io_err)?;
+    let out = tokio::fs::File::from_std(out);
     let mut writer = tokio::io::BufWriter::new(out);
     let mut hasher = Blake3::new();
     let mut written: u64 = 0;
@@ -613,6 +834,10 @@ where
         None => {
             let mut buf = vec![0u8; CIPHERTEXT_FRAME];
             loop {
+                // M8-P1-1: cancel observed between frames -> stop without verifying.
+                if cancel.load(Ordering::SeqCst) {
+                    return Ok(StreamOutcome::Cancelled);
+                }
                 let n = reader.read(&mut buf).await.map_err(map_io_err)?;
                 if n == 0 {
                     break;
@@ -648,6 +873,10 @@ where
             let mut read_chunk = vec![0u8; CIPHERTEXT_FRAME];
             let mut eof = false;
             while !eof {
+                // M8-P1-1: cancel observed between frames -> stop without verifying.
+                if cancel.load(Ordering::SeqCst) {
+                    return Ok(StreamOutcome::Cancelled);
+                }
                 // Fill the buffer until it holds > one frame or we hit EOF.
                 while buf.len() <= CIPHERTEXT_FRAME && !eof {
                     let n = reader.read(&mut read_chunk).await.map_err(map_io_err)?;
@@ -711,7 +940,38 @@ where
         );
         return Err(ErrorCode::CryptoDecryptFailed);
     }
-    Ok(())
+    Ok(StreamOutcome::Done)
+}
+
+/// M8-P1-2: open the restore temp file with NO-FOLLOW + O_EXCL semantics (SPEC
+/// s11.6.1: no-follow writes). `create_new(true)` (O_EXCL) makes the open FAIL if
+/// the path already exists - killing a pre-placed-symlink / race-to-the-path
+/// attack outright - and the platform no-follow flag ensures that even a symlink
+/// at the leaf cannot redirect the write:
+/// - Unix: `O_NOFOLLOW` (open fails with `ELOOP` if the leaf is a symlink).
+/// - Windows: `FILE_FLAG_OPEN_REPARSE_POINT` opens the reparse point itself
+///   (does not traverse it); combined with `create_new` (which fails if anything
+///   exists at the path) a pre-placed reparse point is refused.
+fn open_temp_no_follow(tmp: &std::path::Path) -> std::io::Result<std::fs::File> {
+    let mut opts = std::fs::OpenOptions::new();
+    opts.write(true).create_new(true);
+    #[cfg(unix)]
+    {
+        use std::os::unix::fs::OpenOptionsExt;
+        // O_NOFOLLOW: refuse to open a symlink at the final component.
+        const O_NOFOLLOW: i32 = 0o400000;
+        opts.custom_flags(O_NOFOLLOW);
+    }
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::OpenOptionsExt;
+        // FILE_FLAG_OPEN_REPARSE_POINT: open the reparse point itself rather than
+        // following it. With create_new the path must not already exist, so a
+        // pre-placed reparse point is rejected by O_EXCL before this matters.
+        const FILE_FLAG_OPEN_REPARSE_POINT: u32 = 0x0020_0000;
+        opts.custom_flags(FILE_FLAG_OPEN_REPARSE_POINT);
+    }
+    opts.open(tmp)
 }
 
 /// Map a disk write error to the SPEC s24 code: out-of-space -> `local.disk_full`,
@@ -1022,6 +1282,21 @@ mod tests {
         }
     }
 
+    /// A never-set cancel flag for the streaming tests (the cancel-specific test
+    /// flips its own flag).
+    fn no_cancel() -> RestoreCancel {
+        Arc::new(AtomicBool::new(false))
+    }
+
+    /// A unique random temp path for a no-follow open test (O_EXCL needs an
+    /// unused path).
+    fn rand_tmp(tag: &str) -> std::path::PathBuf {
+        std::env::temp_dir().join(format!(
+            "driven-restore-test-{tag}-{}",
+            uuid::Uuid::new_v4()
+        ))
+    }
+
     #[tokio::test]
     async fn streaming_decrypt_round_trips_multichunk_encrypted_file() {
         // DATA-SAFETY: an encrypted multi-chunk file must decrypt back to the
@@ -1041,12 +1316,22 @@ mod tests {
         let out = tmp_path("multichunk");
         let mut reader = std::io::Cursor::new(blob);
         let mut last_progress = 0u64;
-        let res = stream_to_disk(&mut reader, &out, Some(&suite), &file, &mut |done| {
-            assert!(done >= last_progress, "progress must be monotonic");
-            last_progress = done;
-        })
+        let res = stream_to_disk(
+            &mut reader,
+            &out,
+            Some(&suite),
+            &file,
+            &no_cancel(),
+            &mut |done| {
+                assert!(done >= last_progress, "progress must be monotonic");
+                last_progress = done;
+            },
+        )
         .await;
-        assert!(res.is_ok(), "streaming decrypt must succeed: {res:?}");
+        assert!(
+            matches!(res, StreamOutcome::Done),
+            "streaming decrypt must succeed"
+        );
         let restored = std::fs::read(&out).unwrap();
         assert_eq!(
             restored, plaintext,
@@ -1068,9 +1353,16 @@ mod tests {
             let file = resolved_for(&plaintext, "small.txt");
             let out = tmp_path("small");
             let mut reader = std::io::Cursor::new(blob);
-            stream_to_disk(&mut reader, &out, Some(&suite), &file, &mut |_| {})
-                .await
-                .unwrap();
+            let res = stream_to_disk(
+                &mut reader,
+                &out,
+                Some(&suite),
+                &file,
+                &no_cancel(),
+                &mut |_| {},
+            )
+            .await;
+            assert!(matches!(res, StreamOutcome::Done));
             assert_eq!(std::fs::read(&out).unwrap(), plaintext);
             let _ = std::fs::remove_file(&out);
         }
@@ -1090,9 +1382,16 @@ mod tests {
         let file = resolved_for(&plaintext, "aligned.bin");
         let out = tmp_path("aligned");
         let mut reader = std::io::Cursor::new(blob);
-        stream_to_disk(&mut reader, &out, Some(&suite), &file, &mut |_| {})
-            .await
-            .unwrap();
+        let res = stream_to_disk(
+            &mut reader,
+            &out,
+            Some(&suite),
+            &file,
+            &no_cancel(),
+            &mut |_| {},
+        )
+        .await;
+        assert!(matches!(res, StreamOutcome::Done));
         assert_eq!(std::fs::read(&out).unwrap(), plaintext);
         let _ = std::fs::remove_file(&out);
     }
@@ -1105,9 +1404,8 @@ mod tests {
         let file = resolved_for(&plaintext, "plain.txt");
         let out = tmp_path("plain");
         let mut reader = std::io::Cursor::new(plaintext.clone());
-        stream_to_disk(&mut reader, &out, None, &file, &mut |_| {})
-            .await
-            .unwrap();
+        let res = stream_to_disk(&mut reader, &out, None, &file, &no_cancel(), &mut |_| {}).await;
+        assert!(matches!(res, StreamOutcome::Done));
         assert_eq!(std::fs::read(&out).unwrap(), plaintext);
         let _ = std::fs::remove_file(&out);
     }
@@ -1123,10 +1421,19 @@ mod tests {
         let file = resolved_for(&plaintext, "x.bin");
         let out = tmp_path("wrongkey");
         let mut reader = std::io::Cursor::new(blob);
-        let err = stream_to_disk(&mut reader, &out, Some(&other), &file, &mut |_| {})
-            .await
-            .expect_err("wrong key must fail");
-        assert_eq!(err, ErrorCode::CryptoDecryptFailed);
+        let res = stream_to_disk(
+            &mut reader,
+            &out,
+            Some(&other),
+            &file,
+            &no_cancel(),
+            &mut |_| {},
+        )
+        .await;
+        assert!(
+            matches!(res, StreamOutcome::Failed(ErrorCode::CryptoDecryptFailed)),
+            "wrong key must fail with crypto.decrypt_failed"
+        );
         let _ = std::fs::remove_file(&out);
     }
 
@@ -1141,11 +1448,209 @@ mod tests {
         file.hash_blake3 = *blake3::hash(b"different").as_bytes();
         let out = tmp_path("mismatch");
         let mut reader = std::io::Cursor::new(actual);
-        let err = stream_to_disk(&mut reader, &out, None, &file, &mut |_| {})
-            .await
-            .expect_err("blake3 mismatch must be refused");
-        assert_eq!(err, ErrorCode::CryptoDecryptFailed);
+        let res = stream_to_disk(&mut reader, &out, None, &file, &no_cancel(), &mut |_| {}).await;
+        assert!(
+            matches!(res, StreamOutcome::Failed(ErrorCode::CryptoDecryptFailed)),
+            "blake3 mismatch must be refused"
+        );
         let _ = std::fs::remove_file(&out);
+    }
+
+    // --- M8-P1-1: cancellation deletes the temp + reports Cancelled -----------
+
+    #[tokio::test]
+    async fn streaming_cancel_midstream_stops_and_leaves_no_partial() {
+        // M8-P1-1: a cancel flag observed between frames stops the stream and
+        // returns Cancelled WITHOUT verifying. The temp file may exist mid-write;
+        // restore_one_file (the caller) is what deletes it, so here we assert the
+        // outcome is Cancelled (the caller's deletion is covered separately).
+        let suite = DrivenCryptoSuite::new(driven_crypto::key::SourceKey::generate());
+        // Multi-frame so the loop runs more than once and observes the flag.
+        let plaintext: Vec<u8> = (0..(3 * PLAINTEXT_CHUNK_LEN))
+            .map(|i| (i % 251) as u8)
+            .collect();
+        let blob = encrypt_blob(&suite, &plaintext);
+        let file = resolved_for(&plaintext, "cancel.bin");
+        let out = rand_tmp("cancel");
+        let mut reader = std::io::Cursor::new(blob);
+        // Pre-set the cancel flag so the FIRST frame check trips it.
+        let cancel: RestoreCancel = Arc::new(AtomicBool::new(true));
+        let res =
+            stream_to_disk(&mut reader, &out, Some(&suite), &file, &cancel, &mut |_| {}).await;
+        assert!(
+            matches!(res, StreamOutcome::Cancelled),
+            "a pre-set cancel must stop the stream as Cancelled"
+        );
+        let _ = std::fs::remove_file(&out);
+    }
+
+    #[tokio::test]
+    async fn restore_one_file_cancel_deletes_temp_and_reports_cancelled() {
+        // M8-P1-1 end-to-end for one file: with the cancel flag already set,
+        // restore_one_file must return Cancelled AND leave NO temp file in the
+        // dest dir (the partial is deleted). Uses the InMemoryRemoteStore so the
+        // real download -> stream -> cleanup path runs.
+        use driven_drive::remote_store::UploadBody;
+        let dir = rand_tmp("cancel-onefile");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let plaintext = b"some bytes to restore".to_vec();
+
+        let store = driven_drive::fake::InMemoryRemoteStore::new();
+        let parent = store.root_id().to_string();
+        let entry = store
+            .create(
+                &parent,
+                "x.bin",
+                "application/octet-stream",
+                UploadBody::Bytes(bytes::Bytes::from(plaintext.clone())),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let mut file = resolved_for(&plaintext, "sub/x.bin");
+        file.drive_file_id = Some(entry.id.clone());
+
+        let cancel: RestoreCancel = Arc::new(AtomicBool::new(true));
+        let outcome = restore_one_file(
+            &file,
+            &store,
+            &SuiteVerdict::Plaintext,
+            &token,
+            &cancel,
+            |_| {},
+        )
+        .await;
+        assert!(
+            matches!(outcome, FileOutcome::Cancelled),
+            "cancel before/at stream must report Cancelled"
+        );
+        // No leftover temp file in the dest dir (the partial was deleted, and no
+        // final file was renamed into place).
+        let leftovers: Vec<_> = std::fs::read_dir(dir.join("sub"))
+            .map(|rd| rd.flatten().collect())
+            .unwrap_or_default();
+        assert!(
+            leftovers.is_empty(),
+            "cancel must leave no partial temp: {leftovers:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M8-P1-2: no-follow + O_EXCL temp open --------------------------------
+
+    #[test]
+    fn open_temp_no_follow_rejects_existing_path() {
+        // O_EXCL: the open must FAIL if the temp path already exists (kills the
+        // pre-place / race-to-the-path attack).
+        let path = rand_tmp("excl");
+        std::fs::write(&path, b"pre-placed").unwrap();
+        let err = open_temp_no_follow(&path).expect_err("create_new must reject an existing path");
+        assert_eq!(err.kind(), std::io::ErrorKind::AlreadyExists);
+        let _ = std::fs::remove_file(&path);
+    }
+
+    #[cfg(unix)]
+    #[test]
+    fn open_temp_no_follow_rejects_pre_placed_symlink() {
+        // A symlink pre-placed at the temp path must be refused (O_EXCL fails
+        // because the path exists; even if it did not, O_NOFOLLOW would refuse).
+        use std::os::unix::fs::symlink;
+        let dir = rand_tmp("nofollow-dir");
+        std::fs::create_dir_all(&dir).unwrap();
+        let target = dir.join("target.txt");
+        std::fs::write(&target, b"victim").unwrap();
+        let link = dir.join(".driven-restore-tmp.evil");
+        symlink(&target, &link).unwrap();
+        let err =
+            open_temp_no_follow(&link).expect_err("a pre-placed symlink temp must be refused");
+        // AlreadyExists (O_EXCL) on most platforms; ELOOP if the symlink existed
+        // without O_EXCL. Either way the write did NOT go through to the target.
+        assert!(
+            matches!(
+                err.kind(),
+                std::io::ErrorKind::AlreadyExists | std::io::ErrorKind::Other
+            ),
+            "unexpected error kind: {:?}",
+            err.kind()
+        );
+        // The target was NOT overwritten via the symlink.
+        assert_eq!(std::fs::read(&target).unwrap(), b"victim");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M8-P2-2: search input limits (DESIGN s18.8) --------------------------
+
+    #[test]
+    fn search_query_limits_match_design_s18_8() {
+        // The cap is 256 chars (DESIGN s18.8). A 256-char query is allowed; 257 is
+        // rejected. Control chars (newline, NUL, CR) are rejected. We assert the
+        // pure validation logic (no DB needed) by reproducing the command's guard.
+        let ok = "a".repeat(256);
+        assert_eq!(ok.chars().count(), MAX_QUERY_LEN);
+        let too_long = "a".repeat(257);
+        assert!(too_long.chars().count() > MAX_QUERY_LEN);
+        for bad in ["line\nbreak", "nul\0byte", "carriage\rreturn", "tab\there"] {
+            assert!(
+                bad.contains('\0') || bad.chars().any(|c| c.is_control()),
+                "{bad:?} must be detected as a control-char query"
+            );
+        }
+    }
+
+    // --- M8-P2-1: tree truncation flag ----------------------------------------
+
+    #[test]
+    fn tree_truncation_flag_set_when_children_exceed_cap() {
+        // M8-P2-1: more immediate children than MAX_TREE_NODES => truncated. Build
+        // rows with > cap direct file children at the root and assert the derive +
+        // cap logic the command uses reports truncation.
+        let n = (MAX_TREE_NODES as usize) + 5;
+        let rows: Vec<RestoreFileRow> = (0..n)
+            .map(|i| row(&format!("f{i:06}.txt"), 1, Some("d")))
+            .collect();
+        let nodes = derive_immediate_children("", &rows);
+        let truncated = nodes.len() as u32 > MAX_TREE_NODES;
+        let entries: Vec<_> = nodes.into_iter().take(MAX_TREE_NODES as usize).collect();
+        assert!(
+            truncated,
+            "a folder with > cap children must report truncated"
+        );
+        assert_eq!(entries.len(), MAX_TREE_NODES as usize);
+    }
+
+    // --- M8-P2-5: download error classification -------------------------------
+
+    #[test]
+    fn classify_download_error_maps_distinct_remote_errors() {
+        // M8-P2-5: distinct remote failures map to distinct SPEC s24 codes (not all
+        // drive.unreachable). The fake's fault messages embed the dotted code, so
+        // the string fallback path classifies them.
+        let rate = anyhow::anyhow!("fake: drive.rate_limited after N requests");
+        assert_eq!(classify_download_error(&rate), ErrorCode::DriveRateLimited);
+
+        let auth = anyhow::anyhow!("fake: auth.invalid_grant; reauth required");
+        assert_eq!(classify_download_error(&auth), ErrorCode::AuthInvalidGrant);
+
+        let daily = anyhow::anyhow!("fake: drive.daily_quota_exhausted dailyLimitExceeded");
+        assert_eq!(
+            classify_download_error(&daily),
+            ErrorCode::DriveDailyQuotaExhausted
+        );
+
+        let quota = anyhow::anyhow!("fake: drive.quota_exhausted storageQuotaExceeded");
+        assert_eq!(
+            classify_download_error(&quota),
+            ErrorCode::DriveQuotaExhausted
+        );
+
+        // A 404 / not-found / unclassified maps to drive.unreachable (the object
+        // could not be fetched).
+        let missing = anyhow::anyhow!("fake: no object with id d-missing");
+        assert_eq!(
+            classify_download_error(&missing),
+            ErrorCode::DriveUnreachable
+        );
     }
 
     #[tokio::test]

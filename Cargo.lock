@@ -1243,6 +1243,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "blake3",
+ "bytes",
  "crc32fast",
  "driven-core",
  "driven-crypto",

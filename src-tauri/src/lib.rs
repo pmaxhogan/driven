@@ -155,6 +155,12 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
         tracing::info!(target: "driven::app", account_id = %account_id, "signalling graceful shutdown on quit");
         handle.orchestrator.shutdown();
     }
+    // M8-P1-1: cancel every in-flight RESTORE job up front too (mirrors the
+    // no-orphan AccountHandle drain). Setting each job's cancel flag makes its
+    // task delete the in-flight temp + emit a terminal CANCELLED status, so quit
+    // leaves no orphaned restore task and no partial files. We take the handles
+    // here and await them in the block_on below.
+    let restore_handles = state.cancel_all_restore_jobs();
     tauri::async_runtime::block_on(async move {
         // R3-P1-1: drive ALL per-account shutdowns concurrently. Each
         // `handle.shutdown()` self-bounds its per-task drains and aborts-and-
@@ -167,6 +173,17 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
             tracing::info!(target: "driven::app", account_id = %account_id, "all per-account tasks shut down (no orphans)");
         });
         futures::future::join_all(drains).await;
+
+        // M8-P1-1: join every cancelled restore task so quit waits for each to
+        // observe its cancel flag, delete its temp, and exit (no orphaned restore
+        // task / partial file). A task that already finished is simply joined
+        // immediately; a JoinError (panicked) is swallowed - the post-condition is
+        // "the restore task is no longer running".
+        let restore_drains = restore_handles.into_iter().map(|h| async move {
+            let _ = h.await;
+        });
+        futures::future::join_all(restore_drains).await;
+        tracing::info!(target: "driven::app", "all in-flight restore jobs cancelled + drained (no orphans)");
     });
 }
 
@@ -320,6 +337,7 @@ pub fn run() {
             commands::restore::search_files,
             commands::restore::restore_files,
             commands::restore::get_restore_job,
+            commands::restore::cancel_restore_job,
         ])
         .build(tauri::generate_context!());
 

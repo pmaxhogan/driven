@@ -656,6 +656,23 @@ pub struct RemoteEntryDto {
     pub restorable: bool,
 }
 
+/// The result of `list_remote_tree` (SPEC s11.5; DESIGN s8.4): the immediate
+/// children of a folder plus a `truncated` flag so the webview can tell the user
+/// the listing was capped (M8-P2-1). Before this the command returned a bare
+/// `Vec<RemoteEntryDto>` and silently dropped children past [`MAX_TREE_NODES`],
+/// so a user could believe a large folder was fully shown. The cap itself is
+/// unchanged (the range scan stays bounded); the flag SURFACES it.
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct RemoteTreeDto {
+    /// The immediate children (folders first, then files), capped at
+    /// [`MAX_TREE_NODES`](crate::commands::restore::MAX_TREE_NODES).
+    pub entries: Vec<RemoteEntryDto>,
+    /// `true` when the folder has MORE immediate children than the cap, so the
+    /// UI shows a "showing first N; refine your search" notice.
+    pub truncated: bool,
+}
+
 /// One Restore search hit (SPEC s11.5 `FileSearchHit`; DESIGN s8.4). Mirrors
 /// [`driven_core::state::FileSearchHit`] over the camelCase wire. The path is the
 /// plaintext relative path (decrypted display for encrypted sources, per SPEC s2).
@@ -704,6 +721,10 @@ pub enum RestoreFileState {
     Done,
     /// Failed; `error_code` on the file entry carries the SPEC s24 code.
     Failed,
+    /// Cancelled before this file finished (M8-P1-1): the user cancelled the job
+    /// while this file was pending / mid-stream. Any partial temp was deleted, so
+    /// no half-written file is left on disk.
+    Cancelled,
 }
 
 /// Per-file progress within a restore job (SPEC s11.7 `RestoreJobStatus`).
@@ -744,8 +765,16 @@ pub struct RestoreJobStatus {
     pub bytes_done: u64,
     /// The relative path of the file currently being restored, if any.
     pub current_file: Option<String>,
-    /// `true` once every file has reached a terminal state (done or failed).
+    /// `true` once the job has reached a terminal state - every file is done /
+    /// failed / cancelled. Set for a normal completion AND a cancellation, so the
+    /// webview re-enables its controls on either.
     pub done: bool,
+    /// `true` when the job reached its terminal state because the user CANCELLED
+    /// it (M8-P1-1; SPEC s11.7 CANCELLED terminal state). Distinct from `done`:
+    /// `done && !cancelled` is a normal finish; `done && cancelled` means the job
+    /// was stopped early and any in-flight temp file was deleted (no partial).
+    #[serde(default)]
+    pub cancelled: bool,
     /// Per-file progress entries.
     pub files: Vec<RestoreFileProgress>,
 }

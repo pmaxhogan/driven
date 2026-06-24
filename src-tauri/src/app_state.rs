@@ -8,8 +8,9 @@
 //! real `GoogleDriveStore`s or the in-memory fake (`DRIVEN_USE_FAKE_REMOTE`).
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::Duration;
+use std::time::{Duration, Instant};
 
 use driven_core::orchestrator::Orchestrator;
 use driven_core::state::StateRepo;
@@ -264,14 +265,51 @@ pub struct AppState {
     /// every clone sees the same backing objects). Only ever populated in
     /// [`RemoteMode::Fake`]; in real mode it stays empty.
     fake_remote_stores: FakeRemoteStores,
-    /// M8: live restore-job status snapshots, keyed by job id. The background
-    /// restore task writes the latest [`RestoreJobStatus`](crate::commands::dtos::RestoreJobStatus)
-    /// here on every progress tick (in addition to emitting it on
-    /// `restore:progress`), so `get_restore_job` can serve the current snapshot to
-    /// a webview that subscribed late / missed an event. Behind a sync `Mutex`
-    /// (only ever held for a quick insert / clone-out, never across an await). A
-    /// terminal (done) status is retained so a late poll still sees the result.
-    restore_jobs: std::sync::Mutex<HashMap<String, crate::commands::dtos::RestoreJobStatus>>,
+    /// M8: live restore-job records, keyed by job id. Each entry carries the
+    /// latest [`RestoreJobStatus`](crate::commands::dtos::RestoreJobStatus)
+    /// snapshot (the background task writes it on every progress tick, so
+    /// `get_restore_job` can serve a webview that subscribed late / missed an
+    /// event), plus the per-job CANCEL control + spawned [`JoinHandle`] so
+    /// `cancel_restore_job` and the app-shutdown drain can stop an in-flight job
+    /// (M8-P1-1). Behind a sync `Mutex` (only ever held for a quick insert /
+    /// clone-out / take, never across an await). Terminal entries are retained so
+    /// a late poll still sees the result, but they are TTL-pruned + count-capped
+    /// (M8-P2-3) so a long-running tray app does not leak snapshots forever.
+    restore_jobs: std::sync::Mutex<HashMap<String, RestoreJobEntry>>,
+}
+
+/// M8 (P2-3): max number of TERMINAL restore-job records retained for late
+/// polling. Active (non-terminal) jobs are never evicted by the cap; only
+/// finished ones are pruned once this many accumulate (oldest-terminal first).
+const MAX_RETAINED_TERMINAL_JOBS: usize = 32;
+
+/// M8 (P2-3): how long a TERMINAL restore-job record is retained for a late
+/// `get_restore_job` poll before it is eligible for pruning. Generous (the
+/// webview reconciles right after a job ends) but bounded so the map cannot grow
+/// without limit across many restores in one long-lived session.
+const TERMINAL_JOB_TTL: Duration = Duration::from_secs(3600);
+
+/// M8 (P1-1): the per-job cancellation control shared between the spawned restore
+/// task and the IPC / shutdown paths. A plain [`AtomicBool`] checked between
+/// frames in the stream loop (no extra dependency): set once, observed
+/// monotonically. Cloned (`Arc`) into the spawned task.
+pub type RestoreCancel = Arc<AtomicBool>;
+
+/// M8: one tracked restore job - its latest status snapshot, the instant it
+/// reached a terminal state (for TTL pruning, `None` while running), the shared
+/// cancel flag, and the spawned task handle (taken on cancel / shutdown so the
+/// drain can await it).
+struct RestoreJobEntry {
+    /// The latest status snapshot served by `get_restore_job`.
+    status: crate::commands::dtos::RestoreJobStatus,
+    /// When the job reached a terminal state, for TTL pruning; `None` while it
+    /// is still running.
+    terminal_at: Option<Instant>,
+    /// The shared cancel flag the spawned task observes between frames.
+    cancel: RestoreCancel,
+    /// The spawned job task, behind `Option` so the shutdown drain can TAKE +
+    /// await it by value; `None` once the job finished or was drained.
+    handle: std::sync::Mutex<Option<JoinHandle<()>>>,
 }
 
 /// R2-P1-2: the shared per-account fake-remote-store registry. An `Arc` so
@@ -296,6 +334,35 @@ pub fn fake_remote_store_in(
         .entry(account)
         .or_default()
         .clone()
+}
+
+/// M8 (P2-3): prune retained TERMINAL restore-job records so the map cannot grow
+/// unbounded across many restores in one long-lived tray session. Two bounds:
+/// 1. TTL: a terminal job older than [`TERMINAL_JOB_TTL`] is dropped.
+/// 2. count cap: if more than [`MAX_RETAINED_TERMINAL_JOBS`] terminal jobs
+///    remain, the OLDEST-terminal ones are dropped down to the cap.
+///
+/// Active (non-terminal) jobs are NEVER pruned - only finished ones - so an
+/// in-flight job's status + cancel handle always survive.
+fn prune_terminal_jobs(map: &mut HashMap<String, RestoreJobEntry>) {
+    let now = Instant::now();
+    // 1) TTL: drop terminal jobs older than the retention window.
+    map.retain(|_, e| match e.terminal_at {
+        Some(t) => now.duration_since(t) < TERMINAL_JOB_TTL,
+        None => true,
+    });
+    // 2) count cap: if too many terminal jobs remain, drop the oldest.
+    let mut terminal: Vec<(String, Instant)> = map
+        .iter()
+        .filter_map(|(id, e)| e.terminal_at.map(|t| (id.clone(), t)))
+        .collect();
+    if terminal.len() > MAX_RETAINED_TERMINAL_JOBS {
+        terminal.sort_by_key(|(_, t)| *t);
+        let drop_n = terminal.len() - MAX_RETAINED_TERMINAL_JOBS;
+        for (id, _) in terminal.into_iter().take(drop_n) {
+            map.remove(&id);
+        }
+    }
 }
 
 /// C1: one backend-minted dialog-token binding - the path the user chose via a
@@ -344,13 +411,62 @@ impl AppState {
         }
     }
 
+    /// Lock the restore-jobs map, recovering a poisoned lock (house rule: never
+    /// panic on a poisoned lock).
+    fn lock_restore_jobs(&self) -> std::sync::MutexGuard<'_, HashMap<String, RestoreJobEntry>> {
+        self.restore_jobs.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// M8 (P1-1): SEED a restore job before its task is spawned - its initial
+    /// status snapshot + shared cancel flag - so `get_restore_job` can serve it
+    /// immediately and `cancel_restore_job` works even before the handle is
+    /// attached. The spawned [`JoinHandle`] is attached afterward via
+    /// [`Self::set_restore_job_handle`] (the command spawns the task, then stores
+    /// its handle). Also opportunistically prunes terminal jobs (P2-3).
+    pub fn seed_restore_job(
+        &self,
+        status: crate::commands::dtos::RestoreJobStatus,
+        cancel: RestoreCancel,
+    ) {
+        let mut map = self.lock_restore_jobs();
+        map.insert(
+            status.job_id.clone(),
+            RestoreJobEntry {
+                status,
+                terminal_at: None,
+                cancel,
+                handle: std::sync::Mutex::new(None),
+            },
+        );
+        prune_terminal_jobs(&mut map);
+    }
+
+    /// M8 (P1-1): attach the spawned task handle to an already-seeded job (the
+    /// command spawns the task, then calls this with the returned handle) so the
+    /// cancel / shutdown drain can await it. A no-op if the job already finished
+    /// and was pruned (the handle is simply dropped, detaching the task, which is
+    /// fine since a finished task has nothing to drain).
+    pub fn set_restore_job_handle(&self, job_id: &str, handle: JoinHandle<()>) {
+        if let Some(entry) = self.lock_restore_jobs().get(job_id) {
+            *entry.handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
+        }
+    }
+
     /// M8: record the latest status snapshot for a restore job (the background
     /// task calls this on every progress tick). `get_restore_job` reads it back.
+    /// A terminal (`done`) snapshot stamps the terminal time so the entry becomes
+    /// eligible for TTL pruning (P2-3). Updating an unknown id (e.g. a job whose
+    /// terminal record was already pruned) is a benign no-op.
     pub fn put_restore_job(&self, status: crate::commands::dtos::RestoreJobStatus) {
-        self.restore_jobs
-            .lock()
-            .unwrap_or_else(|e| e.into_inner())
-            .insert(status.job_id.clone(), status);
+        let mut map = self.lock_restore_jobs();
+        let done = status.done;
+        if let Some(entry) = map.get_mut(&status.job_id) {
+            entry.status = status;
+            if done && entry.terminal_at.is_none() {
+                entry.terminal_at = Some(Instant::now());
+            }
+        }
+        prune_terminal_jobs(&mut map);
     }
 
     /// M8: the current status snapshot for `job_id`, if the job exists (live or
@@ -358,11 +474,65 @@ impl AppState {
     /// an error rather than fabricating a status.
     #[must_use]
     pub fn restore_job(&self, job_id: &str) -> Option<crate::commands::dtos::RestoreJobStatus> {
-        self.restore_jobs
+        self.lock_restore_jobs()
+            .get(job_id)
+            .map(|e| e.status.clone())
+    }
+
+    /// M8 (P1-1): request cancellation of a running restore job. Sets the shared
+    /// cancel flag (the spawned task observes it between frames, deletes any
+    /// in-flight temp, and emits a terminal CANCELLED status) and returns the
+    /// spawned [`JoinHandle`] if the job is still tracked + running, so the caller
+    /// can await it. `None` for an unknown / already-finished id - cancellation is
+    /// idempotent (a second call, or a call after the job ended, is a no-op).
+    #[must_use]
+    pub fn cancel_restore_job(&self, job_id: &str) -> Option<JoinHandle<()>> {
+        let map = self.lock_restore_jobs();
+        let entry = map.get(job_id)?;
+        entry.cancel.store(true, Ordering::SeqCst);
+        let handle = entry
+            .handle
             .lock()
             .unwrap_or_else(|e| e.into_inner())
-            .get(job_id)
-            .cloned()
+            .take();
+        handle
+    }
+
+    /// M8 (P1-1): mark a job's handle as drained (the spawned task finished and
+    /// took its own handle). Called by the job task on its way out so the shutdown
+    /// drain does not try to await an already-finished handle.
+    pub fn finish_restore_job_handle(&self, job_id: &str) {
+        if let Some(entry) = self.lock_restore_jobs().get(job_id) {
+            let _ = entry
+                .handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take();
+        }
+    }
+
+    /// M8 (P1-1): signal-cancel EVERY in-flight restore job and TAKE their task
+    /// handles, so the app-shutdown drain can await them (mirrors the M5 no-orphan
+    /// AccountHandle drain). Sets each job's cancel flag, so each task deletes its
+    /// in-flight temp + emits a terminal CANCELLED status before returning, then
+    /// returns the handles for the caller to `join` so quit leaves no orphaned
+    /// restore task and no partial files.
+    #[must_use]
+    pub fn cancel_all_restore_jobs(&self) -> Vec<JoinHandle<()>> {
+        let map = self.lock_restore_jobs();
+        let mut handles = Vec::new();
+        for entry in map.values() {
+            entry.cancel.store(true, Ordering::SeqCst);
+            if let Some(h) = entry
+                .handle
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .take()
+            {
+                handles.push(h);
+            }
+        }
+        handles
     }
 
     /// C1: mint a one-shot dialog token bound to `path` (the path a native
@@ -1089,6 +1259,148 @@ mod tests {
             1,
             "the per-account lock must serialise the critical section (no overlap)"
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Build a minimal terminal/active restore status for the job tests.
+    fn restore_status(job_id: &str, done: bool) -> crate::commands::dtos::RestoreJobStatus {
+        crate::commands::dtos::RestoreJobStatus {
+            job_id: job_id.to_string(),
+            total_files: 1,
+            completed_files: 0,
+            failed_files: 0,
+            total_bytes: 0,
+            bytes_done: 0,
+            current_file: None,
+            done,
+            cancelled: false,
+            files: Vec::new(),
+        }
+    }
+
+    #[tokio::test]
+    async fn cancel_restore_job_sets_flag_and_returns_handle_and_drains() {
+        // M8-P1-1: cancelling a registered job sets its cancel flag (the task
+        // observes it + exits), returns the task handle so the caller can await
+        // it, and is idempotent for an unknown / already-cancelled id.
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+
+        let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
+        let observed_cancel = cancel.clone();
+        // A task that loops until the cancel flag is set (models the stream loop).
+        let handle = tokio::spawn(async move {
+            loop {
+                if observed_cancel.load(Ordering::SeqCst) {
+                    break;
+                }
+                tokio::time::sleep(Duration::from_millis(5)).await;
+            }
+        });
+        app_state.seed_restore_job(restore_status("job-1", false), cancel.clone());
+        app_state.set_restore_job_handle("job-1", handle);
+
+        // Cancel: flag set + handle returned.
+        let returned = app_state.cancel_restore_job("job-1");
+        assert!(cancel.load(Ordering::SeqCst), "cancel flag must be set");
+        let returned = returned.expect("a running job returns its handle");
+        // The task observes the flag and exits; awaiting it completes.
+        tokio::time::timeout(Duration::from_secs(2), returned)
+            .await
+            .expect("cancelled task must finish")
+            .expect("task joined cleanly");
+
+        // Idempotent: a second cancel (handle already taken) returns None.
+        assert!(app_state.cancel_restore_job("job-1").is_none());
+        // Unknown id: None.
+        assert!(app_state.cancel_restore_job("nope").is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn cancel_all_restore_jobs_drains_every_in_flight_job() {
+        // M8-P1-1: the shutdown path cancels EVERY in-flight restore job and
+        // returns their handles so quit can await them (no orphaned restore task).
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+
+        for i in 0..3 {
+            let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
+            let observed = cancel.clone();
+            let handle = tokio::spawn(async move {
+                loop {
+                    if observed.load(Ordering::SeqCst) {
+                        break;
+                    }
+                    tokio::time::sleep(Duration::from_millis(5)).await;
+                }
+            });
+            let id = format!("job-{i}");
+            app_state.seed_restore_job(restore_status(&id, false), cancel);
+            app_state.set_restore_job_handle(&id, handle);
+        }
+
+        let handles = app_state.cancel_all_restore_jobs();
+        assert_eq!(handles.len(), 3, "every in-flight job handle is returned");
+        for h in handles {
+            tokio::time::timeout(Duration::from_secs(2), h)
+                .await
+                .expect("each cancelled restore task must finish")
+                .expect("joined cleanly");
+        }
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn terminal_restore_jobs_are_count_capped() {
+        // M8-P2-3: terminal restore-job records are count-capped so the map does
+        // not leak across many restores. Register MORE than the cap terminal jobs
+        // and assert only the cap remains (plus any active jobs, which we add one
+        // of to prove active jobs are NEVER pruned).
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+
+        // One ACTIVE job that must survive pruning.
+        let active_cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
+        app_state.seed_restore_job(restore_status("active", false), active_cancel);
+
+        // Register many TERMINAL jobs (seed active, then put a done snapshot to
+        // stamp terminal_at + trigger pruning).
+        let total = MAX_RETAINED_TERMINAL_JOBS + 10;
+        for i in 0..total {
+            let id = format!("done-{i}");
+            let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
+            app_state.seed_restore_job(restore_status(&id, false), cancel);
+            app_state.put_restore_job(restore_status(&id, true));
+        }
+
+        let map = app_state.lock_restore_jobs();
+        let terminal = map.values().filter(|e| e.terminal_at.is_some()).count();
+        assert!(
+            terminal <= MAX_RETAINED_TERMINAL_JOBS,
+            "terminal jobs must be capped at {MAX_RETAINED_TERMINAL_JOBS}, got {terminal}"
+        );
+        assert!(
+            map.contains_key("active"),
+            "an active job must never be pruned"
+        );
+        drop(map);
         let _ = std::fs::remove_dir_all(dir);
     }
 
