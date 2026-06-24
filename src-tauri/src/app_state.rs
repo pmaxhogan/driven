@@ -316,6 +316,22 @@ impl AppState {
         Some(binding.path)
     }
 
+    /// C1 / R1-P1-2: PEEK (non-consuming) the path bound to `token`, if it
+    /// exists and has not expired. Unlike [`Self::take_dialog_token`] this does
+    /// NOT consume the token, so a read-only, idempotent, repeatable command
+    /// (`preview_exclusions`, which the user re-runs as they tweak globs) can
+    /// resolve the dialog-derived path without spending the single use the
+    /// subsequent `add_source` write needs. The TTL still bounds replay; only a
+    /// path-bearing WRITE consumes the token.
+    pub fn peek_dialog_token(&self, token: &str) -> Option<std::path::PathBuf> {
+        let map = self.lock_dialog_tokens();
+        let binding = map.get(token)?;
+        if std::time::Instant::now().duration_since(binding.minted_at) >= DIALOG_TOKEN_TTL {
+            return None;
+        }
+        Some(binding.path.clone())
+    }
+
     /// Lock the dialog-token map, recovering a poisoned lock.
     fn lock_dialog_tokens(&self) -> std::sync::MutexGuard<'_, HashMap<String, DialogTokenBinding>> {
         self.dialog_tokens.lock().unwrap_or_else(|e| e.into_inner())
@@ -858,6 +874,32 @@ mod tests {
         assert_eq!(app_state.take_dialog_token(&token), None);
         // An unknown token is rejected.
         assert_eq!(app_state.take_dialog_token("not-a-real-token"), None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn peek_dialog_token_is_non_consuming() {
+        // R1-P1-2: `preview_exclusions` PEEKS the dialog token (non-consuming) so
+        // the user can re-run the preview as they tweak globs AND the subsequent
+        // `add_source` still has the single TAKE it needs. Peeking N times then
+        // taking once must all resolve the same path; a take after that is
+        // rejected.
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(state, HashMap::new(), RemoteMode::Fake);
+        let path = std::path::PathBuf::from("/home/u/preview-root");
+        let token = app_state.mint_dialog_token(path.clone());
+
+        // Multiple peeks all resolve the path WITHOUT consuming the token.
+        assert_eq!(app_state.peek_dialog_token(&token), Some(path.clone()));
+        assert_eq!(app_state.peek_dialog_token(&token), Some(path.clone()));
+        // The single TAKE (what add_source uses) still works after the peeks.
+        assert_eq!(app_state.take_dialog_token(&token), Some(path));
+        // Now consumed: a further peek AND take both return None.
+        assert_eq!(app_state.peek_dialog_token(&token), None);
+        assert_eq!(app_state.take_dialog_token(&token), None);
+        // An unknown token never resolves.
+        assert_eq!(app_state.peek_dialog_token("nope"), None);
 
         let _ = std::fs::remove_dir_all(dir);
     }

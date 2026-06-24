@@ -415,10 +415,15 @@ pub async fn finish_add_account(
     let profile = fetch_google_userinfo(&tokens.access_token).await;
 
     let (account_id, dto) = if let Some(account_id) = reauth_account {
-        // Reauth path: re-store the refresh token + client creds + flip the
+        // Reauth path: re-store the refresh token + client creds, THEN flip the
         // existing account back to Ok, refreshing the profile if we got one.
+        // R1-P1-4: persisting the client creds is FATAL and happens BEFORE the
+        // account is flipped to Ok - if it fails the account stays in its prior
+        // (needs_reauth) state rather than being marked Ok with un-refreshable
+        // creds. The refresh token re-store is harmless to leave (the same
+        // account, same key) and is overwritten on the next successful reauth.
         store_refresh_token(account_id, &tokens.refresh_token)?;
-        store_client_creds(account_id, &creds);
+        store_client_creds(account_id, &creds)?;
 
         let rows = state
             .state()
@@ -452,9 +457,21 @@ pub async fn finish_add_account(
     } else {
         // Fresh add: allocate the id, store the token + client creds, write the
         // row with the real Google email/name (A5).
+        // R1-P1-4: the token AND client creds are persisted BEFORE the account
+        // row is written, and persisting the client creds is FATAL: an account
+        // whose BYO client creds did not persist could never refresh its own
+        // token (the refresh is bound to the minting client). If the creds store
+        // fails, roll back the just-stored refresh token so NO half-account
+        // (token without creds, or a row that cannot refresh) is left behind.
         let account_id = AccountId::new_v4();
         store_refresh_token(account_id, &tokens.refresh_token)?;
-        store_client_creds(account_id, &creds);
+        if let Err(err) = store_client_creds(account_id, &creds) {
+            if let Err(del) = KeyringTokenStore::new(account_id.to_string()).delete_refresh_token()
+            {
+                tracing::error!(target: TARGET, account_id = %account_id, error = %del, "failed to roll back refresh token after client-creds persist failure");
+            }
+            return Err(err);
+        }
 
         // A5: prefer the real Google email; else the user label; else a stable
         // fallback. The display name prefers the user-supplied label, else the
@@ -520,19 +537,29 @@ pub async fn finish_add_account(
     Ok(dto)
 }
 
-/// Persist the per-account BYO OAuth client creds in the keychain (A1).
-/// Best-effort: a keychain write failure is logged (NEVER the secret) but does
-/// not fail the finish - the account is already saved; a missing client-creds
-/// entry falls back to the env/default client on next refresh.
-fn store_client_creds(account_id: AccountId, creds: &(String, String)) {
+/// Persist the per-account BYO OAuth client creds in the keychain (A1; R1-P1-4).
+///
+/// FATAL, not best-effort: a refresh token is bound to the client that minted
+/// it, so an account whose client creds were NOT persisted will fail EVERY
+/// refresh after restart (it falls back to the env/default client, which did not
+/// mint the token -> `invalid_client`). `finish_add_account` therefore aborts +
+/// rolls the account back when this fails, rather than leaving behind an account
+/// that can never refresh its own token. The error maps to `crypto.key_missing`
+/// (the keychain-write failure class); the secret is NEVER logged or embedded.
+fn store_client_creds(account_id: AccountId, creds: &(String, String)) -> CommandResult<()> {
     use driven_drive::google::token_store::{ClientCreds, ClientCredsStore};
     let record = ClientCreds {
         client_id: creds.0.clone(),
         client_secret: creds.1.clone(),
     };
-    if let Err(e) = ClientCredsStore::new(account_id.to_string()).store(&record) {
-        tracing::warn!(target: TARGET, account_id = %account_id, error = %e, "failed to persist BYO client creds in keychain");
-    }
+    ClientCredsStore::new(account_id.to_string())
+        .store(&record)
+        .map_err(|e| {
+            CommandError::with_code(
+                ErrorCode::CryptoKeyMissing,
+                format!("failed to persist BYO OAuth client creds in keychain: {e}"),
+            )
+        })
 }
 
 /// The subset of the Google userinfo response Driven persists (A5).

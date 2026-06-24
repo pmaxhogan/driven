@@ -30,11 +30,12 @@ use driven_core::types::{AccountId, ErrorCode, SourceId};
 
 use driven_crypto::{master_key_to_phrase, Keystore, MasterKey};
 
+use driven_drive::fake::InMemoryRemoteStore;
 use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
 use driven_drive::google::GoogleDriveStore;
 use driven_drive::remote_store::RemoteStore;
 
-use crate::app_state::AppState;
+use crate::app_state::{AppState, RemoteMode};
 use crate::commands::dtos::{
     AddSourceRequest, AddSourceResult, DriveFolderEntry, DriveFolderListing, ExclusionPreview,
     ExclusionPreviewRequest, SourceDto, SourcePatch,
@@ -117,24 +118,42 @@ pub async fn add_source(
     // `..`, require an existing directory).
     let canon = validate_readable_dir(&dialog_path)?;
 
+    // R1-P2-2 (DESIGN s5.2.2): reject a new source root that overlaps an
+    // EXISTING source root (one is an ancestor of the other, or they are
+    // identical). Sibling / disjoint roots are allowed. Checked BEFORE any
+    // master-key generation so an overlap never provisions a key.
+    reject_overlapping_root(state.state().as_ref(), &canon).await?;
+
     let now = SystemClock.now_ms();
     let source_id = SourceId::new_v4();
 
-    // Encryption opt-in (DESIGN s7.1): ensure the account master key exists
-    // (generating it + returning the recovery phrase on the FIRST encrypted
-    // source), then wrap a fresh per-source key under it. `recovery_phrase` is
-    // Some ONLY when the master key was just generated (B3).
-    let (wrapped_source_key, recovery_phrase) = if req.encryption_enabled {
-        let (master, phrase) = ensure_master_key(state.state().as_ref(), &account).await?;
-        let (_source_key, wrapped) = master.wrap_new_source_key().map_err(|e| {
+    // Encryption opt-in (DESIGN s7.1): prepare the account master key (generating
+    // it + encoding the recovery phrase on the FIRST encrypted source), then wrap
+    // a fresh per-source key under it. `recovery_phrase` is Some ONLY when the
+    // master key was just generated (B3). `newly_generated_key` records whether
+    // THIS call minted + stored a brand-new master key in the keychain, so the
+    // atomic DB write below knows it must (a) stamp the account row and (b) on a
+    // DB failure ROLL BACK the keychain entry so a retry re-reveals (R1-P1-1).
+    let (wrapped_source_key, recovery_phrase, newly_generated_key) = if req.encryption_enabled {
+        let prepared = prepare_master_key(&account)?;
+        let (_source_key, wrapped) = prepared.master.wrap_new_source_key().map_err(|e| {
+            // The key may have just been stored in the keychain but no DB row
+            // exists yet; roll it back so a retry starts clean (R1-P1-1).
+            if prepared.newly_generated {
+                let _ = delete_master_key(&account.id);
+            }
             CommandError::with_code(
                 ErrorCode::CryptoKeyMissing,
                 format!("failed to wrap per-source key: {e}"),
             )
         })?;
-        (Some(wrapped.to_bytes()), phrase)
+        (
+            Some(wrapped.to_bytes()),
+            prepared.phrase,
+            prepared.newly_generated,
+        )
     } else {
-        (None, None)
+        (None, None, false)
     };
 
     let row = SourceRow {
@@ -157,11 +176,33 @@ pub async fn add_source(
         created_at: now,
     };
 
-    state
+    // R1-P1-1: ATOMIC account-stamp + source-insert. On the FIRST encrypted
+    // source the account's `encryption_master_key_id` is stamped IN THE SAME
+    // transaction as the source insert, so the two can never diverge. The phrase
+    // (and the keychain key) is only "kept" once this commits; if it fails AND we
+    // just generated a key, delete the keychain entry so the account is left
+    // unprovisioned and a retry re-reveals the phrase.
+    let stamp = if newly_generated_key {
+        Some((req.account_id, req.account_id.to_string()))
+    } else {
+        None
+    };
+    if let Err(err) = state
         .state()
-        .upsert_source(&row)
+        .insert_source_with_optional_master_key_stamp(&row, stamp)
         .await
-        .map_err(CommandError::from)?;
+    {
+        if newly_generated_key {
+            // Roll back the just-stored master key so the account is NOT left
+            // provisioned-without-a-revealed-phrase (R1-P1-1).
+            if let Err(del) = delete_master_key(&account.id) {
+                tracing::error!(target: TARGET, account_id = %req.account_id, error = %del, "failed to roll back orphaned master key after atomic source-insert failure");
+            } else {
+                tracing::warn!(target: TARGET, account_id = %req.account_id, "rolled back master key after atomic source-insert failure; retry will re-reveal the phrase");
+            }
+        }
+        return Err(CommandError::from(err));
+    }
 
     // Reconfigure the owning orchestrator so the new source is picked up without
     // a restart (best-effort: the account may not have a running orchestrator -
@@ -273,15 +314,21 @@ pub async fn pick_drive_folder(
     // The account must exist (so a stale webview id surfaces an error).
     let _ = find_account(state.state().as_ref(), account_id).await?;
 
-    let store = build_account_store(account_id)?;
-    // B1: Drive's root alias is the concrete id "root" (resolves to My Drive's
-    // root). We resolve `None` to "root" for the listing AND echo it back as the
-    // `current_folder_id`, so the user can SELECT the current folder - including
-    // the My Drive root - as the backup destination. Before this fix the backend
-    // echoed `None` at the top level, leaving the wizard with no selectable id.
-    let folder_id = start_folder_id
-        .clone()
-        .unwrap_or_else(|| "root".to_string());
+    // R1-P1-3: honour the run's remote mode. In FAKE mode (dev / e2e /
+    // fake-remote wizard acceptance) we MUST NOT build a real Google store or
+    // touch real keychain creds - build the in-memory fake and list it. Only in
+    // REAL mode do we construct the live GoogleDriveStore from the account's
+    // refresh token. The fake's root id is its synthetic root (not the literal
+    // "root" alias), so `None` resolves to that; in real mode `None` resolves to
+    // Drive's "root" alias (My Drive root).
+    let (store, default_folder_id) = select_picker_store(state.remote_mode(), account_id)?;
+
+    // B1: We resolve `None` to the mode-appropriate root for the listing AND echo
+    // it back as the `current_folder_id`, so the user can SELECT the current
+    // folder - including the root - as the backup destination. Before this fix
+    // the backend echoed `None` at the top level, leaving the wizard with no
+    // selectable id.
+    let folder_id = start_folder_id.clone().unwrap_or(default_folder_id);
 
     let children = store
         .list_folder(&folder_id)
@@ -314,17 +361,47 @@ pub async fn pick_drive_folder(
 /// `preview_exclusions(req)` - preview which files the candidate rules would
 /// include vs exclude (SPEC s11.2; DESIGN s8.5 step 3).
 ///
-/// SPEC s11.6.1: `req.local_path` is validated before the walk. Builds the same
-/// [`build_source_matcher`] the scanner uses over a synthetic `SourceRow`
-/// carrying the candidate rules, walks the tree to a bounded sample, and returns
-/// counts + first-N samples of included vs excluded relative paths. Reads only -
-/// no upload, no state write.
+/// R1-P1-2 (SPEC s11.6.1): the walk root is NEVER a raw webview path. For a NEW
+/// candidate source the root is resolved from `req.local_path_token` (a
+/// backend-minted dialog token, peeked non-consumingly so `add_source` keeps its
+/// single use); for an EXISTING source it is resolved from `req.source_id` ->
+/// `backup_sources.local_path`. A request with neither - or with a token that
+/// does not map to a backend dialog - is rejected. The resolved path is then
+/// validated before the walk. Builds the same [`build_source_matcher`] the
+/// scanner uses over a synthetic `SourceRow` carrying the candidate rules, walks
+/// the tree to a bounded sample, and returns counts + first-N samples of included
+/// vs excluded relative paths. Reads only - no upload, no state write.
 #[tauri::command]
 pub async fn preview_exclusions(
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     req: ExclusionPreviewRequest,
 ) -> CommandResult<ExclusionPreview> {
-    let canon = validate_readable_dir(&req.local_path)?;
+    // R1-P1-2: resolve the walk root from a backend-trusted source, never a raw
+    // webview path. Prefer an explicit existing-source id; else a dialog token.
+    let root = if let Some(source_id_str) = req.source_id.as_deref() {
+        let source_id: SourceId = source_id_str.parse().map_err(|e| {
+            CommandError::with_code(
+                ErrorCode::InternalBug,
+                format!("invalid source id for preview: {e}"),
+            )
+        })?;
+        let row = find_source(state.state().as_ref(), source_id).await?;
+        std::path::PathBuf::from(row.local_path)
+    } else if let Some(token) = req.local_path_token.as_deref() {
+        state.peek_dialog_token(token).ok_or_else(|| {
+            CommandError::with_code(
+                ErrorCode::LocalIoError,
+                "no matching dialog token for the preview folder; pick a folder first",
+            )
+        })?
+    } else {
+        return Err(CommandError::with_code(
+            ErrorCode::LocalIoError,
+            "preview requires a dialog token (new folder) or a source id (existing source)",
+        ));
+    };
+
+    let canon = validate_readable_dir(&root)?;
 
     // A synthetic source carrying the candidate rules so the SAME matcher the
     // scanner uses (defaults + optional gitignore tier + the candidate
@@ -487,25 +564,36 @@ async fn find_source(state: &dyn StateRepo, id: SourceId) -> CommandResult<Sourc
     })
 }
 
-/// Ensure `account` has an account master key in the keychain (DESIGN s7.1).
+/// The prepared account master key for an encrypted source add (R1-P1-1).
+struct PreparedMasterKey {
+    /// The account master key (loaded or freshly generated).
+    master: MasterKey,
+    /// The one-time BIP39 recovery phrase words, `Some` ONLY when this call
+    /// generated a brand-new master key (B3 - shown once to the user).
+    phrase: Option<Vec<String>>,
+    /// `true` when THIS call generated + stored a new master key in the
+    /// keychain, so the caller knows it must stamp the account row atomically AND
+    /// roll the keychain entry back if the DB write fails (R1-P1-1).
+    newly_generated: bool,
+}
+
+/// Prepare `account`'s master key for an encrypted source (DESIGN s7.1).
 ///
-/// On the FIRST encrypted source for the account (no `encryption_master_key_id`
-/// and no master key in the keystore) this GENERATES the master key, stores it,
-/// stamps `encryption_master_key_id` on the account row, and RETURNS the BIP39
-/// recovery phrase (B3 - delivered as a one-time value to the caller, NOT a
-/// fire-and-forget event). On a subsequent encrypted source the existing key is
-/// loaded and the returned phrase is `None` (the account's phrase is unchanged
-/// and was shown once already). Returns `(master_key, Option<phrase_words>)`.
+/// On the FIRST encrypted source (no `encryption_master_key_id`) this GENERATES
+/// the master key, stores it in the keychain, encodes the BIP39 recovery phrase,
+/// and returns `newly_generated = true` with the phrase words (B3). It does NOT
+/// stamp the account row - that stamp now happens ATOMICALLY with the source
+/// insert in the caller (R1-P1-1), so a source-insert failure cannot leave the
+/// account provisioned-but-phraseless.
+///
+/// On a SUBSEQUENT encrypted source the existing key is loaded and the returned
+/// phrase is `None` (`newly_generated = false`).
 ///
 /// B3 safety: if the master key was just generated but its phrase cannot be
-/// encoded, this is a HARD ERROR (`crypto.key_missing`) - we must NEVER create an
-/// encrypted source without being able to reveal its recovery phrase (that would
-/// make the backup unrestorable). The freshly-generated-but-unrevealable key is
-/// rolled back (deleted + the row left unstamped) so a retry can regenerate.
-async fn ensure_master_key(
-    state: &dyn StateRepo,
-    account: &AccountRow,
-) -> CommandResult<(MasterKey, Option<Vec<String>>)> {
+/// encoded, this is a HARD ERROR (`crypto.key_missing`) - an encrypted backup
+/// with no revealable phrase is unrestorable; the just-stored key is rolled back
+/// (keychain entry deleted) so a retry can regenerate from a clean state.
+fn prepare_master_key(account: &AccountRow) -> CommandResult<PreparedMasterKey> {
     let keystore = Keystore::open(&account.id.to_string()).map_err(|e| {
         CommandError::with_code(
             ErrorCode::CryptoKeyMissing,
@@ -521,7 +609,11 @@ async fn ensure_master_key(
                 format!("account master key unavailable: {e}"),
             )
         })?;
-        return Ok((master, None));
+        return Ok(PreparedMasterKey {
+            master,
+            phrase: None,
+            newly_generated: false,
+        });
     }
 
     // First encrypted source: generate + persist the master key.
@@ -533,9 +625,9 @@ async fn ensure_master_key(
         )
     })?;
 
-    // B3: encode the recovery phrase BEFORE stamping the row. If it cannot be
-    // encoded we must NOT proceed (an encrypted backup with no revealable phrase
-    // is unrestorable); roll back the just-stored key and error.
+    // B3: encode the recovery phrase BEFORE returning. If it cannot be encoded we
+    // must NOT proceed (an encrypted backup with no revealable phrase is
+    // unrestorable); roll back the just-stored key and error.
     let phrase = match master_key_to_phrase(&master) {
         Ok(phrase) => phrase,
         Err(e) => {
@@ -550,16 +642,45 @@ async fn ensure_master_key(
     // words are returned once then dropped by the caller, never persisted.
     let words: Vec<String> = phrase.split_whitespace().map(|w| w.to_string()).collect();
 
-    // Stamp the account row so subsequent sources reuse this key (and so the
-    // crypto provider sees the account as encryption-provisioned).
-    let mut updated = account.clone();
-    updated.encryption_master_key_id = Some(account.id.to_string());
-    state
-        .upsert_account(&updated)
-        .await
-        .map_err(CommandError::from)?;
+    Ok(PreparedMasterKey {
+        master,
+        phrase: Some(words),
+        newly_generated: true,
+    })
+}
 
-    Ok((master, Some(words)))
+/// Delete `account_id`'s master key from the keychain (R1-P1-1 rollback). Used to
+/// undo a freshly-generated master key when the atomic source insert fails, so
+/// the account is left unprovisioned and a retry re-reveals the phrase.
+fn delete_master_key(account_id: &AccountId) -> anyhow::Result<()> {
+    let keystore = Keystore::open(&account_id.to_string())?;
+    keystore.delete_master_key()?;
+    Ok(())
+}
+
+/// R1-P2-2 (DESIGN s5.2.2): reject a candidate source root that OVERLAPS any
+/// existing source root - i.e. the candidate is an ancestor of, a descendant of,
+/// or identical to an existing root. Sibling / disjoint roots are allowed. The
+/// comparison canonicalises every existing root the same way the candidate was
+/// canonicalised so a symlinked / case / UNC variant cannot sneak past. Applied
+/// GLOBALLY across all accounts (DESIGN s5.2.2 does not scope it per-account).
+async fn reject_overlapping_root(state: &dyn StateRepo, candidate: &Path) -> CommandResult<()> {
+    let existing = state.list_sources().await.map_err(CommandError::from)?;
+    for src in &existing {
+        // Canonicalise the existing root; if it no longer resolves (the folder
+        // was moved/deleted) it cannot overlap a real candidate, so skip it.
+        let Ok(other) = dunce::canonicalize(&src.local_path) else {
+            continue;
+        };
+        if candidate == other || candidate.starts_with(&other) || other.starts_with(candidate) {
+            return Err(CommandError::with_code(
+                ErrorCode::LocalIoError,
+                "this folder overlaps a folder that is already being backed up \
+                 (one is inside the other); pick one or the other, or split them",
+            ));
+        }
+    }
+    Ok(())
 }
 
 /// Reconfigure `account_id`'s running orchestrator (if one is live) with a
@@ -599,6 +720,28 @@ async fn reconfigure_account(state: &State<'_, AppState>, account_id: AccountId)
         .unwrap_or_default();
     handle.orchestrator.reconfigure(config).await;
     tracing::debug!(target: TARGET, account_id = %account_id, "orchestrator reconfigured after source change");
+}
+
+/// R1-P1-3: select the Drive-folder-picker store + its root id for `remote_mode`.
+///
+/// - [`RemoteMode::Fake`] (dev / e2e / fake-remote wizard acceptance): build an
+///   in-memory [`InMemoryRemoteStore`] and use its synthetic root id. NO real
+///   Google store is built and NO keychain creds are read - the fake-remote
+///   wizard completes end-to-end without real credentials.
+/// - [`RemoteMode::RealGoogleDrive`]: build the live [`GoogleDriveStore`] from
+///   the account's keychain refresh token and use Drive's `"root"` alias.
+fn select_picker_store(
+    remote_mode: RemoteMode,
+    account_id: AccountId,
+) -> CommandResult<(Arc<dyn RemoteStore>, String)> {
+    match remote_mode {
+        RemoteMode::Fake => {
+            let fake = InMemoryRemoteStore::new();
+            let root = fake.root_id().to_string();
+            Ok((Arc::new(fake), root))
+        }
+        RemoteMode::RealGoogleDrive => Ok((build_account_store(account_id)?, "root".to_string())),
+    }
 }
 
 /// Build a one-off real [`GoogleDriveStore`] for `account_id` from its keychain
@@ -753,5 +896,119 @@ mod tests {
         let v = serde_json::to_value(&dto).unwrap();
         assert!(v.get("wrappedSourceKey").is_none());
         assert!(!v.to_string().contains("[1,2,3]"));
+    }
+
+    /// Open a temp SQLite state repo + return it with the temp dir holding it
+    /// alive for the duration of the test.
+    async fn temp_repo() -> (
+        driven_core::state::sqlite::SqliteStateRepo,
+        std::path::PathBuf,
+    ) {
+        let dir = tempdir();
+        let repo = driven_core::state::sqlite::SqliteStateRepo::open(&dir.join("state.db"))
+            .await
+            .expect("open state repo");
+        (repo, dir)
+    }
+
+    /// A persisted source row rooted at `root` (an existing dir) for the overlap
+    /// tests. Inserts the owning account first so the FK is satisfied.
+    async fn persist_source_at(state: &dyn StateRepo, root: &Path) -> AccountId {
+        let account_id = AccountId::new_v4();
+        let account = AccountRow {
+            id: account_id,
+            email: "u@example.com".to_string(),
+            display_name: None,
+            state: driven_core::types::AccountState::Ok,
+            encryption_master_key_id: None,
+            created_at: 0,
+            last_synced_at: None,
+        };
+        state
+            .upsert_account(&account)
+            .await
+            .expect("upsert account");
+        let row = SourceRow {
+            id: SourceId::new_v4(),
+            account_id,
+            display_name: "existing".to_string(),
+            enabled: true,
+            local_path: root.to_string_lossy().to_string(),
+            drive_folder_id: String::new(),
+            drive_folder_path: String::new(),
+            encryption_enabled: false,
+            wrapped_source_key: None,
+            respect_gitignore: true,
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: default_deep_verify_secs(),
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            created_at: 0,
+        };
+        state.upsert_source(&row).await.expect("upsert source");
+        account_id
+    }
+
+    #[tokio::test]
+    async fn reject_overlapping_root_rejects_nested_ancestor_identical_allows_sibling() {
+        // R1-P2-2 (DESIGN s5.2.2): nested / ancestor / identical roots are
+        // rejected; a sibling is allowed.
+        let (repo, dir) = temp_repo().await;
+        // Existing source root: <dir>/parent
+        let parent = dir.join("parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let nested = parent.join("child");
+        std::fs::create_dir_all(&nested).unwrap();
+        let sibling = dir.join("sibling");
+        std::fs::create_dir_all(&sibling).unwrap();
+
+        let canon_parent = dunce::canonicalize(&parent).unwrap();
+        let canon_nested = dunce::canonicalize(&nested).unwrap();
+        let canon_sibling = dunce::canonicalize(&sibling).unwrap();
+
+        persist_source_at(&repo, &canon_parent).await;
+
+        // Identical root -> rejected.
+        let err = reject_overlapping_root(&repo, &canon_parent)
+            .await
+            .expect_err("identical root must be rejected");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
+        // Descendant (nested under the existing root) -> rejected.
+        let err = reject_overlapping_root(&repo, &canon_nested)
+            .await
+            .expect_err("nested root must be rejected");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
+        // Ancestor (the existing root is nested under the candidate) -> rejected.
+        let canon_dir = dunce::canonicalize(&dir).unwrap();
+        let err = reject_overlapping_root(&repo, &canon_dir)
+            .await
+            .expect_err("ancestor root must be rejected");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
+        // A sibling (disjoint) -> allowed.
+        reject_overlapping_root(&repo, &canon_sibling)
+            .await
+            .expect("a sibling root must be allowed");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn select_picker_store_fake_mode_lists_without_real_creds() {
+        // R1-P1-3: under RemoteMode::Fake the picker store is the in-memory fake
+        // (no keychain creds touched) and lists its root successfully. A random
+        // account id with NO keychain entry would FAIL build_account_store in
+        // real mode; here it must succeed because the fake path is taken.
+        let account_id = AccountId::new_v4();
+        let (store, root) =
+            select_picker_store(RemoteMode::Fake, account_id).expect("fake store builds");
+        assert!(!root.is_empty(), "fake root id must be non-empty");
+        // The fresh fake root lists (zero child folders) without error / creds.
+        let children = store.list_folder(&root).await.expect("fake list_folder");
+        assert!(
+            children.is_empty(),
+            "a fresh fake remote has no child folders"
+        );
     }
 }

@@ -246,14 +246,26 @@ pub struct DriveFolderListing {
 
 /// Request body for `preview_exclusions` (SPEC s11.2 `ExclusionPreviewRequest`).
 ///
-/// `local_path` MUST be a dialog-derived path (SPEC s11.6.1) - the preview
-/// walks the local tree, so the same untrusted-path rule applies as
-/// `add_source`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+/// R1-P1-2 (SPEC s11.6.1): the preview WALKS the local tree, so its root must
+/// never be a raw webview-supplied path (a compromised renderer could enumerate
+/// arbitrary readable directories). The root is resolved one of two safe ways:
+/// - a NEW candidate source: `local_path_token` is the one-shot dialog token
+///   `pick_folder_dialog` minted; the backend PEEKS (non-consuming, so the later
+///   `add_source` keeps its single use) the path bound to it;
+/// - an EXISTING source: `source_id` is the source's id; the backend resolves
+///   `backup_sources.local_path` from SQLite.
+///
+/// Exactly one of the two must be present; a request with neither (or a token
+/// that does not map to a backend dialog) is REJECTED.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct ExclusionPreviewRequest {
-    /// Dialog-derived absolute local path to preview (SPEC s11.6.1).
-    pub local_path: PathBuf,
+    /// One-shot dialog token for a NEW candidate source's folder (from
+    /// `pick_folder_dialog`); resolved via a non-consuming peek (R1-P1-2).
+    pub local_path_token: Option<String>,
+    /// An EXISTING source's id; its `local_path` is resolved from SQLite
+    /// (R1-P1-2). Mutually exclusive with `local_path_token`.
+    pub source_id: Option<String>,
     /// Whether `.gitignore` rules are honoured.
     pub respect_gitignore: bool,
     /// Candidate include globs.

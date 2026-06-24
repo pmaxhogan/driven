@@ -316,9 +316,15 @@ async fn build_account(
     };
 
     // --- pacer: real AIMD pacer seeded from the account's config -------------
-    // M5 uses the default orchestrator config (the persisted per-account
-    // settings UI is M6); the bandwidth cap is therefore unset here.
-    let config = OrchestratorConfig::default();
+    // R1-P2-1: load the PERSISTED SPEC s22 settings (scan cadence, bandwidth
+    // cap, metered/battery gates, VSS mode) so a cold start honours the user's
+    // saved settings, not the hard defaults. Before this fix the orchestrator
+    // always booted with `OrchestratorConfig::default()` and only picked up the
+    // persisted values after a live settings edit. A read/parse failure falls
+    // back to the conservative default (reconfigure-style best-effort).
+    let config = crate::commands::settings::load_orchestrator_config(state.as_ref())
+        .await
+        .unwrap_or_default();
     let pacer: Arc<dyn Pacer> = Arc::new(AimdPacer::with_ceilings(
         clock.clone(),
         config.bandwidth_cap_mbps.map(f64::from),
@@ -774,4 +780,67 @@ fn spawn_event_bridge(
 struct AccountSyncStatusEvent {
     account_id: String,
     state: driven_core::types::OrchestratorState,
+}
+
+#[cfg(test)]
+mod tests {
+    use driven_core::orchestrator::OrchestratorConfig;
+    use driven_core::state::sqlite::SqliteStateRepo;
+    use driven_core::state::StateRepo;
+
+    /// R1-P2-1: cold-start orchestrators must build their [`OrchestratorConfig`]
+    /// from the PERSISTED SPEC s22 settings, not the hard defaults. `build_account`
+    /// now reads `commands::settings::load_orchestrator_config` at assembly time
+    /// (replacing the old `OrchestratorConfig::default()`); this asserts that a
+    /// persisted NON-DEFAULT setting is reflected in the config that path yields,
+    /// so a fresh boot honours the user's saved settings without a live edit.
+    #[tokio::test]
+    async fn cold_start_config_reflects_persisted_non_default_setting() {
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("driven-assembly-cfg-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = SqliteStateRepo::open(&dir.join("state.db"))
+            .await
+            .expect("open repo");
+
+        // The hard default scan cadence is 600s; persist a DISTINCT non-default
+        // value so a cold start that ignored persisted settings would fail this.
+        let default_cfg = OrchestratorConfig::default();
+        let persisted_scan_secs: u64 = 123;
+        assert_ne!(
+            default_cfg.scan_interval_secs, persisted_scan_secs,
+            "fixture must differ from the default to prove the persisted value wins"
+        );
+        let global = serde_json::json!({
+            "auto_start_on_login": false,
+            "default_concurrent_uploads": serde_json::Value::Null,
+            "bandwidth_cap_mbps": 7,
+            "skip_on_battery": false,
+            "skip_on_metered": false,
+            "scan_interval_secs": persisted_scan_secs,
+            "deep_verify_interval_secs": 604_800,
+            "io_priority": "low",
+            "log_level": "info",
+        });
+        repo.set_setting("global", &global)
+            .await
+            .expect("seed global");
+
+        // The EXACT function `build_account` reads at cold start.
+        let cfg = crate::commands::settings::load_orchestrator_config(&repo)
+            .await
+            .expect("load config");
+        assert_eq!(
+            cfg.scan_interval_secs, persisted_scan_secs,
+            "cold-start config must reflect the persisted scan cadence (R1-P2-1)"
+        );
+        assert_eq!(cfg.bandwidth_cap_mbps, Some(7));
+        assert!(!cfg.skip_on_battery);
+        assert!(!cfg.skip_on_metered);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
 }
