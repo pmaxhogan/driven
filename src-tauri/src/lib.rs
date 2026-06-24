@@ -123,41 +123,45 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: &[String]) {
     show_main_window(app);
 }
 
-/// GRACEFULLY drain every per-account orchestrator on an explicit Quit
-/// (DESIGN s5.10.2): signal `Orchestrator::shutdown()` so each loop finishes its
-/// in-flight cycle, then AWAIT the run-loop `JoinHandle` (bounded by a timeout
-/// so a wedged cycle cannot hang quit forever - it falls back to abort). This
-/// leaves no orphaned tokio tasks (ROADMAP M5 acceptance) AND lets an in-flight
-/// backup cycle complete rather than being killed mid-upload.
+/// GRACEFULLY shut down every per-account task set on an explicit Quit
+/// (R-P1-1, ROADMAP M5 "no orphaned tokio tasks"; DESIGN s5.10.2 in-flight
+/// drain). For each account [`AccountHandle::shutdown`] signals the orchestrator
+/// plus the watcher/event bridges, then await-with-timeout and abort-and-await
+/// EVERY tracked task (run loop, watcher bridge, event bridge, power poller) so
+/// the process exits with zero orphaned tasks while still giving an in-flight
+/// backup cycle a chance to finish rather than being killed mid-upload.
 ///
 /// Runs on the Tauri async runtime via `block_on` because the Tauri event-loop
-/// callback (`RunEvent`) is synchronous. The per-loop drain is bounded by
-/// [`SHUTDOWN_DRAIN_TIMEOUT`]; on timeout the loop is aborted (never orphaned).
+/// callback (`RunEvent`) is synchronous. The whole sweep is bounded by
+/// [`SHUTDOWN_DRAIN_TIMEOUT`] (an outer guard); per-task drain budgets live in
+/// `AccountHandle::shutdown`. Signalling every orchestrator FIRST lets the
+/// per-account drains overlap rather than serialise their in-flight cycles.
 fn shutdown_orchestrators(app: &tauri::AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };
-    // Signal every orchestrator to stop AFTER its current cycle, then await each
-    // loop. Signalling all first lets the drains overlap rather than serialise.
+    // Signal every orchestrator to stop AFTER its current cycle up front, so the
+    // drains below overlap (each account's in-flight cycle winds down in
+    // parallel instead of one-at-a-time).
     for (account_id, handle) in state.accounts() {
         tracing::info!(target: "driven::app", account_id = %account_id, "signalling graceful shutdown on quit");
         handle.orchestrator.shutdown();
     }
     tauri::async_runtime::block_on(async move {
-        for (account_id, handle) in state.accounts() {
-            // Abort handle for the timeout fallback (does not consume the loop).
-            let abort = handle.run_loop_abort_handle().await;
-            match tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, handle.run_loop_drain()).await {
-                Ok(()) => {
-                    tracing::info!(target: "driven::app", account_id = %account_id, "orchestrator run loop drained cleanly");
-                }
-                Err(_) => {
-                    tracing::warn!(target: "driven::app", account_id = %account_id, "graceful drain timed out; aborting run loop (no orphaned task)");
-                    if let Some(abort) = abort {
-                        abort.abort();
-                    }
-                }
+        // Outer bound: even if a wedged account's per-task aborts somehow stall,
+        // quit cannot hang forever. Each `AccountHandle::shutdown` already
+        // aborts-and-awaits per task, so this is a belt-and-suspenders cap.
+        let sweep = async {
+            for (account_id, handle) in state.accounts() {
+                handle.shutdown().await;
+                tracing::info!(target: "driven::app", account_id = %account_id, "all per-account tasks shut down (no orphans)");
             }
+        };
+        if tokio::time::timeout(SHUTDOWN_DRAIN_TIMEOUT, sweep)
+            .await
+            .is_err()
+        {
+            tracing::warn!(target: "driven::app", "shutdown sweep exceeded the overall budget; exiting anyway");
         }
     });
 }

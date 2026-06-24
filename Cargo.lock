@@ -1241,6 +1241,7 @@ name = "driven-app"
 version = "0.1.0"
 dependencies = [
  "anyhow",
+ "async-trait",
  "driven-core",
  "driven-crypto",
  "driven-drive",

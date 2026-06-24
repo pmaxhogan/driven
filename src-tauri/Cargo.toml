@@ -40,3 +40,8 @@ driven-power = { path = "../crates/driven-power" }
 # M5 assembly seams: real network breaker backend + Windows VSS provider.
 driven-net = { path = "../crates/driven-net" }
 driven-vss = { path = "../crates/driven-vss" }
+
+[dev-dependencies]
+# R-P1-1 shutdown test: a no-op `Orchestrator` impl to build an `AccountHandle`
+# and assert every per-account task is joined after `shutdown()`.
+async-trait.workspace = true

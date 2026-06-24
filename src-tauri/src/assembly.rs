@@ -46,7 +46,7 @@ use driven_net::ReqwestBackend;
 
 use driven_power::RealPowerSource;
 
-use crate::app_state::{AccountHandle, AppState, RemoteMode};
+use crate::app_state::{AccountHandle, AccountTasks, AppState, RemoteMode};
 use crate::crypto_provider_impl::KeystoreCryptoProvider;
 use crate::{events, tray};
 
@@ -136,7 +136,7 @@ pub async fn build_and_spawn(
 
         match build_account(app, &state, account, sources, use_fake).await {
             Ok(BuildOutcome::Spawned(handle)) => {
-                handles.insert(account.id, handle);
+                handles.insert(account.id, *handle);
                 tracing::info!(
                     target: TARGET,
                     account_id = %account.id,
@@ -181,8 +181,11 @@ fn use_fake_remote() -> bool {
 
 /// The result of attempting to build + spawn one account's orchestrator.
 enum BuildOutcome {
-    /// The orchestrator was assembled and its run loop spawned.
-    Spawned(AccountHandle),
+    /// The orchestrator was assembled and its run loop spawned. Boxed because
+    /// [`AccountHandle`] now tracks four per-account task handles + a shutdown
+    /// sender (R-P1-1), so the inline variant would dwarf the unit `NeedsReauth`
+    /// arm (clippy `large_enum_variant`).
+    Spawned(Box<AccountHandle>),
     /// C5-P1-1: real remote mode with no/invalid stored token. The account was
     /// moved to [`AccountState::NeedsReauth`] and the banner emitted; NO fake
     /// fallback was constructed and NO orchestrator was spawned.
@@ -250,7 +253,11 @@ async fn build_account(
     // loop subscribes to this internally (DESIGN s5.7 gate re-evaluation); the
     // sleep/wake suspend/resume EDGES (DESIGN s5.10) arrive on a separate OS
     // message-pump seam that does not exist yet, so they are not bridged here.
-    let _power_poller = power.spawn_poller();
+    //
+    // R-P1-1: the poller loops FOREVER (no natural end), so its handle is KEPT
+    // and stored in `AccountHandle` to be aborted on quit. Dropping it (the old
+    // bug) detached the task and orphaned it past shutdown.
+    let power_poller = power.spawn_poller();
     let power: Arc<dyn driven_power::PowerSource> = power;
 
     // --- network: real ReqwestBackend-backed prober (Some, V-G) --------------
@@ -302,19 +309,31 @@ async fn build_account(
     }
     let orchestrator = Arc::new(orchestrator);
 
+    // R-P1-1: one shutdown signal both bridges select! on, so quit can stop the
+    // watcher bridge (whose `NotifyWatcher` owns the mpsc::Sender, so its
+    // `recv().await` never closes on its own) and the event bridge promptly.
+    let (bridge_shutdown, _bridge_rx0) = tokio::sync::watch::channel(false);
+
     // --- watcher bridge (DESIGN s5.9.1) -------------------------------------
     // The real `NotifyWatcher` emits debounced scan-ticks; forward them into the
     // orchestrator's watcher channel. A watcher that cannot be built / watched
     // is NON-FATAL: the scheduled scan is the authoritative fallback (DESIGN
     // s5.9.4), so the account still backs up, just without the latency win.
-    spawn_watcher_bridge(account.id, orchestrator.watcher_sender(), &sources);
+    // Returns `None` when no enabled source produced a watcher.
+    let watcher_bridge = spawn_watcher_bridge(
+        account.id,
+        orchestrator.watcher_sender(),
+        &sources,
+        bridge_shutdown.subscribe(),
+    );
 
     // --- event bridge: orchestrator broadcast -> tray + IPC events -----------
-    spawn_event_bridge(
+    let event_bridge = spawn_event_bridge(
         app,
         account.id,
         account.email.clone(),
         orchestrator.subscribe(),
+        bridge_shutdown.subscribe(),
     );
 
     // --- spawn the run loop --------------------------------------------------
@@ -333,10 +352,16 @@ async fn build_account(
 
     // Coerce the concrete Arc into the trait object the handle + IPC use.
     let orchestrator: Arc<dyn Orchestrator> = orchestrator;
-    Ok(BuildOutcome::Spawned(AccountHandle::new(
+    Ok(BuildOutcome::Spawned(Box::new(AccountHandle::new(
         orchestrator,
-        run_loop,
-    )))
+        AccountTasks {
+            run_loop,
+            watcher_bridge,
+            event_bridge,
+            power_poller,
+            bridge_shutdown,
+        },
+    ))))
 }
 
 /// Construct the [`RemoteStore`] for one account.
@@ -446,10 +471,11 @@ fn spawn_watcher_bridge(
     account_id: AccountId,
     sender: tokio::sync::mpsc::Sender<driven_core::watcher::ScanTickRequest>,
     sources: &[SourceRow],
-) {
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> Option<tokio::task::JoinHandle<()>> {
     let enabled: Vec<SourceRow> = sources.iter().filter(|s| s.enabled).cloned().collect();
     if enabled.is_empty() {
-        return;
+        return None;
     }
 
     let watcher = NotifyWatcher::new(enabled.clone());
@@ -459,7 +485,7 @@ fn spawn_watcher_bridge(
             account_id = %account_id,
             "watcher subscribe returned no receiver; relying on scheduled scan"
         );
-        return;
+        return None;
     };
 
     for source in &enabled {
@@ -476,23 +502,52 @@ fn spawn_watcher_bridge(
 
     // Move the watcher into the task so its OS handles + debounce tasks stay
     // alive for the run's lifetime (dropping `NotifyWatcher` tears down every
-    // watch). The forwarding loop ends when the watcher channel closes.
-    tokio::spawn(async move {
+    // watch). R-P1-1: the `NotifyWatcher` owns the mpsc::Sender feeding `rx`, so
+    // `rx.recv()` NEVER returns `None` on its own - the bridge MUST also
+    // select! on the shutdown signal, or quit would orphan this task. On
+    // shutdown the task returns and `_watcher` drops, releasing the OS watches.
+    Some(tokio::spawn(async move {
         let _watcher = watcher;
-        while let Some(tick) = rx.recv().await {
-            // `send` (not `try_send`): apply backpressure rather than drop a
-            // scan-tick. The orchestrator's watcher channel is bounded; a closed
-            // receiver means the orchestrator stopped, so end the bridge.
-            if sender.send(tick).await.is_err() {
-                tracing::debug!(
-                    target: TARGET,
-                    account_id = %account_id,
-                    "orchestrator watcher channel closed; ending watcher bridge"
-                );
-                break;
+        loop {
+            tokio::select! {
+                maybe_tick = rx.recv() => {
+                    let Some(tick) = maybe_tick else {
+                        // The watcher was torn down elsewhere; nothing left to
+                        // forward.
+                        break;
+                    };
+                    // `send` (not `try_send`): apply backpressure rather than
+                    // drop a scan-tick. A closed receiver means the orchestrator
+                    // stopped, so end the bridge.
+                    if sender.send(tick).await.is_err() {
+                        tracing::debug!(
+                            target: TARGET,
+                            account_id = %account_id,
+                            "orchestrator watcher channel closed; ending watcher bridge"
+                        );
+                        break;
+                    }
+                }
+                res = shutdown.changed() => {
+                    // `changed()` resolves on a flip OR on sender drop; either
+                    // way, if the flag is set (or the sender is gone) we exit so
+                    // quit leaves no orphaned watcher bridge.
+                    match res {
+                        Ok(()) if *shutdown.borrow() => {
+                            tracing::debug!(
+                                target: TARGET,
+                                account_id = %account_id,
+                                "shutdown signalled; ending watcher bridge"
+                            );
+                            break;
+                        }
+                        Ok(()) => {}
+                        Err(_) => break,
+                    }
+                }
             }
         }
-    });
+    }))
 }
 
 /// Forward one orchestrator's [`OrchestratorEvent`] broadcast (`rx`, from its
@@ -505,11 +560,33 @@ fn spawn_event_bridge(
     account_id: AccountId,
     email: String,
     mut rx: tokio::sync::broadcast::Receiver<OrchestratorEvent>,
-) {
+    mut shutdown: tokio::sync::watch::Receiver<bool>,
+) -> tokio::task::JoinHandle<()> {
     let app = app.clone();
     tokio::spawn(async move {
         loop {
-            match rx.recv().await {
+            // R-P1-1: the broadcast closes naturally when the orchestrator is
+            // dropped, but quit drops the orchestrator AFTER draining tasks, so
+            // also select! on the shutdown signal to end this bridge promptly
+            // (and never orphan it).
+            let event = tokio::select! {
+                res = shutdown.changed() => {
+                    match res {
+                        Ok(()) if *shutdown.borrow() => {
+                            tracing::debug!(
+                                target: TARGET,
+                                account_id = %account_id,
+                                "shutdown signalled; ending event bridge"
+                            );
+                            break;
+                        }
+                        Ok(()) => continue,
+                        Err(_) => break,
+                    }
+                }
+                event = rx.recv() => event,
+            };
+            match event {
                 Ok(OrchestratorEvent::StateChanged { state }) => {
                     // Reflect the new state on the tray icon (SPEC s12).
                     tray::apply_state(&app, account_id, state.clone());
@@ -572,7 +649,7 @@ fn spawn_event_bridge(
                 }
             }
         }
-    });
+    })
 }
 
 /// The per-event `sync:status_changed` payload bridged from one orchestrator's
