@@ -42,7 +42,7 @@ pub mod resumable;
 pub mod retry;
 pub mod token_store;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::task::{Context, Poll};
 use std::time::Duration;
@@ -485,6 +485,14 @@ pub struct GoogleDriveStore {
     /// between-bytes timeout (DESIGN s5.8.4 `*`).
     http_stream: reqwest::Client,
     tokens: RefreshingTokenSource,
+    /// URLs of resumable sessions that have returned [`ResumeProgress::SessionInvalid`]
+    /// and are therefore dead. A client-side non-multiple-chunk rejection never
+    /// reaches Drive, so Drive would still accept a later valid chunk against the
+    /// same session URL; tombstoning the URL here makes EVERY further chunk return
+    /// SessionInvalid, matching the fake + DESIGN s5.4 ("never issue a fresh
+    /// resume_chunk against the old session URL after a 4xx"). Bounded in
+    /// [`GoogleDriveStore::mark_session_dead`].
+    dead_sessions: parking_lot::Mutex<HashSet<String>>,
 }
 
 impl GoogleDriveStore {
@@ -512,6 +520,7 @@ impl GoogleDriveStore {
             http,
             http_stream,
             tokens,
+            dead_sessions: parking_lot::Mutex::new(HashSet::new()),
         }
     }
 
@@ -526,7 +535,25 @@ impl GoogleDriveStore {
             http,
             http_stream,
             tokens,
+            dead_sessions: parking_lot::Mutex::new(HashSet::new()),
         })
+    }
+
+    /// Whether `url` belongs to a session already tombstoned as dead.
+    fn is_session_dead(&self, url: &str) -> bool {
+        self.dead_sessions.lock().contains(url)
+    }
+
+    /// Tombstones `url` so every further chunk on it returns SessionInvalid.
+    /// Bounded: the executor discards a session on SessionInvalid and never
+    /// re-sends its URL, so a tombstoned URL is never legitimately reused; the
+    /// cap is a pure memory safety-bound for a long-running process.
+    fn mark_session_dead(&self, url: &str) {
+        let mut dead = self.dead_sessions.lock();
+        if dead.len() >= 1024 {
+            dead.clear();
+        }
+        dead.insert(url.to_string());
     }
 
     /// Mints a fresh bearer token for an authorized request (SPEC s4.1).
@@ -1350,12 +1377,25 @@ impl RemoteStore for GoogleDriveStore {
         // 256 KiB. Enforce at the trait layer so the contract's
         // `scenario_resumable_non_multiple_rejected` returns SessionInvalid
         // exactly as the fake does (matching the wire-level 400 Drive returns).
+        // A session already tombstoned (a prior SessionInvalid) stays dead:
+        // Drive never saw our client-side rejection, so it would otherwise accept
+        // a later valid chunk against the same URL (DESIGN s5.4 forbids reusing a
+        // dead session). Fail fast, matching the fake.
+        if self.is_session_dead(&session.url) {
+            return Ok(ResumeProgress::SessionInvalid);
+        }
         let is_final = offset + chunk.len() as u64 == session.size;
         if !is_final && (chunk.len() as u64) % resumable::CHUNK_MULTIPLE != 0 {
+            self.mark_session_dead(&session.url);
             return Ok(ResumeProgress::SessionInvalid);
         }
         let token = self.bearer().await?;
-        resumable::push_chunk(self.http_stream(), &token, session, offset, chunk).await
+        let progress =
+            resumable::push_chunk(self.http_stream(), &token, session, offset, chunk).await?;
+        if matches!(progress, ResumeProgress::SessionInvalid) {
+            self.mark_session_dead(&session.url);
+        }
+        Ok(progress)
     }
 
     async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
