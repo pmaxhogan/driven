@@ -75,11 +75,19 @@ export const useActivityStore = defineStore("activity", () => {
   const liveEntries = ref<ActivityEntry[]>([]);
   // The active filter (empty = match all).
   const filter = ref<ActivityFilterDto>({});
-  // The highest zero-based history page index loaded so far (-1 = none yet).
+  // The count of history pages loaded so far, zero-based (-1 = none yet): 0
+  // after loadInitial, +1 per loadMore. R2-P1-2: this is now just a progress
+  // counter (the actual walk is by KEYSET cursor, not a page index), kept so the
+  // view + tests have a stable "how many pages in" signal.
   const loadedPage = ref(-1);
+  // R2-P1-2: the KEYSET cursor for the NEXT history page - the `(ts, id)` of the
+  // OLDEST history row loaded so far. `null` before any load / when history is
+  // exhausted. loadMore pages strictly older than this cursor, so a row
+  // prepended to activity_log between fetches can never shift / skip a page.
+  const oldestCursor = ref<{ ts: number; id: number } | null>(null);
   // Total matching rows reported by the last query (for the count display).
   const total = ref(0);
-  // Whether more history pages remain after `loadedPage`.
+  // Whether more history pages remain after the current cursor.
   const hasMore = ref(false);
   const loading = ref(false);
   // M7-P2-6: stable SPEC s24 code (null = no error); the view maps it via
@@ -117,18 +125,24 @@ export const useActivityStore = defineStore("activity", () => {
     liveEntries.value = [];
     seenIds.clear();
     loadedPage.value = -1;
+    oldestCursor.value = null;
     total.value = 0;
     hasMore.value = false;
     errorCode.value = null;
   }
 
-  /** Insert `rows` at the END of history (older) honoring the dedup index. */
+  /** Insert `rows` at the END of history (older) honoring the dedup index, and
+   * advance the keyset cursor / high-water mark. */
   function appendHistoryUnique(rows: ActivityEntry[]): void {
     for (const row of rows) {
       if (seenIds.has(row.id)) continue;
       seenIds.add(row.id);
       historyEntries.value.push(row);
     }
+    // R2-P1-2: the cursor for the next page is the OLDEST row now held. Rows
+    // arrive newest-first, so the last appended row is the oldest of this page.
+    const last = rows.at(-1);
+    if (last != null) oldestCursor.value = { ts: last.ts, id: last.id };
   }
 
   /** True when `entry` satisfies the active filter (so a live event below the
@@ -151,18 +165,45 @@ export const useActivityStore = defineStore("activity", () => {
     return true;
   }
 
-  /** Prepend a live entry, capping the live tail to `LIVE_TAIL_CAP` by evicting
-   * the oldest live entry (and dropping its id from the dedup index unless the
-   * id is also present in loaded history). */
-  function pushLive(entry: ActivityEntry): void {
-    seenIds.add(entry.id);
-    liveEntries.value.unshift(entry);
+  /** Evict oldest live entries until the tail is within `LIVE_TAIL_CAP`,
+   * dropping each evicted id from the dedup index unless it is also in loaded
+   * history. The live tail is kept newest-first, so eviction is from the END. */
+  function capLiveTail(): void {
     while (liveEntries.value.length > LIVE_TAIL_CAP) {
       const evicted = liveEntries.value.pop();
       if (evicted && !historyEntries.value.some((e) => e.id === evicted.id)) {
         seenIds.delete(evicted.id);
       }
     }
+  }
+
+  /** Prepend a live entry (it is the newest, from `activity:new`), capping the
+   * live tail to `LIVE_TAIL_CAP`. */
+  function pushLive(entry: ActivityEntry): void {
+    seenIds.add(entry.id);
+    liveEntries.value.unshift(entry);
+    capLiveTail();
+  }
+
+  /** R2-P1-1: merge reconciled `rows` (recovered durable rows that the live
+   * broadcast dropped) into the live tail, keeping it strictly newest-first.
+   * Unlike `pushLive`, recovered rows can be OLDER than rows already in the tail
+   * (a ring-buffer drop evicts the OLDEST of a burst, so the recovered rows sit
+   * below the latest delivered), so they must be INSERTED in sort order, not
+   * blindly prepended. Dedup by id; then re-sort + cap. */
+  function mergeRecoveredLive(rows: ActivityEntry[]): void {
+    let added = false;
+    for (const row of rows) {
+      if (seenIds.has(row.id)) continue;
+      seenIds.add(row.id);
+      liveEntries.value.push(row);
+      added = true;
+    }
+    if (!added) return;
+    // Newest-first: ts desc, then id desc (the same total order the backend
+    // keyset uses), so the rendered tail stays globally ordered.
+    liveEntries.value.sort((a, b) => b.ts - a.ts || b.id - a.id);
+    capLiveTail();
   }
 
   /** Load the first history page for the current filter (resets accumulation).
@@ -173,9 +214,10 @@ export const useActivityStore = defineStore("activity", () => {
     const snapshot = { ...filter.value };
     loading.value = true;
     try {
+      // R2-P1-2: the first page carries NO cursor (newest rows).
       const pageDto = await ipc.queryActivity(
         { ...snapshot },
-        { page: 0, limit: ACTIVITY_PAGE_SIZE },
+        { beforeTs: null, beforeId: null, limit: ACTIVITY_PAGE_SIZE },
       );
       // Discard a stale response: a newer load started, or the filter changed.
       if (token !== requestToken || !sameFilter(snapshot, filter.value)) return;
@@ -197,13 +239,18 @@ export const useActivityStore = defineStore("activity", () => {
   async function loadMore(): Promise<void> {
     if (loading.value || !hasMore.value) return;
     const next = loadedPage.value + 1;
+    const cursor = oldestCursor.value;
+    // No cursor yet means loadInitial has not run; nothing older to page.
+    if (cursor == null) return;
     const token = ++requestToken;
     const snapshot = { ...filter.value };
     loading.value = true;
     try {
+      // R2-P1-2: page strictly OLDER than the oldest row we hold (the cursor),
+      // so a row prepended to activity_log between fetches never shifts a page.
       const pageDto = await ipc.queryActivity(
         { ...snapshot },
-        { page: next, limit: ACTIVITY_PAGE_SIZE },
+        { beforeTs: cursor.ts, beforeId: cursor.id, limit: ACTIVITY_PAGE_SIZE },
       );
       if (token !== requestToken || !sameFilter(snapshot, filter.value)) return;
       appendHistoryUnique(pageDto.entries);
@@ -243,49 +290,65 @@ export const useActivityStore = defineStore("activity", () => {
     total.value += 1;
   }
 
-  /** M7-P1-1 / R1-P1-2: reconcile from the durable `activity_log` after a
-   * broadcast lag. Re-query the durable history for the CURRENT filter and merge
-   * each NEW row into the live tail (dedup by id), so rows dropped by the bounded
-   * broadcast are recovered into the visible tail.
+  /** M7-P1-1 / R1-P1-2 / R2-P1-1: reconcile from the durable `activity_log`
+   * after a broadcast lag. Re-query the durable history (KEYSET) for the CURRENT
+   * filter from the newest row forward and merge each NEW row into the live tail
+   * (dedup by id), so rows dropped by the bounded broadcast are recovered into
+   * the visible tail.
    *
-   * R1-P1-2: the old code re-queried only page 0 (`ACTIVITY_PAGE_SIZE` = 100),
-   * but the live-tail contract is the last `LIVE_TAIL_CAP` (1000) events and the
-   * backend broadcast buffer is 256, so a burst > 100 permanently left recent
-   * durable rows out of the tail until manual pagination. Now we page forward,
-   * covering AT LEAST the dropped `skipped` rows (plus the page already merged),
-   * capped at `LIVE_TAIL_CAP`, and stop early once a page yields no NEW row in
-   * range (the gap is closed) or the history is exhausted. Dedup is by id so a
-   * row already present (live or history) is never double-counted.
+   * R2-P1-1: walk by the keyset CURSOR over a bounded SCAN BUDGET and do NOT
+   * early-stop on a zero-new page. The dropped rows can sit DEEPER than an
+   * already-seen newest page (e.g. the newest rows arrived live but a middle
+   * burst was dropped), so stopping on "this page recovered nothing new" (the
+   * old recheck-2 P1 bug) could miss them. Instead page strictly older each step
+   * and stop only when:
+   *   - the durable history is exhausted (a short / empty page), OR
+   *   - the scan budget is spent (sized from the dropped count, capped at
+   *     LIVE_TAIL_CAP - the tail's hard bound).
+   * Dedup is by id so a row already present (live or history) is never
+   * double-counted.
    *
    * This does not disturb the paged history below; it only backfills the tail.
    * `total` is re-synced from the authoritative page total (NOT per-row bumped),
    * so reconciling rows that were already counted does not inflate the count.
    * R1-P2-1: a reconcile also refreshes the header aggregates, which can have
-   * drifted during the lag burst. */
+   * drifted during the lag burst.
+   *
+   * `skipped` (the dropped count) sizes the SCAN BUDGET: we page back enough
+   * rows to cover the burst plus a page of overlap, capped at LIVE_TAIL_CAP, so
+   * the walk recovers the whole burst (even deeper-than-newest drops) while
+   * staying bounded. */
   async function reconcileFromHistory(skipped = 0): Promise<void> {
     const snapshot = { ...filter.value };
-    // How many durable rows we aim to (re-)scan: enough to cover the dropped
-    // burst plus one page of overlap, never more than the live-tail cap. The
-    // backend per-page cap is 10_000; ACTIVITY_PAGE_SIZE keeps each query small.
-    const target = Math.min(
+    // Scan budget (rows), bounded by the live-tail cap so a pathological lag
+    // cannot loop unbounded: cover the dropped burst plus a page of overlap.
+    const maxScan = Math.min(
       LIVE_TAIL_CAP,
       Math.max(ACTIVITY_PAGE_SIZE, skipped + ACTIVITY_PAGE_SIZE),
     );
-    const maxPages = Math.ceil(target / ACTIVITY_PAGE_SIZE);
 
     // Collect all NEW (not-yet-held, filter-matching) rows across the pages
-    // FIRST, preserving global newest-first order (page 0 is newest; each page's
-    // own rows are newest-first). They are pushed at the end in reverse (oldest
-    // first) so the newest overall lands at the FRONT of the live tail - pushLive
-    // prepends, so pushing oldest-first yields newest-first.
+    // FIRST, preserving global newest-first order. They are pushed at the end in
+    // reverse (oldest first) so the newest overall lands at the FRONT of the live
+    // tail - pushLive prepends, so pushing oldest-first yields newest-first.
     const recovered: ActivityEntry[] = [];
     let lastTotal: number | null = null;
-    for (let page = 0; page < maxPages; page++) {
+    let cursor: { ts: number; id: number } | null = null;
+    let scanned = 0;
+    for (;;) {
+      // Stop when the bounded scan budget is spent (defence-in-depth + the
+      // small-lag fast path).
+      if (scanned >= maxScan) break;
+
       let pageDto;
       try {
         pageDto = await ipc.queryActivity(
           { ...snapshot },
-          { page, limit: ACTIVITY_PAGE_SIZE },
+          {
+            beforeTs: cursor?.ts ?? null,
+            beforeId: cursor?.id ?? null,
+            limit: ACTIVITY_PAGE_SIZE,
+          },
         );
       } catch {
         // A failed reconcile is non-fatal: the next live event or a manual
@@ -295,33 +358,39 @@ export const useActivityStore = defineStore("activity", () => {
       // Drop the result if the filter changed while the reconcile was in flight.
       if (!sameFilter(snapshot, filter.value)) return;
       lastTotal = pageDto.total;
+      scanned += pageDto.entries.length;
 
-      // Page rows are newest-first; keep that order in `recovered`.
-      let recoveredThisPage = 0;
       for (const entry of pageDto.entries) {
-        // Skip rows already held (live or history) and rows already staged this
+        // Skip rows already held (live or history), rows already staged this
         // reconcile, and rows outside the active filter.
         if (seenIds.has(entry.id)) continue;
         if (recovered.some((r) => r.id === entry.id)) continue;
         if (!matchesFilter(entry)) continue;
         recovered.push(entry);
-        recoveredThisPage++;
       }
 
-      // Stop once the durable history is exhausted (a short/empty page) OR this
-      // page recovered nothing new (the gap is already closed and we are now
-      // re-walking rows we already hold) - paging further only churns.
+      // Advance the cursor to this page's oldest row for the next iteration.
+      const oldest = pageDto.entries.at(-1);
+      if (oldest != null) cursor = { ts: oldest.ts, id: oldest.id };
+
+      // Stop once the durable history is exhausted (a short / empty page).
       if (!pageDto.hasMore || pageDto.entries.length === 0) break;
-      if (recoveredThisPage === 0) break;
+      // R2-P1-1: CRUCIALLY we do NOT stop on a zero-new page. The dropped rows
+      // can sit DEEPER than an already-seen newest page, so the walk MUST
+      // continue THROUGH all-seen pages until the scan budget (sized from the
+      // dropped `skipped` count, capped at LIVE_TAIL_CAP) is spent or history is
+      // exhausted. The old `recoveredThisPage === 0` early-break was the
+      // recheck-2 P1 bug: it stopped before reaching the deeper dropped rows.
     }
 
-    // Push oldest-first so the newest overall ends at the FRONT of the tail.
-    for (let i = recovered.length - 1; i >= 0; i--) {
-      pushLive(recovered[i]);
-    }
+    // R2-P1-1: merge the recovered rows in SORTED order (a recovered row can be
+    // older than rows already in the tail - a ring-buffer drop evicts the oldest
+    // of a burst - so they must be inserted in newest-first position, not
+    // blindly prepended).
+    mergeRecoveredLive(recovered);
 
-    // Re-sync the count from the authoritative page total (page 0's total is the
-    // full match count and does not change across pages).
+    // Re-sync the count from the authoritative page total (the full match count
+    // does not change across keyset pages).
     if (lastTotal != null) total.value = lastTotal;
     // R1-P2-1: refresh the header aggregates after a lag burst (best-effort).
     if (recovered.length > 0) void loadSummary();

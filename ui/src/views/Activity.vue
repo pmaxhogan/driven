@@ -352,8 +352,9 @@ onUnmounted(() => {
             v-for="et in eventTypeOptions"
             :key="et"
             :value="et"
+            :title="et"
           >
-            {{ et }}
+            {{ eventLabel(et) }}
           </option>
         </select>
       </label>

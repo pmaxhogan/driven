@@ -265,20 +265,29 @@ export interface ActivityFilterDto {
   eventTypes?: string[];
 }
 
-/** Page selector for `query_activity` (mirrors src-tauri PageRequestDto). */
+/** KEYSET page selector for `query_activity` (R2-P1-2; mirrors src-tauri
+ * PageRequestDto). The activity_log is actively prepended to, so the dashboard
+ * pages by the oldest loaded `(ts, id)` CURSOR instead of a shifting offset.
+ * `beforeTs` / `beforeId` are both set (a continuation page) or both null/absent
+ * (the first, newest page). */
 export interface PageRequestDto {
-  page: number;
+  beforeTs?: number | null;
+  beforeId?: number | null;
   limit: number;
 }
 
-/** One page of activity returned by `query_activity` (mirrors src-tauri
- * ActivityPageDto): newest-first entries + paging metadata. */
+/** One KEYSET page of activity returned by `query_activity` (R2-P1-2; mirrors
+ * src-tauri ActivityPageDto): newest-first entries + the cursor metadata.
+ * `nextBeforeTs` / `nextBeforeId` are the `(ts, id)` of the LAST (oldest) row in
+ * this page - the cursor the store passes for the next page (both null when the
+ * page is empty). `hasMore` is true when older matching rows still exist. */
 export interface ActivityPageDto {
   entries: ActivityEntry[];
   total: number;
-  page: number;
   limit: number;
   hasMore: boolean;
+  nextBeforeTs: number | null;
+  nextBeforeId: number | null;
 }
 
 /** `file_state.status` serialized form (mirrors driven_core FileStateStatus). */

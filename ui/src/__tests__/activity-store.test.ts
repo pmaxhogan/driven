@@ -73,25 +73,31 @@ function makeEntry(over: Partial<ActivityEntry> = {}): ActivityEntry {
   };
 }
 
-/** Build a query_activity page DTO for `entries`, with paging metadata. */
+/** Build a KEYSET query_activity page DTO for `entries` (R2-P1-2). `hasMore`
+ * follows the backend keyset rule (a full page MAY have more); the next cursor
+ * is the last (oldest) row's `(ts, id)`. The `page` arg is kept only as a
+ * caller-readability hint and is NOT part of the DTO. */
 function makePage(
   entries: ActivityEntry[],
-  page: number,
+  _page: number,
   total: number,
+  hasMoreOverride?: boolean,
 ): {
   entries: ActivityEntry[];
   total: number;
-  page: number;
   limit: number;
   hasMore: boolean;
+  nextBeforeTs: number | null;
+  nextBeforeId: number | null;
 } {
-  const consumed = (page + 1) * ACTIVITY_PAGE_SIZE;
+  const last = entries.at(-1) ?? null;
   return {
     entries,
     total,
-    page,
     limit: ACTIVITY_PAGE_SIZE,
-    hasMore: total > consumed,
+    hasMore: hasMoreOverride ?? entries.length === ACTIVITY_PAGE_SIZE,
+    nextBeforeTs: last?.ts ?? null,
+    nextBeforeId: last?.id ?? null,
   };
 }
 
@@ -107,14 +113,15 @@ beforeEach(() => {
 });
 
 describe("activity store: pagination", () => {
-  it("loadInitial fetches page 0 and records paging metadata", async () => {
+  it("loadInitial fetches the first page (no cursor) and records paging metadata", async () => {
     const rows = [makeEntry({ id: 3 }), makeEntry({ id: 2 }), makeEntry({ id: 1 })];
-    invokeMock.mockResolvedValueOnce(makePage(rows, 0, 250));
+    invokeMock.mockResolvedValueOnce(makePage(rows, 0, 250, true));
     const store = useActivityStore();
     await store.loadInitial();
+    // R2-P1-2: the first page carries a null cursor.
     expect(invokeMock).toHaveBeenCalledWith("query_activity", {
       filter: {},
-      page: { page: 0, limit: ACTIVITY_PAGE_SIZE },
+      page: { beforeTs: null, beforeId: null, limit: ACTIVITY_PAGE_SIZE },
     });
     expect(store.entries).toHaveLength(3);
     expect(store.entries[0].id).toBe(3);
@@ -123,22 +130,29 @@ describe("activity store: pagination", () => {
     expect(store.loadedPage).toBe(0);
   });
 
-  it("loadMore appends the next page WITHOUT re-querying earlier pages", async () => {
-    const page0 = [makeEntry({ id: 200 }), makeEntry({ id: 199 })];
-    const page1 = [makeEntry({ id: 100 }), makeEntry({ id: 99 })];
-    invokeMock.mockResolvedValueOnce(makePage(page0, 0, 250));
+  it("loadMore pages by the oldest (ts,id) CURSOR, appending without re-querying", async () => {
+    // Page 0: ids 200, 199 (oldest = id 199 @ ts 199).
+    const page0 = [
+      makeEntry({ id: 200, ts: 200 }),
+      makeEntry({ id: 199, ts: 199 }),
+    ];
+    const page1 = [
+      makeEntry({ id: 100, ts: 100 }),
+      makeEntry({ id: 99, ts: 99 }),
+    ];
+    invokeMock.mockResolvedValueOnce(makePage(page0, 0, 250, true));
     const store = useActivityStore();
     await store.loadInitial();
     expect(invokeMock).toHaveBeenCalledTimes(1);
 
-    invokeMock.mockResolvedValueOnce(makePage(page1, 1, 250));
+    invokeMock.mockResolvedValueOnce(makePage(page1, 1, 250, false));
     await store.loadMore();
 
-    // Exactly ONE additional fetch (page 1), never a re-fetch of page 0.
+    // Exactly ONE additional fetch, carrying the cursor = oldest row of page 0.
     expect(invokeMock).toHaveBeenCalledTimes(2);
     expect(invokeMock).toHaveBeenNthCalledWith(2, "query_activity", {
       filter: {},
-      page: { page: 1, limit: ACTIVITY_PAGE_SIZE },
+      page: { beforeTs: 199, beforeId: 199, limit: ACTIVITY_PAGE_SIZE },
     });
     // Pages accumulated client-side, in order.
     expect(store.entries.map((e) => e.id)).toEqual([200, 199, 100, 99]);
@@ -156,8 +170,8 @@ describe("activity store: pagination", () => {
   });
 
   it("loadMore dedups a row already present from the live tail", async () => {
-    const page0 = [makeEntry({ id: 200 })];
-    invokeMock.mockResolvedValueOnce(makePage(page0, 0, 250));
+    const page0 = [makeEntry({ id: 200, ts: 200 })];
+    invokeMock.mockResolvedValueOnce(makePage(page0, 0, 250, true));
     const store = useActivityStore();
     await store.subscribeLive();
     await store.loadInitial();
@@ -168,7 +182,12 @@ describe("activity store: pagination", () => {
 
     // Page 1 includes id 150 again - it must NOT be duplicated.
     invokeMock.mockResolvedValueOnce(
-      makePage([makeEntry({ id: 150, ts: 900 }), makeEntry({ id: 149 })], 1, 250),
+      makePage(
+        [makeEntry({ id: 150, ts: 900 }), makeEntry({ id: 149, ts: 149 })],
+        1,
+        250,
+        false,
+      ),
     );
     await store.loadMore();
     const ids = store.entries.map((e) => e.id);
@@ -320,6 +339,54 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
     expect(invokeMock.mock.calls.filter((c) => c[0] === "query_activity").length)
       .toBeGreaterThanOrEqual(3);
   });
+
+  // R2-P1-1: the recheck-2 P1 - a multi-page burst where the NEWEST page is
+  // ALREADY in seenIds but the dropped rows sit DEEPER (page 1+). The old code
+  // broke on `recoveredThisPage === 0` at the newest page and never reached the
+  // deeper dropped rows. The keyset walk must NOT early-stop on a zero-new page.
+  it("recovers DEEPER dropped rows even when the newest page is already seen", async () => {
+    const store = useActivityStore();
+    await store.subscribeLive();
+
+    // The durable log holds 250 rows (ids 250..1, newest-first). The NEWEST 100
+    // (ids 250..151) already arrived live, so they are all in seenIds. A burst
+    // then dropped rows DEEPER in the log (ids 150..1 - page 1 and page 2).
+    const allRows: ActivityEntry[] = [];
+    for (let id = 250; id >= 1; id--) {
+      allRows.push(makeEntry({ id, ts: id }));
+    }
+    // Pre-seed the newest page into the live tail (these are "already seen").
+    for (const row of allRows.slice(0, ACTIVITY_PAGE_SIZE)) {
+      liveHandler?.(row);
+    }
+    expect(store.entries).toHaveLength(ACTIVITY_PAGE_SIZE);
+
+    const pageOf = (p: number) =>
+      makePage(
+        allRows.slice(p * ACTIVITY_PAGE_SIZE, (p + 1) * ACTIVITY_PAGE_SIZE),
+        p,
+        allRows.length,
+      );
+    // The reconcile re-queries from the newest page forward. Page 0 is ALL seen
+    // (zero new), so a zero-new early-stop would miss pages 1 + 2.
+    invokeMock.mockResolvedValueOnce(pageOf(0));
+    invokeMock.mockResolvedValueOnce(pageOf(1));
+    invokeMock.mockResolvedValueOnce(pageOf(2));
+
+    await store.reconcileFromHistory(150);
+
+    const ids = store.entries.map((e) => e.id);
+    // All 250 rows present (the 100 already-seen + the 150 deeper recovered),
+    // newest-first, no duplicates.
+    expect(ids).toHaveLength(250);
+    expect(new Set(ids).size).toBe(250);
+    expect(ids[0]).toBe(250);
+    expect(ids[ids.length - 1]).toBe(1);
+    // It did NOT stop after the all-seen newest page: it walked >= 3 pages.
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "query_activity").length,
+    ).toBeGreaterThanOrEqual(3);
+  });
 });
 
 describe("activity store: live-tail cap (M7-P2-2)", () => {
@@ -373,7 +440,7 @@ describe("activity store: filters", () => {
 
     expect(invokeMock).toHaveBeenNthCalledWith(2, "query_activity", {
       filter: { minLevel: "error", sourceId: "src-1" },
-      page: { page: 0, limit: ACTIVITY_PAGE_SIZE },
+      page: { beforeTs: null, beforeId: null, limit: ACTIVITY_PAGE_SIZE },
     });
     // Old rows cleared; only the re-queried page remains.
     expect(store.entries.map((e) => e.id)).toEqual([3]);
