@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT DISTINCT event_type AS \"event_type!: String\"\n            FROM activity_log\n            ORDER BY event_type ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "event_type!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "ece383f1273dda33d36a5c9a23d737aeb49c077dc351a1f70442587e503e02c0"
+}

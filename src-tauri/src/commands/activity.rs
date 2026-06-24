@@ -19,10 +19,13 @@
 use tauri::State;
 
 use driven_core::state::{ActivityFilter, ActivityLevel, PageRequest};
-use driven_core::types::{ActivityEntry, ErrorCode, SourceId};
+use driven_core::time::{Clock, SystemClock};
+use driven_core::types::{ActivityEntry, ErrorCode, FileStateStatus, SourceId};
 
 use crate::app_state::AppState;
-use crate::commands::dtos::{ActivityFilterDto, ActivityPageDto, PageRequestDto};
+use crate::commands::dtos::{
+    ActivityFilterDto, ActivityPageDto, ActivitySummaryDto, FileStatusCountDto, PageRequestDto,
+};
 use crate::commands::{CommandError, CommandResult};
 
 /// Tracing target for the activity command layer.
@@ -125,6 +128,124 @@ pub async fn clear_activity_older_than(
         .map_err(CommandError::from)?;
     tracing::debug!(target: TARGET, before_ts, deleted, "clear_activity_older_than");
     Ok(deleted)
+}
+
+/// Max throughput window the webview may request for `activity_summary`
+/// (SPEC s11.6.1 bound): 24h in ms. A larger window is rejected so the rate
+/// denominator stays sane and the byte sum stays bounded to a day.
+const MAX_THROUGHPUT_WINDOW_MS: u64 = 24 * 60 * 60 * 1000;
+
+/// `distinct_activity_event_types()` - the DISTINCT set of `event_type` values
+/// in the durable `activity_log`, sorted ascending (M7-P2-4).
+///
+/// Backs the Activity dashboard's event-type filter dropdown so the user can
+/// filter for a type present in history but not in the currently-loaded rows
+/// (the loaded-rows-only derivation made the backend event-type filter
+/// unreachable for older types). Read-only scalar query - no path validation.
+#[tauri::command]
+pub async fn distinct_activity_event_types(
+    state: State<'_, AppState>,
+) -> CommandResult<Vec<String>> {
+    let types = state
+        .state()
+        .distinct_activity_event_types()
+        .await
+        .map_err(CommandError::from)?;
+    tracing::debug!(target: TARGET, count = types.len(), "distinct_activity_event_types");
+    Ok(types)
+}
+
+/// `activity_summary(day_start_ms, week_start_ms, throughput_window_ms)` - the
+/// Activity dashboard header aggregates (M7-P2-5; DESIGN s8.3): bytes uploaded
+/// today / this week, file count by status, and the current throughput window.
+///
+/// The day / week boundaries are supplied by the webview (computed from the
+/// LOCAL `Date`, so the day boundary honours the user's timezone without a
+/// timezone crate in the backend); the command bounds them and derives the
+/// throughput window start from `now - throughput_window_ms`. All inputs are
+/// scalars - no path validation applies (SPEC s11.6.1). Boundaries that are
+/// negative or inverted (`week_start > day_start`) are rejected as a caller bug.
+#[tauri::command]
+pub async fn activity_summary(
+    state: State<'_, AppState>,
+    day_start_ms: i64,
+    week_start_ms: i64,
+    throughput_window_ms: u64,
+) -> CommandResult<ActivitySummaryDto> {
+    if day_start_ms < 0 || week_start_ms < 0 {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "activity_summary day/week start must be non-negative Unix ms",
+        ));
+    }
+    if week_start_ms > day_start_ms {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "activity_summary week_start_ms must be <= day_start_ms",
+        ));
+    }
+    if !(1..=MAX_THROUGHPUT_WINDOW_MS).contains(&throughput_window_ms) {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            format!(
+                "activity_summary throughput_window_ms must be 1..={MAX_THROUGHPUT_WINDOW_MS}, got {throughput_window_ms}"
+            ),
+        ));
+    }
+
+    let now = SystemClock.now_ms();
+    // Clamp the window start at 0 so a clock skew / tiny `now` can never produce
+    // a negative lower bound (the query treats `ts >= bound`).
+    let window_start = now.saturating_sub(throughput_window_ms as i64).max(0);
+
+    let summary = state
+        .state()
+        .activity_summary(
+            day_start_ms,
+            week_start_ms,
+            window_start,
+            throughput_window_ms,
+        )
+        .await
+        .map_err(CommandError::from)?;
+
+    let file_status_counts = summary
+        .file_status_counts
+        .into_iter()
+        .map(|c| FileStatusCountDto {
+            status: file_state_status_str(c.status).to_string(),
+            count: c.count,
+        })
+        .collect();
+
+    tracing::debug!(
+        target: TARGET,
+        bytes_today = summary.bytes_today,
+        bytes_week = summary.bytes_week,
+        "activity_summary served"
+    );
+
+    Ok(ActivitySummaryDto {
+        bytes_today: summary.bytes_today,
+        bytes_week: summary.bytes_week,
+        file_status_counts,
+        throughput_window_bytes: summary.throughput_window_bytes,
+        throughput_window_ms: summary.throughput_window_ms,
+    })
+}
+
+/// Map a [`FileStateStatus`] to its stable wire string (matching the SPEC s2
+/// `file_state.status` TEXT values + the SQLite serialiser). An explicit match
+/// (not serde) so the wire contract is visible + the i18n key base is stable.
+fn file_state_status_str(s: FileStateStatus) -> &'static str {
+    match s {
+        FileStateStatus::Synced => "synced",
+        FileStateStatus::Pending => "pending",
+        FileStateStatus::Corrupt => "corrupt",
+        FileStateStatus::Locked => "locked",
+        FileStateStatus::Error => "error",
+        FileStateStatus::ExcludedOrphan => "excluded_orphan",
+    }
 }
 
 /// Validate + lower the webview filter DTO to the core [`ActivityFilter`]
@@ -307,6 +428,21 @@ mod tests {
         };
         let err = validate_filter(dto).expect_err("oversized event_type rejected");
         assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn file_state_status_str_round_trips_all_variants() {
+        // M7-P2-5: the status->wire mapping must cover every variant and match
+        // the SPEC s2 / SQLite TEXT values exactly (the i18n key base).
+        assert_eq!(file_state_status_str(FileStateStatus::Synced), "synced");
+        assert_eq!(file_state_status_str(FileStateStatus::Pending), "pending");
+        assert_eq!(file_state_status_str(FileStateStatus::Corrupt), "corrupt");
+        assert_eq!(file_state_status_str(FileStateStatus::Locked), "locked");
+        assert_eq!(file_state_status_str(FileStateStatus::Error), "error");
+        assert_eq!(
+            file_state_status_str(FileStateStatus::ExcludedOrphan),
+            "excluded_orphan"
+        );
     }
 
     #[test]

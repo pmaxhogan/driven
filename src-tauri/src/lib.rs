@@ -312,6 +312,9 @@ pub fn run() {
             // SPEC s11.4 activity (M7).
             commands::activity::query_activity,
             commands::activity::clear_activity_older_than,
+            // M7-P2-4 / P2-5: filter facets + DESIGN s8.3 header aggregates.
+            commands::activity::distinct_activity_event_types,
+            commands::activity::activity_summary,
         ])
         .build(tauri::generate_context!());
 

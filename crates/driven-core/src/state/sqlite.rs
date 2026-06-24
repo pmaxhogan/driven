@@ -33,8 +33,9 @@ use sqlx::sqlite::{
 use uuid::Uuid;
 
 use super::{
-    AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, FileSearchHit,
-    FileStateRow, NewActivity, NewPendingOp, PageRequest, PendingOpRow, SourceRow, StateRepo,
+    AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
+    FileSearchHit, FileStateRow, FileStatusCount, NewActivity, NewPendingOp, PageRequest,
+    PendingOpRow, SourceRow, StateRepo,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -1363,6 +1364,85 @@ impl StateRepo for SqliteStateRepo {
         })
     }
 
+    async fn distinct_activity_event_types(&self) -> Result<Vec<String>> {
+        // M7-P2-4: the DISTINCT event_type set so the dashboard filter dropdown
+        // can offer types present in history but not in the loaded rows. Sorted
+        // ascending for a stable UI order.
+        let rows = sqlx::query!(
+            r#"
+            SELECT DISTINCT event_type AS "event_type!: String"
+            FROM activity_log
+            ORDER BY event_type ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| r.event_type).collect())
+    }
+
+    async fn activity_summary(
+        &self,
+        day_start_ms: UnixMs,
+        week_start_ms: UnixMs,
+        throughput_window_start_ms: UnixMs,
+        throughput_window_ms: u64,
+    ) -> Result<ActivitySummary> {
+        // M7-P2-5 (DESIGN s8.3 header aggregates). Three bounded sums over
+        // `activity_log.bytes` (today / this week / recent throughput window)
+        // plus a GROUP BY over `file_state.status`. `bytes` is nullable and
+        // SUM over no rows is NULL, so COALESCE to 0. The caller passes every
+        // time boundary so this is deterministic + testable.
+        //
+        // SQLite has no unsigned ints; bytes are stored as INTEGER and summed
+        // into i64. A negative byte count is impossible (only non-negative
+        // upload sizes are written), but the decode below clamps via `max(0)`
+        // as defence-in-depth before the lossless cast to u64.
+        let byte_sums = sqlx::query!(
+            r#"
+            SELECT
+                COALESCE(SUM(CASE WHEN ts >= ?1 THEN bytes ELSE 0 END), 0) AS "today!: i64",
+                COALESCE(SUM(CASE WHEN ts >= ?2 THEN bytes ELSE 0 END), 0) AS "week!: i64",
+                COALESCE(SUM(CASE WHEN ts >= ?3 THEN bytes ELSE 0 END), 0) AS "window!: i64"
+            FROM activity_log
+            WHERE ts >= ?2
+            "#,
+            day_start_ms,
+            week_start_ms,
+            throughput_window_start_ms,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        let status_rows = sqlx::query!(
+            r#"
+            SELECT
+                status      AS "status!: String",
+                COUNT(*)    AS "count!: i64"
+            FROM file_state
+            GROUP BY status
+            ORDER BY status ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut file_status_counts = Vec::with_capacity(status_rows.len());
+        for r in status_rows {
+            file_status_counts.push(FileStatusCount {
+                status: file_state_status_from_str(&r.status)?,
+                count: r.count.max(0) as u64,
+            });
+        }
+
+        Ok(ActivitySummary {
+            bytes_today: byte_sums.today.max(0) as u64,
+            bytes_week: byte_sums.week.max(0) as u64,
+            file_status_counts,
+            throughput_window_bytes: byte_sums.window.max(0) as u64,
+            throughput_window_ms,
+        })
+    }
+
     async fn prune_activity_older_than(
         &self,
         before_ms: UnixMs,
@@ -2202,6 +2282,117 @@ mod tests {
         assert_eq!(p2.rows.len(), 1, "last page holds the 5th match");
         assert_eq!(p2.rows[0].ts, 2);
         assert_eq!(p2.rows[0].event_type, "keep");
+    }
+
+    #[tokio::test]
+    async fn distinct_activity_event_types_returns_sorted_unique_set() {
+        // M7-P2-4: the dropdown source. DISTINCT, sorted, across the whole log -
+        // including types not in any single loaded page.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        for (ts, et) in [
+            (1, "upload_done"),
+            (2, "scan_done"),
+            (3, "upload_done"), // duplicate type
+            (4, "paused"),
+        ] {
+            repo.write_activity(NewActivity {
+                ts,
+                source_id: Some(src.id),
+                level: ActivityLevel::Info,
+                event_type: et.into(),
+                file_count: None,
+                bytes: None,
+                message: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        let types = repo.distinct_activity_event_types().await.unwrap();
+        assert_eq!(types, vec!["paused", "scan_done", "upload_done"]);
+    }
+
+    #[tokio::test]
+    async fn activity_summary_aggregates_bytes_and_status_counts() {
+        // M7-P2-5 (DESIGN s8.3 header). Byte sums honour the today / week /
+        // throughput-window boundaries; status counts group `file_state`.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // Boundaries (ms): today >= 1000, week >= 100, throughput window >= 1500.
+        let day_start = 1000;
+        let week_start = 100;
+        let window_start = 1500;
+        let window_ms = 60_000;
+
+        // Rows: one before the week window (excluded entirely), one in the week
+        // but before today, one today-but-before-the-throughput-window, and one
+        // inside the throughput window. `bytes` is the upload size.
+        for (ts, bytes) in [
+            (50, 999_u64), // before week_start -> excluded from every sum
+            (200, 10),     // week only
+            (1200, 20),    // week + today
+            (1800, 30),    // week + today + throughput window
+        ] {
+            repo.write_activity(NewActivity {
+                ts,
+                source_id: Some(src.id),
+                level: ActivityLevel::Info,
+                event_type: "upload_done".into(),
+                file_count: Some(1),
+                bytes: Some(bytes),
+                message: None,
+            })
+            .await
+            .unwrap();
+        }
+
+        // file_state rows: 2 synced, 1 pending across statuses.
+        let mut s1 = sample_file(src.id, "a.txt", 0x01);
+        s1.status = FileStateStatus::Synced;
+        let mut s2 = sample_file(src.id, "b.txt", 0x02);
+        s2.status = FileStateStatus::Synced;
+        let mut p1 = sample_file(src.id, "c.txt", 0x03);
+        p1.status = FileStateStatus::Pending;
+        repo.upsert_file_state(&s1).await.unwrap();
+        repo.upsert_file_state(&s2).await.unwrap();
+        repo.upsert_file_state(&p1).await.unwrap();
+
+        let summary = repo
+            .activity_summary(day_start, week_start, window_start, window_ms)
+            .await
+            .unwrap();
+
+        // today = rows with ts >= 1000: 20 + 30 = 50.
+        assert_eq!(summary.bytes_today, 50);
+        // week = rows with ts >= 100: 10 + 20 + 30 = 60 (the ts=50 row excluded).
+        assert_eq!(summary.bytes_week, 60);
+        // throughput window = rows with ts >= 1500: 30.
+        assert_eq!(summary.throughput_window_bytes, 30);
+        assert_eq!(summary.throughput_window_ms, window_ms);
+
+        // status counts: Pending=1, Synced=2 (sorted ascending by status text).
+        assert_eq!(
+            summary.file_status_counts,
+            vec![
+                FileStatusCount {
+                    status: FileStateStatus::Pending,
+                    count: 1,
+                },
+                FileStatusCount {
+                    status: FileStateStatus::Synced,
+                    count: 2,
+                },
+            ]
+        );
     }
 
     #[test]

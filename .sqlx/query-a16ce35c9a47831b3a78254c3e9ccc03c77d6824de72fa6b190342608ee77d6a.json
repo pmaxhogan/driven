@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                status      AS \"status!: String\",\n                COUNT(*)    AS \"count!: i64\"\n            FROM file_state\n            GROUP BY status\n            ORDER BY status ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "status!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "count!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "a16ce35c9a47831b3a78254c3e9ccc03c77d6824de72fa6b190342608ee77d6a"
+}

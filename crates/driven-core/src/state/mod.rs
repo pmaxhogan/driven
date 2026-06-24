@@ -268,6 +268,42 @@ pub struct ActivityPage {
     pub total: u64,
 }
 
+/// A per-status file count for the Activity dashboard header (DESIGN s8.3
+/// "file count by status").
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileStatusCount {
+    /// The `file_state.status` discriminant.
+    pub status: FileStateStatus,
+    /// Number of `file_state` rows in this status across all sources.
+    pub count: u64,
+}
+
+/// The Activity dashboard header aggregates (DESIGN s8.3): bytes uploaded today
+/// / this week, file count by status, and current throughput.
+///
+/// All time windows are computed by the caller (the IPC command) from a single
+/// `now`, so this method is deterministic + unit-testable: the repo only runs
+/// the bounded aggregate SQL for the passed boundaries.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivitySummary {
+    /// Sum of `activity_log.bytes` for rows at or after the start of today
+    /// (local-midnight ms the caller passes). Byte-carrying rows are the
+    /// upload-completed events, so this is "bytes uploaded today".
+    pub bytes_today: u64,
+    /// Sum of `activity_log.bytes` for rows at or after the start of the week.
+    pub bytes_week: u64,
+    /// File count grouped by `file_state.status` (DESIGN s8.3), each status
+    /// with a non-zero count; statuses with no rows are omitted.
+    pub file_status_counts: Vec<FileStatusCount>,
+    /// Bytes observed in the recent throughput window (sum of
+    /// `activity_log.bytes` at or after `window_start`), used with the window
+    /// length to render a current bytes/sec rate in the UI.
+    pub throughput_window_bytes: u64,
+    /// Length of the throughput window in milliseconds (so the UI computes the
+    /// rate as `throughput_window_bytes / (throughput_window_ms / 1000)`).
+    pub throughput_window_ms: u64,
+}
+
 /// One hit from the `file_state_fts` virtual table (SPEC s2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSearchHit {
@@ -574,6 +610,47 @@ pub trait StateRepo: Send + Sync {
         filter: ActivityFilter,
         page: PageRequest,
     ) -> Result<ActivityPage>;
+
+    /// M7-P2-4: the DISTINCT set of `activity_log.event_type` values present in
+    /// the durable log, sorted ascending. Backs the Activity dashboard's
+    /// event-type filter dropdown so the user can filter for an event type that
+    /// exists in history but is not in the currently-loaded rows.
+    ///
+    /// Default impl returns an empty list; the SQLite repo overrides it with the
+    /// real `SELECT DISTINCT`. (The default keeps the test fakes - which never
+    /// call this - compiling without a per-fake stub.)
+    async fn distinct_activity_event_types(&self) -> Result<Vec<String>> {
+        Ok(Vec::new())
+    }
+
+    /// M7-P2-5: the Activity dashboard header aggregates (DESIGN s8.3): bytes
+    /// uploaded today / this week, file count by status, and the recent
+    /// throughput window. The caller passes every time boundary (computed from a
+    /// single `now`) so the query is deterministic + unit-testable.
+    ///
+    /// - `day_start_ms` / `week_start_ms`: inclusive lower bounds for the
+    ///   today / this-week byte sums.
+    /// - `throughput_window_start_ms`: inclusive lower bound for the recent
+    ///   throughput byte sum; `throughput_window_ms` is its length (carried
+    ///   straight through so the UI computes bytes/sec).
+    ///
+    /// Default impl returns a zeroed summary; the SQLite repo overrides it with
+    /// the real aggregate SQL.
+    async fn activity_summary(
+        &self,
+        day_start_ms: UnixMs,
+        week_start_ms: UnixMs,
+        throughput_window_start_ms: UnixMs,
+        throughput_window_ms: u64,
+    ) -> Result<ActivitySummary> {
+        let _ = (
+            day_start_ms,
+            week_start_ms,
+            throughput_window_start_ms,
+            throughput_window_ms,
+        );
+        Ok(ActivitySummary::default())
+    }
 
     /// Prune `activity_log` rows older than `before_ms`, batched to keep
     /// the write transaction short (DESIGN s18.4 retention policy).

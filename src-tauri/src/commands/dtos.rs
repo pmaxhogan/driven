@@ -577,3 +577,36 @@ pub struct ActivityPageDto {
     /// `true` if at least one more page exists after this one.
     pub has_more: bool,
 }
+
+/// One per-status file count for the Activity header (M7-P2-5; DESIGN s8.3
+/// "file count by status"). Mirrors [`driven_core::state::FileStatusCount`].
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct FileStatusCountDto {
+    /// The `file_state.status` discriminant (`synced` | `pending` | `corrupt`
+    /// | `locked` | `error` | `excluded_orphan`).
+    pub status: String,
+    /// Number of `file_state` rows in this status across all sources.
+    pub count: u64,
+}
+
+/// The Activity dashboard header aggregates returned by `activity_summary`
+/// (M7-P2-5; DESIGN s8.3): bytes uploaded today / this week, file count by
+/// status, and the current throughput window. Mirrors
+/// [`driven_core::state::ActivitySummary`] over the camelCase wire; the UI
+/// formats bytes / rate with `Intl.NumberFormat` per DESIGN s8.7.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivitySummaryDto {
+    /// Bytes uploaded since the start of today (local midnight).
+    pub bytes_today: u64,
+    /// Bytes uploaded since the start of this week.
+    pub bytes_week: u64,
+    /// File count grouped by status; statuses with no rows are omitted.
+    pub file_status_counts: Vec<FileStatusCountDto>,
+    /// Bytes observed in the recent throughput window.
+    pub throughput_window_bytes: u64,
+    /// Length of the throughput window in milliseconds (so the UI derives a
+    /// bytes/sec rate).
+    pub throughput_window_ms: u64,
+}
