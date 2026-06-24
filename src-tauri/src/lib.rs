@@ -18,7 +18,10 @@ rust_i18n::i18n!("locales", fallback = "en-US");
 
 mod app_state;
 mod assembly;
-mod commands;
+// `pub` so the integration tests (`tests/ipc_path_validation.rs`, SPEC s11.6.1)
+// can exercise the path-validation helpers (`validate_writable_dest`,
+// `DialogToken`) against the real implementation.
+pub mod commands;
 mod crypto_provider_impl;
 // The elevation module is the complete M5-shipped "run elevated on login" /
 // "restart elevated" public API (ROADMAP M3.5 deferred to M5). Its callers are
@@ -147,7 +150,8 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
     // Signal every orchestrator to stop AFTER its current cycle up front, so the
     // concurrent drains below see the stop flag already set (each account's
     // in-flight cycle winds down in parallel instead of one-at-a-time).
-    for (account_id, handle) in state.accounts() {
+    let handles = state.accounts();
+    for (account_id, handle) in &handles {
         tracing::info!(target: "driven::app", account_id = %account_id, "signalling graceful shutdown on quit");
         handle.orchestrator.shutdown();
     }
@@ -158,7 +162,7 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
         // outer timeout would risk dropping a cancellation-unsafe drain mid-abort
         // -> an orphaned task). `join_all` returns only once EVERY account's
         // every task is finished.
-        let drains = state.accounts().map(|(account_id, handle)| async move {
+        let drains = handles.into_iter().map(|(account_id, handle)| async move {
             handle.shutdown().await;
             tracing::info!(target: "driven::app", account_id = %account_id, "all per-account tasks shut down (no orphans)");
         });
@@ -296,6 +300,9 @@ pub fn run() {
             commands::sources::remove_source,
             commands::sources::pick_drive_folder,
             commands::sources::preview_exclusions,
+            // SPEC s11.6.1 backend-owned native dialogs (M6 C1).
+            commands::dialogs::pick_folder_dialog,
+            commands::dialogs::pick_save_zip_dialog,
             // SPEC s11.6 settings & misc (M6).
             commands::settings::get_settings,
             commands::settings::update_settings,

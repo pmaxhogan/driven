@@ -2,11 +2,10 @@
 import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import CredentialsWalkthrough from "../components/CredentialsWalkthrough.vue";
 import RecoveryPhraseReveal from "../components/RecoveryPhraseReveal.vue";
-import { pickDriveFolder } from "../ipc/commands";
+import { pickDriveFolder, pickFolderDialog } from "../ipc/commands";
 import { useSetupStore, WIZARD_STEPS } from "../stores/setup";
 
 // Setup wizard (SPEC s25 /setup; DESIGN s8.5 5-step wizard). Drives the whole
@@ -22,9 +21,13 @@ import { useSetupStore, WIZARD_STEPS } from "../stores/setup";
 // encryption step, then synced from the confirm step.
 //
 // i18n: every visible string flows through t() against seeded keys (DESIGN s8.7).
-// IPC path safety (SPEC s11.6.1): the local folder is chosen via the
-// tauri-plugin-dialog directory picker, so add_source receives a dialog-derived
-// path the backend validates - never a webview-supplied string.
+// IPC path safety (SPEC s11.6.1 / C1): the local folder is chosen via the
+// BACKEND-owned native folder dialog (pickFolderDialog), which returns a one-shot
+// token bound to the chosen path; add_source receives that token (never a
+// webview-supplied string), so the backend can prove the path is dialog-derived.
+// B3: the source is created on leaving the encryption step, and any recovery
+// phrase it returns is revealed on the confirm step + Finish is gated on the
+// user acknowledging they saved it (never an empty / un-acknowledged phrase).
 
 const { t } = useI18n();
 const router = useRouter();
@@ -64,7 +67,7 @@ const canAdvance = computed(() => {
       // but also allow Next once signed in.
       return setup.signedIn;
     case "source":
-      return !!setup.localPath && !!setup.driveFolderId;
+      return !!setup.localPathToken && !!setup.driveFolderId;
     case "encryption":
       return !setup.busy;
     case "confirm":
@@ -80,13 +83,18 @@ async function chooseLocalFolder(): Promise<void> {
   pickingFolder.value = true;
   setup.clearError();
   try {
-    const selected = await openDialog({ directory: true, multiple: false });
-    if (typeof selected === "string") {
-      setup.localPath = selected;
-      if (!setup.sourceDisplayName) {
-        setup.sourceDisplayName = baseName(selected);
-      }
+    // C1: the BACKEND owns the dialog and returns { path, token }. We store both
+    // so add_source can present the token proving the path is dialog-derived.
+    const picked = await pickFolderDialog();
+    setup.localPath = picked.path;
+    setup.localPathToken = picked.token;
+    if (!setup.sourceDisplayName) {
+      setup.sourceDisplayName = baseName(picked.path);
     }
+  } catch {
+    // A cancel (or dialog error) surfaces as a rejected command; leave the path
+    // unset so the step's "Next" stays disabled. No hard error shown for a
+    // cancel - the user simply did not pick a folder.
   } finally {
     pickingFolder.value = false;
   }
@@ -132,12 +140,18 @@ async function onNext(): Promise<void> {
 }
 
 async function onFinish(): Promise<void> {
+  // B3: never finish while a displayed recovery phrase is un-acknowledged.
+  if (!setup.canFinish) return;
   try {
     await setup.startInitialSync();
   } catch {
     return; // stay on confirm; error is shown.
   }
   await router.push("/activity");
+}
+
+function onPhraseAck(value: boolean): void {
+  setup.acknowledgePhrase(value);
 }
 
 function baseName(p: string): string {
@@ -251,18 +265,20 @@ function baseName(p: string): string {
         <span>{{ t("wizard.step4.enableLabel") }}</span>
       </label>
 
-      <template v-if="setup.encryptionEnabled">
-        <p class="text-sm text-amber-700 dark:text-amber-500">
-          {{ t("wizard.step4.recoveryWarning") }}
-        </p>
-        <RecoveryPhraseReveal :phrase="setup.recoveryPhrase ?? undefined" />
-      </template>
+      <p
+        v-if="setup.encryptionEnabled"
+        class="text-sm text-amber-700 dark:text-amber-500"
+      >
+        {{ t("wizard.step4.recoveryWarning") }}
+      </p>
+      <!-- B3: the phrase is NOT shown here - it does not exist until the source
+           is created (on Next). It is revealed on the confirm step below. -->
     </div>
 
-    <!-- Step 5: Confirm + start initial sync -->
+    <!-- Step 5: Confirm + recovery-phrase reveal + start initial sync -->
     <div
       v-else
-      class="space-y-2"
+      class="space-y-3"
     >
       <h2 class="text-lg font-medium">
         {{ t("wizard.step5.title") }}
@@ -270,6 +286,16 @@ function baseName(p: string): string {
       <p class="text-zinc-600 dark:text-zinc-400">
         {{ t("wizard.step5.body") }}
       </p>
+
+      <!-- B3: the source's encryption opt-in generated a recovery phrase - show
+           it exactly once and gate Finish on the user acknowledging they saved
+           it. The reveal renders only when a real phrase was returned. -->
+      <RecoveryPhraseReveal
+        v-if="setup.hasRecoveryPhrase"
+        :phrase="setup.recoveryPhrase ?? undefined"
+        :confirmed="setup.phraseAcknowledged"
+        @update:confirmed="onPhraseAck"
+      />
     </div>
 
     <p
@@ -294,7 +320,7 @@ function baseName(p: string): string {
         v-if="setup.step === 'confirm'"
         type="button"
         class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
-        :disabled="setup.busy"
+        :disabled="setup.busy || !setup.canFinish"
         @click="onFinish"
       >
         {{ t("wizard.step5.startButton") }}

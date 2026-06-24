@@ -1,7 +1,6 @@
 <script setup lang="ts">
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import RecoveryPhraseReveal from "./RecoveryPhraseReveal.vue";
 import * as ipc from "../ipc/commands";
@@ -26,7 +25,15 @@ const sources = useSourcesStore();
 
 const emit = defineEmits<{ created: [source: SourceDto] }>();
 
-type Step = "localFolder" | "driveFolder" | "exclusions" | "encryption" | "confirm";
+// B3: a post-confirm "reveal" step is appended when an encrypted add returned a
+// recovery phrase; the user must acknowledge it before the wizard closes.
+type Step =
+  | "localFolder"
+  | "driveFolder"
+  | "exclusions"
+  | "encryption"
+  | "confirm"
+  | "reveal";
 const STEPS: Step[] = [
   "localFolder",
   "driveFolder",
@@ -37,13 +44,21 @@ const STEPS: Step[] = [
 
 const open = ref(false);
 const stepIndex = ref(0);
-const step = computed<Step>(() => STEPS[stepIndex.value]);
+// B3: the reveal step is shown out-of-band (after a successful encrypted add),
+// so it is tracked separately rather than as a normal STEPS index.
+const revealing = ref(false);
+const step = computed<Step>(() =>
+  revealing.value ? "reveal" : STEPS[stepIndex.value],
+);
 
 // Form state.
 const accountId = ref<string | null>(null);
-// `localPath` is ONLY ever set from the dialog result (dialog-derived); there is
-// no text input for it, so the webview cannot inject an arbitrary path.
+// `localPath` is ONLY ever set from the BACKEND folder dialog (dialog-derived);
+// there is no text input for it, so the webview cannot inject an arbitrary path.
 const localPath = ref<string | null>(null);
+// C1: the one-shot dialog token bound to the chosen local folder (required by
+// add_source so the backend can prove the path is dialog-derived).
+const localPathToken = ref<string | null>(null);
 const driveFolderId = ref<string | null>(null);
 const driveFolderPath = ref<string>("");
 const respectGitignore = ref(true);
@@ -51,9 +66,12 @@ const includePatternsText = ref("");
 const excludePatternsText = ref("");
 const encryptionEnabled = ref(false);
 const phraseConfirmed = ref(false);
-// The backend returns the BIP39 phrase on encryption opt-in; until that path is
-// wired it stays empty and the reveal is inert. Never fabricated here.
+// B3: the BIP39 phrase the backend RETURNS from add_source on the first
+// encrypted source. Empty until then; shown once on the reveal step.
 const recoveryPhrase = ref<string[]>([]);
+// B3: the source created on confirm (held so the reveal step can emit it after
+// the phrase is acknowledged).
+const createdSource = ref<SourceDto | null>(null);
 
 // Drive picker state: a breadcrumb stack of the folders descended into, so "up"
 // can re-fetch the parent. The first entry (null id) is the Drive root.
@@ -74,12 +92,9 @@ const includePatterns = computed(() => splitPatterns(includePatternsText.value))
 const excludePatterns = computed(() => splitPatterns(excludePatternsText.value));
 
 const canLeaveLocal = computed(
-  () => accountId.value !== null && localPath.value !== null,
+  () => accountId.value !== null && localPathToken.value !== null,
 );
 const canLeaveDrive = computed(() => driveFolderId.value !== null);
-const canLeaveEncryption = computed(
-  () => !encryptionEnabled.value || phraseConfirmed.value,
-);
 
 const numberFormatter = computed(() => new Intl.NumberFormat(locale.value));
 
@@ -116,8 +131,10 @@ async function start(): Promise<void> {
 
 function reset(): void {
   stepIndex.value = 0;
+  revealing.value = false;
   accountId.value = null;
   localPath.value = null;
+  localPathToken.value = null;
   driveFolderId.value = null;
   driveFolderPath.value = "";
   respectGitignore.value = true;
@@ -126,6 +143,7 @@ function reset(): void {
   encryptionEnabled.value = false;
   phraseConfirmed.value = false;
   recoveryPhrase.value = [];
+  createdSource.value = null;
   crumbs.value = [];
   driveFolders.value = [];
   preview.value = null;
@@ -139,11 +157,14 @@ function close(): void {
 
 async function chooseLocalFolder(): Promise<void> {
   errorMessage.value = null;
-  const selected = await openDialog({ directory: true, multiple: false });
-  // `open` returns null on cancel; a string for a single directory. We never
-  // accept a typed path, only this dialog result.
-  if (typeof selected === "string") {
-    localPath.value = selected;
+  try {
+    // C1: the BACKEND owns the folder dialog and returns { path, token }. We
+    // never accept a typed path - only this dialog result + its token.
+    const picked = await ipc.pickFolderDialog();
+    localPath.value = picked.path;
+    localPathToken.value = picked.token;
+  } catch {
+    // A cancel (or dialog error) leaves the path unset so "Next" stays disabled.
   }
 }
 
@@ -220,6 +241,7 @@ async function confirm(): Promise<void> {
   if (
     accountId.value === null ||
     localPath.value === null ||
+    localPathToken.value === null ||
     driveFolderId.value === null
   ) {
     return;
@@ -228,9 +250,10 @@ async function confirm(): Promise<void> {
   errorMessage.value = null;
   try {
     const displayName = localPath.value.split(/[\\/]/).filter(Boolean).pop();
-    const created = await sources.add({
+    const result = await sources.add({
       accountId: accountId.value,
       displayName: displayName ?? localPath.value,
+      localPathToken: localPathToken.value,
       localPath: localPath.value,
       driveFolderId: driveFolderId.value,
       driveFolderPath: driveFolderPath.value,
@@ -239,13 +262,32 @@ async function confirm(): Promise<void> {
       includePatterns: includePatterns.value,
       excludePatterns: excludePatterns.value,
     });
-    emit("created", created);
-    close();
+    createdSource.value = result.source;
+    // B3: if a recovery phrase was returned (this opt-in generated the master
+    // key), show it ONCE on the reveal step and require acknowledgement before
+    // closing. Otherwise (unencrypted, or a subsequent encrypted source) finish.
+    if (result.recoveryPhrase && result.recoveryPhrase.length > 0) {
+      recoveryPhrase.value = result.recoveryPhrase;
+      phraseConfirmed.value = false;
+      revealing.value = true;
+    } else {
+      emit("created", result.source);
+      close();
+    }
   } catch (e) {
     errorMessage.value = String(e);
   } finally {
     submitting.value = false;
   }
+}
+
+/** B3: leave the reveal step once the user acknowledged the phrase - emit the
+ * created source + close. Guarded so it cannot fire without acknowledgement. */
+function finishReveal(): void {
+  if (!phraseConfirmed.value) return;
+  const created = createdSource.value;
+  if (created) emit("created", created);
+  close();
 }
 
 defineExpose({ start });
@@ -452,7 +494,7 @@ defineExpose({ start });
         </div>
       </div>
 
-      <!-- Step 4: encryption opt-in -->
+      <!-- Step 4: encryption opt-in (phrase is revealed AFTER confirm, B3) -->
       <div
         v-else-if="step === 'encryption'"
         class="space-y-3"
@@ -470,8 +512,19 @@ defineExpose({ start });
         >
           {{ t("wizard.step4.recoveryWarning") }}
         </p>
+      </div>
+
+      <!-- Reveal step: shown after an encrypted add returned a recovery phrase.
+           The user must acknowledge before the wizard closes (B3). -->
+      <div
+        v-else-if="step === 'reveal'"
+        class="space-y-3"
+        data-testid="reveal-step"
+      >
+        <p class="text-sm text-amber-700 dark:text-amber-400">
+          {{ t("wizard.step4.recoveryWarning") }}
+        </p>
         <RecoveryPhraseReveal
-          v-if="encryptionEnabled"
           v-model:confirmed="phraseConfirmed"
           :phrase="recoveryPhrase"
         />
@@ -511,36 +564,49 @@ defineExpose({ start });
           {{ t("common.cancel") }}
         </button>
         <div class="flex gap-2">
+          <!-- B3 reveal step: a single "Done" button gated on acknowledgement;
+               back/next are hidden so the phrase cannot be skipped. -->
           <button
-            v-if="stepIndex > 0"
+            v-if="step === 'reveal'"
             type="button"
-            class="rounded border px-3 py-1.5 text-sm"
-            @click="back"
+            class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
+            :disabled="!phraseConfirmed"
+            data-testid="reveal-done"
+            @click="finishReveal"
           >
-            {{ t("common.back") }}
+            {{ t("common.done") }}
           </button>
-          <button
-            v-if="step !== 'confirm'"
-            type="button"
-            class="rounded border px-3 py-1.5 text-sm"
-            :disabled="
-              (step === 'localFolder' && !canLeaveLocal) ||
-                (step === 'driveFolder' && !canLeaveDrive) ||
-                (step === 'encryption' && !canLeaveEncryption)
-            "
-            @click="next"
-          >
-            {{ t("common.next") }}
-          </button>
-          <button
-            v-else
-            type="button"
-            class="rounded border px-3 py-1.5 text-sm"
-            :disabled="submitting"
-            @click="confirm"
-          >
-            {{ t("common.finish") }}
-          </button>
+          <template v-else>
+            <button
+              v-if="stepIndex > 0"
+              type="button"
+              class="rounded border px-3 py-1.5 text-sm"
+              @click="back"
+            >
+              {{ t("common.back") }}
+            </button>
+            <button
+              v-if="step !== 'confirm'"
+              type="button"
+              class="rounded border px-3 py-1.5 text-sm"
+              :disabled="
+                (step === 'localFolder' && !canLeaveLocal) ||
+                  (step === 'driveFolder' && !canLeaveDrive)
+              "
+              @click="next"
+            >
+              {{ t("common.next") }}
+            </button>
+            <button
+              v-else
+              type="button"
+              class="rounded border px-3 py-1.5 text-sm"
+              :disabled="submitting"
+              @click="confirm"
+            >
+              {{ t("common.finish") }}
+            </button>
+          </template>
         </div>
       </div>
     </div>

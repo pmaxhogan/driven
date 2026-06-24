@@ -42,13 +42,20 @@ export const useSetupStore = defineStore("setup", () => {
   const accountId = ref<string | null>(null);
   const accountEmail = ref<string | null>(null);
   const localPath = ref<string | null>(null);
+  // C1: the one-shot dialog token for the chosen local folder (proves the path
+  // came from the backend folder dialog). Required by add_source.
+  const localPathToken = ref<string | null>(null);
   const driveFolderId = ref<string | null>(null);
   const driveFolderPath = ref<string>("");
   const sourceDisplayName = ref<string>("");
   const encryptionEnabled = ref(false);
-  // The 24-word BIP39 phrase the backend returns on encryption opt-in. Held
-  // only in memory; revealed once via RecoveryPhraseReveal, never persisted.
+  // B3: the 24-word BIP39 phrase the backend RETURNS from add_source on the
+  // first encrypted source. Held only in memory; revealed once via
+  // RecoveryPhraseReveal, never persisted. `null` until the source is created.
   const recoveryPhrase = ref<string[] | null>(null);
+  // B3: the user has acknowledged saving the recovery phrase. Finish is gated
+  // on this whenever a phrase was actually displayed.
+  const phraseAcknowledged = ref(false);
   const sourceId = ref<string | null>(null);
 
   // Transient UX flags surfaced by the view.
@@ -62,6 +69,22 @@ export const useSetupStore = defineStore("setup", () => {
 
   /** True once the OAuth sign-in has resolved to `complete`. */
   const signedIn = computed(() => oauthStatus.value?.kind === "complete");
+
+  /** B3: a recovery phrase was returned (the source's encryption opt-in
+   * generated the master key), so the user MUST see + acknowledge it. */
+  const hasRecoveryPhrase = computed(
+    () => (recoveryPhrase.value?.length ?? 0) > 0,
+  );
+
+  /** B3: the wizard may Finish only once any displayed recovery phrase has been
+   * acknowledged. With no phrase (unencrypted), Finish is always allowed. */
+  const canFinish = computed(
+    () => !hasRecoveryPhrase.value || phraseAcknowledged.value,
+  );
+
+  /** B3: the source has been created (so the confirm step can show the phrase
+   * reveal + the start-sync affordance). */
+  const sourceCreated = computed(() => sourceId.value !== null);
 
   function next(): void {
     if (canGoNext.value) stepIndex.value += 1;
@@ -177,13 +200,15 @@ export const useSetupStore = defineStore("setup", () => {
     try {
       const acct = accountId.value;
       const local = localPath.value;
+      const token = localPathToken.value;
       const drive = driveFolderId.value;
-      if (!acct || !local || !drive) {
+      if (!acct || !local || !token || !drive) {
         throw new Error("source step is incomplete");
       }
       const req: AddSourceRequest = {
         accountId: acct,
         displayName: sourceDisplayName.value || driveFolderPath.value || local,
+        localPathToken: token,
         localPath: local,
         driveFolderId: drive,
         driveFolderPath: driveFolderPath.value,
@@ -193,14 +218,25 @@ export const useSetupStore = defineStore("setup", () => {
         excludePatterns: [],
       };
       const sources = useSourcesStore();
-      const created = await sources.add(req);
-      sourceId.value = created.id;
+      const result = await sources.add(req);
+      sourceId.value = result.source.id;
+      // B3: capture the one-time recovery phrase (present only when this opt-in
+      // generated the account master key). Reset the ack so the confirm step
+      // gates Finish until the user attests they saved the words.
+      recoveryPhrase.value = result.recoveryPhrase;
+      phraseAcknowledged.value = false;
     } catch (e) {
       errorCode.value = toErrorCode(e);
       throw e;
     } finally {
       busy.value = false;
     }
+  }
+
+  /** B3: record the user's acknowledgement that they saved the recovery phrase
+   * (gates Finish on the confirm step). */
+  function acknowledgePhrase(value: boolean): void {
+    phraseAcknowledged.value = value;
   }
 
   /**
@@ -231,11 +267,13 @@ export const useSetupStore = defineStore("setup", () => {
     accountId.value = null;
     accountEmail.value = null;
     localPath.value = null;
+    localPathToken.value = null;
     driveFolderId.value = null;
     driveFolderPath.value = "";
     sourceDisplayName.value = "";
     encryptionEnabled.value = false;
     recoveryPhrase.value = null;
+    phraseAcknowledged.value = false;
     sourceId.value = null;
     busy.value = false;
     errorCode.value = null;
@@ -256,17 +294,22 @@ export const useSetupStore = defineStore("setup", () => {
     accountId,
     accountEmail,
     localPath,
+    localPathToken,
     driveFolderId,
     driveFolderPath,
     sourceDisplayName,
     encryptionEnabled,
     recoveryPhrase,
+    phraseAcknowledged,
     sourceId,
     busy,
     errorCode,
     canGoBack,
     canGoNext,
     signedIn,
+    hasRecoveryPhrase,
+    canFinish,
+    sourceCreated,
     next,
     back,
     clearError,
@@ -278,6 +321,7 @@ export const useSetupStore = defineStore("setup", () => {
     connectAccount,
     checkSigninComplete,
     createFirstSource,
+    acknowledgePhrase,
     startInitialSync,
     reset,
   };

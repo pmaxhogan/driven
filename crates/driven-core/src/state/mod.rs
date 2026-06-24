@@ -550,6 +550,12 @@ pub trait StateRepo: Send + Sync {
 
     // --- settings -----------------------------------------------------------
 
+    /// The schema version recorded in SQLite's `PRAGMA user_version`
+    /// (SPEC s18 diagnostic bundle `schema.txt`). Exposed on the object-safe
+    /// trait so the diagnostic-bundle command (which holds only `dyn StateRepo`)
+    /// can record the REAL schema version rather than "not exposed".
+    async fn schema_version(&self) -> Result<i64>;
+
     /// Reads a setting value (SPEC s22). Returns `None` if the key is
     /// absent. Values are JSON-typed per the schema's TEXT column.
     async fn get_setting(&self, key: &str) -> Result<Option<serde_json::Value>>;

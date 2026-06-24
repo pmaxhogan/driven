@@ -46,6 +46,15 @@ const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 /// The Drive scope Driven requests (full Drive access; SPEC s4).
 const DRIVE_SCOPE: &str = "https://www.googleapis.com/auth/drive";
 
+/// The OpenID userinfo email scope (A5): lets Driven read the account's Google
+/// email via the userinfo endpoint so the Accounts UI / needs_reauth banner show
+/// the real address rather than a placeholder label.
+const USERINFO_EMAIL_SCOPE: &str = "https://www.googleapis.com/auth/userinfo.email";
+
+/// The OpenID userinfo profile scope (A5): lets Driven read the account's
+/// display name from the userinfo endpoint.
+const USERINFO_PROFILE_SCOPE: &str = "https://www.googleapis.com/auth/userinfo.profile";
+
 /// Connect timeout for the code-exchange client (DESIGN s5.8.4; codex V-A1).
 const EXCHANGE_CONNECT_TIMEOUT: Duration = Duration::from_secs(10);
 
@@ -138,6 +147,10 @@ pub async fn run_pkce_loopback_flow(
     let (auth_url, csrf_state) = client
         .authorize_url(CsrfToken::new_random)
         .add_scope(Scope::new(DRIVE_SCOPE.to_string()))
+        // A5: request the userinfo email + profile scopes so the account's real
+        // Google email + display name can be fetched from the userinfo endpoint.
+        .add_scope(Scope::new(USERINFO_EMAIL_SCOPE.to_string()))
+        .add_scope(Scope::new(USERINFO_PROFILE_SCOPE.to_string()))
         // `access_type=offline` + `prompt=consent` force Google to mint a
         // refresh token (otherwise re-auth yields only an access token).
         .add_extra_param("access_type", "offline")

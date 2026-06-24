@@ -20,15 +20,14 @@
 //! map ([`sessions`]); each entry holds the BYO credentials, the live
 //! [`OAuthStatus`], and - on success - the obtained tokens.
 //!
-//! ## Orchestrator lifecycle note (within the frozen M6 surface)
+//! ## Orchestrator lifecycle (A2)
 //!
-//! `finish_add_account` persists the account + token so the per-account
-//! orchestrator is assembled + spawned on the NEXT app start (the boot path
-//! `assembly::build_and_spawn` reads every `accounts` row). `AppState` holds an
-//! immutable handle map with no runtime insert, so this slice does NOT hot-spawn
-//! a brand-new account's orchestrator mid-session; `remove_account` DOES
-//! gracefully shut down an EXISTING account's running orchestrator (reachable
-//! via `state.account(id)`) before deleting its rows + token. Both are honest:
+//! `finish_add_account` persists the account + refresh token + BYO client creds,
+//! then HOT-SPAWNS the per-account orchestrator via [`crate::assembly::spawn_account`]
+//! and inserts its [`AccountHandle`](crate::app_state::AccountHandle) into the
+//! running set, so the wizard's initial `sync_now(sourceId)` finds a live handle
+//! WITHOUT an app restart. `remove_account` gracefully shuts down + REMOVES the
+//! handle before deleting the account's rows + keychain entries. Both are honest:
 //! no fake remote is constructed and no orphaned task is left.
 
 use std::collections::HashMap;
@@ -48,7 +47,7 @@ use driven_drive::google::token_store::KeyringTokenStore;
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    AccountDto, AddAccountWizardSessionId, OAuthAuthUrl, OAuthStatus, SessionId,
+    AccountDto, AddAccountWizardSessionId, OAuthAuthUrl, OAuthStatus, ReauthSession, SessionId,
 };
 use crate::commands::{CommandError, CommandResult};
 use crate::events::EVENT_OAUTH_COMPLETE;
@@ -142,23 +141,6 @@ fn resolve_creds(session: &WizardSession) -> (String, String) {
         .clone()
         .unwrap_or_else(|| std::env::var(ENV_OAUTH_CLIENT_SECRET).unwrap_or_default());
     (client_id, client_secret)
-}
-
-/// Open the consent URL in the system browser (SPEC s4), shell-free so the
-/// URL's `&` query separators survive (the `driven-cli` rundll32 lesson).
-fn open_system_browser(url: &str) -> anyhow::Result<()> {
-    #[cfg(target_os = "windows")]
-    let result = std::process::Command::new("rundll32")
-        .args(["url.dll,FileProtocolHandler", url])
-        .spawn();
-    #[cfg(target_os = "macos")]
-    let result = std::process::Command::new("open").arg(url).spawn();
-    #[cfg(all(unix, not(target_os = "macos")))]
-    let result = std::process::Command::new("xdg-open").arg(url).spawn();
-
-    result
-        .map(|_child| ())
-        .map_err(|e| anyhow::anyhow!("could not launch a browser: {e}"))
 }
 
 /// `list_accounts()` - every configured Google account (SPEC s11.1).
@@ -271,10 +253,15 @@ pub async fn start_oauth_signin(
     // opener is the only place the flow hands us the URL). The flow calls the
     // opener exactly once, so the closure is `FnOnce` and consumes the moved
     // `Sender` (which is `Send`, keeping the spawned future `Send`).
+    //
+    // A4: the BACKEND must NOT open the consent URL - the FRONTEND opens it (it
+    // already receives `authUrl` and routes it to the system browser). So this
+    // closure ONLY captures the URL for the return value; it does NOT launch a
+    // browser (which previously double-opened the consent page).
     let (url_tx, url_rx) = tokio::sync::oneshot::channel::<String>();
     let open_browser = move |url: &str| -> anyhow::Result<()> {
         let _ = url_tx.send(url.to_string());
-        open_system_browser(url)
+        Ok(())
     };
 
     // Progress channel: forward each milestone into the session status.
@@ -380,33 +367,30 @@ pub async fn poll_oauth_status(
 /// `finish_add_account(session, display_name?)` - persist the account once the
 /// OAuth flow completed (SPEC s11.1).
 ///
-/// Stores the refresh token in the keychain (SPEC s4.1) and writes the
-/// `accounts` row (StateRepo). The per-account orchestrator is assembled +
-/// spawned on the next app start (the boot path reads every `accounts` row);
-/// `AppState` exposes no runtime insert, so this slice does not hot-spawn the
-/// new account's loop. Returns the new [`AccountDto`].
-///
-/// Email note: the Google account email is not obtainable through any reachable
-/// API in this slice (the `RemoteStore` surfaces only `storageQuota`, no
-/// userinfo endpoint; no HTTP client is wired into the app shell). The
-/// user-supplied `display_name` is therefore used as the account's display label
-/// AND its `email` field; a fresh add with no display name falls back to a
-/// stable `account-<short-id>` label. This is honest (no fabricated Google
-/// address) and keeps the Accounts UI functional.
+/// Stores the refresh token AND the per-account BYO OAuth client creds in the
+/// keychain (SPEC s4.1; A1: a refresh token is bound to the client that minted
+/// it, so the client creds MUST persist or every BYO refresh fails after
+/// restart), fetches the real Google profile (A5) and writes the `accounts`
+/// row (StateRepo), then HOT-SPAWNS the account's orchestrator so the wizard's
+/// initial `sync_now(sourceId)` finds a live handle WITHOUT an app restart (A2).
+/// Returns the new (or refreshed, on reauth) [`AccountDto`].
 #[tauri::command]
 pub async fn finish_add_account(
+    app: AppHandle,
     state: State<'_, AppState>,
     session: SessionId,
     display_name: Option<String>,
 ) -> CommandResult<AccountDto> {
-    // Take the tokens out of the session (consuming the session on success).
-    let (tokens, reauth_account) = {
+    // Take the tokens + resolved client creds out of the session (consuming the
+    // session on success).
+    let (tokens, reauth_account, creds) = {
         let mut sessions = lock_sessions();
         let s = sessions
             .get_mut(&session.0)
             .ok_or_else(unknown_session_err)?;
+        let creds = resolve_creds(s);
         match (&s.status, s.tokens.take()) {
-            (OAuthStatus::Complete, Some(tokens)) => (tokens, s.account_id),
+            (OAuthStatus::Complete, Some(tokens)) => (tokens, s.account_id, creds),
             (OAuthStatus::Failed { code }, _) => {
                 let ec = ErrorCode::from_code(code).unwrap_or(ErrorCode::AuthConsentRequired);
                 return Err(CommandError::with_code(
@@ -425,22 +409,23 @@ pub async fn finish_add_account(
 
     let now = SystemClock.now_ms();
 
-    let dto = if let Some(account_id) = reauth_account {
-        // Reauth path: re-store the refresh token + flip the existing account
-        // back to Ok. The orchestrator is (re)spawned on next app start.
+    // A5: fetch the real Google profile (email + display name) with the fresh
+    // access token. Best-effort: on failure fall back to a stable label so the
+    // account is still usable (no fabricated Google address).
+    let profile = fetch_google_userinfo(&tokens.access_token).await;
+
+    let (account_id, dto) = if let Some(account_id) = reauth_account {
+        // Reauth path: re-store the refresh token + client creds + flip the
+        // existing account back to Ok, refreshing the profile if we got one.
         store_refresh_token(account_id, &tokens.refresh_token)?;
-        state
-            .state()
-            .mark_account_state(account_id, AccountState::Ok)
-            .await
-            .map_err(CommandError::from)?;
-        // Return the refreshed row.
+        store_client_creds(account_id, &creds);
+
         let rows = state
             .state()
             .list_accounts()
             .await
             .map_err(CommandError::from)?;
-        let row = rows
+        let mut row = rows
             .into_iter()
             .find(|r| r.id == account_id)
             .ok_or_else(|| {
@@ -449,25 +434,53 @@ pub async fn finish_add_account(
                     "reauth account row vanished after re-consent",
                 )
             })?;
-        account_row_to_dto(&row)
+        row.state = AccountState::Ok;
+        if let Some(profile) = &profile {
+            if !profile.email.trim().is_empty() {
+                row.email = profile.email.clone();
+            }
+            if row.display_name.is_none() {
+                row.display_name = profile.name.clone().filter(|n| !n.trim().is_empty());
+            }
+        }
+        state
+            .state()
+            .upsert_account(&row)
+            .await
+            .map_err(CommandError::from)?;
+        (account_id, account_row_to_dto(&row))
     } else {
-        // Fresh add: allocate the id, store the token, write the row.
+        // Fresh add: allocate the id, store the token + client creds, write the
+        // row with the real Google email/name (A5).
         let account_id = AccountId::new_v4();
         store_refresh_token(account_id, &tokens.refresh_token)?;
+        store_client_creds(account_id, &creds);
 
-        let label = display_name
-            .clone()
-            .filter(|d| !d.trim().is_empty())
-            .unwrap_or_else(|| {
+        // A5: prefer the real Google email; else the user label; else a stable
+        // fallback. The display name prefers the user-supplied label, else the
+        // Google profile name.
+        let google_email = profile
+            .as_ref()
+            .map(|p| p.email.clone())
+            .filter(|e| !e.trim().is_empty());
+        let google_name = profile
+            .as_ref()
+            .and_then(|p| p.name.clone())
+            .filter(|n| !n.trim().is_empty());
+        let user_label = display_name.clone().filter(|d| !d.trim().is_empty());
+
+        let email = google_email.clone().unwrap_or_else(|| {
+            user_label.clone().unwrap_or_else(|| {
                 let short = account_id.to_string();
                 let short = short.split('-').next().unwrap_or(&short);
                 format!("account-{short}")
-            });
+            })
+        });
 
         let row = AccountRow {
             id: account_id,
-            email: label.clone(),
-            display_name: display_name.filter(|d| !d.trim().is_empty()),
+            email,
+            display_name: user_label.or(google_name),
             state: AccountState::Ok,
             // No encryption master key at the account level here: per-source
             // encryption opt-in (with its own master key) happens in the
@@ -481,13 +494,101 @@ pub async fn finish_add_account(
             .upsert_account(&row)
             .await
             .map_err(CommandError::from)?;
-        tracing::info!(target: TARGET, account_id = %account_id, "account persisted; orchestrator spawns on next app start");
-        account_row_to_dto(&row)
+        tracing::info!(target: TARGET, account_id = %account_id, "account persisted");
+        (account_id, account_row_to_dto(&row))
     };
 
     // Consume the session now that the account is persisted.
     lock_sessions().remove(&session.0);
+
+    // A2: HOT-SPAWN the account's orchestrator so the wizard's initial
+    // sync_now finds a live handle (no restart). Best-effort: a build failure
+    // is logged - the account is persisted, and the next app start assembles
+    // it - but it must not fail the finish (the account IS saved).
+    match crate::assembly::spawn_account(&app, &state, account_id).await {
+        Ok(true) => {
+            tracing::info!(target: TARGET, account_id = %account_id, "orchestrator hot-spawned after finish_add_account");
+        }
+        Ok(false) => {
+            tracing::warn!(target: TARGET, account_id = %account_id, "account persisted but orchestrator not spawned (needs reauth?)");
+        }
+        Err(err) => {
+            tracing::error!(target: TARGET, account_id = %account_id, %err, "hot-spawn after finish failed; orchestrator will start on next launch");
+        }
+    }
+
     Ok(dto)
+}
+
+/// Persist the per-account BYO OAuth client creds in the keychain (A1).
+/// Best-effort: a keychain write failure is logged (NEVER the secret) but does
+/// not fail the finish - the account is already saved; a missing client-creds
+/// entry falls back to the env/default client on next refresh.
+fn store_client_creds(account_id: AccountId, creds: &(String, String)) {
+    use driven_drive::google::token_store::{ClientCreds, ClientCredsStore};
+    let record = ClientCreds {
+        client_id: creds.0.clone(),
+        client_secret: creds.1.clone(),
+    };
+    if let Err(e) = ClientCredsStore::new(account_id.to_string()).store(&record) {
+        tracing::warn!(target: TARGET, account_id = %account_id, error = %e, "failed to persist BYO client creds in keychain");
+    }
+}
+
+/// The subset of the Google userinfo response Driven persists (A5).
+#[derive(serde::Deserialize)]
+struct GoogleUserinfo {
+    #[serde(default)]
+    email: String,
+    #[serde(default)]
+    name: Option<String>,
+}
+
+/// A5: fetch the Google profile (email + display name) with `access_token` from
+/// the OpenID userinfo endpoint. Best-effort: any transport / non-2xx / parse
+/// failure returns `None` (the caller falls back to a label), and the access
+/// token is NEVER logged.
+async fn fetch_google_userinfo(access_token: &str) -> Option<GoogleUserinfo> {
+    const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
+    let client = match reqwest::Client::builder().build() {
+        Ok(c) => c,
+        Err(e) => {
+            tracing::warn!(target: TARGET, error = %e, "userinfo: failed to build http client");
+            return None;
+        }
+    };
+    let resp = match client
+        .get(USERINFO_URL)
+        .bearer_auth(access_token)
+        .send()
+        .await
+    {
+        Ok(r) => r,
+        Err(e) => {
+            tracing::warn!(target: TARGET, error = %e, "userinfo: request failed; using a label fallback");
+            return None;
+        }
+    };
+    if !resp.status().is_success() {
+        tracing::warn!(target: TARGET, status = resp.status().as_u16(), "userinfo: non-2xx; using a label fallback");
+        return None;
+    }
+    // The workspace `reqwest` has no `json` feature, so read the body as text
+    // and parse with serde_json (mirrors the settings GitHub-releases reader).
+    let body = match resp.text().await {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(target: TARGET, error = %e, "userinfo: read body failed; using a label fallback");
+            return None;
+        }
+    };
+    match serde_json::from_str::<GoogleUserinfo>(&body) {
+        Ok(info) => Some(info),
+        Err(e) => {
+            tracing::warn!(target: TARGET, error = %e, "userinfo: parse failed; using a label fallback");
+            None
+        }
+    }
 }
 
 /// Store a refresh token in the keychain for `account_id` (SPEC s4.1), mapping a
@@ -532,10 +633,11 @@ pub async fn remove_account(
         ));
     }
 
-    // Gracefully stop the running orchestrator for this account, if present, so
-    // quit-free removal leaves no orphaned per-account tasks (mirrors the quit
-    // drain contract). A no-op when the account never spawned (e.g. needs_reauth).
-    if let Some(handle) = state.account(account_id) {
+    // Gracefully stop + REMOVE the running orchestrator for this account, if
+    // present, so quit-free removal leaves no orphaned per-account tasks (mirrors
+    // the quit drain contract) AND the handle is gone from the running set (A2).
+    // A no-op when the account never spawned (e.g. needs_reauth).
+    if let Some(handle) = state.remove_account_handle(account_id) {
         tracing::info!(target: TARGET, account_id = %account_id, "shutting down orchestrator before account removal");
         handle.shutdown().await;
     }
@@ -550,6 +652,12 @@ pub async fn remove_account(
     // Wipe the keychain refresh token (idempotent: absent entry is fine).
     if let Err(e) = KeyringTokenStore::new(account_id.to_string()).delete_refresh_token() {
         tracing::warn!(target: TARGET, account_id = %account_id, error = %e, "failed to delete refresh token from keychain on account removal");
+    }
+    // A1: wipe the per-account BYO client creds too (idempotent).
+    if let Err(e) =
+        driven_drive::google::token_store::ClientCredsStore::new(account_id.to_string()).delete()
+    {
+        tracing::warn!(target: TARGET, account_id = %account_id, error = %e, "failed to delete BYO client creds from keychain on account removal");
     }
     // Wipe the account master key (encryption opt-out / removal; idempotent).
     match Keystore::open(&account_id.to_string()) {
@@ -570,15 +678,19 @@ pub async fn remove_account(
 /// `reauth_account(account_id)` - re-run consent for an account whose refresh
 /// token was revoked (SPEC s11.1; the `account:needs_reauth` banner CTA).
 ///
-/// Begins a fresh PKCE flow scoped to the existing account (a server-side
-/// session carrying `account_id`) and returns the consent URL; on success
-/// `finish_add_account` re-stores the token and flips the account back to `ok`.
+/// A3: begins a fresh PKCE flow scoped to the EXISTING account (a server-side
+/// session carrying `account_id`) and returns BOTH the consent URL AND the
+/// `sessionId`, so the UI opens the URL, polls `poll_oauth_status` / listens for
+/// `oauth:complete`, then calls `finish_add_account(sessionId)` which re-stores
+/// the new refresh token + client creds onto the EXISTING account and flips it
+/// back to `ok` (NO duplicate account is created). The account's orchestrator is
+/// hot-spawned by `finish_add_account` once re-consent completes.
 #[tauri::command]
 pub async fn reauth_account(
     app: AppHandle,
     state: State<'_, AppState>,
     account_id: AccountId,
-) -> CommandResult<OAuthAuthUrl> {
+) -> CommandResult<ReauthSession> {
     // The account must exist (read by id from the strongly-consistent state DB).
     let exists = state
         .state()
@@ -593,12 +705,43 @@ pub async fn reauth_account(
         ));
     }
 
-    // Open a fresh session scoped to the existing account, then drive the
-    // standard start-signin path against it.
+    // A1: a reauth must use the SAME client that minted the original refresh
+    // token (the account's persisted BYO client creds), so the new refresh
+    // token is minted by - and bound to - that client. Seed the session with
+    // the stored creds when present.
     let session_id = uuid::Uuid::new_v4().to_string();
-    lock_sessions().insert(session_id.clone(), WizardSession::new(Some(account_id)));
-    let session = AddAccountWizardSessionId(session_id);
-    start_oauth_signin(app, state, session).await
+    let mut session = WizardSession::new(Some(account_id));
+    if let Some((client_id, client_secret)) = load_account_client_creds(account_id) {
+        session.client_id = Some(client_id);
+        session.client_secret = Some(client_secret);
+    }
+    lock_sessions().insert(session_id.clone(), session);
+
+    // Drive the standard start-signin path against the new session, then return
+    // both the consent URL and the session id so the UI can complete it.
+    let session_arg = AddAccountWizardSessionId(session_id.clone());
+    let OAuthAuthUrl { auth_url } = start_oauth_signin(app, state, session_arg).await?;
+    Ok(ReauthSession {
+        session_id,
+        auth_url,
+    })
+}
+
+/// Load an account's persisted BYO client creds (A1), or `None` when it used the
+/// env/default client. Best-effort: a keychain read failure logs (never the
+/// secret) and returns `None` so reauth falls back to the env/default client.
+fn load_account_client_creds(account_id: AccountId) -> Option<(String, String)> {
+    use driven_drive::google::token_store::ClientCredsStore;
+    match ClientCredsStore::new(account_id.to_string()).load() {
+        Ok(Some(creds)) if !creds.client_id.trim().is_empty() => {
+            Some((creds.client_id, creds.client_secret))
+        }
+        Ok(_) => None,
+        Err(e) => {
+            tracing::warn!(target: TARGET, account_id = %account_id, error = %e, "failed to load BYO client creds for reauth");
+            None
+        }
+    }
 }
 
 /// The error returned for an unknown / stale wizard session id.
@@ -674,6 +817,24 @@ mod tests {
             progress_to_status(OAuthProgress::ExchangingCode),
             OAuthStatus::ExchangingCode
         ));
+    }
+
+    #[test]
+    fn google_userinfo_parses_email_and_name() {
+        // A5: the userinfo response shape Driven persists.
+        let body = r#"{"sub":"123","email":"real@gmail.com","email_verified":true,"name":"Real Name","picture":"https://x"}"#;
+        let info: GoogleUserinfo = serde_json::from_str(body).expect("parse userinfo");
+        assert_eq!(info.email, "real@gmail.com");
+        assert_eq!(info.name.as_deref(), Some("Real Name"));
+    }
+
+    #[test]
+    fn google_userinfo_tolerates_missing_name() {
+        // A minimal userinfo (email only) still parses; name is None.
+        let body = r#"{"email":"only@gmail.com"}"#;
+        let info: GoogleUserinfo = serde_json::from_str(body).expect("parse minimal userinfo");
+        assert_eq!(info.email, "only@gmail.com");
+        assert!(info.name.is_none());
     }
 
     #[test]

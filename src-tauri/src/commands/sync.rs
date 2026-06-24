@@ -108,7 +108,8 @@ pub async fn pause_sync(
     // generation so any in-flight timer is superseded.
     let entries: Vec<(AccountId, Arc<dyn Orchestrator>)> = state
         .accounts()
-        .map(|(id, handle)| (*id, handle.orchestrator.clone()))
+        .into_iter()
+        .map(|(id, handle)| (id, handle.orchestrator.clone()))
         .collect();
 
     let mut tokens: Vec<(AccountId, Arc<dyn Orchestrator>, u64)> =
@@ -156,7 +157,7 @@ pub async fn pause_sync(
 pub async fn resume_sync(state: State<'_, AppState>) -> CommandResult<()> {
     for (id, handle) in state.accounts() {
         handle.orchestrator.set_paused(false).await;
-        let _ = state.bump_pause_generation(*id);
+        let _ = state.bump_pause_generation(id);
     }
     Ok(())
 }

@@ -1348,6 +1348,16 @@ impl StateRepo for SqliteStateRepo {
             .await
     }
 
+    async fn schema_version(&self) -> Result<i64> {
+        // PRAGMA returns a non-standard row shape the `query!` macro cannot
+        // describe, so use the dynamic query API (mirrors the wal_checkpoint
+        // call). `user_version` is an i64-typed pragma column.
+        let row: (i64,) = sqlx::query_as("PRAGMA user_version;")
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(row.0)
+    }
+
     // --- settings -----------------------------------------------------------
 
     async fn get_setting(&self, key: &str) -> Result<Option<Value>> {

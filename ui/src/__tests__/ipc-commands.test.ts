@@ -29,6 +29,7 @@ describe("typed IPC command wrappers", () => {
     const req = {
       accountId: "a",
       displayName: "Docs",
+      localPathToken: "tok-1",
       localPath: "/tmp/docs",
       driveFolderId: "f",
       driveFolderPath: "/Backups/Docs",
@@ -37,7 +38,7 @@ describe("typed IPC command wrappers", () => {
       includePatterns: [],
       excludePatterns: [],
     };
-    invokeMock.mockResolvedValueOnce({ id: "s" });
+    invokeMock.mockResolvedValueOnce({ source: { id: "s" }, recoveryPhrase: null });
     await ipc.addSource(req);
     expect(invokeMock).toHaveBeenCalledWith("add_source", { req });
   });

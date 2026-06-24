@@ -7,9 +7,9 @@
 //! `camelCase` over the wire so the Rust and TS shapes line up by convention,
 //! with no specta annotations, no `xtask`, and no CI codegen step.
 //!
-//! These DTOs are the contract three parallel M6 implementers code against;
-//! the command bodies that construct them are `todo!()` in M6 scaffold and are
-//! filled in by the accounts / sources / settings implementers respectively.
+//! These DTOs are the contract the M6 accounts / sources / settings command
+//! bodies construct; every command has a real, fully-wired body (no scaffold
+//! stubs remain).
 
 use std::path::PathBuf;
 
@@ -65,6 +65,21 @@ pub type SessionId = AddAccountWizardSessionId;
 #[serde(rename_all = "camelCase")]
 pub struct OAuthAuthUrl {
     /// The fully-formed authorization URL (with PKCE challenge + state).
+    pub auth_url: String,
+}
+
+/// The result of `reauth_account` (A3): the consent URL to open PLUS the
+/// server-side session id the UI threads back through `poll_oauth_status` /
+/// `oauth:complete` + `finish_add_account` to COMPLETE the re-consent onto the
+/// EXISTING account (no duplicate account is created). Mirrors
+/// `begin_add_account_wizard` + `start_oauth_signin` combined, since reauth runs
+/// the whole flow in one backend call.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ReauthSession {
+    /// The server-side wizard session id (scoped to the existing account).
+    pub session_id: String,
+    /// The Google consent URL the UI opens in the system browser.
     pub auth_url: String,
 }
 
@@ -132,9 +147,11 @@ pub struct SourceDto {
 
 /// Request body for `add_source` (SPEC s11.2 `AddSourceRequest`).
 ///
-/// `local_path` MUST be a dialog-derived path (SPEC s11.6.1): the webview
-/// cannot inject an arbitrary local path; the add-source wizard rounds-trips a
-/// `tauri-plugin-dialog` selection.
+/// C1 (SPEC s11.6.1): the local path is NOT trusted from the webview - it is the
+/// folder bound to `local_path_token` (a one-shot token from the backend's
+/// `pick_folder_dialog`). The backend resolves the token to the path the USER
+/// chose; a request without a matching token is REJECTED. `local_path` is kept
+/// only as a display echo and is NOT used as the authoritative path.
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct AddSourceRequest {
@@ -142,7 +159,11 @@ pub struct AddSourceRequest {
     pub account_id: AccountId,
     /// User-chosen display name.
     pub display_name: String,
-    /// Dialog-derived absolute local path (SPEC s11.6.1).
+    /// The one-shot dialog token (from `pick_folder_dialog`) proving the local
+    /// path was chosen via a backend-owned native dialog (C1, SPEC s11.6.1).
+    pub local_path_token: String,
+    /// Display echo of the dialog-chosen local path (NOT authoritative - the
+    /// backend uses the path bound to `local_path_token`).
     pub local_path: PathBuf,
     /// Drive destination folder id (from `pick_drive_folder`).
     pub drive_folder_id: String,
@@ -156,6 +177,27 @@ pub struct AddSourceRequest {
     pub include_patterns: Vec<String>,
     /// Exclude globs.
     pub exclude_patterns: Vec<String>,
+}
+
+/// The result of `add_source` (SPEC s11.2; B3 recovery-phrase reveal).
+///
+/// Carries the created [`SourceDto`] AND the one-time BIP39 recovery phrase
+/// (`recovery_phrase`) - present ONLY when this source's encryption opt-in
+/// GENERATED the account master key (the first encrypted source for the
+/// account). The phrase is returned as a ONE-TIME VALUE (NOT a fire-and-forget
+/// event the UI might miss), so the wizard can display it via
+/// RecoveryPhraseReveal AFTER the source/key exists and gate Finish on the user
+/// acknowledging they saved it. `None` for an unencrypted source or a subsequent
+/// encrypted source (the account already has a phrase). The 24 words are never
+/// persisted; the UI shows them once then drops them.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct AddSourceResult {
+    /// The newly created source.
+    pub source: SourceDto,
+    /// The one-time 24-word BIP39 recovery phrase, present only when this opt-in
+    /// generated the account master key. `None` otherwise.
+    pub recovery_phrase: Option<Vec<String>>,
 }
 
 /// Patch body for `update_source` (SPEC s11.2 `SourcePatch`). Every field is
@@ -238,6 +280,24 @@ pub struct ExclusionPreview {
     pub excluded_sample: Vec<String>,
     /// `true` if the sample was truncated (more files than the sample cap).
     pub truncated: bool,
+}
+
+// -----------------------------------------------------------------------------
+// Dialog tokens (SPEC s11.6.1 - C1)
+// -----------------------------------------------------------------------------
+
+/// The result of a backend-owned native dialog (C1, SPEC s11.6.1): the path the
+/// USER chose plus the one-shot `token` the backend minted for it. The webview
+/// passes the token (and path) to the matching write command
+/// (`add_source` / `export_diagnostic_bundle`), which validates the token maps
+/// to exactly that path - so the webview can never inject an arbitrary path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PickedPath {
+    /// The path the native dialog returned (a folder, or a save-file path).
+    pub path: String,
+    /// The opaque one-shot dialog token bound to `path`.
+    pub token: String,
 }
 
 // -----------------------------------------------------------------------------

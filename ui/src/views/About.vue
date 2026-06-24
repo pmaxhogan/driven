@@ -2,7 +2,6 @@
 import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { getVersion } from "@tauri-apps/api/app";
-import { open as openDialog } from "@tauri-apps/plugin-dialog";
 
 import * as ipc from "../ipc/commands";
 import { useSettingsStore } from "../stores/settings";
@@ -103,13 +102,20 @@ async function loadReleases(): Promise<void> {
 async function exportDiagnostics(): Promise<void> {
   exportError.value = null;
   exportedPath.value = null;
-  // Dialog-derived destination only: the backend re-validates the dialog path
-  // (SPEC s11.6.1); the webview never supplies an arbitrary write target.
-  const dest = await openDialog({ directory: true, multiple: false });
-  if (typeof dest !== "string") return;
+  // C1/C2: the BACKEND owns the save-file dialog and returns a concrete `.zip`
+  // path + a one-shot token. The webview never supplies a write target; the
+  // backend writes the ZIP at the token-bound path (SPEC s11.6.1).
+  let token: string;
+  try {
+    const picked = await ipc.pickSaveZipDialog();
+    token = picked.token;
+  } catch {
+    // Cancel (or dialog error): nothing to export.
+    return;
+  }
   exporting.value = true;
   try {
-    exportedPath.value = await ipc.exportDiagnosticBundle(dest);
+    exportedPath.value = await ipc.exportDiagnosticBundle(token);
   } catch (e) {
     exportError.value = String(e);
   } finally {

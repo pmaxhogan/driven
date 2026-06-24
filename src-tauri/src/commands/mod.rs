@@ -8,6 +8,7 @@
 //! the shared DTOs in [`dtos`].
 
 pub mod accounts;
+pub mod dialogs;
 pub mod dtos;
 pub mod settings;
 pub mod sources;

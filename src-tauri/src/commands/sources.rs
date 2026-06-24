@@ -11,17 +11,17 @@
 //! [`driven_core::scanner`]'s exclude matcher WITHOUT uploading.
 //!
 //! Encryption opt-in (DESIGN s7.1): the FIRST encrypted source for an account
-//! generates + persists the account master key (keychain) and reveals the BIP39
-//! recovery phrase exactly once (via the `account:recovery_phrase` event - the
-//! frozen `SourceDto` has no slot for the phrase, and a webview event is the only
-//! Rust->webview channel the M6 surface offers for it). Every encrypted source
-//! gets a fresh per-source key wrapped under the master key, stored in
-//! `backup_sources.wrapped_source_key`.
+//! generates + persists the account master key (keychain) and returns the BIP39
+//! recovery phrase ONCE as a RETURN VALUE on [`AddSourceResult`] (B3 - the phrase
+//! is delivered as a one-time value the UI cannot miss, NOT a fire-and-forget
+//! event; the UI shows it via RecoveryPhraseReveal and gates Finish on an
+//! explicit acknowledgement). Every encrypted source gets a fresh per-source key
+//! wrapped under the master key, stored in `backup_sources.wrapped_source_key`.
 
 use std::path::Path;
 use std::sync::Arc;
 
-use tauri::{AppHandle, Emitter, State};
+use tauri::State;
 
 use driven_core::exclude::build_source_matcher;
 use driven_core::state::{AccountRow, SourceRow, StateRepo};
@@ -36,7 +36,7 @@ use driven_drive::remote_store::RemoteStore;
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    AddSourceRequest, DriveFolderEntry, DriveFolderListing, ExclusionPreview,
+    AddSourceRequest, AddSourceResult, DriveFolderEntry, DriveFolderListing, ExclusionPreview,
     ExclusionPreviewRequest, SourceDto, SourcePatch,
 };
 use crate::commands::{validate_readable_dir, CommandError, CommandResult};
@@ -50,21 +50,6 @@ const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 /// Max sample paths per side (included / excluded) returned by
 /// `preview_exclusions` (the wizard shows the first ~50 of each).
 const PREVIEW_SAMPLE_CAP: usize = 50;
-
-/// Webview event carrying a freshly-generated BIP39 recovery phrase on the first
-/// encrypted source for an account (DESIGN s7.3, s8.5 step 4). Payload:
-/// `{ account_id, phrase }` where `phrase` is the 24-word space-joined string.
-/// The frozen `SourceDto` cannot carry the phrase, so this event is the
-/// reveal-exactly-once channel.
-const EVENT_RECOVERY_PHRASE: &str = "account:recovery_phrase";
-
-/// Environment override for the OAuth client id (SPEC s4), mirroring assembly.
-const ENV_OAUTH_CLIENT_ID: &str = "DRIVEN_OAUTH_CLIENT_ID";
-/// Environment override for the OAuth client secret (SPEC s4).
-const ENV_OAUTH_CLIENT_SECRET: &str = "DRIVEN_OAUTH_CLIENT_SECRET";
-/// The public installed-app client id (SPEC s4), mirroring assembly.
-const DEFAULT_CLIENT_ID: &str =
-    "1094503409775-kvuig3oqtchrq1s4tc1cnpi60mdvnqfe.apps.googleusercontent.com";
 
 /// `list_sources()` - every configured backup source (SPEC s11.2).
 #[tauri::command]
@@ -103,39 +88,53 @@ fn source_row_to_dto(row: &SourceRow) -> SourceDto {
 /// SPEC s11.6.1: `req.local_path` is validated (canonicalise, reject `..`,
 /// require an existing directory) before any filesystem access. On encryption
 /// opt-in the account master key is generated + persisted (first encrypted
-/// source) and the recovery phrase revealed once; a fresh per-source key is
-/// wrapped under the master key into `wrapped_source_key`. The owning account's
-/// running orchestrator is reconfigured so the new (enabled) source is picked up
-/// without a restart.
+/// source) and the recovery phrase is RETURNED on [`AddSourceResult`] once (B3);
+/// a fresh per-source key is wrapped under the master key into
+/// `wrapped_source_key`. The owning account's running orchestrator is
+/// reconfigured (and its crypto provider refreshed, B2) so the new (enabled)
+/// source - including an encrypted one - is picked up without a restart.
 #[tauri::command]
 pub async fn add_source(
-    app: AppHandle,
     state: State<'_, AppState>,
     req: AddSourceRequest,
-) -> CommandResult<SourceDto> {
+) -> CommandResult<AddSourceResult> {
     // The owning account must exist.
     let account = find_account(state.state().as_ref(), req.account_id).await?;
 
-    // SPEC s11.6.1: validate the dialog-derived local path before any walk.
-    let canon = validate_readable_dir(&req.local_path)?;
+    // C1 (SPEC s11.6.1): resolve the local path from the backend-minted dialog
+    // token (single-use) - NOT the webview-supplied `local_path` string. Reject
+    // any request whose token does not map to a backend-dialog path.
+    let dialog_path = state
+        .take_dialog_token(&req.local_path_token)
+        .ok_or_else(|| {
+            CommandError::with_code(
+                ErrorCode::LocalIoError,
+                "no matching dialog token for the source folder; pick a folder first",
+            )
+        })?;
+
+    // Validate the dialog-derived folder before any walk (canonicalise, reject
+    // `..`, require an existing directory).
+    let canon = validate_readable_dir(&dialog_path)?;
 
     let now = SystemClock.now_ms();
     let source_id = SourceId::new_v4();
 
     // Encryption opt-in (DESIGN s7.1): ensure the account master key exists
-    // (generating + revealing the phrase on the FIRST encrypted source), then
-    // wrap a fresh per-source key under it.
-    let wrapped_source_key = if req.encryption_enabled {
-        let master = ensure_master_key(state.state().as_ref(), &account, &app).await?;
+    // (generating it + returning the recovery phrase on the FIRST encrypted
+    // source), then wrap a fresh per-source key under it. `recovery_phrase` is
+    // Some ONLY when the master key was just generated (B3).
+    let (wrapped_source_key, recovery_phrase) = if req.encryption_enabled {
+        let (master, phrase) = ensure_master_key(state.state().as_ref(), &account).await?;
         let (_source_key, wrapped) = master.wrap_new_source_key().map_err(|e| {
             CommandError::with_code(
                 ErrorCode::CryptoKeyMissing,
                 format!("failed to wrap per-source key: {e}"),
             )
         })?;
-        Some(wrapped.to_bytes())
+        (Some(wrapped.to_bytes()), phrase)
     } else {
-        None
+        (None, None)
     };
 
     let row = SourceRow {
@@ -167,13 +166,16 @@ pub async fn add_source(
     // Reconfigure the owning orchestrator so the new source is picked up without
     // a restart (best-effort: the account may not have a running orchestrator -
     // e.g. needs_reauth - in which case the scheduled scan on next start covers
-    // it). The crypto provider was built at assembly time over the THEN-known
-    // sources, so a brand-new encrypted source's key is resolved on next start;
-    // reconfigure still re-arms the watcher + scan cadence for the source set.
+    // it). B2: reconfigure ALSO refreshes the LIVE crypto provider with the
+    // current sources, so a brand-new ENCRYPTED source's key resolves on the next
+    // tick (it is no longer stranded `Unavailable` until restart).
     reconfigure_account(&state, req.account_id).await;
 
-    tracing::info!(target: TARGET, source_id = %source_id, account_id = %req.account_id, encrypted = req.encryption_enabled, "source added");
-    Ok(source_row_to_dto(&row))
+    tracing::info!(target: TARGET, source_id = %source_id, account_id = %req.account_id, encrypted = req.encryption_enabled, revealed_phrase = recovery_phrase.is_some(), "source added");
+    Ok(AddSourceResult {
+        source: source_row_to_dto(&row),
+        recovery_phrase,
+    })
 }
 
 /// `update_source(source_id, patch)` - patch an existing source (SPEC s11.2).
@@ -272,7 +274,11 @@ pub async fn pick_drive_folder(
     let _ = find_account(state.state().as_ref(), account_id).await?;
 
     let store = build_account_store(account_id)?;
-    // Drive's root alias is the literal "root" (resolves to My Drive's root id).
+    // B1: Drive's root alias is the concrete id "root" (resolves to My Drive's
+    // root). We resolve `None` to "root" for the listing AND echo it back as the
+    // `current_folder_id`, so the user can SELECT the current folder - including
+    // the My Drive root - as the backup destination. Before this fix the backend
+    // echoed `None` at the top level, leaving the wizard with no selectable id.
     let folder_id = start_folder_id
         .clone()
         .unwrap_or_else(|| "root".to_string());
@@ -293,15 +299,13 @@ pub async fn pick_drive_folder(
         .collect();
 
     // The current folder's display path: the breadcrumb is maintained by the
-    // webview (it tracks descent), so the backend returns the bare id; an empty
-    // path at root, else the requested id echoed (the webview joins names).
-    let current_folder_path = match &start_folder_id {
-        None => String::new(),
-        Some(_) => String::new(),
-    };
+    // webview (it tracks descent), so the backend returns an empty path here
+    // (the webview joins the descended folder names). "My Drive" at root.
+    let current_folder_path = String::new();
 
     Ok(DriveFolderListing {
-        current_folder_id: start_folder_id,
+        // B1: always a concrete, selectable id (never `None`).
+        current_folder_id: Some(folder_id),
         current_folder_path,
         folders,
     })
@@ -487,16 +491,21 @@ async fn find_source(state: &dyn StateRepo, id: SourceId) -> CommandResult<Sourc
 ///
 /// On the FIRST encrypted source for the account (no `encryption_master_key_id`
 /// and no master key in the keystore) this GENERATES the master key, stores it,
-/// stamps `encryption_master_key_id` on the account row, and REVEALS the BIP39
-/// phrase exactly once via the `account:recovery_phrase` event. On a subsequent
-/// encrypted source the existing key is loaded and NO phrase is re-revealed (the
-/// account's phrase is unchanged). Returns the master key for wrapping the new
-/// per-source key.
+/// stamps `encryption_master_key_id` on the account row, and RETURNS the BIP39
+/// recovery phrase (B3 - delivered as a one-time value to the caller, NOT a
+/// fire-and-forget event). On a subsequent encrypted source the existing key is
+/// loaded and the returned phrase is `None` (the account's phrase is unchanged
+/// and was shown once already). Returns `(master_key, Option<phrase_words>)`.
+///
+/// B3 safety: if the master key was just generated but its phrase cannot be
+/// encoded, this is a HARD ERROR (`crypto.key_missing`) - we must NEVER create an
+/// encrypted source without being able to reveal its recovery phrase (that would
+/// make the backup unrestorable). The freshly-generated-but-unrevealable key is
+/// rolled back (deleted + the row left unstamped) so a retry can regenerate.
 async fn ensure_master_key(
     state: &dyn StateRepo,
     account: &AccountRow,
-    app: &AppHandle,
-) -> CommandResult<MasterKey> {
+) -> CommandResult<(MasterKey, Option<Vec<String>>)> {
     let keystore = Keystore::open(&account.id.to_string()).map_err(|e| {
         CommandError::with_code(
             ErrorCode::CryptoKeyMissing,
@@ -504,17 +513,18 @@ async fn ensure_master_key(
         )
     })?;
 
-    // Already provisioned: load + return it, no phrase reveal.
+    // Already provisioned: load + return it, no phrase (shown once already).
     if account.encryption_master_key_id.is_some() {
-        return keystore.load_master_key().map_err(|e| {
+        let master = keystore.load_master_key().map_err(|e| {
             CommandError::with_code(
                 ErrorCode::CryptoKeyMissing,
                 format!("account master key unavailable: {e}"),
             )
-        });
+        })?;
+        return Ok((master, None));
     }
 
-    // First encrypted source: generate + persist the master key, reveal once.
+    // First encrypted source: generate + persist the master key.
     let master = MasterKey::generate();
     keystore.store_master_key(&master).map_err(|e| {
         CommandError::with_code(
@@ -522,6 +532,23 @@ async fn ensure_master_key(
             format!("failed to store account master key: {e}"),
         )
     })?;
+
+    // B3: encode the recovery phrase BEFORE stamping the row. If it cannot be
+    // encoded we must NOT proceed (an encrypted backup with no revealable phrase
+    // is unrestorable); roll back the just-stored key and error.
+    let phrase = match master_key_to_phrase(&master) {
+        Ok(phrase) => phrase,
+        Err(e) => {
+            let _ = keystore.delete_master_key();
+            return Err(CommandError::with_code(
+                ErrorCode::CryptoKeyMissing,
+                format!("failed to encode recovery phrase; refusing to create an unrestorable encrypted source: {e}"),
+            ));
+        }
+    };
+    // Split the space-joined Zeroizing phrase into the 24 words for the UI; the
+    // words are returned once then dropped by the caller, never persisted.
+    let words: Vec<String> = phrase.split_whitespace().map(|w| w.to_string()).collect();
 
     // Stamp the account row so subsequent sources reuse this key (and so the
     // crypto provider sees the account as encryption-provisioned).
@@ -532,23 +559,7 @@ async fn ensure_master_key(
         .await
         .map_err(CommandError::from)?;
 
-    // Reveal the recovery phrase exactly once (DESIGN s7.3). The Zeroizing phrase
-    // is rendered into the event payload then dropped; it is never persisted.
-    match master_key_to_phrase(&master) {
-        Ok(phrase) => {
-            if let Err(e) = app.emit(
-                EVENT_RECOVERY_PHRASE,
-                serde_json::json!({ "account_id": account.id.to_string(), "phrase": *phrase }),
-            ) {
-                tracing::warn!(target: TARGET, account_id = %account.id, error = %e, "emit account:recovery_phrase failed");
-            }
-        }
-        Err(e) => {
-            tracing::warn!(target: TARGET, account_id = %account.id, error = %e, "failed to encode recovery phrase");
-        }
-    }
-
-    Ok(master)
+    Ok((master, Some(words)))
 }
 
 /// Reconfigure `account_id`'s running orchestrator (if one is live) with a
@@ -564,6 +575,25 @@ async fn reconfigure_account(state: &State<'_, AppState>, account_id: AccountId)
         tracing::debug!(target: TARGET, account_id = %account_id, "no running orchestrator to reconfigure; change applies on next start");
         return;
     };
+
+    // B2: REFRESH the live crypto provider with the account's CURRENT sources so
+    // a just-added / toggled encrypted source's key resolves on the next tick
+    // (the boot snapshot would otherwise fail it closed until restart). Read the
+    // current rows for this account from the strongly-consistent state DB.
+    match state.state().list_sources().await {
+        Ok(rows) => {
+            let account_sources: Vec<SourceRow> = rows
+                .into_iter()
+                .filter(|s| s.account_id == account_id)
+                .collect();
+            handle.crypto.refresh(account_sources);
+            tracing::debug!(target: TARGET, account_id = %account_id, "crypto provider refreshed after source change");
+        }
+        Err(err) => {
+            tracing::warn!(target: TARGET, account_id = %account_id, %err, "failed to read sources to refresh crypto provider; it keeps its prior snapshot");
+        }
+    }
+
     let config = crate::commands::settings::load_orchestrator_config(state.state().as_ref())
         .await
         .unwrap_or_default();
@@ -592,22 +622,15 @@ fn build_account_store(account_id: AccountId) -> CommandResult<Arc<dyn RemoteSto
             )
         })?;
 
-    let (client_id, client_secret) = resolve_oauth_creds();
+    // A1: use the account's persisted BYO client creds (the client that minted
+    // this refresh token), falling back to env/default only if none stored.
+    let (client_id, client_secret) = crate::assembly::resolve_account_oauth_creds(account_id);
     let token_source =
         RefreshingTokenSource::from_stored_refresh_token(refresh_token, client_id, client_secret)
             .map_err(CommandError::from)?
             .with_store(token_store);
     let store = GoogleDriveStore::with_default_clients(token_source).map_err(CommandError::from)?;
     Ok(Arc::new(store))
-}
-
-/// Resolve the OAuth client id + secret for a one-off store: env overrides
-/// first, else the public installed-app default (empty secret for PKCE).
-fn resolve_oauth_creds() -> (String, String) {
-    let client_id =
-        std::env::var(ENV_OAUTH_CLIENT_ID).unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
-    let client_secret = std::env::var(ENV_OAUTH_CLIENT_SECRET).unwrap_or_default();
-    (client_id, client_secret)
 }
 
 #[cfg(test)]

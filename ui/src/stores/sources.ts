@@ -2,7 +2,12 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 
 import * as ipc from "../ipc/commands";
-import type { AddSourceRequest, SourceDto, SourcePatch } from "../ipc/types";
+import type {
+  AddSourceRequest,
+  AddSourceResult,
+  SourceDto,
+  SourcePatch,
+} from "../ipc/types";
 
 // Sources store (SPEC s11.2; DESIGN s8.2 Sources tab). Holds the source list +
 // loading/error flags and the full CRUD over the typed IPC wrappers. The
@@ -25,10 +30,10 @@ export const useSourcesStore = defineStore("sources", () => {
     }
   }
 
-  async function add(req: AddSourceRequest): Promise<SourceDto> {
-    const created = await ipc.addSource(req);
+  async function add(req: AddSourceRequest): Promise<AddSourceResult> {
+    const result = await ipc.addSource(req);
     await refresh();
-    return created;
+    return result;
   }
 
   async function update(

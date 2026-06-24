@@ -2096,6 +2096,9 @@ mod tests {
         async fn delete_activity_by_source(&self, _source: SourceId) -> anyhow::Result<u64> {
             unimplemented!()
         }
+        async fn schema_version(&self) -> anyhow::Result<i64> {
+            Ok(0)
+        }
         async fn get_setting(&self, key: &str) -> anyhow::Result<Option<serde_json::Value>> {
             Ok(self.settings.lock().unwrap().get(key).cloned())
         }

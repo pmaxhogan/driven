@@ -27,13 +27,10 @@ vi.mock("@tauri-apps/api/event", () => ({
   },
 }));
 
-// The local folder picker is a tauri-plugin-dialog directory dialog; the mock
-// returns a fixed dialog-derived path (SPEC s11.6.1: add_source must get a
-// dialog-derived local path, never a webview string).
-const dialogOpenMock = vi.fn();
-vi.mock("@tauri-apps/plugin-dialog", () => ({
-  open: (opts?: unknown) => dialogOpenMock(opts),
-}));
+// C1: the local folder is chosen via the BACKEND-owned dialog command
+// (pick_folder_dialog), which returns { path, token }. There is no longer a
+// frontend tauri-plugin-dialog call in the wizard, so the dialog seam is the
+// invoke mock itself (pick_folder_dialog below).
 
 import { i18n } from "../i18n";
 import SetupWizard from "../views/SetupWizard.vue";
@@ -87,10 +84,16 @@ function installFakeBackend(): void {
         return Promise.resolve({ kind: "complete" });
       case "finish_add_account":
         return Promise.resolve(FAKE_ACCOUNT);
+      case "pick_folder_dialog":
+        return Promise.resolve({ path: "/home/user/Docs", token: "tok-folder" });
       case "pick_drive_folder":
         return Promise.resolve(FAKE_DRIVE_LISTING);
       case "add_source":
-        return Promise.resolve(FAKE_SOURCE);
+        // B3: an encrypted add returns the one-time recovery phrase.
+        return Promise.resolve({
+          source: FAKE_SOURCE,
+          recoveryPhrase: ["alpha", "bravo", "charlie"],
+        });
       case "list_sources":
         return Promise.resolve([FAKE_SOURCE]);
       case "sync_now":
@@ -119,11 +122,9 @@ function oauthCallOrder(): string[] {
 beforeEach(() => {
   invokeMock.mockReset();
   unlistenMock.mockReset();
-  dialogOpenMock.mockReset();
   oauthCompleteHandler = null;
   setActivePinia(createPinia());
   installFakeBackend();
-  dialogOpenMock.mockResolvedValue("/home/user/Docs");
   // window.open is the browser opener seam; stub it so no real window opens.
   vi.stubGlobal("open", vi.fn());
 });
@@ -156,10 +157,11 @@ describe("setup store OAuth sequence (SPEC s11.1)", () => {
     expect(setup.oauthStatus).toEqual({ kind: "awaitingCallback" });
   });
 
-  it("createFirstSource adds the source with its encryption flag", async () => {
+  it("createFirstSource adds the source with its encryption flag + captures the phrase", async () => {
     const setup = useSetupStore();
     setup.accountId = "acct-1";
     setup.localPath = "/home/user/Docs";
+    setup.localPathToken = "tok-folder";
     setup.driveFolderId = "drive-folder-1";
     setup.driveFolderPath = "/Backups/Docs";
     setup.encryptionEnabled = true;
@@ -167,11 +169,21 @@ describe("setup store OAuth sequence (SPEC s11.1)", () => {
 
     const addCall = invokeMock.mock.calls.find((c) => c[0] === "add_source");
     expect(addCall).toBeDefined();
-    expect(
-      (addCall![1] as { req: { encryptionEnabled: boolean } }).req
-        .encryptionEnabled,
-    ).toBe(true);
+    const sentReq = (
+      addCall![1] as {
+        req: { encryptionEnabled: boolean; localPathToken: string };
+      }
+    ).req;
+    expect(sentReq.encryptionEnabled).toBe(true);
+    // C1: the dialog token rides along so the backend can prove the path.
+    expect(sentReq.localPathToken).toBe("tok-folder");
     expect(setup.sourceId).toBe("src-1");
+    // B3: the one-time recovery phrase was captured + Finish is gated until ack.
+    expect(setup.recoveryPhrase).toEqual(["alpha", "bravo", "charlie"]);
+    expect(setup.hasRecoveryPhrase).toBe(true);
+    expect(setup.canFinish).toBe(false);
+    setup.acknowledgePhrase(true);
+    expect(setup.canFinish).toBe(true);
     // Reuses the sources store list (refresh fired after add).
     const sources = useSourcesStore();
     expect(sources.sources).toHaveLength(1);
@@ -274,7 +286,8 @@ describe("SetupWizard walks all five steps (DESIGN s8.5)", () => {
     await wrapper.get("footer button:last-child").trigger("click");
     expect(setup.step).toBe("encryption");
 
-    // Step 4: opt into encryption, then advance (creates the source).
+    // Step 4: opt into encryption, then advance (creates the source + returns
+    // the one-time recovery phrase).
     const encBox = wrapper.find('input[type="checkbox"]');
     await encBox.setValue(true);
     expect(setup.encryptionEnabled).toBe(true);
@@ -283,13 +296,31 @@ describe("SetupWizard walks all five steps (DESIGN s8.5)", () => {
     expect(invokeMock).toHaveBeenCalledWith(
       "add_source",
       expect.objectContaining({
-        req: expect.objectContaining({ encryptionEnabled: true }),
+        req: expect.objectContaining({
+          encryptionEnabled: true,
+          localPathToken: "tok-folder",
+        }),
       }),
     );
     expect(setup.step).toBe("confirm");
 
+    // B3: the recovery phrase is now displayed; Finish is GATED until the user
+    // acknowledges they saved it. The Finish button must start disabled.
+    expect(setup.hasRecoveryPhrase).toBe(true);
+    const finishBtn = () => wrapper.get("footer button:last-child");
+    expect(finishBtn().attributes("disabled")).toBeDefined();
+
+    // Acknowledge the phrase via the reveal's confirm checkbox (the only
+    // checkbox on the confirm step), then Finish.
+    const ackBox = wrapper.find('input[type="checkbox"]');
+    expect(ackBox.exists()).toBe(true);
+    await ackBox.setValue(true);
+    await flushPromises();
+    expect(setup.phraseAcknowledged).toBe(true);
+    expect(finishBtn().attributes("disabled")).toBeUndefined();
+
     // Step 5: finish -> initial sync -> navigate to /activity.
-    await wrapper.get("footer button:last-child").trigger("click");
+    await finishBtn().trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("sync_now", { sourceId: "src-1" });
     expect(router.currentRoute.value.path).toBe("/activity");

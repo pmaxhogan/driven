@@ -53,6 +53,11 @@ pub enum RemoteMode {
 pub struct AccountHandle {
     /// The per-account orchestrator control surface.
     pub orchestrator: Arc<dyn Orchestrator>,
+    /// B2: the per-account LIVE crypto provider. Held so the source-command
+    /// layer can REFRESH its source metadata (`crypto.refresh(..)`) after a
+    /// source add / toggle / remove, so a mid-session encrypted source's key is
+    /// resolved on the next tick (not stranded `Unavailable` until restart).
+    pub crypto: Arc<crate::crypto_provider_impl::KeystoreCryptoProvider>,
     /// The spawned run-loop task. Behind a `Mutex<Option<..>>` so the shutdown
     /// path can TAKE + await it by value; `None` once drained.
     run_loop: Mutex<Option<JoinHandle<()>>>,
@@ -95,6 +100,9 @@ pub const RUN_LOOP_DRAIN_TIMEOUT: Duration = Duration::from_secs(20);
 /// by `assembly::build_account` and stored on [`AccountHandle`]. Groups the four
 /// tracked tasks so the constructor signature stays readable (R-P1-1).
 pub struct AccountTasks {
+    /// B2: the per-account live crypto provider (so the handle can expose it for
+    /// refresh on a source change).
+    pub crypto: Arc<crate::crypto_provider_impl::KeystoreCryptoProvider>,
     /// [`Orchestrator::run`] loop.
     pub run_loop: JoinHandle<()>,
     /// Watcher -> orchestrator scan-tick bridge, or `None` if none was spawned.
@@ -114,6 +122,7 @@ impl AccountHandle {
     pub fn new(orchestrator: Arc<dyn Orchestrator>, tasks: AccountTasks) -> Self {
         Self {
             orchestrator,
+            crypto: tasks.crypto,
             run_loop: Mutex::new(Some(tasks.run_loop)),
             watcher_bridge: Mutex::new(tasks.watcher_bridge),
             event_bridge: Mutex::new(Some(tasks.event_bridge)),
@@ -208,7 +217,14 @@ pub struct AppState {
     /// The SQLite state layer (SPEC s2), shared by every account + IPC path.
     state: Arc<dyn StateRepo>,
     /// Per-account orchestrator handles, keyed by [`AccountId`].
-    accounts: HashMap<AccountId, AccountHandle>,
+    ///
+    /// A2: behind a sync [`std::sync::Mutex`] (never held across an await -
+    /// only ever for a quick insert / clone-out) so the wizard can HOT-SPAWN a
+    /// brand-new account's orchestrator mid-session (`finish_add_account` ->
+    /// `spawn_account`) and `sync_now` finds it without a restart. Each handle
+    /// is an [`Arc`] so a caller can clone it out and drive / await it after
+    /// releasing the map lock.
+    accounts: std::sync::Mutex<HashMap<AccountId, Arc<AccountHandle>>>,
     /// How remotes were constructed this run (real Drive vs in-memory fake).
     remote_mode: RemoteMode,
     /// C5-P2-1: per-account pause "generation" token. Every pause/resume bumps
@@ -219,7 +235,32 @@ pub struct AppState {
     /// and thereby CANCELS the stale timer's auto-resume. Behind a sync `Mutex`
     /// (only ever held for a counter bump/read, never across an await).
     pause_generations: std::sync::Mutex<HashMap<AccountId, u64>>,
+    /// C1 (SPEC s11.6.1): one-shot dialog-token -> path bindings. The backend
+    /// OWNS the native folder / save-file dialogs; each returns an opaque token
+    /// bound to the path the USER actually chose. A path-bearing write command
+    /// (`add_source`, `export_diagnostic_bundle`) must present a token that maps
+    /// to exactly that path - so the (untrusted) webview can never inject an
+    /// arbitrary path. Single-use (taken on validation) with a short TTL so a
+    /// leaked token cannot be replayed later. Behind a sync `Mutex` (only ever
+    /// held for a quick insert / take, never across an await).
+    dialog_tokens: std::sync::Mutex<HashMap<String, DialogTokenBinding>>,
 }
+
+/// C1: one backend-minted dialog-token binding - the path the user chose via a
+/// native dialog plus the instant it was minted (for the short single-use TTL).
+struct DialogTokenBinding {
+    /// The path the native dialog returned (a folder for the folder dialog, a
+    /// concrete file path for the save dialog).
+    path: std::path::PathBuf,
+    /// When the token was minted (for TTL expiry).
+    minted_at: std::time::Instant,
+}
+
+/// C1: how long a backend-minted dialog token stays valid. The webview calls the
+/// dialog command then immediately calls the write command with the token, so a
+/// few minutes is generous; a token older than this is rejected so a leaked one
+/// cannot be replayed much later.
+const DIALOG_TOKEN_TTL: Duration = Duration::from_secs(300);
 
 impl AppState {
     /// Build the managed state from the state repo, the per-account handles,
@@ -230,12 +271,79 @@ impl AppState {
         accounts: HashMap<AccountId, AccountHandle>,
         remote_mode: RemoteMode,
     ) -> Self {
+        let accounts = accounts
+            .into_iter()
+            .map(|(id, handle)| (id, Arc::new(handle)))
+            .collect();
         Self {
             state,
-            accounts,
+            accounts: std::sync::Mutex::new(accounts),
             remote_mode,
             pause_generations: std::sync::Mutex::new(HashMap::new()),
+            dialog_tokens: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    /// C1: mint a one-shot dialog token bound to `path` (the path a native
+    /// backend dialog returned), returning the opaque token string the webview
+    /// threads back into the write command. Also opportunistically evicts
+    /// expired bindings so the map cannot grow unbounded.
+    pub fn mint_dialog_token(&self, path: std::path::PathBuf) -> String {
+        let token = uuid::Uuid::new_v4().to_string();
+        let mut map = self.lock_dialog_tokens();
+        let now = std::time::Instant::now();
+        map.retain(|_, b| now.duration_since(b.minted_at) < DIALOG_TOKEN_TTL);
+        map.insert(
+            token.clone(),
+            DialogTokenBinding {
+                path,
+                minted_at: now,
+            },
+        );
+        token
+    }
+
+    /// C1: TAKE (single-use) the path bound to `token`, if it exists and has not
+    /// expired. Returns `None` for an unknown / already-consumed / expired token
+    /// so a path-bearing command can REJECT a path the user did not pick via a
+    /// backend dialog. Consuming the token here makes it single-use.
+    pub fn take_dialog_token(&self, token: &str) -> Option<std::path::PathBuf> {
+        let mut map = self.lock_dialog_tokens();
+        let binding = map.remove(token)?;
+        if std::time::Instant::now().duration_since(binding.minted_at) >= DIALOG_TOKEN_TTL {
+            return None;
+        }
+        Some(binding.path)
+    }
+
+    /// Lock the dialog-token map, recovering a poisoned lock.
+    fn lock_dialog_tokens(&self) -> std::sync::MutexGuard<'_, HashMap<String, DialogTokenBinding>> {
+        self.dialog_tokens.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// Lock the accounts map, recovering a poisoned lock (house rule: never
+    /// panic on a poisoned lock).
+    fn lock_accounts(&self) -> std::sync::MutexGuard<'_, HashMap<AccountId, Arc<AccountHandle>>> {
+        self.accounts.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// A2: insert (or replace) the live handle for `account`, returning the
+    /// PRIOR handle if one was present (so the caller can shut it down to avoid
+    /// orphaning its tasks - mirrors the M5 no-orphan bookkeeping). Called by
+    /// the wizard hot-spawn path after `finish_add_account`.
+    pub fn insert_account(
+        &self,
+        account: AccountId,
+        handle: AccountHandle,
+    ) -> Option<Arc<AccountHandle>> {
+        self.lock_accounts().insert(account, Arc::new(handle))
+    }
+
+    /// A2: remove + return the live handle for `account` (so the caller can
+    /// shut it down before deleting the account's rows). `None` if the account
+    /// has no running orchestrator (never spawned / needs_reauth).
+    pub fn remove_account_handle(&self, account: AccountId) -> Option<Arc<AccountHandle>> {
+        self.lock_accounts().remove(&account)
     }
 
     /// Bump and return the new pause generation for `account` (C5-P2-1). Called
@@ -270,16 +378,24 @@ impl AppState {
         &self.state
     }
 
-    /// The orchestrator handle for `account`, if present.
+    /// The orchestrator handle for `account`, if present. Returns a cloned
+    /// [`Arc`] so the caller can drive / await it after the map lock is
+    /// released (A2: the map is now behind a sync mutex).
     #[must_use]
-    pub fn account(&self, account: AccountId) -> Option<&AccountHandle> {
-        self.accounts.get(&account)
+    pub fn account(&self, account: AccountId) -> Option<Arc<AccountHandle>> {
+        self.lock_accounts().get(&account).cloned()
     }
 
-    /// Iterate every account's orchestrator handle (for "all accounts"
-    /// commands like `sync_now(None)` / `pause_sync`).
-    pub fn accounts(&self) -> impl Iterator<Item = (&AccountId, &AccountHandle)> {
-        self.accounts.iter()
+    /// Snapshot every account's orchestrator handle (for "all accounts"
+    /// commands like `sync_now(None)` / `pause_sync`). Returns owned
+    /// `(AccountId, Arc<AccountHandle>)` pairs so callers can iterate + await
+    /// without holding the map lock across an await (A2).
+    #[must_use]
+    pub fn accounts(&self) -> Vec<(AccountId, Arc<AccountHandle>)> {
+        self.lock_accounts()
+            .iter()
+            .map(|(id, handle)| (*id, handle.clone()))
+            .collect()
     }
 
     /// How remotes were constructed this run.
@@ -295,6 +411,16 @@ mod tests {
     use driven_core::orchestrator::{Orchestrator, OrchestratorConfig, TickSource};
     use driven_core::types::OrchestratorState;
     use std::sync::atomic::{AtomicBool, Ordering};
+
+    /// A no-source crypto provider for the shutdown tests (B2: `AccountTasks`
+    /// now carries the live crypto provider; these tests only exercise the
+    /// task-drain bookkeeping, so an empty provider suffices).
+    fn test_crypto() -> Arc<crate::crypto_provider_impl::KeystoreCryptoProvider> {
+        Arc::new(crate::crypto_provider_impl::KeystoreCryptoProvider::new(
+            AccountId::new_v4(),
+            Vec::new(),
+        ))
+    }
 
     /// A no-op [`Orchestrator`] whose `run()` returns as soon as `shutdown()` is
     /// signalled - mirroring the real run loop's graceful-drain contract, so the
@@ -426,6 +552,7 @@ mod tests {
         let handle = AccountHandle::new(
             orchestrator,
             AccountTasks {
+                crypto: test_crypto(),
                 run_loop,
                 watcher_bridge: Some(watcher_bridge),
                 event_bridge,
@@ -559,6 +686,7 @@ mod tests {
         let handle = AccountHandle::new(
             orchestrator,
             AccountTasks {
+                crypto: test_crypto(),
                 run_loop,
                 watcher_bridge: None,
                 event_bridge,
@@ -624,6 +752,7 @@ mod tests {
         let handle = AccountHandle::new(
             orchestrator,
             AccountTasks {
+                crypto: test_crypto(),
                 run_loop,
                 watcher_bridge: None,
                 event_bridge,
@@ -696,5 +825,59 @@ mod tests {
             b.poller_abort.is_finished(),
             "account B poller must be finished (aborted, not orphaned)"
         );
+    }
+
+    /// Open a temp-backed state repo for the AppState dialog-token tests.
+    async fn temp_state() -> (Arc<dyn StateRepo>, std::path::PathBuf) {
+        use driven_core::state::sqlite::SqliteStateRepo;
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("driven-appstate-test-{nonce}-{:p}", &nonce));
+        std::fs::create_dir_all(&dir).expect("create temp dir");
+        let repo = SqliteStateRepo::open(&dir.join("state.db"))
+            .await
+            .expect("open state repo");
+        (Arc::new(repo), dir)
+    }
+
+    #[tokio::test]
+    async fn dialog_token_round_trips_and_is_single_use() {
+        // C1 (SPEC s11.6.1): a minted token maps to its path exactly once; a
+        // second take (or an unknown token) returns None so a leaked / replayed
+        // token cannot authorise a second write.
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(state, HashMap::new(), RemoteMode::Fake);
+        let path = std::path::PathBuf::from("/home/u/backups");
+        let token = app_state.mint_dialog_token(path.clone());
+
+        // First take resolves the bound path.
+        assert_eq!(app_state.take_dialog_token(&token), Some(path));
+        // Single-use: a second take is rejected.
+        assert_eq!(app_state.take_dialog_token(&token), None);
+        // An unknown token is rejected.
+        assert_eq!(app_state.take_dialog_token("not-a-real-token"), None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn dialog_tokens_are_distinct_per_mint() {
+        // Two mints yield distinct tokens each bound to its own path.
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(state, HashMap::new(), RemoteMode::Fake);
+        let a = app_state.mint_dialog_token(std::path::PathBuf::from("/a"));
+        let b = app_state.mint_dialog_token(std::path::PathBuf::from("/b"));
+        assert_ne!(a, b);
+        assert_eq!(
+            app_state.take_dialog_token(&b),
+            Some(std::path::PathBuf::from("/b"))
+        );
+        assert_eq!(
+            app_state.take_dialog_token(&a),
+            Some(std::path::PathBuf::from("/a"))
+        );
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

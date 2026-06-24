@@ -30,6 +30,14 @@ export interface OAuthAuthUrl {
   authUrl: string;
 }
 
+/** A3: the result of `reauth_account` - the consent URL PLUS the server-side
+ * session id the UI threads back through poll/finish to complete re-consent
+ * onto the EXISTING account (mirrors src-tauri ReauthSession). */
+export interface ReauthSession {
+  sessionId: string;
+  authUrl: string;
+}
+
 /** Mirrors the Rust `OAuthStatus` (internally tagged on `kind`). */
 export type OAuthStatus =
   | { kind: "openingBrowser" }
@@ -60,6 +68,11 @@ export interface SourceDto {
 export interface AddSourceRequest {
   accountId: string;
   displayName: string;
+  /** C1 (SPEC s11.6.1): the one-shot token from `pickFolderDialog` proving the
+   * local path came from a backend-owned dialog. Authoritative. */
+  localPathToken: string;
+  /** Display echo of the chosen local path (NOT authoritative; the backend uses
+   * the path bound to `localPathToken`). */
   localPath: string;
   driveFolderId: string;
   driveFolderPath: string;
@@ -67,6 +80,22 @@ export interface AddSourceRequest {
   respectGitignore: boolean;
   includePatterns: string[];
   excludePatterns: string[];
+}
+
+/** B3: the result of `add_source` - the created source PLUS the one-time BIP39
+ * recovery phrase, present ONLY when this opt-in generated the account master
+ * key (mirrors src-tauri AddSourceResult). The UI shows the phrase once and
+ * never persists it. */
+export interface AddSourceResult {
+  source: SourceDto;
+  recoveryPhrase: string[] | null;
+}
+
+/** C1: the result of a backend-owned native dialog - the chosen path plus the
+ * one-shot token bound to it (mirrors src-tauri PickedPath). */
+export interface PickedPath {
+  path: string;
+  token: string;
 }
 
 export interface SourcePatch {

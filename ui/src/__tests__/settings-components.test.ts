@@ -264,18 +264,24 @@ describe("AddSourceWizard", () => {
           excludedSample: ["y"],
           truncated: false,
         });
+      if (cmd === "pick_folder_dialog")
+        return Promise.resolve({ path: "/home/u/docs", token: "tok-folder" });
       if (cmd === "add_source")
-        return Promise.resolve(makeSource({ id: "src-new" }));
+        // B3: unencrypted add returns no recovery phrase.
+        return Promise.resolve({
+          source: makeSource({ id: "src-new" }),
+          recoveryPhrase: null,
+        });
       if (cmd === "list_sources") return Promise.resolve([]);
       return Promise.resolve(undefined);
     });
-    openDialogMock.mockResolvedValueOnce("/home/u/docs");
 
     const wrapper = mount(AddSourceWizard, { global: globalMountOptions });
     await (wrapper.vm as unknown as { start: () => Promise<void> }).start();
     await flushPromises();
 
-    // Step 1: choose local folder (dialog-derived path).
+    // Step 1: choose local folder via the BACKEND dialog (C1: dialog-derived
+    // path + one-shot token).
     const chooseLocal = wrapper
       .findAll("button")
       .find(
@@ -283,10 +289,7 @@ describe("AddSourceWizard", () => {
       );
     await chooseLocal!.trigger("click");
     await flushPromises();
-    expect(openDialogMock).toHaveBeenCalledWith({
-      directory: true,
-      multiple: false,
-    });
+    expect(invokeMock).toHaveBeenCalledWith("pick_folder_dialog", undefined);
     expect(wrapper.get('[data-testid="local-path"]').text()).toBe("/home/u/docs");
 
     const clickNext = async () => {
@@ -321,6 +324,7 @@ describe("AddSourceWizard", () => {
     expect(invokeMock).toHaveBeenCalledWith("add_source", {
       req: expect.objectContaining({
         accountId: "acc-1",
+        localPathToken: "tok-folder",
         localPath: "/home/u/docs",
         driveFolderId: "root",
         encryptionEnabled: false,

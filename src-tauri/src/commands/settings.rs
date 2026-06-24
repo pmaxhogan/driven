@@ -621,29 +621,42 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
 // export_diagnostic_bundle (SPEC s11.6, s18)
 // ---------------------------------------------------------------------------
 
-/// `export_diagnostic_bundle(dest)` - write a redacted diagnostic ZIP
+/// `export_diagnostic_bundle(token)` - write a redacted diagnostic ZIP
 /// (SPEC s11.6, s18).
 ///
-/// SPEC s11.6.1: `dest` is treated as untrusted. The dialog-approved root is the
-/// PARENT directory of the user-chosen save path (the add-source/restore/export
-/// dialogs round-trip a `tauri-plugin-dialog` selection, so the parent is a
-/// directory the user actually picked); [`validate_writable_dest`] then confines
-/// the actual write to that one directory (no `..`, no symlink-at-leaf), and
-/// [`atomic_write`] writes the ZIP atomically.
+/// C1 (SPEC s11.6.1): the destination is NOT a webview-supplied string - it is
+/// the concrete `.zip` save path bound to the backend-minted `token` from
+/// `pick_save_zip_dialog`. The token is taken (single-use) and resolved to that
+/// path; a missing / unknown / expired token is REJECTED (the webview cannot
+/// inject a path). C2: the bound path is a FILE, so the ZIP is written AT that
+/// file (not over a directory). [`validate_writable_dest`] confines the write to
+/// the dialog-approved directory (no `..`, no symlink-at-leaf) and
+/// [`atomic_write`] writes the ZIP atomically (SPEC s11.6.1 step 5).
 ///
 /// The bundle (SPEC s18) carries `version.txt`, `os.txt`, a REDACTED
-/// `settings_redacted.json`, `schema.txt` (PRAGMA user_version + table counts),
-/// and `redaction-policy.txt`. Every secret-bearing field (refresh tokens,
-/// recovery phrases, keys, master key, account emails, drive folder names) is
-/// redacted or hashed before it enters the ZIP.
+/// `settings_redacted.json`, `schema.txt` (real PRAGMA user_version + table
+/// counts), `activity_last_30d.csv`, `logs/`, `crashes/`, and
+/// `redaction-policy.txt`. Every secret-bearing field (refresh tokens, recovery
+/// phrases, keys, master key, account emails, drive folder names, local paths,
+/// Drive file ids) is redacted or hashed before it enters the ZIP.
 #[tauri::command]
 pub async fn export_diagnostic_bundle(
     app: AppHandle,
     state: State<'_, AppState>,
-    dest: PathBuf,
+    token: String,
 ) -> CommandResult<PathBuf> {
-    // SPEC s11.6.1: confine the write to the directory the user chose (the
-    // parent of the save path), then re-validate the leaf against it.
+    // C1: resolve the save path from the backend-minted dialog token (single-use).
+    // Reject any request without a matching token - the webview never supplies a
+    // raw path here.
+    let dest = state.take_dialog_token(&token).ok_or_else(|| {
+        CommandError::with_code(
+            ErrorCode::LocalIoError,
+            "no matching dialog token for the export destination; pick a save location first",
+        )
+    })?;
+
+    // C2: the token's path is a concrete FILE. Confine the write to its parent
+    // directory (the dialog-approved root) and re-validate the leaf.
     let parent = dest
         .parent()
         .filter(|p| !p.as_os_str().is_empty())
@@ -653,8 +666,8 @@ pub async fn export_diagnostic_bundle(
                 "diagnostic bundle destination must include a directory",
             )
         })?;
-    let token = DialogToken::for_root(parent.to_string_lossy().to_string());
-    let confined = validate_writable_dest(&dest, &token)?;
+    let dialog_token = DialogToken::for_root(parent.to_string_lossy().to_string());
+    let confined = validate_writable_dest(&dest, &dialog_token)?;
 
     // Build the bundle bytes (redacted, SPEC s18) off the persisted state.
     let zip_bytes = build_diagnostic_zip(&app, state.state().as_ref()).await?;
@@ -688,16 +701,248 @@ async fn build_diagnostic_zip(app: &AppHandle, state: &dyn StateRepo) -> Command
     })?;
     zip.add_file("settings_redacted.json", &settings_json);
 
-    // schema.txt (SPEC s18): PRAGMA user_version + table row counts. Both are
-    // metadata-only (no file paths / ids), so no redaction is needed.
+    // schema.txt (SPEC s18): REAL PRAGMA user_version + table row counts. Both
+    // are metadata-only (no file paths / ids), so no redaction is needed.
     let schema = build_schema_summary(state).await;
     zip.add_file("schema.txt", schema.as_bytes());
+
+    // activity_last_30d.csv (SPEC s18): the activity_log for the last 30 days,
+    // with the free-text message column passed through the redaction pipeline
+    // (paths / drive ids / emails / tokens become stable per-bundle hashes).
+    let activity_csv = build_activity_csv(state).await;
+    zip.add_file("activity_last_30d.csv", activity_csv.as_bytes());
+
+    // logs/ + crashes/ (SPEC s18): the recent tracing output + crash dumps from
+    // <config_dir>/driven/logs/, each passed through the redaction pipeline.
+    add_logs_and_crashes(app, &mut zip);
 
     // redaction-policy.txt (SPEC s18): tell the recipient the bundle's threat
     // model + exactly what was redacted.
     zip.add_file("redaction-policy.txt", REDACTION_POLICY.as_bytes());
 
     Ok(zip.finish())
+}
+
+/// SPEC s18: the maximum bytes of log content the bundle carries (the spec's
+/// "last 50 MB of tracing output"). A per-file cap is applied so one huge log
+/// cannot dominate; the newest files are preferred.
+const MAX_LOG_BYTES: u64 = 50 * 1024 * 1024;
+
+/// Build `activity_last_30d.csv` from the `activity_log` (SPEC s18).
+///
+/// Columns: `ts,event_type,level,source_id,file_count,bytes,message`. The
+/// free-text `message` is passed through [`redact_log_text`] (paths / drive ids /
+/// emails / tokens -> stable per-bundle hashes); the `source_id` is hashed too
+/// (it correlates to a local source). Best-effort: a query failure yields a
+/// header-only CSV with an error note rather than failing the whole bundle.
+async fn build_activity_csv(state: &dyn StateRepo) -> String {
+    use driven_core::state::{ActivityFilter, PageRequest};
+    use driven_core::time::{Clock, SystemClock};
+
+    let mut out = String::new();
+    out.push_str("ts,event_type,level,source_id,file_count,bytes,message\n");
+
+    let now = SystemClock.now_ms();
+    let thirty_days_ms: i64 = 30 * 24 * 60 * 60 * 1000;
+    let since = now.saturating_sub(thirty_days_ms);
+    let filter = ActivityFilter {
+        since_ms: Some(since),
+        ..Default::default()
+    };
+    // Bounded page (SPEC s18.8 caps at 10_000 rows/page); a 30-day window of a
+    // single-user backup tool fits comfortably.
+    let page = PageRequest {
+        page: 0,
+        limit: 10_000,
+    };
+    match state.query_activity(filter, page).await {
+        Ok(activity) => {
+            for row in &activity.rows {
+                let level = format!("{:?}", row.level);
+                let source = row
+                    .source_id
+                    .map(|s| format!("source_{}", stable_hash(&s.to_string())))
+                    .unwrap_or_default();
+                let file_count = row.file_count.map(|c| c.to_string()).unwrap_or_default();
+                let bytes = row.bytes.map(|b| b.to_string()).unwrap_or_default();
+                let message = row
+                    .message
+                    .as_deref()
+                    .map(redact_log_text)
+                    .unwrap_or_default();
+                out.push_str(&format!(
+                    "{},{},{},{},{},{},{}\n",
+                    row.ts,
+                    csv_field(&row.event_type),
+                    csv_field(&level),
+                    csv_field(&source),
+                    file_count,
+                    bytes,
+                    csv_field(&message),
+                ));
+            }
+        }
+        Err(e) => {
+            out.push_str(&format!("# activity query failed: {e}\n"));
+        }
+    }
+    out
+}
+
+/// Escape a CSV field: wrap in double quotes and double any embedded quote when
+/// it contains a comma, quote, or newline (RFC 4180).
+fn csv_field(s: &str) -> String {
+    if s.contains([',', '"', '\n', '\r']) {
+        format!("\"{}\"", s.replace('"', "\"\""))
+    } else {
+        s.to_string()
+    }
+}
+
+/// SPEC s18: add `logs/` (recent tracing output) + `crashes/` (crash dumps) from
+/// `<config_dir>/driven/logs/`, each passed through the redaction pipeline.
+///
+/// Best-effort: a missing log dir / unreadable file is logged + skipped (a
+/// partial bundle is still useful). `crash-*.txt` files go under `crashes/`;
+/// every other file goes under `logs/`. The cumulative log bytes are bounded by
+/// [`MAX_LOG_BYTES`], newest-first.
+fn add_logs_and_crashes(app: &AppHandle, zip: &mut ZipWriter) {
+    use tauri::Manager;
+    let log_dir = match app.path().app_config_dir() {
+        Ok(dir) => dir.join("driven").join("logs"),
+        Err(e) => {
+            tracing::debug!(target: TARGET, error = %e, "diagnostic bundle: cannot resolve log dir; omitting logs/");
+            return;
+        }
+    };
+    let entries = match std::fs::read_dir(&log_dir) {
+        Ok(e) => e,
+        Err(e) => {
+            tracing::debug!(target: TARGET, dir = %log_dir.display(), error = %e, "diagnostic bundle: log dir unreadable; omitting logs/");
+            return;
+        }
+    };
+
+    // Collect (path, modified, is_crash) so we can prefer the newest files and
+    // bound the cumulative log bytes.
+    let mut files: Vec<(std::path::PathBuf, std::time::SystemTime, bool)> = Vec::new();
+    for entry in entries.flatten() {
+        let path = entry.path();
+        if !path.is_file() {
+            continue;
+        }
+        let name = entry.file_name().to_string_lossy().to_string();
+        let is_crash = name.starts_with("crash-");
+        let modified = entry
+            .metadata()
+            .and_then(|m| m.modified())
+            .unwrap_or(std::time::UNIX_EPOCH);
+        files.push((path, modified, is_crash));
+    }
+    // Newest first so the byte budget keeps the most recent logs.
+    files.sort_by_key(|f| std::cmp::Reverse(f.1));
+
+    let mut log_bytes_used: u64 = 0;
+    for (path, _modified, is_crash) in files {
+        let Some(name) = path.file_name().and_then(|n| n.to_str()) else {
+            continue;
+        };
+        let raw = match std::fs::read_to_string(&path) {
+            Ok(c) => c,
+            Err(e) => {
+                tracing::debug!(target: TARGET, file = %path.display(), error = %e, "diagnostic bundle: skipping unreadable log file");
+                continue;
+            }
+        };
+        // Crashes are always included (small + high-value); plain logs respect
+        // the cumulative byte budget.
+        if !is_crash {
+            let len = raw.len() as u64;
+            if log_bytes_used.saturating_add(len) > MAX_LOG_BYTES {
+                continue;
+            }
+            log_bytes_used = log_bytes_used.saturating_add(len);
+        }
+        let redacted = redact_log_text(&raw);
+        let arcname = if is_crash {
+            format!("crashes/{name}")
+        } else {
+            format!("logs/{name}")
+        };
+        zip.add_file(&arcname, redacted.as_bytes());
+    }
+}
+
+/// SPEC s18 redaction pipeline for log / activity free-text. Replaces, in order:
+/// OAuth tokens, `Authorization: Bearer ...` headers, email addresses, Windows +
+/// Unix absolute paths, and long Drive-id-looking tokens, each with a STABLE
+/// per-value hashed placeholder so occurrences correlate within the bundle
+/// without exposing the original value.
+///
+/// This is a best-effort scrubber (the SPEC s18 caveat: incidental free-text may
+/// survive); it errs toward over-redaction of anything that looks secret.
+fn redact_log_text(input: &str) -> String {
+    let mut out = String::with_capacity(input.len());
+    for line in input.lines() {
+        out.push_str(&redact_log_line(line));
+        out.push('\n');
+    }
+    out
+}
+
+/// Redact one log line (token-by-token over whitespace), so a path / email /
+/// token embedded in a message is replaced regardless of surrounding text.
+fn redact_log_line(line: &str) -> String {
+    line.split_inclusive(char::is_whitespace)
+        .map(|chunk| {
+            let trail_ws: String = chunk
+                .chars()
+                .rev()
+                .take_while(|c| c.is_whitespace())
+                .collect();
+            let core = &chunk[..chunk.len() - trail_ws.len()];
+            let redacted = redact_token(core);
+            format!("{redacted}{}", trail_ws.chars().rev().collect::<String>())
+        })
+        .collect()
+}
+
+/// Redact one whitespace-delimited token if it looks secret (token / email /
+/// path / long opaque id), else return it unchanged.
+fn redact_token(tok: &str) -> String {
+    if tok.is_empty() {
+        return tok.to_string();
+    }
+    // Email: contains '@' and a '.' after it.
+    if let Some(at) = tok.find('@') {
+        if tok[at + 1..].contains('.') {
+            return format!("<email:{}>", stable_hash(tok));
+        }
+    }
+    // OAuth tokens: Google access tokens start `ya29.`; refresh tokens `1//`.
+    if tok.starts_with("ya29.") || tok.starts_with("1//") {
+        return "<token-redacted>".to_string();
+    }
+    // Absolute paths: Windows drive (`C:\`/`C:/`) or Unix (`/...`) or UNC.
+    let is_win_abs = tok.len() >= 3
+        && tok.as_bytes()[0].is_ascii_alphabetic()
+        && tok.as_bytes()[1] == b':'
+        && (tok.as_bytes()[2] == b'\\' || tok.as_bytes()[2] == b'/');
+    let is_unix_abs = tok.starts_with('/') && tok.len() > 1;
+    let is_unc = tok.starts_with("\\\\");
+    if is_win_abs || is_unix_abs || is_unc {
+        return format!("<path:{}>", stable_hash(tok));
+    }
+    // Long opaque ids (Drive file ids are ~28-44 url-safe chars): redact a long
+    // run of id-shaped characters with no spaces.
+    if tok.len() >= 24
+        && tok
+            .chars()
+            .all(|c| c.is_ascii_alphanumeric() || c == '-' || c == '_')
+    {
+        return format!("<fileid:{}>", stable_hash(tok));
+    }
+    tok.to_string()
 }
 
 /// A short OS descriptor for `os.txt` (SPEC s18). Compile-time `OS`/`ARCH`
@@ -765,21 +1010,20 @@ fn stable_hash(input: &str) -> String {
     format!("{hash:016x}")
 }
 
-/// Build the `schema.txt` summary (SPEC s18): a row count per known table.
-/// Best-effort: a count that cannot be read is rendered as `?` rather than
-/// failing the whole bundle (a partial schema summary is still useful to a
-/// maintainer). The counts are pure metadata (no file paths / drive ids), so no
-/// redaction is needed.
-///
-/// SPEC s18 also lists `PRAGMA user_version`, but the `user_version` pragma is
-/// only reachable through the concrete `SqliteStateRepo` pool, not the
-/// object-safe [`StateRepo`] trait this command holds; rather than downcast we
-/// record that it is not exposed here and emit the table counts (the part the
-/// trait supports).
+/// Build the `schema.txt` summary (SPEC s18): the REAL `PRAGMA user_version` +
+/// a row count per known table. Best-effort: a value that cannot be read is
+/// rendered as `?` rather than failing the whole bundle (a partial schema
+/// summary is still useful to a maintainer). The values are pure metadata (no
+/// file paths / drive ids), so no redaction is needed.
 async fn build_schema_summary(state: &dyn StateRepo) -> String {
     let mut out = String::new();
     out.push_str("# Driven state DB schema summary (SPEC s18)\n");
-    out.push_str("user_version=(not exposed via the StateRepo trait)\n");
+    // SPEC s18: the REAL schema version from `PRAGMA user_version` (now exposed
+    // on the StateRepo trait).
+    match state.schema_version().await {
+        Ok(v) => out.push_str(&format!("user_version={v}\n")),
+        Err(e) => out.push_str(&format!("user_version=? ({e})\n")),
+    }
     match state.list_accounts().await {
         Ok(rows) => out.push_str(&format!("accounts={}\n", rows.len())),
         Err(e) => out.push_str(&format!("accounts=? ({e})\n")),
@@ -804,15 +1048,23 @@ What this bundle contains:
 - version.txt  : the Driven build version.
 - os.txt       : the OS / arch / family (compile-time constants).
 - settings_redacted.json : your settings, with secrets removed (see below).
-- schema.txt   : state-DB schema version + table row counts (no paths / ids).
+- schema.txt   : state-DB schema version (PRAGMA user_version) + table counts.
+- activity_last_30d.csv : the last 30 days of the activity log, with the
+  free-text message + source id passed through the redaction pipeline below.
+- logs/        : recent tracing output, passed through the redaction pipeline.
+- crashes/     : crash dumps (crash-*.txt), passed through the redaction pipeline.
 - redaction-policy.txt : this file.
 
 What is redacted / never included:
-- OAuth refresh + access tokens (keychain-only; never read into this bundle).
+- OAuth refresh + access tokens (keychain-only; never read into this bundle; any
+  token-shaped string in a log line is replaced with <token-redacted>).
 - Account encryption master keys + per-source keys (keychain-only).
 - BIP39 recovery phrases (never persisted; never collected).
 - The telemetry install id is replaced by a stable per-value hash
   (installid_<hash>) so occurrences can be correlated without exposing the id.
+- In logs / crashes / activity: local paths become <path:<hash>>, Drive file
+  ids become <fileid:<hash>>, email addresses become <email:<hash>> - each a
+  stable per-value hash so occurrences correlate without exposing the original.
 
 Caveat: despite this policy, free-text you supplied (e.g. a display name) is not
 guaranteed to be scrubbed if it appears in a field this policy did not anticipate.
@@ -1423,6 +1675,117 @@ mod tests {
             stable_hash("super-secret-install-id"),
             stable_hash("super-secret-install-id")
         );
+    }
+
+    #[tokio::test]
+    async fn schema_summary_includes_real_user_version() {
+        // C3 (SPEC s18): schema.txt must carry the REAL PRAGMA user_version, not
+        // the old "not exposed" placeholder.
+        let (repo, dir) = seeded_repo().await;
+        let summary = build_schema_summary(&repo).await;
+        assert!(
+            summary.contains("user_version="),
+            "schema.txt must record user_version"
+        );
+        assert!(
+            !summary.contains("not exposed"),
+            "user_version must be the real value, not a placeholder"
+        );
+        // The migrated DB has a non-default user_version; assert it parses to an
+        // integer (>= 0).
+        let line = summary
+            .lines()
+            .find(|l| l.starts_with("user_version="))
+            .unwrap();
+        let val = line.trim_start_matches("user_version=");
+        assert!(
+            val.parse::<i64>().is_ok(),
+            "user_version must be an integer, got `{val}`"
+        );
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn activity_csv_has_header_and_redacts_message() {
+        // C3 (SPEC s18): activity_last_30d.csv exists with the expected header and
+        // its free-text message column is passed through the redaction pipeline.
+        use driven_core::state::{ActivityLevel, NewActivity};
+        let (repo, dir) = seeded_repo().await;
+        // Write an activity row whose message embeds a Unix path + an email; both
+        // must be hashed in the CSV. Use a recent ts so it falls in the 30-day
+        // window the CSV collects.
+        use driven_core::time::{Clock, SystemClock};
+        let now = SystemClock.now_ms();
+        repo.write_activity(NewActivity {
+            ts: now,
+            source_id: None,
+            level: ActivityLevel::Info,
+            event_type: "upload_done".to_string(),
+            file_count: Some(3),
+            bytes: Some(99),
+            message: Some("uploaded /home/secret/file.txt for user@example.com".to_string()),
+        })
+        .await
+        .unwrap();
+
+        let csv = build_activity_csv(&repo).await;
+        assert!(
+            csv.starts_with("ts,event_type,level,source_id,file_count,bytes,message\n"),
+            "CSV must start with the SPEC s18 header"
+        );
+        assert!(csv.contains("upload_done"), "the event row is present");
+        assert!(
+            !csv.contains("/home/secret/file.txt"),
+            "the raw path must be redacted out of the CSV message"
+        );
+        assert!(
+            !csv.contains("user@example.com"),
+            "the raw email must be redacted out of the CSV message"
+        );
+        assert!(
+            csv.contains("<path:") && csv.contains("<email:"),
+            "the redaction pipeline must replace path + email with hashed placeholders"
+        );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn redact_log_text_scrubs_tokens_paths_emails_and_ids() {
+        // C3 (SPEC s18): the log/crash redaction pipeline.
+        let input = "refresh 1//0gAbCdEf access ya29.aBcDeF path C:\\Users\\me\\secret.txt \
+                     email alice@example.com id 1A2b3C4d5E6f7G8h9I0jKlMnOpQr";
+        let out = redact_log_text(input);
+        assert!(!out.contains("1//0gAbCdEf"), "refresh token redacted");
+        assert!(!out.contains("ya29.aBcDeF"), "access token redacted");
+        assert!(
+            out.contains("<token-redacted>"),
+            "tokens become placeholder"
+        );
+        assert!(
+            !out.contains("C:\\Users\\me\\secret.txt"),
+            "windows path redacted"
+        );
+        assert!(out.contains("<path:"), "path becomes a hashed placeholder");
+        assert!(!out.contains("alice@example.com"), "email redacted");
+        assert!(
+            out.contains("<email:"),
+            "email becomes a hashed placeholder"
+        );
+        assert!(
+            !out.contains("1A2b3C4d5E6f7G8h9I0jKlMnOpQr"),
+            "long opaque id (drive-file-id shaped) redacted"
+        );
+        assert!(
+            out.contains("<fileid:"),
+            "long id becomes a hashed placeholder"
+        );
+    }
+
+    #[test]
+    fn redact_log_text_leaves_ordinary_text_alone() {
+        let input = "scan complete 12 files 3 dirs ok";
+        let out = redact_log_text(input);
+        assert_eq!(out.trim_end(), input, "ordinary log text is unchanged");
     }
 
     #[test]

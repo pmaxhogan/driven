@@ -179,6 +179,85 @@ fn use_fake_remote() -> bool {
         .unwrap_or(false)
 }
 
+/// A2: HOT-SPAWN one account's orchestrator into an already-running [`AppState`]
+/// (the wizard's `finish_add_account` calls this so the freshly-added account
+/// has a live orchestrator + handle without an app restart, and the wizard's
+/// initial `sync_now(sourceId)` finds it).
+///
+/// Reads the account row + its sources from the (strongly-consistent) state DB,
+/// builds the SAME per-account stack `build_and_spawn` builds at boot, and
+/// INSERTS the resulting [`AccountHandle`] into the running set (shutting down
+/// any prior handle for that id first, so no per-account task is orphaned -
+/// mirrors the M5 no-orphan bookkeeping). Returns `Ok(true)` when an
+/// orchestrator was spawned, `Ok(false)` when the account needs re-consent
+/// (no/invalid token) so no orchestrator could be spawned.
+///
+/// An account in fake-remote mode (dev/e2e) builds the in-memory store, so the
+/// wizard walkthrough completes end-to-end against the fake remote.
+pub async fn spawn_account(
+    app: &AppHandle,
+    app_state: &AppState,
+    account_id: AccountId,
+) -> anyhow::Result<bool> {
+    let state = app_state.state().clone();
+    let use_fake = use_fake_remote();
+
+    let accounts = state.list_accounts().await?;
+    let account = accounts
+        .into_iter()
+        .find(|a| a.id == account_id)
+        .ok_or_else(|| anyhow::anyhow!("spawn_account: unknown account id {account_id}"))?;
+
+    // Only an Ok account spawns an orchestrator (mirrors build_and_spawn).
+    if account.state != AccountState::Ok {
+        tracing::info!(
+            target: TARGET,
+            account_id = %account.id,
+            state = ?account.state,
+            "spawn_account: account is not Ok; not spawning"
+        );
+        if account.state == AccountState::NeedsReauth {
+            emit_needs_reauth(app, &account);
+        }
+        return Ok(false);
+    }
+
+    let all_sources = state.list_sources().await?;
+    let sources: Vec<SourceRow> = all_sources
+        .into_iter()
+        .filter(|s| s.account_id == account.id)
+        .collect();
+
+    match build_account(app, &state, &account, sources, use_fake).await? {
+        BuildOutcome::Spawned(handle) => {
+            // Replace any prior handle for this id, shutting the old one down so
+            // its tasks are not orphaned (defensive: a fresh add has none).
+            if let Some(prior) = app_state.insert_account(account.id, *handle) {
+                tracing::info!(
+                    target: TARGET,
+                    account_id = %account.id,
+                    "spawn_account: replacing a prior handle; draining the old one"
+                );
+                prior.shutdown().await;
+            }
+            tracing::info!(
+                target: TARGET,
+                account_id = %account.id,
+                "spawn_account: orchestrator assembled + spawned (hot)"
+            );
+            Ok(true)
+        }
+        BuildOutcome::NeedsReauth => {
+            tracing::warn!(
+                target: TARGET,
+                account_id = %account.id,
+                "spawn_account: no valid token; account needs reauth, orchestrator NOT spawned"
+            );
+            Ok(false)
+        }
+    }
+}
+
 /// The result of attempting to build + spawn one account's orchestrator.
 enum BuildOutcome {
     /// The orchestrator was assembled and its run loop spawned. Boxed because
@@ -271,8 +350,11 @@ async fn build_account(
     let vss = build_vss(&config);
 
     // --- crypto: per-source keystore resolver (FAIL CLOSED - GA blocker) -----
-    let crypto: Arc<dyn driven_core::crypto_provider::CryptoProvider> =
-        Arc::new(KeystoreCryptoProvider::new(account.id, sources.clone()));
+    // B2: keep the CONCRETE Arc so the AccountHandle can expose it for live
+    // refresh on a source change (the executor holds the same Arc as
+    // `dyn CryptoProvider`).
+    let crypto = Arc::new(KeystoreCryptoProvider::new(account.id, sources.clone()));
+    let crypto_dyn: Arc<dyn driven_core::crypto_provider::CryptoProvider> = crypto.clone();
 
     // --- executor -----------------------------------------------------------
     let executor: Arc<dyn Executor> = Arc::new(DefaultExecutor::with_clock(
@@ -280,7 +362,7 @@ async fn build_account(
             remote,
             state: state.clone(),
             pacer,
-            crypto: Some(crypto),
+            crypto: Some(crypto_dyn),
             vss: vss.clone(),
             network: Some(network.clone()),
         },
@@ -355,6 +437,7 @@ async fn build_account(
     Ok(BuildOutcome::Spawned(Box::new(AccountHandle::new(
         orchestrator,
         AccountTasks {
+            crypto,
             run_loop,
             watcher_bridge,
             event_bridge,
@@ -406,7 +489,11 @@ fn build_remote(account: &AccountRow, use_fake: bool) -> anyhow::Result<RemoteOu
         Err(err) => return Err(err),
     };
 
-    let (client_id, client_secret) = resolve_oauth_creds();
+    // A1: prefer the account's persisted BYO client creds (the client that
+    // minted this refresh token); fall back to env / public default only when
+    // the account stored none (a default-client account). A refresh token is
+    // bound to the client that minted it, so using the wrong client fails.
+    let (client_id, client_secret) = resolve_account_oauth_creds(account.id);
     let token_source =
         RefreshingTokenSource::from_stored_refresh_token(refresh_token, client_id, client_secret)?
             .with_store(token_store);
@@ -445,6 +532,33 @@ fn resolve_oauth_creds() -> (String, String) {
         std::env::var(ENV_OAUTH_CLIENT_ID).unwrap_or_else(|_| DEFAULT_CLIENT_ID.to_string());
     let client_secret = std::env::var(ENV_OAUTH_CLIENT_SECRET).unwrap_or_default();
     (client_id, client_secret)
+}
+
+/// A1: resolve the OAuth client creds for `account_id`, preferring its PERSISTED
+/// BYO client creds (loaded from the keychain) over the env / public default.
+///
+/// The refresh token in the keychain was minted by a specific OAuth client; a
+/// refresh against a different client fails (`invalid_client`). So an account
+/// that brought its own client MUST refresh against that same client across
+/// restarts. Shared with `commands::sources` (the Drive-folder picker builds the
+/// same one-off store). NEVER logs the secret.
+pub fn resolve_account_oauth_creds(account_id: AccountId) -> (String, String) {
+    use driven_drive::google::token_store::ClientCredsStore;
+    match ClientCredsStore::new(account_id.to_string()).load() {
+        Ok(Some(creds)) if !creds.client_id.trim().is_empty() => {
+            (creds.client_id, creds.client_secret)
+        }
+        Ok(_) => resolve_oauth_creds(),
+        Err(err) => {
+            tracing::warn!(
+                target: TARGET,
+                account_id = %account_id,
+                %err,
+                "failed to load account BYO client creds from keychain; using env/default client"
+            );
+            resolve_oauth_creds()
+        }
+    }
 }
 
 /// Build the Windows VSS snapshot provider (ROADMAP M3.5), or `None` off

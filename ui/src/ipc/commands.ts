@@ -10,12 +10,15 @@ import type {
   AccountDto,
   AddAccountWizardSessionId,
   AddSourceRequest,
+  AddSourceResult,
   DriveFolderListing,
   ExclusionPreview,
   ExclusionPreviewRequest,
   GlobalSyncStatus,
   OAuthAuthUrl,
   OAuthStatus,
+  PickedPath,
+  ReauthSession,
   ReleaseDto,
   SessionId,
   SettingsDto,
@@ -69,7 +72,7 @@ export function removeAccount(
   return invoke("remove_account", { accountId, deleteRemote });
 }
 
-export function reauthAccount(accountId: string): Promise<OAuthAuthUrl> {
+export function reauthAccount(accountId: string): Promise<ReauthSession> {
   return invoke("reauth_account", { accountId });
 }
 
@@ -79,7 +82,7 @@ export function listSources(): Promise<SourceDto[]> {
   return invoke("list_sources");
 }
 
-export function addSource(req: AddSourceRequest): Promise<SourceDto> {
+export function addSource(req: AddSourceRequest): Promise<AddSourceResult> {
   return invoke("add_source", { req });
 }
 
@@ -110,6 +113,21 @@ export function previewExclusions(
   return invoke("preview_exclusions", { req });
 }
 
+// --- Backend-owned native dialogs (SPEC s11.6.1, C1) ---
+
+/** Open the backend-owned native folder picker; returns the chosen path + a
+ * one-shot token to pass to `addSource` (SPEC s11.6.1). */
+export function pickFolderDialog(): Promise<PickedPath> {
+  return invoke("pick_folder_dialog");
+}
+
+/** Open the backend-owned native save-file picker for the diagnostic `.zip`;
+ * returns the chosen path + a one-shot token to pass to
+ * `exportDiagnosticBundle` (SPEC s11.6.1, C2). */
+export function pickSaveZipDialog(): Promise<PickedPath> {
+  return invoke("pick_save_zip_dialog");
+}
+
 // --- Sync (SPEC s11.3) ---
 
 export function syncNow(sourceId: string | null): Promise<void> {
@@ -138,8 +156,8 @@ export function updateSettings(patch: SettingsPatch): Promise<SettingsDto> {
   return invoke("update_settings", { patch });
 }
 
-export function exportDiagnosticBundle(dest: string): Promise<string> {
-  return invoke("export_diagnostic_bundle", { dest });
+export function exportDiagnosticBundle(token: string): Promise<string> {
+  return invoke("export_diagnostic_bundle", { token });
 }
 
 export function checkForUpdates(): Promise<UpdateInfo | null> {

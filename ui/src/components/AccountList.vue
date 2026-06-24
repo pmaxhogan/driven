@@ -4,7 +4,7 @@ import { useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
-import { onAccountNeedsReauth } from "../ipc/events";
+import { onAccountNeedsReauth, onOauthComplete } from "../ipc/events";
 import { useAccountsStore } from "../stores/accounts";
 
 // Accounts settings tab body (SPEC s11.1; DESIGN s8.2). Lists the connected
@@ -22,13 +22,23 @@ const router = useRouter();
 const confirmingRemoveId = ref<string | null>(null);
 const deleteRemote = ref(false);
 const reauthError = ref<string | null>(null);
+// A3: the in-flight re-consent session id (set when the user clicks Reconnect).
+// Completed via the `oauth:complete` event so re-consent lands on the EXISTING
+// account without creating a duplicate.
+const reauthSessionId = ref<string | null>(null);
 
 let unlisten: UnlistenFn | null = null;
+let unlistenOauth: UnlistenFn | null = null;
 
 onMounted(async () => {
   await accounts.refresh();
   unlisten = await onAccountNeedsReauth((payload) => {
     accounts.markNeedsReauth(payload.account_id);
+  });
+  // A3: when the loopback server reports the re-consent finished, complete the
+  // session onto the existing account.
+  unlistenOauth = await onOauthComplete(() => {
+    void finishReauth();
   });
 });
 
@@ -37,7 +47,24 @@ onUnmounted(() => {
     unlisten();
     unlisten = null;
   }
+  if (unlistenOauth) {
+    unlistenOauth();
+    unlistenOauth = null;
+  }
 });
+
+async function finishReauth(): Promise<void> {
+  const sessionId = reauthSessionId.value;
+  if (!sessionId) return;
+  try {
+    const done = await accounts.completeReauth(sessionId);
+    if (done) {
+      reauthSessionId.value = null;
+    }
+  } catch (e) {
+    reauthError.value = String(e);
+  }
+}
 
 function addAccount(): void {
   void router.push("/setup");
@@ -62,7 +89,11 @@ async function confirmRemove(accountId: string): Promise<void> {
 async function reconnect(accountId: string): Promise<void> {
   reauthError.value = null;
   try {
-    const authUrl = await accounts.reauth(accountId);
+    // A3: the backend returns BOTH the consent URL and the session id; the
+    // FRONTEND opens the URL (A4: single owner), and the session id is held so
+    // `oauth:complete` can finish re-consent onto the existing account.
+    const { sessionId, authUrl } = await accounts.reauth(accountId);
+    reauthSessionId.value = sessionId;
     if (typeof window !== "undefined" && typeof window.open === "function") {
       window.open(authUrl, "_blank");
     }

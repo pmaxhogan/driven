@@ -346,6 +346,9 @@ mod tests {
         async fn delete_activity_by_source(&self, _source: SourceId) -> Result<u64> {
             unimplemented!()
         }
+        async fn schema_version(&self) -> Result<i64> {
+            unimplemented!()
+        }
         async fn get_setting(&self, _key: &str) -> Result<Option<serde_json::Value>> {
             unimplemented!()
         }

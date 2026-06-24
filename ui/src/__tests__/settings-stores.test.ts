@@ -116,14 +116,49 @@ describe("accounts store", () => {
     expect(invokeMock).toHaveBeenNthCalledWith(2, "list_accounts", undefined);
   });
 
-  it("reauth returns the auth url", async () => {
-    invokeMock.mockResolvedValueOnce({ authUrl: "https://accounts.google/x" });
+  it("reauth returns the session id + auth url (A3)", async () => {
+    invokeMock.mockResolvedValueOnce({
+      sessionId: "sess-reauth",
+      authUrl: "https://accounts.google/x",
+    });
     const store = useAccountsStore();
-    const url = await store.reauth("acc-1");
+    const { sessionId, authUrl } = await store.reauth("acc-1");
     expect(invokeMock).toHaveBeenCalledWith("reauth_account", {
       accountId: "acc-1",
     });
-    expect(url).toBe("https://accounts.google/x");
+    expect(sessionId).toBe("sess-reauth");
+    expect(authUrl).toBe("https://accounts.google/x");
+  });
+
+  it("completeReauth finishes onto the existing account when oauth completed (A3)", async () => {
+    invokeMock.mockReset();
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "poll_oauth_status":
+          return Promise.resolve({ kind: "complete" });
+        case "finish_add_account":
+          return Promise.resolve({
+            id: "acc-1",
+            email: "user@example.com",
+            displayName: null,
+            state: "ok",
+            encryptionEnabled: false,
+            createdAt: 0,
+            lastSyncedAt: null,
+          });
+        case "list_accounts":
+          return Promise.resolve([]);
+        default:
+          return Promise.resolve(undefined);
+      }
+    });
+    const store = useAccountsStore();
+    const done = await store.completeReauth("sess-reauth");
+    expect(done).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("finish_add_account", {
+      session: "sess-reauth",
+      displayName: null,
+    });
   });
 
   it("markNeedsReauth flips state and feeds the needsReauth getter", async () => {
@@ -153,11 +188,12 @@ describe("sources store", () => {
   it("add posts the request under `req` and re-lists", async () => {
     const store = useSourcesStore();
     const created = makeSource({ id: "src-new" });
-    invokeMock.mockResolvedValueOnce(created); // add_source
+    invokeMock.mockResolvedValueOnce({ source: created, recoveryPhrase: null }); // add_source
     invokeMock.mockResolvedValueOnce([created]); // refresh
     const req = {
       accountId: "acc-1",
       displayName: "Docs",
+      localPathToken: "tok-1",
       localPath: "/home/u/docs",
       driveFolderId: "f-1",
       driveFolderPath: "Backups/Docs",
@@ -168,7 +204,7 @@ describe("sources store", () => {
     };
     const result = await store.add(req);
     expect(invokeMock).toHaveBeenNthCalledWith(1, "add_source", { req });
-    expect(result.id).toBe("src-new");
+    expect(result.source.id).toBe("src-new");
     expect(store.sources).toHaveLength(1);
   });
 

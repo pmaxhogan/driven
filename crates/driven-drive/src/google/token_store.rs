@@ -47,6 +47,13 @@ const TARGET: &str = "driven::drive::token";
 /// keyring "service" namespace for Driven Google refresh tokens (SPEC s4.1).
 const KEYRING_SERVICE: &str = "driven.google.refresh_token";
 
+/// keyring "service" namespace for Driven per-account BYO OAuth client
+/// credentials (A1 / DESIGN s6.1). A refresh token is bound to the OAuth client
+/// that minted it, so the account's `client_id` + `client_secret` MUST persist
+/// alongside the refresh token - otherwise a restart falls back to the
+/// env/default client and every BYO-client refresh fails (`invalid_client`).
+const KEYRING_CLIENT_CREDS_SERVICE: &str = "driven.google.client_creds";
+
 /// Google's OAuth token endpoint (SPEC s4.1 refresh path).
 const GOOGLE_TOKEN_URL: &str = "https://oauth2.googleapis.com/token";
 
@@ -111,6 +118,91 @@ impl KeyringTokenStore {
     /// entry is a no-op (SPEC s4.1).
     pub fn delete_refresh_token(&self) -> anyhow::Result<()> {
         map_delete_result(self.entry()?.delete_credential())
+    }
+}
+
+/// A persisted per-account BYO OAuth client credential pair (A1).
+///
+/// `client_secret` is empty for a PKCE installed-app client (no real secret).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ClientCreds {
+    /// The OAuth client id that minted the account's refresh token.
+    pub client_id: String,
+    /// The OAuth client secret (empty for a PKCE installed-app client).
+    pub client_secret: String,
+}
+
+/// Keychain wrapper for an account's BYO OAuth client credentials (A1 / DESIGN
+/// s6.1). One entry per account, in the [`KEYRING_CLIENT_CREDS_SERVICE`]
+/// namespace, keyed by account id. The two fields are stored as a single
+/// newline-separated record (`client_id\nclient_secret`) so one keychain entry
+/// holds the pair. The secret is NEVER logged.
+pub struct ClientCredsStore {
+    account: String,
+}
+
+impl ClientCredsStore {
+    /// Builds a client-creds store scoped to `account` (the keychain lookup key
+    /// within the Driven client-creds namespace).
+    pub fn new(account: impl Into<String>) -> Self {
+        Self {
+            account: account.into(),
+        }
+    }
+
+    /// Opens the keychain entry for this account's client creds.
+    fn entry(&self) -> anyhow::Result<Entry> {
+        Entry::new(KEYRING_CLIENT_CREDS_SERVICE, &self.account)
+            .map_err(|e| anyhow::anyhow!("keychain: failed to open client-creds entry: {e}"))
+    }
+
+    /// Persists `creds` for this account (A1). Stored as
+    /// `client_id\nclient_secret` in one keychain entry.
+    pub fn store(&self, creds: &ClientCreds) -> anyhow::Result<()> {
+        let record = encode_client_creds(creds);
+        self.entry()?
+            .set_password(&record)
+            .map_err(|e| anyhow::anyhow!("keychain: failed to store client creds: {e}"))
+    }
+
+    /// Loads the stored client creds, or `None` if the account never persisted
+    /// any (a default/env-client account). A `NoEntry` maps to `Ok(None)`.
+    pub fn load(&self) -> anyhow::Result<Option<ClientCreds>> {
+        match self.entry()?.get_password() {
+            Ok(record) => Ok(Some(decode_client_creds(&record))),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(e) => Err(anyhow::anyhow!(
+                "keychain: failed to load client creds: {e}"
+            )),
+        }
+    }
+
+    /// Deletes the stored client creds (e.g. on account removal). Absent entry
+    /// is a no-op.
+    pub fn delete(&self) -> anyhow::Result<()> {
+        map_delete_result(self.entry()?.delete_credential())
+    }
+}
+
+/// Encode a [`ClientCreds`] pair as the single keychain record
+/// `client_id\nclient_secret`. Pure so it is unit-testable without a keychain.
+fn encode_client_creds(creds: &ClientCreds) -> String {
+    format!("{}\n{}", creds.client_id, creds.client_secret)
+}
+
+/// Decode a keychain record (`client_id\nclient_secret`) into [`ClientCreds`].
+/// A record with no newline is treated as a bare client id (empty secret). Pure
+/// so it is unit-testable without a keychain.
+fn decode_client_creds(record: &str) -> ClientCreds {
+    match record.split_once('\n') {
+        Some((id, secret)) => ClientCreds {
+            client_id: id.to_string(),
+            client_secret: secret.to_string(),
+        },
+        None => ClientCreds {
+            client_id: record.to_string(),
+            client_secret: String::new(),
+        },
     }
 }
 
@@ -399,6 +491,38 @@ mod tests {
     fn map_load_ok_is_some() {
         let r = map_load_result(Ok("tok".to_string())).unwrap();
         assert_eq!(r, Some("tok".to_string()));
+    }
+
+    #[test]
+    fn client_creds_encode_decode_round_trips() {
+        // A1: a BYO client id + secret round-trips through the single keychain
+        // record (`client_id\nclient_secret`).
+        let creds = ClientCreds {
+            client_id: "byo-id.apps.googleusercontent.com".to_string(),
+            client_secret: "byo-secret".to_string(),
+        };
+        let record = encode_client_creds(&creds);
+        assert_eq!(decode_client_creds(&record), creds);
+    }
+
+    #[test]
+    fn client_creds_decode_tolerates_pkce_empty_secret() {
+        // A PKCE installed-app client has an empty secret; the record is
+        // `id\n` and decodes to an empty secret.
+        let creds = ClientCreds {
+            client_id: "pkce-id".to_string(),
+            client_secret: String::new(),
+        };
+        let record = encode_client_creds(&creds);
+        assert_eq!(decode_client_creds(&record), creds);
+        // A bare record with no newline is treated as a client id, empty secret.
+        assert_eq!(
+            decode_client_creds("bare-id"),
+            ClientCreds {
+                client_id: "bare-id".to_string(),
+                client_secret: String::new(),
+            }
+        );
     }
 
     #[test]
