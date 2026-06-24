@@ -623,6 +623,52 @@ impl SyncOrchestrator {
         });
     }
 
+    /// Persist one `activity_log` row AND broadcast it as
+    /// [`OrchestratorEvent::ActivityWritten`] (SPEC s11.7 `activity:new`).
+    ///
+    /// The SINGLE chokepoint every orchestrator activity-record helper routes
+    /// through, so the live-tail emission is GUARANTEED for every durable
+    /// activity row (M7: the app shell's event bridge re-emits the carried
+    /// [`ActivityEntry`] to the webview within 500ms - event-driven, no
+    /// polling). The broadcast carries the assigned auto-increment id so the
+    /// webview dedups the live tail against the paged history.
+    ///
+    /// A write hiccup is logged and skips the broadcast (no phantom entry) but
+    /// never aborts the cycle - the upload pipeline must not be held hostage by
+    /// an activity-log error (mirrors the prior per-helper contract). A `send`
+    /// with no subscribers is benign: the row is durable and the next
+    /// `query_activity` page surfaces it.
+    async fn record_activity(&self, row: NewActivity) {
+        let entry = crate::types::ActivityEntry {
+            // The id is filled in from the storage layer's assigned value below;
+            // a placeholder here is never broadcast (we only emit on Ok).
+            id: 0,
+            ts: row.ts,
+            source_id: row.source_id.map(|s| s.to_string()),
+            level: row.level,
+            event_type: row.event_type.clone(),
+            file_count: row.file_count,
+            bytes: row.bytes,
+            message: row.message.clone(),
+        };
+        match self.state.write_activity(row).await {
+            Ok(id) => {
+                let entry = crate::types::ActivityEntry { id: id.0, ..entry };
+                let _ = self
+                    .events
+                    .send(OrchestratorEvent::ActivityWritten { entry });
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: TARGET,
+                    event_type = %entry.event_type,
+                    %err,
+                    "failed to write activity row; live tail not emitted"
+                );
+            }
+        }
+    }
+
     /// Evaluates the power / network gates before a batch (DESIGN s5.7, s5.8).
     ///
     /// Order mirrors DESIGN s5.7's precedence: a manual pause wins over every
@@ -800,9 +846,7 @@ impl SyncOrchestrator {
                 bytes: None,
                 message: Some(collision.as_str().to_string()),
             };
-            if let Err(err) = self.state.write_activity(row).await {
-                tracing::warn!(target: TARGET, source_id = %source_id, path = %collision, %err, "failed to write unicode_collision activity row");
-            }
+            self.record_activity(row).await;
         }
     }
 
@@ -831,9 +875,7 @@ impl SyncOrchestrator {
                 bytes: None,
                 message: Some(path.as_str().to_string()),
             };
-            if let Err(err) = self.state.write_activity(row).await {
-                tracing::warn!(target: TARGET, source_id = %source_id, path = %path, %err, "failed to write ads_skipped activity row");
-            }
+            self.record_activity(row).await;
         }
     }
 
@@ -861,9 +903,7 @@ impl SyncOrchestrator {
                 bytes: None,
                 message: Some(shown.clone()),
             };
-            if let Err(err) = self.state.write_activity(row).await {
-                tracing::warn!(target: TARGET, source_id = %source_id, path = %shown, %err, "failed to write invalid_filename activity row");
-            }
+            self.record_activity(row).await;
         }
     }
 
@@ -904,9 +944,7 @@ impl SyncOrchestrator {
                 bytes: None,
                 message: Some(path.as_str().to_string()),
             };
-            if let Err(err) = self.state.write_activity(row).await {
-                tracing::warn!(target: TARGET, source_id = %source_id, %err, "failed to write outcome activity row");
-            }
+            self.record_activity(row).await;
         }
     }
 
@@ -3511,6 +3549,11 @@ mod tests {
             OrchestratorConfig::default(),
         );
 
+        // M7: every durable activity write must ALSO broadcast an
+        // ActivityWritten event (the app shell re-emits it as `activity:new`
+        // for the live tail). Subscribe before the write so the event is caught.
+        let mut events = orch.subscribe();
+
         let collider = RelativePath::try_from("dir/caf\u{e9}.txt".to_string()).unwrap();
         orch.record_collisions(src_id, std::slice::from_ref(&collider))
             .await;
@@ -3529,6 +3572,21 @@ mod tests {
             "row carries the colliding path"
         );
         assert_eq!(row.source_id, Some(src_id), "row is scoped to the source");
+
+        // M7: the ActivityWritten broadcast carries the same row as an
+        // ActivityEntry (the wire shape) with the storage-assigned id.
+        let mut saw_activity = None;
+        while let Ok(ev) = events.try_recv() {
+            if let OrchestratorEvent::ActivityWritten { entry } = ev {
+                saw_activity = Some(entry);
+                break;
+            }
+        }
+        let entry = saw_activity.expect("ActivityWritten broadcast on a durable activity write");
+        assert_eq!(entry.level, ActivityLevel::Error);
+        assert_eq!(entry.event_type, "local.unicode_collision");
+        assert_eq!(entry.message.as_deref(), Some("dir/caf\u{e9}.txt"));
+        assert_eq!(entry.source_id, Some(src_id.to_string()));
     }
 
     // --- P1-7: the real run() event loop ------------------------------------

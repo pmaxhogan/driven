@@ -1,13 +1,14 @@
 //! Tauri IPC command surface (SPEC s11).
 //!
 //! M6 lands the accounts / sources / settings surface (SPEC s11.1 / s11.2 /
-//! s11.6) alongside the M5 sync commands (SPEC s11.3); the restore + activity
-//! surface (SPEC s11.4 / s11.5) is M7/M8. The shared [`CommandError`] + the
-//! [`validate_writable_dest`] path-safety helper live here; the per-area
-//! commands live in [`accounts`], [`sources`], [`settings`], and [`sync`], and
-//! the shared DTOs in [`dtos`].
+//! s11.6) alongside the M5 sync commands (SPEC s11.3); M7 adds the activity
+//! surface (SPEC s11.4, [`activity`]); the restore surface (SPEC s11.5) is M8.
+//! The shared [`CommandError`] + the [`validate_writable_dest`] path-safety
+//! helper live here; the per-area commands live in [`accounts`], [`activity`],
+//! [`sources`], [`settings`], and [`sync`], and the shared DTOs in [`dtos`].
 
 pub mod accounts;
+pub mod activity;
 pub mod dialogs;
 pub mod dtos;
 pub mod settings;

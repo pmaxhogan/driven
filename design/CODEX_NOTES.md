@@ -817,3 +817,101 @@ The codex recheck-3 (baseline 3af8fc8, M6 @ df46a0e) raised 3 P1 + 2 P2, all loc
 | R3-P2-2 (`sources.rs:update_source`, DESIGN 18.8) | `update_source` accepted any `deep_verify_interval_secs` (0 = constant churn, `u32::MAX` = suppress for decades). | `settings.rs` exposes `DEEP_VERIFY_MIN`/`DEEP_VERIFY_MAX` (`pub(crate)`) and a `validate_deep_verify_interval(value)` helper sharing the SAME `check_range` bound the global settings validator uses (3600..=31_536_000), returning the stable `internal.invalid_input` s24 code; `update_source` calls it on the patch value BEFORE persisting. Test: 0, `u32::MAX`, just-below-min, and just-above-max rejected; the 7-day default + both inclusive bounds accepted. |
 
 Cross-cutting: backend/frontend contracts stayed in sync (the only UI additions are the `recoveryPhrase.revealFirstHint` `en-US` key + the store's `phraseRevealed`/`markPhraseRevealed` surface; no DTO shape changed, no new sqlx query/migration). All gates green: `cargo build/clippy(-D warnings)/test --workspace` (539 passed, google_e2e + elevation honest gate-skip), `build -p driven-app`, `deny check`, `fmt --check`; `pnpm install` (lockfile unchanged), `pnpm lint/test:unit (43 passed)/build` (vue-tsc clean). Anti-fake-green stub sweep on the M6 non-test surface: zero `todo!`/`unimplemented!`/`unreachable!` (the planner/scanner/orchestrator `unimplemented!()` are pre-existing `#[cfg(test)]` Fake doubles, outside the touched surface).
+
+## M6 codex recheck-4 (FINAL) - ACCEPTED RESIDUALS; M6 review CLOSED
+
+The codex recheck-4 (baseline 3af8fc8, M6 @ f9fb164, CI + Chaos GREEN, vue-tsc clean)
+raised **1 P1 + 6 P2** (`.claude/codex-reviews/M6-recheck4-20260624-095729.md`). Per the
+user-set close point ("round-4, then truly close"), M6 review is now **CLOSED** - these are
+ACCEPTED RESIDUALS tracked for the **M9 pre-GA hardening** pass (NOT faked-green; none are
+normal-single-user-use data loss). R4-P1-1 is flagged DATA-SAFETY / top pre-GA priority.
+
+- **R4-P1-1 [P1, DATA-SAFETY -> fix FIRST in M9] (`sources.rs:194`)** - the first encrypted
+  source is written `enabled:true` and `reconfigure_account` runs BEFORE the user
+  acknowledges the one-time recovery phrase. The reveal+ack gate (R3-P1-1) is CLIENT-SIDE
+  only; if the app/renderer dies in the narrow window between `add_source` returning (phrase
+  in hand) and the user ack, the source stays enabled + encrypted and future syncs create
+  backups the user can never restore on a new machine. PROPER FIX (root-cause): persist the
+  first encrypted source as DISABLED/pending; add a backend `ack_recovery_phrase_saved(source_id)`
+  command that enables + reconfigures only after a durable ack; exclude pending sources from
+  scheduler + manual sync. (Narrow crash-window, so deferred - but it is the correct design
+  and supersedes the layered UI gates; do this before any real release.)
+- R4-P2-1 (`sources.rs:432`) - `preview_exclusions` accepts BOTH `source_id` and
+  `local_path_token` (silently prefers `source_id`) and builds the matcher WITHOUT
+  `validate_source_patterns`. Fix: `match (source_id, local_path_token)` reject both/neither;
+  validate patterns before building the synthetic source.
+- R4-P2-2 (`sources.rs:401`) - `pick_drive_folder` always returns `current_folder_path=""`,
+  so `backup_sources.drive_folder_path` is persisted blank/wrong. Fix: backend returns the
+  real breadcrumb, OR frontend persists its own crumb instead of the empty backend value.
+- R4-P2-3 (`sources.rs:194`) - `add_source` trusts renderer `display_name`/`drive_folder_id`/
+  `drive_folder_path` into SQLite with no printable/path-shape/length validation. Fix: shared
+  validators + length caps before building `SourceRow`.
+- R4-P2-4 (`accounts.rs:109`) - OAuth wizard sessions live in a process-global HashMap with
+  no TTL/cleanup except a successful finish; abandoned flows accumulate. Fix: add
+  created/updated timestamps, expire stale/terminal sessions, expose a cancel command.
+- R4-P2-5 (`accounts.rs:696`, `settings.rs:1777`) - the userinfo + GitHub-releases
+  `reqwest::Client`s have no connect/total timeout; a blackholed request hangs the IPC
+  command. Fix: explicit `connect_timeout` + `timeout`.
+- R4-P2-6 (`sources.rs:742`) - overlap detection SKIPS an existing source whose path no
+  longer canonicalizes (fail-open), letting a temporarily-missing root be overlapped then
+  revived into a nested-source state. Fix: persist canonical roots at add time and compare
+  against the stored value, or fail closed when an existing root cannot be resolved.
+
+These (esp. R4-P1-1) are tracked as a first-class pre-GA task; M9 (release pipeline) is the
+gate before any real release, so the hardening pass lands there.
+
+## M7 - Activity dashboard (ROADMAP M7)
+
+M7 builds the Activity dashboard end-to-end. No spec deviations; a few design
+decisions worth recording for later milestones:
+
+- **Pagination is OFFSET-based, not a cursor.** SPEC s11.4 / s18.8 define the
+  page selector as `PageRequest { page, limit }` (offset = page*limit) and the
+  existing `StateRepo::query_activity` (shipped pre-M7) already implements it
+  that way with a `1..=10_000` limit guard and a matching `COUNT(*)` total.
+  M7 REUSES that method verbatim rather than introducing a `(timestamp, id)`
+  cursor. The task brief preferred a cursor "so live inserts do not shift
+  pages"; that risk is handled CLIENT-SIDE instead: the live tail and the paged
+  history converge into ONE list in the Pinia store, deduped by row id, so a row
+  that a new insert shifts across a page boundary is recognised as already-seen
+  and never double-counted. Net effect matches the cursor goal (scroll back
+  through 1000+ events with no duplicates and no re-query of earlier pages)
+  without a schema/SQL change or sqlx re-prepare (0 drift). A true keyset cursor
+  is a possible later optimisation if offset depth becomes a perf concern.
+- **`activity:new` emission is now GUARANTEED at the single orchestrator
+  chokepoint.** The event channel + `emit_activity_new` helper existed since M5
+  (`#[allow(dead_code)]`, uncalled). M7 adds `OrchestratorEvent::ActivityWritten
+  { entry: ActivityEntry }` and a private `Orchestrator::record_activity(row)`
+  helper that writes the row AND broadcasts the assigned-id entry; all four
+  orchestrator activity-record helpers (`record_collisions`,
+  `record_ads_skipped`, `record_invalid_filenames`, `record_outcome_activity`)
+  now route through it, so EVERY durable activity row emits. The app-shell event
+  bridge (`assembly.rs spawn_event_bridge`) translates `ActivityWritten` ->
+  `activity:new`. In NON-test code the orchestrator is the SOLE `write_activity`
+  caller (the only other call site is a settings.rs test), so this covers the
+  whole production write path.
+- **`ActivityEntry` is the single wire DTO** (defined in `driven-core` types,
+  serde camelCase, `From<&ActivityRow>`): it is both the `activity:new` payload
+  AND the per-row element of `ActivityPageDto`, so the live tail and the paged
+  history share one shape with no drift. `query_activity` IPC bounds the page
+  `limit` to `1..=1000` and validates `min_level` (enum), `source_id` (UUID),
+  and the `event_types` IN-list (count + per-entry length) before the query
+  (SPEC s11.6.1; scalar-only filters, no raw paths). The retention command
+  `clear_activity_older_than` passes through to the batched prune with a
+  5M-row hard cap.
+- **"Export diagnostic bundle" button** (ROADMAP M7 task list; DESIGN s8.3
+  places it on the Activity dashboard). The backend command
+  (`export_diagnostic_bundle`) + its backend-owned save-dialog/dialog-token flow
+  shipped in M6 and is also surfaced on the About tab. M7 adds the button to
+  Activity.vue per DESIGN s8.3, reusing the SAME `pickSaveZipDialog` ->
+  `exportDiagnosticBundle` flow (no new backend work); both entry points call the
+  one M6 command.
+
+All gates green: `cargo build/clippy(-D warnings)/test --workspace` (driven-core
+185 + driven-app 94 + the rest; google_e2e + elevation honest gate-skip),
+`build -p driven-app`, `deny check`, `fmt --check`; `pnpm install` (lockfile
+unchanged), `pnpm lint/test:unit (54 passed, 11 new activity-store)/build`
+(vue-tsc clean). Anti-fake-green stub sweep on the touched surface
+(`src-tauri/src` + orchestrator.rs/types.rs): zero `todo!`/`unimplemented!`/
+`unreachable!` in non-test code (the orchestrator `unimplemented!()` are
+pre-existing `#[cfg(test)]` Fake doubles).

@@ -781,10 +781,25 @@ fn spawn_event_bridge(
                     }
                     tray::notify_needs_reauth(&app, &email);
                 }
+                Ok(OrchestratorEvent::ActivityWritten { entry }) => {
+                    // M7: forward every durable activity row to the webview as
+                    // `activity:new` (SPEC s11.7) so the Activity dashboard's
+                    // live tail updates within 500ms - event-driven, no polling.
+                    // The carried `ActivityEntry` is already the camelCase wire
+                    // shape, so it re-emits with no re-mapping.
+                    if let Err(err) = events::emit_activity_new(&app, &entry) {
+                        tracing::debug!(
+                            target: TARGET,
+                            account_id = %account_id,
+                            %err,
+                            "emit activity:new failed"
+                        );
+                    }
+                }
                 Ok(_) => {
                     // Progress / Power / Network events: not bridged to the
-                    // webview in M5 (the progress + activity DTOs land with the
-                    // M6 IPC layer). The tray's coarse state is driven by
+                    // webview in M5 (the progress DTO lands with a later
+                    // milestone). The tray's coarse state is driven by
                     // StateChanged above.
                 }
                 Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {

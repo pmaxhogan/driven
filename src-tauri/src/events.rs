@@ -24,9 +24,10 @@ pub const EVENT_SYNC_SOURCE_PROGRESS: &str = "sync:source_progress";
 /// `activity:new` - a new activity-log entry (payload: `ActivityEntry`,
 /// SPEC s11.7).
 ///
-/// Reserved for M7 (activity dashboard): the `ActivityEntry` DTO does not exist
-/// in M5, so the channel constant + its emit helper are defined but uncalled.
-#[allow(dead_code)]
+/// M7 (activity dashboard): the orchestrator broadcasts
+/// `OrchestratorEvent::ActivityWritten` on every durable activity write and the
+/// event bridge re-emits the carried `ActivityEntry` on this channel for the
+/// dashboard's live tail.
 pub const EVENT_ACTIVITY_NEW: &str = "activity:new";
 /// `account:needs_reauth` - a refresh token was revoked (payload:
 /// `{ account_id, email }`, SPEC s11.7).
@@ -69,9 +70,9 @@ pub fn emit_sync_status_changed<P: Serialize + Clone>(
 
 /// Broadcast `activity:new` with the new activity entry (SPEC s11.7).
 ///
-/// Reserved for M7 (activity dashboard): no M5 caller emits activity entries
-/// yet (the `ActivityEntry` DTO lands with that milestone).
-#[allow(dead_code)]
+/// M7 (activity dashboard): the event bridge calls this on every
+/// `OrchestratorEvent::ActivityWritten`, forwarding the carried `ActivityEntry`
+/// (already the camelCase wire shape) to the webview's live tail.
 pub fn emit_activity_new<P: Serialize + Clone>(app: &AppHandle, entry: &P) -> tauri::Result<()> {
     app.emit(EVENT_ACTIVITY_NEW, entry)
 }

@@ -309,6 +309,9 @@ pub fn run() {
             commands::settings::export_diagnostic_bundle,
             commands::settings::check_for_updates,
             commands::settings::list_releases,
+            // SPEC s11.4 activity (M7).
+            commands::activity::query_activity,
+            commands::activity::clear_activity_older_than,
         ])
         .build(tauri::generate_context!());
 

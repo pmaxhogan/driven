@@ -483,6 +483,71 @@ impl ErrorDetail {
     }
 }
 
+// -----------------------------------------------------------------------------
+// ActivityEntry: the wire shape of one activity-log row (SPEC s11.4 / s11.7)
+// -----------------------------------------------------------------------------
+
+/// One activity-log entry as it crosses the IPC boundary to the webview
+/// (SPEC s11.4 `query_activity` page rows, SPEC s11.7 `activity:new` payload).
+///
+/// This is the SINGLE wire DTO for activity: it is both the per-row element of
+/// the paginated `ActivityPage` returned by `query_activity` AND the payload of
+/// the live-tail `activity:new` event the orchestrator broadcasts. Defining it
+/// here (in `driven-core`) - rather than only in the app-shell IPC layer - lets
+/// [`OrchestratorEvent::ActivityWritten`] carry it directly, so the app shell's
+/// event bridge re-emits it to the webview with no re-serialisation or shape
+/// drift between the live tail and the paged history.
+///
+/// Wire casing is `camelCase` to match the hand-written TypeScript IPC surface
+/// (DESIGN s8.6; `design/CODEX_NOTES.md` M6 "the typed-IPC surface is camelCase
+/// over the wire"). It mirrors [`crate::state::ActivityRow`] field-for-field with
+/// `source_id` rendered as the UUID string the webview already keys sources by.
+#[derive(Clone, Debug, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityEntry {
+    /// Stable auto-increment row id (`activity_log.id`). The webview dedups the
+    /// live tail against the paged history by this id.
+    pub id: i64,
+    /// Wall-time the event occurred (Unix epoch ms).
+    pub ts: UnixMs,
+    /// Owning source id (UUID string), or `None` for a global event.
+    pub source_id: Option<String>,
+    /// Severity: `info` | `warn` | `error` (the serialised
+    /// [`crate::state::ActivityLevel`]).
+    pub level: crate::state::ActivityLevel,
+    /// Event-type discriminant (e.g. `upload_done`, `scan_done`, a SPEC s24
+    /// error code). Used as the i18n lookup base for the row's label.
+    pub event_type: String,
+    /// File count associated with the event, if any.
+    pub file_count: Option<u64>,
+    /// Byte count associated with the event, if any.
+    pub bytes: Option<u64>,
+    /// Free-form human-readable message, if any (already redaction-safe: the
+    /// orchestrator only writes paths/codes here, never secrets).
+    pub message: Option<String>,
+}
+
+impl From<&crate::state::ActivityRow> for ActivityEntry {
+    fn from(row: &crate::state::ActivityRow) -> Self {
+        Self {
+            id: row.id.0,
+            ts: row.ts,
+            source_id: row.source_id.map(|s| s.to_string()),
+            level: row.level,
+            event_type: row.event_type.clone(),
+            file_count: row.file_count,
+            bytes: row.bytes,
+            message: row.message.clone(),
+        }
+    }
+}
+
+impl From<crate::state::ActivityRow> for ActivityEntry {
+    fn from(row: crate::state::ActivityRow) -> Self {
+        (&row).into()
+    }
+}
+
 /// An event the orchestrator broadcasts to long-lived consumers
 /// (the IPC event bridge, the tray, the activity-log writer) (SPEC s5
 /// `events: broadcast::Sender<OrchestratorEvent>`, s11.7).
@@ -528,6 +593,18 @@ pub enum OrchestratorEvent {
     AccountNeedsReauth {
         /// The account that needs re-consent.
         account_id: AccountId,
+    },
+    /// A new `activity_log` row was just written (SPEC s11.7 `activity:new`).
+    ///
+    /// Broadcast by the orchestrator immediately after every durable
+    /// `write_activity`, so the app shell's event bridge can re-emit the
+    /// carried [`ActivityEntry`] to the webview as `activity:new` for the
+    /// live tail (M7 acceptance: the tail reflects an event within 500ms,
+    /// event-driven - no polling). The entry carries the assigned row id so
+    /// the webview can dedup it against the paged history.
+    ActivityWritten {
+        /// The entry just persisted (the wire shape the webview consumes).
+        entry: ActivityEntry,
     },
 }
 

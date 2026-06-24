@@ -514,3 +514,66 @@ pub struct ReleaseDto {
     /// The release page URL.
     pub url: String,
 }
+
+// -----------------------------------------------------------------------------
+// Activity (SPEC s11.4)
+// -----------------------------------------------------------------------------
+
+/// Filter body for `query_activity` (SPEC s11.4 `ActivityFilter`).
+///
+/// Every field is optional; an empty filter matches every row, and present
+/// fields combine with logical AND. The values arrive from the (untrusted)
+/// webview and are validated + bounded by the command body BEFORE they reach the
+/// query (SPEC s11.6.1: scalar-only filters, no raw paths). Mirrors
+/// [`driven_core::state::ActivityFilter`] over the camelCase wire.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityFilterDto {
+    /// Limit to a single source (UUID string); a malformed id is rejected.
+    pub source_id: Option<String>,
+    /// Lower-bound timestamp (Unix ms), inclusive.
+    pub since_ms: Option<i64>,
+    /// Upper-bound timestamp (Unix ms), exclusive.
+    pub before_ms: Option<i64>,
+    /// Minimum severity: `info` | `warn` | `error`; an unknown value is
+    /// rejected (SPEC s11.6.1: validate enum filters).
+    pub min_level: Option<String>,
+    /// Event-type discriminants to include; empty = all. Each is bounded in
+    /// length and count so a hostile renderer cannot build a giant IN-list.
+    #[serde(default)]
+    pub event_types: Vec<String>,
+}
+
+/// Page selector for `query_activity` (SPEC s11.4 `PageRequest`), mirroring
+/// [`driven_core::state::PageRequest`]. Zero-based `page`, `limit` rows per page;
+/// the command bounds `limit` to `1..=MAX_ACTIVITY_PAGE_LIMIT` before the query.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct PageRequestDto {
+    /// Zero-based page index.
+    pub page: u32,
+    /// Max rows per page (bounded by the command, SPEC s11.6.1).
+    pub limit: u32,
+}
+
+/// One page of activity returned by `query_activity` (SPEC s11.4
+/// `ActivityPage`): newest-first rows plus paging metadata so the webview can
+/// accumulate pages client-side and know whether more remain.
+///
+/// `has_more` is derived from `total` + the requested page so the frontend
+/// pager does not have to re-derive the arithmetic; the live tail dedups
+/// prepended `activity:new` entries against the accumulated pages by row id.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityPageDto {
+    /// The matching entries for this page, newest-first.
+    pub entries: Vec<driven_core::types::ActivityEntry>,
+    /// Total matching rows across all pages (for the pager + `has_more`).
+    pub total: u64,
+    /// The zero-based page index these rows correspond to.
+    pub page: u32,
+    /// The page size used for this query (the bounded limit).
+    pub limit: u32,
+    /// `true` if at least one more page exists after this one.
+    pub has_more: bool,
+}
