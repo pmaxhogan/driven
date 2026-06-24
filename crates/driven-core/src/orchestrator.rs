@@ -736,6 +736,24 @@ impl SyncOrchestrator {
                     self.reconciled.lock().await.done.insert(source.id);
                 }
                 Err(err) => {
+                    // R-P2-2: a revoked token observed during the reconcile
+                    // corrupt-trash retry surfaces as a classified
+                    // `ReconcileError::AuthInvalidGrant`. Handle it IDENTICALLY
+                    // to the normal-path V-F transition (DESIGN s5.4): mark the
+                    // account needs_reauth, emit AccountNeedsReauth, suspend the
+                    // loop, and STOP reconciling the remaining sources - there
+                    // is no point pushing more remote work through a dead
+                    // credential. The source is NOT marked reconciled (it
+                    // retries once the user re-links).
+                    if crate::executor::reconcile_error_is_invalid_grant(&err) {
+                        tracing::warn!(
+                            target: TARGET,
+                            source_id = %source.id,
+                            "reconcile hit auth.invalid_grant; entering needs_reauth and stopping the reconcile pass (DESIGN s5.4)"
+                        );
+                        self.enter_needs_reauth().await;
+                        return Err(err);
+                    }
                     tracing::warn!(
                         target: TARGET,
                         source_id = %source.id,
@@ -952,6 +970,25 @@ impl SyncOrchestrator {
         if !invalid_grant {
             return false;
         }
+        self.enter_needs_reauth().await;
+        true
+    }
+
+    /// R-P2-2 + V-F (DESIGN s5.4): run the needs-reauth transition for THIS
+    /// account: persist [`AccountState::NeedsReauth`], emit
+    /// [`OrchestratorEvent::AccountNeedsReauth`] (the app shell turns it into a
+    /// reauth prompt + OS notification), and SUSPEND the orchestrator loop so it
+    /// EXITS after this cycle and issues zero further remote calls until the M6
+    /// reauth flow rebuilds it with a fresh token.
+    ///
+    /// Shared by the normal-path [`Self::handle_auth_failure`] (an
+    /// `OpOutcome::Failed { AuthInvalidGrant }` from execute) AND the reconcile
+    /// corrupt-trash path ([`Self::reconcile_once`] detecting
+    /// [`ReconcileError::AuthInvalidGrant`]) so a revoked token is handled
+    /// IDENTICALLY no matter which remote call first observed it. The state
+    /// write is best-effort logged (a transient DB hiccup must not abort the
+    /// transition), but the in-memory event + the suspend flag fire regardless.
+    async fn enter_needs_reauth(&self) {
         tracing::warn!(
             target: TARGET,
             account_id = %self.account_id,
@@ -973,7 +1010,6 @@ impl SyncOrchestrator {
         // suspended until the M6 reauth flow rebuilds it with a fresh token.
         self.suspended
             .store(true, std::sync::atomic::Ordering::SeqCst);
-        true
     }
 
     /// Runs the full scan -> plan -> execute -> verify pipeline for one source
@@ -1706,6 +1742,12 @@ mod tests {
         /// `?` propagates) - drives the M3.5 "VSS released even on a mid-loop
         /// error" test.
         execute_returns_err: std::sync::atomic::AtomicBool,
+        /// R-P2-2: when `true`, `reconcile` returns a classified
+        /// `ReconcileError::AuthInvalidGrant` (wrapped into `anyhow`) - simulates
+        /// a revoked token observed during the corrupt-trash retry, so the
+        /// "reconcile invalid_grant -> needs_reauth + suspend" test can assert
+        /// the orchestrator runs the V-F transition off the reconcile path.
+        reconcile_auth_fail: std::sync::atomic::AtomicBool,
     }
 
     #[async_trait]
@@ -1760,6 +1802,14 @@ mod tests {
             // WITHOUT recording the source as adopted, so the P1-1 test can
             // assert the failed source is retried on the next cycle.
             self.reconciles.fetch_add(1, Ordering::SeqCst);
+            // R-P2-2: a revoked token during the reconcile corrupt-trash retry
+            // surfaces as a CLASSIFIED error the orchestrator must turn into
+            // needs_reauth + suspend (not a plain transient retry).
+            if self.reconcile_auth_fail.load(Ordering::SeqCst) {
+                return Err(anyhow::Error::new(
+                    crate::executor::ReconcileError::AuthInvalidGrant,
+                ));
+            }
             if self.reconcile_failures_remaining.load(Ordering::SeqCst) > 0 {
                 self.reconcile_failures_remaining
                     .fetch_sub(1, Ordering::SeqCst);
@@ -3150,6 +3200,105 @@ mod tests {
         let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
         let joined =
             res.expect("run() must EXIT after the account is suspended (did not within 5s)");
+        joined
+            .expect("run task panicked")
+            .expect("run() returned Ok on suspend");
+    }
+
+    #[tokio::test]
+    async fn reconcile_invalid_grant_marks_needs_reauth_and_suspends_loop() {
+        // R-P2-2: a revoked token observed during the reconcile corrupt-trash
+        // retry (which never produces an `OpOutcome`, so the normal-path V-F
+        // check never sees it) must run the SAME needs_reauth transition: mark
+        // the account NeedsReauth, emit `AccountNeedsReauth`, and SUSPEND the
+        // loop so subsequent cycles issue ZERO remote work AND the run loop
+        // EXITS. Without the fix the reconcile error was swallowed (logged +
+        // retried) and the account kept hammering the dead credential.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.bin"), b"src a bytes").unwrap();
+        let mut src = source_in(account, dir.path());
+        src.last_deep_verify_at = None;
+        src.last_full_scan_at = None;
+
+        let exec = Arc::new(RecordingExecutor::default());
+        // reconcile (which runs BEFORE execute in the cycle) hits invalid_grant.
+        exec.reconcile_auth_fail.store(true, Ordering::SeqCst);
+        let state = Arc::new(FakeState::with_sources(vec![src.clone()]));
+        let clock = Arc::new(FakeClock::new());
+        clock.advance(std::time::Duration::from_millis(5_000));
+        let orch = Arc::new(SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec.clone(),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock.clone(),
+            OrchestratorConfig::default(),
+        ));
+
+        let mut events = orch.subscribe();
+
+        // The cycle's `reconcile_once().await?` returns Err (the classified
+        // auth error). `run_cycle` surfaces it; the run loop treats that as a
+        // logged failure, but the suspend transition already fired.
+        let res = orch.run_cycle(TickSource::Scheduled).await;
+        assert!(
+            res.is_err(),
+            "the reconcile invalid_grant must surface as a cycle error"
+        );
+
+        // The account was moved to NeedsReauth.
+        assert!(
+            state
+                .account_state_changes()
+                .iter()
+                .any(|(id, st)| *id == account && *st == AccountState::NeedsReauth),
+            "reconcile invalid_grant must mark the account needs_reauth; got {:?}",
+            state.account_state_changes()
+        );
+
+        // The `account:needs_reauth` event was broadcast.
+        let mut saw_event = false;
+        while let Ok(ev) = events.try_recv() {
+            if let OrchestratorEvent::AccountNeedsReauth { account_id } = ev {
+                assert_eq!(account_id, account);
+                saw_event = true;
+            }
+        }
+        assert!(
+            saw_event,
+            "reconcile invalid_grant must emit OrchestratorEvent::AccountNeedsReauth"
+        );
+
+        // The account never reached execute (reconcile failed first) AND a
+        // subsequent cycle is GATED to zero remote work (suspended).
+        assert_eq!(
+            exec.executes.load(Ordering::SeqCst),
+            0,
+            "reconcile invalid_grant must stop the cycle before any execute"
+        );
+        let reconciles_after_first = exec.reconciles.load(Ordering::SeqCst);
+        orch.run_cycle(TickSource::Manual).await.unwrap();
+        assert_eq!(
+            exec.reconciles.load(Ordering::SeqCst),
+            reconciles_after_first,
+            "a suspended (needs_reauth) account must issue ZERO reconcile/remote calls on later cycles"
+        );
+        assert_eq!(
+            exec.executes.load(Ordering::SeqCst),
+            0,
+            "a suspended account must issue ZERO execute calls on later cycles"
+        );
+
+        // The run loop EXITS once suspended (does not keep ticking the dead
+        // credential). Spawn it, fire a trigger, and assert it terminates.
+        let run_orch = orch.clone();
+        let handle = tokio::spawn(async move { run_orch.run().await });
+        orch.trigger(TickSource::Manual).await;
+        let res = tokio::time::timeout(std::time::Duration::from_secs(5), handle).await;
+        let joined =
+            res.expect("run() must EXIT after a reconcile-driven suspend (did not within 5s)");
         joined
             .expect("run task panicked")
             .expect("run() returned Ok on suspend");

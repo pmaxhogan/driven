@@ -2565,12 +2565,25 @@ impl DefaultExecutor {
         }
     }
 
-    /// R2-P1-1: retry trashing a corrupt CREATE object whose earlier trash
-    /// failed (the durable cleanup the reconcile pass drives). Returns `true`
-    /// when the object is confirmed gone (trashed now, or already trashed/gone -
-    /// an idempotent no-op), so the caller can drop the pending op; `false` when
-    /// the trash failed again and the op must be kept for the next cycle.
-    async fn retry_trash_corrupt(&self, file_id: &str, context: &str) -> bool {
+    /// R2-P1-1 + R-P2-2: retry trashing a corrupt CREATE object whose earlier
+    /// trash failed (the durable cleanup the reconcile pass drives). Returns
+    /// `Ok(true)` when the object is confirmed gone (trashed now, or already
+    /// trashed/gone - an idempotent no-op), so the caller can drop the pending
+    /// op; `Ok(false)` when the trash failed for a RETRYABLE reason and the op
+    /// must be kept for the next cycle.
+    ///
+    /// R-P2-2: a trash that fails specifically with `invalid_grant` (a revoked
+    /// refresh token) is NOT a "keep the op and retry" condition - retrying
+    /// hammers a dead credential. It returns `Err(ReconcileError::AuthInvalidGrant)`
+    /// so the reconcile pass can propagate it and the orchestrator runs the SAME
+    /// needs-reauth transition the normal upload path takes (DESIGN s5.4). The
+    /// pacer is still notified (consistent accounting) before the classified
+    /// error is surfaced.
+    async fn retry_trash_corrupt(
+        &self,
+        file_id: &str,
+        context: &str,
+    ) -> Result<bool, ReconcileError> {
         self.pacer.permit_request().await;
         match self.remote.trash(file_id).await {
             Ok(()) => {
@@ -2581,18 +2594,27 @@ impl DefaultExecutor {
                     file_id = %file_id,
                     "reconcile: trashed the previously-stranded corrupt create object"
                 );
-                true
+                Ok(true)
             }
             Err(e) => {
                 let class = classify_drive_error(&e);
                 self.pacer.note_response(class.response_class());
+                if class == DriveError::InvalidGrant {
+                    warn!(
+                        target: TARGET,
+                        name = %context,
+                        file_id = %file_id,
+                        "reconcile: re-trash of the stranded corrupt object hit auth.invalid_grant; account needs reauth (stopping remote work): {e}"
+                    );
+                    return Err(ReconcileError::AuthInvalidGrant);
+                }
                 warn!(
                     target: TARGET,
                     name = %context,
                     file_id = %file_id,
                     "reconcile: re-trash of the stranded corrupt object failed again; keeping the op: {e}"
                 );
-                false
+                Ok(false)
             }
         }
     }
@@ -2835,14 +2857,18 @@ impl Executor for DefaultExecutor {
         for op in pending {
             let payload = PendingOpPayload::from_value(&op.payload_json);
             if let Some(corrupt_file_id) = payload.corrupt_file_id.clone() {
+                // R-P2-2: a revoked token during the trash retry surfaces a
+                // classified error the orchestrator turns into needs-reauth +
+                // suspend; propagate it (do NOT keep hammering the dead token).
                 if self
                     .retry_trash_corrupt(&corrupt_file_id, op.relative_path.as_str())
-                    .await
+                    .await?
                 {
                     self.state.delete_pending_op(op.id).await?;
                 }
-                // Either way, this op is fully handled; never falls through to
-                // the crypto-dependent upload-recovery paths.
+                // Either way (other than the propagated auth error above), this
+                // op is fully handled; never falls through to the crypto-
+                // dependent upload-recovery paths.
                 continue;
             }
             remaining.push(op);
@@ -4025,6 +4051,42 @@ fn classify_from_classification(kind: &DriveErrorClassification) -> DriveError {
         DriveErrorClassification::StorageQuota => DriveError::QuotaExhausted,
         DriveErrorClassification::Other => DriveError::Other,
     }
+}
+
+/// R-P2-2: a typed error surfaced from [`Executor::reconcile`] when the
+/// reconcile pass hit a credential failure that the orchestrator MUST act on
+/// (the refresh token returned `invalid_grant`).
+///
+/// The trait still returns `anyhow::Result<()>` so existing call sites and the
+/// `?`-propagation in `reconcile_once` are unchanged; this type is wrapped into
+/// the returned `anyhow::Error` and the orchestrator downcasts it via
+/// [`reconcile_error_is_invalid_grant`] to drive the SAME needs-reauth
+/// transition the normal-path V-F (DESIGN s5.4) takes. Without this, an
+/// `invalid_grant` raised while RETRYING the trash of a stranded corrupt CREATE
+/// object (the reconcile-only path, which never produces an `OpOutcome`) would
+/// be classified for pacing, logged, and swallowed - leaving the account
+/// hammering a revoked token forever.
+#[derive(Debug, thiserror::Error)]
+pub enum ReconcileError {
+    /// The Drive token returned `invalid_grant` during the corrupt-trash retry
+    /// (or any reconcile remote call). The orchestrator marks the account
+    /// `needs_reauth`, emits `AccountNeedsReauth`, suspends the loop, and stops
+    /// remote work (DESIGN s5.4).
+    #[error("reconcile hit auth.invalid_grant; account needs reauth")]
+    AuthInvalidGrant,
+}
+
+/// R-P2-2: `true` iff `err` (the `anyhow::Error` returned by
+/// [`Executor::reconcile`]) carries a [`ReconcileError::AuthInvalidGrant`] - the
+/// signal that reconcile hit a revoked token and the orchestrator must run the
+/// needs-reauth transition. Downcasts the typed cause; a plain reconcile error
+/// (DB hiccup, transient Drive fault) returns `false` and is retried next cycle.
+#[must_use]
+pub fn reconcile_error_is_invalid_grant(err: &anyhow::Error) -> bool {
+    matches!(
+        err.downcast_ref::<ReconcileError>(),
+        Some(ReconcileError::AuthInvalidGrant)
+    )
 }
 
 /// Extract the stranded corrupt-create file id from a Drive-side error, if it
