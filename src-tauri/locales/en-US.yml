@@ -14,11 +14,25 @@ tray:
   settings: "Settings"
   restore: "Restore"
   quit: "Quit Driven"
+  tooltip:
+    idle: "Driven - idle, last sync OK"
+    syncing: "Driven - syncing..."
+    paused_manual: "Driven - paused"
+    paused_battery: "Driven - paused on battery power"
+    paused_metered: "Driven - paused on metered network"
+    offline: "Connected, no Internet"
+    no_internet: "Connected, no Internet"
+    captive_portal: "Captive portal - click to sign in"
+    dns_failed: "DNS is not resolving"
+    service_down: "Google Drive is unavailable"
+    needs_reauth: "Driven needs to sign in again"
+    error: "Driven - error, attention needed"
+    suspending: "Suspending..."
 
 notifications:
   first_sync_complete:
     title: "First sync complete"
-    body: "%{count} files backed up to Google Drive."
+    body: "Your files are now backed up to Google Drive."
   needs_reauth:
     title: "Driven needs to sign in again"
     body: "Sign in to %{account} to keep backups running."
@@ -28,3 +42,13 @@ notifications:
   paused_metered:
     title: "Sync paused"
     body: "On metered network; sync will resume on unmetered."
+  error:
+    title: "Driven - sync error"
+    generic: "Backup hit an error (%{code}). Open Driven for details."
+    drive_quota: "Your Google Drive is full. Free up space to resume backups."
+    drive_daily_quota: "Google Drive's daily limit was reached. Backups resume after it resets."
+    crypto_key_missing: "The encryption key is unavailable, so backups are paused. Open Driven to unlock it."
+    crypto_decrypt_failed: "A file failed to decrypt. Open Driven for details."
+    disk_full: "The source disk is out of space. Free up space to resume backups."
+    vss_unavailable: "A locked file needs elevated access to back up. Open Driven for details."
+    db_corrupt: "Driven's local database is corrupt. Open Driven to rebuild it."
