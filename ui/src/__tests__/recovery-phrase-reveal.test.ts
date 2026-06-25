@@ -94,6 +94,64 @@ describe("RecoveryPhraseReveal reveal-gate (R3-P1-1)", () => {
     expect(revealBtn()).toBeTruthy();
   });
 
+  // M9c D4 (M6 R4-P1-1, DATA-SAFETY): when a backend reveal action is supplied,
+  // the FIRST reveal must AWAIT it and only latch `everRevealed` on success - so
+  // the backend records the reveal the ack gate requires. A rejected backend
+  // reveal leaves the phrase hidden + the checkbox locked.
+  it("awaits the backend reveal action and latches only on success", async () => {
+    let calls = 0;
+    const wrapper = mount(RecoveryPhraseReveal, {
+      props: {
+        phrase: PHRASE,
+        confirmed: false,
+        revealAction: async () => {
+          calls += 1;
+        },
+      },
+      global: { plugins: [i18n] },
+    });
+    const revealBtn = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("recoveryPhrase.revealButton"));
+    await revealBtn!.trigger("click");
+    await flushPromises();
+
+    expect(calls).toBe(1);
+    // Latched: the checkbox is enabled and revealed=true was emitted.
+    expect(
+      wrapper.get('[data-testid="phrase-ack"]').attributes("disabled"),
+    ).toBeUndefined();
+    expect(wrapper.emitted("update:revealed")![0]).toEqual([true]);
+  });
+
+  it("does not latch (or enable ack) when the backend reveal action rejects", async () => {
+    const wrapper = mount(RecoveryPhraseReveal, {
+      props: {
+        phrase: PHRASE,
+        confirmed: false,
+        revealAction: async () => {
+          throw { code: "crypto.key_missing" };
+        },
+      },
+      global: { plugins: [i18n] },
+    });
+    const revealBtn = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("recoveryPhrase.revealButton"));
+    await revealBtn!.trigger("click");
+    await flushPromises();
+
+    // The reveal failed: no revealed signal, the checkbox stays locked, and a
+    // reveal-error was surfaced for the parent.
+    expect(wrapper.emitted("update:revealed")).toBeUndefined();
+    expect(
+      wrapper.get('[data-testid="phrase-ack"]').attributes("disabled"),
+    ).toBeDefined();
+    expect(wrapper.emitted("reveal-error")).toBeTruthy();
+    // The words are not shown (still hidden).
+    expect(wrapper.find('[data-testid="phrase-words"]').exists()).toBe(false);
+  });
+
   it("keeps the checkbox disabled with no phrase even after a toggle attempt", async () => {
     // An empty phrase (the unencrypted case) never enables the checkbox.
     const wrapper = mountReveal([]);

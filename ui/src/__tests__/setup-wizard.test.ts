@@ -90,11 +90,19 @@ function installFakeBackend(): void {
       case "pick_drive_folder":
         return Promise.resolve(FAKE_DRIVE_LISTING);
       case "add_source":
-        // B3: an encrypted add returns the one-time recovery phrase.
+        // B3: an encrypted add returns the one-time recovery phrase. M9c D4: the
+        // first encrypted source is persisted DISABLED + pending a backend ack.
         return Promise.resolve({
           source: FAKE_SOURCE,
           recoveryPhrase: ["alpha", "bravo", "charlie"],
+          pendingRecoveryAck: true,
         });
+      case "reveal_recovery_phrase":
+        // M9c D4: the backend reveal returns the same words + records the reveal.
+        return Promise.resolve(["alpha", "bravo", "charlie"]);
+      case "ack_recovery_phrase_saved":
+        // M9c D4: the ack enables the (until-now disabled) source.
+        return Promise.resolve({ ...FAKE_SOURCE, enabled: true });
       case "list_sources":
         return Promise.resolve([FAKE_SOURCE]);
       case "sync_now":

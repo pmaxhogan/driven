@@ -191,11 +191,22 @@ pub async fn add_source(
         (None, None, false)
     };
 
+    // M9c D4 (M6 R4-P1-1, DATA-SAFETY): the FIRST encrypted source (the one that
+    // generated the account master key, `newly_generated_key`) is persisted
+    // DISABLED and held pending a recovery-phrase ACK. The scheduler + manual sync
+    // filter on `enabled`, so a disabled source is NEVER backed up - this closes the
+    // window where the app/renderer could die between `add_source` returning the
+    // phrase and the user acknowledging it, leaving an ENABLED encrypted source
+    // whose backups are unrestorable on a new machine. The source is enabled only
+    // by `ack_recovery_phrase_saved`, which itself requires a recorded backend
+    // `reveal_recovery_phrase`. A subsequent encrypted source (master key already
+    // exists) or an unencrypted source is enabled immediately as before.
+    let pending_recovery_ack = newly_generated_key;
     let row = SourceRow {
         id: source_id,
         account_id: req.account_id,
         display_name: req.display_name.clone(),
-        enabled: true,
+        enabled: !pending_recovery_ack,
         local_path: canon.to_string_lossy().to_string(),
         drive_folder_id: req.drive_folder_id.clone(),
         drive_folder_path: req.drive_folder_path.clone(),
@@ -246,18 +257,160 @@ pub async fn add_source(
     // serialise unrelated adds.
     drop(_guard);
 
-    // Reconfigure the owning orchestrator so the new source is picked up without
-    // a restart (best-effort: the account may not have a running orchestrator -
-    // e.g. needs_reauth - in which case the scheduled scan on next start covers
-    // it). B2: reconfigure ALSO refreshes the LIVE crypto provider with the
-    // current sources, so a brand-new ENCRYPTED source's key resolves on the next
-    // tick (it is no longer stranded `Unavailable` until restart).
-    reconfigure_account(&state, req.account_id).await;
+    if pending_recovery_ack {
+        // M9c D4: the source is DISABLED + awaiting a recovery-phrase ack. Register
+        // the pending ack so `reveal_recovery_phrase` / `ack_recovery_phrase_saved`
+        // can gate enabling it. Do NOT reconfigure the orchestrator: a disabled
+        // source has nothing to sync, and reconfiguring now would refresh the crypto
+        // provider for a source that must not be backed up until acknowledged. The
+        // ack enables + reconfigures.
+        state.register_pending_recovery_ack(source_id, req.account_id);
+        tracing::info!(target: TARGET, source_id = %source_id, account_id = %req.account_id, "first encrypted source persisted DISABLED, awaiting recovery-phrase ack (D4)");
+    } else {
+        // Reconfigure the owning orchestrator so the new source is picked up without
+        // a restart (best-effort: the account may not have a running orchestrator -
+        // e.g. needs_reauth - in which case the scheduled scan on next start covers
+        // it). B2: reconfigure ALSO refreshes the LIVE crypto provider with the
+        // current sources, so a brand-new ENCRYPTED source's key resolves on the next
+        // tick (it is no longer stranded `Unavailable` until restart).
+        reconfigure_account(&state, req.account_id).await;
+    }
 
-    tracing::info!(target: TARGET, source_id = %source_id, account_id = %req.account_id, encrypted = req.encryption_enabled, revealed_phrase = recovery_phrase.is_some(), "source added");
+    tracing::info!(target: TARGET, source_id = %source_id, account_id = %req.account_id, encrypted = req.encryption_enabled, revealed_phrase = recovery_phrase.is_some(), pending_recovery_ack, "source added");
     Ok(AddSourceResult {
         source: source_row_to_dto(&row),
         recovery_phrase,
+        pending_recovery_ack,
+    })
+}
+
+/// `reveal_recovery_phrase(source_id)` - re-derive + return the account's BIP39
+/// recovery phrase for a source that is awaiting a recovery-phrase ack (M9c D4,
+/// M6 R4-P1-1; DATA-SAFETY).
+///
+/// This is the BACKEND-verified reveal the ack gate depends on: it is valid ONLY
+/// for a source registered as pending-ack (the first encrypted source for its
+/// account). It loads the account master key from the keychain and re-encodes the
+/// deterministic phrase (`master_key_to_phrase`), RECORDS that a real reveal
+/// happened for this source, and returns the 24 words. `ack_recovery_phrase_saved`
+/// is rejected unless this has been called, so a user can never acknowledge a
+/// phrase the backend never actually revealed. The words are returned once and the
+/// caller (the wizard) shows them then drops them; they are never persisted.
+#[tauri::command]
+pub async fn reveal_recovery_phrase(
+    state: State<'_, AppState>,
+    source_id: SourceId,
+) -> CommandResult<Vec<String>> {
+    // Only a source that is awaiting an ack may have its phrase revealed here. An
+    // unknown / already-acked source is rejected (the phrase is shown ONCE during
+    // onboarding; it is never a general "show me my phrase" API).
+    let account_id = state
+        .pending_recovery_ack_account(source_id)
+        .ok_or_else(|| {
+            CommandError::with_code(
+                ErrorCode::InvalidInput,
+                "no recovery phrase is pending for this source",
+            )
+        })?;
+
+    // Re-derive the phrase from the account master key (deterministic). The key was
+    // generated + stored by `add_source`; load it and re-encode the phrase.
+    let account = find_account(state.state().as_ref(), account_id).await?;
+    let prepared = load_master_key_for_reveal(&account)?;
+    let phrase = master_key_to_phrase(&prepared).map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::CryptoKeyMissing,
+            format!("failed to encode recovery phrase: {e}"),
+        )
+    })?;
+    let words: Vec<String> = phrase.split_whitespace().map(|w| w.to_string()).collect();
+
+    // Record the backend reveal so the ack can proceed.
+    let recorded = state.record_recovery_reveal(source_id);
+    debug_assert!(recorded, "pending-ack source must record a reveal");
+    let _ = recorded;
+    tracing::info!(target: TARGET, source_id = %source_id, account_id = %account_id, "recovery phrase revealed by backend (D4)");
+    Ok(words)
+}
+
+/// `ack_recovery_phrase_saved(source_id)` - record the user's durable
+/// acknowledgement that they saved the recovery phrase, ENABLE the (until-now
+/// disabled) first encrypted source, and reconfigure its account so backups can
+/// begin (M9c D4, M6 R4-P1-1; DATA-SAFETY).
+///
+/// The ack is REJECTED unless a real backend `reveal_recovery_phrase` was recorded
+/// for this source - a UI checkbox alone can never enable encrypted backups. On a
+/// valid ack the source's `enabled` flag is flipped to `true` (the scheduler +
+/// manual sync now include it), the pending-ack entry is cleared, and the
+/// orchestrator is reconfigured (refreshing the live crypto provider) so the
+/// source is picked up without a restart.
+#[tauri::command]
+pub async fn ack_recovery_phrase_saved(
+    state: State<'_, AppState>,
+    source_id: SourceId,
+) -> CommandResult<SourceDto> {
+    // DATA-SAFETY gate: the ack is ineffective unless the backend actually revealed
+    // the phrase first. `None` = no pending ack (unknown / already enabled);
+    // `Some(false)` = pending but never revealed (reject); `Some(true)` = ok.
+    match state.recovery_reveal_recorded(source_id) {
+        None => {
+            return Err(CommandError::with_code(
+                ErrorCode::InvalidInput,
+                "no recovery-phrase acknowledgement is pending for this source",
+            ));
+        }
+        Some(false) => {
+            return Err(CommandError::with_code(
+                ErrorCode::InvalidInput,
+                "cannot acknowledge the recovery phrase before it has been revealed",
+            ));
+        }
+        Some(true) => {}
+    }
+
+    // Enable the source (it was persisted disabled). Read by id, flip `enabled`,
+    // persist via the same upsert `update_source` uses.
+    let mut row = find_source(state.state().as_ref(), source_id).await?;
+    row.enabled = true;
+    state
+        .state()
+        .upsert_source(&row)
+        .await
+        .map_err(CommandError::from)?;
+
+    // The ack is durable; clear the pending entry so a replay is a no-op.
+    state.clear_pending_recovery_ack(source_id);
+
+    // Reconfigure so the now-enabled (encrypted) source is picked up + its key
+    // resolves on the next tick (B2), without a restart.
+    reconfigure_account(&state, row.account_id).await;
+
+    tracing::info!(target: TARGET, source_id = %source_id, account_id = %row.account_id, "recovery phrase acknowledged; first encrypted source ENABLED (D4)");
+    Ok(source_row_to_dto(&row))
+}
+
+/// M9c D4: load `account`'s master key from the keychain for a recovery-phrase
+/// re-reveal. The account must already be provisioned (it generated the key on the
+/// first encrypted source add); an unprovisioned account or an unreadable key is a
+/// hard error (the phrase cannot be shown).
+fn load_master_key_for_reveal(account: &AccountRow) -> CommandResult<MasterKey> {
+    if account.encryption_master_key_id.is_none() {
+        return Err(CommandError::with_code(
+            ErrorCode::CryptoKeyMissing,
+            "account has no encryption master key to reveal",
+        ));
+    }
+    let keystore = Keystore::open(&account.id.to_string()).map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::CryptoKeyMissing,
+            format!("failed to open keystore for account: {e}"),
+        )
+    })?;
+    keystore.load_master_key().map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::CryptoKeyMissing,
+            format!("account master key unavailable: {e}"),
+        )
     })
 }
 

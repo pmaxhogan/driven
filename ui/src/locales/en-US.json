@@ -198,6 +198,7 @@
     "title": "Your recovery phrase",
     "instructions": "Write down these 24 words in order and keep them somewhere safe. They are the only way to recover an encrypted backup if you lose this device.",
     "revealButton": "Reveal recovery phrase",
+    "revealingButton": "Revealing...",
     "hideButton": "Hide",
     "copyButton": "Copy",
     "confirmedLabel": "I have saved my recovery phrase",

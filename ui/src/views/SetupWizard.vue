@@ -142,6 +142,17 @@ async function onNext(): Promise<void> {
 async function onFinish(): Promise<void> {
   // B3: never finish while a displayed recovery phrase is un-acknowledged.
   if (!setup.canFinish) return;
+  // M9c D4 (DATA-SAFETY): if the first encrypted source is pending a backend
+  // recovery-phrase ack, acknowledge it FIRST - this ENABLES the until-now-disabled
+  // source (the backend rejects the ack unless a real reveal was recorded). Only
+  // then can the initial sync back it up. If the ack fails, stay on confirm.
+  if (setup.pendingRecoveryAck) {
+    try {
+      await setup.ackRecoveryPhrase();
+    } catch {
+      return; // error surfaced via errorLong; stay on confirm.
+    }
+  }
   try {
     await setup.startInitialSync();
   } catch {
@@ -158,6 +169,20 @@ function onPhraseAck(value: boolean): void {
 // re-locked because it changed). Finish gates on reveal AND acknowledge.
 function onPhraseRevealed(value: boolean): void {
   setup.markPhraseRevealed(value);
+}
+
+// M9c D4: the BACKEND reveal action threaded into RecoveryPhraseReveal (only for a
+// pending-ack source). It records the reveal the ack gate requires.
+async function revealPhraseAction(): Promise<void> {
+  await setup.revealRecoveryPhrase();
+}
+
+// M9c D4: surface a backend reveal error.
+function onPhraseRevealError(code: unknown): void {
+  setup.errorCode =
+    code && typeof code === "object" && "code" in code
+      ? String((code as { code: unknown }).code)
+      : "internal.bug";
 }
 
 function baseName(p: string): string {
@@ -300,8 +325,10 @@ function baseName(p: string): string {
         v-if="setup.hasRecoveryPhrase"
         :phrase="setup.recoveryPhrase ?? undefined"
         :confirmed="setup.phraseAcknowledged"
+        :reveal-action="setup.pendingRecoveryAck ? revealPhraseAction : undefined"
         @update:confirmed="onPhraseAck"
         @update:revealed="onPhraseRevealed"
+        @reveal-error="onPhraseRevealError"
       />
     </div>
 

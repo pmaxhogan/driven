@@ -122,6 +122,22 @@ export function previewExclusions(
   return invoke("preview_exclusions", { req });
 }
 
+/** M9c D4 (M6 R4-P1-1, DATA-SAFETY): backend-reveal the recovery phrase for a
+ * source that is awaiting a recovery-phrase ack (the first encrypted source). The
+ * backend RECORDS this reveal; `ackRecoveryPhraseSaved` is rejected unless this
+ * was called. Returns the 24 BIP39 words (shown once, never persisted). */
+export function revealRecoveryPhrase(sourceId: string): Promise<string[]> {
+  return invoke("reveal_recovery_phrase", { sourceId });
+}
+
+/** M9c D4 (M6 R4-P1-1, DATA-SAFETY): acknowledge that the recovery phrase was
+ * saved, which ENABLES the (until-now disabled) first encrypted source so backups
+ * can begin. REJECTED by the backend unless a real `revealRecoveryPhrase` was
+ * recorded first. Returns the now-enabled source. */
+export function ackRecoveryPhraseSaved(sourceId: string): Promise<SourceDto> {
+  return invoke("ack_recovery_phrase_saved", { sourceId });
+}
+
 // --- Backend-owned native dialogs (SPEC s11.6.1, C1) ---
 
 /** Open the backend-owned native folder picker; returns the chosen path + a

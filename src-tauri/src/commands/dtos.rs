@@ -198,6 +198,14 @@ pub struct AddSourceResult {
     /// The one-time 24-word BIP39 recovery phrase, present only when this opt-in
     /// generated the account master key. `None` otherwise.
     pub recovery_phrase: Option<Vec<String>>,
+    /// M9c D4 (M6 R4-P1-1, DATA-SAFETY): `true` when this source was persisted
+    /// DISABLED and is awaiting a recovery-phrase ack - i.e. it is the first
+    /// encrypted source for the account (it generated the master key). The source
+    /// will NOT be backed up (it is excluded from the scheduler + manual sync)
+    /// until `reveal_recovery_phrase` + `ack_recovery_phrase_saved` enable it, so
+    /// no encrypted data is created before the recovery phrase is durably saveable.
+    /// `false` for an unencrypted source or a subsequent encrypted source.
+    pub pending_recovery_ack: bool,
 }
 
 /// Patch body for `update_source` (SPEC s11.2 `SourcePatch`). Every field is

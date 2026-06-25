@@ -64,6 +64,12 @@ export const useSetupStore = defineStore("setup", () => {
   // changes/clears.
   const phraseRevealed = ref(false);
   const sourceId = ref<string | null>(null);
+  // M9c D4 (M6 R4-P1-1, DATA-SAFETY): true when the created first source was
+  // persisted DISABLED and awaits a backend recovery-phrase ack. Finish then calls
+  // ackRecoveryPhrase (which ENABLES the source) before starting the initial sync;
+  // the reveal button calls revealRecoveryPhrase (the backend reveal the ack gate
+  // requires).
+  const pendingRecoveryAck = ref(false);
 
   // Transient UX flags surfaced by the view.
   const busy = ref(false);
@@ -239,6 +245,9 @@ export const useSetupStore = defineStore("setup", () => {
       const sources = useSourcesStore();
       const result = await sources.add(req);
       sourceId.value = result.source.id;
+      // M9c D4: a pending-ack source was persisted DISABLED; Finish calls the
+      // backend ack (which enables it).
+      pendingRecoveryAck.value = result.pendingRecoveryAck;
       // B3: capture the one-time recovery phrase (present only when this opt-in
       // generated the account master key). Reset the ack so the confirm step
       // gates Finish until the user attests they saved the words.
@@ -268,6 +277,26 @@ export const useSetupStore = defineStore("setup", () => {
     if (!value) {
       phraseAcknowledged.value = false;
     }
+  }
+
+  /** M9c D4: the BACKEND reveal action (the ack gate depends on it). Only
+   * meaningful for a pending-ack source. Returns the words for display. */
+  async function revealRecoveryPhrase(): Promise<string[]> {
+    const sid = sourceId.value;
+    if (!sid) throw new Error("no source to reveal a recovery phrase for");
+    const sources = useSourcesStore();
+    return sources.revealRecoveryPhrase(sid);
+  }
+
+  /** M9c D4: acknowledge the recovery phrase was saved, ENABLING the first
+   * encrypted source. Rejected by the backend unless a real reveal was recorded.
+   * Called by Finish before the initial sync when the source is pending-ack. */
+  async function ackRecoveryPhrase(): Promise<void> {
+    const sid = sourceId.value;
+    if (!sid) throw new Error("no source to acknowledge");
+    const sources = useSourcesStore();
+    await sources.ackRecoveryPhrase(sid);
+    pendingRecoveryAck.value = false;
   }
 
   /**
@@ -307,6 +336,7 @@ export const useSetupStore = defineStore("setup", () => {
     phraseAcknowledged.value = false;
     phraseRevealed.value = false;
     sourceId.value = null;
+    pendingRecoveryAck.value = false;
     busy.value = false;
     errorCode.value = null;
   }
@@ -335,6 +365,7 @@ export const useSetupStore = defineStore("setup", () => {
     phraseAcknowledged,
     phraseRevealed,
     sourceId,
+    pendingRecoveryAck,
     busy,
     errorCode,
     canGoBack,
@@ -356,6 +387,8 @@ export const useSetupStore = defineStore("setup", () => {
     createFirstSource,
     acknowledgePhrase,
     markPhraseRevealed,
+    revealRecoveryPhrase,
+    ackRecoveryPhrase,
     startInitialSync,
     reset,
   };

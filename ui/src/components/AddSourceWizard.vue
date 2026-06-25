@@ -76,6 +76,11 @@ const recoveryPhrase = ref<string[]>([]);
 // B3: the source created on confirm (held so the reveal step can emit it after
 // the phrase is acknowledged).
 const createdSource = ref<SourceDto | null>(null);
+// M9c D4 (M6 R4-P1-1, DATA-SAFETY): true when the created source was persisted
+// DISABLED and awaits a backend recovery-phrase ack. The reveal-step Done button
+// then calls ackRecoveryPhraseSaved (which enables the source); the reveal button
+// calls revealRecoveryPhrase (the backend reveal the ack gate requires).
+const pendingRecoveryAck = ref(false);
 
 // Drive picker state: a breadcrumb stack of the folders descended into, so "up"
 // can re-fetch the parent. The first entry (null id) is the Drive root.
@@ -149,6 +154,7 @@ function reset(): void {
   phraseRevealed.value = false;
   recoveryPhrase.value = [];
   createdSource.value = null;
+  pendingRecoveryAck.value = false;
   crumbs.value = [];
   driveFolders.value = [];
   preview.value = null;
@@ -270,6 +276,9 @@ async function confirm(): Promise<void> {
       excludePatterns: excludePatterns.value,
     });
     createdSource.value = result.source;
+    // M9c D4: a pending-ack source was persisted DISABLED; the reveal step's Done
+    // calls the backend ack to enable it.
+    pendingRecoveryAck.value = result.pendingRecoveryAck;
     // B3: if a recovery phrase was returned (this opt-in generated the master
     // key), show it ONCE on the reveal step and require acknowledgement before
     // closing. Otherwise (unencrypted, or a subsequent encrypted source) finish.
@@ -290,13 +299,31 @@ async function confirm(): Promise<void> {
   }
 }
 
-/** B3: leave the reveal step once the user acknowledged the phrase - emit the
- * created source + close. Guarded so it cannot fire without acknowledgement. */
-function finishReveal(): void {
+/** B3 + M9c D4: leave the reveal step once the user acknowledged the phrase. When
+ * the source is pending a backend recovery-phrase ack, call ackRecoveryPhraseSaved
+ * FIRST (it ENABLES the until-now-disabled source); the backend rejects it unless
+ * a real reveal was recorded, so the client gate is backed by the server gate.
+ * Then emit the (now-enabled) created source + close. */
+async function finishReveal(): Promise<void> {
   // R3-P1-1: never leave the reveal step unless the phrase was revealed AND
   // acknowledged.
   if (!phraseConfirmed.value || !phraseRevealed.value) return;
   const created = createdSource.value;
+  if (created && pendingRecoveryAck.value) {
+    submitting.value = true;
+    errorMessage.value = null;
+    try {
+      const enabled = await sources.ackRecoveryPhrase(created.id);
+      pendingRecoveryAck.value = false;
+      emit("created", enabled);
+      close();
+    } catch (e) {
+      errorMessage.value = String(e);
+    } finally {
+      submitting.value = false;
+    }
+    return;
+  }
   if (created) emit("created", created);
   close();
 }
@@ -306,6 +333,19 @@ function finishReveal(): void {
 function onPhraseRevealed(value: boolean): void {
   phraseRevealed.value = value;
   if (!value) phraseConfirmed.value = false;
+}
+
+/** M9c D4: the reveal action threaded into RecoveryPhraseReveal - the BACKEND
+ * reveal the ack gate depends on. Only meaningful for a pending-ack source. */
+async function revealPhraseAction(): Promise<void> {
+  const created = createdSource.value;
+  if (!created || !pendingRecoveryAck.value) return;
+  await sources.revealRecoveryPhrase(created.id);
+}
+
+/** M9c D4: surface a backend reveal error on the reveal step. */
+function onPhraseRevealError(code: unknown): void {
+  errorMessage.value = String(code);
 }
 
 defineExpose({ start });
@@ -545,7 +585,9 @@ defineExpose({ start });
         <RecoveryPhraseReveal
           v-model:confirmed="phraseConfirmed"
           :phrase="recoveryPhrase"
+          :reveal-action="pendingRecoveryAck ? revealPhraseAction : undefined"
           @update:revealed="onPhraseRevealed"
+          @reveal-error="onPhraseRevealError"
         />
       </div>
 

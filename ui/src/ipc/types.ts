@@ -89,6 +89,12 @@ export interface AddSourceRequest {
 export interface AddSourceResult {
   source: SourceDto;
   recoveryPhrase: string[] | null;
+  /** M9c D4 (M6 R4-P1-1, DATA-SAFETY): true when this source was persisted
+   * DISABLED and awaits a recovery-phrase ack (the first encrypted source for
+   * the account). It is NOT backed up until `revealRecoveryPhrase` +
+   * `ackRecoveryPhraseSaved` enable it, so no unrestorable encrypted backups can
+   * run before the phrase is durably saved. False otherwise. */
+  pendingRecoveryAck: boolean;
 }
 
 /** C1: the result of a backend-owned native dialog - the chosen path plus the

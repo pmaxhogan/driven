@@ -282,6 +282,30 @@ pub struct AppState {
     /// app-quit drain joins it with NO orphan (mirrors the M5 no-orphan
     /// bookkeeping).
     updater: UpdaterRuntime,
+    /// M9c D4 (M6 R4-P1-1, DATA-SAFETY): per-source recovery-phrase ACK gate. The
+    /// FIRST encrypted source for an account is persisted DISABLED (excluded from
+    /// the scheduler + manual sync, which filter on `enabled`) and a pending-ack
+    /// entry is registered here. The source is only ENABLED once
+    /// `ack_recovery_phrase_saved` lands - and that ack is REJECTED unless a real
+    /// backend `reveal_recovery_phrase` was recorded first (`revealed == true`). So
+    /// a user can never tick "I saved it" without the backend having actually
+    /// revealed the phrase, and no encrypted backups run before the recovery phrase
+    /// is durably saveable - closing the unrestorable-backup window. Behind a sync
+    /// `Mutex` (only ever held for a quick insert / read / take, never across an
+    /// await).
+    recovery_acks: std::sync::Mutex<HashMap<driven_core::types::SourceId, RecoveryAckState>>,
+}
+
+/// M9c D4: one pending recovery-phrase ack - the owning account (so the ack can
+/// reconfigure it once the source is enabled) and whether the backend has actually
+/// REVEALED the phrase (`reveal_recovery_phrase`). `ack_recovery_phrase_saved` is
+/// rejected unless `revealed` is true.
+struct RecoveryAckState {
+    /// The account owning the pending-ack source (used to reconfigure on enable).
+    account_id: AccountId,
+    /// True once `reveal_recovery_phrase` has actually returned the phrase from the
+    /// backend for this source. The ack is ineffective until this is set.
+    revealed: bool,
 }
 
 /// M9a (SPEC s15.2): the in-app updater runtime state held on [`AppState`].
@@ -438,7 +462,76 @@ impl AppState {
             fake_remote_stores,
             restore_jobs: std::sync::Mutex::new(HashMap::new()),
             updater: UpdaterRuntime::default(),
+            recovery_acks: std::sync::Mutex::new(HashMap::new()),
         }
+    }
+
+    // --- M9c D4: recovery-phrase ACK gate (M6 R4-P1-1, DATA-SAFETY) ---------
+
+    /// Lock the recovery-ack map, recovering a poisoned lock (house rule: never
+    /// panic on a poisoned lock).
+    fn lock_recovery_acks(
+        &self,
+    ) -> std::sync::MutexGuard<'_, HashMap<driven_core::types::SourceId, RecoveryAckState>> {
+        self.recovery_acks.lock().unwrap_or_else(|e| e.into_inner())
+    }
+
+    /// M9c D4: register that `source` (on `account`) was persisted DISABLED and is
+    /// awaiting a recovery-phrase ack. Called by `add_source` on the FIRST encrypted
+    /// source (the one that generated the account master key). Until the ack lands
+    /// the source stays disabled, so the scheduler + manual sync (which filter on
+    /// `enabled`) never back it up.
+    pub fn register_pending_recovery_ack(
+        &self,
+        source: driven_core::types::SourceId,
+        account: AccountId,
+    ) {
+        self.lock_recovery_acks().insert(
+            source,
+            RecoveryAckState {
+                account_id: account,
+                revealed: false,
+            },
+        );
+    }
+
+    /// M9c D4: record that the backend actually REVEALED the phrase for `source`
+    /// (`reveal_recovery_phrase`). Returns `true` if `source` had a pending ack
+    /// (so the reveal is meaningful), `false` for an unknown / already-acked source.
+    /// The ack is only accepted after this has been recorded.
+    pub fn record_recovery_reveal(&self, source: driven_core::types::SourceId) -> bool {
+        match self.lock_recovery_acks().get_mut(&source) {
+            Some(entry) => {
+                entry.revealed = true;
+                true
+            }
+            None => false,
+        }
+    }
+
+    /// M9c D4: whether `source` has a pending recovery ack AND its phrase has been
+    /// revealed by the backend - the precondition `ack_recovery_phrase_saved`
+    /// enforces. `None` means no pending ack at all; `Some(false)` means pending but
+    /// the phrase was never revealed (the ack must be rejected); `Some(true)` means
+    /// the ack may proceed.
+    #[must_use]
+    pub fn recovery_reveal_recorded(&self, source: driven_core::types::SourceId) -> Option<bool> {
+        self.lock_recovery_acks().get(&source).map(|e| e.revealed)
+    }
+
+    /// M9c D4: the account owning `source`'s pending recovery ack, if one exists.
+    #[must_use]
+    pub fn pending_recovery_ack_account(
+        &self,
+        source: driven_core::types::SourceId,
+    ) -> Option<AccountId> {
+        self.lock_recovery_acks().get(&source).map(|e| e.account_id)
+    }
+
+    /// M9c D4: clear the pending recovery ack for `source` once it has been enabled
+    /// (the ack succeeded). Idempotent - clearing an unknown source is a no-op.
+    pub fn clear_pending_recovery_ack(&self, source: driven_core::types::SourceId) {
+        self.lock_recovery_acks().remove(&source);
     }
 
     // --- M9a updater runtime (SPEC s15.2) ----------------------------------
@@ -1318,6 +1411,52 @@ mod tests {
         assert_eq!(app_state.take_dialog_token(&token), None);
         // An unknown token is rejected.
         assert_eq!(app_state.take_dialog_token("not-a-real-token"), None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn recovery_ack_gate_requires_a_recorded_backend_reveal() {
+        // M9c D4 (M6 R4-P1-1, DATA-SAFETY): the ack gate `ack_recovery_phrase_saved`
+        // enforces is the AppState predicate `recovery_reveal_recorded`. A source
+        // registered as pending-ack is NOT acknowledgeable until the backend records
+        // a real reveal; an unknown source has no pending ack at all.
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+        let source = driven_core::types::SourceId::new_v4();
+        let account = AccountId::new_v4();
+
+        // Unknown source: no pending ack -> the ack would be rejected (None).
+        assert_eq!(app_state.recovery_reveal_recorded(source), None);
+        assert_eq!(app_state.pending_recovery_ack_account(source), None);
+
+        // Register a pending ack (add_source's first-encrypted-source path).
+        app_state.register_pending_recovery_ack(source, account);
+        // Pending but NOT revealed: the ack must be rejected (Some(false)).
+        assert_eq!(app_state.recovery_reveal_recorded(source), Some(false));
+        assert_eq!(
+            app_state.pending_recovery_ack_account(source),
+            Some(account)
+        );
+
+        // Record a backend reveal (reveal_recovery_phrase). Now the ack may proceed.
+        assert!(
+            app_state.record_recovery_reveal(source),
+            "recording a reveal for a pending source returns true"
+        );
+        assert_eq!(app_state.recovery_reveal_recorded(source), Some(true));
+
+        // Recording a reveal for an UNKNOWN source is a no-op (false).
+        assert!(!app_state.record_recovery_reveal(driven_core::types::SourceId::new_v4()));
+
+        // After the ack succeeds, clearing the pending entry makes a replay a no-op.
+        app_state.clear_pending_recovery_ack(source);
+        assert_eq!(app_state.recovery_reveal_recorded(source), None);
 
         let _ = std::fs::remove_dir_all(dir);
     }

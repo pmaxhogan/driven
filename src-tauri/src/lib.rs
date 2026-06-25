@@ -394,6 +394,11 @@ pub fn run() {
             commands::sources::remove_source,
             commands::sources::pick_drive_folder,
             commands::sources::preview_exclusions,
+            // M9c D4 (M6 R4-P1-1, DATA-SAFETY): backend recovery-phrase reveal +
+            // ack gate. The first encrypted source is persisted disabled until the
+            // phrase is revealed by the backend AND acknowledged.
+            commands::sources::reveal_recovery_phrase,
+            commands::sources::ack_recovery_phrase_saved,
             // SPEC s11.6.1 backend-owned native dialogs (M6 C1).
             commands::dialogs::pick_folder_dialog,
             commands::dialogs::pick_save_zip_dialog,

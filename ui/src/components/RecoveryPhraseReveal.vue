@@ -20,16 +20,30 @@ import { useI18n } from "vue-i18n";
 const { t } = useI18n();
 
 const props = withDefaults(
-  defineProps<{ phrase?: string[]; confirmed?: boolean }>(),
-  { phrase: () => [], confirmed: false },
+  defineProps<{
+    phrase?: string[];
+    confirmed?: boolean;
+    // M9c D4: an optional async reveal action the parent supplies (the backend
+    // `revealRecoveryPhrase`). When present, the FIRST reveal awaits it and only
+    // latches `everRevealed` on success - so the recorded backend reveal that the
+    // ack gate requires actually happens. When absent, reveal is purely
+    // client-side (the existing behaviour; used where no backend reveal applies).
+    revealAction?: () => Promise<void>;
+  }>(),
+  { phrase: () => [], confirmed: false, revealAction: undefined },
 );
 
 const emit = defineEmits<{
   "update:confirmed": [value: boolean];
   "update:revealed": [value: boolean];
+  // M9c D4: surfaced when the backend reveal action rejects, so the parent can
+  // show the localized error.
+  "reveal-error": [code: unknown];
 }>();
 
 const revealed = ref(false);
+// M9c D4: true while the async backend reveal is in flight (disables the button).
+const revealing = ref(false);
 // R3-P1-1: latches true the first time the user reveals the phrase; never
 // auto-clears on hide (re-hiding does not "un-see" the words). Only a phrase
 // change resets it.
@@ -42,9 +56,32 @@ const hasPhrase = computed(() => props.phrase.length > 0);
 // revealed AND a real phrase is present.
 const ackEnabled = computed(() => everRevealed.value && hasPhrase.value);
 
-function toggle(): void {
-  revealed.value = !revealed.value;
-  if (revealed.value && hasPhrase.value && !everRevealed.value) {
+async function toggle(): Promise<void> {
+  // Hiding is always allowed and never un-sees the words.
+  if (revealed.value) {
+    revealed.value = false;
+    return;
+  }
+  // Revealing for the FIRST time with a backend reveal action: await it so the
+  // backend records the reveal (the ack gate depends on it). Only latch on
+  // success; a rejected backend reveal leaves the phrase hidden + un-latched.
+  if (
+    !everRevealed.value &&
+    hasPhrase.value &&
+    typeof props.revealAction === "function"
+  ) {
+    revealing.value = true;
+    try {
+      await props.revealAction();
+    } catch (e) {
+      revealing.value = false;
+      emit("reveal-error", e);
+      return;
+    }
+    revealing.value = false;
+  }
+  revealed.value = true;
+  if (hasPhrase.value && !everRevealed.value) {
     everRevealed.value = true;
     emit("update:revealed", true);
   }
@@ -87,6 +124,7 @@ watch(
   () => {
     revealed.value = false;
     everRevealed.value = false;
+    revealing.value = false;
     copied.value = false;
     emit("update:revealed", false);
     if (props.confirmed) emit("update:confirmed", false);
@@ -106,14 +144,16 @@ watch(
     <div class="flex gap-2">
       <button
         type="button"
-        class="rounded border px-3 py-1.5 text-sm"
-        :disabled="!hasPhrase"
+        class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
+        :disabled="!hasPhrase || revealing"
         @click="toggle"
       >
         {{
-          revealed
-            ? t("recoveryPhrase.hideButton")
-            : t("recoveryPhrase.revealButton")
+          revealing
+            ? t("recoveryPhrase.revealingButton")
+            : revealed
+              ? t("recoveryPhrase.hideButton")
+              : t("recoveryPhrase.revealButton")
         }}
       </button>
       <button

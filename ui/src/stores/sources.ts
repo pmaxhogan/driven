@@ -55,5 +55,32 @@ export const useSourcesStore = defineStore("sources", () => {
     await ipc.syncNow(sourceId);
   }
 
-  return { sources, loading, error, refresh, add, update, remove, syncNow };
+  /** M9c D4 (M6 R4-P1-1, DATA-SAFETY): backend-reveal the recovery phrase for a
+   * source awaiting an ack. Records the reveal so the ack can proceed; returns the
+   * 24 words for one-time display. */
+  async function revealRecoveryPhrase(sourceId: string): Promise<string[]> {
+    return ipc.revealRecoveryPhrase(sourceId);
+  }
+
+  /** M9c D4: acknowledge the recovery phrase was saved, ENABLING the first
+   * encrypted source so backups can begin. Rejected by the backend unless a real
+   * reveal was recorded first. Refreshes the list so the now-enabled source shows. */
+  async function ackRecoveryPhrase(sourceId: string): Promise<SourceDto> {
+    const updated = await ipc.ackRecoveryPhraseSaved(sourceId);
+    await refresh();
+    return updated;
+  }
+
+  return {
+    sources,
+    loading,
+    error,
+    refresh,
+    add,
+    update,
+    remove,
+    syncNow,
+    revealRecoveryPhrase,
+    ackRecoveryPhrase,
+  };
 });
