@@ -20,9 +20,21 @@ const { t } = useI18n();
 // update so an emit that fired before the webview attached is still reflected.
 const updater = useUpdaterStore();
 
+// R4-P2-1: subscribe() can reject on a partial listener-registration failure (it
+// now cleans up + resets state so a later retry can re-subscribe). A failed
+// subscribe must NOT skip pending-update hydration: the backend's startup check
+// may have ALREADY recorded a pending update, and get_pending_update_info is an
+// independent path that still surfaces the banner even with no live listeners. So
+// run hydration in a `finally` and swallow the subscribe error here (the store
+// already records it via checkErrorCode; we only log so boot never throws).
 onMounted(async () => {
-  await updater.subscribe();
-  await updater.hydratePending();
+  try {
+    await updater.subscribe();
+  } catch (e) {
+    console.error("updater subscribe failed at app boot", e);
+  } finally {
+    await updater.hydratePending();
+  }
 });
 
 const navLinks = [

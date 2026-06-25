@@ -16,12 +16,29 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 // Capture the updater event handlers so the test can fire events on demand.
 const handlers: Record<string, (payload: unknown) => void> = {};
+// A SINGLE spy every per-listener unlisten delegates to, so existing tests can
+// still assert the total teardown count.
 const unlistenMock = vi.fn();
+// Per-event unlisten spies (so a leak test can assert WHICH listeners were torn
+// down on a partial failure), keyed by event name.
+const perEventUnlisten: Record<string, ReturnType<typeof vi.fn>> = {};
+// Event names whose `listen()` should REJECT (simulate a registration failure).
+const failEvents = new Set<string>();
+
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(
     async (event: string, cb: (e: { payload: unknown }) => void) => {
+      if (failEvents.has(event)) {
+        throw new Error(`listen failed for ${event}`);
+      }
       handlers[event] = (payload: unknown) => cb({ payload });
-      return unlistenMock;
+      const un = vi.fn(() => {
+        // Model a real unlisten: a torn-down listener no longer fires.
+        delete handlers[event];
+        unlistenMock();
+      });
+      perEventUnlisten[event] = un;
+      return un;
     },
   ),
 }));
@@ -52,6 +69,8 @@ beforeEach(() => {
   setActivePinia(createPinia());
   invokeMock.mockReset();
   for (const k of Object.keys(handlers)) delete handlers[k];
+  for (const k of Object.keys(perEventUnlisten)) delete perEventUnlisten[k];
+  failEvents.clear();
   unlistenMock.mockReset();
 });
 
@@ -298,5 +317,49 @@ describe("updater store", () => {
     store.unsubscribe();
     // Three listeners (available, progress, downloaded) were torn down.
     expect(unlistenMock).toHaveBeenCalledTimes(3);
+  });
+
+  it("R4-P2-1: a partial subscribe failure leaks NO listener and allows a later successful subscribe + hydration", async () => {
+    invokeMock.mockResolvedValue(null);
+    const store = useUpdaterStore();
+
+    // Make the LAST listener registration fail; the first two will have resolved.
+    failEvents.add("updater:downloaded");
+    await expect(store.subscribe()).rejects.toThrow();
+
+    // The two listeners that DID register were torn down (no leak) - exactly the
+    // count that successfully registered before the failure.
+    expect(unlistenMock).toHaveBeenCalledTimes(2);
+    expect(perEventUnlisten["updater:available"]).toHaveBeenCalledTimes(1);
+    expect(perEventUnlisten["updater:download_progress"]).toHaveBeenCalledTimes(1);
+
+    // A leaked listener would still fire into the store; assert it does NOT.
+    handlers["updater:available"]?.(update("9.9.9"));
+    expect(store.available).toBeNull();
+
+    // A later subscribe must NOT no-op (desiredSubscribed was reset): clear the
+    // forced failure and re-subscribe successfully.
+    unlistenMock.mockClear();
+    failEvents.clear();
+    await store.subscribe();
+
+    // Now a live event surfaces the banner (the retry's listeners are live).
+    handlers["updater:available"]?.(update("1.0.0"));
+    expect(store.available?.version).toBe("1.0.0");
+    expect(store.bannerVisible).toBe(true);
+
+    // And hydration still runs independently (App.vue calls it in a finally even
+    // when subscribe rejected). Model the backend having recorded a pending
+    // update and assert hydratePending fetches it. Use a fresh store (nothing
+    // available yet) so hydratePending is not short-circuited by the live update.
+    setActivePinia(createPinia());
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_pending_update_info") return Promise.resolve(update("2.0.0"));
+      return Promise.resolve(null);
+    });
+    const freshStore = useUpdaterStore();
+    expect(freshStore.available).toBeNull();
+    await freshStore.hydratePending();
+    expect(freshStore.available?.version).toBe("2.0.0");
   });
 });

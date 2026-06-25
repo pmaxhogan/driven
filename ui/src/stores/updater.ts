@@ -249,22 +249,63 @@ export const useUpdaterStore = defineStore("updater", () => {
   let unlistenDownloaded: UnlistenFn | null = null;
   let desiredSubscribed = false;
 
-  /** Subscribe to the updater event stream (idempotent). */
+  /** Subscribe to the updater event stream (idempotent).
+   *
+   * R4-P2-1: register every listener with cleanup-on-partial-failure. The prior
+   * `Promise.all` form leaked handles when ONE registration rejected: the other
+   * (already-resolved) listeners stayed attached but their unlisten handles were
+   * dropped on the floor (never assigned), AND `desiredSubscribed` was left
+   * `true`, so a later retry no-opped forever - the store could never re-subscribe
+   * and an `updater:available` event could fire into a dead store. Now we collect
+   * whatever resolved (`allSettled`), and on ANY rejection we unlisten everything
+   * that DID register, reset `desiredSubscribed=false` (so a retry can try again),
+   * and re-throw so the caller can log/retry. Only on full success do we keep the
+   * handles. */
   async function subscribe(): Promise<void> {
     if (desiredSubscribed) return;
     desiredSubscribed = true;
-    const [a, p, d] = await Promise.all([
+
+    const results = await Promise.allSettled([
       onUpdaterAvailable((info) => onAvailable(info)),
       onUpdaterDownloadProgress((payload) => onProgress(payload)),
       onUpdaterDownloaded(() => onDownloaded()),
     ]);
-    if (!desiredSubscribed) {
-      // Unsubscribed before the listeners resolved: tear them down now.
-      a();
-      p();
-      d();
+
+    // Gather the handles that DID register (so we can tear them down on any
+    // partial failure) and the first rejection reason (if any).
+    const registered: UnlistenFn[] = [];
+    let failure: unknown = null;
+    for (const r of results) {
+      if (r.status === "fulfilled") registered.push(r.value);
+      else if (failure === null) failure = r.reason;
+    }
+
+    // If we were torn down while awaiting (unsubscribe() raced ahead), OR any
+    // registration failed, unlisten everything that registered and reset state so
+    // a future subscribe() can retry cleanly.
+    if (!desiredSubscribed || failure !== null) {
+      for (const un of registered) {
+        try {
+          un();
+        } catch {
+          // Best-effort teardown; never mask the original failure.
+        }
+      }
+      unlistenAvailable = null;
+      unlistenProgress = null;
+      unlistenDownloaded = null;
+      desiredSubscribed = false;
+      if (failure !== null) {
+        // Propagate so the caller (App.vue boot) can log + a later retry can
+        // re-subscribe. Hydration still runs (App.vue guards it).
+        throw failure;
+      }
       return;
     }
+
+    // Full success: keep the handles. `results` is in the same order as the
+    // listener array above, so each fulfilled value maps to its event.
+    const [a, p, d] = registered;
     unlistenAvailable = a;
     unlistenProgress = p;
     unlistenDownloaded = d;
