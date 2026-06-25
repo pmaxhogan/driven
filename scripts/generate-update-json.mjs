@@ -6,21 +6,26 @@
 // detached `.sig` signature, it emits one manifest laid out to match the
 // endpoint URL shape the updater fetches:
 //
-//   updates/<channel>/<target>/<version>/update.json
+//   updates/<channel>/<os>/<arch>/update.json
 //
-// where <target> is the Tauri updater target triple (e.g. `windows-x86_64`,
-// `darwin-aarch64`, `linux-x86_64`) - matching the `{{target}}` placeholder in
-// the endpoint - and <version> matches `{{current_version}}` (the RUNNING build's
-// version; the updater substitutes its own version, so the manifest for "what
-// 0.1.0 should update to" lives under .../<0.1.0>/update.json).
+// where <os> is the Tauri `{{target}}` placeholder (`windows` | `darwin` |
+// `linux`) and <arch> is the `{{arch}}` placeholder (`x86_64` | `aarch64`).
+// The path carries NO version segment: per Tauri's static-server model the
+// manifest itself carries the latest version and the updater compares its
+// running version to it (R1-P1-1 - including `{{current_version}}` made a 0.1.0
+// app look under /0.1.0/ while a 0.1.1 release wrote under /0.1.1/, so updates
+// were never discovered). The channel lives in the PATH ({{channel}} is NOT a
+// valid Tauri placeholder).
 //
-// The manifest itself is the standard Tauri shape:
-//   { version, notes, pub_date, platforms: { "<target>": { signature, url } } }
-// (a single-target manifest per file; one file per target).
+// The manifest itself is the standard Tauri shape, keyed by the COMBINED
+// `<os>-<arch>` platform key Tauri matches at runtime:
+//   { version, notes, pub_date, platforms: { "<os>-<arch>": { signature, url } } }
+// (a single-platform manifest per file; one file per os/arch).
 //
-// PURE Node, NO network: it only reads local bundle + `.sig` files and writes
-// JSON. The GitHub Actions wiring that CALLS this (uploading the bundles +
-// committing the manifests) is M9d - here we just generate + unit-smoke it.
+// PURE Node, NO network: it only reads local bundle + `.sig` files (the assets
+// dir the workflow populates via `gh release download`) and writes JSON. The
+// GitHub Actions wiring that CALLS this (downloading the release assets +
+// deploying the manifests) lives in release.yml / dev-channel.yml.
 //
 // Usage:
 //   node scripts/generate-update-json.mjs <stable|dev> [options]
@@ -31,12 +36,16 @@
 //   --sha <gitsha>       For the `dev` channel, the version becomes
 //                        `0.0.0-dev.<sha>` unless --version is given.
 //   --bundles <dir>      Directory to scan for bundle + `.sig` files
-//                        (default: src-tauri/target/release/bundle).
+//                        (default: src-tauri/target/release/bundle). Alias:
+//                        --assets-dir (the workflow downloads release assets
+//                        into a flat dir and points this at it).
+//   --assets-dir <dir>   Alias for --bundles.
 //   --out <dir>          Output root (default: ./updates).
 //   --base-url <url>     Public base URL the bundles are hosted at; the per-target
 //                        `url` is `<base-url>/<bundle-filename>`. Defaults to
 //                        https://github.com/pmaxhogan/driven/releases/download/v<version>
 //   --notes <text>       Release notes for the manifest (default: empty).
+//   --notes-file <path>  Read the release notes from a file (overrides --notes).
 //   --pub-date <rfc3339> Publish date (default: now).
 //   --self-check         Run the built-in self-check (a temp-fixture smoke) and exit.
 //   --help               Show this help.
@@ -84,6 +93,19 @@ export function targetForBundle(filename) {
   return null;
 }
 
+/** Split a combined Tauri platform key (`<os>-<arch>`, e.g. `darwin-aarch64`)
+ * into its `{{target}}` OS segment and `{{arch}}` architecture segment - the two
+ * path segments the updater endpoint substitutes. The combined form remains the
+ * `platforms` map KEY (what Tauri matches at runtime); the split is only for the
+ * directory layout `updates/<channel>/<os>/<arch>/update.json`. */
+export function osArchForTarget(target) {
+  const idx = target.indexOf("-");
+  if (idx <= 0 || idx === target.length - 1) {
+    throw new Error(`malformed platform key (expected <os>-<arch>): ${target}`);
+  }
+  return { os: target.slice(0, idx), arch: target.slice(idx + 1) };
+}
+
 /** Parse argv (after the channel) into an options object. */
 export function parseArgs(argv) {
   const opts = {};
@@ -103,6 +125,7 @@ export function parseArgs(argv) {
         opts.sha = take();
         break;
       case "--bundles":
+      case "--assets-dir":
         opts.bundles = take();
         break;
       case "--out":
@@ -113,6 +136,9 @@ export function parseArgs(argv) {
         break;
       case "--notes":
         opts.notes = take();
+        break;
+      case "--notes-file":
+        opts.notesFile = take();
         break;
       case "--pub-date":
         opts.pubDate = take();
@@ -218,9 +244,12 @@ export function buildManifest({ version, target, signature, url, notes, pubDate 
   };
 }
 
-/** The output path for a manifest, matching the endpoint URL shape. */
-export function manifestOutPath(outRoot, channel, target, version) {
-  return path.join(outRoot, channel, target, version, "update.json");
+/** The output path for a manifest, matching the endpoint URL shape
+ * `updates/<channel>/<os>/<arch>/update.json` (R1-P1-1: NO version segment).
+ * `target` is the combined `<os>-<arch>` platform key. */
+export function manifestOutPath(outRoot, channel, target) {
+  const { os: targetOs, arch } = osArchForTarget(target);
+  return path.join(outRoot, channel, targetOs, arch, "update.json");
 }
 
 /** Generate all manifests. Returns the list of written file paths. */
@@ -233,11 +262,23 @@ export async function generate(channel, opts, { readConfVersion, log = console }
     ? path.resolve(opts.bundles)
     : path.join(REPO_ROOT, "src-tauri", "target", "release", "bundle");
   const outRoot = opts.out ? path.resolve(opts.out) : path.join(REPO_ROOT, "updates");
+  // The default download base: stable assets live on the `v<version>` tag, but
+  // the `dev` channel publishes to a single ROLLING `dev` GH release (the bundle
+  // version is 0.0.0-dev.<sha> but the tag is just `dev`), so its assets are at
+  // /releases/download/dev (R1-P1-4). An explicit --base-url overrides either.
   const baseUrl =
     opts.baseUrl ??
-    `https://github.com/${GITHUB_REPO}/releases/download/v${version}`;
+    (channel === "dev"
+      ? `https://github.com/${GITHUB_REPO}/releases/download/dev`
+      : `https://github.com/${GITHUB_REPO}/releases/download/v${version}`);
   const pubDate = opts.pubDate ?? new Date().toISOString();
-  const notes = opts.notes ?? "";
+  // Release notes for the in-app changelog (R1-P1-6): --notes-file wins over
+  // --notes (the workflow writes `gh release view --json body` to a file to
+  // avoid shell-quoting a multi-line body), then the inline --notes, else "".
+  let notes = opts.notes ?? "";
+  if (opts.notesFile) {
+    notes = (await fs.readFile(path.resolve(opts.notesFile), "utf8")).trim();
+  }
 
   const bundles = await collectSignedBundles(bundlesDir, log);
   if (bundles.length === 0) {
@@ -257,7 +298,7 @@ export async function generate(channel, opts, { readConfVersion, log = console }
       notes,
       pubDate,
     });
-    const outPath = manifestOutPath(outRoot, channel, b.target, version);
+    const outPath = manifestOutPath(outRoot, channel, b.target);
     await fs.mkdir(path.dirname(outPath), { recursive: true });
     await fs.writeFile(outPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
     written.push(outPath);
@@ -278,15 +319,17 @@ Options:
   --sha <gitsha>        dev channel version becomes 0.0.0-dev.<sha>.
   --bundles <dir>       Directory of bundle + .sig files
                         (default: src-tauri/target/release/bundle).
+  --assets-dir <dir>    Alias for --bundles.
   --out <dir>           Output root (default: ./updates).
   --base-url <url>      Public base URL the bundles are hosted at.
   --notes <text>        Release notes for the manifest.
+  --notes-file <path>   Read release notes from a file (overrides --notes).
   --pub-date <rfc3339>  Publish date (default: now).
   --self-check          Run the built-in temp-fixture smoke test and exit.
   --help                Show this help.
 
 Output layout (matches the updater endpoint URL):
-  updates/<channel>/<target>/<version>/update.json
+  updates/<channel>/<os>/<arch>/update.json
 `;
 
 /** Built-in self-check: build a temp fixture of fake bundles + .sig files, run
@@ -315,7 +358,13 @@ export async function selfCheck() {
   const silent = { info: () => {}, warn: () => {} };
   const result = await generate(
     "stable",
-    { version: "0.1.0", bundles, out, baseUrl: "https://example.test/dl" },
+    {
+      version: "0.1.0",
+      bundles,
+      out,
+      baseUrl: "https://example.test/dl",
+      notes: "Release notes for 0.1.0.",
+    },
     { readConfVersion: async () => "0.1.0", log: silent },
   );
 
@@ -323,12 +372,16 @@ export async function selfCheck() {
   if (result.version !== "0.1.0") errors.push(`version: ${result.version}`);
   if (result.written.length !== 2) errors.push(`expected 2 manifests, got ${result.written.length}`);
 
-  // Windows manifest at the expected path + shape.
-  const winPath = manifestOutPath(out, "stable", "windows-x86_64", "0.1.0");
+  // Windows manifest at the expected path + shape (NO version segment).
+  const winPath = manifestOutPath(out, "stable", "windows-x86_64");
+  if (!winPath.endsWith(path.join("stable", "windows", "x86_64", "update.json"))) {
+    errors.push(`win path layout: ${winPath}`);
+  }
   const win = JSON.parse(await fs.readFile(winPath, "utf8"));
   if (win.version !== "0.1.0") errors.push("win version");
   if (!win.platforms["windows-x86_64"]) errors.push("win platform key");
   if (win.platforms["windows-x86_64"]?.signature !== "SIGWIN==") errors.push("win signature");
+  if (win.notes !== "Release notes for 0.1.0.") errors.push(`win notes: ${win.notes}`);
   if (
     win.platforms["windows-x86_64"]?.url !==
     "https://example.test/dl/Driven_0.1.0_x64-setup.exe"
@@ -337,7 +390,7 @@ export async function selfCheck() {
   }
 
   // macOS aarch64 manifest.
-  const macPath = manifestOutPath(out, "stable", "darwin-aarch64", "0.1.0");
+  const macPath = manifestOutPath(out, "stable", "darwin-aarch64");
   const mac = JSON.parse(await fs.readFile(macPath, "utf8"));
   if (mac.platforms["darwin-aarch64"]?.signature !== "SIGMAC==") errors.push("mac signature");
 

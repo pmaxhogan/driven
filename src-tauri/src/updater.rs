@@ -4,7 +4,10 @@
 //!
 //! 1. RUNTIME CHANNEL SELECTION. The Tauri updater natively substitutes only
 //!    `{{target}}`, `{{arch}}`, and `{{current_version}}` - **`{{channel}}` is
-//!    NOT a valid placeholder** (SPEC s15.1). The channel (`stable` vs `dev`)
+//!    NOT a valid placeholder** (SPEC s15.1). Driven's static-server layout uses
+//!    `{{target}}` (OS) + `{{arch}}` and NO `{{current_version}}` segment (the
+//!    manifest carries the latest version; the updater compares its running
+//!    version to it). The channel (`stable` vs `dev`)
 //!    therefore lives in the URL PATH and is chosen AT RUNTIME via
 //!    `app.updater_builder().endpoints(vec![<channel URL>])`. [`build_updater`]
 //!    is that wrapper. The active channel is read from / written to the SPEC s22
@@ -59,14 +62,21 @@ const CHECK_INTERVAL: Duration = Duration::from_secs(6 * 60 * 60);
 /// `KEY_UPDATER`).
 const KEY_UPDATER: &str = "updater";
 
-/// The stable-channel update-manifest URL (SPEC s15.1/s15.2). `{{target}}` /
-/// `{{current_version}}` are substituted by the Tauri updater; the channel
-/// (`stable`) is in the PATH, never a placeholder.
+/// The stable-channel update-manifest URL (SPEC s15.1/s15.2). `{{target}}` (OS:
+/// `windows`/`darwin`/`linux`) and `{{arch}}` (`x86_64`/`aarch64`/...) are
+/// substituted by the Tauri updater; the channel (`stable`) is in the PATH,
+/// never a placeholder. The path carries NO `{{current_version}}` segment (the
+/// manifest itself carries the latest version; including the installed version
+/// made a 0.1.0 app fetch /0.1.0/ while the 0.1.1 release wrote /0.1.1/, so
+/// updates were never discovered - R1-P1-1). This MUST stay byte-identical to
+/// `scripts/generate-update-json.mjs`'s output layout, tauri.conf.json, and the
+/// release/dev-channel workflow deploy paths.
 const STABLE_ENDPOINT: &str =
-    "https://driven.maxhogan.dev/updates/stable/{{target}}/{{current_version}}/update.json";
-/// The dev-channel update-manifest URL (SPEC s15.2). Pre-release / opt-in.
+    "https://driven.maxhogan.dev/updates/stable/{{target}}/{{arch}}/update.json";
+/// The dev-channel update-manifest URL (SPEC s15.2). Pre-release / opt-in. Same
+/// layout as [`STABLE_ENDPOINT`], differing only in the channel path segment.
 const DEV_ENDPOINT: &str =
-    "https://driven.maxhogan.dev/updates/dev/{{target}}/{{current_version}}/update.json";
+    "https://driven.maxhogan.dev/updates/dev/{{target}}/{{arch}}/update.json";
 
 // ---------------------------------------------------------------------------
 // Channel
@@ -104,7 +114,8 @@ impl Channel {
     }
 
     /// The channel's update-manifest endpoint URL (SPEC s15.2). The channel is in
-    /// the PATH; `{{target}}` / `{{current_version}}` are Tauri placeholders.
+    /// the PATH; `{{target}}` / `{{arch}}` are the Tauri placeholders (no
+    /// `{{current_version}}` segment - R1-P1-1).
     #[must_use]
     pub fn endpoint_url(self) -> &'static str {
         match self {
@@ -222,6 +233,25 @@ fn build_update_info(update: &tauri_plugin_updater::Update, channel: Channel) ->
         published_at: update.date.map(|d| d.to_string()),
         channel: channel.as_str().to_string(),
     }
+}
+
+/// Pure: the channel whose name `updater:downloaded` reports for a pending
+/// update tagged with `channel_str` (R1-P2-3). Returns the canonical channel
+/// string (`stable` | `dev`) - a dev update reports `dev`, not the old
+/// hardcoded `stable`. Lenient parse means a corrupt tag falls back to stable.
+#[must_use]
+fn downloaded_channel(channel_str: &str) -> String {
+    Channel::from_str_lenient(channel_str).as_str().to_string()
+}
+
+/// Pure: whether `install_update` should RESTORE the pending update after the
+/// `download_and_install` result `is_err` (R1-P2-2). On any error we restore so
+/// the banner's next Install retries; on success the value stays taken (the app
+/// relaunches). Factored out so the keep-pending policy is unit-tested without a
+/// live download / a real `Update`.
+#[must_use]
+fn should_restore_pending(install_was_err: bool) -> bool {
+    install_was_err
 }
 
 /// The outcome of an update check, as the pure dispatch path sees it.
@@ -352,9 +382,10 @@ async fn periodic_check_once(app: &AppHandle) {
     };
     match run_check(app, channel).await {
         Ok((outcome, update)) => {
-            if matches!(outcome, CheckOutcome::Available(_)) {
-                // Stash the raw Update so install_update can apply it directly.
-                state.set_pending_update(update);
+            if let Some(update) = update {
+                // Stash the raw Update + its channel so install_update can apply
+                // it directly and emit the real channel on downloaded.
+                state.set_pending_update(Some((update, channel.as_str().to_string())));
             }
             let app_for_emit = app.clone();
             let info = dispatch_check_outcome(outcome, |info| {
@@ -391,8 +422,8 @@ pub async fn check_for_update(
 ) -> CommandResult<Option<UpdateInfo>> {
     let channel = read_channel(state.state().as_ref()).await?;
     let (outcome, update) = run_check(&app, channel).await?;
-    if matches!(outcome, CheckOutcome::Available(_)) {
-        state.set_pending_update(update);
+    if let Some(update) = update {
+        state.set_pending_update(Some((update, channel.as_str().to_string())));
     } else {
         // Up to date: clear any stale pending update from an earlier check.
         state.set_pending_update(None);
@@ -417,12 +448,18 @@ pub async fn check_for_update(
 /// signature / download failure maps to the s24 update code surface.
 #[tauri::command]
 pub async fn install_update(app: AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
-    let update = state.take_pending_update().ok_or_else(|| {
+    // Take the pending update + its channel. On a download/install FAILURE we
+    // restore it (R1-P2-2) so the banner's next Install retries the SAME update
+    // instead of failing "no pending update" until the user re-checks. On
+    // SUCCESS the app relaunches, so leaving it taken is correct.
+    let (update, channel_str) = state.take_pending_update().ok_or_else(|| {
         CommandError::with_code(
             ErrorCode::UpdateEndpointUnreachable,
             "no pending update to install; run a check first",
         )
     })?;
+    // The display channel for the downloaded event (R1-P2-3).
+    let channel = Channel::from_str_lenient(&downloaded_channel(&channel_str));
 
     // The progress callback accumulates downloaded bytes and emits
     // `updater:download_progress`. `content_length` arrives once the server
@@ -439,19 +476,23 @@ pub async fn install_update(app: AppHandle, state: State<'_, AppState>) -> Comma
     };
 
     let done_app = app.clone();
-    let done_info = build_update_info(&update, Channel::Stable);
+    // R1-P2-3: emit `updater:downloaded` with the REAL channel the update came
+    // from, not a hardcoded Stable.
+    let done_info = build_update_info(&update, channel);
     let on_done = move || {
-        // Emit the channel-agnostic info; the channel field is only used for
-        // display, and the install is for whatever channel the check used.
         if let Err(e) = crate::events::emit_updater_downloaded(&done_app, &done_info) {
             tracing::debug!(target: TARGET, error = %e, "emit updater:downloaded failed");
         }
     };
 
-    update
-        .download_and_install(on_chunk, on_done)
-        .await
-        .map_err(map_install_error)?;
+    // Install via `&update` so a failure leaves the value intact to restore.
+    let install_result = update.download_and_install(on_chunk, on_done).await;
+    if should_restore_pending(install_result.is_err()) {
+        // R1-P2-2: restore the pending update (with its channel) so the user can
+        // retry without re-checking.
+        state.set_pending_update(Some((update, channel_str)));
+    }
+    install_result.map_err(map_install_error)?;
 
     tracing::info!(target: TARGET, "update staged; relaunching");
     // Relaunch into the freshly-installed version (tauri-plugin-process). This
@@ -559,9 +600,17 @@ mod tests {
                 "no {{channel}} placeholder: {url}"
             );
             assert!(url.contains("{{target}}"), "has target placeholder: {url}");
+            assert!(url.contains("{{arch}}"), "has arch placeholder: {url}");
+            // R1-P1-1: the path MUST NOT carry the installed version - the
+            // manifest carries the latest version instead, so the updater
+            // actually discovers a newer release.
             assert!(
-                url.contains("{{current_version}}"),
-                "has current_version placeholder: {url}"
+                !url.contains("{{current_version}}"),
+                "no current_version segment (R1-P1-1): {url}"
+            );
+            assert!(
+                url.ends_with("/update.json"),
+                "ends with update.json: {url}"
             );
             // The URL must parse as a real URL (modulo the placeholders, which
             // are valid path chars).
@@ -618,6 +667,34 @@ mod tests {
         assert_eq!(emitted.borrow().len(), 1);
         assert_eq!(emitted.borrow()[0].version, "0.2.0");
         assert_eq!(returned.as_ref().map(|i| i.version.as_str()), Some("0.2.0"));
+    }
+
+    #[test]
+    fn downloaded_event_carries_the_real_channel() {
+        // R1-P2-3: the `updater:downloaded` payload reports the channel the
+        // pending update actually came from - a dev update must report `dev`,
+        // not the old hardcoded `stable`. A corrupt/empty tag falls back to
+        // stable (never silently claims dev).
+        assert_eq!(downloaded_channel("dev"), "dev");
+        assert_eq!(downloaded_channel("stable"), "stable");
+        assert_eq!(downloaded_channel(""), "stable");
+        assert_eq!(downloaded_channel("garbage"), "stable");
+    }
+
+    #[test]
+    fn pending_update_survives_a_failed_install_only() {
+        // R1-P2-2: a FAILED `download_and_install` must restore the pending
+        // update (so the banner's next Install retries); a SUCCESS leaves it
+        // taken (the app relaunches). This is the keep-pending policy the
+        // install command applies to the real download result.
+        assert!(
+            should_restore_pending(true),
+            "failed install must restore pending"
+        );
+        assert!(
+            !should_restore_pending(false),
+            "successful install must NOT restore pending"
+        );
     }
 
     #[test]

@@ -287,15 +287,18 @@ pub struct AppState {
 /// M9a (SPEC s15.2): the in-app updater runtime state held on [`AppState`].
 ///
 /// `pending` holds the [`tauri_plugin_updater::Update`] the most recent check
-/// found (manual or periodic), so `install_update` can `download_and_install`
-/// the SAME object without re-resolving the manifest; it is TAKEN on install (a
-/// fresh check re-populates it). `task` + `shutdown` track the single app-wide
+/// found (manual or periodic) PLUS the channel it came from, so `install_update`
+/// can `download_and_install` the SAME object without re-resolving the manifest
+/// AND emit `updater:downloaded` with the REAL channel (R1-P2-3). It is TAKEN on
+/// install but RESTORED on a download/install failure (R1-P2-2) so the banner's
+/// next Install retries instead of failing "no pending update"; a fresh check
+/// also re-populates it. `task` + `shutdown` track the single app-wide
 /// periodic-check task so the quit drain stops + joins it with no orphan.
 #[derive(Default)]
 pub struct UpdaterRuntime {
-    /// The update the latest check found, awaiting install; `None` when up to
-    /// date / not yet checked / already consumed by an install.
-    pending: std::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+    /// The update the latest check found (with its channel string), awaiting
+    /// install; `None` when up to date / not yet checked / already installed.
+    pending: std::sync::Mutex<Option<(tauri_plugin_updater::Update, String)>>,
     /// The spawned periodic-check task, behind `Option` so the shutdown drain
     /// can TAKE + await it by value; `None` once drained / never spawned.
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -440,11 +443,12 @@ impl AppState {
 
     // --- M9a updater runtime (SPEC s15.2) ----------------------------------
 
-    /// M9a: record the [`tauri_plugin_updater::Update`] a check found, so a
-    /// subsequent `install_update` stages + applies the SAME object without
-    /// re-resolving the manifest. Overwrites any prior pending update (a newer
-    /// check supersedes an older one). `None` clears it.
-    pub fn set_pending_update(&self, update: Option<tauri_plugin_updater::Update>) {
+    /// M9a: record the [`tauri_plugin_updater::Update`] a check found PLUS the
+    /// channel string it came from, so a subsequent `install_update` stages +
+    /// applies the SAME object without re-resolving the manifest AND emits the
+    /// REAL channel on `updater:downloaded` (R1-P2-3). Overwrites any prior
+    /// pending update (a newer check supersedes an older one). `None` clears it.
+    pub fn set_pending_update(&self, update: Option<(tauri_plugin_updater::Update, String)>) {
         *self
             .updater
             .pending
@@ -452,11 +456,13 @@ impl AppState {
             .unwrap_or_else(|e| e.into_inner()) = update;
     }
 
-    /// M9a: TAKE (single-use) the pending update for installation. `None` when no
-    /// check has found an update (so `install_update` returns a clear "nothing to
-    /// install" error rather than guessing).
+    /// M9a: TAKE (single-use) the pending update + its channel for installation.
+    /// `None` when no check has found an update (so `install_update` returns a
+    /// clear "nothing to install" error rather than guessing). On a failed
+    /// install the caller RESTORES it via [`Self::set_pending_update`] so the
+    /// banner's next Install retries (R1-P2-2).
     #[must_use]
-    pub fn take_pending_update(&self) -> Option<tauri_plugin_updater::Update> {
+    pub fn take_pending_update(&self) -> Option<(tauri_plugin_updater::Update, String)> {
         self.updater
             .pending
             .lock()

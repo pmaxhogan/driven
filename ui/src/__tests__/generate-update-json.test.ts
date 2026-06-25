@@ -7,9 +7,10 @@ import { fileURLToPath } from "node:url";
 // generate-update-json.mjs smoke test (SPEC s15 / s19.3; ROADMAP M9). Imports the
 // pure functions from the script (no network, no real bundles) and asserts the
 // emitted update.json SHAPE + PATH LAYOUT against a temp fixture of fake
-// bundles+.sig - the exact contract the in-app updater's endpoint URL expects:
-//   updates/<channel>/<target>/<version>/update.json
-// with a `{ version, notes, pub_date, platforms: { <target>: { signature, url } } }`
+// bundles+.sig - the exact contract the in-app updater's endpoint URL expects
+// (R1-P1-1: NO version segment - the manifest carries the latest version):
+//   updates/<channel>/<os>/<arch>/update.json
+// with a `{ version, notes, pub_date, platforms: { <os>-<arch>: { signature, url } } }`
 // manifest.
 
 const __filename = fileURLToPath(import.meta.url);
@@ -53,7 +54,23 @@ describe("generate-update-json.mjs", () => {
     await expect(mod.selfCheck()).resolves.toBe(true);
   });
 
-  it("generates a per-target manifest at the endpoint-shaped path", async () => {
+  it("splits a combined platform key into os/arch path segments", () => {
+    expect(mod.osArchForTarget("windows-x86_64")).toEqual({
+      os: "windows",
+      arch: "x86_64",
+    });
+    expect(mod.osArchForTarget("darwin-aarch64")).toEqual({
+      os: "darwin",
+      arch: "aarch64",
+    });
+    expect(mod.osArchForTarget("linux-x86_64")).toEqual({
+      os: "linux",
+      arch: "x86_64",
+    });
+    expect(() => mod.osArchForTarget("garbage")).toThrow();
+  });
+
+  it("writes the manifest at the version-less os/arch path with real notes", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-vitest-"));
     const bundles = path.join(tmp, "bundle");
     const out = path.join(tmp, "out");
@@ -69,26 +86,74 @@ describe("generate-update-json.mjs", () => {
     const silent = { info: () => {}, warn: () => {} };
     const result = await mod.generate(
       "stable",
-      { version: "0.2.0", bundles, out, baseUrl: "https://dl.example.test" },
+      {
+        version: "0.2.0",
+        bundles,
+        out,
+        baseUrl: "https://dl.example.test",
+        notes: "## 0.2.0\n\n- Faster sync",
+      },
       { readConfVersion: async () => "0.2.0", log: silent },
     );
 
     expect(result.version).toBe("0.2.0");
     expect(result.written.length).toBe(1);
 
-    const manifestPath = mod.manifestOutPath(
-      out,
-      "stable",
-      "windows-x86_64",
-      "0.2.0",
+    // R1-P1-1: the path is updates/stable/windows/x86_64/update.json - NO
+    // version segment.
+    const manifestPath = mod.manifestOutPath(out, "stable", "windows-x86_64");
+    expect(manifestPath.replace(/\\/g, "/")).toContain(
+      "stable/windows/x86_64/update.json",
     );
+    expect(manifestPath).not.toContain("0.2.0");
+
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
     expect(manifest.version).toBe("0.2.0");
     expect(manifest.platforms["windows-x86_64"].signature).toBe("TESTSIG==");
     expect(manifest.platforms["windows-x86_64"].url).toBe(
       "https://dl.example.test/Driven_0.2.0_x64-setup.exe",
     );
+    // R1-P1-6: the notes propagate into the manifest (the in-app changelog).
+    expect(manifest.notes).toBe("## 0.2.0\n\n- Faster sync");
     expect(typeof manifest.pub_date).toBe("string");
+
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("reads notes from --notes-file and uses the rolling dev base URL", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-dev-"));
+    const bundles = path.join(tmp, "bundle");
+    const out = path.join(tmp, "out");
+    const notesFile = path.join(tmp, "notes.md");
+    await fs.mkdir(bundles, { recursive: true });
+    await fs.writeFile(notesFile, "dev rolling notes\n");
+
+    // A fake signed macOS bundle.
+    await fs.writeFile(path.join(bundles, "Driven_aarch64.app.tar.gz"), "fake");
+    await fs.writeFile(
+      path.join(bundles, "Driven_aarch64.app.tar.gz.sig"),
+      "DEVSIG==\n",
+    );
+
+    const silent = { info: () => {}, warn: () => {} };
+    const result = await mod.generate(
+      "dev",
+      { sha: "abc1234", bundles, out, notesFile },
+      { log: silent },
+    );
+
+    expect(result.version).toBe("0.0.0-dev.abc1234");
+    const manifestPath = mod.manifestOutPath(out, "dev", "darwin-aarch64");
+    expect(manifestPath.replace(/\\/g, "/")).toContain(
+      "dev/darwin/aarch64/update.json",
+    );
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    // Notes came from the file (trimmed).
+    expect(manifest.notes).toBe("dev rolling notes");
+    // The dev base URL defaults to the rolling `dev` tag, NOT v<version>.
+    expect(manifest.platforms["darwin-aarch64"].url).toBe(
+      "https://github.com/pmaxhogan/driven/releases/download/dev/Driven_aarch64.app.tar.gz",
+    );
 
     await fs.rm(tmp, { recursive: true, force: true });
   });
