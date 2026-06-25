@@ -24,5 +24,11 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v4
         with:
+          # Prefer a PAT / App token (RELEASE_PLEASE_TOKEN) so the release PR is
+          # authored by a real identity and its CI runs WITHOUT the manual
+          # "approve workflows" gate GitHub forces on GITHUB_TOKEN-created PRs.
+          # Falls back to GITHUB_TOKEN when the secret is absent (current
+          # behaviour, approval still required) so the workflow never breaks.
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
