@@ -383,6 +383,11 @@ pub struct GlobalSettings {
     pub post_backup_hook: Option<String>,
     /// How long a hook command may run before it is killed, in seconds.
     pub hook_timeout_secs: u32,
+    /// V2 metered pause-or-throttle: `pause` | `throttle` (DESIGN s17).
+    pub metered_mode: String,
+    /// Bandwidth cap (Mbps) used while metered in `throttle` mode; `null`
+    /// falls back to `bandwidthCapMbps`.
+    pub metered_bandwidth_cap_mbps: Option<u32>,
 }
 
 /// V2 schedule-window settings (DESIGN s17). Mirrors
@@ -496,6 +501,10 @@ pub struct GlobalSettingsPatch {
     pub post_backup_hook: Option<Option<String>>,
     /// See [`GlobalSettings::hook_timeout_secs`].
     pub hook_timeout_secs: Option<u32>,
+    /// See [`GlobalSettings::metered_mode`].
+    pub metered_mode: Option<String>,
+    /// See [`GlobalSettings::metered_bandwidth_cap_mbps`]. `Some(None)` clears it.
+    pub metered_bandwidth_cap_mbps: Option<Option<u32>>,
 }
 
 /// Partial SPEC s22 `telemetry` settings.

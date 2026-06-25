@@ -31,7 +31,7 @@ use std::path::PathBuf;
 use serde::Deserialize;
 use tauri::{AppHandle, State};
 
-use driven_core::orchestrator::OrchestratorConfig;
+use driven_core::orchestrator::{MeteredMode, OrchestratorConfig};
 use driven_core::state::StateRepo;
 use driven_core::types::ErrorCode;
 
@@ -289,6 +289,23 @@ pub async fn update_settings(
             cur.hook_timeout_secs = v;
             orchestrator_affecting = true;
         }
+        if let Some(v) = g.metered_mode {
+            check_enum("metered_mode", &v, METERED_MODES)?;
+            cur.metered_mode = v;
+            orchestrator_affecting = true;
+        }
+        if let Some(v) = g.metered_bandwidth_cap_mbps {
+            if let Some(n) = v {
+                check_range(
+                    "metered_bandwidth_cap_mbps",
+                    n,
+                    BANDWIDTH_CAP_MIN,
+                    BANDWIDTH_CAP_MAX,
+                )?;
+            }
+            cur.metered_bandwidth_cap_mbps = v;
+            orchestrator_affecting = true;
+        }
         store_group(repo, KEY_GLOBAL, &storage::Global::from(cur)).await?;
     }
 
@@ -430,6 +447,8 @@ const UPDATE_CHECK_MAX: u32 = 604_800;
 
 /// Valid `io_priority` values (SPEC s22).
 const IO_PRIORITIES: &[&str] = &["normal", "low", "idle"];
+/// V2 metered pause-or-throttle modes (DESIGN s17).
+const METERED_MODES: &[&str] = &["pause", "throttle"];
 /// Valid `log_level` values (the `tracing` levels).
 const LOG_LEVELS: &[&str] = &["error", "warn", "info", "debug", "trace"];
 /// Valid updater `channel` values (SPEC s22).
@@ -608,11 +627,20 @@ mod storage {
         pub post_backup_hook: Option<String>,
         #[serde(default = "default_hook_timeout_secs")]
         pub hook_timeout_secs: u32,
+        #[serde(default = "default_metered_mode")]
+        pub metered_mode: String,
+        #[serde(default)]
+        pub metered_bandwidth_cap_mbps: Option<u32>,
     }
 
     /// Default hook timeout (seconds) for a pre-V2 `global` blob missing it.
     fn default_hook_timeout_secs() -> u32 {
         60
+    }
+
+    /// Default metered mode (V1 behaviour: pause) for a pre-V2 `global` blob.
+    fn default_metered_mode() -> String {
+        "pause".to_string()
     }
 
     impl From<Global> for GlobalSettings {
@@ -631,6 +659,8 @@ mod storage {
                 pre_backup_hook: s.pre_backup_hook,
                 post_backup_hook: s.post_backup_hook,
                 hook_timeout_secs: s.hook_timeout_secs,
+                metered_mode: s.metered_mode,
+                metered_bandwidth_cap_mbps: s.metered_bandwidth_cap_mbps,
             }
         }
     }
@@ -651,6 +681,8 @@ mod storage {
                 pre_backup_hook: d.pre_backup_hook,
                 post_backup_hook: d.post_backup_hook,
                 hook_timeout_secs: d.hook_timeout_secs,
+                metered_mode: d.metered_mode,
+                metered_bandwidth_cap_mbps: d.metered_bandwidth_cap_mbps,
             }
         }
     }
@@ -867,6 +899,12 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
         pre_backup_hook: global.pre_backup_hook.clone(),
         post_backup_hook: global.post_backup_hook.clone(),
         hook_timeout_secs: global.hook_timeout_secs,
+        metered_mode: if global.metered_mode == "throttle" {
+            MeteredMode::Throttle
+        } else {
+            MeteredMode::Pause
+        },
+        metered_bandwidth_cap_mbps: global.metered_bandwidth_cap_mbps,
     })
 }
 
@@ -2020,6 +2058,8 @@ fn default_global() -> GlobalSettings {
         pre_backup_hook: None,
         post_backup_hook: None,
         hook_timeout_secs: 60,
+        metered_mode: "pause".to_string(),
+        metered_bandwidth_cap_mbps: None,
     }
 }
 

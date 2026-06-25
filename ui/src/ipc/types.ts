@@ -180,6 +180,10 @@ export interface GlobalSettings {
   postBackupHook: string | null;
   /** How long a hook may run before it is killed, in seconds. */
   hookTimeoutSecs: number;
+  /** V2 metered behaviour: "pause" | "throttle". */
+  meteredMode: string;
+  /** Bandwidth cap (Mbps) while metered in throttle mode; null falls back. */
+  meteredBandwidthCapMbps: number | null;
 }
 
 export interface TelemetrySettings {
@@ -227,6 +231,8 @@ export interface GlobalSettingsPatch {
   preBackupHook?: string | null;
   postBackupHook?: string | null;
   hookTimeoutSecs?: number;
+  meteredMode?: string;
+  meteredBandwidthCapMbps?: number | null;
 }
 
 export interface TelemetrySettingsPatch {
