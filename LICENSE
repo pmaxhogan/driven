@@ -1,0 +1,19 @@
+Driven is dual-licensed, at your option, under either of:
+
+  * MIT License (see LICENSE-MIT)
+  * Apache License, Version 2.0 (see LICENSE-APACHE)
+
+Copyright (c) 2026 Max Hogan (pmaxhogan) and the Driven contributors.
+
+SPDX-License-Identifier: MIT OR Apache-2.0
+
+You may use this software under the terms of either license. This matches the
+`license = "MIT OR Apache-2.0"` declaration in the workspace Cargo.toml and the
+allowances in deny.toml, so the dual license is consistent across the project.
+
+Unless you explicitly state otherwise, any contribution intentionally submitted
+for inclusion in this work by you, as defined in the Apache-2.0 license, shall be
+dual-licensed as above, without any additional terms or conditions.
+
+The full text of each license is in the LICENSE-MIT and LICENSE-APACHE files in
+the root of this repository.
