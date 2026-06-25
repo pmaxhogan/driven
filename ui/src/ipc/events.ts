@@ -98,6 +98,23 @@ export function onUpdaterAvailable(
   return listen<UpdateInfo>("updater:available", (e) => handler(e.payload));
 }
 
+/** `updater:download_progress` payload: { downloaded, total } (SPEC s15.2). M9a:
+ * the in-app banner subscribes to render a progress bar while `installUpdate`
+ * stages the update. `total` is null until the server reports a content length. */
+export interface UpdaterDownloadProgressPayload {
+  downloaded: number;
+  total: number | null;
+}
+
+export function onUpdaterDownloadProgress(
+  handler: (payload: UpdaterDownloadProgressPayload) => void,
+): Promise<UnlistenFn> {
+  return listen<UpdaterDownloadProgressPayload>(
+    "updater:download_progress",
+    (e) => handler(e.payload),
+  );
+}
+
 /** `updater:downloaded` payload: UpdateInfo (SPEC s11.7). */
 export function onUpdaterDownloaded(
   handler: (info: UpdateInfo) => void,

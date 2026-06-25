@@ -171,12 +171,20 @@
     "updateAvailable": "Update available: {version}",
     "upToDate": "You are up to date.",
     "installUpdateButton": "Install update",
+    "viewChangelogButton": "View changelog",
+    "loadMoreReleasesButton": "Load more releases",
+    "downloading": "Downloading update...",
+    "updateDownloaded": "Update downloaded. Restarting...",
     "licenseLabel": "License",
     "releaseNotesTitle": "Release notes",
     "displayLanguageLabel": "Display language",
     "moreLanguagesComing": "More languages coming soon.",
     "telemetryLabel": "Send anonymous usage stats",
     "exportDiagnosticsButton": "Export diagnostic bundle"
+  },
+  "changelog": {
+    "title": "What's new in {version}",
+    "noNotes": "No release notes were provided for this version."
   },
   "accountList": {
     "title": "Accounts"

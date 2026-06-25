@@ -1,43 +1,36 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onMounted, onUnmounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { getVersion } from "@tauri-apps/api/app";
 
 import * as ipc from "../ipc/commands";
 import { useSettingsStore } from "../stores/settings";
-import type { ReleaseDto, UpdateInfo } from "../ipc/types";
+import { useUpdaterStore } from "../stores/updater";
+import ChangelogModal from "../components/ChangelogModal.vue";
+import type { ReleaseDto } from "../ipc/types";
 
-// About view (SPEC s11.6, s25 /about; DESIGN s8.2 About tab). Shows the app
-// version, the update channel selector (stable / dev), Check-for-updates, the
-// license, the release-notes viewer (list_releases), the telemetry opt-out, the
-// diagnostic-bundle export, and a "more languages coming" placeholder (DESIGN
-// s8.7: V1 ships en-US only, the selector arrives with V2). Channel + telemetry
-// edits round-trip through the settings store; the version comes from the Tauri
-// app metadata; the license is the workspace SPDX id (SPEC s23).
+// About view (SPEC s11.6, s15, s25 /about; DESIGN s8.2 About tab). Shows the app
+// version, the update channel selector (stable / dev), Check-for-updates, an
+// in-app "update available" banner with Install + download progress + View
+// changelog, the paginated release-notes viewer (list_releases) with a per-entry
+// ChangelogModal, the license, the telemetry opt-out, and the diagnostic-bundle
+// export. Channel + the updater flow round-trip through the updater store; the
+// telemetry toggle + diagnostics through the settings store; the version comes
+// from the Tauri app metadata; the license is the workspace SPDX id (SPEC s23).
 const { t, locale } = useI18n();
 const settings = useSettingsStore();
+const updater = useUpdaterStore();
 
 const version = ref<string>("");
-// Workspace license (SPEC s23 workspace.package.license). Bound via a ref so it
-// renders through an interpolation (an SPDX id is not a translatable string).
+// Workspace license (SPEC s23 workspace.package.license).
 const license = ref<string>("MIT OR Apache-2.0");
 
 const channels = ["stable", "dev"] as const;
-
-const checking = ref(false);
-const checked = ref(false);
-const update = ref<UpdateInfo | null>(null);
-const checkError = ref<string | null>(null);
-
-const releases = ref<ReleaseDto[]>([]);
-const releasesLoading = ref(false);
-const releasesError = ref<string | null>(null);
 
 const exporting = ref(false);
 const exportError = ref<string | null>(null);
 const exportedPath = ref<string | null>(null);
 
-const channel = computed(() => settings.settings?.updater.channel ?? "stable");
 const telemetryEnabled = computed(
   () => settings.settings?.telemetry.enabled ?? false,
 );
@@ -50,6 +43,12 @@ function formatReleaseDate(iso: string): string {
   );
 }
 
+/** Localize a SPEC s24 error code, falling back to a generic message. */
+function localizeError(code: string | null): string {
+  if (code === null) return "";
+  return t(`errors.${code}.long`);
+}
+
 onMounted(async () => {
   try {
     version.value = await getVersion();
@@ -59,27 +58,20 @@ onMounted(async () => {
   if (settings.settings === null) {
     await settings.refresh();
   }
-  await loadReleases();
+  // Subscribe to live updater events (a periodic background check can surface an
+  // update without a manual click) and load the channel + the releases list.
+  await updater.subscribe();
+  await updater.loadChannel();
+  await updater.loadReleases();
 });
 
-async function checkForUpdates(): Promise<void> {
-  checking.value = true;
-  checkError.value = null;
-  try {
-    update.value = await ipc.checkForUpdates();
-    checked.value = true;
-  } catch (e) {
-    checkError.value = String(e);
-  } finally {
-    checking.value = false;
-  }
-}
+onUnmounted(() => {
+  updater.unsubscribe();
+});
 
-async function setChannel(event: Event): Promise<void> {
+async function onChannelChange(event: Event): Promise<void> {
   const value = (event.target as HTMLSelectElement).value;
-  await settings.patch({ updater: { channel: value } });
-  // A channel change can change what "latest" means; refresh the notes.
-  await loadReleases();
+  await updater.setChannel(value);
 }
 
 async function setTelemetry(event: Event): Promise<void> {
@@ -87,30 +79,16 @@ async function setTelemetry(event: Event): Promise<void> {
   await settings.patch({ telemetry: { enabled: checkedValue } });
 }
 
-async function loadReleases(): Promise<void> {
-  releasesLoading.value = true;
-  releasesError.value = null;
-  try {
-    releases.value = await ipc.listReleases(1);
-  } catch (e) {
-    releasesError.value = String(e);
-  } finally {
-    releasesLoading.value = false;
-  }
-}
-
 async function exportDiagnostics(): Promise<void> {
   exportError.value = null;
   exportedPath.value = null;
   // C1/C2: the BACKEND owns the save-file dialog and returns a concrete `.zip`
-  // path + a one-shot token. The webview never supplies a write target; the
-  // backend writes the ZIP at the token-bound path (SPEC s11.6.1).
+  // path + a one-shot token. The webview never supplies a write target.
   let token: string;
   try {
     const picked = await ipc.pickSaveZipDialog();
     token = picked.token;
   } catch {
-    // Cancel (or dialog error): nothing to export.
     return;
   }
   exporting.value = true;
@@ -122,6 +100,10 @@ async function exportDiagnostics(): Promise<void> {
     exporting.value = false;
   }
 }
+
+function viewReleaseChangelog(release: ReleaseDto): void {
+  updater.openChangelog(release);
+}
 </script>
 
 <template>
@@ -129,6 +111,75 @@ async function exportDiagnostics(): Promise<void> {
     <h1 class="text-2xl font-semibold">
       {{ t("about.title") }}
     </h1>
+
+    <!-- Update-available banner (listens to updater:available via the store). -->
+    <div
+      v-if="updater.bannerVisible && updater.available"
+      class="space-y-2 rounded border border-emerald-300 bg-emerald-50 p-4 text-sm dark:border-emerald-700 dark:bg-emerald-950"
+      data-testid="update-banner"
+    >
+      <p class="font-medium">
+        {{ t("about.updateAvailable", { version: updater.available.version }) }}
+      </p>
+      <div class="flex flex-wrap items-center gap-2">
+        <button
+          type="button"
+          class="rounded bg-emerald-600 px-3 py-1.5 text-white disabled:opacity-50"
+          :disabled="updater.installing"
+          data-testid="install-update"
+          @click="updater.install()"
+        >
+          {{ t("about.installUpdateButton") }}
+        </button>
+        <button
+          type="button"
+          class="rounded border px-3 py-1.5"
+          @click="updater.openAvailableChangelog()"
+        >
+          {{ t("about.viewChangelogButton") }}
+        </button>
+        <button
+          type="button"
+          class="rounded px-3 py-1.5 text-zinc-500"
+          @click="updater.dismissBanner()"
+        >
+          {{ t("common.close") }}
+        </button>
+      </div>
+
+      <!-- Download progress while installing. -->
+      <div
+        v-if="updater.installing"
+        class="space-y-1"
+        data-testid="install-progress"
+      >
+        <div class="h-2 w-full overflow-hidden rounded bg-emerald-200 dark:bg-emerald-900">
+          <div
+            class="h-full bg-emerald-600 transition-all"
+            :style="{
+              width:
+                updater.downloadFraction !== null
+                  ? `${Math.round(updater.downloadFraction * 100)}%`
+                  : '100%',
+            }"
+          />
+        </div>
+        <p class="text-xs text-zinc-600 dark:text-zinc-400">
+          {{
+            updater.downloadComplete
+              ? t("about.updateDownloaded")
+              : t("about.downloading")
+          }}
+        </p>
+      </div>
+      <p
+        v-if="updater.installErrorCode"
+        class="text-sm text-red-600"
+        data-testid="install-error"
+      >
+        {{ localizeError(updater.installErrorCode) }}
+      </p>
+    </div>
 
     <div class="space-y-1 text-sm">
       <p>{{ t("about.version", { version }) }}</p>
@@ -144,9 +195,10 @@ async function exportDiagnostics(): Promise<void> {
           t("about.channelLabel")
         }}</span>
         <select
-          :value="channel"
+          :value="updater.channel"
           class="w-full rounded border px-2 py-1"
-          @change="setChannel"
+          data-testid="channel-select"
+          @change="onChannelChange"
         >
           <option
             v-for="ch in channels"
@@ -163,32 +215,36 @@ async function exportDiagnostics(): Promise<void> {
       <button
         type="button"
         class="rounded border px-3 py-1.5 text-sm"
-        :disabled="checking"
-        @click="checkForUpdates"
+        :disabled="updater.checking"
+        data-testid="check-updates"
+        @click="updater.check()"
       >
         {{ t("about.checkForUpdatesButton") }}
       </button>
       <p
-        v-if="checking"
+        v-if="updater.checking"
         class="text-sm text-zinc-500"
       >
         {{ t("common.loading") }}
       </p>
       <p
-        v-else-if="checkError"
+        v-else-if="updater.checkErrorCode"
         class="text-sm text-red-600"
+        data-testid="check-error"
       >
-        {{ checkError }}
+        {{ localizeError(updater.checkErrorCode) }}
       </p>
       <p
-        v-else-if="checked && update"
+        v-else-if="updater.checked && updater.available"
         class="text-sm"
+        data-testid="check-available"
       >
-        {{ t("about.updateAvailable", { version: update.version }) }}
+        {{ t("about.updateAvailable", { version: updater.available.version }) }}
       </p>
       <p
-        v-else-if="checked"
+        v-else-if="updater.checked"
         class="text-sm text-zinc-500"
+        data-testid="check-uptodate"
       >
         {{ t("about.upToDate") }}
       </p>
@@ -232,24 +288,25 @@ async function exportDiagnostics(): Promise<void> {
         {{ t("about.releaseNotesTitle") }}
       </h2>
       <p
-        v-if="releasesLoading"
+        v-if="updater.releasesLoading && updater.releases.length === 0"
         class="text-sm text-zinc-500"
       >
         {{ t("common.loading") }}
       </p>
       <p
-        v-else-if="releasesError"
+        v-else-if="updater.releasesErrorCode"
         class="text-sm text-red-600"
+        data-testid="releases-error"
       >
-        {{ releasesError }}
+        {{ localizeError(updater.releasesErrorCode) }}
       </p>
       <ul
-        v-else-if="releases.length > 0"
+        v-else-if="updater.releases.length > 0"
         class="space-y-3"
         data-testid="release-notes"
       >
         <li
-          v-for="release in releases"
+          v-for="release in updater.releases"
           :key="release.version"
           class="space-y-1 border-b pb-3"
         >
@@ -259,11 +316,25 @@ async function exportDiagnostics(): Promise<void> {
           <p class="text-xs text-zinc-400">
             {{ formatReleaseDate(release.publishedAt) }}
           </p>
-          <p class="whitespace-pre-line text-sm text-zinc-600 dark:text-zinc-400">
-            {{ release.notes }}
-          </p>
+          <button
+            type="button"
+            class="text-sm text-emerald-700 underline dark:text-emerald-400"
+            @click="viewReleaseChangelog(release)"
+          >
+            {{ t("about.viewChangelogButton") }}
+          </button>
         </li>
       </ul>
+      <button
+        v-if="updater.hasMoreReleases"
+        type="button"
+        class="rounded border px-3 py-1.5 text-sm"
+        :disabled="updater.releasesLoading"
+        data-testid="load-more-releases"
+        @click="updater.loadMoreReleases()"
+      >
+        {{ t("about.loadMoreReleasesButton") }}
+      </button>
     </div>
 
     <p class="text-sm text-zinc-500">
@@ -272,5 +343,10 @@ async function exportDiagnostics(): Promise<void> {
       }}:</span>
       {{ t("about.moreLanguagesComing") }}
     </p>
+
+    <ChangelogModal
+      :release="updater.changelogRelease"
+      @close="updater.closeChangelog()"
+    />
   </section>
 </template>

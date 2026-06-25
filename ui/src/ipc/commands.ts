@@ -177,6 +177,36 @@ export function listReleases(page: number): Promise<ReleaseDto[]> {
   return invoke("list_releases", { page });
 }
 
+// --- In-app updater (SPEC s15.2; M9a) ---
+
+/** Manually check the active channel's signed `update.json` manifest for a newer
+ * release (SPEC s15.2). Distinct from `checkForUpdates` (the GitHub-releases
+ * About-tab check): this records the pending update so `installUpdate` can apply
+ * it, and emits `updater:available`. Returns the update info or null when up to
+ * date. */
+export function checkForUpdate(): Promise<UpdateInfo | null> {
+  return invoke("check_for_update");
+}
+
+/** Download + apply the pending update (from the most recent check) and relaunch
+ * (SPEC s15.2). Progress arrives on `updater:download_progress`; `updater:downloaded`
+ * fires right before the relaunch. On success the app restarts and this never
+ * resolves; a missing pending update / signature failure rejects with an s24 code. */
+export function installUpdate(): Promise<void> {
+  return invoke("install_update");
+}
+
+/** The active updater channel (`stable` | `dev`), from settings (SPEC s15.2). */
+export function getUpdateChannel(): Promise<string> {
+  return invoke("get_update_channel");
+}
+
+/** Switch the active updater channel and persist it (SPEC s15.2). Returns the
+ * stored channel. The next check uses the new channel. */
+export function setUpdateChannel(channel: string): Promise<string> {
+  return invoke("set_update_channel", { channel });
+}
+
 // --- Activity (SPEC s11.4) ---
 
 /** Query a paginated, filtered page of the activity log (SPEC s11.4). The
