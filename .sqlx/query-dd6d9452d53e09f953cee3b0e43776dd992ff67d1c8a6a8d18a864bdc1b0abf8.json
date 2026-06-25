@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                SELECT folder AS \"folder!: String\"\n                FROM (\n                    SELECT DISTINCT\n                        substr(\n                            substr(relative_path, ?2 + 1),\n                            1,\n                            instr(substr(relative_path, ?2 + 1), '/') - 1\n                        ) AS folder\n                    FROM file_state\n                    WHERE source_id = ?1\n                      AND instr(substr(relative_path, ?2 + 1), '/') > 0\n                )\n                ORDER BY folder ASC\n                LIMIT ?3\n                ",
+  "describe": {
+    "columns": [
+      {
+        "name": "folder!: String",
+        "ordinal": 0,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      null
+    ]
+  },
+  "hash": "dd6d9452d53e09f953cee3b0e43776dd992ff67d1c8a6a8d18a864bdc1b0abf8"
+}

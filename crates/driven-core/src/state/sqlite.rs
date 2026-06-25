@@ -34,8 +34,8 @@ use uuid::Uuid;
 
 use super::{
     AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
-    FileSearchHit, FileStateRow, FileStatusCount, NewActivity, NewPendingOp, PageRequest,
-    PendingOpRow, RestoreFileRow, SourceRow, StateRepo,
+    FileSearchHit, FileStateRow, FileStatusCount, ImmediateTreeChildren, NewActivity, NewPendingOp,
+    PageRequest, PendingOpRow, RestoreFileRow, SourceRow, StateRepo,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -1853,6 +1853,211 @@ impl StateRepo for SqliteStateRepo {
             .collect()
     }
 
+    async fn list_immediate_tree_children(
+        &self,
+        source: SourceId,
+        prefix: &str,
+        children_cap: u32,
+    ) -> Result<ImmediateTreeChildren> {
+        let source_str = source.to_string();
+        // Fetch cap + 1 of EACH child kind so a count overflow is detectable
+        // without a separate COUNT (R3-P2-3: cap CHILDREN, not descendant rows).
+        let fetch = (u64::from(children_cap).saturating_add(1)).min(i64::MAX as u64) as i64;
+
+        // The byte length of the prefix portion to strip from each path to get the
+        // "local" remainder under the prefix. For an empty prefix this is 0 (the
+        // whole path is local); otherwise it is `len(prefix) + 1` (skip the
+        // trailing '/'). SQLite `substr` is 1-indexed, so the local remainder is
+        // `substr(relative_path, strip_len + 1)`.
+        //
+        // We reuse the SAME indexed range bounds `list_file_state_under_prefix`
+        // uses ([prefix/, prefix0) plus the exact-prefix row), so both queries are
+        // indexed range scans over the `(source_id, relative_path)` PK rather than
+        // full-table scans. The exact-`prefix` row (a FILE whose name equals the
+        // prefix) is NOT a child of the prefix-as-directory, so it is excluded from
+        // BOTH child queries (only descendants under `prefix/` are children).
+        let (lower, upper) = if prefix.is_empty() {
+            // Empty prefix = source root: every row for the source is a child.
+            (String::new(), String::new())
+        } else {
+            (format!("{prefix}/"), format!("{prefix}0"))
+        };
+        // strip_len: chars to drop from the front of relative_path to get the local
+        // remainder. SQLite length()/substr operate on UTF-8 characters, which is
+        // consistent for both (we never mix bytes + chars).
+        let strip_len: i64 = if prefix.is_empty() {
+            0
+        } else {
+            // +1 for the '/' after the prefix.
+            (prefix.chars().count() as i64).saturating_add(1)
+        };
+
+        // --- immediate FILES: local remainder contains NO '/' ------------------
+        // A direct file child's path is exactly `prefix/<name>` (or `<name>` at
+        // root), so the local remainder `substr(relative_path, strip_len+1)` has no
+        // path separator. We ORDER BY relative_path so the cap takes the
+        // alphabetically-first files deterministically.
+        let file_rows = if prefix.is_empty() {
+            sqlx::query!(
+                r#"
+                SELECT
+                    source_id     AS "source_id!: String",
+                    relative_path AS "relative_path!: String",
+                    size          AS "size!: i64",
+                    status        AS "status!: String",
+                    drive_file_id AS "drive_file_id: String"
+                FROM file_state
+                WHERE source_id = ?1
+                  AND instr(substr(relative_path, ?2 + 1), '/') = 0
+                ORDER BY relative_path ASC
+                LIMIT ?3
+                "#,
+                source_str,
+                strip_len,
+                fetch,
+            )
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.source_id,
+                    r.relative_path,
+                    r.size,
+                    r.status,
+                    r.drive_file_id,
+                )
+            })
+            .collect::<Vec<_>>()
+        } else {
+            sqlx::query!(
+                r#"
+                SELECT
+                    source_id     AS "source_id!: String",
+                    relative_path AS "relative_path!: String",
+                    size          AS "size!: i64",
+                    status        AS "status!: String",
+                    drive_file_id AS "drive_file_id: String"
+                FROM file_state
+                WHERE source_id = ?1
+                  AND relative_path >= ?2 AND relative_path < ?3
+                  AND instr(substr(relative_path, ?4 + 1), '/') = 0
+                ORDER BY relative_path ASC
+                LIMIT ?5
+                "#,
+                source_str,
+                lower,
+                upper,
+                strip_len,
+                fetch,
+            )
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|r| {
+                (
+                    r.source_id,
+                    r.relative_path,
+                    r.size,
+                    r.status,
+                    r.drive_file_id,
+                )
+            })
+            .collect::<Vec<_>>()
+        };
+
+        // --- immediate SUB-FOLDERS: DISTINCT first local segment for deeper rows -
+        // A sub-folder child is the first path segment of any row whose local
+        // remainder DOES contain a '/'. We compute that segment in SQL
+        // (`substr(rest, 1, instr(rest,'/')-1)`) and DISTINCT it, so a sub-folder
+        // with 100k files contributes exactly ONE folder child - it can no longer
+        // crowd out siblings (R3-P2-3). ORDER BY the segment for a deterministic
+        // cap.
+        let folder_rows = if prefix.is_empty() {
+            sqlx::query!(
+                r#"
+                SELECT folder AS "folder!: String"
+                FROM (
+                    SELECT DISTINCT
+                        substr(
+                            substr(relative_path, ?2 + 1),
+                            1,
+                            instr(substr(relative_path, ?2 + 1), '/') - 1
+                        ) AS folder
+                    FROM file_state
+                    WHERE source_id = ?1
+                      AND instr(substr(relative_path, ?2 + 1), '/') > 0
+                )
+                ORDER BY folder ASC
+                LIMIT ?3
+                "#,
+                source_str,
+                strip_len,
+                fetch,
+            )
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|r| r.folder)
+            .collect::<Vec<_>>()
+        } else {
+            sqlx::query!(
+                r#"
+                SELECT folder AS "folder!: String"
+                FROM (
+                    SELECT DISTINCT
+                        substr(
+                            substr(relative_path, ?4 + 1),
+                            1,
+                            instr(substr(relative_path, ?4 + 1), '/') - 1
+                        ) AS folder
+                    FROM file_state
+                    WHERE source_id = ?1
+                      AND relative_path >= ?2 AND relative_path < ?3
+                      AND instr(substr(relative_path, ?4 + 1), '/') > 0
+                )
+                ORDER BY folder ASC
+                LIMIT ?5
+                "#,
+                source_str,
+                lower,
+                upper,
+                strip_len,
+                fetch,
+            )
+            .fetch_all(&self.pool)
+            .await?
+            .into_iter()
+            .map(|r| r.folder)
+            .collect::<Vec<_>>()
+        };
+
+        let cap = children_cap as usize;
+        // Truncated iff EITHER child kind overflowed its cap (we fetched cap + 1).
+        let truncated = file_rows.len() > cap || folder_rows.len() > cap;
+
+        let files: Result<Vec<RestoreFileRow>> = file_rows
+            .into_iter()
+            .take(cap)
+            .map(|(source_id, relative_path, size, status, drive_file_id)| {
+                Ok(RestoreFileRow {
+                    source_id: SourceId(uuid_from_str(&source_id)?),
+                    relative_path: relative_path_from_string(relative_path)?,
+                    size: size as u64,
+                    status: file_state_status_from_str(&status)?,
+                    drive_file_id,
+                })
+            })
+            .collect();
+        let folders: Vec<String> = folder_rows.into_iter().take(cap).collect();
+
+        Ok(ImmediateTreeChildren {
+            folders,
+            files: files?,
+            truncated,
+        })
+    }
+
     async fn search_files_glob(
         &self,
         source: Option<SourceId>,
@@ -3342,6 +3547,136 @@ mod tests {
             .unwrap();
         // limit 3 -> at most 4 rows fetched (3 + 1 truncation sentinel).
         assert_eq!(rows.len(), 4);
+    }
+
+    #[tokio::test]
+    async fn immediate_tree_children_lists_direct_folders_and_files() {
+        // R3-P2-3: the immediate-children query returns DISTINCT direct sub-folders
+        // + direct files, NOT transitive descendants.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        for p in [
+            "a.txt",
+            "src/main.rs",
+            "src/lib.rs",
+            "src/nested/deep.rs",
+            "srcfoo.txt", // NOT under "src/"
+            "docs/readme.md",
+        ] {
+            repo.upsert_file_state(&sample_file(src.id, p, 0x01))
+                .await
+                .unwrap();
+        }
+
+        // Root: folders {docs, src}; files {a.txt, srcfoo.txt}.
+        let root = repo
+            .list_immediate_tree_children(src.id, "", 5_000)
+            .await
+            .unwrap();
+        assert_eq!(root.folders, vec!["docs".to_string(), "src".to_string()]);
+        let root_files: Vec<&str> = root
+            .files
+            .iter()
+            .map(|r| r.relative_path.as_str())
+            .collect();
+        assert_eq!(root_files, ["a.txt", "srcfoo.txt"]);
+        assert!(!root.truncated);
+
+        // Under "src": folder {nested}; files {lib.rs, main.rs} (deep.rs is NOT a
+        // direct child).
+        let under_src = repo
+            .list_immediate_tree_children(src.id, "src", 5_000)
+            .await
+            .unwrap();
+        assert_eq!(under_src.folders, vec!["nested".to_string()]);
+        let src_files: Vec<&str> = under_src
+            .files
+            .iter()
+            .map(|r| r.relative_path.as_str())
+            .collect();
+        assert_eq!(src_files, ["src/lib.rs", "src/main.rs"]);
+    }
+
+    #[tokio::test]
+    async fn immediate_tree_children_does_not_hide_siblings_behind_huge_first_folder() {
+        // R3-P2-3 (the discriminating test): the FIRST sub-folder holds MANY more
+        // files than the old descendant-scan cap would have fetched. With the old
+        // approach those files would exhaust the scan and HIDE the later sibling
+        // folders/files. The new immediate-children query collapses the huge folder
+        // to ONE folder child, so all later siblings still appear.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // "aaa_big/" with a LOT of files (alphabetically first so a descendant scan
+        // would hit it before the siblings).
+        let big = 1_500usize;
+        for i in 0..big {
+            repo.upsert_file_state(&sample_file(src.id, &format!("aaa_big/f{i:06}.txt"), 0x01))
+                .await
+                .unwrap();
+        }
+        // Later sibling folder + sibling file (alphabetically AFTER aaa_big).
+        repo.upsert_file_state(&sample_file(src.id, "zzz_other/note.txt", 0x02))
+            .await
+            .unwrap();
+        repo.upsert_file_state(&sample_file(src.id, "zzz_root.txt", 0x03))
+            .await
+            .unwrap();
+
+        // Cap the CHILDREN at a small number; the huge folder is ONE child, so the
+        // siblings are NOT crowded out.
+        let children = repo
+            .list_immediate_tree_children(src.id, "", 100)
+            .await
+            .unwrap();
+        assert_eq!(
+            children.folders,
+            vec!["aaa_big".to_string(), "zzz_other".to_string()],
+            "the huge first folder must collapse to one child and NOT hide the later sibling folder"
+        );
+        let files: Vec<&str> = children
+            .files
+            .iter()
+            .map(|r| r.relative_path.as_str())
+            .collect();
+        assert_eq!(
+            files,
+            ["zzz_root.txt"],
+            "the later sibling FILE must still be listed (R3-P2-3)"
+        );
+        assert!(
+            !children.truncated,
+            "two folders + one file is under the cap, so not truncated"
+        );
+    }
+
+    #[tokio::test]
+    async fn immediate_tree_children_truncates_on_child_count_overflow() {
+        // R3-P2-3: `truncated` is set when the IMMEDIATE CHILD count exceeds the
+        // cap (not because a single folder is large).
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        // 5 immediate files; cap at 3 -> truncated, returns exactly 3.
+        for i in 0..5 {
+            repo.upsert_file_state(&sample_file(src.id, &format!("f{i}.txt"), 0x01))
+                .await
+                .unwrap();
+        }
+        let children = repo
+            .list_immediate_tree_children(src.id, "", 3)
+            .await
+            .unwrap();
+        assert_eq!(children.files.len(), 3, "capped to the children cap");
+        assert!(children.truncated, "more files than the cap => truncated");
     }
 
     #[tokio::test]

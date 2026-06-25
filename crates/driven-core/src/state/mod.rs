@@ -374,6 +374,28 @@ pub struct RestoreFileRow {
     pub drive_file_id: Option<String>,
 }
 
+/// R3-P2-3: the IMMEDIATE children of one Restore-tree folder, computed in SQL
+/// (not derived from a capped scan of all descendants). The Restore browser opens
+/// one folder at a time and needs only its direct sub-folders + direct files; the
+/// previous design scanned the first N DESCENDANT rows and derived children from
+/// them, so a first sub-folder holding 100k+ files would exhaust the descendant
+/// cap and HIDE later sibling folders/files. This type carries exactly the direct
+/// children, each capped independently, so siblings are never dropped.
+#[derive(Debug, Clone, PartialEq, Eq, Default)]
+pub struct ImmediateTreeChildren {
+    /// Distinct immediate sub-folder names (the first path segment under the
+    /// prefix for any deeper row), alphabetical, capped at the children cap.
+    pub folders: Vec<String>,
+    /// Immediate FILE rows (a row whose path is exactly `prefix/<name>`),
+    /// alphabetical by name, capped at the children cap.
+    pub files: Vec<RestoreFileRow>,
+    /// True when EITHER the folder count OR the file count exceeded the requested
+    /// cap (so the caller can surface a "showing first N" notice). Set ONLY on a
+    /// genuine immediate-child overflow - never because a single sub-folder is
+    /// large (R3-P2-3: a large first child must not hide siblings).
+    pub truncated: bool,
+}
+
 // -----------------------------------------------------------------------------
 // The trait surface.
 // -----------------------------------------------------------------------------
@@ -801,6 +823,31 @@ pub trait StateRepo: Send + Sync {
     ) -> Result<Vec<RestoreFileRow>> {
         let _ = (source, prefix, limit);
         Ok(Vec::new())
+    }
+
+    /// R3-P2-3: list the IMMEDIATE children (direct sub-folders + direct files) of
+    /// `prefix` for `source`, computing them in SQL rather than deriving them from
+    /// a capped scan of all descendants. `prefix` is a validated, `/`-separated,
+    /// plaintext path (empty = the source root). The implementation must:
+    ///   - return DISTINCT first-segment sub-folder names (for rows deeper than the
+    ///     immediate level) and the immediate FILE rows (path == `prefix/<name>`),
+    ///   - cap the number of CHILDREN (folders, files) at `children_cap`, and set
+    ///     [`ImmediateTreeChildren::truncated`] ONLY when an immediate-child COUNT
+    ///     overflows the cap - NEVER because one sub-folder is large.
+    ///
+    /// This is the correct replacement for deriving children from
+    /// [`Self::list_file_state_under_prefix`] (which capped DESCENDANT rows and so
+    /// could hide later siblings when the first sub-folder was huge). The default
+    /// impl returns empty (the test fakes never call it); the SQLite repo overrides
+    /// it with two capped indexed range-scans over the same prefix bounds.
+    async fn list_immediate_tree_children(
+        &self,
+        source: SourceId,
+        prefix: &str,
+        children_cap: u32,
+    ) -> Result<ImmediateTreeChildren> {
+        let _ = (source, prefix, children_cap);
+        Ok(ImmediateTreeChildren::default())
     }
 
     /// M8: GLOB-search `file_state.relative_path` (SPEC s11.5 the `search_files`

@@ -47,6 +47,11 @@ use tauri::{AppHandle, Emitter, Manager, State};
 use tokio::io::AsyncReadExt;
 
 use driven_core::crypto_provider::CryptoResolution;
+// R3-P2-3: `RestoreFileRow` is now used only by the test-only
+// `derive_immediate_children` helper + the unit tests (production navigation reads
+// `ImmediateTreeChildren` via `list_immediate_tree_children`), so the import is
+// test-scoped to avoid an unused-import warning in release builds.
+#[cfg(test)]
 use driven_core::state::RestoreFileRow;
 use driven_core::types::{ErrorCode, SourceId};
 use driven_crypto::{ContentDecryptor, SourceCryptoSuite, HEADER_LEN};
@@ -68,11 +73,6 @@ const TARGET: &str = "driven::app::restore";
 /// `truncated` flag so the user knows, M8-P2-1); the underlying range scan is
 /// bounded so a pathological tree cannot blow up the IPC.
 pub(crate) const MAX_TREE_NODES: u32 = 5_000;
-
-/// Underlying `file_state` row cap for one tree open. A folder's range scan can
-/// touch the whole subtree (to derive immediate sub-folders), so this bounds the
-/// scan independently of the returned-node cap above.
-const MAX_TREE_SCAN_ROWS: u32 = 100_000;
 
 /// Max search hits returned to the webview for one query (SPEC s11.6.1 bound).
 const MAX_SEARCH_LIMIT: u32 = 1_000;
@@ -116,28 +116,31 @@ pub async fn list_remote_tree(
 ) -> CommandResult<RemoteTreeDto> {
     let prefix = validate_prefix(&prefix)?;
 
-    let rows = state
+    // R3-P2-3: query the IMMEDIATE children directly in SQL (capped CHILDREN), so a
+    // single huge sub-folder can NEVER crowd out later sibling folders/files. The
+    // previous design scanned the first N DESCENDANT rows and derived children from
+    // them, so a first sub-folder with 100k+ files would exhaust the scan cap and
+    // hide every sibling after it (the UI saw only `truncated`). Now the DB returns
+    // distinct immediate sub-folders + immediate files, each capped independently,
+    // and `truncated` is set ONLY on a genuine immediate-child overflow.
+    let children = state
         .state()
-        .list_file_state_under_prefix(source_id, &prefix, MAX_TREE_SCAN_ROWS)
+        .list_immediate_tree_children(source_id, &prefix, MAX_TREE_NODES)
         .await
         .map_err(CommandError::from)?;
 
-    let nodes = derive_immediate_children(&prefix, &rows);
-    // M8-P2-1: SURFACE the cap instead of silently dropping children. `truncated`
-    // is true when the folder has more immediate children than the returned cap
-    // (or the underlying scan itself hit its row cap, in which case deeper folders
-    // may also be incomplete), so the UI can tell the user the listing is partial.
-    let truncated = nodes.len() as u32 > MAX_TREE_NODES || rows.len() as u32 >= MAX_TREE_SCAN_ROWS;
-    let entries: Vec<RemoteEntryDto> = nodes.into_iter().take(MAX_TREE_NODES as usize).collect();
+    let entries = immediate_children_to_entries(&prefix, &children);
+    let truncated = children.truncated;
 
     tracing::debug!(
         target: TARGET,
         %source_id,
         prefix = %prefix,
-        scanned = rows.len(),
+        folders = children.folders.len(),
+        files = children.files.len(),
         returned = entries.len(),
         truncated,
-        "list_remote_tree served from file_state"
+        "list_remote_tree served from file_state (immediate children)"
     );
     Ok(RemoteTreeDto { entries, truncated })
 }
@@ -243,9 +246,14 @@ pub async fn restore_files(
         ));
     }
 
-    // SPEC s11.6.1: resolve + CONSUME the one-shot dialog token to the approved
-    // destination directory. A missing / replayed token is rejected.
-    let dest_dir = state.take_dialog_token(&dest_token).ok_or_else(|| {
+    // R3-P2-1: PEEK (do NOT consume) the one-shot dialog token first, so any
+    // failure in the token-INDEPENDENT validation below (a stale selection, a
+    // missing/unuploaded row, a destination collision, or a keychain/setup error)
+    // leaves the token INTACT - the user is not forced to re-pick the folder. The
+    // token is CONSUMED only immediately before the job is actually accepted (just
+    // before the atomic seed+spawn), so the single use is spent only on a real
+    // restore. A missing / replayed / expired token is still rejected here.
+    let dest_dir = state.peek_dialog_token(&dest_token).ok_or_else(|| {
         CommandError::with_code(
             ErrorCode::LocalIoError,
             "no matching destination folder; pick a restore folder first",
@@ -264,46 +272,18 @@ pub async fn restore_files(
             "restore destination is not a directory",
         ));
     }
-    let dest_token = DialogToken::for_root(dest_dir.to_string_lossy().to_string());
+    let dest_root = DialogToken::for_root(dest_dir.to_string_lossy().to_string());
 
     // Resolve each selected item to its authoritative file_state row UP FRONT (so
     // a bad selection fails the command rather than the background job): the
     // (source_id, relative_path) pair is the file_state PK; the backend reads the
     // Drive id + size + status from SQLite, never trusting webview-supplied ids.
-    let mut resolved: Vec<ResolvedRestore> = Vec::with_capacity(items.len());
-    for item in &items {
-        let source_id: SourceId = item.source_id.parse().map_err(|e| {
-            CommandError::with_code(
-                ErrorCode::InvalidInput,
-                format!("invalid source id in restore selection: {e}"),
-            )
-        })?;
-        let relative_path = driven_core::types::RelativePath::try_from(item.relative_path.clone())
-            .map_err(|e| {
-                CommandError::with_code(
-                    ErrorCode::InvalidInput,
-                    format!("invalid relative path in restore selection: {e}"),
-                )
-            })?;
-        let row = state
-            .state()
-            .get_file_state(source_id, &relative_path)
-            .await
-            .map_err(CommandError::from)?
-            .ok_or_else(|| {
-                CommandError::with_code(
-                    ErrorCode::InternalBug,
-                    format!("unknown file to restore: {}", item.relative_path),
-                )
-            })?;
-        resolved.push(ResolvedRestore {
-            source_id,
-            relative_path: row.relative_path.as_str().to_string(),
-            size: row.size,
-            drive_file_id: row.drive_file_id.clone(),
-            hash_blake3: row.hash_blake3,
-        });
-    }
+    // R3-P2-2: a row that was never uploaded (drive_file_id == NULL) or is not in
+    // a restorable (`synced`) state is rejected here as bad INPUT, before any job
+    // is spawned, rather than flowing in and failing later as `internal.bug`. This
+    // resolution + the R3-P1-1 collision pre-check are token-INDEPENDENT, so they
+    // run BEFORE the dialog token is consumed (R3-P2-1).
+    let resolved = resolve_restore_items(state.inner(), &items).await?;
 
     // R2-P2-1: build ALL fallible setup (the per-account remote stores + crypto
     // suites the job will use) BEFORE seeding/emitting the job, so an early Err
@@ -313,6 +293,20 @@ pub async fn restore_files(
     // job on the UI. `build_restore_plans` does NOT touch the job map, so on Err
     // the `?` below returns with `restore_jobs` still empty.
     let plans = build_restore_plans(state.inner(), resolved).await?;
+
+    // R3-P2-1: ALL token-independent validation + fallible setup has now succeeded,
+    // so the restore WILL be accepted. CONSUME the one-shot token now (the first +
+    // only irreversible step). The peeked `dest_dir` equals the path bound to the
+    // token, so `dest_root` (built from it above) is the approved root; we just
+    // spend the single use so the token cannot be replayed. A concurrent take that
+    // already consumed it (None) is rejected without spawning a job.
+    if state.take_dialog_token(&dest_token).is_none() {
+        return Err(CommandError::with_code(
+            ErrorCode::LocalIoError,
+            "no matching destination folder; pick a restore folder first",
+        ));
+    }
+    let dest_token = dest_root;
 
     // All fallible setup succeeded. NOW mint the job id, build the initial
     // (all-pending) status from the plans, seed it WITH its cancel flag (P1-1),
@@ -340,29 +334,155 @@ pub async fn restore_files(
             })
             .collect(),
     };
+    // Clone the initial status for the seed (stored on AppState) and for the first
+    // emit, since the original `status` moves INTO the spawned task below (it owns
+    // + mutates the live status as the job runs).
+    let status_seed = status.clone();
+    let status_for_emit = status.clone();
     // M8-P1-1: the per-job cancel flag the spawned task observes between frames;
-    // `cancel_restore_job` + the shutdown drain set it. Seed the job so a cancel /
-    // late poll resolves it immediately, before the task handle is attached.
+    // `cancel_restore_job` + the shutdown drain set it.
     let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
-    state.seed_restore_job(status.clone(), cancel.clone());
-    emit_progress(&app, &status);
 
-    // Spawn the background job. It owns the plans + the dest token + the cancel
-    // flag; it drives each file, updates + emits + records the status, and never
-    // blocks the IPC. On exit it clears its own handle so the shutdown drain does
-    // not await an already-finished task.
+    // R3-P1-2: ATOMIC seed + handle-registration via a START BARRIER, so
+    // `cancel_all_restore_jobs` (app quit) NEVER observes a seeded restore job that
+    // lacks an awaitable handle, and a quit anywhere in the spawn window leaves NO
+    // partial temp.
+    //
+    // The previous code seeded the job, spawned the task, THEN attached the handle
+    // - a window in which a quit saw a handle-less job it could not await/abort,
+    // and if the task had already begun (created a temp) the process could exit
+    // mid-write leaving a partial. We close that window:
+    // 1. Spawn the task FIRST, but gate ALL of its filesystem work behind a
+    //    oneshot `release_rx.await`: until released it creates NO temp / touches no
+    //    disk. (A oneshot await is an async wait, not a poll/sleep loop.)
+    // 2. Seed the job AND register the JoinHandle in ONE locked insert
+    //    (`seed_restore_job` now takes the handle), so the moment the job is
+    //    observable it ALREADY has an awaitable handle.
+    // 3. ONLY THEN release the barrier. On release the task re-checks the cancel
+    //    flag IMMEDIATELY (before any temp): if a quit/cancel set it during the
+    //    window, the task exits cleanly via `run_restore_job`'s pre-file cancel
+    //    check (it marks every file Cancelled, emits the terminal status, and
+    //    clears its own handle) - no temp is ever created.
     let app_for_job = app.clone();
     let job_cancel = cancel.clone();
+    let job_id_for_task = job_id.clone();
+    let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
     // tokio::spawn (not tauri::async_runtime::spawn) so the returned handle is a
     // tokio JoinHandle the AppState tracks + the shutdown drain awaits, matching
     // the per-account task handles (the command already runs on the tokio runtime).
     let handle = tokio::task::spawn(async move {
+        // BARRIER: do nothing (no temp, no disk) until released. If the command
+        // returns Err before releasing (so `release_tx` is dropped), `await`
+        // resolves to Err and the task exits without seeding-side effects. If the
+        // job was cancelled during the seed window, the cancel flag is already set
+        // and `run_restore_job`'s first pre-file check exits cleanly (no temp).
+        if release_rx.await.is_err() {
+            // Not released (the command failed after spawn but before release, or
+            // the sender was dropped): clear our own handle if the job was seeded,
+            // then exit without doing any filesystem work.
+            if let Some(state) = app_for_job.try_state::<AppState>() {
+                state.finish_restore_job_handle(&job_id_for_task);
+            }
+            return;
+        }
         run_restore_job(app_for_job, plans, dest_token, &mut status, job_cancel).await;
     });
-    // Attach the handle so cancel / shutdown can await it (P1-1).
-    state.set_restore_job_handle(&job_id, handle);
+
+    // Seed the job AND attach the handle atomically (one locked insert), so a
+    // seeded job is NEVER observable without an awaitable handle (R3-P1-2). Done
+    // under the SAME lock that seeds the job.
+    state.seed_restore_job(status_seed, cancel, handle);
+    // The job is now observable WITH its handle. Release the barrier so the task
+    // proceeds (or exits cleanly if a cancel landed during the window).
+    let _ = release_tx.send(());
+    // Emit the first (all-pending) tick so the webview shows the job.
+    emit_progress(&app, &status_for_emit);
 
     Ok(RestoreJobId(job_id))
+}
+
+/// Resolve + validate the selected restore `items` against authoritative
+/// `file_state` (token-INDEPENDENT, so it runs BEFORE the one-shot dialog token is
+/// consumed - R3-P2-1). For each item it:
+///   - parses the source id + relative path (bad shapes -> `internal.invalid_input`),
+///   - looks up the `file_state` PK row (an unknown row is a stale / forged
+///     selection -> `internal.invalid_input`, NOT `internal.bug` - R3-P2-2),
+///   - R3-P2-2 restore-eligibility: REJECTS a row that was never uploaded
+///     (`drive_file_id == NULL`) or whose status is not `synced`, as bad input. A
+///     non-`synced` row's recorded `hash_blake3` may not match the bytes currently
+///     on Drive, so restoring it would fail the in-stream BLAKE3 verify late (a
+///     confusing `crypto.decrypt_failed`) or hand back a mismatched object; we
+///     reject it up front instead (documented in design/CODEX_NOTES.md).
+///
+/// Then it runs the R3-P1-1 destination-collision pre-check over the whole
+/// selection (duplicate / case-folded / file-vs-dir path conflicts), rejecting the
+/// WHOLE job before any job is spawned or the token consumed. Split out so this
+/// pure validation is unit-testable against a real `AppState` without a Tauri
+/// `AppHandle`.
+async fn resolve_restore_items(
+    state: &AppState,
+    items: &[RestoreItem],
+) -> CommandResult<Vec<ResolvedRestore>> {
+    let mut resolved: Vec<ResolvedRestore> = Vec::with_capacity(items.len());
+    for item in items {
+        let source_id: SourceId = item.source_id.parse().map_err(|e| {
+            CommandError::with_code(
+                ErrorCode::InvalidInput,
+                format!("invalid source id in restore selection: {e}"),
+            )
+        })?;
+        let relative_path = driven_core::types::RelativePath::try_from(item.relative_path.clone())
+            .map_err(|e| {
+                CommandError::with_code(
+                    ErrorCode::InvalidInput,
+                    format!("invalid relative path in restore selection: {e}"),
+                )
+            })?;
+        let row = state
+            .state()
+            .get_file_state(source_id, &relative_path)
+            .await
+            .map_err(CommandError::from)?
+            .ok_or_else(|| {
+                CommandError::with_code(
+                    ErrorCode::InvalidInput,
+                    format!("unknown file to restore: {}", item.relative_path),
+                )
+            })?;
+        if row.drive_file_id.is_none() {
+            return Err(CommandError::with_code(
+                ErrorCode::InvalidInput,
+                format!(
+                    "file is not restorable (never uploaded): {}",
+                    item.relative_path
+                ),
+            ));
+        }
+        if row.status != driven_core::types::FileStateStatus::Synced {
+            return Err(CommandError::with_code(
+                ErrorCode::InvalidInput,
+                format!(
+                    "file is not restorable (status is {}, not synced): {}",
+                    file_state_status_str(row.status),
+                    item.relative_path
+                ),
+            ));
+        }
+        resolved.push(ResolvedRestore {
+            source_id,
+            relative_path: row.relative_path.as_str().to_string(),
+            size: row.size,
+            drive_file_id: row.drive_file_id.clone(),
+            hash_blake3: row.hash_blake3,
+        });
+    }
+
+    // R3-P1-1: reject the WHOLE job if any two selected items would write to the
+    // SAME destination (case-folded), or if one item's destination is a strict
+    // path-prefix of another's (a file vs a directory at the same path).
+    detect_dest_collisions(&resolved)?;
+
+    Ok(resolved)
 }
 
 /// `cancel_restore_job(job)` - request cancellation of a running restore job
@@ -472,12 +592,36 @@ async fn build_restore_plans(
 // -----------------------------------------------------------------------------
 
 /// One file resolved to its authoritative `file_state` fields (M8).
+#[derive(Debug)]
 struct ResolvedRestore {
     source_id: SourceId,
     relative_path: String,
     size: u64,
     drive_file_id: Option<String>,
     hash_blake3: [u8; 32],
+}
+
+/// R3-P1-1: the restore-eligible subset of one resolved item, used for the
+/// destination-collision pre-check. A restore writes every selected item to
+/// `dest/<relative_path>`, so two items whose normalized destination KEY collide
+/// (an exact duplicate, a case-folded duplicate on a case-insensitive dest, or a
+/// file whose key is a strict path-prefix of another item's directory key) would
+/// silently overwrite each other (data loss). We compute these keys up front and
+/// reject the WHOLE job on any collision (a visible bad-request error) BEFORE any
+/// fallible setup, the dialog token is consumed, or the job is spawned.
+struct DestKey {
+    /// The original (display) relative path - used in the rejection message.
+    display: String,
+    /// The case-FOLDED path segments (each segment lowercased) of the
+    /// destination key. We fold case to the SAFE direction (treat `Foo.txt` and
+    /// `foo.txt` as colliding): a case-insensitive destination is the norm on the
+    /// supported platforms (Windows ALWAYS, macOS/APFS by default), and an
+    /// over-reject is a visible error while an under-reject is silent data loss
+    /// (R3-P1-1). We DEFAULT TO folding rather than probing the dest's case
+    /// sensitivity (documented in design/CODEX_NOTES.md): probing would create
+    /// throwaway files in the user's chosen folder for an edge that does not arise
+    /// on the supported platforms.
+    folded: Vec<String>,
 }
 
 /// One file's restore plan: the resolved file plus the store to download from and
@@ -1111,6 +1255,86 @@ fn resolve_suite(
     }
 }
 
+/// R3-P1-1: reject the restore job if any two selected items would collide at the
+/// destination. A restore writes each item to `dest/<relative_path>`, so a
+/// collision SILENTLY overwrites one file with another (data loss). Two collision
+/// shapes are rejected, BOTH under case-FOLDING (so `Foo.txt` and `foo.txt` count
+/// as the same destination on a case-insensitive dest - Windows always, macOS/APFS
+/// by default; see [`DestKey`]):
+///   1. DUPLICATE: two items map to the same folded destination key (e.g. two
+///      sources both selecting `foo.txt`, or `Foo.txt` + `foo.txt`).
+///   2. FILE-VS-DIR PREFIX: one item's folded key is a strict path-PREFIX of
+///      another's, i.e. one item is a FILE at a path that is also a DIRECTORY
+///      component of another item's path (e.g. `a/b` as a file vs `a/b/c` as a
+///      file - `a/b` cannot be both a file and a directory).
+///
+/// The prefix test is SEGMENT-WISE, never a raw string `starts_with` (so `foo`
+/// does NOT falsely prefix `foobar`): we build the set of every PROPER ANCESTOR
+/// directory path of every item and check it against the set of full file keys -
+/// any intersection is a file-vs-dir conflict.
+fn detect_dest_collisions(resolved: &[ResolvedRestore]) -> CommandResult<()> {
+    use std::collections::HashMap;
+
+    // Build the folded key for each item.
+    let keys: Vec<DestKey> = resolved
+        .iter()
+        .map(|r| DestKey {
+            display: r.relative_path.clone(),
+            folded: r
+                .relative_path
+                .split('/')
+                .filter(|s| !s.is_empty())
+                .map(|s| s.to_lowercase())
+                .collect(),
+        })
+        .collect();
+
+    // 1) DUPLICATE folded full key. Map folded-joined -> first display path seen.
+    let mut seen: HashMap<String, String> = HashMap::with_capacity(keys.len());
+    for k in &keys {
+        let joined = k.folded.join("/");
+        if let Some(prev) = seen.get(&joined) {
+            return Err(CommandError::with_code(
+                ErrorCode::InvalidInput,
+                format!(
+                    "restore selection has two files that map to the same destination (case-insensitive): \"{}\" and \"{}\"",
+                    prev, k.display
+                ),
+            ));
+        }
+        seen.insert(joined.clone(), k.display.clone());
+    }
+
+    // 2) FILE-VS-DIR PREFIX: every PROPER ANCESTOR dir path of every item, mapped
+    //    back to the item whose ancestor it is. If any ancestor path equals some
+    //    item's FULL file key, that file path is also used as a directory - reject.
+    let mut ancestor_of: HashMap<String, String> = HashMap::new();
+    for k in &keys {
+        // Proper ancestors: all but the last segment, accumulated.
+        for end in 1..k.folded.len() {
+            let ancestor = k.folded[..end].join("/");
+            ancestor_of
+                .entry(ancestor)
+                .or_insert_with(|| k.display.clone());
+        }
+    }
+    for k in &keys {
+        let joined = k.folded.join("/");
+        if let Some(descendant) = ancestor_of.get(&joined) {
+            // `joined` is a FILE key that is ALSO an ancestor directory of
+            // `descendant` - a file-vs-directory conflict at the same path.
+            return Err(CommandError::with_code(
+                ErrorCode::InvalidInput,
+                format!(
+                    "restore selection conflicts: \"{}\" is a file but is also a folder on the path to \"{}\"",
+                    k.display, descendant
+                ),
+            ));
+        }
+    }
+    Ok(())
+}
+
 /// Validate a `list_remote_tree` prefix (SPEC s11.6.1): a Drive-relative,
 /// `/`-separated, printable, length-bounded PLAINTEXT path - NOT a local path. An
 /// empty prefix (the source root) is allowed. Returns the normalized prefix (no
@@ -1177,10 +1401,62 @@ fn is_glob_query(query: &str) -> bool {
     !is_simple_trailing_prefix
 }
 
+/// R3-P2-3: convert the SQL-computed [`ImmediateTreeChildren`] (distinct immediate
+/// sub-folder names + immediate file rows) into the webview [`RemoteEntryDto`]
+/// list. Folders sort before files, each alphabetically (the DB already returns
+/// each kind sorted; we just concatenate folders-then-files). The full
+/// `relative_path` is rebuilt as `prefix/<name>` (or `<name>` at the root).
+fn immediate_children_to_entries(
+    prefix: &str,
+    children: &driven_core::state::ImmediateTreeChildren,
+) -> Vec<RemoteEntryDto> {
+    let prefix_join = |name: &str| -> String {
+        if prefix.is_empty() {
+            name.to_string()
+        } else {
+            format!("{prefix}/{name}")
+        }
+    };
+    let mut out: Vec<RemoteEntryDto> =
+        Vec::with_capacity(children.folders.len() + children.files.len());
+    for name in &children.folders {
+        out.push(RemoteEntryDto {
+            relative_path: prefix_join(name),
+            name: name.clone(),
+            is_dir: true,
+            size: 0,
+            status: None,
+            restorable: false,
+        });
+    }
+    for row in &children.files {
+        let full = row.relative_path.as_str().to_string();
+        // The display name is the leaf segment of the full relative path.
+        let name = full.rsplit('/').next().unwrap_or(&full).to_string();
+        out.push(RemoteEntryDto {
+            relative_path: full,
+            name,
+            is_dir: false,
+            size: row.size,
+            status: Some(file_state_status_str(row.status).to_string()),
+            restorable: row.drive_file_id.is_some(),
+        });
+    }
+    out
+}
+
 /// Derive the IMMEDIATE children (sub-folders + files) of `prefix` from the
 /// subtree rows. A row whose path equals `prefix/<name>` is a direct FILE child; a
 /// row deeper than that (`prefix/<dir>/...`) contributes its first segment as a
 /// direct FOLDER child (deduped). Folders sort before files, each alphabetically.
+///
+/// R3-P2-3: the production `list_remote_tree` no longer derives children from a
+/// capped descendant scan (that hid siblings behind a huge first sub-folder) - it
+/// queries immediate children in SQL via `list_immediate_tree_children`. This
+/// helper is retained ONLY for the unit tests that assert the folder/file split +
+/// ordering semantics (the same semantics the SQL now enforces), so it is
+/// `#[cfg(test)]`.
+#[cfg(test)]
 fn derive_immediate_children(prefix: &str, rows: &[RestoreFileRow]) -> Vec<RemoteEntryDto> {
     use std::collections::BTreeMap;
 
@@ -2683,5 +2959,359 @@ mod tests {
             "a failed restore setup must leave NO job entry in AppState (R2-P2-1)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- R3-P1-1: destination-collision detection -----------------------------
+
+    fn resolved_item(source: SourceId, rel: &str) -> ResolvedRestore {
+        ResolvedRestore {
+            source_id: source,
+            relative_path: rel.to_string(),
+            size: 1,
+            drive_file_id: Some("d".to_string()),
+            hash_blake3: [0u8; 32],
+        }
+    }
+
+    #[test]
+    fn detect_dest_collisions_rejects_same_destination_key() {
+        // R3-P1-1: two items from DIFFERENT sources both restoring `foo.txt` map to
+        // the SAME destination key (dest/foo.txt) and would silently overwrite each
+        // other - reject the whole job.
+        let a = SourceId::new_v4();
+        let b = SourceId::new_v4();
+        let sel = vec![resolved_item(a, "foo.txt"), resolved_item(b, "foo.txt")];
+        let err = detect_dest_collisions(&sel)
+            .expect_err("two items with the same dest key must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn detect_dest_collisions_folds_case_on_insensitive_dest() {
+        // R3-P1-1: on a case-insensitive destination (Windows always, macOS/APFS by
+        // default - the folding we DEFAULT to), `Foo.txt` and `foo.txt` collide.
+        let a = SourceId::new_v4();
+        let b = SourceId::new_v4();
+        let sel = vec![
+            resolved_item(a, "dir/Foo.txt"),
+            resolved_item(b, "dir/foo.txt"),
+        ];
+        let err = detect_dest_collisions(&sel)
+            .expect_err("Foo.txt + foo.txt must collide under case-folding");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn detect_dest_collisions_rejects_file_vs_dir_prefix_conflict() {
+        // R3-P1-1: one item is a FILE at `a/b` while another is `a/b/c` (so `a/b`
+        // must also be a directory) - `a/b` cannot be both. Reject. (Segment-wise:
+        // `a/b` is a proper ancestor of `a/b/c`.)
+        let a = SourceId::new_v4();
+        let sel = vec![resolved_item(a, "a/b"), resolved_item(a, "a/b/c")];
+        let err = detect_dest_collisions(&sel)
+            .expect_err("a file-vs-dir path-prefix conflict must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn detect_dest_collisions_allows_non_colliding_multisource_selection() {
+        // R3-P1-1: a clean multi-source selection with DISTINCT destination keys
+        // (and no segment-wise prefix `foo` vs `foobar` false positive) succeeds.
+        let a = SourceId::new_v4();
+        let b = SourceId::new_v4();
+        let sel = vec![
+            resolved_item(a, "foo.txt"),
+            resolved_item(b, "bar.txt"),
+            resolved_item(a, "dir/foo.txt"),
+            resolved_item(b, "dir/baz.txt"),
+            // `foo` (a dir name in `foo/x`) must NOT collide with the file `foobar`.
+            resolved_item(a, "foo/x"),
+            resolved_item(a, "foobar"),
+        ];
+        assert!(
+            detect_dest_collisions(&sel).is_ok(),
+            "a non-colliding multi-source selection must be allowed"
+        );
+    }
+
+    // --- R3-P2-2: unuploaded / non-synced rows rejected as bad input ----------
+
+    /// Build a real AppState backed by a fresh SQLite repo + one account/source,
+    /// returning the state, the source id, and the temp dir (for cleanup).
+    async fn state_with_source() -> (AppState, SourceId, std::path::PathBuf) {
+        use crate::app_state::RemoteMode;
+        use driven_core::state::StateRepo;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+        let nonce = uuid::Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("driven-restore-resolve-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = driven_core::state::SqliteStateRepo::open(&dir.join("state.db"))
+            .await
+            .expect("open state repo");
+        // Seed one account + one source so file_state rows have a valid FK.
+        let account = driven_core::state::AccountRow {
+            id: driven_core::types::AccountId::new_v4(),
+            email: "alice@example.com".into(),
+            display_name: Some("Alice".into()),
+            state: driven_core::types::AccountState::Ok,
+            encryption_master_key_id: Some("kc:alice".into()),
+            created_at: 1_700_000_000_000,
+            last_synced_at: None,
+        };
+        repo.upsert_account(&account).await.unwrap();
+        let src_id = SourceId::new_v4();
+        let source = driven_core::state::SourceRow {
+            id: src_id,
+            account_id: account.id,
+            display_name: "Docs".into(),
+            enabled: true,
+            local_path: "/home/alice/docs".into(),
+            drive_folder_id: "folder-1".into(),
+            drive_folder_path: "/Driven/Docs".into(),
+            encryption_enabled: false,
+            wrapped_source_key: None,
+            respect_gitignore: true,
+            include_patterns: vec!["**/*".into()],
+            exclude_patterns: vec!["**/*.tmp".into()],
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: 604_800,
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            created_at: 1_700_000_000_000,
+        };
+        repo.upsert_source(&source).await.unwrap();
+        let app_state = AppState::new(
+            Arc::new(repo),
+            HashMap::new(),
+            RemoteMode::Fake,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+        );
+        (app_state, src_id, dir)
+    }
+
+    fn file_state_row(
+        source: SourceId,
+        rel: &str,
+        drive: Option<&str>,
+        status: FileStateStatus,
+    ) -> driven_core::state::FileStateRow {
+        driven_core::state::FileStateRow {
+            source_id: source,
+            relative_path: driven_core::types::RelativePath::try_from(rel.to_string()).unwrap(),
+            size: 3,
+            mtime_ns: 0,
+            hash_blake3: [0u8; 32],
+            drive_file_id: drive.map(|s| s.to_string()),
+            drive_md5: None,
+            encrypted_remote_path: None,
+            status,
+            last_uploaded_at: None,
+            last_verified_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn resolve_restore_items_rejects_null_drive_file_id_as_bad_input() {
+        // R3-P2-2: a selection containing a row with drive_file_id = NULL (never
+        // uploaded) is rejected with the BAD-REQUEST code (internal.invalid_input),
+        // NOT internal.bug, BEFORE any job is spawned.
+        let (state, src, dir) = state_with_source().await;
+        // An uploaded+synced row (eligible) and a NULL-drive_file_id row (ineligible).
+        state
+            .state()
+            .upsert_file_state(&file_state_row(
+                src,
+                "ok.txt",
+                Some("d-ok"),
+                FileStateStatus::Synced,
+            ))
+            .await
+            .unwrap();
+        state
+            .state()
+            .upsert_file_state(&file_state_row(
+                src,
+                "never.bin",
+                None,
+                FileStateStatus::Pending,
+            ))
+            .await
+            .unwrap();
+
+        let items = vec![
+            RestoreItem {
+                source_id: src.to_string(),
+                relative_path: "ok.txt".to_string(),
+            },
+            RestoreItem {
+                source_id: src.to_string(),
+                relative_path: "never.bin".to_string(),
+            },
+        ];
+        let err = resolve_restore_items(&state, &items)
+            .await
+            .expect_err("a NULL-drive_file_id selection must be rejected");
+        assert_eq!(
+            err.code,
+            ErrorCode::InvalidInput,
+            "an unuploaded row must be bad input, not internal.bug"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_restore_items_rejects_non_synced_row_as_bad_input() {
+        // R3-P2-2: an uploaded row whose status is not `synced` (e.g. error) is
+        // rejected as bad input (its recorded hash may not match the remote bytes).
+        let (state, src, dir) = state_with_source().await;
+        state
+            .state()
+            .upsert_file_state(&file_state_row(
+                src,
+                "stale.txt",
+                Some("d-1"),
+                FileStateStatus::Error,
+            ))
+            .await
+            .unwrap();
+        let items = vec![RestoreItem {
+            source_id: src.to_string(),
+            relative_path: "stale.txt".to_string(),
+        }];
+        let err = resolve_restore_items(&state, &items)
+            .await
+            .expect_err("a non-synced row must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_restore_items_accepts_clean_synced_selection() {
+        // The happy path: a clean, non-colliding selection of uploaded+synced rows
+        // resolves successfully (so the collision/eligibility guards do not over-reject).
+        let (state, src, dir) = state_with_source().await;
+        for rel in ["a.txt", "sub/b.txt"] {
+            state
+                .state()
+                .upsert_file_state(&file_state_row(
+                    src,
+                    rel,
+                    Some("d"),
+                    FileStateStatus::Synced,
+                ))
+                .await
+                .unwrap();
+        }
+        let items = vec![
+            RestoreItem {
+                source_id: src.to_string(),
+                relative_path: "a.txt".to_string(),
+            },
+            RestoreItem {
+                source_id: src.to_string(),
+                relative_path: "sub/b.txt".to_string(),
+            },
+        ];
+        let resolved = resolve_restore_items(&state, &items)
+            .await
+            .expect("a clean synced selection must resolve");
+        assert_eq!(resolved.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- R3-P1-2: atomic seed+handle vs a quit in the seed->release window -----
+
+    #[tokio::test]
+    async fn seeded_restore_job_always_has_awaitable_handle_for_shutdown_drain() {
+        // R3-P1-2: a seeded restore job is NEVER observable without an awaitable
+        // handle. We model the exact race: seed the job WITH its handle (one locked
+        // insert), then BEFORE releasing the barrier the app quits and runs the
+        // shutdown drain. The drain must find the handle (drain, not orphan), and
+        // the gated task must do NO filesystem work + leave NO temp.
+        use crate::app_state::RemoteMode;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let nonce = uuid::Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("driven-restore-seedrace-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = driven_core::state::SqliteStateRepo::open(&dir.join("state.db"))
+            .await
+            .expect("open state repo");
+        let app_state = AppState::new(
+            Arc::new(repo),
+            HashMap::new(),
+            RemoteMode::Fake,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+        );
+
+        let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
+        let job_cancel = cancel.clone();
+        let (release_tx, release_rx) = tokio::sync::oneshot::channel::<()>();
+        // The gated task: do NOTHING until released. If released with the cancel
+        // flag set (the quit path), exit immediately WITHOUT touching disk - mirrors
+        // run_restore_job's pre-file cancel check. A marker file proves no fs work.
+        let marker = dir.join("did-fs-work.marker");
+        let marker_for_task = marker.clone();
+        let handle = tokio::task::spawn(async move {
+            if release_rx.await.is_err() {
+                return;
+            }
+            if job_cancel.load(Ordering::SeqCst) {
+                // Quit/cancel observed on release: exit clean, no fs work.
+                return;
+            }
+            // Would-be filesystem work (never reached in this test).
+            let _ = std::fs::write(&marker_for_task, b"x");
+        });
+
+        // Seed the job WITH its handle ATOMICALLY (R3-P1-2): the instant it is
+        // observable it already has an awaitable handle.
+        let status = restore_status_for("seed-race");
+        app_state.seed_restore_job(status, cancel.clone(), handle);
+
+        // QUIT in the window BEFORE release: the shutdown drain sets every cancel
+        // flag and TAKES every handle. It must find this job's handle.
+        let handles = app_state.cancel_all_restore_jobs();
+        assert_eq!(
+            handles.len(),
+            1,
+            "a seeded job MUST expose an awaitable handle to the shutdown drain (R3-P1-2)"
+        );
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "the drain set the cancel flag"
+        );
+
+        // Now release the barrier (the spawn-window code path) and await the task.
+        let _ = release_tx.send(());
+        for h in handles {
+            tokio::time::timeout(std::time::Duration::from_secs(2), h)
+                .await
+                .expect("the gated task must join (not orphan)")
+                .expect("joined cleanly");
+        }
+        // The task saw the cancel on release and did NO filesystem work / no temp.
+        assert!(
+            !marker.exists(),
+            "a quit in the seed->release window must leave NO partial fs work (R3-P1-2)"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    fn restore_status_for(job_id: &str) -> RestoreJobStatus {
+        RestoreJobStatus {
+            job_id: job_id.to_string(),
+            total_files: 1,
+            completed_files: 0,
+            failed_files: 0,
+            total_bytes: 0,
+            bytes_done: 0,
+            current_file: None,
+            done: false,
+            cancelled: false,
+            files: Vec::new(),
+        }
     }
 }

@@ -417,16 +417,23 @@ impl AppState {
         self.restore_jobs.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// M8 (P1-1): SEED a restore job before its task is spawned - its initial
-    /// status snapshot + shared cancel flag - so `get_restore_job` can serve it
-    /// immediately and `cancel_restore_job` works even before the handle is
-    /// attached. The spawned [`JoinHandle`] is attached afterward via
-    /// [`Self::set_restore_job_handle`] (the command spawns the task, then stores
-    /// its handle). Also opportunistically prunes terminal jobs (P2-3).
+    /// M8 (P1-1; R3-P1-2): SEED a restore job - its initial status snapshot, shared
+    /// cancel flag, AND its already-spawned task [`JoinHandle`] - in ONE locked
+    /// insert. Registering the handle ATOMICALLY with the seed (rather than seeding
+    /// first and attaching the handle in a separate call) closes the R3-P1-2 race:
+    /// `cancel_all_restore_jobs` (app quit) can NEVER observe a seeded restore job
+    /// that lacks an awaitable handle. The command spawns the task behind a START
+    /// BARRIER (the task does no filesystem work until released), seeds it here with
+    /// its handle, THEN releases the barrier - so a quit anywhere in the spawn
+    /// window finds a drainable handle and the task creates no partial temp.
+    /// `get_restore_job` can serve the job immediately and `cancel_restore_job`
+    /// works the moment the job is seeded. Also opportunistically prunes terminal
+    /// jobs (P2-3).
     pub fn seed_restore_job(
         &self,
         status: crate::commands::dtos::RestoreJobStatus,
         cancel: RestoreCancel,
+        handle: JoinHandle<()>,
     ) {
         let mut map = self.lock_restore_jobs();
         map.insert(
@@ -435,21 +442,10 @@ impl AppState {
                 status,
                 terminal_at: None,
                 cancel,
-                handle: std::sync::Mutex::new(None),
+                handle: std::sync::Mutex::new(Some(handle)),
             },
         );
         prune_terminal_jobs(&mut map);
-    }
-
-    /// M8 (P1-1): attach the spawned task handle to an already-seeded job (the
-    /// command spawns the task, then calls this with the returned handle) so the
-    /// cancel / shutdown drain can await it. A no-op if the job already finished
-    /// and was pruned (the handle is simply dropped, detaching the task, which is
-    /// fine since a finished task has nothing to drain).
-    pub fn set_restore_job_handle(&self, job_id: &str, handle: JoinHandle<()>) {
-        if let Some(entry) = self.lock_restore_jobs().get(job_id) {
-            *entry.handle.lock().unwrap_or_else(|e| e.into_inner()) = Some(handle);
-        }
     }
 
     /// M8: record the latest status snapshot for a restore job (the background
@@ -1337,8 +1333,7 @@ mod tests {
                 tokio::time::sleep(Duration::from_millis(5)).await;
             }
         });
-        app_state.seed_restore_job(restore_status("job-1", false), cancel.clone());
-        app_state.set_restore_job_handle("job-1", handle);
+        app_state.seed_restore_job(restore_status("job-1", false), cancel.clone(), handle);
 
         // Cancel: flag set + handle returned.
         let returned = app_state.cancel_restore_job("job-1");
@@ -1386,8 +1381,7 @@ mod tests {
             }
         });
         let task_finished = handle.abort_handle();
-        app_state.seed_restore_job(restore_status("ui-job", false), cancel.clone());
-        app_state.set_restore_job_handle("ui-job", handle);
+        app_state.seed_restore_job(restore_status("ui-job", false), cancel.clone(), handle);
 
         // UI cancel: flag set, but the handle is LEFT tracked (not taken/dropped).
         assert!(
@@ -1445,8 +1439,7 @@ mod tests {
                 }
             });
             let id = format!("job-{i}");
-            app_state.seed_restore_job(restore_status(&id, false), cancel);
-            app_state.set_restore_job_handle(&id, handle);
+            app_state.seed_restore_job(restore_status(&id, false), cancel, handle);
         }
 
         let handles = app_state.cancel_all_restore_jobs();
@@ -1474,9 +1467,17 @@ mod tests {
             default_fake_registry(),
         );
 
+        // A trivial already-finished handle (the pruning test does not exercise the
+        // task itself; seed_restore_job now requires a handle, R3-P1-2).
+        let noop_handle = || tokio::spawn(async {});
+
         // One ACTIVE job that must survive pruning.
         let active_cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
-        app_state.seed_restore_job(restore_status("active", false), active_cancel);
+        app_state.seed_restore_job(
+            restore_status("active", false),
+            active_cancel,
+            noop_handle(),
+        );
 
         // Register many TERMINAL jobs (seed active, then put a done snapshot to
         // stamp terminal_at + trigger pruning).
@@ -1484,7 +1485,7 @@ mod tests {
         for i in 0..total {
             let id = format!("done-{i}");
             let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
-            app_state.seed_restore_job(restore_status(&id, false), cancel);
+            app_state.seed_restore_job(restore_status(&id, false), cancel, noop_handle());
             app_state.put_restore_job(restore_status(&id, true));
         }
 
