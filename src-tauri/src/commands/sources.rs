@@ -182,6 +182,23 @@ pub async fn add_source(
         None => None,
     };
 
+    // R6-P1-1 (DATA-SAFETY gate bypass): inside the per-account encrypted lock,
+    // REJECT a second encrypted add while ANY recovery-phrase ack is still pending
+    // on this account. The first encrypted source stamps the account master key
+    // and is held DISABLED + pending-ack; a SECOND encrypted add would see
+    // `newly_generated = false` (the key already exists), persist ENABLED, and
+    // start encrypted backups BEFORE the user ever revealed/acked the recovery
+    // phrase - the backups would be unrestorable on a new machine. The durable
+    // `recovery_phrase_acks` table (read under the lock so it is current) is the
+    // gate source of truth: while any row exists for this account, no further
+    // encrypted source may be added. The user must finish revealing + acking the
+    // pending source first (an s24 invalid-input the wizard surfaces). Net
+    // invariant: no encrypted source on an account can be enabled / start backups
+    // while any recovery-phrase ack is still pending on that account.
+    if req.encryption_enabled {
+        reject_encrypted_add_while_ack_pending(state.state().as_ref(), req.account_id).await?;
+    }
+
     // Encryption opt-in (DESIGN s7.1): prepare the account master key (generating
     // it + encoding the recovery phrase on the FIRST encrypted source), then wrap
     // a fresh per-source key under it. `recovery_phrase` is Some ONLY when the
@@ -914,6 +931,37 @@ async fn find_pending_recovery_ack_account(
         .map(|r| r.account_id))
 }
 
+/// R6-P1-1 (DATA-SAFETY): reject an encrypted `add_source` on `account` while ANY
+/// recovery-phrase ack is still pending for it. The first encrypted source stamps
+/// the account master key and is held DISABLED + pending-ack; without this guard a
+/// SECOND encrypted add takes the already-provisioned path (`newly_generated =
+/// false`), persists ENABLED, and arms encrypted backups before the user ever
+/// revealed/acked the recovery phrase - an unrestorable backup. Reading the durable
+/// `recovery_phrase_acks` table (the gate source of truth, so this holds across a
+/// restart) under the per-account encrypted lock, any pending row for the account
+/// rejects the add with the stable s24 `internal.invalid_input` code. The user must
+/// finish revealing + acking the pending source first.
+async fn reject_encrypted_add_while_ack_pending(
+    state: &dyn StateRepo,
+    account: AccountId,
+) -> CommandResult<()> {
+    let any_pending = state
+        .list_pending_recovery_acks()
+        .await
+        .map_err(CommandError::from)?
+        .into_iter()
+        .any(|r| r.account_id == account);
+    if any_pending {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "another encrypted backup on this account is still waiting for its \
+             recovery phrase to be revealed and saved; finish that step first, \
+             then add this encrypted source",
+        ));
+    }
+    Ok(())
+}
+
 /// R4-P1-2 (DATA-SAFETY): reject ENABLING `source` while it still has a DURABLE
 /// pending recovery-phrase ack. `enabling == false` (a disable, or no change of
 /// state) is always allowed; only flipping a pending source to `enabled=true` is
@@ -1474,6 +1522,104 @@ mod tests {
         reject_enable_of_pending_encrypted_source(&repo, source_id, true)
             .await
             .expect("after the durable ack, enabling is allowed");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reject_encrypted_add_while_ack_pending_blocks_second_encrypted_add() {
+        // R6-P1-1 (DATA-SAFETY gate bypass): while the FIRST encrypted source is
+        // still pending its recovery-phrase ack, a SECOND encrypted add on the same
+        // account must be REJECTED (s24 invalid-input) - otherwise it would take the
+        // already-provisioned path, persist ENABLED, and arm encrypted backups
+        // before any recovery phrase was acked (unrestorable backups). A different
+        // account is unaffected; once the pending ack clears (durable ack), a
+        // further encrypted add is allowed. This is the exact predicate `add_source`
+        // enforces under the per-account encrypted lock.
+        let (repo, dir) = temp_repo().await;
+
+        // Account A with a pending first encrypted source (disabled + durable ack).
+        let account_a = AccountId::new_v4();
+        let account = AccountRow {
+            id: account_a,
+            email: "a@example.com".to_string(),
+            display_name: None,
+            state: driven_core::types::AccountState::Ok,
+            encryption_master_key_id: None,
+            created_at: 0,
+            last_synced_at: None,
+        };
+        repo.upsert_account(&account).await.expect("upsert account");
+        let first_source = SourceId::new_v4();
+        let row = SourceRow {
+            id: first_source,
+            account_id: account_a,
+            display_name: "First".to_string(),
+            enabled: false,
+            local_path: "/home/u/first".to_string(),
+            drive_folder_id: String::new(),
+            drive_folder_path: String::new(),
+            encryption_enabled: true,
+            wrapped_source_key: Some(vec![1, 2, 3]),
+            respect_gitignore: true,
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: default_deep_verify_secs(),
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            created_at: 0,
+        };
+        repo.insert_first_encrypted_source_pending_ack(&row, account_a.to_string(), 0)
+            .await
+            .expect("seed pending source");
+
+        // A SECOND encrypted add on account A is rejected while the ack is pending.
+        let err = reject_encrypted_add_while_ack_pending(&repo, account_a)
+            .await
+            .expect_err("second encrypted add must be rejected while ack pending");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+
+        // A DIFFERENT account with no pending ack is unaffected.
+        let account_b = AccountId::new_v4();
+        let account = AccountRow {
+            id: account_b,
+            email: "b@example.com".to_string(),
+            display_name: None,
+            state: driven_core::types::AccountState::Ok,
+            encryption_master_key_id: None,
+            created_at: 0,
+            last_synced_at: None,
+        };
+        repo.upsert_account(&account)
+            .await
+            .expect("upsert account b");
+        reject_encrypted_add_while_ack_pending(&repo, account_b)
+            .await
+            .expect("a different account with no pending ack is allowed");
+
+        // The first source is DISABLED until the ack clears, so it never runs
+        // encrypted backups in the pending window (the scheduler filters on
+        // `enabled`).
+        let first = find_source(&repo, first_source)
+            .await
+            .expect("first source");
+        assert!(
+            !first.enabled,
+            "the pending first encrypted source must stay disabled (no backups) until acked"
+        );
+
+        // After the durable ack (reveal + atomic enable+clear), the pending row is
+        // gone and a further encrypted add on account A is allowed.
+        repo.mark_recovery_phrase_revealed(first_source)
+            .await
+            .unwrap();
+        repo.enable_source_and_clear_recovery_ack(first_source)
+            .await
+            .unwrap();
+        reject_encrypted_add_while_ack_pending(&repo, account_a)
+            .await
+            .expect("after the pending ack clears, a further encrypted add is allowed");
 
         let _ = std::fs::remove_dir_all(dir);
     }
