@@ -2160,3 +2160,61 @@ surfaces the banner with no live listeners). New vitest asserts: a partial subsc
 listener (only the registered ones are torn down, a would-be-leaked event does not mutate the store),
 a later subscribe succeeds (desiredSubscribed was reset) and its live event surfaces the banner, and
 hydration still runs.
+
+## M9 fix round 4a
+
+Codex M9-4 (baseline 97f596e, M9 @ f9b1a41) raised 4 P1 + 1 P2. Round 4a fixes the
+TWO DATA-SAFETY P1s (recovery-phrase gate DURABILITY + the update_source enable gate);
+the other two P1s (dev-channel stage-then-publish, fetch-live fail-closed) + the
+updater-store P2 are round 4b (a concurrent worktree agent on .github/ + scripts +
+updater store). Round 4a touched ONLY src-tauri/src (recovery/sources/app_state/lib +
+dtos) + crates/driven-core (state trait/sqlite + a new migration) + ui (SourceTable.vue,
+types.ts, locales, test fixtures). All gates green on Windows: cargo build/clippy
+-Dwarnings/test --workspace (159 driven-core + 49 driven-app, all pass) + build -p
+driven-app + deny check + fmt --check + git diff --check; just sqlx-prepare (6 new .sqlx
+entries, 0 drift); cd ui pnpm install/lint/test:unit (144 pass)/build (vue-tsc clean).
+Anti-fake-green stub sweep on the touched surface (src-tauri/src + ui): zero non-test
+todo!/unimplemented!/unreachable!.
+
+- **R4-P1-1 - recovery-phrase ACK gate made DURABLE [DATA-SAFETY] FIXED.** M9c D4
+  persisted the FIRST encrypted source `enabled:false` + master key, but the pending-ack
+  gate state (pending + revealed) lived ONLY in process memory (app_state `recovery_acks`).
+  A crash AFTER the source + master key were persisted but BEFORE reveal+ack lost the
+  gate: the user could no longer reveal/ack the original phrase, and later encrypted
+  sources could arm encryption without it (unrestorable backups). Fix: a new migration
+  `0004_recovery_phrase_acks.sql` adds a `recovery_phrase_acks` table (source_id PK + FK
+  ON DELETE CASCADE, account_id, revealed, created_at). New StateRepo methods (SQLite
+  transactional, default impls for in-memory doubles):
+  `insert_first_encrypted_source_pending_ack` writes the master-key CAS stamp + the
+  (disabled) source insert + the pending-ack record ALL in ONE transaction (a durable
+  encrypted source can never exist without its durable pending-ack record);
+  `list_pending_recovery_acks` (startup reconstruction); `mark_recovery_phrase_revealed`
+  (durable revealed=1); `recovery_ack_revealed` (the gate predicate); and
+  `enable_source_and_clear_recovery_ack` (atomic enable + delete-record on ack). The
+  command layer now reads/writes the DURABLE table for every gate decision: `add_source`
+  uses the atomic insert, `reveal_recovery_phrase` resolves the owning account from the
+  durable record + durably records the reveal, and `ack_recovery_phrase_saved` checks the
+  durable `revealed` flag then commits the atomic enable+clear. `AppState` keeps the
+  in-memory `recovery_acks` as a reconstructed-on-startup MIRROR
+  (`reconstruct_recovery_acks_from_db`, called in lib.rs setup after build_and_spawn).
+  Invariant: after ANY restart a not-yet-acked encrypted source is still disabled + still
+  reveal/ackable, and no second encrypted source can enable without the durable ack. Tests
+  (driven-core sqlite): `first_encrypted_source_pending_ack_persists_atomically`,
+  `..._rolls_back_on_failure`, `recovery_ack_gate_survives_restart_then_durable_ack_enables`
+  (reload over the SAME db file -> still disabled + ackable -> durable ack flips it),
+  `mark_revealed_and_revealed_query_unknown_source_are_noops`,
+  `delete_source_cascades_its_pending_recovery_ack`; (driven-app)
+  `find_pending_recovery_ack_account_resolves_durable_record`.
+- **R4-P1-2 - update_source must enforce the ack gate [DATA-SAFETY] FIXED.**
+  `update_source` (and any enable/sync-trigger path that toggles `enabled`) could flip a
+  disabled pending encrypted source to `enabled=true`, bypassing the gate. Fix: a shared
+  `reject_enable_of_pending_encrypted_source` helper REJECTS enabling a source that still
+  has a durable `recovery_phrase_acks` record (the s24 `internal.invalid_input` code);
+  `ack_recovery_phrase_saved` remains the ONLY enable path for a pending source. The
+  durable record is the source of truth so this holds across a restart. UI:
+  `SourceDto.pendingRecoveryAck` (enriched in `list_sources` + returned by `add_source`)
+  disables the SourceTable enable toggle with a tooltip + an "Awaiting recovery phrase"
+  badge (new i18n keys `settings.sources.pendingRecoveryAck{Badge,Tooltip}`); the backend
+  rejection is the real guard. Tests: (driven-app)
+  `reject_enable_of_pending_encrypted_source_gate` (rejected until the durable ack, allowed
+  after); (vitest) `disables the enable toggle for a pending-recovery-ack source (R4-P1-2)`.
