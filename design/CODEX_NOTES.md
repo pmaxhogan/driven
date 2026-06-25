@@ -2335,3 +2335,74 @@ sqlx 0-drift; non-test stub sweep on the touched surface = 0.
   (root swapped to a symlink-out-of-root AFTER bind is rejected, no bytes land outside the
   originally-bound root); the Windows `RootIdentity` capture/verify path is exercised by the
   existing Windows confine tests (they now bind a `ConfinedRoot`).
+
+## M9 fix round 6
+
+Codex M9-6 (baseline 97f596e, M9 @ 74c98dd): 2 P1 + 1 P2, all legitimate, single sole-actor.
+Touched `src-tauri/src/commands/sources.rs`, `scripts/generate-update-json.mjs`,
+`ui/src/__tests__/generate-update-json.test.ts`, `src-tauri/src/updater.rs`,
+`src-tauri/src/tray.rs`, `src-tauri/locales/en-US.yml`. All gates green incl. clippy -D warnings,
+fmt, deny, vue-tsc; no sqlx/migration/workflow change (no sqlx-prepare / actionlint needed);
+non-test stub sweep on the touched surface = 0.
+
+- **R6-P1-1 - second encrypted add bypasses the recovery-phrase ack gate [DATA-SAFETY] FIXED.**
+  The ack gate only triggered when THIS `add_source` call newly generated the account master
+  key (`newly_generated_key`). A SECOND encrypted `add_source` while the FIRST encrypted source
+  was still pending its ack saw the already-stamped account, got `newly_generated = false`,
+  persisted `enabled: true`, inserted with NO pending-ack record, and reconfigured the
+  orchestrator - so encrypted backups for the second source began BEFORE any recovery phrase
+  was ever revealed/acked (unrestorable on a new machine). Fix: inside the per-account
+  encrypted-source lock (so the read is current and serialised against a racing add), BEFORE
+  preparing the master key, `reject_encrypted_add_while_ack_pending` reads the DURABLE
+  `recovery_phrase_acks` table and REJECTS the encrypted add (stable s24 `internal.invalid_input`,
+  message guiding the user to finish revealing+saving the pending source's phrase first) if ANY
+  row exists for the account. Chose the REJECT over the disabled-then-enable path (spec's stated
+  preference - simpler + unambiguous; the disabled path would also leak a second pending-ack
+  record with no second-source reveal flow). Net invariant: no encrypted source on an account can
+  be enabled / start backups while any recovery-phrase ack is still pending on that account.
+  Test (driven-app): `reject_encrypted_add_while_ack_pending_blocks_second_encrypted_add` - with
+  account A's first encrypted source seeded pending+disabled, a second encrypted add on A is
+  rejected (InvalidInput) and the first source stays DISABLED (no backups) through the pending
+  window; a different account B is unaffected; after the durable ack clears, a further encrypted
+  add on A is allowed.
+
+- **R6-P1-2 - orphan .sig produces a broken update.json [PIPELINE INTEGRITY] FIXED.**
+  `collectSignedBundles` trusted a `.sig` file as proof its sibling installer existed: it derived
+  `bundleFile` from the `.sig` path, read ONLY the signature, and emitted a download URL from the
+  bundle name. A partial release (`Driven...exe.sig` but no `Driven...exe`) still produced a
+  valid-looking manifest whose `url` 404s, so clients discover an update they cannot download.
+  Fix: before accepting a candidate, `await fs.stat(bundleFile)` and require it to be a regular
+  FILE - an orphan `.sig` (stat fails) or a non-file at that path ERRORS the run with a clear
+  message ("orphan signature ... no sibling installer ... R6-P1-2"), so a partial update tree
+  never publishes. Tests (vitest): an orphan `.sig` makes `generate` reject AND writes no
+  manifest; `collectSignedBundles` rejects the orphan but accepts once the real installer is
+  dropped next to it.
+
+- **R6-P2-1 - dev-channel periodic checks did not apply silently [SPEC-CONFORMANCE] FIXED.**
+  DESIGN s9.4 ("New dev -> applies silently with a tray notification"), but the periodic check
+  stored a pending update + emitted `updater:available` (the manual banner path) for ALL channels.
+  Fix: a pure per-channel router `delivery_for_periodic_available(channel)` -> `SilentInstall`
+  for `Dev`, `ManualBanner` for `Stable`. `periodic_check_once` branches on it: STABLE keeps the
+  existing manual banner (record pending + emit available); DEV calls
+  `silent_install_dev_update`, which reuses the SAME `download_and_install` plumbing as manual
+  `install_update` (emitting `updater:download_progress` + the channel-correct `updater:downloaded`
+  so any open UI still reflects progress), then raises a tray notification via the new
+  `tray::notify_dev_update_installed` (new i18n keys `notifications.dev_update_installed.{title,
+  body}`). A dev download/verify failure is logged + swallowed (the periodic loop survives; the
+  next interval retries) and is NOT surfaced as a banner (dev is the silent channel). Test
+  (driven-app): `dev_channel_periodic_available_takes_silent_install_path`.
+
+  **DEV-UPDATE UX INTERPRETATION (DESIGN s9.4 is terse - documenting the chosen faithful reading):**
+  "applies silently with a tray notification" is implemented as DOWNLOAD + INSTALL (stage the
+  update via `download_and_install`) + a TRAY NOTIFICATION, with the staged update applying on the
+  NEXT Driven restart - we deliberately do NOT call `app.restart()` to force an immediate relaunch.
+  Rationale (spec's instruction: if ambiguous, implement the safest faithful reading - download+
+  install, tray-notify, apply on next restart): "silently" means no banner / no user-gated install
+  prompt (the install happens with no interaction), not "yank the app out from under a power user
+  mid-work". Forcing an immediate restart would terminate in-flight backups + lose unsaved UI
+  state with no consent - more disruptive than the stable banner it is meant to be lighter than.
+  The tray toast tells the power user a fresh dev build is staged and will apply on restart. This
+  matches Tauri's native staged-update model (install stages; the new binary is picked up on next
+  launch) and keeps the manual `install_update` (which DOES `app.restart()`) as the only forced-
+  relaunch path. If the product later wants an immediate auto-restart for dev, it is a one-line
+  change (call `app.restart()` after the tray notify) - the plumbing is already wired.

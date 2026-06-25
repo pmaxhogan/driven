@@ -16,8 +16,12 @@
 //!
 //! 2. PERIODIC CHECK. On startup AND every [`CHECK_INTERVAL`] (6h) a background
 //!    task ([`spawn_periodic_check`]) checks the active channel and, on an
-//!    available update, records it as the pending update + emits
-//!    `updater:available`. The task is a tokio `interval` loop (NOT a busy /
+//!    available update, surfaces it PER CHANNEL (DESIGN s9.4, R6-P2-1): the
+//!    STABLE channel records the pending update + emits `updater:available` (the
+//!    manual in-app banner asks the user to apply), while the DEV channel applies
+//!    SILENTLY - it downloads + installs the staged update and raises a tray
+//!    notification (the staged update applies on the next restart). The task is a
+//!    tokio `interval` loop (NOT a busy /
 //!    sleep-poll loop) that `select!`s on a shutdown watch, and its handle +
 //!    shutdown sender are registered on [`AppState`] so the app-quit drain joins
 //!    it with NO orphan (mirrors the M5 per-account no-orphan bookkeeping).
@@ -305,6 +309,32 @@ fn pending_action_for_channel_switch() -> PendingAction {
     PendingAction::Clear
 }
 
+/// R6-P2-1: how a PERIODIC check should surface an available update, decided per
+/// channel (DESIGN s9.4). `Stable` shows the manual in-app banner (the user is
+/// asked to apply, default 24h deferral); `Dev` applies SILENTLY with a tray
+/// notification (the dev channel is for power users who want the freshest build).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum AvailableUpdateDelivery {
+    /// Stable: record the pending update + emit `updater:available` so the in-app
+    /// banner asks the user to apply (the existing manual path).
+    ManualBanner,
+    /// Dev: download + install the update SILENTLY and raise a tray notification;
+    /// the staged update applies on the next Driven restart (DESIGN s9.4).
+    SilentInstall,
+}
+
+/// Pure (R6-P2-1): the [`AvailableUpdateDelivery`] for an available update on a
+/// PERIODIC check, per DESIGN s9.4. `Dev` -> silent install + tray notify; every
+/// other channel -> the manual banner. Factored out so the per-channel routing is
+/// unit-tested without a real `AppHandle` / a constructible `Update`.
+#[must_use]
+fn delivery_for_periodic_available(channel: Channel) -> AvailableUpdateDelivery {
+    match channel {
+        Channel::Dev => AvailableUpdateDelivery::SilentInstall,
+        Channel::Stable => AvailableUpdateDelivery::ManualBanner,
+    }
+}
+
 /// The outcome of an update check, as the pure dispatch path sees it.
 #[derive(Debug, Clone)]
 enum CheckOutcome {
@@ -417,9 +447,10 @@ pub fn spawn_periodic_check(app: &AppHandle) {
 }
 
 /// One periodic-check iteration: read the active channel, run a check, and on an
-/// available update record the pending update + emit `updater:available`. All
-/// failures are logged, never propagated (the loop must survive a transient
-/// network error).
+/// available update surface it PER CHANNEL (R6-P2-1, DESIGN s9.4) - STABLE records
+/// the pending update + emits `updater:available` (manual banner), DEV downloads +
+/// installs silently + tray-notifies. All failures are logged, never propagated
+/// (the loop must survive a transient network error).
 async fn periodic_check_once(app: &AppHandle) {
     let Some(state) = app.try_state::<AppState>() else {
         return;
@@ -432,36 +463,94 @@ async fn periodic_check_once(app: &AppHandle) {
         }
     };
     match run_check(app, channel).await {
-        Ok((outcome, update)) => {
-            // R5-P2-1: SetFound on an available update, Clear on UpToDate. The
-            // UpToDate clear drops any stale pending update from an earlier check
-            // (e.g. already installed, or left over from before a channel switch)
-            // so get_pending_update_info / install_update never refer to a
-            // no-longer-available update.
-            match (pending_action_for_check(update.is_some()), update) {
-                (PendingAction::SetFound, Some(update)) => {
-                    // Stash the raw Update + its channel so install_update can
-                    // apply it directly and emit the real channel on downloaded.
-                    state.set_pending_update(Some((update, channel.as_str().to_string())));
-                }
-                _ => {
+        Ok((CheckOutcome::Available(info), Some(update))) => {
+            // R6-P2-1 (DESIGN s9.4): the DEV channel applies updates SILENTLY with a
+            // tray notification; STABLE shows the manual in-app banner. Route per
+            // channel.
+            match delivery_for_periodic_available(channel) {
+                AvailableUpdateDelivery::SilentInstall => {
+                    // Dev: do NOT stash a pending update / emit the manual banner -
+                    // download + install now, then tray-notify. The staged update
+                    // applies on the next Driven restart (we do not force a restart
+                    // mid-work; see CODEX_NOTES M9 fix round 6). Clear any stale
+                    // pending update from a prior check so the banner never shows.
                     state.set_pending_update(None);
+                    tracing::info!(target: TARGET, version = %info.version, "dev update available; installing silently (periodic check)");
+                    silent_install_dev_update(app, update, &info).await;
+                }
+                AvailableUpdateDelivery::ManualBanner => {
+                    // Stable: record the raw Update + its channel so install_update
+                    // can apply it directly + emit the real channel on downloaded,
+                    // and emit `updater:available` so the in-app banner asks the user.
+                    state.set_pending_update(Some((update, channel.as_str().to_string())));
+                    let app_for_emit = app.clone();
+                    let _ = dispatch_check_outcome(CheckOutcome::Available(info.clone()), |info| {
+                        if let Err(e) = crate::events::emit_updater_available(&app_for_emit, info) {
+                            tracing::debug!(target: TARGET, error = %e, "emit updater:available failed");
+                        }
+                    });
+                    tracing::info!(target: TARGET, version = %info.version, channel = %info.channel, "update available (periodic check, manual banner)");
                 }
             }
-            let app_for_emit = app.clone();
-            let info = dispatch_check_outcome(outcome, |info| {
-                if let Err(e) = crate::events::emit_updater_available(&app_for_emit, info) {
-                    tracing::debug!(target: TARGET, error = %e, "emit updater:available failed");
-                }
-            });
-            if let Some(info) = info {
-                tracing::info!(target: TARGET, version = %info.version, channel = %info.channel, "update available (periodic check)");
-            } else {
-                tracing::debug!(target: TARGET, channel = channel.as_str(), "no update available (periodic check)");
+        }
+        Ok((CheckOutcome::UpToDate, _)) | Ok((_, None)) => {
+            // R5-P2-1: UpToDate clears any stale pending update from an earlier
+            // check (e.g. already installed, or left over from before a channel
+            // switch) so get_pending_update_info / install_update never refer to a
+            // no-longer-available update.
+            match pending_action_for_check(false) {
+                PendingAction::Clear => state.set_pending_update(None),
+                PendingAction::SetFound => {}
             }
+            tracing::debug!(target: TARGET, channel = channel.as_str(), "no update available (periodic check)");
         }
         Err(e) => {
             tracing::debug!(target: TARGET, error = %e, channel = channel.as_str(), "updater periodic check failed (will retry next interval)");
+        }
+    }
+}
+
+/// R6-P2-1 (DESIGN s9.4): download + install a DEV-channel update SILENTLY, then
+/// raise a tray notification. Reuses the same `download_and_install` plumbing the
+/// manual `install_update` uses (emitting `updater:download_progress` +
+/// `updater:downloaded` so any open UI still reflects progress), but does NOT
+/// force a restart - the staged update applies on the next Driven restart, so a
+/// power user is not interrupted mid-work. A download/verify failure is logged and
+/// swallowed (the periodic loop must survive it; the next interval retries); it is
+/// NOT surfaced as a banner (dev is the silent channel).
+async fn silent_install_dev_update(
+    app: &AppHandle,
+    update: tauri_plugin_updater::Update,
+    info: &UpdateInfo,
+) {
+    let channel = Channel::Dev;
+
+    let progress_app = app.clone();
+    let mut downloaded: u64 = 0;
+    let on_chunk = move |chunk_len: usize, content_len: Option<u64>| {
+        downloaded = downloaded.saturating_add(chunk_len as u64);
+        if let Err(e) =
+            crate::events::emit_updater_download_progress(&progress_app, downloaded, content_len)
+        {
+            tracing::debug!(target: TARGET, error = %e, "emit updater:download_progress failed");
+        }
+    };
+
+    let done_app = app.clone();
+    let done_info = build_update_info(&update, channel);
+    let on_done = move || {
+        if let Err(e) = crate::events::emit_updater_downloaded(&done_app, &done_info) {
+            tracing::debug!(target: TARGET, error = %e, "emit updater:downloaded failed");
+        }
+    };
+
+    match update.download_and_install(on_chunk, on_done).await {
+        Ok(()) => {
+            tracing::info!(target: TARGET, version = %info.version, "dev update installed silently; applies on next restart");
+            crate::tray::notify_dev_update_installed(app, &info.version);
+        }
+        Err(e) => {
+            tracing::warn!(target: TARGET, error = %e, version = %info.version, "dev silent update install failed (will retry next interval)");
         }
     }
 }
@@ -838,6 +927,24 @@ mod tests {
             pending_action_for_channel_switch(),
             PendingAction::Clear,
             "a channel switch invalidates any old-channel pending update"
+        );
+    }
+
+    #[test]
+    fn dev_channel_periodic_available_takes_silent_install_path() {
+        // R6-P2-1 (DESIGN s9.4): a DEV-channel periodic check with an available
+        // update applies SILENTLY (download/install + tray notify) - NOT the manual
+        // in-app banner. STABLE keeps the manual banner path. This is the pure
+        // per-channel routing `periodic_check_once` branches on.
+        assert_eq!(
+            delivery_for_periodic_available(Channel::Dev),
+            AvailableUpdateDelivery::SilentInstall,
+            "dev updates apply silently with a tray notification (DESIGN s9.4)"
+        );
+        assert_eq!(
+            delivery_for_periodic_available(Channel::Stable),
+            AvailableUpdateDelivery::ManualBanner,
+            "stable updates use the manual in-app banner"
         );
     }
 

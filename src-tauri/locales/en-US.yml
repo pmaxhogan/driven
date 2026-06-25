@@ -36,6 +36,9 @@ notifications:
   needs_reauth:
     title: "Driven needs to sign in again"
     body: "Sign in to %{account} to keep backups running."
+  dev_update_installed:
+    title: "Dev update ready"
+    body: "Driven %{version} (dev channel) was installed and will apply the next time Driven restarts."
   paused_battery:
     title: "Sync paused"
     body: "On battery power; sync will resume on AC."

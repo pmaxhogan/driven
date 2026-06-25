@@ -770,6 +770,19 @@ pub fn notify_needs_reauth(app: &AppHandle, account: &str) {
     );
 }
 
+/// R6-P2-1 (DESIGN s9.4): raise the "dev update installed" tray notification. The
+/// dev channel applies updates SILENTLY - the periodic checker downloads + installs
+/// the staged update without a banner and calls this so the power user is told a
+/// fresh dev build is ready (it applies on the next Driven restart). `version` is
+/// the installed dev version (e.g. `0.1.1-dev.42.abc1234`).
+pub fn notify_dev_update_installed(app: &AppHandle, version: &str) {
+    show_notification(
+        app,
+        rust_i18n::t!("notifications.dev_update_installed.title").into_owned(),
+        rust_i18n::t!("notifications.dev_update_installed.body", version = version).into_owned(),
+    );
+}
+
 /// Set the tray to the "Suspending..." visual (DESIGN s5.10.2): yellow icon +
 /// suspend tooltip. Driven by [`PowerEvent::Suspending`](driven_core::types::PowerEvent),
 /// which is NOT an [`OrchestratorState`], so the shell's power bridge MUST call
