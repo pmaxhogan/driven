@@ -122,8 +122,19 @@ export const useRestoreStore = defineStore("restore", () => {
     }
   }
 
-  /** Select a source to browse, resetting the tree to its root. */
+  /** Select a source to browse, resetting the tree to its root.
+   *
+   * R3-P1-1 (defense in depth): clear the multi-selection when the ACTIVE source
+   * changes. The selection is keyed by `${sourceId}::${relativePath}` and survives
+   * folder navigation by design, but accumulating selections ACROSS sources is
+   * what lets two sources' identically-named files (e.g. both `foo.txt`) target
+   * the same restore destination. The backend now REJECTS such a job outright
+   * (the real guard), but clearing here keeps the UX honest so the user does not
+   * unknowingly carry a hidden cross-source selection into a rejected restore. */
   async function selectSource(id: string): Promise<void> {
+    if (sourceId.value !== null && sourceId.value !== id) {
+      clearSelection();
+    }
     sourceId.value = id;
     prefix.value = "";
     query.value = "";

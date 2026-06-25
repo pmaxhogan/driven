@@ -457,4 +457,66 @@ describe("restore store", () => {
     expect(store.restoring).toBe(false);
     expect(store.cancelling).toBe(false);
   });
+
+  it("surfaces a backend destination-collision rejection as a localizable errorCode (R3-P1-1)", async () => {
+    // R3-P1-1: the backend now REJECTS a restore whose selected items collide at
+    // the destination (duplicate / case-folded / file-vs-dir) with the
+    // internal.invalid_input code. The store must surface that code (so the view
+    // renders t(`errors.internal.invalid_input.long`)) and NOT consume the dialog
+    // token (so the user can fix the selection and retry without re-picking).
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources")
+        return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree")
+        return Promise.resolve(tree([file("foo.txt"), file("Foo.txt")]));
+      if (cmd === "restore_files")
+        // The typed IPC wrapper normalizes a thrown command error to { code }.
+        return Promise.reject({ code: "internal.invalid_input" });
+      return Promise.resolve([]);
+    });
+
+    const store = useRestoreStore();
+    await store.loadSources();
+    store.toggleSelect("s1", "foo.txt");
+    store.toggleSelect("s1", "Foo.txt");
+    store.setDestination("/home/u/restored", "tok-collide");
+
+    await store.startRestore();
+
+    expect(store.errorCode).toBe("internal.invalid_input");
+    // The restore did not start: no active job, controls re-enabled.
+    expect(store.activeJobId).toBeNull();
+    expect(store.restoring).toBe(false);
+  });
+
+  it("clears the cross-source selection when the active source changes (R3-P1-1 defense in depth)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources")
+        return Promise.resolve([
+          source("s1", "Documents"),
+          source("s2", "Photos"),
+        ]);
+      if (cmd === "list_remote_tree")
+        return Promise.resolve(tree([file("foo.txt")]));
+      return Promise.resolve([]);
+    });
+
+    const store = useRestoreStore();
+    await store.loadSources();
+    // Auto-selected s1; select a file there.
+    expect(store.sourceId).toBe("s1");
+    store.toggleSelect("s1", "foo.txt");
+    expect(store.selectedCount).toBe(1);
+
+    // Switching to a DIFFERENT source clears the accumulated selection, so two
+    // sources' identically-named files cannot silently pile up into one restore.
+    await store.selectSource("s2");
+    expect(store.sourceId).toBe("s2");
+    expect(store.selectedCount).toBe(0);
+
+    // Re-selecting the SAME source does not clear (no source change).
+    store.toggleSelect("s2", "foo.txt");
+    await store.selectSource("s2");
+    expect(store.selectedCount).toBe(1);
+  });
 });
