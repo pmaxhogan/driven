@@ -33,6 +33,13 @@ describe("generate-update-json.mjs", () => {
       "darwin-aarch64",
     );
     expect(mod.targetForBundle("Driven_x64.app.tar.gz")).toBe("darwin-x86_64");
+    // R3-P1-1: the release.yml [arch] / dev-channel rename forms both map.
+    expect(
+      mod.targetForBundle("Driven_0.1.0_darwin_aarch64.app.tar.gz"),
+    ).toBe("darwin-aarch64");
+    expect(
+      mod.targetForBundle("Driven_0.1.0_darwin_x86_64.app.tar.gz"),
+    ).toBe("darwin-x86_64");
     expect(mod.targetForBundle("driven_0.1.0_amd64.AppImage")).toBe(
       "linux-x86_64",
     );
@@ -40,14 +47,60 @@ describe("generate-update-json.mjs", () => {
     expect(mod.targetForBundle("Driven_0.1.0_amd64.deb")).toBeNull();
   });
 
-  it("resolves the dev version from a sha", async () => {
-    const v = await mod.resolveVersion("dev", { sha: "abc1234" }, async () => "9.9.9");
-    expect(v).toBe("0.0.0-dev.abc1234");
+  it("R3-P1-1: REJECTS an archless macOS updater bundle instead of defaulting to x86_64", () => {
+    // The default tauri on-disk name (`Driven.app.tar.gz`) has no arch; both mac
+    // jobs would collide. The generator must refuse to guess, not silently
+    // classify it as Intel.
+    expect(() => mod.targetForBundle("Driven.app.tar.gz")).toThrow(
+      /archless macOS/,
+    );
   });
 
   it("resolves the stable version from the conf reader", async () => {
     const v = await mod.resolveVersion("stable", {}, async () => "0.1.0");
     expect(v).toBe("0.1.0");
+  });
+
+  it("uses an explicit --version verbatim (the dev workflow's normal path)", async () => {
+    const v = await mod.resolveVersion(
+      "dev",
+      { version: "0.1.1-dev.123.abc1234" },
+      async () => "9.9.9",
+    );
+    expect(v).toBe("0.1.1-dev.123.abc1234");
+  });
+
+  it("R3-P2-1: dev version delegates to the SHARED set-dev-version logic (no 0.0.0-dev.<sha>)", async () => {
+    // No precomputed --version: with --run-number + --dev-sha the generator must
+    // delegate to the injected shared computeDev helper (computeDevVersionFromRepo
+    // in production) - NOT re-implement a below-stable 0.0.0-dev.<sha> version.
+    const calls: Array<[unknown, unknown]> = [];
+    const computeDev = async (run: unknown, sha: unknown) => {
+      calls.push([run, sha]);
+      return "0.1.1-dev.42.cafe123";
+    };
+    const v = await mod.resolveVersion(
+      "dev",
+      { runNumber: "42", devSha: "cafe123" },
+      async () => "9.9.9",
+      computeDev,
+    );
+    expect(v).toBe("0.1.1-dev.42.cafe123");
+    expect(calls).toEqual([["42", "cafe123"]]);
+    // The version is ABOVE stable 0.1.0 (the whole point of R3-P2-1), never 0.0.0.
+    expect(v.startsWith("0.0.0")).toBe(false);
+  });
+
+  it("R3-P2-1: dev without --version or --run-number/--dev-sha is rejected (no implicit 0.0.0)", async () => {
+    await expect(
+      mod.resolveVersion("dev", {}, async () => "9.9.9"),
+    ).rejects.toThrow(/dev. channel requires --version/);
+  });
+
+  it("rejects an invalid --version", async () => {
+    await expect(
+      mod.resolveVersion("stable", { version: "not-a-version" }, async () => "0.1.0"),
+    ).rejects.toThrow(/invalid --version/);
   });
 
   it("the built-in self-check passes (shape + path layout)", async () => {
@@ -138,11 +191,11 @@ describe("generate-update-json.mjs", () => {
     const silent = { info: () => {}, warn: () => {} };
     const result = await mod.generate(
       "dev",
-      { sha: "abc1234", bundles, out, notesFile },
+      { version: "0.1.1-dev.123.abc1234", bundles, out, notesFile },
       { log: silent },
     );
 
-    expect(result.version).toBe("0.0.0-dev.abc1234");
+    expect(result.version).toBe("0.1.1-dev.123.abc1234");
     const manifestPath = mod.manifestOutPath(out, "dev", "darwin-aarch64");
     expect(manifestPath.replace(/\\/g, "/")).toContain(
       "dev/darwin/aarch64/update.json",
@@ -235,6 +288,171 @@ describe("generate-update-json.mjs", () => {
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
     expect(manifest.platforms["windows-x86_64"].signature).toBe("EXESIG==");
     expect(manifest.platforms["windows-x86_64"].url).toContain("-setup.exe");
+
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("R3-P1-1: two arch-named mac bundles yield BOTH darwin/x86_64 AND darwin/aarch64 manifests", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-macduo-"));
+    const bundles = path.join(tmp, "bundle");
+    const out = path.join(tmp, "out");
+    await fs.mkdir(bundles, { recursive: true });
+
+    // Both mac jobs' arch-stamped updater artifacts (the contract release.yml +
+    // dev-channel.yml now enforce).
+    await fs.writeFile(
+      path.join(bundles, "Driven_0.1.0_darwin_aarch64.app.tar.gz"),
+      "arm",
+    );
+    await fs.writeFile(
+      path.join(bundles, "Driven_0.1.0_darwin_aarch64.app.tar.gz.sig"),
+      "ARMSIG==\n",
+    );
+    await fs.writeFile(
+      path.join(bundles, "Driven_0.1.0_darwin_x86_64.app.tar.gz"),
+      "intel",
+    );
+    await fs.writeFile(
+      path.join(bundles, "Driven_0.1.0_darwin_x86_64.app.tar.gz.sig"),
+      "INTELSIG==\n",
+    );
+
+    const silent = { info: () => {}, warn: () => {} };
+    const result = await mod.generate(
+      "stable",
+      { version: "0.1.0", bundles, out, baseUrl: "https://dl.example.test" },
+      { readConfVersion: async () => "0.1.0", log: silent },
+    );
+
+    expect(result.written.length).toBe(2);
+    const arm = JSON.parse(
+      await fs.readFile(mod.manifestOutPath(out, "stable", "darwin-aarch64"), "utf8"),
+    );
+    const intel = JSON.parse(
+      await fs.readFile(mod.manifestOutPath(out, "stable", "darwin-x86_64"), "utf8"),
+    );
+    expect(arm.platforms["darwin-aarch64"].signature).toBe("ARMSIG==");
+    expect(intel.platforms["darwin-x86_64"].signature).toBe("INTELSIG==");
+    // The two arches must NOT collide onto one manifest.
+    expect(arm.platforms["darwin-x86_64"]).toBeUndefined();
+    expect(intel.platforms["darwin-aarch64"]).toBeUndefined();
+
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("R3-P1-1: an archless mac bundle aborts the whole generate run", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-macbare-"));
+    const bundles = path.join(tmp, "bundle");
+    const out = path.join(tmp, "out");
+    await fs.mkdir(bundles, { recursive: true });
+    await fs.writeFile(path.join(bundles, "Driven.app.tar.gz"), "bare");
+    await fs.writeFile(path.join(bundles, "Driven.app.tar.gz.sig"), "BARESIG==\n");
+
+    const silent = { info: () => {}, warn: () => {} };
+    await expect(
+      mod.generate(
+        "stable",
+        { version: "0.1.0", bundles, out, baseUrl: "https://dl.example.test" },
+        { readConfVersion: async () => "0.1.0", log: silent },
+      ),
+    ).rejects.toThrow(/archless macOS/);
+
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("R3-P1-2: assertRequiredTargets passes for the full set, fails for a missing one", () => {
+    const required = mod.V1_REQUIRED_TARGETS;
+    expect(required).toEqual([
+      "windows-x86_64",
+      "darwin-x86_64",
+      "darwin-aarch64",
+      "linux-x86_64",
+    ]);
+    // Full set: no throw.
+    expect(() => mod.assertRequiredTargets(required, [...required])).not.toThrow();
+    // Missing darwin-aarch64: throws naming the gap.
+    expect(() =>
+      mod.assertRequiredTargets(required, [
+        "windows-x86_64",
+        "darwin-x86_64",
+        "linux-x86_64",
+      ]),
+    ).toThrow(/darwin-aarch64/);
+  });
+
+  it("parseRequiredTargets splits + validates, rejects empty and malformed", () => {
+    expect(mod.parseRequiredTargets("windows-x86_64, darwin-aarch64")).toEqual([
+      "windows-x86_64",
+      "darwin-aarch64",
+    ]);
+    // Dedupes.
+    expect(
+      mod.parseRequiredTargets("linux-x86_64 linux-x86_64"),
+    ).toEqual(["linux-x86_64"]);
+    expect(() => mod.parseRequiredTargets("   ")).toThrow(/no targets named/);
+    expect(() => mod.parseRequiredTargets("garbage")).toThrow();
+  });
+
+  it("R3-P1-2: --require-targets makes generate FAIL when a required target is missing", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-partial-"));
+    const bundles = path.join(tmp, "bundle");
+    const out = path.join(tmp, "out");
+    await fs.mkdir(bundles, { recursive: true });
+
+    // Only a Windows bundle present - the mac + linux targets are MISSING, so a
+    // require-targets run must refuse to publish this partial tree.
+    await fs.writeFile(path.join(bundles, "Driven_0.1.0_x64-setup.exe"), "win");
+    await fs.writeFile(
+      path.join(bundles, "Driven_0.1.0_x64-setup.exe.sig"),
+      "WINSIG==\n",
+    );
+
+    const silent = { info: () => {}, warn: () => {} };
+    await expect(
+      mod.generate(
+        "stable",
+        {
+          version: "0.1.0",
+          bundles,
+          out,
+          baseUrl: "https://dl.example.test",
+          requireTargets: "windows-x86_64,darwin-x86_64,darwin-aarch64,linux-x86_64",
+        },
+        { readConfVersion: async () => "0.1.0", log: silent },
+      ),
+    ).rejects.toThrow(/incomplete updater target set|missing/);
+
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("R3-P1-2: --require-targets passes when every required target is present", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-full-"));
+    const bundles = path.join(tmp, "bundle");
+    const out = path.join(tmp, "out");
+    await fs.mkdir(bundles, { recursive: true });
+
+    const mk = async (name: string, sig: string) => {
+      await fs.writeFile(path.join(bundles, name), "x");
+      await fs.writeFile(path.join(bundles, `${name}.sig`), `${sig}\n`);
+    };
+    await mk("Driven_0.1.0_x64-setup.exe", "WIN==");
+    await mk("Driven_0.1.0_darwin_x86_64.app.tar.gz", "MACX==");
+    await mk("Driven_0.1.0_darwin_aarch64.app.tar.gz", "MACA==");
+    await mk("driven_0.1.0_amd64.AppImage", "LIN==");
+
+    const silent = { info: () => {}, warn: () => {} };
+    const result = await mod.generate(
+      "stable",
+      {
+        version: "0.1.0",
+        bundles,
+        out,
+        baseUrl: "https://dl.example.test",
+        requireTargets: "windows-x86_64,darwin-x86_64,darwin-aarch64,linux-x86_64",
+      },
+      { readConfVersion: async () => "0.1.0", log: silent },
+    );
+    expect(result.written.length).toBe(4);
 
     await fs.rm(tmp, { recursive: true, force: true });
   });

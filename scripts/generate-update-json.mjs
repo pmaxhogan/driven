@@ -31,10 +31,20 @@
 //   node scripts/generate-update-json.mjs <stable|dev> [options]
 //
 // Options:
-//   --version <semver>   Override the version (stable defaults to the version in
-//                        src-tauri/tauri.conf.json).
-//   --sha <gitsha>       For the `dev` channel, the version becomes
-//                        `0.0.0-dev.<sha>` unless --version is given.
+//   --version <semver>   The manifest version. Stable defaults to the version in
+//                        src-tauri/tauri.conf.json. The `dev` channel REQUIRES it
+//                        (the workflow computes it once via
+//                        `set-dev-version.mjs --print-dev-version` and threads the
+//                        SAME monotonic value here - R3-P2-1).
+//   --run-number <n>     dev only: with --dev-sha, derive the version from the
+//   --dev-sha <sha>      SHARED set-dev-version logic (computeDevVersionFromRepo)
+//                        when no precomputed --version is supplied (a manual run).
+//                        There is NO `0.0.0-dev.<sha>` form anymore (R3-P2-1).
+//   --require-targets <list>
+//                        Comma/space separated combined `<os>-<arch>` keys (e.g.
+//                        `windows-x86_64,darwin-x86_64,darwin-aarch64,linux-x86_64`)
+//                        that MUST each produce a manifest, else the run ERRORS
+//                        (R3-P1-2 - blocks a partial update tree from publishing).
 //   --bundles <dir>      Directory to scan for bundle + `.sig` files
 //                        (default: src-tauri/target/release/bundle). Alias:
 //                        --assets-dir (the workflow downloads release assets
@@ -55,6 +65,17 @@ import path from "node:path";
 import { fileURLToPath } from "node:url";
 import os from "node:os";
 
+// R3-P2-1: the dev version has ONE source of truth - set-dev-version.mjs's
+// monotonic `<next-patch>-dev.<run_number>.<sha>` logic. The generator must NOT
+// re-implement a contradictory `0.0.0-dev.<sha>` form (that published a dev
+// manifest BELOW stable, so opted-in users were never offered the update). We
+// import the shared helpers so a manual `dev` run computes the SAME value the
+// dev-channel workflow patches into the app metadata + bundles.
+import {
+  computeDevVersionFromRepo,
+  isValidVersion,
+} from "./set-dev-version.mjs";
+
 const __filename = fileURLToPath(import.meta.url);
 const __dirname = path.dirname(__filename);
 const REPO_ROOT = path.resolve(__dirname, "..");
@@ -62,22 +83,52 @@ const REPO_ROOT = path.resolve(__dirname, "..");
 /** The GitHub repo whose releases host the bundles (the default base URL). */
 const GITHUB_REPO = "pmaxhogan/driven";
 
+/** The EXACT V1 GA updater target set (R3-P1-2). Every channel release MUST
+ * produce a manifest for each of these or the publish is a partial (potentially
+ * bricking) update tree. Kept as the single source of truth used by
+ * [`assertRequiredTargets`] and the `--require-targets` default. */
+export const V1_REQUIRED_TARGETS = [
+  "windows-x86_64",
+  "darwin-x86_64",
+  "darwin-aarch64",
+  "linux-x86_64",
+];
+
 /** Map a bundle FILENAME to its Tauri updater target triple, or null if the file
  * is not an updater-eligible bundle. The updater consumes one bundle per target:
  *  - Windows: the NSIS installer (`*-setup.exe`) or the `.msi`.
  *  - macOS: the `.app.tar.gz` (the updater artifact for app bundles); the arch is
  *    in the filename (`x64`/`x86_64` vs `aarch64`/`arm64`).
  *  - Linux: the `.AppImage` (or its `.tar.gz`).
- * The `.sig` is the detached signature sitting next to the bundle. */
+ * The `.sig` is the detached signature sitting next to the bundle.
+ *
+ * R3-P1-1: a macOS `.app.tar.gz` carries NO arch in tauri's default on-disk name
+ * (it is named from the `.app` bundle, e.g. `Driven.app.tar.gz`), so BOTH the
+ * aarch64 and x86_64 mac jobs would emit the same basename and collide in a flat
+ * release asset set - silently dropping one arch or advertising ARM as x86_64.
+ * The workflows now force the arch into the mac asset/bundle name BEFORE upload
+ * (release.yml via tauri-action `releaseAssetNamePattern` with `[arch]`;
+ * dev-channel.yml by renaming the collected bundle+sig per `matrix.target`). To
+ * make that contract enforced rather than assumed, an ARCHLESS mac updater
+ * bundle is REJECTED (throws) here instead of defaulting to x86_64. */
 export function targetForBundle(filename) {
   const lower = filename.toLowerCase();
   const isArm = /(aarch64|arm64)/.test(lower);
+  const isX86 = /(x86_64|x64|amd64|intel)/.test(lower);
 
   // macOS app bundle updater artifact.
   if (lower.endsWith(".app.tar.gz")) {
     if (isArm) return "darwin-aarch64";
-    // Default macOS app bundles to x86_64 when the arch is not in the name.
-    return "darwin-x86_64";
+    if (isX86) return "darwin-x86_64";
+    // R3-P1-1: refuse to guess the arch of an archless mac updater bundle - the
+    // workflow MUST stamp the arch into the name (Driven_<arch>.app.tar.gz or
+    // [name]_[version]_[platform]_[arch].app.tar.gz). Defaulting to x86_64 would
+    // mis-advertise an Apple-silicon build as Intel.
+    throw new Error(
+      `archless macOS updater bundle: ${filename}; the release/dev workflow must ` +
+        `stamp the arch into the name (e.g. Driven_aarch64.app.tar.gz) so each mac ` +
+        `arch maps to a distinct target (R3-P1-1)`,
+    );
   }
   // Windows installers.
   if (lower.endsWith(".exe") || lower.endsWith(".msi")) {
@@ -120,8 +171,14 @@ export function parseArgs(argv) {
       case "--version":
         opts.version = take();
         break;
-      case "--sha":
-        opts.sha = take();
+      case "--require-targets":
+        opts.requireTargets = take();
+        break;
+      case "--run-number":
+        opts.runNumber = take();
+        break;
+      case "--dev-sha":
+        opts.devSha = take();
         break;
       case "--bundles":
       case "--assets-dir":
@@ -156,15 +213,43 @@ export function parseArgs(argv) {
   return opts;
 }
 
-/** Resolve the version for a channel + options. Stable defaults to the
- * tauri.conf.json version; dev becomes `0.0.0-dev.<sha>` unless overridden. */
-export async function resolveVersion(channel, opts, readConfVersion) {
-  if (opts.version) return opts.version;
-  if (channel === "dev") {
-    if (!opts.sha) {
-      throw new Error("the `dev` channel requires --sha <gitsha> (or --version)");
+/** Resolve the version for a channel + options.
+ *
+ * stable: the version in tauri.conf.json (release-please keeps it in lockstep
+ * with the tag).
+ *
+ * dev (R3-P2-1): the version is the SHARED monotonic `<next-patch>-dev.<run>.<sha>`
+ * value owned by set-dev-version.mjs - NEVER the old `0.0.0-dev.<sha>` form. The
+ * dev-channel workflow computes it once (`set-dev-version.mjs --print-dev-version`)
+ * and threads the SAME value into the app metadata AND here via `--version`, so
+ * `--version` is the normal path. For a manual operator run WITHOUT a precomputed
+ * value, pass `--run-number <n> --dev-sha <sha>` and the generator delegates to
+ * the same `computeDevVersionFromRepo` helper (the ONE source of truth) rather
+ * than re-deriving a contradictory version here.
+ *
+ * `computeDev` is injectable for tests (defaults to the real shared helper). */
+export async function resolveVersion(
+  channel,
+  opts,
+  readConfVersion,
+  computeDev = computeDevVersionFromRepo,
+) {
+  if (opts.version) {
+    if (!isValidVersion(opts.version)) {
+      throw new Error(`invalid --version: ${opts.version}`);
     }
-    return `0.0.0-dev.${opts.sha}`;
+    return opts.version;
+  }
+  if (channel === "dev") {
+    if (opts.runNumber !== undefined && opts.devSha !== undefined) {
+      // Delegate to the shared monotonic logic (set-dev-version.mjs).
+      return computeDev(opts.runNumber, opts.devSha);
+    }
+    throw new Error(
+      "the `dev` channel requires --version <semver> (computed once via " +
+        "`set-dev-version.mjs --print-dev-version <run> <sha>` in the workflow), " +
+        "or --run-number <n> --dev-sha <sha> to derive it from the shared logic",
+    );
   }
   // stable: read from tauri.conf.json.
   return readConfVersion();
@@ -330,12 +415,56 @@ export function manifestOutPath(outRoot, channel, target) {
   return path.join(outRoot, channel, targetOs, arch, "update.json");
 }
 
+/** Parse a `--require-targets` value (comma/space separated combined `<os>-<arch>`
+ * keys) into a deduped, validated list. An empty/whitespace value is an error
+ * (the caller asked to require targets but named none). */
+export function parseRequiredTargets(raw) {
+  const list = String(raw)
+    .split(/[,\s]+/)
+    .map((s) => s.trim())
+    .filter((s) => s.length > 0);
+  if (list.length === 0) {
+    throw new Error("--require-targets given but no targets named");
+  }
+  for (const t of list) {
+    // Validate the shape (throws on a malformed key); we ignore the result.
+    osArchForTarget(t);
+  }
+  return [...new Set(list)];
+}
+
+/** R3-P1-2: fail unless EVERY required target produced a manifest. A partial
+ * updater tree (a missing `.sig`, an asset collision, a mapping miss) otherwise
+ * deploys silently while CI stays green and bricks/strands the missing arch's
+ * auto-update. `produced` is the list of combined `<os>-<arch>` keys actually
+ * generated; `required` is the must-have set. */
+export function assertRequiredTargets(required, produced) {
+  const have = new Set(produced);
+  const missing = required.filter((t) => !have.has(t));
+  if (missing.length > 0) {
+    throw new Error(
+      `incomplete updater target set: missing [${missing.join(", ")}] ` +
+        `(produced [${[...have].sort().join(", ")}]); refusing to publish a ` +
+        `PARTIAL update tree (R3-P1-2). Required: [${required.join(", ")}]`,
+    );
+  }
+}
+
 /** Generate all manifests. Returns the list of written file paths. */
-export async function generate(channel, opts, { readConfVersion, log = console } = {}) {
+export async function generate(
+  channel,
+  opts,
+  { readConfVersion, log = console, computeDev } = {},
+) {
   if (channel !== "stable" && channel !== "dev") {
     throw new Error(`channel must be \`stable\` or \`dev\` (got \`${channel}\`)`);
   }
-  const version = await resolveVersion(channel, opts, readConfVersion ?? readTauriConfVersion);
+  const version = await resolveVersion(
+    channel,
+    opts,
+    readConfVersion ?? readTauriConfVersion,
+    computeDev ?? computeDevVersionFromRepo,
+  );
   const bundlesDir = opts.bundles
     ? path.resolve(opts.bundles)
     : path.join(REPO_ROOT, "src-tauri", "target", "release", "bundle");
@@ -369,6 +498,7 @@ export async function generate(channel, opts, { readConfVersion, log = console }
   }
 
   const written = [];
+  const producedTargets = [];
   for (const b of bundles) {
     const url = `${baseUrl.replace(/\/$/, "")}/${b.bundleName}`;
     const manifest = buildManifest({
@@ -383,8 +513,18 @@ export async function generate(channel, opts, { readConfVersion, log = console }
     await fs.mkdir(path.dirname(outPath), { recursive: true });
     await fs.writeFile(outPath, JSON.stringify(manifest, null, 2) + "\n", "utf8");
     written.push(outPath);
+    producedTargets.push(b.target);
     log.info?.(`wrote ${path.relative(REPO_ROOT, outPath)} (${b.target})`);
   }
+
+  // R3-P1-2: if the caller declared a required target set, EVERY one must have
+  // produced a manifest or we refuse to return success (so the workflow never
+  // uploads/deploys a partial update tree).
+  if (opts.requireTargets !== undefined) {
+    const required = parseRequiredTargets(opts.requireTargets);
+    assertRequiredTargets(required, producedTargets);
+  }
+
   return { version, channel, written };
 }
 
@@ -396,8 +536,14 @@ Usage:
   node scripts/generate-update-json.mjs <stable|dev> [options]
 
 Options:
-  --version <semver>    Override the version (stable defaults to tauri.conf.json).
-  --sha <gitsha>        dev channel version becomes 0.0.0-dev.<sha>.
+  --version <semver>    The manifest version. Stable defaults to tauri.conf.json.
+                        REQUIRED for the dev channel (the workflow threads the
+                        shared monotonic <next-patch>-dev.<run>.<sha> value here).
+  --run-number <n>      dev only: with --dev-sha, derive the version from the
+  --dev-sha <sha>       shared set-dev-version logic when no --version is given.
+  --require-targets <l> Comma/space separated <os>-<arch> keys that MUST each
+                        produce a manifest, else ERROR (e.g.
+                        windows-x86_64,darwin-x86_64,darwin-aarch64,linux-x86_64).
   --bundles <dir>       Directory of bundle + .sig files
                         (default: src-tauri/target/release/bundle).
   --assets-dir <dir>    Alias for --bundles.
