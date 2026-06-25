@@ -157,6 +157,17 @@ pub async fn add_source(
     // than slipping into SQLite and breaking the next scan's matcher build.
     validate_source_patterns(&req.include_patterns, &req.exclude_patterns)?;
 
+    // R4-P2-3: validate the renderer-supplied metadata (display name + Drive
+    // destination fields) before persisting - non-empty, no control chars,
+    // length-capped - so a buggy / hostile renderer cannot write junk into
+    // `backup_sources`. Done before any master-key work (no key for a rejected
+    // add).
+    validate_source_metadata(
+        &req.display_name,
+        &req.drive_folder_id,
+        &req.drive_folder_path,
+    )?;
+
     let now = SystemClock.now_ms();
     let source_id = SourceId::new_v4();
 
@@ -493,6 +504,9 @@ pub async fn update_source(
     let mut row = find_source(state.state().as_ref(), source_id).await?;
 
     if let Some(display_name) = patch.display_name {
+        // R4-P2-3: validate the patched display name (non-empty, no control
+        // chars, length-capped) before it lands in SQLite.
+        validate_display_name(&display_name)?;
         row.display_name = display_name;
     }
     if let Some(enabled) = patch.enabled {
@@ -708,30 +722,32 @@ pub async fn preview_exclusions(
     state: State<'_, AppState>,
     req: ExclusionPreviewRequest,
 ) -> CommandResult<ExclusionPreview> {
-    // R1-P1-2: resolve the walk root from a backend-trusted source, never a raw
-    // webview path. Prefer an explicit existing-source id; else a dialog token.
-    let root = if let Some(source_id_str) = req.source_id.as_deref() {
-        let source_id: SourceId = source_id_str.parse().map_err(|e| {
-            CommandError::with_code(
-                ErrorCode::InternalBug,
-                format!("invalid source id for preview: {e}"),
-            )
-        })?;
-        let row = find_source(state.state().as_ref(), source_id).await?;
-        std::path::PathBuf::from(row.local_path)
-    } else if let Some(token) = req.local_path_token.as_deref() {
-        state.peek_dialog_token(token).ok_or_else(|| {
-            CommandError::with_code(
-                ErrorCode::LocalIoError,
-                "no matching dialog token for the preview folder; pick a folder first",
-            )
-        })?
-    } else {
-        return Err(CommandError::with_code(
-            ErrorCode::LocalIoError,
-            "preview requires a dialog token (new folder) or a source id (existing source)",
-        ));
-    };
+    // R4-P2-1: validate the candidate include / exclude globs BEFORE walking,
+    // so an invalid / oversized glob surfaces a stable s24 invalid-input error
+    // (the same code add_source / update_source use) instead of a confusing
+    // matcher-build failure mid-preview.
+    validate_source_patterns(&req.include_patterns, &req.exclude_patterns)?;
+
+    // R1-P1-2 / R4-P2-1: resolve the walk root from a backend-trusted source,
+    // never a raw webview path. The request must carry EXACTLY ONE selector - an
+    // existing-source id OR a dialog token; both-set / neither-set is rejected
+    // (accepting both and silently preferring one hid caller bugs).
+    let root =
+        match classify_preview_selector(req.source_id.as_deref(), req.local_path_token.as_deref())?
+        {
+            PreviewRootSelector::Source(source_id) => {
+                let row = find_source(state.state().as_ref(), source_id).await?;
+                std::path::PathBuf::from(row.local_path)
+            }
+            PreviewRootSelector::Token(token) => {
+                state.peek_dialog_token(token).ok_or_else(|| {
+                    CommandError::with_code(
+                        ErrorCode::LocalIoError,
+                        "no matching dialog token for the preview folder; pick a folder first",
+                    )
+                })?
+            }
+        };
 
     let canon = validate_readable_dir(&root)?;
 
@@ -893,6 +909,130 @@ fn validate_source_patterns(
             format!("invalid backup rules: {e}"),
         )
     })
+}
+
+/// R4-P2-1: the single, validated walk-root selector for `preview_exclusions`.
+#[derive(Debug)]
+enum PreviewRootSelector<'a> {
+    /// An existing source's id (its `local_path` is resolved from SQLite).
+    Source(SourceId),
+    /// A backend-minted dialog token for a NEW candidate folder.
+    Token(&'a str),
+}
+
+/// R4-P2-1: validate the `(source_id, local_path_token)` pair for
+/// `preview_exclusions` and return the single selector to resolve. The request
+/// MUST carry EXACTLY ONE of the two: both-set is rejected (it previously
+/// silently preferred `source_id`, hiding caller bugs) and neither-set is
+/// rejected. A malformed `source_id` is rejected as invalid input. Pure
+/// (no I/O), so the both/neither/malformed branches are unit-testable.
+fn classify_preview_selector<'a>(
+    source_id: Option<&'a str>,
+    local_path_token: Option<&'a str>,
+) -> CommandResult<PreviewRootSelector<'a>> {
+    match (source_id, local_path_token) {
+        (Some(_), Some(_)) => Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "preview takes either a source id OR a dialog token, not both",
+        )),
+        (Some(source_id_str), None) => {
+            let id: SourceId = source_id_str.parse().map_err(|e| {
+                CommandError::with_code(
+                    ErrorCode::InvalidInput,
+                    format!("invalid source id for preview: {e}"),
+                )
+            })?;
+            Ok(PreviewRootSelector::Source(id))
+        }
+        (None, Some(token)) => Ok(PreviewRootSelector::Token(token)),
+        (None, None) => Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "preview requires a dialog token (new folder) or a source id (existing source)",
+        )),
+    }
+}
+
+/// Max chars for a source `display_name` (a short human label, not free text).
+const MAX_DISPLAY_NAME_LEN: usize = 256;
+/// Max chars for a Drive folder id (a Google Drive id is ~33 chars; cap well
+/// above that but bounded so a junk renderer value cannot bloat the row).
+const MAX_DRIVE_FOLDER_ID_LEN: usize = 512;
+/// Max chars for a Drive folder breadcrumb path.
+const MAX_DRIVE_FOLDER_PATH_LEN: usize = 4096;
+
+/// R4-P2-3: validate the renderer-supplied source METADATA before it lands in
+/// SQLite. `add_source` trusted `display_name` / `drive_folder_id` /
+/// `drive_folder_path` verbatim, so a buggy / hostile renderer could write a
+/// control-char-laden or unbounded string into `backup_sources`. This enforces:
+/// - `display_name`: non-empty (after trim), no control chars, length-capped.
+/// - `drive_folder_id`: non-empty, no control chars / whitespace, length-capped.
+/// - `drive_folder_path`: optional (empty = My Drive root), no control chars,
+///   length-capped (it is a `/`-joined breadcrumb, NOT a local path - the local
+///   path is validated separately via the dialog token).
+///
+/// All rejections map to the stable s24 `internal.invalid_input` code so the
+/// wizard shows a "check your input" message. Shared by `add_source` and the
+/// `update_source` display-name patch.
+fn validate_source_metadata(
+    display_name: &str,
+    drive_folder_id: &str,
+    drive_folder_path: &str,
+) -> CommandResult<()> {
+    let invalid = |msg: &str| CommandError::with_code(ErrorCode::InvalidInput, msg.to_string());
+
+    let name = display_name.trim();
+    if name.is_empty() {
+        return Err(invalid("display name must not be empty"));
+    }
+    if name.chars().count() > MAX_DISPLAY_NAME_LEN {
+        return Err(invalid("display name is too long"));
+    }
+    if display_name.chars().any(|c| c.is_control()) {
+        return Err(invalid("display name must not contain control characters"));
+    }
+
+    if drive_folder_id.trim().is_empty() {
+        return Err(invalid("a Drive destination folder must be selected"));
+    }
+    if drive_folder_id.chars().count() > MAX_DRIVE_FOLDER_ID_LEN {
+        return Err(invalid("Drive folder id is too long"));
+    }
+    if drive_folder_id
+        .chars()
+        .any(|c| c.is_control() || c.is_whitespace())
+    {
+        return Err(invalid("Drive folder id has invalid characters"));
+    }
+
+    // The breadcrumb path is optional (empty = My Drive root). When present it
+    // must be a printable, length-bounded string (it is display metadata, not a
+    // filesystem path).
+    if drive_folder_path.chars().count() > MAX_DRIVE_FOLDER_PATH_LEN {
+        return Err(invalid("Drive folder path is too long"));
+    }
+    if drive_folder_path.chars().any(|c| c.is_control()) {
+        return Err(invalid(
+            "Drive folder path must not contain control characters",
+        ));
+    }
+    Ok(())
+}
+
+/// R4-P2-3: validate just a `display_name` (the `update_source` patch path,
+/// where the Drive folder fields are not editable). Reuses the metadata rules.
+fn validate_display_name(display_name: &str) -> CommandResult<()> {
+    let invalid = |msg: &str| CommandError::with_code(ErrorCode::InvalidInput, msg.to_string());
+    let name = display_name.trim();
+    if name.is_empty() {
+        return Err(invalid("display name must not be empty"));
+    }
+    if name.chars().count() > MAX_DISPLAY_NAME_LEN {
+        return Err(invalid("display name is too long"));
+    }
+    if display_name.chars().any(|c| c.is_control()) {
+        return Err(invalid("display name must not contain control characters"));
+    }
+    Ok(())
 }
 
 /// Look up an account by id from the strongly-consistent state DB, erroring if
@@ -1088,19 +1228,41 @@ fn delete_master_key(account_id: &AccountId) -> anyhow::Result<()> {
 
 /// R1-P2-2 (DESIGN s5.2.2): reject a candidate source root that OVERLAPS any
 /// existing source root - i.e. the candidate is an ancestor of, a descendant of,
-/// or identical to an existing root. Sibling / disjoint roots are allowed. The
-/// comparison canonicalises every existing root the same way the candidate was
-/// canonicalised so a symlinked / case / UNC variant cannot sneak past. Applied
-/// GLOBALLY across all accounts (DESIGN s5.2.2 does not scope it per-account).
+/// or identical to an existing root. Sibling / disjoint roots are allowed.
+/// Applied GLOBALLY across all accounts (DESIGN s5.2.2 does not scope it
+/// per-account).
+///
+/// R4-P2-6 (fail-CLOSED): every `backup_sources.local_path` is already stored in
+/// CANONICAL form (`add_source` persists `dunce::canonicalize(dialog_path)`), so
+/// the overlap check compares the canonical candidate against the STORED
+/// canonical value DIRECTLY - it does NOT re-canonicalise the existing root.
+/// Re-canonicalising at check time was fail-OPEN: a temporarily-missing root
+/// (the folder moved / a drive briefly unmounted) failed to resolve and was
+/// SKIPPED, letting a new source be created that overlaps it; when the root
+/// reappeared the two sources were in a nested state. Comparing the stored
+/// canonical path needs no filesystem access, so a missing root is still
+/// compared (fail-closed: a would-be overlap is rejected even while the existing
+/// root is offline). A stored path that is somehow not absolute (legacy / bad
+/// data) is treated as un-comparable and, to stay fail-closed, rejects the add
+/// with a clear error rather than being silently skipped.
 async fn reject_overlapping_root(state: &dyn StateRepo, candidate: &Path) -> CommandResult<()> {
     let existing = state.list_sources().await.map_err(CommandError::from)?;
     for src in &existing {
-        // Canonicalise the existing root; if it no longer resolves (the folder
-        // was moved/deleted) it cannot overlap a real candidate, so skip it.
-        let Ok(other) = dunce::canonicalize(&src.local_path) else {
-            continue;
-        };
-        if candidate == other || candidate.starts_with(&other) || other.starts_with(candidate) {
+        // The stored path is canonical from add time; compare it directly (no
+        // re-canonicalise, so a temporarily-missing root is still compared).
+        let other = Path::new(&src.local_path);
+        // Defence-in-depth: a non-absolute stored path cannot be compared by
+        // prefix safely. Rather than fail-open (skip), fail-closed: refuse the
+        // add so a corrupted row can be investigated instead of silently
+        // bypassing the overlap guard.
+        if !other.is_absolute() {
+            return Err(CommandError::with_code(
+                ErrorCode::LocalIoError,
+                "an existing backup source has an unexpected (non-absolute) stored \
+                 path; cannot safely check for overlap - please remove and re-add it",
+            ));
+        }
+        if candidate == other || candidate.starts_with(other) || other.starts_with(candidate) {
             return Err(CommandError::with_code(
                 ErrorCode::LocalIoError,
                 "this folder overlaps a folder that is already being backed up \
@@ -1440,6 +1602,159 @@ mod tests {
             .expect("a sibling root must be allowed");
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn reject_overlapping_root_fails_closed_when_existing_root_is_missing() {
+        // R4-P2-6: the existing source's stored path is canonical from add time.
+        // The overlap check compares it DIRECTLY (no re-canonicalise), so a root
+        // that no longer exists on disk is STILL compared - a nested candidate is
+        // rejected (fail-closed) instead of being silently allowed because the
+        // root failed to canonicalise.
+        let (repo, dir) = temp_repo().await;
+        // Persist an existing source at a canonical absolute path, then DELETE the
+        // directory so it cannot canonicalise at check time.
+        let parent = dir.join("gone-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let canon_parent = dunce::canonicalize(&parent).unwrap();
+        persist_source_at(&repo, &canon_parent).await;
+        std::fs::remove_dir_all(&parent).unwrap();
+
+        // A candidate nested under the (now-missing) stored root must be rejected
+        // (fail-closed): the path comparison still fires even though the root is
+        // gone from disk.
+        let nested = canon_parent.join("child");
+        let err = reject_overlapping_root(&repo, &nested)
+            .await
+            .expect_err("a candidate nested under a missing existing root must be rejected");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn validate_source_metadata_enforces_printable_nonempty_bounded() {
+        // R4-P2-3: the renderer-supplied source metadata is validated before it
+        // lands in SQLite. A valid set passes.
+        validate_source_metadata("My Docs", "drive-folder-id", "Backups/Docs")
+            .expect("a clean metadata set is accepted");
+        // An empty Drive folder PATH is allowed (My Drive root).
+        validate_source_metadata("My Docs", "root", "").expect("empty path = My Drive root");
+
+        // Empty / whitespace display name -> rejected.
+        assert_eq!(
+            validate_source_metadata("   ", "fid", "")
+                .expect_err("empty display name")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        // Control char in display name -> rejected.
+        assert_eq!(
+            validate_source_metadata("bad\u{0007}name", "fid", "")
+                .expect_err("control char in display name")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        // Empty Drive folder id -> rejected.
+        assert_eq!(
+            validate_source_metadata("ok", "  ", "")
+                .expect_err("empty drive folder id")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        // Whitespace inside the Drive folder id -> rejected.
+        assert_eq!(
+            validate_source_metadata("ok", "has space", "")
+                .expect_err("whitespace in drive folder id")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        // Over-long display name -> rejected.
+        let long_name = "x".repeat(MAX_DISPLAY_NAME_LEN + 1);
+        assert_eq!(
+            validate_source_metadata(&long_name, "fid", "")
+                .expect_err("over-long display name")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        // Over-long Drive folder path -> rejected.
+        let long_path = "a/".repeat(MAX_DRIVE_FOLDER_PATH_LEN);
+        assert_eq!(
+            validate_source_metadata("ok", "fid", &long_path)
+                .expect_err("over-long drive folder path")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        // Control char in the Drive folder path -> rejected.
+        assert_eq!(
+            validate_source_metadata("ok", "fid", "Backups/\u{0000}/Docs")
+                .expect_err("control char in drive folder path")
+                .code,
+            ErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn classify_preview_selector_requires_exactly_one_of_source_or_token() {
+        // R4-P2-1: exactly one selector. Both-set / neither-set / malformed id
+        // are rejected; a single valid selector resolves.
+        let sid = SourceId::new_v4();
+        match classify_preview_selector(Some(&sid.to_string()), None)
+            .expect("a lone source id resolves")
+        {
+            PreviewRootSelector::Source(got) => assert_eq!(got, sid),
+            PreviewRootSelector::Token(_) => panic!("expected a source selector"),
+        }
+        match classify_preview_selector(None, Some("tok")).expect("a lone token resolves") {
+            PreviewRootSelector::Token(t) => assert_eq!(t, "tok"),
+            PreviewRootSelector::Source(_) => panic!("expected a token selector"),
+        }
+        // Both set -> rejected.
+        assert_eq!(
+            classify_preview_selector(Some(&sid.to_string()), Some("tok"))
+                .expect_err("both selectors set must be rejected")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        // Neither set -> rejected.
+        assert_eq!(
+            classify_preview_selector(None, None)
+                .expect_err("no selector must be rejected")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        // Malformed source id -> rejected as invalid input (not an internal bug).
+        assert_eq!(
+            classify_preview_selector(Some("not-a-uuid"), None)
+                .expect_err("a malformed source id must be rejected")
+                .code,
+            ErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn validate_display_name_enforces_printable_nonempty_bounded() {
+        // R4-P2-3: the update_source display-name patch reuses the same rules.
+        validate_display_name("Renamed").expect("a clean display name is accepted");
+        assert_eq!(
+            validate_display_name("")
+                .expect_err("empty display name")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        assert_eq!(
+            validate_display_name("line\nbreak")
+                .expect_err("control char display name")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        let long = "y".repeat(MAX_DISPLAY_NAME_LEN + 1);
+        assert_eq!(
+            validate_display_name(&long)
+                .expect_err("over-long display name")
+                .code,
+            ErrorCode::InvalidInput
+        );
     }
 
     /// Build a Fake-mode [`AppState`] with no running orchestrators, backed by a

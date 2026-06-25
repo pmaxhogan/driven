@@ -480,6 +480,7 @@ pub fn run() {
             commands::accounts::submit_oauth_credentials,
             commands::accounts::start_oauth_signin,
             commands::accounts::poll_oauth_status,
+            commands::accounts::cancel_oauth_wizard,
             commands::accounts::finish_add_account,
             commands::accounts::remove_account,
             commands::accounts::reauth_account,

@@ -1858,6 +1858,13 @@ impl StateRepo for SqliteStateRepo {
         // an outer `WHERE ts >= week_start` would drop those rows before the
         // per-sum CASE ran, undercounting throughput at week boundaries. Gate
         // by `MIN(day, week, throughput)` so every CASE owns its own window.
+        //
+        // M7-R3-P2 (recheck-3): the byte aggregates count ONLY `upload_done`
+        // rows. "Uploaded today / this week" + the throughput rate are upload
+        // metrics; any other byte-carrying event type (a future scan/dry-run/
+        // error row that happens to set `bytes`) must NOT inflate them. The
+        // outer `WHERE event_type = 'upload_done'` constrains every CASE sum to
+        // upload rows; the `file_state.status` GROUP BY is unaffected.
         let byte_sums = sqlx::query!(
             r#"
             SELECT
@@ -1865,7 +1872,7 @@ impl StateRepo for SqliteStateRepo {
                 COALESCE(SUM(CASE WHEN ts >= ?2 THEN bytes ELSE 0 END), 0) AS "week!: i64",
                 COALESCE(SUM(CASE WHEN ts >= ?3 THEN bytes ELSE 0 END), 0) AS "window!: i64"
             FROM activity_log
-            WHERE ts >= MIN(?1, ?2, ?3)
+            WHERE ts >= MIN(?1, ?2, ?3) AND event_type = 'upload_done'
             "#,
             day_start_ms,
             week_start_ms,
@@ -4015,6 +4022,66 @@ mod tests {
         assert_eq!(summary.bytes_today, 0);
         // week = rows with ts >= 1000: only the ts=1500 row -> 30.
         assert_eq!(summary.bytes_week, 30);
+    }
+
+    #[tokio::test]
+    async fn activity_summary_byte_sums_count_only_upload_done_rows() {
+        // M7-R3-P2 (recheck-3): the "Uploaded today / this week" + throughput
+        // byte aggregates MUST count only `upload_done` rows. A byte-carrying
+        // row of any OTHER event type (here a synthetic scan/dry-run row) must
+        // not inflate them. Before the fix the sums included every row's
+        // `bytes`, so such a row would over-report uploads.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let day_start = 1000;
+        let week_start = 100;
+        let window_start = 1500;
+        let window_ms = 60_000;
+
+        // A real upload_done row inside ALL three windows (counts everywhere)
+        // plus a NON-upload byte-carrying row inside all three windows (a
+        // future event type that happens to set `bytes` - must be ignored by
+        // the byte aggregates).
+        repo.write_activity(NewActivity {
+            ts: 1800,
+            source_id: Some(src.id),
+            level: ActivityLevel::Info,
+            event_type: "upload_done".into(),
+            file_count: Some(1),
+            bytes: Some(40),
+            message: None,
+        })
+        .await
+        .unwrap();
+        repo.write_activity(NewActivity {
+            ts: 1900,
+            source_id: Some(src.id),
+            level: ActivityLevel::Info,
+            event_type: "scan_done".into(),
+            file_count: Some(1),
+            bytes: Some(1_000_000),
+            message: None,
+        })
+        .await
+        .unwrap();
+
+        let summary = repo
+            .activity_summary(day_start, week_start, window_start, window_ms)
+            .await
+            .unwrap();
+
+        // Every byte aggregate sees ONLY the upload_done row's 40 bytes; the
+        // 1_000_000-byte scan_done row is excluded.
+        assert_eq!(summary.bytes_today, 40, "today counts only upload_done");
+        assert_eq!(summary.bytes_week, 40, "week counts only upload_done");
+        assert_eq!(
+            summary.throughput_window_bytes, 40,
+            "throughput counts only upload_done"
+        );
     }
 
     #[tokio::test]

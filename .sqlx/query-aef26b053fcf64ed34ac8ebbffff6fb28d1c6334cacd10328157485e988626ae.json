@@ -1,0 +1,32 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                COALESCE(SUM(CASE WHEN ts >= ?1 THEN bytes ELSE 0 END), 0) AS \"today!: i64\",\n                COALESCE(SUM(CASE WHEN ts >= ?2 THEN bytes ELSE 0 END), 0) AS \"week!: i64\",\n                COALESCE(SUM(CASE WHEN ts >= ?3 THEN bytes ELSE 0 END), 0) AS \"window!: i64\"\n            FROM activity_log\n            WHERE ts >= MIN(?1, ?2, ?3) AND event_type = 'upload_done'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "today!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "week!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      },
+      {
+        "name": "window!: i64",
+        "ordinal": 2,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "aef26b053fcf64ed34ac8ebbffff6fb28d1c6334cacd10328157485e988626ae"
+}

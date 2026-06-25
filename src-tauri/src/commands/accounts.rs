@@ -86,10 +86,19 @@ struct WizardSession {
     /// `true` once `start_oauth_signin` has launched the flow, so a second call
     /// is a no-op rather than a duplicate loopback bind.
     started: bool,
+    /// R4-P2-4: wall-time (ms) the session was opened. With `updated_at` this
+    /// lets `prune_stale_sessions` reap abandoned flows.
+    created_at: i64,
+    /// R4-P2-4: wall-time (ms) of the last status / token / cred mutation. A
+    /// session whose `updated_at` is older than the TTL (or a terminal session
+    /// past the shorter terminal grace) is pruned, so abandoned flows do not
+    /// accumulate the BYO creds / tokens in the process-global map forever.
+    updated_at: i64,
 }
 
 impl WizardSession {
     fn new(account_id: Option<AccountId>) -> Self {
+        let now = SystemClock.now_ms();
         Self {
             client_id: None,
             client_secret: None,
@@ -97,8 +106,64 @@ impl WizardSession {
             tokens: None,
             account_id,
             started: false,
+            created_at: now,
+            updated_at: now,
         }
     }
+
+    /// R4-P2-4: stamp `updated_at` (called on every mutation so the TTL is
+    /// measured from the last activity, not session open).
+    fn touch(&mut self) {
+        self.updated_at = SystemClock.now_ms();
+    }
+
+    /// R4-P2-4: whether this session is in a terminal OAuth state (the flow
+    /// completed or failed). Terminal sessions are pruned after a short grace;
+    /// non-terminal (abandoned) ones after the full TTL.
+    fn is_terminal(&self) -> bool {
+        matches!(
+            self.status,
+            OAuthStatus::Complete | OAuthStatus::Failed { .. }
+        )
+    }
+}
+
+/// R4-P2-4: how long an ABANDONED (non-terminal) wizard session lives before
+/// `prune_stale_sessions` reaps it (30 min - longer than any real consent
+/// flow, but bounded).
+const SESSION_TTL_MS: i64 = 30 * 60 * 1000;
+/// R4-P2-4: grace for a TERMINAL session (Complete / Failed) the UI never
+/// consumed via `finish_add_account` / `cancel_oauth_wizard` (5 min). A
+/// completed session normally is removed by `finish_add_account`; this reaps
+/// one the UI walked away from.
+const SESSION_TERMINAL_GRACE_MS: i64 = 5 * 60 * 1000;
+/// R4-P2-4: absolute max lifetime since session OPEN (2h). A pathological flow
+/// kept "fresh" by repeated polling cannot live forever; once a session is this
+/// old it is reaped regardless of recent activity.
+const SESSION_MAX_LIFETIME_MS: i64 = 2 * 60 * 60 * 1000;
+
+/// R4-P2-4: remove abandoned / stale-terminal wizard sessions. Called at the
+/// natural entry points (opening a new add / reauth flow). A non-terminal
+/// session idle past `SESSION_TTL_MS`, or a terminal session idle past
+/// `SESSION_TERMINAL_GRACE_MS`, is dropped (clearing its BYO creds + tokens
+/// from the process-global map). Pure map maintenance - never touches the DB or
+/// keychain.
+fn prune_stale_sessions() {
+    let now = SystemClock.now_ms();
+    let mut sessions = lock_sessions();
+    sessions.retain(|_id, s| {
+        // Absolute lifetime cap since open: reap regardless of recent activity.
+        if now.saturating_sub(s.created_at) >= SESSION_MAX_LIFETIME_MS {
+            return false;
+        }
+        let idle = now.saturating_sub(s.updated_at);
+        let ttl = if s.is_terminal() {
+            SESSION_TERMINAL_GRACE_MS
+        } else {
+            SESSION_TTL_MS
+        };
+        idle < ttl
+    });
 }
 
 /// The process-wide registry of in-flight wizard sessions, keyed by session id.
@@ -197,6 +262,9 @@ fn account_state_str(state: AccountState) -> &'static str {
 pub async fn begin_add_account_wizard(
     _state: State<'_, AppState>,
 ) -> CommandResult<AddAccountWizardSessionId> {
+    // R4-P2-4: reap any abandoned / stale-terminal sessions before opening a new
+    // one, so the process-global map cannot accumulate them across a long run.
+    prune_stale_sessions();
     let id = uuid::Uuid::new_v4().to_string();
     lock_sessions().insert(id.clone(), WizardSession::new(None));
     tracing::info!(target: TARGET, session = %id, "add-account wizard session opened");
@@ -227,6 +295,7 @@ pub async fn submit_oauth_credentials(
     }
     s.client_id = Some(client_id);
     s.client_secret = Some(client_secret);
+    s.touch(); // R4-P2-4: measure the TTL from the last activity.
     Ok(())
 }
 
@@ -263,6 +332,7 @@ pub async fn start_oauth_signin(
         let creds = resolve_creds(s)?;
         s.started = true;
         s.status = OAuthStatus::OpeningBrowser;
+        s.touch(); // R4-P2-4.
         creds
     };
 
@@ -293,6 +363,7 @@ pub async fn start_oauth_signin(
                     // Never downgrade a terminal status set elsewhere.
                     if !matches!(s.status, OAuthStatus::Complete | OAuthStatus::Failed { .. }) {
                         s.status = progress_to_status(p);
+                        s.touch(); // R4-P2-4.
                     }
                 }
             }
@@ -313,6 +384,7 @@ pub async fn start_oauth_signin(
                     if let Some(s) = sessions.get_mut(&session_id) {
                         s.tokens = Some(tokens);
                         s.status = OAuthStatus::Complete;
+                        s.touch(); // R4-P2-4.
                     }
                     OAuthStatus::Complete
                 }
@@ -326,6 +398,7 @@ pub async fn start_oauth_signin(
                     let mut sessions = lock_sessions();
                     if let Some(s) = sessions.get_mut(&session_id) {
                         s.status = status.clone();
+                        s.touch(); // R4-P2-4.
                     }
                     tracing::warn!(target: TARGET, session = %session_id, %err, "oauth flow failed");
                     status
@@ -379,6 +452,28 @@ pub async fn poll_oauth_status(
         .get(&session.0)
         .map(|s| s.status.clone())
         .ok_or_else(unknown_session_err)
+}
+
+/// `cancel_oauth_wizard(session)` - abandon an in-flight add-account / reauth
+/// wizard session, dropping it from the server-side registry (R4-P2-4).
+///
+/// The webview calls this when the user closes / cancels the wizard, so the
+/// session's BYO creds + any obtained tokens are cleared from the process-global
+/// map immediately rather than waiting for the TTL sweep. Idempotent: cancelling
+/// an unknown / already-removed session is a no-op (the desired end state - the
+/// session is gone - already holds), so a double-cancel never errors. This only
+/// drops the in-memory session; it never touches the account row or keychain (a
+/// finished account is persisted by `finish_add_account`, not here).
+#[tauri::command]
+pub async fn cancel_oauth_wizard(
+    _state: State<'_, AppState>,
+    session: SessionId,
+) -> CommandResult<()> {
+    // Also reap any other stale sessions while here (cheap map maintenance).
+    prune_stale_sessions();
+    let removed = lock_sessions().remove(&session.0).is_some();
+    tracing::info!(target: TARGET, session = %session.0, removed, "oauth wizard session cancelled");
+    Ok(())
 }
 
 /// `finish_add_account(session, display_name?)` - persist the account once the
@@ -695,7 +790,13 @@ struct GoogleUserinfo {
 /// token is NEVER logged.
 async fn fetch_google_userinfo(access_token: &str) -> Option<GoogleUserinfo> {
     const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
-    let client = match reqwest::Client::builder().build() {
+    // R4-P2-5: bound the request so a blackholed endpoint cannot hang the IPC
+    // command forever (no timeout = wait indefinitely). 10s connect, 30s total.
+    let client = match reqwest::Client::builder()
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
+        .build()
+    {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(target: TARGET, error = %e, "userinfo: failed to build http client");
@@ -850,6 +951,9 @@ pub async fn reauth_account(
         ));
     }
 
+    // R4-P2-4: reap abandoned / stale-terminal sessions before opening this one.
+    prune_stale_sessions();
+
     // A1: a reauth must use the SAME client that minted the original refresh
     // token (the account's persisted BYO client creds), so the new refresh
     // token is minted by - and bound to - that client. Seed the session with
@@ -946,6 +1050,61 @@ mod tests {
         assert!(dto.encryption_enabled);
         assert_eq!(dto.created_at, 123);
         assert_eq!(dto.last_synced_at, Some(456));
+    }
+
+    #[test]
+    fn prune_stale_sessions_reaps_abandoned_and_stale_terminal_sessions() {
+        // R4-P2-4: an abandoned (non-terminal) session past SESSION_TTL_MS and a
+        // terminal session past SESSION_TERMINAL_GRACE_MS are reaped; a recent
+        // session of either kind is kept. Unique ids keep this test isolated from
+        // the shared process-global session map.
+        let now = SystemClock.now_ms();
+        let tag = uuid::Uuid::new_v4().to_string();
+        let fresh_id = format!("{tag}-fresh");
+        let stale_abandoned_id = format!("{tag}-stale-abandoned");
+        let recent_terminal_id = format!("{tag}-recent-terminal");
+        let stale_terminal_id = format!("{tag}-stale-terminal");
+
+        {
+            let mut sessions = lock_sessions();
+            // Fresh non-terminal: kept.
+            let mut fresh = WizardSession::new(None);
+            fresh.updated_at = now;
+            sessions.insert(fresh_id.clone(), fresh);
+            // Abandoned non-terminal, idle past the TTL: reaped.
+            let mut stale = WizardSession::new(None);
+            stale.updated_at = now - SESSION_TTL_MS - 1;
+            sessions.insert(stale_abandoned_id.clone(), stale);
+            // Terminal but recent (within grace): kept.
+            let mut recent_terminal = WizardSession::new(None);
+            recent_terminal.status = OAuthStatus::Complete;
+            recent_terminal.updated_at = now - 1;
+            sessions.insert(recent_terminal_id.clone(), recent_terminal);
+            // Terminal past the grace: reaped.
+            let mut stale_terminal = WizardSession::new(None);
+            stale_terminal.status = OAuthStatus::Failed {
+                code: "auth.consent_required".to_string(),
+            };
+            stale_terminal.updated_at = now - SESSION_TERMINAL_GRACE_MS - 1;
+            sessions.insert(stale_terminal_id.clone(), stale_terminal);
+        }
+
+        prune_stale_sessions();
+
+        let sessions = lock_sessions();
+        assert!(sessions.contains_key(&fresh_id), "fresh session kept");
+        assert!(
+            !sessions.contains_key(&stale_abandoned_id),
+            "abandoned past-TTL session reaped"
+        );
+        assert!(
+            sessions.contains_key(&recent_terminal_id),
+            "recent terminal session kept (within grace)"
+        );
+        assert!(
+            !sessions.contains_key(&stale_terminal_id),
+            "terminal past-grace session reaped"
+        );
     }
 
     #[test]

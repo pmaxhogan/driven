@@ -888,6 +888,31 @@ const MAX_LOG_BYTES: u64 = 50 * 1024 * 1024;
 /// (it correlates to a local source). Best-effort: a query failure yields a
 /// header-only CSV with an error note rather than failing the whole bundle.
 async fn build_activity_csv(state: &dyn StateRepo, redactor: &Redactor) -> String {
+    // M7-R3-P2 (recheck-3): the activity_log can exceed one page in a 30-day
+    // window now that every successful upload writes a per-file `upload_done`
+    // row (a large first backup is easily > 10k events). A single
+    // `PageRequest::first(10_000)` silently dropped the rest of the required
+    // history. The keyset-paged collector below walks ALL pages.
+    //
+    // CSV_PAGE_SIZE is the SPEC s18.8 per-page cap (10_000); CSV_MAX_ROWS bounds
+    // the whole bundle (5M = the activity_log retention hard cap) so a runaway
+    // log cannot produce an unbounded snapshot.
+    const CSV_PAGE_SIZE: u32 = 10_000;
+    const CSV_MAX_ROWS: usize = 5_000_000;
+    build_activity_csv_paged(state, redactor, CSV_PAGE_SIZE, CSV_MAX_ROWS).await
+}
+
+/// Keyset-paged collector behind [`build_activity_csv`] (M7-R3-P2). Walks every
+/// `activity_log` page in the 30-day window (newest-first, then `after_cursor`)
+/// until `!has_more` or the row cap, so the bundle carries the full required
+/// history rather than just the first page. `page_size` / `max_rows` are
+/// parameters so a test can drive the multi-page loop with a small page.
+async fn build_activity_csv_paged(
+    state: &dyn StateRepo,
+    redactor: &Redactor,
+    page_size: u32,
+    max_rows: usize,
+) -> String {
     use driven_core::state::{ActivityFilter, PageRequest};
     use driven_core::time::{Clock, SystemClock};
 
@@ -901,39 +926,60 @@ async fn build_activity_csv(state: &dyn StateRepo, redactor: &Redactor) -> Strin
         since_ms: Some(since),
         ..Default::default()
     };
-    // Bounded first page (SPEC s18.8 caps at 10_000 rows/page); a 30-day window
-    // of a single-user backup tool fits comfortably (R2-P1-2 keyset: the
-    // newest-first page with no cursor).
-    let page = PageRequest::first(10_000);
-    match state.query_activity(filter, page).await {
-        Ok(activity) => {
-            for row in &activity.rows {
-                let level = format!("{:?}", row.level);
-                let source = row
-                    .source_id
-                    .map(|s| format!("source_{}", stable_hash(&s.to_string())))
-                    .unwrap_or_default();
-                let file_count = row.file_count.map(|c| c.to_string()).unwrap_or_default();
-                let bytes = row.bytes.map(|b| b.to_string()).unwrap_or_default();
-                let message = row
-                    .message
-                    .as_deref()
-                    .map(|m| redactor.redact_text(m))
-                    .unwrap_or_default();
-                out.push_str(&format!(
-                    "{},{},{},{},{},{},{}\n",
-                    row.ts,
-                    csv_field(&row.event_type),
-                    csv_field(&level),
-                    csv_field(&source),
-                    file_count,
-                    bytes,
-                    csv_field(&message),
-                ));
+
+    let mut cursor: Option<(i64, i64)> = None;
+    let mut written: usize = 0;
+    loop {
+        let page = match cursor {
+            None => PageRequest::first(page_size),
+            Some((ts, id)) => PageRequest::after_cursor(ts, id, page_size),
+        };
+        match state.query_activity(filter.clone(), page).await {
+            Ok(activity) => {
+                let last = activity.rows.last().map(|r| (r.ts, r.id.0));
+                for row in &activity.rows {
+                    if written >= max_rows {
+                        break;
+                    }
+                    let level = format!("{:?}", row.level);
+                    let source = row
+                        .source_id
+                        .map(|s| format!("source_{}", stable_hash(&s.to_string())))
+                        .unwrap_or_default();
+                    let file_count = row.file_count.map(|c| c.to_string()).unwrap_or_default();
+                    let bytes = row.bytes.map(|b| b.to_string()).unwrap_or_default();
+                    let message = row
+                        .message
+                        .as_deref()
+                        .map(|m| redactor.redact_text(m))
+                        .unwrap_or_default();
+                    out.push_str(&format!(
+                        "{},{},{},{},{},{},{}\n",
+                        row.ts,
+                        csv_field(&row.event_type),
+                        csv_field(&level),
+                        csv_field(&source),
+                        file_count,
+                        bytes,
+                        csv_field(&message),
+                    ));
+                    written += 1;
+                }
+                // Stop on history-exhausted, the row cap, or a degenerate page
+                // with no cursor to advance (defence against a non-advancing
+                // backend).
+                if !activity.has_more || written >= max_rows {
+                    break;
+                }
+                match last {
+                    Some((ts, id)) => cursor = Some((ts, id)),
+                    None => break,
+                }
             }
-        }
-        Err(e) => {
-            out.push_str(&format!("# activity query failed: {e}\n"));
+            Err(e) => {
+                out.push_str(&format!("# activity query failed: {e}\n"));
+                break;
+            }
         }
     }
     out
@@ -1779,8 +1825,13 @@ async fn fetch_releases(page: u32) -> CommandResult<Vec<GithubRelease>> {
         "https://api.github.com/repos/{GITHUB_REPO}/releases?per_page={RELEASES_PER_PAGE}&page={page}"
     );
 
+    // R4-P2-5: bound the request so a blackholed GitHub endpoint cannot hang the
+    // IPC command forever (no timeout = wait indefinitely). 10s connect, 30s
+    // total.
     let client = reqwest::Client::builder()
         .user_agent(GITHUB_USER_AGENT)
+        .connect_timeout(std::time::Duration::from_secs(10))
+        .timeout(std::time::Duration::from_secs(30))
         .build()
         .map_err(|e| {
             CommandError::with_code(ErrorCode::InternalBug, format!("build http client: {e}"))
@@ -2286,6 +2337,70 @@ mod tests {
         assert!(
             csv.contains("<path:") && csv.contains("<email:"),
             "the redaction pipeline must replace path + email with hashed placeholders"
+        );
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn activity_csv_pages_through_all_rows_not_just_the_first_page() {
+        // M7-R3-P2 (recheck-3): the CSV must carry EVERY activity row in the
+        // 30-day window, not just the first page. With a per-file `upload_done`
+        // row per upload the log easily exceeds one page; the old single
+        // `PageRequest::first(10_000)` silently dropped the rest. Drive the
+        // keyset loop with a tiny page size so a handful of rows spans several
+        // pages, and assert all rows land in the CSV.
+        use driven_core::state::{ActivityLevel, NewActivity};
+        use driven_core::time::{Clock, SystemClock};
+        let (repo, dir) = seeded_repo().await;
+        let now = SystemClock.now_ms();
+
+        // Write 25 recent rows (inside the 30-day window). Distinct messages so
+        // each can be located in the output.
+        let total_rows = 25_usize;
+        for i in 0..total_rows {
+            repo.write_activity(NewActivity {
+                ts: now - i as i64, // strictly decreasing so ordering is stable
+                source_id: None,
+                level: ActivityLevel::Info,
+                event_type: "upload_done".to_string(),
+                file_count: Some(1),
+                bytes: Some(i as u64),
+                message: Some(format!("row-marker-{i}")),
+            })
+            .await
+            .unwrap();
+        }
+
+        // page_size = 4 forces ~7 keyset pages over the 25 rows.
+        let csv = build_activity_csv_paged(&repo, &Redactor::context_free(), 4, 1_000_000).await;
+
+        // Every row's marker is present exactly once -> the loop walked all
+        // pages and dropped nothing. The message is the LAST CSV column, so each
+        // row ends `...,row-marker-{i}\n`; match the marker WITH its trailing
+        // newline so `row-marker-1` is not a substring hit inside `row-marker-12`.
+        for i in 0..total_rows {
+            let marker = format!("row-marker-{i}\n");
+            assert_eq!(
+                csv.matches(&marker).count(),
+                1,
+                "row {i} must appear exactly once in the paged CSV"
+            );
+        }
+        // Exactly `total_rows` data rows emitted (one `upload_done` per row in
+        // the event_type column - an unambiguous per-row count that, unlike a raw
+        // newline count, is not confused by a multi-line quoted message field).
+        assert_eq!(
+            csv.matches("upload_done").count(),
+            total_rows,
+            "every data row emitted exactly once across all pages"
+        );
+
+        // The row cap is honoured: capping at 10 rows yields exactly 10 data rows.
+        let capped = build_activity_csv_paged(&repo, &Redactor::context_free(), 4, 10).await;
+        assert_eq!(
+            capped.matches("upload_done").count(),
+            10,
+            "exactly max_rows data rows when the cap is hit"
         );
         cleanup(dir);
     }
