@@ -450,6 +450,10 @@
       "signature_invalid": {
         "short": "Update rejected",
         "long": "The update's signature could not be verified and was rejected for your safety."
+      },
+      "manual_required_macos": {
+        "short": "Manual update needed",
+        "long": "Automatic updates are not available on macOS. Download and reinstall the latest release to update Driven."
       }
     },
     "crypto": {

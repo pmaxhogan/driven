@@ -5,6 +5,7 @@ import { useI18n } from "vue-i18n";
 import AddSourceWizard from "./AddSourceWizard.vue";
 import RecoveryPhraseReveal from "./RecoveryPhraseReveal.vue";
 import * as ipc from "../ipc/commands";
+import { toErrorCode } from "../ipc/errors";
 import { useAccountsStore } from "../stores/accounts";
 import { useSourcesStore } from "../stores/sources";
 import type { ExclusionPreview, SourceDto } from "../ipc/types";
@@ -45,7 +46,10 @@ const revealPhrase = ref<string[]>([]);
 const revealConfirmed = ref(false);
 const revealEverShown = ref(false);
 const revealAcking = ref(false);
-const revealError = ref<string | null>(null);
+// R8-P2-1: the recovery reveal/ack error as a stable SPEC s24 CODE (not a raw
+// String(e), which renders a Tauri structured error as `[object Object]` and can
+// leak backend English). The template localizes it via t(`errors.${code}.long`).
+const revealErrorCode = ref<string | null>(null);
 
 const numberFormatter = computed(() => new Intl.NumberFormat(locale.value));
 
@@ -159,7 +163,7 @@ async function confirmRemove(sourceId: string): Promise<void> {
 function beginRevealAck(source: SourceDto): void {
   editingId.value = null;
   confirmingRemoveId.value = null;
-  revealError.value = null;
+  revealErrorCode.value = null;
   revealConfirmed.value = false;
   revealEverShown.value = false;
   revealPhrase.value = [];
@@ -177,9 +181,11 @@ async function revealPhraseAction(): Promise<void> {
   revealPhrase.value = await sources.revealRecoveryPhrase(id);
 }
 
-// R7-P2-1: surface a backend reveal error from RecoveryPhraseReveal.
+// R7-P2-1 / R8-P2-1: surface a backend reveal error from RecoveryPhraseReveal as
+// a stable SPEC s24 code (normalized via toErrorCode), so the template localizes
+// it - never `[object Object]` / leaked backend English.
 function onRevealError(code: unknown): void {
-  revealError.value = String(code);
+  revealErrorCode.value = toErrorCode(code);
 }
 
 function cancelRevealAck(): void {
@@ -187,7 +193,7 @@ function cancelRevealAck(): void {
   revealPhrase.value = [];
   revealConfirmed.value = false;
   revealEverShown.value = false;
-  revealError.value = null;
+  revealErrorCode.value = null;
 }
 
 // RecoveryPhraseReveal signals when the phrase has actually been shown (so the ack
@@ -204,12 +210,13 @@ function onRevealShown(value: boolean): void {
 async function confirmRevealAck(sourceId: string): Promise<void> {
   if (!revealConfirmed.value || !revealEverShown.value) return;
   revealAcking.value = true;
-  revealError.value = null;
+  revealErrorCode.value = null;
   try {
     await sources.ackRecoveryPhrase(sourceId);
     cancelRevealAck();
   } catch (e) {
-    revealError.value = String(e);
+    // R8-P2-1: store the stable code; the template localizes it.
+    revealErrorCode.value = toErrorCode(e);
   } finally {
     revealAcking.value = false;
   }
@@ -458,10 +465,10 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
                   @reveal-error="onRevealError"
                 />
                 <p
-                  v-if="revealError"
+                  v-if="revealErrorCode"
                   class="text-red-600"
                 >
-                  {{ revealError }}
+                  {{ t(`errors.${revealErrorCode}.long`) }}
                 </p>
                 <div class="flex gap-2">
                   <button

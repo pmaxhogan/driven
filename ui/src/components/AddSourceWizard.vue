@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 
 import RecoveryPhraseReveal from "./RecoveryPhraseReveal.vue";
 import * as ipc from "../ipc/commands";
+import { toErrorCode } from "../ipc/errors";
 import { useAccountsStore } from "../stores/accounts";
 import { useSourcesStore } from "../stores/sources";
 import type {
@@ -96,6 +97,11 @@ const preview = ref<ExclusionPreview | null>(null);
 const previewLoading = ref(false);
 const submitting = ref(false);
 const errorMessage = ref<string | null>(null);
+// R8-P2-1: the recovery reveal/ack error on the reveal step as a stable SPEC s24
+// CODE (not a raw String(e), which renders a Tauri structured error as
+// `[object Object]` and can leak backend English). The reveal step localizes it
+// via t(`errors.${code}.long`).
+const revealErrorCode = ref<string | null>(null);
 
 const includePatterns = computed(() => splitPatterns(includePatternsText.value));
 const excludePatterns = computed(() => splitPatterns(excludePatternsText.value));
@@ -159,6 +165,7 @@ function reset(): void {
   driveFolders.value = [];
   preview.value = null;
   errorMessage.value = null;
+  revealErrorCode.value = null;
   submitting.value = false;
 }
 
@@ -311,14 +318,15 @@ async function finishReveal(): Promise<void> {
   const created = createdSource.value;
   if (created && pendingRecoveryAck.value) {
     submitting.value = true;
-    errorMessage.value = null;
+    revealErrorCode.value = null;
     try {
       const enabled = await sources.ackRecoveryPhrase(created.id);
       pendingRecoveryAck.value = false;
       emit("created", enabled);
       close();
     } catch (e) {
-      errorMessage.value = String(e);
+      // R8-P2-1: store the stable code; the reveal step localizes it.
+      revealErrorCode.value = toErrorCode(e);
     } finally {
       submitting.value = false;
     }
@@ -343,9 +351,11 @@ async function revealPhraseAction(): Promise<void> {
   await sources.revealRecoveryPhrase(created.id);
 }
 
-/** M9c D4: surface a backend reveal error on the reveal step. */
+/** M9c D4 / R8-P2-1: surface a backend reveal error on the reveal step as a
+ * stable SPEC s24 code (normalized via toErrorCode), so the template localizes it
+ * - never `[object Object]` / leaked backend English. */
 function onPhraseRevealError(code: unknown): void {
-  errorMessage.value = String(code);
+  revealErrorCode.value = toErrorCode(code);
 }
 
 defineExpose({ start });
@@ -589,6 +599,13 @@ defineExpose({ start });
           @update:revealed="onPhraseRevealed"
           @reveal-error="onPhraseRevealError"
         />
+        <p
+          v-if="revealErrorCode"
+          class="text-sm text-red-600"
+          data-testid="reveal-error"
+        >
+          {{ t(`errors.${revealErrorCode}.long`) }}
+        </p>
       </div>
 
       <!-- Step 5: confirm -->
