@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT COUNT(*) AS n FROM backup_sources WHERE account_id = ?1 AND id != ?2 AND encryption_enabled = 1",
+  "describe": {
+    "columns": [
+      {
+        "name": "n",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "d6bc894e51e592ac9f452e166b0e86e5bb8d5d4be79408d63ba8c7ac73b75d9a"
+}

@@ -536,6 +536,13 @@ pub async fn update_source(
 /// backed-up Drive content) is NOT performed in this slice (no standalone Drive
 /// store handle is exposed to IPC for a bulk remote trash); a `true` request is
 /// rejected so the caller is never told the remote was deleted when it was not.
+///
+/// R5-P1-1 (DATA-SAFETY): a source still holding a DURABLE pending recovery-phrase
+/// ack (a first encrypted source the user never saved the phrase for) is removed
+/// via the explicit DISCARD transaction, which - when it was the account's only
+/// encrypted source - also clears the account master-key stamp + deletes the
+/// keychain master key, so a later encrypted source re-provisions and RE-REVEALS a
+/// fresh phrase rather than silently reusing an unrecoverable key.
 #[tauri::command]
 pub async fn remove_source(
     state: State<'_, AppState>,
@@ -552,6 +559,47 @@ pub async fn remove_source(
 
     let row = find_source(state.state().as_ref(), source_id).await?;
     let account_id = row.account_id;
+
+    // R5-P1-1 (DATA-SAFETY): if this source still has a DURABLE pending
+    // recovery-phrase ack (a first encrypted source the user never acked), a plain
+    // `delete_source` would cascade the ack row but LEAVE the account's master-key
+    // stamp + the keychain master key. The NEXT encrypted source would then take
+    // the "already provisioned" path, return NO recovery phrase, and arm encryption
+    // the user can never restore. Route it through the explicit DISCARD transaction
+    // instead: it deletes the source (+ ack) AND, when this was the account's only
+    // encrypted source, clears the master-key stamp atomically; we then delete the
+    // keychain master key so no provisioned-but-phraseless key is left behind. A
+    // SUBSEQUENT encrypted source then re-provisions + re-reveals a fresh phrase.
+    let pending = state
+        .state()
+        .recovery_ack_revealed(source_id)
+        .await
+        .map_err(CommandError::from)?
+        .is_some();
+
+    if pending {
+        let outcome = state
+            .state()
+            .discard_pending_encrypted_source(source_id)
+            .await
+            .map_err(CommandError::from)?;
+        // Mirror the cleared durable gate into the in-memory map (idempotent).
+        state.clear_pending_recovery_ack(source_id);
+        if outcome.master_key_cleared {
+            // The account's master-key stamp was cleared in the same transaction;
+            // now SAFELY delete the keychain master key (idempotent - NoEntry is
+            // Ok). This only runs when no OTHER encrypted source needed it, so a
+            // key another source still uses is never deleted.
+            if let Err(del) = delete_master_key(&account_id) {
+                tracing::error!(target: TARGET, account_id = %account_id, error = %del, "failed to delete orphaned master key after discarding the only pending encrypted source");
+            } else {
+                tracing::info!(target: TARGET, account_id = %account_id, "deleted account master key after discarding the only pending encrypted source (R5-P1-1)");
+            }
+        }
+        reconfigure_account(&state, account_id).await;
+        tracing::info!(target: TARGET, source_id = %source_id, account_id = %account_id, master_key_cleared = outcome.master_key_cleared, "pending encrypted source discarded");
+        return Ok(());
+    }
 
     state
         .state()
@@ -1426,6 +1474,84 @@ mod tests {
         reject_enable_of_pending_encrypted_source(&repo, source_id, true)
             .await
             .expect("after the durable ack, enabling is allowed");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn discard_pending_encrypted_source_clears_stamp_then_next_add_reveals_fresh_phrase() {
+        // R5-P1-1 (DATA-SAFETY): the remove path for a pending first encrypted source
+        // routes through `discard_pending_encrypted_source`, which clears the
+        // account's master-key stamp when it was the only encrypted source. A
+        // SUBSEQUENT encrypted source then takes the FRESH-key path (newly_generated
+        // = true, a recovery phrase is revealed) rather than the silent
+        // already-provisioned path. We exercise the StateRepo + prepare_master_key
+        // seam directly (no keychain side effects): after a discard the stamp is
+        // NULL, so `prepare_master_key` would mint + reveal a new phrase.
+        let (repo, dir) = temp_repo().await;
+
+        // Seed a pending first-encrypted source (disabled + durable pending-ack +
+        // stamped master key).
+        let account_id = AccountId::new_v4();
+        let account = AccountRow {
+            id: account_id,
+            email: "u@example.com".to_string(),
+            display_name: None,
+            state: driven_core::types::AccountState::Ok,
+            encryption_master_key_id: None,
+            created_at: 0,
+            last_synced_at: None,
+        };
+        repo.upsert_account(&account).await.expect("upsert account");
+        let source_id = SourceId::new_v4();
+        let row = SourceRow {
+            id: source_id,
+            account_id,
+            display_name: "Secret".to_string(),
+            enabled: false,
+            local_path: "/home/u/secret-discard".to_string(),
+            drive_folder_id: String::new(),
+            drive_folder_path: String::new(),
+            encryption_enabled: true,
+            wrapped_source_key: Some(vec![7, 7, 7]),
+            respect_gitignore: true,
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: default_deep_verify_secs(),
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            created_at: 0,
+        };
+        repo.insert_first_encrypted_source_pending_ack(&row, "kc:u-master".into(), 0)
+            .await
+            .expect("seed pending source");
+        // The source has a durable pending ack (so remove_source routes to discard).
+        assert!(repo
+            .recovery_ack_revealed(source_id)
+            .await
+            .unwrap()
+            .is_some());
+
+        // Discard the pending source (the only encrypted source).
+        let outcome = repo
+            .discard_pending_encrypted_source(source_id)
+            .await
+            .expect("discard");
+        assert!(
+            outcome.master_key_cleared,
+            "discarding the only encrypted source must clear the master key"
+        );
+
+        // The account stamp is now NULL: a subsequent encrypted source takes the
+        // fresh-key path. `prepare_master_key` reflects that decision (the account is
+        // unprovisioned again, so `newly_generated` would be true and a phrase
+        // returned). We assert the gating column rather than calling the keychain.
+        let after = find_account(&repo, account_id).await.expect("account");
+        assert_eq!(
+            after.encryption_master_key_id, None,
+            "after a discard the next encrypted source must re-provision (fresh phrase), not reuse a silent key"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

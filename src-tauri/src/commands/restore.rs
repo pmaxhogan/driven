@@ -308,7 +308,15 @@ pub async fn restore_files(
             "no matching destination folder; pick a restore folder first",
         ));
     }
-    let dest_token = dest_root;
+    // R5-P1-3 (DATA-SAFETY): BIND the approved root to a STABLE identity (canonical
+    // path + on-disk dev/inode or volume file-id) right now, at consume time. The
+    // background job carries this `ConfinedRoot`, and every per-file write
+    // re-verifies the root against it - so a root swapped to a symlink/junction
+    // AFTER this point is rejected and no decrypted bytes land outside the chosen
+    // directory (the root-level analogue of the per-component parent-swap TOCTOU).
+    let dest_root = confine::ConfinedRoot::bind(dest_root).map_err(|code| {
+        CommandError::with_code(code, "restore destination folder is no longer valid")
+    })?;
 
     // All fallible setup succeeded. NOW mint the job id, build the initial
     // (all-pending) status from the plans, seed it WITH its cancel flag (P1-1),
@@ -387,7 +395,7 @@ pub async fn restore_files(
             }
             return;
         }
-        run_restore_job(app_for_job, plans, dest_token, &mut status, job_cancel).await;
+        run_restore_job(app_for_job, plans, dest_root, &mut status, job_cancel).await;
     });
 
     // Seed the job AND attach the handle atomically (one locked insert), so a
@@ -671,7 +679,7 @@ enum FileOutcome {
 async fn run_restore_job(
     app: AppHandle,
     plans: Vec<RestorePlan>,
-    dest_token: DialogToken,
+    dest_root: confine::ConfinedRoot,
     status: &mut RestoreJobStatus,
     cancel: RestoreCancel,
 ) {
@@ -695,7 +703,7 @@ async fn run_restore_job(
             &plan.file,
             plan.store.as_ref(),
             &plan.crypto,
-            &dest_token,
+            &dest_root,
             &cancel,
             |bytes_done| {
                 // Per-file streamed progress: update this file's bytes + the overall
@@ -824,7 +832,7 @@ async fn restore_one_file<F: FnMut(u64)>(
     file: &ResolvedRestore,
     store: &dyn RemoteStore,
     crypto: &SuiteVerdict,
-    dest_token: &DialogToken,
+    dest_root: &confine::ConfinedRoot,
     cancel: &RestoreCancel,
     mut on_progress: F,
 ) -> FileOutcome {
@@ -846,7 +854,7 @@ async fn restore_one_file<F: FnMut(u64)>(
     // CREATES the parent directory chain (component-at-a-time confined, R1-P1-1) so
     // the handle-based confine open below can re-open it; it is the structural
     // pre-step, while `ConfinedDest` provides the TOCTOU-safe write/rename.
-    if let Err(e) = validate_restore_dest(dest_token, &file.relative_path) {
+    if let Err(e) = validate_restore_dest(dest_root.token(), &file.relative_path) {
         return FileOutcome::Failed(e.code);
     }
 
@@ -877,7 +885,7 @@ async fn restore_one_file<F: FnMut(u64)>(
     // failure / cancel leaves no temp - the R2-P2-2 abort-safe cleanup: dropping
     // the future drops `confined`, whose Drop deletes the still-uncommitted temp).
     let (mut confined, temp_file) =
-        match confine::ConfinedDest::open(dest_token, &file.relative_path) {
+        match confine::ConfinedDest::open(dest_root, &file.relative_path) {
             Ok(pair) => pair,
             Err(code) => return FileOutcome::Failed(code),
         };
@@ -1622,6 +1630,203 @@ mod confine {
 
     use crate::commands::DialogToken;
 
+    /// R5-P1-3 (DATA-SAFETY): a STABLE identity of the dialog-approved restore ROOT,
+    /// captured ONCE at pick/consume time (in `restore_files`) and re-verified at
+    /// every per-file [`ConfinedDest::open`].
+    ///
+    /// The earlier code carried only the root PATH STRING; `ConfinedDest::open`
+    /// re-canonicalised that string on every file. If the selected root was swapped
+    /// to a symlink/junction BETWEEN the bind and a later open, the new target became
+    /// the "approved" root and decrypted bytes could land outside the user-chosen
+    /// directory - the root-level analogue of the parent-component TOCTOU the
+    /// handle-relative parent walk already closes (that walk pins components BELOW
+    /// the root, but the root itself was still re-resolved from a string).
+    ///
+    /// This binds the root's real on-disk identity at consume time and rejects any
+    /// later canonicalisation whose identity differs:
+    /// - Unix: `(st_dev, st_ino)` of the canonical root.
+    /// - Windows: `(dwVolumeSerialNumber, nFileIndexHigh, nFileIndexLow)` of the
+    ///   canonical root directory (its file id on the volume).
+    ///
+    /// cfg-gated per OS; an unsupported target has no identity (`None`) and the open
+    /// falls back to the canonical-path equality check alone (still rejecting a root
+    /// whose resolved path changed).
+    #[derive(Debug, Clone, Copy, PartialEq, Eq)]
+    pub(super) struct RootIdentity {
+        #[cfg(unix)]
+        dev: u64,
+        #[cfg(unix)]
+        ino: u64,
+        #[cfg(windows)]
+        volume_serial: u32,
+        #[cfg(windows)]
+        file_index_high: u32,
+        #[cfg(windows)]
+        file_index_low: u32,
+    }
+
+    impl RootIdentity {
+        /// Capture the identity of the directory at `canon_root` (an already
+        /// canonicalised path). Returns `None` if the identity cannot be read
+        /// (e.g. the directory vanished) so the caller can treat that as a mismatch.
+        pub(super) fn capture(canon_root: &std::path::Path) -> Option<Self> {
+            #[cfg(unix)]
+            {
+                use std::os::unix::fs::MetadataExt;
+                let meta = std::fs::metadata(canon_root).ok()?;
+                Some(RootIdentity {
+                    dev: meta.dev(),
+                    ino: meta.ino(),
+                })
+            }
+            #[cfg(windows)]
+            {
+                root_identity_windows(canon_root)
+            }
+            #[cfg(not(any(unix, windows)))]
+            {
+                let _ = canon_root;
+                None
+            }
+        }
+    }
+
+    /// Windows: read the canonical root directory's volume serial + file id via a
+    /// no-follow `BY_HANDLE_FILE_INFORMATION` so the identity is the REAL directory
+    /// inode-equivalent (a junction swapped in later resolves to a different file
+    /// id). `None` on any failure (treated as a mismatch by the caller).
+    #[cfg(windows)]
+    fn root_identity_windows(canon_root: &std::path::Path) -> Option<RootIdentity> {
+        use std::os::windows::ffi::OsStrExt;
+        use std::os::windows::io::{AsRawHandle, FromRawHandle, OwnedHandle};
+        use windows_sys::Win32::Foundation::{HANDLE, INVALID_HANDLE_VALUE};
+        use windows_sys::Win32::Storage::FileSystem::{
+            CreateFileW, GetFileInformationByHandle, BY_HANDLE_FILE_INFORMATION,
+            FILE_FLAG_BACKUP_SEMANTICS, FILE_FLAG_OPEN_REPARSE_POINT, FILE_READ_ATTRIBUTES,
+            FILE_SHARE_DELETE, FILE_SHARE_READ, FILE_SHARE_WRITE, OPEN_EXISTING,
+        };
+        let wide: Vec<u16> = canon_root
+            .as_os_str()
+            .encode_wide()
+            .chain(std::iter::once(0))
+            .collect();
+        // SAFETY: `wide` is a valid NUL-terminated wide string outliving the call;
+        // CreateFileW does not retain it. BACKUP_SEMANTICS opens a directory handle;
+        // OPEN_REPARSE_POINT opens the link itself rather than its target so a
+        // swapped junction is identified as a different object.
+        let raw = unsafe {
+            CreateFileW(
+                wide.as_ptr(),
+                FILE_READ_ATTRIBUTES,
+                FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
+                std::ptr::null(),
+                OPEN_EXISTING,
+                FILE_FLAG_BACKUP_SEMANTICS | FILE_FLAG_OPEN_REPARSE_POINT,
+                std::ptr::null_mut::<core::ffi::c_void>() as HANDLE,
+            )
+        };
+        if raw == INVALID_HANDLE_VALUE || raw.is_null() {
+            return None;
+        }
+        // SAFETY: `raw` is a valid handle we own from a successful CreateFileW.
+        let handle = unsafe { OwnedHandle::from_raw_handle(raw as *mut _) };
+        let mut info: BY_HANDLE_FILE_INFORMATION = unsafe { std::mem::zeroed() };
+        // SAFETY: handle is valid; info is a valid out-param.
+        let ok = unsafe { GetFileInformationByHandle(handle.as_raw_handle() as HANDLE, &mut info) };
+        if ok == 0 {
+            return None;
+        }
+        Some(RootIdentity {
+            volume_serial: info.dwVolumeSerialNumber,
+            file_index_high: info.nFileIndexHigh,
+            file_index_low: info.nFileIndexLow,
+        })
+    }
+
+    /// R5-P1-3 (DATA-SAFETY): the dialog-approved restore ROOT bound to a STABLE
+    /// canonical path + on-disk identity at consume time, so every per-file
+    /// [`ConfinedDest::open`] re-verifies the root has not been swapped underneath
+    /// it (a root-level TOCTOU). Carries the original [`DialogToken`] for the
+    /// structural `validate_restore_dest` pre-step (which creates the dir chain).
+    #[derive(Debug, Clone)]
+    pub(super) struct ConfinedRoot {
+        /// The dialog token (the original root path string), for the structural
+        /// `validate_restore_dest` pre-step.
+        token: DialogToken,
+        /// The root canonicalised ONCE at bind time. A later canonicalisation that
+        /// differs is rejected (the root path was redirected).
+        canon_root: std::path::PathBuf,
+        /// The root's on-disk identity captured at bind time (`None` on an
+        /// unsupported target; then only the canonical-path equality holds).
+        identity: Option<RootIdentity>,
+    }
+
+    impl ConfinedRoot {
+        /// Bind a `ConfinedRoot` from the dialog token at consume time: canonicalise
+        /// the root and capture its identity. Called ONCE in `restore_files` after
+        /// the token is consumed, then carried into the background job so every
+        /// per-file open verifies against this fixed identity.
+        pub(super) fn bind(dialog_token: DialogToken) -> Result<Self, ErrorCode> {
+            let canon_root = dunce::canonicalize(&dialog_token.0).map_err(map_io_err)?;
+            let identity = RootIdentity::capture(&canon_root);
+            Ok(ConfinedRoot {
+                token: dialog_token,
+                canon_root,
+                identity,
+            })
+        }
+
+        /// The dialog token for the structural `validate_restore_dest` pre-step.
+        pub(super) fn token(&self) -> &DialogToken {
+            &self.token
+        }
+
+        /// R5-P1-3: re-resolve the root and confirm it is still the SAME directory
+        /// bound at consume time - same canonical path AND (where available) same
+        /// on-disk identity. A mismatch means the root was swapped to a
+        /// symlink/junction between bind and now; REJECT so no decrypted bytes land
+        /// outside the user-chosen directory. Returns the verified canonical root.
+        fn verify(&self) -> Result<std::path::PathBuf, ErrorCode> {
+            let now_root = dunce::canonicalize(&self.token.0).map_err(map_io_err)?;
+            if now_root != self.canon_root {
+                tracing::warn!(
+                    target: TARGET,
+                    bound = %self.canon_root.display(),
+                    now = %now_root.display(),
+                    "restore root canonical path changed between bind and open; refusing (R5-P1-3)"
+                );
+                return Err(ErrorCode::LocalIoError);
+            }
+            // Identity recheck (defence beyond the path string: a path can resolve
+            // to the same STRING while pointing at a different object after a swap).
+            let now_identity = RootIdentity::capture(&now_root);
+            match (self.identity, now_identity) {
+                (Some(bound), Some(now)) if bound != now => {
+                    tracing::warn!(
+                        target: TARGET,
+                        root = %now_root.display(),
+                        "restore root identity changed between bind and open; refusing (R5-P1-3)"
+                    );
+                    return Err(ErrorCode::LocalIoError);
+                }
+                // Bound an identity but it cannot be read now (root vanished /
+                // unreadable) -> treat as a mismatch.
+                (Some(_), None) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        root = %now_root.display(),
+                        "restore root identity unreadable at open; refusing (R5-P1-3)"
+                    );
+                    return Err(ErrorCode::LocalIoError);
+                }
+                // No identity captured on this target (unsupported OS), or both read
+                // and equal: the canonical-path equality above already held.
+                _ => {}
+            }
+            Ok(now_root)
+        }
+    }
+
     /// A restore destination confined to a pinned parent directory handle, holding
     /// the VERIFIED temp file's own OS handle through commit (M9c D1).
     pub(super) struct ConfinedDest {
@@ -1668,18 +1873,25 @@ mod confine {
         /// temp handle the guard RETAINS, so the streamer's write/verify and the
         /// guard's commit-rename act on the SAME file object.
         pub(super) fn open(
-            dialog_token: &DialogToken,
+            root: &ConfinedRoot,
             relative_path: &str,
         ) -> Result<(Self, std::fs::File), ErrorCode> {
-            // Re-derive the canonical root + the validated relative segments (same
-            // rules `validate_restore_dest` enforced). RelativePath rejects `..`,
+            // Derive the validated relative segments (same rules
+            // `validate_restore_dest` enforced). RelativePath rejects `..`,
             // absolute, drive/UNC, NUL.
             let rel: RelativePath = RelativePath::try_from(relative_path.to_string())
                 .map_err(|_| ErrorCode::LocalIoError)?;
             let rel = rel.as_str();
             let segments: Vec<&str> = rel.split('/').filter(|s| !s.is_empty()).collect();
             let (leaf, dir_segments) = segments.split_last().ok_or(ErrorCode::LocalIoError)?;
-            let canon_root = dunce::canonicalize(&dialog_token.0).map_err(map_io_err)?;
+
+            // R5-P1-3 (DATA-SAFETY): re-verify the ROOT is still the SAME directory
+            // bound at consume time (canonical path + on-disk identity). A root
+            // swapped to a symlink/junction between bind and now is REJECTED here,
+            // BEFORE any handle is opened or temp created - so decrypted bytes can
+            // never land outside the user-chosen directory. The returned
+            // `canon_root` is the verified root the no-follow parent walk pins to.
+            let canon_root = root.verify()?;
 
             platform::open_confined(&canon_root, dir_segments, leaf)
         }
@@ -2652,8 +2864,9 @@ mod tests {
 
         // validate_restore_dest creates the (already-existing) parent chain.
         validate_restore_dest(&token, "existing.bin").expect("validate dest");
+        let root = confine::ConfinedRoot::bind(token.clone()).expect("bind root");
         let (mut confined, mut temp) =
-            confine::ConfinedDest::open(&token, "existing.bin").expect("open confined dest");
+            confine::ConfinedDest::open(&root, "existing.bin").expect("open confined dest");
         {
             use std::io::Write as _;
             temp.write_all(b"NEW").unwrap();
@@ -2698,8 +2911,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let token = DialogToken::for_root(dir.to_string_lossy().to_string());
         validate_restore_dest(&token, "out.bin").expect("validate dest");
+        let root = confine::ConfinedRoot::bind(token.clone()).expect("bind root");
         let (mut confined, mut temp) =
-            confine::ConfinedDest::open(&token, "out.bin").expect("open confined dest");
+            confine::ConfinedDest::open(&root, "out.bin").expect("open confined dest");
         {
             use std::io::Write as _;
             temp.write_all(b"VERIFIED-BYTES").unwrap();
@@ -2734,8 +2948,9 @@ mod tests {
         std::fs::create_dir_all(&dir).unwrap();
         let token = DialogToken::for_root(dir.to_string_lossy().to_string());
         validate_restore_dest(&token, "secret.bin").expect("validate dest");
+        let root = confine::ConfinedRoot::bind(token.clone()).expect("bind root");
         let (mut confined, mut temp) =
-            confine::ConfinedDest::open(&token, "secret.bin").expect("open confined dest");
+            confine::ConfinedDest::open(&root, "secret.bin").expect("open confined dest");
         {
             use std::io::Write as _;
             temp.write_all(b"GOOD-VERIFIED").unwrap();
@@ -2805,11 +3020,12 @@ mod tests {
             .unwrap();
         let mut file = resolved_for(&plaintext, "nested/f.bin");
         file.drive_file_id = Some(entry.id.clone());
+        let root = confine::ConfinedRoot::bind(token).expect("bind root");
         let outcome = restore_one_file(
             &file,
             &store,
             &SuiteVerdict::Plaintext,
-            &token,
+            &root,
             &no_cancel(),
             |_| {},
         )
@@ -2833,8 +3049,9 @@ mod tests {
         let token = DialogToken::for_root(dir.to_string_lossy().to_string());
         validate_restore_dest(&token, "ghost.bin").expect("validate dest");
         {
+            let root = confine::ConfinedRoot::bind(token.clone()).expect("bind root");
             let (_confined, mut temp) =
-                confine::ConfinedDest::open(&token, "ghost.bin").expect("open confined dest");
+                confine::ConfinedDest::open(&root, "ghost.bin").expect("open confined dest");
             use std::io::Write as _;
             temp.write_all(b"partial bytes never committed").unwrap();
             drop(temp);
@@ -2891,11 +3108,12 @@ mod tests {
         let mut file = resolved_for(&plaintext, "d.bin");
         file.drive_file_id = Some(entry.id.clone());
 
+        let root = confine::ConfinedRoot::bind(token).expect("bind root");
         let outcome = restore_one_file(
             &file,
             &store,
             &SuiteVerdict::Plaintext,
-            &token,
+            &root,
             &no_cancel(),
             |_| {},
         )
@@ -3043,11 +3261,12 @@ mod tests {
         file.drive_file_id = Some(entry.id.clone());
 
         let cancel: RestoreCancel = Arc::new(AtomicBool::new(true));
+        let root = confine::ConfinedRoot::bind(token).expect("bind root");
         let outcome = restore_one_file(
             &file,
             &store,
             &SuiteVerdict::Plaintext,
-            &token,
+            &root,
             &cancel,
             |_| {},
         )
@@ -3089,13 +3308,16 @@ mod tests {
         //    chain `root/sub/`.
         validate_restore_dest(&token, "sub/file.bin").expect("validate against real dir");
         assert!(root.join("sub").is_dir(), "real sub dir created");
+        // Bind the root identity BEFORE the swap (the root itself is unchanged; only
+        // a child component is swapped, which the no-follow parent walk rejects).
+        let confined_root = confine::ConfinedRoot::bind(token).expect("bind root");
 
         // 2) ATTACK: swap `root/sub` for a symlink to `outside` AFTER validation.
         std::fs::remove_dir(root.join("sub")).unwrap();
         symlink(&outside, root.join("sub")).unwrap();
 
         // 3) ConfinedDest::open must REJECT the swapped symlink component.
-        let err = confine::ConfinedDest::open(&token, "sub/file.bin")
+        let err = confine::ConfinedDest::open(&confined_root, "sub/file.bin")
             .err()
             .expect("a post-validation parent swap to a symlink must be rejected");
         assert_eq!(err, ErrorCode::LocalIoError);
@@ -3126,9 +3348,10 @@ mod tests {
         std::fs::create_dir_all(&root).unwrap();
         std::fs::create_dir_all(&outside).unwrap();
         let token = DialogToken::for_root(root.to_string_lossy().to_string());
+        let confined_root = confine::ConfinedRoot::bind(token).expect("bind root");
         // root/escape -> outside.
         symlink(&outside, root.join("escape")).unwrap();
-        let err = confine::ConfinedDest::open(&token, "escape/x.bin")
+        let err = confine::ConfinedDest::open(&confined_root, "escape/x.bin")
             .err()
             .expect("a symlinked parent component must be rejected");
         assert_eq!(err, ErrorCode::LocalIoError);
@@ -3142,6 +3365,57 @@ mod tests {
         );
         let _ = std::fs::remove_dir_all(&root);
         let _ = std::fs::remove_dir_all(&outside);
+    }
+
+    // --- R5-P1-3: restore ROOT swapped between bind and open ------------------
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confined_open_rejects_root_swapped_to_symlink_after_bind() {
+        // R5-P1-3 (the discriminating root-level TOCTOU test): bind the ConfinedRoot
+        // against a REAL root directory, then a local process REPLACES the root
+        // itself with a symlink pointing OUT of root. A later ConfinedDest::open must
+        // be REJECTED (the bound canonical-path + on-disk identity no longer match
+        // the re-resolved root) and must write NO bytes - temp OR final - into the
+        // swapped-in target outside the original root.
+        use std::os::unix::fs::symlink;
+        let parent = rand_tmp("root-swap-parent");
+        std::fs::create_dir_all(&parent).unwrap();
+        let real_root = parent.join("root");
+        let outside = parent.join("outside");
+        std::fs::create_dir_all(&real_root).unwrap();
+        std::fs::create_dir_all(&outside).unwrap();
+
+        let token = DialogToken::for_root(real_root.to_string_lossy().to_string());
+        // BIND while `root` is the real directory (captures its canonical path +
+        // dev/inode).
+        let confined_root = confine::ConfinedRoot::bind(token).expect("bind real root");
+
+        // ATTACK: replace the real root dir with a symlink to `outside` AFTER the
+        // bind. A naive re-canonicalisation of the root path string would now treat
+        // `outside` as the approved root.
+        std::fs::remove_dir(&real_root).unwrap();
+        symlink(&outside, &real_root).unwrap();
+
+        // open must REJECT: the re-resolved root identity differs from the bound one.
+        let err = confine::ConfinedDest::open(&confined_root, "file.bin")
+            .err()
+            .expect("a root swapped to a symlink after bind must be rejected");
+        assert_eq!(err, ErrorCode::LocalIoError);
+
+        // THE invariant: nothing (temp or final) was written into `outside`.
+        let leaked: Vec<_> = std::fs::read_dir(&outside)
+            .unwrap()
+            .filter_map(Result::ok)
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "no bytes may land outside the originally-bound root via a root swap: {leaked:?}"
+        );
+
+        let _ = std::fs::remove_file(&real_root);
+        let _ = std::fs::remove_dir_all(&outside);
+        let _ = std::fs::remove_dir_all(&parent);
     }
 
     // --- M8-P2-2: search input limits (DESIGN s18.8) --------------------------

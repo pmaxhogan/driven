@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE accounts SET encryption_master_key_id = NULL WHERE id = ?1 AND encryption_master_key_id IS NOT NULL",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "2a75d17402950e0ed49f5078e3e2152c1de1ea893ff0b8368143fd76a7d5bb11"
+}

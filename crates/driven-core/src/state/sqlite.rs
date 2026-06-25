@@ -34,8 +34,9 @@ use uuid::Uuid;
 
 use super::{
     AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
-    FileSearchHit, FileStateRow, FileStatusCount, ImmediateTreeChildren, NewActivity, NewPendingOp,
-    PageRequest, PendingOpRow, PendingRecoveryAck, RestoreFileRow, SourceRow, StateRepo,
+    DiscardPendingOutcome, FileSearchHit, FileStateRow, FileStatusCount, ImmediateTreeChildren,
+    NewActivity, NewPendingOp, PageRequest, PendingOpRow, PendingRecoveryAck, RestoreFileRow,
+    SourceRow, StateRepo,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -1012,6 +1013,78 @@ impl StateRepo for SqliteStateRepo {
             .await?;
         tx.commit().await?;
         Ok(())
+    }
+
+    async fn discard_pending_encrypted_source(
+        &self,
+        source: SourceId,
+    ) -> Result<DiscardPendingOutcome> {
+        // M9 R5-P1-1 (DATA-SAFETY): delete the pending source (cascading its ack +
+        // file_state + pending_ops) AND - when it is the account's sole encrypted
+        // source - clear the account's master-key stamp, all in ONE transaction so
+        // a crash can never leave the account stamped with a phraseless key NOR the
+        // source gone with a still-needed key cleared. The keychain key is deleted
+        // by the caller (outside this tx) only when `master_key_cleared` is true.
+        let id = source.to_string();
+        let mut tx = self.pool.begin().await?;
+
+        // Resolve the owning account + whether this is the only encrypted source.
+        let row = sqlx::query!(
+            r#"SELECT account_id AS "account_id!: String" FROM backup_sources WHERE id = ?1"#,
+            id,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(row) = row else {
+            // Already gone: nothing to discard.
+            tx.rollback().await?;
+            return Ok(DiscardPendingOutcome {
+                master_key_cleared: false,
+                account_id: None,
+            });
+        };
+        let account_id_str = row.account_id;
+        let account_id = AccountId(uuid_from_str(&account_id_str)?);
+
+        // Count OTHER encrypted sources on the same account (excluding this one).
+        let other_encrypted = sqlx::query!(
+            "SELECT COUNT(*) AS n FROM backup_sources \
+             WHERE account_id = ?1 AND id != ?2 AND encryption_enabled = 1",
+            account_id_str,
+            id,
+        )
+        .fetch_one(&mut *tx)
+        .await?
+        .n;
+
+        // Delete the source row (cascades recovery_phrase_acks + file_state +
+        // pending_ops via ON DELETE CASCADE).
+        sqlx::query!("DELETE FROM backup_sources WHERE id = ?1", id)
+            .execute(&mut *tx)
+            .await?;
+
+        let master_key_cleared = if other_encrypted == 0 {
+            // Sole encrypted source: clear the account stamp so a later encrypted
+            // source re-provisions + re-reveals a fresh key. A targeted column
+            // update (does not clobber other columns).
+            sqlx::query!(
+                "UPDATE accounts SET encryption_master_key_id = NULL \
+                 WHERE id = ?1 AND encryption_master_key_id IS NOT NULL",
+                account_id_str,
+            )
+            .execute(&mut *tx)
+            .await?
+            .rows_affected()
+                > 0
+        } else {
+            false
+        };
+
+        tx.commit().await?;
+        Ok(DiscardPendingOutcome {
+            master_key_cleared,
+            account_id: Some(account_id),
+        })
     }
 
     async fn mark_source_scanned(
@@ -2814,6 +2887,106 @@ mod tests {
             repo.list_pending_recovery_acks().await.unwrap().is_empty(),
             "the pending-ack record cascades with the source delete"
         );
+    }
+
+    #[tokio::test]
+    async fn discard_pending_only_encrypted_source_clears_master_key_stamp() {
+        // R5-P1-1 (DATA-SAFETY): discarding a pending FIRST encrypted source that is
+        // the account's only encrypted source deletes the source (+ cascades the
+        // ack) AND clears the account's master-key stamp, signalling the caller to
+        // delete the keychain key. So a later encrypted source re-provisions + re-
+        // reveals a fresh phrase rather than silently reusing an unrecoverable key.
+        let (repo, _dir) = temp_repo().await;
+        let mut acct = sample_account();
+        acct.encryption_master_key_id = None;
+        repo.upsert_account(&acct).await.unwrap();
+        let mut src = sample_source(acct.id);
+        src.encryption_enabled = true;
+        src.enabled = false;
+        repo.insert_first_encrypted_source_pending_ack(&src, "kc:alice-master".into(), 3)
+            .await
+            .unwrap();
+        // The stamp is now set + a pending ack exists.
+        assert_eq!(
+            repo.list_accounts().await.unwrap()[0]
+                .encryption_master_key_id
+                .as_deref(),
+            Some("kc:alice-master")
+        );
+
+        let outcome = repo.discard_pending_encrypted_source(src.id).await.unwrap();
+        assert!(
+            outcome.master_key_cleared,
+            "the sole encrypted source discard must clear the master key"
+        );
+        assert_eq!(outcome.account_id, Some(acct.id));
+        // The source + its ack are gone, and the account stamp is cleared.
+        assert!(repo.list_sources().await.unwrap().is_empty());
+        assert!(repo.list_pending_recovery_acks().await.unwrap().is_empty());
+        assert_eq!(
+            repo.list_accounts().await.unwrap()[0].encryption_master_key_id,
+            None,
+            "the account master-key stamp must be cleared after discarding the only encrypted source"
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_pending_keeps_master_key_when_another_encrypted_source_exists() {
+        // R5-P1-1: if ANOTHER encrypted source still needs the master key, discarding
+        // a pending source must NOT clear the stamp (and the caller must NOT delete
+        // the keychain key) - only the pending source row + its ack are removed.
+        let (repo, _dir) = temp_repo().await;
+        let mut acct = sample_account();
+        acct.encryption_master_key_id = None;
+        repo.upsert_account(&acct).await.unwrap();
+
+        // First encrypted source provisions the key (pending ack).
+        let mut first = sample_source(acct.id);
+        first.encryption_enabled = true;
+        first.enabled = false;
+        repo.insert_first_encrypted_source_pending_ack(&first, "kc:alice-master".into(), 1)
+            .await
+            .unwrap();
+        // A SECOND encrypted source already exists + enabled (uses the same key).
+        let mut second = sample_source(acct.id);
+        second.id = SourceId::new_v4();
+        second.encryption_enabled = true;
+        second.enabled = true;
+        second.local_path = "/home/alice/other".into();
+        repo.upsert_source(&second).await.unwrap();
+
+        let outcome = repo
+            .discard_pending_encrypted_source(first.id)
+            .await
+            .unwrap();
+        assert!(
+            !outcome.master_key_cleared,
+            "a key another encrypted source still needs must NOT be cleared"
+        );
+        // The pending source is gone but the second source + stamp remain.
+        let sources = repo.list_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert_eq!(sources[0].id, second.id);
+        assert_eq!(
+            repo.list_accounts().await.unwrap()[0]
+                .encryption_master_key_id
+                .as_deref(),
+            Some("kc:alice-master"),
+            "the master-key stamp must be kept while another encrypted source needs it"
+        );
+    }
+
+    #[tokio::test]
+    async fn discard_pending_unknown_source_is_a_noop() {
+        // R5-P1-1: discarding a source that is already gone is a no-op (no key
+        // cleared, no account resolved) - idempotent.
+        let (repo, _dir) = temp_repo().await;
+        let outcome = repo
+            .discard_pending_encrypted_source(SourceId::new_v4())
+            .await
+            .unwrap();
+        assert!(!outcome.master_key_cleared);
+        assert_eq!(outcome.account_id, None);
     }
 
     #[tokio::test]

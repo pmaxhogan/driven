@@ -114,6 +114,24 @@ pub struct PendingRecoveryAck {
     pub created_at: UnixMs,
 }
 
+/// M9 R5-P1-1 (DATA-SAFETY): the result of
+/// [`StateRepo::discard_pending_encrypted_source`] - whether the account's master
+/// key stamp was cleared (so the caller must delete the keychain master key), plus
+/// the owning account id (for the keychain handle + reconfigure).
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct DiscardPendingOutcome {
+    /// `true` when the discarded source was the account's ONLY encrypted source, so
+    /// its `encryption_master_key_id` stamp was cleared in the same transaction -
+    /// the caller MUST now delete the keychain master key so no provisioned key is
+    /// left with no ever-revealed recovery record. `false` when another encrypted
+    /// source still needs the key (the stamp + keychain key are KEPT), or when the
+    /// source was already gone.
+    pub master_key_cleared: bool,
+    /// The account that owned the discarded source, for the keychain handle +
+    /// orchestrator reconfigure. `None` only when the source was already gone.
+    pub account_id: Option<AccountId>,
+}
+
 /// One row of `file_state` (SPEC s2).
 ///
 /// Primary key is the `(source_id, relative_path)` pair.
@@ -606,6 +624,77 @@ pub trait StateRepo: Send + Sync {
         row.enabled = true;
         let row = row.clone();
         self.upsert_source(&row).await
+    }
+
+    /// M9 R5-P1-1 (DATA-SAFETY): ATOMICALLY (one transaction) DISCARD a pending
+    /// first-encrypted source that the user removes BEFORE saving its recovery
+    /// phrase - deleting the `backup_sources` row (cascading its
+    /// `recovery_phrase_acks` record + `file_state` / `pending_ops`) AND clearing
+    /// the owning account's `encryption_master_key_id` stamp, but ONLY when this is
+    /// the account's sole encrypted source.
+    ///
+    /// Before this method, `remove_source` on a pending encrypted source dropped the
+    /// `backup_sources` row (and cascaded the ack), but LEFT
+    /// `accounts.encryption_master_key_id` + the keychain master key in place. The
+    /// NEXT encrypted source then took the "already provisioned" path, returned NO
+    /// recovery phrase, and could start encrypted backups the user can never restore.
+    ///
+    /// Returns [`DiscardPendingOutcome`] telling the caller whether the account's
+    /// master key was actually cleared (so it should delete the keychain key) - the
+    /// keychain deletion happens OUTSIDE the DB transaction (the keychain is not
+    /// transactional), and only when this was the only encrypted source. The caller
+    /// MUST have verified `source` has a durable pending ack
+    /// ([`Self::recovery_ack_revealed`] is `Some`) before calling; if `source` is
+    /// not pending, or another encrypted source still needs the master key, the
+    /// stamp + keychain key are KEPT (`master_key_cleared == false`) and only the
+    /// source row is removed.
+    ///
+    /// The default impl performs the steps sequentially (adequate for in-memory test
+    /// doubles); the SQLite impl overrides it with a real `BEGIN`/`COMMIT`.
+    async fn discard_pending_encrypted_source(
+        &self,
+        source: SourceId,
+    ) -> Result<DiscardPendingOutcome> {
+        // Look up the source + its account, count OTHER encrypted sources on the
+        // account, then delete the source and (when it was the only encrypted
+        // source) clear the account stamp.
+        let sources = self.list_sources().await?;
+        let Some(row) = sources.iter().find(|r| r.id == source) else {
+            // Already gone: nothing to discard, nothing to clear.
+            return Ok(DiscardPendingOutcome {
+                master_key_cleared: false,
+                account_id: None,
+            });
+        };
+        let account_id = row.account_id;
+        let other_encrypted = sources
+            .iter()
+            .any(|r| r.id != source && r.account_id == account_id && r.encryption_enabled);
+        self.delete_source(source).await?;
+        if other_encrypted {
+            return Ok(DiscardPendingOutcome {
+                master_key_cleared: false,
+                account_id: Some(account_id),
+            });
+        }
+        // Sole encrypted source: clear the account's master-key stamp so a later
+        // encrypted source re-provisions (and re-reveals) a fresh key.
+        let mut accounts = self.list_accounts().await?;
+        if let Some(acct) = accounts.iter_mut().find(|a| a.id == account_id) {
+            if acct.encryption_master_key_id.is_some() {
+                acct.encryption_master_key_id = None;
+                let acct = acct.clone();
+                self.upsert_account(&acct).await?;
+                return Ok(DiscardPendingOutcome {
+                    master_key_cleared: true,
+                    account_id: Some(account_id),
+                });
+            }
+        }
+        Ok(DiscardPendingOutcome {
+            master_key_cleared: false,
+            account_id: Some(account_id),
+        })
     }
 
     /// Stamps `backup_sources.last_full_scan_at` and (when `deep_verify_at`
