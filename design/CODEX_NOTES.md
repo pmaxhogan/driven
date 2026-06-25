@@ -1872,3 +1872,90 @@ by compilation + the manual M9 acceptance. fetch-live-channel.sh's "download the
 live tree" relies on the CF site being reachable at deploy time; a transient miss
 briefly drops the other channel's manifest until its own workflow re-publishes
 (strictly better than wiping AND failing the deploy).
+
+## M9 fix round 2 (codex M9-2 recheck-1: 3 P1 + 2 P2)
+
+Source review: `.claude/codex-reviews/M9-2-20260624-210939.md` (baseline 97f596e, M9 @
+db60326). Recheck-1 of cap-2. Per-finding:
+
+- R2-P1-1 (dev version below stable + non-monotonic). The dev build was
+  `0.0.0-dev.<sha>`, which is LOWER than stable `0.1.0` (a stable user opting into
+  `dev` was never offered an update) and short SHAs do not sort by time. FIX: derive
+  `<next-patch>-dev.<run_number>.<short-sha>` from the CURRENT
+  `[workspace.package].version` (NOT hardcoded). New pure helpers in set-dev-version.mjs:
+  `readWorkspaceVersion`, `computeDevVersion(current, runNumber, sha)`,
+  `computeDevVersionFromRepo`, plus a `--print-dev-version <run> <sha>` CLI mode. Both
+  dev-channel.yml jobs (build + publish-manifest) compute the SAME value via that CLI
+  (a pure function of the checked-out Cargo.toml + run_number + sha, so byte-identical),
+  patch the app metadata with it, AND pass it to the generator via `--version`. SemVer
+  ordering: 0.1.1-dev.* > 0.1.0 and run_number (numeric prerelease identifier) makes
+  successive builds strictly increasing. Tests: computeDevVersion shape; dev > stable
+  AND < next-stable; monotonic via run_number (sha is not the sort key); rejects a
+  non-release base / bad run / bad sha (set-dev-version.test.ts, with an inline SemVer
+  comparator proving the ordering).
+
+- R2-P1-2 (rolling dev release accretes assets; generator silently keeps first
+  duplicate -> manifest can point at a STALE signed bundle). FIX (both layers):
+  (1) a new pre-build `clean-dev-assets` job wipes the rolling `dev` release's existing
+  assets ONCE before the matrix build uploads the current run's bundles (a single job,
+  not per matrix row, so the 4 parallel rows do not delete each other's fresh uploads;
+  the release/tag is preserved, only assets cleared); (2) generate-update-json.mjs no
+  longer silently keeps-first - `collectSignedBundles(dir, log, expectedVersion)` now
+  groups by target and ERRORS on a stale bundle (a candidate whose filename version
+  differs from the expected/manifest version) or any conflicting versions for one
+  target; the legitimate single-build Windows `.msi`+NSIS `.exe` pair (same version) is
+  kept deterministically (prefer NSIS) with a warning. Tests: versionFromBundleName;
+  stale-old-version -> throws; same-version msi+nsis pair -> one manifest pointing at
+  the NSIS installer (generate-update-json.test.ts).
+
+- R2-P1-3 (`updater:available` lost if About not mounted). The only listener lived in
+  About.vue (mounted on demand) but the backend STARTUP check emits early. FIX: own the
+  updater event subscription at the APP ROOT (App.vue `onMounted` -> `updater.subscribe()`,
+  never torn down - it is the app-lifetime component; About no longer subscribes/
+  unsubscribes, it just reads shared store state). BELT-AND-SUSPENDERS: a new backend
+  `get_pending_update_info` IPC command (peek, non-consuming) + `AppState::peek_pending_update`
+  + the pure `pending_info_from_snapshot` mapper, with App.vue calling
+  `updater.hydratePending()` on boot so an event that fired before the webview attached
+  is still reflected. IPC contract kept in sync: ui/src/ipc/commands.ts `getPendingUpdateInfo`,
+  lib.rs invoke_handler registration, store `hydratePending` action. Tests:
+  pending_info_snapshot_maps_and_normalizes_channel (Rust); root-subscription event with
+  no view mounted -> banner; hydratePending fills the banner; hydratePending does not
+  clobber a fresher live update (updater-store.test.ts).
+
+- R2-P2-1 (claimed wrong tauri-action input `uploadUpdaterJson` -> `includeUpdaterJson`).
+  FALSE POSITIVE - NOT changed, and deliberately so. VERIFIED via TWO primary sources:
+  (a) the authoritative tauri-action `action.yml` (dev branch) lists `uploadUpdaterJson`
+  (default true) and has NO `includeUpdaterJson` input; (b) Context7's tauri-action docs
+  agree (`uploadUpdaterJson`, default true). `includeUpdaterJson` does not exist and would
+  be SILENTLY IGNORED, causing tauri-action to upload its own conflicting latest.json -
+  the exact bug the review feared. So the current `uploadUpdaterJson: false` is correct;
+  renaming it would BREAK the contract. Both workflows now carry an inline comment with
+  the verification so a future reader does not "fix" it back. (Spec told us to verify via
+  Context7 and not guess; the evidence overrides the finding.)
+
+- R2-P2-2 (release notes hardcoded "See CHANGELOG.md for details."). FIX: a new
+  unit-tested `scripts/extract-changelog.mjs` (pure `extractSection` / `headingVersion` /
+  `normalizeVersion` over the release-please / Keep-a-Changelog heading shapes) extracts
+  THIS tag's section. release.yml uses it for BOTH the GitHub Release `releaseBody` (build
+  job, threaded via a GITHUB_OUTPUT heredoc) AND the manifest `--notes-file` (publish job,
+  extracted directly from CHANGELOG.md, falling back to the GH release body only if the
+  changelog has no section yet). `--allow-empty` + a bash fallback means a missing section
+  never fails the release build. Tests: extract-changelog.test.ts (non-empty section for a
+  tagged version, no bleed into adjacent sections, heading-shape parsing, empty for an
+  unknown version).
+
+Also done: removed the pre-existing unused `isX64` in generate-update-json.mjs.
+
+GATES: cargo build --workspace --all-targets + clippy -D warnings + test --workspace
+(151+197+43... all green, incl. the new updater test) + build -p driven-app + deny check
+(ok) + fmt --check + git diff --check all clean. ui: pnpm install (lockfile unchanged) +
+lint + test:unit (130 passed) + build (vue-tsc --noEmit clean). actionlint 0 findings on
+all workflows. No sqlx::query! touched (the peek reads an in-memory mutex), so no
+.sqlx regen. Anti-fake-green stub sweep on src-tauri/src + scripts + ui: zero non-test
+todo!/unimplemented!/unreachable!.
+
+RESIDUALS: same `install_update` live-download untestability as round 1 (plugin Update
+not constructable offline). The byte-identical-dev-version guarantee rests on both
+dev-channel.yml jobs running `--print-dev-version` against the SAME checked-out commit
+with the same run_number + sha - true within one workflow run by construction (concurrency
+group serializes runs; the publish job `needs: build`).
