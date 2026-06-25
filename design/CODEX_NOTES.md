@@ -3036,3 +3036,50 @@ telemetry-worker + scripts/ untouched. Anti-fake-green stub sweep on the touched
 {accounts,sources,settings}.rs + lib.rs, crates/driven-core state/sqlite.rs, ui src): zero non-test
 `todo!(`/`unimplemented!(`/`unreachable!(` (the `unimplemented!()` hits are all `#[cfg(test)]` Fake
 StateRepo doubles).
+
+## M10 GA-prep
+
+GA release docs only - NO tag, NO release trigger (the v0.1.0 tag + real release run are a later
+step after the pipeline is validated via a dev build). Files:
+
+- `README.md` rewritten as real GA content: what Driven is, feature list, screenshot placeholder
+  note, per-platform install (Windows MSI/NSIS, macOS universal DMG, Linux AppImage + .deb) all
+  pointing at the GH Releases page; unsigned-binary bypass notes (Windows SmartScreen "More info ->
+  Run anyway", macOS Gatekeeper right-click-Open / `xattr -dr com.apple.quarantine`); the macOS
+  auto-updater-NOT-reliable-in-V1 caveat with the re-download-the-DMG workaround (matches the M9 r8
+  backend macOS update gate); BYO Google OAuth client-credentials note + pointer to the first-run
+  wizard (SPEC s4 PKCE loopback, secret stays local, refresh tokens in keychain); update-channel
+  note (Settings > About, stable vs dev); build-from-source quickstart + design/ links.
+- `CHANGELOG.md` reshaped to the release-please-compatible form: `# Changelog` header followed by a
+  seeded `## [0.1.0]` entry under `### Features`, summarizing the V1 set (encrypted one-way Drive
+  backup, scanner/planner with excludes, paced concurrent executor with resumable uploads, battery/
+  network awareness, Windows VSS, restore browser w/ FTS, activity dashboard, signed auto-update +
+  stable/dev channel, anonymous opt-out telemetry, first-run wizard). release-please (release-type
+  `simple`, manifest pinned at 0.1.0) prepends the NEXT version directly under `# Changelog`, above
+  the seeded 0.1.0 section, so future releases append cleanly. The old Keep-a-Changelog `[Unreleased]`
+  scaffold was replaced.
+- LICENSE: the repo already declares `license = "MIT OR Apache-2.0"` in the workspace Cargo.toml with
+  `LICENSE-MIT` + `LICENSE-APACHE` present. The spec said "use MIT", but the HARD RULE is to match the
+  existing crate declaration and keep deny green; MIT-only would CONFLICT with the `MIT OR Apache-2.0`
+  metadata. Resolution: added a top-level `LICENSE` documenting the existing dual license
+  (`SPDX-License-Identifier: MIT OR Apache-2.0`), and updated the copyright holder in `LICENSE`,
+  `LICENSE-MIT`, and `LICENSE-APACHE` to "Max Hogan (pmaxhogan) and the Driven contributors", 2026.
+  Both MIT and Apache-2.0 are already in deny.toml's allow list, so `cargo deny check` stays green and
+  the dual license is consistent across Cargo.toml / deny.toml / LICENSE files. The single `LICENSE`
+  file deliverable is satisfied without overriding the crate metadata to MIT-only.
+- `CONTRIBUTING.md`: Conventional-Commits requirement (drives release-please), the local gates
+  (`just lint` / `just test` / `just deny` plus the individual SQLX_OFFLINE cargo + ui prettier/build
+  commands), the branch/PR flow, and the house rules (ASCII only / no em-en dashes, LF, driven-core
+  I/O-free, no user data in logs/telemetry).
+- `CODE_OF_CONDUCT.md`: Contributor Covenant v2.1 verbatim (ASCII-only), maintainer contact
+  max@maxhogan.dev.
+
+release-please config: no change needed - release-please-config.json already uses the default
+`CHANGELOG.md` path and the M9d/r9-resolved gating/version contract (simple, manifest 0.1.0, extra-files
+Cargo/tauri/ui). CHANGELOG + config already agree. Did NOT change the manifest version or the gating.
+
+Gates: docs-only change but ran the full suite. SQLX_OFFLINE cargo build --workspace --all-targets +
+clippy --workspace --all-targets -D warnings + test --workspace (honest google_e2e + elevation
+gate-skips) + deny check + fmt --all --check + git diff --check. ui: pnpm install + lint + prettier
+--check src + build (vue-tsc clean). No workflow changed, so actionlint not required. NO tag, NO
+workflow_dispatch, NO release.
