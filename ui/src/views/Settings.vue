@@ -135,6 +135,14 @@ async function setVssMode(event: Event): Promise<void> {
   const value = (event.target as HTMLSelectElement).value;
   await settings.patch({ windows: { vssMode: value } });
 }
+
+// SPEC s16 (M9b): toggle anonymous usage telemetry (default ON). Round-trips
+// through the settings store so the snapshot reflects the authoritative stored
+// value; the backend honors the change immediately on the next ping tick.
+async function setTelemetryEnabled(event: Event): Promise<void> {
+  const checked = (event.target as HTMLInputElement).checked;
+  await settings.patch({ telemetry: { enabled: checked } });
+}
 </script>
 
 <template>
@@ -300,6 +308,24 @@ async function setVssMode(event: Event): Promise<void> {
             </option>
           </select>
         </label>
+
+        <div
+          class="space-y-1 border-t pt-4"
+          data-testid="telemetry-setting"
+        >
+          <label class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              data-testid="telemetry-toggle"
+              :checked="settings.settings.telemetry.enabled"
+              @change="setTelemetryEnabled"
+            >
+            {{ t("settings.rules.telemetryLabel") }}
+          </label>
+          <p class="text-xs text-zinc-500">
+            {{ t("settings.rules.telemetryNote") }}
+          </p>
+        </div>
       </div>
     </div>
   </section>

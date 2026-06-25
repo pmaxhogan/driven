@@ -162,7 +162,9 @@
         "auto": "Automatic",
         "always": "Always",
         "never": "Never"
-      }
+      },
+      "telemetryLabel": "Send anonymous usage stats",
+      "telemetryNote": "Anonymous usage stats only - no file names or contents are ever sent. One click to disable."
     }
   },
   "about": {

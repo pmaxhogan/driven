@@ -232,6 +232,27 @@ export function getPendingUpdateInfo(): Promise<UpdateInfo | null> {
   return invoke("get_pending_update_info");
 }
 
+// --- Anonymous usage telemetry (SPEC s16; M9b) ---
+
+/** Whether anonymous usage stats are sent (SPEC s16). DEFAULT ON; a fresh
+ * install reports `true`. The Settings toggle binds to this. */
+export function getTelemetryEnabled(): Promise<boolean> {
+  return invoke("get_telemetry_enabled");
+}
+
+/** Toggle anonymous usage stats (SPEC s16). Persisted immediately and honored by
+ * the next ping tick (and the in-flight loop makes no further network call when
+ * turned OFF). Returns the stored value. */
+export function setTelemetryEnabled(enabled: boolean): Promise<boolean> {
+  return invoke("set_telemetry_enabled", { enabled });
+}
+
+/** The stable anonymous install id (SPEC s16), minting one on first read if
+ * absent. Anonymous - not linkable to a user; safe to show on the privacy note. */
+export function getTelemetryInstallId(): Promise<string> {
+  return invoke("get_telemetry_install_id");
+}
+
 // --- Activity (SPEC s11.4) ---
 
 /** Query a paginated, filtered page of the activity log (SPEC s11.4). The

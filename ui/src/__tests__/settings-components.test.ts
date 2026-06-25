@@ -579,4 +579,38 @@ describe("Settings Rules tab", () => {
       patch: { windows: { vssMode: "never" } },
     });
   });
+
+  it("reflects telemetry default ON and toggling it patches telemetry.enabled (SPEC s16)", async () => {
+    // M9b (SPEC s16): the "Send anonymous usage stats" toggle reflects the stored
+    // telemetry.enabled (default ON) and unchecking it round-trips a
+    // { telemetry: { enabled: false } } patch through update_settings.
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const toggle = wrapper.get('[data-testid="telemetry-toggle"]');
+    // Default ON: the box is checked.
+    expect((toggle.element as HTMLInputElement).checked).toBe(true);
+    // The privacy note is shown.
+    expect(wrapper.get('[data-testid="telemetry-setting"]').text()).toContain(
+      i18n.global.t("settings.rules.telemetryNote"),
+    );
+
+    // Uncheck -> patches telemetry.enabled = false.
+    await toggle.setValue(false);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { telemetry: { enabled: false } },
+    });
+  });
 });
