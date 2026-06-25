@@ -76,6 +76,13 @@ bundle:
 deny:
     cargo deny check
 
+# Print Rust + UI line-coverage totals locally, matching the coverage CI gate
+# (.github/workflows/coverage.yml). Needs `cargo install cargo-llvm-cov`. For
+# the exact parsed percentages CI compares against main, run ./scripts/coverage.sh.
+coverage:
+    cargo llvm-cov --workspace --exclude src-tauri --exclude driven-chaos --summary-only
+    pnpm --dir ui run test:coverage
+
 # --- sqlx dev helpers (need `cargo install sqlx-cli`) ---
 
 # Regenerate the committed .sqlx/ offline query cache. Spins up a throwaway

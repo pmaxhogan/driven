@@ -1,0 +1,178 @@
+name: Coverage
+
+# Coverage gate (CONTRIBUTING.md "Coverage gate"). Reports Rust + UI line
+# coverage on every PR, compares it to the latest `main` baseline, and FAILS
+# the check if either number regresses below `main` (minus a small jitter
+# epsilon). Mark this "coverage" check as Required in branch protection to
+# block merges on a regression.
+#
+# Baseline model (bootstrapping-safe): every push to `main` recomputes
+# coverage and stores it in the Actions cache. PRs restore that baseline and
+# diff against it. Before the first `main` build that carries this workflow
+# there is no baseline, so the gate is informational (fail-open) for that one
+# run, then enforces from the next PR onward.
+#
+# Scope: the library crates (`--exclude src-tauri --exclude driven-chaos`).
+# src-tauri is a thin IPC layer over driven-core; driven-chaos is the stress
+# harness. Both are excluded from the measured/report set (their tests are not
+# run for coverage), but `--workspace --exclude` still auto-includes any NEW
+# crate in the gate, which a hand-maintained `-p` list would silently miss. The
+# Vue/TS app (`ui/`) is measured in full. (telemetry-worker is its own toolchain
+# and is out of scope for this gate.)
+
+on:
+  push:
+    branches: [main]
+  pull_request:
+    branches: [main]
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: true
+
+permissions:
+  contents: read
+  pull-requests: write
+
+env:
+  CARGO_TERM_COLOR: always
+  SQLX_OFFLINE: "true"
+  # Percentage-point slack so float jitter in line counts never flips the gate.
+  COVERAGE_EPSILON: "0.1"
+  BASELINE_FILE: coverage-baseline.json
+
+jobs:
+  coverage:
+    name: coverage
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Install Linux Tauri deps
+        # Some workspace crates pull in the GTK/webkit stack transitively; the
+        # coverage build needs the same system libs the rust-test job installs.
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
+
+      - uses: dtolnay/rust-toolchain@stable
+        with: { components: llvm-tools-preview }
+      - uses: taiki-e/install-action@v2
+        with: { tool: cargo-llvm-cov }
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with: { version: 10 }
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: pnpm install
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      # --- Compute this commit's coverage -------------------------------------
+      - name: Rust coverage (library crates)
+        run: |
+          cargo llvm-cov --workspace --exclude src-tauri --exclude driven-chaos \
+            --summary-only --json --output-path coverage-rust.json
+          RUST_PCT=$(jq '.data[0].totals.lines.percent' coverage-rust.json)
+          echo "HEAD_RUST=$RUST_PCT" >> "$GITHUB_ENV"
+          echo "Rust line coverage: ${RUST_PCT}%"
+
+      - name: UI coverage (vue/ts)
+        working-directory: ui
+        run: pnpm run test:coverage
+
+      - name: Extract UI coverage
+        run: |
+          UI_PCT=$(jq '.total.lines.pct' ui/coverage/coverage-summary.json)
+          echo "HEAD_UI=$UI_PCT" >> "$GITHUB_ENV"
+          echo "UI line coverage: ${UI_PCT}%"
+
+      # --- main: publish the baseline -----------------------------------------
+      - name: Write baseline file
+        if: github.event_name == 'push'
+        run: |
+          jq -n --argjson rust "$HEAD_RUST" --argjson ui "$HEAD_UI" \
+            '{rust: $rust, ui: $ui}' > "$BASELINE_FILE"
+          cat "$BASELINE_FILE"
+      - name: Save baseline to cache
+        if: github.event_name == 'push'
+        uses: actions/cache/save@v4
+        with:
+          path: ${{ env.BASELINE_FILE }}
+          # New key per commit; PRs restore the most recent via restore-keys.
+          key: driven-cov-baseline-${{ github.sha }}
+
+      # --- PR: restore baseline, comment the delta, gate ----------------------
+      - name: Restore baseline from cache
+        if: github.event_name == 'pull_request'
+        uses: actions/cache/restore@v4
+        with:
+          path: ${{ env.BASELINE_FILE }}
+          key: driven-cov-baseline-none
+          restore-keys: |
+            driven-cov-baseline-
+
+      - name: Comment coverage + enforce gate
+        if: github.event_name == 'pull_request'
+        uses: actions/github-script@v7
+        with:
+          script: |
+            const fs = require('fs');
+            const eps = parseFloat(process.env.COVERAGE_EPSILON);
+            const head = { rust: parseFloat(process.env.HEAD_RUST), ui: parseFloat(process.env.HEAD_UI) };
+
+            let base = null;
+            try { base = JSON.parse(fs.readFileSync(process.env.BASELINE_FILE, 'utf8')); }
+            catch (e) { core.info('No coverage baseline on main yet; gate is informational this run.'); }
+
+            const fmt = (n) => (n === null || n === undefined ? 'n/a' : `${n.toFixed(2)}%`);
+            const row = (label, b, h) => {
+              if (b === null || b === undefined) return `| ${label} | n/a | ${fmt(h)} | n/a |`;
+              const d = h - b;
+              const sign = d >= 0 ? '+' : '';
+              const ok = d >= -eps ? 'OK' : 'REGRESSED';
+              return `| ${label} | ${fmt(b)} | ${fmt(h)} | ${sign}${d.toFixed(2)} (${ok}) |`;
+            };
+
+            const regressed = [];
+            if (base) {
+              if (head.rust < base.rust - eps) regressed.push(`Rust ${fmt(head.rust)} < main ${fmt(base.rust)}`);
+              if (head.ui   < base.ui   - eps) regressed.push(`UI ${fmt(head.ui)} < main ${fmt(base.ui)}`);
+            }
+
+            const lines = [
+              '<!-- coverage-gate -->',
+              '## Coverage',
+              '',
+              '| Area | main | this PR | delta |',
+              '| --- | --- | --- | --- |',
+              row('Rust (lib crates)', base?.rust, head.rust),
+              row('UI (vue/ts)', base?.ui, head.ui),
+              '',
+              base
+                ? (regressed.length
+                    ? `**Gate: FAILED** - coverage regressed vs main:\n- ${regressed.join('\n- ')}`
+                    : `**Gate: passed** - no coverage regression (epsilon ${eps} pp).`)
+                : '**Gate: informational** - no `main` baseline cached yet; will enforce from the next PR.',
+            ];
+            const body = lines.join('\n');
+
+            const { owner, repo } = context.repo;
+            const issue_number = context.issue.number;
+            const { data: comments } = await github.rest.issues.listComments({ owner, repo, issue_number });
+            const existing = comments.find(c => c.body && c.body.includes('<!-- coverage-gate -->'));
+            if (existing) {
+              await github.rest.issues.updateComment({ owner, repo, comment_id: existing.id, body });
+            } else {
+              await github.rest.issues.createComment({ owner, repo, issue_number, body });
+            }
+
+            if (regressed.length) {
+              core.setFailed(`Coverage regressed vs main: ${regressed.join('; ')}`);
+            }
