@@ -273,6 +273,15 @@ jobs:
       - name: Overlay live dev manifests (do not wipe the other channel)
         run: bash scripts/fetch-live-channel.sh dev site/updates "$UPDATES_BASE"
 
+      # M12: copy the root landing page into the site/ deploy root BEFORE the
+      # whole-site `pages deploy`. The deploy is a whole-site snapshot, so without
+      # this the release deploy would WIPE the live landing at driven.maxhogan.dev
+      # root. The copy is ADDITIVE - it only writes site/{index.html,styles.css,
+      # icon.svg,404.html} and never touches site/updates, so the freshly generated
+      # stable + overlaid live dev manifests are unaffected.
+      - name: Assemble landing into site/ (do not wipe the root page)
+        run: bash scripts/assemble-landing.sh site site-landing
+
       # Publish the merged channel/target tree to Cloudflare Pages so
       # driven.maxhogan.dev/updates/stable/<os>/<arch>/update.json serves it
       # (SPEC s15.3 V1).

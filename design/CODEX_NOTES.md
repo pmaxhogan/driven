@@ -3128,3 +3128,55 @@ restriction. release.yml's bundle set is otherwise UNCHANGED.
 Gates: workflow-only change. actionlint clean on dev-channel.yml + release.yml. git diff --check clean.
 ASCII + LF. No Rust/ui touched. NO tag, NO workflow_dispatch, NO release (the orchestrator re-triggers
 the dev build after this push).
+
+## M12 landing page
+
+Built the root landing page for driven.maxhogan.dev. Before M12 the root 404'd: the
+`driven-updates` CF Pages project only served `/updates/<channel>/...` manifests (assembled at
+deploy time), with nothing at the site root. M12 adds an on-brand marketing page at the root WITHOUT
+breaking the updater-manifest deploy/serve path.
+
+What shipped:
+- `site-landing/` (committed source): `index.html` + `styles.css` + `icon.svg` (a copy of the C2
+  road-to-cloud master `src-tauri/icons/icon.svg`) + `404.html`. Plain HTML/CSS, NO framework/build
+  step, NO external CDN/JS/trackers (privacy-respecting static page). Deep teal brand (#0F766E - the
+  icon background), the README tagline ("One-way, encrypted backup of your local folders to your own
+  Google Drive."), a feature list mirroring the README, a per-platform "Get it" section (Win
+  MSI/NSIS, macOS DMG universal, Linux AppImage/.deb) linking Releases, a bring-your-own-OAuth/Drive
+  trust blurb, and an MIT-OR-Apache-2.0 footer. Primary Download CTA ->
+  github.com/pmaxhogan/driven/releases. Responsive (CSS grid auto-fit, clamp() type), accessible
+  (semantic landmarks, skip link, alt text, focus-visible outlines, dark-mode aware with sufficient
+  contrast), ASCII-only, LF.
+- `scripts/assemble-landing.sh <site-dir> <landing-dir>` (defaults `site` / `site-landing`): copies
+  the known landing files (index.html, styles.css, icon.svg, 404.html) to the site/ deploy root.
+  Idempotent, ADDITIVE (never touches site/updates), fail-closed if a required file is missing.
+
+Whole-site no-wipe integration (the critical bit). `wrangler pages deploy site` publishes a
+WHOLE-SITE snapshot to `driven-updates`, so the landing and the updater manifests share ONE site:
+every `pages deploy site` must carry BOTH the landing AND both channels' live updates/ or whatever
+is absent gets wiped. So:
+- `release.yml` (stable) and `dev-channel.yml` (dev) now run `assemble-landing.sh` as a new step
+  placed AFTER their existing updates/ tree generation + `fetch-live-channel.sh` other-channel
+  overlay and BEFORE the `pages deploy site` step. The copy is purely additive to site/ root and
+  leaves site/updates untouched, so the 4 stable + 4 dev manifests still generate, overlay, deploy,
+  and pass their existing smokes exactly as before - the only delta is the root page now rides along.
+- NEW `.github/workflows/deploy-landing.yml`: lets the marketing page ship independently of a
+  release. Triggers on push to main touching `site-landing/**`, `scripts/assemble-landing.sh`,
+  `scripts/fetch-live-channel.sh`, or the workflow itself, plus workflow_dispatch. It reassembles the
+  FULL site each run: assemble-landing into site/, then `fetch-live-channel.sh stable site/updates`
+  AND `fetch-live-channel.sh dev site/updates` to overlay BOTH live channels' manifests (tolerating a
+  first-publish 404, failing closed on any other fetch error), then `pages deploy site
+  --project-name=driven-updates --branch=main`. So a landing-only change never wipes the updater
+  manifests. Uses the CLOUDFLARE_API_TOKEN / CLOUDFLARE_ACCOUNT_ID secrets.
+- Post-deploy smokes in deploy-landing.yml use the SAME bounded curl retry as the manifest smokes
+  (`curl -f --retry 8 --retry-delay 5 --retry-all-errors`, no bash sleep/poll loop) to ride CF Pages
+  propagation: (1) the root `https://driven.maxhogan.dev/` must return 200 AND the body must contain
+  the tagline marker; (2) a no-wipe check re-fetches every manifest that was present in the assembled
+  tree and fails if any is no longer 200 (a first-ever deploy with no live manifests to preserve is
+  acceptable).
+
+Gates: actionlint 0 findings on deploy-landing.yml + release.yml + dev-channel.yml; HTML tag-balance
+validated; assemble-landing.sh `bash -n` + live-run verified; `git diff --check` clean; ASCII + LF
+throughout; rendered the page in a headless browser to confirm it is on-brand. No app code
+(src-tauri/ui/crates) touched; no release/tag triggered. The push to main fires deploy-landing.yml,
+which deploys the landing live (intended).

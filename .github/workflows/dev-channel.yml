@@ -405,6 +405,16 @@ jobs:
       - name: Overlay live stable manifests (do not wipe the other channel)
         run: bash scripts/fetch-live-channel.sh stable site/updates "$UPDATES_BASE"
 
+      # M12: copy the root landing page into the site/ deploy root BEFORE the
+      # whole-site `pages deploy`. The deploy is a whole-site snapshot, so without
+      # this a dev-channel deploy would WIPE the live landing at
+      # driven.maxhogan.dev root. The copy is ADDITIVE - it only writes
+      # site/{index.html,styles.css,icon.svg,404.html} and never touches
+      # site/updates, so the freshly generated dev + overlaid live stable manifests
+      # are unaffected.
+      - name: Assemble landing into site/ (do not wipe the root page)
+        run: bash scripts/assemble-landing.sh site site-landing
+
       # R7-P1-1: deploy the `site/` PARENT (which contains `updates/`), NOT the
       # bare `updates/` dir, so the served path keeps the `/updates/` prefix and
       # matches the app's `updates/dev/<os>/<arch>/update.json` fetch endpoint.

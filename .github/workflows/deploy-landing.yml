@@ -1,0 +1,142 @@
+name: deploy-landing
+
+# Independent deploy of the driven.maxhogan.dev ROOT landing page (M12).
+#
+# `wrangler pages deploy site` publishes a WHOLE-SITE snapshot to the
+# driven-updates CF Pages project (which serves driven.maxhogan.dev). So the
+# landing page and the updater manifests share ONE site. The release.yml /
+# dev-channel.yml pipelines already redeploy the whole site (and now copy the
+# landing into it), but those only run on a tag / dev build. This workflow lets
+# the MARKETING page ship on its own - whenever site-landing/ (or the assemble
+# script / this workflow) changes on main - WITHOUT cutting a release.
+#
+# Critical no-wipe invariant: because the deploy is a whole-site snapshot, this
+# workflow must reassemble the FULL site every time:
+#   site/                <- landing (index.html, styles.css, icon.svg, 404.html)
+#   site/updates/stable/ <- the currently-live stable manifests (overlaid)
+#   site/updates/dev/    <- the currently-live dev manifests (overlaid)
+# It does this by copying the landing in AND pulling BOTH channels' live
+# manifests via scripts/fetch-live-channel.sh (which tolerates a first-publish
+# 404 and otherwise fails closed). If it deployed the landing alone it would wipe
+# every updater manifest; this assembly preserves them.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "site-landing/**"
+      - "scripts/assemble-landing.sh"
+      - "scripts/fetch-live-channel.sh"
+      - ".github/workflows/deploy-landing.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  deployments: write
+
+concurrency:
+  # Serialize with itself; do not cancel an in-flight deploy mid-snapshot.
+  group: deploy-landing
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: assemble + deploy landing (whole-site, no-wipe)
+    runs-on: ubuntu-latest
+    env:
+      # The live updates site whose BOTH channels must be preserved across the
+      # whole-site `pages deploy` snapshot.
+      UPDATES_BASE: https://driven.maxhogan.dev/updates
+      SITE_URL: https://driven.maxhogan.dev/
+      # The tagline marker that must appear in the deployed landing body - this is
+      # the README one-liner, also the #tagline element in index.html.
+      TAGLINE_MARKER: "One-way, encrypted backup of your local folders to your own Google Drive."
+    steps:
+      - uses: actions/checkout@v4
+
+      # 1. Copy the committed landing page to the site root.
+      - name: Assemble landing into site/
+        run: bash scripts/assemble-landing.sh site site-landing
+
+      # 2. Overlay BOTH live channels' updater manifests so the whole-site deploy
+      #    does NOT wipe them. fetch-live-channel.sh writes
+      #    site/updates/<channel>/<plat>/update.json, tolerating a genuine
+      #    first-publish 404 and failing closed on any other fetch error.
+      - name: Overlay live stable manifests (do not wipe stable)
+        run: bash scripts/fetch-live-channel.sh stable site/updates "$UPDATES_BASE"
+
+      - name: Overlay live dev manifests (do not wipe dev)
+        run: bash scripts/fetch-live-channel.sh dev site/updates "$UPDATES_BASE"
+
+      - name: Show assembled site tree
+        run: |
+          set -euo pipefail
+          echo "site/ root:"; ls -la site
+          echo "site/updates tree:"; find site/updates -type f 2>/dev/null | sort || true
+
+      # 3. Deploy the whole site (landing + both channels' updates) to CF Pages.
+      - name: Deploy site to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy site --project-name=driven-updates --branch=main
+
+      # 4. Post-deploy smoke: the root must serve 200 AND its body must contain
+      #    the tagline marker. Cloudflare Pages propagation can lag the deploy and
+      #    is not atomic across edges, so a fresh root can 404 briefly. -f makes a
+      #    404 a retryable error and curl's own bounded retry (8 attempts, 5s
+      #    apart) rides out propagation - the SAME pattern the manifest smokes use,
+      #    no bash sleep/poll loop.
+      - name: Smoke test deployed landing root
+        run: |
+          set -euo pipefail
+          body="$(mktemp)"
+          code="$(curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 15 --max-time 120 \
+            -o "$body" -w '%{http_code}' "$SITE_URL" 2>/dev/null || true)"
+          code="${code:-000}"
+          if [ "$code" != "200" ]; then
+            echo "::error::landing smoke: ${SITE_URL} returned HTTP ${code} (expected 200)"
+            exit 1
+          fi
+          if ! grep -qF "$TAGLINE_MARKER" "$body"; then
+            echo "::error::landing smoke: ${SITE_URL} returned 200 but body is missing the tagline marker"
+            exit 1
+          fi
+          echo "landing smoke OK: ${SITE_URL} serves 200 and contains the tagline marker"
+          rm -f "$body"
+
+      # 5. Verify the deploy did NOT wipe the updater manifests: at least one
+      #    channel must still serve a valid manifest. A first-ever deploy may have
+      #    no live manifests to preserve (both 404), which is acceptable - the
+      #    release/dev pipelines publish them. So this only FAILS if a manifest was
+      #    present in the assembled tree but is unreachable after deploy.
+      - name: Verify updater manifests survived the deploy
+        run: |
+          set -euo pipefail
+          checked=0
+          fail=0
+          for chan in stable dev; do
+            for t in windows/x86_64 darwin/x86_64 darwin/aarch64 linux/x86_64; do
+              local_manifest="site/updates/${chan}/${t}/update.json"
+              [ -f "$local_manifest" ] || continue
+              checked=$((checked + 1))
+              url="${UPDATES_BASE}/${chan}/${t}/update.json"
+              code="$(curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors \
+                --connect-timeout 15 --max-time 120 \
+                -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+              code="${code:-000}"
+              if [ "$code" != "200" ]; then
+                echo "::error::no-wipe check: ${url} returned HTTP ${code} (expected 200) - the landing deploy may have wiped a live manifest"
+                fail=1
+              else
+                echo "no-wipe OK: ${url} still serves 200"
+              fi
+            done
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::landing deploy appears to have wiped one or more live updater manifests"
+            exit 1
+          fi
+          echo "no-wipe verified: ${checked} assembled manifest(s) still reachable (0 = first-ever deploy, nothing to preserve)"
