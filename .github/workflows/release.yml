@@ -290,7 +290,7 @@ jobs:
       # matches the app's fetch endpoint. Deploying `updates` made its contents the
       # Pages root (`/stable/...`), 404ing every updater check.
       - name: Deploy manifests to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

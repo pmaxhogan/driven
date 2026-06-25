@@ -260,7 +260,7 @@ jobs:
           echo "Collected:"; ls -la "$out" || true
 
       - name: Publish to rolling dev pre-release
-        uses: softprops/action-gh-release@v2
+        uses: softprops/action-gh-release@v3
         with:
           tag_name: dev
           name: "Driven dev (rolling)"
@@ -419,7 +419,7 @@ jobs:
       # bare `updates/` dir, so the served path keeps the `/updates/` prefix and
       # matches the app's `updates/dev/<os>/<arch>/update.json` fetch endpoint.
       - name: Deploy dev manifests to Cloudflare Pages
-        uses: cloudflare/wrangler-action@v3
+        uses: cloudflare/wrangler-action@v4
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}

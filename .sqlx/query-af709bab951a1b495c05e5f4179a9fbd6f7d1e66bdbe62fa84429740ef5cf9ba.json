@@ -6,87 +6,189 @@
       {
         "name": "id!: String",
         "ordinal": 0,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "id"
+          }
+        }
       },
       {
         "name": "account_id!: String",
         "ordinal": 1,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "account_id"
+          }
+        }
       },
       {
         "name": "display_name!: String",
         "ordinal": 2,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "display_name"
+          }
+        }
       },
       {
         "name": "enabled!: i64",
         "ordinal": 3,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "enabled"
+          }
+        }
       },
       {
         "name": "local_path!: String",
         "ordinal": 4,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "local_path"
+          }
+        }
       },
       {
         "name": "drive_folder_id!: String",
         "ordinal": 5,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "drive_folder_id"
+          }
+        }
       },
       {
         "name": "drive_folder_path!: String",
         "ordinal": 6,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "drive_folder_path"
+          }
+        }
       },
       {
         "name": "encryption_enabled!: i64",
         "ordinal": 7,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "encryption_enabled"
+          }
+        }
       },
       {
         "name": "wrapped_source_key: Vec<u8>",
         "ordinal": 8,
-        "type_info": "Blob"
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "wrapped_source_key"
+          }
+        }
       },
       {
         "name": "respect_gitignore!: i64",
         "ordinal": 9,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "respect_gitignore"
+          }
+        }
       },
       {
         "name": "include_patterns!: String",
         "ordinal": 10,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "include_patterns"
+          }
+        }
       },
       {
         "name": "exclude_patterns!: String",
         "ordinal": 11,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "exclude_patterns"
+          }
+        }
       },
       {
         "name": "schedule_json_v2_reserved: String",
         "ordinal": 12,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "schedule_json_v2_reserved"
+          }
+        }
       },
       {
         "name": "deep_verify_interval_secs!: i64",
         "ordinal": 13,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "deep_verify_interval_secs"
+          }
+        }
       },
       {
         "name": "last_full_scan_at: i64",
         "ordinal": 14,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "last_full_scan_at"
+          }
+        }
       },
       {
         "name": "last_deep_verify_at: i64",
         "ordinal": 15,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "last_deep_verify_at"
+          }
+        }
       },
       {
         "name": "created_at!: i64",
         "ordinal": 16,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "created_at"
+          }
+        }
       }
     ],
     "parameters": {

@@ -6,47 +6,101 @@
       {
         "name": "id!: i64",
         "ordinal": 0,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "pending_ops",
+            "name": "id"
+          }
+        }
       },
       {
         "name": "source_id!: String",
         "ordinal": 1,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pending_ops",
+            "name": "source_id"
+          }
+        }
       },
       {
         "name": "op_type!: String",
         "ordinal": 2,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pending_ops",
+            "name": "op_type"
+          }
+        }
       },
       {
         "name": "relative_path!: String",
         "ordinal": 3,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pending_ops",
+            "name": "relative_path"
+          }
+        }
       },
       {
         "name": "payload_json!: String",
         "ordinal": 4,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pending_ops",
+            "name": "payload_json"
+          }
+        }
       },
       {
         "name": "attempts!: i64",
         "ordinal": 5,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "pending_ops",
+            "name": "attempts"
+          }
+        }
       },
       {
         "name": "last_error: String",
         "ordinal": 6,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "pending_ops",
+            "name": "last_error"
+          }
+        }
       },
       {
         "name": "scheduled_for!: i64",
         "ordinal": 7,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "pending_ops",
+            "name": "scheduled_for"
+          }
+        }
       },
       {
         "name": "created_at!: i64",
         "ordinal": 8,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "pending_ops",
+            "name": "created_at"
+          }
+        }
       }
     ],
     "parameters": {

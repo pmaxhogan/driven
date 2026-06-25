@@ -6,57 +6,123 @@
       {
         "name": "source_id!: String",
         "ordinal": 0,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "source_id"
+          }
+        }
       },
       {
         "name": "relative_path!: String",
         "ordinal": 1,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "relative_path"
+          }
+        }
       },
       {
         "name": "size!: i64",
         "ordinal": 2,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "size"
+          }
+        }
       },
       {
         "name": "mtime_ns!: i64",
         "ordinal": 3,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "mtime_ns"
+          }
+        }
       },
       {
         "name": "hash_blake3!: Vec<u8>",
         "ordinal": 4,
-        "type_info": "Blob"
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "hash_blake3"
+          }
+        }
       },
       {
         "name": "drive_file_id: String",
         "ordinal": 5,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "drive_file_id"
+          }
+        }
       },
       {
         "name": "drive_md5: Vec<u8>",
         "ordinal": 6,
-        "type_info": "Blob"
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "drive_md5"
+          }
+        }
       },
       {
         "name": "encrypted_remote_path: String",
         "ordinal": 7,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "encrypted_remote_path"
+          }
+        }
       },
       {
         "name": "status!: String",
         "ordinal": 8,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "status"
+          }
+        }
       },
       {
         "name": "last_uploaded_at: i64",
         "ordinal": 9,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "last_uploaded_at"
+          }
+        }
       },
       {
         "name": "last_verified_at: i64",
         "ordinal": 10,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "file_state",
+            "name": "last_verified_at"
+          }
+        }
       }
     ],
     "parameters": {

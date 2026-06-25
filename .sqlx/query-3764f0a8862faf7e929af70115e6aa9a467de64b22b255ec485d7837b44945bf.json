@@ -6,7 +6,13 @@
       {
         "name": "revealed!: i64",
         "ordinal": 0,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "recovery_phrase_acks",
+            "name": "revealed"
+          }
+        }
       }
     ],
     "parameters": {

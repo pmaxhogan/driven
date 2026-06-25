@@ -6,49 +6,97 @@
       {
         "name": "id!: i64",
         "ordinal": 0,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "id"
+          }
+        }
       },
       {
         "name": "ts!: i64",
         "ordinal": 1,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "ts"
+          }
+        }
       },
       {
         "name": "source_id: String",
         "ordinal": 2,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "source_id"
+          }
+        }
       },
       {
         "name": "level!: String",
         "ordinal": 3,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "level"
+          }
+        }
       },
       {
         "name": "event_type!: String",
         "ordinal": 4,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "event_type"
+          }
+        }
       },
       {
         "name": "file_count: i64",
         "ordinal": 5,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "file_count"
+          }
+        }
       },
       {
         "name": "bytes: i64",
         "ordinal": 6,
-        "type_info": "Integer"
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "bytes"
+          }
+        }
       },
       {
         "name": "message: String",
         "ordinal": 7,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "message"
+          }
+        }
       }
     ],
     "parameters": {
       "Right": 8
     },
     "nullable": [
-      true,
+      false,
       false,
       true,
       false,

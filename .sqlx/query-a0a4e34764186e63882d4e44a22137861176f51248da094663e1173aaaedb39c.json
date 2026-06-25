@@ -6,12 +6,19 @@
       {
         "name": "code!: String",
         "ordinal": 0,
-        "type_info": "Text"
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "activity_log",
+            "name": "event_type"
+          }
+        }
       },
       {
         "name": "count!: i64",
         "ordinal": 1,
-        "type_info": "Null"
+        "type_info": "Integer",
+        "origin": "Expression"
       }
     ],
     "parameters": {
@@ -19,7 +26,7 @@
     },
     "nullable": [
       false,
-      null
+      false
     ]
   },
   "hash": "a0a4e34764186e63882d4e44a22137861176f51248da094663e1173aaaedb39c"

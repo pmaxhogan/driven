@@ -22,7 +22,7 @@ jobs:
   release-please:
     runs-on: ubuntu-latest
     steps:
-      - uses: googleapis/release-please-action@v4
+      - uses: googleapis/release-please-action@v5
         with:
           # Prefer a PAT / App token (RELEASE_PLEASE_TOKEN) so the release PR is
           # authored by a real identity and its CI runs WITHOUT the manual
