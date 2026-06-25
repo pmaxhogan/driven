@@ -79,6 +79,9 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
         days: [true, true, true, true, true, true, true],
         utcOffsetMinutes: 0,
       },
+      preBackupHook: null,
+      postBackupHook: null,
+      hookTimeoutSecs: 60,
     },
     telemetry: {
       enabled: true,
@@ -642,6 +645,46 @@ describe("Settings Rules tab", () => {
     await dayButtons[0].trigger("click");
     await flushPromises();
     expect(lastSchedule()?.days[0]).toBe(false);
+  });
+
+  it("backup hooks: setting a command patches it, clearing patches null", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    type GlobalPatch = { patch?: { global?: Record<string, unknown> } };
+    const lastGlobalPatch = (key: string): unknown =>
+      invokeMock.mock.calls
+        .filter(
+          (c) => c[0] === "update_settings" && key in ((c[1] as GlobalPatch).patch?.global ?? {})
+        )
+        .map((c) => (c[1] as GlobalPatch).patch!.global![key])
+        .pop();
+
+    // Set a pre-backup hook command.
+    const pre = wrapper.get('[data-testid="pre-hook"]');
+    await pre.setValue("./backup-pre.sh");
+    await pre.trigger("change");
+    await flushPromises();
+    expect(lastGlobalPatch("preBackupHook")).toBe("./backup-pre.sh");
+
+    // Clearing the post-hook patches null (no hook).
+    const post = wrapper.get('[data-testid="post-hook"]');
+    await post.setValue("   ");
+    await post.trigger("change");
+    await flushPromises();
+    expect(lastGlobalPatch("postBackupHook")).toBeNull();
   });
 
   it("an empty bandwidth cap patches null (unlimited)", async () => {

@@ -175,6 +175,11 @@ export interface GlobalSettings {
   ioPriority: string;
   logLevel: string;
   schedule: ScheduleSettings;
+  /** V2 pre/post backup shell hooks (null = no hook). */
+  preBackupHook: string | null;
+  postBackupHook: string | null;
+  /** How long a hook may run before it is killed, in seconds. */
+  hookTimeoutSecs: number;
 }
 
 export interface TelemetrySettings {
@@ -218,6 +223,10 @@ export interface GlobalSettingsPatch {
   logLevel?: string;
   /** Present = replace the whole schedule window. */
   schedule?: ScheduleSettings;
+  /** Present = set; null clears the hook. */
+  preBackupHook?: string | null;
+  postBackupHook?: string | null;
+  hookTimeoutSecs?: number;
 }
 
 export interface TelemetrySettingsPatch {

@@ -45,6 +45,11 @@ const scheduleStart = ref("00:00");
 const scheduleEnd = ref("00:00");
 const scheduleDays = ref<boolean[]>([true, true, true, true, true, true, true]);
 
+// Pre/post backup hook local mirrors (DESIGN s17).
+const preBackupHook = ref("");
+const postBackupHook = ref("");
+const hookTimeoutSecs = ref(60);
+
 function minutesToHHMM(min: number): string {
   const m = ((Math.floor(min) % 1440) + 1440) % 1440;
   const hh = String(Math.floor(m / 60)).padStart(2, "0");
@@ -94,6 +99,9 @@ watch(
       // Coerce to exactly seven booleans regardless of what was stored.
       scheduleDays.value = dayIndices.map((i) => sched.days?.[i] ?? true);
     }
+    preBackupHook.value = s.global.preBackupHook ?? "";
+    postBackupHook.value = s.global.postBackupHook ?? "";
+    hookTimeoutSecs.value = s.global.hookTimeoutSecs ?? 60;
   },
   { immediate: true }
 );
@@ -149,6 +157,23 @@ async function commitDeepVerifyInterval(event: Event): Promise<void> {
   const current = settings.settings?.global.deepVerifyIntervalSecs ?? 604800;
   const value = parsePositiveInt((event.target as HTMLInputElement).value, current);
   await settings.patch({ global: { deepVerifyIntervalSecs: value } });
+}
+
+// Backup hooks (DESIGN s17). A blank command clears the hook (sent as null).
+async function commitPreHook(): Promise<void> {
+  const cmd = preBackupHook.value.trim();
+  await settings.patch({ global: { preBackupHook: cmd === "" ? null : cmd } });
+}
+
+async function commitPostHook(): Promise<void> {
+  const cmd = postBackupHook.value.trim();
+  await settings.patch({ global: { postBackupHook: cmd === "" ? null : cmd } });
+}
+
+async function commitHookTimeout(event: Event): Promise<void> {
+  const current = settings.settings?.global.hookTimeoutSecs ?? 60;
+  const value = parsePositiveInt((event.target as HTMLInputElement).value, current);
+  await settings.patch({ global: { hookTimeoutSecs: value } });
 }
 
 async function setIoPriority(event: Event): Promise<void> {
@@ -404,6 +429,51 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             </option>
           </select>
         </label>
+
+        <div class="space-y-2 border-t pt-4" data-testid="hooks-setting">
+          <h3 class="font-medium">{{ t("settings.rules.hooks.title") }}</h3>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.hooks.preLabel")
+            }}</span>
+            <input
+              v-model="preBackupHook"
+              type="text"
+              data-testid="pre-hook"
+              :placeholder="t('settings.rules.hooks.placeholder')"
+              class="w-full rounded border px-2 py-1 font-mono"
+              @change="commitPreHook"
+            />
+          </label>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.hooks.postLabel")
+            }}</span>
+            <input
+              v-model="postBackupHook"
+              type="text"
+              data-testid="post-hook"
+              :placeholder="t('settings.rules.hooks.placeholder')"
+              class="w-full rounded border px-2 py-1 font-mono"
+              @change="commitPostHook"
+            />
+          </label>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.hooks.timeoutLabel")
+            }}</span>
+            <input
+              type="number"
+              min="1"
+              :value="hookTimeoutSecs"
+              class="w-full rounded border px-2 py-1"
+              @change="commitHookTimeout"
+            />
+          </label>
+          <p class="text-xs text-zinc-500">
+            {{ t("settings.rules.hooks.note") }}
+          </p>
+        </div>
 
         <div class="space-y-1 border-t pt-4" data-testid="telemetry-setting">
           <label class="flex items-center gap-2">

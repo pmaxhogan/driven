@@ -74,6 +74,9 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
         days: [true, true, true, true, true, true, true],
         utcOffsetMinutes: 0,
       },
+      preBackupHook: null,
+      postBackupHook: null,
+      hookTimeoutSecs: 60,
     },
     telemetry: {
       enabled: true,
