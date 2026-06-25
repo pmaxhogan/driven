@@ -102,16 +102,18 @@ jobs:
         run: cargo run -p driven-chaos -- run-all --fault-injection
 
   chaos-real-drive:
-    name: chaos real-drive (M4-gated, skipped)
-    # WIRED but SKIPPED until M4 (STRESS_HARNESS s7 "Gating on M4"): the
-    # real-Drive E2E refresh token does not exist until the GoogleDriveStore
-    # (M4) lands, so this job is configured now and stays `if: false`-skipped.
-    # The `secrets` context is NOT available in a job-level `if`, so we cannot
-    # gate on the secret being present here - instead the maintainer flips this
-    # literal `false` to `true` (or to a `vars.*` flag) when the
-    # DRIVEN_E2E_REFRESH_TOKEN secret is configured at M4. Until then the job is
-    # SKIPPED, never FAILED.
-    if: ${{ false }}
+    name: chaos real-drive (tag-only)
+    # Real-Drive E2E chaos suite. The DRIVEN_E2E_REFRESH_TOKEN +
+    # DRIVEN_E2E_DEST_FOLDER_ID secrets now exist (provisioned post-M4), so this
+    # job is LIVE - but, per the chaos COST POLICY above, it runs ONLY on a `v*`
+    # tag push (release gate), never on per-PR / per-main-push runs. The
+    # `secrets` context is not available in a job-level `if`, so we gate on the
+    # ref instead; the cap:real_drive_creds rows inside the harness still skip
+    # cleanly (never red) if the creds are ever absent. This does NOT expand the
+    # chaos matrix: the hermetic / fake-drive jobs keep their windows-only-on-
+    # PR, 3-OS-only-on-tag policy; this job is a single ubuntu real-Drive leg
+    # added only on tags.
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     env:
       DRIVEN_E2E_REFRESH_TOKEN: ${{ secrets.DRIVEN_E2E_REFRESH_TOKEN }}
