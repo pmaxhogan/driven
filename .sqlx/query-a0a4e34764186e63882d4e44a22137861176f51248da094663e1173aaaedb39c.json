@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                event_type AS \"code!: String\",\n                COUNT(*)   AS \"count!: i64\"\n            FROM activity_log\n            WHERE ts >= ?1 AND ts <= ?2 AND level = ?3\n            GROUP BY event_type\n            ORDER BY event_type ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "code!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "count!: i64",
+        "ordinal": 1,
+        "type_info": "Null"
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      null
+    ]
+  },
+  "hash": "a0a4e34764186e63882d4e44a22137861176f51248da094663e1173aaaedb39c"
+}

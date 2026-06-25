@@ -35,6 +35,9 @@ ignore = [
 ]
 
 [licenses]
+# M9b (SPEC s16 / P2-1): the `os_info` crate (telemetry coarse OS version) is
+# MIT-licensed, already covered by the "MIT" allowance below - no new license
+# allowance is required, and `cargo deny check` stays green with it added.
 allow = [
     "MIT",
     "Apache-2.0",

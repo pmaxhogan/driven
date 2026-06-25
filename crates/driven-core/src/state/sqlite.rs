@@ -1904,13 +1904,22 @@ impl StateRepo for SqliteStateRepo {
         })
     }
 
-    async fn telemetry_events_24h(&self, since_ms: UnixMs) -> Result<TelemetryAggregate> {
-        // M9b (SPEC s16): the anonymous-telemetry 24h aggregate. Read-only; every
-        // value is a count/size/error-code - NO file name, path, or content is
-        // selected. `since_ms` is `now - 24h` (the caller passes it for
-        // determinism). SQLite has no unsigned ints; sums decode into i64 and are
-        // clamped via `max(0)` before the lossless cast to u64 (defence-in-depth -
-        // only non-negative sizes/counts are ever written).
+    async fn telemetry_events_since(
+        &self,
+        since_ms: UnixMs,
+        now_ms: UnixMs,
+    ) -> Result<TelemetryAggregate> {
+        // M9b (SPEC s16): the anonymous-telemetry aggregate over `[since_ms, now_ms]`.
+        // Read-only; every value is a count/size/error-code - NO file name, path,
+        // or content is selected. The caller passes `since_ms = max(now-24h,
+        // last_sent+1)` (DELTAS, P2-3) and `now_ms = now`. Bounding the UPPER end
+        // at `now_ms` excludes clock-skewed future rows (P2-2). SQLite has no
+        // unsigned ints; sums decode into i64 and are clamped via `max(0)` before
+        // the lossless cast to u64 (only non-negative sizes/counts are written).
+        //
+        // A degenerate window (since_ms > now_ms, e.g. a backwards clock step)
+        // selects nothing - the `BETWEEN`/`>= AND <=` predicate is simply empty,
+        // so the aggregate is all-zero (no panic, no double-count).
 
         // upload_done count + byte sum in the window.
         let uploads = sqlx::query!(
@@ -1919,9 +1928,10 @@ impl StateRepo for SqliteStateRepo {
                 COUNT(*)                  AS "files!: i64",
                 COALESCE(SUM(bytes), 0)   AS "bytes!: i64"
             FROM activity_log
-            WHERE ts >= ?1 AND event_type = 'upload_done'
+            WHERE ts >= ?1 AND ts <= ?2 AND event_type = 'upload_done'
             "#,
             since_ms,
+            now_ms,
         )
         .fetch_one(&self.pool)
         .await?;
@@ -1936,11 +1946,12 @@ impl StateRepo for SqliteStateRepo {
                 event_type AS "code!: String",
                 COUNT(*)   AS "count!: i64"
             FROM activity_log
-            WHERE ts >= ?1 AND level = ?2
+            WHERE ts >= ?1 AND ts <= ?2 AND level = ?3
             GROUP BY event_type
             ORDER BY event_type ASC
             "#,
             since_ms,
+            now_ms,
             error_level,
         )
         .fetch_all(&self.pool)
@@ -1956,9 +1967,10 @@ impl StateRepo for SqliteStateRepo {
             r#"
             SELECT COUNT(*) AS "n!: i64"
             FROM activity_log
-            WHERE ts >= ?1 AND event_type = 'update_applied'
+            WHERE ts >= ?1 AND ts <= ?2 AND event_type = 'update_applied'
             "#,
             since_ms,
+            now_ms,
         )
         .fetch_one(&self.pool)
         .await?;
@@ -1969,9 +1981,12 @@ impl StateRepo for SqliteStateRepo {
             r#"
             SELECT COUNT(*) AS "n!: i64"
             FROM backup_sources
-            WHERE last_deep_verify_at IS NOT NULL AND last_deep_verify_at >= ?1
+            WHERE last_deep_verify_at IS NOT NULL
+              AND last_deep_verify_at >= ?1
+              AND last_deep_verify_at <= ?2
             "#,
             since_ms,
+            now_ms,
         )
         .fetch_one(&self.pool)
         .await?;
@@ -3958,11 +3973,12 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn telemetry_events_24h_aggregates_uploads_errors_and_deep_verify() {
-        // M9b (SPEC s16): the telemetry 24h aggregate counts upload_done rows +
-        // bytes, groups error-level rows by error code, counts update_applied
-        // rows, and counts sources whose last_deep_verify_at falls in the window.
-        // It NEVER selects a path/name. Rows older than `since` are excluded.
+    async fn telemetry_events_since_aggregates_uploads_errors_and_deep_verify() {
+        // M9b (SPEC s16): the telemetry aggregate counts upload_done rows + bytes,
+        // groups error-level rows by error code, counts update_applied rows, and
+        // counts sources whose last_deep_verify_at falls in the window. It NEVER
+        // selects a path/name. Rows older than `since` are excluded; rows AFTER
+        // `now` (clock skew, P2-2) are also excluded.
         use super::TelemetryAggregate;
         let (repo, _dir) = temp_repo().await;
         let acct = sample_account();
@@ -3971,10 +3987,11 @@ mod tests {
         repo.upsert_source(&src).await.unwrap();
 
         let since = 1000;
+        let now = 2000;
 
         // Two upload_done rows in-window (100 + 200 bytes), one BEFORE the window
-        // (excluded), two error rows (one drive.rate_limited, two local.io_error),
-        // and one update_applied row.
+        // (excluded), one AFTER `now` (clock-skew future, excluded), two error rows
+        // (one drive.rate_limited, two local.io_error), and one update_applied row.
         let rows: &[(i64, ActivityLevel, &str, Option<u64>)] = &[
             (500, ActivityLevel::Info, "upload_done", Some(999)), // pre-window -> excluded
             (1100, ActivityLevel::Info, "upload_done", Some(100)),
@@ -3984,6 +4001,9 @@ mod tests {
             (1500, ActivityLevel::Error, "local.io_error", None),
             (1600, ActivityLevel::Info, "update_applied", None),
             (600, ActivityLevel::Error, "drive.rate_limited", None), // pre-window -> excluded
+            // P2-2: a future-dated row (ts > now) must be excluded by the upper bound.
+            (9000, ActivityLevel::Info, "upload_done", Some(5000)),
+            (9100, ActivityLevel::Error, "drive.rate_limited", None),
         ];
         for (ts, level, et, bytes) in rows.iter().copied() {
             repo.write_activity(NewActivity {
@@ -4000,15 +4020,19 @@ mod tests {
         }
 
         // A second source with a deep-verify completed IN the window, plus the
-        // first source with a deep-verify BEFORE the window (excluded).
+        // first source with a deep-verify BEFORE the window (excluded). A third
+        // with a deep-verify AFTER `now` (clock skew, excluded by the upper bound).
         let mut src2 = sample_source(acct.id);
         src2.last_deep_verify_at = Some(1450);
         repo.upsert_source(&src2).await.unwrap();
         let mut src_old = src.clone();
         src_old.last_deep_verify_at = Some(900); // before window -> excluded
         repo.upsert_source(&src_old).await.unwrap();
+        let mut src_future = sample_source(acct.id);
+        src_future.last_deep_verify_at = Some(9500); // after now -> excluded (P2-2)
+        repo.upsert_source(&src_future).await.unwrap();
 
-        let agg = repo.telemetry_events_24h(since).await.unwrap();
+        let agg = repo.telemetry_events_since(since, now).await.unwrap();
 
         assert_eq!(agg.files_uploaded, 2, "two in-window upload_done rows");
         assert_eq!(agg.bytes_uploaded, 300, "100 + 200 bytes in-window");
@@ -4018,18 +4042,26 @@ mod tests {
                 ("drive.rate_limited".to_string(), 1),
                 ("local.io_error".to_string(), 2),
             ],
-            "errors grouped by code, sorted, in-window only"
+            "errors grouped by code, sorted, in-window only (future row excluded)"
         );
         assert_eq!(agg.update_applied, 1);
         assert_eq!(
             agg.deep_verify_runs, 1,
-            "only the in-window deep-verify source counts"
+            "only the in-window deep-verify source counts (future one excluded)"
         );
 
         // Empty-window sanity: a window far in the future yields an all-zero
         // aggregate (the Default).
-        let empty = repo.telemetry_events_24h(9_999_999).await.unwrap();
+        let empty = repo
+            .telemetry_events_since(9_999_999, 10_000_000)
+            .await
+            .unwrap();
         assert_eq!(empty, TelemetryAggregate::default());
+
+        // Degenerate window (since > now, e.g. a backwards clock step) selects
+        // nothing - no panic, all-zero.
+        let degenerate = repo.telemetry_events_since(now, since).await.unwrap();
+        assert_eq!(degenerate, TelemetryAggregate::default());
     }
 
     #[test]
@@ -4060,7 +4092,19 @@ mod tests {
 
         let telemetry = repo.get_setting("telemetry").await.unwrap().unwrap();
         let install_id = telemetry["install_id"].as_str().unwrap();
-        assert_eq!(install_id.len(), 32); // hex of 16 bytes
+        // M9b (P1-3): the seed now writes a canonical UUID v4 (8-4-4-4-12, version
+        // nibble '4', variant nibble in 8|9|a|b), 36 chars incl. dashes.
+        assert_eq!(install_id.len(), 36, "install_id is a UUID v4");
+        let b = install_id.as_bytes();
+        assert!(
+            b[8] == b'-' && b[13] == b'-' && b[18] == b'-' && b[23] == b'-',
+            "UUID dash positions"
+        );
+        assert_eq!(b[14], b'4', "version nibble is 4");
+        assert!(
+            matches!(b[19], b'8' | b'9' | b'a' | b'b'),
+            "variant nibble in 8|9|a|b"
+        );
 
         // Round-trip a custom value.
         let v = serde_json::json!({"foo": "bar", "n": 7});

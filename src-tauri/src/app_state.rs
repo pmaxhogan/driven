@@ -357,6 +357,12 @@ pub struct TelemetryRuntime {
     /// The shutdown signal the periodic-ping task `select!`s on, so it exits
     /// promptly on quit rather than waiting out its 24h interval.
     shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
+    /// M9b (P1-2): a cancellation flag flipped to `true` the instant
+    /// `set_telemetry_enabled(false)` commits, so an IN-FLIGHT ping that is
+    /// mid-build aborts BEFORE its network send (the disable is honored
+    /// immediately, not merely on the next 24h tick). Re-armed to `false` on
+    /// re-enable. Shared with the ping task via [`AppState::telemetry_cancel`].
+    cancel: Arc<std::sync::atomic::AtomicBool>,
 }
 
 /// M8 (P2-3): max number of TERMINAL restore-job records retained for late
@@ -703,6 +709,24 @@ impl AppState {
             .shutdown
             .lock()
             .unwrap_or_else(|e| e.into_inner()) = Some(shutdown);
+    }
+
+    /// M9b (P1-2): the shared telemetry cancellation flag. The ping task clones
+    /// this `Arc` and checks it right before its network send; the IPC toggle flips
+    /// it via [`set_telemetry_cancelled`] so a disable aborts an in-flight ping
+    /// immediately.
+    #[must_use]
+    pub fn telemetry_cancel(&self) -> Arc<std::sync::atomic::AtomicBool> {
+        Arc::clone(&self.telemetry.cancel)
+    }
+
+    /// M9b (P1-2): set the telemetry cancellation flag. `set_telemetry_enabled`
+    /// flips it to `true` when disabling (abort any in-flight send immediately) and
+    /// back to `false` when re-enabling (re-arm the ping path).
+    pub fn set_telemetry_cancelled(&self, cancelled: bool) {
+        self.telemetry
+            .cancel
+            .store(cancelled, std::sync::atomic::Ordering::SeqCst);
     }
 
     /// M9b: signal the periodic-ping task to stop and TAKE its handle so the

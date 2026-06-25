@@ -68,6 +68,12 @@ blake3 = "1"
 # in NON-test code (the periodic ping task takes `&dyn TelemetrySink`), so
 # async-trait must be a regular dependency, not just a dev-dependency.
 async-trait.workspace = true
+# M9b (SPEC s16 / P2-1): a COARSE OS version for the telemetry payload (e.g.
+# "11.26200", "14.5"). os_info is a small, cross-platform crate (MIT) that reads
+# the OS version without a host shell-out. PRIVACY: only the low-cardinality
+# version string is used - never a hostname/path/PII. default-features off drops
+# the optional `log` dependency (we do not need its internal logging).
+os_info = { version = "3", default-features = false }
 
 driven-core = { path = "../crates/driven-core" }
 driven-drive = { path = "../crates/driven-drive" }

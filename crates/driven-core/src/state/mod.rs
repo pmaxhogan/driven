@@ -1046,15 +1046,22 @@ pub trait StateRepo: Send + Sync {
         Ok(ActivitySummary::default())
     }
 
-    /// M9b (SPEC s16): the anonymous-telemetry 24h aggregate, computed from the
-    /// durable `activity_log` + `backup_sources` over `[since_ms, now]`. The caller
-    /// (the telemetry client) passes `since_ms = now - 24h` so the query is
-    /// deterministic + unit-testable. Read-only; touches no file names/paths.
+    /// M9b (SPEC s16): the anonymous-telemetry aggregate, computed from the durable
+    /// `activity_log` + `backup_sources` over the HALF-OPEN-ish window
+    /// `[since_ms, now_ms]` (both bounds passed by the caller). The telemetry client
+    /// passes `since_ms = max(now - 24h, last_sent + 1)` and `now_ms = now`, so each
+    /// ping reports only the events since the last successful send (DELTAS, P2-3)
+    /// and clock-skewed future rows past `now` are excluded (P2-2). Read-only;
+    /// touches no file names/paths.
     ///
     /// Default impl returns a zeroed aggregate (the in-memory test doubles never
     /// call it); the SQLite repo overrides it with bounded aggregate SQL.
-    async fn telemetry_events_24h(&self, since_ms: UnixMs) -> Result<TelemetryAggregate> {
-        let _ = since_ms;
+    async fn telemetry_events_since(
+        &self,
+        since_ms: UnixMs,
+        now_ms: UnixMs,
+    ) -> Result<TelemetryAggregate> {
+        let _ = (since_ms, now_ms);
         Ok(TelemetryAggregate::default())
     }
 
