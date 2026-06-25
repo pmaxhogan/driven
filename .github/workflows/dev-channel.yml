@@ -109,7 +109,7 @@ jobs:
     env:
       SQLX_OFFLINE: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
@@ -283,7 +283,7 @@ jobs:
       RELEASE_TAG: dev
       UPDATES_BASE: https://driven.maxhogan.dev/updates
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
@@ -489,7 +489,7 @@ jobs:
     env:
       RELEASE_TAG: dev
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:

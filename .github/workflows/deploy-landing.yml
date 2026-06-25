@@ -52,7 +52,7 @@ jobs:
       # the README one-liner, also the #tagline element in index.html.
       TAGLINE_MARKER: "One-way, encrypted backup of your local folders to your own Google Drive."
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       # 1. Copy the committed landing page to the site root.
       - name: Assemble landing into site/

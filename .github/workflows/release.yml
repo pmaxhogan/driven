@@ -46,7 +46,7 @@ jobs:
       # resolve against the committed .sqlx/ cache (same as ci.yml).
       SQLX_OFFLINE: "true"
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
@@ -167,7 +167,7 @@ jobs:
       # whole-site `pages deploy` snapshot (R1-P1-7).
       UPDATES_BASE: https://driven.maxhogan.dev/updates
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - uses: actions/setup-node@v4
         with:
