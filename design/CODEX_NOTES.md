@@ -1705,3 +1705,69 @@ tree is reachable at driven.maxhogan.dev/updates/...; (4) release-please's Rust
 strategy + the typed JSON extra-files bump all three version sources together;
 (5) the dev `[dev-build]` / dispatch gate fires the matrix as intended; (6) the
 tag-only chaos-real-drive leg passes with the live DRIVEN_E2E_* secrets.
+## M9a - updater (in-app updater feature)
+
+SHIPPED (SPEC s15, ROADMAP M9 part 1 - the IN-APP UPDATER feature only; the
+release-pipeline GH Actions, CF hosting, telemetry, and pre-GA hardening remain
+separate M9b/M9c/M9d workflows):
+
+- `tauri.conf.json` `plugins.updater`: pubkey (the provisioned ed25519 public
+  key), the STABLE default endpoint
+  `https://driven.maxhogan.dev/updates/stable/{{target}}/{{current_version}}/update.json`,
+  `dialog: false` (Driven shows its own banner). `{{channel}}` is deliberately NOT
+  used (not a valid Tauri placeholder per SPEC s15.1) - the channel is in the PATH
+  and chosen at runtime.
+- Deps: `tauri-plugin-updater` + `tauri-plugin-process` (Cargo.toml), both plugins
+  registered in `lib.rs`; `@tauri-apps/plugin-updater` + `@tauri-apps/plugin-process`
+  (ui/package.json). Capabilities: `updater:default` + `process:default`.
+- `src-tauri/src/updater.rs`: `Channel { Stable, Dev }` read/written via the SPEC
+  s22 `updater.channel` settings group (no ad-hoc state; sibling fields preserved
+  on write). `build_updater` overrides the runtime endpoint per channel via
+  `app.updater_builder().endpoints(..)`. A periodic check (startup + every 6h via a
+  `tokio::interval`, NOT a sleep/poll loop) `select!`s on a shutdown watch and is
+  joined into the M5 quit drain (`AppState::shutdown_updater_task` + the bounded
+  abort-capable `drain_restore_handle` in lib.rs) so quit leaves NO orphan. Emits
+  `updater:available` / `updater:download_progress` / `updater:downloaded`. IPC:
+  `check_for_update`, `install_update` (download_and_install + `app.restart()` via
+  tauri-plugin-process), `get_update_channel`, `set_update_channel`.
+- `scripts/generate-update-json.mjs` (Node ESM, pure, no network): writes per-target
+  `update.json` into `updates/<channel>/<target>/<version>/update.json` matching the
+  endpoint URL shape; derives version from tauri.conf.json (stable) or
+  `0.0.0-dev.<sha>` (dev). Has `--help` + `--self-check`, unit-smoked from vitest.
+- UI: `ChangelogModal.vue` (sanitized markdown release notes via
+  `sanitizeMarkdown.ts` - HTML-escape-first + tag whitelist, XSS-safe; i18n).
+  About tab extended with a channel toggle, Check-for-updates, an
+  `updater:available` banner with Install + download progress + View-changelog, and
+  paginated `list_releases`. `ui/src/stores/updater.ts` Pinia store + vitest.
+
+TESTS (exercise the feature, no live endpoint): Rust - channel get/set round-trip
+through settings, per-channel URL correctness (no `{{channel}}`, valid placeholders),
+the available-update dispatch emits via a recording closure, up-to-date does not.
+UI vitest - channel get/set, check available vs up-to-date -> banner, a live
+`updater:available` event -> banner, install + download-progress fraction,
+signature-failure error code, releases pagination, ChangelogModal render +
+sanitizer XSS-safety. generate-update-json.mjs - shape + path-layout smoke against
+a temp fixture.
+
+DEVIATIONS / RESIDUALS:
+
+- TEST SEAM: the plugin's real `check()` / `download_and_install` touch the network
+  + filesystem and the `Update` struct cannot be constructed in a unit test, so the
+  network-free DECISION logic (channel parse, URL build, `Update`->`UpdateInfo`
+  mapping, available-update dispatch) is split into pure functions the tests
+  exercise; `build_updater` / `run_check` / the real install are validated only by
+  compilation + the manual M9 acceptance (a real CI release -> picks-up-update),
+  NOT by an offline unit test (intentional - no test hits `driven.maxhogan.dev`).
+- `UpdateInfo.published_at` for a checked manifest uses `OffsetDateTime::Display`
+  (ISO-8601-shaped) rather than a strict RFC3339 format-description call, to avoid a
+  direct `time` crate dependency; the UI parses it with `new Date(..)` and falls
+  back to the raw string. The GitHub-releases path (M6 `check_for_updates`) is
+  unchanged and still returns the API's RFC3339 `published_at`.
+- The M6 `check_for_updates` / `list_releases` (GitHub releases API) commands are
+  retained for the About tab's release-notes viewer; the new `check_for_update` /
+  `install_update` (Tauri manifest) are the actual signed-update path. Both coexist
+  by design (releases-API for notes, manifest for the staged signed download).
+- The actual `update.json` hosting (`driven.maxhogan.dev/updates`) does not exist
+  until the M9c CF-Pages workflow, and the GH Actions that CALL
+  generate-update-json.mjs land in M9d - so end-to-end auto-update is not live yet;
+  M9a delivers the in-app client + the manifest generator only.
