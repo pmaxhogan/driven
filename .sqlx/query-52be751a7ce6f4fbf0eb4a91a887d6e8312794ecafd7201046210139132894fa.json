@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE backup_sources SET enabled = 1 WHERE account_id = ?1 AND id IN (SELECT source_id FROM recovery_phrase_acks WHERE account_id = ?1)",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "52be751a7ce6f4fbf0eb4a91a887d6e8312794ecafd7201046210139132894fa"
+}

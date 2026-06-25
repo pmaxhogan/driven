@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM recovery_phrase_acks WHERE account_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "cd5a5e2d2af8c7584ab321fca8382fa8de8843a3434dc96e8a4f51dbd9f1bdc2"
+}

@@ -3180,3 +3180,48 @@ validated; assemble-landing.sh `bash -n` + live-run verified; `git diff --check`
 throughout; rendered the page in a headless browser to confirm it is on-brand. No app code
 (src-tauri/ui/crates) touched; no release/tag triggered. The push to main fires deploy-landing.yml,
 which deploys the landing live (intended).
+
+## Capstone fix (post-GA hardening)
+
+The whole-system codex CAPSTONE (empty-tree baseline, path-scoped over the full M1-M10 surface;
+reviews `capstone-security-20260625-082248.md` xhigh + `capstone-rest-20260625-082254.md` high)
+surfaced 1 promoted-P1 (data-safety) + 2 P2. v0.1.0 was already shipped, so this is POST-GA hardening
+(the upgrade repair runs on a v0.1.0 -> v0.1.1 boot, so the fleet benefits). All three are fixed;
+the capstone GA-blocker-class finding (CAP-P1) is resolved.
+
+- CAP-P1 (DATA-SAFETY) `state/sqlite.rs` recovery-repair now normalizes EVERY account with encrypted
+  sources AND unacked recovery state, not only zero-ack-row accounts. The pre-fix
+  `repair_unacked_encrypted_sources_on_upgrade` skipped any account that already had an ack row, so a
+  PARTIALLY-gated account (one pending ack + a sibling encrypted source still ENABLED) escaped the
+  safety net and could keep producing encrypted backups before the recovery phrase was acked
+  (potentially unrecoverable). The repair now, per account: disables EVERY still-enabled encrypted
+  source, seeds a pending ack for EVERY encrypted source missing one (ON CONFLICT DO NOTHING -
+  idempotent), and counts the account as repaired only when it actually disabled or seeded something
+  (a fully-gated account is a no-op). The backfill marker is written only after normalization. The ack
+  path (`enable_source_and_clear_recovery_ack`) now re-enables the RIGHT SET: it resolves the owning
+  account from the source's pending-ack row, re-enables every source on that account that has a pending
+  ack row (the gate-disabled set), and clears ALL the account's pending acks in one transaction - so a
+  single per-account recovery-phrase ack restores a multi-source account fully, not just the earliest
+  source. A user-disabled sibling has no ack row, so it is never re-enabled. New regression test
+  `upgrade_repair_normalizes_partially_gated_multi_source_account`. (Subsumes the documented
+  R9-P1-1 multi-source residual + capstone-rest P2-2.)
+- CAP-P2a `commands/accounts.rs` BYO OAuth `client_id` AND `client_secret` are now rejected at the
+  input boundary if they contain control characters or newlines (`reject_control_chars`). The keychain
+  record is newline-delimited, so a newline in either field corrupted `decode_record` on restart and
+  stranded the account in reauth/refresh failure. Only non-empty `client_id` was validated before. New
+  test `reject_control_chars_rejects_newlines_and_controls_but_accepts_clean_creds`.
+- CAP-P2b `commands/restore.rs` restore now fails-closed on the DB `SourceRow.encryption_enabled` flag
+  (`apply_encryption_policy`), mirroring the executor: if the row says encrypted, ONLY a Suite provider
+  is acceptable (Plaintext/Unavailable -> Unavailable/error); if the row says unencrypted, plaintext is
+  forced and any provider suite ignored. Previously `resolve_suite` trusted the live crypto provider
+  directly, so a stale provider snapshot (reconfigure_account keeps the old snapshot if list_sources
+  fails) could route an encrypted source through the plaintext path. New tests
+  `encrypted_source_with_provider_{plaintext,unavailable}_fails_closed`,
+  `encrypted_source_with_provider_suite_uses_the_suite`,
+  `unencrypted_source_with_provider_{suite,unavailable}_forces_plaintext`.
+
+sqlx: the CAP-P1 repair added new `sqlx::query!` macros, so `just sqlx-prepare` was re-run (5 old
+query json files replaced; 0 drift). Gates green: cargo build/clippy/test --workspace, build -p
+driven-app, deny check, fmt --all --check, git diff --check, sqlx 0-drift; ui pnpm lint/test:unit/build
+(vue-tsc) unaffected (no UI surface touched). Anti-fake-green stub sweep over the touched surface: zero
+non-test todo!/unimplemented!/unreachable!.

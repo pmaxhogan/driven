@@ -200,6 +200,22 @@ fn progress_to_status(p: OAuthProgress) -> OAuthStatus {
 /// a direct IPC call can never start OAuth against a Driven-owned client (DESIGN
 /// s6.1). The secret may legitimately be empty for a PKCE installed-app client;
 /// only the client id is required.
+/// CAP-P2a (post-GA hardening): reject any control character (Unicode `Cc`,
+/// which includes `\n`, `\r`, `\t`, NUL, and other C0/C1 controls) in a BYO OAuth
+/// credential field. The creds are stored as a newline-delimited keychain record
+/// (`client_id\nclient_secret`), so a control char - especially a newline - would
+/// decode to a different pair on the next restart and strand the account in a
+/// refresh/reauth failure. `field` names the offending field for the error.
+fn reject_control_chars(value: &str, field: &str) -> CommandResult<()> {
+    if value.chars().any(char::is_control) {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            format!("{field} must not contain control characters (newlines, tabs, etc.)"),
+        ));
+    }
+    Ok(())
+}
+
 fn resolve_creds(session: &WizardSession) -> CommandResult<(String, String)> {
     let client_id = session
         .client_id
@@ -293,6 +309,18 @@ pub async fn submit_oauth_credentials(
             "OAuth client id must not be empty",
         ));
     }
+    // CAP-P2a (post-GA hardening): the BYO creds are persisted as a single
+    // newline-DELIMITED keychain record (`client_id\nclient_secret`,
+    // token_store.rs `encode_client_creds`), and `decode_client_creds` splits on
+    // the FIRST newline. A newline or other control character embedded in either
+    // field would round-trip to a DIFFERENT pair after a restart (the secret bleeds
+    // into the id or is truncated), stranding the account in a refresh/reauth
+    // failure. Reject control characters (incl. CR/LF/TAB) in BOTH fields at the
+    // input boundary so the keychain record can never be ambiguous. Real Google
+    // OAuth client ids/secrets are printable ASCII, so this rejects only malformed
+    // input.
+    reject_control_chars(&client_id, "OAuth client id")?;
+    reject_control_chars(&client_secret, "OAuth client secret")?;
     s.client_id = Some(client_id);
     s.client_secret = Some(client_secret);
     s.touch(); // R4-P2-4: measure the TTL from the last activity.
@@ -1296,5 +1324,46 @@ mod tests {
         let (id, secret) = resolve_creds(&s).expect("byo creds resolve");
         assert_eq!(id, "byo-id");
         assert_eq!(secret, "byo-secret");
+    }
+
+    #[test]
+    fn reject_control_chars_rejects_newlines_and_controls_but_accepts_clean_creds() {
+        // CAP-P2a (post-GA hardening): a BYO OAuth credential with an embedded
+        // newline (or any control char) must be rejected at the input boundary,
+        // because the keychain record is `client_id\nclient_secret` and a newline
+        // would decode to a different pair after a restart (stranding the account
+        // in reauth/refresh failure). A clean printable credential is accepted.
+        let nl = reject_control_chars("abc\ndef", "OAuth client id")
+            .expect_err("an embedded newline must be rejected");
+        assert_eq!(nl.code, ErrorCode::InvalidInput);
+        // CR, TAB, and NUL are likewise control chars and rejected.
+        assert_eq!(
+            reject_control_chars("abc\rdef", "OAuth client secret")
+                .expect_err("CR rejected")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        assert_eq!(
+            reject_control_chars("abc\tdef", "OAuth client id")
+                .expect_err("TAB rejected")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        assert_eq!(
+            reject_control_chars("abc\0def", "OAuth client secret")
+                .expect_err("NUL rejected")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        // A realistic Google client id + secret (printable ASCII) is accepted.
+        reject_control_chars(
+            "123456789012-abcdefghijklmnop.apps.googleusercontent.com",
+            "OAuth client id",
+        )
+        .expect("a clean printable client id is accepted");
+        reject_control_chars("GOCSPX-AbCdEf0123456789_xyz", "OAuth client secret")
+            .expect("a clean printable client secret is accepted");
+        // An empty secret (valid for a PKCE installed-app client) is accepted.
+        reject_control_chars("", "OAuth client secret").expect("an empty secret is accepted");
     }
 }

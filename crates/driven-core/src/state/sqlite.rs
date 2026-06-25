@@ -996,21 +996,59 @@ impl StateRepo for SqliteStateRepo {
         // pending-ack record must be all-or-nothing, so a crash can never leave
         // the source enabled with a stale pending record (or cleared but still
         // disabled).
+        //
+        // CAP-P1 (post-GA hardening): the ack re-enables the RIGHT SET. The recovery
+        // phrase is per-ACCOUNT (derived from the account master key), so a single
+        // ack covers every encrypted source the gate disabled on that account - not
+        // just `source`. The upgrade repair gate-disables EVERY encrypted source on
+        // an unacked account and seeds a pending `recovery_phrase_acks` row for each,
+        // so the set of gate-disabled sources is EXACTLY the set of the account's
+        // sources that have a pending ack row. We therefore, in ONE transaction:
+        //   1) re-enable every `backup_sources` row that has a pending ack row on the
+        //      SAME account as `source` (the canonical onboarding flow has exactly
+        //      one such row, so this is identical to the old behaviour there), and
+        //   2) delete ALL of that account's pending ack rows.
+        // A user-disabled sibling has NO ack row, so it is never re-enabled.
         let id = source.to_string();
         let mut tx = self.pool.begin().await?;
-        let affected = sqlx::query!("UPDATE backup_sources SET enabled = 1 WHERE id = ?1", id,)
-            .execute(&mut *tx)
-            .await?
-            .rows_affected();
-        if affected == 0 {
+
+        // Resolve the owning account from the source's pending-ack record (the
+        // strongly-consistent gate source of truth). Reject an unknown / already-
+        // acked source so a forged id cannot enable anything.
+        let account = sqlx::query!(
+            r#"SELECT account_id AS "account_id!: String" FROM recovery_phrase_acks WHERE source_id = ?1"#,
+            id,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        let Some(account) = account else {
             tx.rollback().await?;
             return Err(anyhow!(
-                "source not found for recovery-ack enable; transaction rolled back"
+                "no pending recovery ack for this source; transaction rolled back"
             ));
-        }
-        sqlx::query!("DELETE FROM recovery_phrase_acks WHERE source_id = ?1", id,)
-            .execute(&mut *tx)
-            .await?;
+        };
+        let account_id = account.account_id;
+
+        // 1) Re-enable EVERY source on the account that has a pending ack row (the
+        // gate-disabled set). User-disabled siblings (no ack row) are untouched.
+        sqlx::query!(
+            "UPDATE backup_sources SET enabled = 1 \
+             WHERE account_id = ?1 \
+               AND id IN (SELECT source_id FROM recovery_phrase_acks WHERE account_id = ?1)",
+            account_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // 2) Clear ALL of the account's pending ack rows (the whole gate is now
+        // satisfied by the single per-account recovery phrase).
+        sqlx::query!(
+            "DELETE FROM recovery_phrase_acks WHERE account_id = ?1",
+            account_id,
+        )
+        .execute(&mut *tx)
+        .await?;
+
         tx.commit().await?;
         Ok(())
     }
@@ -1039,24 +1077,35 @@ impl StateRepo for SqliteStateRepo {
             return Ok(0);
         }
 
-        // Accounts with a stamped master key that have encrypted source(s) but
-        // ZERO recovery_phrase_acks rows: these pre-date the durable gate. The
-        // canonical pending source is the earliest-created encrypted source on
-        // the account (deterministic tie-break by id).
+        // CAP-P1 (post-GA hardening): this one-time repair normalizes EVERY account
+        // with a stamped master key that has encrypted source(s). It runs EXACTLY
+        // ONCE on the v0.1.x upgrade (gated by the durable marker above), so at the
+        // moment it runs there are two shapes of unacknowledged account it must
+        // catch - the OLD filter (`NOT EXISTS any ack row`) only caught the first:
+        //   (a) NO recovery_phrase_acks row at all - the legacy pre-0004 state where
+        //       the gate lived only in memory, so an encrypted source could be
+        //       persisted ENABLED with no durable ack record. (As today: disable +
+        //       seed a pending ack.)
+        //   (b) a PARTIALLY-gated / inconsistent account that ALREADY has a pending
+        //       ack row for one source AND another encrypted source still ENABLED.
+        //       The old zero-ack-only filter EXCLUDED this account, so the enabled
+        //       sibling kept producing unrestorable encrypted backups before the
+        //       phrase was acked (the promoted R9-P1-1 residual / CAP-P1).
+        // Because a fully-acknowledged account has its ack rows DELETED on ack (so it
+        // looks like (a)), the one-time MARKER - not an ack-row predicate - is what
+        // guarantees a legitimately-acked source is never re-disabled on a later
+        // boot. The per-source ack seeding below is `ON CONFLICT DO NOTHING`, so an
+        // account that is ALREADY correctly gated (every encrypted source disabled +
+        // already has its ack row) is a no-op and is not counted as repaired.
         let candidates = sqlx::query!(
             r#"
             SELECT
-                a.id AS "account_id!: String",
-                a.encryption_master_key_id AS "master_key_id!: String"
+                a.id AS "account_id!: String"
             FROM accounts a
             WHERE a.encryption_master_key_id IS NOT NULL
               AND EXISTS (
                   SELECT 1 FROM backup_sources s
                   WHERE s.account_id = a.id AND s.encryption_enabled = 1
-              )
-              AND NOT EXISTS (
-                  SELECT 1 FROM recovery_phrase_acks r
-                  WHERE r.account_id = a.id
               )
             ORDER BY a.created_at ASC, a.id ASC
             "#,
@@ -1070,51 +1119,40 @@ impl StateRepo for SqliteStateRepo {
 
             // DISABLE every encrypted source on the account (the scheduler +
             // manual sync filter on `enabled`, so this stops the unrestorable
-            // backups until the phrase is re-revealed + re-acked).
-            sqlx::query!(
+            // backups until the phrase is re-revealed + re-acked). Count whether
+            // this account had any work (a disabled source or a newly-seeded ack)
+            // so `repaired` reflects accounts we actually normalized.
+            let disabled = sqlx::query!(
                 "UPDATE backup_sources SET enabled = 0 \
-                 WHERE account_id = ?1 AND encryption_enabled = 1",
+                 WHERE account_id = ?1 AND encryption_enabled = 1 AND enabled = 1",
                 account_id,
             )
             .execute(&mut *tx)
-            .await?;
+            .await?
+            .rows_affected();
 
-            // Pick the canonical (earliest-created) encrypted source.
-            let canonical = sqlx::query!(
-                r#"
-                SELECT id AS "id!: String"
-                FROM backup_sources
-                WHERE account_id = ?1 AND encryption_enabled = 1
-                ORDER BY created_at ASC, id ASC
-                LIMIT 1
-                "#,
-                account_id,
-            )
-            .fetch_optional(&mut *tx)
-            .await?;
-            let Some(canonical) = canonical else {
-                // No encrypted source after all (raced/inconsistent): nothing to
-                // do for this account.
-                continue;
-            };
-
-            // Insert the PENDING ack row (revealed = 0) for the canonical source.
-            // A REPLACE so a partial earlier run (now rolled back) cannot leave a
-            // stale row that fails the PK.
-            sqlx::query!(
+            // Seed a PENDING ack row (revealed = 0) for EVERY encrypted source on the
+            // account that does not already have one. This records the EXACT
+            // gate-disabled set, so `enable_source_and_clear_recovery_ack` re-enables
+            // all of them (and ONLY them) on a single per-account ack. An existing
+            // ack row is left untouched (its revealed flag is preserved). The
+            // `ON CONFLICT ... DO NOTHING` keeps the repair idempotent.
+            let seeded = sqlx::query!(
                 "INSERT INTO recovery_phrase_acks (source_id, account_id, revealed, created_at) \
-                 VALUES (?1, ?2, 0, ?3) \
-                 ON CONFLICT(source_id) DO UPDATE SET \
-                    account_id = excluded.account_id, \
-                    revealed   = 0, \
-                    created_at = excluded.created_at",
-                canonical.id,
+                 SELECT s.id, s.account_id, 0, ?2 \
+                 FROM backup_sources s \
+                 WHERE s.account_id = ?1 AND s.encryption_enabled = 1 \
+                 ON CONFLICT(source_id) DO NOTHING",
                 account_id,
                 now,
             )
             .execute(&mut *tx)
-            .await?;
-            repaired += 1;
+            .await?
+            .rows_affected();
+
+            if disabled > 0 || seeded > 0 {
+                repaired += 1;
+            }
         }
 
         // Set the durable marker so this repair never runs again.
@@ -3289,6 +3327,99 @@ mod tests {
         let acks = repo.list_pending_recovery_acks().await.unwrap();
         assert_eq!(acks.len(), 1, "only account C's pre-existing ack remains");
         assert_eq!(acks[0].source_id, enc_c.id);
+    }
+
+    #[tokio::test]
+    async fn upgrade_repair_normalizes_partially_gated_multi_source_account() {
+        // CAP-P1 (post-GA hardening, DATA-SAFETY): a PARTIALLY-gated account - one
+        // encrypted source already disabled with a pending ack row AND a sibling
+        // encrypted source still ENABLED with no ack row - must be FULLY normalized
+        // by the upgrade repair: BOTH sources disabled, BOTH given a pending ack.
+        // The pre-fix repair skipped any account that already had an ack row, so the
+        // enabled sibling kept producing encrypted backups before the recovery phrase
+        // was acked (potentially unrecoverable). A single per-account ack then
+        // re-enables the WHOLE gate-disabled set, not just the earliest source.
+        let (repo, _dir) = temp_repo().await;
+
+        let mut acct = sample_account();
+        acct.encryption_master_key_id = None; // the pending primitive stamps it
+        repo.upsert_account(&acct).await.unwrap();
+
+        // Source 1: encrypted, disabled, with a durable pending ack (canonical flow).
+        let mut gated = sample_source(acct.id);
+        gated.encryption_enabled = true;
+        gated.enabled = false;
+        repo.insert_first_encrypted_source_pending_ack(&gated, "kc:alice-master".into(), 5)
+            .await
+            .unwrap();
+
+        // Source 2: encrypted, still ENABLED, with NO ack row - the escaped sibling.
+        let mut escaped = sample_source(acct.id);
+        escaped.encryption_enabled = true;
+        escaped.enabled = true;
+        repo.upsert_source(&escaped).await.unwrap();
+
+        // Precondition: exactly one pending ack (the gated source) + sibling enabled.
+        let acks = repo.list_pending_recovery_acks().await.unwrap();
+        assert_eq!(
+            acks.len(),
+            1,
+            "precondition: only the gated source is acked"
+        );
+        assert_eq!(acks[0].source_id, gated.id);
+        assert!(
+            repo.list_sources()
+                .await
+                .unwrap()
+                .iter()
+                .find(|s| s.id == escaped.id)
+                .unwrap()
+                .enabled,
+            "precondition: the escaped encrypted sibling is still enabled"
+        );
+
+        // Run the repair: the partially-gated account IS normalized (not skipped).
+        let repaired = repo
+            .repair_unacked_encrypted_sources_on_upgrade(99)
+            .await
+            .unwrap();
+        assert_eq!(repaired, 1, "the partially-gated account is repaired");
+
+        // BOTH encrypted sources are now DISABLED with a pending ack row each.
+        let sources = repo.list_sources().await.unwrap();
+        for s in &sources {
+            assert!(
+                !s.enabled,
+                "every encrypted source on the account is gate-disabled after repair"
+            );
+        }
+        let acks = repo.list_pending_recovery_acks().await.unwrap();
+        assert_eq!(acks.len(), 2, "a pending ack exists for BOTH sources");
+        let acked: Vec<_> = acks.iter().map(|a| a.source_id).collect();
+        assert!(
+            acked.contains(&gated.id) && acked.contains(&escaped.id),
+            "both the gated source and the escaped sibling now have a pending ack"
+        );
+
+        // A single per-account ack (reveal + enable+clear on ONE source) re-enables
+        // BOTH gate-disabled sources and clears the whole account gate.
+        repo.mark_recovery_phrase_revealed(escaped.id)
+            .await
+            .unwrap();
+        repo.enable_source_and_clear_recovery_ack(escaped.id)
+            .await
+            .unwrap();
+        let sources = repo.list_sources().await.unwrap();
+        for s in &sources {
+            assert!(
+                s.enabled,
+                "one account ack re-enables ALL gate-disabled sources"
+            );
+        }
+        assert!(
+            repo.list_pending_recovery_acks().await.unwrap().is_empty(),
+            "the whole account gate is cleared after a single ack"
+        );
     }
 
     #[tokio::test]

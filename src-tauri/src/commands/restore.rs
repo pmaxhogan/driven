@@ -1237,12 +1237,19 @@ fn map_io_err(e: std::io::Error) -> ErrorCode {
 // -----------------------------------------------------------------------------
 
 /// Resolve the per-source crypto verdict for a restore via the account's live
-/// crypto provider (fail-closed). An account with no running handle (never
-/// spawned / needs_reauth) yields `Unavailable` for an ENCRYPTED source so its
-/// files fail closed with `crypto.key_missing` rather than streaming ciphertext
-/// to disk; an unencrypted source resolves `Plaintext` (no handle needed since
-/// there is nothing to decrypt). `encryption_enabled` is the source row's flag, so
-/// the no-handle path can distinguish the two without touching the keystore.
+/// crypto provider, applying the FAIL-CLOSED policy keyed on the DB
+/// `SourceRow.encryption_enabled` flag (CAP-P2b, post-GA hardening). An account
+/// with no running handle (never spawned / needs_reauth) yields `Unavailable` for
+/// an ENCRYPTED source so its files fail closed with `crypto.key_missing` rather
+/// than streaming ciphertext to disk; an unencrypted source resolves `Plaintext`
+/// (no handle needed since there is nothing to decrypt).
+///
+/// CAP-P2b: the DB row's `encryption_enabled` - NOT the live provider's verdict -
+/// is the fail-closed authority, mirroring the EXECUTOR's policy
+/// (`executor.rs::resolve_source_crypto`). A stale provider snapshot
+/// (`reconfigure_account` keeps the prior snapshot when `list_sources` fails,
+/// sources.rs) could otherwise return `Plaintext` for an encrypted source and route
+/// ciphertext through the plaintext path. See [`apply_encryption_policy`].
 fn resolve_suite(
     state: &AppState,
     account_id: driven_core::types::AccountId,
@@ -1250,23 +1257,40 @@ fn resolve_suite(
     encryption_enabled: bool,
 ) -> SuiteVerdict {
     use driven_core::crypto_provider::CryptoProvider;
-    match state.account(account_id) {
-        Some(handle) => match handle.crypto.resolve(&source_id) {
-            CryptoResolution::Plaintext => SuiteVerdict::Plaintext,
-            CryptoResolution::Suite(s) => SuiteVerdict::Suite(s),
-            CryptoResolution::Unavailable => SuiteVerdict::Unavailable,
-        },
-        // No running handle: we cannot resolve a per-source key. Fail an ENCRYPTED
-        // source closed (Unavailable -> crypto.key_missing); an UNENCRYPTED source
-        // has nothing to decrypt, so stream its plaintext (the per-file blake3
-        // verify still guards against any corruption).
-        None => {
-            if encryption_enabled {
-                SuiteVerdict::Unavailable
-            } else {
-                SuiteVerdict::Plaintext
-            }
-        }
+    let resolution = match state.account(account_id) {
+        Some(handle) => handle.crypto.resolve(&source_id),
+        // No running handle: we cannot resolve a per-source key. Treat it as
+        // `Unavailable` and let the DB-keyed policy decide (an encrypted source
+        // fails closed; an unencrypted source forces plaintext).
+        None => CryptoResolution::Unavailable,
+    };
+    apply_encryption_policy(encryption_enabled, resolution)
+}
+
+/// CAP-P2b (post-GA hardening): the PURE fail-closed policy mirroring the
+/// executor (`executor.rs::resolve_source_crypto`). The DB `encryption_enabled`
+/// flag is the AUTHORITY; the live provider's `CryptoResolution` is only TRUSTED
+/// to supply the suite when the DB says encrypted:
+///
+/// - **DB encrypted** (`encryption_enabled == true`): ONLY a resolved
+///   [`CryptoResolution::Suite`] is acceptable -> [`SuiteVerdict::Suite`]. A
+///   provider `Plaintext` or `Unavailable` (e.g. a stale snapshot, or no running
+///   handle) FAILS CLOSED -> [`SuiteVerdict::Unavailable`] (`crypto.key_missing`),
+///   so ciphertext is never streamed through the plaintext path.
+/// - **DB unencrypted** (`encryption_enabled == false`): FORCE
+///   [`SuiteVerdict::Plaintext`], IGNORING any suite the provider returns. An
+///   unencrypted source has nothing to decrypt, so a spurious provider suite must
+///   never be applied.
+fn apply_encryption_policy(encryption_enabled: bool, resolution: CryptoResolution) -> SuiteVerdict {
+    if !encryption_enabled {
+        // DB says unencrypted: force plaintext, ignore any provider suite.
+        return SuiteVerdict::Plaintext;
+    }
+    // DB says encrypted: only a real suite is acceptable; anything else fails
+    // closed (never degrade to plaintext for an encrypted source).
+    match resolution {
+        CryptoResolution::Suite(s) => SuiteVerdict::Suite(s),
+        CryptoResolution::Plaintext | CryptoResolution::Unavailable => SuiteVerdict::Unavailable,
     }
 }
 
@@ -3914,5 +3938,76 @@ mod tests {
             cancelled: false,
             files: Vec::new(),
         }
+    }
+
+    // --- CAP-P2b: restore fail-closed on the DB encryption_enabled flag --------
+
+    /// A real (constructible) suite for the policy tests. The suite is never
+    /// invoked here - the policy only ROUTES it - so a fresh per-source key is fine.
+    fn fake_suite() -> Arc<dyn SourceCryptoSuite> {
+        Arc::new(DrivenCryptoSuite::new(
+            driven_crypto::key::SourceKey::generate(),
+        ))
+    }
+
+    #[test]
+    fn encrypted_source_with_provider_plaintext_fails_closed() {
+        // CAP-P2b (post-GA hardening): the DB row says the source is ENCRYPTED, but
+        // a stale/buggy provider snapshot returns Plaintext. The restore policy must
+        // FAIL CLOSED (Unavailable -> crypto.key_missing), NEVER stream ciphertext
+        // through the plaintext path. Mirrors the executor's resolve_source_crypto.
+        let verdict = apply_encryption_policy(true, CryptoResolution::Plaintext);
+        assert!(
+            matches!(verdict, SuiteVerdict::Unavailable),
+            "encrypted DB row + provider Plaintext must fail closed, not stream plaintext"
+        );
+    }
+
+    #[test]
+    fn encrypted_source_with_provider_unavailable_fails_closed() {
+        // CAP-P2b: an encrypted source whose provider cannot resolve a key (no
+        // running handle, locked keychain) fails closed.
+        let verdict = apply_encryption_policy(true, CryptoResolution::Unavailable);
+        assert!(
+            matches!(verdict, SuiteVerdict::Unavailable),
+            "encrypted DB row + Unavailable must fail closed"
+        );
+    }
+
+    #[test]
+    fn encrypted_source_with_provider_suite_uses_the_suite() {
+        // CAP-P2b: the ONE accepted shape for an encrypted source - the provider
+        // resolved a real suite - decrypts via that suite.
+        let verdict = apply_encryption_policy(true, CryptoResolution::Suite(fake_suite()));
+        assert!(
+            matches!(verdict, SuiteVerdict::Suite(_)),
+            "encrypted DB row + resolved suite must decrypt via the suite"
+        );
+    }
+
+    #[test]
+    fn unencrypted_source_with_provider_suite_forces_plaintext() {
+        // CAP-P2b: the DB row says UNENCRYPTED, but a stale provider snapshot returns
+        // a suite. The policy must FORCE plaintext and IGNORE the suite - an
+        // unencrypted source has nothing to decrypt, and applying a spurious suite
+        // would corrupt the restore.
+        let verdict = apply_encryption_policy(false, CryptoResolution::Suite(fake_suite()));
+        assert!(
+            matches!(verdict, SuiteVerdict::Plaintext),
+            "unencrypted DB row must force plaintext even if the provider returns a suite"
+        );
+    }
+
+    #[test]
+    fn unencrypted_source_with_provider_unavailable_forces_plaintext() {
+        // CAP-P2b: an unencrypted source streams plaintext regardless of the
+        // provider verdict (even Unavailable) - there is nothing to decrypt.
+        let plain = apply_encryption_policy(false, CryptoResolution::Plaintext);
+        assert!(matches!(plain, SuiteVerdict::Plaintext));
+        let unavail = apply_encryption_policy(false, CryptoResolution::Unavailable);
+        assert!(
+            matches!(unavail, SuiteVerdict::Plaintext),
+            "unencrypted DB row forces plaintext even on an Unavailable provider"
+        );
     }
 }

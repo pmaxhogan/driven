@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT account_id AS \"account_id!: String\" FROM recovery_phrase_acks WHERE source_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "account_id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "77703ca5e17dba000bd39a7d836166d9ea3b05d5bfae2442e3a448493210a4c7"
+}

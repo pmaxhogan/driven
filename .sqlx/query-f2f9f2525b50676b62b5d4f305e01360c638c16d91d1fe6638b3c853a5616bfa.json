@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE backup_sources SET enabled = 0 WHERE account_id = ?1 AND encryption_enabled = 1 AND enabled = 1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "f2f9f2525b50676b62b5d4f305e01360c638c16d91d1fe6638b3c853a5616bfa"
+}
