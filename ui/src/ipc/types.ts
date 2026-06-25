@@ -151,6 +151,19 @@ export interface ExclusionPreview {
 
 // --- Settings & misc (SPEC s11.6, s22) ---
 
+export interface ScheduleSettings {
+  enabled: boolean;
+  /** Minutes after local midnight the allowed window opens, 0..=1439. */
+  startMinute: number;
+  /** Minutes after local midnight the allowed window closes, 0..=1439.
+   *  end < start wraps past midnight; end == start allows the whole day. */
+  endMinute: number;
+  /** Seven booleans, index 0=Sunday..6=Saturday (matches Date.getDay()). */
+  days: boolean[];
+  /** Minutes to add to UTC to reach local time (-new Date().getTimezoneOffset()). */
+  utcOffsetMinutes: number;
+}
+
 export interface GlobalSettings {
   autoStartOnLogin: boolean;
   defaultConcurrentUploads: number | null;
@@ -161,6 +174,7 @@ export interface GlobalSettings {
   deepVerifyIntervalSecs: number;
   ioPriority: string;
   logLevel: string;
+  schedule: ScheduleSettings;
 }
 
 export interface TelemetrySettings {
@@ -202,6 +216,8 @@ export interface GlobalSettingsPatch {
   deepVerifyIntervalSecs?: number;
   ioPriority?: string;
   logLevel?: string;
+  /** Present = replace the whole schedule window. */
+  schedule?: ScheduleSettings;
 }
 
 export interface TelemetrySettingsPatch {

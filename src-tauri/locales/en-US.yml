@@ -20,6 +20,7 @@ tray:
     paused_manual: "Driven - paused"
     paused_battery: "Driven - paused on battery power"
     paused_metered: "Driven - paused on metered network"
+    paused_schedule: "Driven - paused outside the scheduled window"
     offline: "Connected, no Internet"
     no_internet: "Connected, no Internet"
     captive_portal: "Captive portal - click to sign in"

@@ -61,7 +61,7 @@ use crate::state::{ActivityLevel, NewActivity, SourceRow, StateRepo};
 use crate::time::Clock;
 use crate::types::{
     AccountId, ExecProgress, OrchestratorEvent, OrchestratorState, PauseReason, PowerEvent,
-    RelativePath, ScanMode, UnixMs,
+    RelativePath, ScanMode, ScheduleConfig, UnixMs,
 };
 use crate::watcher::ScanTickRequest;
 
@@ -172,6 +172,12 @@ pub struct OrchestratorConfig {
     /// `windows` settings key, wired in by the app shell (M5/M6); the field is
     /// here now so the orchestrator honours it.
     pub vss_mode: VssMode,
+    /// Schedule window (V2 schedule windows, DESIGN s17): when
+    /// [`enabled`](ScheduleConfig::enabled), the gate pauses with
+    /// [`PauseReason::Schedule`] outside the allowed local-time window and
+    /// resumes automatically once the clock re-enters it. The
+    /// [`Default`](ScheduleConfig::default) is disabled (V1 behaviour).
+    pub schedule: ScheduleConfig,
 }
 
 impl Default for OrchestratorConfig {
@@ -187,6 +193,7 @@ impl Default for OrchestratorConfig {
             bandwidth_cap_mbps: None,
             pacer_ceilings: PacerCeilings::default(),
             vss_mode: VssMode::Auto,
+            schedule: ScheduleConfig::default(),
         }
     }
 }
@@ -720,6 +727,15 @@ impl SyncOrchestrator {
         // Battery gate (DESIGN s5.7): pause on battery when skip_on_battery.
         if cfg.skip_on_battery && !power.ac_connected {
             return GateDecision::Pause(PauseReason::Battery);
+        }
+
+        // Schedule window (V2 schedule windows, DESIGN s17): pause outside the
+        // user's allowed local-time window. Reads the injected Clock so the
+        // decision is deterministic; the gate re-opens on a later cycle once
+        // the clock re-enters the window (no manual resume needed). A disabled
+        // schedule always allows, so this is inert under the V1 default.
+        if !cfg.schedule.allows(self.clock.now_ms()) {
+            return GateDecision::Pause(PauseReason::Schedule);
         }
 
         // Drive circuit breaker (DESIGN s5.8.3): if Drive's breaker is open,
@@ -2425,6 +2441,87 @@ mod tests {
             exec.executes.load(Ordering::SeqCst),
             0,
             "battery pause must not execute any plan"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_gate_pauses_outside_window() {
+        // AC + online + not metered, but the clock (FakeClock starts at epoch
+        // 1970-01-01 00:00 UTC) is outside a 09:00-17:00 window => Paused{Schedule}.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let cfg = OrchestratorConfig {
+            schedule: crate::types::ScheduleConfig {
+                enabled: true,
+                start_minute: 9 * 60,
+                end_minute: 17 * 60,
+                days: [true; 7],
+                utc_offset_minutes: 0,
+            },
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            cfg,
+        );
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        assert_eq!(
+            orch.state().await,
+            OrchestratorState::Paused {
+                reason: PauseReason::Schedule
+            }
+        );
+        assert_eq!(
+            exec.executes.load(Ordering::SeqCst),
+            0,
+            "outside the schedule window no plan executes"
+        );
+    }
+
+    #[tokio::test]
+    async fn schedule_gate_opens_inside_window() {
+        // Same window, but advance the clock to 09:00 UTC so the gate opens and
+        // the cycle proceeds past the schedule gate (no Schedule pause).
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let cfg = OrchestratorConfig {
+            schedule: crate::types::ScheduleConfig {
+                enabled: true,
+                start_minute: 9 * 60,
+                end_minute: 17 * 60,
+                days: [true; 7],
+                utc_offset_minutes: 0,
+            },
+            ..OrchestratorConfig::default()
+        };
+        let (orch, clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            cfg,
+        );
+        clock.advance(std::time::Duration::from_secs(9 * 3600)); // -> 09:00 UTC
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        assert_ne!(
+            orch.state().await,
+            OrchestratorState::Paused {
+                reason: PauseReason::Schedule
+            },
+            "inside the window the schedule gate must not pause"
         );
     }
 

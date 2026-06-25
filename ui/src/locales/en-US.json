@@ -164,7 +164,23 @@
         "never": "Never"
       },
       "telemetryLabel": "Send anonymous usage stats",
-      "telemetryNote": "Anonymous usage stats only - no file names or contents are ever sent. One click to disable."
+      "telemetryNote": "Anonymous usage stats only - no file names or contents are ever sent. One click to disable.",
+      "schedule": {
+        "label": "Only back up during a schedule window",
+        "startLabel": "From",
+        "endLabel": "To",
+        "daysLabel": "On these days",
+        "note": "Outside this window backups pause and resume automatically. Times are in this computer's local time zone.",
+        "day": {
+          "0": "Sun",
+          "1": "Mon",
+          "2": "Tue",
+          "3": "Wed",
+          "4": "Thu",
+          "5": "Fri",
+          "6": "Sat"
+        }
+      }
     }
   },
   "about": {

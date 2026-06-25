@@ -67,6 +67,13 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       deepVerifyIntervalSecs: 604800,
       ioPriority: "low",
       logLevel: "info",
+      schedule: {
+        enabled: false,
+        startMinute: 0,
+        endMinute: 0,
+        days: [true, true, true, true, true, true, true],
+        utcOffsetMinutes: 0,
+      },
     },
     telemetry: {
       enabled: true,

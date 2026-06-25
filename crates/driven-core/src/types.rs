@@ -326,6 +326,109 @@ pub enum PauseReason {
     /// DNS broken; SPEC s24 `net.dns_failed`). Kept distinct from [`Offline`]
     /// per CODEX_NOTES P2-9 (M4).
     DnsFailed,
+    /// Outside the user's configured schedule window (V2 schedule windows,
+    /// DESIGN s17). The orchestrator resumes automatically once the local
+    /// clock re-enters the allowed window - no manual action required.
+    Schedule,
+}
+
+// -----------------------------------------------------------------------------
+// ScheduleConfig (V2 schedule windows - DESIGN s17)
+// -----------------------------------------------------------------------------
+
+/// A time-of-day + day-of-week window during which sync is allowed (V2
+/// schedule windows, DESIGN s17 "only sync 23:00-06:00").
+///
+/// The window is expressed in the user's LOCAL wall-clock time. Like the
+/// pacer's "midnight Pacific" quota boundary (see [`crate::pacer`]),
+/// `driven-core` stays free of a timezone database: local time is derived
+/// from a fixed [`Self::utc_offset_minutes`] the app layer captures from the
+/// OS / browser. The bounded consequence is the same as the pacer's - across
+/// a DST transition the window shifts by up to an hour until the app
+/// re-reads the offset. This is deliberate and documented (DESIGN s17).
+///
+/// The predicate is a pure function of the injected [`Clock`](crate::time::Clock)
+/// reading, so the orchestrator gate is deterministic under `FakeClock`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+pub struct ScheduleConfig {
+    /// When `false` the schedule never gates (sync runs at any time). This is
+    /// the V1 behaviour and the [`Default`].
+    pub enabled: bool,
+    /// Minutes after local midnight the allowed window opens, `0..=1439`.
+    pub start_minute: u16,
+    /// Minutes after local midnight the allowed window closes, `0..=1439`.
+    ///
+    /// - `end > start`: a same-day window `[start, end)`.
+    /// - `end < start`: the window wraps past midnight (active `[start, 1440)`
+    ///   and `[0, end)`).
+    /// - `end == start`: the whole day is allowed (only [`Self::days`] gates).
+    pub end_minute: u16,
+    /// Which local days the window is active on, indexed `0 = Sunday ..=
+    /// 6 = Saturday` to match JavaScript's `Date.getDay()`. The window is
+    /// evaluated against the CURRENT local day, so a window that wraps past
+    /// midnight (e.g. 23:00-06:00) needs both the evening day and the
+    /// following morning's day enabled for the whole window to be allowed.
+    pub days: [bool; 7],
+    /// Minutes to ADD to UTC to reach the user's local wall-clock time
+    /// (e.g. `-480` for PST = UTC-8). The app layer sets this from the OS;
+    /// the browser value is `-new Date().getTimezoneOffset()`.
+    pub utc_offset_minutes: i16,
+}
+
+impl Default for ScheduleConfig {
+    /// Disabled: sync runs at any time (V1 behaviour). The window fields are
+    /// inert while `enabled` is false.
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            start_minute: 0,
+            end_minute: 0,
+            days: [true; 7],
+            utc_offset_minutes: 0,
+        }
+    }
+}
+
+impl ScheduleConfig {
+    /// Milliseconds per minute / minutes per day, for the local-time maths.
+    const MS_PER_MIN: i64 = 60_000;
+    const MINS_PER_DAY: i64 = 1_440;
+
+    /// True if sync is allowed at the wall-clock instant `now_ms`.
+    ///
+    /// A disabled schedule always allows. Otherwise the UTC instant is shifted
+    /// into local wall time by [`Self::utc_offset_minutes`], reduced to a
+    /// local day-of-week + minute-of-day, and tested against the window. Uses
+    /// Euclidean division/remainder so a negative (pre-epoch) or
+    /// backwards-jumped clock reading still yields an in-range day/minute
+    /// rather than a panic (DESIGN s18.7 - the clock may move backwards).
+    pub fn allows(&self, now_ms: UnixMs) -> bool {
+        if !self.enabled {
+            return true;
+        }
+        let local_ms = now_ms.saturating_add((self.utc_offset_minutes as i64) * Self::MS_PER_MIN);
+        let total_min = local_ms.div_euclid(Self::MS_PER_MIN);
+        let min_of_day = total_min.rem_euclid(Self::MINS_PER_DAY) as u16;
+        // Days since the Unix epoch in local time. 1970-01-01 was a Thursday,
+        // which is `getDay() == 4`, so offset the day count by 4 before the
+        // mod-7 to land on the Sunday-indexed weekday.
+        let day_index = total_min.div_euclid(Self::MINS_PER_DAY);
+        let dow = (day_index + 4).rem_euclid(7) as usize;
+        if !self.days[dow] {
+            return false;
+        }
+        let (s, e) = (self.start_minute, self.end_minute);
+        if s == e {
+            // Whole day allowed; only the day-of-week gates.
+            return true;
+        }
+        if s < e {
+            min_of_day >= s && min_of_day < e
+        } else {
+            // Wraps past midnight.
+            min_of_day >= s || min_of_day < e
+        }
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -1208,5 +1311,114 @@ mod tests {
     fn relative_path_from_path_round_trips() {
         let rp: RelativePath = std::path::Path::new("a/b.txt").try_into().unwrap();
         assert_eq!(rp.as_str(), "a/b.txt");
+    }
+
+    // --- ScheduleConfig (V2 schedule windows) -------------------------------
+
+    /// Monday 2024-01-01 00:00:00 UTC, in epoch ms. The dow formula resolves
+    /// this to `getDay() == 1` (Monday); used as the anchor for the cases
+    /// below (offsets in minutes/days are added on top).
+    const MON_2024_01_01_UTC_MS: UnixMs = 1_704_067_200_000;
+    const MIN_MS: UnixMs = 60_000;
+    const DAY_MS: UnixMs = 1_440 * MIN_MS;
+
+    fn all_days() -> [bool; 7] {
+        [true; 7]
+    }
+
+    #[test]
+    fn schedule_disabled_always_allows() {
+        let s = ScheduleConfig::default();
+        assert!(!s.enabled);
+        assert!(s.allows(MON_2024_01_01_UTC_MS));
+        assert!(s.allows(0));
+        assert!(s.allows(-1)); // pre-epoch must not panic
+    }
+
+    #[test]
+    fn schedule_same_day_window_half_open() {
+        // 09:00-17:00 every day.
+        let s = ScheduleConfig {
+            enabled: true,
+            start_minute: 9 * 60,
+            end_minute: 17 * 60,
+            days: all_days(),
+            utc_offset_minutes: 0,
+        };
+        let at = |min: i64| s.allows(MON_2024_01_01_UTC_MS + min * MIN_MS);
+        assert!(!at(0)); // 00:00 - before
+        assert!(!at(8 * 60 + 59)); // 08:59 - before
+        assert!(at(9 * 60)); // 09:00 - open (inclusive)
+        assert!(at(16 * 60 + 59)); // 16:59 - inside
+        assert!(!at(17 * 60)); // 17:00 - close (exclusive)
+        assert!(!at(23 * 60)); // 23:00 - after
+    }
+
+    #[test]
+    fn schedule_wrap_past_midnight() {
+        // 23:00-06:00 every day.
+        let s = ScheduleConfig {
+            enabled: true,
+            start_minute: 23 * 60,
+            end_minute: 6 * 60,
+            days: all_days(),
+            utc_offset_minutes: 0,
+        };
+        let at = |min: i64| s.allows(MON_2024_01_01_UTC_MS + min * MIN_MS);
+        assert!(at(23 * 60)); // 23:00 - open
+        assert!(at(23 * 60 + 30)); // 23:30 - evening tail
+        assert!(at(0)); // 00:00 - past midnight
+        assert!(at(5 * 60 + 59)); // 05:59 - morning
+        assert!(!at(6 * 60)); // 06:00 - close (exclusive)
+        assert!(!at(12 * 60)); // noon - outside
+    }
+
+    #[test]
+    fn schedule_equal_bounds_is_whole_day() {
+        // start == end => only the day-of-week gates.
+        let s = ScheduleConfig {
+            enabled: true,
+            start_minute: 0,
+            end_minute: 0,
+            days: all_days(),
+            utc_offset_minutes: 0,
+        };
+        for h in [0, 6, 12, 18, 23] {
+            assert!(s.allows(MON_2024_01_01_UTC_MS + h * 60 * MIN_MS));
+        }
+    }
+
+    #[test]
+    fn schedule_day_of_week_gates() {
+        // Whole-day window, but only Monday (index 1) enabled.
+        let mut days = [false; 7];
+        days[1] = true; // Monday
+        let s = ScheduleConfig {
+            enabled: true,
+            start_minute: 0,
+            end_minute: 0,
+            days,
+            utc_offset_minutes: 0,
+        };
+        assert!(s.allows(MON_2024_01_01_UTC_MS)); // Monday
+        assert!(!s.allows(MON_2024_01_01_UTC_MS + DAY_MS)); // Tuesday
+        assert!(!s.allows(MON_2024_01_01_UTC_MS - DAY_MS)); // Sunday
+        assert!(s.allows(MON_2024_01_01_UTC_MS + 7 * DAY_MS)); // next Monday
+    }
+
+    #[test]
+    fn schedule_utc_offset_shifts_local_time() {
+        // 00:00-01:00 LOCAL, every day, at UTC+1. 00:00 UTC == 01:00 local,
+        // which is outside [00:00, 01:00); one hour earlier (23:00 UTC) ==
+        // 00:00 local, which is inside.
+        let s = ScheduleConfig {
+            enabled: true,
+            start_minute: 0,
+            end_minute: 60,
+            days: all_days(),
+            utc_offset_minutes: 60,
+        };
+        assert!(!s.allows(MON_2024_01_01_UTC_MS)); // 01:00 local
+        assert!(s.allows(MON_2024_01_01_UTC_MS - 60 * MIN_MS)); // 00:00 local
     }
 }

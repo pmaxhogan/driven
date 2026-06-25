@@ -166,7 +166,10 @@ impl TrayIcon {
 /// yellow-with-`!`) rather than a plain user/auto pause (DESIGN s8.1 yellow)?
 fn pause_reason_is_network(reason: PauseReason) -> bool {
     match reason {
-        PauseReason::Manual | PauseReason::Battery | PauseReason::Metered => false,
+        PauseReason::Manual
+        | PauseReason::Battery
+        | PauseReason::Metered
+        | PauseReason::Schedule => false,
         PauseReason::Offline
         | PauseReason::ServiceDown
         | PauseReason::NoInternet
@@ -265,6 +268,7 @@ fn tooltip_for_pause(reason: PauseReason) -> String {
         PauseReason::Manual => "tray.tooltip.paused_manual",
         PauseReason::Battery => "tray.tooltip.paused_battery",
         PauseReason::Metered => "tray.tooltip.paused_metered",
+        PauseReason::Schedule => "tray.tooltip.paused_schedule",
         PauseReason::Offline => "tray.tooltip.offline",
         PauseReason::NoInternet => "tray.tooltip.no_internet",
         PauseReason::CaptivePortal => "tray.tooltip.captive_portal",
@@ -1068,6 +1072,7 @@ mod tests {
             PauseReason::Manual,
             PauseReason::Battery,
             PauseReason::Metered,
+            PauseReason::Schedule,
         ] {
             assert_eq!(
                 TrayIcon::for_state(&OrchestratorState::Paused { reason }),

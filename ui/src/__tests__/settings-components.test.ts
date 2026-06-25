@@ -4,7 +4,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { mount, flushPromises } from "@vue/test-utils";
 
 import { i18n } from "../i18n";
-import type { SettingsDto, SourceDto } from "../ipc/types";
+import type { ScheduleSettings, SettingsDto, SourceDto } from "../ipc/types";
 
 // Component tests for the M6 settings UI: the SourceTable row actions, the
 // AddSourceWizard multi-step flow, and the Rules-tab round-trip. They drive the
@@ -72,6 +72,13 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       deepVerifyIntervalSecs: 604800,
       ioPriority: "low",
       logLevel: "info",
+      schedule: {
+        enabled: false,
+        startMinute: 0,
+        endMinute: 0,
+        days: [true, true, true, true, true, true, true],
+        utcOffsetMinutes: 0,
+      },
     },
     telemetry: {
       enabled: true,
@@ -586,6 +593,55 @@ describe("Settings Rules tab", () => {
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
       patch: { global: { bandwidthCapMbps: 50 } },
     });
+  });
+
+  it("schedule window: enable, edit time, and toggle a day each patch the schedule", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    type SchedPatch = { patch?: { global?: { schedule?: ScheduleSettings } } };
+    const lastSchedule = (): ScheduleSettings | undefined =>
+      invokeMock.mock.calls
+        .filter((c) => c[0] === "update_settings" && (c[1] as SchedPatch).patch?.global?.schedule)
+        .map((c) => (c[1] as SchedPatch).patch!.global!.schedule!)
+        .pop();
+
+    // The time/day controls are hidden until the schedule is enabled.
+    expect(wrapper.find('input[type="time"]').exists()).toBe(false);
+
+    await wrapper.get('[data-testid="schedule-enabled"]').setValue(true);
+    await flushPromises();
+    const enabled = lastSchedule();
+    expect(enabled?.enabled).toBe(true);
+    expect(enabled?.days).toHaveLength(7);
+    expect(typeof enabled?.utcOffsetMinutes).toBe("number");
+
+    // The window controls are now visible; editing the start time re-patches
+    // the local minute-of-day (09:30 -> 570).
+    const start = wrapper.get('input[type="time"]');
+    await start.setValue("09:30");
+    await start.trigger("change");
+    await flushPromises();
+    expect(lastSchedule()?.startMinute).toBe(9 * 60 + 30);
+
+    // Toggling the Sunday (index 0) button flips that day off.
+    const dayButtons = wrapper.findAll('[data-testid="schedule-setting"] button');
+    expect(dayButtons).toHaveLength(7);
+    await dayButtons[0].trigger("click");
+    await flushPromises();
+    expect(lastSchedule()?.days[0]).toBe(false);
   });
 
   it("an empty bandwidth cap patches null (unlimited)", async () => {
