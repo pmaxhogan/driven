@@ -349,6 +349,11 @@ jobs:
       # R3-P1-2: --require-targets makes the generator ERROR unless EVERY V1
       # target produced a manifest, so a partial dev update tree (missing `.sig`,
       # asset collision, mapping miss) can never deploy while CI stays green.
+      # R7-P1-1 (deploy path == fetch path): generate UNDER a `site/` staging root
+      # (`site/updates/dev/...`) and deploy the `site/` parent below, so Cloudflare
+      # Pages serves the manifests at `/updates/dev/...` - matching the app's fetch
+      # endpoint exactly. Deploying the bare `updates/` dir made its contents the
+      # Pages root, stripping the `/updates/` prefix and 404ing every updater check.
       - name: Generate dev update.json tree
         run: |
           set -euo pipefail
@@ -356,6 +361,7 @@ jobs:
             --version "${{ steps.ver.outputs.version }}" \
             --assets-dir release-assets \
             --notes-file release-notes.md \
+            --out site/updates \
             --require-targets "windows-x86_64,darwin-x86_64,darwin-aarch64,linux-x86_64" \
             --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
 
@@ -365,24 +371,66 @@ jobs:
         run: |
           set -euo pipefail
           for t in windows/x86_64 darwin/x86_64 darwin/aarch64 linux/x86_64; do
-            if [ ! -f "updates/dev/${t}/update.json" ]; then
-              echo "::error::missing required manifest updates/dev/${t}/update.json"
+            if [ ! -f "site/updates/dev/${t}/update.json" ]; then
+              echo "::error::missing required manifest site/updates/dev/${t}/update.json"
               exit 1
             fi
           done
 
       # R1-P1-7: `pages deploy` is a whole-site snapshot, so overlay the OTHER
       # channel's (stable) currently-live manifests before deploying or this
-      # would clobber updates/stable.
+      # would clobber updates/stable. R7-P1-1: tree-dir is the staging `site/updates`.
       - name: Overlay live stable manifests (do not wipe the other channel)
-        run: bash scripts/fetch-live-channel.sh stable updates "$UPDATES_BASE"
+        run: bash scripts/fetch-live-channel.sh stable site/updates "$UPDATES_BASE"
 
+      # R7-P1-1: deploy the `site/` PARENT (which contains `updates/`), NOT the
+      # bare `updates/` dir, so the served path keeps the `/updates/` prefix and
+      # matches the app's `updates/dev/<os>/<arch>/update.json` fetch endpoint.
       - name: Deploy dev manifests to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
         with:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
-          command: pages deploy updates --project-name=driven-updates --branch=main
+          command: pages deploy site --project-name=driven-updates --branch=main
+
+      # R7-P1-1 (post-deploy smoke): prove the deployed dev manifests are reachable
+      # at the EXACT public URL the in-app updater fetches
+      # (`$UPDATES_BASE/dev/<os>/<arch>/update.json`). Catches the deploy-path !=
+      # fetch-path mismatch for real: a wrong prefix or missing manifest 404s and
+      # FAILS the job rather than shipping a silently-broken dev channel. Validates
+      # 200 AND a parseable JSON manifest with a `version` for each required target.
+      - name: Smoke test deployed dev manifests
+        run: |
+          set -euo pipefail
+          # Cloudflare Pages propagation can lag the deploy by a few seconds; a
+          # bounded curl retry (NOT a sleep/poll loop) rides that out.
+          fail=0
+          for t in windows/x86_64 darwin/x86_64 darwin/aarch64 linux/x86_64; do
+            url="${UPDATES_BASE}/dev/${t}/update.json"
+            body="$(mktemp)"
+            code="$(curl -sSL --retry 5 --retry-delay 4 --retry-all-errors \
+              --connect-timeout 15 --max-time 120 \
+              -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
+            code="${code:-000}"
+            if [ "$code" != "200" ]; then
+              echo "::error::dev smoke: ${url} returned HTTP ${code} (expected 200)"
+              fail=1
+              rm -f "$body"
+              continue
+            fi
+            if ! node -e 'const v=JSON.parse(require("fs").readFileSync(process.argv[1],"utf8"));if(!v||typeof v.version!=="string"||v.version.length===0){console.error("manifest has no version string");process.exit(1)}' "$body"; then
+              echo "::error::dev smoke: ${url} returned 200 but not a valid update manifest (no version)"
+              fail=1
+            else
+              echo "dev smoke OK: ${url} (version $(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$body"))"
+            fi
+            rm -f "$body"
+          done
+          if [ "$fail" -ne 0 ]; then
+            echo "::error::dev updater smoke FAILED - the deployed manifests are not reachable at the app's fetch path"
+            exit 1
+          fi
+          echo "all required dev manifests are reachable at ${UPDATES_BASE}/dev/<os>/<arch>/update.json"
 
   # R4-P1-3 (the "THEN GC" half of stage-then-publish): garbage-collect the
   # PREVIOUS runs' assets from the rolling `dev` release - but ONLY now, after the

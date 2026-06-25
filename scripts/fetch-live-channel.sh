@@ -19,7 +19,14 @@
 # Usage:
 #   scripts/fetch-live-channel.sh <channel> <tree-dir> <updates-base-url>
 # e.g.
-#   scripts/fetch-live-channel.sh dev updates https://driven.maxhogan.dev/updates
+#   scripts/fetch-live-channel.sh dev site/updates https://driven.maxhogan.dev/updates
+#
+# R7-P1-1: <tree-dir> is the local `updates/` tree that the workflow will deploy.
+# The workflows assemble it under a `site/` staging parent (so it is
+# `site/updates/<channel>/...`) and `wrangler pages deploy site` - deploying the
+# PARENT keeps the served `/updates/` URL prefix that the in-app updater fetches.
+# This script appends `<channel>/<plat>/update.json` to whatever <tree-dir> it is
+# given, so it works unchanged whether the tree root is `updates` or `site/updates`.
 #
 # FAIL-CLOSED policy (R4-P1-4). The deploy that follows is a WHOLE-SITE snapshot,
 # so any OTHER-channel manifest we fail to overlay here is WIPED off the live site
