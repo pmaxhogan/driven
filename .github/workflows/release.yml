@@ -1,0 +1,156 @@
+name: Release
+
+# Tag-triggered GA release pipeline (SPEC s19.3).
+#
+# Fires ONLY on a `v*` tag push (which release-please.yml creates when the
+# "chore: release" PR is merged). Builds signed installers + updater artifacts
+# for all four GA targets, attaches them to the GitHub Release, then publishes
+# the per-target `updates/stable/.../update.json` manifests to the GitHub
+# Release AND to Cloudflare Pages (driven-updates -> driven.maxhogan.dev) so the
+# in-app updater can fetch them (SPEC s15.3 V1).
+#
+# COST POLICY: the full 4-row (3-OS) build matrix is allowed here because this
+# is the tag-only (`v*`) path - it runs once per tagged release, not per push.
+# The rolling dev channel (dev-channel.yml) is gated separately so main pushes
+# do NOT silently trigger a 3-OS bundle.
+
+on:
+  push:
+    tags:
+      - "v*"
+
+# tauri-action creates/updates the GitHub Release and uploads assets; the
+# manifest job uploads further assets and deploys to CF Pages.
+permissions:
+  contents: write
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  build:
+    name: build ${{ matrix.target }}
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    env:
+      # The Tauri app boots the headless core whose state layer uses sqlx
+      # compile-time-checked queries; release runners have no live DB, so
+      # resolve against the committed .sqlx/ cache (same as ci.yml).
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux Tauri deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: pnpm install
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      - name: Build + sign + release (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          # Updater signing keypair. The password secret EXISTS but is empty.
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          tagName: ${{ github.ref_name }}
+          releaseName: "Driven ${{ github.ref_name }}"
+          releaseBody: "See CHANGELOG.md for details."
+          releaseDraft: false
+          prerelease: false
+          # tauri-action's own updater JSON (latest.json) is target-flat and
+          # does NOT match Driven's channel-in-path endpoint layout
+          # (SPEC s15). We generate the channel/target tree ourselves in the
+          # publish-updater-manifest job, so suppress the built-in one to avoid
+          # a confusing second manifest on the release. (The .sig files are
+          # still uploaded - uploadUpdaterSignatures defaults to true - so the
+          # manifest generator can reference them.)
+          uploadUpdaterJson: false
+          args: --target ${{ matrix.target }}
+
+  publish-updater-manifest:
+    name: publish stable update manifests
+    needs: build
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      deployments: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Builds updates/stable/<target>/update.json for every GA target by
+      # reading the just-published release assets (installers + .sig files) of
+      # the current tag. Script is authored by M9a (scripts/generate-update-json.mjs);
+      # it executes for real only here, at a tag, by which point M9a has landed.
+      - name: Generate stable update.json tree
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: ${{ github.ref_name }}
+        run: node scripts/generate-update-json.mjs stable
+
+      # Attach the generated manifests to the GitHub Release too (a CDN-of-last-
+      # resort + an auditable record of what was published for this tag).
+      - name: Upload manifests to GitHub Release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          shopt -s nullglob
+          files=(updates/stable/*/update.json)
+          if [ ${#files[@]} -eq 0 ]; then
+            echo "::error::no updates/stable/*/update.json files were generated"
+            exit 1
+          fi
+          for f in "${files[@]}"; do
+            target="$(basename "$(dirname "$f")")"
+            # Flatten to a unique asset name; the canonical fetch path is CF Pages.
+            cp "$f" "stable-${target}-update.json"
+            gh release upload "$RELEASE_TAG" "stable-${target}-update.json" --clobber
+          done
+
+      # Publish the channel/target tree to Cloudflare Pages so
+      # driven.maxhogan.dev/updates/stable/<target>/update.json serves it
+      # (SPEC s15.3 V1). NOTE (see CODEX_NOTES "M9d"): `pages deploy` replaces
+      # the whole site snapshot, so this deploy must carry BOTH channels'
+      # current trees. generate-update-json.mjs is responsible for assembling
+      # the full `updates/` directory (stable + the existing dev tree) before
+      # this step; deploying only updates/stable would clobber updates/dev.
+      - name: Deploy manifests to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy updates --project-name=driven-updates --branch=main
