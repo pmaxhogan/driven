@@ -227,7 +227,7 @@ driven/
 │  │  ├─ ci.yml
 │  │  ├─ release-please.yml
 │  │  ├─ release.yml                   # tag-triggered, stable channel
-│  │  └─ dev-channel.yml               # main-push-triggered, dev channel
+│  │  └─ dev-channel.yml               # gated (dispatch OR [dev-build] marker), dev channel
 │  └─ release-please-config.json
 │
 ├─ updater/                            # static endpoint payload (also served from gh-pages branch / R2)
@@ -1520,12 +1520,28 @@ jobs:
 
 ### 19.4 `dev-channel.yml`
 
-Triggers: `push: main` (after release-please runs and doesn't open a new PR).
+Triggers (R9-P2-2 - GATED, NOT every main push): `workflow_dispatch` (manual, from
+the Actions tab) OR a `push: main` whose HEAD commit message contains the literal
+marker `[dev-build]`. A decision step gates the build on `event_name == dispatch ||
+commit message contains [dev-build]`, so ordinary main commits (docs, refactors,
+release-please commits - those ride the tag path in release.yml) do NOT spend
+premium CI minutes on a dev installer.
 
 Same build matrix as release.yml but:
-- Version is `0.0.0-dev.<short-sha>`.
+- Version is `<next-patch>-dev.<run_number>.<sha>` (computed by
+  `scripts/set-dev-version.mjs`): strictly ABOVE the current stable release and
+  MONOTONIC across dev builds, so a stable user who opts into dev is always offered
+  a strictly-newer dev build (the earlier `0.0.0-dev.<short-sha>` was LOWER than
+  stable `0.1.0` and broke that). The build, publish-manifest, and GC jobs all
+  derive the SAME value from the same checked-out commit.
+- STAGE-THEN-PUBLISH (R4-P1-3): builds + uploads THIS run's run-unique assets to a
+  rolling `dev` GitHub Release, then generates + validates all manifests, and only
+  AFTER that succeeds GCs superseded assets - it never deletes before the rebuild
+  validates (no broken-link window).
 - Uploads to a `dev` GitHub Release ("rolling") via `softprops/action-gh-release`.
-- Generates `dev/{{target}}/update.json` published to `gh-pages`.
+- Generates `dev/{{target}}/update.json` published to Cloudflare Pages under
+  `/updates/dev/` (the other channel's live manifests are preserved by
+  `scripts/fetch-live-channel.sh`, fail-closed).
 
 ---
 

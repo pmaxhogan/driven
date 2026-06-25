@@ -2558,3 +2558,78 @@ M9-9, M9's per-milestone loop closes; any residual is deferred to the pre-GA who
   + deny check + fmt --all --check + git diff --check all green; no sqlx/migration change (no
   sqlx-prepare needed). ui pnpm install + lint + test:unit (152) + build (vue-tsc clean). Stub sweep on
   the touched surface (src-tauri/src, ui): zero non-test `todo!(`/`unimplemented!(`/`unreachable!(`.
+
+## M9 fix round 9 (closeout) (codex M9-9b: fix P1-2 + 3 P2, document P1-1 as accepted residual)
+
+Source review: `.claude/codex-reviews/M9-9b-20260625-014635.md` (baseline 97f596e, M9 @ 4cf769c). This
+is the M9 CLOSEOUT round: after it lands + CI green, the M9 per-milestone codex loop CLOSES - no further
+M9 codex recheck. Any residual is caught by the pre-GA whole-repo xhigh capstone (task #14) + M10.
+Single sole-actor.
+
+- R9-P1-2 (RecoveryPhraseReveal post-restart reveal could latch then get reset, DATA-SAFETY). After
+  `await revealAction`, `toggle` checked `hasPhrase` (the parent `phrase` prop) before Vue had delivered
+  the prop, and when the prop then arrived the `watch(() => props.phrase)` reset `revealed`/`everRevealed`
+  to false. So the post-restart SourceTable reveal/ack path (reachable at v0.1.0 by restarting
+  mid-onboarding) could reveal successfully yet keep the ack checkbox LOCKED, leaving a pending encrypted
+  source disabled forever. FIXED deterministically: `revealAction` now RETURNS the phrase
+  (`() => Promise<string[] | void>`); `toggle` latches `revealed`/`everRevealed` FROM the returned value
+  (via a new `latchReveal(phrase)` helper) - it no longer depends on Vue having delivered the prop. The
+  prop watcher records the latched words in `latchedPhrase` and SKIPS the re-lock when the incoming prop
+  is just the (later-tick) delivery of those SAME words (`samePhrase`), so the latch survives; a
+  genuinely DIFFERENT or cleared phrase still re-locks (the R3-P1-1 contract). `ackEnabled` now treats
+  "a real phrase is present" as satisfied by the prop OR the latched phrase, so the checkbox is reachable
+  across the prop tick. Both parents (`SourceTable.vue`, `AddSourceWizard.vue`) updated to RETURN the
+  revealed phrase from their reveal actions. Vitest (`recovery-phrase-reveal.test.ts`): a post-restart
+  reveal (empty prop, action returns the words) UNLOCKS the ack and STAYS unlocked across the same-words
+  prop delivery (and the user can acknowledge); a DIFFERENT phrase arriving after a latch still re-locks.
+
+- R9-P2-1 (fetch-live-channel.sh fail closed on preservation WRITE errors too, release-pipeline). The
+  script used `set -uo pipefail` WITHOUT `-e`, so a failed `mkdir`/`mv` in the channel-preservation
+  overlay could still let it exit 0 - the following whole-site Cloudflare Pages deploy would then WIPE
+  the other channel's live manifests (channel wipe; broken auto-update for that channel). FIXED:
+  `set -euo pipefail` + EXPLICIT checked overlay writes - the `ok` branch now checks `mkdir -p
+  "$dest_dir"` and `mv "$tmp" "$dest"`, and on either failure cleans up the temp file, emits a
+  `::error::` line, and `exit 1` (fail closed, aborting the deploy; consistent with the existing fetch
+  fail-closed policy that tolerates only a genuine 404). Re-validated with a stubbed-curl harness: the
+  two existing behaviors still hold (transient non-404 fetch failure -> exit 1; all-local i.e. every
+  dest already generated -> exit 0, curl never called), plus all-404 -> exit 0, the new overlay-write
+  failure -> exit 1, and the happy path overlays a manifest and exits 0.
+
+- R9-P2-2 (DOCUMENTED DEVIATION - align design docs to the resolved dev-channel contract). The
+  `dev-channel.yml` workflow is the RESOLVED-CORRECT contract; DESIGN.md ("per-commit builds from main"),
+  SPEC.md s19.4 ("main-push-triggered", "`0.0.0-dev.<short-sha>`"), and ROADMAP.md ("`0.0.0-dev.<sha>`")
+  described the EARLIER sketch. The workflow was deliberately changed across M9: (a) GATED on a manual
+  `workflow_dispatch` OR a `[dev-build]` head-commit marker (NOT every main push) to bound premium CI
+  minutes - most main commits have no business producing a dev installer; (b) the dev version is
+  `<next-patch>-dev.<run_number>.<sha>` (R2-P1-1) so it is strictly ABOVE the current stable + MONOTONIC
+  across dev builds (the old `0.0.0-dev.<sha>` was LOWER than stable `0.1.0`, so a stable user opting into
+  dev was never offered an update). The workflow was NOT reverted; instead the docs were updated to
+  match: DESIGN.md s3.6 update-channels bullet, SPEC.md s19.4 + the dev-channel.yml tree comment, and
+  ROADMAP.md M9 acceptance. This is a deliberate documented deviation from the original SPEC sketch.
+
+- R9-P2-3 (About.vue macOS manual-download link must follow the channel). The macOS DMG download link
+  was hardcoded to the stable `/releases/latest`, so a dev-channel macOS user shown a dev update banner
+  was sent to STABLE. FIXED: a `macDownloadUrl` computed derives the URL from `updater.available.channel`
+  - `dev` -> `/releases/tag/dev` (the rolling dev release tag dev-channel.yml publishes via
+  softprops/action-gh-release), otherwise `/releases/latest` (defaults to stable when no update is in
+  hand). Vitest (`about-mac-gating.test.ts`): a dev-channel available update links to `/releases/tag/dev`
+  and a stable one to `/releases/latest`.
+
+- R9-P1-1 (ACCEPTED M9 RESIDUAL - NOT fixed this round). `crates/driven-core/src/state/sqlite.rs`
+  (~:1075 disable-all, :1105 single ack row, :1001 re-enable-one): the pre-0004 upgrade repair disables
+  ALL encrypted sources for an account but creates an ack row for / re-enables only the EARLIEST source.
+  A pre-0004 account with MULTIPLE encrypted sources would leave previously-enabled siblings disabled
+  forever after the one visible ack; if the earliest encrypted source was intentionally disabled, ack
+  flips it on. This is NOT reachable at the v0.1.0 first GA: there is NO pre-0004 install base - every
+  fresh install creates the 0004 table from the start and routes every encrypted source through the
+  proper per-source gate, so the disable-all/ack-one repair path is never entered. ACCEPTED as an M9
+  residual; revisit in the pre-GA whole-repo xhigh capstone (task #14) / post-GA. The correct fix is to
+  record each source's ORIGINAL enabled-state and restore ALL affected sources atomically on the
+  account-level ack (or create per-source ack rows for every enabled encrypted source that was disabled).
+
+  Gates: SQLX_OFFLINE cargo build --workspace --all-targets + clippy --workspace --all-targets -D
+  warnings + test --workspace (google_e2e + elevation honest gate-skip) + build -p driven-app + deny
+  check + fmt --all --check + git diff --check all green; no sqlx/migration change. ui pnpm install +
+  lint + test:unit + build (vue-tsc clean). fetch-live-channel.sh re-validated via a stubbed-curl
+  harness (no committed shell test; no .yml changed, so no actionlint run). Stub sweep on the touched
+  surface (ui, scripts, src-tauri/src): zero non-test `todo!(`/`unimplemented!(`/`unreachable!(`.

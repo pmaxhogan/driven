@@ -133,7 +133,15 @@ honour them; deviating requires re-asking the user.
     work cleanly on macOS in V1** — macOS users do a manual reinstall
     per release. No fix planned until Apple hardware is available.
 - **Update channels:** **stable + dev.** Stable = tagged releases on `main`.
-  Dev = per-commit builds from `main`. Dev is opt-in; stable is the default.
+  Dev = GATED dev builds (NOT every main commit): `dev-channel.yml` builds only on
+  a manual `workflow_dispatch` OR when the head commit message contains the
+  `[dev-build]` marker - this bounds premium CI minutes (most main commits, e.g.
+  docs/refactors, have no business producing a dev installer). The dev version is
+  `<next-patch>-dev.<run_number>.<sha>` (above the current stable + monotonic across
+  dev builds, so the updater always offers a strictly-newer dev build). Dev is
+  opt-in; stable is the default. (R9-P2-2: see design/CODEX_NOTES.md "M9 fix round 9
+  (closeout)" for why this gated/versioned contract replaced the earlier
+  per-commit, `0.0.0-dev.<sha>` sketch.)
 
 ### 3.7 Test strategy
 - **Hybrid trait-based DriveClient.** `RemoteStore` trait; an

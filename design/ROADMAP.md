@@ -551,8 +551,10 @@ opt-in (dev channel). Each new version surfaces release notes in-app.
 - Manual test: build v0.1.0 locally, install it, then release v0.1.1
   via CI → installed app picks up the update, downloads, verifies
   signature, applies on next restart.
-- Dev channel test: same flow with a `0.0.0-dev.<sha>` build pushed via
-  `dev-channel.yml`.
+- Dev channel test: same flow with a `<next-patch>-dev.<run_number>.<sha>` build
+  produced by `dev-channel.yml` (R9-P2-2: GATED on a manual `workflow_dispatch` OR a
+  `[dev-build]` head-commit marker, NOT every main push; the version is above the
+  current stable + monotonic so the updater offers a strictly-newer dev build).
 - Tamper test: corrupt the bundled binary in the release asset → updater
   refuses to apply (signature check fails).
 - In-app changelog shows the release notes from `CHANGELOG.md`.
