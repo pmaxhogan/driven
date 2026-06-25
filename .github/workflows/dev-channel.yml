@@ -88,11 +88,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # M10 dev-build fix: the DEV version is `<next-patch>-dev.<run>.<sha>`,
+        # whose pre-release identifier (`dev.<run>.<sha>`) is NON-numeric. The
+        # Windows MSI (WiX) bundler maps SemVer -> a 4-part numeric MSI version
+        # and REQUIRES the pre-release to be numeric-only (<=65535), so it rejects
+        # the dev pre-release ("optional pre-release identifier in app version
+        # must be numeric-only ... for msi target"). The dev channel only needs
+        # the in-app auto-updater path, which the NSIS `-setup.exe` + its updater
+        # artifact (.sig) fully cover - so build the Windows DEV bundle NSIS-only
+        # (skip MSI) via `--bundles nsis`. mac/linux have no MSI concept and pass
+        # the full version through, so their bundleArgs stay empty. STABLE
+        # (release.yml, no pre-release) is unaffected and keeps the full msi+nsis
+        # bundle set. See design/CODEX_NOTES.md "## M10 dev-build fix".
         include:
-          - { os: macos-latest, target: aarch64-apple-darwin }
-          - { os: macos-latest, target: x86_64-apple-darwin }
-          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: macos-latest, target: aarch64-apple-darwin, bundleArgs: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, bundleArgs: "" }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, bundleArgs: "" }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc, bundleArgs: "--bundles nsis" }
     runs-on: ${{ matrix.os }}
     env:
       SQLX_OFFLINE: "true"
@@ -174,7 +186,17 @@ jobs:
           # `uploadUpdaterJson` (default true); `includeUpdaterJson` does not exist
           # and would be silently ignored. Keep `uploadUpdaterJson` (false positive).
           uploadUpdaterJson: false
-          args: --target ${{ matrix.target }}
+          # M10 dev-build fix: `bundleArgs` is empty for mac/linux and
+          # `--bundles nsis` for the Windows dev matrix entry. tauri-action passes
+          # `args` verbatim to `tauri build` (parsed by string-argv), and
+          # `tauri build -b/--bundles nsis` restricts the Windows bundle to NSIS,
+          # skipping the MSI whose WiX bundler rejects the non-numeric dev
+          # pre-release. createUpdaterArtifacts is true in tauri.conf.json, so the
+          # NSIS `-setup.exe` still emits its updater artifact + `.sig`, and the
+          # collect/generate steps still produce the windows-x86_64 manifest the
+          # `--require-targets` guard expects. (Verified against Context7
+          # tauri-action + tauri v2 docs.)
+          args: --target ${{ matrix.target }} ${{ matrix.bundleArgs }}
 
       # The exact bundle paths vary per OS/target; collect everything the
       # bundler produced (installers + .sig) under the target dir.

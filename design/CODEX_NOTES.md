@@ -3083,3 +3083,48 @@ clippy --workspace --all-targets -D warnings + test --workspace (honest google_e
 gate-skips) + deny check + fmt --all --check + git diff --check. ui: pnpm install + lint + prettier
 --check src + build (vue-tsc clean). No workflow changed, so actionlint not required. NO tag, NO
 workflow_dispatch, NO release.
+
+## M10 dev-build fix
+
+Finding: the FIRST real dev pipeline run (dev-channel.yml workflow_dispatch) FAILED only on the Windows
+MSI bundle step with:
+  `failed to bundle project: optional pre-release identifier in app version must be numeric-only and
+   cannot be greater than 65535 for msi target`
+Root cause: the dev version scheme is `<next-patch>-dev.<run_number>.<short-sha>` (e.g.
+`0.1.1-dev.22.bf3bc8f`), whose pre-release identifier `dev.22.bf3bc8f` is NON-numeric. The Windows MSI
+(WiX) bundler maps SemVer -> a 4-part numeric MSI version and REQUIRES the pre-release to be
+numeric-only (<=65535), so it rejects the dev pre-release. macOS x2 + Linux built + signed fine, and the
+Windows app `.exe` itself BUILT fine - ONLY the MSI BUNDLE step failed. The STABLE release (v0.1.0, no
+pre-release) is NOT affected (MSI accepts `0.1.0`), so this never blocked the GA tag - it is
+DEV-CHANNEL-ONLY.
+
+Resolution (NSIS-only dev Windows build): the dev channel exists for rolling early-adopter installs that
+ride the in-app auto-updater, which the NSIS `-setup.exe` + its updater artifact (.sig) fully cover; the
+MSI (enterprise/manual installer) is not needed for dev, and the dev version scheme is fundamentally
+MSI-incompatible. So dev-channel.yml now builds the Windows dev bundle NSIS-only:
+- Added a `bundleArgs` matrix field - empty (`""`) for the two macOS rows + the Linux row, and
+  `--bundles nsis` for the windows-latest / x86_64-pc-windows-msvc row ONLY.
+- Appended `${{ matrix.bundleArgs }}` to the tauri-action `args` (`--target ${{ matrix.target }}
+  ${{ matrix.bundleArgs }}`). tauri-action passes `args` verbatim to `tauri build` (parsed via
+  string-argv), and `tauri build -b/--bundles nsis` restricts the Windows bundle set to NSIS, skipping
+  MSI. The dev VERSION scheme is UNCHANGED.
+- Verified via Context7 (tauri-apps/tauri-action + tauri v2 docs): `nsis` is a valid `--bundles` target
+  identifier (the bundle `targets` set is `app, dmg, msi, nsis, deb, rpm, appimage, all`); with
+  `createUpdaterArtifacts: true` in tauri.conf.json, NSIS on Windows emits BOTH the `-setup.exe`
+  installer AND its `.sig` updater artifact independently of MSI. So the NSIS-only output preserves the
+  windows-x86_64 updater artifact + `.sig`.
+- The downstream path is intact: the Collect step already globs `*-setup.exe` + `*-setup.exe.sig`, and
+  generate-update-json.mjs maps `*-setup.exe` -> `windows-x86_64` (it already prefers NSIS over MSI), so
+  the `--require-targets "windows-x86_64,..."` guard still passes and the windows-x86_64 dev manifest is
+  still produced + smoke-tested.
+
+dev/stable Windows-bundle divergence: STABLE (release.yml) deliberately keeps the FULL Windows bundle
+set (msi + nsis, from tauri.conf.json `targets`) with NO `--bundles` restriction - the GA version has no
+pre-release so WiX accepts it, and the MSI is wanted for enterprise/manual installs. Only the DEV
+channel drops MSI. A comment was added in release.yml next to its `args` line documenting this
+divergence + the MSI numeric-pre-release reason, so no one "fixes" stable by copying the dev
+restriction. release.yml's bundle set is otherwise UNCHANGED.
+
+Gates: workflow-only change. actionlint clean on dev-channel.yml + release.yml. git diff --check clean.
+ASCII + LF. No Rust/ui touched. NO tag, NO workflow_dispatch, NO release (the orchestrator re-triggers
+the dev build after this push).

@@ -144,6 +144,14 @@ jobs:
           # distinct darwin/<arch> manifest. The pattern is consistent with the
           # dev-channel rename + the generator's filename parser.
           releaseAssetNamePattern: "[name]_[version]_[platform]_[arch][ext]"
+          # M10 dev/stable Windows-bundle divergence: STABLE keeps the FULL
+          # Windows bundle set (msi + nsis, from tauri.conf.json `targets`) - no
+          # `--bundles` restriction here. The GA version (e.g. 0.1.0) has NO
+          # pre-release, so the MSI (WiX) bundler accepts it. The DEV channel
+          # (dev-channel.yml) builds Windows NSIS-only because its version carries
+          # a NON-numeric pre-release (`<next-patch>-dev.<run>.<sha>`) that WiX
+          # rejects (MSI requires a numeric-only pre-release <=65535). Do NOT add
+          # `--bundles nsis` here. See design/CODEX_NOTES.md "## M10 dev-build fix".
           args: --target ${{ matrix.target }}
 
   publish-updater-manifest:
