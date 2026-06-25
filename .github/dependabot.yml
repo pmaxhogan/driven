@@ -1,0 +1,74 @@
+# Dependabot config (M9 tail, task #10). Keeps the four real dependency
+# ecosystems patched on a weekly cadence with a small, grouped PR footprint.
+#
+# Conventions:
+# - Weekly schedule (Monday) - a single-maintainer cadence, not a daily flood.
+# - Minor + patch updates are GROUPED into one PR per ecosystem so routine bumps
+#   land together; MAJOR updates open their own PR (they may need code changes).
+# - open-pull-requests-limit is kept low so the queue never overwhelms review.
+# - All PRs target the default branch (main) and use Conventional-Commits-style
+#   prefixes so they match the repo's commit history.
+version: 2
+updates:
+  # Rust workspace (root Cargo.toml + all member crates + src-tauri).
+  - package-ecosystem: cargo
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+      prefix-development: "build(deps-dev)"
+    groups:
+      cargo-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Vue/Vite frontend (ui/).
+  - package-ecosystem: npm
+    directory: "/ui"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+      prefix-development: "build(deps-dev)"
+    groups:
+      ui-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # Cloudflare telemetry worker (telemetry-worker/).
+  - package-ecosystem: npm
+    directory: "/telemetry-worker"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "build(deps)"
+      prefix-development: "build(deps-dev)"
+    groups:
+      telemetry-worker-minor-patch:
+        update-types:
+          - minor
+          - patch
+
+  # GitHub Actions used by the workflows in .github/workflows/.
+  - package-ecosystem: github-actions
+    directory: "/"
+    schedule:
+      interval: weekly
+      day: monday
+    open-pull-requests-limit: 5
+    commit-message:
+      prefix: "ci(deps)"
+    groups:
+      actions-minor-patch:
+        update-types:
+          - minor
+          - patch
