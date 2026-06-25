@@ -335,6 +335,34 @@ fn delivery_for_periodic_available(channel: Channel) -> AvailableUpdateDelivery 
     }
 }
 
+/// R8-P1-2 (SPEC s15 / DESIGN s9.4): whether an auto-update install is permitted
+/// in-app on this OS, or must be deferred to a MANUAL DMG reinstall. Unsigned
+/// macOS V1 cannot reliably apply an in-app update, so BOTH the periodic dev
+/// silent-install path and the manual `install_update` command must short-circuit
+/// to surfacing manual availability instead of calling `download_and_install`.
+/// Windows + Linux install in-app unchanged.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum InstallDisposition {
+    /// Install the update in-app via `download_and_install` (Windows / Linux).
+    Install,
+    /// macOS: do NOT install in-app; surface the manual DMG-reinstall path
+    /// (release/download URL) + a tray/event note instead.
+    ManualOnMacos,
+}
+
+/// Pure (R8-P1-2): the [`InstallDisposition`] for the running OS. Takes the
+/// "is this macOS" verdict as a parameter (production passes
+/// `cfg!(target_os = "macos")`) so BOTH arms are reachable + unit-tested on
+/// every host, and there is no cfg-gated dead code for 3-OS clippy.
+#[must_use]
+fn install_disposition(os_is_macos: bool) -> InstallDisposition {
+    if os_is_macos {
+        InstallDisposition::ManualOnMacos
+    } else {
+        InstallDisposition::Install
+    }
+}
+
 /// The outcome of an update check, as the pure dispatch path sees it.
 #[derive(Debug, Clone)]
 enum CheckOutcome {
@@ -469,14 +497,46 @@ async fn periodic_check_once(app: &AppHandle) {
             // channel.
             match delivery_for_periodic_available(channel) {
                 AvailableUpdateDelivery::SilentInstall => {
-                    // Dev: do NOT stash a pending update / emit the manual banner -
-                    // download + install now, then tray-notify. The staged update
-                    // applies on the next Driven restart (we do not force a restart
-                    // mid-work; see CODEX_NOTES M9 fix round 6). Clear any stale
-                    // pending update from a prior check so the banner never shows.
-                    state.set_pending_update(None);
-                    tracing::info!(target: TARGET, version = %info.version, "dev update available; installing silently (periodic check)");
-                    silent_install_dev_update(app, update, &info).await;
+                    // R8-P1-2 (SPEC s15 / DESIGN s9.4): the dev silent-install path
+                    // must NOT call `download_and_install` on macOS (unsigned V1: the
+                    // in-app updater is unreliable there). On macOS, surface MANUAL
+                    // availability instead - record the pending update + emit
+                    // `updater:available` (About.vue's macOS guard then shows the DMG
+                    // download link, not an in-app Install button) and raise a tray
+                    // note. Windows/Linux install silently as before.
+                    match install_disposition(cfg!(target_os = "macos")) {
+                        InstallDisposition::Install => {
+                            // Dev (non-macOS): do NOT stash a pending update / emit the
+                            // manual banner - download + install now, then tray-notify.
+                            // The staged update applies on the next Driven restart (we
+                            // do not force a restart mid-work; see CODEX_NOTES M9 fix
+                            // round 6). Clear any stale pending update from a prior
+                            // check so the banner never shows.
+                            state.set_pending_update(None);
+                            tracing::info!(target: TARGET, version = %info.version, "dev update available; installing silently (periodic check)");
+                            silent_install_dev_update(app, update, &info).await;
+                        }
+                        InstallDisposition::ManualOnMacos => {
+                            // macOS: record the pending update + its channel (so the
+                            // About surface can show it) and emit `updater:available`
+                            // + a tray note pointing at the manual DMG. NEVER reaches
+                            // `download_and_install`.
+                            state.set_pending_update(Some((update, channel.as_str().to_string())));
+                            let app_for_emit = app.clone();
+                            let _ = dispatch_check_outcome(
+                                CheckOutcome::Available(info.clone()),
+                                |info| {
+                                    if let Err(e) =
+                                        crate::events::emit_updater_available(&app_for_emit, info)
+                                    {
+                                        tracing::debug!(target: TARGET, error = %e, "emit updater:available failed");
+                                    }
+                                },
+                            );
+                            tracing::info!(target: TARGET, version = %info.version, "dev update available on macOS; surfacing MANUAL DMG reinstall (in-app updater disabled on unsigned macOS V1)");
+                            crate::tray::notify_manual_update_available(app, &info.version);
+                        }
+                    }
                 }
                 AvailableUpdateDelivery::ManualBanner => {
                     // Stable: record the raw Update + its channel so install_update
@@ -598,6 +658,23 @@ pub async fn check_for_update(
 /// signature / download failure maps to the s24 update code surface.
 #[tauri::command]
 pub async fn install_update(app: AppHandle, state: State<'_, AppState>) -> CommandResult<()> {
+    // R8-P1-2 (SPEC s15 / DESIGN s9.4): on macOS the in-app updater is unreliable
+    // (unsigned V1), so `install_update` must NEVER reach `download_and_install`.
+    // Short-circuit to the manual-DMG path - leave the pending update intact (so
+    // the About surface can still show the DMG download link) and raise a tray
+    // note. The UI renders the returned `update.manual_required_macos` code via
+    // `t("errors.update.manual_required_macos.long")`. Windows/Linux install in
+    // place unchanged.
+    if install_disposition(cfg!(target_os = "macos")) == InstallDisposition::ManualOnMacos {
+        if let Some((version, ..)) = state.peek_pending_update() {
+            crate::tray::notify_manual_update_available(&app, &version);
+        }
+        return Err(CommandError::with_code(
+            ErrorCode::UpdateManualRequiredMacos,
+            "in-app update install is disabled on macOS; download and reinstall the latest release manually",
+        ));
+    }
+
     // Take the pending update + its channel. On a download/install FAILURE we
     // restore it (R1-P2-2) so the banner's next Install retries the SAME update
     // instead of failing "no pending update" until the user re-checks. On
@@ -945,6 +1022,25 @@ mod tests {
             delivery_for_periodic_available(Channel::Stable),
             AvailableUpdateDelivery::ManualBanner,
             "stable updates use the manual in-app banner"
+        );
+    }
+
+    #[test]
+    fn macos_install_disposition_is_manual_other_oses_install() {
+        // R8-P1-2 (SPEC s15 / DESIGN s9.4): on macOS BOTH the dev periodic silent
+        // install AND the manual `install_update` command must take the
+        // MANUAL-availability branch (never `download_and_install`); on every other
+        // OS they install in-app. This is the pure per-OS routing both paths branch
+        // on (production passes `cfg!(target_os = "macos")`).
+        assert_eq!(
+            install_disposition(true),
+            InstallDisposition::ManualOnMacos,
+            "macOS must NOT install in-app (unsigned V1: manual DMG reinstall)"
+        );
+        assert_eq!(
+            install_disposition(false),
+            InstallDisposition::Install,
+            "Windows/Linux install the update in-app"
         );
     }
 

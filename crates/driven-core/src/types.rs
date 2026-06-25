@@ -940,6 +940,12 @@ pub enum ErrorCode {
     /// `update.signature_invalid` - Tauri updater signature verification
     /// failed.
     UpdateSignatureInvalid,
+    /// `update.manual_required_macos` - the in-app updater is disabled on macOS
+    /// (unsigned V1: the in-app updater is unreliable there - SPEC s15 / DESIGN
+    /// s9.4), so an install was short-circuited. The UI must direct the user to
+    /// download + reinstall the latest DMG manually instead of installing in
+    /// place. R8-P1-2.
+    UpdateManualRequiredMacos,
     /// `crypto.key_missing` - keychain entry not found.
     CryptoKeyMissing,
     /// `crypto.decrypt_failed` - AEAD verification failed.
@@ -1004,6 +1010,7 @@ impl ErrorCode {
             ErrorCode::NetProxyRequired => "net.proxy_required",
             ErrorCode::UpdateEndpointUnreachable => "update.endpoint_unreachable",
             ErrorCode::UpdateSignatureInvalid => "update.signature_invalid",
+            ErrorCode::UpdateManualRequiredMacos => "update.manual_required_macos",
             ErrorCode::CryptoKeyMissing => "crypto.key_missing",
             ErrorCode::CryptoDecryptFailed => "crypto.decrypt_failed",
             ErrorCode::CryptoRecoveryPhraseInvalid => "crypto.recovery_phrase_invalid",
@@ -1055,6 +1062,7 @@ impl ErrorCode {
             "net.proxy_required" => ErrorCode::NetProxyRequired,
             "update.endpoint_unreachable" => ErrorCode::UpdateEndpointUnreachable,
             "update.signature_invalid" => ErrorCode::UpdateSignatureInvalid,
+            "update.manual_required_macos" => ErrorCode::UpdateManualRequiredMacos,
             "crypto.key_missing" => ErrorCode::CryptoKeyMissing,
             "crypto.decrypt_failed" => ErrorCode::CryptoDecryptFailed,
             "crypto.recovery_phrase_invalid" => ErrorCode::CryptoRecoveryPhraseInvalid,

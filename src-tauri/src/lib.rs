@@ -326,29 +326,51 @@ pub fn run() {
                 // once). Done BEFORE assembly so the orchestrator never sees them
                 // as enabled, and BEFORE the reconstruct below so the in-memory
                 // gate mirrors the freshly-seeded pending rows.
-                {
+                //
+                // R8-P1-1 (DATA-SAFETY): the repair must FAIL CLOSED. If it ERRORS,
+                // a pre-0004 encrypted source may remain `enabled` with no durable
+                // ack; spawning its orchestrator would keep backing it up with an
+                // unsaved phrase (unrestorable). So on a repair error we do NOT
+                // call `build_and_spawn` - we build a QUIESCED AppState (no
+                // orchestrators spawned, so nothing syncs), surface a tray note,
+                // and leave the repair marker unset so a later boot retries and,
+                // on success, spawns normally.
+                let repair_result = {
                     use driven_core::time::Clock;
                     let now = driven_core::time::SystemClock.now_ms();
-                    match state.repair_unacked_encrypted_sources_on_upgrade(now).await {
-                        Ok(0) => {}
-                        Ok(n) => tracing::warn!(
-                            repaired_accounts = n,
-                            "R7-P1-2: disabled pre-0004 encrypted sources lacking a durable recovery-ack; user must re-reveal + re-ack the phrase"
-                        ),
-                        Err(err) => tracing::error!(%err, "R7-P1-2: recovery-ack upgrade repair failed; encrypted sources without a durable ack may remain enabled"),
-                    }
+                    state.repair_unacked_encrypted_sources_on_upgrade(now).await
+                };
+                match &repair_result {
+                    Ok(0) => {}
+                    Ok(n) => tracing::warn!(
+                        repaired_accounts = *n,
+                        "R7-P1-2: disabled pre-0004 encrypted sources lacking a durable recovery-ack; user must re-reveal + re-ack the phrase"
+                    ),
+                    Err(err) => tracing::error!(%err, "R8-P1-1: recovery-ack upgrade repair FAILED; failing closed - starting quiesced (no sync) until it succeeds"),
                 }
-                let app_state = assembly::build_and_spawn(&handle, state).await?;
+
+                let app_state = if assembly::repair_allows_spawn(&repair_result) {
+                    assembly::build_and_spawn(&handle, state).await?
+                } else {
+                    // Fail closed: manage state but spawn NO orchestrators.
+                    assembly::build_quiesced(state)
+                };
                 // R4-P1-1 (DATA-SAFETY): reconstruct the recovery-phrase ACK gate
                 // from the DURABLE `recovery_phrase_acks` table, so a process that
                 // restarts mid-onboarding (after the first encrypted source +
                 // master key were persisted but before reveal+ack) resumes the
                 // exact pending-ack gate - the disabled source is still
                 // reveal/ackable and no second encrypted source can enable without
-                // the durable ack.
+                // the durable ack. Runs in both paths so the command-layer gate is
+                // correct even while quiesced.
                 app_state.reconstruct_recovery_acks_from_db().await;
                 handle.manage(app_state);
                 tray::build(&handle)?;
+                // R8-P1-1: tell the user why sync is held off (after the tray
+                // exists so the notification can route through it).
+                if !assembly::repair_allows_spawn(&repair_result) {
+                    tray::notify_repair_failed(&handle);
+                }
                 // M9a (SPEC s15.2): start the periodic update-check task (an
                 // immediate check on startup, then every 6h). Spawned here -
                 // INSIDE the Tauri async runtime's `block_on` so `tokio::spawn`

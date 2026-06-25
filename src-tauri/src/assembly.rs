@@ -182,6 +182,47 @@ pub async fn build_and_spawn(
     ))
 }
 
+/// R8-P1-1 (DATA-SAFETY): the FAIL-CLOSED decision for the boot path. `true` iff
+/// the one-time upgrade recovery-ack repair SUCCEEDED, so it is safe to spawn the
+/// sync orchestrators. On a repair ERROR this returns `false` so the boot path
+/// goes QUIESCED ([`build_quiesced`]) and no orchestrator (encrypted or otherwise)
+/// is started until the repair succeeds on a later boot. Pure + unit-tested so the
+/// fail-closed branch is asserted without a live Tauri runtime / `AppHandle`.
+#[must_use]
+pub fn repair_allows_spawn(repair: &anyhow::Result<usize>) -> bool {
+    repair.is_ok()
+}
+
+/// R8-P1-1 (DATA-SAFETY): build a QUIESCED [`AppState`] - one that manages the
+/// state repo but spawns NO per-account orchestrators - for the FAIL-CLOSED
+/// startup path. When the one-time upgrade recovery-ack repair
+/// ([`StateRepo::repair_unacked_encrypted_sources_on_upgrade`]) FAILS, a pre-0004
+/// encrypted source could still be `enabled` with no durable recovery ack; running
+/// its orchestrator would keep producing encrypted backups for a phrase the user
+/// may never have saved (unrestorable). So instead of [`build_and_spawn`], the
+/// boot path builds THIS - no orchestrator runs, so nothing syncs - and surfaces a
+/// startup error + tray note. The repair marker stays unset, so a later boot
+/// retries and, on success, spawns normally.
+///
+/// Mirrors the no-orchestrator AppState shape `build_and_spawn` would return with
+/// an empty handle set: the same `remote_mode` verdict and a fresh shared
+/// fake-remote registry (unused while quiesced). The IPC layer still works (the
+/// state repo is managed), so the user can reach Settings to reveal/ack a phrase.
+#[must_use]
+pub fn build_quiesced(state: Arc<dyn StateRepo>) -> AppState {
+    let remote_mode = if use_fake_remote() {
+        RemoteMode::Fake
+    } else {
+        RemoteMode::RealGoogleDrive
+    };
+    let fake_remote_stores: FakeRemoteStores = Arc::new(std::sync::Mutex::new(HashMap::new()));
+    tracing::error!(
+        target: TARGET,
+        "R8-P1-1: starting QUIESCED (no orchestrators spawned) - the recovery-ack upgrade repair failed, so sync is held off until it succeeds on a later boot"
+    );
+    AppState::new(state, HashMap::new(), remote_mode, fake_remote_stores)
+}
+
 /// `true` when `DRIVEN_USE_FAKE_REMOTE=1` selects the in-memory fake remote.
 fn use_fake_remote() -> bool {
     std::env::var(ENV_USE_FAKE_REMOTE)
@@ -1045,6 +1086,96 @@ mod tests {
         assert_eq!(cfg.bandwidth_cap_mbps, Some(7));
         assert!(!cfg.skip_on_battery);
         assert!(!cfg.skip_on_metered);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// R8-P1-1 (DATA-SAFETY): the boot path must FAIL CLOSED on a repair error -
+    /// `repair_allows_spawn` is the gate. A successful repair (`Ok`) permits
+    /// spawning the orchestrators; a repair error (`Err`) does NOT, so the boot
+    /// path goes quiesced and no orchestrator (encrypted or otherwise) starts.
+    #[test]
+    fn repair_error_does_not_allow_spawn() {
+        assert!(
+            super::repair_allows_spawn(&Ok(0)),
+            "a clean repair (no accounts touched) must allow spawning"
+        );
+        assert!(
+            super::repair_allows_spawn(&Ok(3)),
+            "a clean repair (some accounts repaired) must allow spawning"
+        );
+        assert!(
+            !super::repair_allows_spawn(&Err(anyhow::anyhow!("injected repair failure"))),
+            "a FAILED repair must NOT allow spawning (fail closed)"
+        );
+    }
+
+    /// R8-P1-1 (DATA-SAFETY): when the repair fails, the boot path builds a
+    /// QUIESCED AppState via `build_quiesced` - even with an ENABLED ENCRYPTED
+    /// account+source present in the DB, it spawns ZERO orchestrators, so the
+    /// unsafe pre-0004 encrypted source does NOT keep syncing. The companion clean
+    /// path (a healthy DB) is covered by the live boot in lib.rs (which needs an
+    /// AppHandle); here we prove the fail-closed branch starts nothing.
+    #[tokio::test]
+    async fn quiesced_build_spawns_no_orchestrators_even_with_enabled_encrypted_source() {
+        use super::{AccountRow, SourceRow};
+        use driven_core::types::{AccountId, AccountState, SourceId};
+
+        let nonce = std::time::SystemTime::now()
+            .duration_since(std::time::UNIX_EPOCH)
+            .map(|d| d.as_nanos())
+            .unwrap_or(0);
+        let dir = std::env::temp_dir().join(format!("driven-assembly-quiesce-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = SqliteStateRepo::open(&dir.join("state.db"))
+            .await
+            .expect("open repo");
+
+        // Seed an Ok account WITH an encryption master key + an ENABLED encrypted
+        // source - the exact "unsafe pre-0004" shape the repair guards. If the boot
+        // path spawned orchestrators, THIS source would resume encrypted backups.
+        let account_id = AccountId::new_v4();
+        repo.upsert_account(&AccountRow {
+            id: account_id,
+            email: "quiesce@example.com".to_string(),
+            display_name: None,
+            state: AccountState::Ok,
+            encryption_master_key_id: Some("mk-quiesce".to_string()),
+            created_at: 1,
+            last_synced_at: None,
+        })
+        .await
+        .expect("seed account");
+        repo.upsert_source(&SourceRow {
+            id: SourceId::new_v4(),
+            account_id,
+            display_name: "enc-src".to_string(),
+            enabled: true,
+            local_path: dir.join("src").to_string_lossy().into_owned(),
+            drive_folder_id: "folder-1".to_string(),
+            drive_folder_path: "/Backups".to_string(),
+            encryption_enabled: true,
+            wrapped_source_key: Some(vec![1, 2, 3, 4]),
+            respect_gitignore: true,
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: 604_800,
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            created_at: 1,
+        })
+        .await
+        .expect("seed source");
+
+        let state: std::sync::Arc<dyn StateRepo> = std::sync::Arc::new(repo);
+        // The fail-closed builder: NO AppHandle, NO orchestrators.
+        let app_state = super::build_quiesced(state);
+        assert!(
+            app_state.accounts().is_empty(),
+            "quiesced boot must spawn ZERO orchestrators (fail closed), got {}",
+            app_state.accounts().len()
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

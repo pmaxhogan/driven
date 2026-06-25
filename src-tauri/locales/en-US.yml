@@ -39,6 +39,12 @@ notifications:
   dev_update_installed:
     title: "Dev update ready"
     body: "Driven %{version} (dev channel) was installed and will apply the next time Driven restarts."
+  manual_update_available:
+    title: "Update available"
+    body: "Driven %{version} is available. Download and reinstall the latest release to update."
+  repair_failed:
+    title: "Driven paused for safety"
+    body: "Driven could not verify your encrypted backups are safe to resume, so backups are paused. Restart Driven to retry."
   paused_battery:
     title: "Sync paused"
     body: "On battery power; sync will resume on AC."

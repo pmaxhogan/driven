@@ -221,8 +221,10 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         | ErrorCode::LocalDiskFull
         | ErrorCode::LocalInvalidFilename
         | ErrorCode::LocalAdsSkipped
-        // Updater signature / crypto / state / harness / internal -> red.
+        // Updater signature / manual-required / crypto / state / harness /
+        // internal -> red (none is a network reachability condition).
         | ErrorCode::UpdateSignatureInvalid
+        | ErrorCode::UpdateManualRequiredMacos
         | ErrorCode::CryptoKeyMissing
         | ErrorCode::CryptoDecryptFailed
         | ErrorCode::CryptoRecoveryPhraseInvalid
@@ -780,6 +782,36 @@ pub fn notify_dev_update_installed(app: &AppHandle, version: &str) {
         app,
         rust_i18n::t!("notifications.dev_update_installed.title").into_owned(),
         rust_i18n::t!("notifications.dev_update_installed.body", version = version).into_owned(),
+    );
+}
+
+/// R8-P1-2 (SPEC s15 / DESIGN s9.4): raise the "manual update available" tray
+/// notification on macOS, where the in-app updater is disabled (unsigned V1) and
+/// the user must download + reinstall the latest DMG manually. Used by both the
+/// periodic dev-channel path and the `install_update` short-circuit so a macOS
+/// user is told a newer build exists and how to apply it. `version` is the
+/// available version.
+pub fn notify_manual_update_available(app: &AppHandle, version: &str) {
+    show_notification(
+        app,
+        rust_i18n::t!("notifications.manual_update_available.title").into_owned(),
+        rust_i18n::t!(
+            "notifications.manual_update_available.body",
+            version = version
+        )
+        .into_owned(),
+    );
+}
+
+/// R8-P1-1 (DATA-SAFETY): raise the "paused for safety" tray notification when the
+/// one-time recovery-ack upgrade repair failed and Driven started QUIESCED (no
+/// orchestrators spawned). Tells the user backups are held off and a restart
+/// retries the repair, rather than silently doing nothing.
+pub fn notify_repair_failed(app: &AppHandle) {
+    show_notification(
+        app,
+        rust_i18n::t!("notifications.repair_failed.title").into_owned(),
+        rust_i18n::t!("notifications.repair_failed.body").into_owned(),
     );
 }
 
