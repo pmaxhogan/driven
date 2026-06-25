@@ -626,6 +626,100 @@ pub trait StateRepo: Send + Sync {
         self.upsert_source(&row).await
     }
 
+    /// M9 R7-P1-2 (DATA-SAFETY): one-time upgrade repair for encrypted sources
+    /// that pre-date the durable recovery-ack gate (migration `0004`).
+    ///
+    /// Before `0004` the recovery-phrase ack gate lived ONLY in process memory,
+    /// so a first encrypted source could be persisted `enabled=1` with NO durable
+    /// `recovery_phrase_acks` row recording that the user ever saved (or even
+    /// revealed) the phrase. After upgrading, [`Self::list_pending_recovery_acks`]
+    /// finds nothing and the scheduler keeps producing encrypted backups for a
+    /// phrase the user may never have saved - unrestorable on a new machine.
+    ///
+    /// This repair runs EXACTLY ONCE (gated on a durable `settings` marker so a
+    /// second boot is a no-op and freshly-acked sources created AFTER the upgrade
+    /// are never touched). On that single run, for every account with a stamped
+    /// `encryption_master_key_id` that has encrypted source(s) but ZERO
+    /// `recovery_phrase_acks` rows, it:
+    /// - inserts a PENDING ack row (`revealed=0`) for one canonical source (the
+    ///   earliest-created encrypted source on the account), and
+    /// - DISABLES every encrypted source on that account, so the scheduler +
+    ///   manual sync (which filter on `enabled`) stop backing them up until the
+    ///   user re-reveals + re-acks the phrase (the same gate the first-source path
+    ///   uses).
+    ///
+    /// It is idempotent and safe: an account that already has any
+    /// `recovery_phrase_acks` row (mid-onboarding under the durable flow) is left
+    /// alone, and once the marker is set the repair never disables a
+    /// legitimately-acked source (whose ack row was deleted on a real ack).
+    /// Returns the number of accounts repaired.
+    ///
+    /// The default impl performs the steps sequentially (adequate for in-memory
+    /// test doubles); the SQLite impl overrides it with a real transaction.
+    async fn repair_unacked_encrypted_sources_on_upgrade(&self, now: UnixMs) -> Result<usize> {
+        const MARKER_KEY: &str = "recovery.ack_backfill_v1";
+        if self.get_setting(MARKER_KEY).await?.is_some() {
+            return Ok(0);
+        }
+
+        let accounts = self.list_accounts().await?;
+        let sources = self.list_sources().await?;
+        let acks = self.list_pending_recovery_acks().await?;
+
+        let mut repaired = 0usize;
+        for account in &accounts {
+            if account.encryption_master_key_id.is_none() {
+                continue;
+            }
+            // Encrypted sources on this account, earliest-created first (the
+            // canonical pending source is the earliest).
+            let mut encrypted: Vec<&SourceRow> = sources
+                .iter()
+                .filter(|s| s.account_id == account.id && s.encryption_enabled)
+                .collect();
+            if encrypted.is_empty() {
+                continue;
+            }
+            // Skip accounts that already have a durable ack record (they went
+            // through the durable flow; the existing gate handles them).
+            if acks.iter().any(|a| a.account_id == account.id) {
+                continue;
+            }
+            encrypted.sort_by(|a, b| {
+                a.created_at
+                    .cmp(&b.created_at)
+                    .then_with(|| a.id.to_string().cmp(&b.id.to_string()))
+            });
+            // Disable every encrypted source on the account.
+            for src in &encrypted {
+                if src.enabled {
+                    let mut row = (*src).clone();
+                    row.enabled = false;
+                    self.upsert_source(&row).await?;
+                }
+            }
+            // Insert a pending ack row (revealed=0) for the canonical source via
+            // the same atomic primitive the first-source path uses. The
+            // master-key stamp is a compare-and-set against the already-stamped
+            // key (a no-op), the source is re-inserted DISABLED, and the durable
+            // pending-ack record is written.
+            let canonical = encrypted[0];
+            let mut canonical_disabled = (*canonical).clone();
+            canonical_disabled.enabled = false;
+            let master_key_id = account
+                .encryption_master_key_id
+                .clone()
+                .ok_or_else(|| anyhow::anyhow!("stamped account lost its master key id"))?;
+            self.insert_first_encrypted_source_pending_ack(&canonical_disabled, master_key_id, now)
+                .await?;
+            repaired += 1;
+        }
+
+        self.set_setting(MARKER_KEY, &serde_json::json!({ "at": now }))
+            .await?;
+        Ok(repaired)
+    }
+
     /// M9 R5-P1-1 (DATA-SAFETY): ATOMICALLY (one transaction) DISCARD a pending
     /// first-encrypted source that the user removes BEFORE saving its recovery
     /// phrase - deleting the `backup_sources` row (cascading its

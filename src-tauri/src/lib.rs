@@ -317,6 +317,27 @@ pub fn run() {
             tauri::async_runtime::block_on(async move {
                 let db_path = state_db_path(&handle)?;
                 let state = migrations::run(&db_path).await?;
+                // R7-P1-2 (DATA-SAFETY): one-time upgrade repair for encrypted
+                // sources that pre-date the durable recovery-ack gate (migration
+                // 0004). Such a source could be ENABLED with no durable ack row,
+                // so sync would keep producing encrypted backups for a phrase the
+                // user may never have saved. The repair DISABLES those sources +
+                // seeds a pending ack row (gated on a durable marker so it runs
+                // once). Done BEFORE assembly so the orchestrator never sees them
+                // as enabled, and BEFORE the reconstruct below so the in-memory
+                // gate mirrors the freshly-seeded pending rows.
+                {
+                    use driven_core::time::Clock;
+                    let now = driven_core::time::SystemClock.now_ms();
+                    match state.repair_unacked_encrypted_sources_on_upgrade(now).await {
+                        Ok(0) => {}
+                        Ok(n) => tracing::warn!(
+                            repaired_accounts = n,
+                            "R7-P1-2: disabled pre-0004 encrypted sources lacking a durable recovery-ack; user must re-reveal + re-ack the phrase"
+                        ),
+                        Err(err) => tracing::error!(%err, "R7-P1-2: recovery-ack upgrade repair failed; encrypted sources without a durable ack may remain enabled"),
+                    }
+                }
                 let app_state = assembly::build_and_spawn(&handle, state).await?;
                 // R4-P1-1 (DATA-SAFETY): reconstruct the recovery-phrase ACK gate
                 // from the DURABLE `recovery_phrase_acks` table, so a process that

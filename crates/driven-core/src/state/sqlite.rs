@@ -1015,6 +1015,123 @@ impl StateRepo for SqliteStateRepo {
         Ok(())
     }
 
+    async fn repair_unacked_encrypted_sources_on_upgrade(&self, now: UnixMs) -> Result<usize> {
+        // M9 R7-P1-2 (DATA-SAFETY): a one-time upgrade repair, done in ONE
+        // transaction so the disable + pending-ack inserts + the durable marker
+        // are all-or-nothing (a crash mid-repair leaves the DB unchanged and the
+        // repair re-runs cleanly on the next boot). See the trait docs for the
+        // full rationale + invariant.
+        const MARKER_KEY: &str = "recovery.ack_backfill_v1";
+
+        let mut tx = self.pool.begin().await?;
+
+        // Idempotency gate: a durable settings marker. If it is already set the
+        // repair has run; do nothing (so freshly-acked sources created AFTER the
+        // upgrade - whose ack rows were legitimately deleted - are never touched).
+        let existing = sqlx::query!(
+            r#"SELECT value AS "value!: String" FROM settings WHERE key = ?1"#,
+            MARKER_KEY,
+        )
+        .fetch_optional(&mut *tx)
+        .await?;
+        if existing.is_some() {
+            tx.rollback().await?;
+            return Ok(0);
+        }
+
+        // Accounts with a stamped master key that have encrypted source(s) but
+        // ZERO recovery_phrase_acks rows: these pre-date the durable gate. The
+        // canonical pending source is the earliest-created encrypted source on
+        // the account (deterministic tie-break by id).
+        let candidates = sqlx::query!(
+            r#"
+            SELECT
+                a.id AS "account_id!: String",
+                a.encryption_master_key_id AS "master_key_id!: String"
+            FROM accounts a
+            WHERE a.encryption_master_key_id IS NOT NULL
+              AND EXISTS (
+                  SELECT 1 FROM backup_sources s
+                  WHERE s.account_id = a.id AND s.encryption_enabled = 1
+              )
+              AND NOT EXISTS (
+                  SELECT 1 FROM recovery_phrase_acks r
+                  WHERE r.account_id = a.id
+              )
+            ORDER BY a.created_at ASC, a.id ASC
+            "#,
+        )
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut repaired = 0usize;
+        for cand in &candidates {
+            let account_id = &cand.account_id;
+
+            // DISABLE every encrypted source on the account (the scheduler +
+            // manual sync filter on `enabled`, so this stops the unrestorable
+            // backups until the phrase is re-revealed + re-acked).
+            sqlx::query!(
+                "UPDATE backup_sources SET enabled = 0 \
+                 WHERE account_id = ?1 AND encryption_enabled = 1",
+                account_id,
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            // Pick the canonical (earliest-created) encrypted source.
+            let canonical = sqlx::query!(
+                r#"
+                SELECT id AS "id!: String"
+                FROM backup_sources
+                WHERE account_id = ?1 AND encryption_enabled = 1
+                ORDER BY created_at ASC, id ASC
+                LIMIT 1
+                "#,
+                account_id,
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            let Some(canonical) = canonical else {
+                // No encrypted source after all (raced/inconsistent): nothing to
+                // do for this account.
+                continue;
+            };
+
+            // Insert the PENDING ack row (revealed = 0) for the canonical source.
+            // A REPLACE so a partial earlier run (now rolled back) cannot leave a
+            // stale row that fails the PK.
+            sqlx::query!(
+                "INSERT INTO recovery_phrase_acks (source_id, account_id, revealed, created_at) \
+                 VALUES (?1, ?2, 0, ?3) \
+                 ON CONFLICT(source_id) DO UPDATE SET \
+                    account_id = excluded.account_id, \
+                    revealed   = 0, \
+                    created_at = excluded.created_at",
+                canonical.id,
+                account_id,
+                now,
+            )
+            .execute(&mut *tx)
+            .await?;
+            repaired += 1;
+        }
+
+        // Set the durable marker so this repair never runs again.
+        let marker_value = serde_json::json!({ "at": now }).to_string();
+        sqlx::query!(
+            "INSERT INTO settings (key, value) VALUES (?1, ?2) \
+             ON CONFLICT(key) DO UPDATE SET value = excluded.value",
+            MARKER_KEY,
+            marker_value,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(repaired)
+    }
+
     async fn discard_pending_encrypted_source(
         &self,
         source: SourceId,
@@ -2853,6 +2970,177 @@ mod tests {
             None,
             "no pending record remains after the ack"
         );
+    }
+
+    #[tokio::test]
+    async fn upgrade_repair_disables_unacked_encrypted_source_and_seeds_pending_ack() {
+        // R7-P1-2 (DATA-SAFETY): a pre-0004 encrypted source - persisted ENABLED
+        // with a stamped master key but NO recovery_phrase_acks row - must be
+        // DISABLED + given a pending ack row by the one-time upgrade repair, then
+        // a re-reveal + ack re-enables it.
+        let (repo, _dir) = temp_repo().await;
+
+        // Simulate the pre-0004 state: stamped account + ENABLED encrypted source,
+        // no ack row (write the source directly, bypassing the durable primitive).
+        let acct = sample_account(); // stamped (encryption_master_key_id = kc:alice)
+        repo.upsert_account(&acct).await.unwrap();
+        let mut src = sample_source(acct.id);
+        src.encryption_enabled = true;
+        src.enabled = true;
+        repo.upsert_source(&src).await.unwrap();
+        assert!(
+            repo.list_pending_recovery_acks().await.unwrap().is_empty(),
+            "precondition: no durable ack row exists for the pre-0004 source"
+        );
+
+        // Run the repair.
+        let repaired = repo
+            .repair_unacked_encrypted_sources_on_upgrade(123)
+            .await
+            .expect("repair runs");
+        assert_eq!(repaired, 1, "one account repaired");
+
+        // The source is now DISABLED with a pending (unrevealed) ack row.
+        let sources = repo.list_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(
+            !sources[0].enabled,
+            "the unacked encrypted source must be disabled by the repair"
+        );
+        let acks = repo.list_pending_recovery_acks().await.unwrap();
+        assert_eq!(acks.len(), 1, "a pending ack row was seeded");
+        assert_eq!(acks[0].source_id, src.id);
+        assert_eq!(acks[0].account_id, acct.id);
+        assert!(!acks[0].revealed, "the seeded ack is not yet revealed");
+        assert_eq!(
+            repo.recovery_ack_revealed(src.id).await.unwrap(),
+            Some(false)
+        );
+
+        // A re-reveal + atomic enable+clear re-enables the source (same gate as
+        // the first-source path).
+        assert!(repo.mark_recovery_phrase_revealed(src.id).await.unwrap());
+        repo.enable_source_and_clear_recovery_ack(src.id)
+            .await
+            .unwrap();
+        let sources = repo.list_sources().await.unwrap();
+        assert!(sources[0].enabled, "re-reveal + ack re-enables the source");
+        assert!(
+            repo.list_pending_recovery_acks().await.unwrap().is_empty(),
+            "the pending ack row is cleared after a durable ack"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_repair_is_idempotent_and_never_touches_already_acked_source() {
+        // R7-P1-2 (DATA-SAFETY): the repair runs ONCE (durable marker) and must
+        // NEVER disable a legitimately-acked source whose ack row was deleted on a
+        // real ack. A second repair run is a no-op even against such a source.
+        let (repo, _dir) = temp_repo().await;
+
+        // Pre-0004 unacked source: first repair disables + seeds it.
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let mut src = sample_source(acct.id);
+        src.encryption_enabled = true;
+        src.enabled = true;
+        repo.upsert_source(&src).await.unwrap();
+
+        assert_eq!(
+            repo.repair_unacked_encrypted_sources_on_upgrade(1)
+                .await
+                .unwrap(),
+            1
+        );
+
+        // The user re-reveals + acks: the source is enabled, the ack row deleted -
+        // exactly the "legitimately acked, no ack row" shape the repair must not
+        // re-disable.
+        repo.mark_recovery_phrase_revealed(src.id).await.unwrap();
+        repo.enable_source_and_clear_recovery_ack(src.id)
+            .await
+            .unwrap();
+        assert!(repo.list_sources().await.unwrap()[0].enabled);
+        assert!(repo.list_pending_recovery_acks().await.unwrap().is_empty());
+
+        // A SECOND repair (e.g. next boot) is a no-op: the marker is set, so the
+        // acked-and-cleared source is NOT re-disabled and NO ack row is re-seeded.
+        assert_eq!(
+            repo.repair_unacked_encrypted_sources_on_upgrade(2)
+                .await
+                .unwrap(),
+            0,
+            "the repair is gated by a durable marker and runs once"
+        );
+        assert!(
+            repo.list_sources().await.unwrap()[0].enabled,
+            "the legitimately-acked source must STAY enabled across re-runs"
+        );
+        assert!(
+            repo.list_pending_recovery_acks().await.unwrap().is_empty(),
+            "no pending ack is re-seeded for the acked source"
+        );
+    }
+
+    #[tokio::test]
+    async fn upgrade_repair_skips_unencrypted_and_unstamped_and_pending_accounts() {
+        // R7-P1-2: the repair must only touch stamped accounts that have encrypted
+        // sources but no ack row. Unencrypted sources, unstamped accounts, and
+        // accounts already mid-onboarding under the durable flow are left alone.
+        let (repo, _dir) = temp_repo().await;
+
+        // Account A: stamped, but the source is UNENCRYPTED -> untouched.
+        let acct_a = sample_account();
+        repo.upsert_account(&acct_a).await.unwrap();
+        let mut plain = sample_source(acct_a.id);
+        plain.encryption_enabled = false;
+        plain.enabled = true;
+        repo.upsert_source(&plain).await.unwrap();
+
+        // Account B: UNSTAMPED (no master key) with an encrypted source -> the
+        // repair cannot have a phrase to gate, so it is left alone.
+        let mut acct_b = sample_account();
+        acct_b.id = AccountId::new_v4();
+        acct_b.email = "bob@example.com".into();
+        acct_b.encryption_master_key_id = None;
+        repo.upsert_account(&acct_b).await.unwrap();
+        let mut enc_b = sample_source(acct_b.id);
+        enc_b.encryption_enabled = true;
+        enc_b.enabled = true;
+        repo.upsert_source(&enc_b).await.unwrap();
+
+        // Account C: stamped + encrypted source ALREADY pending under the durable
+        // flow (has an ack row) -> left alone.
+        let mut acct_c = sample_account();
+        acct_c.id = AccountId::new_v4();
+        acct_c.email = "carol@example.com".into();
+        acct_c.encryption_master_key_id = None; // primitive stamps it
+        repo.upsert_account(&acct_c).await.unwrap();
+        let mut enc_c = sample_source(acct_c.id);
+        enc_c.encryption_enabled = true;
+        enc_c.enabled = false;
+        repo.insert_first_encrypted_source_pending_ack(&enc_c, "kc:carol-master".into(), 5)
+            .await
+            .unwrap();
+
+        let repaired = repo
+            .repair_unacked_encrypted_sources_on_upgrade(99)
+            .await
+            .unwrap();
+        assert_eq!(repaired, 0, "no eligible account to repair");
+
+        // A stays enabled (unencrypted), B stays enabled (unstamped), C keeps its
+        // single pre-existing pending ack (no new one seeded, still disabled).
+        let sources = repo.list_sources().await.unwrap();
+        let a = sources.iter().find(|s| s.id == plain.id).unwrap();
+        let b = sources.iter().find(|s| s.id == enc_b.id).unwrap();
+        let c = sources.iter().find(|s| s.id == enc_c.id).unwrap();
+        assert!(a.enabled, "unencrypted source untouched");
+        assert!(b.enabled, "unstamped account's source untouched");
+        assert!(!c.enabled, "durable-pending source stays disabled");
+        let acks = repo.list_pending_recovery_acks().await.unwrap();
+        assert_eq!(acks.len(), 1, "only account C's pre-existing ack remains");
+        assert_eq!(acks[0].source_id, enc_c.id);
     }
 
     #[tokio::test]
