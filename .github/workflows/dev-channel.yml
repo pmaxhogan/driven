@@ -60,47 +60,30 @@ jobs:
           echo "build=$build" >> "$GITHUB_OUTPUT"
           echo "dev build decision: $build (event=$EVENT_NAME)"
 
-  # R2-P1-2: the rolling `dev` release is REUSED across runs, so prior runs'
-  # signed bundles accrete on it. A later step downloads ALL assets to build the
-  # manifest - so a stale bundle could be advertised under the new version (an
-  # integrity bug). Wipe the rolling release's existing assets ONCE here, before
-  # the matrix build uploads the CURRENT run's bundles. Doing it in a single
-  # pre-build job (not per matrix row) avoids the 4 parallel rows deleting each
-  # other's freshly-uploaded assets. The release/tag itself is preserved (only
-  # its assets are cleared); the matrix then repopulates it with this run only.
-  clean-dev-assets:
-    name: clear stale rolling-dev assets
-    needs: gate
-    if: needs.gate.outputs.build == 'true'
-    runs-on: ubuntu-latest
-    permissions:
-      contents: write
-    steps:
-      - name: Delete existing assets on the rolling dev release
-        env:
-          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          GH_REPO: ${{ github.repository }}
-        run: |
-          set -euo pipefail
-          # No `dev` release yet (first ever dev build) -> nothing to clean.
-          if ! gh release view dev >/dev/null 2>&1; then
-            echo "no rolling dev release yet; nothing to clean"
-            exit 0
-          fi
-          assets="$(gh release view dev --json assets --jq '.assets[].name')"
-          if [ -z "$assets" ]; then
-            echo "rolling dev release has no assets; nothing to clean"
-            exit 0
-          fi
-          while IFS= read -r name; do
-            [ -z "$name" ] && continue
-            echo "deleting stale dev asset: $name"
-            gh release delete-asset dev "$name" --yes
-          done <<< "$assets"
+  # R4-P1-3 (STAGE-THEN-PUBLISH): the rolling `dev` release is REUSED across runs,
+  # so prior runs' signed bundles accrete on it. The PREVIOUS design deleted ALL
+  # of the rolling release's assets BEFORE this run's matrix built/uploaded - so a
+  # failed or cancelled run (matrix, signing, upload, or the publish job) left the
+  # live `dev` manifests on Cloudflare Pages pointing at now-DELETED GitHub assets
+  # (broken dev auto-update until the next good run). The fix is to NEVER delete
+  # the previous good release's assets until this run's replacement is fully built,
+  # validated, AND deployed:
+  #   1. build  -> uploads THIS run's bundles (run-unique <ver>-dev.<run>.<sha>
+  #                names, so they never collide with the prior run's assets).
+  #   2. publish-dev-manifest -> downloads ONLY this run's assets (filtered by the
+  #                computed dev version), generates + validates all 4 target
+  #                manifests, overlays the live stable channel, deploys the
+  #                whole-site snapshot. A failure ANYWHERE up to here leaves the
+  #                previous good dev release (assets + live manifests) intact.
+  #   3. gc-stale-dev-assets -> only AFTER (2) succeeds, delete every asset on the
+  #                rolling release that is NOT from this run.
+  # So there is no longer a delete-then-rebuild window. The pre-build delete job is
+  # gone; the generator's stale-bundle guard (R2-P1-2) is preserved by scoping the
+  # publish-job download to the current run's version, not by wiping first.
 
   build:
     name: build dev ${{ matrix.target }}
-    needs: [gate, clean-dev-assets]
+    needs: gate
     if: needs.gate.outputs.build == 'true'
     strategy:
       fail-fast: false
@@ -196,19 +179,25 @@ jobs:
       # The exact bundle paths vary per OS/target; collect everything the
       # bundler produced (installers + .sig) under the target dir.
       #
-      # R3-P1-1: tauri-action here only BUILDS (no tagName), so its
+      # R3-P1-1 + R4-P1-3: tauri-action here only BUILDS (no tagName), so its
       # `releaseAssetNamePattern` cannot help - we upload the on-disk bundles
       # ourselves via softprops/action-gh-release. The on-disk macOS updater
       # artifact is named from the `.app` bundle (`Driven.app.tar.gz`) and carries
-      # NO arch, so the aarch64 + x86_64 mac runs would upload the SAME basename
-      # to the ONE rolling `dev` release and collide (one arch lost / ARM
-      # advertised as x86_64). Stamp the matrix arch into the mac `.app.tar.gz`
-      # (and its `.sig`) name during collection so each mac arch lands as a
-      # distinct asset the generator maps to darwin/<arch>. The naming is
-      # consistent with release.yml's pattern and the generator's parser.
+      # NO arch (and NO version), so the aarch64 + x86_64 mac runs would upload the
+      # SAME basename to the ONE rolling `dev` release and collide (one arch lost /
+      # ARM advertised as x86_64), AND a later run could not tell its mac bundle
+      # apart from a previous run's. Because the stage-then-publish flow (R4-P1-3)
+      # no longer wipes the rolling release before building, every dev asset must
+      # be RUN-UNIQUE so the publish job can select exactly this run's bundles and
+      # the GC step can delete exactly the previous runs'. Stamp BOTH the matrix
+      # arch AND this run's dev version into the mac `.app.tar.gz` (and its `.sig`).
+      # The dev version token (<patch>-dev.<run>.<sha>, no underscores) is what the
+      # generator's filename parser already extracts, and is unique per run.
       - name: Collect bundle artifacts
         id: collect
         shell: bash
+        env:
+          DEV_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
           out="dev-artifacts"
@@ -227,16 +216,19 @@ jobs:
             *)                    MAC_ARCH="" ;;
           esac
           if [ -n "$MAC_ARCH" ]; then
-            # Rename Driven.app.tar.gz -> Driven_<arch>.app.tar.gz (and the .sig)
-            # ONLY if the name does not already carry the arch.
+            # Rename Driven.app.tar.gz -> Driven_<version>_<arch>.app.tar.gz (and
+            # the .sig) so the mac updater artifact carries BOTH the arch (so each
+            # mac arch maps to a distinct darwin/<arch> manifest) AND this run's
+            # version (so it is run-unique like the installers). Skip if it already
+            # carries the arch token (idempotent).
             for f in "$out"/*.app.tar.gz "$out"/*.app.tar.gz.sig; do
               [ -e "$f" ] || continue
               base="$(basename "$f")"
               if printf '%s' "$base" | grep -qiE 'aarch64|arm64|x86_64|x64'; then
                 continue
               fi
-              # Insert _<arch> just before the `.app.tar.gz` suffix.
-              newbase="$(printf '%s' "$base" | sed -E "s/\\.app\\.tar\\.gz(\\.sig)?$/_${MAC_ARCH}.app.tar.gz\\1/")"
+              # Insert _<version>_<arch> just before the `.app.tar.gz` suffix.
+              newbase="$(printf '%s' "$base" | sed -E "s/\\.app\\.tar\\.gz(\\.sig)?$/_${DEV_VERSION}_${MAC_ARCH}.app.tar.gz\\1/")"
               if [ "$newbase" != "$base" ]; then
                 mv "$f" "$out/$newbase"
                 echo "renamed mac artifact $base -> $newbase"
@@ -291,24 +283,51 @@ jobs:
           echo "version=$version" >> "$GITHUB_OUTPUT"
           echo "dev version: $version"
 
-      # R1-P1-2/4: download the rolling `dev` release's assets so the generator
-      # has real bundle + `.sig` inputs (it reads them from a local dir). The
-      # clean-dev-assets job wiped prior runs' assets before this run's matrix
-      # uploaded, so only the CURRENT run's bundles are present (R2-P1-2).
-      - name: Download dev release assets
+      # R1-P1-2/4 + R4-P1-3: download the rolling `dev` release's assets so the
+      # generator has real bundle + `.sig` inputs (it reads them from a local
+      # dir). Because the stage-then-publish flow (R4-P1-3) NO LONGER wipes prior
+      # runs' assets before building, the rolling release can hold BOTH this run's
+      # bundles AND older runs'. The generator's stale-bundle guard would ERROR on
+      # accreted older assets, so we download ONLY the assets whose filename
+      # carries THIS run's computed dev version (a run-unique
+      # <next-patch>-dev.<run_number>.<sha> token). The build job now stamps that
+      # version into EVERY dev asset name (installers, AppImage, AND the mac
+      # `.app.tar.gz`), so a pure version-substring match selects exactly this
+      # run's bundles. We FAIL CLOSED if no current-run asset is found.
+      - name: Download THIS run's dev release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEV_VERSION: ${{ steps.ver.outputs.version }}
         run: |
           set -euo pipefail
           mkdir -p release-assets
-          gh release download "$RELEASE_TAG" \
-            --repo "$GITHUB_REPOSITORY" \
-            --dir release-assets \
-            --pattern '*-setup.exe' --pattern '*-setup.exe.sig' \
-            --pattern '*.msi' --pattern '*.msi.sig' \
-            --pattern '*.app.tar.gz' --pattern '*.app.tar.gz.sig' \
-            --pattern '*.AppImage' --pattern '*.AppImage.sig'
+          # All asset names on the rolling release.
+          names="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name')"
+          if [ -z "$names" ]; then
+            echo "::error::rolling dev release has no assets to publish"
+            exit 1
+          fi
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            case "$name" in
+              *"$DEV_VERSION"*)
+                echo "download current-run asset: $name"
+                gh release download "$RELEASE_TAG" \
+                  --repo "$GITHUB_REPOSITORY" \
+                  --dir release-assets \
+                  --pattern "$name" --clobber
+                ;;
+              *)
+                echo "skip stale asset (not this run): $name"
+                ;;
+            esac
+          done <<< "$names"
           echo "Downloaded assets:"; ls -la release-assets
+          if [ -z "$(ls -A release-assets)" ]; then
+            echo "::error::no current-run dev assets matched version $DEV_VERSION"
+            exit 1
+          fi
 
       # R1-P1-6: notes for the dev manifest's in-app changelog (the rolling
       # pre-release body).
@@ -364,3 +383,72 @@ jobs:
           apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
           accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
           command: pages deploy updates --project-name=driven-updates --branch=main
+
+  # R4-P1-3 (the "THEN GC" half of stage-then-publish): garbage-collect the
+  # PREVIOUS runs' assets from the rolling `dev` release - but ONLY now, after the
+  # whole pipeline (build + validate + manifest generate + CF Pages deploy)
+  # succeeded. Until this point the previous good dev release (its assets AND the
+  # live manifests that point at them) stayed fully intact, so any earlier failure
+  # or cancellation never stranded dev users on deleted assets. We delete every
+  # asset whose name does NOT carry THIS run's dev version (the run-unique token
+  # the build job stamps into every asset name); this run's freshly published +
+  # already-deployed assets are kept. A failure of THIS job alone is harmless
+  # (worst case: stale assets linger until the next dev build GCs them) - it
+  # depends on publish-dev-manifest so it cannot run on a failed publish.
+  gc-stale-dev-assets:
+    name: garbage-collect superseded rolling-dev assets
+    needs: publish-dev-manifest
+    if: needs.publish-dev-manifest.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    env:
+      RELEASE_TAG: dev
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Recompute the SAME run-unique dev version (pure function of the checked-out
+      # Cargo.toml version + run_number + short sha) so we know which assets to KEEP.
+      - name: Compute dev version
+        id: ver
+        shell: bash
+        run: |
+          set -euo pipefail
+          version="$(node scripts/set-dev-version.mjs --print-dev-version \
+            "${{ github.run_number }}" "$(git rev-parse --short HEAD)")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dev version: $version"
+
+      - name: Delete superseded dev assets (keep this run's)
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          DEV_VERSION: ${{ steps.ver.outputs.version }}
+        run: |
+          set -euo pipefail
+          if ! gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            echo "no rolling dev release; nothing to GC"
+            exit 0
+          fi
+          names="$(gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json assets --jq '.assets[].name')"
+          if [ -z "$names" ]; then
+            echo "rolling dev release has no assets; nothing to GC"
+            exit 0
+          fi
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            case "$name" in
+              *"$DEV_VERSION"*)
+                echo "keep current-run asset: $name"
+                ;;
+              *)
+                echo "deleting superseded dev asset: $name"
+                gh release delete-asset "$RELEASE_TAG" "$name" --yes \
+                  --repo "$GITHUB_REPOSITORY"
+                ;;
+            esac
+          done <<< "$names"

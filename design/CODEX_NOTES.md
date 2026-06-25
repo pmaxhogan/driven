@@ -2097,3 +2097,66 @@ flat-release asset set, or the CF Pages whole-site snapshot. Per the round-3 spe
 release-pipeline codex loop HARD-STOPS after recheck-3: any further pipeline-only edges are
 to be validated/hardened against the actual M10 tag run, NOT chased as static hypotheticals
 indefinitely.
+
+## M9 fix round 4b (codex M9-4: 2 release-pipeline P1 + 1 updater-store P2; r4b worktree, concurrent with r4a)
+
+Source review: `.claude/codex-reviews/M9-4-20260624-223910.md` (baseline 97f596e, M9 @ f9b1a41).
+This round split: the 2 DATA-SAFETY P1s (recovery durability + update_source ack gate) were r4a
+(a concurrent main-checkout agent on disjoint Rust/SourceTable files); r4b (this worktree) owns the
+2 release-pipeline P1s + the updater-store P2. Files touched here:
+`.github/workflows/dev-channel.yml`, `scripts/fetch-live-channel.sh`, `ui/src/stores/updater.ts`,
+`ui/src/App.vue`, `ui/src/__tests__/updater-store.test.ts` (release.yml already routes through the
+shared fetch script, so its deploy path is covered transitively).
+
+### R4-P1-3 (dev-channel.yml) STAGE-THEN-PUBLISH - never delete dev assets before the rebuild validates
+Before: a `clean-dev-assets` job deleted ALL of the rolling `dev` release's assets BEFORE this run's
+matrix built/uploaded. A failed/cancelled run after that delete (and `concurrency.cancel-in-progress:
+true` makes cancellation routine) left the live CF Pages dev manifests pointing at now-deleted GitHub
+assets -> broken dev auto-update until the next good run.
+Fix: removed the pre-build delete job. New ordering is build -> publish-dev-manifest -> gc-stale-dev-assets:
+  1. The build job stamps THIS run's run-unique dev version (`<next-patch>-dev.<run>.<sha>`) into
+     EVERY collected asset name - including the macOS `.app.tar.gz` (which previously carried neither
+     arch nor version), so no asset can collide with a prior run's on the rolling release.
+  2. publish-dev-manifest downloads ONLY the assets whose filename contains this run's dev version
+     (pure substring match), so the generator's stale-bundle guard sees a single clean run. It then
+     generates + validates all 4 target manifests, overlays the live stable channel (fail-closed,
+     below), and deploys the whole-site snapshot. A failure ANYWHERE up to here leaves the previous
+     good dev release (assets AND live manifests) fully intact.
+  3. gc-stale-dev-assets runs ONLY on `needs.publish-dev-manifest.result == 'success'` and deletes
+     every rolling-release asset NOT carrying this run's dev version. A failure of THIS job alone is
+     harmless (stale assets linger until the next dev build GCs them).
+So there is no longer any delete-then-rebuild window; cancellation is now safe.
+
+### R4-P1-4 (fetch-live-channel.sh, used by BOTH release.yml + dev-channel.yml) FAIL CLOSED
+Before: the overlay script treated transport/non-200 fetches of the OTHER channel's live manifests as
+"skip". Because the subsequent `pages deploy` is a WHOLE-SITE snapshot, a transient blip while
+preserving e.g. `stable` during a `dev` deploy dropped stable's manifests from the snapshot and the
+deploy WIPED them -> every stable user's auto-update broke.
+Fix: fail closed. Each per-platform fetch now retries (curl `--retry 3 --retry-all-errors` inside an
+outer 4-attempt loop with backoff + connect/max timeouts). A genuine HTTP 404 is the ONLY tolerated
+miss (the known first-publish case - that channel/platform was never published, nothing to preserve).
+ANY persistent non-404 outcome (transport, timeout, 5xx, 403, 200-with-empty-body) makes the script
+exit non-zero, which fails the workflow step and ABORTS the deploy before the whole-site snapshot can
+wipe the live channel. The script lists EVERY failing manifest before aborting. Applies to both deploy
+paths because both invoke this one script.
+Durable-source-of-truth option (future, removes the fetch dependency entirely): commit each channel's
+published manifests to the repo (or keep a canonical R2/KV copy) and deploy the MERGE of both channels
+from there, so a whole-site deploy never depends on re-fetching the other channel's live tree. Until
+then, fail-closed is the safe behavior.
+
+### R4-P2-1 (ui/src/stores/updater.ts + App.vue) subscribe() partial-failure cleanup + hydration ordering
+Before: `subscribe()` set `desiredSubscribed=true`, then `Promise.all`'d the three listener
+registrations. If one rejected, the other (already-resolved) listeners stayed attached but their
+unlisten handles were never assigned (leaked), and `desiredSubscribed` stayed `true` so every later
+`subscribe()` no-opped forever - the store could never recover, and an `updater:available` event
+could fire into a dead store. App.vue also `await`ed subscribe() before hydration, so a subscribe
+rejection skipped `get_pending_update_info` hydration entirely.
+Fix: subscribe() now uses `Promise.allSettled`, collects the handles that DID register, and on ANY
+rejection (or an `unsubscribe()` race) unlistens everything that registered, nulls the handles, resets
+`desiredSubscribed=false`, and re-throws so a retry can re-subscribe. Only on full success are the
+handles kept. App.vue wraps `subscribe()` in try/catch and runs `hydratePending()` in a `finally`, so
+a subscribe failure logs but never skips pending-update hydration (an independent path that still
+surfaces the banner with no live listeners). New vitest asserts: a partial subscribe failure leaks no
+listener (only the registered ones are torn down, a would-be-leaked event does not mutate the store),
+a later subscribe succeeds (desiredSubscribed was reset) and its live event surfaces the banner, and
+hydration still runs.

@@ -21,13 +21,32 @@
 # e.g.
 #   scripts/fetch-live-channel.sh dev updates https://driven.maxhogan.dev/updates
 #
-# A missing live manifest (HTTP 404 - that platform/channel was never published)
-# is skipped, not an error. A network/transport failure is logged and skipped so
-# a transient blip never blocks a release deploy (worst case: the other channel's
-# manifest is briefly absent until its own workflow re-publishes it; that is
-# strictly better than wiping it AND failing the deploy).
+# FAIL-CLOSED policy (R4-P1-4). The deploy that follows is a WHOLE-SITE snapshot,
+# so any OTHER-channel manifest we fail to overlay here is WIPED off the live site
+# by the deploy - breaking auto-update for every user on that channel. Treating a
+# transport / 5xx / non-200 fetch as "skip" therefore silently destroys the other
+# channel on a transient blip. So:
+#   - A genuine HTTP 404 is the ONLY tolerated miss: it means that platform on the
+#     OTHER channel was never published yet (the known first-publish case), so
+#     there is nothing to preserve.
+#   - ANY other failure (transport error, timeout, 5xx, 403, a 200 with an empty
+#     body, etc.) is retried a few times; if it still fails, the script EXITS
+#     NON-ZERO so the calling workflow ABORTS the deploy. A briefly-skipped deploy
+#     is strictly better than wiping a live channel's manifests.
+#
+# A durable source of truth (e.g. committing each channel's published manifests to
+# the repo, or keeping a canonical R2/KV copy and deploying the MERGE of both
+# channels from there) would remove this fetch dependency entirely; see
+# design/CODEX_NOTES.md "## M9 fix round 4b". Until then, fail closed.
 
 set -uo pipefail
+
+# Per-URL fetch tuning: a few retries with backoff to ride out a transient blip,
+# then fail closed. curl's own retry covers transient transport/5xx; we also wrap
+# it in an outer loop so a non-retryable-by-curl miss (e.g. a flaky 200/empty) is
+# retried too.
+FETCH_ATTEMPTS="${FETCH_LIVE_ATTEMPTS:-4}"
+FETCH_RETRY_DELAY="${FETCH_LIVE_RETRY_DELAY:-3}"
 
 CHANNEL="${1:?usage: fetch-live-channel.sh <channel> <tree-dir> <updates-base-url>}"
 TREE_DIR="${2:?usage: fetch-live-channel.sh <channel> <tree-dir> <updates-base-url>}"
@@ -47,7 +66,45 @@ PLATFORMS=(
   "linux/x86_64"
 )
 
+# Fetch one URL into $tmp with retries. Echoes a result token on stdout:
+#   ok    - a 200 with a non-empty body (tmp holds the manifest)
+#   404   - a genuine 404 (the OTHER channel never published this platform)
+#   fail  - persistent non-404 failure after all retries (caller must fail closed)
+# Diagnostics go to stderr so they do not pollute the result token.
+fetch_one() {
+  url="$1"
+  out="$2"
+  attempt=1
+  while [ "$attempt" -le "$FETCH_ATTEMPTS" ]; do
+    # -w writes ONLY the http_code to stdout; transport failures make curl exit
+    # non-zero and may emit no code, so default to 000. --retry handles curl's
+    # own transient 5xx/transport retries within the attempt.
+    code="$(curl -sSL --retry 3 --retry-delay 2 --retry-all-errors \
+      --connect-timeout 15 --max-time 120 \
+      -o "$out" -w '%{http_code}' "$url" 2>/dev/null || true)"
+    code="${code:-000}"
+    if [ "$code" = "200" ] && [ -s "$out" ]; then
+      echo "ok"
+      return 0
+    fi
+    if [ "$code" = "404" ]; then
+      # A definitive "not published yet" - do NOT retry, do NOT fail.
+      echo "404"
+      return 0
+    fi
+    echo "fetch attempt ${attempt}/${FETCH_ATTEMPTS} for ${url} failed (http ${code})" >&2
+    rm -f "$out"
+    if [ "$attempt" -lt "$FETCH_ATTEMPTS" ]; then
+      sleep "$FETCH_RETRY_DELAY"
+    fi
+    attempt=$((attempt + 1))
+  done
+  echo "fail"
+  return 0
+}
+
 overlaid=0
+failed=0
 for plat in "${PLATFORMS[@]}"; do
   rel="${CHANNEL}/${plat}/update.json"
   dest="${TREE_DIR}/${rel}"
@@ -58,16 +115,32 @@ for plat in "${PLATFORMS[@]}"; do
   fi
   url="${BASE_URL}/${rel}"
   tmp="$(mktemp)"
-  code="$(curl -fsSL -o "$tmp" -w '%{http_code}' "$url" || true)"
-  if [ "$code" = "200" ] && [ -s "$tmp" ]; then
-    mkdir -p "$(dirname "$dest")"
-    mv "$tmp" "$dest"
-    overlaid=$((overlaid + 1))
-    echo "overlaid live: ${rel}"
-  else
-    rm -f "$tmp"
-    echo "skip (http ${code:-error}): ${rel}"
-  fi
+  result="$(fetch_one "$url" "$tmp")"
+  case "$result" in
+    ok)
+      mkdir -p "$(dirname "$dest")"
+      mv "$tmp" "$dest"
+      overlaid=$((overlaid + 1))
+      echo "overlaid live: ${rel}"
+      ;;
+    404)
+      rm -f "$tmp"
+      echo "first-publish (404, nothing to preserve): ${rel}"
+      ;;
+    *)
+      # Persistent NON-404 failure. FAIL CLOSED: record it and keep going so the
+      # log lists EVERY failing manifest, then exit non-zero below to ABORT the
+      # deploy. Deploying now would wipe this live ${CHANNEL} manifest.
+      rm -f "$tmp"
+      echo "::error::fetch-live-channel: persistent fetch failure for ${url}; refusing to deploy a partial site that would wipe the live ${CHANNEL} channel"
+      failed=$((failed + 1))
+      ;;
+  esac
 done
+
+if [ "$failed" -gt 0 ]; then
+  echo "fetch-live-channel: FAILED CLOSED - ${failed} live ${CHANNEL} manifest(s) could not be preserved; aborting before the whole-site deploy" >&2
+  exit 1
+fi
 
 echo "fetch-live-channel: overlaid ${overlaid} live ${CHANNEL} manifest(s) into ${TREE_DIR}"
