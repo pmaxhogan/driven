@@ -489,6 +489,60 @@ describe("restore store", () => {
     expect(store.restoring).toBe(false);
   });
 
+  it("clears a STALE activeJobId when a new restore is rejected (M9c D3, M8 R4-P2-2)", async () => {
+    // M9c D3: startRestore must clear activeJobId BEFORE the new IPC, so a REJECTED
+    // new restore does not leave the store tracking the PRIOR job id (a later
+    // reconcile / cancel would otherwise target stale state). We run a first
+    // successful restore (activeJobId = job-prior), then a second restore that the
+    // backend REJECTS, and assert activeJobId is now null - not the old id.
+    let restoreCall = 0;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources")
+        return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree")
+        return Promise.resolve(tree([file("a.txt"), file("b.txt")]));
+      if (cmd === "restore_files") {
+        restoreCall += 1;
+        // First call succeeds (a prior job); second call is rejected.
+        return restoreCall === 1
+          ? Promise.resolve("job-prior")
+          : Promise.reject({ code: "internal.invalid_input" });
+      }
+      if (cmd === "get_restore_job")
+        return Promise.resolve({
+          jobId: "job-prior",
+          totalFiles: 1,
+          completedFiles: 0,
+          failedFiles: 0,
+          totalBytes: 0,
+          bytesDone: 0,
+          currentFile: null,
+          done: false,
+          cancelled: false,
+          files: [],
+        });
+      return Promise.resolve([]);
+    });
+
+    const store = useRestoreStore();
+    await store.loadSources();
+
+    // First restore: succeeds and records the prior job id.
+    store.toggleSelect("s1", "a.txt");
+    store.setDestination("/home/u/restored", "tok-1");
+    await store.startRestore();
+    expect(store.activeJobId).toBe("job-prior");
+
+    // Second restore: rejected. The stale prior id MUST be cleared (D3).
+    store.toggleSelect("s1", "b.txt");
+    store.setDestination("/home/u/restored", "tok-2");
+    await store.startRestore();
+
+    expect(store.errorCode).toBe("internal.invalid_input");
+    expect(store.activeJobId).toBeNull();
+    expect(store.restoring).toBe(false);
+  });
+
   it("clears the cross-source selection when the active source changes (R3-P1-1 defense in depth)", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources")

@@ -266,6 +266,12 @@ export const useRestoreStore = defineStore("restore", () => {
     cancelling.value = false;
     errorCode.value = null;
     job.value = null;
+    // M9c D3 (M8 R4-P2-2): clear the PRIOR job id BEFORE the new IPC. If the new
+    // restore is REJECTED (e.g. a collision / bad-input error from the R3 fixes),
+    // the store must NOT keep tracking the OLD job id - a later reconcile / cancel
+    // would otherwise target stale state. The returned id is assigned only on
+    // success below.
+    activeJobId.value = null;
     try {
       // M8-P2-4: keep the returned job id so a remount / missed terminal event
       // can reconcile current state via getRestoreJob(jobId).
