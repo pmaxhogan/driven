@@ -1564,3 +1564,95 @@ deny/fmt + ui lint/test/vue-tsc/build). The Windows temp create-instant junction
 window and the `FILE_RENAME_INFO` no-WRITE_THROUGH note remain as previously
 documented under R2-P1-1 (no plaintext ever leaves root; data is `sync_all`'d) -
 unchanged by this round.
+
+## M9d - release pipeline
+
+Authored the release / ops pipeline (DISJOINT from M9a's updater feature): the
+tag-triggered build/sign/publish workflow, release-please automation + config,
+the rolling dev channel, the Cloudflare Pages /updates wiring, and the chaos
+real-Drive flip. NOTHING under src-tauri/src, ui/, tauri.conf.json, Cargo.toml,
+or ui/package.json was touched (those are M9a/M9b/M9c).
+
+### Shipped
+
+- `.github/workflows/release.yml` - trigger `push: tags: ['v*']`. Build matrix
+  (macos aarch64 + x86_64, ubuntu-22.04 x86_64, windows x86_64) via
+  tauri-apps/tauri-action@v0 with GITHUB_TOKEN + TAURI_SIGNING_PRIVATE_KEY +
+  TAURI_SIGNING_PRIVATE_KEY_PASSWORD; `args: --target <matrix.target>`;
+  `uploadUpdaterJson: false` (tauri-action's flat latest.json does NOT match
+  Driven's channel-in-path layout, so we generate the tree ourselves; the .sig
+  files still upload). A `publish-updater-manifest` job (needs: build) runs
+  `node scripts/generate-update-json.mjs stable`, attaches the per-target
+  manifests to the GH Release, and `wrangler pages deploy updates` to CF Pages
+  `driven-updates`.
+- `.github/workflows/release-please.yml` - on push main,
+  googleapis/release-please-action@v4 with config-file + manifest-file;
+  `contents: write` + `pull-requests: write`. Maintains the chore release PR;
+  merging it tags v* -> fires release.yml.
+- `release-please-config.json` + `.release-please-manifest.json` - manifest mode.
+- `.github/workflows/dev-channel.yml` - rolling 0.0.0-dev.<short-sha> dev channel
+  (gated, see tradeoff below). Same 4-row matrix, uploads to a rolling `dev`
+  pre-release via softprops/action-gh-release@v2, generates updates/dev/... and
+  deploys to CF Pages.
+- `chaos.yml` - flipped the `chaos-real-drive` job from `if: ${{ false }}` to
+  `if: ${{ startsWith(github.ref, 'refs/tags/') }}` so the v* tag exercises the
+  real-Drive chaos suite (the DRIVEN_E2E_* secrets now exist). The chaos matrix
+  was NOT otherwise expanded: hermetic / fake-drive stay windows-only on PR/main,
+  3-OS only on tags; real-drive is a single ubuntu leg added only on tags.
+
+### release-please-type choice
+
+`release-type: rust` for the root (`.`) package. Driven's canonical version lives
+in the Cargo workspace (`[workspace.package].version` in the root Cargo.toml;
+src-tauri/Cargo.toml uses `version.workspace = true`), which the Rust strategy
+understands and bumps natively, and it generates the Rust-flavored CHANGELOG. The
+two non-Rust version mirrors (`src-tauri/tauri.conf.json` and `ui/package.json`)
+are bumped via per-package `extra-files` entries using the typed JSON updater
+(`{type: json, path, jsonpath: "$.version"}`). NOTE: for `.json` extra-files the
+typed form is REQUIRED - unlike `.yaml`, a bare-string `.json` extra-file does
+NOT auto-apply a `$.version` updater (it only runs the comment-marker Generic
+updater, and there are no `x-release-please-version` markers in those files), so
+bare-string entries would silently fail to bump. extra-files are placed INSIDE
+the package block (manifest-mode requirement), not at top level.
+
+### dev-channel trigger tradeoff (COST POLICY)
+
+The full 4-row (3-OS) Tauri bundle is expensive (premium macOS/Windows minutes).
+Firing it on EVERY main push would silently burn the CI budget on commits that
+have no business producing a dev installer. So dev-channel.yml does NOT build on
+every push: a `gate` job decides `build=true` only when (a) it is manually
+dispatched (`workflow_dispatch`), OR (b) the head commit message contains the
+explicit `[dev-build]` marker. It also explicitly skips release-please's
+"chore(main): release" / "release" commits so it never double-fires with the
+release.yml tag path. release.yml's full matrix is acceptable precisely because
+it is tag-only (once per tagged release). If cadence-based dev builds are wanted
+later, prefer a `schedule:` (nightly) over an every-push trigger.
+
+### Cloudflare Pages whole-site-snapshot caveat (IMPORTANT for M9a's script)
+
+`wrangler pages deploy <dir>` replaces the ENTIRE site snapshot - it is not an
+incremental upload. Driven serves both channels from one Pages project
+(driven.maxhogan.dev/updates/stable/... and /updates/dev/...). If release.yml
+deployed only `updates/stable/` it would wipe `updates/dev/`, and vice-versa.
+Both manifest jobs therefore `pages deploy updates` (the whole tree), and
+`scripts/generate-update-json.mjs` (M9a) MUST assemble the COMPLETE `updates/`
+directory - the channel it is generating PLUS the other channel's current tree
+(e.g. fetched from the live site or the GH-release-attached copies) - before the
+deploy step runs. This is the one cross-file contract between M9d's workflows and
+M9a's generator; it is called out here because getting it wrong silently breaks
+the OTHER channel's updater on every publish.
+
+### What remains to be proven at the M10 v0.1.0 tag
+
+End-to-end is NOT exercisable on a push (no tag), so it is validated for real at
+M10. Statically validated now: actionlint clean on all 5 workflows (0 findings),
+JSON + YAML parse, ASCII + LF, secret names match what is provisioned, the
+update.json path layout (`updates/<channel>/<target>/update.json`) matches M9a's
+endpoint shape. Unproven until the tag: (1) tauri-action actually signs + uploads
+all 4 targets and the .sig files; (2) `scripts/generate-update-json.mjs` exists
+(M9a) and emits the full two-channel `updates/` tree; (3) wrangler-action
+authenticates against account 9c20c14daa20466a2d761a47162f719a and the deployed
+tree is reachable at driven.maxhogan.dev/updates/...; (4) release-please's Rust
+strategy + the typed JSON extra-files bump all three version sources together;
+(5) the dev `[dev-build]` / dispatch gate fires the matrix as intended; (6) the
+tag-only chaos-real-drive leg passes with the live DRIVEN_E2E_* secrets.
