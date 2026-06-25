@@ -2917,3 +2917,122 @@ Single sole-actor.
   touched surface (telemetry.rs, app_state.rs, settings.rs, orchestrator.rs, state/mod.rs, state/sqlite.rs,
   index.ts): zero non-test `todo!(`/`unimplemented!(`/`unreachable!(` (the `unimplemented!()` hits are all
   inside `#[cfg(test)]` mock StateRepo impls). TELEMETRY CODEX LOOP CLOSED; residuals -> capstone #14.
+
+## M9 tail round (documented residuals + tooling; M9 now feature-complete pending M10)
+
+The final M9 sub-round (`.claude/m9-tail-spec.md`): the LOW-PRIORITY documented residuals carried
+across M6/M7 plus dev tooling (prettier-in-CI + Dependabot). ONE sole-actor pass; ordering was
+load-bearing - all A+B code/tests FIRST, THEN the prettier format pass (so it formats the new code
+too), THEN dependabot. After this lands + CI green, M9 is feature-complete; the pre-GA xhigh capstone
+(#14) remains the only open M9 item before M10.
+
+### A. M6 codex recheck-4 residual P2s (task #9 remainder; the 6 P2s - the R4-P1-1 recovery-phrase P1 was already done in M9c/r4a)
+
+All six implemented; none were stale. (`R4-P1-1` recovery-phrase durable-ack was already landed by
+M9c/r4a and is NOT re-touched here.)
+
+- R4-P2-1 (`commands/sources.rs` `preview_exclusions`) - it silently PREFERRED `source_id` when both
+  it and `local_path_token` were set, and built the matcher WITHOUT validating the candidate globs.
+  FIX: a pure `classify_preview_selector(source_id, token)` returns the single validated
+  `PreviewRootSelector` - both-set and neither-set are rejected (`internal.invalid_input`), a malformed
+  source id is rejected as invalid input (was `internal.bug`); and `validate_source_patterns` now runs
+  BEFORE the walk. Test: `classify_preview_selector_requires_exactly_one_of_source_or_token` (both /
+  neither / malformed / each lone selector).
+- R4-P2-2 (`ui/.../AddSourceWizard.vue` `loadDriveFolder`) - `pick_drive_folder` always returns an
+  empty `currentFolderPath` (the backend lists one folder's children, not the ancestor chain), and the
+  wizard OVERWROTE its own client-maintained breadcrumb (`crumbs` stack) with that empty value, so
+  `backup_sources.drive_folder_path` persisted blank. FIX (frontend keeps its own crumb, per the
+  recheck-4 note's option): persist `crumb.path` (the `parent/name` breadcrumb the descend builds),
+  falling back to the backend value only at root. Verified STALE-FREE in `SetupWizard.vue` (it only ever
+  lists the root, where empty == My Drive root, so no change needed there). Test:
+  `settings-components.test.ts` "persists the client-maintained Drive breadcrumb (R4-P2-2)" (descend
+  through the rendered folder button; the rendered path + the `add_source` `driveFolderPath` arg become
+  the breadcrumb, not blank).
+- R4-P2-3 (`commands/sources.rs` `add_source` / `update_source`) - the renderer `display_name` /
+  `drive_folder_id` / `drive_folder_path` were trusted verbatim into SQLite. FIX: shared
+  `validate_source_metadata` (non-empty + no control chars + length caps on the display name; non-empty
+  + no control/whitespace + cap on the folder id; optional + no control + cap on the folder path) runs in
+  `add_source` before any master-key work; `validate_display_name` gates the `update_source` display-name
+  patch. All reject with `internal.invalid_input`. Tests:
+  `validate_source_metadata_enforces_printable_nonempty_bounded` +
+  `validate_display_name_enforces_printable_nonempty_bounded`.
+- R4-P2-4 (`commands/accounts.rs` OAuth wizard sessions) - the process-global session map had no TTL /
+  cleanup / cancel, so abandoned flows accumulated BYO creds + tokens. FIX: `WizardSession` gains
+  `created_at` / `updated_at` (touched on every mutation); `prune_stale_sessions` reaps a non-terminal
+  session idle past `SESSION_TTL_MS` (30 min), a terminal one past `SESSION_TERMINAL_GRACE_MS` (5 min),
+  or ANY session past the absolute `SESSION_MAX_LIFETIME_MS` (2 h) - called at the natural entry points
+  (`begin_add_account_wizard`, `reauth_account`). A new `cancel_oauth_wizard(session)` IPC drops a
+  session on demand (idempotent), wired through `setup` store `cancel()` + `SetupWizard.vue`
+  `onBeforeUnmount`, with the typed `cancelOauthWizard` wrapper. Registered in `lib.rs`. Test:
+  `prune_stale_sessions_reaps_abandoned_and_stale_terminal_sessions`.
+- R4-P2-5 (`commands/accounts.rs` `fetch_google_userinfo` + `commands/settings.rs` `fetch_releases`) -
+  both `reqwest::Client`s had no timeout, so a blackholed endpoint hung the IPC command forever. FIX:
+  explicit `connect_timeout(10s)` + `timeout(30s)` on both builders.
+- R4-P2-6 (`commands/sources.rs` `reject_overlapping_root`) - it RE-canonicalised each existing root at
+  check time and SKIPPED (fail-OPEN) one that no longer resolved, letting a new source overlap a
+  temporarily-missing root. FIX (fail-CLOSED): `backup_sources.local_path` is already canonical from add
+  time, so compare the candidate against the STORED canonical path DIRECTLY (no filesystem access, so a
+  missing root is still compared); a non-absolute stored path (corrupt/legacy) now rejects the add rather
+  than being skipped. Test: `reject_overlapping_root_fails_closed_when_existing_root_is_missing` (delete
+  the existing root's directory, then a nested candidate is still rejected).
+
+### B. M7 codex recheck-3 P2 polish (task #13; `.claude/codex-reviews/M7-recheck3-20260624-151912.md`, 5 P2)
+
+All five implemented; none were stale.
+
+- #1 (diagnostic CSV one-page cap, `commands/settings.rs` `build_activity_csv`) - it read only
+  `PageRequest::first(10_000)`, so a 30-day window > 10k events (now that every upload writes a per-file
+  `upload_done` row) silently dropped history. FIX: a keyset-paged collector
+  (`build_activity_csv_paged`, page_size + max_rows params for testability) walks every page
+  (`first` then `after_cursor` by the oldest `(ts, id.0)`) until `!has_more` or the 5M-row bundle cap.
+  Test: `activity_csv_pages_through_all_rows_not_just_the_first_page` (25 rows over page_size 4 -> every
+  row emitted exactly once; the cap is honoured).
+- #2 (summary byte sums over EVERY row, `state/sqlite.rs` `activity_summary`) - "Uploaded today / this
+  week" + throughput summed `bytes` from all rows, so a future byte-carrying non-upload event would
+  inflate them. FIX: the outer filter gains `AND event_type = 'upload_done'`. sqlx::query! changed ->
+  `just sqlx-prepare` (one query removed, one added; 0 net drift). Test:
+  `activity_summary_byte_sums_count_only_upload_done_rows` (a 1M-byte `scan_done` row is ignored).
+- #3 (DST-unsafe week start, `ui/.../stores/activity.ts` `loadSummary`) - `weekStart = dayStart -
+  dayOfWeek * 24h` crosses a DST boundary wrong. FIX: `new Date(year, month, date - getDay())`
+  (local calendar arithmetic). Test: "computes the week start by local calendar arithmetic (DST-safe)".
+- #4 (filter dropdown frozen at mount, `ui/.../stores/activity.ts`) - a new event type appearing live /
+  via lag reconcile could not be filtered until reload. FIX: `noteEventType` inserts an unseen
+  `entry.eventType` (sorted) into `eventTypeOptions` from `onLiveEvent` AND the reconcile scan, BEFORE
+  the dedup/filter gate (so even a filtered-out row's type becomes selectable). Tests: "adds a new event
+  type seen on a live row..." + "exposes a new event type even when the live row is filtered out".
+- #5 (stale `errorCode` after a successful loadMore retry, `ui/.../stores/activity.ts` `loadMore`) - a
+  failed page load set `errorCode` and a later success never cleared it. FIX: clear `errorCode` at the
+  start of each `loadMore` attempt. Test: "clears a prior loadMore error after a successful retry".
+
+### C. prettier --check in the ui CI (+ scoped format pass)
+
+`.prettierrc.json` already existed (2-space / double-quotes / semis, matching CLAUDE.md) but was
+unwired. Added `format` + `format:check` package scripts (`prettier --write/--check src`), a
+`.prettierignore` (dist / node_modules / coverage / env.d.ts), and a `prettier --check` step to the
+ui CI job (after lint, before test:unit). Ran `prettier --write src` ONCE (AFTER A+B's ui edits, so it
+formatted the new code too). The format pass collided with `eslint-plugin-vue`'s template-formatting
+rules (179 new warnings: `vue/max-attributes-per-line`, `vue/html-self-closing`), so added
+`eslint-config-prettier` (new ui dev-dep) as the LAST eslint config entry to disable every
+formatting-conflicting rule - `pnpm lint` is back to 0 warnings/0 errors and prettier owns formatting.
+Scoped to `ui/` only; `scripts/` + `telemetry-worker/` were NOT touched.
+
+### D. Dependabot (task #10)
+
+`.github/dependabot.yml` (version 2): four ecosystems - cargo `/` (root workspace + crates +
+src-tauri), npm `/ui`, npm `/telemetry-worker`, github-actions `/` - all weekly (Monday), each grouping
+minor+patch into one PR (major opens its own), `open-pull-requests-limit: 5`, Conventional-Commits
+prefixes (`build(deps)` / `ci(deps)`), targeting the default branch (main). Valid YAML; actionlint on
+ci.yml exits 0.
+
+### Gates (all green before push)
+
+SQLX_OFFLINE cargo build --workspace --all-targets + clippy --workspace --all-targets -D warnings +
+test --workspace (driven-core + driven-app incl. the new sources/accounts/sqlite/settings tests; only
+the honest elevation/google_e2e gate-skips ignored) + build -p driven-app + deny check + fmt --all
+--check + git diff --check. sqlx::query! changed (activity_summary upload_done filter) -> `just
+sqlx-prepare` run, 0 net drift (1 query removed, 1 added). ui: pnpm install + lint (0/0) + prettier
+--check (clean) + test:unit (164) + build (vue-tsc clean). actionlint on ci.yml + valid dependabot.yml.
+telemetry-worker + scripts/ untouched. Anti-fake-green stub sweep on the touched surface (src-tauri/src
+{accounts,sources,settings}.rs + lib.rs, crates/driven-core state/sqlite.rs, ui src): zero non-test
+`todo!(`/`unimplemented!(`/`unreachable!(` (the `unimplemented!()` hits are all `#[cfg(test)]` Fake
+StateRepo doubles).
