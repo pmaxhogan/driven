@@ -1,0 +1,4 @@
+driven updater signature smoke fixture
+This tiny artifact is signed with the Driven updater minisign key.
+The committed .sig is verified against the tauri.conf.json pubkey in a cargo test
+so a wrong pubkey edit (or key drift) fails CI before a release is cut.

@@ -110,3 +110,15 @@ bytes.workspace = true
 # R2-P2-1 run-loop drain-budget test: `tokio::time::pause` for virtual time so
 # the long in-flight drain is instant (test-util is NOT part of tokio `full`).
 tokio = { workspace = true, features = ["test-util"] }
+# R5-P1-4 updater-signature smoke (tests/release_signature_smoke.rs): verifies a
+# committed fixture + .sig against the tauri.conf.json `pubkey` using the SAME
+# decode path tauri-plugin-updater 2.10.1 `verify_signature` uses (base64-decode
+# the config pubkey -> minisign `PublicKey::decode`; base64-decode the .sig ->
+# `Signature::decode`; `verify(.., allow_legacy = true)`). Both crates are
+# ALREADY in the dependency graph transitively via tauri-plugin-updater (pinned
+# minisign-verify 0.2.5) and base64 is the workspace dep, so this adds NO new
+# crate to the tree (deny check unaffected); declaring them dev-deps just lets
+# the smoke call the exact same API. VERIFY needs no private key, so CI runs this
+# every build with only the committed pubkey + fixture + sig.
+minisign-verify = "0.2.5"
+base64.workspace = true
