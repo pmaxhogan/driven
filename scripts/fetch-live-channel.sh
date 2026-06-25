@@ -46,7 +46,13 @@
 # channels from there) would remove this fetch dependency entirely; see
 # design/CODEX_NOTES.md "## M9 fix round 4b". Until then, fail closed.
 
-set -uo pipefail
+# R9-P2-1: `set -e` (errexit) added to the existing `-uo pipefail`. Without it, a
+# failed preservation write (mkdir/mv in the overlay below) could leave the script
+# exiting 0, letting the whole-site deploy proceed WITHOUT the preserved
+# other-channel manifests - a silent channel wipe. With `-e` plus the explicit
+# checked writes below, any overlay write failure aborts non-zero and the calling
+# workflow skips the deploy (fail closed, consistent with the fetch policy above).
+set -euo pipefail
 
 # Per-URL fetch tuning: a few retries with backoff to ride out a transient blip,
 # then fail closed. curl's own retry covers transient transport/5xx; we also wrap
@@ -125,8 +131,21 @@ for plat in "${PLATFORMS[@]}"; do
   result="$(fetch_one "$url" "$tmp")"
   case "$result" in
     ok)
-      mkdir -p "$(dirname "$dest")"
-      mv "$tmp" "$dest"
+      # R9-P2-1: check the overlay WRITES explicitly. A failed mkdir/mv here would,
+      # without this guard (and pre-`set -e`), let the script still exit 0 and the
+      # whole-site deploy wipe this live ${CHANNEL} manifest. Fail closed: abort the
+      # deploy on any write failure (and clean up the temp file first).
+      dest_dir="$(dirname "$dest")"
+      if ! mkdir -p "$dest_dir"; then
+        rm -f "$tmp"
+        echo "::error::fetch-live-channel: could not create ${dest_dir}; refusing to deploy a partial site that would wipe the live ${CHANNEL} channel" >&2
+        exit 1
+      fi
+      if ! mv "$tmp" "$dest"; then
+        rm -f "$tmp"
+        echo "::error::fetch-live-channel: could not write ${dest}; refusing to deploy a partial site that would wipe the live ${CHANNEL} channel" >&2
+        exit 1
+      fi
       overlaid=$((overlaid + 1))
       echo "overlaid live: ${rel}"
       ;;
