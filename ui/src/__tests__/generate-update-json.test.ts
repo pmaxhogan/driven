@@ -425,6 +425,60 @@ describe("generate-update-json.mjs", () => {
     await fs.rm(tmp, { recursive: true, force: true });
   });
 
+  it("R6-P1-2: an orphan .sig (no sibling installer) ERRORS instead of emitting a manifest", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-orphan-"));
+    const bundles = path.join(tmp, "bundle");
+    const out = path.join(tmp, "out");
+    await fs.mkdir(bundles, { recursive: true });
+
+    // A signature with NO sibling installer - a partial release. The generator
+    // must NOT emit a valid-looking manifest whose download URL 404s.
+    await fs.writeFile(
+      path.join(bundles, "Driven_0.1.0_x64-setup.exe.sig"),
+      "ORPHANSIG==\n",
+    );
+
+    const silent = { info: () => {}, warn: () => {} };
+    await expect(
+      mod.generate(
+        "stable",
+        { version: "0.1.0", bundles, out, baseUrl: "https://dl.example.test" },
+        { readConfVersion: async () => "0.1.0", log: silent },
+      ),
+    ).rejects.toThrow(/orphan signature|no sibling installer/);
+
+    // No manifest was written for the orphan target.
+    await expect(
+      fs.stat(mod.manifestOutPath(out, "stable", "windows-x86_64")),
+    ).rejects.toThrow();
+
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("R6-P1-2: collectSignedBundles accepts a .sig only when the sibling bundle is a real file", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-orphan2-"));
+    const bundles = path.join(tmp, "bundle");
+    await fs.mkdir(bundles, { recursive: true });
+
+    // Orphan: signature present, bundle absent -> rejected.
+    await fs.writeFile(
+      path.join(bundles, "Driven_0.1.0_x64-setup.exe.sig"),
+      "SIG==\n",
+    );
+    const silent = { info: () => {}, warn: () => {} };
+    await expect(
+      mod.collectSignedBundles(bundles, silent, "0.1.0"),
+    ).rejects.toThrow(/orphan signature|no sibling installer/);
+
+    // Now drop the real installer next to it -> accepted, exactly one candidate.
+    await fs.writeFile(path.join(bundles, "Driven_0.1.0_x64-setup.exe"), "real");
+    const got = await mod.collectSignedBundles(bundles, silent, "0.1.0");
+    expect(got.length).toBe(1);
+    expect(got[0].target).toBe("windows-x86_64");
+
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
   it("R3-P1-2: --require-targets passes when every required target is present", async () => {
     const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-full-"));
     const bundles = path.join(tmp, "bundle");

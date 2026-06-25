@@ -333,6 +333,29 @@ export async function collectSignedBundles(bundlesDir, log = console, expectedVe
         log.warn?.(`skip (no target mapping): ${bundleName}`);
         continue;
       }
+      // R6-P1-2: a `.sig` is NOT proof the sibling installer exists. A partial
+      // release (the signature uploaded but the bundle missing) would otherwise
+      // emit a valid-looking manifest whose `url` 404s, so clients discover an
+      // update they cannot download. Require the sibling bundle to exist AND be a
+      // regular FILE before accepting the candidate; an orphan `.sig` (or a
+      // directory/symlink-to-nothing at that path) ERRORS the run so a partial
+      // update tree never publishes.
+      let bundleStat;
+      try {
+        bundleStat = await fs.stat(bundleFile);
+      } catch (e) {
+        throw new Error(
+          `orphan signature: ${entry.name} has no sibling installer at ` +
+            `${path.basename(bundleFile)} (${e.code ?? e.message}); refusing to ` +
+            `emit a manifest pointing at a missing download (R6-P1-2)`,
+        );
+      }
+      if (!bundleStat.isFile()) {
+        throw new Error(
+          `signature ${entry.name} sibling ${path.basename(bundleFile)} is not a ` +
+            `regular file; refusing to emit a manifest for it (R6-P1-2)`,
+        );
+      }
       const signature = (await fs.readFile(full, "utf8")).trim();
       if (signature.length === 0) {
         throw new Error(`empty signature file: ${full}`);
