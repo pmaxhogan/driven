@@ -1959,3 +1959,73 @@ not constructable offline). The byte-identical-dev-version guarantee rests on bo
 dev-channel.yml jobs running `--print-dev-version` against the SAME checked-out commit
 with the same run_number + sha - true within one workflow run by construction (concurrency
 group serializes runs; the publish job `needs: build`).
+
+## M9 fix round 3 (codex M9-3 recheck-2: 2 P1 + 1 P2) - release-pipeline integrity, HARD STOP
+
+Source review: `.claude/codex-reviews/M9-3-20260624-214234.md` (baseline 97f596e, M9 @
+5e877ce). Scope was the release pipeline ONLY (generate-update-json.mjs + release.yml +
+dev-channel.yml + their tests); no Rust/Vue product code changed. tauri-action's macOS
+`.app.tar.gz` naming + the `releaseAssetNamePattern` `[arch]` behavior were confirmed via
+Context7 (`/tauri-apps/tauri-action`), not guessed: the on-disk macOS updater artifact is
+named from the `.app` bundle and carries the VERSION but NO arch, so both mac matrix rows
+emit the same basename; `releaseAssetNamePattern: '[name]_[version]_[platform]_[arch][ext]'`
+forces the arch into the uploaded asset (and its `.sig`) at tauri-action's release-upload
+step. Per-finding:
+
+- R3-P1-1 (macOS arch collision; archless mac bundle silently classified as x86_64). Both
+  `aarch64-apple-darwin` and `x86_64-apple-darwin` jobs produced an archless
+  `Driven.app.tar.gz`, so in a FLAT GitHub Release asset set one arch was lost or ARM was
+  advertised as x86_64; `targetForBundle()` defaulted an archless mac bundle to
+  `darwin-x86_64`. FIX (consistent naming across BOTH workflows + the generator parser):
+  (1) release.yml tauri-action now sets `releaseAssetNamePattern:
+  "[name]_[version]_[platform]_[arch][ext]"` so every uploaded asset (incl. each mac
+  `.app.tar.gz` + `.sig`) carries the arch; (2) dev-channel.yml's `Collect bundle
+  artifacts` step - which uploads on-disk bundles itself (tauri-action only builds there,
+  no tagName, so the pattern cannot apply) - now stamps the matrix arch into the mac
+  `.app.tar.gz`/`.sig` name (`Driven_<arch>.app.tar.gz`), idempotently (skips names that
+  already carry an arch token); (3) `targetForBundle()` now REJECTS (throws) an archless
+  mac updater bundle instead of guessing x86_64, and recognizes the x86_64 token set
+  (`x86_64|x64|amd64|intel`). The throw propagates out of `collectSignedBundles` (a non-mac
+  unmapped file like `.deb` still returns null and is skipped). Tests: arch-named forms map
+  to darwin/aarch64 + darwin/x86_64; an archless `Driven.app.tar.gz` throws from both
+  `targetForBundle` AND a full `generate` run; two arch-named mac bundles yield BOTH
+  darwin/x86_64 AND darwin/aarch64 manifests with no platform-key collision.
+
+- R3-P1-2 (partial updater trees go green). The generator only errored on ZERO bundles and
+  the workflows only checked the manifest glob was non-empty, so a missing `.sig`, an asset
+  collision, or a mapping miss could deploy a PARTIAL tree while CI passed. FIX: a new
+  `--require-targets <comma/space-list>` generator option (parsed + validated by
+  `parseRequiredTargets`, checked by `assertRequiredTargets`) ERRORS unless EVERY named
+  combined `<os>-<arch>` key produced a manifest. Both workflows pass the EXACT V1 set
+  `windows-x86_64,darwin-x86_64,darwin-aarch64,linux-x86_64` (also exported as
+  `V1_REQUIRED_TARGETS`). Defense-in-depth: each workflow ALSO has a shell step asserting
+  every required `updates/<channel>/<os>/<arch>/update.json` exists before any upload/deploy.
+  Tests: assertRequiredTargets passes on the full set + names the gap on a missing one;
+  parseRequiredTargets dedupes/validates/rejects empty+malformed; `generate` with
+  `requireTargets` FAILS on a Windows-only dir and PASSES on the full four-target dir.
+
+- R3-P2-1 (stale `--sha` dev-version: `0.0.0-dev.<sha>`, contradicting set-dev-version.mjs).
+  The generator re-implemented a below-stable dev version, a SECOND source of truth. FIX:
+  removed `--sha` and the `0.0.0-dev.<sha>` default entirely. The generator now statically
+  imports `computeDevVersionFromRepo` + `isValidVersion` from set-dev-version.mjs (the ONE
+  source of truth). `resolveVersion` for dev REQUIRES `--version` (the workflow's normal
+  path - it threads the shared `--print-dev-version` value) or, for a manual run,
+  `--run-number <n> --dev-sha <sha>` which DELEGATES to the shared monotonic helper; it
+  never derives a contradictory version. `computeDev` is injectable for tests. Help + header
+  comments + the stale test rewritten. Tests: explicit `--version` used verbatim; dev
+  delegates to the injected shared computeDev (and is ABOVE stable, never 0.0.0); dev with
+  neither `--version` nor run/sha is rejected; invalid `--version` rejected.
+
+GATES: cargo build --workspace --all-targets (SQLX_OFFLINE) + clippy -D warnings + test
+--workspace + build -p driven-app + deny check + fmt --check + git diff --check; ui pnpm
+install + lint + test:unit + build (vue-tsc --noEmit clean); actionlint 0 findings on all
+workflows. No sqlx::query! touched (no .sqlx regen). Anti-fake-green stub sweep on scripts
++ src-tauri/src + ui: zero non-test todo!/unimplemented!/unreachable!.
+
+FINAL VALIDATION + HARD STOP: the release pipeline's TRUE test is the real M10 v0.1.0 tag
+run (release.yml fires only on a `v*` tag; dev-channel on `[dev-build]`/dispatch) - a static
+generator/workflow review cannot exercise tauri-action's real per-OS bundle output, the
+flat-release asset set, or the CF Pages whole-site snapshot. Per the round-3 spec, the
+release-pipeline codex loop HARD-STOPS after recheck-3: any further pipeline-only edges are
+to be validated/hardened against the actual M10 tag run, NOT chased as static hypotheticals
+indefinitely.
