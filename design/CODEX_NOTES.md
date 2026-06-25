@@ -2218,3 +2218,58 @@ todo!/unimplemented!/unreachable!.
   rejection is the real guard. Tests: (driven-app)
   `reject_enable_of_pending_encrypted_source_gate` (rejected until the durable ack, allowed
   after); (vitest) `disables the enable toggle for a pending-recovery-ack source (R4-P1-2)`.
+
+## M9 fix round 5b (codex M9-5: updater pubkey GA-blocker + pending hygiene; r5b worktree, concurrent with r5a)
+
+Scope: the two updater findings from codex M9-5 (R5-P1-4 pubkey format, R5-P2-1 pending
+hygiene). The 3 data-safety P1s in the same review (remove-pending-encrypted-source orphan,
+post-restart reveal/ack action, restore root TOCTOU) are r5a's. r5b touched ONLY
+`src-tauri/src/updater.rs`, `src-tauri/tauri.conf.json` (unchanged in the end - see verdict),
+`src-tauri/Cargo.toml` (dev-deps), and a NEW committed smoke
+(`src-tauri/tests/release_signature_smoke.rs` + `tests/fixtures/updater/fixture.bin` + `.sig`).
+
+- **R5-P1-4 - updater pubkey format [GA-BLOCKER] - SETTLED EMPIRICALLY: codex was WRONG, pubkey
+  KEPT.** Codex claimed the configured `pubkey` (base64 of the whole minisign `.pub` file,
+  `dW50cnVzdGVkIGNvbW1lbnQ6...`) was wrong and that Tauri wants the bare `RWS...` line. This was
+  a FALSE POSITIVE; changing it would have BROKEN production update verification. Proof, read out
+  of the in-tree `tauri-plugin-updater` 2.10.1 source (`updater.rs:1453` `verify_signature`):
+  it does `let pub_key_decoded = base64_to_string(pub_key)?; PublicKey::decode(&pub_key_decoded)?`
+  i.e. it base64-DECODES the configured `pubkey` FIRST, then parses the decoded minisign text
+  (`untrusted comment: ...\nRWS...`). So the config MUST be the base64-of-the-.pub-file form; the
+  bare `RWS...` line would fail `base64_to_string`/`PublicKey::decode` and break every update.
+  EMPIRICAL settle: signed a throwaway fixture with the real updater private key
+  (`cargo tauri signer sign`, key at `~/.tauri/driven-updater.key`, NEVER printed/committed),
+  committed only the fixture + its `.sig`, and verify them against the tauri.conf.json `pubkey`
+  via the EXACT same decode+verify path tauri uses (base64-decode pubkey -> `PublicKey::decode`;
+  base64-decode `.sig` -> `Signature::decode`; `verify(data, &sig, allow_legacy = true)`). The
+  configured pubkey VERIFIES the signature -> KEPT as-is. Regression smoke
+  `release_signature_smoke.rs` (3 tests): `configured_pubkey_verifies_the_committed_fixture_signature`
+  (the GA guard - reads the pubkey LIVE from tauri.conf.json so a wrong edit / key drift fails CI),
+  `configured_pubkey_is_base64_of_a_minisign_pub_file_not_the_bare_rws_line` (asserts the format and
+  that the bare RWS line FAILS verify - locks the verdict), `tampered_fixture_fails_verification`
+  (one-byte flip fails - proves the smoke really checks the sig). VERIFY needs no private key, so CI
+  runs it every build via `cargo test --workspace`. minisign-verify 0.2.5 + base64 (workspace) added
+  as DEV-deps only; both already in the graph transitively via tauri-plugin-updater, so NO new crate
+  and deny check is unaffected. NOTE: the test FILE was renamed off `updater_signature` to
+  `release_signature_smoke` because a test-binary name containing "update" trips Windows UAC
+  installer-detection (`os error 740: requires elevation`) and would fail headless CI.
+- **R5-P2-1 - clear stale pending update on UpToDate / channel switch FIXED.**
+  `periodic_check_once` previously only SET pending when a check found an update; an `UpToDate`
+  result left a prior pending `Update` intact, and `set_update_channel` persisted the new channel
+  without clearing the backend pending update - so `get_pending_update_info` / `install_update`
+  could refer to an already-installed or old-channel update. Fix: `periodic_check_once` now CLEARS
+  pending on UpToDate (and still sets on found), and `set_update_channel` clears pending after a
+  successful channel write. The clear-vs-keep policy is routed through pure unit-tested predicates
+  (`pending_action_for_check`, `pending_action_for_channel_switch` -> `PendingAction`), mirroring the
+  existing `should_restore_pending` / `dispatch_check_outcome` test seam (a real
+  `tauri_plugin_updater::Update` can't be constructed in a unit test, so the decision is tested pure
+  and the side-effecting `set_pending_update(None)` rides the branch). Tests:
+  `up_to_date_check_clears_pending_available_update_sets`, `channel_switch_always_clears_pending`.
+  (`set_pending_update(None)` is a pre-existing AppState method - app_state.rs was NOT modified.)
+
+Gates (worktree, base cf8d5d3): cargo build --workspace --all-targets + clippy
+--workspace --all-targets -D warnings + test --workspace (incl. the new smoke; 27 ok groups,
+0 fail) + deny check (advisories/bans/licenses/sources ok) + fmt --check + git diff --check all
+GREEN. ui: pnpm install/lint/test:unit (145)/build (vue-tsc) all GREEN. Stub sweep: zero
+non-test todo!/unimplemented!/unreachable! on src-tauri/src. No CI workflow added (smoke runs
+under cargo test), so actionlint N/A.
