@@ -28,7 +28,11 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only cancel a SUPERSEDED PR run (a newer commit on the same PR). NEVER
+  # cancel a push-to-main run: those compute and SAVE the baseline cache, and a
+  # rapid run of merges would otherwise cancel each baseline run before it
+  # saved, leaving the gate permanently without a baseline to compare against.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 permissions:
   contents: read
