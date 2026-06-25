@@ -7,6 +7,7 @@ import * as ipc from "../ipc/commands";
 import { useSettingsStore } from "../stores/settings";
 import { useUpdaterStore } from "../stores/updater";
 import ChangelogModal from "../components/ChangelogModal.vue";
+import { isMacOS } from "../platform";
 import type { ReleaseDto } from "../ipc/types";
 
 // About view (SPEC s11.6, s15, s25 /about; DESIGN s8.2 About tab). Shows the app
@@ -26,6 +27,14 @@ const version = ref<string>("");
 const license = ref<string>("MIT OR Apache-2.0");
 
 const channels = ["stable", "dev"] as const;
+
+// R1-P2-1: the V1 macOS in-app updater is not expected to work cleanly, so on
+// macOS we hide the in-app "Install update" action and surface a manual DMG
+// download link to the GitHub releases page instead. Windows + Linux keep the
+// in-app install.
+const isMac = isMacOS();
+// The GitHub releases page the macOS user downloads the latest DMG from.
+const latestReleaseUrl = "https://github.com/pmaxhogan/driven/releases/latest";
 
 const exporting = ref(false);
 const exportError = ref<string | null>(null);
@@ -121,8 +130,28 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       <p class="font-medium">
         {{ t("about.updateAvailable", { version: updater.available.version }) }}
       </p>
+      <!-- macOS: the V1 in-app updater is not reliable, so offer a manual DMG
+           download instead of in-app install (R1-P2-1). -->
+      <p
+        v-if="isMac"
+        class="text-sm"
+        data-testid="install-mac-unsupported"
+      >
+        {{ t("about.installUpdateMacUnsupported") }}
+      </p>
       <div class="flex flex-wrap items-center gap-2">
+        <a
+          v-if="isMac"
+          :href="latestReleaseUrl"
+          target="_blank"
+          rel="noopener noreferrer"
+          class="rounded bg-emerald-600 px-3 py-1.5 text-white"
+          data-testid="download-latest-dmg"
+        >
+          {{ t("about.downloadLatestDmgButton") }}
+        </a>
         <button
+          v-else
           type="button"
           class="rounded bg-emerald-600 px-3 py-1.5 text-white disabled:opacity-50"
           :disabled="updater.installing"
@@ -147,9 +176,9 @@ function viewReleaseChangelog(release: ReleaseDto): void {
         </button>
       </div>
 
-      <!-- Download progress while installing. -->
+      <!-- Download progress while installing (Windows/Linux only). -->
       <div
-        v-if="updater.installing"
+        v-if="!isMac && updater.installing"
         class="space-y-1"
         data-testid="install-progress"
       >

@@ -180,7 +180,9 @@
     "displayLanguageLabel": "Display language",
     "moreLanguagesComing": "More languages coming soon.",
     "telemetryLabel": "Send anonymous usage stats",
-    "exportDiagnosticsButton": "Export diagnostic bundle"
+    "exportDiagnosticsButton": "Export diagnostic bundle",
+    "installUpdateMacUnsupported": "In-app updates are not available on macOS. Download the latest version manually:",
+    "downloadLatestDmgButton": "Download the latest release"
   },
   "changelog": {
     "title": "What's new in {version}",
