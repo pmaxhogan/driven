@@ -120,6 +120,66 @@ describe("updater store", () => {
     expect(store.bannerVisible).toBe(true);
   });
 
+  it("R2-P1-3: a live updater:available sets the banner even with NO view mounted (root subscription)", async () => {
+    // The app-root (App.vue) owns the subscription, so an event that fires while
+    // About is not mounted still drives the shared store banner. We model the
+    // root by subscribing directly on the store (no component) and firing the
+    // event - the banner must surface purely from store state.
+    invokeMock.mockResolvedValue(null);
+    const store = useUpdaterStore();
+    await store.subscribe();
+
+    // Nothing mounted, no manual check - banner hidden.
+    expect(store.bannerVisible).toBe(false);
+
+    // The backend's startup periodic check emits while About is closed.
+    handlers["updater:available"]?.(update("0.4.0"));
+
+    expect(store.available?.version).toBe("0.4.0");
+    expect(store.bannerVisible).toBe(true);
+    expect(store.checked).toBe(true);
+  });
+
+  it("R2-P1-3: hydratePending() fills the banner from the backend pending update on startup", async () => {
+    // A startup emit can be lost if it fires before the webview attaches; the
+    // app-root boot hydrates from get_pending_update_info so the banner still
+    // appears.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_pending_update_info") return Promise.resolve(update("0.5.0"));
+      return Promise.resolve(null);
+    });
+
+    const store = useUpdaterStore();
+    expect(store.available).toBeNull();
+
+    await store.hydratePending();
+
+    expect(store.available?.version).toBe("0.5.0");
+    expect(store.bannerVisible).toBe(true);
+    expect(invokeMock).toHaveBeenCalledWith("get_pending_update_info", undefined);
+  });
+
+  it("R2-P1-3: hydratePending() does NOT clobber an already-available update", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_pending_update_info") return Promise.resolve(update("0.1.0"));
+      return Promise.resolve(null);
+    });
+    const store = useUpdaterStore();
+    await store.subscribe();
+    // A fresher live event arrived first.
+    handlers["updater:available"]?.(update("0.9.0"));
+    expect(store.available?.version).toBe("0.9.0");
+
+    // Hydration must not overwrite the fresher live value.
+    await store.hydratePending();
+    expect(store.available?.version).toBe("0.9.0");
+    // get_pending_update_info is short-circuited (available already set).
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "get_pending_update_info",
+      undefined,
+    );
+  });
+
   it("dismissBanner hides the banner without clearing the update", async () => {
     invokeMock.mockResolvedValue(null);
     const store = useUpdaterStore();

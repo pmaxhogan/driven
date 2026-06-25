@@ -235,6 +235,24 @@ fn build_update_info(update: &tauri_plugin_updater::Update, channel: Channel) ->
     }
 }
 
+/// Pure: build an [`UpdateInfo`] from a peeked pending-update snapshot (R2-P1-3).
+/// `snapshot` is `(version, notes, published_at, channel_str)` as
+/// [`AppState::peek_pending_update`] returns it; the channel string is normalized
+/// through [`Channel::from_str_lenient`] so a corrupt tag reports `stable` rather
+/// than leaking garbage. Pure + unit-tested (no AppHandle / network).
+#[must_use]
+fn pending_info_from_snapshot(
+    snapshot: (String, Option<String>, Option<String>, String),
+) -> UpdateInfo {
+    let (version, notes, published_at, channel_str) = snapshot;
+    UpdateInfo {
+        version,
+        notes: notes.filter(|b| !b.is_empty()),
+        published_at,
+        channel: Channel::from_str_lenient(&channel_str).as_str().to_string(),
+    }
+}
+
 /// Pure: the channel whose name `updater:downloaded` reports for a pending
 /// update tagged with `channel_str` (R1-P2-3). Returns the canonical channel
 /// string (`stable` | `dev`) - a dev update reports `dev`, not the old
@@ -514,6 +532,21 @@ fn map_install_error(e: tauri_plugin_updater::Error) -> CommandError {
     }
 }
 
+/// `get_pending_update_info()` - the pending available update, if any (R2-P1-3,
+/// SPEC s15.2). The STARTUP periodic check (lib.rs setup) can find + record an
+/// update + emit `updater:available` BEFORE the webview has attached its
+/// listeners, so that one-shot event is lost. The app-root updater-store boot
+/// (App.vue) calls this on startup to HYDRATE the banner from the recorded
+/// pending update, so a missed startup emit still surfaces. Non-consuming (peek):
+/// `install_update` still finds the pending update afterward. Returns `None` when
+/// no check has recorded an update.
+#[tauri::command]
+pub async fn get_pending_update_info(
+    state: State<'_, AppState>,
+) -> CommandResult<Option<UpdateInfo>> {
+    Ok(state.peek_pending_update().map(pending_info_from_snapshot))
+}
+
 /// `get_update_channel()` - the active updater channel (SPEC s15.2), as the
 /// `stable` | `dev` string the UI toggle binds to.
 #[tauri::command]
@@ -695,6 +728,35 @@ mod tests {
             !should_restore_pending(false),
             "successful install must NOT restore pending"
         );
+    }
+
+    #[test]
+    fn pending_info_snapshot_maps_and_normalizes_channel() {
+        // R2-P1-3: get_pending_update_info hydrates the app-root store from the
+        // recorded pending update. The pure mapper builds the frozen UpdateInfo
+        // from the owned peek snapshot, normalizes the channel string (a corrupt
+        // tag reports `stable`, never garbage), and drops an empty notes body.
+        let dev = pending_info_from_snapshot((
+            "0.1.1-dev.5.abc1234".to_string(),
+            Some("Dev build notes.".to_string()),
+            Some("2026-06-24T00:00:00Z".to_string()),
+            "dev".to_string(),
+        ));
+        assert_eq!(dev.version, "0.1.1-dev.5.abc1234");
+        assert_eq!(dev.channel, "dev");
+        assert_eq!(dev.notes.as_deref(), Some("Dev build notes."));
+        assert_eq!(dev.published_at.as_deref(), Some("2026-06-24T00:00:00Z"));
+
+        // Empty notes -> None; corrupt channel tag -> stable.
+        let stable = pending_info_from_snapshot((
+            "0.2.0".to_string(),
+            Some(String::new()),
+            None,
+            "garbage".to_string(),
+        ));
+        assert_eq!(stable.channel, "stable");
+        assert!(stable.notes.is_none());
+        assert!(stable.published_at.is_none());
     }
 
     #[test]

@@ -409,6 +409,10 @@ pub fn run() {
             updater::install_update,
             updater::get_update_channel,
             updater::set_update_channel,
+            // R2-P1-3: hydrate the app-root updater store on startup so an
+            // `updater:available` emitted by the startup check before the webview
+            // attached is still reflected in the banner.
+            updater::get_pending_update_info,
             // SPEC s11.4 activity (M7).
             commands::activity::query_activity,
             commands::activity::clear_activity_older_than,

@@ -470,6 +470,30 @@ impl AppState {
             .take()
     }
 
+    /// M9a (R2-P1-3): PEEK (non-consuming) the pending update as an owned
+    /// snapshot, so the `get_pending_update_info` IPC can hydrate the webview's
+    /// updater store on startup WITHOUT taking the pending update (install still
+    /// needs it). Returns `(version, notes, published_at_rfc3339, channel)` while
+    /// holding the lock briefly; `None` when no check has recorded an update.
+    /// Kept as owned primitives so `AppState` stays decoupled from the updater
+    /// DTO mapping (updater.rs builds the `UpdateInfo`).
+    #[must_use]
+    pub fn peek_pending_update(&self) -> Option<(String, Option<String>, Option<String>, String)> {
+        self.updater
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .as_ref()
+            .map(|(update, channel)| {
+                (
+                    update.version.clone(),
+                    update.body.clone().filter(|b| !b.is_empty()),
+                    update.date.map(|d| d.to_string()),
+                    channel.clone(),
+                )
+            })
+    }
+
     /// M9a: register the spawned periodic-check task + its shutdown sender so the
     /// app-quit drain can stop + join it with no orphan. Called once after the
     /// updater task is spawned in `lib.rs` setup.

@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref } from "vue";
+import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { getVersion } from "@tauri-apps/api/app";
 
@@ -67,15 +67,12 @@ onMounted(async () => {
   if (settings.settings === null) {
     await settings.refresh();
   }
-  // Subscribe to live updater events (a periodic background check can surface an
-  // update without a manual click) and load the channel + the releases list.
-  await updater.subscribe();
+  // R2-P1-3: the updater EVENT subscriptions are owned at the app root (App.vue)
+  // so a startup `updater:available` is never lost when About is not mounted.
+  // About only loads the channel + releases list for its own surface; the banner
+  // is driven entirely by the shared store state the root subscription feeds.
   await updater.loadChannel();
   await updater.loadReleases();
-});
-
-onUnmounted(() => {
-  updater.unsubscribe();
 });
 
 async function onChannelChange(event: Event): Promise<void> {

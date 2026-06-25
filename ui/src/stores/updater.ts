@@ -130,6 +130,27 @@ export const useUpdaterStore = defineStore("updater", () => {
     bannerDismissed.value = false;
   }
 
+  /** R2-P1-3: hydrate the banner from the backend's recorded PENDING update on
+   * startup. The startup periodic check can find + record an update + emit
+   * `updater:available` before the webview attaches its listeners, so that
+   * one-shot event is lost; this fills the gap. No-op when nothing is pending or
+   * when a live event already surfaced an update (so we never clobber fresher
+   * state). Does NOT un-dismiss a banner the user already closed. */
+  async function hydratePending(): Promise<void> {
+    if (available.value !== null) return;
+    try {
+      const info = await ipc.getPendingUpdateInfo();
+      if (info !== null && available.value === null) {
+        available.value = info;
+        checked.value = true;
+      }
+    } catch (e) {
+      // Hydration is best-effort; surface as the check error channel but never
+      // throw out of app boot.
+      checkErrorCode.value = toErrorCode(e);
+    }
+  }
+
   /** Ingest a `updater:download_progress` event into the progress bar. */
   function onProgress(payload: UpdaterDownloadProgressPayload): void {
     downloaded.value = payload.downloaded;
@@ -292,6 +313,7 @@ export const useUpdaterStore = defineStore("updater", () => {
     onAvailable,
     onProgress,
     onDownloaded,
+    hydratePending,
     install,
     dismissBanner,
     openChangelog,

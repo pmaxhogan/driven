@@ -207,6 +207,15 @@ export function setUpdateChannel(channel: string): Promise<string> {
   return invoke("set_update_channel", { channel });
 }
 
+/** The pending available update recorded by the most recent check (R2-P1-3,
+ * SPEC s15.2), or null when none. Used by the app-root updater boot to HYDRATE
+ * the store on startup: the startup periodic check can record an update + emit
+ * `updater:available` before the webview attaches its listeners, so this catches
+ * a missed startup emit. Non-consuming - `installUpdate` still finds it. */
+export function getPendingUpdateInfo(): Promise<UpdateInfo | null> {
+  return invoke("get_pending_update_info");
+}
+
 // --- Activity (SPEC s11.4) ---
 
 /** Query a paginated, filtered page of the activity log (SPEC s11.4). The
