@@ -48,6 +48,36 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # R2-P2-2: deterministic release notes for the GitHub Release body AND the
+      # in-app changelog. Extract THIS tag's section from CHANGELOG.md (managed by
+      # release-please) instead of hardcoding "See CHANGELOG.md for details." The
+      # same notes are read back by the manifest job (gh release view --json body)
+      # and fed to the updater manifest, so the in-app "View changelog" shows real
+      # notes. We write to a file (multi-line, markdown) and load it into the step
+      # output via the GITHUB_OUTPUT heredoc form (safe for arbitrary content).
+      - name: Extract release notes from CHANGELOG.md
+        id: notes
+        shell: bash
+        run: |
+          set -euo pipefail
+          # --allow-empty: never fail the release build if the section is missing;
+          # fall back to a minimal pointer so the body is non-empty.
+          node scripts/extract-changelog.mjs "${{ github.ref_name }}" \
+            --out release-notes.md --allow-empty
+          if [ ! -s release-notes.md ] || [ "$(tr -d '[:space:]' < release-notes.md)" = "" ]; then
+            printf 'Release %s. See CHANGELOG.md for details.\n' "${{ github.ref_name }}" > release-notes.md
+          fi
+          {
+            echo "body<<RELEASE_NOTES_EOF"
+            cat release-notes.md
+            echo "RELEASE_NOTES_EOF"
+          } >> "$GITHUB_OUTPUT"
+          echo "release notes bytes: $(wc -c < release-notes.md)"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -85,7 +115,9 @@ jobs:
         with:
           tagName: ${{ github.ref_name }}
           releaseName: "Driven ${{ github.ref_name }}"
-          releaseBody: "See CHANGELOG.md for details."
+          # R2-P2-2: the real CHANGELOG.md section for this tag (deterministic),
+          # not a hardcoded pointer - this is what the in-app changelog shows.
+          releaseBody: ${{ steps.notes.outputs.body }}
           releaseDraft: false
           prerelease: false
           # tauri-action's own updater JSON (latest.json) is target-flat and
@@ -95,6 +127,14 @@ jobs:
           # a confusing second manifest on the release. (The .sig files are
           # still uploaded - uploadUpdaterSignatures defaults to true - so the
           # manifest generator can reference them.)
+          #
+          # R2-P2-1: codex flagged this as the wrong key (claimed `includeUpdaterJson`).
+          # VERIFIED against the authoritative tauri-action action.yml (dev branch)
+          # AND Context7 docs: the input IS `uploadUpdaterJson` (default true);
+          # `includeUpdaterJson` does NOT exist and would be silently IGNORED,
+          # causing tauri-action to upload its own conflicting latest.json. So the
+          # current key is correct - do NOT rename it. (False positive; see
+          # design/CODEX_NOTES.md "M9 fix round 2".)
           uploadUpdaterJson: false
           args: --target ${{ matrix.target }}
 
@@ -136,15 +176,22 @@ jobs:
             --pattern '*.AppImage' --pattern '*.AppImage.sig'
           echo "Downloaded assets:"; ls -la release-assets
 
-      # R1-P1-6: fetch the GitHub Release body so the manifest carries real
-      # release NOTES (the in-app "View changelog" reads the manifest body).
-      - name: Fetch release notes
+      # R1-P1-6 + R2-P2-2: real release NOTES for the manifest's in-app changelog.
+      # Extract THIS tag's section straight from CHANGELOG.md (deterministic,
+      # independent of whether the build job set the body), and fall back to the
+      # GitHub Release body only if the changelog has no section yet.
+      - name: Resolve release notes
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           set -euo pipefail
-          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
-            --json body --jq '.body // ""' > release-notes.md
+          node scripts/extract-changelog.mjs "$RELEASE_TAG" \
+            --out release-notes.md --allow-empty
+          if [ ! -s release-notes.md ] || [ "$(tr -d '[:space:]' < release-notes.md)" = "" ]; then
+            echo "CHANGELOG.md section empty; falling back to the GitHub Release body"
+            gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+              --json body --jq '.body // ""' > release-notes.md
+          fi
           echo "Notes bytes: $(wc -c < release-notes.md)"
 
       # R1-P1-1 / R1-P1-3: build updates/stable/<os>/<arch>/update.json from the
