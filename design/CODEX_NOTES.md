@@ -2845,3 +2845,75 @@ Single sole-actor.
   vitest (44 tests, incl. the new version/os_version PII negatives + real-shape acceptance + numeric
   range negatives). Stub sweep on the touched surface (telemetry.rs, settings.rs, lib.rs, index.ts,
   settings.ts, Settings.vue, About.vue): zero non-test `todo!(`/`unimplemented!(`/`unreachable!(`.
+
+## M9b fix round 3 (telemetry closeout)
+
+  Codex M9b recheck-2 (`.claude/codex-reviews/M9b-recheck2-20260625-035753.md`, baseline 8bb3fe9, M9b @
+  853d9e0): 2 P1 + 3 P2, all legit. ONE sole-actor pass (client + worker stay a coupled, byte-consistent
+  contract). Spec: `.claude/m9b-fix-spec-r3.md`. THE TELEMETRY CODEX LOOP CLOSES AFTER THIS LANDS + CI
+  GREEN - there is NO recheck-3; any residual telemetry findings roll into the pre-GA xhigh capstone
+  (#14), not a further telemetry round.
+
+  - R3-P1-1 (CONSENT INTEGRITY: atomic + commuting telemetry settings mutations, `state/mod.rs` +
+    `state/sqlite.rs` + `telemetry.rs`): the per-field telemetry writers were whole-blob read-modify-writes
+    over one JSON object, so a ping that read `{enabled:true}`, then the user disabled, then the ping wrote
+    its STALE object back, RESURRECTED `enabled:true` (silent re-enable after restart - a consent
+    violation). FIX: a new object-safe `StateRepo::patch_setting_field(key, field, value)` does an ATOMIC,
+    field-level SQLite `json_set` UPDATE in ONE statement (the field name is guarded to a strict
+    `[A-Za-z0-9_]+` allowlist since it cannot be a bound parameter inside a JSON path; the value is bound +
+    `json(?)`-wrapped; an absent/non-object row starts from `'{}'`). Every telemetry settings mutation -
+    `write_enabled`, `write_last_sent_at`, `write_last_recorded_version`, and `ensure_install_id` (now
+    patches ONLY `install_id`; the `enabled`/`endpoint` defaults are applied on READ in `read_prefs`, so it
+    no longer seeds siblings via a whole-blob write) - routes through it, so the four fields COMMUTE: a
+    `last_sent_at` write can never overwrite a sibling `enabled` a concurrent disable just flipped. Test:
+    `disable_concurrent_with_last_sent_at_write_does_not_persist_enabled_true` (seed enabled=true, disable,
+    then commit last_sent_at -> enabled STAYS false AND last_sent_at lands).
+  - R3-P1-2 (send-admission gate: no post-disable send, `app_state.rs` + `telemetry.rs` +
+    `commands/settings.rs`): the final cancel/pref re-check was not atomic with `sink.send`, so a
+    `set_telemetry_enabled(false)` landing between the re-check and the POST start still sent. FIX: a shared
+    send-admission `Arc<tokio::Mutex<()>>` on `TelemetryRuntime` (exposed via
+    `AppState::telemetry_send_gate`). `maybe_send_once` now ACQUIRES the gate, does the final cancel + pref
+    re-check UNDER it, and holds it across the awaited `sink.send`. The disable path (`apply_enabled_change`,
+    which BOTH `set_telemetry_enabled` AND the `update_settings` telemetry branch route through) sets the
+    cancel flag FIRST, then acquires the SAME gate to coordinate - so a disable that landed before admission
+    makes the under-gate re-check observe cancel and abort with NO network call, and a disable arriving while
+    a send holds the gate blocks until release (cancel already set -> next send is not admitted). Test:
+    `disable_landing_before_send_admission_prevents_the_send` (the test holds the gate standing in for the
+    disable, the spawned ping passes the early check then blocks at admission, cancel+enabled=false land,
+    gate releases -> ping's under-gate re-check aborts, sink called 0 times).
+  - R3-P2-1 (deep_verify_runs counts RUNS not sources, `orchestrator.rs` + `state/sqlite.rs` +
+    `state/mod.rs`): the aggregate counted `backup_sources` rows whose single `last_deep_verify_at` is
+    in-window, so two deep verifies for one source inside 24h (cadence min is 1h) collapsed to 1
+    (undercount). FIX: the orchestrator writes a DURABLE `deep_verify_done` `activity_log` Info row at the
+    deep-verify completion site (right after `mark_source_scanned`, only on a `deep_verify` cycle that
+    reached the all-ops-succeeded point, mirroring the `update_applied` pattern; best-effort, logged +
+    swallowed). `telemetry_events_since` now COUNTS those rows (`event_type='deep_verify_done'`, `ts` in
+    window) instead of source metadata. Tests: the sqlite aggregate test now seeds two in-window
+    `deep_verify_done` rows for the SAME source and asserts `deep_verify_runs == 2` (pre-window + future
+    excluded); `deep_verify_timestamp_persisted_so_next_cycle_not_due` asserts exactly one
+    `deep_verify_done` row at `now` with the source id. (sqlx::query! changed -> sqlx-prepare run, 0 drift;
+    the old backup_sources query file was removed + the new activity_log one added.)
+  - R3-P2-2 (byte-accurate body cap, `telemetry-worker/src/index.ts`): `request.text()` read the whole body
+    before the check and `raw.length` counted UTF-16 code units, not bytes, so a multibyte/chunked body
+    could exceed the 16 KiB byte cap. FIX: an explicit `Content-Length` that is non-integer/negative is a
+    400 `invalid_content_length` and one over the cap is a 400 `body_too_large` up front; then a new
+    `readBodyCapped` reads the body stream with a BYTE counter, cancelling + rejecting the moment the
+    cumulative byte count exceeds the cap (never `raw.length`). Tests: a >16KiB-BYTE multibyte body (6000
+    CJK chars = under the cap in code units, over in bytes) -> 400 `body_too_large`; a non-integer
+    Content-Length -> 400 `invalid_content_length`.
+  - R3-P2-3 (5xx on AE write failure, `telemetry-worker/src/index.ts`): the Worker returned 204 even when
+    `writeDataPoint` threw, so the client advanced `last_sent_at` and permanently dropped that window while
+    looking healthy. FIX: a thrown write returns 503 `write_failed` (logged generically, never the body) so
+    the client does NOT checkpoint; it retries on the next scheduled tick (no retry-storm). Test updated:
+    a throwing AE binding now asserts a 5xx + `write_failed` (was 204).
+
+  Gates (all green): SQLX_OFFLINE cargo build --workspace --all-targets + clippy --workspace --all-targets
+  -D warnings + test --workspace (full suite pass incl. the 2 new telemetry tests + the updated deep-verify
+  + sqlite aggregate tests; only the honest elevation/google_e2e gate-skips ignored) + build -p driven-app
+  + deny check + fmt --all --check + git diff --check. sqlx::query! changed (deep_verify count moved to
+  activity_log) -> `just sqlx-prepare` run, 0 drift. ui pnpm install + lint + test:unit (159) + build
+  (vue-tsc clean; no UI change - the telemetry IPC contracts are unchanged). worker: pnpm install + tsc +
+  eslint + vitest (46 tests, incl. the new byte-cap + invalid-content-length + 5xx). Stub sweep on the
+  touched surface (telemetry.rs, app_state.rs, settings.rs, orchestrator.rs, state/mod.rs, state/sqlite.rs,
+  index.ts): zero non-test `todo!(`/`unimplemented!(`/`unreachable!(` (the `unimplemented!()` hits are all
+  inside `#[cfg(test)]` mock StateRepo impls). TELEMETRY CODEX LOOP CLOSED; residuals -> capstone #14.
