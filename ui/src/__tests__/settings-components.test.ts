@@ -55,6 +55,7 @@ function makeSource(over: Partial<SourceDto> = {}): SourceDto {
     deepVerifyIntervalSecs: 604800,
     lastFullScanAt: null,
     createdAt: 0,
+    pendingRecoveryAck: false,
     ...over,
   };
 }
@@ -135,6 +136,36 @@ describe("SourceTable", () => {
       sourceId: "src-1",
       patch: { enabled: false },
     });
+  });
+
+  it("disables the enable toggle for a pending-recovery-ack source (R4-P1-2)", async () => {
+    // R4-P1-2 (DATA-SAFETY): a first-encrypted source still awaiting its recovery
+    // phrase ack must not be enableable from the table - the toggle is disabled
+    // (with a tooltip + badge) and a change is a no-op (no update_source call).
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources")
+        return Promise.resolve([
+          makeSource({ encryptionEnabled: true, enabled: false, pendingRecoveryAck: true }),
+        ]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+
+    const checkbox = wrapper.get('input[type="checkbox"]');
+    expect((checkbox.element as HTMLInputElement).disabled).toBe(true);
+    expect(wrapper.find('[data-testid="pending-recovery-ack-badge"]').exists()).toBe(
+      true,
+    );
+
+    // Even if a change event is fired, the handler is a no-op (no update_source).
+    await checkbox.trigger("change");
+    await flushPromises();
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "update_source",
+      expect.anything(),
+    );
   });
 
   it("Run now fires sync_now for the row's source", async () => {

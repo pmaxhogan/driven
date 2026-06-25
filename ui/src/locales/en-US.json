@@ -112,7 +112,9 @@
       "editExclusionsButton": "Edit exclusions",
       "runNowButton": "Run now",
       "removeButton": "Remove",
-      "deleteRemoteLabel": "Also delete backed-up files from Drive"
+      "deleteRemoteLabel": "Also delete backed-up files from Drive",
+      "pendingRecoveryAckBadge": "Awaiting recovery phrase",
+      "pendingRecoveryAckTooltip": "Reveal and save this source's recovery phrase before it can be enabled."
     },
     "addSource": {
       "title": "Add backup source",

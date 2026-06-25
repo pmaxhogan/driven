@@ -69,6 +69,7 @@ const FAKE_SOURCE = {
   deepVerifyIntervalSecs: 0,
   lastFullScanAt: null,
   createdAt: 0,
+  pendingRecoveryAck: false,
 };
 
 /** Wire the fake backend: route each command name to its canned response. */

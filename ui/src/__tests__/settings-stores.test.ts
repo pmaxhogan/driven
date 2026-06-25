@@ -50,6 +50,7 @@ function makeSource(over: Partial<SourceDto> = {}): SourceDto {
     deepVerifyIntervalSecs: 604800,
     lastFullScanAt: null,
     createdAt: 0,
+    pendingRecoveryAck: false,
     ...over,
   };
 }

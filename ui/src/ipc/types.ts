@@ -63,6 +63,10 @@ export interface SourceDto {
   deepVerifyIntervalSecs: number;
   lastFullScanAt: number | null;
   createdAt: number;
+  /** R4-P1-2 (DATA-SAFETY): true when this first-encrypted source is still
+   * awaiting its recovery-phrase ack (persisted disabled). The UI disables the
+   * enable toggle for it (the backend update_source is the real guard). */
+  pendingRecoveryAck: boolean;
 }
 
 export interface AddSourceRequest {

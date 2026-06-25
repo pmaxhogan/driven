@@ -58,6 +58,14 @@ function openWizard(): void {
 }
 
 async function toggleEnabled(source: SourceDto): Promise<void> {
+  // R4-P1-2 (DATA-SAFETY): a first-encrypted source still awaiting its
+  // recovery-phrase ack cannot be enabled here - the user must finish the
+  // reveal+ack step first. The toggle is disabled in the template, but guard the
+  // handler too so a programmatic change cannot bypass it (the backend
+  // update_source is the real guard and would reject it regardless).
+  if (source.pendingRecoveryAck) {
+    return;
+  }
   await sources.update(source.id, { enabled: !source.enabled });
 }
 
@@ -202,9 +210,22 @@ async function confirmRemove(sourceId: string): Promise<void> {
               <input
                 type="checkbox"
                 :checked="source.enabled"
+                :disabled="source.pendingRecoveryAck"
                 :aria-label="t('settings.sources.column.enabled')"
+                :title="
+                  source.pendingRecoveryAck
+                    ? t('settings.sources.pendingRecoveryAckTooltip')
+                    : undefined
+                "
                 @change="toggleEnabled(source)"
               >
+              <span
+                v-if="source.pendingRecoveryAck"
+                class="ml-2 text-xs text-amber-600 dark:text-amber-500"
+                data-testid="pending-recovery-ack-badge"
+              >
+                {{ t("settings.sources.pendingRecoveryAckBadge") }}
+              </span>
             </td>
             <td class="break-all py-2">
               {{ source.localPath }}
