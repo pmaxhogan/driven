@@ -374,6 +374,73 @@ export function writePing(env: Env, p: PingPayload): void {
   });
 }
 
+/// Read the request body from the stream with a BYTE counter, rejecting as soon
+/// as the cumulative byte count exceeds `maxBytes` (M9b P2-2). This is byte-
+/// accurate (it counts the raw bytes of each chunk, NOT UTF-16 code units), so a
+/// multibyte / chunked body that lies about (or omits) its Content-Length cannot
+/// slip past the cap. On success returns the UTF-8-decoded text; on an oversized
+/// body returns `body_too_large`; on a stream error returns `unreadable_body`.
+/// Never throws.
+async function readBodyCapped(
+  request: Request,
+  maxBytes: number,
+): Promise<{ ok: true; text: string } | { ok: false; error: string }> {
+  const body = request.body;
+  // No stream (e.g. an empty body): decode whatever text() yields (it is empty
+  // or tiny), still guarding against a surprise oversized read.
+  if (body === null) {
+    try {
+      const text = await request.text();
+      // Byte-measure via the UTF-8 encoder (text() already buffered it, but the
+      // byte length is what the cap is about).
+      if (new TextEncoder().encode(text).length > maxBytes) {
+        return { ok: false, error: "body_too_large" };
+      }
+      return { ok: true, text };
+    } catch {
+      return { ok: false, error: "unreadable_body" };
+    }
+  }
+
+  const reader = body.getReader();
+  const chunks: Uint8Array[] = [];
+  let total = 0;
+  try {
+    for (;;) {
+      const { done, value } = await reader.read();
+      if (done) break;
+      if (value) {
+        total += value.byteLength;
+        // Stop the moment we exceed the cap (we read at most maxBytes+1 bytes
+        // worth of chunks; we do not keep draining a hostile unbounded stream).
+        if (total > maxBytes) {
+          try {
+            await reader.cancel();
+          } catch {
+            // Best-effort cancel; ignore.
+          }
+          return { ok: false, error: "body_too_large" };
+        }
+        chunks.push(value);
+      }
+    }
+  } catch {
+    return { ok: false, error: "unreadable_body" };
+  }
+
+  // Concatenate the collected chunks and UTF-8 decode.
+  const buf = new Uint8Array(total);
+  let offset = 0;
+  for (const c of chunks) {
+    buf.set(c, offset);
+    offset += c.byteLength;
+  }
+  // UTF-8 decode (non-fatal: replaces invalid sequences with U+FFFD rather than
+  // throwing, so a body with bad bytes still parses-or-fails downstream as JSON).
+  const text = new TextDecoder().decode(buf);
+  return { ok: true, text };
+}
+
 /// The Worker request handler (SPEC s16). Pure-ish: takes `request` + `env`, so a
 /// unit test drives it with a mocked AE binding (no live runtime, no network).
 ///
@@ -399,23 +466,32 @@ export async function handle(request: Request, env: Env): Promise<Response> {
     });
   }
 
-  // Cap the body size before reading it fully (SPEC s16). A declared
-  // Content-Length over the cap is rejected up front; the actual read is also
-  // bounded below in case the header lies.
-  const declaredLen = Number(request.headers.get("content-length") ?? "0");
-  if (Number.isFinite(declaredLen) && declaredLen > MAX_BODY_BYTES) {
-    return json(400, { error: "body_too_large" });
+  // Cap the body size BY BYTES before parsing (SPEC s16; M9b P2-2). Two checks:
+  //  1. An EXPLICIT Content-Length that is invalid or over the cap is a 400 up
+  //     front (no read at all). A negative / NaN / non-integer length is rejected
+  //     as malformed rather than trusted.
+  //  2. Because the header can be absent or LIE (chunked transfer / a hostile
+  //     client), the actual body is read from the stream with a BYTE counter that
+  //     stops as soon as it exceeds the cap (reading at most MAX_BODY_BYTES+1
+  //     bytes), then decoded. `raw.length` (UTF-16 code units) is NEVER used as a
+  //     byte cap - a multibyte body could exceed the byte cap while staying under
+  //     it in code units.
+  const clHeader = request.headers.get("content-length");
+  if (clHeader !== null) {
+    const declaredLen = Number(clHeader);
+    if (!Number.isInteger(declaredLen) || declaredLen < 0) {
+      return json(400, { error: "invalid_content_length" });
+    }
+    if (declaredLen > MAX_BODY_BYTES) {
+      return json(400, { error: "body_too_large" });
+    }
   }
 
-  let raw: string;
-  try {
-    raw = await request.text();
-  } catch {
-    return json(400, { error: "unreadable_body" });
+  const bodyResult = await readBodyCapped(request, MAX_BODY_BYTES);
+  if (!bodyResult.ok) {
+    return json(400, { error: bodyResult.error });
   }
-  if (raw.length > MAX_BODY_BYTES) {
-    return json(400, { error: "body_too_large" });
-  }
+  const raw = bodyResult.text;
 
   let parsed: unknown;
   try {
@@ -430,17 +506,21 @@ export async function handle(request: Request, env: Env): Promise<Response> {
     return json(400, { error: "invalid_payload", field: result.reason });
   }
 
-  // Write to Analytics Engine. A binding error must not 500 the client (the ping
-  // is best-effort on the client side too); log a generic message (no body) and
-  // still return success so the client does not retry-storm.
+  // Write to Analytics Engine. M9b P2-3: if the write THROWS (e.g. a
+  // misconfigured / missing AE binding), return a 5xx - do NOT 204. A 204 makes
+  // the client treat the window as delivered and advance `last_sent_at`, so a
+  // broken binding would permanently DROP that window while looking healthy. A
+  // 5xx makes the client NOT checkpoint; it does not retry-storm (it simply waits
+  // for the next scheduled tick), so the window is retried later rather than lost.
   try {
     writePing(env, result.payload);
   } catch {
     // Intentionally generic - never log the payload/body.
     console.error("telemetry: writeDataPoint failed");
+    return json(503, { error: "write_failed" });
   }
 
-  // 204 No Content: accepted, nothing to return.
+  // 204 No Content: accepted + written, nothing to return.
   return new Response(null, { status: 204 });
 }
 

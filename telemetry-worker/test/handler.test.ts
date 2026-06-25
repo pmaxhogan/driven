@@ -155,6 +155,44 @@ describe("telemetry worker handler", () => {
     expect(writes).toHaveLength(0);
   });
 
+  it("rejects a >16KiB-BYTE multibyte body even though its UTF-16 length is under the cap", async () => {
+    // M9b P2-2: the cap must be BYTE-accurate. A body of 3-byte UTF-8 chars (e.g.
+    // CJK) has FEWER UTF-16 code units than bytes, so a `raw.length` (code-unit)
+    // cap would wrongly accept a body that is over the byte cap. Build a body that
+    // is ~18 KiB of UTF-8 bytes but only ~6000 UTF-16 code units (under 16384), and
+    // assert it is rejected as body_too_large with NO AE write.
+    const { env, writes } = mockEnv();
+    const multibyte = "中".repeat(6000); // 6000 code units, 18000 UTF-8 bytes
+    expect(multibyte.length).toBeLessThan(16 * 1024); // under the cap in code units
+    expect(new TextEncoder().encode(multibyte).length).toBeGreaterThan(16 * 1024); // over in bytes
+    // Either the up-front (byte-measured) Content-Length check or the stream
+    // byte-counter rejects it - both are byte-accurate; the point is that the
+    // UTF-16 `raw.length` (under the cap) NEVER lets it through. JSON.parse never
+    // runs (rejected first).
+    const req = new Request("https://driven.maxhogan.dev/telemetry/v1/ping", {
+      method: "POST",
+      headers: { "content-type": "application/json" },
+      body: multibyte,
+    });
+    const res = await handle(req, env);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "body_too_large" });
+    expect(writes).toHaveLength(0);
+  });
+
+  it("rejects an invalid (non-integer) Content-Length up front with 400", async () => {
+    // M9b P2-2: a malformed Content-Length is rejected up front rather than
+    // trusted. (A negative or NaN length is not a real request.)
+    const { env, writes } = mockEnv();
+    const res = await handle(
+      postPing(JSON.stringify(validPayload()), { "content-length": "not-a-number" }),
+      env,
+    );
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_content_length" });
+    expect(writes).toHaveLength(0);
+  });
+
   it("returns 405 for the wrong method on the ping path", async () => {
     const { env, writes } = mockEnv();
     const res = await handle(
@@ -176,7 +214,11 @@ describe("telemetry worker handler", () => {
     expect(writes).toHaveLength(0);
   });
 
-  it("still returns 204 if the AE write throws (best-effort, no client retry-storm)", async () => {
+  it("returns 5xx (not 204) if the AE write throws, so the client does not checkpoint", async () => {
+    // M9b P2-3: a throwing writeDataPoint (e.g. a misconfigured / missing AE
+    // binding) must NOT 204 - a 204 would make the client advance last_sent_at and
+    // permanently drop the window. A 5xx makes the client skip the checkpoint and
+    // retry on the next scheduled tick (no retry-storm).
     const env = {
       TELEMETRY: {
         writeDataPoint: () => {
@@ -186,7 +228,9 @@ describe("telemetry worker handler", () => {
     } as unknown as Env;
     const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
     const res = await handle(postPing(JSON.stringify(validPayload())), env);
-    expect(res.status).toBe(204);
+    expect(res.status).toBeGreaterThanOrEqual(500);
+    expect(res.status).toBeLessThan(600);
+    expect(await res.json()).toMatchObject({ error: "write_failed" });
     // It logged a GENERIC message (no payload/body).
     expect(errSpy).toHaveBeenCalledWith("telemetry: writeDataPoint failed");
     errSpy.mockRestore();
