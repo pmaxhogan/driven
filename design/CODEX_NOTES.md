@@ -1565,6 +1565,55 @@ window and the `FILE_RENAME_INFO` no-WRITE_THROUGH note remain as previously
 documented under R2-P1-1 (no plaintext ever leaves root; data is `sync_all`'d) -
 unchanged by this round.
 
+## M8 codex recheck-4 (FINAL) - ACCEPTED RESIDUALS; M8 review CLOSED
+
+The codex recheck-4 (`high`, baseline 1a7ad60, M8 @ 97f596e, CI + Chaos GREEN,
+vue-tsc clean) raised **1 P1 + 2 P2** -
+`.claude/codex-reviews/M8-recheck4-20260624-192136.md`. This is the cap-4 hard stop
+the user set when granting the 2 bonus rounds: M8 CLOSES regardless, and these
+recheck-4 findings are ACCEPTED RESIDUALS deferred to **M9 pre-GA hardening + the
+pre-GA xhigh whole-repo security capstone (task #14)** - NOT a recheck-5. This
+mirrors the M6 recheck-4 precedent (an even more severe data-safety item -
+recovery-phrase ack -> unrestorable backups - was likewise documented and deferred
+to M9 pre-GA rather than looped on). The recheck cycle was NOT converging (each
+round surfaced NEW restore.rs edge cases), so remaining restore hardening is better
+done holistically in the pre-GA pass than in another reactive single-finding round.
+
+- **R4-P1-1 (restore.rs commit() verify->rename TOCTOU) - DATA-SAFETY GA-BLOCKER,
+  deferred to M9 pre-GA.** The restored bytes are BLAKE3-verified through the OPEN
+  temp file, but `commit()` drops/closes that handle and then renames BY TEMP
+  NAME/PATH (Unix `renameat(parent, temp_name, ..)`; Windows re-opens from
+  `c.temp_path`). A local process watching the dest dir can unlink/replace
+  `.driven-restore-tmp.<uuid>` AFTER verification and BEFORE the rename, so the final
+  file can hold attacker-controlled bytes that never passed verification (silent
+  restore corruption). Narrow local race (needs an attacker process actively winning
+  the verify->commit window), but real. FIX (for M9 pre-GA): keep the temp HANDLE
+  owned through commit and commit/verify the SAME object - Windows
+  `SetFileInformationByHandle(FileRenameInfo)` on the original temp handle; Unix keep
+  the temp fd, verify final/name identity against the open fd before defusing the
+  cleanup guard (prefer an fd-based link-by-fd strategy where available). Do NOT
+  trust the temp pathname after verification. **GA is gated on this** (M9 pre-GA +
+  capstone #14 xhigh over the restore path will re-flag it if unfixed).
+
+- **R4-P2-1 (restore.rs:209/:461 + :1442) shared restore-eligibility predicate.**
+  The tree/search DTOs mark a row `restorable` whenever `drive_file_id` is present,
+  but restore resolution rejects anything whose status != `Synced` (R3-P2-2), so a
+  changed/pending/error row with an old Drive id LOOKS selectable then fails only at
+  restore start. Fix (M9 pre-GA): one shared eligibility predicate
+  (`drive_file_id.is_some() && status == Synced`) used by BOTH the tree/search DTO
+  `restorable` flag and restore resolution, so the UI never offers an ineligible row.
+
+- **R4-P2-2 (ui/src/stores/restore.ts:268) stale activeJobId on rejected start.**
+  `startRestore()` clears `job` but leaves `activeJobId` from the prior restore until
+  the new IPC succeeds; if the new restore is REJECTED (e.g. a collision/bad-input
+  error from the R3 fixes), the store still tracks the OLD job id, so a later
+  reconcile/cancel can target stale state. Fix (M9 pre-GA): set `activeJobId = null`
+  BEFORE calling `restoreFiles()`, assign the returned id only on success.
+
+M8 is CLOSED. Restore flow (list_remote_tree / search_files / streaming-decrypt
+restore_files + Restore.vue) ships with these 3 documented residuals folded into the
+M9 pre-GA hardening scope; the R4-P1-1 TOCTOU is the data-safety GA-blocker.
+
 ## M9d - release pipeline
 
 Authored the release / ops pipeline (DISJOINT from M9a's updater feature): the
