@@ -138,6 +138,13 @@ pub trait Pacer: Send + Sync {
     /// Returns the current ceilings snapshot (for the diagnostics bundle
     /// and the "current rate" status read-out).
     fn ceilings(&self) -> PacerCeilings;
+
+    /// Set the effective bandwidth cap at runtime, in Mbps (`None` =
+    /// unlimited). Drives the V2 metered-network throttle (DESIGN s17): the
+    /// orchestrator lowers the cap on a metered network and lifts it off one.
+    /// The default is a no-op so simple test/fake pacers need not implement it;
+    /// [`AimdPacer`] overrides it.
+    fn set_bandwidth_cap(&self, _mbps: Option<f64>) {}
 }
 
 /// `serde` helper: (de)serialise a [`Duration`] as integer milliseconds so
@@ -368,12 +375,25 @@ impl TokenBucket {
 /// the optional bandwidth bucket, the AIMD ceilings, a backoff deadline,
 /// and the clean-window timer. All time decisions read the injected
 /// [`Clock`] so tests drive AIMD deterministically with a `FakeClock`.
+/// The optional bandwidth gate, mutable at runtime (V2 metered throttle).
+///
+/// `rate` is the current effective refill rate (bytes/s), `None` = unlimited.
+/// `bucket` is the live [`TokenBucket`] held behind an `Arc` so
+/// [`AimdPacer::permit_bytes`] can clone it out under a brief lock and run the
+/// async `acquire` WITHOUT holding the gate lock across the await.
+/// [`Pacer::set_bandwidth_cap`] swaps both atomically when the cap changes.
+struct ByteGate {
+    rate: Option<f64>,
+    bucket: Option<Arc<TokenBucket>>,
+}
+
 pub struct AimdPacer {
     qps_bucket: TokenBucket,
     file_bucket: TokenBucket,
-    /// `Some` when `settings.bandwidth_cap_mbps` is set; `None` bypasses
-    /// the byte gate entirely (SPEC s9).
-    bytes_bucket: Option<TokenBucket>,
+    /// The optional bandwidth gate (SPEC s9), swappable at runtime so the
+    /// metered-network throttle (V2, DESIGN s17) can lower / lift the cap
+    /// without rebuilding the pacer. `None` rate bypasses the byte gate.
+    bytes: Mutex<ByteGate>,
     /// Wall-clock deadline (ms) before which `permit_request` sleeps
     /// (SPEC s9 `backoff_until`). `<= now` means no backoff.
     backoff_until_ms: AtomicI64,
@@ -383,9 +403,6 @@ pub struct AimdPacer {
     clean_window_start_ms: AtomicI64,
     /// Bit-packed current ceilings, guarded for atomic snapshot/update.
     ceilings: Mutex<PacerCeilings>,
-    /// Bandwidth refill rate captured at construction so a daily re-init
-    /// can rebuild the byte bucket identically (it is independent of AIMD).
-    bytes_rate_per_sec: Option<f64>,
     clock: Arc<dyn Clock>,
 }
 
@@ -394,14 +411,14 @@ pub struct AimdPacer {
 // `TokenBucket` Debug impl above).
 impl std::fmt::Debug for AimdPacer {
     fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        let bytes_rate = lock_recover(&self.bytes).rate;
         f.debug_struct("AimdPacer")
             .field("qps_bucket", &self.qps_bucket)
             .field("file_bucket", &self.file_bucket)
-            .field("bytes_bucket", &self.bytes_bucket)
+            .field("bytes_rate_per_sec", &bytes_rate)
             .field("backoff_until_ms", &self.backoff_until_ms)
             .field("clean_window_start_ms", &self.clean_window_start_ms)
             .field("ceilings", &self.ceilings)
-            .field("bytes_rate_per_sec", &self.bytes_rate_per_sec)
             .finish_non_exhaustive()
     }
 }
@@ -439,19 +456,26 @@ impl AimdPacer {
         let bytes_rate_per_sec = bandwidth_cap_mbps.map(|mbps| mbps * 1_000_000.0 / 8.0);
         let bytes_bucket = bytes_rate_per_sec.map(|rate| {
             // Burst = 2x refill (SPEC s9).
-            TokenBucket::new(rate, rate * 2.0, clock.clone())
+            Arc::new(TokenBucket::new(rate, rate * 2.0, clock.clone()))
         });
         let now = clock.now_ms();
         Self {
             qps_bucket,
             file_bucket,
-            bytes_bucket,
+            bytes: Mutex::new(ByteGate {
+                rate: bytes_rate_per_sec,
+                bucket: bytes_bucket,
+            }),
             backoff_until_ms: AtomicI64::new(now),
             clean_window_start_ms: AtomicI64::new(now),
             ceilings: Mutex::new(ceilings),
-            bytes_rate_per_sec,
             clock,
         }
+    }
+
+    /// The bytes/sec refill rate for a `bandwidth_cap_mbps` setting (SPEC s9).
+    fn mbps_to_bytes_per_sec(mbps: f64) -> f64 {
+        mbps * 1_000_000.0 / 8.0
     }
 
     /// Sleeps out any active backoff window, polling the wall clock so a
@@ -582,8 +606,11 @@ impl AimdPacer {
             default.file_creates_per_sec as f64,
             (default.file_creates_per_sec as f64) * 2.0,
         );
-        if let (Some(b), Some(rate)) = (&self.bytes_bucket, self.bytes_rate_per_sec) {
-            b.reconfigure(rate, rate * 2.0);
+        {
+            let gate = lock_recover(&self.bytes);
+            if let (Some(b), Some(rate)) = (&gate.bucket, gate.rate) {
+                b.reconfigure(rate, rate * 2.0);
+            }
         }
         self.clean_window_start_ms.store(now, Ordering::Release);
     }
@@ -604,10 +631,28 @@ impl Pacer for AimdPacer {
     }
 
     async fn permit_bytes(&self, n: u64) {
-        // `None` = unlimited / bypassed (SPEC s9): the gate is a no-op.
-        if let Some(bucket) = &self.bytes_bucket {
+        // Clone the live bucket out under a BRIEF lock so the async `acquire`
+        // never holds the gate lock across an await (and a concurrent
+        // `set_bandwidth_cap` can swap it). A `None` bucket = unlimited no-op.
+        let bucket = lock_recover(&self.bytes).bucket.clone();
+        if let Some(bucket) = bucket {
             bucket.acquire(n).await;
         }
+    }
+
+    fn set_bandwidth_cap(&self, mbps: Option<f64>) {
+        // V2 metered throttle (DESIGN s17): swap the effective cap at runtime.
+        // Idempotent so the orchestrator may call it every cycle. A daily-quota
+        // re-init rebuilds the bucket from `rate`, so updating `rate` keeps the
+        // two consistent.
+        let new_rate = mbps.map(Self::mbps_to_bytes_per_sec);
+        let mut gate = lock_recover(&self.bytes);
+        if gate.rate == new_rate {
+            return;
+        }
+        gate.rate = new_rate;
+        gate.bucket =
+            new_rate.map(|rate| Arc::new(TokenBucket::new(rate, rate * 2.0, self.clock.clone())));
     }
 
     fn note_response(&self, classification: ResponseClass) {
@@ -871,6 +916,56 @@ mod tests {
         // the clock (no driver needed).
         pacer.permit_bytes(u64::MAX).await;
         assert_eq!(fake.now_ms(), 0, "no-op acquire did not block");
+    }
+
+    #[tokio::test]
+    async fn set_bandwidth_cap_installs_a_cap_at_runtime() {
+        let (fake, c) = clock();
+        let pacer = Arc::new(AimdPacer::new(c, None)); // starts unlimited
+        pacer.permit_bytes(u64::MAX).await;
+        assert_eq!(fake.now_ms(), 0, "no cap yet: instant");
+
+        // Install a 1 Mbps cap (125_000 B/s, burst 250_000) at runtime.
+        pacer.set_bandwidth_cap(Some(1.0));
+        pacer.permit_bytes(250_000).await; // drains the fresh burst, still t=0
+        let p2 = pacer.clone();
+        drive(&fake, Duration::from_millis(50), async move {
+            p2.permit_bytes(125_000).await;
+        })
+        .await;
+        assert!(
+            fake.now_ms() >= 900,
+            "throttled once the cap was installed, clock at {}",
+            fake.now_ms()
+        );
+    }
+
+    #[tokio::test]
+    async fn set_bandwidth_cap_lifts_the_cap() {
+        let (fake, c) = clock();
+        let pacer = Arc::new(AimdPacer::new(c, Some(1.0))); // starts capped
+        pacer.set_bandwidth_cap(None); // lift the cap
+        pacer.permit_bytes(u64::MAX).await;
+        assert_eq!(fake.now_ms(), 0, "cap lifted: acquire is now a no-op");
+    }
+
+    #[tokio::test]
+    async fn set_bandwidth_cap_is_idempotent_for_the_same_rate() {
+        let (fake, c) = clock();
+        let pacer = Arc::new(AimdPacer::new(c, Some(1.0)));
+        pacer.permit_bytes(250_000).await; // drain the burst at t=0
+                                           // Re-applying the SAME cap must NOT rebuild (and refill) the bucket.
+        pacer.set_bandwidth_cap(Some(1.0));
+        let p2 = pacer.clone();
+        drive(&fake, Duration::from_millis(50), async move {
+            p2.permit_bytes(125_000).await;
+        })
+        .await;
+        assert!(
+            fake.now_ms() >= 900,
+            "idempotent re-apply kept the drained bucket, clock at {}",
+            fake.now_ms()
+        );
     }
 
     #[tokio::test]

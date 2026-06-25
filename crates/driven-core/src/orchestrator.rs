@@ -57,7 +57,7 @@ use driven_vss::{VssMode, VssProvider};
 use crate::executor::{Executor, OpOutcome};
 use crate::hooks::{CommandRunner, HookKind, NoopCommandRunner};
 use crate::network::{NetworkProbe, NetworkState, ServiceHealth, ServiceName};
-use crate::pacer::PacerCeilings;
+use crate::pacer::{Pacer, PacerCeilings};
 use crate::state::{ActivityLevel, NewActivity, SourceRow, StateRepo};
 use crate::time::Clock;
 use crate::types::{
@@ -189,6 +189,40 @@ pub struct OrchestratorConfig {
     pub post_backup_hook: Option<String>,
     /// How long a hook command may run before it is killed, in seconds.
     pub hook_timeout_secs: u32,
+    /// What [`skip_on_metered`](Self::skip_on_metered) DOES on a metered
+    /// network (V2 metered pause-or-throttle, DESIGN s17): fully pause
+    /// (default, V1 behaviour) or keep syncing at a reduced bandwidth cap.
+    pub metered_mode: MeteredMode,
+    /// The bandwidth cap (Mbps) applied while metered in
+    /// [`MeteredMode::Throttle`]. `None` falls back to the normal
+    /// [`bandwidth_cap_mbps`](Self::bandwidth_cap_mbps).
+    pub metered_bandwidth_cap_mbps: Option<u32>,
+}
+
+/// What Driven does on a metered network when
+/// [`skip_on_metered`](OrchestratorConfig::skip_on_metered) is on (V2, DESIGN
+/// s17).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize, Default)]
+#[serde(rename_all = "snake_case")]
+pub enum MeteredMode {
+    /// Pause sync entirely while metered (the V1 behaviour).
+    #[default]
+    Pause,
+    /// Keep syncing but cap bandwidth at
+    /// [`metered_bandwidth_cap_mbps`](OrchestratorConfig::metered_bandwidth_cap_mbps).
+    Throttle,
+}
+
+/// The effective bandwidth cap (Mbps) for the current network (V2 metered
+/// throttle, DESIGN s17). On a metered network with `skip_on_metered` on and
+/// [`MeteredMode::Throttle`], the metered cap applies (falling back to the base
+/// cap if unset); otherwise the base cap. Pure, for testability.
+fn effective_bandwidth_cap_mbps(cfg: &OrchestratorConfig, on_metered: bool) -> Option<u32> {
+    if on_metered && cfg.skip_on_metered && cfg.metered_mode == MeteredMode::Throttle {
+        cfg.metered_bandwidth_cap_mbps.or(cfg.bandwidth_cap_mbps)
+    } else {
+        cfg.bandwidth_cap_mbps
+    }
 }
 
 impl Default for OrchestratorConfig {
@@ -208,6 +242,8 @@ impl Default for OrchestratorConfig {
             pre_backup_hook: None,
             post_backup_hook: None,
             hook_timeout_secs: 60,
+            metered_mode: MeteredMode::Pause,
+            metered_bandwidth_cap_mbps: None,
         }
     }
 }
@@ -373,6 +409,11 @@ pub struct SyncOrchestrator {
     /// [`Self::with_command_runner`]. The hook COMMANDS come from
     /// [`OrchestratorConfig`]; this is only the seam that runs them.
     command_runner: Arc<dyn CommandRunner>,
+    /// The executor's rate pacer, shared in for the V2 metered throttle
+    /// (DESIGN s17): the orchestrator lowers / lifts its bandwidth cap as the
+    /// network goes on / off metered. `None` (the default / tests) disables the
+    /// runtime throttle; the cap then stays at its construction value.
+    pacer: Option<Arc<dyn Pacer>>,
     /// Per-orchestrator record-at-create ledger (P1-A). The recorder hook wired
     /// into the provider by [`Self::with_vss`] pushes each freshly-created
     /// shadow GUID here synchronously; `record_vss_orphans` drains it into the
@@ -438,6 +479,7 @@ impl SyncOrchestrator {
             shutdown_rx,
             vss: None,
             command_runner: Arc::new(NoopCommandRunner),
+            pacer: None,
             vss_create_ledger: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             orphan_cleanup_done: Mutex::new(false),
             suspended: std::sync::atomic::AtomicBool::new(false),
@@ -472,6 +514,28 @@ impl SyncOrchestrator {
     pub fn with_command_runner(mut self, runner: Arc<dyn CommandRunner>) -> Self {
         self.command_runner = runner;
         self
+    }
+
+    /// Share in the executor's [`Pacer`] so the orchestrator can drive the V2
+    /// metered throttle (DESIGN s17). Pass the SAME `Arc` the executor holds so
+    /// a runtime cap change is seen by the upload path. Without this the metered
+    /// throttle is inert (the pacer keeps its construction-time cap).
+    pub fn with_pacer(mut self, pacer: Arc<dyn Pacer>) -> Self {
+        self.pacer = Some(pacer);
+        self
+    }
+
+    /// Apply the effective bandwidth cap for the current network to the shared
+    /// pacer (V2 metered throttle, DESIGN s17). On a metered network in
+    /// [`MeteredMode::Throttle`] the metered cap applies; otherwise the normal
+    /// cap. A no-op when no pacer was shared in. Idempotent (the pacer ignores
+    /// an unchanged rate), so it is safe to call every cycle.
+    async fn apply_bandwidth_cap(&self) {
+        let Some(pacer) = &self.pacer else { return };
+        let cfg = self.config.read().await;
+        let on_metered = self.power.current().await.on_metered_network;
+        let mbps = effective_bandwidth_cap_mbps(&cfg, on_metered);
+        pacer.set_bandwidth_cap(mbps.map(f64::from));
     }
 
     /// Run a configured pre/post backup hook command and record the outcome as
@@ -797,8 +861,11 @@ impl SyncOrchestrator {
             return GateDecision::Pause(pause_reason_for_network(net));
         }
 
-        // Metered network (DESIGN s5.7): pause if configured.
-        if cfg.skip_on_metered && power.on_metered_network {
+        // Metered network (DESIGN s5.7): in Pause mode pause; in Throttle mode
+        // (V2, DESIGN s17) keep syncing - the reduced cap is applied to the
+        // pacer in `apply_bandwidth_cap` before the source loop.
+        if cfg.skip_on_metered && power.on_metered_network && cfg.metered_mode == MeteredMode::Pause
+        {
             return GateDecision::Pause(PauseReason::Metered);
         }
 
@@ -1462,6 +1529,12 @@ impl SyncOrchestrator {
             }
             GateDecision::Proceed => {}
         }
+
+        // V2 metered throttle (DESIGN s17): the gates are open, so apply the
+        // effective bandwidth cap for the current network to the shared pacer
+        // before any upload. On a metered network in Throttle mode this lowers
+        // the cap; off metered it lifts it back to the base cap. Idempotent.
+        self.apply_bandwidth_cap().await;
 
         // Remote reconcile phase (DESIGN s5.6): now that the gates are open we
         // may safely issue Drive calls. Guarded to run at most once before the
@@ -2642,6 +2715,137 @@ mod tests {
             .1
             .iter()
             .any(|(k, v)| k == "DRIVEN_RESULT" && v == "ok"));
+    }
+
+    /// Records the last `set_bandwidth_cap` argument; the rate gates are no-ops.
+    #[derive(Default)]
+    struct FakePacer {
+        last_cap: StdMutex<Option<Option<f64>>>,
+    }
+
+    #[async_trait]
+    impl Pacer for FakePacer {
+        async fn permit_request(&self) {}
+        async fn permit_file_create(&self) {}
+        async fn permit_bytes(&self, _n: u64) {}
+        fn note_response(&self, _c: crate::pacer::ResponseClass) {}
+        fn ceilings(&self) -> PacerCeilings {
+            PacerCeilings::default()
+        }
+        fn set_bandwidth_cap(&self, mbps: Option<f64>) {
+            *self.last_cap.lock().unwrap() = Some(mbps);
+        }
+    }
+
+    fn power_on_metered() -> PowerState {
+        PowerState {
+            ac_connected: true,
+            battery_percent: Some(100),
+            on_metered_network: true,
+            network_reachable: true,
+        }
+    }
+
+    #[test]
+    fn effective_cap_throttles_only_when_metered_and_throttle_mode() {
+        let base = OrchestratorConfig {
+            bandwidth_cap_mbps: Some(100),
+            skip_on_metered: true,
+            metered_bandwidth_cap_mbps: Some(2),
+            ..OrchestratorConfig::default()
+        };
+        let throttle = OrchestratorConfig {
+            metered_mode: MeteredMode::Throttle,
+            ..base.clone()
+        };
+        // Off metered -> base cap, regardless of mode.
+        assert_eq!(effective_bandwidth_cap_mbps(&throttle, false), Some(100));
+        // Metered + throttle -> the metered cap.
+        assert_eq!(effective_bandwidth_cap_mbps(&throttle, true), Some(2));
+        // Metered + pause -> base cap (it will be paused anyway, not throttled).
+        assert_eq!(effective_bandwidth_cap_mbps(&base, true), Some(100));
+        // Metered + throttle but no metered cap -> falls back to base.
+        let no_cap = OrchestratorConfig {
+            metered_bandwidth_cap_mbps: None,
+            ..throttle.clone()
+        };
+        assert_eq!(effective_bandwidth_cap_mbps(&no_cap, true), Some(100));
+    }
+
+    #[tokio::test]
+    async fn metered_throttle_does_not_pause_and_caps_the_pacer() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let cfg = OrchestratorConfig {
+            skip_on_metered: true,
+            metered_mode: MeteredMode::Throttle,
+            metered_bandwidth_cap_mbps: Some(2),
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_metered(),
+            Arc::new(FakeNet::online()),
+            cfg,
+        );
+        let pacer = Arc::new(FakePacer::default());
+        let orch = orch.with_pacer(pacer.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        assert_ne!(
+            orch.state().await,
+            OrchestratorState::Paused {
+                reason: PauseReason::Metered
+            },
+            "throttle mode must not pause on a metered network"
+        );
+        assert_eq!(
+            *pacer.last_cap.lock().unwrap(),
+            Some(Some(2.0)),
+            "the metered cap (2 Mbps) was applied to the pacer"
+        );
+    }
+
+    #[tokio::test]
+    async fn metered_pause_mode_still_pauses_and_skips_the_cap() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let cfg = OrchestratorConfig {
+            skip_on_metered: true,
+            metered_mode: MeteredMode::Pause,
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_metered(),
+            Arc::new(FakeNet::online()),
+            cfg,
+        );
+        let pacer = Arc::new(FakePacer::default());
+        let orch = orch.with_pacer(pacer.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        assert_eq!(
+            orch.state().await,
+            OrchestratorState::Paused {
+                reason: PauseReason::Metered
+            }
+        );
+        assert_eq!(
+            *pacer.last_cap.lock().unwrap(),
+            None,
+            "pause mode pauses before applying any cap"
+        );
     }
 
     #[tokio::test]

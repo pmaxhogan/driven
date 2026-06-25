@@ -434,7 +434,10 @@ async fn build_account(
         ExecutorDeps {
             remote,
             state: state.clone(),
-            pacer,
+            // Clone so the orchestrator can share the SAME pacer for the V2
+            // metered throttle (`with_pacer` below) - a runtime cap change must
+            // be seen by this executor's upload path.
+            pacer: pacer.clone(),
             crypto: Some(crypto_dyn),
             vss: vss.clone(),
             network: Some(network.clone()),
@@ -466,6 +469,9 @@ async fn build_account(
     // orchestrator keeps the inert no-op runner and configured hooks never run.
     orchestrator =
         orchestrator.with_command_runner(Arc::new(crate::hook_runner::TokioCommandRunner));
+    // Share the executor's pacer so the V2 metered throttle (DESIGN s17) can
+    // lower / lift its bandwidth cap as the network goes on / off metered.
+    orchestrator = orchestrator.with_pacer(pacer);
     let orchestrator = Arc::new(orchestrator);
 
     // R-P1-1: one shutdown signal both bridges select! on, so quit can stop the

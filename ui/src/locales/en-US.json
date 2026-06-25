@@ -144,7 +144,15 @@
     "rules": {
       "title": "Global rules",
       "skipOnBatteryLabel": "Pause backups while on battery",
-      "skipOnMeteredLabel": "Pause backups on metered networks",
+      "skipOnMeteredLabel": "Limit backups on metered networks",
+      "metered": {
+        "modeLabel": "On a metered network",
+        "mode": {
+          "pause": "Pause backups",
+          "throttle": "Keep backing up, but slower"
+        },
+        "capLabel": "Metered bandwidth cap (Mbps)"
+      },
       "bandwidthCapLabel": "Bandwidth cap (Mbps)",
       "bandwidthCapUnlimited": "Unlimited",
       "concurrentUploadsLabel": "Concurrent uploads",

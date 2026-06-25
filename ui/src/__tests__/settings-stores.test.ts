@@ -77,6 +77,8 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       preBackupHook: null,
       postBackupHook: null,
       hookTimeoutSecs: 60,
+      meteredMode: "pause",
+      meteredBandwidthCapMbps: null,
     },
     telemetry: {
       enabled: true,

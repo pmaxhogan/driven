@@ -50,6 +50,11 @@ const preBackupHook = ref("");
 const postBackupHook = ref("");
 const hookTimeoutSecs = ref(60);
 
+// Metered pause-or-throttle local mirrors (DESIGN s17).
+const meteredModes = ["pause", "throttle"] as const;
+const meteredMode = ref("pause");
+const meteredCapText = ref("");
+
 function minutesToHHMM(min: number): string {
   const m = ((Math.floor(min) % 1440) + 1440) % 1440;
   const hh = String(Math.floor(m / 60)).padStart(2, "0");
@@ -102,6 +107,9 @@ watch(
     preBackupHook.value = s.global.preBackupHook ?? "";
     postBackupHook.value = s.global.postBackupHook ?? "";
     hookTimeoutSecs.value = s.global.hookTimeoutSecs ?? 60;
+    meteredMode.value = s.global.meteredMode ?? "pause";
+    meteredCapText.value =
+      s.global.meteredBandwidthCapMbps === null ? "" : String(s.global.meteredBandwidthCapMbps);
   },
   { immediate: true }
 );
@@ -131,6 +139,17 @@ async function setSkipOnBattery(event: Event): Promise<void> {
 async function setSkipOnMetered(event: Event): Promise<void> {
   const checked = (event.target as HTMLInputElement).checked;
   await settings.patch({ global: { skipOnMetered: checked } });
+}
+
+async function setMeteredMode(event: Event): Promise<void> {
+  const value = (event.target as HTMLSelectElement).value;
+  await settings.patch({ global: { meteredMode: value } });
+}
+
+async function commitMeteredCap(): Promise<void> {
+  await settings.patch({
+    global: { meteredBandwidthCapMbps: parseOptionalPositiveInt(meteredCapText.value) },
+  });
 }
 
 async function commitBandwidthCap(): Promise<void> {
@@ -282,6 +301,41 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
           />
           {{ t("settings.rules.skipOnMeteredLabel") }}
         </label>
+
+        <div
+          v-if="settings.settings.global.skipOnMetered"
+          class="space-y-2 pl-6"
+          data-testid="metered-setting"
+        >
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.metered.modeLabel")
+            }}</span>
+            <select
+              data-testid="metered-mode"
+              :value="meteredMode"
+              class="w-full rounded border px-2 py-1"
+              @change="setMeteredMode"
+            >
+              <option v-for="mode in meteredModes" :key="mode" :value="mode">
+                {{ t(`settings.rules.metered.mode.${mode}`) }}
+              </option>
+            </select>
+          </label>
+          <label v-if="meteredMode === 'throttle'" class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.metered.capLabel")
+            }}</span>
+            <input
+              v-model="meteredCapText"
+              type="number"
+              min="1"
+              :placeholder="t('settings.rules.bandwidthCapUnlimited')"
+              class="w-full rounded border px-2 py-1"
+              @change="commitMeteredCap"
+            />
+          </label>
+        </div>
 
         <div class="space-y-2 border-t pt-4" data-testid="schedule-setting">
           <label class="flex items-center gap-2">

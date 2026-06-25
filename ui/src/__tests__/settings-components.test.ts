@@ -82,6 +82,8 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       preBackupHook: null,
       postBackupHook: null,
       hookTimeoutSecs: 60,
+      meteredMode: "pause",
+      meteredBandwidthCapMbps: null,
     },
     telemetry: {
       enabled: true,
@@ -645,6 +647,49 @@ describe("Settings Rules tab", () => {
     await dayButtons[0].trigger("click");
     await flushPromises();
     expect(lastSchedule()?.days[0]).toBe(false);
+  });
+
+  it("metered: switching to throttle patches the mode and reveals the cap input", async () => {
+    // Deep-merge the global on round-trip so the metered section (gated on
+    // skipOnMetered) stays rendered after the mode patch.
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: { global?: Record<string, unknown> } }).patch;
+        const base = makeSettings();
+        return Promise.resolve({
+          ...base,
+          global: { ...base.global, ...(patch.global ?? {}) },
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    // In pause mode the throttle cap input is hidden.
+    expect(wrapper.find('[data-testid="metered-setting"] input[type="number"]').exists()).toBe(
+      false
+    );
+
+    await wrapper.get('[data-testid="metered-mode"]').setValue("throttle");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { meteredMode: "throttle" } },
+    });
+
+    // The cap input now appears; setting it patches the metered cap.
+    const cap = wrapper.get('[data-testid="metered-setting"] input[type="number"]');
+    await cap.setValue("5");
+    await cap.trigger("change");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { meteredBandwidthCapMbps: 5 } },
+    });
   });
 
   it("backup hooks: setting a command patches it, clearing patches null", async () => {
