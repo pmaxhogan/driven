@@ -92,6 +92,29 @@ const MAX_VERSION_LEN = 64;
 /// string). Bounded so a hostile client cannot stuff a path/PII here.
 const MAX_OS_VERSION_LEN = 64;
 
+/// Strict content allowlist for `version` (M9b P1-2). Length is bounded above; the
+/// SHAPE must match what `src-tauri/src/telemetry.rs` actually emits, which is the
+/// crate version from `AppHandle::package_info().version` - a semver `MAJOR.MINOR.PATCH`
+/// optionally followed by a dot-separated alphanumeric/hyphen prerelease and/or a
+/// `+build` suffix. The CI dev channel emits e.g. `0.1.1-dev.123.ab0c9f1`. This is a
+/// pragmatic semver-ish allowlist: a leading `MAJOR.MINOR.PATCH` of digits, then an
+/// OPTIONAL `-prerelease` of dot-separated `[0-9A-Za-z-]` identifiers, then an
+/// OPTIONAL `+build` of dot-separated `[0-9A-Za-z-]` identifiers. It REJECTS `/`,
+/// `\`, `@`, whitespace, and control chars (none of those appear in a crate version),
+/// so a short PII string like `alice@example.com` or `/home/alice` cannot pass.
+const VERSION_RE = /^[0-9]+\.[0-9]+\.[0-9]+(?:-[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?(?:\+[0-9A-Za-z-]+(?:\.[0-9A-Za-z-]+)*)?$/;
+
+/// Strict content allowlist for `os_version` (M9b P1-2). The client collects this
+/// via the `os_info` crate `Version` (`src-tauri/src/telemetry.rs::coarse_os_version`),
+/// which renders as either a dotted numeric build (e.g. Windows `11.26200`, macOS
+/// `14.5`, Linux `10.0.19045`) OR a short `Custom` string for some distros (e.g.
+/// `rolling`, a codename, or `22.04 LTS`). So the allowed charset is COARSE platform
+/// chars only: ASCII letters, digits, dots, hyphens, underscores, and single spaces
+/// between tokens. It REJECTS `/`, `\`, `@`, control chars, and whitespace-RUNS
+/// (so a path/email/PII string with separators or padding is a 400). The leading and
+/// trailing char must be alphanumeric so a value cannot start/end with a separator.
+const OS_VERSION_RE = /^[0-9A-Za-z](?:[0-9A-Za-z._-]| (?! ))*[0-9A-Za-z]$|^[0-9A-Za-z]$/;
+
 /// Max number of distinct `errors_by_class` keys accepted (the s24 code set is
 /// ~44; this cap rejects a high-cardinality flood while leaving headroom).
 const MAX_ERROR_CLASSES = 64;
@@ -99,6 +122,22 @@ const MAX_ERROR_CLASSES = 64;
 /// Max accepted per-class error count (a sane 24h-window upper bound; rejects an
 /// absurd value that could skew the dataset).
 const MAX_ERROR_COUNT = 1_000_000_000;
+
+/// Per-field numeric caps for the `events_24h` aggregates (M9b P2-2). Each is a
+/// sane 24h-window upper bound; a value above it (or a fraction / non-safe-integer)
+/// is a 400 so a hostile client cannot poison the bounded-integer AE measures with
+/// fractions or huge finite doubles. `bytes_uploaded` allows up to ~1 PiB/day; the
+/// counts are generous but finite.
+const MAX_FILES_UPLOADED = 1_000_000_000;
+const MAX_BYTES_UPLOADED = 1_125_899_906_842_624; // 1 PiB (under Number.MAX_SAFE_INTEGER)
+const MAX_DEEP_VERIFY_RUNS = 1_000_000;
+
+/// Sane `ts` (Unix epoch MILLISECONDS) window (M9b P2-2). The client sends
+/// `SystemClock.now_ms()`, so reject anything outside a plausible range: from
+/// 2020-01-01 to 2100-01-01. This catches a seconds-vs-ms mistake, a fraction, a
+/// huge finite double, or an absurd far-future/past timestamp.
+const TS_MIN_MS = 1_577_836_800_000; // 2020-01-01T00:00:00Z
+const TS_MAX_MS = 4_102_444_800_000; // 2100-01-01T00:00:00Z
 
 /// The closed set of SPEC s24 error codes (the ONLY accepted `errors_by_class`
 /// keys). MUST mirror `crates/driven-core/src/types.rs` `ErrorCode::code()` - the
@@ -157,15 +196,20 @@ function json(status: number, body: Record<string, unknown>): Response {
   });
 }
 
-/// Type guard: is `v` a finite, non-negative number? (counts/sizes must be.)
-function isNonNegNumber(v: unknown): v is number {
-  return typeof v === "number" && Number.isFinite(v) && v >= 0;
+/// Type guard: is `v` a bounded, non-negative SAFE integer in `[0, max]`? (M9b
+/// P2-2: counts/sizes must be a non-negative integer representable exactly as a JS
+/// number - `Number.isSafeInteger` rejects fractions AND huge finite doubles that
+/// would round - and under a per-field cap, so the bounded-integer AE measures
+/// stay clean.)
+function isBoundedCount(v: unknown, max: number): v is number {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= 0 && v <= max;
 }
 
-/// Type guard: is `v` a bounded, non-negative integer count? (counts/sizes must
-/// be a finite non-negative integer under `max`.)
-function isBoundedCount(v: unknown, max: number): v is number {
-  return typeof v === "number" && Number.isFinite(v) && Number.isInteger(v) && v >= 0 && v <= max;
+/// Type guard: is `v` a SAFE integer within `[min, max]`? (M9b P2-2: used for the
+/// `ts` epoch-ms range so a fraction, a huge double, or an absurd timestamp is a
+/// 400.)
+function isIntegerInRange(v: unknown, min: number, max: number): v is number {
+  return typeof v === "number" && Number.isSafeInteger(v) && v >= min && v <= max;
 }
 
 /// Validate the parsed JSON into a [`PingPayload`], or return a reason string for
@@ -189,9 +233,18 @@ export function validatePing(value: unknown): { ok: true; payload: PingPayload }
   if (typeof v.install_id !== "string" || !UUID_V4.test(v.install_id)) {
     return { ok: false, reason: "install_id" };
   }
-  if (!isNonNegNumber(v.ts)) return { ok: false, reason: "ts" };
-  // version: a bounded, non-empty string (semver + optional channel suffix).
-  if (typeof v.version !== "string" || v.version.length === 0 || v.version.length > MAX_VERSION_LEN) {
+  // ts: a SAFE integer within a plausible epoch-ms window (M9b P2-2). Rejects a
+  // fraction, a huge finite double, a seconds-vs-ms mistake, and an absurd date.
+  if (!isIntegerInRange(v.ts, TS_MIN_MS, TS_MAX_MS)) return { ok: false, reason: "ts" };
+  // version: bounded length AND a strict semver-ish content allowlist (M9b P1-2).
+  // Length-bounded first, then the regex (which also forbids /, \, @, whitespace,
+  // control chars) so a short PII string cannot pass the length check.
+  if (
+    typeof v.version !== "string" ||
+    v.version.length === 0 ||
+    v.version.length > MAX_VERSION_LEN ||
+    !VERSION_RE.test(v.version)
+  ) {
     return { ok: false, reason: "version" };
   }
   // os / arch / channel: closed whitelists (rejects arbitrary platform strings).
@@ -199,10 +252,18 @@ export function validatePing(value: unknown): { ok: true; payload: PingPayload }
   if (typeof v.arch !== "string" || !ARCHES.has(v.arch)) return { ok: false, reason: "arch" };
   if (typeof v.channel !== "string" || !CHANNELS.has(v.channel)) return { ok: false, reason: "channel" };
 
-  // os_version: optional; when present it must be a bounded string (or null).
+  // os_version: optional; when present it must be a bounded string (or null) AND
+  // match the coarse platform-version content allowlist (M9b P1-2). The regex
+  // forbids /, \, @, control chars, and whitespace-runs, so a path/email/PII
+  // string cannot pass the length check.
   let osVersion: string | null = null;
   if (v.os_version !== undefined && v.os_version !== null) {
-    if (typeof v.os_version !== "string" || v.os_version.length > MAX_OS_VERSION_LEN) {
+    if (
+      typeof v.os_version !== "string" ||
+      v.os_version.length === 0 ||
+      v.os_version.length > MAX_OS_VERSION_LEN ||
+      !OS_VERSION_RE.test(v.os_version)
+    ) {
       return { ok: false, reason: "os_version" };
     }
     osVersion = v.os_version;
@@ -211,9 +272,17 @@ export function validatePing(value: unknown): { ok: true; payload: PingPayload }
   const e = v.events_24h;
   if (typeof e !== "object" || e === null) return { ok: false, reason: "events_24h" };
   const ev = e as Record<string, unknown>;
-  if (!isNonNegNumber(ev.files_uploaded)) return { ok: false, reason: "events_24h.files_uploaded" };
-  if (!isNonNegNumber(ev.bytes_uploaded)) return { ok: false, reason: "events_24h.bytes_uploaded" };
-  if (!isNonNegNumber(ev.deep_verify_runs)) return { ok: false, reason: "events_24h.deep_verify_runs" };
+  // M9b P2-2: each aggregate must be a bounded, non-negative SAFE integer under
+  // its per-field cap (rejects fractions, huge finite doubles, and absurd values).
+  if (!isBoundedCount(ev.files_uploaded, MAX_FILES_UPLOADED)) {
+    return { ok: false, reason: "events_24h.files_uploaded" };
+  }
+  if (!isBoundedCount(ev.bytes_uploaded, MAX_BYTES_UPLOADED)) {
+    return { ok: false, reason: "events_24h.bytes_uploaded" };
+  }
+  if (!isBoundedCount(ev.deep_verify_runs, MAX_DEEP_VERIFY_RUNS)) {
+    return { ok: false, reason: "events_24h.deep_verify_runs" };
+  }
   // SPEC s16: update_applied is a BOOLEAN (byte-consistent with the Rust client).
   if (typeof ev.update_applied !== "boolean") return { ok: false, reason: "events_24h.update_applied" };
   if (typeof ev.errors_by_class !== "object" || ev.errors_by_class === null || Array.isArray(ev.errors_by_class)) {
