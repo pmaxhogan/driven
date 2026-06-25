@@ -1,0 +1,187 @@
+name: dev-channel
+
+# Rolling "dev" pre-release channel (SPEC s19.4).
+#
+# Produces a 0.0.0-dev.<short-sha> build for early adopters who opt into the
+# dev updater channel (driven.maxhogan.dev/updates/dev/...). Same 4-row build
+# matrix as release.yml, uploaded to a single rolling "dev" GitHub pre-release
+# and published to Cloudflare Pages under updates/dev/.
+#
+# COST POLICY (DELIBERATE TRADEOFF - read before loosening the trigger):
+# The full 4-row (3-OS) Tauri bundle is EXPENSIVE (macOS + Windows minutes are
+# billed at a premium). Running it on EVERY push to main would silently burn the
+# CI budget on commits that have no business producing a dev installer (docs,
+# refactors, the release-please "chore: release" commits, etc.). So this
+# workflow does NOT fire on every main push: it is GATED to fire only when
+#   (a) it is manually dispatched (workflow_dispatch), OR
+#   (b) the head commit message contains the explicit marker `[dev-build]`.
+# It also explicitly SKIPS release-please's "chore(main): release" / "release"
+# commits so it never double-fires alongside the release.yml tag path.
+# To cut a dev build, either run it from the Actions tab or push a commit whose
+# message includes `[dev-build]`. If a future need arises for cadence-based dev
+# builds, prefer a `schedule:` (e.g. nightly) over an every-push trigger - that
+# bounds the cost to a known number of runs per week.
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  # One rolling dev build at a time; cancel a superseded in-flight one.
+  group: ${{ github.workflow }}
+  cancel-in-progress: true
+
+jobs:
+  gate:
+    name: decide whether to build a dev bundle
+    runs-on: ubuntu-latest
+    outputs:
+      build: ${{ steps.decide.outputs.build }}
+    steps:
+      - id: decide
+        env:
+          # head_commit is null for workflow_dispatch; guard with the ||.
+          COMMIT_MSG: ${{ github.event.head_commit.message }}
+          EVENT_NAME: ${{ github.event_name }}
+        run: |
+          build=false
+          if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
+            build=true
+          elif printf '%s' "$COMMIT_MSG" | head -n1 | grep -qiE 'release-please|chore\(main\): release|chore: release'; then
+            # release-please commits ride the tag path (release.yml); never a dev build.
+            build=false
+          elif printf '%s' "$COMMIT_MSG" | grep -qF '[dev-build]'; then
+            build=true
+          fi
+          echo "build=$build" >> "$GITHUB_OUTPUT"
+          echo "dev build decision: $build (event=$EVENT_NAME)"
+
+  build:
+    name: build dev ${{ matrix.target }}
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - { os: macos-latest, target: aarch64-apple-darwin }
+          - { os: macos-latest, target: x86_64-apple-darwin }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
+          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+    runs-on: ${{ matrix.os }}
+    env:
+      SQLX_OFFLINE: "true"
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Compute dev version
+        id: ver
+        shell: bash
+        run: echo "version=0.0.0-dev.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          targets: ${{ matrix.target }}
+
+      - name: Install Linux Tauri deps
+        if: runner.os == 'Linux'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
+            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
+
+      - uses: Swatinem/rust-cache@v2
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: pnpm install
+        working-directory: ui
+        run: pnpm install --frozen-lockfile
+
+      # Build the bundle (no GitHub Release created here; tauri-action only
+      # builds, then softprops/action-gh-release uploads to the rolling tag).
+      - name: Build + sign (tauri-action)
+        uses: tauri-apps/tauri-action@v0
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          TAURI_SIGNING_PRIVATE_KEY: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY }}
+          TAURI_SIGNING_PRIVATE_KEY_PASSWORD: ${{ secrets.TAURI_SIGNING_PRIVATE_KEY_PASSWORD }}
+        with:
+          # No tagName -> tauri-action builds but does not create/upload a
+          # release; we collect the artifacts and publish them ourselves so all
+          # four targets land on ONE rolling "dev" pre-release.
+          uploadUpdaterJson: false
+          args: --target ${{ matrix.target }}
+
+      # The exact bundle paths vary per OS/target; collect everything the
+      # bundler produced (installers + .sig) under the target dir.
+      - name: Collect bundle artifacts
+        id: collect
+        shell: bash
+        run: |
+          out="dev-artifacts"
+          mkdir -p "$out"
+          # Tauri writes bundles under target/<triple>/release/bundle/**.
+          find "target/${{ matrix.target }}/release/bundle" -type f \
+            \( -name '*.dmg' -o -name '*.app.tar.gz' -o -name '*.app.tar.gz.sig' \
+               -o -name '*.msi' -o -name '*.msi.sig' -o -name '*-setup.exe' \
+               -o -name '*-setup.exe.sig' -o -name '*.AppImage' -o -name '*.AppImage.sig' \
+               -o -name '*.deb' \) \
+            -exec cp {} "$out/" \; || true
+          echo "Collected:"; ls -la "$out" || true
+
+      - name: Publish to rolling dev pre-release
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: dev
+          name: "Driven dev (rolling)"
+          body: "Rolling dev channel build ${{ steps.ver.outputs.version }} (${{ github.sha }}). Pre-release; not for production."
+          prerelease: true
+          files: dev-artifacts/*
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+  publish-dev-manifest:
+    name: publish dev update manifests
+    needs: build
+    if: needs.build.result == 'success'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+      deployments: write
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # Generate updates/dev/<target>/update.json from the rolling "dev"
+      # release assets (M9a's script; executes for real once M9a lands).
+      - name: Generate dev update.json tree
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          RELEASE_TAG: dev
+        run: node scripts/generate-update-json.mjs dev
+
+      # See CODEX_NOTES "M9d": `pages deploy` is a whole-site snapshot, so the
+      # generator must assemble the full updates/ tree (dev + the existing
+      # stable tree) before this deploy or it would clobber updates/stable.
+      - name: Deploy dev manifests to Cloudflare Pages
+        uses: cloudflare/wrangler-action@v3
+        with:
+          apiToken: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          accountId: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+          command: pages deploy updates --project-name=driven-updates --branch=main
