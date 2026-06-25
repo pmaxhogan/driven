@@ -47,7 +47,7 @@ tokio.workspace = true
 # (futures::future::join_all) so two slow accounts do not serialise and risk an
 # outer-timeout abort mid-drain (which would orphan a task).
 futures.workspace = true
-rust-i18n = "3"
+rust-i18n = "4"
 sys-locale = "0.3"
 # M6 (SPEC s11.1): the accounts wizard mints opaque server-side session ids.
 uuid.workspace = true
