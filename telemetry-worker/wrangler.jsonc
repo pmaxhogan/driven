@@ -1,0 +1,38 @@
+{
+  // Driven anonymous-telemetry ingest Worker (SPEC s16, ROADMAP M9b).
+  //
+  // DEPLOYMENT IS DEFERRED to M10/ops (needs `wrangler deploy` + CF creds). This
+  // config is committed + statically validated (`wrangler types` / `tsc`) now; the
+  // live deploy happens at M10. See design/CODEX_NOTES.md "## M9b - telemetry".
+  "$schema": "node_modules/wrangler/config-schema.json",
+  "name": "driven-telemetry",
+  "main": "src/index.ts",
+  "compatibility_date": "2025-02-11",
+  // The Driven Cloudflare account (SPEC s16).
+  "account_id": "9c20c14daa20466a2d761a47162f719a",
+  // Do NOT publish a *.workers.dev URL - this Worker is reached only via the
+  // custom route below (the canonical Driven host).
+  "workers_dev": false,
+  // SPEC s16: route ONLY the /telemetry/* path prefix on driven.maxhogan.dev to
+  // this Worker. A path-scoped route (pattern with `/telemetry/*`) takes
+  // precedence over the CF Pages site on the same hostname for that prefix, so
+  // the Pages site keeps serving the root + /updates while this Worker owns
+  // /telemetry/*. `zone_name` ties the route to the maxhogan.dev zone.
+  "routes": [
+    {
+      "pattern": "driven.maxhogan.dev/telemetry/*",
+      "zone_name": "maxhogan.dev"
+    }
+  ],
+  // SPEC s16: the Analytics Engine dataset the validated ping is written to. The
+  // binding name (`TELEMETRY`) matches `Env.TELEMETRY` in src/index.ts.
+  "analytics_engine_datasets": [
+    {
+      "binding": "TELEMETRY",
+      "dataset": "driven_telemetry"
+    }
+  ],
+  "observability": {
+    "enabled": true
+  }
+}

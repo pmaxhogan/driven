@@ -378,7 +378,9 @@ async fn maybe_send_once(
             return false;
         }
     };
-    let channel = read_channel(state).await.unwrap_or_else(|_| "stable".to_string());
+    let channel = read_channel(state)
+        .await
+        .unwrap_or_else(|_| "stable".to_string());
     let since_ms = now_ms.saturating_sub(WINDOW.as_millis() as i64);
     let aggregate = match state.telemetry_events_24h(since_ms).await {
         Ok(a) => a,
@@ -624,8 +626,7 @@ mod tests {
         write_enabled(&repo, false).await.unwrap();
 
         let sink = RecordingSink::default();
-        let attempted =
-            maybe_send_once(&repo, "0.1.0".to_string(), 1_700_000_000_000, &sink).await;
+        let attempted = maybe_send_once(&repo, "0.1.0".to_string(), 1_700_000_000_000, &sink).await;
 
         assert!(!attempted, "disabled telemetry must not attempt a send");
         assert_eq!(
@@ -643,8 +644,7 @@ mod tests {
         let (repo, dir) = temp_repo().await;
         // Default seed has enabled=true + a generated install_id.
         let sink = RecordingSink::default();
-        let attempted =
-            maybe_send_once(&repo, "0.1.0".to_string(), 1_700_000_000_000, &sink).await;
+        let attempted = maybe_send_once(&repo, "0.1.0".to_string(), 1_700_000_000_000, &sink).await;
 
         assert!(attempted, "enabled telemetry must attempt a send");
         let sent = sink.sent.lock().unwrap();
@@ -663,8 +663,7 @@ mod tests {
         // still reports "attempted" (it did not panic / propagate).
         let (repo, dir) = temp_repo().await;
         let sink = FailingSink;
-        let attempted =
-            maybe_send_once(&repo, "0.1.0".to_string(), 1_700_000_000_000, &sink).await;
+        let attempted = maybe_send_once(&repo, "0.1.0".to_string(), 1_700_000_000_000, &sink).await;
         assert!(
             attempted,
             "a failed send is still an attempt (error swallowed, not fatal)"

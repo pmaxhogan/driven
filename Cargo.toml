@@ -12,6 +12,12 @@ members = [
     "crates/driven-chaos",
     "src-tauri",
 ]
+# M9b (SPEC s16): the telemetry Cloudflare Worker has its own (TypeScript/wrangler)
+# toolchain and is NOT a cargo crate - keep it out of the workspace so a stray
+# manifest there could never be pulled into `cargo build --workspace`.
+exclude = [
+    "telemetry-worker",
+]
 
 [workspace.package]
 version = "0.1.0"

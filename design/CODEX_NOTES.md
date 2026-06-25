@@ -2633,3 +2633,82 @@ Single sole-actor.
   lint + test:unit + build (vue-tsc clean). fetch-live-channel.sh re-validated via a stubbed-curl
   harness (no committed shell test; no .yml changed, so no actionlint run). Stub sweep on the touched
   surface (ui, scripts, src-tauri/src): zero non-test `todo!(`/`unimplemented!(`/`unreachable!(`.
+
+## M9b - telemetry (anonymous usage stats: client + Cloudflare Worker)
+
+  SPEC s16: an opt-out-able anonymous usage ping (client) + the Cloudflare Worker that ingests it into
+  Analytics Engine. DEFAULT ON, one click off, honored immediately, privacy-preserving.
+
+  CLIENT (`src-tauri/src/telemetry.rs`):
+  - `install_id`: a UUID v4 anonymous id. The migration 0002 seed already writes a random
+    `telemetry.install_id`; `ensure_install_id` additionally MINTS a UUID v4 + persists it (preserving
+    siblings) if the stored field is empty (a pre-seed DB / cleared field), so it is always non-empty and
+    STABLE across restarts (test: `install_id_persists_across_reload`).
+  - `telemetry.enabled` pref, DEFAULT ON: a missing/malformed flag reads as enabled. When OFF the send
+    path makes NO network call at all and the toggle is honored on the very next tick (the loop re-reads
+    the pref each iteration) - test `disabled_telemetry_sends_no_ping` asserts zero sink calls.
+  - Cadence: startup + every 24h via a tokio `interval` (NOT a sleep/poll loop), joined into the M5
+    shutdown drain (AppState `TelemetryRuntime` { task, shutdown } + `set_telemetry_task` /
+    `shutdown_telemetry_task`; lib.rs spawns it in setup after `manage(app_state)` and drains it on quit
+    via the bounded abort-capable `drain_restore_handle`, mirroring the M9a updater task - no orphan).
+  - Payload (SPEC s16): `{ install_id, ts, version, os, os_version?, arch, channel, events_24h: {
+    files_uploaded, bytes_uploaded, errors_by_class: {<code>: n}, deep_verify_runs, update_applied },
+    latency_p50_p95_ms: { scan: [], upload_per_mb: [] } }`. version = `app.package_info().version`; os/arch
+    = `std::env::consts::{OS,ARCH}`; channel from the updater `channel` setting.
+  - events_24h aggregation (`StateRepo::telemetry_events_24h(since_ms)`, SQLite override, read-only,
+    bounded): files_uploaded/bytes_uploaded = count/SUM(bytes) of `activity_log` `upload_done` rows in
+    `[now-24h, now]`; errors_by_class = COUNT grouped by `event_type` of `error`-level rows (event_type IS
+    the SPEC s24 error code for a failed op - a fixed dotted-code enum, never user data); deep_verify_runs
+    = COUNT of `backup_sources` whose `last_deep_verify_at` falls in-window; update_applied = COUNT of any
+    `update_applied` activity rows (0 in V1 - no such row is written yet; the aggregate picks it up
+    automatically if/when one is). Test `telemetry_events_24h_aggregates_uploads_errors_and_deep_verify`.
+  - Best-effort send: the POST is behind a `TelemetrySink` trait (the offline test seam); production
+    `HttpTelemetrySink` is a single bounded-timeout (15s) reqwest POST. A failure (network/timeout/non-2xx)
+    is logged at info + SWALLOWED - it NEVER affects backups, never surfaces, never retries in a storm
+    (test `send_error_is_swallowed_and_non_fatal`). Tests NEVER hit the live endpoint.
+  - IPC: `get_telemetry_enabled` / `set_telemetry_enabled` / `get_telemetry_install_id`, mirrored into
+    `ui/src/ipc/commands.ts`. UI: a "Send anonymous usage stats" toggle (default ON) + a short i18n privacy
+    note in Settings > Rules, round-tripping `{ telemetry: { enabled } }` through the settings store; vitest
+    asserts default-ON + toggle-patches.
+
+  PRIVACY REVIEW (load-bearing): the payload carries ONLY counts, sizes, error CODES, and (empty in V1)
+  latency arrays, plus the anonymous random `install_id` + a platform descriptor + the channel. It does
+  NOT carry, and the aggregation SQL does NOT select, any file name, path, message, account email, or
+  content. The `activity_log.message` column (which holds a relative path for per-op rows) is never read
+  by `telemetry_events_24h`. A unit test (`payload_has_the_spec_s16_shape_and_carries_no_paths`) asserts
+  the serialized JSON's top-level keys are exactly the SPEC s16 set and contains no `path`/`message`/file
+  name. `os_version` is honestly `None` in V1 (no OS-version crate dependency - dependency-minimalism +
+  privacy; it is a nullable field skipped when None). Latency percentiles are emitted as EMPTY arrays
+  rather than fabricated, because V1 records no per-op durations in durable state; real latency capture is
+  a later instrumentation-bearing change (the keys are present so the wire shape is stable).
+
+  WORKER (`telemetry-worker/`, OUTSIDE the cargo workspace + the ui build - its own TS/wrangler toolchain;
+  added to the root Cargo.toml `exclude`):
+  - `POST /telemetry/v1/ping` -> validate the JSON shape (`validatePing`: strict on install_id/version/os/
+    arch/channel + the non-negative numeric aggregates; tolerant of absent os_version + empty latency
+    arrays) -> `writeDataPoint` to the `TELEMETRY` Analytics Engine dataset binding (indexes=[install_id];
+    blobs=[os, arch, channel, version, errors JSON]; doubles=[files, bytes, deep_verify, update_applied,
+    total_errors, ts]) -> 204. Malformed body/JSON/oversized -> 400; wrong method -> 405; any other path ->
+    404. Body size capped at 16 KB (declared Content-Length + actual length). Never logs the raw body (an AE
+    write error logs a GENERIC message + still returns 204 so the best-effort client does not retry-storm).
+  - Routing (SPEC s16): `routes: [{ pattern: "driven.maxhogan.dev/telemetry/*", zone_name: "maxhogan.dev" }]`
+    + `workers_dev: false` on the Driven account (id 9c20c14daa20466a2d761a47162f719a). A path-scoped
+    Worker route takes precedence over the CF Pages site on the same hostname for the `/telemetry/*` prefix,
+    so Pages keeps serving the root + /updates while this Worker owns /telemetry/* (confirmed via Context7
+    CF docs: custom-domain/zone-scoped routes + path patterns).
+  - Tested: a unit test of `handle(request, env)` against a MOCKED AE binding (a `writeDataPoint` spy) -
+    valid POST -> 1 write + 204; malformed/negative-aggregate/oversized -> 400; wrong method -> 405; wrong
+    path -> 404; AE-throw -> still 204 + generic log. tsc (`--noEmit`) + eslint clean; `wrangler types`
+    parses the config + emits the `TELEMETRY: AnalyticsEngineDataset` Env. 11 worker tests pass.
+
+  DEFERRED (M10/ops): the actual `wrangler deploy` + the live e2e telemetry validation (a real ping landing
+  in Analytics Engine) need CF creds + a real deploy. This round IMPLEMENTS + statically validates only
+  (tsc / wrangler types / a mocked-binding handler unit test). The dataset `driven_telemetry` is created on
+  first `writeDataPoint` at deploy time; the CF project `driven-telemetry` is already provisioned.
+
+  Gates: SQLX_OFFLINE cargo build --workspace --all-targets + clippy --workspace --all-targets -D warnings
+  + test --workspace (google_e2e + elevation honest gate-skip) + build -p driven-app + deny check + fmt
+  --all --check + git diff --check all green; sqlx-prepare run (4 new query files, 0 drift). ui pnpm
+  install + lint + test:unit + build (vue-tsc clean). worker: pnpm install + tsc + eslint + vitest green.
+  Stub sweep on the touched surface (src-tauri/src, ui, telemetry-worker): zero non-test
+  `todo!(`/`unimplemented!(`/`unreachable!(`.
