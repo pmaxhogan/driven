@@ -12,6 +12,7 @@
     "format": "prettier --write src",
     "format:check": "prettier --check src",
     "test:unit": "vitest run --passWithNoTests",
+    "test:coverage": "vitest run --coverage --passWithNoTests",
     "test:watch": "vitest"
   },
   "dependencies": {
@@ -30,6 +31,7 @@
     "@intlify/unplugin-vue-i18n": "^11.0.0",
     "@types/node": "^22",
     "@vitejs/plugin-vue": "^5.1.0",
+    "@vitest/coverage-v8": "^2.1.0",
     "@vue/test-utils": "^2.4.6",
     "@vue/tsconfig": "^0.7.0",
     "autoprefixer": "^10.4.20",

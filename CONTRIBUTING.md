@@ -72,6 +72,7 @@ recipes:
 just lint   # cargo fmt --all -- --check ; cargo clippy --workspace --all-targets -- -D warnings ; pnpm --dir ui lint
 just test   # cargo test --workspace ; pnpm --dir ui test:unit
 just deny   # cargo deny check
+just coverage  # Rust + UI line coverage (must not regress vs main; see below)
 ```
 
 Run them individually if you prefer:
@@ -104,14 +105,70 @@ example real-Google-Drive end-to-end tests with no credentials, or VSS /
 elevation tests without admin). A clean run is all-pass plus those honest skips,
 not a hidden failure.
 
+## Coverage gate
+
+The `coverage` workflow (`.github/workflows/coverage.yml`) measures line
+coverage on every PR and **fails the check if either number regresses below
+`main`** (minus a 0.1pp epsilon that absorbs float jitter). It posts a sticky
+PR comment with the `main` baseline, this PR's number, and the delta. New code
+must come with tests that keep coverage from dropping.
+
+Two numbers are gated:
+
+- **Rust** - the library crates (`cargo llvm-cov --workspace --exclude
+  src-tauri --exclude driven-chaos`). `src-tauri` is a thin IPC layer over
+  `driven-core` and `driven-chaos` is the stress harness, so neither is part of
+  the gate; put real logic in `driven-core` (where it is unit-tested) and keep
+  `src-tauri` commands thin.
+- **UI** - the whole Vue/TS app (`ui/`, vitest v8 coverage with `all: true`, so
+  a new untested file lowers the total).
+
+How the baseline works: every push to `main` recomputes coverage and caches it;
+PRs compare against that cached number. The first `main` build that carries the
+workflow has no prior baseline, so that one run is informational, then the gate
+enforces from the next PR onward.
+
+Run it locally before pushing:
+
+```sh
+just coverage          # prints Rust + UI line-coverage totals
+./scripts/coverage.sh  # same, parsed to the exact percentages CI compares
+```
+
+`just coverage` needs `cargo install cargo-llvm-cov`; the parsed script also
+needs `jq`.
+
+> Maintainer setup (one-time): mark **coverage** as a Required status check in
+> the `main` branch protection rule so a regression actually blocks merge. The
+> workflow failing is necessary but not sufficient until the check is required.
+
 ## Branch and PR flow
 
-1. Branch off `main`.
+1. Branch off `main`, one branch per logical change. Name it `<type>/<slug>`
+   (for example `feat/schedule-windows`).
 2. Make your change with Conventional-Commit messages.
 3. Run the local gates above until green.
 4. Open a pull request against `main`. CI runs the same gates plus the chaos
-   harness.
+   harness and the coverage gate.
 5. Keep the PR focused; smaller PRs review faster.
+
+### Squash merge (required)
+
+PRs land on `main` via **Squash and merge** - the whole branch becomes one
+commit. Because that squash commit's subject is what release-please reads, set
+the squash subject to a Conventional-Commit line that summarises the PR (GitHub
+pre-fills it from the PR title, so title your PR in Conventional-Commit form,
+for example `feat(restore): point-in-time restore`). Individual
+work-in-progress commit messages on the branch do not need to be release-grade;
+only the squash subject does. This keeps `main` linear and one-commit-per-PR.
+
+### Stacking dependent PRs
+
+If a change depends on another that is still in review, branch it off the
+dependency's branch instead of `main` and say so in the PR description ("stacked
+on #NN"). Its diff will show the parent's changes until the parent merges;
+rebase onto `main` after the parent lands. Independent changes should branch off
+`main` so each PR diff is self-contained.
 
 Releases are cut by release-please: merging the maintained "chore: release" PR
 tags `v*` and triggers the build / publish pipeline. Do not hand-edit version

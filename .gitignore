@@ -14,6 +14,12 @@ ui/dist
 ui/.vite
 *.local
 
+# Coverage artefacts (cargo-llvm-cov + vitest; regenerate with `just coverage`)
+ui/coverage
+/coverage-rust.json
+/coverage-baseline.json
+/scratch-rust-cov.json
+
 # Editor
 .idea/
 .vscode/
