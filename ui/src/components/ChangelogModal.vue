@@ -20,7 +20,7 @@ const open = computed(() => props.release !== null);
 
 /** The release notes rendered to sanitized HTML (empty string when no notes). */
 const renderedNotes = computed(() =>
-  props.release ? sanitizeMarkdown(props.release.notes ?? "") : "",
+  props.release ? sanitizeMarkdown(props.release.notes ?? "") : ""
 );
 
 /** A localized publish date, falling back to the raw string if unparseable. */
@@ -28,9 +28,7 @@ const formattedDate = computed(() => {
   if (!props.release || !props.release.publishedAt) return "";
   const date = new Date(props.release.publishedAt);
   if (Number.isNaN(date.getTime())) return props.release.publishedAt;
-  return new Intl.DateTimeFormat(locale.value, { dateStyle: "medium" }).format(
-    date,
-  );
+  return new Intl.DateTimeFormat(locale.value, { dateStyle: "medium" }).format(date);
 });
 
 function close(): void {
@@ -55,10 +53,7 @@ function close(): void {
           <h2 class="text-lg font-semibold">
             {{ t("changelog.title", { version: release?.name ?? release?.version }) }}
           </h2>
-          <p
-            v-if="formattedDate"
-            class="text-xs text-zinc-400"
-          >
+          <p v-if="formattedDate" class="text-xs text-zinc-400">
             {{ formattedDate }}
           </p>
         </div>
@@ -80,11 +75,7 @@ function close(): void {
         v-html="renderedNotes"
       />
       <!-- eslint-enable vue/no-v-html -->
-      <p
-        v-else
-        class="text-sm text-zinc-500"
-        data-testid="changelog-empty"
-      >
+      <p v-else class="text-sm text-zinc-500" data-testid="changelog-empty">
         {{ t("changelog.noNotes") }}
       </p>
     </div>

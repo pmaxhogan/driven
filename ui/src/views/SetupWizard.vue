@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, ref } from "vue";
+import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
 
@@ -52,8 +52,18 @@ onMounted(async () => {
   }
 });
 
+// R4-P2-4: if the wizard is left while an OAuth session is still open (the user
+// navigated away mid-flow), tell the backend to drop it so its BYO creds +
+// tokens do not linger in the server-side registry. After a successful finish
+// the session is already consumed, so this cancel is an idempotent no-op.
+onBeforeUnmount(() => {
+  if (setup.session) {
+    void setup.cancel();
+  }
+});
+
 const errorLong = computed<string | null>(() =>
-  setup.errorCode ? t(`errors.${setup.errorCode}.long`) : null,
+  setup.errorCode ? t(`errors.${setup.errorCode}.long`) : null
 );
 
 // --- Per-step "can advance" gating -------------------------------------------
@@ -203,10 +213,7 @@ function baseName(p: string): string {
     </header>
 
     <!-- Step 1: Welcome -->
-    <div
-      v-if="setup.step === 'welcome'"
-      class="space-y-2"
-    >
+    <div v-if="setup.step === 'welcome'" class="space-y-2">
       <h2 class="text-lg font-medium">
         {{ t("wizard.step1.title") }}
       </h2>
@@ -216,10 +223,7 @@ function baseName(p: string): string {
     </div>
 
     <!-- Step 2: BYO credentials + sign-in -->
-    <div
-      v-else-if="setup.step === 'credentials'"
-      class="space-y-3"
-    >
+    <div v-else-if="setup.step === 'credentials'" class="space-y-3">
       <h2 class="text-lg font-medium">
         {{ t("wizard.step2.title") }}
       </h2>
@@ -227,10 +231,7 @@ function baseName(p: string): string {
     </div>
 
     <!-- Step 3: First backup source -->
-    <div
-      v-else-if="setup.step === 'source'"
-      class="space-y-3"
-    >
+    <div v-else-if="setup.step === 'source'" class="space-y-3">
       <h2 class="text-lg font-medium">
         {{ t("wizard.step3.title") }}
       </h2>
@@ -247,18 +248,13 @@ function baseName(p: string): string {
         >
           {{ t("wizard.step3.chooseFolderButton") }}
         </button>
-        <p
-          v-if="setup.localPath"
-          class="break-all text-sm text-zinc-600 dark:text-zinc-400"
-        >
+        <p v-if="setup.localPath" class="break-all text-sm text-zinc-600 dark:text-zinc-400">
           {{ setup.localPath }}
         </p>
       </div>
 
       <div class="space-y-2">
-        <span class="block text-sm font-medium">{{
-          t("wizard.step3.driveDestinationLabel")
-        }}</span>
+        <span class="block text-sm font-medium">{{ t("wizard.step3.driveDestinationLabel") }}</span>
         <button
           type="button"
           class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
@@ -267,20 +263,14 @@ function baseName(p: string): string {
         >
           {{ t("settings.addSource.chooseDriveButton") }}
         </button>
-        <p
-          v-if="setup.driveFolderPath"
-          class="break-all text-sm text-zinc-600 dark:text-zinc-400"
-        >
+        <p v-if="setup.driveFolderPath" class="break-all text-sm text-zinc-600 dark:text-zinc-400">
           {{ setup.driveFolderPath }}
         </p>
       </div>
     </div>
 
     <!-- Step 4: Encryption opt-in + recovery phrase -->
-    <div
-      v-else-if="setup.step === 'encryption'"
-      class="space-y-3"
-    >
+    <div v-else-if="setup.step === 'encryption'" class="space-y-3">
       <h2 class="text-lg font-medium">
         {{ t("wizard.step4.title") }}
       </h2>
@@ -289,17 +279,11 @@ function baseName(p: string): string {
       </p>
 
       <label class="flex items-center gap-2 text-sm">
-        <input
-          v-model="setup.encryptionEnabled"
-          type="checkbox"
-        >
+        <input v-model="setup.encryptionEnabled" type="checkbox" />
         <span>{{ t("wizard.step4.enableLabel") }}</span>
       </label>
 
-      <p
-        v-if="setup.encryptionEnabled"
-        class="text-sm text-amber-700 dark:text-amber-500"
-      >
+      <p v-if="setup.encryptionEnabled" class="text-sm text-amber-700 dark:text-amber-500">
         {{ t("wizard.step4.recoveryWarning") }}
       </p>
       <!-- B3: the phrase is NOT shown here - it does not exist until the source
@@ -307,10 +291,7 @@ function baseName(p: string): string {
     </div>
 
     <!-- Step 5: Confirm + recovery-phrase reveal + start initial sync -->
-    <div
-      v-else
-      class="space-y-3"
-    >
+    <div v-else class="space-y-3">
       <h2 class="text-lg font-medium">
         {{ t("wizard.step5.title") }}
       </h2>
@@ -332,11 +313,7 @@ function baseName(p: string): string {
       />
     </div>
 
-    <p
-      v-if="errorLong"
-      class="text-sm text-red-600"
-      role="alert"
-    >
+    <p v-if="errorLong" class="text-sm text-red-600" role="alert">
       {{ errorLong }}
     </p>
 

@@ -20,15 +20,13 @@ vi.mock("@tauri-apps/api/core", () => ({
 let progressHandler: ((payload: unknown) => void) | null = null;
 const unlistenMock = vi.fn();
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(
-    async (event: string, cb: (e: { payload: unknown }) => void) => {
-      if (event === "restore:progress") {
-        progressHandler = (payload: unknown) => cb({ payload });
-        return unlistenMock;
-      }
-      return vi.fn();
-    },
-  ),
+  listen: vi.fn(async (event: string, cb: (e: { payload: unknown }) => void) => {
+    if (event === "restore:progress") {
+      progressHandler = (payload: unknown) => cb({ payload });
+      return unlistenMock;
+    }
+    return vi.fn();
+  }),
 }));
 
 import { useRestoreStore } from "../stores/restore";
@@ -76,12 +74,7 @@ function folder(name: string, prefix = ""): RemoteEntryDto {
   };
 }
 
-function file(
-  name: string,
-  prefix = "",
-  restorable = true,
-  size = 10,
-): RemoteEntryDto {
+function file(name: string, prefix = "", restorable = true, size = 10): RemoteEntryDto {
   return {
     relativePath: prefix ? `${prefix}/${name}` : name,
     name,
@@ -102,10 +95,8 @@ beforeEach(() => {
 describe("restore store", () => {
   it("loads sources and browses the root tree lazily", async () => {
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "list_sources")
-        return Promise.resolve([source("s1", "Documents")]);
-      if (cmd === "list_remote_tree")
-        return Promise.resolve(tree([folder("src"), file("a.txt")]));
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree") return Promise.resolve(tree([folder("src"), file("a.txt")]));
       return Promise.resolve([]);
     });
 
@@ -122,21 +113,17 @@ describe("restore store", () => {
     expect(store.nodes[1].name).toBe("a.txt");
 
     // list_remote_tree was called for the root prefix (lazy per folder).
-    const treeCall = invokeMock.mock.calls.find(
-      (c) => c[0] === "list_remote_tree",
-    );
+    const treeCall = invokeMock.mock.calls.find((c) => c[0] === "list_remote_tree");
     expect(treeCall?.[1]).toMatchObject({ sourceId: "s1", prefix: "" });
   });
 
   it("descends into a folder and back via breadcrumbs", async () => {
     invokeMock.mockImplementation((cmd: string, args: unknown) => {
-      if (cmd === "list_sources")
-        return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
       if (cmd === "list_remote_tree") {
         const prefix = (args as { prefix: string }).prefix;
         if (prefix === "") return Promise.resolve(tree([folder("src")]));
-        if (prefix === "src")
-          return Promise.resolve(tree([file("main.rs", "src")]));
+        if (prefix === "src") return Promise.resolve(tree([file("main.rs", "src")]));
         return Promise.resolve(tree([]));
       }
       return Promise.resolve([]);
@@ -165,8 +152,7 @@ describe("restore store", () => {
       },
     ];
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "list_sources")
-        return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
       if (cmd === "list_remote_tree") return Promise.resolve(tree([]));
       if (cmd === "search_files") return Promise.resolve(hits);
       return Promise.resolve([]);
@@ -178,9 +164,7 @@ describe("restore store", () => {
 
     expect(store.isSearching).toBe(true);
     expect(store.rows).toEqual(hits);
-    const searchCall = invokeMock.mock.calls.find(
-      (c) => c[0] === "search_files",
-    );
+    const searchCall = invokeMock.mock.calls.find((c) => c[0] === "search_files");
     expect(searchCall?.[1]).toMatchObject({ sourceId: "s1", query: "*.rs" });
 
     // Clearing the search returns to the tree.
@@ -190,10 +174,8 @@ describe("restore store", () => {
 
   it("toggles selection and builds RestoreItems", async () => {
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "list_sources")
-        return Promise.resolve([source("s1", "Documents")]);
-      if (cmd === "list_remote_tree")
-        return Promise.resolve(tree([file("a.txt"), file("b.txt")]));
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree") return Promise.resolve(tree([file("a.txt"), file("b.txt")]));
       return Promise.resolve([]);
     });
     const store = useRestoreStore();
@@ -240,10 +222,8 @@ describe("restore store", () => {
       ],
     };
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "list_sources")
-        return Promise.resolve([source("s1", "Documents")]);
-      if (cmd === "list_remote_tree")
-        return Promise.resolve(tree([file("secret.bin")]));
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree") return Promise.resolve(tree([file("secret.bin")]));
       if (cmd === "restore_files") return Promise.resolve("job-1");
       if (cmd === "get_restore_job") return Promise.resolve(seeded);
       return Promise.resolve([]);
@@ -354,10 +334,8 @@ describe("restore store", () => {
       ],
     };
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "list_sources")
-        return Promise.resolve([source("s1", "Documents")]);
-      if (cmd === "list_remote_tree")
-        return Promise.resolve(tree([file("a.bin")]));
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree") return Promise.resolve(tree([file("a.bin")]));
       if (cmd === "restore_files") return Promise.resolve("job-9");
       if (cmd === "get_restore_job") return Promise.resolve(terminal);
       return Promise.resolve([]);
@@ -374,9 +352,7 @@ describe("restore store", () => {
     store.unsubscribeProgress();
     await store.subscribeProgress();
 
-    const getCall = invokeMock.mock.calls.find(
-      (c) => c[0] === "get_restore_job",
-    );
+    const getCall = invokeMock.mock.calls.find((c) => c[0] === "get_restore_job");
     expect(getCall?.[1]).toMatchObject({ job: "job-9" });
     // The reconciled terminal state is reflected (controls re-enabled).
     expect(store.job?.done).toBe(true);
@@ -385,10 +361,8 @@ describe("restore store", () => {
 
   it("cancels the active job and reflects a terminal cancelled status (M8-P1-1)", async () => {
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "list_sources")
-        return Promise.resolve([source("s1", "Documents")]);
-      if (cmd === "list_remote_tree")
-        return Promise.resolve(tree([file("big.bin")]));
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree") return Promise.resolve(tree([file("big.bin")]));
       if (cmd === "restore_files") return Promise.resolve("job-c");
       if (cmd === "cancel_restore_job") return Promise.resolve(null);
       if (cmd === "get_restore_job")
@@ -425,9 +399,7 @@ describe("restore store", () => {
 
     // Request cancel: the cancel IPC is invoked with the job id; cancelling gates.
     await store.cancelRestore();
-    const cancelCall = invokeMock.mock.calls.find(
-      (c) => c[0] === "cancel_restore_job",
-    );
+    const cancelCall = invokeMock.mock.calls.find((c) => c[0] === "cancel_restore_job");
     expect(cancelCall?.[1]).toMatchObject({ job: "job-c" });
     expect(store.cancelling).toBe(true);
 
@@ -466,8 +438,7 @@ describe("restore store", () => {
     // renders t(`errors.internal.invalid_input.long`)) and NOT consume the dialog
     // token (so the user can fix the selection and retry without re-picking).
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "list_sources")
-        return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
       if (cmd === "list_remote_tree")
         return Promise.resolve(tree([file("foo.txt"), file("Foo.txt")]));
       if (cmd === "restore_files")
@@ -498,10 +469,8 @@ describe("restore store", () => {
     // backend REJECTS, and assert activeJobId is now null - not the old id.
     let restoreCall = 0;
     invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "list_sources")
-        return Promise.resolve([source("s1", "Documents")]);
-      if (cmd === "list_remote_tree")
-        return Promise.resolve(tree([file("a.txt"), file("b.txt")]));
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree") return Promise.resolve(tree([file("a.txt"), file("b.txt")]));
       if (cmd === "restore_files") {
         restoreCall += 1;
         // First call succeeds (a prior job); second call is rejected.
@@ -547,12 +516,8 @@ describe("restore store", () => {
   it("clears the cross-source selection when the active source changes (R3-P1-1 defense in depth)", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources")
-        return Promise.resolve([
-          source("s1", "Documents"),
-          source("s2", "Photos"),
-        ]);
-      if (cmd === "list_remote_tree")
-        return Promise.resolve(tree([file("foo.txt")]));
+        return Promise.resolve([source("s1", "Documents"), source("s2", "Photos")]);
+      if (cmd === "list_remote_tree") return Promise.resolve(tree([file("foo.txt")]));
       return Promise.resolve([]);
     });
 

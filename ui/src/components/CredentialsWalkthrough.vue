@@ -32,9 +32,7 @@ let unlisten: UnlistenFn | null = null;
 // R1-P2-4 (DESIGN s6.1): a PKCE installed-app client legitimately has an EMPTY
 // secret, so only a non-empty client ID is required to submit. The secret is
 // passed through as-is (possibly empty).
-const canSubmit = computed(
-  () => clientId.value.trim().length > 0 && !setup.busy,
-);
+const canSubmit = computed(() => clientId.value.trim().length > 0 && !setup.busy);
 
 /** Human-facing status line for the in-flight OAuth handshake. */
 const statusLabel = computed<string | null>(() => {
@@ -57,14 +55,14 @@ const statusLabel = computed<string | null>(() => {
 });
 
 const errorLong = computed<string | null>(() =>
-  setup.errorCode ? t(`errors.${setup.errorCode}.long`) : null,
+  setup.errorCode ? t(`errors.${setup.errorCode}.long`) : null
 );
 
 const awaiting = computed(
   () =>
     setup.oauthStatus?.kind === "awaitingCallback" ||
     setup.oauthStatus?.kind === "openingBrowser" ||
-    setup.oauthStatus?.kind === "exchangingCode",
+    setup.oauthStatus?.kind === "exchangingCode"
 );
 
 async function signIn(): Promise<void> {
@@ -107,9 +105,7 @@ onBeforeUnmount(() => {
 
     <div class="space-y-3">
       <label class="block space-y-1">
-        <span class="text-sm font-medium">{{
-          t("wizard.step2.clientIdLabel")
-        }}</span>
+        <span class="text-sm font-medium">{{ t("wizard.step2.clientIdLabel") }}</span>
         <input
           v-model="clientId"
           type="text"
@@ -118,13 +114,11 @@ onBeforeUnmount(() => {
           class="w-full rounded border px-3 py-1.5 text-sm"
           :placeholder="t('wizard.step2.clientIdPlaceholder')"
           :disabled="setup.busy || awaiting"
-        >
+        />
       </label>
 
       <label class="block space-y-1">
-        <span class="text-sm font-medium">{{
-          t("wizard.step2.clientSecretLabel")
-        }}</span>
+        <span class="text-sm font-medium">{{ t("wizard.step2.clientSecretLabel") }}</span>
         <input
           v-model="clientSecret"
           type="password"
@@ -133,7 +127,7 @@ onBeforeUnmount(() => {
           class="w-full rounded border px-3 py-1.5 text-sm"
           :placeholder="t('wizard.step2.clientSecretPlaceholder')"
           :disabled="setup.busy || awaiting"
-        >
+        />
       </label>
     </div>
 
@@ -157,24 +151,14 @@ onBeforeUnmount(() => {
         {{ t("common.confirm") }}
       </button>
 
-      <span
-        v-if="setup.busy"
-        class="text-sm text-zinc-500"
-      >{{ t("common.loading") }}</span>
+      <span v-if="setup.busy" class="text-sm text-zinc-500">{{ t("common.loading") }}</span>
     </div>
 
-    <p
-      v-if="statusLabel"
-      class="text-sm text-zinc-500"
-    >
+    <p v-if="statusLabel" class="text-sm text-zinc-500">
       {{ statusLabel }}
     </p>
 
-    <p
-      v-if="errorLong"
-      class="text-sm text-red-600"
-      role="alert"
-    >
+    <p v-if="errorLong" class="text-sm text-red-600" role="alert">
       {{ errorLong }}
     </p>
   </div>

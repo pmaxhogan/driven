@@ -71,6 +71,9 @@ jobs:
       - name: lint
         working-directory: ui
         run: pnpm lint
+      - name: prettier --check
+        working-directory: ui
+        run: pnpm format:check
       - name: test:unit
         working-directory: ui
         run: pnpm test:unit

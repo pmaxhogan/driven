@@ -32,31 +32,25 @@ function flushListen(): void {
   for (const r of resolvers) r();
 }
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(
-    async (event: string, cb: (e: { payload: unknown }) => void) => {
-      if (blockListen) {
-        await new Promise<void>((res) => {
-          pendingResolvers.push(res);
-        });
-      }
-      if (event === "activity:new") {
-        liveHandler = (payload: unknown) => cb({ payload });
-        return unlistenNewMock;
-      }
-      if (event === "activity:lagged") {
-        laggedHandler = (payload: { skipped: number }) => cb({ payload });
-        return unlistenLaggedMock;
-      }
-      return vi.fn();
-    },
-  ),
+  listen: vi.fn(async (event: string, cb: (e: { payload: unknown }) => void) => {
+    if (blockListen) {
+      await new Promise<void>((res) => {
+        pendingResolvers.push(res);
+      });
+    }
+    if (event === "activity:new") {
+      liveHandler = (payload: unknown) => cb({ payload });
+      return unlistenNewMock;
+    }
+    if (event === "activity:lagged") {
+      laggedHandler = (payload: { skipped: number }) => cb({ payload });
+      return unlistenLaggedMock;
+    }
+    return vi.fn();
+  }),
 }));
 
-import {
-  useActivityStore,
-  ACTIVITY_PAGE_SIZE,
-  LIVE_TAIL_CAP,
-} from "../stores/activity";
+import { useActivityStore, ACTIVITY_PAGE_SIZE, LIVE_TAIL_CAP } from "../stores/activity";
 import type { ActivityEntry } from "../ipc/types";
 
 function makeEntry(over: Partial<ActivityEntry> = {}): ActivityEntry {
@@ -81,7 +75,7 @@ function makePage(
   entries: ActivityEntry[],
   _page: number,
   total: number,
-  hasMoreOverride?: boolean,
+  hasMoreOverride?: boolean
 ): {
   entries: ActivityEntry[];
   total: number;
@@ -132,14 +126,8 @@ describe("activity store: pagination", () => {
 
   it("loadMore pages by the oldest (ts,id) CURSOR, appending without re-querying", async () => {
     // Page 0: ids 200, 199 (oldest = id 199 @ ts 199).
-    const page0 = [
-      makeEntry({ id: 200, ts: 200 }),
-      makeEntry({ id: 199, ts: 199 }),
-    ];
-    const page1 = [
-      makeEntry({ id: 100, ts: 100 }),
-      makeEntry({ id: 99, ts: 99 }),
-    ];
+    const page0 = [makeEntry({ id: 200, ts: 200 }), makeEntry({ id: 199, ts: 199 })];
+    const page1 = [makeEntry({ id: 100, ts: 100 }), makeEntry({ id: 99, ts: 99 })];
     invokeMock.mockResolvedValueOnce(makePage(page0, 0, 250, true));
     const store = useActivityStore();
     await store.loadInitial();
@@ -182,12 +170,7 @@ describe("activity store: pagination", () => {
 
     // Page 1 includes id 150 again - it must NOT be duplicated.
     invokeMock.mockResolvedValueOnce(
-      makePage(
-        [makeEntry({ id: 150, ts: 900 }), makeEntry({ id: 149, ts: 149 })],
-        1,
-        250,
-        false,
-      ),
+      makePage([makeEntry({ id: 150, ts: 900 }), makeEntry({ id: 149, ts: 149 })], 1, 250, false)
     );
     await store.loadMore();
     const ids = store.entries.map((e) => e.id);
@@ -264,7 +247,7 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
   it("activity:lagged re-queries page 0 and merges dropped rows without duplicates", async () => {
     // Initial page 0 has rows 5 and 4.
     invokeMock.mockResolvedValueOnce(
-      makePage([makeEntry({ id: 5, ts: 500 }), makeEntry({ id: 4, ts: 400 })], 0, 2),
+      makePage([makeEntry({ id: 5, ts: 500 }), makeEntry({ id: 4, ts: 400 })], 0, 2)
     );
     const store = useActivityStore();
     await store.subscribeLive();
@@ -283,8 +266,8 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
           makeEntry({ id: 5, ts: 500 }),
         ],
         0,
-        4,
-      ),
+        4
+      )
     );
     laggedHandler?.({ skipped: 2 });
     // Let the async reconcile settle.
@@ -316,7 +299,7 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
       makePage(
         allRows.slice(p * ACTIVITY_PAGE_SIZE, (p + 1) * ACTIVITY_PAGE_SIZE),
         p,
-        allRows.length,
+        allRows.length
       );
     // Queue page 0, 1, 2 in order (the reconcile pages forward until the gap is
     // covered / history exhausted).
@@ -336,8 +319,9 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
     expect(ids[ids.length - 1]).toBe(1);
     expect(store.total).toBe(250);
     // The reconcile queried at least 3 pages (skipped 150 -> target 250 rows).
-    expect(invokeMock.mock.calls.filter((c) => c[0] === "query_activity").length)
-      .toBeGreaterThanOrEqual(3);
+    expect(
+      invokeMock.mock.calls.filter((c) => c[0] === "query_activity").length
+    ).toBeGreaterThanOrEqual(3);
   });
 
   // R2-P1-1: the recheck-2 P1 - a multi-page burst where the NEWEST page is
@@ -365,7 +349,7 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
       makePage(
         allRows.slice(p * ACTIVITY_PAGE_SIZE, (p + 1) * ACTIVITY_PAGE_SIZE),
         p,
-        allRows.length,
+        allRows.length
       );
     // The reconcile re-queries from the newest page forward. Page 0 is ALL seen
     // (zero new), so a zero-new early-stop would miss pages 1 + 2.
@@ -384,7 +368,7 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
     expect(ids[ids.length - 1]).toBe(1);
     // It did NOT stop after the all-seen newest page: it walked >= 3 pages.
     expect(
-      invokeMock.mock.calls.filter((c) => c[0] === "query_activity").length,
+      invokeMock.mock.calls.filter((c) => c[0] === "query_activity").length
     ).toBeGreaterThanOrEqual(3);
   });
 });
@@ -426,16 +410,12 @@ describe("activity store: live-tail cap (M7-P2-2)", () => {
 
 describe("activity store: filters", () => {
   it("applyFilter re-queries from page 0 with the new filter and resets state", async () => {
-    invokeMock.mockResolvedValueOnce(
-      makePage([makeEntry({ id: 1 }), makeEntry({ id: 2 })], 0, 2),
-    );
+    invokeMock.mockResolvedValueOnce(makePage([makeEntry({ id: 1 }), makeEntry({ id: 2 })], 0, 2));
     const store = useActivityStore();
     await store.loadInitial();
     expect(store.entries).toHaveLength(2);
 
-    invokeMock.mockResolvedValueOnce(
-      makePage([makeEntry({ id: 3, level: "error" })], 0, 1),
-    );
+    invokeMock.mockResolvedValueOnce(makePage([makeEntry({ id: 3, level: "error" })], 0, 1));
     await store.applyFilter({ minLevel: "error", sourceId: "src-1" });
 
     expect(invokeMock).toHaveBeenNthCalledWith(2, "query_activity", {
@@ -491,14 +471,12 @@ describe("activity store: request token (M7-P2-1)", () => {
       () =>
         new Promise((res) => {
           resolveFirst = res;
-        }),
+        })
     );
     const firstLoad = store.loadInitial();
 
     // While in flight, the user applies an error-only filter, which re-queries.
-    invokeMock.mockResolvedValueOnce(
-      makePage([makeEntry({ id: 99, level: "error" })], 0, 1),
-    );
+    invokeMock.mockResolvedValueOnce(makePage([makeEntry({ id: 99, level: "error" })], 0, 1));
     await store.applyFilter({ minLevel: "error" });
     expect(store.entries.map((e) => e.id)).toEqual([99]);
 
@@ -518,15 +496,8 @@ describe("activity store: backend facets + summary (M7-P2-4, P2-5)", () => {
     invokeMock.mockResolvedValueOnce(["paused", "scan_done", "upload_done"]);
     const store = useActivityStore();
     await store.loadEventTypeOptions();
-    expect(invokeMock).toHaveBeenCalledWith(
-      "distinct_activity_event_types",
-      undefined,
-    );
-    expect(store.eventTypeOptions).toEqual([
-      "paused",
-      "scan_done",
-      "upload_done",
-    ]);
+    expect(invokeMock).toHaveBeenCalledWith("distinct_activity_event_types", undefined);
+    expect(store.eventTypeOptions).toEqual(["paused", "scan_done", "upload_done"]);
   });
 
   it("loadSummary stores the header aggregates", async () => {
@@ -542,7 +513,7 @@ describe("activity store: backend facets + summary (M7-P2-4, P2-5)", () => {
     await store.loadSummary();
     expect(invokeMock).toHaveBeenCalledWith(
       "activity_summary",
-      expect.objectContaining({ throughputWindowMs: 60000 }),
+      expect.objectContaining({ throughputWindowMs: 60000 })
     );
     expect(store.summary).toEqual(summary);
   });
@@ -565,9 +536,7 @@ describe("activity store: backend facets + summary (M7-P2-4, P2-5)", () => {
       };
       // Every activity_summary call resolves with the same summary.
       invokeMock.mockImplementation((cmd: string) =>
-        cmd === "activity_summary"
-          ? Promise.resolve(summary)
-          : Promise.resolve(undefined),
+        cmd === "activity_summary" ? Promise.resolve(summary) : Promise.resolve(undefined)
       );
 
       // Fire a burst of byte-carrying upload events.
@@ -575,16 +544,12 @@ describe("activity store: backend facets + summary (M7-P2-4, P2-5)", () => {
         liveHandler?.(makeEntry({ id: i, ts: i, eventType: "upload_done", bytes: 512 }));
       }
       // No summary call yet (debounce pending).
-      expect(
-        invokeMock.mock.calls.filter((c) => c[0] === "activity_summary").length,
-      ).toBe(0);
+      expect(invokeMock.mock.calls.filter((c) => c[0] === "activity_summary").length).toBe(0);
 
       // Advance past the debounce window: exactly ONE summary reload fires.
       await vi.advanceTimersByTimeAsync(1000);
       await Promise.resolve();
-      const summaryCalls = invokeMock.mock.calls.filter(
-        (c) => c[0] === "activity_summary",
-      ).length;
+      const summaryCalls = invokeMock.mock.calls.filter((c) => c[0] === "activity_summary").length;
       expect(summaryCalls).toBe(1);
       expect(store.summary).toEqual(summary);
     } finally {
@@ -601,16 +566,102 @@ describe("activity store: backend facets + summary (M7-P2-4, P2-5)", () => {
       await store.subscribeLive();
       invokeMock.mockResolvedValue(undefined);
 
-      liveHandler?.(
-        makeEntry({ id: 1, ts: 1, eventType: "drive.checksum_mismatch", bytes: null }),
-      );
+      liveHandler?.(makeEntry({ id: 1, ts: 1, eventType: "drive.checksum_mismatch", bytes: null }));
       await vi.advanceTimersByTimeAsync(2000);
-      expect(
-        invokeMock.mock.calls.filter((c) => c[0] === "activity_summary").length,
-      ).toBe(0);
+      expect(invokeMock.mock.calls.filter((c) => c[0] === "activity_summary").length).toBe(0);
       void store;
     } finally {
       vi.useRealTimers();
     }
+  });
+});
+
+describe("activity store: recheck-3 polish (M7-R3-P2)", () => {
+  it("computes the week start by local calendar arithmetic (DST-safe)", async () => {
+    // M7-R3-P2: weekStart must be local-midnight `dayOfWeek` days back via Date
+    // construction, NOT `dayStart - dayOfWeek * 24h` (which crosses DST wrong).
+    // Assert the passed weekStart equals the calendar value for a fixed `now`.
+    const fixedNow = new Date(2026, 2, 11, 15, 30, 0); // Wed 2026-03-11 (US DST week)
+    vi.useFakeTimers();
+    vi.setSystemTime(fixedNow);
+    try {
+      invokeMock.mockResolvedValueOnce({
+        bytesToday: 0,
+        bytesWeek: 0,
+        fileStatusCounts: [],
+        throughputWindowBytes: 0,
+        throughputWindowMs: 60000,
+      });
+      const store = useActivityStore();
+      await store.loadSummary();
+
+      const dayStart = new Date(2026, 2, 11).getTime();
+      const weekStart = new Date(2026, 2, 11 - fixedNow.getDay()).getTime();
+      expect(invokeMock).toHaveBeenCalledWith("activity_summary", {
+        dayStartMs: dayStart,
+        weekStartMs: weekStart,
+        throughputWindowMs: 60000,
+      });
+      // The calendar weekStart is NOT necessarily dayStart - day*24h across a
+      // DST boundary; assert it is a true local midnight (no sub-day remainder).
+      const wk = new Date(weekStart);
+      expect(wk.getHours()).toBe(0);
+      expect(wk.getMinutes()).toBe(0);
+      expect(wk.getSeconds()).toBe(0);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("adds a new event type seen on a live row to the filter dropdown source", async () => {
+    invokeMock.mockResolvedValueOnce(["upload_done"]);
+    const store = useActivityStore();
+    await store.loadEventTypeOptions();
+    await store.subscribeLive();
+    expect(store.eventTypeOptions).toEqual(["upload_done"]);
+
+    // A brand-new event type arrives live; it must appear in the dropdown source
+    // (sorted) so the user can filter for it without a reload.
+    liveHandler?.(makeEntry({ id: 2, ts: 2000, eventType: "trash_done" }));
+    expect(store.eventTypeOptions).toEqual(["trash_done", "upload_done"]);
+
+    // A live row of an already-known type does not duplicate the option.
+    liveHandler?.(makeEntry({ id: 3, ts: 3000, eventType: "upload_done" }));
+    expect(store.eventTypeOptions).toEqual(["trash_done", "upload_done"]);
+  });
+
+  it("exposes a new event type even when the live row is filtered out", async () => {
+    invokeMock.mockResolvedValueOnce(makePage([], 0, 0));
+    const store = useActivityStore();
+    // Filter to errors only.
+    await store.applyFilter({ minLevel: "error" });
+    await store.subscribeLive();
+
+    // An INFO row of a new type is filtered out of the view but its type must
+    // still become selectable in the dropdown.
+    liveHandler?.(makeEntry({ id: 9, ts: 9000, level: "info", eventType: "deep_verify_done" }));
+    expect(store.entries).toHaveLength(0);
+    expect(store.eventTypeOptions).toContain("deep_verify_done");
+  });
+
+  it("clears a prior loadMore error after a successful retry", async () => {
+    // Page 0 loads, hasMore=true.
+    invokeMock.mockResolvedValueOnce(makePage([makeEntry({ id: 200, ts: 200 })], 0, 250, true));
+    const store = useActivityStore();
+    await store.loadInitial();
+    expect(store.errorCode).toBeNull();
+
+    // First loadMore FAILS -> errorCode set.
+    invokeMock.mockRejectedValueOnce({ code: "state.db_locked" });
+    await store.loadMore();
+    expect(store.errorCode).toBe("state.db_locked");
+    // hasMore is unchanged by a failed load, so a retry is possible.
+    expect(store.hasMore).toBe(true);
+
+    // Retry SUCCEEDS -> the stale error must be cleared.
+    invokeMock.mockResolvedValueOnce(makePage([makeEntry({ id: 100, ts: 100 })], 1, 250, false));
+    await store.loadMore();
+    expect(store.errorCode).toBeNull();
+    expect(store.entries.map((e) => e.id)).toEqual([200, 100]);
   });
 });

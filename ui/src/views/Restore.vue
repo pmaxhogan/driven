@@ -24,10 +24,7 @@ const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"] as const;
 function formatBytes(bytes: number): string {
   const fmt0 = new Intl.NumberFormat(locale.value);
   if (bytes <= 0) return `${fmt0.format(0)} ${BYTE_UNITS[0]}`;
-  const exponent = Math.min(
-    Math.floor(Math.log(bytes) / Math.log(1024)),
-    BYTE_UNITS.length - 1,
-  );
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), BYTE_UNITS.length - 1);
   const value = bytes / Math.pow(1024, exponent);
   const fmt = new Intl.NumberFormat(locale.value, {
     maximumFractionDigits: exponent === 0 ? 0 : 1,
@@ -60,7 +57,7 @@ watch(
   () => props.sourceId,
   (id) => {
     if (id) void restore.selectSource(id);
-  },
+  }
 );
 
 async function onSourceChange(event: Event): Promise<void> {
@@ -87,38 +84,27 @@ async function onClearSearch(): Promise<void> {
     <!-- Source selector + search -->
     <div class="flex flex-wrap items-end gap-3">
       <label class="flex flex-col gap-1 text-sm">
-        <span class="text-zinc-600 dark:text-zinc-400">{{
-          t("restore.source")
-        }}</span>
+        <span class="text-zinc-600 dark:text-zinc-400">{{ t("restore.source") }}</span>
         <select
           class="rounded border border-zinc-300 bg-white px-2 py-1 dark:border-zinc-700 dark:bg-zinc-800"
           :value="restore.sourceId ?? ''"
           @change="onSourceChange"
         >
-          <option
-            v-for="s in restore.sources"
-            :key="s.id"
-            :value="s.id"
-          >
+          <option v-for="s in restore.sources" :key="s.id" :value="s.id">
             {{ s.displayName }}
           </option>
         </select>
       </label>
 
-      <form
-        class="flex items-end gap-2"
-        @submit.prevent="onSearchSubmit"
-      >
+      <form class="flex items-end gap-2" @submit.prevent="onSearchSubmit">
         <label class="flex flex-col gap-1 text-sm">
-          <span class="text-zinc-600 dark:text-zinc-400">{{
-            t("restore.search.label")
-          }}</span>
+          <span class="text-zinc-600 dark:text-zinc-400">{{ t("restore.search.label") }}</span>
           <input
             v-model="searchInput"
             type="search"
             :placeholder="t('restore.search.placeholder')"
             class="w-64 rounded border border-zinc-300 bg-white px-2 py-1 dark:border-zinc-700 dark:bg-zinc-800"
-          >
+          />
         </label>
         <button
           type="submit"
@@ -143,23 +129,12 @@ async function onClearSearch(): Promise<void> {
       class="flex flex-wrap items-center gap-1 text-sm text-zinc-600 dark:text-zinc-400"
       :aria-label="t('restore.breadcrumb.label')"
     >
-      <button
-        type="button"
-        class="hover:underline"
-        @click="restore.goToBreadcrumb(-1)"
-      >
+      <button type="button" class="hover:underline" @click="restore.goToBreadcrumb(-1)">
         {{ t("restore.breadcrumb.root") }}
       </button>
-      <template
-        v-for="(seg, i) in restore.breadcrumbs"
-        :key="i"
-      >
+      <template v-for="(seg, i) in restore.breadcrumbs" :key="i">
         <span aria-hidden="true">/</span>
-        <button
-          type="button"
-          class="hover:underline"
-          @click="restore.goToBreadcrumb(i)"
-        >
+        <button type="button" class="hover:underline" @click="restore.goToBreadcrumb(i)">
           {{ seg }}
         </button>
       </template>
@@ -174,10 +149,7 @@ async function onClearSearch(): Promise<void> {
     </p>
 
     <!-- Loading -->
-    <p
-      v-if="restore.loading"
-      class="text-sm text-zinc-500"
-    >
+    <p v-if="restore.loading" class="text-sm text-zinc-500">
       {{ t("restore.loading") }}
     </p>
 
@@ -210,10 +182,7 @@ async function onClearSearch(): Promise<void> {
       >
         <!-- A folder node (tree only): click to descend. -->
         <template v-if="!restore.isSearching && 'isDir' in row && row.isDir">
-          <span
-            class="w-5 text-center"
-            aria-hidden="true"
-          >[+]</span>
+          <span class="w-5 text-center" aria-hidden="true">[+]</span>
           <button
             type="button"
             class="flex-1 text-left font-medium hover:underline"
@@ -232,7 +201,7 @@ async function onClearSearch(): Promise<void> {
             :checked="
               restore.isSelected(
                 'sourceId' in row ? row.sourceId : (restore.sourceId ?? ''),
-                row.relativePath,
+                row.relativePath
               )
             "
             :disabled="!row.restorable"
@@ -240,26 +209,17 @@ async function onClearSearch(): Promise<void> {
             @change="
               restore.toggleSelect(
                 'sourceId' in row ? row.sourceId : (restore.sourceId ?? ''),
-                row.relativePath,
+                row.relativePath
               )
             "
-          >
-          <span
-            class="flex-1 truncate"
-            :title="row.relativePath"
-          >
+          />
+          <span class="flex-1 truncate" :title="row.relativePath">
             {{ "name" in row ? row.name : row.relativePath }}
           </span>
-          <span
-            v-if="'size' in row"
-            class="text-zinc-400"
-          >{{
-            formatBytes(row.size)
+          <span v-if="'size' in row" class="text-zinc-400">{{ formatBytes(row.size) }}</span>
+          <span v-if="!row.restorable" class="text-amber-600 dark:text-amber-400">{{
+            t("restore.node.notUploaded")
           }}</span>
-          <span
-            v-if="!row.restorable"
-            class="text-amber-600 dark:text-amber-400"
-          >{{ t("restore.node.notUploaded") }}</span>
         </template>
       </li>
     </ul>
@@ -352,52 +312,29 @@ async function onClearSearch(): Promise<void> {
           :style="{ width: overallPercent + '%' }"
         />
       </div>
-      <p
-        v-if="restore.job.currentFile"
-        class="truncate text-xs text-zinc-500"
-      >
+      <p v-if="restore.job.currentFile" class="truncate text-xs text-zinc-500">
         {{ t("restore.progress.current", { file: restore.job.currentFile }) }}
       </p>
       <!-- Per-file breakdown -->
       <ul class="max-h-48 space-y-1 overflow-auto text-xs">
-        <li
-          v-for="f in restore.job.files"
-          :key="f.relativePath"
-          class="flex items-center gap-2"
-        >
-          <span
-            class="flex-1 truncate"
-            :title="f.relativePath"
-          >{{
-            f.relativePath
-          }}</span>
+        <li v-for="f in restore.job.files" :key="f.relativePath" class="flex items-center gap-2">
+          <span class="flex-1 truncate" :title="f.relativePath">{{ f.relativePath }}</span>
           <span
             v-if="f.state === 'failed'"
             class="text-red-600 dark:text-red-400"
             :title="f.errorCode ? t(`errors.${f.errorCode}.long`) : undefined"
-          >{{ t("restore.file.failed") }}</span>
-          <span
-            v-else-if="f.state === 'done'"
-            class="text-emerald-600 dark:text-emerald-400"
-          >{{ t("restore.file.done") }}</span>
-          <span
-            v-else-if="f.state === 'restoring'"
-            class="text-zinc-500"
-          >{{
+            >{{ t("restore.file.failed") }}</span
+          >
+          <span v-else-if="f.state === 'done'" class="text-emerald-600 dark:text-emerald-400">{{
+            t("restore.file.done")
+          }}</span>
+          <span v-else-if="f.state === 'restoring'" class="text-zinc-500">{{
             t("restore.file.restoring")
           }}</span>
-          <span
-            v-else-if="f.state === 'cancelled'"
-            class="text-zinc-500"
-          >{{
+          <span v-else-if="f.state === 'cancelled'" class="text-zinc-500">{{
             t("restore.file.cancelled")
           }}</span>
-          <span
-            v-else
-            class="text-zinc-400"
-          >{{
-            t("restore.file.pending")
-          }}</span>
+          <span v-else class="text-zinc-400">{{ t("restore.file.pending") }}</span>
         </li>
       </ul>
     </div>

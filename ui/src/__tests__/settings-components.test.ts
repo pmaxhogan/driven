@@ -123,8 +123,7 @@ describe("SourceTable", () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources") return Promise.resolve([makeSource()]);
       if (cmd === "list_accounts") return Promise.resolve([]);
-      if (cmd === "update_source")
-        return Promise.resolve(makeSource({ enabled: false }));
+      if (cmd === "update_source") return Promise.resolve(makeSource({ enabled: false }));
       return Promise.resolve(undefined);
     });
     const wrapper = mount(SourceTable, { global: globalMountOptions });
@@ -155,17 +154,12 @@ describe("SourceTable", () => {
 
     const checkbox = wrapper.get('input[type="checkbox"]');
     expect((checkbox.element as HTMLInputElement).disabled).toBe(true);
-    expect(wrapper.find('[data-testid="pending-recovery-ack-badge"]').exists()).toBe(
-      true,
-    );
+    expect(wrapper.find('[data-testid="pending-recovery-ack-badge"]').exists()).toBe(true);
 
     // Even if a change event is fired, the handler is a no-op (no update_source).
     await checkbox.trigger("change");
     await flushPromises();
-    expect(invokeMock).not.toHaveBeenCalledWith(
-      "update_source",
-      expect.anything(),
-    );
+    expect(invokeMock).not.toHaveBeenCalledWith("update_source", expect.anything());
   });
 
   it("exposes a post-restart reveal/ack action that enables a pending source (R5-P1-2, R7-P2-1)", async () => {
@@ -191,7 +185,7 @@ describe("SourceTable", () => {
       if (cmd === "ack_recovery_phrase_saved") {
         acked = true;
         return Promise.resolve(
-          makeSource({ encryptionEnabled: true, enabled: true, pendingRecoveryAck: false }),
+          makeSource({ encryptionEnabled: true, enabled: true, pendingRecoveryAck: false })
         );
       }
       return Promise.resolve(undefined);
@@ -203,10 +197,7 @@ describe("SourceTable", () => {
     const revealBtn = wrapper.get('[data-testid="reveal-ack-button"]');
     await revealBtn.trigger("click");
     await flushPromises();
-    expect(invokeMock).not.toHaveBeenCalledWith(
-      "reveal_recovery_phrase",
-      expect.anything(),
-    );
+    expect(invokeMock).not.toHaveBeenCalledWith("reveal_recovery_phrase", expect.anything());
 
     // The reveal/ack panel is open. Clicking Reveal inside RecoveryPhraseReveal is
     // what records the backend reveal AND fetches the words (so the ack checkbox
@@ -268,10 +259,7 @@ describe("SourceTable", () => {
     await flushPromises();
 
     // No backend reveal was recorded, and the panel is closed.
-    expect(invokeMock).not.toHaveBeenCalledWith(
-      "reveal_recovery_phrase",
-      expect.anything(),
-    );
+    expect(invokeMock).not.toHaveBeenCalledWith("reveal_recovery_phrase", expect.anything());
     expect(wrapper.find('[data-testid="reveal-ack-panel"]').exists()).toBe(false);
   });
 
@@ -338,10 +326,7 @@ describe("SourceTable", () => {
     await flushPromises();
     const editButton = wrapper
       .findAll("button")
-      .find(
-        (b) =>
-          b.text() === i18n.global.t("settings.sources.editExclusionsButton"),
-      );
+      .find((b) => b.text() === i18n.global.t("settings.sources.editExclusionsButton"));
     await editButton!.trigger("click");
     await flushPromises();
     const editor = wrapper.get('[data-testid="exclusion-editor"]');
@@ -352,7 +337,7 @@ describe("SourceTable", () => {
       // the request under `req` (matching the Rust signature).
       expect.objectContaining({
         req: expect.objectContaining({ sourceId: "src-1" }),
-      }),
+      })
     );
     const excludeArea = editor.findAll("textarea")[1];
     await excludeArea.setValue("node_modules\n*.log");
@@ -422,18 +407,14 @@ describe("AddSourceWizard", () => {
     // path + one-shot token).
     const chooseLocal = wrapper
       .findAll("button")
-      .find(
-        (b) => b.text() === i18n.global.t("settings.addSource.chooseLocalButton"),
-      );
+      .find((b) => b.text() === i18n.global.t("settings.addSource.chooseLocalButton"));
     await chooseLocal!.trigger("click");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("pick_folder_dialog", undefined);
     expect(wrapper.get('[data-testid="local-path"]').text()).toBe("/home/u/docs");
 
     const clickNext = async () => {
-      const next = wrapper
-        .findAll("button")
-        .find((b) => b.text() === i18n.global.t("common.next"));
+      const next = wrapper.findAll("button").find((b) => b.text() === i18n.global.t("common.next"));
       await next!.trigger("click");
       await flushPromises();
     };
@@ -481,9 +462,90 @@ describe("AddSourceWizard", () => {
     // only way to set it is the dialog (mocked above). Assert the absence.
     const textInputs = wrapper.findAll('input[type="text"]');
     const pathInputs = textInputs.filter((i) =>
-      (i.element as HTMLInputElement).value.includes("/"),
+      (i.element as HTMLInputElement).value.includes("/")
     );
     expect(pathInputs).toHaveLength(0);
+  });
+
+  it("persists the client-maintained Drive breadcrumb (R4-P2-2)", async () => {
+    // R4-P2-2: pick_drive_folder returns an empty currentFolderPath (the backend
+    // lists one folder's children, not the ancestor chain). The wizard builds
+    // the breadcrumb itself in `crumbs` (parent/name) and must persist THAT path
+    // - not the empty backend value - so backup_sources.drive_folder_path is the
+    // real folder path, not blank. Drive it through the UI: descend into a
+    // folder and assert the rendered Drive-folder path reflects the breadcrumb,
+    // then finish and assert add_source receives the non-empty driveFolderPath.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_accounts")
+        return Promise.resolve([{ id: "acc-1", state: "active", label: "a", createdAt: 0 }]);
+      if (cmd === "pick_folder_dialog")
+        return Promise.resolve({ path: "/home/u/docs", token: "tok-folder" });
+      if (cmd === "pick_drive_folder")
+        return Promise.resolve({
+          currentFolderId: "fid",
+          currentFolderPath: "", // backend always blank
+          folders: [{ id: "f-docs", name: "Docs" }],
+        });
+      if (cmd === "preview_exclusions")
+        return Promise.resolve({
+          includedCount: 1,
+          excludedCount: 0,
+          includedBytes: 1,
+          includedSample: ["a"],
+          excludedSample: [],
+          truncated: false,
+        });
+      if (cmd === "add_source")
+        return Promise.resolve({
+          source: makeSource({ driveFolderPath: "Docs" }),
+          recoveryPhrase: null,
+          pendingRecoveryAck: false,
+        });
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(AddSourceWizard, { global: globalMountOptions });
+    await (wrapper.vm as unknown as { start: () => Promise<void> }).start();
+    await flushPromises();
+
+    // Step 1: choose the local folder via the backend dialog.
+    const chooseLocal = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.addSource.chooseLocalButton"));
+    await chooseLocal!.trigger("click");
+    await flushPromises();
+
+    const clickNext = async () => {
+      const next = wrapper.findAll("button").find((b) => b.text() === i18n.global.t("common.next"));
+      await next!.trigger("click");
+      await flushPromises();
+    };
+
+    // -> Drive step: root listing loaded, path empty.
+    await clickNext();
+    const driveLabel = i18n.global.t("settings.addSource.step.driveFolder");
+    expect(wrapper.text()).toContain(`${driveLabel}:`);
+
+    // Click the "Docs" folder to descend; the rendered path must now be "Docs",
+    // proving the client breadcrumb was persisted (not the empty backend value).
+    const docsBtn = wrapper.findAll("button").find((b) => b.text() === "Docs");
+    await docsBtn!.trigger("click");
+    await flushPromises();
+    expect(wrapper.text()).toContain(`${driveLabel}: Docs`);
+
+    // Finish: add_source receives the breadcrumb path, not a blank string.
+    await clickNext(); // -> exclusions
+    await clickNext(); // -> encryption
+    await clickNext(); // -> confirm
+    const finish = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("common.finish"));
+    await finish!.trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("add_source", {
+      req: expect.objectContaining({ driveFolderPath: "Docs" }),
+    });
   });
 });
 
@@ -532,7 +594,7 @@ describe("Settings Rules tab", () => {
         return Promise.resolve(
           makeSettings({
             global: { ...makeSettings().global, bandwidthCapMbps: 25 },
-          }),
+          })
         );
       if (cmd === "update_settings") {
         const patch = (args as { patch: Record<string, unknown> }).patch;
@@ -602,7 +664,7 @@ describe("Settings Rules tab", () => {
     expect((toggle.element as HTMLInputElement).checked).toBe(true);
     // The privacy note is shown.
     expect(wrapper.get('[data-testid="telemetry-setting"]').text()).toContain(
-      i18n.global.t("settings.rules.telemetryNote"),
+      i18n.global.t("settings.rules.telemetryNote")
     );
 
     // Uncheck -> calls set_telemetry_enabled(false), NOT update_settings.

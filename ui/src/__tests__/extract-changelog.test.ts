@@ -9,10 +9,7 @@ import { fileURLToPath } from "node:url";
 // heading shapes - no file IO, no network.
 
 const __filename = fileURLToPath(import.meta.url);
-const SCRIPT = path.resolve(
-  path.dirname(__filename),
-  "../../../scripts/extract-changelog.mjs",
-);
+const SCRIPT = path.resolve(path.dirname(__filename), "../../../scripts/extract-changelog.mjs");
 
 const mod = await import(SCRIPT);
 
@@ -48,9 +45,7 @@ describe("extract-changelog.mjs", () => {
 
   it("pulls the version out of the various heading shapes", () => {
     expect(
-      mod.headingVersion(
-        "## [0.2.0](https://github.com/o/r/compare/v0.1.0...v0.2.0) (2026-07-01)",
-      ),
+      mod.headingVersion("## [0.2.0](https://github.com/o/r/compare/v0.1.0...v0.2.0) (2026-07-01)")
     ).toBe("0.2.0");
     expect(mod.headingVersion("## [0.1.0] - 2026-06-01")).toBe("0.1.0");
     expect(mod.headingVersion("## 0.3.0 (2026-08-01)")).toBe("0.3.0");

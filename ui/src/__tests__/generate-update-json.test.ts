@@ -14,35 +14,20 @@ import { fileURLToPath } from "node:url";
 // manifest.
 
 const __filename = fileURLToPath(import.meta.url);
-const SCRIPT = path.resolve(
-  path.dirname(__filename),
-  "../../../scripts/generate-update-json.mjs",
-);
+const SCRIPT = path.resolve(path.dirname(__filename), "../../../scripts/generate-update-json.mjs");
 
 const mod = await import(SCRIPT);
 
 describe("generate-update-json.mjs", () => {
   it("maps bundle filenames to the correct Tauri target triples", () => {
-    expect(mod.targetForBundle("Driven_0.1.0_x64-setup.exe")).toBe(
-      "windows-x86_64",
-    );
-    expect(mod.targetForBundle("Driven_0.1.0_arm64-setup.exe")).toBe(
-      "windows-aarch64",
-    );
-    expect(mod.targetForBundle("Driven_aarch64.app.tar.gz")).toBe(
-      "darwin-aarch64",
-    );
+    expect(mod.targetForBundle("Driven_0.1.0_x64-setup.exe")).toBe("windows-x86_64");
+    expect(mod.targetForBundle("Driven_0.1.0_arm64-setup.exe")).toBe("windows-aarch64");
+    expect(mod.targetForBundle("Driven_aarch64.app.tar.gz")).toBe("darwin-aarch64");
     expect(mod.targetForBundle("Driven_x64.app.tar.gz")).toBe("darwin-x86_64");
     // R3-P1-1: the release.yml [arch] / dev-channel rename forms both map.
-    expect(
-      mod.targetForBundle("Driven_0.1.0_darwin_aarch64.app.tar.gz"),
-    ).toBe("darwin-aarch64");
-    expect(
-      mod.targetForBundle("Driven_0.1.0_darwin_x86_64.app.tar.gz"),
-    ).toBe("darwin-x86_64");
-    expect(mod.targetForBundle("driven_0.1.0_amd64.AppImage")).toBe(
-      "linux-x86_64",
-    );
+    expect(mod.targetForBundle("Driven_0.1.0_darwin_aarch64.app.tar.gz")).toBe("darwin-aarch64");
+    expect(mod.targetForBundle("Driven_0.1.0_darwin_x86_64.app.tar.gz")).toBe("darwin-x86_64");
+    expect(mod.targetForBundle("driven_0.1.0_amd64.AppImage")).toBe("linux-x86_64");
     // A non-updater artifact maps to null (skipped).
     expect(mod.targetForBundle("Driven_0.1.0_amd64.deb")).toBeNull();
   });
@@ -51,9 +36,7 @@ describe("generate-update-json.mjs", () => {
     // The default tauri on-disk name (`Driven.app.tar.gz`) has no arch; both mac
     // jobs would collide. The generator must refuse to guess, not silently
     // classify it as Intel.
-    expect(() => mod.targetForBundle("Driven.app.tar.gz")).toThrow(
-      /archless macOS/,
-    );
+    expect(() => mod.targetForBundle("Driven.app.tar.gz")).toThrow(/archless macOS/);
   });
 
   it("resolves the stable version from the conf reader", async () => {
@@ -65,7 +48,7 @@ describe("generate-update-json.mjs", () => {
     const v = await mod.resolveVersion(
       "dev",
       { version: "0.1.1-dev.123.abc1234" },
-      async () => "9.9.9",
+      async () => "9.9.9"
     );
     expect(v).toBe("0.1.1-dev.123.abc1234");
   });
@@ -83,7 +66,7 @@ describe("generate-update-json.mjs", () => {
       "dev",
       { runNumber: "42", devSha: "cafe123" },
       async () => "9.9.9",
-      computeDev,
+      computeDev
     );
     expect(v).toBe("0.1.1-dev.42.cafe123");
     expect(calls).toEqual([["42", "cafe123"]]);
@@ -92,14 +75,14 @@ describe("generate-update-json.mjs", () => {
   });
 
   it("R3-P2-1: dev without --version or --run-number/--dev-sha is rejected (no implicit 0.0.0)", async () => {
-    await expect(
-      mod.resolveVersion("dev", {}, async () => "9.9.9"),
-    ).rejects.toThrow(/dev. channel requires --version/);
+    await expect(mod.resolveVersion("dev", {}, async () => "9.9.9")).rejects.toThrow(
+      /dev. channel requires --version/
+    );
   });
 
   it("rejects an invalid --version", async () => {
     await expect(
-      mod.resolveVersion("stable", { version: "not-a-version" }, async () => "0.1.0"),
+      mod.resolveVersion("stable", { version: "not-a-version" }, async () => "0.1.0")
     ).rejects.toThrow(/invalid --version/);
   });
 
@@ -131,10 +114,7 @@ describe("generate-update-json.mjs", () => {
 
     // One fake signed Windows bundle.
     await fs.writeFile(path.join(bundles, "Driven_0.2.0_x64-setup.exe"), "fake");
-    await fs.writeFile(
-      path.join(bundles, "Driven_0.2.0_x64-setup.exe.sig"),
-      "TESTSIG==\n",
-    );
+    await fs.writeFile(path.join(bundles, "Driven_0.2.0_x64-setup.exe.sig"), "TESTSIG==\n");
 
     const silent = { info: () => {}, warn: () => {} };
     const result = await mod.generate(
@@ -146,7 +126,7 @@ describe("generate-update-json.mjs", () => {
         baseUrl: "https://dl.example.test",
         notes: "## 0.2.0\n\n- Faster sync",
       },
-      { readConfVersion: async () => "0.2.0", log: silent },
+      { readConfVersion: async () => "0.2.0", log: silent }
     );
 
     expect(result.version).toBe("0.2.0");
@@ -155,16 +135,14 @@ describe("generate-update-json.mjs", () => {
     // R1-P1-1: the path is updates/stable/windows/x86_64/update.json - NO
     // version segment.
     const manifestPath = mod.manifestOutPath(out, "stable", "windows-x86_64");
-    expect(manifestPath.replace(/\\/g, "/")).toContain(
-      "stable/windows/x86_64/update.json",
-    );
+    expect(manifestPath.replace(/\\/g, "/")).toContain("stable/windows/x86_64/update.json");
     expect(manifestPath).not.toContain("0.2.0");
 
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
     expect(manifest.version).toBe("0.2.0");
     expect(manifest.platforms["windows-x86_64"].signature).toBe("TESTSIG==");
     expect(manifest.platforms["windows-x86_64"].url).toBe(
-      "https://dl.example.test/Driven_0.2.0_x64-setup.exe",
+      "https://dl.example.test/Driven_0.2.0_x64-setup.exe"
     );
     // R1-P1-6: the notes propagate into the manifest (the in-app changelog).
     expect(manifest.notes).toBe("## 0.2.0\n\n- Faster sync");
@@ -183,29 +161,24 @@ describe("generate-update-json.mjs", () => {
 
     // A fake signed macOS bundle.
     await fs.writeFile(path.join(bundles, "Driven_aarch64.app.tar.gz"), "fake");
-    await fs.writeFile(
-      path.join(bundles, "Driven_aarch64.app.tar.gz.sig"),
-      "DEVSIG==\n",
-    );
+    await fs.writeFile(path.join(bundles, "Driven_aarch64.app.tar.gz.sig"), "DEVSIG==\n");
 
     const silent = { info: () => {}, warn: () => {} };
     const result = await mod.generate(
       "dev",
       { version: "0.1.1-dev.123.abc1234", bundles, out, notesFile },
-      { log: silent },
+      { log: silent }
     );
 
     expect(result.version).toBe("0.1.1-dev.123.abc1234");
     const manifestPath = mod.manifestOutPath(out, "dev", "darwin-aarch64");
-    expect(manifestPath.replace(/\\/g, "/")).toContain(
-      "dev/darwin/aarch64/update.json",
-    );
+    expect(manifestPath.replace(/\\/g, "/")).toContain("dev/darwin/aarch64/update.json");
     const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
     // Notes came from the file (trimmed).
     expect(manifest.notes).toBe("dev rolling notes");
     // The dev base URL defaults to the rolling `dev` tag, NOT v<version>.
     expect(manifest.platforms["darwin-aarch64"].url).toBe(
-      "https://github.com/pmaxhogan/driven/releases/download/dev/Driven_aarch64.app.tar.gz",
+      "https://github.com/pmaxhogan/driven/releases/download/dev/Driven_aarch64.app.tar.gz"
     );
 
     await fs.rm(tmp, { recursive: true, force: true });
@@ -213,15 +186,15 @@ describe("generate-update-json.mjs", () => {
 
   it("rejects an unknown channel", async () => {
     await expect(
-      mod.generate("nightly", {}, { readConfVersion: async () => "0.1.0" }),
+      mod.generate("nightly", {}, { readConfVersion: async () => "0.1.0" })
     ).rejects.toThrow(/channel/);
   });
 
   it("parses a SemVer version token out of a bundle filename (R2-P1-2)", () => {
     expect(mod.versionFromBundleName("Driven_0.1.0_x64-setup.exe")).toBe("0.1.0");
-    expect(
-      mod.versionFromBundleName("Driven_0.1.1-dev.5.abc1234_x64-setup.exe"),
-    ).toBe("0.1.1-dev.5.abc1234");
+    expect(mod.versionFromBundleName("Driven_0.1.1-dev.5.abc1234_x64-setup.exe")).toBe(
+      "0.1.1-dev.5.abc1234"
+    );
     // A version-less macOS bundle yields null.
     expect(mod.versionFromBundleName("Driven_aarch64.app.tar.gz")).toBeNull();
   });
@@ -235,15 +208,9 @@ describe("generate-update-json.mjs", () => {
     // Two Windows NSIS bundles for the SAME target but DIFFERENT versions: the
     // current run's 0.1.2 plus a stale 0.1.1 left over on the rolling release.
     await fs.writeFile(path.join(bundles, "Driven_0.1.2_x64-setup.exe"), "new");
-    await fs.writeFile(
-      path.join(bundles, "Driven_0.1.2_x64-setup.exe.sig"),
-      "NEWSIG==\n",
-    );
+    await fs.writeFile(path.join(bundles, "Driven_0.1.2_x64-setup.exe.sig"), "NEWSIG==\n");
     await fs.writeFile(path.join(bundles, "Driven_0.1.1_x64-setup.exe"), "old");
-    await fs.writeFile(
-      path.join(bundles, "Driven_0.1.1_x64-setup.exe.sig"),
-      "OLDSIG==\n",
-    );
+    await fs.writeFile(path.join(bundles, "Driven_0.1.1_x64-setup.exe.sig"), "OLDSIG==\n");
 
     const silent = { info: () => {}, warn: () => {} };
     // With the expected version armed, the stale 0.1.1 asset must abort the run -
@@ -252,8 +219,8 @@ describe("generate-update-json.mjs", () => {
       mod.generate(
         "stable",
         { version: "0.1.2", bundles, out, baseUrl: "https://dl.example.test" },
-        { readConfVersion: async () => "0.1.2", log: silent },
-      ),
+        { readConfVersion: async () => "0.1.2", log: silent }
+      )
     ).rejects.toThrow(/stale bundle|conflicting bundles/);
 
     await fs.rm(tmp, { recursive: true, force: true });
@@ -270,16 +237,13 @@ describe("generate-update-json.mjs", () => {
     await fs.writeFile(path.join(bundles, "Driven_0.2.0_x64.msi"), "msi");
     await fs.writeFile(path.join(bundles, "Driven_0.2.0_x64.msi.sig"), "MSISIG==\n");
     await fs.writeFile(path.join(bundles, "Driven_0.2.0_x64-setup.exe"), "exe");
-    await fs.writeFile(
-      path.join(bundles, "Driven_0.2.0_x64-setup.exe.sig"),
-      "EXESIG==\n",
-    );
+    await fs.writeFile(path.join(bundles, "Driven_0.2.0_x64-setup.exe.sig"), "EXESIG==\n");
 
     const silent = { info: () => {}, warn: () => {} };
     const result = await mod.generate(
       "stable",
       { version: "0.2.0", bundles, out, baseUrl: "https://dl.example.test" },
-      { readConfVersion: async () => "0.2.0", log: silent },
+      { readConfVersion: async () => "0.2.0", log: silent }
     );
 
     // Exactly ONE manifest for windows-x86_64, pointing at the NSIS installer.
@@ -300,36 +264,30 @@ describe("generate-update-json.mjs", () => {
 
     // Both mac jobs' arch-stamped updater artifacts (the contract release.yml +
     // dev-channel.yml now enforce).
-    await fs.writeFile(
-      path.join(bundles, "Driven_0.1.0_darwin_aarch64.app.tar.gz"),
-      "arm",
-    );
+    await fs.writeFile(path.join(bundles, "Driven_0.1.0_darwin_aarch64.app.tar.gz"), "arm");
     await fs.writeFile(
       path.join(bundles, "Driven_0.1.0_darwin_aarch64.app.tar.gz.sig"),
-      "ARMSIG==\n",
+      "ARMSIG==\n"
     );
-    await fs.writeFile(
-      path.join(bundles, "Driven_0.1.0_darwin_x86_64.app.tar.gz"),
-      "intel",
-    );
+    await fs.writeFile(path.join(bundles, "Driven_0.1.0_darwin_x86_64.app.tar.gz"), "intel");
     await fs.writeFile(
       path.join(bundles, "Driven_0.1.0_darwin_x86_64.app.tar.gz.sig"),
-      "INTELSIG==\n",
+      "INTELSIG==\n"
     );
 
     const silent = { info: () => {}, warn: () => {} };
     const result = await mod.generate(
       "stable",
       { version: "0.1.0", bundles, out, baseUrl: "https://dl.example.test" },
-      { readConfVersion: async () => "0.1.0", log: silent },
+      { readConfVersion: async () => "0.1.0", log: silent }
     );
 
     expect(result.written.length).toBe(2);
     const arm = JSON.parse(
-      await fs.readFile(mod.manifestOutPath(out, "stable", "darwin-aarch64"), "utf8"),
+      await fs.readFile(mod.manifestOutPath(out, "stable", "darwin-aarch64"), "utf8")
     );
     const intel = JSON.parse(
-      await fs.readFile(mod.manifestOutPath(out, "stable", "darwin-x86_64"), "utf8"),
+      await fs.readFile(mod.manifestOutPath(out, "stable", "darwin-x86_64"), "utf8")
     );
     expect(arm.platforms["darwin-aarch64"].signature).toBe("ARMSIG==");
     expect(intel.platforms["darwin-x86_64"].signature).toBe("INTELSIG==");
@@ -353,8 +311,8 @@ describe("generate-update-json.mjs", () => {
       mod.generate(
         "stable",
         { version: "0.1.0", bundles, out, baseUrl: "https://dl.example.test" },
-        { readConfVersion: async () => "0.1.0", log: silent },
-      ),
+        { readConfVersion: async () => "0.1.0", log: silent }
+      )
     ).rejects.toThrow(/archless macOS/);
 
     await fs.rm(tmp, { recursive: true, force: true });
@@ -362,21 +320,12 @@ describe("generate-update-json.mjs", () => {
 
   it("R3-P1-2: assertRequiredTargets passes for the full set, fails for a missing one", () => {
     const required = mod.V1_REQUIRED_TARGETS;
-    expect(required).toEqual([
-      "windows-x86_64",
-      "darwin-x86_64",
-      "darwin-aarch64",
-      "linux-x86_64",
-    ]);
+    expect(required).toEqual(["windows-x86_64", "darwin-x86_64", "darwin-aarch64", "linux-x86_64"]);
     // Full set: no throw.
     expect(() => mod.assertRequiredTargets(required, [...required])).not.toThrow();
     // Missing darwin-aarch64: throws naming the gap.
     expect(() =>
-      mod.assertRequiredTargets(required, [
-        "windows-x86_64",
-        "darwin-x86_64",
-        "linux-x86_64",
-      ]),
+      mod.assertRequiredTargets(required, ["windows-x86_64", "darwin-x86_64", "linux-x86_64"])
     ).toThrow(/darwin-aarch64/);
   });
 
@@ -386,9 +335,7 @@ describe("generate-update-json.mjs", () => {
       "darwin-aarch64",
     ]);
     // Dedupes.
-    expect(
-      mod.parseRequiredTargets("linux-x86_64 linux-x86_64"),
-    ).toEqual(["linux-x86_64"]);
+    expect(mod.parseRequiredTargets("linux-x86_64 linux-x86_64")).toEqual(["linux-x86_64"]);
     expect(() => mod.parseRequiredTargets("   ")).toThrow(/no targets named/);
     expect(() => mod.parseRequiredTargets("garbage")).toThrow();
   });
@@ -402,10 +349,7 @@ describe("generate-update-json.mjs", () => {
     // Only a Windows bundle present - the mac + linux targets are MISSING, so a
     // require-targets run must refuse to publish this partial tree.
     await fs.writeFile(path.join(bundles, "Driven_0.1.0_x64-setup.exe"), "win");
-    await fs.writeFile(
-      path.join(bundles, "Driven_0.1.0_x64-setup.exe.sig"),
-      "WINSIG==\n",
-    );
+    await fs.writeFile(path.join(bundles, "Driven_0.1.0_x64-setup.exe.sig"), "WINSIG==\n");
 
     const silent = { info: () => {}, warn: () => {} };
     await expect(
@@ -418,8 +362,8 @@ describe("generate-update-json.mjs", () => {
           baseUrl: "https://dl.example.test",
           requireTargets: "windows-x86_64,darwin-x86_64,darwin-aarch64,linux-x86_64",
         },
-        { readConfVersion: async () => "0.1.0", log: silent },
-      ),
+        { readConfVersion: async () => "0.1.0", log: silent }
+      )
     ).rejects.toThrow(/incomplete updater target set|missing/);
 
     await fs.rm(tmp, { recursive: true, force: true });
@@ -433,24 +377,19 @@ describe("generate-update-json.mjs", () => {
 
     // A signature with NO sibling installer - a partial release. The generator
     // must NOT emit a valid-looking manifest whose download URL 404s.
-    await fs.writeFile(
-      path.join(bundles, "Driven_0.1.0_x64-setup.exe.sig"),
-      "ORPHANSIG==\n",
-    );
+    await fs.writeFile(path.join(bundles, "Driven_0.1.0_x64-setup.exe.sig"), "ORPHANSIG==\n");
 
     const silent = { info: () => {}, warn: () => {} };
     await expect(
       mod.generate(
         "stable",
         { version: "0.1.0", bundles, out, baseUrl: "https://dl.example.test" },
-        { readConfVersion: async () => "0.1.0", log: silent },
-      ),
+        { readConfVersion: async () => "0.1.0", log: silent }
+      )
     ).rejects.toThrow(/orphan signature|no sibling installer/);
 
     // No manifest was written for the orphan target.
-    await expect(
-      fs.stat(mod.manifestOutPath(out, "stable", "windows-x86_64")),
-    ).rejects.toThrow();
+    await expect(fs.stat(mod.manifestOutPath(out, "stable", "windows-x86_64"))).rejects.toThrow();
 
     await fs.rm(tmp, { recursive: true, force: true });
   });
@@ -461,14 +400,11 @@ describe("generate-update-json.mjs", () => {
     await fs.mkdir(bundles, { recursive: true });
 
     // Orphan: signature present, bundle absent -> rejected.
-    await fs.writeFile(
-      path.join(bundles, "Driven_0.1.0_x64-setup.exe.sig"),
-      "SIG==\n",
-    );
+    await fs.writeFile(path.join(bundles, "Driven_0.1.0_x64-setup.exe.sig"), "SIG==\n");
     const silent = { info: () => {}, warn: () => {} };
-    await expect(
-      mod.collectSignedBundles(bundles, silent, "0.1.0"),
-    ).rejects.toThrow(/orphan signature|no sibling installer/);
+    await expect(mod.collectSignedBundles(bundles, silent, "0.1.0")).rejects.toThrow(
+      /orphan signature|no sibling installer/
+    );
 
     // Now drop the real installer next to it -> accepted, exactly one candidate.
     await fs.writeFile(path.join(bundles, "Driven_0.1.0_x64-setup.exe"), "real");
@@ -504,7 +440,7 @@ describe("generate-update-json.mjs", () => {
         baseUrl: "https://dl.example.test",
         requireTargets: "windows-x86_64,darwin-x86_64,darwin-aarch64,linux-x86_64",
       },
-      { readConfVersion: async () => "0.1.0", log: silent },
+      { readConfVersion: async () => "0.1.0", log: silent }
     );
     expect(result.written.length).toBe(4);
 

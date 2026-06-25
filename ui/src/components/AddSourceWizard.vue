@@ -7,11 +7,7 @@ import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
 import { useAccountsStore } from "../stores/accounts";
 import { useSourcesStore } from "../stores/sources";
-import type {
-  DriveFolderEntry,
-  ExclusionPreview,
-  SourceDto,
-} from "../ipc/types";
+import type { DriveFolderEntry, ExclusionPreview, SourceDto } from "../ipc/types";
 
 // Add-source wizard (SPEC s11.2; DESIGN s8.5 step 3 / s8.2 add-source wizard).
 // Five steps: pick a LOCAL folder (tauri-plugin-dialog, dialog-derived path
@@ -28,29 +24,15 @@ const emit = defineEmits<{ created: [source: SourceDto] }>();
 
 // B3: a post-confirm "reveal" step is appended when an encrypted add returned a
 // recovery phrase; the user must acknowledge it before the wizard closes.
-type Step =
-  | "localFolder"
-  | "driveFolder"
-  | "exclusions"
-  | "encryption"
-  | "confirm"
-  | "reveal";
-const STEPS: Step[] = [
-  "localFolder",
-  "driveFolder",
-  "exclusions",
-  "encryption",
-  "confirm",
-];
+type Step = "localFolder" | "driveFolder" | "exclusions" | "encryption" | "confirm" | "reveal";
+const STEPS: Step[] = ["localFolder", "driveFolder", "exclusions", "encryption", "confirm"];
 
 const open = ref(false);
 const stepIndex = ref(0);
 // B3: the reveal step is shown out-of-band (after a successful encrypted add),
 // so it is tracked separately rather than as a normal STEPS index.
 const revealing = ref(false);
-const step = computed<Step>(() =>
-  revealing.value ? "reveal" : STEPS[stepIndex.value],
-);
+const step = computed<Step>(() => (revealing.value ? "reveal" : STEPS[stepIndex.value]));
 
 // Form state.
 const accountId = ref<string | null>(null);
@@ -106,9 +88,7 @@ const revealErrorCode = ref<string | null>(null);
 const includePatterns = computed(() => splitPatterns(includePatternsText.value));
 const excludePatterns = computed(() => splitPatterns(excludePatternsText.value));
 
-const canLeaveLocal = computed(
-  () => accountId.value !== null && localPathToken.value !== null,
-);
+const canLeaveLocal = computed(() => accountId.value !== null && localPathToken.value !== null);
 const canLeaveDrive = computed(() => driveFolderId.value !== null);
 
 const numberFormatter = computed(() => new Intl.NumberFormat(locale.value));
@@ -194,7 +174,14 @@ async function loadDriveFolder(crumb: Crumb): Promise<void> {
     const listing = await ipc.pickDriveFolder(accountId.value, crumb.id);
     driveFolders.value = listing.folders;
     driveFolderId.value = listing.currentFolderId;
-    driveFolderPath.value = listing.currentFolderPath;
+    // R4-P2-2: the backend cannot derive the full breadcrumb (it lists one
+    // folder's children, not the ancestor chain), so it returns an empty
+    // `currentFolderPath`. The wizard maintains the breadcrumb itself in the
+    // `crumbs` stack (descend appends `parent/name`), so persist THAT path -
+    // using the empty backend value here was what left `drive_folder_path` blank
+    // in SQLite. Fall back to the backend value only if the crumb has no path
+    // (root), keeping "My Drive" root as empty.
+    driveFolderPath.value = crumb.path || listing.currentFolderPath;
   } catch (e) {
     errorMessage.value = String(e);
   } finally {
@@ -365,13 +352,8 @@ defineExpose({ start });
 </script>
 
 <template>
-  <div
-    v-if="open"
-    class="fixed inset-0 flex items-center justify-center bg-black/40"
-  >
-    <div
-      class="w-full max-w-lg space-y-4 rounded bg-white p-6 dark:bg-zinc-900"
-    >
+  <div v-if="open" class="fixed inset-0 flex items-center justify-center bg-black/40">
+    <div class="w-full max-w-lg space-y-4 rounded bg-white p-6 dark:bg-zinc-900">
       <h2 class="text-lg font-medium">
         {{ t("settings.addSource.title") }}
       </h2>
@@ -387,33 +369,19 @@ defineExpose({ start });
       </ol>
 
       <!-- Step 1: local folder + account -->
-      <div
-        v-if="step === 'localFolder'"
-        class="space-y-3"
-      >
+      <div v-if="step === 'localFolder'" class="space-y-3">
         <label class="block space-y-1 text-sm">
           <span class="text-zinc-600 dark:text-zinc-400">{{
             t("settings.sources.column.account")
           }}</span>
-          <select
-            v-model="accountId"
-            class="w-full rounded border px-2 py-1.5 text-sm"
-          >
-            <option
-              v-for="account in accounts.accounts"
-              :key="account.id"
-              :value="account.id"
-            >
+          <select v-model="accountId" class="w-full rounded border px-2 py-1.5 text-sm">
+            <option v-for="account in accounts.accounts" :key="account.id" :value="account.id">
               {{ account.email }}
             </option>
           </select>
         </label>
 
-        <button
-          type="button"
-          class="rounded border px-3 py-1.5 text-sm"
-          @click="chooseLocalFolder"
-        >
+        <button type="button" class="rounded border px-3 py-1.5 text-sm" @click="chooseLocalFolder">
           {{ t("settings.addSource.chooseLocalButton") }}
         </button>
         <p
@@ -426,10 +394,7 @@ defineExpose({ start });
       </div>
 
       <!-- Step 2: Drive folder picker -->
-      <div
-        v-else-if="step === 'driveFolder'"
-        class="space-y-3"
-      >
+      <div v-else-if="step === 'driveFolder'" class="space-y-3">
         <nav class="flex flex-wrap items-center gap-1 text-xs">
           <button
             v-for="(crumb, i) in crumbs"
@@ -441,20 +406,11 @@ defineExpose({ start });
             {{ i === 0 ? t("settings.addSource.step.driveFolder") : crumb.path.split("/").pop() }}
           </button>
         </nav>
-        <p
-          v-if="drivePickerLoading"
-          class="text-sm text-zinc-500"
-        >
+        <p v-if="drivePickerLoading" class="text-sm text-zinc-500">
           {{ t("common.loading") }}
         </p>
-        <ul
-          v-else
-          class="max-h-56 divide-y overflow-auto rounded border"
-        >
-          <li
-            v-for="folder in driveFolders"
-            :key="folder.id"
-          >
+        <ul v-else class="max-h-56 divide-y overflow-auto rounded border">
+          <li v-for="folder in driveFolders" :key="folder.id">
             <button
               type="button"
               class="w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800"
@@ -470,16 +426,9 @@ defineExpose({ start });
       </div>
 
       <!-- Step 3: exclusions preview -->
-      <div
-        v-else-if="step === 'exclusions'"
-        class="space-y-3"
-      >
+      <div v-else-if="step === 'exclusions'" class="space-y-3">
         <label class="flex items-center gap-2 text-sm">
-          <input
-            v-model="respectGitignore"
-            type="checkbox"
-            @change="loadPreview"
-          >
+          <input v-model="respectGitignore" type="checkbox" @change="loadPreview" />
           {{ t("settings.addSource.respectGitignoreLabel") }}
         </label>
         <label class="block space-y-1 text-sm">
@@ -505,17 +454,10 @@ defineExpose({ start });
           />
         </label>
 
-        <p
-          v-if="previewLoading"
-          class="text-sm text-zinc-500"
-        >
+        <p v-if="previewLoading" class="text-sm text-zinc-500">
           {{ t("common.loading") }}
         </p>
-        <div
-          v-else-if="preview"
-          class="space-y-2 text-sm"
-          data-testid="exclusion-preview"
-        >
+        <div v-else-if="preview" class="space-y-2 text-sm" data-testid="exclusion-preview">
           <p>
             {{
               t("settings.addSource.preview.included", {
@@ -538,60 +480,36 @@ defineExpose({ start });
           </p>
           <div class="grid grid-cols-2 gap-3">
             <ul class="max-h-40 overflow-auto text-xs text-zinc-600 dark:text-zinc-400">
-              <li
-                v-for="(path, i) in preview.includedSample"
-                :key="`inc-${i}`"
-                class="break-all"
-              >
+              <li v-for="(path, i) in preview.includedSample" :key="`inc-${i}`" class="break-all">
                 {{ path }}
               </li>
             </ul>
             <ul class="max-h-40 overflow-auto text-xs text-zinc-400 line-through">
-              <li
-                v-for="(path, i) in preview.excludedSample"
-                :key="`exc-${i}`"
-                class="break-all"
-              >
+              <li v-for="(path, i) in preview.excludedSample" :key="`exc-${i}`" class="break-all">
                 {{ path }}
               </li>
             </ul>
           </div>
-          <p
-            v-if="preview.truncated"
-            class="text-xs text-zinc-500"
-          >
+          <p v-if="preview.truncated" class="text-xs text-zinc-500">
             {{ t("settings.addSource.preview.truncated") }}
           </p>
         </div>
       </div>
 
       <!-- Step 4: encryption opt-in (phrase is revealed AFTER confirm, B3) -->
-      <div
-        v-else-if="step === 'encryption'"
-        class="space-y-3"
-      >
+      <div v-else-if="step === 'encryption'" class="space-y-3">
         <label class="flex items-center gap-2 text-sm">
-          <input
-            v-model="encryptionEnabled"
-            type="checkbox"
-          >
+          <input v-model="encryptionEnabled" type="checkbox" />
           {{ t("wizard.step4.enableLabel") }}
         </label>
-        <p
-          v-if="encryptionEnabled"
-          class="text-xs text-amber-700 dark:text-amber-400"
-        >
+        <p v-if="encryptionEnabled" class="text-xs text-amber-700 dark:text-amber-400">
           {{ t("wizard.step4.recoveryWarning") }}
         </p>
       </div>
 
       <!-- Reveal step: shown after an encrypted add returned a recovery phrase.
            The user must acknowledge before the wizard closes (B3). -->
-      <div
-        v-else-if="step === 'reveal'"
-        class="space-y-3"
-        data-testid="reveal-step"
-      >
+      <div v-else-if="step === 'reveal'" class="space-y-3" data-testid="reveal-step">
         <p class="text-sm text-amber-700 dark:text-amber-400">
           {{ t("wizard.step4.recoveryWarning") }}
         </p>
@@ -602,46 +520,27 @@ defineExpose({ start });
           @update:revealed="onPhraseRevealed"
           @reveal-error="onPhraseRevealError"
         />
-        <p
-          v-if="revealErrorCode"
-          class="text-sm text-red-600"
-          data-testid="reveal-error"
-        >
+        <p v-if="revealErrorCode" class="text-sm text-red-600" data-testid="reveal-error">
           {{ t(`errors.${revealErrorCode}.long`) }}
         </p>
       </div>
 
       <!-- Step 5: confirm -->
-      <div
-        v-else
-        class="space-y-2 text-sm"
-        data-testid="confirm-summary"
-      >
-        <p>
-          {{ t("settings.addSource.step.localFolder") }}: {{ localPath }}
-        </p>
-        <p>
-          {{ t("settings.addSource.step.driveFolder") }}: {{ driveFolderPath }}
-        </p>
+      <div v-else class="space-y-2 text-sm" data-testid="confirm-summary">
+        <p>{{ t("settings.addSource.step.localFolder") }}: {{ localPath }}</p>
+        <p>{{ t("settings.addSource.step.driveFolder") }}: {{ driveFolderPath }}</p>
         <p>
           {{ t("settings.sources.column.encryption") }}:
           {{ encryptionEnabled ? t("common.enabled") : t("common.disabled") }}
         </p>
       </div>
 
-      <p
-        v-if="errorMessage"
-        class="text-sm text-red-600"
-      >
+      <p v-if="errorMessage" class="text-sm text-red-600">
         {{ errorMessage }}
       </p>
 
       <div class="flex justify-between gap-2">
-        <button
-          type="button"
-          class="rounded border px-3 py-1.5 text-sm"
-          @click="close"
-        >
+        <button type="button" class="rounded border px-3 py-1.5 text-sm" @click="close">
           {{ t("common.cancel") }}
         </button>
         <div class="flex gap-2">
@@ -672,7 +571,7 @@ defineExpose({ start });
               class="rounded border px-3 py-1.5 text-sm"
               :disabled="
                 (step === 'localFolder' && !canLeaveLocal) ||
-                  (step === 'driveFolder' && !canLeaveDrive)
+                (step === 'driveFolder' && !canLeaveDrive)
               "
               @click="next"
             >

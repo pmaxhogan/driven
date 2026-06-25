@@ -73,10 +73,7 @@ describe("Activity event-type filter dropdown (R2-P2-4)", () => {
 
     // Sanity: the store holds the backend codes.
     const store = useActivityStore();
-    expect(store.eventTypeOptions).toEqual([
-      "upload_done",
-      "some.unknown_code",
-    ]);
+    expect(store.eventTypeOptions).toEqual(["upload_done", "some.unknown_code"]);
 
     // The known code localizes to its activity.events label ("Uploaded"),
     // NOT the raw "upload_done"; the value + title keep the raw code.
@@ -89,9 +86,7 @@ describe("Activity event-type filter dropdown (R2-P2-4)", () => {
 
     // An unknown code falls back to the raw code (the helper's safe fallback),
     // still carried as value + title.
-    const unknownOption = options.find(
-      (o) => o.element.value === "some.unknown_code",
-    );
+    const unknownOption = options.find((o) => o.element.value === "some.unknown_code");
     expect(unknownOption).toBeTruthy();
     expect(unknownOption!.text()).toBe("some.unknown_code");
     expect(unknownOption!.attributes("title")).toBe("some.unknown_code");

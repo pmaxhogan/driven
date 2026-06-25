@@ -9,6 +9,8 @@
     "preview": "vite preview",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
+    "format": "prettier --write src",
+    "format:check": "prettier --check src",
     "test:unit": "vitest run --passWithNoTests",
     "test:watch": "vitest"
   },
@@ -32,6 +34,7 @@
     "@vue/tsconfig": "^0.7.0",
     "autoprefixer": "^10.4.20",
     "eslint": "^9.0.0",
+    "eslint-config-prettier": "^9.1.0",
     "eslint-plugin-vue": "^9.28.0",
     "jsdom": "^25.0.0",
     "postcss": "^8.4.47",

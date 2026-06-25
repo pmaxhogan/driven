@@ -2,6 +2,12 @@ import vue from "eslint-plugin-vue";
 import vueParser from "vue-eslint-parser";
 import tseslint from "typescript-eslint";
 import vueI18n from "@intlify/eslint-plugin-vue-i18n";
+// Prettier owns formatting (M9 tail): this config turns off every ESLint rule
+// that conflicts with Prettier (incl. eslint-plugin-vue's template-formatting
+// rules like vue/max-attributes-per-line and vue/html-self-closing), so
+// `prettier --write` and `eslint` never fight over the same code. It MUST be
+// the LAST entry so its disables win.
+import prettierConfig from "eslint-config-prettier";
 
 export default [
   {
@@ -71,4 +77,6 @@ export default [
       "vue/multi-word-component-names": "off",
     },
   },
+  // MUST be last: disable all formatting rules that conflict with Prettier.
+  prettierConfig,
 ];

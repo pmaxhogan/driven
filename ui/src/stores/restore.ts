@@ -79,7 +79,7 @@ export const useRestoreStore = defineStore("restore", () => {
 
   /** The breadcrumb segments of the current prefix (for the path bar). */
   const breadcrumbs = computed<string[]>(() =>
-    prefix.value === "" ? [] : prefix.value.split("/"),
+    prefix.value === "" ? [] : prefix.value.split("/")
   );
 
   /** Whether the view is showing search results (vs the folder tree). */
@@ -90,7 +90,7 @@ export const useRestoreStore = defineStore("restore", () => {
 
   /** True when the current view has nothing to show and is not loading. */
   const isEmpty = computed(
-    () => !loading.value && rows.value.length === 0 && errorCode.value === null,
+    () => !loading.value && rows.value.length === 0 && errorCode.value === null
   );
 
   /** The number of files currently selected. */
@@ -98,10 +98,7 @@ export const useRestoreStore = defineStore("restore", () => {
 
   /** Whether a restore can be started (selection + a destination + a source). */
   const canRestore = computed(
-    () =>
-      selectedKeys.value.size > 0 &&
-      destToken.value !== null &&
-      !restoring.value,
+    () => selectedKeys.value.size > 0 && destToken.value !== null && !restoring.value
   );
 
   /** The stable selection key for a (sourceId, relativePath) pair. */

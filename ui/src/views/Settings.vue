@@ -13,10 +13,9 @@ import { useSettingsStore } from "../stores/settings";
 // the Rules tab is the global-rules form (SPEC s22 `global` + Windows `vss_mode`)
 // editing the settings store. About is its own route (/about -> About.vue) per
 // the s25 route map, so it is not a tab here.
-const props = withDefaults(
-  defineProps<{ tab?: "accounts" | "sources" | "rules" }>(),
-  { tab: "accounts" },
-);
+const props = withDefaults(defineProps<{ tab?: "accounts" | "sources" | "rules" }>(), {
+  tab: "accounts",
+});
 
 const { t } = useI18n();
 const router = useRouter();
@@ -51,7 +50,7 @@ watch(
       void settings.refresh();
     }
   },
-  { immediate: true },
+  { immediate: true }
 );
 
 // Keep the local numeric mirrors in sync with the loaded snapshot.
@@ -60,15 +59,11 @@ watch(
   (s) => {
     if (!s) return;
     bandwidthCapText.value =
-      s.global.bandwidthCapMbps === null
-        ? ""
-        : String(s.global.bandwidthCapMbps);
+      s.global.bandwidthCapMbps === null ? "" : String(s.global.bandwidthCapMbps);
     concurrentUploadsText.value =
-      s.global.defaultConcurrentUploads === null
-        ? ""
-        : String(s.global.defaultConcurrentUploads);
+      s.global.defaultConcurrentUploads === null ? "" : String(s.global.defaultConcurrentUploads);
   },
-  { immediate: true },
+  { immediate: true }
 );
 
 // Accept `string | number`: an `<input type="number">` bound with `v-model`
@@ -107,9 +102,7 @@ async function commitBandwidthCap(): Promise<void> {
 async function commitConcurrentUploads(): Promise<void> {
   await settings.patch({
     global: {
-      defaultConcurrentUploads: parseOptionalPositiveInt(
-        concurrentUploadsText.value,
-      ),
+      defaultConcurrentUploads: parseOptionalPositiveInt(concurrentUploadsText.value),
     },
   });
 }
@@ -171,24 +164,15 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
 
     <AccountList v-if="active === 'accounts'" />
     <SourceTable v-else-if="active === 'sources'" />
-    <div
-      v-else
-      class="space-y-4"
-    >
+    <div v-else class="space-y-4">
       <h2 class="text-lg font-medium">
         {{ t("settings.rules.title") }}
       </h2>
 
-      <p
-        v-if="settings.loading"
-        class="text-sm text-zinc-500"
-      >
+      <p v-if="settings.loading" class="text-sm text-zinc-500">
         {{ t("common.loading") }}
       </p>
-      <p
-        v-else-if="settings.error"
-        class="text-sm text-red-600"
-      >
+      <p v-else-if="settings.error" class="text-sm text-red-600">
         {{ settings.error }}
       </p>
       <div
@@ -201,7 +185,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             type="checkbox"
             :checked="settings.settings.global.skipOnBattery"
             @change="setSkipOnBattery"
-          >
+          />
           {{ t("settings.rules.skipOnBatteryLabel") }}
         </label>
 
@@ -210,7 +194,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             type="checkbox"
             :checked="settings.settings.global.skipOnMetered"
             @change="setSkipOnMetered"
-          >
+          />
           {{ t("settings.rules.skipOnMeteredLabel") }}
         </label>
 
@@ -225,7 +209,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             :placeholder="t('settings.rules.bandwidthCapUnlimited')"
             class="w-full rounded border px-2 py-1"
             @change="commitBandwidthCap"
-          >
+          />
         </label>
 
         <label class="block space-y-1">
@@ -240,7 +224,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             :placeholder="t('settings.rules.concurrentUploadsAuto')"
             class="w-full rounded border px-2 py-1"
             @change="commitConcurrentUploads"
-          >
+          />
         </label>
 
         <label class="block space-y-1">
@@ -253,7 +237,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             :value="settings.settings.global.scanIntervalSecs"
             class="w-full rounded border px-2 py-1"
             @change="commitScanInterval"
-          >
+          />
         </label>
 
         <label class="block space-y-1">
@@ -266,7 +250,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             :value="settings.settings.global.deepVerifyIntervalSecs"
             class="w-full rounded border px-2 py-1"
             @change="commitDeepVerifyInterval"
-          >
+          />
         </label>
 
         <label class="block space-y-1">
@@ -278,20 +262,13 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             class="w-full rounded border px-2 py-1"
             @change="setIoPriority"
           >
-            <option
-              v-for="priority in ioPriorities"
-              :key="priority"
-              :value="priority"
-            >
+            <option v-for="priority in ioPriorities" :key="priority" :value="priority">
               {{ t(`settings.rules.ioPriority.${priority}`) }}
             </option>
           </select>
         </label>
 
-        <label
-          v-if="settings.settings.windows"
-          class="block space-y-1"
-        >
+        <label v-if="settings.settings.windows" class="block space-y-1">
           <span class="text-zinc-600 dark:text-zinc-400">{{
             t("settings.rules.vssModeLabel")
           }}</span>
@@ -300,27 +277,20 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             class="w-full rounded border px-2 py-1"
             @change="setVssMode"
           >
-            <option
-              v-for="mode in vssModes"
-              :key="mode"
-              :value="mode"
-            >
+            <option v-for="mode in vssModes" :key="mode" :value="mode">
               {{ t(`settings.rules.vssMode.${mode}`) }}
             </option>
           </select>
         </label>
 
-        <div
-          class="space-y-1 border-t pt-4"
-          data-testid="telemetry-setting"
-        >
+        <div class="space-y-1 border-t pt-4" data-testid="telemetry-setting">
           <label class="flex items-center gap-2">
             <input
               type="checkbox"
               data-testid="telemetry-toggle"
               :checked="settings.settings.telemetry.enabled"
               @change="setTelemetryEnabled"
-            >
+            />
             {{ t("settings.rules.telemetryLabel") }}
           </label>
           <p class="text-xs text-zinc-500">

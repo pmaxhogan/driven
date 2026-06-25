@@ -125,7 +125,7 @@ function oauthCallOrder(): string[] {
         "start_oauth_signin",
         "poll_oauth_status",
         "finish_add_account",
-      ].includes(cmd),
+      ].includes(cmd)
     );
 }
 
@@ -223,16 +223,12 @@ describe("setup store OAuth sequence (SPEC s11.1)", () => {
 
     await setup.createFirstSource();
     expect(setup.sourceId).toBe("src-1");
-    const addCallsAfterFirst = invokeMock.mock.calls.filter(
-      (c) => c[0] === "add_source",
-    ).length;
+    const addCallsAfterFirst = invokeMock.mock.calls.filter((c) => c[0] === "add_source").length;
     expect(addCallsAfterFirst).toBe(1);
 
     // Re-enter the step: createFirstSource must short-circuit (no second add).
     await setup.createFirstSource();
-    const addCallsAfterSecond = invokeMock.mock.calls.filter(
-      (c) => c[0] === "add_source",
-    ).length;
+    const addCallsAfterSecond = invokeMock.mock.calls.filter((c) => c[0] === "add_source").length;
     expect(addCallsAfterSecond).toBe(1);
     expect(setup.errorCode).toBeNull();
     expect(setup.sourceId).toBe("src-1");
@@ -301,7 +297,7 @@ describe("SetupWizard walks all five steps (DESIGN s8.5)", () => {
     // The "Sign in with Google" button is the first button in the step body.
     const stepButtons = wrapper.findAll("button");
     const signInBtn = stepButtons.find(
-      (b) => b.text() === i18n.global.t("wizard.step2.signInButton"),
+      (b) => b.text() === i18n.global.t("wizard.step2.signInButton")
     );
     expect(signInBtn).toBeTruthy();
     await signInBtn!.trigger("click");
@@ -325,9 +321,7 @@ describe("SetupWizard walks all five steps (DESIGN s8.5)", () => {
 
     const chooseDrive = wrapper
       .findAll("button")
-      .find(
-        (b) => b.text() === i18n.global.t("settings.addSource.chooseDriveButton"),
-      );
+      .find((b) => b.text() === i18n.global.t("settings.addSource.chooseDriveButton"));
     await chooseDrive!.trigger("click");
     await flushPromises();
     expect(setup.driveFolderId).toBe("drive-folder-1");
@@ -349,7 +343,7 @@ describe("SetupWizard walks all five steps (DESIGN s8.5)", () => {
           encryptionEnabled: true,
           localPathToken: "tok-folder",
         }),
-      }),
+      })
     );
     expect(setup.step).toBe("confirm");
 

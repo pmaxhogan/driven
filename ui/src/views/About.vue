@@ -42,25 +42,19 @@ const isMac = isMacOS();
 // in hand (e.g. before any check).
 const releasesBase = "https://github.com/pmaxhogan/driven/releases";
 const macDownloadUrl = computed(() =>
-  updater.available?.channel === "dev"
-    ? `${releasesBase}/tag/dev`
-    : `${releasesBase}/latest`,
+  updater.available?.channel === "dev" ? `${releasesBase}/tag/dev` : `${releasesBase}/latest`
 );
 
 const exporting = ref(false);
 const exportError = ref<string | null>(null);
 const exportedPath = ref<string | null>(null);
 
-const telemetryEnabled = computed(
-  () => settings.settings?.telemetry.enabled ?? false,
-);
+const telemetryEnabled = computed(() => settings.settings?.telemetry.enabled ?? false);
 
 function formatReleaseDate(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
-  return new Intl.DateTimeFormat(locale.value, { dateStyle: "medium" }).format(
-    date,
-  );
+  return new Intl.DateTimeFormat(locale.value, { dateStyle: "medium" }).format(date);
 }
 
 /** Localize a SPEC s24 error code, falling back to a generic message. */
@@ -142,11 +136,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       </p>
       <!-- macOS: the V1 in-app updater is not reliable, so offer a manual DMG
            download instead of in-app install (R1-P2-1). -->
-      <p
-        v-if="isMac"
-        class="text-sm"
-        data-testid="install-mac-unsupported"
-      >
+      <p v-if="isMac" class="text-sm" data-testid="install-mac-unsupported">
         {{ t("about.installUpdateMacUnsupported") }}
       </p>
       <div class="flex flex-wrap items-center gap-2">
@@ -187,11 +177,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       </div>
 
       <!-- Download progress while installing (Windows/Linux only). -->
-      <div
-        v-if="!isMac && updater.installing"
-        class="space-y-1"
-        data-testid="install-progress"
-      >
+      <div v-if="!isMac && updater.installing" class="space-y-1" data-testid="install-progress">
         <div class="h-2 w-full overflow-hidden rounded bg-emerald-200 dark:bg-emerald-900">
           <div
             class="h-full bg-emerald-600 transition-all"
@@ -204,18 +190,10 @@ function viewReleaseChangelog(release: ReleaseDto): void {
           />
         </div>
         <p class="text-xs text-zinc-600 dark:text-zinc-400">
-          {{
-            updater.downloadComplete
-              ? t("about.updateDownloaded")
-              : t("about.downloading")
-          }}
+          {{ updater.downloadComplete ? t("about.updateDownloaded") : t("about.downloading") }}
         </p>
       </div>
-      <p
-        v-if="updater.installErrorCode"
-        class="text-sm text-red-600"
-        data-testid="install-error"
-      >
+      <p v-if="updater.installErrorCode" class="text-sm text-red-600" data-testid="install-error">
         {{ localizeError(updater.installErrorCode) }}
       </p>
     </div>
@@ -230,20 +208,14 @@ function viewReleaseChangelog(release: ReleaseDto): void {
 
     <div class="max-w-xs space-y-1 text-sm">
       <label class="block space-y-1">
-        <span class="text-zinc-600 dark:text-zinc-400">{{
-          t("about.channelLabel")
-        }}</span>
+        <span class="text-zinc-600 dark:text-zinc-400">{{ t("about.channelLabel") }}</span>
         <select
           :value="updater.channel"
           class="w-full rounded border px-2 py-1"
           data-testid="channel-select"
           @change="onChannelChange"
         >
-          <option
-            v-for="ch in channels"
-            :key="ch"
-            :value="ch"
-          >
+          <option v-for="ch in channels" :key="ch" :value="ch">
             {{ t(`about.channel.${ch}`) }}
           </option>
         </select>
@@ -260,17 +232,10 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       >
         {{ t("about.checkForUpdatesButton") }}
       </button>
-      <p
-        v-if="updater.checking"
-        class="text-sm text-zinc-500"
-      >
+      <p v-if="updater.checking" class="text-sm text-zinc-500">
         {{ t("common.loading") }}
       </p>
-      <p
-        v-else-if="updater.checkErrorCode"
-        class="text-sm text-red-600"
-        data-testid="check-error"
-      >
+      <p v-else-if="updater.checkErrorCode" class="text-sm text-red-600" data-testid="check-error">
         {{ localizeError(updater.checkErrorCode) }}
       </p>
       <p
@@ -280,21 +245,13 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       >
         {{ t("about.updateAvailable", { version: updater.available.version }) }}
       </p>
-      <p
-        v-else-if="updater.checked"
-        class="text-sm text-zinc-500"
-        data-testid="check-uptodate"
-      >
+      <p v-else-if="updater.checked" class="text-sm text-zinc-500" data-testid="check-uptodate">
         {{ t("about.upToDate") }}
       </p>
     </div>
 
     <label class="flex max-w-md items-center gap-2 text-sm">
-      <input
-        type="checkbox"
-        :checked="telemetryEnabled"
-        @change="setTelemetry"
-      >
+      <input type="checkbox" :checked="telemetryEnabled" @change="setTelemetry" />
       {{ t("about.telemetryLabel") }}
     </label>
 
@@ -307,10 +264,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       >
         {{ t("about.exportDiagnosticsButton") }}
       </button>
-      <p
-        v-if="exportError"
-        class="text-sm text-red-600"
-      >
+      <p v-if="exportError" class="text-sm text-red-600">
         {{ exportError }}
       </p>
       <p
@@ -339,11 +293,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       >
         {{ localizeError(updater.releasesErrorCode) }}
       </p>
-      <ul
-        v-else-if="updater.releases.length > 0"
-        class="space-y-3"
-        data-testid="release-notes"
-      >
+      <ul v-else-if="updater.releases.length > 0" class="space-y-3" data-testid="release-notes">
         <li
           v-for="release in updater.releases"
           :key="release.version"
@@ -377,15 +327,10 @@ function viewReleaseChangelog(release: ReleaseDto): void {
     </div>
 
     <p class="text-sm text-zinc-500">
-      <span class="text-zinc-600 dark:text-zinc-400">{{
-        t("about.displayLanguageLabel")
-      }}:</span>
+      <span class="text-zinc-600 dark:text-zinc-400">{{ t("about.displayLanguageLabel") }}:</span>
       {{ t("about.moreLanguagesComing") }}
     </p>
 
-    <ChangelogModal
-      :release="updater.changelogRelease"
-      @close="updater.closeChangelog()"
-    />
+    <ChangelogModal :release="updater.changelogRelease" @close="updater.closeChangelog()" />
   </section>
 </template>

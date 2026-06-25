@@ -137,9 +137,7 @@ describe("SourceTable reveal/ack error localization (R8-P2-1)", () => {
 describe("AddSourceWizard reveal-step error localization (R8-P2-1)", () => {
   it("renders a STRUCTURED reveal error as the localized message, not [object Object]", async () => {
     const accounts = useAccountsStore();
-    accounts.accounts = [
-      { id: "acct-1", email: "u@example.com" },
-    ] as never;
+    accounts.accounts = [{ id: "acct-1", email: "u@example.com" }] as never;
 
     const wrapper = mount(AddSourceWizard, { global: { plugins: [i18n] } });
     // Drive the wizard straight to the reveal step with a pending-ack created

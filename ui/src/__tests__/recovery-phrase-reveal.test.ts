@@ -29,9 +29,7 @@ describe("RecoveryPhraseReveal reveal-gate (R3-P1-1)", () => {
     expect(ack().attributes("disabled")).toBeDefined();
     expect(wrapper.emitted("update:revealed")).toBeUndefined();
     // The "reveal first" hint is shown while the checkbox is locked.
-    expect(wrapper.text()).toContain(
-      i18n.global.t("recoveryPhrase.revealFirstHint"),
-    );
+    expect(wrapper.text()).toContain(i18n.global.t("recoveryPhrase.revealFirstHint"));
 
     // Reveal the phrase.
     const revealBtn = wrapper
@@ -86,9 +84,7 @@ describe("RecoveryPhraseReveal reveal-gate (R3-P1-1)", () => {
     const confirmedEvents = wrapper.emitted("update:confirmed")!;
     expect(confirmedEvents[confirmedEvents.length - 1]).toEqual([false]);
     // The checkbox is locked again (a fresh phrase must be revealed anew).
-    expect(
-      wrapper.get('[data-testid="phrase-ack"]').attributes("disabled"),
-    ).toBeDefined();
+    expect(wrapper.get('[data-testid="phrase-ack"]').attributes("disabled")).toBeDefined();
 
     // A button labelled "Reveal" is shown again (the phrase is hidden once more).
     expect(revealBtn()).toBeTruthy();
@@ -118,9 +114,7 @@ describe("RecoveryPhraseReveal reveal-gate (R3-P1-1)", () => {
 
     expect(calls).toBe(1);
     // Latched: the checkbox is enabled and revealed=true was emitted.
-    expect(
-      wrapper.get('[data-testid="phrase-ack"]').attributes("disabled"),
-    ).toBeUndefined();
+    expect(wrapper.get('[data-testid="phrase-ack"]').attributes("disabled")).toBeUndefined();
     expect(wrapper.emitted("update:revealed")![0]).toEqual([true]);
   });
 
@@ -144,9 +138,7 @@ describe("RecoveryPhraseReveal reveal-gate (R3-P1-1)", () => {
     // The reveal failed: no revealed signal, the checkbox stays locked, and a
     // reveal-error was surfaced for the parent.
     expect(wrapper.emitted("update:revealed")).toBeUndefined();
-    expect(
-      wrapper.get('[data-testid="phrase-ack"]').attributes("disabled"),
-    ).toBeDefined();
+    expect(wrapper.get('[data-testid="phrase-ack"]').attributes("disabled")).toBeDefined();
     expect(wrapper.emitted("reveal-error")).toBeTruthy();
     // The words are not shown (still hidden).
     expect(wrapper.find('[data-testid="phrase-words"]').exists()).toBe(false);
@@ -237,9 +229,7 @@ describe("RecoveryPhraseReveal reveal-gate (R3-P1-1)", () => {
     // revealed, so the checkbox stays disabled.
     await revealBtn!.trigger("click");
     await flushPromises();
-    expect(
-      wrapper.get('[data-testid="phrase-ack"]').attributes("disabled"),
-    ).toBeDefined();
+    expect(wrapper.get('[data-testid="phrase-ack"]').attributes("disabled")).toBeDefined();
     expect(wrapper.emitted("update:revealed")).toBeUndefined();
   });
 });

@@ -20,7 +20,7 @@ export type TranslationExistsFn = (key: string) => boolean;
 export function activityEventLabel(
   eventType: string,
   t: TranslateFn,
-  te: TranslationExistsFn,
+  te: TranslationExistsFn
 ): string {
   const eventKey = `activity.events.${eventType}`;
   if (te(eventKey)) return t(eventKey);

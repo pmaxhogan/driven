@@ -67,9 +67,7 @@ export const useUpdaterStore = defineStore("updater", () => {
   const changelogRelease = ref<ReleaseDto | null>(null);
 
   /** Whether the update-available banner should be shown. */
-  const bannerVisible = computed(
-    () => available.value !== null && !bannerDismissed.value,
-  );
+  const bannerVisible = computed(() => available.value !== null && !bannerDismissed.value);
 
   /** Download progress as a 0..1 fraction, or null when the total is unknown. */
   const downloadFraction = computed<number | null>(() => {

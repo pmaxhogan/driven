@@ -8,10 +8,7 @@ import { fileURLToPath } from "node:url";
 // version validation without touching the real files.
 
 const __filename = fileURLToPath(import.meta.url);
-const SCRIPT = path.resolve(
-  path.dirname(__filename),
-  "../../../scripts/set-dev-version.mjs",
-);
+const SCRIPT = path.resolve(path.dirname(__filename), "../../../scripts/set-dev-version.mjs");
 
 const mod = await import(SCRIPT);
 
@@ -51,22 +48,23 @@ describe("set-dev-version.mjs", () => {
   });
 
   it("throws when there is no [workspace.package] version", () => {
-    expect(() =>
-      mod.setWorkspaceVersion("[workspace]\nmembers = []\n", "0.2.0"),
-    ).toThrow(/workspace.package/);
+    expect(() => mod.setWorkspaceVersion("[workspace]\nmembers = []\n", "0.2.0")).toThrow(
+      /workspace.package/
+    );
   });
 
   it("sets the top-level version on a JSON object", () => {
-    expect(mod.setJsonVersion({ version: "0.1.0", name: "x" }, "0.2.0")).toEqual(
-      { version: "0.2.0", name: "x" },
-    );
+    expect(mod.setJsonVersion({ version: "0.1.0", name: "x" }, "0.2.0")).toEqual({
+      version: "0.2.0",
+      name: "x",
+    });
   });
 
   it("reads the [workspace.package] version out of Cargo.toml (R2-P1-1)", () => {
     expect(mod.readWorkspaceVersion(SAMPLE_CARGO)).toBe("0.1.0");
-    expect(() =>
-      mod.readWorkspaceVersion("[workspace]\nmembers = []\n"),
-    ).toThrow(/workspace.package/);
+    expect(() => mod.readWorkspaceVersion("[workspace]\nmembers = []\n")).toThrow(
+      /workspace.package/
+    );
   });
 
   // A minimal SemVer comparator (SemVer 2.0.0 sec 11) sufficient to PROVE the
@@ -105,17 +103,11 @@ describe("set-dev-version.mjs", () => {
   }
 
   it("computeDevVersion derives <next-patch>-dev.<run>.<sha> from the stable version", () => {
-    expect(mod.computeDevVersion("0.1.0", 123, "abc1234")).toBe(
-      "0.1.1-dev.123.abc1234",
-    );
+    expect(mod.computeDevVersion("0.1.0", 123, "abc1234")).toBe("0.1.1-dev.123.abc1234");
     // Tracks future stable bumps (NOT hardcoded to 0.1.x).
-    expect(mod.computeDevVersion("1.4.9", 7, "deadbee")).toBe(
-      "1.4.10-dev.7.deadbee",
-    );
+    expect(mod.computeDevVersion("1.4.9", 7, "deadbee")).toBe("1.4.10-dev.7.deadbee");
     // run_number may arrive as a string (GITHUB_OUTPUT capture).
-    expect(mod.computeDevVersion("0.1.0", "88", "f00")).toBe(
-      "0.1.1-dev.88.f00",
-    );
+    expect(mod.computeDevVersion("0.1.0", "88", "f00")).toBe("0.1.1-dev.88.f00");
   });
 
   it("R2-P1-1: the dev version is ABOVE the current stable release", () => {
@@ -139,12 +131,8 @@ describe("set-dev-version.mjs", () => {
   });
 
   it("computeDevVersion rejects a non-release base or bad run/sha", () => {
-    expect(() => mod.computeDevVersion("0.1.0-dev.1.abc", 1, "abc")).toThrow(
-      /clean/,
-    );
-    expect(() => mod.computeDevVersion("0.1.0", "1.2", "abc")).toThrow(
-      /run_number/,
-    );
+    expect(() => mod.computeDevVersion("0.1.0-dev.1.abc", 1, "abc")).toThrow(/clean/);
+    expect(() => mod.computeDevVersion("0.1.0", "1.2", "abc")).toThrow(/run_number/);
     expect(() => mod.computeDevVersion("0.1.0", 1, "bad sha")).toThrow(/sha/);
   });
 

@@ -38,7 +38,7 @@ const props = withDefaults(
     // the latch falls back to the prop once it arrives.
     revealAction?: () => Promise<string[] | void>;
   }>(),
-  { phrase: () => [], confirmed: false, revealAction: undefined },
+  { phrase: () => [], confirmed: false, revealAction: undefined }
 );
 
 const emit = defineEmits<{
@@ -93,15 +93,11 @@ function latchReveal(phrase: string[]): void {
 // so the Reveal button must be clickable even before any phrase is loaded - the
 // action populates `phrase`. Without an action, reveal is purely client-side and
 // still requires a phrase to be present.
-const hasRevealAction = computed(
-  () => typeof props.revealAction === "function",
-);
+const hasRevealAction = computed(() => typeof props.revealAction === "function");
 
 // The Reveal button is usable when there is a phrase to show OR a backend action
 // that will supply one. (Re-hiding stays available once revealed.)
-const canReveal = computed(
-  () => revealed.value || hasPhrase.value || hasRevealAction.value,
-);
+const canReveal = computed(() => revealed.value || hasPhrase.value || hasRevealAction.value);
 
 // R3-P1-1: the acknowledge checkbox is usable only once the phrase has been
 // revealed AND a real phrase is present.
@@ -110,9 +106,7 @@ const canReveal = computed(
 // before Vue delivers the prop, and the ack control must not stay locked across
 // that tick.
 const ackEnabled = computed(
-  () =>
-    everRevealed.value &&
-    (hasPhrase.value || (latchedPhrase.value?.length ?? 0) > 0),
+  () => everRevealed.value && (hasPhrase.value || (latchedPhrase.value?.length ?? 0) > 0)
 );
 
 async function toggle(): Promise<void> {
@@ -148,9 +142,7 @@ async function toggle(): Promise<void> {
   // phrase at all does not unlock ack.
   if (!everRevealed.value) {
     const effectivePhrase =
-      Array.isArray(returnedPhrase) && returnedPhrase.length > 0
-        ? returnedPhrase
-        : props.phrase;
+      Array.isArray(returnedPhrase) && returnedPhrase.length > 0 ? returnedPhrase : props.phrase;
     if (effectivePhrase.length > 0) {
       latchReveal(effectivePhrase.slice());
     }
@@ -213,7 +205,7 @@ watch(
     latchedPhrase.value = null;
     emit("update:revealed", false);
     if (props.confirmed) emit("update:confirmed", false);
-  },
+  }
 );
 </script>
 
@@ -257,32 +249,22 @@ watch(
       class="grid grid-cols-3 gap-1 text-sm"
       data-testid="phrase-words"
     >
-      <li
-        v-for="(word, index) in props.phrase"
-        :key="index"
-        class="font-mono"
-      >
+      <li v-for="(word, index) in props.phrase" :key="index" class="font-mono">
         {{ index + 1 }}. {{ word }}
       </li>
     </ol>
 
-    <label
-      class="flex items-center gap-2 text-sm"
-      :class="{ 'opacity-50': !ackEnabled }"
-    >
+    <label class="flex items-center gap-2 text-sm" :class="{ 'opacity-50': !ackEnabled }">
       <input
         type="checkbox"
         :checked="props.confirmed"
         :disabled="!ackEnabled"
         data-testid="phrase-ack"
         @change="onConfirmToggle"
-      >
+      />
       {{ t("recoveryPhrase.confirmedLabel") }}
     </label>
-    <p
-      v-if="!ackEnabled"
-      class="text-xs text-zinc-500"
-    >
+    <p v-if="!ackEnabled" class="text-xs text-zinc-500">
       {{ t("recoveryPhrase.revealFirstHint") }}
     </p>
   </div>

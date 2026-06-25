@@ -391,12 +391,7 @@ export type RestoreJobId = string;
 /** Per-file lifecycle state within a restore job (mirrors src-tauri
  * RestoreFileState). `cancelled` (M8-P1-1) means the user cancelled before this
  * file finished; any partial temp was deleted (no half-written file). */
-export type RestoreFileState =
-  | "pending"
-  | "restoring"
-  | "done"
-  | "failed"
-  | "cancelled";
+export type RestoreFileState = "pending" | "restoring" | "done" | "failed" | "cancelled";
 
 /** Per-file progress within a restore job (mirrors src-tauri
  * RestoreFileProgress). `errorCode` is a stable SPEC s24 i18n key when failed. */

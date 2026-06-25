@@ -254,7 +254,7 @@ describe("settings store", () => {
     invokeMock.mockResolvedValueOnce(
       makeSettings({
         global: { ...makeSettings().global, skipOnBattery: false },
-      }),
+      })
     );
     await store.patch({ global: { skipOnBattery: false } });
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
@@ -266,9 +266,7 @@ describe("settings store", () => {
   it("patch surfaces the error and rethrows", async () => {
     const store = useSettingsStore();
     invokeMock.mockRejectedValueOnce(new Error("write failed"));
-    await expect(store.patch({ updater: { channel: "dev" } })).rejects.toThrow(
-      "write failed",
-    );
+    await expect(store.patch({ updater: { channel: "dev" } })).rejects.toThrow("write failed");
     expect(store.error).toContain("write failed");
   });
 

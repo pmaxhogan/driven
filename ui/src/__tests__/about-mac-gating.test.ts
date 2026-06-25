@@ -66,10 +66,8 @@ beforeEach(() => {
   });
 });
 
-const MAC_UA =
-  "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15";
-const WIN_UA =
-  "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+const MAC_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15";
+const WIN_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
 
 describe("About.vue macOS updater gating", () => {
   it("on macOS hides in-app install and shows a DMG download link", async () => {
@@ -96,9 +94,7 @@ describe("About.vue macOS updater gating", () => {
     const link = wrapper.find('[data-testid="download-latest-dmg"]');
     expect(link.exists()).toBe(true);
     expect(link.attributes("href")).toContain("/releases/latest");
-    expect(
-      wrapper.find('[data-testid="install-mac-unsupported"]').exists(),
-    ).toBe(true);
+    expect(wrapper.find('[data-testid="install-mac-unsupported"]').exists()).toBe(true);
   });
 
   // R9-P2-3: the macOS manual-download link must FOLLOW the update channel. A
@@ -123,9 +119,7 @@ describe("About.vue macOS updater gating", () => {
 
     const link = wrapper.find('[data-testid="download-latest-dmg"]');
     expect(link.exists()).toBe(true);
-    expect(link.attributes("href")).toBe(
-      "https://github.com/pmaxhogan/driven/releases/tag/dev",
-    );
+    expect(link.attributes("href")).toBe("https://github.com/pmaxhogan/driven/releases/tag/dev");
   });
 
   it("on macOS a stable-channel update links to the latest release", async () => {
@@ -146,9 +140,7 @@ describe("About.vue macOS updater gating", () => {
 
     const link = wrapper.find('[data-testid="download-latest-dmg"]');
     expect(link.exists()).toBe(true);
-    expect(link.attributes("href")).toBe(
-      "https://github.com/pmaxhogan/driven/releases/latest",
-    );
+    expect(link.attributes("href")).toBe("https://github.com/pmaxhogan/driven/releases/latest");
   });
 
   it("on Windows shows the in-app install button (no DMG link)", async () => {
@@ -169,8 +161,6 @@ describe("About.vue macOS updater gating", () => {
 
     expect(wrapper.find('[data-testid="update-banner"]').exists()).toBe(true);
     expect(wrapper.find('[data-testid="install-update"]').exists()).toBe(true);
-    expect(wrapper.find('[data-testid="download-latest-dmg"]').exists()).toBe(
-      false,
-    );
+    expect(wrapper.find('[data-testid="download-latest-dmg"]').exists()).toBe(false);
   });
 });

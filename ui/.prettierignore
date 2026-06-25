@@ -1,0 +1,7 @@
+# Generated + vendored output - never format these.
+dist
+node_modules
+coverage
+
+# Auto-generated type shims.
+env.d.ts

@@ -24,13 +24,7 @@ import type {
 // affordance. Both paths funnel through the single `poll()` action below.
 
 /** DESIGN s8.5 wizard steps, 1-indexed to match the design. */
-export const WIZARD_STEPS = [
-  "welcome",
-  "credentials",
-  "source",
-  "encryption",
-  "confirm",
-] as const;
+export const WIZARD_STEPS = ["welcome", "credentials", "source", "encryption", "confirm"] as const;
 export type WizardStep = (typeof WIZARD_STEPS)[number];
 
 export const useSetupStore = defineStore("setup", () => {
@@ -85,18 +79,14 @@ export const useSetupStore = defineStore("setup", () => {
 
   /** B3: a recovery phrase was returned (the source's encryption opt-in
    * generated the master key), so the user MUST see + acknowledge it. */
-  const hasRecoveryPhrase = computed(
-    () => (recoveryPhrase.value?.length ?? 0) > 0,
-  );
+  const hasRecoveryPhrase = computed(() => (recoveryPhrase.value?.length ?? 0) > 0);
 
   /** B3 + R3-P1-1: the wizard may Finish only once any displayed recovery phrase
    * has been REVEALED and acknowledged. With no phrase (unencrypted), Finish is
    * always allowed. Gating on reveal (not just acknowledge) blocks a user from
    * ticking the confirm box while the phrase is still hidden. */
   const canFinish = computed(
-    () =>
-      !hasRecoveryPhrase.value ||
-      (phraseRevealed.value && phraseAcknowledged.value),
+    () => !hasRecoveryPhrase.value || (phraseRevealed.value && phraseAcknowledged.value)
   );
 
   /** B3: the source has been created (so the confirm step can show the phrase
@@ -119,10 +109,7 @@ export const useSetupStore = defineStore("setup", () => {
     session.value = await ipc.beginAddAccountWizard();
   }
 
-  async function submitCredentials(
-    clientId: string,
-    clientSecret: string,
-  ): Promise<void> {
+  async function submitCredentials(clientId: string, clientSecret: string): Promise<void> {
     const s = requireSession();
     await ipc.submitOauthCredentials(s, clientId, clientSecret);
   }
@@ -157,7 +144,7 @@ export const useSetupStore = defineStore("setup", () => {
   async function connectAccount(
     clientId: string,
     clientSecret: string,
-    openUrl: (url: string) => void = defaultOpenUrl,
+    openUrl: (url: string) => void = defaultOpenUrl
   ): Promise<void> {
     busy.value = true;
     errorCode.value = null;
@@ -341,6 +328,23 @@ export const useSetupStore = defineStore("setup", () => {
     errorCode.value = null;
   }
 
+  /** R4-P2-4: abandon the wizard - tell the backend to drop the in-flight OAuth
+   * session (clearing its BYO creds + tokens from the server-side registry),
+   * then reset local state. Best-effort: a backend error is swallowed (the TTL
+   * sweep reaps an unreachable session anyway), and the local reset always runs.
+   * Idempotent - safe if the session was already consumed by `finish`. */
+  async function cancel(): Promise<void> {
+    const s = session.value;
+    if (s) {
+      try {
+        await ipc.cancelOauthWizard(s);
+      } catch {
+        // Non-fatal: the backend TTL sweep reaps an abandoned session.
+      }
+    }
+    reset();
+  }
+
   function requireSession(): SessionId {
     if (!session.value) {
       throw new Error("setup wizard session not started");
@@ -391,6 +395,7 @@ export const useSetupStore = defineStore("setup", () => {
     ackRecoveryPhrase,
     startInitialSync,
     reset,
+    cancel,
   };
 });
 

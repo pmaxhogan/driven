@@ -50,7 +50,7 @@ export function beginAddAccountWizard(): Promise<AddAccountWizardSessionId> {
 export function submitOauthCredentials(
   session: SessionId,
   clientId: string,
-  clientSecret: string,
+  clientSecret: string
 ): Promise<void> {
   return invoke("submit_oauth_credentials", {
     session,
@@ -67,17 +67,22 @@ export function pollOauthStatus(session: SessionId): Promise<OAuthStatus> {
   return invoke("poll_oauth_status", { session });
 }
 
+/** R4-P2-4: abandon an in-flight add-account / reauth wizard session, dropping
+ * it (and its BYO creds + tokens) from the backend registry. Idempotent - safe
+ * to call on close even if the session was already consumed by
+ * finishAddAccount. */
+export function cancelOauthWizard(session: SessionId): Promise<void> {
+  return invoke("cancel_oauth_wizard", { session });
+}
+
 export function finishAddAccount(
   session: SessionId,
-  displayName: string | null,
+  displayName: string | null
 ): Promise<AccountDto> {
   return invoke("finish_add_account", { session, displayName });
 }
 
-export function removeAccount(
-  accountId: string,
-  deleteRemote: boolean,
-): Promise<void> {
+export function removeAccount(accountId: string, deleteRemote: boolean): Promise<void> {
   return invoke("remove_account", { accountId, deleteRemote });
 }
 
@@ -95,30 +100,22 @@ export function addSource(req: AddSourceRequest): Promise<AddSourceResult> {
   return invoke("add_source", { req });
 }
 
-export function updateSource(
-  sourceId: string,
-  patch: SourcePatch,
-): Promise<SourceDto> {
+export function updateSource(sourceId: string, patch: SourcePatch): Promise<SourceDto> {
   return invoke("update_source", { sourceId, patch });
 }
 
-export function removeSource(
-  sourceId: string,
-  deleteRemote: boolean,
-): Promise<void> {
+export function removeSource(sourceId: string, deleteRemote: boolean): Promise<void> {
   return invoke("remove_source", { sourceId, deleteRemote });
 }
 
 export function pickDriveFolder(
   accountId: string,
-  startFolderId: string | null,
+  startFolderId: string | null
 ): Promise<DriveFolderListing> {
   return invoke("pick_drive_folder", { accountId, startFolderId });
 }
 
-export function previewExclusions(
-  req: ExclusionPreviewRequest,
-): Promise<ExclusionPreview> {
+export function previewExclusions(req: ExclusionPreviewRequest): Promise<ExclusionPreview> {
   return invoke("preview_exclusions", { req });
 }
 
@@ -260,7 +257,7 @@ export function getTelemetryInstallId(): Promise<string> {
  * event-driven via `onActivityNew` (SPEC s11.7), not polled here. */
 export function queryActivity(
   filter: ActivityFilterDto,
-  page: PageRequestDto,
+  page: PageRequestDto
 ): Promise<ActivityPageDto> {
   return invoke("query_activity", { filter, page });
 }
@@ -285,7 +282,7 @@ export function distinctActivityEventTypes(): Promise<string[]> {
 export function activitySummary(
   dayStartMs: number,
   weekStartMs: number,
-  throughputWindowMs: number,
+  throughputWindowMs: number
 ): Promise<ActivitySummaryDto> {
   return invoke("activity_summary", {
     dayStartMs,
@@ -300,10 +297,7 @@ export function activitySummary(
  * tree (SPEC s11.5). Reads file_state (local metadata), never Drive; names are
  * plaintext even for encrypted sources. `prefix` is a Drive-relative plaintext
  * path (empty string = the source root). */
-export function listRemoteTree(
-  sourceId: string,
-  prefix: string,
-): Promise<RemoteTreeDto> {
+export function listRemoteTree(sourceId: string, prefix: string): Promise<RemoteTreeDto> {
   return invoke("list_remote_tree", { sourceId, prefix });
 }
 
@@ -313,7 +307,7 @@ export function listRemoteTree(
 export function searchFiles(
   sourceId: string | null,
   query: string,
-  limit: number,
+  limit: number
 ): Promise<FileSearchHitDto[]> {
   return invoke("search_files", { sourceId, query, limit });
 }
@@ -322,10 +316,7 @@ export function searchFiles(
  * `destToken` is a one-shot token from `pickFolderDialog` (the webview never
  * supplies a raw path). Returns the spawned job id; progress arrives on
  * `restore:progress` (subscribe via `onRestoreProgress`). */
-export function restoreFiles(
-  items: RestoreItem[],
-  destToken: string,
-): Promise<RestoreJobId> {
+export function restoreFiles(items: RestoreItem[], destToken: string): Promise<RestoreJobId> {
   return invoke("restore_files", { items, destToken });
 }
 

@@ -115,8 +115,7 @@ export const useActivityStore = defineStore("activity", () => {
   });
 
   const isEmpty = computed(
-    () =>
-      !loading.value && entries.value.length === 0 && errorCode.value === null,
+    () => !loading.value && entries.value.length === 0 && errorCode.value === null
   );
 
   /** Reset all accumulated state (entries, dedup index, paging, live tail). */
@@ -185,6 +184,17 @@ export const useActivityStore = defineStore("activity", () => {
     capLiveTail();
   }
 
+  /** M7-R3-P2 (recheck-3): record an event type seen on a live / recovered row
+   * into the filter dropdown source if it is not already there. Without this a
+   * NEW event type that first appears live (or via lag reconcile) shows up in
+   * the table but cannot be selected in the filter until a reload re-fetches
+   * the distinct set. Keeps the option list sorted (the dropdown renders it as
+   * the backend does). */
+  function noteEventType(eventType: string): void {
+    if (eventTypeOptions.value.includes(eventType)) return;
+    eventTypeOptions.value = [...eventTypeOptions.value, eventType].sort();
+  }
+
   /** R2-P1-1: merge reconciled `rows` (recovered durable rows that the live
    * broadcast dropped) into the live tail, keeping it strictly newest-first.
    * Unlike `pushLive`, recovered rows can be OLDER than rows already in the tail
@@ -217,7 +227,7 @@ export const useActivityStore = defineStore("activity", () => {
       // R2-P1-2: the first page carries NO cursor (newest rows).
       const pageDto = await ipc.queryActivity(
         { ...snapshot },
-        { beforeTs: null, beforeId: null, limit: ACTIVITY_PAGE_SIZE },
+        { beforeTs: null, beforeId: null, limit: ACTIVITY_PAGE_SIZE }
       );
       // Discard a stale response: a newer load started, or the filter changed.
       if (token !== requestToken || !sameFilter(snapshot, filter.value)) return;
@@ -245,12 +255,16 @@ export const useActivityStore = defineStore("activity", () => {
     const token = ++requestToken;
     const snapshot = { ...filter.value };
     loading.value = true;
+    // M7-R3-P2 (recheck-3): clear any prior page-load error before a new attempt
+    // so a successful retry does not keep showing a stale error banner. A fresh
+    // failure below re-sets it; a success leaves it cleared.
+    errorCode.value = null;
     try {
       // R2-P1-2: page strictly OLDER than the oldest row we hold (the cursor),
       // so a row prepended to activity_log between fetches never shifts a page.
       const pageDto = await ipc.queryActivity(
         { ...snapshot },
-        { beforeTs: cursor.ts, beforeId: cursor.id, limit: ACTIVITY_PAGE_SIZE },
+        { beforeTs: cursor.ts, beforeId: cursor.id, limit: ACTIVITY_PAGE_SIZE }
       );
       if (token !== requestToken || !sameFilter(snapshot, filter.value)) return;
       appendHistoryUnique(pageDto.entries);
@@ -284,6 +298,10 @@ export const useActivityStore = defineStore("activity", () => {
     if (entry.bytes != null && entry.bytes > 0) {
       scheduleSummaryRefresh();
     }
+    // M7-R3-P2 (recheck-3): expose a brand-new event type to the filter dropdown
+    // even when the row itself is filtered out of the current view, so the user
+    // can then select it. Done before the dedup / filter gate below.
+    noteEventType(entry.eventType);
     if (seenIds.has(entry.id)) return;
     if (!matchesFilter(entry)) return;
     pushLive(entry);
@@ -324,7 +342,7 @@ export const useActivityStore = defineStore("activity", () => {
     // cannot loop unbounded: cover the dropped burst plus a page of overlap.
     const maxScan = Math.min(
       LIVE_TAIL_CAP,
-      Math.max(ACTIVITY_PAGE_SIZE, skipped + ACTIVITY_PAGE_SIZE),
+      Math.max(ACTIVITY_PAGE_SIZE, skipped + ACTIVITY_PAGE_SIZE)
     );
 
     // Collect all NEW (not-yet-held, filter-matching) rows across the pages
@@ -348,7 +366,7 @@ export const useActivityStore = defineStore("activity", () => {
             beforeTs: cursor?.ts ?? null,
             beforeId: cursor?.id ?? null,
             limit: ACTIVITY_PAGE_SIZE,
-          },
+          }
         );
       } catch {
         // A failed reconcile is non-fatal: the next live event or a manual
@@ -361,6 +379,10 @@ export const useActivityStore = defineStore("activity", () => {
       scanned += pageDto.entries.length;
 
       for (const entry of pageDto.entries) {
+        // M7-R3-P2 (recheck-3): record the event type for the filter dropdown
+        // BEFORE the dedup / filter gate, so a type recovered via lag reconcile
+        // becomes selectable even if this row is filtered out / already held.
+        noteEventType(entry.eventType);
         // Skip rows already held (live or history), rows already staged this
         // reconcile, and rows outside the active filter.
         if (seenIds.has(entry.id)) continue;
@@ -412,19 +434,20 @@ export const useActivityStore = defineStore("activity", () => {
    * computed from the LOCAL `Date` so "today" honours the user's timezone. */
   async function loadSummary(): Promise<void> {
     const now = new Date();
-    const dayStart = new Date(
+    const dayStart = new Date(now.getFullYear(), now.getMonth(), now.getDate()).getTime();
+    // M7-R3-P2 (recheck-3): the week start MUST be local CALENDAR arithmetic,
+    // not `dayStart - dayOfWeek * 24h`. Subtracting fixed 24h blocks crosses a
+    // DST boundary wrong (a spring-forward / fall-back week is 23h or 25h on one
+    // day), shifting "this week" off local midnight. Constructing the Date with
+    // `getDate() - getDay()` lets the engine normalize to the correct local
+    // midnight `dayOfWeek` days back (Sunday = 0), DST included.
+    const weekStart = new Date(
       now.getFullYear(),
       now.getMonth(),
-      now.getDate(),
+      now.getDate() - now.getDay()
     ).getTime();
-    // Start of the week = local midnight `dayOfWeek` days back (Sunday = 0).
-    const weekStart = dayStart - now.getDay() * 24 * 60 * 60 * 1000;
     try {
-      summary.value = await ipc.activitySummary(
-        dayStart,
-        weekStart,
-        THROUGHPUT_WINDOW_MS,
-      );
+      summary.value = await ipc.activitySummary(dayStart, weekStart, THROUGHPUT_WINDOW_MS);
     } catch {
       // Non-fatal: the header simply renders no aggregates if the summary fails.
       summary.value = null;

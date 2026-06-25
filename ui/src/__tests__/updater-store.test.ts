@@ -26,21 +26,19 @@ const perEventUnlisten: Record<string, ReturnType<typeof vi.fn>> = {};
 const failEvents = new Set<string>();
 
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn(
-    async (event: string, cb: (e: { payload: unknown }) => void) => {
-      if (failEvents.has(event)) {
-        throw new Error(`listen failed for ${event}`);
-      }
-      handlers[event] = (payload: unknown) => cb({ payload });
-      const un = vi.fn(() => {
-        // Model a real unlisten: a torn-down listener no longer fires.
-        delete handlers[event];
-        unlistenMock();
-      });
-      perEventUnlisten[event] = un;
-      return un;
-    },
-  ),
+  listen: vi.fn(async (event: string, cb: (e: { payload: unknown }) => void) => {
+    if (failEvents.has(event)) {
+      throw new Error(`listen failed for ${event}`);
+    }
+    handlers[event] = (payload: unknown) => cb({ payload });
+    const un = vi.fn(() => {
+      // Model a real unlisten: a torn-down listener no longer fires.
+      delete handlers[event];
+      unlistenMock();
+    });
+    perEventUnlisten[event] = un;
+    return un;
+  }),
 }));
 
 import { useUpdaterStore, RELEASES_PER_PAGE } from "../stores/updater";
@@ -193,10 +191,7 @@ describe("updater store", () => {
     await store.hydratePending();
     expect(store.available?.version).toBe("0.9.0");
     // get_pending_update_info is short-circuited (available already set).
-    expect(invokeMock).not.toHaveBeenCalledWith(
-      "get_pending_update_info",
-      undefined,
-    );
+    expect(invokeMock).not.toHaveBeenCalledWith("get_pending_update_info", undefined);
   });
 
   it("dismissBanner hides the banner without clearing the update", async () => {
@@ -265,9 +260,7 @@ describe("updater store", () => {
   });
 
   it("paginates releases: load first page then append more", async () => {
-    const firstPage = Array.from({ length: RELEASES_PER_PAGE }, (_, i) =>
-      release(`0.${i + 10}.0`),
-    );
+    const firstPage = Array.from({ length: RELEASES_PER_PAGE }, (_, i) => release(`0.${i + 10}.0`));
     const secondPage = [release("0.5.0"), release("0.4.0")];
     invokeMock.mockImplementation((cmd: string, args?: unknown) => {
       if (cmd === "list_releases") {

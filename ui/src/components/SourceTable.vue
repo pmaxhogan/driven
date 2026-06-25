@@ -236,37 +236,21 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
       <h2 class="text-lg font-medium">
         {{ t("settings.sources.title") }}
       </h2>
-      <button
-        type="button"
-        class="rounded border px-3 py-1.5 text-sm"
-        @click="openWizard"
-      >
+      <button type="button" class="rounded border px-3 py-1.5 text-sm" @click="openWizard">
         {{ t("settings.sources.addButton") }}
       </button>
     </div>
 
-    <p
-      v-if="sources.loading"
-      class="text-sm text-zinc-500"
-    >
+    <p v-if="sources.loading" class="text-sm text-zinc-500">
       {{ t("common.loading") }}
     </p>
-    <p
-      v-else-if="sources.error"
-      class="text-sm text-red-600"
-    >
+    <p v-else-if="sources.error" class="text-sm text-red-600">
       {{ sources.error }}
     </p>
-    <p
-      v-else-if="sources.sources.length === 0"
-      class="text-sm text-zinc-500"
-    >
+    <p v-else-if="sources.sources.length === 0" class="text-sm text-zinc-500">
       {{ t("settings.sources.empty") }}
     </p>
-    <table
-      v-else
-      class="w-full text-left text-sm"
-    >
+    <table v-else class="w-full text-left text-sm">
       <thead class="text-xs text-zinc-500">
         <tr>
           <th class="py-1">
@@ -293,10 +277,7 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
         </tr>
       </thead>
       <tbody class="divide-y">
-        <template
-          v-for="source in sources.sources"
-          :key="source.id"
-        >
+        <template v-for="source in sources.sources" :key="source.id">
           <tr>
             <td class="py-2">
               {{ source.displayName }}
@@ -313,7 +294,7 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
                     : undefined
                 "
                 @change="toggleEnabled(source)"
-              >
+              />
               <span
                 v-if="source.pendingRecoveryAck"
                 class="ml-2 text-xs text-amber-600 dark:text-amber-500"
@@ -371,20 +352,14 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
           </tr>
 
           <tr v-if="editingId === source.id">
-            <td
-              colspan="7"
-              class="py-2"
-            >
-              <div
-                class="space-y-2 rounded border p-3"
-                data-testid="exclusion-editor"
-              >
+            <td colspan="7" class="py-2">
+              <div class="space-y-2 rounded border p-3" data-testid="exclusion-editor">
                 <label class="flex items-center gap-2 text-sm">
                   <input
                     v-model="editRespectGitignore"
                     type="checkbox"
                     @change="loadEditPreview(source)"
-                  >
+                  />
                   {{ t("settings.addSource.respectGitignoreLabel") }}
                 </label>
                 <label class="block space-y-1 text-sm">
@@ -409,16 +384,10 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
                     @blur="loadEditPreview(source)"
                   />
                 </label>
-                <p
-                  v-if="editPreviewLoading"
-                  class="text-sm text-zinc-500"
-                >
+                <p v-if="editPreviewLoading" class="text-sm text-zinc-500">
                   {{ t("common.loading") }}
                 </p>
-                <p
-                  v-else-if="editPreview"
-                  class="text-sm"
-                >
+                <p v-else-if="editPreview" class="text-sm">
                   {{
                     t("settings.addSource.preview.included", {
                       count: numberFormatter.format(editPreview.includedCount),
@@ -453,10 +422,7 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
           </tr>
 
           <tr v-if="revealingId === source.id">
-            <td
-              colspan="7"
-              class="py-2"
-            >
+            <td colspan="7" class="py-2">
               <div
                 class="space-y-2 rounded border border-amber-300 bg-amber-50 p-3 text-sm dark:bg-amber-950/30"
                 data-testid="reveal-ack-panel"
@@ -471,19 +437,14 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
                   @update:revealed="onRevealShown"
                   @reveal-error="onRevealError"
                 />
-                <p
-                  v-if="revealErrorCode"
-                  class="text-red-600"
-                >
+                <p v-if="revealErrorCode" class="text-red-600">
                   {{ t(`errors.${revealErrorCode}.long`) }}
                 </p>
                 <div class="flex gap-2">
                   <button
                     type="button"
                     class="rounded border border-amber-400 px-2 py-1 text-xs text-amber-700 disabled:opacity-50 dark:text-amber-400"
-                    :disabled="
-                      !revealConfirmed || !revealEverShown || revealAcking
-                    "
+                    :disabled="!revealConfirmed || !revealEverShown || revealAcking"
                     data-testid="reveal-ack-confirm"
                     @click="confirmRevealAck(source.id)"
                   >
@@ -502,10 +463,7 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
           </tr>
 
           <tr v-if="confirmingRemoveId === source.id">
-            <td
-              colspan="7"
-              class="py-2"
-            >
+            <td colspan="7" class="py-2">
               <div
                 class="space-y-2 rounded border border-red-300 bg-red-50 p-3 text-sm dark:bg-red-950/30"
                 data-testid="source-remove-confirm"
@@ -518,10 +476,7 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
                   {{ t("settings.sources.pendingRemoveWarning") }}
                 </p>
                 <label class="flex items-center gap-2">
-                  <input
-                    v-model="deleteRemote"
-                    type="checkbox"
-                  >
+                  <input v-model="deleteRemote" type="checkbox" />
                   {{ t("settings.sources.deleteRemoteLabel") }}
                 </label>
                 <div class="flex gap-2">
@@ -547,9 +502,6 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
       </tbody>
     </table>
 
-    <AddSourceWizard
-      ref="wizard"
-      @created="sources.refresh()"
-    />
+    <AddSourceWizard ref="wizard" @created="sources.refresh()" />
   </div>
 </template>

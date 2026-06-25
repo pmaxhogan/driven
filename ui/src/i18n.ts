@@ -4,9 +4,7 @@ import enUS from "./locales/en-US.json";
 const messages = { "en-US": enUS };
 
 const detected =
-  typeof navigator !== "undefined" && navigator.language
-    ? navigator.language
-    : "en-US";
+  typeof navigator !== "undefined" && navigator.language ? navigator.language : "en-US";
 
 export const i18n = createI18n({
   legacy: false,

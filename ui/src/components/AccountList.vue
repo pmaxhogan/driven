@@ -118,11 +118,7 @@ function formatLastSynced(ms: number | null): string {
       <h2 class="text-lg font-medium">
         {{ t("settings.accounts.title") }}
       </h2>
-      <button
-        type="button"
-        class="rounded border px-3 py-1.5 text-sm"
-        @click="addAccount"
-      >
+      <button type="button" class="rounded border px-3 py-1.5 text-sm" @click="addAccount">
         {{ t("settings.accounts.addButton") }}
       </button>
     </div>
@@ -135,40 +131,21 @@ function formatLastSynced(ms: number | null): string {
       {{ t("errors.auth.invalid_grant.long") }}
     </div>
 
-    <p
-      v-if="reauthError"
-      class="text-sm text-red-600"
-    >
+    <p v-if="reauthError" class="text-sm text-red-600">
       {{ reauthError }}
     </p>
 
-    <p
-      v-if="accounts.loading"
-      class="text-sm text-zinc-500"
-    >
+    <p v-if="accounts.loading" class="text-sm text-zinc-500">
       {{ t("common.loading") }}
     </p>
-    <p
-      v-else-if="accounts.error"
-      class="text-sm text-red-600"
-    >
+    <p v-else-if="accounts.error" class="text-sm text-red-600">
       {{ accounts.error }}
     </p>
-    <p
-      v-else-if="accounts.accounts.length === 0"
-      class="text-sm text-zinc-500"
-    >
+    <p v-else-if="accounts.accounts.length === 0" class="text-sm text-zinc-500">
       {{ t("settings.accounts.empty") }}
     </p>
-    <ul
-      v-else
-      class="divide-y"
-    >
-      <li
-        v-for="account in accounts.accounts"
-        :key="account.id"
-        class="space-y-2 py-2"
-      >
+    <ul v-else class="divide-y">
+      <li v-for="account in accounts.accounts" :key="account.id" class="space-y-2 py-2">
         <div class="flex items-center justify-between">
           <div>
             <p class="text-sm font-medium">
@@ -206,10 +183,7 @@ function formatLastSynced(ms: number | null): string {
           data-testid="remove-confirm"
         >
           <label class="flex items-center gap-2">
-            <input
-              v-model="deleteRemote"
-              type="checkbox"
-            >
+            <input v-model="deleteRemote" type="checkbox" />
             {{ t("settings.accounts.deleteRemoteLabel") }}
           </label>
           <div class="flex gap-2">
@@ -220,11 +194,7 @@ function formatLastSynced(ms: number | null): string {
             >
               {{ t("settings.accounts.removeButton") }}
             </button>
-            <button
-              type="button"
-              class="rounded border px-2 py-1 text-xs"
-              @click="cancelRemove"
-            >
+            <button type="button" class="rounded border px-2 py-1 text-xs" @click="cancelRemove">
               {{ t("common.cancel") }}
             </button>
           </div>

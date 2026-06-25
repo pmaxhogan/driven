@@ -37,9 +37,7 @@ describe("ChangelogModal", () => {
   });
 
   it("renders a sample release body as formatted HTML", () => {
-    const wrapper = mountModal(
-      release("## Highlights\n\n- Faster **sync**\n- Fixed `crash`\n"),
-    );
+    const wrapper = mountModal(release("## Highlights\n\n- Faster **sync**\n- Fixed `crash`\n"));
     expect(wrapper.find('[data-testid="changelog-modal"]').exists()).toBe(true);
     const body = wrapper.find('[data-testid="changelog-body"]');
     expect(body.exists()).toBe(true);
@@ -70,9 +68,7 @@ describe("ChangelogModal", () => {
 
 describe("sanitizeMarkdown XSS safety", () => {
   it("escapes raw HTML / script tags so they are inert text", () => {
-    const out = sanitizeMarkdown(
-      "Hello <script>alert('x')</script> <img src=x onerror=alert(1)>",
-    );
+    const out = sanitizeMarkdown("Hello <script>alert('x')</script> <img src=x onerror=alert(1)>");
     // No live tags: the angle brackets are escaped.
     expect(out).not.toContain("<script>");
     expect(out).not.toContain("<img");

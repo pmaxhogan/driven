@@ -6,20 +6,13 @@
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-import type {
-  ActivityEntry,
-  GlobalSyncStatus,
-  RestoreJobStatus,
-  UpdateInfo,
-} from "./types";
+import type { ActivityEntry, GlobalSyncStatus, RestoreJobStatus, UpdateInfo } from "./types";
 
 /** `sync:status_changed` payload: GlobalSyncStatus (SPEC s11.7). */
 export function onSyncStatusChanged(
-  handler: (status: GlobalSyncStatus) => void,
+  handler: (status: GlobalSyncStatus) => void
 ): Promise<UnlistenFn> {
-  return listen<GlobalSyncStatus>("sync:status_changed", (e) =>
-    handler(e.payload),
-  );
+  return listen<GlobalSyncStatus>("sync:status_changed", (e) => handler(e.payload));
 }
 
 /** `sync:source_progress` payload: { sourceId, progress } (SPEC s11.7). */
@@ -29,18 +22,14 @@ export interface SourceProgressPayload {
 }
 
 export function onSyncSourceProgress(
-  handler: (payload: SourceProgressPayload) => void,
+  handler: (payload: SourceProgressPayload) => void
 ): Promise<UnlistenFn> {
-  return listen<SourceProgressPayload>("sync:source_progress", (e) =>
-    handler(e.payload),
-  );
+  return listen<SourceProgressPayload>("sync:source_progress", (e) => handler(e.payload));
 }
 
 /** `activity:new` payload: ActivityEntry (SPEC s11.7). The Activity dashboard's
  * live tail subscribes to this and prepends new entries (deduped by id). */
-export function onActivityNew(
-  handler: (entry: ActivityEntry) => void,
-): Promise<UnlistenFn> {
+export function onActivityNew(handler: (entry: ActivityEntry) => void): Promise<UnlistenFn> {
   return listen<ActivityEntry>("activity:new", (e) => handler(e.payload));
 }
 
@@ -56,11 +45,9 @@ export interface ActivityLaggedPayload {
  * gap (not just page 0): the activity store reconciles by re-querying the
  * durable `activity_log` and dedup-merging, so no durable row is lost. */
 export function onActivityLagged(
-  handler: (payload: ActivityLaggedPayload) => void,
+  handler: (payload: ActivityLaggedPayload) => void
 ): Promise<UnlistenFn> {
-  return listen<ActivityLaggedPayload>("activity:lagged", (e) =>
-    handler(e.payload),
-  );
+  return listen<ActivityLaggedPayload>("activity:lagged", (e) => handler(e.payload));
 }
 
 /** `account:needs_reauth` payload: { account_id, email } (SPEC s11.7). */
@@ -70,11 +57,9 @@ export interface NeedsReauthPayload {
 }
 
 export function onAccountNeedsReauth(
-  handler: (payload: NeedsReauthPayload) => void,
+  handler: (payload: NeedsReauthPayload) => void
 ): Promise<UnlistenFn> {
-  return listen<NeedsReauthPayload>("account:needs_reauth", (e) =>
-    handler(e.payload),
-  );
+  return listen<NeedsReauthPayload>("account:needs_reauth", (e) => handler(e.payload));
 }
 
 /** `oauth:complete` payload: { session_id, status } (SPEC s11.7). */
@@ -84,17 +69,13 @@ export interface OAuthCompletePayload {
 }
 
 export function onOauthComplete(
-  handler: (payload: OAuthCompletePayload) => void,
+  handler: (payload: OAuthCompletePayload) => void
 ): Promise<UnlistenFn> {
-  return listen<OAuthCompletePayload>("oauth:complete", (e) =>
-    handler(e.payload),
-  );
+  return listen<OAuthCompletePayload>("oauth:complete", (e) => handler(e.payload));
 }
 
 /** `updater:available` payload: UpdateInfo (SPEC s11.7). */
-export function onUpdaterAvailable(
-  handler: (info: UpdateInfo) => void,
-): Promise<UnlistenFn> {
+export function onUpdaterAvailable(handler: (info: UpdateInfo) => void): Promise<UnlistenFn> {
   return listen<UpdateInfo>("updater:available", (e) => handler(e.payload));
 }
 
@@ -107,18 +88,15 @@ export interface UpdaterDownloadProgressPayload {
 }
 
 export function onUpdaterDownloadProgress(
-  handler: (payload: UpdaterDownloadProgressPayload) => void,
+  handler: (payload: UpdaterDownloadProgressPayload) => void
 ): Promise<UnlistenFn> {
-  return listen<UpdaterDownloadProgressPayload>(
-    "updater:download_progress",
-    (e) => handler(e.payload),
+  return listen<UpdaterDownloadProgressPayload>("updater:download_progress", (e) =>
+    handler(e.payload)
   );
 }
 
 /** `updater:downloaded` payload: UpdateInfo (SPEC s11.7). */
-export function onUpdaterDownloaded(
-  handler: (info: UpdateInfo) => void,
-): Promise<UnlistenFn> {
+export function onUpdaterDownloaded(handler: (info: UpdateInfo) => void): Promise<UnlistenFn> {
   return listen<UpdateInfo>("updater:downloaded", (e) => handler(e.payload));
 }
 
@@ -126,7 +104,7 @@ export function onUpdaterDownloaded(
  * store subscribes to this for live per-file + overall progress, errors, and the
  * terminal `done` state. */
 export function onRestoreProgress(
-  handler: (status: RestoreJobStatus) => void,
+  handler: (status: RestoreJobStatus) => void
 ): Promise<UnlistenFn> {
   return listen<RestoreJobStatus>("restore:progress", (e) => handler(e.payload));
 }

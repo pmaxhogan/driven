@@ -16,9 +16,7 @@ export const useAccountsStore = defineStore("accounts", () => {
   const error = ref<string | null>(null);
 
   /** Accounts the backend has flagged as needing re-authentication. */
-  const needsReauth = computed(() =>
-    accounts.value.filter((a) => a.state === "needs_reauth"),
-  );
+  const needsReauth = computed(() => accounts.value.filter((a) => a.state === "needs_reauth"));
 
   async function refresh(): Promise<void> {
     loading.value = true;
@@ -32,10 +30,7 @@ export const useAccountsStore = defineStore("accounts", () => {
     }
   }
 
-  async function remove(
-    accountId: string,
-    deleteRemote: boolean,
-  ): Promise<void> {
+  async function remove(accountId: string, deleteRemote: boolean): Promise<void> {
     await ipc.removeAccount(accountId, deleteRemote);
     await refresh();
   }
@@ -47,9 +42,7 @@ export const useAccountsStore = defineStore("accounts", () => {
    * (driven by the `oauth:complete` event or a manual poll). The re-consent
    * persists onto the EXISTING account - no duplicate is created.
    */
-  async function reauth(
-    accountId: string,
-  ): Promise<{ sessionId: string; authUrl: string }> {
+  async function reauth(accountId: string): Promise<{ sessionId: string; authUrl: string }> {
     const { sessionId, authUrl } = await ipc.reauthAccount(accountId);
     return { sessionId, authUrl };
   }

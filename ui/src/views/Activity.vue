@@ -7,11 +7,7 @@ import { toErrorCode } from "../ipc/errors";
 import { activityEventLabel } from "../stores/activityEventLabel";
 import { useActivityStore } from "../stores/activity";
 import { useSourcesStore } from "../stores/sources";
-import type {
-  ActivityEntry,
-  ActivityLevel,
-  FileStateStatus,
-} from "../ipc/types";
+import type { ActivityEntry, ActivityLevel, FileStateStatus } from "../ipc/types";
 
 // Activity dashboard (SPEC s11.4; DESIGN s8.3). A live tail (subscribes to
 // `activity:new` and prepends new rows, deduped by id) over a paginated history
@@ -41,7 +37,7 @@ const dateTimeFormatter = computed(
     new Intl.DateTimeFormat(locale.value, {
       dateStyle: "medium",
       timeStyle: "medium",
-    }),
+    })
 );
 const numberFormatter = computed(() => new Intl.NumberFormat(locale.value));
 
@@ -51,10 +47,7 @@ const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"] as const;
 
 function formatBytes(bytes: number): string {
   if (bytes <= 0) return `${numberFormatter.value.format(0)} ${BYTE_UNITS[0]}`;
-  const exponent = Math.min(
-    Math.floor(Math.log(bytes) / Math.log(1024)),
-    BYTE_UNITS.length - 1,
-  );
+  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), BYTE_UNITS.length - 1);
   const value = bytes / Math.pow(1024, exponent);
   const fmt = new Intl.NumberFormat(locale.value, {
     maximumFractionDigits: exponent === 0 ? 0 : 1,
@@ -64,10 +57,10 @@ function formatBytes(bytes: number): string {
 
 // Header aggregate view model (M7-P2-5). Null until the summary loads.
 const bytesToday = computed(() =>
-  activity.summary ? formatBytes(activity.summary.bytesToday) : null,
+  activity.summary ? formatBytes(activity.summary.bytesToday) : null
 );
 const bytesWeek = computed(() =>
-  activity.summary ? formatBytes(activity.summary.bytesWeek) : null,
+  activity.summary ? formatBytes(activity.summary.bytesWeek) : null
 );
 const throughput = computed(() => {
   const s = activity.summary;
@@ -129,14 +122,10 @@ function sourceLabel(entry: ActivityEntry): string {
 
 // Build the filter DTO from the form and apply it (re-query from page 0).
 async function applyFilters(): Promise<void> {
-  const eventTypes =
-    filterEventType.value.length > 0 ? [filterEventType.value] : [];
+  const eventTypes = filterEventType.value.length > 0 ? [filterEventType.value] : [];
   await activity.applyFilter({
     sourceId: filterSourceId.value.length > 0 ? filterSourceId.value : null,
-    minLevel:
-      filterLevel.value.length > 0
-        ? (filterLevel.value as ActivityLevel)
-        : null,
+    minLevel: filterLevel.value.length > 0 ? (filterLevel.value as ActivityLevel) : null,
     eventTypes,
   });
 }
@@ -211,24 +200,13 @@ onUnmounted(() => {
           data-testid="activity-export-bundle"
           @click="exportBundle"
         >
-          {{
-            exporting
-              ? t("activity.exporting")
-              : t("activity.exportBundleButton")
-          }}
+          {{ exporting ? t("activity.exporting") : t("activity.exportBundleButton") }}
         </button>
       </div>
-      <p
-        v-if="exportErrorCode"
-        class="text-sm text-red-600"
-        data-testid="activity-export-error"
-      >
+      <p v-if="exportErrorCode" class="text-sm text-red-600" data-testid="activity-export-error">
         {{ t(`errors.${exportErrorCode}.long`) }}
       </p>
-      <p
-        v-else-if="exportedPath"
-        class="text-sm text-green-700 dark:text-green-400"
-      >
+      <p v-else-if="exportedPath" class="text-sm text-green-700 dark:text-green-400">
         {{ t("activity.exportedTo", { path: exportedPath }) }}
       </p>
 
@@ -267,10 +245,7 @@ onUnmounted(() => {
             {{ t("activity.summary.byStatus") }}
           </dt>
           <dd class="text-sm">
-            <span
-              v-if="statusCounts.length === 0"
-              class="text-zinc-400"
-            >
+            <span v-if="statusCounts.length === 0" class="text-zinc-400">
               {{ t("activity.summary.noFiles") }}
             </span>
             <span
@@ -286,14 +261,9 @@ onUnmounted(() => {
       </dl>
     </header>
 
-    <div
-      class="flex flex-wrap items-end gap-3 rounded border p-3"
-      data-testid="activity-filters"
-    >
+    <div class="flex flex-wrap items-end gap-3 rounded border p-3" data-testid="activity-filters">
       <label class="block space-y-1 text-sm">
-        <span class="text-zinc-600 dark:text-zinc-400">{{
-          t("activity.filters.source")
-        }}</span>
+        <span class="text-zinc-600 dark:text-zinc-400">{{ t("activity.filters.source") }}</span>
         <select
           v-model="filterSourceId"
           class="block rounded border px-2 py-1 text-sm"
@@ -302,20 +272,14 @@ onUnmounted(() => {
           <option value="">
             {{ t("activity.filters.allSources") }}
           </option>
-          <option
-            v-for="s in sources.sources"
-            :key="s.id"
-            :value="s.id"
-          >
+          <option v-for="s in sources.sources" :key="s.id" :value="s.id">
             {{ s.displayName }}
           </option>
         </select>
       </label>
 
       <label class="block space-y-1 text-sm">
-        <span class="text-zinc-600 dark:text-zinc-400">{{
-          t("activity.filters.level")
-        }}</span>
+        <span class="text-zinc-600 dark:text-zinc-400">{{ t("activity.filters.level") }}</span>
         <select
           v-model="filterLevel"
           class="block rounded border px-2 py-1 text-sm"
@@ -337,9 +301,7 @@ onUnmounted(() => {
       </label>
 
       <label class="block space-y-1 text-sm">
-        <span class="text-zinc-600 dark:text-zinc-400">{{
-          t("activity.filters.eventType")
-        }}</span>
+        <span class="text-zinc-600 dark:text-zinc-400">{{ t("activity.filters.eventType") }}</span>
         <select
           v-model="filterEventType"
           class="block rounded border px-2 py-1 text-sm"
@@ -348,39 +310,22 @@ onUnmounted(() => {
           <option value="">
             {{ t("activity.filters.allEventTypes") }}
           </option>
-          <option
-            v-for="et in eventTypeOptions"
-            :key="et"
-            :value="et"
-            :title="et"
-          >
+          <option v-for="et in eventTypeOptions" :key="et" :value="et" :title="et">
             {{ eventLabel(et) }}
           </option>
         </select>
       </label>
 
-      <button
-        type="button"
-        class="rounded border px-3 py-1.5 text-sm"
-        @click="clearFilters"
-      >
+      <button type="button" class="rounded border px-3 py-1.5 text-sm" @click="clearFilters">
         {{ t("activity.filters.clear") }}
       </button>
     </div>
 
-    <p
-      v-if="activity.errorCode"
-      class="text-sm text-red-600"
-      data-testid="activity-error"
-    >
+    <p v-if="activity.errorCode" class="text-sm text-red-600" data-testid="activity-error">
       {{ t(`errors.${activity.errorCode}.long`) }}
     </p>
 
-    <p
-      v-if="!activity.errorCode"
-      class="text-sm text-zinc-500"
-      data-testid="activity-count"
-    >
+    <p v-if="!activity.errorCode" class="text-sm text-zinc-500" data-testid="activity-count">
       {{
         t("activity.countSummary", {
           shown: numberFormatter.format(shownCount),
@@ -422,24 +367,14 @@ onUnmounted(() => {
         </tr>
       </thead>
       <tbody class="divide-y">
-        <tr
-          v-for="entry in activity.entries"
-          :key="entry.id"
-          data-testid="activity-row"
-        >
+        <tr v-for="entry in activity.entries" :key="entry.id" data-testid="activity-row">
           <td class="whitespace-nowrap py-2">
             {{ formatTime(entry) }}
           </td>
-          <td
-            class="py-2 font-medium"
-            :class="levelClass(entry.level)"
-          >
+          <td class="py-2 font-medium" :class="levelClass(entry.level)">
             {{ levelLabel(entry.level) }}
           </td>
-          <td
-            class="break-all py-2"
-            :title="entry.eventType"
-          >
+          <td class="break-all py-2" :title="entry.eventType">
             {{ eventLabel(entry.eventType) }}
           </td>
           <td class="break-all py-2">
@@ -447,10 +382,7 @@ onUnmounted(() => {
           </td>
           <td class="break-all py-2">
             <span v-if="entry.message">{{ entry.message }}</span>
-            <span
-              v-else-if="entry.fileCount != null"
-              class="text-zinc-500"
-            >
+            <span v-else-if="entry.fileCount != null" class="text-zinc-500">
               {{
                 t("activity.files", {
                   count: numberFormatter.format(entry.fileCount),
@@ -462,10 +394,7 @@ onUnmounted(() => {
       </tbody>
     </table>
 
-    <div
-      v-if="activity.hasMore"
-      class="flex justify-center"
-    >
+    <div v-if="activity.hasMore" class="flex justify-center">
       <button
         type="button"
         class="rounded border px-3 py-1.5 text-sm"
@@ -473,17 +402,10 @@ onUnmounted(() => {
         data-testid="activity-load-more"
         @click="activity.loadMore()"
       >
-        {{
-          activity.loading
-            ? t("activity.loadingMore")
-            : t("activity.loadMore")
-        }}
+        {{ activity.loading ? t("activity.loadingMore") : t("activity.loadMore") }}
       </button>
     </div>
-    <p
-      v-else-if="activity.entries.length > 0"
-      class="text-center text-xs text-zinc-400"
-    >
+    <p v-else-if="activity.entries.length > 0" class="text-center text-xs text-zinc-400">
       {{ t("activity.allLoaded") }}
     </p>
   </section>
