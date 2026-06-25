@@ -32,7 +32,7 @@ ignore = "0.4.26"
 # The `rayon` feature enables `Hasher::update_rayon` for multi-core hashing
 # of large files in the M3 streaming upload pipeline (DESIGN s11.4.4).
 blake3 = { version = "1", features = ["rayon"] }
-sqlx = { version = "0.8", default-features = false, features = [
+sqlx = { version = "0.9", default-features = false, features = [
     "runtime-tokio",
     "tls-rustls",
     "sqlite",
