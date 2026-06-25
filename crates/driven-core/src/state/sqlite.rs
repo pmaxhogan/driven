@@ -2189,7 +2189,13 @@ impl StateRepo for SqliteStateRepo {
             .find(|t| *t == table)
             .ok_or_else(|| anyhow!("unknown state table for row count: {table}"))?;
         let sql = format!("SELECT COUNT(*) FROM {safe}");
-        let count: i64 = sqlx::query_scalar(&sql).fetch_one(&self.pool).await?;
+        // sqlx 0.9 requires dynamic (non-`'static`) query strings to be wrapped in
+        // `AssertSqlSafe` to acknowledge the injection audit. This is safe: `safe`
+        // is an allow-listed `&'static str` from `KNOWN_STATE_TABLES` and the SQL
+        // carries no caller-supplied substring (see the allow-list match above).
+        let count: i64 = sqlx::query_scalar(sqlx::AssertSqlSafe(sql))
+            .fetch_one(&self.pool)
+            .await?;
         Ok(count)
     }
 

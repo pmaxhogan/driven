@@ -2321,7 +2321,7 @@ mod confine {
             // size_of::<FILE_RENAME_INFO>()`, so writing the struct + the flexible
             // FileName array through `info` stays in bounds + aligned.
             unsafe {
-                (*info).Anonymous.ReplaceIfExists = 1; // BOOLEAN TRUE
+                (*info).Anonymous.ReplaceIfExists = true; // windows-sys 0.61: field is a Rust `bool`
                 (*info).RootDirectory = std::ptr::null_mut::<core::ffi::c_void>() as HANDLE;
                 (*info).FileNameLength = name_bytes as u32;
                 let dst = std::ptr::addr_of_mut!((*info).FileName) as *mut u16;
