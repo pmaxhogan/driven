@@ -1771,3 +1771,104 @@ DEVIATIONS / RESIDUALS:
   until the M9c CF-Pages workflow, and the GH Actions that CALL
   generate-update-json.mjs land in M9d - so end-to-end auto-update is not live yet;
   M9a delivers the in-app client + the manifest generator only.
+
+## M9 fix round 1 (codex M9-1 xhigh: 7 P1 + 3 P2 + release-please config)
+
+Source review: `.claude/codex-reviews/M9-1-20260624-202938.md` (baseline 97f596e, M9 @
+3484889). All 10 findings were cross-track integration gaps from the concurrent
+M9a (updater client) / M9d (release pipeline) split: neither track owned the
+END-TO-END updater contract, so the endpoint layout, the manifest source, the
+notes, the channel, and the dev metadata did not line up. One sole-actor fixed
+them together (they are interdependent) plus the failing release-please config.
+
+THE UNIFYING FIX - the updater PATH CONTRACT. Per Tauri's static-server model the
+manifest is keyed by `{{target}}-{{arch}}` and carries the LATEST version (the
+updater compares its running version to the manifest's), so the path must NOT
+include the installed version. The single canonical layout, now byte-identical
+across all five files:
+
+    updates/<channel>/{{target}}/{{arch}}/update.json
+
+(`{{target}}` = os: windows|darwin|linux; `{{arch}}` = x86_64|aarch64). The
+`platforms` map KEY stays the combined `<os>-<arch>` (what Tauri matches at
+runtime); only the directory layout splits it into <os>/<arch> segments. Files
+kept in lockstep: `src-tauri/tauri.conf.json` endpoints, `src-tauri/src/updater.rs`
+STABLE/DEV_ENDPOINT, `scripts/generate-update-json.mjs` (manifestOutPath +
+osArchForTarget), `.github/workflows/release.yml`, `.github/workflows/dev-channel.yml`.
+
+PER-FINDING:
+
+- R1-P1-1 (drop {{current_version}}): removed the version segment from
+  tauri.conf.json + updater.rs endpoints + the generator output path. updater.rs
+  test now asserts NO `{{current_version}}`, HAS `{{arch}}`, ends `/update.json`.
+  generate-update-json.mjs `manifestOutPath` dropped its `version` arg; new
+  `osArchForTarget` splits the combined key into the <os>/<arch> dirs.
+- R1-P1-2 (manifest job had no bundle artifacts): both publish jobs now
+  `gh release download <tag>` the just-published installers + `.sig` into a flat
+  `release-assets/` dir and pass `--assets-dir release-assets` to the generator
+  (chose download-from-release over cross-job artifact upload - the assets already
+  live on the release, so this is the smaller, single-source-of-truth path).
+- R1-P1-3 (upload glob + RELEASE_TAG scoping): upload glob is now
+  `updates/stable/**/update.json` (globstar) matching the final layout; the asset
+  name flattens to `stable-<os>-<arch>-update.json`; `RELEASE_TAG` is a JOB-level
+  env (`${{ github.ref_name }}`) so every step sees it.
+- R1-P1-4 (dev generator missing --sha + wrong asset URL): dev publish job passes
+  `--sha $(git rev-parse --short HEAD)` and `--base-url .../releases/download/dev`
+  (the ROLLING dev tag; the generator also DEFAULTS dev's base-url to the `dev`
+  tag now, since the bundle version is 0.0.0-dev.<sha> but the assets live on tag
+  `dev`).
+- R1-P1-5 (dev metadata never patched): new `scripts/set-dev-version.mjs` patches
+  0.0.0-dev.<sha> into the THREE canonical sources release-please bumps - root
+  Cargo.toml `[workspace.package].version` (src-tauri uses version.workspace=true),
+  tauri.conf.json, ui/package.json - in a new "Patch dev version" step BEFORE the
+  Tauri build, so the produced dev app actually reports the dev version.
+- R1-P1-6 (empty notes): both publish jobs `gh release view --json body` into
+  `release-notes.md` and pass `--notes-file`; the generator reads + trims it into
+  the manifest `notes` (the in-app "View changelog" reads the manifest body).
+- R1-P1-7 (CF deploy wipes the other channel): `pages deploy` is a whole-site
+  snapshot, so each publish job runs new `scripts/fetch-live-channel.sh <other>`
+  which curls the OTHER channel's currently-live per-platform manifests from
+  `driven.maxhogan.dev/updates` and overlays them into the tree before deploy
+  (never clobbering a locally-generated file; a 404/transient miss is skipped, not
+  fatal). Chosen source-of-truth: the LIVE site itself (no extra branch/bucket).
+- R1-P2-1 (macOS in-app install): new `ui/src/platform.ts` `isMacOS()` (userAgent,
+  no new Tauri plugin/capability); About.vue gates the banner - macOS shows a
+  "Download the latest release" link to /releases/latest + an unsupported note,
+  Windows/Linux keep the in-app Install + progress. vitest covers both platforms.
+- R1-P2-2 (pending consumed before install): `install_update` installs via
+  `&update` and RESTORES the pending (with channel) on a failed
+  download_and_install, so the banner's next Install retries. Pure
+  `should_restore_pending(is_err)` unit-tested.
+- R1-P2-3 (downloaded event hardcoded Stable): AppState `pending` now stores
+  `(Update, channel_string)`; `install_update` emits `updater:downloaded` with the
+  REAL channel via `downloaded_channel(channel_str)` (unit-tested: dev->dev,
+  garbage->stable).
+
+RELEASE-PLEASE CONFIG CHOICE. The first run failed `value at path package.version
+is not tagged` because `release-type: "rust"` pointed at the VIRTUAL workspace
+root `.` which has no literal `[package].version` (only `[workspace.package]` +
+members using `version.workspace = true`). Switched to `release-type: "simple"`
+(reads its version from `.release-please-manifest.json`, no Cargo `[package]`
+parse) with `extra-files`: a `toml` updater for `Cargo.toml` jsonpath
+`$.workspace.package.version` plus `json` updaters for tauri.conf.json +
+ui/package.json `$.version`. This bumps the same three human-authored version
+sources in lockstep without the virtual-manifest pitfall. NOTE: the `simple`
+strategy does not rewrite Cargo.lock's per-crate `version =` lines; the workspace
+is built WITHOUT `--locked`, so cargo reconciles the lock on the next build (no CI
+break). The release tag stays `v<version>` (include-component-in-tag=false).
+
+NEW TESTS: generate-update-json (osArchForTarget split; version-less os/arch path;
+notes propagation; --notes-file + rolling-dev base URL); updater.rs
+(downloaded_event_carries_the_real_channel; pending_update_survives_a_failed_install_only;
+endpoint asserts no current_version + has arch); set-dev-version (workspace-version
+edit touches only [workspace.package], JSON version set, version validation);
+platform (isMacUserAgent); about-mac-gating (macOS hides install + shows DMG link,
+Windows shows install). actionlint clean on all workflows.
+
+RESIDUALS: the real `install_update` download path still cannot be unit-tested (the
+plugin `Update` is not constructable offline) - the restore + channel POLICY is
+unit-tested via the extracted pure helpers, but the live download is validated only
+by compilation + the manual M9 acceptance. fetch-live-channel.sh's "download the
+live tree" relies on the CF site being reachable at deploy time; a transient miss
+briefly drops the other channel's manifest until its own workflow re-publishes
+(strictly better than wiping AND failing the deploy).
