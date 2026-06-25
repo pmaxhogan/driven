@@ -1458,3 +1458,109 @@ All findings from `.claude/codex-reviews/M8-recheck2-20260624-173857.md` fixed.
   the `ConfinedDest` Drop guard above (dropping the aborted future removes the temp).
   Tests (virtual-time `start_paused`): a stuck task is aborted within the budget (not
   allowed to finish its long sleep); a prompt task is joined cleanly without abort.
+
+## M8 codex recheck-3 fixes (round 4: 2 P1 + 3 P2, FINAL - cap-4 hard stop)
+
+All findings from `.claude/codex-reviews/M8-recheck3-20260624-183342.md` (baseline
+1a7ad60, M8 @ 209bc1e) fixed. This was the FINAL fix round under the user-granted
+cap of 4: after codex recheck-4 M8 closes regardless, and any recheck-4 residual is
+documented here / pushed to M9 pre-GA hardening (no round 5).
+
+- **R3-P1-1 - detect restore target collisions (DATA-SAFETY).** The UI kept the
+  multi-selection across source switches and the backend restored every selected
+  item to `dest/<relative_path>`, so two sources both selecting `foo.txt` - or
+  `Foo.txt`+`foo.txt` on a case-insensitive dest - SILENTLY overwrote each other.
+  The BACKEND is now the real guard: before consuming the dialog token or spawning
+  the job, `detect_dest_collisions` (`restore.rs`) computes each selected item's
+  destination KEY and REJECTS the whole job (`internal.invalid_input`, naming the
+  two conflicting paths) on (a) a duplicate folded key or (b) a file-vs-directory
+  path-prefix conflict (one item's key is a strict, SEGMENT-WISE ancestor of
+  another's - never a raw `starts_with`, so `foo` does not falsely prefix
+  `foobar`). Case folding is the documented DEFAULT (each segment lowercased): a
+  case-insensitive dest is the norm on the supported platforms (Windows ALWAYS,
+  macOS/APFS by default), and an over-reject is a visible error while an
+  under-reject is silent data loss - so we DO NOT probe the dest's case
+  sensitivity (a probe would create throwaway files in the user's folder for an
+  edge that does not arise on the supported platforms). Defense in depth: the
+  store (`restore.ts` `selectSource`) clears the selection when the ACTIVE source
+  changes, so cross-source selections do not silently accumulate. Tests:
+  `detect_dest_collisions_rejects_same_destination_key`,
+  `detect_dest_collisions_folds_case_on_insensitive_dest`,
+  `detect_dest_collisions_rejects_file_vs_dir_prefix_conflict`,
+  `detect_dest_collisions_allows_non_colliding_multisource_selection`; UI
+  `surfaces a backend destination-collision rejection...` + `clears the
+  cross-source selection when the active source changes`.
+
+- **R3-P1-2 - atomic seed+spawn+handle vs shutdown (no orphan / no partial temp).**
+  The job was seeded (status+cancel), THEN spawned, THEN the `JoinHandle` attached
+  in a separate `set_restore_job_handle` call - a window where a quit's
+  `cancel_all_restore_jobs` saw a seeded job with NO awaitable handle, and if the
+  task had already created a temp the process could exit mid-write leaving a
+  partial. Fixed with a START BARRIER: the task is spawned but gated behind a
+  `tokio::sync::oneshot` (`release_rx.await`) so it does NO filesystem work until
+  released; `seed_restore_job` now takes the `JoinHandle` and inserts status +
+  cancel + handle in ONE locked insert (so a seeded job is NEVER observable without
+  an awaitable handle); only THEN is the barrier released, and the task re-checks
+  the cancel flag immediately on release (via `run_restore_job`'s pre-file check)
+  so a quit/cancel in the window exits clean with no temp. `set_restore_job_handle`
+  is removed (the atomic seed replaces it). Net invariant: the shutdown drain never
+  sees a handle-less seeded job, and a quit anywhere in the spawn window leaves no
+  partial temp. Test: `seeded_restore_job_always_has_awaitable_handle_for_shutdown_
+  drain` (seed-with-handle, then a quit BEFORE release finds the handle and the
+  gated task does no fs work / leaves no marker).
+
+- **R3-P2-1 - do not burn the one-shot dest token on a pre-acceptance failure.**
+  `restore_files` CONSUMED the token before validating the selection / building
+  plans, so any stale-selection / unuploaded-row / collision / keychain / setup
+  error burned the token and forced the user to re-pick the folder. CHOSEN
+  CONTRACT (documented): peek-early / take-late. The command now PEEKs the token
+  (`peek_dialog_token`, non-consuming) to resolve+validate the dest dir, runs ALL
+  token-independent validation (resolution + eligibility + collision check) and the
+  fallible `build_restore_plans` setup, and CONSUMES the token (`take_dialog_token`)
+  only immediately before the atomic seed/spawn - the first + only irreversible
+  step. So every pre-spawn failure leaves the token INTACT; no re-pick signal is
+  needed. (The peeked path equals the bound path, so the consume is purely to spend
+  the single use + bound replay.) Covered by the resolve/collision tests above (all
+  fail BEFORE the consume) plus the existing single-use token test.
+
+- **R3-P2-2 - reject unuploaded / non-restorable rows as bad input.** A stale /
+  malicious renderer could queue a row with `drive_file_id = NULL` (never uploaded)
+  or a non-`synced` status; these flowed in and failed later as `internal.bug`.
+  `resolve_restore_items` (`restore.rs`) now REJECTS, with `internal.invalid_input`
+  before any job is spawned: an unknown PK row (a stale/forged selection - widened
+  from `internal.bug`), a row with NULL `drive_file_id`, and a row whose status is
+  not `synced`. ELIGIBILITY SEMANTICS (documented): restore requires an uploaded
+  object AND `status == Synced`. We deliberately do NOT restore a non-`synced` row
+  (pending/error/corrupt/locked): its recorded `hash_blake3` may not match the
+  bytes currently on Drive, so the restore would either fail the in-stream BLAKE3
+  verify late (a confusing `crypto.decrypt_failed`) or hand back a mismatched
+  object - rejecting up front is the honest, visible behaviour. Tests:
+  `resolve_restore_items_rejects_null_drive_file_id_as_bad_input`,
+  `resolve_restore_items_rejects_non_synced_row_as_bad_input`,
+  `resolve_restore_items_accepts_clean_synced_selection`.
+
+- **R3-P2-3 - query immediate tree children in SQL, not first-N descendants.**
+  `list_remote_tree` derived immediate children from the first `MAX_TREE_SCAN_ROWS`
+  DESCENDANT rows, so a first sub-folder holding 100k+ files exhausted the scan and
+  HID later sibling folders/files (the UI saw only `truncated`). Added
+  `StateRepo::list_immediate_tree_children` (SQLite override) which queries
+  IMMEDIATE children directly with two capped INDEXED range-scans over the same
+  `[prefix/, prefix0)` bounds: immediate FILES (local remainder has no `/`, via
+  `instr(substr(...),'/')=0`) and DISTINCT first-segment SUB-FOLDERS (deeper rows,
+  `substr(...,1,instr(...)-1)`). Children are capped (cap+1 fetched per kind);
+  `truncated` is set ONLY on a genuine immediate-CHILD overflow, never because one
+  sub-folder is large. `MAX_TREE_SCAN_ROWS` is gone; `derive_immediate_children`
+  is now `#[cfg(test)]` (its split/ordering semantics are now enforced by the SQL).
+  New `.sqlx` query files committed (sqlx-prepare, 0 drift). Tests (SqliteStateRepo,
+  real DB): `immediate_tree_children_lists_direct_folders_and_files`,
+  `immediate_tree_children_does_not_hide_siblings_behind_huge_first_folder` (the
+  discriminating test - a 1500-file first folder no longer hides the later sibling
+  folder/file), `immediate_tree_children_truncates_on_child_count_overflow`.
+
+### Residual / not-fixed (recheck-3)
+
+None. All 2 P1 + 3 P2 fixed with tests + full gates green (cargo build/clippy/test/
+deny/fmt + ui lint/test/vue-tsc/build). The Windows temp create-instant junction
+window and the `FILE_RENAME_INFO` no-WRITE_THROUGH note remain as previously
+documented under R2-P1-1 (no plaintext ever leaves root; data is `sync_all`'d) -
+unchanged by this round.
