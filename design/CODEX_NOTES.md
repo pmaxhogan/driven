@@ -2273,3 +2273,65 @@ Gates (worktree, base cf8d5d3): cargo build --workspace --all-targets + clippy
 GREEN. ui: pnpm install/lint/test:unit (145)/build (vue-tsc) all GREEN. Stub sweep: zero
 non-test todo!/unimplemented!/unreachable! on src-tauri/src. No CI workflow added (smoke runs
 under cargo test), so actionlint N/A.
+
+## M9 fix round 5a (codex M9-5: 3 DATA-SAFETY P1s; CONCURRENT with r5b)
+
+Baseline cf8d5d3. Disjoint from r5b (updater.rs / tauri.conf.json). Touched only
+src-tauri/src/commands/{sources,restore}.rs, crates/driven-core/src/state/{mod,sqlite}.rs,
+ui/src/components/SourceTable.vue (+ en-US.json + a vitest). All gates green incl. vue-tsc +
+sqlx 0-drift; non-test stub sweep on the touched surface = 0.
+
+- **R5-P1-1 - removing a PENDING encrypted source orphaned the master key [DATA-SAFETY] FIXED.**
+  `remove_source` on a first encrypted source the user never acked dropped `backup_sources`
+  (cascading the `recovery_phrase_acks` row) but LEFT `accounts.encryption_master_key_id` +
+  the keychain master key. The next encrypted source then took the "already provisioned"
+  path (no recovery phrase) and could arm encryption the user can never restore. Fix:
+  `remove_source` now detects a durable pending ack (`recovery_ack_revealed(id).is_some()`)
+  and routes through a NEW atomic discard transaction
+  `StateRepo::discard_pending_encrypted_source` (default impl + real SQLite `BEGIN/COMMIT`
+  override): it deletes the source (cascading the ack + file_state + pending_ops) AND, ONLY
+  when it was the account's SOLE encrypted source, clears the account master-key stamp,
+  returning `DiscardPendingOutcome { master_key_cleared, account_id }`. When
+  `master_key_cleared`, the command then deletes the keychain master key (idempotent; never
+  deleted while another encrypted source still needs it). Net invariant: a later encrypted
+  source ALWAYS either reuses an acked phrase or triggers a FRESH reveal+ack - never the
+  silent already-provisioned path. Tests (driven-core sqlite):
+  `discard_pending_only_encrypted_source_clears_master_key_stamp`,
+  `discard_pending_keeps_master_key_when_another_encrypted_source_exists`,
+  `discard_pending_unknown_source_is_a_noop`; (driven-app)
+  `discard_pending_encrypted_source_clears_stamp_then_next_add_reveals_fresh_phrase`.
+
+- **R5-P1-2 - no post-restart reveal/ack UI [DATA-SAFETY] FIXED.**
+  After a crash/restart before ack, the durable pending source showed only a disabled
+  toggle + badge; the reveal/ack flow lived only in volatile wizard state, so r4a's
+  "still reveal/ackable after restart" invariant was unreachable. Fix: SourceTable now has
+  a pending-recovery ROW ACTION ("Reveal and save recovery phrase") that calls
+  `revealRecoveryPhrase(id)` (records the durable backend reveal + returns the 24 words),
+  shows them via the existing `RecoveryPhraseReveal` gated on the user attesting they saved
+  them, then `ackRecoveryPhrase(id)` (the backend's ONLY enable path, rejected without a
+  recorded reveal) which enables the source + clears pending, and refreshes. Remove of a
+  pending source is no longer dangerous (it is the safe discard from R5-P1-1); the remove
+  confirm panel shows a clear "discards the encrypted setup" warning for a pending row. New
+  i18n keys `settings.sources.{revealAckButton,revealAckIntro,revealAckConfirmButton,
+  pendingRemoveWarning}`. Test (vitest): `exposes a post-restart reveal/ack action that
+  enables a pending source (R5-P1-2)`.
+
+- **R5-P1-3 - restore ROOT confinement was a re-resolved path STRING (TOCTOU) [DATA-SAFETY] FIXED.**
+  `restore_files` built `DialogToken::for_root(dest_dir)` and `ConfinedDest::open`
+  re-canonicalised that STRING on every file. The per-component no-follow parent walk pinned
+  components BELOW the root, but the ROOT itself was still re-resolved - a root swapped to a
+  symlink/junction between bind and a later open redirected decrypted bytes outside the
+  user-chosen directory. Fix: bind a STABLE root IDENTITY once at consume time via the new
+  `confine::ConfinedRoot::bind` (canonical path + on-disk identity: Unix `(st_dev, st_ino)`,
+  Windows `(dwVolumeSerialNumber, nFileIndex{High,Low})` from a no-follow
+  `BY_HANDLE_FILE_INFORMATION`; cfg-gated, `None` on unsupported targets falls back to the
+  canonical-path equality). The background job carries the `ConfinedRoot`, and
+  `ConfinedDest::open` re-verifies (`ConfinedRoot::verify`) the re-resolved root matches the
+  bound canonical path AND identity, REJECTING (`local.io_error`) before any handle/temp is
+  opened on a mismatch. `validate_restore_dest` still runs off `ConfinedRoot::token()` for
+  the structural dir-chain pre-step. Residual: the per-file open's parent walk already pins
+  components below the root no-follow (R2-P1-1); the new identity bind closes the
+  root-level analogue. Test (unix): `confined_open_rejects_root_swapped_to_symlink_after_bind`
+  (root swapped to a symlink-out-of-root AFTER bind is rejected, no bytes land outside the
+  originally-bound root); the Windows `RootIdentity` capture/verify path is exercised by the
+  existing Windows confine tests (they now bind a `ConfinedRoot`).
