@@ -1,0 +1,205 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="utf-8">
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <title>Driven - encrypted one-way backup to your own Google Drive</title>
+  <meta name="description" content="Driven is a desktop app for Windows, macOS, and Linux that makes one-way, encrypted backups of your local folders to your own Google Drive.">
+  <meta name="color-scheme" content="light dark">
+  <link rel="icon" type="image/svg+xml" href="icon.svg">
+  <link rel="stylesheet" href="styles.css">
+  <meta property="og:title" content="Driven">
+  <meta property="og:description" content="One-way, encrypted backup of your local folders to your own Google Drive.">
+  <meta property="og:type" content="website">
+</head>
+<body>
+  <a class="skip-link" href="#main">Skip to content</a>
+
+  <header class="site-header">
+    <div class="wrap header-inner">
+      <span class="brand">
+        <img class="brand-mark" src="icon.svg" width="36" height="36" alt="">
+        <span class="brand-name">Driven</span>
+      </span>
+      <nav class="header-nav" aria-label="Primary">
+        <a href="#features">Features</a>
+        <a href="#get-it">Get it</a>
+        <a href="#privacy">Privacy</a>
+        <a href="https://github.com/pmaxhogan/driven">GitHub</a>
+      </nav>
+    </div>
+  </header>
+
+  <main id="main">
+    <section class="hero">
+      <div class="wrap hero-inner">
+        <img class="hero-mark" src="icon.svg" width="128" height="128"
+             alt="Driven app icon: a road leading up into a cloud on a deep teal background">
+        <h1 class="hero-title">Driven</h1>
+        <p class="hero-tagline" id="tagline">
+          One-way, encrypted backup of your local folders to your own Google Drive.
+        </p>
+        <p class="hero-sub">
+          A fast, battery- and network-aware desktop app for Windows, macOS, and
+          Linux. Your source folders stay the single source of truth; Driven only
+          ever uploads, so there are no two-way sync surprises.
+        </p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="https://github.com/pmaxhogan/driven/releases">
+            Download
+          </a>
+          <a class="btn btn-secondary" href="https://github.com/pmaxhogan/driven">
+            View on GitHub
+          </a>
+        </div>
+        <p class="hero-note">
+          Free and open source. Dual-licensed MIT or Apache-2.0.
+        </p>
+      </div>
+    </section>
+
+    <section id="features" class="section" aria-labelledby="features-heading">
+      <div class="wrap">
+        <h2 id="features-heading" class="section-title">What Driven does</h2>
+        <ul class="feature-grid">
+          <li class="feature">
+            <h3>One-way to your own Drive</h3>
+            <p>
+              Backs up to a Google Drive you control. No second cloud bill, no
+              two-way sync surprises - local changes flow up, never back down.
+            </p>
+          </li>
+          <li class="feature">
+            <h3>Client-side encryption</h3>
+            <p>
+              Optional per-source encryption (XChaCha20-Poly1305) scrambles file
+              names and contents on your machine. A BIP39 recovery phrase guards
+              the master key, so Google stores only ciphertext.
+            </p>
+          </li>
+          <li class="feature">
+            <h3>Gitignore-aware scanner</h3>
+            <p>
+              Honors your <code>.gitignore</code>, built-in and custom exclude
+              rules, and a configurable symlink policy, so you back up what matters
+              and skip the noise.
+            </p>
+          </li>
+          <li class="feature">
+            <h3>Battery and network aware</h3>
+            <p>
+              Backups defer on battery and on metered or offline networks, then
+              resume automatically. A paced, concurrent executor retries and
+              resumes interrupted uploads.
+            </p>
+          </li>
+          <li class="feature">
+            <h3>Windows Volume Shadow Copy</h3>
+            <p>
+              VSS support backs up locked files - Outlook PSTs, running database
+              files, VM disks - that an ordinary copy cannot read.
+            </p>
+          </li>
+          <li class="feature">
+            <h3>In-app restore browser</h3>
+            <p>
+              Browse your backup with full-text file-name search and streaming
+              decrypt, then restore exactly the files you need.
+            </p>
+          </li>
+          <li class="feature">
+            <h3>Activity dashboard</h3>
+            <p>
+              A live tail plus a filterable history shows what was backed up, when,
+              and whether anything needs attention.
+            </p>
+          </li>
+          <li class="feature">
+            <h3>Signed auto-update</h3>
+            <p>
+              In-app auto-update with signed update manifests and a stable or dev
+              channel selector keeps you current. (See the macOS note below.)
+            </p>
+          </li>
+          <li class="feature">
+            <h3>Opt-out telemetry</h3>
+            <p>
+              Anonymous, opt-out telemetry records coarse counts only - never file
+              names, paths, or content.
+            </p>
+          </li>
+        </ul>
+      </div>
+    </section>
+
+    <section id="get-it" class="section section-alt" aria-labelledby="get-it-heading">
+      <div class="wrap">
+        <h2 id="get-it-heading" class="section-title">Get it</h2>
+        <p class="section-lead">
+          Download the installer for your platform from the
+          <a href="https://github.com/pmaxhogan/driven/releases">GitHub Releases page</a>.
+          Grab the latest release and pick the asset for your OS.
+        </p>
+        <ul class="platform-grid">
+          <li class="platform">
+            <h3>Windows</h3>
+            <p><code>.msi</code> or <code>.exe</code> (NSIS) installer.</p>
+          </li>
+          <li class="platform">
+            <h3>macOS</h3>
+            <p><code>.dmg</code>, universal (Apple Silicon and Intel).</p>
+          </li>
+          <li class="platform">
+            <h3>Linux</h3>
+            <p><code>.AppImage</code> (portable) or <code>.deb</code> (Debian / Ubuntu).</p>
+          </li>
+        </ul>
+        <p class="section-note">
+          V1 binaries are not yet code-signed with a paid OS certificate, so the
+          OS may warn you on first run. On Windows click "More info" then "Run
+          anyway"; on macOS right-click the app and choose "Open". The in-app
+          auto-updater works on Windows and Linux; on macOS, re-download the latest
+          <code>.dmg</code> to update until Developer ID signing lands.
+        </p>
+        <div class="cta-row">
+          <a class="btn btn-primary" href="https://github.com/pmaxhogan/driven/releases">
+            Go to Releases
+          </a>
+        </div>
+      </div>
+    </section>
+
+    <section id="privacy" class="section" aria-labelledby="privacy-heading">
+      <div class="wrap">
+        <h2 id="privacy-heading" class="section-title">Bring your own keys</h2>
+        <p class="section-lead">
+          Driven uses YOUR own Google OAuth client credentials and backs up to a
+          Google Drive YOU own - not a shared, app-wide cloud account. You stay in
+          control of your Google project, and there is no shared rate-limit or
+          verification bottleneck.
+        </p>
+        <p class="section-lead">
+          The OAuth flow uses PKCE on a loopback redirect, so your client secret
+          never leaves your machine, and refresh tokens are stored only in the OS
+          keychain. With per-source encryption enabled, your files are encrypted
+          locally before upload, so the data at rest in Drive is ciphertext only.
+        </p>
+      </div>
+    </section>
+  </main>
+
+  <footer class="site-footer">
+    <div class="wrap footer-inner">
+      <p class="footer-brand">
+        <img class="brand-mark" src="icon.svg" width="24" height="24" alt="">
+        Driven
+      </p>
+      <nav class="footer-nav" aria-label="Footer">
+        <a href="https://github.com/pmaxhogan/driven">GitHub</a>
+        <a href="https://github.com/pmaxhogan/driven/releases">Releases</a>
+        <a href="https://github.com/pmaxhogan/driven/blob/main/LICENSE">License (MIT or Apache-2.0)</a>
+      </nav>
+    </div>
+  </footer>
+</body>
+</html>
