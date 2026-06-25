@@ -374,6 +374,29 @@ pub struct GlobalSettings {
     pub io_priority: String,
     /// `tracing` log level.
     pub log_level: String,
+    /// V2 schedule window (DESIGN s17): when enabled, sync is gated to the
+    /// configured local-time window.
+    pub schedule: ScheduleSettings,
+}
+
+/// V2 schedule-window settings (DESIGN s17). Mirrors
+/// [`driven_core::types::ScheduleConfig`]; the times are local wall-clock
+/// minutes and `utc_offset_minutes` is `-new Date().getTimezoneOffset()`.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScheduleSettings {
+    /// When `false`, sync runs at any time (the default / V1 behaviour).
+    pub enabled: bool,
+    /// Minutes after local midnight the allowed window opens, `0..=1439`.
+    pub start_minute: u32,
+    /// Minutes after local midnight the allowed window closes, `0..=1439`.
+    /// `end < start` wraps past midnight; `end == start` allows the whole day.
+    pub end_minute: u32,
+    /// Seven booleans, `0 = Sunday ..= 6 = Saturday`, marking the local days
+    /// the window is active on.
+    pub days: Vec<bool>,
+    /// Minutes to add to UTC to reach local time (e.g. `-480` for PST).
+    pub utc_offset_minutes: i32,
 }
 
 /// SPEC s22 `telemetry` settings.
@@ -459,6 +482,8 @@ pub struct GlobalSettingsPatch {
     pub io_priority: Option<String>,
     /// See [`GlobalSettings::log_level`].
     pub log_level: Option<String>,
+    /// See [`GlobalSettings::schedule`]. Present = replace the whole schedule.
+    pub schedule: Option<ScheduleSettings>,
 }
 
 /// Partial SPEC s22 `telemetry` settings.

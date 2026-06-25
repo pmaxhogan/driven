@@ -37,6 +37,27 @@ const vssModes = ["auto", "always", "never"] as const;
 const bandwidthCapText = ref("");
 const concurrentUploadsText = ref("");
 
+// Schedule-window (DESIGN s17) local mirrors. Times are edited as "HH:MM"
+// strings (native <input type="time">); days[0]=Sunday..[6]=Saturday.
+const dayIndices = [0, 1, 2, 3, 4, 5, 6] as const;
+const scheduleEnabled = ref(false);
+const scheduleStart = ref("00:00");
+const scheduleEnd = ref("00:00");
+const scheduleDays = ref<boolean[]>([true, true, true, true, true, true, true]);
+
+function minutesToHHMM(min: number): string {
+  const m = ((Math.floor(min) % 1440) + 1440) % 1440;
+  const hh = String(Math.floor(m / 60)).padStart(2, "0");
+  const mm = String(m % 60).padStart(2, "0");
+  return `${hh}:${mm}`;
+}
+
+function hhmmToMinutes(value: string): number {
+  const [h, m] = value.split(":").map((n) => Number(n));
+  if (!Number.isFinite(h) || !Number.isFinite(m)) return 0;
+  return (((h * 60 + m) % 1440) + 1440) % 1440;
+}
+
 function go(route: string): void {
   void router.push(route);
 }
@@ -62,6 +83,17 @@ watch(
       s.global.bandwidthCapMbps === null ? "" : String(s.global.bandwidthCapMbps);
     concurrentUploadsText.value =
       s.global.defaultConcurrentUploads === null ? "" : String(s.global.defaultConcurrentUploads);
+    // Defensive: a partial global (e.g. an update_settings round-trip that
+    // echoes only the patched keys) may omit `schedule`; keep the prior local
+    // values rather than crash the watcher.
+    const sched = s.global.schedule;
+    if (sched) {
+      scheduleEnabled.value = sched.enabled;
+      scheduleStart.value = minutesToHHMM(sched.startMinute);
+      scheduleEnd.value = minutesToHHMM(sched.endMinute);
+      // Coerce to exactly seven booleans regardless of what was stored.
+      scheduleDays.value = dayIndices.map((i) => sched.days?.[i] ?? true);
+    }
   },
   { immediate: true }
 );
@@ -122,6 +154,34 @@ async function commitDeepVerifyInterval(event: Event): Promise<void> {
 async function setIoPriority(event: Event): Promise<void> {
   const value = (event.target as HTMLSelectElement).value;
   await settings.patch({ global: { ioPriority: value } });
+}
+
+// Persist the whole schedule window. The UTC offset is captured fresh from
+// this machine on every save (DESIGN s17 - driven-core stays tz-database-free
+// and reasons from a fixed offset). `getTimezoneOffset()` returns minutes to
+// SUBTRACT to reach UTC, so negate it to get "minutes to add to UTC".
+async function commitSchedule(): Promise<void> {
+  await settings.patch({
+    global: {
+      schedule: {
+        enabled: scheduleEnabled.value,
+        startMinute: hhmmToMinutes(scheduleStart.value),
+        endMinute: hhmmToMinutes(scheduleEnd.value),
+        days: [...scheduleDays.value],
+        utcOffsetMinutes: -new Date().getTimezoneOffset(),
+      },
+    },
+  });
+}
+
+async function setScheduleEnabled(event: Event): Promise<void> {
+  scheduleEnabled.value = (event.target as HTMLInputElement).checked;
+  await commitSchedule();
+}
+
+async function toggleScheduleDay(index: number): Promise<void> {
+  scheduleDays.value[index] = !scheduleDays.value[index];
+  await commitSchedule();
 }
 
 async function setVssMode(event: Event): Promise<void> {
@@ -197,6 +257,68 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
           />
           {{ t("settings.rules.skipOnMeteredLabel") }}
         </label>
+
+        <div class="space-y-2 border-t pt-4" data-testid="schedule-setting">
+          <label class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              data-testid="schedule-enabled"
+              :checked="scheduleEnabled"
+              @change="setScheduleEnabled"
+            />
+            {{ t("settings.rules.schedule.label") }}
+          </label>
+          <div v-if="scheduleEnabled" class="space-y-2 pl-6">
+            <div class="flex gap-3">
+              <label class="block space-y-1">
+                <span class="text-zinc-600 dark:text-zinc-400">{{
+                  t("settings.rules.schedule.startLabel")
+                }}</span>
+                <input
+                  v-model="scheduleStart"
+                  type="time"
+                  class="rounded border px-2 py-1"
+                  @change="commitSchedule"
+                />
+              </label>
+              <label class="block space-y-1">
+                <span class="text-zinc-600 dark:text-zinc-400">{{
+                  t("settings.rules.schedule.endLabel")
+                }}</span>
+                <input
+                  v-model="scheduleEnd"
+                  type="time"
+                  class="rounded border px-2 py-1"
+                  @change="commitSchedule"
+                />
+              </label>
+            </div>
+            <div class="space-y-1">
+              <span class="text-zinc-600 dark:text-zinc-400">{{
+                t("settings.rules.schedule.daysLabel")
+              }}</span>
+              <div class="flex gap-1">
+                <button
+                  v-for="i in dayIndices"
+                  :key="i"
+                  type="button"
+                  class="rounded border px-2 py-1 text-xs"
+                  :class="
+                    scheduleDays[i]
+                      ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
+                      : 'text-zinc-500'
+                  "
+                  @click="toggleScheduleDay(i)"
+                >
+                  {{ t(`settings.rules.schedule.day.${i}`) }}
+                </button>
+              </div>
+            </div>
+            <p class="text-xs text-zinc-500">
+              {{ t("settings.rules.schedule.note") }}
+            </p>
+          </div>
+        </div>
 
         <label class="block space-y-1">
           <span class="text-zinc-600 dark:text-zinc-400">{{

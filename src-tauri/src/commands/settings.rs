@@ -39,8 +39,8 @@ use driven_vss::VssMode;
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    GlobalSettings, ReleaseDto, SettingsDto, SettingsPatch, TelemetrySettings, UiSettings,
-    UpdateInfo, UpdaterSettings, WindowsSettings,
+    GlobalSettings, ReleaseDto, ScheduleSettings, SettingsDto, SettingsPatch, TelemetrySettings,
+    UiSettings, UpdateInfo, UpdaterSettings, WindowsSettings,
 };
 use crate::commands::{
     atomic_write, validate_writable_dest, CommandError, CommandResult, DialogToken,
@@ -260,6 +260,14 @@ pub async fn update_settings(
                 new_log_level = Some(v.clone());
             }
             cur.log_level = v;
+        }
+        if let Some(v) = g.schedule {
+            // Schedule window (DESIGN s17): bounds are local minutes 0..=1439
+            // (an end of 0 means midnight, which wraps a same-evening start).
+            check_range("schedule.start_minute", v.start_minute, 0, 1439)?;
+            check_range("schedule.end_minute", v.end_minute, 0, 1439)?;
+            cur.schedule = v;
+            orchestrator_affecting = true;
         }
         store_group(repo, KEY_GLOBAL, &storage::Global::from(cur)).await?;
     }
@@ -504,8 +512,56 @@ mod storage {
     use serde::{Deserialize, Serialize};
 
     use crate::commands::dtos::{
-        GlobalSettings, TelemetrySettings, UiSettings, UpdaterSettings, WindowsSettings,
+        GlobalSettings, ScheduleSettings, TelemetrySettings, UiSettings, UpdaterSettings,
+        WindowsSettings,
     };
+
+    /// `snake_case` on-disk form of the V2 schedule window (DESIGN s17).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Schedule {
+        pub enabled: bool,
+        pub start_minute: u32,
+        pub end_minute: u32,
+        pub days: Vec<bool>,
+        pub utc_offset_minutes: i32,
+    }
+
+    impl Default for Schedule {
+        fn default() -> Self {
+            // Disabled, all-day/every-day (matches `default_schedule`).
+            Schedule {
+                enabled: false,
+                start_minute: 0,
+                end_minute: 0,
+                days: vec![true; 7],
+                utc_offset_minutes: 0,
+            }
+        }
+    }
+
+    impl From<Schedule> for ScheduleSettings {
+        fn from(s: Schedule) -> Self {
+            ScheduleSettings {
+                enabled: s.enabled,
+                start_minute: s.start_minute,
+                end_minute: s.end_minute,
+                days: s.days,
+                utc_offset_minutes: s.utc_offset_minutes,
+            }
+        }
+    }
+
+    impl From<ScheduleSettings> for Schedule {
+        fn from(d: ScheduleSettings) -> Self {
+            Schedule {
+                enabled: d.enabled,
+                start_minute: d.start_minute,
+                end_minute: d.end_minute,
+                days: d.days,
+                utc_offset_minutes: d.utc_offset_minutes,
+            }
+        }
+    }
 
     /// `snake_case` on-disk form of the SPEC s22 `global` group.
     #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -519,6 +575,11 @@ mod storage {
         pub deep_verify_interval_secs: u32,
         pub io_priority: String,
         pub log_level: String,
+        // Added in V2 (schedule windows). `serde(default)` so a `global` blob
+        // persisted before this field still deserialises (the disabled
+        // default = V1 behaviour).
+        #[serde(default)]
+        pub schedule: Schedule,
     }
 
     impl From<Global> for GlobalSettings {
@@ -533,6 +594,7 @@ mod storage {
                 deep_verify_interval_secs: s.deep_verify_interval_secs,
                 io_priority: s.io_priority,
                 log_level: s.log_level,
+                schedule: s.schedule.into(),
             }
         }
     }
@@ -549,6 +611,7 @@ mod storage {
                 deep_verify_interval_secs: d.deep_verify_interval_secs,
                 io_priority: d.io_priority,
                 log_level: d.log_level,
+                schedule: d.schedule.into(),
             }
         }
     }
@@ -761,7 +824,28 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
         bandwidth_cap_mbps: global.bandwidth_cap_mbps,
         pacer_ceilings: defaults.pacer_ceilings,
         vss_mode,
+        schedule: schedule_settings_to_config(&global.schedule),
     })
+}
+
+/// Map the persisted [`ScheduleSettings`] DTO onto the core
+/// [`ScheduleConfig`], clamping defensively: minutes saturate into
+/// `0..=1439` and `days` is coerced to exactly seven booleans (missing days
+/// default to allowed) so a malformed stored blob can never panic the gate.
+fn schedule_settings_to_config(s: &ScheduleSettings) -> driven_core::types::ScheduleConfig {
+    let mut days = [true; 7];
+    for (i, slot) in days.iter_mut().enumerate() {
+        if let Some(d) = s.days.get(i) {
+            *slot = *d;
+        }
+    }
+    driven_core::types::ScheduleConfig {
+        enabled: s.enabled,
+        start_minute: s.start_minute.min(1439) as u16,
+        end_minute: s.end_minute.min(1439) as u16,
+        days,
+        utc_offset_minutes: s.utc_offset_minutes.clamp(-1440, 1440) as i16,
+    }
 }
 
 // ---------------------------------------------------------------------------
@@ -1890,6 +1974,20 @@ fn default_global() -> GlobalSettings {
         deep_verify_interval_secs: 604_800,
         io_priority: "low".to_string(),
         log_level: "info".to_string(),
+        schedule: default_schedule(),
+    }
+}
+
+/// The disabled schedule (V1 behaviour: sync at any time). All seven days are
+/// pre-checked so a user who only flips `enabled` gets a sane "all day, every
+/// day" window to narrow.
+fn default_schedule() -> ScheduleSettings {
+    ScheduleSettings {
+        enabled: false,
+        start_minute: 0,
+        end_minute: 0,
+        days: vec![true; 7],
+        utc_offset_minutes: 0,
     }
 }
 
