@@ -206,7 +206,9 @@ pub async fn search_files(
             source_id: h.source_id.to_string(),
             relative_path: h.relative_path.as_str().to_string(),
             status: file_state_status_str(h.status).to_string(),
-            restorable: h.drive_file_id.is_some(),
+            // M9c D2: ONE shared predicate (status==Synced AND has a Drive id), so
+            // the search surface never marks restorable a row resolution rejects.
+            restorable: is_restorable(h.status, h.drive_file_id.as_deref()),
         })
         .collect();
 
@@ -449,16 +451,21 @@ async fn resolve_restore_items(
                     format!("unknown file to restore: {}", item.relative_path),
                 )
             })?;
-        if row.drive_file_id.is_none() {
-            return Err(CommandError::with_code(
-                ErrorCode::InvalidInput,
-                format!(
-                    "file is not restorable (never uploaded): {}",
-                    item.relative_path
-                ),
-            ));
-        }
-        if row.status != driven_core::types::FileStateStatus::Synced {
+        // M9c D2 (M8 R4-P2-1): gate resolution on the SAME `is_restorable`
+        // predicate the tree/search DTOs use, so the UI never offers a row that is
+        // rejected here. The granular branches below only choose the precise
+        // bad-input MESSAGE (never-uploaded vs non-synced); the eligibility
+        // DECISION is the single shared predicate.
+        if !is_restorable(row.status, row.drive_file_id.as_deref()) {
+            if row.drive_file_id.is_none() {
+                return Err(CommandError::with_code(
+                    ErrorCode::InvalidInput,
+                    format!(
+                        "file is not restorable (never uploaded): {}",
+                        item.relative_path
+                    ),
+                ));
+            }
             return Err(CommandError::with_code(
                 ErrorCode::InvalidInput,
                 format!(
@@ -1439,7 +1446,8 @@ fn immediate_children_to_entries(
             is_dir: false,
             size: row.size,
             status: Some(file_state_status_str(row.status).to_string()),
-            restorable: row.drive_file_id.is_some(),
+            // M9c D2: ONE shared predicate (status==Synced AND has a Drive id).
+            restorable: is_restorable(row.status, row.drive_file_id.as_deref()),
         });
     }
     out
@@ -1518,10 +1526,26 @@ fn derive_immediate_children(prefix: &str, rows: &[RestoreFileRow]) -> Vec<Remot
             is_dir: false,
             size: row.size,
             status: Some(file_state_status_str(row.status).to_string()),
-            restorable: row.drive_file_id.is_some(),
+            // M9c D2: same shared predicate the production path uses.
+            restorable: is_restorable(row.status, row.drive_file_id.as_deref()),
         });
     }
     out
+}
+
+/// M9c D2 (M8 R4-P2-1): the ONE shared restore-eligibility predicate. A backed-up
+/// file is restorable iff it has a Drive object id AND its status is `Synced`.
+///
+/// Both the tree/search DTO `restorable` flag AND restore resolution
+/// ([`resolve_restore_items`]) go through this SAME predicate, so the UI can never
+/// offer a row that resolution would then reject. Before this fix the DTOs marked
+/// a row restorable on `drive_file_id.is_some()` ALONE, but resolution also
+/// requires `status == Synced` (R3-P2-2: a changed/pending/error row's recorded
+/// `hash_blake3` may not match the bytes currently on Drive), so a stale-status
+/// row LOOKED selectable then failed only at restore start. Folding both checks
+/// into one function keeps the two surfaces in lockstep.
+fn is_restorable(status: driven_core::types::FileStateStatus, drive_file_id: Option<&str>) -> bool {
+    drive_file_id.is_some() && status == driven_core::types::FileStateStatus::Synced
 }
 
 /// The serialized (snake_case) discriminant of a [`FileStateStatus`], matching the
@@ -1568,38 +1592,71 @@ fn file_state_status_str(status: driven_core::types::FileStateStatus) -> &'stati
 /// ABORT that drops the future - R2-P2-2), [`Drop`] best-effort removes the temp so
 /// no partial / out-of-root file is left behind.
 ///
+/// M9c D1 (M8 R4-P1-1) - verify->rename TOCTOU on the TEMP itself: the guard now
+/// RETAINS the temp file's OWN handle from create through commit. The streamer
+/// writes + BLAKE3-verifies through a DUPLICATE of that handle (returned by
+/// `open`); the original stays owned by the guard. So the rename acts on the SAME
+/// verified file object, NOT on a re-resolution of the temp pathname:
+/// - Windows: `SetFileInformationByHandle(FileRenameInfo)` on the RETAINED temp
+///   handle (opened with `DELETE` access). A local process that unlinks/replaces
+///   `.driven-restore-tmp.<uuid>` after verification cannot affect the rename - the
+///   handle still names the original object; the substitute is a different object.
+/// - Unix: before `renameat` the guard fstat's the RETAINED temp fd and fstatat's
+///   the temp NAME in the pinned parent; the rename proceeds ONLY if `(st_dev,
+///   st_ino)` match (the name still points at the verified file object). A swap is
+///   detected and the commit FAILS (`crypto.decrypt_failed`-class IO error) rather
+///   than renaming attacker bytes into place - no silent corruption.
+///
 /// Residual gaps (documented in `design/CODEX_NOTES.md`): on Windows the temp is
 /// created by full path then immediately rechecked in-root, so an empty (zero
 /// plaintext) temp can momentarily exist out-of-root if a junction is swapped in
 /// at exactly the create instant - it is detected and deleted before byte one, so
-/// NO plaintext ever leaves root; and `FILE_RENAME_INFO` has no WRITE_THROUGH (the
-/// file DATA is already `sync_all`'d; only the rename metadata is not flush-forced).
+/// NO plaintext ever leaves root; `FILE_RENAME_INFO` has no WRITE_THROUGH (the file
+/// DATA is already `sync_all`'d; only the rename metadata is not flush-forced); and
+/// the Windows rename DESTINATION is still derived from the pinned parent handle's
+/// resolved path (the handle-relative `RootDirectory` form is NT-API-only), so the
+/// parent-pin - not a dest-string - is what confines the target directory.
 mod confine {
     use super::{map_io_err, ErrorCode, TARGET};
     use driven_core::types::RelativePath;
 
     use crate::commands::DialogToken;
 
-    /// A restore destination confined to a pinned parent directory handle.
+    /// A restore destination confined to a pinned parent directory handle, holding
+    /// the VERIFIED temp file's own OS handle through commit (M9c D1).
     pub(super) struct ConfinedDest {
         /// The leaf file name to rename the temp to on commit.
         leaf: std::ffi::OsString,
         /// The temp's basename (relative to the pinned parent), used by the Unix
-        /// handle-relative `renameat` / `unlinkat`. (On Windows the rename + cleanup
-        /// go by `temp_path`, so this is Unix-only to avoid a dead-field warning.)
+        /// handle-relative `renameat` / `unlinkat` / identity recheck. (On Windows
+        /// the cleanup is by `temp_path`, so this is Unix-only.)
         #[cfg(unix)]
         temp_name: std::ffi::OsString,
         /// Whether the temp still needs removal on drop (true until commit succeeds
         /// or the temp create itself failed).
         armed: bool,
-        /// The full temp path - retained for the Drop-based best-effort cleanup (and
-        /// on Windows for re-opening the temp handle to rename it).
+        /// The full temp path - retained for the Drop-based best-effort cleanup.
         temp_path: std::path::PathBuf,
         /// Platform parent-directory handle the create + rename are relative to.
         #[cfg(unix)]
         parent: std::os::fd::OwnedFd,
         #[cfg(windows)]
         parent: std::os::windows::io::OwnedHandle,
+        /// M9c D1 (M8 R4-P1-1): the temp file's OWN handle, RETAINED from create
+        /// through commit so the rename acts on the SAME, BLAKE3-VERIFIED object -
+        /// NOT a re-resolution of the temp pathname after verification. The streamer
+        /// writes + verifies through a DUPLICATE of this handle (returned by `open`);
+        /// keeping the original here means a local process that unlinks/replaces the
+        /// temp file at its path AFTER verification cannot make commit rename the
+        /// attacker's substitute (the retained handle still refers to the original
+        /// inode / file object). On Windows the rename is `SetFileInformationByHandle
+        /// (FileRenameInfo)` on THIS handle (needs the DELETE access it was opened
+        /// with); on Unix it is `renameat` guarded by an fstat/fstatat identity
+        /// recheck of the temp name against this fd (a swap is detected + refused).
+        #[cfg(unix)]
+        temp_handle: std::os::fd::OwnedFd,
+        #[cfg(windows)]
+        temp_handle: std::os::windows::io::OwnedHandle,
     }
 
     impl ConfinedDest {
@@ -1607,7 +1664,9 @@ mod confine {
         /// root: pin the parent chain with no-follow handles and create the temp
         /// relative to the final parent handle. Returns the guard plus the OPEN temp
         /// file to stream into (so the caller owns the file directly - no
-        /// take-once/Option/panic).
+        /// take-once/Option/panic). M9c D1: the returned file is a DUPLICATE of the
+        /// temp handle the guard RETAINS, so the streamer's write/verify and the
+        /// guard's commit-rename act on the SAME file object.
         pub(super) fn open(
             dialog_token: &DialogToken,
             relative_path: &str,
@@ -1625,15 +1684,15 @@ mod confine {
             platform::open_confined(&canon_root, dir_segments, leaf)
         }
 
-        /// Commit: rename the temp to the leaf RELATIVE to the pinned parent handle
-        /// (atomic replace over an existing dest). Defuses the Drop cleanup on
-        /// success. R2-P1-1: the rename is handle-relative, so a concurrent parent
-        /// swap cannot redirect it out of root.
+        /// Commit: rename the temp to the leaf via the RETAINED, VERIFIED temp
+        /// handle (M9c D1) - never by re-resolving the temp pathname after
+        /// verification. Atomic replace over an existing dest. Defuses the Drop
+        /// cleanup on success. R2-P1-1: the rename remains parent-pinned, so a
+        /// concurrent parent swap cannot redirect it out of root; M9c D1: it also
+        /// acts on the same file object the streamer verified, so a temp swap
+        /// between verify and rename cannot smuggle unverified bytes into the final
+        /// file (a detected swap fails the commit - no silent corruption).
         pub(super) async fn commit(&mut self) -> Result<(), ErrorCode> {
-            // Drop the writer's std::fs::File clone (already taken by the streamer
-            // and dropped by now) is not our concern here; the temp's OS handle was
-            // closed when the streamer's tokio File was dropped. We rename by the
-            // pinned parent handle + names.
             let result = platform::commit_rename(self);
             if result.is_ok() {
                 self.armed = false;
@@ -1678,6 +1737,11 @@ mod confine {
         /// Walk `dir_segments` from `canon_root` opening each with
         /// `O_NOFOLLOW | O_DIRECTORY` (a symlink component fails the open), then
         /// `openat` the temp `O_WRONLY|O_CREAT|O_EXCL|O_NOFOLLOW|O_CLOEXEC`.
+        ///
+        /// M9c D1: the temp fd is opened ONCE and RETAINED on the guard; the
+        /// streamer receives a `try_clone` DUP to write through. So commit's
+        /// identity recheck + renameat operate on the SAME object the streamer
+        /// verified.
         pub(super) fn open_confined(
             canon_root: &Path,
             dir_segments: &[&str],
@@ -1714,7 +1778,13 @@ mod confine {
                 Mode::from_bits_truncate(0o600),
             )
             .map_err(|e| map_io_err(e.into()))?;
-            let temp_file = std::fs::File::from(temp_fd);
+            // M9c D1: DUP the temp fd for the streamer; the guard RETAINS the
+            // original `temp_fd` through commit. The dup shares the file
+            // description (writes through it are writes to the same object); both
+            // refer to the SAME inode, which is what the commit identity recheck
+            // pins to.
+            let streamer_fd = temp_fd.try_clone().map_err(map_io_err)?;
+            let temp_file = std::fs::File::from(streamer_fd);
 
             // The temp path is informational only (cleanup is handle-relative).
             let mut temp_path = canon_root.to_path_buf();
@@ -1730,6 +1800,7 @@ mod confine {
                     armed: true,
                     temp_path,
                     parent,
+                    temp_handle: temp_fd,
                 },
                 temp_file,
             ))
@@ -1737,9 +1808,43 @@ mod confine {
 
         /// Rename the temp to the leaf RELATIVE to the pinned parent fd. `renameat`
         /// atomically replaces an existing dest on Unix.
+        ///
+        /// M9c D1 (M8 R4-P1-1): BEFORE the rename, prove the temp NAME in the
+        /// pinned parent still refers to the SAME file object as the RETAINED,
+        /// VERIFIED temp fd - by comparing `(st_dev, st_ino)` of `fstat(temp_fd)`
+        /// against `fstatat(parent, temp_name, NOFOLLOW)`. If a local process
+        /// unlinked/replaced the temp between the BLAKE3 verify and now, the name
+        /// resolves to a DIFFERENT object (or to nothing); we REFUSE the commit
+        /// rather than rename attacker-controlled bytes into the final file (no
+        /// silent restore corruption). Only on a confirmed identity match do we
+        /// `renameat` the verified object into place.
         pub(super) fn commit_rename(c: &ConfinedDest) -> Result<(), ErrorCode> {
             let from = c.temp_name.to_string_lossy().to_string();
             let to = c.leaf.to_string_lossy().to_string();
+
+            // Identity of the VERIFIED handle.
+            let handle_stat =
+                rustix::fs::fstat(c.temp_handle.as_fd()).map_err(|e| map_io_err(e.into()))?;
+            // Identity of whatever the temp NAME currently points at (no-follow, so
+            // a symlink swapped in is not chased).
+            let name_stat = rustix::fs::statat(
+                c.parent.as_fd(),
+                from.as_str(),
+                rustix::fs::AtFlags::SYMLINK_NOFOLLOW,
+            )
+            .map_err(|e| map_io_err(e.into()))?;
+            if handle_stat.st_dev != name_stat.st_dev || handle_stat.st_ino != name_stat.st_ino {
+                // The temp name no longer refers to the verified object: a swap
+                // happened in the verify->rename window. Refuse (the Drop guard
+                // best-effort unlinks whatever now sits at the temp name).
+                tracing::warn!(
+                    target: super::super::TARGET,
+                    temp = %c.temp_path.display(),
+                    "restore temp identity changed between verify and rename; refusing commit (D1)"
+                );
+                return Err(ErrorCode::LocalIoError);
+            }
+
             rustix::fs::renameat(
                 c.parent.as_fd(),
                 from.as_str(),
@@ -1913,7 +2018,15 @@ mod confine {
                 let _ = std::fs::remove_file(&temp_path);
                 return Err(ErrorCode::LocalIoError);
             }
-            let temp_file = std::fs::File::from(temp_handle);
+            // M9c D1 (M8 R4-P1-1): DUP the temp handle for the streamer; the guard
+            // RETAINS the original `temp_handle` (opened with DELETE access) through
+            // commit. `try_clone` preserves access rights, so the dup can write and
+            // the retained handle can still `SetFileInformationByHandle(FileRenameInfo)`.
+            // Both refer to the SAME file object, so commit renames the EXACT object
+            // the streamer verified - a temp swap at the path after verification
+            // cannot redirect the rename.
+            let streamer_handle = temp_handle.try_clone().map_err(|_| map_last_error())?;
+            let temp_file = std::fs::File::from(streamer_handle);
 
             Ok((
                 ConfinedDest {
@@ -1921,6 +2034,7 @@ mod confine {
                     armed: true,
                     temp_path,
                     parent,
+                    temp_handle,
                 },
                 temp_file,
             ))
@@ -1943,37 +2057,19 @@ mod confine {
         ///   own pinned identity (it always does) and, defensively, re-derive +
         ///   recheck it is the same volume path we verified at open.
         ///
-        /// The temp is re-opened (DELETE access) and renamed to
-        /// `<resolved_parent>\\<leaf>` with `ReplaceIfExists` (atomic replace).
+        /// M9c D1 (M8 R4-P1-1): the rename is performed on the RETAINED, VERIFIED
+        /// temp handle (opened with DELETE at create, kept on the guard) - NOT a
+        /// re-open of `temp_path`. So a local process that unlinks/replaces the temp
+        /// at its path after the BLAKE3 verify cannot make this rename move the
+        /// attacker's substitute: `SetFileInformationByHandle` acts on the file
+        /// OBJECT the handle names (the original, verified inode), regardless of
+        /// what the temp NAME points at now. `ReplaceIfExists` gives the atomic
+        /// replace over an existing dest (R1-P2-2).
         pub(super) fn commit_rename(c: &ConfinedDest) -> Result<(), ErrorCode> {
             // Derive the dest from the PINNED parent handle's resolved real path
             // (TOCTOU-safe: this resolves the pinned inode, not a re-walked string).
             let resolved_parent = final_path_of(&c.parent)?;
             let full_dest = resolved_parent.join(&c.leaf);
-
-            // Re-open the temp with DELETE access. We re-open by full path because
-            // the streamer dropped the original temp handle; the temp lives under
-            // the pinned (verified) parent and is unpredictably named, so this
-            // re-open cannot be redirected by an attacker (a swapped parent would
-            // not contain our random temp name).
-            let twide = to_wide(&c.temp_path);
-            // SAFETY: twide is a valid NUL-terminated wide string outliving the call.
-            let traw = unsafe {
-                CreateFileW(
-                    twide.as_ptr(),
-                    DELETE | FILE_GENERIC_WRITE,
-                    FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE,
-                    std::ptr::null(),
-                    OPEN_EXISTING,
-                    FILE_FLAG_OPEN_REPARSE_POINT,
-                    std::ptr::null_mut::<core::ffi::c_void>() as HANDLE,
-                )
-            };
-            if traw == INVALID_HANDLE_VALUE || traw.is_null() {
-                return Err(map_last_error());
-            }
-            // SAFETY: traw is a valid owned handle from a successful CreateFileW.
-            let temp_handle = unsafe { OwnedHandle::from_raw_handle(traw as *mut _) };
 
             // Build an 8-byte-ALIGNED FILE_RENAME_INFO (a `Vec<u64>` backing, since
             // the struct holds a HANDLE and must be 8-aligned) with NULL
@@ -1995,11 +2091,12 @@ mod confine {
                 let dst = std::ptr::addr_of_mut!((*info).FileName) as *mut u16;
                 std::ptr::copy_nonoverlapping(name_wide.as_ptr(), dst, name_wide.len());
             }
-            // SAFETY: temp_handle valid; info is a well-formed, aligned
-            // FILE_RENAME_INFO of `total` bytes.
+            // M9c D1: rename the RETAINED verified temp handle (NOT a re-open).
+            // SAFETY: c.temp_handle is a valid owned handle (DELETE access); info is
+            // a well-formed, aligned FILE_RENAME_INFO of `total` bytes.
             let ok = unsafe {
                 SetFileInformationByHandle(
-                    temp_handle.as_raw_handle() as HANDLE,
+                    c.temp_handle.as_raw_handle() as HANDLE,
                     FileRenameInfo,
                     info as *const core::ffi::c_void,
                     total as u32,
@@ -2084,6 +2181,98 @@ mod tests {
             !nodes[0].restorable,
             "a file with no drive id is not restorable"
         );
+    }
+
+    // --- M9c D2: ONE shared restore-eligibility predicate ---------------------
+
+    #[test]
+    fn is_restorable_requires_synced_status_and_a_drive_id() {
+        use FileStateStatus as S;
+        // Eligible: synced + has a drive id.
+        assert!(is_restorable(S::Synced, Some("d1")));
+        // Ineligible: synced but never uploaded (no drive id).
+        assert!(!is_restorable(S::Synced, None));
+        // Ineligible: has a drive id but a non-synced status (its recorded hash may
+        // not match the bytes on Drive). EVERY non-synced status is rejected.
+        for st in [
+            S::Pending,
+            S::Corrupt,
+            S::Locked,
+            S::Error,
+            S::ExcludedOrphan,
+        ] {
+            assert!(
+                !is_restorable(st, Some("d1")),
+                "a {st:?} row must NOT be restorable even with a drive id"
+            );
+        }
+    }
+
+    #[test]
+    fn tree_dto_marks_non_synced_row_not_restorable() {
+        // M9c D2: the tree DTO mapper uses the shared predicate, so a row with a
+        // Drive id but a NON-SYNCED status is NOT offered as restorable - matching
+        // what resolution would do (so the UI never offers a row that then fails).
+        let mut r = row("changed.bin", 7, Some("d-old"));
+        r.status = FileStateStatus::Error;
+        let children = driven_core::state::ImmediateTreeChildren {
+            folders: Vec::new(),
+            files: vec![r],
+            truncated: false,
+        };
+        let entries = immediate_children_to_entries("", &children);
+        assert_eq!(entries.len(), 1);
+        assert!(
+            !entries[0].restorable,
+            "a non-synced row (even with a drive id) must not be marked restorable in the tree DTO"
+        );
+    }
+
+    #[tokio::test]
+    async fn resolve_and_dto_agree_on_eligibility_via_one_predicate() {
+        // M9c D2: the SAME `is_restorable` predicate gates BOTH the DTO `restorable`
+        // flag and restore resolution. A row that the DTO marks NOT restorable
+        // (uploaded but status=Error) must ALSO be rejected at resolution - they
+        // can never disagree.
+        let (state, src, dir) = state_with_source().await;
+        state
+            .state()
+            .upsert_file_state(&file_state_row(
+                src,
+                "stale.txt",
+                Some("d-1"),
+                FileStateStatus::Error,
+            ))
+            .await
+            .unwrap();
+        // DTO side: not restorable.
+        let r = RestoreFileRow {
+            source_id: src,
+            relative_path: driven_core::types::RelativePath::try_from("stale.txt".to_string())
+                .unwrap(),
+            size: 3,
+            status: FileStateStatus::Error,
+            drive_file_id: Some("d-1".to_string()),
+        };
+        let children = driven_core::state::ImmediateTreeChildren {
+            folders: Vec::new(),
+            files: vec![r],
+            truncated: false,
+        };
+        assert!(
+            !immediate_children_to_entries("", &children)[0].restorable,
+            "DTO marks the stale row not restorable"
+        );
+        // Resolution side: the identical predicate rejects it as bad input.
+        let items = vec![RestoreItem {
+            source_id: src.to_string(),
+            relative_path: "stale.txt".to_string(),
+        }];
+        let err = resolve_restore_items(&state, &items)
+            .await
+            .expect_err("the same predicate must reject the stale row at resolution");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[test]
@@ -2492,6 +2681,144 @@ mod tests {
         assert!(
             temps.is_empty(),
             "no temp must remain after commit: {temps:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- M9c D1 (M8 R4-P1-1): verify->rename TOCTOU on the temp itself ---------
+
+    #[tokio::test]
+    async fn confined_commit_uses_retained_handle_after_streamer_drops_its_dup() {
+        // M9c D1: the streamer writes through a DUP of the temp handle and drops it
+        // after verifying; the guard RETAINS the original handle and commit renames
+        // THAT. So after the streamer's file is fully dropped, commit still places
+        // exactly the bytes that were written + verified - it never re-reads the
+        // temp pathname to find the object to rename.
+        let dir = rand_tmp("d1-retained-handle");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        validate_restore_dest(&token, "out.bin").expect("validate dest");
+        let (mut confined, mut temp) =
+            confine::ConfinedDest::open(&token, "out.bin").expect("open confined dest");
+        {
+            use std::io::Write as _;
+            temp.write_all(b"VERIFIED-BYTES").unwrap();
+            temp.sync_all().unwrap();
+        }
+        // Drop the streamer's dup (mirrors stream_to_disk dropping its tokio File
+        // after the BLAKE3 verify). The guard's retained handle is still open.
+        drop(temp);
+        confined
+            .commit()
+            .await
+            .expect("commit via the retained handle");
+        drop(confined);
+        assert_eq!(
+            std::fs::read(dir.join("out.bin")).unwrap(),
+            b"VERIFIED-BYTES",
+            "the committed file must hold exactly the verified bytes"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn confined_commit_rejects_temp_swapped_after_verification() {
+        // M9c D1 (THE discriminating data-safety test): a local process unlinks the
+        // verified temp and drops an ATTACKER file at the SAME temp name AFTER the
+        // streamer wrote + verified the good bytes and dropped its handle, but
+        // BEFORE commit. The commit must DETECT the swap (the temp name no longer
+        // names the verified object) and FAIL - the final file must NEVER hold the
+        // attacker's unverified bytes (no silent restore corruption).
+        let dir = rand_tmp("d1-swap");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        validate_restore_dest(&token, "secret.bin").expect("validate dest");
+        let (mut confined, mut temp) =
+            confine::ConfinedDest::open(&token, "secret.bin").expect("open confined dest");
+        {
+            use std::io::Write as _;
+            temp.write_all(b"GOOD-VERIFIED").unwrap();
+            temp.sync_all().unwrap();
+        }
+        drop(temp); // streamer drops its dup after verify; the guard keeps its handle.
+
+        // Find the temp by its well-known prefix and SWAP it: unlink the verified
+        // temp, then create a brand-new file (different inode) at the same name with
+        // attacker bytes.
+        let temp_entry = std::fs::read_dir(&dir)
+            .unwrap()
+            .filter_map(Result::ok)
+            .find(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".driven-restore-tmp.")
+            })
+            .expect("the temp file must exist before the swap");
+        let temp_p = temp_entry.path();
+        std::fs::remove_file(&temp_p).unwrap();
+        std::fs::write(&temp_p, b"EVIL-UNVERIFIED-BYTES").unwrap();
+
+        // Commit must REFUSE: the temp name now points at a different object than
+        // the retained, verified handle.
+        let err = confined
+            .commit()
+            .await
+            .expect_err("a temp swapped after verification must fail the commit");
+        assert_eq!(err, ErrorCode::LocalIoError);
+        drop(confined);
+
+        // THE invariant: the final file is NOT the attacker's bytes (it was never
+        // created, or - if some path created it - it must not be the EVIL content).
+        let final_p = dir.join("secret.bin");
+        if let Ok(bytes) = std::fs::read(&final_p) {
+            assert_ne!(
+                bytes, b"EVIL-UNVERIFIED-BYTES",
+                "the committed file must NEVER hold the attacker's unverified bytes (D1)"
+            );
+        }
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn restore_one_file_committed_bytes_equal_verified_bytes() {
+        // M9c D1 end-to-end: a full restore_one_file run downloads, streams,
+        // verifies the BLAKE3, and commits via the retained handle. The committed
+        // file must equal exactly the verified plaintext (the round-trip the D1 fix
+        // protects). Uses the InMemoryRemoteStore so the real path runs.
+        use driven_drive::remote_store::UploadBody;
+        let dir = rand_tmp("d1-e2e");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let plaintext = b"the exact bytes that must land".to_vec();
+        let store = driven_drive::fake::InMemoryRemoteStore::new();
+        let parent = store.root_id().to_string();
+        let entry = store
+            .create(
+                &parent,
+                "f.bin",
+                "application/octet-stream",
+                UploadBody::Bytes(bytes::Bytes::from(plaintext.clone())),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let mut file = resolved_for(&plaintext, "nested/f.bin");
+        file.drive_file_id = Some(entry.id.clone());
+        let outcome = restore_one_file(
+            &file,
+            &store,
+            &SuiteVerdict::Plaintext,
+            &token,
+            &no_cancel(),
+            |_| {},
+        )
+        .await;
+        assert!(matches!(outcome, FileOutcome::Done), "restore must succeed");
+        assert_eq!(
+            std::fs::read(dir.join("nested").join("f.bin")).unwrap(),
+            plaintext,
+            "the committed file must equal the verified plaintext exactly (D1)"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
