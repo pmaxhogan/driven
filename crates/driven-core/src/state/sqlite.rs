@@ -1975,15 +1975,17 @@ impl StateRepo for SqliteStateRepo {
         .fetch_one(&self.pool)
         .await?;
 
-        // deep-verify passes that completed in the window, from the per-source
-        // `last_deep_verify_at` metadata on `backup_sources`.
+        // deep-verify passes that completed in the window (R3-P2-1): COUNT the
+        // durable `deep_verify_done` activity rows the orchestrator writes at each
+        // deep-verify completion - NOT sources whose single `last_deep_verify_at`
+        // metadata timestamp is in-window. Counting rows means two deep verifies
+        // for the SAME source inside 24h count as 2 (the cadence min is 1h), where
+        // the old per-source metadata count collapsed them to 1 (undercount).
         let deep_verify_row = sqlx::query!(
             r#"
             SELECT COUNT(*) AS "n!: i64"
-            FROM backup_sources
-            WHERE last_deep_verify_at IS NOT NULL
-              AND last_deep_verify_at >= ?1
-              AND last_deep_verify_at <= ?2
+            FROM activity_log
+            WHERE ts >= ?1 AND ts <= ?2 AND event_type = 'deep_verify_done'
             "#,
             since_ms,
             now_ms,
@@ -2173,6 +2175,49 @@ impl StateRepo for SqliteStateRepo {
         )
         .execute(&self.pool)
         .await?;
+        Ok(())
+    }
+
+    async fn patch_setting_field(&self, key: &str, field: &str, value: &Value) -> Result<()> {
+        // M9b R3-P1-1: ATOMIC, field-level patch via SQLite `json_set` in ONE
+        // UPDATE so concurrent patches of DIFFERENT fields COMMUTE (a last_sent_at
+        // write never overwrites a sibling `enabled` another caller just flipped).
+        //
+        // The JSON path is built as `$."<field>"` with the field name QUOTED, so a
+        // field containing a dot/bracket is treated as one literal key, not a path
+        // expression. The field name cannot be a bound parameter inside a JSON path,
+        // so it is interpolated - guard it to a strict `[A-Za-z0-9_]+` allowlist
+        // (the telemetry field names: `enabled`, `install_id`, `endpoint`,
+        // `last_sent_at`, `last_recorded_version`) and reject anything else, so no
+        // attacker-influenced string can ever reach the interpolated path. The value
+        // is bound as a parameter and wrapped in `json(?)` so it is stored as a JSON
+        // value (a number stays a number, a string stays a string), not a quoted
+        // blob.
+        if field.is_empty()
+            || !field
+                .bytes()
+                .all(|b| b.is_ascii_alphanumeric() || b == b'_')
+        {
+            return Err(anyhow!(
+                "internal.bad_request: settings field name {field:?} is not a bare identifier"
+            ));
+        }
+        let value_json = serde_json::to_string(value)?;
+        // `$."field"` - the field is interpolated (validated above); the path
+        // literal is otherwise constant. An absent / non-object row starts from an
+        // empty object so the patched doc is well-formed `{field: value}`.
+        let path = format!("$.\"{field}\"");
+        let sql = "INSERT INTO settings (key, value) VALUES (?1, json_set('{}', ?2, json(?3))) \
+                   ON CONFLICT(key) DO UPDATE SET \
+                   value = json_set(\
+                   CASE WHEN json_valid(settings.value) AND json_type(settings.value) = 'object' \
+                   THEN settings.value ELSE '{}' END, ?2, json(?3))";
+        sqlx::query(sql)
+            .bind(key)
+            .bind(path)
+            .bind(value_json)
+            .execute(&self.pool)
+            .await?;
         Ok(())
     }
 
@@ -3976,7 +4021,7 @@ mod tests {
     async fn telemetry_events_since_aggregates_uploads_errors_and_deep_verify() {
         // M9b (SPEC s16): the telemetry aggregate counts upload_done rows + bytes,
         // groups error-level rows by error code, counts update_applied rows, and
-        // counts sources whose last_deep_verify_at falls in the window. It NEVER
+        // counts `deep_verify_done` activity ROWS in the window (R3-P2-1). It NEVER
         // selects a path/name. Rows older than `since` are excluded; rows AFTER
         // `now` (clock skew, P2-2) are also excluded.
         use super::TelemetryAggregate;
@@ -3992,6 +4037,9 @@ mod tests {
         // Two upload_done rows in-window (100 + 200 bytes), one BEFORE the window
         // (excluded), one AFTER `now` (clock-skew future, excluded), two error rows
         // (one drive.rate_limited, two local.io_error), and one update_applied row.
+        // R3-P2-1: also THREE deep_verify_done rows - one BEFORE the window
+        // (excluded), TWO IN-window for the SAME source (must count as 2, not 1),
+        // and one AFTER `now` (clock-skew future, excluded).
         let rows: &[(i64, ActivityLevel, &str, Option<u64>)] = &[
             (500, ActivityLevel::Info, "upload_done", Some(999)), // pre-window -> excluded
             (1100, ActivityLevel::Info, "upload_done", Some(100)),
@@ -4001,9 +4049,14 @@ mod tests {
             (1500, ActivityLevel::Error, "local.io_error", None),
             (1600, ActivityLevel::Info, "update_applied", None),
             (600, ActivityLevel::Error, "drive.rate_limited", None), // pre-window -> excluded
+            (800, ActivityLevel::Info, "deep_verify_done", None),    // pre-window -> excluded
+            // R3-P2-1: two deep verifies for the SAME source in-window -> count 2.
+            (1450, ActivityLevel::Info, "deep_verify_done", None),
+            (1700, ActivityLevel::Info, "deep_verify_done", None),
             // P2-2: a future-dated row (ts > now) must be excluded by the upper bound.
             (9000, ActivityLevel::Info, "upload_done", Some(5000)),
             (9100, ActivityLevel::Error, "drive.rate_limited", None),
+            (9500, ActivityLevel::Info, "deep_verify_done", None), // after now -> excluded
         ];
         for (ts, level, et, bytes) in rows.iter().copied() {
             repo.write_activity(NewActivity {
@@ -4019,19 +4072,6 @@ mod tests {
             .unwrap();
         }
 
-        // A second source with a deep-verify completed IN the window, plus the
-        // first source with a deep-verify BEFORE the window (excluded). A third
-        // with a deep-verify AFTER `now` (clock skew, excluded by the upper bound).
-        let mut src2 = sample_source(acct.id);
-        src2.last_deep_verify_at = Some(1450);
-        repo.upsert_source(&src2).await.unwrap();
-        let mut src_old = src.clone();
-        src_old.last_deep_verify_at = Some(900); // before window -> excluded
-        repo.upsert_source(&src_old).await.unwrap();
-        let mut src_future = sample_source(acct.id);
-        src_future.last_deep_verify_at = Some(9500); // after now -> excluded (P2-2)
-        repo.upsert_source(&src_future).await.unwrap();
-
         let agg = repo.telemetry_events_since(since, now).await.unwrap();
 
         assert_eq!(agg.files_uploaded, 2, "two in-window upload_done rows");
@@ -4046,8 +4086,8 @@ mod tests {
         );
         assert_eq!(agg.update_applied, 1);
         assert_eq!(
-            agg.deep_verify_runs, 1,
-            "only the in-window deep-verify source counts (future one excluded)"
+            agg.deep_verify_runs, 2,
+            "R3-P2-1: two in-window deep_verify_done ROWS for the same source count as 2 (not collapsed to 1); pre-window + future rows excluded"
         );
 
         // Empty-window sanity: a window far in the future yields an all-zero

@@ -268,15 +268,18 @@ pub async fn update_settings(
     // R2-P1-1 + R2-P2-1: route an `enabled` change through telemetry.rs's SINGLE
     // cancel-preserving path so EVERY renderer path (this generic update_settings
     // AND the dedicated set_telemetry_enabled) flips the in-flight cancel flag and
-    // honors opt-out IMMEDIATELY. `apply_enabled_change` does a preserving
-    // read-modify-write that mutates ONLY `enabled`, keeping `install_id`,
-    // `endpoint`, AND the `last_sent_at` delta checkpoint intact (no clobber via a
-    // narrow `storage::Telemetry` round-trip). A telemetry patch with no `enabled`
-    // field is a no-op (nothing else in the group is user-writable here).
+    // honors opt-out IMMEDIATELY. `apply_enabled_change` commits an ATOMIC,
+    // COMMUTING field-level patch that mutates ONLY `enabled` (R3-P1-1: a SQLite
+    // `json_set` so a racing `last_sent_at` write can never resurrect a stale
+    // flag), keeping `install_id`, `endpoint`, AND the `last_sent_at` delta
+    // checkpoint intact, AND coordinates via the shared send-admission gate
+    // (R3-P1-2) so no post-disable send is admitted. A telemetry patch with no
+    // `enabled` field is a no-op (nothing else in the group is user-writable here).
     if let Some(t) = patch.telemetry {
         if let Some(v) = t.enabled {
             let cancel = state.telemetry_cancel();
-            crate::telemetry::apply_enabled_change(repo, &cancel, v).await?;
+            let gate = state.telemetry_send_gate();
+            crate::telemetry::apply_enabled_change(repo, &cancel, &gate, v).await?;
         }
     }
 

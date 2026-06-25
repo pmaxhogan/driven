@@ -398,8 +398,10 @@ pub struct TelemetryAggregate {
     /// `error`-level activity row). Sorted by code so the wire payload is
     /// deterministic. Never carries a path or message.
     pub errors_by_class: Vec<(String, u64)>,
-    /// Number of sources whose `backup_sources.last_deep_verify_at` falls inside
-    /// the window (a deep-verify pass completed in the last 24h).
+    /// Number of `deep_verify_done` activity rows in the window (R3-P2-1): one
+    /// durable row per COMPLETED deep-verify pass, so two deep verifies for the
+    /// same source inside 24h count as 2 (not collapsed to 1 by the single
+    /// `backup_sources.last_deep_verify_at` metadata timestamp).
     pub deep_verify_runs: u64,
     /// Number of `update_applied` activity rows in the window. (No such row is
     /// written in V1, so this is honestly 0 until the updater records one; the
@@ -1115,6 +1117,24 @@ pub trait StateRepo: Send + Sync {
 
     /// Writes a setting value, replacing any prior value at this key.
     async fn set_setting(&self, key: &str, value: &serde_json::Value) -> Result<()>;
+
+    /// M9b R3-P1-1: ATOMICALLY patch a SINGLE top-level field of the JSON object
+    /// stored at `key`, leaving all sibling fields untouched. Implemented with a
+    /// SQLite-side `json_set` UPDATE in ONE statement, so it is a read-modify-write
+    /// that COMMUTES with a concurrent patch of a DIFFERENT field: a telemetry
+    /// `last_sent_at` write can never resurrect a stale `enabled` that another
+    /// caller just flipped (the consent-integrity guarantee). `field` is a bare
+    /// top-level key name (no JSON path syntax); `value` is the new JSON value for
+    /// that field. If the row is absent (or not a JSON object) it is created as a
+    /// JSON object holding just `{field: value}`. The field-level write is the
+    /// ONLY safe primitive for telemetry settings mutations (P1-1); whole-blob
+    /// `set_setting` is reserved for atomic multi-field writes that own the doc.
+    async fn patch_setting_field(
+        &self,
+        key: &str,
+        field: &str,
+        value: &serde_json::Value,
+    ) -> Result<()>;
 
     // --- search -------------------------------------------------------------
 

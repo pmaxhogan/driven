@@ -358,6 +358,14 @@ mod tests {
         async fn set_setting(&self, _key: &str, _value: &serde_json::Value) -> Result<()> {
             unimplemented!()
         }
+        async fn patch_setting_field(
+            &self,
+            _key: &str,
+            _field: &str,
+            _value: &serde_json::Value,
+        ) -> Result<()> {
+            unimplemented!()
+        }
         async fn search_files(
             &self,
             _source: Option<SourceId>,

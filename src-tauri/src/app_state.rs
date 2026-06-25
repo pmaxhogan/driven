@@ -363,6 +363,15 @@ pub struct TelemetryRuntime {
     /// immediately, not merely on the next 24h tick). Re-armed to `false` on
     /// re-enable. Shared with the ping task via [`AppState::telemetry_cancel`].
     cancel: Arc<std::sync::atomic::AtomicBool>,
+    /// M9b R3-P1-2: the SEND-ADMISSION gate shared between the ping path and the
+    /// disable path. The ping ACQUIRES this lock, re-checks the cancel flag + pref
+    /// UNDER it, and starts the network send while holding it; the disable path
+    /// sets [`Self::cancel`] FIRST and then ACQUIRES the SAME gate to coordinate,
+    /// so a disable can never be admitted concurrently with a send's final
+    /// re-check, and a send that begins after the disable observed the gate sees
+    /// the cancel flag already set and aborts. A `tokio::Mutex` so it can be held
+    /// across the awaited send. Shared via [`AppState::telemetry_send_gate`].
+    send_gate: Arc<Mutex<()>>,
 }
 
 /// M8 (P2-3): max number of TERMINAL restore-job records retained for late
@@ -727,6 +736,15 @@ impl AppState {
         self.telemetry
             .cancel
             .store(cancelled, std::sync::atomic::Ordering::SeqCst);
+    }
+
+    /// M9b R3-P1-2: the shared SEND-ADMISSION gate. The ping path holds it across
+    /// its final cancel/pref re-check + network send; the disable path acquires it
+    /// (after setting cancel) so a disable is never admitted concurrently with a
+    /// send and any send starting after the disable sees the cancel flag set.
+    #[must_use]
+    pub fn telemetry_send_gate(&self) -> Arc<Mutex<()>> {
+        Arc::clone(&self.telemetry.send_gate)
     }
 
     /// M9b: signal the periodic-ping task to stop and TAKE its handle so the

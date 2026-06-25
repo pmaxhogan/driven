@@ -169,50 +169,40 @@ async fn read_prefs(state: &dyn StateRepo) -> CommandResult<TelemetryPrefs> {
     })
 }
 
-/// Persist `telemetry.last_sent_at` (Unix ms) after a SUCCESSFUL send, preserving
-/// all sibling fields (read-modify-write). The next ping then aggregates only
-/// events after this timestamp (DELTAS, P2-3).
+/// Persist `telemetry.last_sent_at` (Unix ms) after a SUCCESSFUL send.
+///
+/// R3-P1-1 (CONSENT INTEGRITY): this is an ATOMIC, COMMUTING field-level patch
+/// (`patch_setting_field` -> SQLite `json_set`), NOT a read-modify-write of the
+/// whole blob. The old RMW could read `{enabled:true}`, the user could disable
+/// telemetry, then this write would put its STALE object back and resurrect
+/// `enabled:true` - so after restart telemetry was silently re-enabled. Patching
+/// ONLY `last_sent_at` can never overwrite a sibling `enabled` a concurrent
+/// disable just flipped: the delta checkpoint and the consent flag are
+/// independent, commuting writes. The next ping aggregates only events after this
+/// timestamp (DELTAS, P2-3).
 async fn write_last_sent_at(state: &dyn StateRepo, now_ms: i64) -> CommandResult<()> {
-    let mut group = match state
-        .get_setting(KEY_TELEMETRY)
-        .await
-        .map_err(CommandError::from)?
-    {
-        Some(serde_json::Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
-    };
-    group.insert(
-        "last_sent_at".to_string(),
-        serde_json::Value::Number(now_ms.into()),
-    );
     state
-        .set_setting(KEY_TELEMETRY, &serde_json::Value::Object(group))
+        .patch_setting_field(
+            KEY_TELEMETRY,
+            "last_sent_at",
+            &serde_json::Value::Number(now_ms.into()),
+        )
         .await
         .map_err(CommandError::from)
 }
 
-/// Persist the `telemetry.enabled` flag, PRESERVING the sibling `install_id` /
-/// `endpoint` fields (read-modify-write the raw object so a toggle never wipes
-/// the stable install id).
+/// Persist the `telemetry.enabled` flag.
+///
+/// R3-P1-1 (CONSENT INTEGRITY): an ATOMIC, COMMUTING field-level patch
+/// (`patch_setting_field` -> SQLite `json_set`) of ONLY `enabled`. It never
+/// reads/writes the siblings, so it cannot wipe the stable `install_id` /
+/// `endpoint` / `last_sent_at`, AND a concurrent `last_sent_at` write (from an
+/// in-flight ping) can never overwrite the `enabled` flag this just set - the
+/// disable is durable. A missing row is created as a JSON object holding just
+/// `{enabled: ...}` (the other fields default correctly on read).
 async fn write_enabled(state: &dyn StateRepo, enabled: bool) -> CommandResult<()> {
-    let mut group = match state
-        .get_setting(KEY_TELEMETRY)
-        .await
-        .map_err(CommandError::from)?
-    {
-        Some(serde_json::Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
-    };
-    group.insert("enabled".to_string(), serde_json::Value::Bool(enabled));
-    // Keep the document complete + well-typed even if it was never seeded.
-    group
-        .entry("install_id".to_string())
-        .or_insert_with(|| serde_json::Value::String(String::new()));
-    group
-        .entry("endpoint".to_string())
-        .or_insert_with(|| serde_json::Value::String(DEFAULT_ENDPOINT.to_string()));
     state
-        .set_setting(KEY_TELEMETRY, &serde_json::Value::Object(group))
+        .patch_setting_field(KEY_TELEMETRY, "enabled", &serde_json::Value::Bool(enabled))
         .await
         .map_err(CommandError::from)
 }
@@ -238,24 +228,19 @@ async fn read_last_recorded_version(state: &dyn StateRepo) -> CommandResult<Opti
         .map(ToString::to_string))
 }
 
-/// Persist `telemetry.last_recorded_version`, PRESERVING all sibling fields
-/// (read-modify-write the raw object so this never wipes `install_id` / `enabled`
-/// / `endpoint` / `last_sent_at`).
+/// Persist `telemetry.last_recorded_version`.
+///
+/// R3-P1-1: an ATOMIC, COMMUTING field-level patch of ONLY
+/// `last_recorded_version`, so it never wipes `install_id` / `enabled` /
+/// `endpoint` / `last_sent_at` and cannot race-clobber a concurrent sibling
+/// write.
 async fn write_last_recorded_version(state: &dyn StateRepo, version: &str) -> CommandResult<()> {
-    let mut group = match state
-        .get_setting(KEY_TELEMETRY)
-        .await
-        .map_err(CommandError::from)?
-    {
-        Some(serde_json::Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
-    };
-    group.insert(
-        KEY_LAST_RECORDED_VERSION.to_string(),
-        serde_json::Value::String(version.to_string()),
-    );
     state
-        .set_setting(KEY_TELEMETRY, &serde_json::Value::Object(group))
+        .patch_setting_field(
+            KEY_TELEMETRY,
+            KEY_LAST_RECORDED_VERSION,
+            &serde_json::Value::String(version.to_string()),
+        )
         .await
         .map_err(CommandError::from)
 }
@@ -347,26 +332,19 @@ async fn ensure_install_id(state: &dyn StateRepo) -> CommandResult<String> {
         );
     }
     let id = uuid::Uuid::new_v4().to_string();
-    let mut group = match state
-        .get_setting(KEY_TELEMETRY)
-        .await
-        .map_err(CommandError::from)?
-    {
-        Some(serde_json::Value::Object(map)) => map,
-        _ => serde_json::Map::new(),
-    };
-    group.insert(
-        "install_id".to_string(),
-        serde_json::Value::String(id.clone()),
-    );
-    group
-        .entry("enabled".to_string())
-        .or_insert(serde_json::Value::Bool(true));
-    group
-        .entry("endpoint".to_string())
-        .or_insert_with(|| serde_json::Value::String(DEFAULT_ENDPOINT.to_string()));
+    // R3-P1-1: ATOMIC, COMMUTING field-level patch of ONLY `install_id` (SQLite
+    // `json_set`), so minting the id never overwrites a sibling `enabled` /
+    // `last_sent_at` a concurrent toggle / ping just wrote. The `enabled` /
+    // `endpoint` defaults are applied on READ (`read_prefs`: missing enabled ->
+    // true (default ON); missing endpoint -> DEFAULT_ENDPOINT), so they need not
+    // be seeded here - seeding them via a whole-blob write is exactly the
+    // non-commuting RMW that could resurrect a stale flag.
     state
-        .set_setting(KEY_TELEMETRY, &serde_json::Value::Object(group))
+        .patch_setting_field(
+            KEY_TELEMETRY,
+            "install_id",
+            &serde_json::Value::String(id.clone()),
+        )
         .await
         .map_err(CommandError::from)?;
     Ok(id)
@@ -611,6 +589,7 @@ async fn maybe_send_once(
     now_ms: i64,
     sink: &dyn TelemetrySink,
     cancel: Option<&std::sync::atomic::AtomicBool>,
+    gate: Option<&tokio::sync::Mutex<()>>,
 ) -> bool {
     use std::sync::atomic::Ordering;
 
@@ -652,10 +631,27 @@ async fn maybe_send_once(
     let os_version = coarse_os_version();
     let payload = build_payload(install_id, now_ms, version, channel, os_version, aggregate);
 
-    // P1-2: RE-READ the pref IMMEDIATELY before the send. If the user disabled
-    // telemetry during the (id-ensure / aggregate / build) window, abort with NO
-    // network call - the toggle is honored immediately. Also re-check the cancel
-    // flag (set_telemetry_enabled flips it the instant the toggle commits).
+    // R3-P1-2 (SEND-ADMISSION GATE): acquire the shared gate, then do the final
+    // cancel/pref re-check AND the network send WHILE HOLDING IT. The disable path
+    // (`apply_enabled_change`) sets the cancel flag FIRST and then acquires this
+    // SAME gate, so:
+    //   - a disable that lands BEFORE we acquire the gate has set cancel, so the
+    //     under-gate re-check below sees it and aborts with NO network call;
+    //   - a disable that arrives WHILE we hold the gate blocks until we release it,
+    //     and cancel is already true for the next tick - so no post-disable send is
+    //     ever admitted.
+    // The lock is held across the awaited `sink.send`, so admission and the send
+    // are atomic w.r.t. the disable path (the requirement; mid-request abort is not
+    // needed). When no gate is supplied (unit tests of the no-gate path) the
+    // re-check still runs, just without the cross-task serialization.
+    let _admission: Option<tokio::sync::MutexGuard<'_, ()>> = match gate {
+        Some(g) => Some(g.lock().await),
+        None => None,
+    };
+
+    // P1-2: RE-CHECK cancel + pref IMMEDIATELY before the send, now UNDER the gate.
+    // If the user disabled telemetry during the (id-ensure / aggregate / build)
+    // window, abort with NO network call - the toggle is honored immediately.
     if cancel.is_some_and(|c| c.load(Ordering::SeqCst)) {
         tracing::debug!(target: TARGET, "telemetry cancelled before send; no ping sent");
         return false;
@@ -672,7 +668,8 @@ async fn maybe_send_once(
         }
     }
 
-    // BEST-EFFORT: log + swallow any send failure. NEVER affects backups.
+    // BEST-EFFORT: log + swallow any send failure. NEVER affects backups. Sent
+    // UNDER the admission gate so a concurrent disable cannot interleave.
     match sink.send(&prefs.endpoint, &payload).await {
         Ok(()) => {
             tracing::debug!(target: TARGET, files = payload.events_24h.files_uploaded, "telemetry ping sent");
@@ -750,9 +747,20 @@ async fn ping_once(app: &AppHandle, sink: &dyn TelemetrySink) {
     let version = app.package_info().version.to_string();
     let now_ms = driven_core::time::SystemClock.now_ms();
     // P1-2: pass the shared cancel flag so a disable that commits mid-ping aborts
-    // the send immediately (not merely on the next tick).
+    // the send immediately (not merely on the next tick). R3-P1-2: also pass the
+    // shared send-admission gate so the final re-check + send is atomic w.r.t. the
+    // disable path.
     let cancel = state.telemetry_cancel();
-    let _ = maybe_send_once(state.state().as_ref(), version, now_ms, sink, Some(&cancel)).await;
+    let gate = state.telemetry_send_gate();
+    let _ = maybe_send_once(
+        state.state().as_ref(),
+        version,
+        now_ms,
+        sink,
+        Some(&cancel),
+        Some(&gate),
+    )
+    .await;
 }
 
 // ---------------------------------------------------------------------------
@@ -775,17 +783,33 @@ pub async fn get_telemetry_enabled(state: State<'_, AppState>) -> CommandResult<
 /// When DISABLING it flips the AppState cancel flag FIRST (so an in-flight ping
 /// checking the flag right before its send sees the cancellation even if the pref
 /// write has not landed yet, P1-2); when ENABLING it re-arms (clears) the flag.
-/// Then it commits the pref via the preserving `write_enabled` (which mutates ONLY
-/// `enabled`, keeping `install_id`, `endpoint`, AND `last_sent_at` intact - so a
-/// toggle never wipes the stable id or the delta checkpoint, R2-P2-1).
+/// Then it commits the pref via the preserving `write_enabled` (an ATOMIC
+/// field-level `json_set` patch of ONLY `enabled` - keeping `install_id`,
+/// `endpoint`, AND `last_sent_at` intact, AND never resurrecting a stale flag from
+/// a racing `last_sent_at` write, R3-P1-1).
+///
+/// R3-P1-2 (SEND-ADMISSION GATE): when DISABLING, after setting the cancel flag it
+/// ACQUIRES the shared send-admission `gate` (then releases it) before/around the
+/// pref commit. The ping path holds the SAME gate across its final cancel re-check
+/// and network send, so this acquire cannot complete while a send is mid-flight,
+/// and the moment it does the cancel flag is already set, so the NEXT send admitted
+/// through the gate re-checks cancel and aborts. No post-disable send is admitted.
 pub async fn apply_enabled_change(
     state: &dyn StateRepo,
     cancel: &std::sync::atomic::AtomicBool,
+    gate: &tokio::sync::Mutex<()>,
     enabled: bool,
 ) -> CommandResult<()> {
     use std::sync::atomic::Ordering;
-    // P1-2: flip the cancel flag BEFORE the write when disabling.
+    // P1-2: flip the cancel flag BEFORE anything else when disabling, so an
+    // in-flight ping's under-gate re-check observes the cancellation.
     cancel.store(!enabled, Ordering::SeqCst);
+    // R3-P1-2: coordinate with the send-admission gate. Acquiring it serializes
+    // this disable against an in-flight send's admission+send section: we cannot
+    // proceed until any in-progress send releases the gate, and by then cancel is
+    // already set so no further send is admitted. (Acquired even on ENABLE for a
+    // single, simple ordering rule; the guard drops at the end of the statement.)
+    let _admission = gate.lock().await;
     write_enabled(state, enabled).await?;
     tracing::info!(target: TARGET, enabled, "telemetry enabled toggled");
     Ok(())
@@ -804,7 +828,8 @@ pub async fn set_telemetry_enabled(
     enabled: bool,
 ) -> CommandResult<bool> {
     let cancel = state.telemetry_cancel();
-    apply_enabled_change(state.state().as_ref(), &cancel, enabled).await?;
+    let gate = state.telemetry_send_gate();
+    apply_enabled_change(state.state().as_ref(), &cancel, &gate, enabled).await?;
     Ok(enabled)
 }
 
@@ -1036,8 +1061,15 @@ mod tests {
         write_enabled(&repo, false).await.unwrap();
 
         let sink = RecordingSink::default();
-        let attempted =
-            maybe_send_once(&repo, "0.1.0".to_string(), 1_700_000_000_000, &sink, None).await;
+        let attempted = maybe_send_once(
+            &repo,
+            "0.1.0".to_string(),
+            1_700_000_000_000,
+            &sink,
+            None,
+            None,
+        )
+        .await;
 
         assert!(!attempted, "disabled telemetry must not attempt a send");
         assert_eq!(
@@ -1055,8 +1087,15 @@ mod tests {
         let (repo, dir) = temp_repo().await;
         // Default seed has enabled=true + a generated install_id.
         let sink = RecordingSink::default();
-        let attempted =
-            maybe_send_once(&repo, "0.1.0".to_string(), 1_700_000_000_000, &sink, None).await;
+        let attempted = maybe_send_once(
+            &repo,
+            "0.1.0".to_string(),
+            1_700_000_000_000,
+            &sink,
+            None,
+            None,
+        )
+        .await;
 
         assert!(attempted, "enabled telemetry must attempt a send");
         let sent = sink.sent.lock().unwrap();
@@ -1075,8 +1114,15 @@ mod tests {
         // still reports "attempted" (it did not panic / propagate).
         let (repo, dir) = temp_repo().await;
         let sink = FailingSink;
-        let attempted =
-            maybe_send_once(&repo, "0.1.0".to_string(), 1_700_000_000_000, &sink, None).await;
+        let attempted = maybe_send_once(
+            &repo,
+            "0.1.0".to_string(),
+            1_700_000_000_000,
+            &sink,
+            None,
+            None,
+        )
+        .await;
         assert!(
             attempted,
             "a failed send is still an attempt (error swallowed, not fatal)"
@@ -1121,6 +1167,7 @@ mod tests {
             1_700_000_000_000,
             &sink,
             Some(&cancel),
+            None,
         )
         .await;
         assert!(!attempted, "a cancelled ping is not attempted");
@@ -1145,10 +1192,131 @@ mod tests {
         // legs converge on "no send when disabled". Assert the no-send outcome.
         write_enabled(&repo, false).await.unwrap();
         let sink = CountingSink::default();
-        let attempted =
-            maybe_send_once(&repo, "0.1.0".to_string(), 1_700_000_000_000, &sink, None).await;
+        let attempted = maybe_send_once(
+            &repo,
+            "0.1.0".to_string(),
+            1_700_000_000_000,
+            &sink,
+            None,
+            None,
+        )
+        .await;
         assert!(!attempted, "disabled pref aborts the send");
         assert_eq!(sink.calls.load(Ordering::SeqCst), 0, "no network call");
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn disable_concurrent_with_last_sent_at_write_does_not_persist_enabled_true() {
+        // R3-P1-1 (CONSENT INTEGRITY): the canonical re-enable race. A ping read
+        // `{enabled:true}`, the user DISABLES telemetry, then the ping commits its
+        // `last_sent_at`. With the OLD whole-blob read-modify-write the ping wrote
+        // its STALE `{enabled:true,...}` object back, resurrecting `enabled:true`
+        // (silent re-enable after restart). With field-level `json_set` patches the
+        // `last_sent_at` write touches ONLY that field, so the disable's
+        // `enabled=false` SURVIVES. This test exercises that exact interleaving:
+        //   1. seed enabled=true,
+        //   2. (ping has read enabled=true) - the user disables -> enabled=false,
+        //   3. the ping commits last_sent_at,
+        //   4. assert enabled is STILL false (no resurrection) AND last_sent_at lands.
+        let (repo, dir) = temp_repo().await;
+        write_enabled(&repo, true).await.unwrap();
+        assert!(read_prefs(&repo).await.unwrap().enabled);
+
+        // Step 2: the disable lands (the user opted out) while a ping is mid-flight.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let gate = tokio::sync::Mutex::new(());
+        apply_enabled_change(&repo, &cancel, &gate, false)
+            .await
+            .unwrap();
+
+        // Step 3: the (already-in-flight) ping commits its delta checkpoint. This is
+        // the write that, under the old RMW, would resurrect enabled=true.
+        write_last_sent_at(&repo, 1_700_000_000_000).await.unwrap();
+
+        // Step 4: enabled must STILL be false (durable opt-out), and the last_sent_at
+        // checkpoint must have landed (the two fields commute).
+        let prefs = read_prefs(&repo).await.unwrap();
+        assert!(
+            !prefs.enabled,
+            "R3-P1-1: a last_sent_at write must NOT resurrect a disabled enabled flag"
+        );
+        assert_eq!(
+            prefs.last_sent_at,
+            Some(1_700_000_000_000),
+            "the last_sent_at checkpoint still lands (the fields commute)"
+        );
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn disable_landing_before_send_admission_prevents_the_send() {
+        // R3-P1-2 (SEND-ADMISSION GATE): a disable that lands AFTER the early
+        // enabled check but BEFORE the ping is admitted to send must prevent the
+        // send (not merely block the next tick). The gate is the serialization
+        // point: the ping acquires it and re-checks cancel UNDER it; a disable that
+        // acquired the gate first (setting cancel before it did) makes that
+        // under-gate re-check observe the cancellation.
+        //
+        // We force the in-window timing deterministically: the TEST holds the gate
+        // (standing in for a disable that has acquired it), spawns the ping (which
+        // passes the early enabled check, then BLOCKS trying to acquire the gate at
+        // admission), sets cancel=true + writes enabled=false WHILE the ping is
+        // blocked, then releases the gate. The ping then acquires it, re-checks
+        // cancel, sees it set, and aborts with NO network call.
+        let (repo, dir) = temp_repo().await;
+        // Enabled at entry so the early check passes (the disable lands later).
+        write_enabled(&repo, true).await.unwrap();
+
+        let repo = std::sync::Arc::new(repo);
+        let sink = std::sync::Arc::new(CountingSink::default());
+        let cancel = std::sync::Arc::new(std::sync::atomic::AtomicBool::new(false));
+        let gate = std::sync::Arc::new(tokio::sync::Mutex::new(()));
+
+        // The test takes the gate first, modelling a disable that has acquired the
+        // send-admission gate. The ping will block at admission until we release it.
+        let held = gate.clone().lock_owned().await;
+
+        let repo_c = repo.clone();
+        let sink_c = sink.clone();
+        let cancel_c = cancel.clone();
+        let gate_c = gate.clone();
+        let ping = tokio::spawn(async move {
+            maybe_send_once(
+                repo_c.as_ref(),
+                "0.1.0".to_string(),
+                1_700_000_000_000,
+                sink_c.as_ref(),
+                Some(cancel_c.as_ref()),
+                Some(gate_c.as_ref()),
+            )
+            .await
+        });
+
+        // Yield so the spawned ping runs up to the gate acquisition and blocks
+        // (it has already passed the early enabled check). Use a bounded
+        // cooperative yield rather than a sleep/poll loop.
+        tokio::task::yield_now().await;
+        tokio::task::yield_now().await;
+
+        // The disable commits WHILE the ping is blocked at admission: set cancel
+        // first (what apply_enabled_change does), persist enabled=false, then
+        // release the gate so the ping is admitted into its under-gate re-check.
+        cancel.store(true, Ordering::SeqCst);
+        write_enabled(repo.as_ref(), false).await.unwrap();
+        drop(held);
+
+        let attempted = ping.await.unwrap();
+        assert!(
+            !attempted,
+            "a disable landing before send admission prevents the send"
+        );
+        assert_eq!(
+            sink.calls.load(Ordering::SeqCst),
+            0,
+            "no network call once the disable was admitted before the send"
+        );
+        drop(repo);
         cleanup(dir);
     }
 
@@ -1219,7 +1387,7 @@ mod tests {
 
         let sink = RecordingSink::default();
         // First ping at `now` sends the 1 upload, records last_sent_at = now.
-        assert!(maybe_send_once(&repo, "0.1.0".to_string(), now, &sink, None).await);
+        assert!(maybe_send_once(&repo, "0.1.0".to_string(), now, &sink, None, None).await);
         {
             let sent = sink.sent.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(sent.len(), 1);
@@ -1234,7 +1402,7 @@ mod tests {
 
         // Second ping at the SAME instant (a restart) - the delta window
         // (last_sent, now] is empty -> 0 uploads (NOT 1 again).
-        assert!(maybe_send_once(&repo, "0.1.0".to_string(), now, &sink, None).await);
+        assert!(maybe_send_once(&repo, "0.1.0".to_string(), now, &sink, None, None).await);
         {
             let sent = sink.sent.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(sent.len(), 2);
@@ -1288,8 +1456,11 @@ mod tests {
         // generic settings save honors opt-out exactly like set_telemetry_enabled.
         let (repo, dir) = temp_repo().await;
         let cancel = std::sync::atomic::AtomicBool::new(false);
+        let gate = tokio::sync::Mutex::new(());
 
-        apply_enabled_change(&repo, &cancel, false).await.unwrap();
+        apply_enabled_change(&repo, &cancel, &gate, false)
+            .await
+            .unwrap();
         assert!(
             cancel.load(Ordering::SeqCst),
             "disabling trips the cancel flag (in-flight ping aborts)"
@@ -1300,7 +1471,9 @@ mod tests {
         );
 
         // Re-enabling re-arms (clears) the flag.
-        apply_enabled_change(&repo, &cancel, true).await.unwrap();
+        apply_enabled_change(&repo, &cancel, &gate, true)
+            .await
+            .unwrap();
         assert!(
             !cancel.load(Ordering::SeqCst),
             "enabling clears the cancel flag"
@@ -1324,8 +1497,13 @@ mod tests {
 
         // Toggle enabled off then on via the shared path.
         let cancel = std::sync::atomic::AtomicBool::new(false);
-        apply_enabled_change(&repo, &cancel, false).await.unwrap();
-        apply_enabled_change(&repo, &cancel, true).await.unwrap();
+        let gate = tokio::sync::Mutex::new(());
+        apply_enabled_change(&repo, &cancel, &gate, false)
+            .await
+            .unwrap();
+        apply_enabled_change(&repo, &cancel, &gate, true)
+            .await
+            .unwrap();
 
         assert_eq!(
             read_prefs(&repo).await.unwrap().last_sent_at,
