@@ -83,6 +83,14 @@ jobs:
         shell: bash
         run: echo "version=0.0.0-dev.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
 
+      # R1-P1-5: patch 0.0.0-dev.<sha> into the canonical version sources (root
+      # Cargo.toml [workspace.package], tauri.conf.json, ui/package.json) BEFORE
+      # the Tauri build so the produced app actually reports the dev version -
+      # otherwise updater version comparison + paths use the stale stable version.
+      - name: Patch dev version into app metadata
+        shell: bash
+        run: node scripts/set-dev-version.mjs "${{ steps.ver.outputs.version }}"
+
       - uses: dtolnay/rust-toolchain@stable
         with:
           targets: ${{ matrix.target }}
@@ -161,6 +169,10 @@ jobs:
     permissions:
       contents: write
       deployments: write
+    env:
+      # The rolling pre-release tag the dev bundles + .sig live on.
+      RELEASE_TAG: dev
+      UPDATES_BASE: https://driven.maxhogan.dev/updates
     steps:
       - uses: actions/checkout@v4
 
@@ -168,17 +180,57 @@ jobs:
         with:
           node-version: 22
 
-      # Generate updates/dev/<target>/update.json from the rolling "dev"
-      # release assets (M9a's script; executes for real once M9a lands).
-      - name: Generate dev update.json tree
+      - name: Compute dev version
+        id: ver
+        shell: bash
+        run: echo "version=0.0.0-dev.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+
+      # R1-P1-2/4: download the rolling `dev` release's assets so the generator
+      # has real bundle + `.sig` inputs (it reads them from a local dir).
+      - name: Download dev release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: dev
-        run: node scripts/generate-update-json.mjs dev
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets \
+            --pattern '*-setup.exe' --pattern '*-setup.exe.sig' \
+            --pattern '*.msi' --pattern '*.msi.sig' \
+            --pattern '*.app.tar.gz' --pattern '*.app.tar.gz.sig' \
+            --pattern '*.AppImage' --pattern '*.AppImage.sig'
+          echo "Downloaded assets:"; ls -la release-assets
 
-      # See CODEX_NOTES "M9d": `pages deploy` is a whole-site snapshot, so the
-      # generator must assemble the full updates/ tree (dev + the existing
-      # stable tree) before this deploy or it would clobber updates/stable.
+      # R1-P1-6: notes for the dev manifest's in-app changelog (the rolling
+      # pre-release body).
+      - name: Fetch dev release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json body --jq '.body // ""' > release-notes.md
+          echo "Notes bytes: $(wc -c < release-notes.md)"
+
+      # R1-P1-1/4: generate updates/dev/<os>/<arch>/update.json with the dev
+      # version (--sha), real notes, and the ROLLING `dev` tag asset base URL
+      # (the bundle version is 0.0.0-dev.<sha> but the assets live on tag `dev`).
+      - name: Generate dev update.json tree
+        run: |
+          set -euo pipefail
+          node scripts/generate-update-json.mjs dev \
+            --sha "$(git rev-parse --short HEAD)" \
+            --assets-dir release-assets \
+            --notes-file release-notes.md \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+
+      # R1-P1-7: `pages deploy` is a whole-site snapshot, so overlay the OTHER
+      # channel's (stable) currently-live manifests before deploying or this
+      # would clobber updates/stable.
+      - name: Overlay live stable manifests (do not wipe the other channel)
+        run: bash scripts/fetch-live-channel.sh stable updates "$UPDATES_BASE"
+
       - name: Deploy dev manifests to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
         with:

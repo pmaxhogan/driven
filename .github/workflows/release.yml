@@ -105,6 +105,11 @@ jobs:
     permissions:
       contents: write
       deployments: write
+    env:
+      RELEASE_TAG: ${{ github.ref_name }}
+      # The live updates site whose OTHER channel must be preserved across the
+      # whole-site `pages deploy` snapshot (R1-P1-7).
+      UPDATES_BASE: https://driven.maxhogan.dev/updates
     steps:
       - uses: actions/checkout@v4
 
@@ -112,42 +117,77 @@ jobs:
         with:
           node-version: 22
 
-      # Builds updates/stable/<target>/update.json for every GA target by
-      # reading the just-published release assets (installers + .sig files) of
-      # the current tag. Script is authored by M9a (scripts/generate-update-json.mjs);
-      # it executes for real only here, at a tag, by which point M9a has landed.
-      - name: Generate stable update.json tree
+      # R1-P1-2: the generator reads bundles + `.sig` from a local dir, but the
+      # matrix build artifacts live as GitHub Release assets. Download the
+      # just-published release's assets into a flat dir so the generator has real
+      # inputs (an empty dir would generate nothing).
+      - name: Download release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
-          RELEASE_TAG: ${{ github.ref_name }}
-        run: node scripts/generate-update-json.mjs stable
+        run: |
+          set -euo pipefail
+          mkdir -p release-assets
+          gh release download "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --dir release-assets \
+            --pattern '*-setup.exe' --pattern '*-setup.exe.sig' \
+            --pattern '*.msi' --pattern '*.msi.sig' \
+            --pattern '*.app.tar.gz' --pattern '*.app.tar.gz.sig' \
+            --pattern '*.AppImage' --pattern '*.AppImage.sig'
+          echo "Downloaded assets:"; ls -la release-assets
 
-      # Attach the generated manifests to the GitHub Release too (a CDN-of-last-
-      # resort + an auditable record of what was published for this tag).
+      # R1-P1-6: fetch the GitHub Release body so the manifest carries real
+      # release NOTES (the in-app "View changelog" reads the manifest body).
+      - name: Fetch release notes
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          gh release view "$RELEASE_TAG" --repo "$GITHUB_REPOSITORY" \
+            --json body --jq '.body // ""' > release-notes.md
+          echo "Notes bytes: $(wc -c < release-notes.md)"
+
+      # R1-P1-1 / R1-P1-3: build updates/stable/<os>/<arch>/update.json from the
+      # downloaded assets, with real notes + the v<tag> asset base URL.
+      - name: Generate stable update.json tree
+        run: |
+          set -euo pipefail
+          node scripts/generate-update-json.mjs stable \
+            --assets-dir release-assets \
+            --notes-file release-notes.md \
+            --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
+
+      # R1-P1-3: attach the generated manifests to the GitHub Release too (a
+      # CDN-of-last-resort + an auditable record of what was published for this
+      # tag). Glob matches the FINAL layout updates/stable/<os>/<arch>/update.json.
       - name: Upload manifests to GitHub Release
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
-          shopt -s nullglob
-          files=(updates/stable/*/update.json)
+          set -euo pipefail
+          shopt -s nullglob globstar
+          files=(updates/stable/**/update.json)
           if [ ${#files[@]} -eq 0 ]; then
-            echo "::error::no updates/stable/*/update.json files were generated"
+            echo "::error::no updates/stable/**/update.json files were generated"
             exit 1
           fi
           for f in "${files[@]}"; do
-            target="$(basename "$(dirname "$f")")"
+            arch="$(basename "$(dirname "$f")")"
+            os="$(basename "$(dirname "$(dirname "$f")")")"
             # Flatten to a unique asset name; the canonical fetch path is CF Pages.
-            cp "$f" "stable-${target}-update.json"
-            gh release upload "$RELEASE_TAG" "stable-${target}-update.json" --clobber
+            cp "$f" "stable-${os}-${arch}-update.json"
+            gh release upload "$RELEASE_TAG" "stable-${os}-${arch}-update.json" --clobber
           done
 
-      # Publish the channel/target tree to Cloudflare Pages so
-      # driven.maxhogan.dev/updates/stable/<target>/update.json serves it
-      # (SPEC s15.3 V1). NOTE (see CODEX_NOTES "M9d"): `pages deploy` replaces
-      # the whole site snapshot, so this deploy must carry BOTH channels'
-      # current trees. generate-update-json.mjs is responsible for assembling
-      # the full `updates/` directory (stable + the existing dev tree) before
-      # this step; deploying only updates/stable would clobber updates/dev.
+      # R1-P1-7: `pages deploy` replaces the WHOLE site snapshot, so before
+      # deploying we overlay the OTHER channel's (dev) CURRENTLY-LIVE manifests
+      # into the tree. Without this, a stable deploy would wipe updates/dev.
+      - name: Overlay live dev manifests (do not wipe the other channel)
+        run: bash scripts/fetch-live-channel.sh dev updates "$UPDATES_BASE"
+
+      # Publish the merged channel/target tree to Cloudflare Pages so
+      # driven.maxhogan.dev/updates/stable/<os>/<arch>/update.json serves it
+      # (SPEC s15.3 V1).
       - name: Deploy manifests to Cloudflare Pages
         uses: cloudflare/wrangler-action@v3
         with:

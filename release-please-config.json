@@ -7,10 +7,15 @@
   "prerelease": false,
   "packages": {
     ".": {
-      "release-type": "rust",
+      "release-type": "simple",
       "package-name": "driven",
       "component": "driven",
       "extra-files": [
+        {
+          "type": "toml",
+          "path": "Cargo.toml",
+          "jsonpath": "$.workspace.package.version"
+        },
         {
           "type": "json",
           "path": "src-tauri/tauri.conf.json",
