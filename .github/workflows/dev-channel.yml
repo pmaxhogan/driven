@@ -60,9 +60,47 @@ jobs:
           echo "build=$build" >> "$GITHUB_OUTPUT"
           echo "dev build decision: $build (event=$EVENT_NAME)"
 
+  # R2-P1-2: the rolling `dev` release is REUSED across runs, so prior runs'
+  # signed bundles accrete on it. A later step downloads ALL assets to build the
+  # manifest - so a stale bundle could be advertised under the new version (an
+  # integrity bug). Wipe the rolling release's existing assets ONCE here, before
+  # the matrix build uploads the CURRENT run's bundles. Doing it in a single
+  # pre-build job (not per matrix row) avoids the 4 parallel rows deleting each
+  # other's freshly-uploaded assets. The release/tag itself is preserved (only
+  # its assets are cleared); the matrix then repopulates it with this run only.
+  clean-dev-assets:
+    name: clear stale rolling-dev assets
+    needs: gate
+    if: needs.gate.outputs.build == 'true'
+    runs-on: ubuntu-latest
+    permissions:
+      contents: write
+    steps:
+      - name: Delete existing assets on the rolling dev release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+          GH_REPO: ${{ github.repository }}
+        run: |
+          set -euo pipefail
+          # No `dev` release yet (first ever dev build) -> nothing to clean.
+          if ! gh release view dev >/dev/null 2>&1; then
+            echo "no rolling dev release yet; nothing to clean"
+            exit 0
+          fi
+          assets="$(gh release view dev --json assets --jq '.assets[].name')"
+          if [ -z "$assets" ]; then
+            echo "rolling dev release has no assets; nothing to clean"
+            exit 0
+          fi
+          while IFS= read -r name; do
+            [ -z "$name" ] && continue
+            echo "deleting stale dev asset: $name"
+            gh release delete-asset dev "$name" --yes
+          done <<< "$assets"
+
   build:
     name: build dev ${{ matrix.target }}
-    needs: gate
+    needs: [gate, clean-dev-assets]
     if: needs.gate.outputs.build == 'true'
     strategy:
       fail-fast: false
@@ -78,12 +116,29 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
+      - uses: actions/setup-node@v4
+        with:
+          node-version: 22
+
+      # R2-P1-1: derive a dev version that is (a) ABOVE the current stable release
+      # and (b) MONOTONIC between dev builds: <next-patch>-dev.<run_number>.<sha>,
+      # computed from the CURRENT [workspace.package].version (NOT hardcoded). The
+      # SAME byte-identical value patches the app metadata AND the generated
+      # manifest (the publish job recomputes it deterministically from the same
+      # run_number + sha + checked-out Cargo.toml). 0.0.0-dev.<sha> was LOWER than
+      # stable 0.1.0 (a stable user opting into dev was never offered an update)
+      # and short SHAs do not sort by time.
       - name: Compute dev version
         id: ver
         shell: bash
-        run: echo "version=0.0.0-dev.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          version="$(node scripts/set-dev-version.mjs --print-dev-version \
+            "${{ github.run_number }}" "$(git rev-parse --short HEAD)")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dev version: $version"
 
-      # R1-P1-5: patch 0.0.0-dev.<sha> into the canonical version sources (root
+      # R1-P1-5: patch the dev version into the canonical version sources (root
       # Cargo.toml [workspace.package], tauri.conf.json, ui/package.json) BEFORE
       # the Tauri build so the produced app actually reports the dev version -
       # otherwise updater version comparison + paths use the stale stable version.
@@ -130,6 +185,11 @@ jobs:
           # No tagName -> tauri-action builds but does not create/upload a
           # release; we collect the artifacts and publish them ourselves so all
           # four targets land on ONE rolling "dev" pre-release.
+          #
+          # R2-P2-1: codex claimed the key should be `includeUpdaterJson`. VERIFIED
+          # against the tauri-action action.yml + Context7 docs: the input IS
+          # `uploadUpdaterJson` (default true); `includeUpdaterJson` does not exist
+          # and would be silently ignored. Keep `uploadUpdaterJson` (false positive).
           uploadUpdaterJson: false
           args: --target ${{ matrix.target }}
 
@@ -180,13 +240,26 @@ jobs:
         with:
           node-version: 22
 
+      # R2-P1-1: recompute the SAME dev version the build job patched in - it is a
+      # pure function of (current Cargo.toml workspace version, github.run_number,
+      # short sha), all identical at this commit, so this is byte-identical to the
+      # value the app metadata + bundles carry. We pass it to the generator's
+      # --version so the manifest version matches the bundles exactly (and the
+      # generator's stale-bundle guard can reject any accreted old asset - R2-P1-2).
       - name: Compute dev version
         id: ver
         shell: bash
-        run: echo "version=0.0.0-dev.$(git rev-parse --short HEAD)" >> "$GITHUB_OUTPUT"
+        run: |
+          set -euo pipefail
+          version="$(node scripts/set-dev-version.mjs --print-dev-version \
+            "${{ github.run_number }}" "$(git rev-parse --short HEAD)")"
+          echo "version=$version" >> "$GITHUB_OUTPUT"
+          echo "dev version: $version"
 
       # R1-P1-2/4: download the rolling `dev` release's assets so the generator
-      # has real bundle + `.sig` inputs (it reads them from a local dir).
+      # has real bundle + `.sig` inputs (it reads them from a local dir). The
+      # clean-dev-assets job wiped prior runs' assets before this run's matrix
+      # uploaded, so only the CURRENT run's bundles are present (R2-P1-2).
       - name: Download dev release assets
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
@@ -213,14 +286,17 @@ jobs:
             --json body --jq '.body // ""' > release-notes.md
           echo "Notes bytes: $(wc -c < release-notes.md)"
 
-      # R1-P1-1/4: generate updates/dev/<os>/<arch>/update.json with the dev
-      # version (--sha), real notes, and the ROLLING `dev` tag asset base URL
-      # (the bundle version is 0.0.0-dev.<sha> but the assets live on tag `dev`).
+      # R1-P1-1/4 + R2-P1-1/2: generate updates/dev/<os>/<arch>/update.json with
+      # the EXACT dev version the bundles carry (--version, byte-identical to the
+      # app metadata), real notes, and the ROLLING `dev` tag asset base URL (the
+      # assets live on tag `dev` even though the bundle version is the dev
+      # prerelease). Passing --version also arms the generator's stale-bundle
+      # guard: any accreted asset whose filename version differs aborts the run.
       - name: Generate dev update.json tree
         run: |
           set -euo pipefail
           node scripts/generate-update-json.mjs dev \
-            --sha "$(git rev-parse --short HEAD)" \
+            --version "${{ steps.ver.outputs.version }}" \
             --assets-dir release-assets \
             --notes-file release-notes.md \
             --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"

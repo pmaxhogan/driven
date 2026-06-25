@@ -72,7 +72,6 @@ const GITHUB_REPO = "pmaxhogan/driven";
 export function targetForBundle(filename) {
   const lower = filename.toLowerCase();
   const isArm = /(aarch64|arm64)/.test(lower);
-  const isX64 = /(x86_64|x64|amd64)/.test(lower);
 
   // macOS app bundle updater artifact.
   if (lower.endsWith(".app.tar.gz")) {
@@ -182,13 +181,51 @@ async function readTauriConfVersion() {
   return conf.version;
 }
 
+/** Extract a SemVer-shaped version token from a bundle filename, or null if the
+ * name carries none (e.g. a macOS `*.app.tar.gz` is typically version-less).
+ * Used by [`collectSignedBundles`] to detect a STALE accreted bundle (R2-P1-2):
+ * a rolling dev release keeps old assets, and a manifest that advertises the new
+ * version while pointing at an old signed bundle is an integrity bug. */
+export function versionFromBundleName(filename) {
+  // Match <x>.<y>.<z> with an optional `-prerelease` (the dev form carries
+  // `-dev.<run>.<sha>`). Greedy on the prerelease so `0.1.1-dev.5.abc` is whole.
+  const m = filename.match(/(\d+\.\d+\.\d+(?:-[0-9A-Za-z.]+)?)/);
+  return m ? m[1] : null;
+}
+
+/** Rank two same-target candidates so the kept one is DETERMINISTIC for a
+ * legitimate single-build duplicate (Windows emits BOTH `.msi` and NSIS
+ * `-setup.exe`, each mapping to `windows-x86_64`). We prefer the NSIS installer
+ * (`.exe`) over the `.msi` - matching tauri-action's Windows updater default -
+ * then fall back to a stable filename sort. Returns the bundle to KEEP. */
+function preferWindowsInstaller(a, b) {
+  const isExe = (n) => n.toLowerCase().endsWith(".exe");
+  if (isExe(a.bundleName) && !isExe(b.bundleName)) return a;
+  if (isExe(b.bundleName) && !isExe(a.bundleName)) return b;
+  return a.bundleName.localeCompare(b.bundleName) <= 0 ? a : b;
+}
+
 /** Scan `bundlesDir` (recursively) for `.sig` files and pair each with its
  * sibling bundle, returning `[{ target, bundleFile, sigFile, signature }]`.
+ *
  * A `.sig` whose bundle filename does not map to a known target is skipped (with
- * a warning) rather than failing the whole run. */
-export async function collectSignedBundles(bundlesDir, log = console) {
-  const out = [];
-  const seenTargets = new Set();
+ * a warning) rather than failing the whole run.
+ *
+ * R2-P1-2: when two bundles map to the SAME target the function MUST NOT
+ * silently keep the first (that let a manifest advertise a new version while
+ * pointing at an OLD signed bundle accreted on the rolling dev release). The
+ * resolution is:
+ *  - if the two candidates carry DIFFERENT parseable versions, ERROR (a stale
+ *    accreted bundle - the directory was not cleaned to the current run); when
+ *    `expectedVersion` is given, also ERROR if a candidate's version does not
+ *    match it.
+ *  - if both are the current/same version (or version-less, e.g. macOS), this is
+ *    the legitimate Windows `.msi` + NSIS `.exe` pair: keep ONE deterministically
+ *    (prefer NSIS) and warn.
+ */
+export async function collectSignedBundles(bundlesDir, log = console, expectedVersion = null) {
+  // First pass: gather EVERY signed bundle, grouped by target.
+  const byTarget = new Map();
 
   async function walk(dir) {
     let entries;
@@ -211,22 +248,63 @@ export async function collectSignedBundles(bundlesDir, log = console) {
         log.warn?.(`skip (no target mapping): ${bundleName}`);
         continue;
       }
-      if (seenTargets.has(target)) {
-        // Two bundles map to the same target (e.g. .exe + .msi). Keep the first
-        // deterministically and warn; the updater wants exactly one per target.
-        log.warn?.(`duplicate target ${target}; keeping first, skipping ${bundleName}`);
-        continue;
-      }
       const signature = (await fs.readFile(full, "utf8")).trim();
       if (signature.length === 0) {
         throw new Error(`empty signature file: ${full}`);
       }
-      seenTargets.add(target);
-      out.push({ target, bundleFile, bundleName, sigFile: full, signature });
+      const version = versionFromBundleName(bundleName);
+      const candidate = { target, bundleFile, bundleName, sigFile: full, signature, version };
+      const list = byTarget.get(target);
+      if (list) list.push(candidate);
+      else byTarget.set(target, [candidate]);
     }
   }
 
   await walk(bundlesDir);
+
+  // Second pass: resolve each target to exactly one bundle, ERRORing on a stale
+  // mismatch (R2-P1-2) rather than silently keeping the first.
+  const out = [];
+  for (const [target, candidates] of byTarget) {
+    // If we know the expected version, any candidate carrying a DIFFERENT
+    // parseable version is a stale accreted asset - fail loudly.
+    if (expectedVersion) {
+      const stale = candidates.find((c) => c.version !== null && c.version !== expectedVersion);
+      if (stale) {
+        throw new Error(
+          `stale bundle for target ${target}: ${stale.bundleName} is version ` +
+            `${stale.version} but the manifest version is ${expectedVersion}; the ` +
+            `assets dir was not cleaned to the current run (R2-P1-2). Delete prior ` +
+            `release assets before regenerating.`,
+        );
+      }
+    }
+    if (candidates.length === 1) {
+      out.push(candidates[0]);
+      continue;
+    }
+    // Multiple candidates for one target. They must all share a version (a real
+    // duplicate from ONE build, e.g. Windows .msi + NSIS .exe). Differing
+    // parseable versions => stale accretion => ERROR.
+    const versions = new Set(candidates.map((c) => c.version).filter((v) => v !== null));
+    if (versions.size > 1) {
+      const detail = candidates.map((c) => `${c.bundleName} (${c.version ?? "no-version"})`).join(", ");
+      throw new Error(
+        `conflicting bundles for target ${target}: ${detail}; refusing to guess - ` +
+          `clean the assets dir to a single run (R2-P1-2).`,
+      );
+    }
+    // Same version (or version-less): the legitimate msi+nsis Windows pair. Keep
+    // one deterministically (prefer NSIS) and warn so the choice is visible.
+    const kept = candidates.reduce((acc, c) => preferWindowsInstaller(acc, c));
+    for (const c of candidates) {
+      if (c !== kept) {
+        log.warn?.(`duplicate target ${target}; keeping ${kept.bundleName}, skipping ${c.bundleName}`);
+      }
+    }
+    out.push(kept);
+  }
+
   // Deterministic order (sorted by target) so output + tests are stable.
   out.sort((a, b) => a.target.localeCompare(b.target));
   return out;
@@ -280,7 +358,10 @@ export async function generate(channel, opts, { readConfVersion, log = console }
     notes = (await fs.readFile(path.resolve(opts.notesFile), "utf8")).trim();
   }
 
-  const bundles = await collectSignedBundles(bundlesDir, log);
+  // Pass the resolved version so a STALE accreted bundle (a prior dev run's
+  // asset still on the rolling release) is rejected, not silently published
+  // (R2-P1-2).
+  const bundles = await collectSignedBundles(bundlesDir, log, version);
   if (bundles.length === 0) {
     throw new Error(
       `no signed bundles (*.sig) found under ${bundlesDir}; build with bundle.createUpdaterArtifacts=true first`,

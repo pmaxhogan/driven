@@ -163,4 +163,79 @@ describe("generate-update-json.mjs", () => {
       mod.generate("nightly", {}, { readConfVersion: async () => "0.1.0" }),
     ).rejects.toThrow(/channel/);
   });
+
+  it("parses a SemVer version token out of a bundle filename (R2-P1-2)", () => {
+    expect(mod.versionFromBundleName("Driven_0.1.0_x64-setup.exe")).toBe("0.1.0");
+    expect(
+      mod.versionFromBundleName("Driven_0.1.1-dev.5.abc1234_x64-setup.exe"),
+    ).toBe("0.1.1-dev.5.abc1234");
+    // A version-less macOS bundle yields null.
+    expect(mod.versionFromBundleName("Driven_aarch64.app.tar.gz")).toBeNull();
+  });
+
+  it("R2-P1-2: ERRORS on a stale accreted bundle (old version) instead of silently keeping it", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-stale-"));
+    const bundles = path.join(tmp, "bundle");
+    const out = path.join(tmp, "out");
+    await fs.mkdir(bundles, { recursive: true });
+
+    // Two Windows NSIS bundles for the SAME target but DIFFERENT versions: the
+    // current run's 0.1.2 plus a stale 0.1.1 left over on the rolling release.
+    await fs.writeFile(path.join(bundles, "Driven_0.1.2_x64-setup.exe"), "new");
+    await fs.writeFile(
+      path.join(bundles, "Driven_0.1.2_x64-setup.exe.sig"),
+      "NEWSIG==\n",
+    );
+    await fs.writeFile(path.join(bundles, "Driven_0.1.1_x64-setup.exe"), "old");
+    await fs.writeFile(
+      path.join(bundles, "Driven_0.1.1_x64-setup.exe.sig"),
+      "OLDSIG==\n",
+    );
+
+    const silent = { info: () => {}, warn: () => {} };
+    // With the expected version armed, the stale 0.1.1 asset must abort the run -
+    // NOT be silently published under 0.1.2.
+    await expect(
+      mod.generate(
+        "stable",
+        { version: "0.1.2", bundles, out, baseUrl: "https://dl.example.test" },
+        { readConfVersion: async () => "0.1.2", log: silent },
+      ),
+    ).rejects.toThrow(/stale bundle|conflicting bundles/);
+
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
+
+  it("R2-P1-2: keeps NSIS deterministically for the legitimate same-version msi+nsis pair", async () => {
+    const tmp = await fs.mkdtemp(path.join(os.tmpdir(), "driven-updjson-pair-"));
+    const bundles = path.join(tmp, "bundle");
+    const out = path.join(tmp, "out");
+    await fs.mkdir(bundles, { recursive: true });
+
+    // ONE Windows build emits both .msi and NSIS .exe, same version - a real
+    // duplicate target. The generator keeps exactly one (NSIS) without erroring.
+    await fs.writeFile(path.join(bundles, "Driven_0.2.0_x64.msi"), "msi");
+    await fs.writeFile(path.join(bundles, "Driven_0.2.0_x64.msi.sig"), "MSISIG==\n");
+    await fs.writeFile(path.join(bundles, "Driven_0.2.0_x64-setup.exe"), "exe");
+    await fs.writeFile(
+      path.join(bundles, "Driven_0.2.0_x64-setup.exe.sig"),
+      "EXESIG==\n",
+    );
+
+    const silent = { info: () => {}, warn: () => {} };
+    const result = await mod.generate(
+      "stable",
+      { version: "0.2.0", bundles, out, baseUrl: "https://dl.example.test" },
+      { readConfVersion: async () => "0.2.0", log: silent },
+    );
+
+    // Exactly ONE manifest for windows-x86_64, pointing at the NSIS installer.
+    expect(result.written.length).toBe(1);
+    const manifestPath = mod.manifestOutPath(out, "stable", "windows-x86_64");
+    const manifest = JSON.parse(await fs.readFile(manifestPath, "utf8"));
+    expect(manifest.platforms["windows-x86_64"].signature).toBe("EXESIG==");
+    expect(manifest.platforms["windows-x86_64"].url).toContain("-setup.exe");
+
+    await fs.rm(tmp, { recursive: true, force: true });
+  });
 });
