@@ -101,6 +101,56 @@ describe("About.vue macOS updater gating", () => {
     ).toBe(true);
   });
 
+  // R9-P2-3: the macOS manual-download link must FOLLOW the update channel. A
+  // dev-channel update points the macOS user at the rolling dev pre-release
+  // (`/releases/tag/dev`), a stable update at `/releases/latest`. Previously it was
+  // hardcoded to stable, sending dev users to the wrong page.
+  it("on macOS a dev-channel update links to the dev release tag", async () => {
+    setUserAgent(MAC_UA);
+    const settings = useSettingsStore();
+    settings.settings = FAKE_SETTINGS as never;
+    const wrapper = mountAbout();
+    await flushPromises();
+
+    const updater = useUpdaterStore();
+    updater.available = {
+      version: "0.2.0-dev.42.abcdef0",
+      notes: "Nightly.",
+      publishedAt: "2026-06-24T00:00:00Z",
+      channel: "dev",
+    };
+    await flushPromises();
+
+    const link = wrapper.find('[data-testid="download-latest-dmg"]');
+    expect(link.exists()).toBe(true);
+    expect(link.attributes("href")).toBe(
+      "https://github.com/pmaxhogan/driven/releases/tag/dev",
+    );
+  });
+
+  it("on macOS a stable-channel update links to the latest release", async () => {
+    setUserAgent(MAC_UA);
+    const settings = useSettingsStore();
+    settings.settings = FAKE_SETTINGS as never;
+    const wrapper = mountAbout();
+    await flushPromises();
+
+    const updater = useUpdaterStore();
+    updater.available = {
+      version: "0.2.0",
+      notes: "Stable.",
+      publishedAt: "2026-06-24T00:00:00Z",
+      channel: "stable",
+    };
+    await flushPromises();
+
+    const link = wrapper.find('[data-testid="download-latest-dmg"]');
+    expect(link.exists()).toBe(true);
+    expect(link.attributes("href")).toBe(
+      "https://github.com/pmaxhogan/driven/releases/latest",
+    );
+  });
+
   it("on Windows shows the in-app install button (no DMG link)", async () => {
     setUserAgent(WIN_UA);
     const settings = useSettingsStore();

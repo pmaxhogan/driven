@@ -33,8 +33,19 @@ const channels = ["stable", "dev"] as const;
 // download link to the GitHub releases page instead. Windows + Linux keep the
 // in-app install.
 const isMac = isMacOS();
-// The GitHub releases page the macOS user downloads the latest DMG from.
-const latestReleaseUrl = "https://github.com/pmaxhogan/driven/releases/latest";
+// The GitHub releases page the macOS user downloads the DMG from.
+// R9-P2-3: this must follow the CHANNEL of the update being offered, not always
+// point at stable. A dev-channel macOS user shown a dev update banner must be sent
+// to the rolling dev pre-release (`/releases/tag/dev`, the tag dev-channel.yml
+// publishes), not to `/releases/latest` (the stable release). Derive it from
+// `updater.available.channel`; default to the stable latest page when no update is
+// in hand (e.g. before any check).
+const releasesBase = "https://github.com/pmaxhogan/driven/releases";
+const macDownloadUrl = computed(() =>
+  updater.available?.channel === "dev"
+    ? `${releasesBase}/tag/dev`
+    : `${releasesBase}/latest`,
+);
 
 const exporting = ref(false);
 const exportError = ref<string | null>(null);
@@ -139,7 +150,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       <div class="flex flex-wrap items-center gap-2">
         <a
           v-if="isMac"
-          :href="latestReleaseUrl"
+          :href="macDownloadUrl"
           target="_blank"
           rel="noopener noreferrer"
           class="rounded bg-emerald-600 px-3 py-1.5 text-white"
