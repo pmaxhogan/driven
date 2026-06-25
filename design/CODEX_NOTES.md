@@ -1614,6 +1614,74 @@ M8 is CLOSED. Restore flow (list_remote_tree / search_files / streaming-decrypt
 restore_files + Restore.vue) ships with these 3 documented residuals folded into the
 M9 pre-GA hardening scope; the R4-P1-1 TOCTOU is the data-safety GA-blocker.
 
+## M9c - data-safety hardening
+
+The M9c pre-GA pass fixed the 4 CRITICAL data-safety residuals carried from M6 +
+M8 (the M8 recheck-4 trio + the M6 recheck-4 recovery-phrase P1). Disjoint from
+M9 r3 (release pipeline) - touches ONLY `src-tauri/src` (restore + recovery +
+commands + app_state) and `ui/` (restore store + recovery-phrase reveal + the two
+wizards). All gates green on Windows (cargo build/clippy -D/test --lib 157 passed;
+deny/fmt/git diff --check); `cd ui` pnpm install/lint/test:unit (133 passed)/build
+(vue-tsc clean). The Unix-only D1 swap-detection test is cfg-gated (runs on the
+3-OS CI Linux/macOS legs). Stub sweep on the touched surface: zero non-test
+`todo!`/`unimplemented!`/`unreachable!`.
+
+- **D1 (M8 R4-P1-1) - restore commit() verify->rename TOCTOU [DATA-SAFETY
+  GA-BLOCKER] FIXED.** `commit()` previously dropped the BLAKE3-verified temp
+  handle and renamed BY temp NAME/PATH (Unix `renameat`; Windows re-opened the
+  temp from `c.temp_path`), so a local process could unlink/replace the temp
+  between verification and rename and get unverified bytes committed (silent
+  restore corruption). Fix: `ConfinedDest` now RETAINS the temp file's OWN handle
+  from create through commit; the streamer writes + verifies through a `try_clone`
+  DUP, and the rename acts on the RETAINED, verified object.
+  - Windows: `SetFileInformationByHandle(FileRenameInfo)` is now called on the
+    RETAINED temp handle (opened with `DELETE`), NOT a re-open of `temp_path`. A
+    swap at the path cannot redirect the rename - the handle still names the
+    original inode.
+  - Unix: before `renameat` the commit fstat's the retained temp fd and
+    `statat(..., SYMLINK_NOFOLLOW)`'s the temp name in the pinned parent, and
+    proceeds ONLY if `(st_dev, st_ino)` match; a detected swap FAILS the commit
+    (`local.io_error`) - no silent corruption.
+  - Residual (documented): on Windows the rename DESTINATION is still derived from
+    the pinned PARENT handle's resolved path (the handle-relative `RootDirectory`
+    form of FILE_RENAME_INFO is NT-API-only), so the parent-pin - not a dest
+    string - confines the target dir; the SOURCE object is now fully
+    handle-pinned. `FILE_RENAME_INFO` still has no WRITE_THROUGH (file DATA is
+    `sync_all`'d; only the rename metadata is not flush-forced). Tests:
+    `confined_commit_uses_retained_handle_after_streamer_drops_its_dup`,
+    `restore_one_file_committed_bytes_equal_verified_bytes` (both OS),
+    `confined_commit_rejects_temp_swapped_after_verification` (Unix).
+- **D2 (M8 R4-P2-1) - shared restore-eligibility predicate FIXED.** Added ONE
+  `is_restorable(status, drive_file_id) = drive_file_id.is_some() && status ==
+  Synced` used by the tree DTO mapper, the search DTO mapper, AND restore
+  resolution (`resolve_restore_items`). The DTOs no longer mark a non-synced row
+  (with a stale Drive id) restorable, so the UI never offers a row resolution then
+  rejects. Tests: `is_restorable_requires_synced_status_and_a_drive_id`,
+  `tree_dto_marks_non_synced_row_not_restorable`,
+  `resolve_and_dto_agree_on_eligibility_via_one_predicate`.
+- **D3 (M8 R4-P2-2) - stale activeJobId on rejected restore FIXED.** `startRestore`
+  now sets `activeJobId = null` BEFORE calling `restoreFiles`, assigning the
+  returned id only on success - so a rejected new restore no longer leaves the
+  store tracking the PRIOR job id (stale reconcile/cancel). Vitest:
+  `clears a STALE activeJobId when a new restore is rejected`.
+- **D4 (M6 R4-P1-1) - recovery-phrase backend-ACK [DATA-SAFETY] FIXED (P1 only;
+  the 6 M6 P2s remain deferred).** Root-cause fix per the documented residual: the
+  FIRST encrypted source (the add that generates the master key) is now persisted
+  `enabled:false` and registered pending-ack on `AppState`; it is EXCLUDED from the
+  scheduler + manual sync (both filter on `enabled`), so no encrypted backups run
+  before the recovery phrase is durably saveable. Two new backend commands gate
+  enabling it: `reveal_recovery_phrase(source_id)` re-derives the phrase from the
+  keychain master key and RECORDS a real backend reveal; `ack_recovery_phrase_saved
+  (source_id)` is REJECTED unless that reveal was recorded, and on success flips
+  `enabled:true` + reconfigures the account. `add_source` returns a new
+  `pending_recovery_ack` flag; the wizard (`AddSourceWizard` + `SetupWizard`) thread
+  a backend reveal action into `RecoveryPhraseReveal` (which now awaits it and
+  latches "revealed" only on success) and call the backend ack on Finish before the
+  initial sync. So a UI checkbox can never enable encrypted backups without a real
+  backend reveal. Tests: backend `recovery_ack_gate_requires_a_recorded_backend_reveal`
+  (the AppState gate the command enforces); vitest reveal-action latch +
+  reject-leaves-locked. New i18n key `recoveryPhrase.revealingButton`.
+
 ## M9d - release pipeline
 
 Authored the release / ops pipeline (DISJOINT from M9a's updater feature): the
