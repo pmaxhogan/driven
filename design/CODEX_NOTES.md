@@ -2406,3 +2406,48 @@ non-test stub sweep on the touched surface = 0.
   launch) and keeps the manual `install_update` (which DOES `app.restart()`) as the only forced-
   relaunch path. If the product later wants an immediate auto-restart for dev, it is a one-line
   change (call `app.restart()` after the tray notify) - the plumbing is already wired.
+
+## M9 fix round 7b
+
+Source: codex review `.claude/codex-reviews/M9-7-20260625-002821.md` (baseline 97f596e, M9 @
+23b15d3). This round fixes the single GA-blocker pipeline finding P1-1 (the 2 data-safety findings
+are round 7a, concurrent). Files touched: `.github/workflows/release.yml`,
+`.github/workflows/dev-channel.yml`, `scripts/fetch-live-channel.sh` (header docs only - the script
+logic is tree-dir-parameterized and unchanged). updater.rs and tauri.conf.json were NOT touched
+(option (a) chosen - see below).
+
+### R7-P1-1 (release.yml + dev-channel.yml + updater.rs:79) deploy path != fetch path -> 404
+The in-app updater fetches `https://driven.maxhogan.dev/updates/<channel>/{{target}}/{{arch}}/update.json`
+(updater.rs `STABLE_ENDPOINT`/`DEV_ENDPOINT`, tauri.conf.json plugins.updater.endpoints). Both
+manifest jobs previously ran `wrangler pages deploy updates`. Per Cloudflare Pages semantics
+(verified via Context7 cloudflare-docs: `wrangler pages deploy <dir>` uploads `<dir>`'s CONTENTS as
+the deployment ROOT - subfolders map 1:1 to URL path segments), deploying the bare `updates/` dir
+served the manifests at `/<channel>/...` (the `/updates/` prefix STRIPPED), so every stable + dev
+updater check 404'd. GA-blocker.
+
+**Option chosen: (a) - deploy a `site/` STAGING PARENT that contains `updates/`.** Strongly
+preferred over (b) because it keeps updater.rs + tauri.conf.json + generate-update-json.mjs
+BYTE-IDENTICAL (zero runtime-endpoint surface change) and leaves the Pages site ROOT free for the
+future landing page (#12). Concretely, both jobs now:
+  - generate into `site/updates/<channel>/...` via the generator's existing `--out site/updates`
+    flag (the generator itself is unchanged - `--out` already existed; default stays `./updates`);
+  - overlay the OTHER channel's live manifests into the same staging tree by passing tree-dir
+    `site/updates` to `scripts/fetch-live-channel.sh` (the script appends
+    `<channel>/<plat>/update.json` to whatever tree-dir it is given, so it works unchanged for
+    `updates` or `site/updates`);
+  - (release.yml only) glob the GitHub-Release manifest upload + the required-manifest existence
+    check from `site/updates/stable/**` instead of `updates/stable/**`;
+  - run `wrangler pages deploy site` (the PARENT) instead of `pages deploy updates`. Pages now
+    serves `site/`'s contents at root -> `/updates/<channel>/<os>/<arch>/update.json`, matching the
+    app's fetch endpoint EXACTLY. No updater.rs/tauri.conf.json edit was needed.
+
+**Post-deploy curl smoke (NEW, in BOTH workflows).** After the `pages deploy site` step, each job
+curls all four REQUIRED targets' `update.json` at the REAL public URL the app fetches
+(`$UPDATES_BASE/<channel>/<os>/<arch>/update.json`) and FAILS the job (non-zero exit) unless every
+one returns HTTP 200 AND a JSON body with a non-empty `version` string. This is what catches the
+deploy-path != fetch-path mismatch FOR REAL at release/dev-build time - if the prefix is ever wrong
+again, or a manifest is missing, the smoke 404s and the job fails instead of silently shipping a
+broken channel. The curl uses a bounded `--retry` (NOT a sleep/poll loop) to ride out the few-second
+Cloudflare Pages propagation lag. (Caveat: real end-to-end CF serving is only exercised on a tagged
+release / dev-build run that actually deploys; the smoke guards the path at that point. Plain CI / PR
+runs do not deploy, so they cannot exercise the live curl - that is by design.)
