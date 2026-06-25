@@ -136,6 +136,14 @@ jobs:
           # current key is correct - do NOT rename it. (False positive; see
           # design/CODEX_NOTES.md "M9 fix round 2".)
           uploadUpdaterJson: false
+          # R3-P1-1: macOS `.app.tar.gz` is named from the `.app` bundle and
+          # carries NO arch, so BOTH mac jobs would upload the SAME basename
+          # (Driven.app.tar.gz) and collide in this flat release - dropping one
+          # arch or advertising ARM as x86_64. Force the arch into EVERY uploaded
+          # asset name (and its `.sig`) so the generator maps each mac arch to a
+          # distinct darwin/<arch> manifest. The pattern is consistent with the
+          # dev-channel rename + the generator's filename parser.
+          releaseAssetNamePattern: "[name]_[version]_[platform]_[arch][ext]"
           args: --target ${{ matrix.target }}
 
   publish-updater-manifest:
@@ -196,12 +204,17 @@ jobs:
 
       # R1-P1-1 / R1-P1-3: build updates/stable/<os>/<arch>/update.json from the
       # downloaded assets, with real notes + the v<tag> asset base URL.
+      # R3-P1-2: --require-targets makes the generator ERROR (failing this step,
+      # so nothing is uploaded/deployed) unless EVERY V1 target produced a
+      # manifest. A missing `.sig`, an asset collision, or a mapping miss can no
+      # longer ship a PARTIAL stable update tree while CI stays green.
       - name: Generate stable update.json tree
         run: |
           set -euo pipefail
           node scripts/generate-update-json.mjs stable \
             --assets-dir release-assets \
             --notes-file release-notes.md \
+            --require-targets "windows-x86_64,darwin-x86_64,darwin-aarch64,linux-x86_64" \
             --base-url "https://github.com/${GITHUB_REPOSITORY}/releases/download/${RELEASE_TAG}"
 
       # R1-P1-3: attach the generated manifests to the GitHub Release too (a
@@ -213,6 +226,15 @@ jobs:
         run: |
           set -euo pipefail
           shopt -s nullglob globstar
+          # R3-P1-2 (defense in depth): the generator already errors on an
+          # incomplete set, but assert here too that every required V1 manifest
+          # exists before any upload - a partial tree must never reach the release.
+          for t in windows/x86_64 darwin/x86_64 darwin/aarch64 linux/x86_64; do
+            if [ ! -f "updates/stable/${t}/update.json" ]; then
+              echo "::error::missing required manifest updates/stable/${t}/update.json"
+              exit 1
+            fi
+          done
           files=(updates/stable/**/update.json)
           if [ ${#files[@]} -eq 0 ]; then
             echo "::error::no updates/stable/**/update.json files were generated"
