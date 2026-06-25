@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE recovery_phrase_acks SET revealed = 1 WHERE source_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "422289676d4d94a8e90bcab5bfdc2dbfae1c70cb3739002cf0be44ba1f38d459"
+}

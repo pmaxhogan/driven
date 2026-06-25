@@ -93,6 +93,27 @@ pub struct SourceRow {
     pub created_at: UnixMs,
 }
 
+/// One row of `recovery_phrase_acks` (M9 R4-P1-1, DATA-SAFETY; migration
+/// `0004`).
+///
+/// The DURABLE recovery-phrase ACK gate state for the FIRST encrypted source of
+/// an account. Written atomically with the source insert + master-key stamp, so
+/// a durable encrypted source can never exist without its durable pending-ack
+/// record; reconstructed into the in-memory gate on startup. Deleted (in the same
+/// transaction that enables the source) once the ack succeeds.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+pub struct PendingRecoveryAck {
+    /// FK to `backup_sources.id` - the first encrypted (pending, disabled) source.
+    pub source_id: SourceId,
+    /// FK to `accounts.id` - the account whose master key/phrase this gates.
+    pub account_id: AccountId,
+    /// `true` once `reveal_recovery_phrase` has durably recorded a real backend
+    /// reveal. `ack_recovery_phrase_saved` is rejected unless this is set.
+    pub revealed: bool,
+    /// Wall-time the pending-ack record was created (Unix epoch ms).
+    pub created_at: UnixMs,
+}
+
 /// One row of `file_state` (SPEC s2).
 ///
 /// Primary key is the `(source_id, relative_path)` pair.
@@ -415,6 +436,7 @@ pub const KNOWN_STATE_TABLES: &[&str] = &[
     "activity_log",
     "settings",
     "file_checksum_mismatch",
+    "recovery_phrase_acks",
 ];
 
 /// Storage contract for the SQLite-backed state at
@@ -505,6 +527,85 @@ pub trait StateRepo: Send + Sync {
             self.upsert_account(&row).await?;
         }
         self.upsert_source(source).await
+    }
+
+    /// M9 R4-P1-1 (M6 R4-P1-1, DATA-SAFETY): ATOMICALLY (one transaction)
+    /// stamp the account's `encryption_master_key_id` (a COMPARE-AND-SET, only
+    /// when still NULL), insert/replace the FIRST-encrypted `backup_sources` row
+    /// (persisted `enabled=false`), AND write its DURABLE pending-recovery-ack
+    /// record (`recovery_phrase_acks`, `revealed=0`).
+    ///
+    /// Before this method the pending-ack gate lived only in process memory, so a
+    /// crash after the source + master key were persisted but before reveal+ack
+    /// lost the gate: the user could no longer reveal/ack the phrase and later
+    /// encrypted sources could arm encryption without it (unrestorable backups).
+    /// Doing all three writes in one transaction makes the outcome all-or-nothing:
+    /// either the account is stamped AND the disabled source exists AND its
+    /// durable pending-ack record exists, or none persist and a retry re-reveals
+    /// the phrase.
+    ///
+    /// The default impl performs the writes sequentially (adequate for in-memory
+    /// test doubles); the SQLite impl overrides it with a real transaction.
+    async fn insert_first_encrypted_source_pending_ack(
+        &self,
+        source: &SourceRow,
+        master_key_id: String,
+        created_at: UnixMs,
+    ) -> Result<()> {
+        self.insert_source_with_optional_master_key_stamp(
+            source,
+            Some((source.account_id, master_key_id)),
+        )
+        .await?;
+        // No-op default ack persistence for in-memory doubles (they never
+        // reconstruct from disk); the SQLite impl writes the real row.
+        let _ = created_at;
+        Ok(())
+    }
+
+    /// M9 R4-P1-1: every DURABLE pending-recovery-ack record, for startup
+    /// reconstruction of the in-memory gate. Default impl returns empty (the
+    /// in-memory doubles never persist these); the SQLite repo overrides it.
+    async fn list_pending_recovery_acks(&self) -> Result<Vec<PendingRecoveryAck>> {
+        Ok(Vec::new())
+    }
+
+    /// M9 R4-P1-1: DURABLY record that the backend revealed the phrase for
+    /// `source` (`recovery_phrase_acks.revealed = 1`). Returns `true` if a pending
+    /// record existed (so the reveal is meaningful), `false` for an unknown /
+    /// already-acked source. Default impl is a no-op returning `false`; the SQLite
+    /// repo overrides it.
+    async fn mark_recovery_phrase_revealed(&self, source: SourceId) -> Result<bool> {
+        let _ = source;
+        Ok(false)
+    }
+
+    /// M9 R4-P1-1: the DURABLE `revealed` flag for `source`'s pending recovery
+    /// ack. `None` = no pending record (unknown / already enabled); `Some(false)`
+    /// = pending but never revealed (the ack must be rejected); `Some(true)` = the
+    /// ack may proceed. Default impl returns `None`; the SQLite repo overrides it.
+    async fn recovery_ack_revealed(&self, source: SourceId) -> Result<Option<bool>> {
+        let _ = source;
+        Ok(None)
+    }
+
+    /// M9 R4-P1-1: ATOMICALLY (one transaction) flip `backup_sources.enabled` to
+    /// `1` for `source` AND DELETE its `recovery_phrase_acks` row - the durable
+    /// commit of a recovery-phrase ack. Doing both in one transaction means a
+    /// crash can never leave the source enabled without its pending-ack cleared,
+    /// nor cleared without enabled. The caller must have verified the durable
+    /// `revealed` flag first ([`Self::recovery_ack_revealed`]). Default impl does
+    /// the two writes sequentially (the source enable then a no-op ack clear) for
+    /// in-memory doubles; the SQLite repo overrides it with a real transaction.
+    async fn enable_source_and_clear_recovery_ack(&self, source: SourceId) -> Result<()> {
+        let mut rows = self.list_sources().await?;
+        let row = rows
+            .iter_mut()
+            .find(|r| r.id == source)
+            .ok_or_else(|| anyhow::anyhow!("source not found for recovery-ack enable"))?;
+        row.enabled = true;
+        let row = row.clone();
+        self.upsert_source(&row).await
     }
 
     /// Stamps `backup_sources.last_full_scan_at` and (when `deep_verify_at`

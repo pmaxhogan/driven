@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT revealed AS \"revealed!: i64\" FROM recovery_phrase_acks WHERE source_id = ?1",
+  "describe": {
+    "columns": [
+      {
+        "name": "revealed!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "3764f0a8862faf7e929af70115e6aa9a467de64b22b255ec485d7837b44945bf"
+}

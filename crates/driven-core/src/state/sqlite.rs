@@ -35,7 +35,7 @@ use uuid::Uuid;
 use super::{
     AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
     FileSearchHit, FileStateRow, FileStatusCount, ImmediateTreeChildren, NewActivity, NewPendingOp,
-    PageRequest, PendingOpRow, RestoreFileRow, SourceRow, StateRepo,
+    PageRequest, PendingOpRow, PendingRecoveryAck, RestoreFileRow, SourceRow, StateRepo,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -797,6 +797,219 @@ impl StateRepo for SqliteStateRepo {
         .execute(&mut *tx)
         .await?;
 
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_first_encrypted_source_pending_ack(
+        &self,
+        source: &SourceRow,
+        master_key_id: String,
+        created_at: UnixMs,
+    ) -> Result<()> {
+        // M9 R4-P1-1 (DATA-SAFETY): the master-key stamp, the (disabled) source
+        // insert, AND the durable pending-recovery-ack record are ALL written in
+        // ONE transaction, so a durable encrypted source can never exist without
+        // its durable pending-ack record (and vice versa).
+        let mut tx = self.pool.begin().await?;
+
+        // 1) COMPARE-AND-SET stamp the account's master-key id (same semantics as
+        //    `insert_source_with_optional_master_key_stamp`): update ONLY when the
+        //    column is still NULL so a concurrent stamp is never clobbered.
+        let account_id = source.account_id.to_string();
+        let affected = sqlx::query!(
+            "UPDATE accounts SET encryption_master_key_id = ?1 \
+             WHERE id = ?2 AND encryption_master_key_id IS NULL",
+            master_key_id,
+            account_id,
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if affected == 0 {
+            let current = sqlx::query!(
+                r#"SELECT encryption_master_key_id AS "mk: String" FROM accounts WHERE id = ?1"#,
+                account_id,
+            )
+            .fetch_optional(&mut *tx)
+            .await?;
+            match current {
+                None => {
+                    tx.rollback().await?;
+                    return Err(anyhow!(
+                        "account not found for master-key stamp; transaction rolled back"
+                    ));
+                }
+                Some(row) if row.mk.as_deref() == Some(master_key_id.as_str()) => {}
+                Some(_) => {
+                    tx.rollback().await?;
+                    return Err(anyhow!(
+                        "account master key already set by a concurrent writer; \
+                         refusing to stamp a divergent key (transaction rolled back)"
+                    ));
+                }
+            }
+        }
+
+        // 2) Insert/replace the (disabled) source row.
+        let id = source.id.to_string();
+        let src_account_id = source.account_id.to_string();
+        let enabled = source.enabled as i64;
+        let encryption_enabled = source.encryption_enabled as i64;
+        let respect_gitignore = source.respect_gitignore as i64;
+        let include_patterns = serde_json::to_string(&source.include_patterns)?;
+        let exclude_patterns = serde_json::to_string(&source.exclude_patterns)?;
+        let wrapped: Option<&[u8]> = source.wrapped_source_key.as_deref();
+        let deep_verify_interval_secs = source.deep_verify_interval_secs as i64;
+
+        sqlx::query!(
+            r#"
+            INSERT INTO backup_sources (
+                id, account_id, display_name, enabled,
+                local_path, drive_folder_id, drive_folder_path,
+                encryption_enabled, wrapped_source_key, respect_gitignore,
+                include_patterns, exclude_patterns, schedule_json_v2_reserved,
+                deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
+                created_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, ?6, ?7,
+                ?8, ?9, ?10,
+                ?11, ?12, ?13,
+                ?14, ?15, ?16,
+                ?17
+            )
+            ON CONFLICT(id) DO UPDATE SET
+                account_id                = excluded.account_id,
+                display_name              = excluded.display_name,
+                enabled                   = excluded.enabled,
+                local_path                = excluded.local_path,
+                drive_folder_id           = excluded.drive_folder_id,
+                drive_folder_path         = excluded.drive_folder_path,
+                encryption_enabled        = excluded.encryption_enabled,
+                wrapped_source_key        = excluded.wrapped_source_key,
+                respect_gitignore         = excluded.respect_gitignore,
+                include_patterns          = excluded.include_patterns,
+                exclude_patterns          = excluded.exclude_patterns,
+                schedule_json_v2_reserved = excluded.schedule_json_v2_reserved,
+                deep_verify_interval_secs = excluded.deep_verify_interval_secs,
+                last_full_scan_at         = excluded.last_full_scan_at,
+                last_deep_verify_at       = excluded.last_deep_verify_at,
+                created_at                = excluded.created_at
+            "#,
+            id,
+            src_account_id,
+            source.display_name,
+            enabled,
+            source.local_path,
+            source.drive_folder_id,
+            source.drive_folder_path,
+            encryption_enabled,
+            wrapped,
+            respect_gitignore,
+            include_patterns,
+            exclude_patterns,
+            source.schedule_json_v2_reserved,
+            deep_verify_interval_secs,
+            source.last_full_scan_at,
+            source.last_deep_verify_at,
+            source.created_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // 3) Write the durable pending-recovery-ack record (revealed = 0). A
+        //    REPLACE so a retry of the same source id (e.g. after a transient
+        //    failure) re-seeds a clean pending record rather than failing on the
+        //    PK.
+        sqlx::query!(
+            "INSERT INTO recovery_phrase_acks (source_id, account_id, revealed, created_at) \
+             VALUES (?1, ?2, 0, ?3) \
+             ON CONFLICT(source_id) DO UPDATE SET \
+                account_id = excluded.account_id, \
+                revealed   = 0, \
+                created_at = excluded.created_at",
+            id,
+            src_account_id,
+            created_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn list_pending_recovery_acks(&self) -> Result<Vec<PendingRecoveryAck>> {
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                source_id  AS "source_id!: String",
+                account_id AS "account_id!: String",
+                revealed   AS "revealed!: i64",
+                created_at AS "created_at!: i64"
+            FROM recovery_phrase_acks
+            ORDER BY created_at ASC, source_id ASC
+            "#,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        rows.into_iter()
+            .map(|r| {
+                Ok(PendingRecoveryAck {
+                    source_id: SourceId(uuid_from_str(&r.source_id)?),
+                    account_id: AccountId(uuid_from_str(&r.account_id)?),
+                    revealed: r.revealed != 0,
+                    created_at: r.created_at,
+                })
+            })
+            .collect()
+    }
+
+    async fn mark_recovery_phrase_revealed(&self, source: SourceId) -> Result<bool> {
+        let id = source.to_string();
+        let affected = sqlx::query!(
+            "UPDATE recovery_phrase_acks SET revealed = 1 WHERE source_id = ?1",
+            id,
+        )
+        .execute(&self.pool)
+        .await?
+        .rows_affected();
+        Ok(affected > 0)
+    }
+
+    async fn recovery_ack_revealed(&self, source: SourceId) -> Result<Option<bool>> {
+        let id = source.to_string();
+        let row = sqlx::query!(
+            r#"SELECT revealed AS "revealed!: i64" FROM recovery_phrase_acks WHERE source_id = ?1"#,
+            id,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| r.revealed != 0))
+    }
+
+    async fn enable_source_and_clear_recovery_ack(&self, source: SourceId) -> Result<()> {
+        // M9 R4-P1-1 (DATA-SAFETY): enabling the source and clearing its durable
+        // pending-ack record must be all-or-nothing, so a crash can never leave
+        // the source enabled with a stale pending record (or cleared but still
+        // disabled).
+        let id = source.to_string();
+        let mut tx = self.pool.begin().await?;
+        let affected = sqlx::query!("UPDATE backup_sources SET enabled = 1 WHERE id = ?1", id,)
+            .execute(&mut *tx)
+            .await?
+            .rows_affected();
+        if affected == 0 {
+            tx.rollback().await?;
+            return Err(anyhow!(
+                "source not found for recovery-ack enable; transaction rolled back"
+            ));
+        }
+        sqlx::query!("DELETE FROM recovery_phrase_acks WHERE source_id = ?1", id,)
+            .execute(&mut *tx)
+            .await?;
         tx.commit().await?;
         Ok(())
     }
@@ -2417,6 +2630,189 @@ mod tests {
             repo.list_sources().await.unwrap().len(),
             2,
             "both sources persist under the single shared key"
+        );
+    }
+
+    #[tokio::test]
+    async fn first_encrypted_source_pending_ack_persists_atomically() {
+        // R4-P1-1 (DATA-SAFETY): the first-encrypted-source insert stamps the
+        // account master key, persists the DISABLED source, AND writes the durable
+        // pending-ack record - all in one transaction.
+        let (repo, _dir) = temp_repo().await;
+        let mut acct = sample_account();
+        acct.encryption_master_key_id = None;
+        repo.upsert_account(&acct).await.unwrap();
+
+        let mut src = sample_source(acct.id);
+        src.encryption_enabled = true;
+        src.enabled = false; // persisted disabled, pending ack
+        repo.insert_first_encrypted_source_pending_ack(&src, "kc:alice-master".into(), 42)
+            .await
+            .expect("atomic first-encrypted-source insert");
+
+        // Account stamped, source persisted disabled, pending-ack row written.
+        let after = repo.list_accounts().await.unwrap();
+        assert_eq!(
+            after[0].encryption_master_key_id.as_deref(),
+            Some("kc:alice-master")
+        );
+        let sources = repo.list_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(!sources[0].enabled, "the pending source must be disabled");
+        let acks = repo.list_pending_recovery_acks().await.unwrap();
+        assert_eq!(acks.len(), 1);
+        assert_eq!(acks[0].source_id, src.id);
+        assert_eq!(acks[0].account_id, acct.id);
+        assert!(!acks[0].revealed, "a fresh pending ack is not yet revealed");
+    }
+
+    #[tokio::test]
+    async fn first_encrypted_source_pending_ack_rolls_back_on_failure() {
+        // R4-P1-1 (DATA-SAFETY): if the source insert fails, NEITHER the master-key
+        // stamp NOR the pending-ack record may persist (else the account looks
+        // provisioned with no revealable phrase). Force an FK failure with a source
+        // whose account_id points at no account.
+        let (repo, _dir) = temp_repo().await;
+        let mut acct = sample_account();
+        acct.encryption_master_key_id = None;
+        repo.upsert_account(&acct).await.unwrap();
+
+        let mut bad = sample_source(AccountId::new_v4());
+        bad.encryption_enabled = true;
+        bad.enabled = false;
+        repo.insert_first_encrypted_source_pending_ack(&bad, "kc:alice-master".into(), 1)
+            .await
+            .expect_err("source insert must fail on the FK violation");
+
+        assert_eq!(
+            repo.list_accounts().await.unwrap()[0].encryption_master_key_id,
+            None,
+            "the account must NOT be stamped after a rolled-back insert"
+        );
+        assert!(repo.list_sources().await.unwrap().is_empty());
+        assert!(
+            repo.list_pending_recovery_acks().await.unwrap().is_empty(),
+            "no pending-ack record may persist after a rolled-back insert"
+        );
+    }
+
+    #[tokio::test]
+    async fn recovery_ack_gate_survives_restart_then_durable_ack_enables() {
+        // R4-P1-1 (DATA-SAFETY): the pending-ack gate is reconstructable from disk
+        // across a process restart. A pending source reloaded over the SAME db is
+        // still disabled + ackable; recording a durable reveal then the atomic
+        // enable+clear flips it on.
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("state.db");
+
+        let source_id;
+        let account_id;
+        {
+            // "First boot": create the pending first-encrypted source.
+            let repo = SqliteStateRepo::open(&path).await.expect("open 1");
+            let mut acct = sample_account();
+            acct.encryption_master_key_id = None;
+            repo.upsert_account(&acct).await.unwrap();
+            account_id = acct.id;
+            let mut src = sample_source(acct.id);
+            src.encryption_enabled = true;
+            src.enabled = false;
+            source_id = src.id;
+            repo.insert_first_encrypted_source_pending_ack(&src, "kc:alice-master".into(), 7)
+                .await
+                .expect("seed pending source");
+        }
+
+        // "Restart": a FRESH repo handle over the same db file.
+        let repo = SqliteStateRepo::open(&path).await.expect("open 2");
+
+        // The gate survived: the source is still disabled and still pending+ackable.
+        let sources = repo.list_sources().await.unwrap();
+        assert_eq!(sources.len(), 1);
+        assert!(
+            !sources[0].enabled,
+            "the pending source must still be disabled after a restart"
+        );
+        let acks = repo.list_pending_recovery_acks().await.unwrap();
+        assert_eq!(
+            acks.len(),
+            1,
+            "the durable pending-ack survived the restart"
+        );
+        assert_eq!(acks[0].account_id, account_id);
+        assert_eq!(
+            repo.recovery_ack_revealed(source_id).await.unwrap(),
+            Some(false),
+            "pending but not yet revealed after restart"
+        );
+
+        // The ack must be REJECTED before a reveal (the gate the command enforces).
+        // (The command-layer rejection is tested in the app crate; here we assert
+        // the durable predicate it reads.)
+        assert_eq!(
+            repo.recovery_ack_revealed(source_id).await.unwrap(),
+            Some(false)
+        );
+
+        // Record a durable reveal, then the atomic enable+clear commits the ack.
+        assert!(
+            repo.mark_recovery_phrase_revealed(source_id).await.unwrap(),
+            "marking a pending source revealed returns true"
+        );
+        assert_eq!(
+            repo.recovery_ack_revealed(source_id).await.unwrap(),
+            Some(true),
+            "the reveal is now durably recorded"
+        );
+        repo.enable_source_and_clear_recovery_ack(source_id)
+            .await
+            .expect("durable ack enables + clears");
+
+        // The source is now enabled and the pending record is gone.
+        let sources = repo.list_sources().await.unwrap();
+        assert!(sources[0].enabled, "the acked source is now enabled");
+        assert!(
+            repo.list_pending_recovery_acks().await.unwrap().is_empty(),
+            "the pending-ack record is cleared after a durable ack"
+        );
+        assert_eq!(
+            repo.recovery_ack_revealed(source_id).await.unwrap(),
+            None,
+            "no pending record remains after the ack"
+        );
+    }
+
+    #[tokio::test]
+    async fn mark_revealed_and_revealed_query_unknown_source_are_noops() {
+        // R4-P1-1: durable reveal/query for a source with no pending record are
+        // benign (false / None), so a forged / already-acked id cannot enable a
+        // gate that does not exist.
+        let (repo, _dir) = temp_repo().await;
+        let unknown = SourceId::new_v4();
+        assert!(!repo.mark_recovery_phrase_revealed(unknown).await.unwrap());
+        assert_eq!(repo.recovery_ack_revealed(unknown).await.unwrap(), None);
+    }
+
+    #[tokio::test]
+    async fn delete_source_cascades_its_pending_recovery_ack() {
+        // R4-P1-1: removing a pending source before acking drops its durable
+        // pending-ack record (ON DELETE CASCADE) - no orphan.
+        let (repo, _dir) = temp_repo().await;
+        let mut acct = sample_account();
+        acct.encryption_master_key_id = None;
+        repo.upsert_account(&acct).await.unwrap();
+        let mut src = sample_source(acct.id);
+        src.encryption_enabled = true;
+        src.enabled = false;
+        repo.insert_first_encrypted_source_pending_ack(&src, "kc:alice-master".into(), 3)
+            .await
+            .unwrap();
+        assert_eq!(repo.list_pending_recovery_acks().await.unwrap().len(), 1);
+
+        repo.delete_source(src.id).await.unwrap();
+        assert!(
+            repo.list_pending_recovery_acks().await.unwrap().is_empty(),
+            "the pending-ack record cascades with the source delete"
         );
     }
 

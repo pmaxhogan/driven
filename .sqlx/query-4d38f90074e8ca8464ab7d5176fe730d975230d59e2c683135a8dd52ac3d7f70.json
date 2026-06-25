@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO recovery_phrase_acks (source_id, account_id, revealed, created_at) VALUES (?1, ?2, 0, ?3) ON CONFLICT(source_id) DO UPDATE SET account_id = excluded.account_id, revealed   = 0, created_at = excluded.created_at",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "4d38f90074e8ca8464ab7d5176fe730d975230d59e2c683135a8dd52ac3d7f70"
+}

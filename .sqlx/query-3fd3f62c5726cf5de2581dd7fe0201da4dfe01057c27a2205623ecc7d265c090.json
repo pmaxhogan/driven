@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                source_id  AS \"source_id!: String\",\n                account_id AS \"account_id!: String\",\n                revealed   AS \"revealed!: i64\",\n                created_at AS \"created_at!: i64\"\n            FROM recovery_phrase_acks\n            ORDER BY created_at ASC, source_id ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "source_id!: String",
+        "ordinal": 0,
+        "type_info": "Text"
+      },
+      {
+        "name": "account_id!: String",
+        "ordinal": 1,
+        "type_info": "Text"
+      },
+      {
+        "name": "revealed!: i64",
+        "ordinal": 2,
+        "type_info": "Integer"
+      },
+      {
+        "name": "created_at!: i64",
+        "ordinal": 3,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 0
+    },
+    "nullable": [
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "3fd3f62c5726cf5de2581dd7fe0201da4dfe01057c27a2205623ecc7d265c090"
+}
