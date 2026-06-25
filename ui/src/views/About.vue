@@ -93,7 +93,9 @@ async function onChannelChange(event: Event): Promise<void> {
 
 async function setTelemetry(event: Event): Promise<void> {
   const checkedValue = (event.target as HTMLInputElement).checked;
-  await settings.patch({ telemetry: { enabled: checkedValue } });
+  // SPEC s16 (M9b R2-P1-1): use the dedicated set_telemetry_enabled command so the
+  // backend flips the in-flight ping cancel flag immediately (opt-out honored mid-ping).
+  await settings.setTelemetryEnabled(checkedValue);
 }
 
 async function exportDiagnostics(): Promise<void> {

@@ -37,5 +37,27 @@ export const useSettingsStore = defineStore("settings", () => {
     }
   }
 
-  return { settings, loading, error, refresh, patch };
+  // SPEC s16 (M9b R2-P1-1): toggle anonymous telemetry through the DEDICATED
+  // set_telemetry_enabled command (NOT the generic update_settings patch), so the
+  // backend flips the in-flight ping cancel flag IMMEDIATELY - a disable click
+  // while a ping is building still aborts that send. After the toggle commits we
+  // refresh the snapshot so the stored value is reflected authoritatively. (The
+  // backend also routes update_settings' telemetry branch through the same
+  // cancel-preserving path, so either route is safe; this is the explicit one.)
+  async function setTelemetryEnabled(enabled: boolean): Promise<void> {
+    error.value = null;
+    try {
+      await ipc.setTelemetryEnabled(enabled);
+      if (settings.value) {
+        settings.value = { ...settings.value, telemetry: { ...settings.value.telemetry, enabled } };
+      } else {
+        await refresh();
+      }
+    } catch (e) {
+      error.value = String(e);
+      throw e;
+    }
+  }
+
+  return { settings, loading, error, refresh, patch, setTelemetryEnabled };
 });

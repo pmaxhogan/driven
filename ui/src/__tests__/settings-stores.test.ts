@@ -271,4 +271,32 @@ describe("settings store", () => {
     );
     expect(store.error).toContain("write failed");
   });
+
+  it("setTelemetryEnabled calls set_telemetry_enabled and updates the snapshot (R2-P1-1)", async () => {
+    // R2-P1-1: the telemetry toggle routes through the DEDICATED command (not the
+    // generic update_settings patch) so the backend flips the in-flight cancel
+    // flag immediately; the store then reflects the new value in its snapshot.
+    const store = useSettingsStore();
+    invokeMock.mockResolvedValueOnce(makeSettings()); // refresh
+    await store.refresh();
+    expect(store.settings?.telemetry.enabled).toBe(true);
+
+    invokeMock.mockResolvedValueOnce(false); // set_telemetry_enabled
+    await store.setTelemetryEnabled(false);
+    expect(invokeMock).toHaveBeenCalledWith("set_telemetry_enabled", {
+      enabled: false,
+    });
+    expect(store.settings?.telemetry.enabled).toBe(false);
+    // It did NOT route through the generic update_settings patch.
+    expect(invokeMock).not.toHaveBeenCalledWith("update_settings", {
+      patch: { telemetry: { enabled: false } },
+    });
+  });
+
+  it("setTelemetryEnabled surfaces the error and rethrows", async () => {
+    const store = useSettingsStore();
+    invokeMock.mockRejectedValueOnce(new Error("toggle failed"));
+    await expect(store.setTelemetryEnabled(false)).rejects.toThrow("toggle failed");
+    expect(store.error).toContain("toggle failed");
+  });
 });

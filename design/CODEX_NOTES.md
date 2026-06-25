@@ -2772,3 +2772,76 @@ Single sole-actor.
   pnpm install + lint + test:unit (157) + build (vue-tsc clean). worker: pnpm install + tsc + eslint +
   vitest (27 tests, incl. the new PII-rejection negatives). Stub sweep on the touched surface: zero
   non-test `todo!(`/`unimplemented!(`/`unreachable!(`.
+
+## M9b fix round 2
+
+  Codex M9b recheck-1 (`.claude/codex-reviews/M9b-recheck-20260625-032935.md`, baseline 8bb3fe9, M9b @
+  4ba7b22): 2 P1 + 3 P2, all legit refinements of round 1. ONE sole-actor pass (client + worker stay a
+  coupled, byte-consistent payload contract). Spec: `.claude/m9b-fix-spec-r2.md`. Telemetry closes after
+  this + recheck-2.
+
+  - R2-P1-1 (opt-out via EVERY renderer path, `telemetry.rs` + `commands/settings.rs` + `stores/settings.ts`
+    + `Settings.vue` + `About.vue`): round 1 only flipped the in-flight cancel flag in the dedicated
+    `set_telemetry_enabled` command, but the Settings/About toggles called the generic `update_settings`,
+    so a disable click while a ping was building could still send. FIX: a SHARED
+    `telemetry::apply_enabled_change(state, cancel, enabled)` helper now owns the one cancel-preserving path
+    - it flips the `AppState` `TelemetryRuntime.cancel` `AtomicBool` (set BEFORE the write when disabling,
+    cleared on enable) then does the preserving `write_enabled`. BOTH `set_telemetry_enabled` AND the
+    `update_settings` telemetry branch route through it, so any backend path honors opt-out immediately. The
+    UI toggles (Settings + About) now call the dedicated `set_telemetry_enabled` IPC via a new
+    `settingsStore.setTelemetryEnabled(enabled)` action (which updates the snapshot in place), not the
+    generic patch. Tests: `apply_enabled_change_off_trips_cancel_flag_and_persists` (Rust),
+    `settings-stores` `setTelemetryEnabled calls set_telemetry_enabled ...`, and the `settings-components`
+    toggle test now asserts `set_telemetry_enabled` is called and `update_settings` is NOT.
+  - R2-P1-2 (content-validate version + os_version, `telemetry-worker/src/index.ts`): round 1 only
+    length-checked these two blobs, so short PII (`alice@example.com`, `/home/alice`) fit. FIX: strict
+    content allowlists in ADDITION to the length cap. `VERSION_RE` is a pragmatic semver-ish allowlist
+    (`MAJOR.MINOR.PATCH` + optional dot-separated `[0-9A-Za-z-]` prerelease + optional `+build`) that
+    ACCEPTS the client's REAL `package_info().version` outputs - plain `0.1.0` on stable and
+    `0.1.1-dev.<run>.<sha>` on the CI dev channel (verified against `telemetry.rs`). `OS_VERSION_RE` allows
+    only coarse platform chars (ASCII alnum, dot, hyphen, underscore, single inter-token spaces; leading +
+    trailing char alphanumeric; whitespace-RUNS rejected) - accepts the real `os_info` coarse outputs
+    (`11.26200`, `14.5`, `10.0.19045`, `22.04 LTS`, `rolling`, codenames). Both REJECT `/`, `\`, `@`, control
+    chars -> 400. Negatives added: email/path/backslash-shaped version, email/path-shaped + whitespace-run
+    os_version; positives assert the real stable + dev version shapes and the real os_info shapes are
+    accepted.
+  - R2-P2-1 (preserve `last_sent_at` on a settings toggle, `commands/settings.rs`): the narrow
+    `storage::Telemetry` struct omitted `last_sent_at`, so an `update_settings` telemetry patch
+    deserialized the group and wrote back only `enabled/install_id/endpoint`, DROPPING the delta checkpoint
+    (-> duplicate windows after a toggle). FIX: the `update_settings` telemetry branch no longer round-trips
+    through `storage::Telemetry`; it routes through `apply_enabled_change`, whose preserving
+    read-modify-write mutates ONLY `enabled` and keeps `install_id` / `endpoint` / `last_sent_at` /
+    `last_recorded_version` intact. (`storage::Telemetry` is still used by the read-only `get_settings`
+    display path, which never persists, so no clobber.) Test:
+    `update_settings_telemetry_patch_preserves_last_sent_at`.
+  - R2-P2-2 (integer + range validation on numeric fields, `telemetry-worker/src/index.ts`): round 1
+    accepted any finite non-negative number for `files_uploaded` / `bytes_uploaded` / `deep_verify_runs` /
+    `ts`, so fractions + huge finite doubles slipped in. FIX: `isBoundedCount` now requires
+    `Number.isSafeInteger` (rejects fractions AND non-safe-integer doubles) under per-field caps
+    (`MAX_FILES_UPLOADED = 1e9`, `MAX_BYTES_UPLOADED = 1 PiB`, `MAX_DEEP_VERIFY_RUNS = 1e6`); `ts` is
+    validated by `isIntegerInRange` to a plausible epoch-ms window (`TS_MIN_MS` 2020-01-01 .. `TS_MAX_MS`
+    2100-01-01), catching a seconds-vs-ms mistake too. Any violation -> 400. Negatives added: fractional
+    files/bytes/deep_verify/ts, huge non-safe-integer bytes + ts, over-cap bytes, seconds-granularity +
+    far-future ts.
+  - R2-P2-3 (actually record `update_applied`, `telemetry.rs` + `lib.rs`): nothing wrote an `activity_log`
+    row with `event_type='update_applied'`, so the aggregate was always 0/false. FIX: a new
+    `telemetry::record_update_applied_if_changed(state, running_version, now_ms)` persists the last-observed
+    app version in the `telemetry` group (`last_recorded_version`, preserved by the read-modify-write
+    helpers). On boot (lib.rs setup, after `manage(app_state)` + before the first ping is spawned) it
+    compares the running `package_info().version` to the stored one: a FIRST run with no recorded version
+    just seeds it (a fresh install is NOT an update, no event); a CHANGED version writes exactly ONE
+    `update_applied` Info activity row and advances the stored version; an UNCHANGED version writes nothing.
+    Cheap, idempotent, fully non-fatal (every error logged + swallowed, never blocks boot). The existing
+    `telemetry_events_since` aggregate counts these rows, so the ping field is now driven by a real path.
+    Test: `update_applied_recorded_exactly_once_on_version_change` (fresh -> 0, same -> 0, change -> 1,
+    re-boot -> still 1; aggregate == 1).
+
+  Gates (all green): SQLX_OFFLINE cargo build --workspace --all-targets + clippy --workspace --all-targets
+  -D warnings + test --workspace (telemetry 19 incl. the 3 new; full suite pass, only the honest
+  elevation/google_e2e gate-skips ignored) + build -p driven-app + deny check + fmt --all --check + git
+  diff --check. No `sqlx::query!` / migration change this round (the update_applied path reuses
+  `write_activity` + the existing `telemetry_events_since` query), so no sqlx-prepare needed - 0 drift. ui
+  pnpm install + lint + test:unit (159) + build (vue-tsc clean). worker: pnpm install + tsc + eslint +
+  vitest (44 tests, incl. the new version/os_version PII negatives + real-shape acceptance + numeric
+  range negatives). Stub sweep on the touched surface (telemetry.rs, settings.rs, lib.rs, index.ts,
+  settings.ts, Settings.vue, About.vue): zero non-test `todo!(`/`unimplemented!(`/`unreachable!(`.

@@ -580,16 +580,15 @@ describe("Settings Rules tab", () => {
     });
   });
 
-  it("reflects telemetry default ON and toggling it patches telemetry.enabled (SPEC s16)", async () => {
-    // M9b (SPEC s16): the "Send anonymous usage stats" toggle reflects the stored
-    // telemetry.enabled (default ON) and unchecking it round-trips a
-    // { telemetry: { enabled: false } } patch through update_settings.
-    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+  it("reflects telemetry default ON and toggling it calls set_telemetry_enabled (SPEC s16 R2-P1-1)", async () => {
+    // M9b R2-P1-1: the "Send anonymous usage stats" toggle reflects the stored
+    // telemetry.enabled (default ON) and unchecking it calls the DEDICATED
+    // set_telemetry_enabled command (NOT a generic update_settings patch), so the
+    // backend flips the in-flight ping cancel flag immediately (opt-out honored
+    // mid-ping).
+    invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "get_settings") return Promise.resolve(makeSettings());
-      if (cmd === "update_settings") {
-        const patch = (args as { patch: Record<string, unknown> }).patch;
-        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
-      }
+      if (cmd === "set_telemetry_enabled") return Promise.resolve(false);
       return Promise.resolve(undefined);
     });
     const wrapper = mount(Settings, {
@@ -606,10 +605,13 @@ describe("Settings Rules tab", () => {
       i18n.global.t("settings.rules.telemetryNote"),
     );
 
-    // Uncheck -> patches telemetry.enabled = false.
+    // Uncheck -> calls set_telemetry_enabled(false), NOT update_settings.
     await toggle.setValue(false);
     await flushPromises();
-    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+    expect(invokeMock).toHaveBeenCalledWith("set_telemetry_enabled", {
+      enabled: false,
+    });
+    expect(invokeMock).not.toHaveBeenCalledWith("update_settings", {
       patch: { telemetry: { enabled: false } },
     });
   });

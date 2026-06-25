@@ -136,12 +136,13 @@ async function setVssMode(event: Event): Promise<void> {
   await settings.patch({ windows: { vssMode: value } });
 }
 
-// SPEC s16 (M9b): toggle anonymous usage telemetry (default ON). Round-trips
-// through the settings store so the snapshot reflects the authoritative stored
-// value; the backend honors the change immediately on the next ping tick.
+// SPEC s16 (M9b R2-P1-1): toggle anonymous usage telemetry (default ON) via the
+// DEDICATED set_telemetry_enabled command, so the backend flips the in-flight ping
+// cancel flag immediately - a disable click while a ping is building still aborts
+// that send (the generic update_settings path would too, but this is explicit).
 async function setTelemetryEnabled(event: Event): Promise<void> {
   const checked = (event.target as HTMLInputElement).checked;
-  await settings.patch({ telemetry: { enabled: checked } });
+  await settings.setTelemetryEnabled(checked);
 }
 </script>
 
