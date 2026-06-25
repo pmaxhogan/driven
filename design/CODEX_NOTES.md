@@ -2451,3 +2451,52 @@ broken channel. The curl uses a bounded `--retry` (NOT a sleep/poll loop) to rid
 Cloudflare Pages propagation lag. (Caveat: real end-to-end CF serving is only exercised on a tagged
 release / dev-build run that actually deploys; the smoke guards the path at that point. Plain CI / PR
 runs do not deploy, so they cannot exercise the live curl - that is by design.)
+
+## M9 fix round 7a (codex M9-7: data-safety P1-2 + P2-1)
+
+Source review: `.claude/codex-reviews/M9-7-20260625-002821.md` (baseline 97f596e, M9 @ 23b15d3).
+This round is the two DATA-SAFETY findings; the P1 CF-deploy-path finding is round 7b (concurrent).
+
+- R7-P1-2 (recovery-ack migration backfill, DATA-SAFETY). Migration `0004` only CREATES the empty
+  `recovery_phrase_acks` table, so any encrypted source created BEFORE `0004` (when the ack gate was
+  in-memory only) stays ENABLED with NO durable ack row. After upgrade `list_pending_recovery_acks`
+  finds nothing and the scheduler keeps producing encrypted backups for a phrase the user may never
+  have saved - unrestorable on a new machine. Fixed with a one-time STARTUP REPAIR (chosen over pure
+  SQL because it needs app logic to pick a canonical source + reason about "already-acked"):
+  `StateRepo::repair_unacked_encrypted_sources_on_upgrade(now)` (default impl in `state/mod.rs`,
+  atomic SQLite override in `state/sqlite.rs`), called from `lib.rs` setup BEFORE `build_and_spawn`
+  (so the orchestrator never sees the bad sources as enabled) and BEFORE
+  `reconstruct_recovery_acks_from_db` (so the in-memory mirror picks up the freshly-seeded pending
+  rows). For every account with a stamped `encryption_master_key_id` that has encrypted source(s) but
+  ZERO `recovery_phrase_acks` rows, it DISABLES every encrypted source on the account + seeds a
+  PENDING ack row (`revealed=0`) for the earliest-created encrypted source - the same gate the
+  first-source path uses; re-reveal + re-ack re-enables. IDEMPOTENCY + the "never disable an
+  already-acked source" invariant are guaranteed by a durable `settings` marker
+  (`recovery.ack_backfill_v1`): the repair runs EXACTLY ONCE on the first post-upgrade boot. That is
+  the only moment a "no ack row" encrypted source must be pre-0004 (the durable flow that DELETES the
+  ack row on a legitimate ack did not exist before this version), so disabling it is correct; on every
+  later boot the marker short-circuits the repair, so a legitimately-acked source (ack row deleted,
+  source enabled) is never re-disabled. The SQLite override does the disable + pending-ack inserts +
+  the marker write in ONE transaction (all-or-nothing; a crash re-runs cleanly). Tests in `sqlite.rs`:
+  pre-0004 enabled+unacked source -> disabled + pending ack seeded, then re-reveal+ack re-enables;
+  idempotent re-run never touches an already-acked source; unencrypted / unstamped / durable-pending
+  accounts are skipped.
+
+- R7-P2-1 (reveal-before-click, DATA-SAFETY). `SourceTable.beginRevealAck` called
+  `sources.revealRecoveryPhrase` as soon as the post-restart panel OPENED, so the durable
+  `revealed=1` backend state could be set even if the user cancelled without seeing the phrase -
+  weakening the "revealed == the user actually saw it" invariant. Fixed by moving the
+  `revealRecoveryPhrase` IPC OUT of the open handler and INTO a `revealPhraseAction` threaded into
+  `RecoveryPhraseReveal` as its `reveal-action`, which fires only on the user's Reveal CLICK (it
+  fetches + durably records the reveal AND returns the 24 words, which the action stores into
+  `revealPhrase`). `beginRevealAck` is now a sync state-reset + open (no IPC). `RecoveryPhraseReveal`
+  gained a `canReveal` gate so the Reveal button is clickable even before a phrase is loaded WHEN a
+  `revealAction` is supplied (the action populates the phrase); `everRevealed` still latches only once
+  a real phrase is present, so a no-phrase reveal never unlocks ack. Vitest (`settings-components`):
+  opening the panel does NOT call `reveal_recovery_phrase`; clicking Reveal inside the panel does;
+  opening + cancelling never records a reveal.
+
+  Gates: cargo build/clippy/test --workspace + build -p driven-app + deny + fmt + git diff --check all
+  green; `.sqlx` regenerated (0 drift) for the new repair queries; ui pnpm lint + test:unit (149) +
+  build (vue-tsc clean). Stub sweep on the touched surface (driven-core/src, src-tauri/src, ui): zero
+  non-test `todo!(`/`unimplemented!(`/`unreachable!(`.
