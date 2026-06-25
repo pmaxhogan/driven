@@ -175,10 +175,17 @@ function beginRevealAck(source: SourceDto): void {
 // fetches + durably records the reveal and stores the 24 words for display; if it
 // rejects, RecoveryPhraseReveal surfaces the error and leaves the phrase hidden +
 // the ack locked, and the backend reveal is never recorded.
-async function revealPhraseAction(): Promise<void> {
+//
+// R9-P1-2: RETURN the revealed phrase so RecoveryPhraseReveal latches the reveal
+// from the return value directly. The `revealPhrase` prop is still set (for
+// display), but it lands on a later reactive tick; returning the words lets the
+// ack control unlock deterministically without waiting for that prop delivery.
+async function revealPhraseAction(): Promise<string[]> {
   const id = revealingId.value;
-  if (id === null) return;
-  revealPhrase.value = await sources.revealRecoveryPhrase(id);
+  if (id === null) return [];
+  const phrase = await sources.revealRecoveryPhrase(id);
+  revealPhrase.value = phrase;
+  return phrase;
 }
 
 // R7-P2-1 / R8-P2-1: surface a backend reveal error from RecoveryPhraseReveal as

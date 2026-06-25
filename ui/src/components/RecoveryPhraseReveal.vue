@@ -28,7 +28,15 @@ const props = withDefaults(
     // latches `everRevealed` on success - so the recorded backend reveal that the
     // ack gate requires actually happens. When absent, reveal is purely
     // client-side (the existing behaviour; used where no backend reveal applies).
-    revealAction?: () => Promise<void>;
+    //
+    // R9-P1-2: the action RETURNS the revealed phrase (the 24 words). The
+    // post-restart SourceTable path supplies the phrase via this return value, and
+    // `toggle` latches `revealed`/`everRevealed` deterministically FROM the returned
+    // value - it does NOT wait for Vue to deliver the parent's `phrase` prop, which
+    // may land on a later tick and previously left the ack control locked. The
+    // action may also return void (it set the parent prop itself), in which case
+    // the latch falls back to the prop once it arrives.
+    revealAction?: () => Promise<string[] | void>;
   }>(),
   { phrase: () => [], confirmed: false, revealAction: undefined },
 );
@@ -50,7 +58,35 @@ const revealing = ref(false);
 const everRevealed = ref(false);
 const copied = ref(false);
 
+// R9-P1-2: the phrase value we latched the reveal against. Set when `toggle`
+// latches (from the action's returned phrase or the prop). The prop watcher uses
+// it to tell an already-latched reveal's own prop delivery (same words, must NOT
+// re-lock) apart from a genuinely fresh/cleared phrase (must re-lock). `null`
+// means "nothing latched yet".
+const latchedPhrase = ref<string[] | null>(null);
+
 const hasPhrase = computed(() => props.phrase.length > 0);
+
+// R9-P1-2: compare two phrase word-lists for equality (order-sensitive).
+function samePhrase(a: readonly string[], b: readonly string[]): boolean {
+  if (a.length !== b.length) return false;
+  for (let i = 0; i < a.length; i += 1) {
+    if (a[i] !== b[i]) return false;
+  }
+  return true;
+}
+
+// R9-P1-2: latch the reveal against a concrete phrase. Idempotent: emits
+// `update:revealed` only on the first latch. The phrase here is the source of
+// truth for the latch, so a later prop delivery of the SAME words cannot re-lock.
+function latchReveal(phrase: string[]): void {
+  if (phrase.length === 0) return;
+  latchedPhrase.value = phrase.slice();
+  if (!everRevealed.value) {
+    everRevealed.value = true;
+    emit("update:revealed", true);
+  }
+}
 
 // M9c D4 / R7-P2-1: a backend reveal action is supplied. When present, the reveal
 // click itself FETCHES + records the phrase (the post-restart SourceTable case),
@@ -69,7 +105,15 @@ const canReveal = computed(
 
 // R3-P1-1: the acknowledge checkbox is usable only once the phrase has been
 // revealed AND a real phrase is present.
-const ackEnabled = computed(() => everRevealed.value && hasPhrase.value);
+// R9-P1-2: "a real phrase is present" is satisfied by the prop OR by the phrase we
+// latched from the reveal action's return value - the post-restart path latches
+// before Vue delivers the prop, and the ack control must not stay locked across
+// that tick.
+const ackEnabled = computed(
+  () =>
+    everRevealed.value &&
+    (hasPhrase.value || (latchedPhrase.value?.length ?? 0) > 0),
+);
 
 async function toggle(): Promise<void> {
   // Hiding is always allowed and never un-sees the words.
@@ -78,15 +122,16 @@ async function toggle(): Promise<void> {
     return;
   }
   // Revealing for the FIRST time with a backend reveal action: await it so the
-  // backend records the reveal AND (post-restart) returns the phrase the action
-  // stores into `phrase` (the ack gate depends on the recorded reveal). Only
-  // latch on success; a rejected backend reveal leaves the phrase hidden +
-  // un-latched. The phrase need NOT be present yet - the action supplies it.
+  // backend records the reveal AND (post-restart) RETURNS the phrase (the ack gate
+  // depends on the recorded reveal). Only latch on success; a rejected backend
+  // reveal leaves the phrase hidden + un-latched. The phrase need NOT be present
+  // in the prop yet - the action's return value supplies it.
+  let returnedPhrase: string[] | void = undefined;
   if (!everRevealed.value && hasRevealAction.value) {
     revealing.value = true;
     try {
       // props.revealAction is guaranteed a function by hasRevealAction.
-      await props.revealAction!();
+      returnedPhrase = await props.revealAction!();
     } catch (e) {
       revealing.value = false;
       emit("reveal-error", e);
@@ -95,11 +140,20 @@ async function toggle(): Promise<void> {
     revealing.value = false;
   }
   revealed.value = true;
-  // Latch only once a real phrase is present (the action above may have just
-  // populated it). A reveal action that yielded no phrase does not unlock ack.
-  if (hasPhrase.value && !everRevealed.value) {
-    everRevealed.value = true;
-    emit("update:revealed", true);
+  // R9-P1-2: latch DETERMINISTICALLY from the phrase the reveal yielded - the
+  // action's return value if it gave one, otherwise the prop (the client-side case
+  // where the parent already had the phrase). This does NOT depend on Vue having
+  // delivered an updated `phrase` prop yet, so the post-restart path no longer
+  // leaves the ack control locked across the prop tick. A reveal that yielded no
+  // phrase at all does not unlock ack.
+  if (!everRevealed.value) {
+    const effectivePhrase =
+      Array.isArray(returnedPhrase) && returnedPhrase.length > 0
+        ? returnedPhrase
+        : props.phrase;
+    if (effectivePhrase.length > 0) {
+      latchReveal(effectivePhrase.slice());
+    }
   }
 }
 
@@ -135,13 +189,28 @@ function onConfirmToggle(event: Event): void {
 // R3-P1-1: when the phrase changes or clears, re-lock everything - a fresh
 // phrase must be revealed and acknowledged anew. Reset local reveal state and
 // signal the parent to clear both `revealed` and `confirmed`.
+//
+// R9-P1-2: EXCEPT when the incoming prop is just the delivery of the phrase we
+// already latched (the post-restart path latches from the reveal action's return
+// value, then the parent sets the prop to those SAME words on a later tick). That
+// delivery must NOT re-lock the already-revealed/acknowledged state. Only a
+// genuinely different (or cleared) phrase re-locks.
 watch(
   () => props.phrase,
-  () => {
+  (next) => {
+    if (
+      everRevealed.value &&
+      latchedPhrase.value !== null &&
+      samePhrase(next, latchedPhrase.value)
+    ) {
+      // Same words we already latched: keep the latch + ack intact.
+      return;
+    }
     revealed.value = false;
     everRevealed.value = false;
     revealing.value = false;
     copied.value = false;
+    latchedPhrase.value = null;
     emit("update:revealed", false);
     if (props.confirmed) emit("update:confirmed", false);
   },

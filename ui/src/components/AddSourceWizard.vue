@@ -344,11 +344,14 @@ function onPhraseRevealed(value: boolean): void {
 }
 
 /** M9c D4: the reveal action threaded into RecoveryPhraseReveal - the BACKEND
- * reveal the ack gate depends on. Only meaningful for a pending-ack source. */
-async function revealPhraseAction(): Promise<void> {
+ * reveal the ack gate depends on. Only meaningful for a pending-ack source.
+ * R9-P1-2: returns the revealed phrase so RecoveryPhraseReveal latches from the
+ * return value. Here the `recoveryPhrase` prop is already set (from the add
+ * result), so this matches it; returning it keeps the latch deterministic. */
+async function revealPhraseAction(): Promise<string[]> {
   const created = createdSource.value;
-  if (!created || !pendingRecoveryAck.value) return;
-  await sources.revealRecoveryPhrase(created.id);
+  if (!created || !pendingRecoveryAck.value) return [];
+  return sources.revealRecoveryPhrase(created.id);
 }
 
 /** M9c D4 / R8-P2-1: surface a backend reveal error on the reveal step as a

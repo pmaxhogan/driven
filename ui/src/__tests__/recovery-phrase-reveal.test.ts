@@ -152,6 +152,81 @@ describe("RecoveryPhraseReveal reveal-gate (R3-P1-1)", () => {
     expect(wrapper.find('[data-testid="phrase-words"]').exists()).toBe(false);
   });
 
+  // R9-P1-2 (DATA-SAFETY): the post-restart SourceTable path. The reveal action
+  // RETURNS the phrase and the parent only delivers the `phrase` prop on a LATER
+  // tick. The ack control must unlock from the action's return value and STAY
+  // unlocked across that prop delivery - it must not be re-locked by the watcher
+  // when the same words arrive as a prop. Previously this left the ack checkbox
+  // locked, so a pending encrypted source stayed disabled.
+  it("latches from the reveal-action return value and stays unlocked across the prop delivery", async () => {
+    const wrapper = mount(RecoveryPhraseReveal, {
+      props: {
+        // Post-restart: no phrase prop yet; the action supplies it.
+        phrase: [] as string[],
+        confirmed: false,
+        revealAction: async () => PHRASE,
+      },
+      global: { plugins: [i18n] },
+    });
+    const ack = () => wrapper.get('[data-testid="phrase-ack"]');
+
+    const revealBtn = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("recoveryPhrase.revealButton"));
+    await revealBtn!.trigger("click");
+    await flushPromises();
+
+    // Latched from the returned value even though the prop is still empty.
+    expect(ack().attributes("disabled")).toBeUndefined();
+    const revealedEvents = wrapper.emitted("update:revealed");
+    expect(revealedEvents).toBeTruthy();
+    expect(revealedEvents![0]).toEqual([true]);
+
+    // Now the parent delivers the SAME words as the prop on a later tick. The
+    // ack control must STAY unlocked - the watcher must not clobber the latch.
+    await wrapper.setProps({ phrase: PHRASE });
+    await flushPromises();
+
+    expect(ack().attributes("disabled")).toBeUndefined();
+    // No spurious revealed=false was emitted by the prop delivery.
+    const after = wrapper.emitted("update:revealed")!;
+    expect(after[after.length - 1]).toEqual([true]);
+
+    // And the user can acknowledge it.
+    await ack().setValue(true);
+    const confirmedEvents = wrapper.emitted("update:confirmed");
+    expect(confirmedEvents).toBeTruthy();
+    expect(confirmedEvents![confirmedEvents!.length - 1]).toEqual([true]);
+  });
+
+  // R9-P1-2: a genuinely DIFFERENT phrase arriving after a latch must still
+  // re-lock (the existing re-lock contract is preserved, distinct from the
+  // same-words delivery above).
+  it("still re-locks when a different phrase arrives after latching", async () => {
+    const wrapper = mount(RecoveryPhraseReveal, {
+      props: {
+        phrase: [] as string[],
+        confirmed: false,
+        revealAction: async () => PHRASE,
+      },
+      global: { plugins: [i18n] },
+    });
+    const ack = () => wrapper.get('[data-testid="phrase-ack"]');
+    const revealBtn = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("recoveryPhrase.revealButton"));
+    await revealBtn!.trigger("click");
+    await flushPromises();
+    expect(ack().attributes("disabled")).toBeUndefined();
+
+    // A different phrase must re-lock.
+    await wrapper.setProps({ phrase: ["delta", "echo", "foxtrot"] });
+    await flushPromises();
+    expect(ack().attributes("disabled")).toBeDefined();
+    const revealedEvents = wrapper.emitted("update:revealed")!;
+    expect(revealedEvents[revealedEvents.length - 1]).toEqual([false]);
+  });
+
   it("keeps the checkbox disabled with no phrase even after a toggle attempt", async () => {
     // An empty phrase (the unencrypted case) never enables the checkbox.
     const wrapper = mountReveal([]);
