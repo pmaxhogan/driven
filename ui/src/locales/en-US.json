@@ -114,7 +114,11 @@
       "removeButton": "Remove",
       "deleteRemoteLabel": "Also delete backed-up files from Drive",
       "pendingRecoveryAckBadge": "Awaiting recovery phrase",
-      "pendingRecoveryAckTooltip": "Reveal and save this source's recovery phrase before it can be enabled."
+      "pendingRecoveryAckTooltip": "Reveal and save this source's recovery phrase before it can be enabled.",
+      "revealAckButton": "Reveal and save recovery phrase",
+      "revealAckIntro": "Reveal this source's recovery phrase, save it somewhere safe, then confirm to start its encrypted backups.",
+      "revealAckConfirmButton": "Confirm and enable",
+      "pendingRemoveWarning": "This source has not saved its recovery phrase yet. Removing it discards the encrypted setup, including the account's master key when no other encrypted source needs it."
     },
     "addSource": {
       "title": "Add backup source",

@@ -3,6 +3,7 @@ import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
 import AddSourceWizard from "./AddSourceWizard.vue";
+import RecoveryPhraseReveal from "./RecoveryPhraseReveal.vue";
 import * as ipc from "../ipc/commands";
 import { useAccountsStore } from "../stores/accounts";
 import { useSourcesStore } from "../stores/sources";
@@ -31,6 +32,21 @@ const savingEdit = ref(false);
 // Inline remove-confirmation state.
 const confirmingRemoveId = ref<string | null>(null);
 const deleteRemote = ref(false);
+
+// R5-P1-2 (DATA-SAFETY): post-restart recovery-phrase reveal/ack state, keyed by
+// the pending source being remediated. The wizard's reveal/ack flow lives only in
+// volatile wizard state, so a first-encrypted source that survived a crash/restart
+// (durably pending) needs its OWN reachable reveal/ack action here. Opening the
+// panel fetches + records the backend reveal (revealRecoveryPhrase), shows the 24
+// words via RecoveryPhraseReveal, and gates ack on the user attesting they saved
+// them; ack (ackRecoveryPhrase) enables the source + clears the pending state.
+const revealingId = ref<string | null>(null);
+const revealPhrase = ref<string[]>([]);
+const revealConfirmed = ref(false);
+const revealEverShown = ref(false);
+const revealLoading = ref(false);
+const revealAcking = ref(false);
+const revealError = ref<string | null>(null);
 
 const numberFormatter = computed(() => new Intl.NumberFormat(locale.value));
 
@@ -132,6 +148,63 @@ async function confirmRemove(sourceId: string): Promise<void> {
   await sources.remove(sourceId, deleteRemote.value);
   confirmingRemoveId.value = null;
   deleteRemote.value = false;
+}
+
+// R5-P1-2 (DATA-SAFETY): open the post-restart reveal/ack panel for a pending
+// first-encrypted source. Fetch + record the backend reveal FIRST (it returns the
+// 24 words and durably marks the reveal so the ack can proceed), then show them via
+// RecoveryPhraseReveal gated on the user attesting they saved them. Any other inline
+// panel (edit / remove) is closed so only one is open at a time.
+async function beginRevealAck(source: SourceDto): Promise<void> {
+  editingId.value = null;
+  confirmingRemoveId.value = null;
+  revealError.value = null;
+  revealConfirmed.value = false;
+  revealEverShown.value = false;
+  revealPhrase.value = [];
+  revealingId.value = source.id;
+  revealLoading.value = true;
+  try {
+    revealPhrase.value = await sources.revealRecoveryPhrase(source.id);
+  } catch (e) {
+    revealError.value = String(e);
+    revealingId.value = null;
+  } finally {
+    revealLoading.value = false;
+  }
+}
+
+function cancelRevealAck(): void {
+  revealingId.value = null;
+  revealPhrase.value = [];
+  revealConfirmed.value = false;
+  revealEverShown.value = false;
+  revealError.value = null;
+}
+
+// RecoveryPhraseReveal signals when the phrase has actually been shown (so the ack
+// checkbox unlocks) or re-locked (clears the acknowledgement).
+function onRevealShown(value: boolean): void {
+  revealEverShown.value = value;
+  if (!value) revealConfirmed.value = false;
+}
+
+// R5-P1-2: acknowledge the saved phrase, ENABLING the until-now-disabled source.
+// The backend rejects the ack unless a real reveal was recorded (done by
+// beginRevealAck), so the client gate is backed by the server gate. On success the
+// list refreshes (the source is now enabled, no longer pending) and the panel closes.
+async function confirmRevealAck(sourceId: string): Promise<void> {
+  if (!revealConfirmed.value || !revealEverShown.value) return;
+  revealAcking.value = true;
+  revealError.value = null;
+  try {
+    await sources.ackRecoveryPhrase(sourceId);
+    cancelRevealAck();
+  } catch (e) {
+    revealError.value = String(e);
+  } finally {
+    revealAcking.value = false;
+  }
 }
 </script>
 
@@ -242,6 +315,15 @@ async function confirmRemove(sourceId: string): Promise<void> {
             <td class="py-2">
               <div class="flex flex-wrap gap-1">
                 <button
+                  v-if="source.pendingRecoveryAck"
+                  type="button"
+                  class="rounded border border-amber-400 px-2 py-1 text-xs text-amber-700 dark:text-amber-400"
+                  data-testid="reveal-ack-button"
+                  @click="beginRevealAck(source)"
+                >
+                  {{ t("settings.sources.revealAckButton") }}
+                </button>
+                <button
                   type="button"
                   class="rounded border px-2 py-1 text-xs"
                   @click="beginEditExclusions(source)"
@@ -348,6 +430,60 @@ async function confirmRemove(sourceId: string): Promise<void> {
             </td>
           </tr>
 
+          <tr v-if="revealingId === source.id">
+            <td
+              colspan="7"
+              class="py-2"
+            >
+              <div
+                class="space-y-2 rounded border border-amber-300 bg-amber-50 p-3 text-sm dark:bg-amber-950/30"
+                data-testid="reveal-ack-panel"
+              >
+                <p class="text-amber-700 dark:text-amber-400">
+                  {{ t("settings.sources.revealAckIntro") }}
+                </p>
+                <p
+                  v-if="revealLoading"
+                  class="text-zinc-500"
+                >
+                  {{ t("common.loading") }}
+                </p>
+                <RecoveryPhraseReveal
+                  v-else
+                  v-model:confirmed="revealConfirmed"
+                  :phrase="revealPhrase"
+                  @update:revealed="onRevealShown"
+                />
+                <p
+                  v-if="revealError"
+                  class="text-red-600"
+                >
+                  {{ revealError }}
+                </p>
+                <div class="flex gap-2">
+                  <button
+                    type="button"
+                    class="rounded border border-amber-400 px-2 py-1 text-xs text-amber-700 disabled:opacity-50 dark:text-amber-400"
+                    :disabled="
+                      !revealConfirmed || !revealEverShown || revealAcking
+                    "
+                    data-testid="reveal-ack-confirm"
+                    @click="confirmRevealAck(source.id)"
+                  >
+                    {{ t("settings.sources.revealAckConfirmButton") }}
+                  </button>
+                  <button
+                    type="button"
+                    class="rounded border px-2 py-1 text-xs"
+                    @click="cancelRevealAck"
+                  >
+                    {{ t("common.cancel") }}
+                  </button>
+                </div>
+              </div>
+            </td>
+          </tr>
+
           <tr v-if="confirmingRemoveId === source.id">
             <td
               colspan="7"
@@ -357,6 +493,13 @@ async function confirmRemove(sourceId: string): Promise<void> {
                 class="space-y-2 rounded border border-red-300 bg-red-50 p-3 text-sm dark:bg-red-950/30"
                 data-testid="source-remove-confirm"
               >
+                <p
+                  v-if="source.pendingRecoveryAck"
+                  class="text-red-700 dark:text-red-400"
+                  data-testid="pending-remove-warning"
+                >
+                  {{ t("settings.sources.pendingRemoveWarning") }}
+                </p>
                 <label class="flex items-center gap-2">
                   <input
                     v-model="deleteRemote"

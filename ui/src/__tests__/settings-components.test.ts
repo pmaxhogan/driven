@@ -168,6 +168,66 @@ describe("SourceTable", () => {
     );
   });
 
+  it("exposes a post-restart reveal/ack action that enables a pending source (R5-P1-2)", async () => {
+    // R5-P1-2 (DATA-SAFETY): a first-encrypted source that survived a restart is
+    // durably pending; the table must expose a reachable reveal/ack action. Clicking
+    // it records the backend reveal (reveal_recovery_phrase) + shows the words, then
+    // a successful ack (ack_recovery_phrase_saved) enables the source and clears the
+    // pending state - reachable WITHOUT the volatile wizard.
+    const words = Array.from({ length: 24 }, (_, i) => `word${i + 1}`);
+    let acked = false;
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources")
+        return Promise.resolve([
+          makeSource({
+            encryptionEnabled: true,
+            enabled: false,
+            pendingRecoveryAck: !acked,
+          }),
+        ]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      if (cmd === "reveal_recovery_phrase") return Promise.resolve(words);
+      if (cmd === "ack_recovery_phrase_saved") {
+        acked = true;
+        return Promise.resolve(
+          makeSource({ encryptionEnabled: true, enabled: true, pendingRecoveryAck: false }),
+        );
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+
+    // The pending-recovery row action is present; clicking it reveals the phrase.
+    const revealBtn = wrapper.get('[data-testid="reveal-ack-button"]');
+    await revealBtn.trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("reveal_recovery_phrase", {
+      sourceId: "src-1",
+    });
+
+    // The reveal/ack panel is open. Reveal the words inside RecoveryPhraseReveal so
+    // the ack checkbox unlocks (the gate requires the user to actually see them).
+    const panel = wrapper.get('[data-testid="reveal-ack-panel"]');
+    const showButton = panel
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("recoveryPhrase.revealButton"));
+    await showButton!.trigger("click");
+    await flushPromises();
+
+    // Tick the acknowledgement checkbox, then confirm -> ack enables the source.
+    await panel.get('[data-testid="phrase-ack"]').setValue(true);
+    const confirm = panel.get('[data-testid="reveal-ack-confirm"]');
+    expect((confirm.element as HTMLButtonElement).disabled).toBe(false);
+    await confirm.trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("ack_recovery_phrase_saved", {
+      sourceId: "src-1",
+    });
+    // The panel closed (pending state cleared after the refresh).
+    expect(wrapper.find('[data-testid="reveal-ack-panel"]').exists()).toBe(false);
+  });
+
   it("Run now fires sync_now for the row's source", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources") return Promise.resolve([makeSource()]);
