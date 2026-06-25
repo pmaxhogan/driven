@@ -37,7 +37,7 @@ function validPayload(): Record<string, unknown> {
       bytes_uploaded: 345_678,
       errors_by_class: { "drive.rate_limited": 2, "local.io_error": 1 },
       deep_verify_runs: 1,
-      update_applied: 0,
+      update_applied: false,
     },
     latency_p50_p95_ms: {
       scan: [],
@@ -68,22 +68,43 @@ describe("telemetry worker handler", () => {
     };
     // install_id is the AE index (anonymous sampling key).
     expect(dp.indexes).toEqual(["00000000-0000-4000-8000-000000000000"]);
-    // Low-card dimensions in blobs (os, arch, channel, version, errors JSON).
+    // Low-card dims in blobs (os, arch, channel, version, os_version, errors JSON).
     expect(dp.blobs[0]).toBe("windows");
     expect(dp.blobs[1]).toBe("x86_64");
     expect(dp.blobs[2]).toBe("stable");
     expect(dp.blobs[3]).toBe("0.1.0");
-    expect(JSON.parse(dp.blobs[4])).toEqual({
+    expect(dp.blobs[4]).toBe(""); // os_version null -> ""
+    expect(JSON.parse(dp.blobs[5])).toEqual({
       "drive.rate_limited": 2,
       "local.io_error": 1,
     });
-    // Numeric measures: files, bytes, deep_verify, update_applied, total_errors, ts.
+    // Numeric measures: files, bytes, deep_verify, update_applied(0/1), total_errors, ts.
     expect(dp.doubles[0]).toBe(12);
     expect(dp.doubles[1]).toBe(345_678);
     expect(dp.doubles[2]).toBe(1);
-    expect(dp.doubles[3]).toBe(0);
+    expect(dp.doubles[3]).toBe(0); // update_applied false -> 0
     expect(dp.doubles[4]).toBe(3); // total errors = 2 + 1
     expect(dp.doubles[5]).toBe(1_700_000_000_000);
+  });
+
+  it("maps update_applied=true to the 0/1 double 1", async () => {
+    const { env, writes } = mockEnv();
+    const p = validPayload();
+    (p.events_24h as Record<string, unknown>).update_applied = true;
+    const res = await handle(postPing(JSON.stringify(p)), env);
+    expect(res.status).toBe(204);
+    const dp = writes[0] as { doubles: number[] };
+    expect(dp.doubles[3]).toBe(1);
+  });
+
+  it("persists a coarse os_version blob when the client sends one", async () => {
+    const { env, writes } = mockEnv();
+    const p = validPayload();
+    p.os_version = "11.26200";
+    const res = await handle(postPing(JSON.stringify(p)), env);
+    expect(res.status).toBe(204);
+    const dp = writes[0] as { blobs: string[] };
+    expect(dp.blobs[4]).toBe("11.26200");
   });
 
   it("rejects malformed JSON with 400 and writes nothing", async () => {
@@ -188,5 +209,140 @@ describe("telemetry worker handler", () => {
     expect(r.ok).toBe(true);
     if (r.ok) writePing(env, r.payload);
     expect(writes).toHaveLength(1);
+  });
+
+  // ----------------------------------------------------------------------
+  // PUBLIC-ENDPOINT HARDENING (M9b P1-1): reject PII / junk before AE.
+  // ----------------------------------------------------------------------
+
+  it("rejects a path-shaped install_id with 400 (not a UUID v4)", async () => {
+    const { env, writes } = mockEnv();
+    const bad = validPayload();
+    bad.install_id = "C:/Users/alice/Documents/secret.txt";
+    const res = await handle(postPing(JSON.stringify(bad)), env);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ error: "invalid_payload", field: "install_id" });
+    expect(writes).toHaveLength(0);
+  });
+
+  it("rejects an email-shaped install_id with 400 (not a UUID v4)", async () => {
+    const { env, writes } = mockEnv();
+    const bad = validPayload();
+    bad.install_id = "alice@example.com";
+    const res = await handle(postPing(JSON.stringify(bad)), env);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ field: "install_id" });
+    expect(writes).toHaveLength(0);
+  });
+
+  it("rejects a non-v4 UUID (wrong version nibble) with 400", async () => {
+    const bad = validPayload();
+    // A v1-style UUID (version nibble 1) must be rejected.
+    bad.install_id = "00000000-0000-1000-8000-000000000000";
+    const r = validatePing(bad);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("install_id");
+  });
+
+  it("rejects a junk channel not in the whitelist with 400", async () => {
+    const { env, writes } = mockEnv();
+    const bad = validPayload();
+    bad.channel = "beta'; DROP TABLE--";
+    const res = await handle(postPing(JSON.stringify(bad)), env);
+    expect(res.status).toBe(400);
+    expect(await res.json()).toMatchObject({ field: "channel" });
+    expect(writes).toHaveLength(0);
+  });
+
+  it("rejects a junk os not in the whitelist with 400", async () => {
+    const bad = validPayload();
+    bad.os = "/etc/passwd";
+    const r = validatePing(bad);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("os");
+  });
+
+  it("rejects a junk arch not in the whitelist with 400", async () => {
+    const bad = validPayload();
+    bad.arch = "i-made-this-up";
+    const r = validatePing(bad);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("arch");
+  });
+
+  it("rejects an errors_by_class key outside the SPEC s24 code set with 400", async () => {
+    const { env, writes } = mockEnv();
+    const bad = validPayload();
+    (bad.events_24h as Record<string, unknown>).errors_by_class = {
+      "drive.rate_limited": 1,
+      "C:/Users/alice/secret.txt": 5, // path-shaped junk key
+    };
+    const res = await handle(postPing(JSON.stringify(bad)), env);
+    expect(res.status).toBe(400);
+    const body = (await res.json()) as { error: string; field: string };
+    expect(body.error).toBe("invalid_payload");
+    expect(body.field).toContain("errors_by_class");
+    expect(writes).toHaveLength(0);
+  });
+
+  it("rejects an email-shaped errors_by_class key with 400", async () => {
+    const bad = validPayload();
+    (bad.events_24h as Record<string, unknown>).errors_by_class = {
+      "alice@example.com": 1,
+    };
+    const r = validatePing(bad);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain("errors_by_class");
+  });
+
+  it("rejects too many errors_by_class keys (high-cardinality flood) with 400", async () => {
+    const bad = validPayload();
+    const flood: Record<string, number> = {};
+    for (let i = 0; i < 200; i++) flood[`internal.bug${i}`] = 1;
+    (bad.events_24h as Record<string, unknown>).errors_by_class = flood;
+    const r = validatePing(bad);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain("errors_by_class");
+  });
+
+  it("rejects a non-integer / out-of-range errors_by_class value with 400", async () => {
+    const bad = validPayload();
+    (bad.events_24h as Record<string, unknown>).errors_by_class = {
+      "drive.rate_limited": 1e15, // absurdly large -> over MAX_ERROR_COUNT
+    };
+    const r = validatePing(bad);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toContain("errors_by_class");
+  });
+
+  it("rejects an over-long version string with 400", async () => {
+    const bad = validPayload();
+    bad.version = "9".repeat(128);
+    const r = validatePing(bad);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("version");
+  });
+
+  it("rejects an over-long / path-shaped os_version with 400", async () => {
+    const bad = validPayload();
+    bad.os_version = "/" + "a".repeat(128);
+    const r = validatePing(bad);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("os_version");
+  });
+
+  it("rejects a numeric update_applied (must be boolean) with 400", async () => {
+    const bad = validPayload();
+    (bad.events_24h as Record<string, unknown>).update_applied = 1;
+    const r = validatePing(bad);
+    expect(r.ok).toBe(false);
+    if (!r.ok) expect(r.reason).toBe("events_24h.update_applied");
+  });
+
+  it("accepts a valid lowercase UUID v4 install_id", () => {
+    const p = validPayload();
+    p.install_id = "9f8e7d6c-5b4a-4392-8170-0a1b2c3d4e5f";
+    const r = validatePing(p);
+    expect(r.ok).toBe(true);
   });
 });

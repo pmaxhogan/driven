@@ -42,7 +42,7 @@ interface PingPayload {
   ts: number;
   version: string;
   os: string;
-  os_version?: string | null;
+  os_version: string | null;
   arch: string;
   channel: string;
   events_24h: {
@@ -50,13 +50,104 @@ interface PingPayload {
     bytes_uploaded: number;
     errors_by_class: Record<string, number>;
     deep_verify_runs: number;
-    update_applied: number;
+    // SPEC s16: update_applied is a BOOLEAN (an in-app update was applied in the
+    // window or not). Kept byte-consistent with the Rust client payload.
+    update_applied: boolean;
   };
   latency_p50_p95_ms: {
     scan: number[];
     upload_per_mb: number[];
   };
 }
+
+// --------------------------------------------------------------------------
+// PUBLIC-ENDPOINT HARDENING (M9b P1-1): this Worker is on a public hostname, so
+// validatePing must reject ANYTHING that could persist PII / high-cardinality
+// junk into Analytics Engine. Every accepted field is either a UUID v4, a value
+// from a closed whitelist, a SPEC s24 error CODE, or a bounded number. Anything
+// else is a 400. (The payload is privacy-safe BY CONTRACT from the client, but a
+// public endpoint must not TRUST the client.)
+// --------------------------------------------------------------------------
+
+/// UUID v4 (RFC 4122 variant) - the only accepted `install_id` shape (SPEC s16:
+/// "a UUID v4 minted on first run"). Lowercase hex; version nibble 4; variant
+/// nibble 8/9/a/b. Rejects path/email-shaped or arbitrary strings.
+const UUID_V4 = /^[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}$/;
+
+/// Closed whitelist for `channel` (SPEC s15 updater channels).
+const CHANNELS = new Set(["stable", "dev"]);
+
+/// Closed whitelist for `os` (SPEC s16 `os` family; matches Rust
+/// `std::env::consts::OS` for the platforms Driven ships on).
+const OS_FAMILIES = new Set(["windows", "macos", "linux"]);
+
+/// Closed whitelist for `arch` (SPEC s16 `arch`; matches Rust
+/// `std::env::consts::ARCH` for the targets Driven ships on).
+const ARCHES = new Set(["x86_64", "aarch64"]);
+
+/// Max accepted `version` string length (semver + a channel suffix is short).
+const MAX_VERSION_LEN = 64;
+
+/// Max accepted `os_version` string length (e.g. "11.26200", "14.5", a kernel
+/// string). Bounded so a hostile client cannot stuff a path/PII here.
+const MAX_OS_VERSION_LEN = 64;
+
+/// Max number of distinct `errors_by_class` keys accepted (the s24 code set is
+/// ~44; this cap rejects a high-cardinality flood while leaving headroom).
+const MAX_ERROR_CLASSES = 64;
+
+/// Max accepted per-class error count (a sane 24h-window upper bound; rejects an
+/// absurd value that could skew the dataset).
+const MAX_ERROR_COUNT = 1_000_000_000;
+
+/// The closed set of SPEC s24 error codes (the ONLY accepted `errors_by_class`
+/// keys). MUST mirror `crates/driven-core/src/types.rs` `ErrorCode::code()` - the
+/// codes the Rust client actually emits as `activity_log.event_type` for an
+/// error-level row. Renaming/removing a code is a breaking i18n change (SPEC
+/// s24), so this list is append-only in lockstep with the Rust enum.
+const ERROR_CODES = new Set([
+  "auth.invalid_grant",
+  "auth.consent_required",
+  "auth.network_unreachable",
+  "drive.rate_limited",
+  "drive.daily_quota_exhausted",
+  "drive.quota_exhausted",
+  "drive.upload_size_limit",
+  "drive.checksum_mismatch",
+  "drive.unreachable",
+  "drive.resumable_session_invalid",
+  "drive.dest_folder_missing",
+  "drive.dest_folder_permission_denied",
+  "local.file_locked",
+  "local.vss_unavailable",
+  "local.file_changed_during_upload",
+  "local.file_replaced_during_upload",
+  "local.io_error",
+  "local.path_too_long",
+  "local.unicode_collision",
+  "local.disk_full",
+  "local.invalid_filename",
+  "local.ads_skipped",
+  "net.offline",
+  "net.no_internet",
+  "net.dns_failed",
+  "net.captive_portal",
+  "net.timeout",
+  "net.intermittent",
+  "net.proxy_required",
+  "update.endpoint_unreachable",
+  "update.signature_invalid",
+  "update.manual_required_macos",
+  "crypto.key_missing",
+  "crypto.decrypt_failed",
+  "crypto.recovery_phrase_invalid",
+  "state.db_locked",
+  "state.db_corrupt",
+  "state.reconcile_orphan",
+  "harness.timeout",
+  "internal.bug",
+  "internal.invalid_input",
+]);
 
 /// A small JSON Response helper that never echoes the request body.
 function json(status: number, body: Record<string, unknown>): Response {
@@ -71,27 +162,51 @@ function isNonNegNumber(v: unknown): v is number {
   return typeof v === "number" && Number.isFinite(v) && v >= 0;
 }
 
-/// Type guard: is `v` a non-empty string?
-function isNonEmptyString(v: unknown): v is string {
-  return typeof v === "string" && v.length > 0;
+/// Type guard: is `v` a bounded, non-negative integer count? (counts/sizes must
+/// be a finite non-negative integer under `max`.)
+function isBoundedCount(v: unknown, max: number): v is number {
+  return typeof v === "number" && Number.isFinite(v) && Number.isInteger(v) && v >= 0 && v <= max;
 }
 
 /// Validate the parsed JSON into a [`PingPayload`], or return a reason string for
-/// a 400. Strict on the load-bearing fields (install_id, version, os, arch,
-/// channel, the numeric aggregates); tolerant of an absent `os_version` and of an
-/// empty latency array (V1 sends empty arrays). Never throws.
+/// a 400.
+///
+/// PUBLIC-ENDPOINT HARDENING (M9b P1-1): because the endpoint is public, this is
+/// strict on EVERY field - `install_id` must be a UUID v4; `channel` / `os` /
+/// `arch` must be from a closed whitelist; `version` / `os_version` are length-
+/// bounded; `errors_by_class` keys must be in the SPEC s24 code set with a capped
+/// key count and a bounded per-class value; numeric aggregates must be bounded
+/// non-negative integers. Anything else is a 400 so no PII / high-cardinality
+/// junk reaches Analytics Engine. Tolerant only of an empty latency array (V1
+/// sends empty arrays) and a null/absent `os_version`. Never throws.
 export function validatePing(value: unknown): { ok: true; payload: PingPayload } | { ok: false; reason: string } {
   if (typeof value !== "object" || value === null) {
     return { ok: false, reason: "body is not a JSON object" };
   }
   const v = value as Record<string, unknown>;
 
-  if (!isNonEmptyString(v.install_id)) return { ok: false, reason: "install_id" };
+  // install_id MUST be a UUID v4 (rejects path/email/arbitrary-string ids).
+  if (typeof v.install_id !== "string" || !UUID_V4.test(v.install_id)) {
+    return { ok: false, reason: "install_id" };
+  }
   if (!isNonNegNumber(v.ts)) return { ok: false, reason: "ts" };
-  if (!isNonEmptyString(v.version)) return { ok: false, reason: "version" };
-  if (!isNonEmptyString(v.os)) return { ok: false, reason: "os" };
-  if (!isNonEmptyString(v.arch)) return { ok: false, reason: "arch" };
-  if (!isNonEmptyString(v.channel)) return { ok: false, reason: "channel" };
+  // version: a bounded, non-empty string (semver + optional channel suffix).
+  if (typeof v.version !== "string" || v.version.length === 0 || v.version.length > MAX_VERSION_LEN) {
+    return { ok: false, reason: "version" };
+  }
+  // os / arch / channel: closed whitelists (rejects arbitrary platform strings).
+  if (typeof v.os !== "string" || !OS_FAMILIES.has(v.os)) return { ok: false, reason: "os" };
+  if (typeof v.arch !== "string" || !ARCHES.has(v.arch)) return { ok: false, reason: "arch" };
+  if (typeof v.channel !== "string" || !CHANNELS.has(v.channel)) return { ok: false, reason: "channel" };
+
+  // os_version: optional; when present it must be a bounded string (or null).
+  let osVersion: string | null = null;
+  if (v.os_version !== undefined && v.os_version !== null) {
+    if (typeof v.os_version !== "string" || v.os_version.length > MAX_OS_VERSION_LEN) {
+      return { ok: false, reason: "os_version" };
+    }
+    osVersion = v.os_version;
+  }
 
   const e = v.events_24h;
   if (typeof e !== "object" || e === null) return { ok: false, reason: "events_24h" };
@@ -99,13 +214,22 @@ export function validatePing(value: unknown): { ok: true; payload: PingPayload }
   if (!isNonNegNumber(ev.files_uploaded)) return { ok: false, reason: "events_24h.files_uploaded" };
   if (!isNonNegNumber(ev.bytes_uploaded)) return { ok: false, reason: "events_24h.bytes_uploaded" };
   if (!isNonNegNumber(ev.deep_verify_runs)) return { ok: false, reason: "events_24h.deep_verify_runs" };
-  if (!isNonNegNumber(ev.update_applied)) return { ok: false, reason: "events_24h.update_applied" };
-  if (typeof ev.errors_by_class !== "object" || ev.errors_by_class === null) {
+  // SPEC s16: update_applied is a BOOLEAN (byte-consistent with the Rust client).
+  if (typeof ev.update_applied !== "boolean") return { ok: false, reason: "events_24h.update_applied" };
+  if (typeof ev.errors_by_class !== "object" || ev.errors_by_class === null || Array.isArray(ev.errors_by_class)) {
     return { ok: false, reason: "events_24h.errors_by_class" };
   }
-  // errors_by_class values must all be non-negative numbers (counts).
-  for (const [k, n] of Object.entries(ev.errors_by_class as Record<string, unknown>)) {
-    if (!isNonNegNumber(n)) return { ok: false, reason: `events_24h.errors_by_class[${k}]` };
+  // errors_by_class: keys MUST be SPEC s24 error codes; values bounded counts;
+  // key count capped (no high-cardinality flood).
+  const errEntries = Object.entries(ev.errors_by_class as Record<string, unknown>);
+  if (errEntries.length > MAX_ERROR_CLASSES) {
+    return { ok: false, reason: "events_24h.errors_by_class.too_many" };
+  }
+  const errors: Record<string, number> = {};
+  for (const [k, n] of errEntries) {
+    if (!ERROR_CODES.has(k)) return { ok: false, reason: `events_24h.errors_by_class[${k}]` };
+    if (!isBoundedCount(n, MAX_ERROR_COUNT)) return { ok: false, reason: `events_24h.errors_by_class[${k}]` };
+    errors[k] = n;
   }
 
   const l = v.latency_p50_p95_ms;
@@ -117,19 +241,19 @@ export function validatePing(value: unknown): { ok: true; payload: PingPayload }
   return {
     ok: true,
     payload: {
-      install_id: v.install_id as string,
+      install_id: v.install_id,
       ts: v.ts as number,
-      version: v.version as string,
-      os: v.os as string,
-      os_version: typeof v.os_version === "string" ? (v.os_version as string) : null,
-      arch: v.arch as string,
-      channel: v.channel as string,
+      version: v.version,
+      os: v.os,
+      os_version: osVersion,
+      arch: v.arch,
+      channel: v.channel,
       events_24h: {
         files_uploaded: ev.files_uploaded as number,
         bytes_uploaded: ev.bytes_uploaded as number,
-        errors_by_class: ev.errors_by_class as Record<string, number>,
+        errors_by_class: errors,
         deep_verify_runs: ev.deep_verify_runs as number,
-        update_applied: ev.update_applied as number,
+        update_applied: ev.update_applied,
       },
       latency_p50_p95_ms: {
         scan: (lv.scan as unknown[]).filter((n): n is number => typeof n === "number"),
@@ -150,9 +274,10 @@ function totalErrors(errors: Record<string, number>): number {
 
 /// Write one validated ping to Analytics Engine (SPEC s16). The dataset schema:
 /// - indexes: [install_id]   (the sampling/grouping key - anonymous)
-/// - blobs:   [os, arch, channel, version, errors_by_class JSON]  (low-card dims)
+/// - blobs:   [os, arch, channel, version, os_version, errors_by_class JSON]
+///            (low-card dims; os_version is "" when the client did not send one)
 /// - doubles: [files_uploaded, bytes_uploaded, deep_verify_runs, update_applied,
-///             total_errors, ts]  (the numeric measures)
+///             total_errors, ts]  (the numeric measures; update_applied is 0/1)
 /// Writes are non-blocking (no await / waitUntil needed per the CF docs).
 export function writePing(env: Env, p: PingPayload): void {
   env.TELEMETRY.writeDataPoint({
@@ -162,6 +287,8 @@ export function writePing(env: Env, p: PingPayload): void {
       p.arch,
       p.channel,
       p.version,
+      // Coarse OS version (e.g. "11.26200"); bounded + non-PII, "" when absent.
+      p.os_version ?? "",
       // The error-code -> count map as JSON (codes are a fixed enum; never PII).
       JSON.stringify(p.events_24h.errors_by_class),
     ],
@@ -169,7 +296,9 @@ export function writePing(env: Env, p: PingPayload): void {
       p.events_24h.files_uploaded,
       p.events_24h.bytes_uploaded,
       p.events_24h.deep_verify_runs,
-      p.events_24h.update_applied,
+      // SPEC s16: update_applied is a boolean; AE doubles are numeric, so it is
+      // stored as 0/1 (the dataset column stays a clean 0-or-1 flag).
+      p.events_24h.update_applied ? 1 : 0,
       totalErrors(p.events_24h.errors_by_class),
       p.ts,
     ],
