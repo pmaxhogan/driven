@@ -58,14 +58,18 @@ pub const EVENT_OAUTH_COMPLETE: &str = "oauth:complete";
 /// `updater:available` - a newer release is available (payload: `UpdateInfo`,
 /// SPEC s11.7).
 ///
-/// M6: the About tab + in-app banner subscribe. The periodic updater check
-/// emits it; the emit helper lands with the settings implementer, so the
-/// constant is defined-but-uncalled in the M6 scaffold.
-#[allow(dead_code)]
+/// M9a: the About tab + in-app banner subscribe. The periodic updater check
+/// (startup + every 6h) and the manual `check_for_update` IPC emit it via
+/// [`emit_updater_available`] when [`crate::updater`] finds a newer signed
+/// release on the active channel.
 pub const EVENT_UPDATER_AVAILABLE: &str = "updater:available";
+/// `updater:download_progress` - a staged update is downloading (payload:
+/// `{ downloaded, total }`, SPEC s15.2). M9a: emitted by `install_update` on
+/// every chunk so the in-app banner shows a progress bar.
+pub const EVENT_UPDATER_DOWNLOAD_PROGRESS: &str = "updater:download_progress";
 /// `updater:downloaded` - the available update finished downloading and is
-/// ready to install (payload: `UpdateInfo`, SPEC s11.7).
-#[allow(dead_code)]
+/// ready to install (payload: `UpdateInfo`, SPEC s11.7). M9a: emitted by
+/// `install_update` right before the relaunch.
 pub const EVENT_UPDATER_DOWNLOADED: &str = "updater:downloaded";
 /// `restore:progress` - a restore job advanced (payload: `RestoreJobStatus`,
 /// SPEC s11.7).
@@ -125,4 +129,39 @@ pub fn emit_account_needs_reauth(
         EVENT_ACCOUNT_NEEDS_REAUTH,
         serde_json::json!({ "account_id": account_id, "email": email }),
     )
+}
+
+/// Broadcast `updater:available` with the available-update info (SPEC s11.7,
+/// s15.2). M9a: the periodic check + the manual `check_for_update` IPC call this
+/// when [`crate::updater`] finds a newer signed release on the active channel.
+pub fn emit_updater_available<P: Serialize + Clone>(
+    app: &AppHandle,
+    info: &P,
+) -> tauri::Result<()> {
+    app.emit(EVENT_UPDATER_AVAILABLE, info)
+}
+
+/// Broadcast `updater:download_progress` (SPEC s15.2): `downloaded` of `total`
+/// bytes staged so far. `total` is `None` until the server reports a content
+/// length. M9a: `install_update` calls this on every chunk so the banner can
+/// render a progress bar.
+pub fn emit_updater_download_progress(
+    app: &AppHandle,
+    downloaded: u64,
+    total: Option<u64>,
+) -> tauri::Result<()> {
+    app.emit(
+        EVENT_UPDATER_DOWNLOAD_PROGRESS,
+        serde_json::json!({ "downloaded": downloaded, "total": total }),
+    )
+}
+
+/// Broadcast `updater:downloaded` (SPEC s11.7): the staged update finished
+/// downloading and is about to be applied + the app relaunched. M9a:
+/// `install_update` calls this right before `app.restart()`.
+pub fn emit_updater_downloaded<P: Serialize + Clone>(
+    app: &AppHandle,
+    info: &P,
+) -> tauri::Result<()> {
+    app.emit(EVENT_UPDATER_DOWNLOADED, info)
 }

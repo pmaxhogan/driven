@@ -276,6 +276,32 @@ pub struct AppState {
     /// a late poll still sees the result, but they are TTL-pruned + count-capped
     /// (M8-P2-3) so a long-running tray app does not leak snapshots forever.
     restore_jobs: std::sync::Mutex<HashMap<String, RestoreJobEntry>>,
+    /// M9a (SPEC s15.2): the in-app updater runtime - the pending checked update
+    /// (held so `install_update` stages + applies the SAME object the check
+    /// found) plus the periodic-check task handle + shutdown signal, so the
+    /// app-quit drain joins it with NO orphan (mirrors the M5 no-orphan
+    /// bookkeeping).
+    updater: UpdaterRuntime,
+}
+
+/// M9a (SPEC s15.2): the in-app updater runtime state held on [`AppState`].
+///
+/// `pending` holds the [`tauri_plugin_updater::Update`] the most recent check
+/// found (manual or periodic), so `install_update` can `download_and_install`
+/// the SAME object without re-resolving the manifest; it is TAKEN on install (a
+/// fresh check re-populates it). `task` + `shutdown` track the single app-wide
+/// periodic-check task so the quit drain stops + joins it with no orphan.
+#[derive(Default)]
+pub struct UpdaterRuntime {
+    /// The update the latest check found, awaiting install; `None` when up to
+    /// date / not yet checked / already consumed by an install.
+    pending: std::sync::Mutex<Option<tauri_plugin_updater::Update>>,
+    /// The spawned periodic-check task, behind `Option` so the shutdown drain
+    /// can TAKE + await it by value; `None` once drained / never spawned.
+    task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The shutdown signal the periodic-check task `select!`s on, so it exits
+    /// promptly on quit rather than waiting out its 6h interval.
+    shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
 }
 
 /// M8 (P2-3): max number of TERMINAL restore-job records retained for late
@@ -408,7 +434,69 @@ impl AppState {
             ensure_master_key_locks: std::sync::Mutex::new(HashMap::new()),
             fake_remote_stores,
             restore_jobs: std::sync::Mutex::new(HashMap::new()),
+            updater: UpdaterRuntime::default(),
         }
+    }
+
+    // --- M9a updater runtime (SPEC s15.2) ----------------------------------
+
+    /// M9a: record the [`tauri_plugin_updater::Update`] a check found, so a
+    /// subsequent `install_update` stages + applies the SAME object without
+    /// re-resolving the manifest. Overwrites any prior pending update (a newer
+    /// check supersedes an older one). `None` clears it.
+    pub fn set_pending_update(&self, update: Option<tauri_plugin_updater::Update>) {
+        *self
+            .updater
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = update;
+    }
+
+    /// M9a: TAKE (single-use) the pending update for installation. `None` when no
+    /// check has found an update (so `install_update` returns a clear "nothing to
+    /// install" error rather than guessing).
+    #[must_use]
+    pub fn take_pending_update(&self) -> Option<tauri_plugin_updater::Update> {
+        self.updater
+            .pending
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    /// M9a: register the spawned periodic-check task + its shutdown sender so the
+    /// app-quit drain can stop + join it with no orphan. Called once after the
+    /// updater task is spawned in `lib.rs` setup.
+    pub fn set_updater_task(&self, task: JoinHandle<()>, shutdown: watch::Sender<bool>) {
+        *self.updater.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+        *self
+            .updater
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(shutdown);
+    }
+
+    /// M9a: signal the periodic-check task to stop and TAKE its handle so the
+    /// caller can await it (the app-quit drain). Returns `None` if no task is
+    /// tracked (never spawned / already drained). Mirrors the M8 restore-job
+    /// no-orphan take pattern.
+    #[must_use]
+    pub fn shutdown_updater_task(&self) -> Option<JoinHandle<()>> {
+        if let Some(tx) = self
+            .updater
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            // A send error only means the receiver is already gone - benign.
+            let _ = tx.send(true);
+        }
+        self.updater
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
     }
 
     /// Lock the restore-jobs map, recovering a poisoned lock (house rule: never

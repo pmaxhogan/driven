@@ -27,6 +27,12 @@ tauri-plugin-deep-link = "2"
 # diagnostic-export round-trip a dialog-derived path (the webview never injects
 # a raw local path).
 tauri-plugin-dialog = "2"
+# M9a (SPEC s15): the in-app updater. `tauri-plugin-updater` fetches the signed
+# per-target `update.json` manifest + bundle and verifies the ed25519 signature
+# against the pubkey in tauri.conf.json; `tauri-plugin-process` provides the
+# relaunch (`app.restart()`) after an update is staged.
+tauri-plugin-updater = "2"
+tauri-plugin-process = "2"
 # M6 (SPEC s11.6.1): Windows-friendly canonicalisation (no \\?\ UNC prefix) for
 # validate_writable_dest path confinement.
 dunce = "1"

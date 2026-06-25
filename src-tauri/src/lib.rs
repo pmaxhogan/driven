@@ -36,6 +36,9 @@ mod i18n;
 mod migrations;
 mod panic_hook;
 mod tray;
+// M9a (SPEC s15): the in-app updater - runtime channel selection, the periodic
+// check task, and the check/install/get-channel/set-channel IPC commands.
+mod updater;
 
 use std::path::PathBuf;
 
@@ -170,6 +173,12 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
     // leaves no orphaned restore task and no partial files. We take the handles
     // here and await them in the block_on below.
     let restore_handles = state.cancel_all_restore_jobs();
+    // M9a: signal + take the periodic updater-check task so the drain below joins
+    // it too (no orphan). It is a tokio-interval task that select!s on its
+    // shutdown watch, so it exits promptly once signalled; the bounded drain
+    // below still aborts-and-awaits it if it is mid-check (e.g. a slow network
+    // request) so quit cannot hang.
+    let updater_handle = state.shutdown_updater_task();
     tauri::async_runtime::block_on(async move {
         // R3-P1-1: drive ALL per-account shutdowns concurrently. Each
         // `handle.shutdown()` self-bounds its per-task drains and aborts-and-
@@ -201,6 +210,14 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
             .map(|h| async move { drain_restore_handle(h).await });
         futures::future::join_all(restore_drains).await;
         tracing::info!(target: "driven::app", "all in-flight restore jobs cancelled + drained (no orphans)");
+
+        // M9a: drain the periodic updater-check task with the SAME bounded,
+        // abort-capable budget so quit never hangs on a mid-check task and leaves
+        // no orphan.
+        if let Some(handle) = updater_handle {
+            drain_restore_handle(handle).await;
+            tracing::info!(target: "driven::app", "updater periodic check task drained (no orphan)");
+        }
     });
 }
 
@@ -267,6 +284,13 @@ pub fn run() {
         // round-trip a dialog-derived path so the webview can never inject an
         // arbitrary local path (the untrusted-webview path-confinement rule).
         .plugin(tauri_plugin_dialog::init())
+        // M9a (SPEC s15): the in-app updater + the process plugin (for the
+        // post-install relaunch via `app.restart()`). The updater fetches the
+        // signed per-target `update.json` and verifies the ed25519 signature
+        // against `tauri.conf.json` `plugins.updater.pubkey`; the runtime channel
+        // endpoint is overridden per-check in `updater::build_updater`.
+        .plugin(tauri_plugin_process::init())
+        .plugin(tauri_plugin_updater::Builder::new().build())
         // V5-P1-1 / DESIGN s8.1: closing the main window HIDES it to the tray;
         // it does NOT quit the app or stop sync. The app keeps running in the
         // background; Quit is reachable only via the tray menu / `--quit`.
@@ -296,6 +320,14 @@ pub fn run() {
                 let app_state = assembly::build_and_spawn(&handle, state).await?;
                 handle.manage(app_state);
                 tray::build(&handle)?;
+                // M9a (SPEC s15.2): start the periodic update-check task (an
+                // immediate check on startup, then every 6h). Spawned here -
+                // INSIDE the Tauri async runtime's `block_on` so `tokio::spawn`
+                // has a reactor, and AFTER `manage(app_state)` so it can read the
+                // active channel + record the pending update. Its handle +
+                // shutdown sender are tracked on AppState so the quit drain joins
+                // it with no orphan.
+                updater::spawn_periodic_check(&handle);
                 Ok::<(), anyhow::Error>(())
             })?;
 
@@ -371,6 +403,12 @@ pub fn run() {
             commands::settings::export_diagnostic_bundle,
             commands::settings::check_for_updates,
             commands::settings::list_releases,
+            // SPEC s15.2 updater (M9a): runtime channel selection + the
+            // tauri-plugin-updater check/install path.
+            updater::check_for_update,
+            updater::install_update,
+            updater::get_update_channel,
+            updater::set_update_channel,
             // SPEC s11.4 activity (M7).
             commands::activity::query_activity,
             commands::activity::clear_activity_older_than,
