@@ -462,6 +462,10 @@ async fn build_account(
         // (DESIGN s5.3).
         orchestrator = orchestrator.with_vss(vss);
     }
+    // Real pre/post backup hook runner (V2, DESIGN s17): without this the
+    // orchestrator keeps the inert no-op runner and configured hooks never run.
+    orchestrator =
+        orchestrator.with_command_runner(Arc::new(crate::hook_runner::TokioCommandRunner));
     let orchestrator = Arc::new(orchestrator);
 
     // R-P1-1: one shutdown signal both bridges select! on, so quit can stop the

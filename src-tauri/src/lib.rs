@@ -32,6 +32,7 @@ mod crypto_provider_impl;
 #[allow(dead_code)]
 mod elevation;
 mod events;
+mod hook_runner;
 mod i18n;
 mod migrations;
 mod panic_hook;

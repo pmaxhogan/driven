@@ -55,6 +55,7 @@ use driven_power::PowerSource;
 use driven_vss::{VssMode, VssProvider};
 
 use crate::executor::{Executor, OpOutcome};
+use crate::hooks::{CommandRunner, HookKind, NoopCommandRunner};
 use crate::network::{NetworkProbe, NetworkState, ServiceHealth, ServiceName};
 use crate::pacer::PacerCeilings;
 use crate::state::{ActivityLevel, NewActivity, SourceRow, StateRepo};
@@ -178,6 +179,16 @@ pub struct OrchestratorConfig {
     /// resumes automatically once the clock re-enters it. The
     /// [`Default`](ScheduleConfig::default) is disabled (V1 behaviour).
     pub schedule: ScheduleConfig,
+    /// Optional shell command run BEFORE a backup cycle touches any source
+    /// (V2 pre/post backup hooks, DESIGN s17). A non-zero / timed-out /
+    /// unspawnable pre-hook aborts that cycle's backup. `None` = no hook.
+    pub pre_backup_hook: Option<String>,
+    /// Optional shell command run AFTER a backup cycle's source loop,
+    /// regardless of outcome (`DRIVEN_RESULT` is `ok`/`error`). A failure is a
+    /// warning only. `None` = no hook.
+    pub post_backup_hook: Option<String>,
+    /// How long a hook command may run before it is killed, in seconds.
+    pub hook_timeout_secs: u32,
 }
 
 impl Default for OrchestratorConfig {
@@ -194,6 +205,9 @@ impl Default for OrchestratorConfig {
             pacer_ceilings: PacerCeilings::default(),
             vss_mode: VssMode::Auto,
             schedule: ScheduleConfig::default(),
+            pre_backup_hook: None,
+            post_backup_hook: None,
+            hook_timeout_secs: 60,
         }
     }
 }
@@ -354,6 +368,11 @@ pub struct SyncOrchestrator {
     /// path), and the executor (holding a CLONE of this same `Arc`) reads
     /// locked files from the snapshots in between. Set via [`Self::with_vss`].
     vss: Option<Arc<dyn VssProvider>>,
+    /// Pre/post backup hook runner (V2, DESIGN s17). Defaults to the inert
+    /// [`NoopCommandRunner`]; the app injects a real process runner via
+    /// [`Self::with_command_runner`]. The hook COMMANDS come from
+    /// [`OrchestratorConfig`]; this is only the seam that runs them.
+    command_runner: Arc<dyn CommandRunner>,
     /// Per-orchestrator record-at-create ledger (P1-A). The recorder hook wired
     /// into the provider by [`Self::with_vss`] pushes each freshly-created
     /// shadow GUID here synchronously; `record_vss_orphans` drains it into the
@@ -418,6 +437,7 @@ impl SyncOrchestrator {
             shutdown_tx,
             shutdown_rx,
             vss: None,
+            command_runner: Arc::new(NoopCommandRunner),
             vss_create_ledger: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             orphan_cleanup_done: Mutex::new(false),
             suspended: std::sync::atomic::AtomicBool::new(false),
@@ -444,6 +464,64 @@ impl SyncOrchestrator {
         }));
         self.vss = Some(vss);
         self
+    }
+
+    /// Attach a real pre/post backup hook runner (V2, DESIGN s17). Without
+    /// this the orchestrator keeps the inert [`NoopCommandRunner`], so a
+    /// configured hook is silently a no-op until the app wires this.
+    pub fn with_command_runner(mut self, runner: Arc<dyn CommandRunner>) -> Self {
+        self.command_runner = runner;
+        self
+    }
+
+    /// Run a configured pre/post backup hook command and record the outcome as
+    /// an activity row. Returns whether the command SUCCEEDED (clean zero
+    /// exit). Passes `DRIVEN_HOOK` (`pre`/`post`), `DRIVEN_ACCOUNT_ID`, and -
+    /// for the post hook - `DRIVEN_RESULT` (`ok`/`error`).
+    async fn run_backup_hook(&self, kind: HookKind, command: &str, result: Option<&str>) -> bool {
+        let timeout_secs = self.config.read().await.hook_timeout_secs.max(1);
+        let mut env = vec![
+            ("DRIVEN_HOOK".to_string(), kind.as_str().to_string()),
+            ("DRIVEN_ACCOUNT_ID".to_string(), self.account_id.to_string()),
+        ];
+        if let Some(r) = result {
+            env.push(("DRIVEN_RESULT".to_string(), r.to_string()));
+        }
+        let outcome = self
+            .command_runner
+            .run(
+                command,
+                &env,
+                std::time::Duration::from_secs(u64::from(timeout_secs)),
+            )
+            .await;
+        let level = if outcome.succeeded() {
+            ActivityLevel::Info
+        } else {
+            ActivityLevel::Warn
+        };
+        // Best-effort: a failure to record the activity row must not abort the
+        // backup decision the caller makes on the return value.
+        if let Err(e) = self
+            .state
+            .write_activity(NewActivity {
+                ts: self.clock.now_ms(),
+                source_id: None,
+                level,
+                event_type: format!("hook.{}", kind.as_str()),
+                file_count: None,
+                bytes: None,
+                message: Some(format!(
+                    "{} backup hook: {}",
+                    kind.as_str(),
+                    outcome.describe()
+                )),
+            })
+            .await
+        {
+            tracing::warn!(target: TARGET, account_id = %self.account_id, error = %e, "failed to record hook activity row");
+        }
+        outcome.succeeded()
     }
 
     /// Release any Driven-created shadow copies older than one hour that an
@@ -1398,6 +1476,31 @@ impl SyncOrchestrator {
         // return that would otherwise leak the shadow copies until next
         // startup's orphan sweep.
         let sources = self.state.list_enabled_sources_for(self.account_id).await?;
+
+        // Pre/post backup hooks (V2, DESIGN s17). Snapshot the configured
+        // commands once; the pre-hook gates the cycle, the post-hook runs after.
+        let (pre_hook, post_hook) = {
+            let c = self.config.read().await;
+            (c.pre_backup_hook.clone(), c.post_backup_hook.clone())
+        };
+        // Pre-backup hook: run BEFORE any source is touched. A failed pre-hook
+        // (non-zero / timed out / unspawnable) ABORTS this cycle's backup (no
+        // scan, no upload); the next cycle retries. Skipped when no source would
+        // run or no hook is configured. No VSS snapshot exists yet on this path,
+        // so the early return needs no snapshot cleanup.
+        if !sources.is_empty() {
+            if let Some(cmd) = pre_hook.as_deref() {
+                if !self.run_backup_hook(HookKind::Pre, cmd, None).await {
+                    tracing::warn!(target: TARGET, account_id = %self.account_id, "pre-backup hook failed; skipping this cycle's backup");
+                    self.transition(OrchestratorState::Idle {
+                        last_run_at: Some(self.clock.now_ms()),
+                    })
+                    .await;
+                    return Ok(());
+                }
+            }
+        }
+
         let loop_result: anyhow::Result<()> = async {
             for source in &sources {
                 let deep_verify = self.deep_verify_due(source);
@@ -1445,6 +1548,18 @@ impl SyncOrchestrator {
         let recorded = self.record_vss_orphans().await;
         self.end_vss_cycle();
         self.forget_vss_orphans(&recorded).await;
+
+        // Post-backup hook: run AFTER the source loop, regardless of outcome.
+        // A failure is a warning only - the backup already ran. `DRIVEN_RESULT`
+        // reflects whether the loop succeeded.
+        if !sources.is_empty() {
+            if let Some(cmd) = post_hook.as_deref() {
+                let result = if loop_result.is_ok() { "ok" } else { "error" };
+                self.run_backup_hook(HookKind::Post, cmd, Some(result))
+                    .await;
+            }
+        }
+
         loop_result?;
 
         self.transition(OrchestratorState::Idle {
@@ -2411,6 +2526,122 @@ mod tests {
         let orch =
             SyncOrchestrator::new(account, state, executor, power, net, clock.clone(), config);
         (orch, clock)
+    }
+
+    /// One recorded hook invocation: the command and its env vars.
+    type HookCall = (String, Vec<(String, String)>);
+
+    /// Records every hook invocation (command + env) and optionally fails.
+    #[derive(Default)]
+    struct FakeCommandRunner {
+        calls: StdMutex<Vec<HookCall>>,
+        fail: std::sync::atomic::AtomicBool,
+    }
+
+    #[async_trait]
+    impl CommandRunner for FakeCommandRunner {
+        async fn run(
+            &self,
+            command: &str,
+            env: &[(String, String)],
+            _timeout: std::time::Duration,
+        ) -> crate::hooks::HookOutcome {
+            self.calls
+                .lock()
+                .unwrap()
+                .push((command.to_string(), env.to_vec()));
+            if self.fail.load(Ordering::SeqCst) {
+                crate::hooks::HookOutcome {
+                    exit_code: Some(1),
+                    timed_out: false,
+                    spawn_error: None,
+                }
+            } else {
+                crate::hooks::HookOutcome::success()
+            }
+        }
+    }
+
+    #[tokio::test]
+    async fn pre_backup_hook_failure_aborts_the_cycle() {
+        // A failing pre-hook skips the backup: no execute, and the post-hook
+        // does NOT run (the backup never happened).
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let cfg = OrchestratorConfig {
+            pre_backup_hook: Some("run-pre".into()),
+            post_backup_hook: Some("run-post".into()),
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            cfg,
+        );
+        let runner = Arc::new(FakeCommandRunner::default());
+        runner.fail.store(true, Ordering::SeqCst);
+        let orch = orch.with_command_runner(runner.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        assert_eq!(
+            exec.executes.load(Ordering::SeqCst),
+            0,
+            "a failed pre-hook must skip the backup"
+        );
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 1, "only the pre-hook runs; post is skipped");
+        assert_eq!(calls[0].0, "run-pre");
+        assert!(calls[0]
+            .1
+            .iter()
+            .any(|(k, v)| k == "DRIVEN_HOOK" && v == "pre"));
+        assert!(calls[0].1.iter().any(|(k, _)| k == "DRIVEN_ACCOUNT_ID"));
+    }
+
+    #[tokio::test]
+    async fn post_backup_hook_runs_after_a_successful_pre_hook() {
+        // Pre succeeds -> the cycle proceeds and the post-hook runs with
+        // DRIVEN_RESULT=ok.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let cfg = OrchestratorConfig {
+            pre_backup_hook: Some("run-pre".into()),
+            post_backup_hook: Some("run-post".into()),
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            cfg,
+        );
+        let runner = Arc::new(FakeCommandRunner::default());
+        let orch = orch.with_command_runner(runner.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        let calls = runner.calls.lock().unwrap();
+        assert_eq!(calls.len(), 2, "pre then post both run");
+        assert_eq!(calls[0].0, "run-pre");
+        assert_eq!(calls[1].0, "run-post");
+        assert!(calls[1]
+            .1
+            .iter()
+            .any(|(k, v)| k == "DRIVEN_HOOK" && v == "post"));
+        assert!(calls[1]
+            .1
+            .iter()
+            .any(|(k, v)| k == "DRIVEN_RESULT" && v == "ok"));
     }
 
     #[tokio::test]

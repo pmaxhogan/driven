@@ -377,6 +377,12 @@ pub struct GlobalSettings {
     /// V2 schedule window (DESIGN s17): when enabled, sync is gated to the
     /// configured local-time window.
     pub schedule: ScheduleSettings,
+    /// V2 pre/post backup shell hooks (DESIGN s17). `null` = no hook.
+    pub pre_backup_hook: Option<String>,
+    /// See [`Self::pre_backup_hook`]; runs after a backup cycle.
+    pub post_backup_hook: Option<String>,
+    /// How long a hook command may run before it is killed, in seconds.
+    pub hook_timeout_secs: u32,
 }
 
 /// V2 schedule-window settings (DESIGN s17). Mirrors
@@ -484,6 +490,12 @@ pub struct GlobalSettingsPatch {
     pub log_level: Option<String>,
     /// See [`GlobalSettings::schedule`]. Present = replace the whole schedule.
     pub schedule: Option<ScheduleSettings>,
+    /// See [`GlobalSettings::pre_backup_hook`]. `Some(None)` clears it.
+    pub pre_backup_hook: Option<Option<String>>,
+    /// See [`GlobalSettings::post_backup_hook`]. `Some(None)` clears it.
+    pub post_backup_hook: Option<Option<String>>,
+    /// See [`GlobalSettings::hook_timeout_secs`].
+    pub hook_timeout_secs: Option<u32>,
 }
 
 /// Partial SPEC s22 `telemetry` settings.

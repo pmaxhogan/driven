@@ -269,6 +269,26 @@ pub async fn update_settings(
             cur.schedule = v;
             orchestrator_affecting = true;
         }
+        if let Some(v) = g.pre_backup_hook {
+            // A blank command clears the hook.
+            cur.pre_backup_hook = v.and_then(|s| {
+                let t = s.trim().to_string();
+                (!t.is_empty()).then_some(t)
+            });
+            orchestrator_affecting = true;
+        }
+        if let Some(v) = g.post_backup_hook {
+            cur.post_backup_hook = v.and_then(|s| {
+                let t = s.trim().to_string();
+                (!t.is_empty()).then_some(t)
+            });
+            orchestrator_affecting = true;
+        }
+        if let Some(v) = g.hook_timeout_secs {
+            check_range("hook_timeout_secs", v, 1, 86_400)?;
+            cur.hook_timeout_secs = v;
+            orchestrator_affecting = true;
+        }
         store_group(repo, KEY_GLOBAL, &storage::Global::from(cur)).await?;
     }
 
@@ -580,6 +600,19 @@ mod storage {
         // default = V1 behaviour).
         #[serde(default)]
         pub schedule: Schedule,
+        // Added in V2 (pre/post backup hooks). `serde(default)` so a pre-V2
+        // `global` blob still deserialises.
+        #[serde(default)]
+        pub pre_backup_hook: Option<String>,
+        #[serde(default)]
+        pub post_backup_hook: Option<String>,
+        #[serde(default = "default_hook_timeout_secs")]
+        pub hook_timeout_secs: u32,
+    }
+
+    /// Default hook timeout (seconds) for a pre-V2 `global` blob missing it.
+    fn default_hook_timeout_secs() -> u32 {
+        60
     }
 
     impl From<Global> for GlobalSettings {
@@ -595,6 +628,9 @@ mod storage {
                 io_priority: s.io_priority,
                 log_level: s.log_level,
                 schedule: s.schedule.into(),
+                pre_backup_hook: s.pre_backup_hook,
+                post_backup_hook: s.post_backup_hook,
+                hook_timeout_secs: s.hook_timeout_secs,
             }
         }
     }
@@ -612,6 +648,9 @@ mod storage {
                 io_priority: d.io_priority,
                 log_level: d.log_level,
                 schedule: d.schedule.into(),
+                pre_backup_hook: d.pre_backup_hook,
+                post_backup_hook: d.post_backup_hook,
+                hook_timeout_secs: d.hook_timeout_secs,
             }
         }
     }
@@ -825,6 +864,9 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
         pacer_ceilings: defaults.pacer_ceilings,
         vss_mode,
         schedule: schedule_settings_to_config(&global.schedule),
+        pre_backup_hook: global.pre_backup_hook.clone(),
+        post_backup_hook: global.post_backup_hook.clone(),
+        hook_timeout_secs: global.hook_timeout_secs,
     })
 }
 
@@ -1975,6 +2017,9 @@ fn default_global() -> GlobalSettings {
         io_priority: "low".to_string(),
         log_level: "info".to_string(),
         schedule: default_schedule(),
+        pre_backup_hook: None,
+        post_backup_hook: None,
+        hook_timeout_secs: 60,
     }
 }
 

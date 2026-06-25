@@ -165,6 +165,14 @@
       },
       "telemetryLabel": "Send anonymous usage stats",
       "telemetryNote": "Anonymous usage stats only - no file names or contents are ever sent. One click to disable.",
+      "hooks": {
+        "title": "Backup hooks",
+        "preLabel": "Before each backup (shell command)",
+        "postLabel": "After each backup (shell command)",
+        "timeoutLabel": "Hook timeout (seconds)",
+        "placeholder": "(none)",
+        "note": "Commands run in your shell once per backup cycle. A non-zero exit from the before-hook skips that backup. DRIVEN_HOOK, DRIVEN_ACCOUNT_ID, and (for the after-hook) DRIVEN_RESULT are set."
+      },
       "schedule": {
         "label": "Only back up during a schedule window",
         "startLabel": "From",

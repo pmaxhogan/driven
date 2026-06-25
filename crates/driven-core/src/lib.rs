@@ -22,6 +22,7 @@
 pub mod crypto_provider;
 pub mod exclude;
 pub mod executor;
+pub mod hooks;
 pub mod network;
 pub mod orchestrator;
 pub mod pacer;
