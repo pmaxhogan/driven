@@ -2500,3 +2500,61 @@ This round is the two DATA-SAFETY findings; the P1 CF-deploy-path finding is rou
   green; `.sqlx` regenerated (0 drift) for the new repair queries; ui pnpm lint + test:unit (149) +
   build (vue-tsc clean). Stub sweep on the touched surface (driven-core/src, src-tauri/src, ui): zero
   non-test `todo!(`/`unimplemented!(`/`unreachable!(`.
+
+## M9 fix round 8 (codex M9-8: 2 P1 + 1 P2 - refinements; closes the M9 codex loop)
+
+Source review: `.claude/codex-reviews/M9-8-20260625-010000.md` (baseline 97f596e, M9 @ b02e519). All 3
+legit; both P1s refine prior fixes (R7-P1-2 + R6-P2-1/R1-P2-1). Single sole-actor. After codex recheck
+M9-9, M9's per-milestone loop closes; any residual is deferred to the pre-GA whole-repo xhigh capstone
+(task #14) + M10.
+
+- R8-P1-1 (upgrade recovery-repair must FAIL CLOSED, DATA-SAFETY). The R7-P1-2 repair
+  (`repair_unacked_encrypted_sources_on_upgrade`) was called in `lib.rs` setup but its `Err` only
+  LOGGED - setup then proceeded to `assembly::build_and_spawn`, so a pre-0004 enabled encrypted source
+  with no durable ack kept SYNCING (the exact unsafe state the repair exists to prevent). Fixed to FAIL
+  CLOSED: `assembly::repair_allows_spawn(&result)` (pure; `true` iff `Ok`) gates the boot. On a repair
+  error the boot path calls the new `assembly::build_quiesced(state)` instead of `build_and_spawn` - it
+  manages the state repo but spawns ZERO orchestrators (no account syncs, encrypted or not), so nothing
+  backs up until the repair succeeds. The repair marker stays UNSET on error, so a later boot retries
+  and, on success, spawns normally. `reconstruct_recovery_acks_from_db` runs in both paths (the command
+  gate stays correct while quiesced), so the user can still reach Settings to reveal/ack. A tray note
+  (`tray::notify_repair_failed`, backend i18n `notifications.repair_failed`) tells the user why sync is
+  held off. The IPC layer keeps working while quiesced (state is managed). Tests (`assembly.rs`):
+  `repair_allows_spawn` is Ok->true / Err->false; `build_quiesced` over a SqliteStateRepo seeded with
+  an ENABLED ENCRYPTED account+source spawns ZERO orchestrators (`accounts().is_empty()`) - the
+  injected-failure / fail-closed branch starts nothing; the clean spawn path is covered by the live
+  lib.rs boot (needs an AppHandle).
+
+- R8-P1-2 (backend macOS gate on ALL auto-update install paths). The macOS in-app-updater guard lived
+  ONLY in About.vue, so the dev-channel PERIODIC silent install reached `download_and_install` on macOS
+  (and so did `install_update` if invoked). DESIGN: unsigned macOS V1 must use a MANUAL DMG reinstall.
+  Fixed with a BACKEND gate `updater::install_disposition(os_is_macos)` (pure; returns
+  `ManualOnMacos`/`Install`; production passes `cfg!(target_os = "macos")`, so BOTH arms stay reachable
+  + unit-tested on every host and there is NO cfg-gated dead code for 3-OS clippy). The periodic dev
+  path: on macOS it records the pending update + emits `updater:available` (so About's macOS guard
+  shows the DMG link) + raises `tray::notify_manual_update_available`, NEVER `download_and_install`;
+  non-macOS installs silently as before. `install_update`: on macOS short-circuits BEFORE taking the
+  pending update (leaves it intact so the About surface still shows the DMG link), raises the manual
+  tray note, and returns the new `ErrorCode::UpdateManualRequiredMacos` (`update.manual_required_macos`)
+  which the UI renders via `t("errors.update.manual_required_macos.long")`; Windows/Linux unchanged. New
+  error code added to `code()` + `from_code()` + classified non-network in `tray::error_code_is_network`;
+  i18n keys added (frontend `errors.update.manual_required_macos`, backend
+  `notifications.manual_update_available`). Test (`updater.rs`):
+  `install_disposition(true) == ManualOnMacos`, `install_disposition(false) == Install`.
+
+- R8-P2-1 (normalize recovery reveal/ack errors). `SourceTable.vue` (onRevealError / confirmRevealAck
+  catch) and `AddSourceWizard.vue` (finishReveal ack catch / onPhraseRevealError) stored `String(e)` /
+  `String(code)`, so a Tauri STRUCTURED error rendered as `[object Object]` and backend English could
+  leak. Fixed to normalize with the existing `toErrorCode(e)` helper into a stable SPEC s24 code stored
+  in a `revealErrorCode` ref, rendered via `t(\`errors.${code}.long\`)` (matching the setup/updater
+  stores). The reveal/ack codes (`internal.invalid_input`, `crypto.key_missing`) already exist in the
+  bundle, so no new reveal/ack i18n keys were needed. Vitest (`recovery-reveal-error-i18n.test.ts`):
+  a structured reveal error AND a structured ack error in SourceTable, and a structured reveal error in
+  the AddSourceWizard reveal step, each render the localized long message and NOT `[object Object]` /
+  the raw backend English.
+
+  Gates: SQLX_OFFLINE cargo build --workspace --all-targets + clippy --workspace --all-targets -D
+  warnings + test --workspace (167 app; google_e2e + elevation honest gate-skip) + build -p driven-app
+  + deny check + fmt --all --check + git diff --check all green; no sqlx/migration change (no
+  sqlx-prepare needed). ui pnpm install + lint + test:unit (152) + build (vue-tsc clean). Stub sweep on
+  the touched surface (src-tauri/src, ui): zero non-test `todo!(`/`unimplemented!(`/`unreachable!(`.
