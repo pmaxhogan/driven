@@ -36,7 +36,7 @@ use super::{
     AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
     DiscardPendingOutcome, FileSearchHit, FileStateRow, FileStatusCount, ImmediateTreeChildren,
     NewActivity, NewPendingOp, PageRequest, PendingOpRow, PendingRecoveryAck, RestoreFileRow,
-    SourceRow, StateRepo,
+    SourceRow, StateRepo, TelemetryAggregate,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -1901,6 +1901,87 @@ impl StateRepo for SqliteStateRepo {
             file_status_counts,
             throughput_window_bytes: byte_sums.window.max(0) as u64,
             throughput_window_ms,
+        })
+    }
+
+    async fn telemetry_events_24h(&self, since_ms: UnixMs) -> Result<TelemetryAggregate> {
+        // M9b (SPEC s16): the anonymous-telemetry 24h aggregate. Read-only; every
+        // value is a count/size/error-code - NO file name, path, or content is
+        // selected. `since_ms` is `now - 24h` (the caller passes it for
+        // determinism). SQLite has no unsigned ints; sums decode into i64 and are
+        // clamped via `max(0)` before the lossless cast to u64 (defence-in-depth -
+        // only non-negative sizes/counts are ever written).
+
+        // upload_done count + byte sum in the window.
+        let uploads = sqlx::query!(
+            r#"
+            SELECT
+                COUNT(*)                  AS "files!: i64",
+                COALESCE(SUM(bytes), 0)   AS "bytes!: i64"
+            FROM activity_log
+            WHERE ts >= ?1 AND event_type = 'upload_done'
+            "#,
+            since_ms,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        // Error counts keyed by the SPEC s24 error CODE (the event_type of an
+        // error-level row). event_type is a fixed dotted-code enum, never user
+        // data. Sorted by code for a deterministic wire payload.
+        let error_level = activity_level_to_str(ActivityLevel::Error);
+        let error_rows = sqlx::query!(
+            r#"
+            SELECT
+                event_type AS "code!: String",
+                COUNT(*)   AS "count!: i64"
+            FROM activity_log
+            WHERE ts >= ?1 AND level = ?2
+            GROUP BY event_type
+            ORDER BY event_type ASC
+            "#,
+            since_ms,
+            error_level,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        let errors_by_class = error_rows
+            .into_iter()
+            .map(|r| (r.code, r.count.max(0) as u64))
+            .collect();
+
+        // update_applied count in the window (0 in V1 - no such row is written
+        // yet; the aggregate picks it up automatically if the updater records one).
+        let update_applied_row = sqlx::query!(
+            r#"
+            SELECT COUNT(*) AS "n!: i64"
+            FROM activity_log
+            WHERE ts >= ?1 AND event_type = 'update_applied'
+            "#,
+            since_ms,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        // deep-verify passes that completed in the window, from the per-source
+        // `last_deep_verify_at` metadata on `backup_sources`.
+        let deep_verify_row = sqlx::query!(
+            r#"
+            SELECT COUNT(*) AS "n!: i64"
+            FROM backup_sources
+            WHERE last_deep_verify_at IS NOT NULL AND last_deep_verify_at >= ?1
+            "#,
+            since_ms,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+
+        Ok(TelemetryAggregate {
+            files_uploaded: uploads.files.max(0) as u64,
+            bytes_uploaded: uploads.bytes.max(0) as u64,
+            errors_by_class,
+            deep_verify_runs: deep_verify_row.n.max(0) as u64,
+            update_applied: update_applied_row.n.max(0) as u64,
         })
     }
 
@@ -3874,6 +3955,81 @@ mod tests {
         assert_eq!(summary.bytes_today, 0);
         // week = rows with ts >= 1000: only the ts=1500 row -> 30.
         assert_eq!(summary.bytes_week, 30);
+    }
+
+    #[tokio::test]
+    async fn telemetry_events_24h_aggregates_uploads_errors_and_deep_verify() {
+        // M9b (SPEC s16): the telemetry 24h aggregate counts upload_done rows +
+        // bytes, groups error-level rows by error code, counts update_applied
+        // rows, and counts sources whose last_deep_verify_at falls in the window.
+        // It NEVER selects a path/name. Rows older than `since` are excluded.
+        use super::TelemetryAggregate;
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let since = 1000;
+
+        // Two upload_done rows in-window (100 + 200 bytes), one BEFORE the window
+        // (excluded), two error rows (one drive.rate_limited, two local.io_error),
+        // and one update_applied row.
+        let rows: &[(i64, ActivityLevel, &str, Option<u64>)] = &[
+            (500, ActivityLevel::Info, "upload_done", Some(999)), // pre-window -> excluded
+            (1100, ActivityLevel::Info, "upload_done", Some(100)),
+            (1200, ActivityLevel::Info, "upload_done", Some(200)),
+            (1300, ActivityLevel::Error, "drive.rate_limited", None),
+            (1400, ActivityLevel::Error, "local.io_error", None),
+            (1500, ActivityLevel::Error, "local.io_error", None),
+            (1600, ActivityLevel::Info, "update_applied", None),
+            (600, ActivityLevel::Error, "drive.rate_limited", None), // pre-window -> excluded
+        ];
+        for (ts, level, et, bytes) in rows.iter().copied() {
+            repo.write_activity(NewActivity {
+                ts,
+                source_id: Some(src.id),
+                level,
+                event_type: et.into(),
+                file_count: None,
+                bytes,
+                message: Some("secret/path/file.txt".into()), // must NOT leak
+            })
+            .await
+            .unwrap();
+        }
+
+        // A second source with a deep-verify completed IN the window, plus the
+        // first source with a deep-verify BEFORE the window (excluded).
+        let mut src2 = sample_source(acct.id);
+        src2.last_deep_verify_at = Some(1450);
+        repo.upsert_source(&src2).await.unwrap();
+        let mut src_old = src.clone();
+        src_old.last_deep_verify_at = Some(900); // before window -> excluded
+        repo.upsert_source(&src_old).await.unwrap();
+
+        let agg = repo.telemetry_events_24h(since).await.unwrap();
+
+        assert_eq!(agg.files_uploaded, 2, "two in-window upload_done rows");
+        assert_eq!(agg.bytes_uploaded, 300, "100 + 200 bytes in-window");
+        assert_eq!(
+            agg.errors_by_class,
+            vec![
+                ("drive.rate_limited".to_string(), 1),
+                ("local.io_error".to_string(), 2),
+            ],
+            "errors grouped by code, sorted, in-window only"
+        );
+        assert_eq!(agg.update_applied, 1);
+        assert_eq!(
+            agg.deep_verify_runs, 1,
+            "only the in-window deep-verify source counts"
+        );
+
+        // Empty-window sanity: a window far in the future yields an all-zero
+        // aggregate (the Default).
+        let empty = repo.telemetry_events_24h(9_999_999).await.unwrap();
+        assert_eq!(empty, TelemetryAggregate::default());
     }
 
     #[test]

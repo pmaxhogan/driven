@@ -1,0 +1,26 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                COUNT(*)                  AS \"files!: i64\",\n                COALESCE(SUM(bytes), 0)   AS \"bytes!: i64\"\n            FROM activity_log\n            WHERE ts >= ?1 AND event_type = 'upload_done'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "files!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      },
+      {
+        "name": "bytes!: i64",
+        "ordinal": 1,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false,
+      false
+    ]
+  },
+  "hash": "ba5ade9a4f1bafc92597dce7e4b91cc546cb11d0d50259c56d777e5cefa73f89"
+}

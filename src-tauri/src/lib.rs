@@ -35,6 +35,9 @@ mod events;
 mod i18n;
 mod migrations;
 mod panic_hook;
+// M9b (SPEC s16): anonymous usage telemetry - the install_id + enabled pref, the
+// startup + 24h ping task, and the get/set IPC commands.
+mod telemetry;
 mod tray;
 // M9a (SPEC s15): the in-app updater - runtime channel selection, the periodic
 // check task, and the check/install/get-channel/set-channel IPC commands.
@@ -179,6 +182,12 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
     // below still aborts-and-awaits it if it is mid-check (e.g. a slow network
     // request) so quit cannot hang.
     let updater_handle = state.shutdown_updater_task();
+    // M9b: signal + take the periodic telemetry-ping task so the drain below joins
+    // it too (no orphan). It is a tokio-interval task that select!s on its shutdown
+    // watch, so it exits promptly once signalled; the bounded drain below still
+    // aborts-and-awaits it if it is mid-ping (e.g. a slow best-effort POST) so quit
+    // cannot hang.
+    let telemetry_handle = state.shutdown_telemetry_task();
     tauri::async_runtime::block_on(async move {
         // R3-P1-1: drive ALL per-account shutdowns concurrently. Each
         // `handle.shutdown()` self-bounds its per-task drains and aborts-and-
@@ -217,6 +226,14 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
         if let Some(handle) = updater_handle {
             drain_restore_handle(handle).await;
             tracing::info!(target: "driven::app", "updater periodic check task drained (no orphan)");
+        }
+
+        // M9b: drain the periodic telemetry-ping task with the SAME bounded,
+        // abort-capable budget so quit never hangs on a mid-ping task and leaves no
+        // orphan.
+        if let Some(handle) = telemetry_handle {
+            drain_restore_handle(handle).await;
+            tracing::info!(target: "driven::app", "telemetry ping task drained (no orphan)");
         }
     });
 }
@@ -379,6 +396,16 @@ pub fn run() {
                 // shutdown sender are tracked on AppState so the quit drain joins
                 // it with no orphan.
                 updater::spawn_periodic_check(&handle);
+                // M9b (SPEC s16): start the anonymous-telemetry ping task (an
+                // immediate ping on startup if enabled, then every 24h). Spawned
+                // here - INSIDE the Tauri async runtime's `block_on` so
+                // `tokio::spawn` has a reactor, and AFTER `manage(app_state)` so it
+                // can read the telemetry pref + aggregate from the state DB. Its
+                // handle + shutdown sender are tracked on AppState so the quit drain
+                // joins it with no orphan. It self-checks the enabled pref each tick
+                // (default ON, honored immediately on toggle), and when disabled
+                // makes NO network call.
+                telemetry::spawn_periodic_ping(&handle);
                 Ok::<(), anyhow::Error>(())
             })?;
 
@@ -469,6 +496,10 @@ pub fn run() {
             // `updater:available` emitted by the startup check before the webview
             // attached is still reflected in the banner.
             updater::get_pending_update_info,
+            // SPEC s16 telemetry (M9b): the anonymous-usage toggle + install id.
+            telemetry::get_telemetry_enabled,
+            telemetry::set_telemetry_enabled,
+            telemetry::get_telemetry_install_id,
             // SPEC s11.4 activity (M7).
             commands::activity::query_activity,
             commands::activity::clear_activity_older_than,

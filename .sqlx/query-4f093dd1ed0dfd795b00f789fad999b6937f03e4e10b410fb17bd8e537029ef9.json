@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT COUNT(*) AS \"n!: i64\"\n            FROM activity_log\n            WHERE ts >= ?1 AND event_type = 'update_applied'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "n!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "4f093dd1ed0dfd795b00f789fad999b6937f03e4e10b410fb17bd8e537029ef9"
+}

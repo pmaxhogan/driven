@@ -380,6 +380,33 @@ pub struct ActivitySummary {
     pub throughput_window_ms: u64,
 }
 
+/// M9b (SPEC s16): the anonymous-telemetry 24h aggregate, computed entirely from
+/// the durable `activity_log` + `backup_sources` (the `file_state` metadata) over
+/// the last 24h.
+///
+/// PRIVACY (load-bearing): this carries ONLY counts/sizes/error-codes - never a
+/// file name, path, or content. `errors_by_class` is keyed by the SPEC s24 error
+/// CODE (the `activity_log.event_type` discriminant of an `error`-level row),
+/// which is a fixed enum of dotted code strings, never user data.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct TelemetryAggregate {
+    /// Number of `upload_done` activity rows in the window ("files uploaded").
+    pub files_uploaded: u64,
+    /// Sum of `activity_log.bytes` for `upload_done` rows in the window.
+    pub bytes_uploaded: u64,
+    /// Error counts keyed by the SPEC s24 error code (the `event_type` of an
+    /// `error`-level activity row). Sorted by code so the wire payload is
+    /// deterministic. Never carries a path or message.
+    pub errors_by_class: Vec<(String, u64)>,
+    /// Number of sources whose `backup_sources.last_deep_verify_at` falls inside
+    /// the window (a deep-verify pass completed in the last 24h).
+    pub deep_verify_runs: u64,
+    /// Number of `update_applied` activity rows in the window. (No such row is
+    /// written in V1, so this is honestly 0 until the updater records one; the
+    /// aggregate picks it up automatically if/when it does.)
+    pub update_applied: u64,
+}
+
 /// One hit from the `file_state_fts` virtual table (SPEC s2).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct FileSearchHit {
@@ -1017,6 +1044,18 @@ pub trait StateRepo: Send + Sync {
             throughput_window_ms,
         );
         Ok(ActivitySummary::default())
+    }
+
+    /// M9b (SPEC s16): the anonymous-telemetry 24h aggregate, computed from the
+    /// durable `activity_log` + `backup_sources` over `[since_ms, now]`. The caller
+    /// (the telemetry client) passes `since_ms = now - 24h` so the query is
+    /// deterministic + unit-testable. Read-only; touches no file names/paths.
+    ///
+    /// Default impl returns a zeroed aggregate (the in-memory test doubles never
+    /// call it); the SQLite repo overrides it with bounded aggregate SQL.
+    async fn telemetry_events_24h(&self, since_ms: UnixMs) -> Result<TelemetryAggregate> {
+        let _ = since_ms;
+        Ok(TelemetryAggregate::default())
     }
 
     /// Prune `activity_log` rows older than `before_ms`, batched to keep

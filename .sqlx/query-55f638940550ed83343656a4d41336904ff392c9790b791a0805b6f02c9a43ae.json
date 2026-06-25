@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT COUNT(*) AS \"n!: i64\"\n            FROM backup_sources\n            WHERE last_deep_verify_at IS NOT NULL AND last_deep_verify_at >= ?1\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "n!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "55f638940550ed83343656a4d41336904ff392c9790b791a0805b6f02c9a43ae"
+}

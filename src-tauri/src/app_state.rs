@@ -282,6 +282,11 @@ pub struct AppState {
     /// app-quit drain joins it with NO orphan (mirrors the M5 no-orphan
     /// bookkeeping).
     updater: UpdaterRuntime,
+    /// M9b (SPEC s16): the anonymous-telemetry runtime - the periodic ping task
+    /// handle + shutdown signal, so the app-quit drain joins it with NO orphan
+    /// (mirrors the M9a updater bookkeeping). The ping itself is best-effort and
+    /// holds no state here beyond the task control surface.
+    telemetry: TelemetryRuntime,
     /// M9c D4 (M6 R4-P1-1, DATA-SAFETY); R4-P1-1 made DURABLE: per-source
     /// recovery-phrase ACK gate, a reconstructed-on-startup MIRROR of the durable
     /// `recovery_phrase_acks` table. The FIRST encrypted source for an account is
@@ -336,6 +341,21 @@ pub struct UpdaterRuntime {
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// The shutdown signal the periodic-check task `select!`s on, so it exits
     /// promptly on quit rather than waiting out its 6h interval.
+    shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
+}
+
+/// M9b (SPEC s16): the anonymous-telemetry runtime state held on [`AppState`].
+///
+/// `task` + `shutdown` track the single app-wide periodic-ping task so the quit
+/// drain stops + joins it with no orphan (mirrors [`UpdaterRuntime`]). The ping
+/// reads settings + aggregates on each tick, so no payload state lives here.
+#[derive(Default)]
+pub struct TelemetryRuntime {
+    /// The spawned periodic-ping task, behind `Option` so the shutdown drain can
+    /// TAKE + await it by value; `None` once drained / never spawned.
+    task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The shutdown signal the periodic-ping task `select!`s on, so it exits
+    /// promptly on quit rather than waiting out its 24h interval.
     shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
 }
 
@@ -470,6 +490,7 @@ impl AppState {
             fake_remote_stores,
             restore_jobs: std::sync::Mutex::new(HashMap::new()),
             updater: UpdaterRuntime::default(),
+            telemetry: TelemetryRuntime::default(),
             recovery_acks: std::sync::Mutex::new(HashMap::new()),
         }
     }
@@ -660,6 +681,46 @@ impl AppState {
             let _ = tx.send(true);
         }
         self.updater
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    // --- M9b telemetry runtime (SPEC s16) ----------------------------------
+
+    /// M9b: register the spawned periodic-ping task + its shutdown sender so the
+    /// app-quit drain can stop + join it with no orphan. Called once after the
+    /// telemetry task is spawned in `lib.rs` setup (mirrors the M9a updater task).
+    pub fn set_telemetry_task(&self, task: JoinHandle<()>, shutdown: watch::Sender<bool>) {
+        *self
+            .telemetry
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(task);
+        *self
+            .telemetry
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(shutdown);
+    }
+
+    /// M9b: signal the periodic-ping task to stop and TAKE its handle so the
+    /// caller can await it (the app-quit drain). Returns `None` if no task is
+    /// tracked (never spawned / already drained). Mirrors `shutdown_updater_task`.
+    #[must_use]
+    pub fn shutdown_telemetry_task(&self) -> Option<JoinHandle<()>> {
+        if let Some(tx) = self
+            .telemetry
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            // A send error only means the receiver is already gone - benign.
+            let _ = tx.send(true);
+        }
+        self.telemetry
             .task
             .lock()
             .unwrap_or_else(|e| e.into_inner())

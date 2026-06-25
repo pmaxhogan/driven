@@ -64,6 +64,10 @@ crc32fast = "1"
 # verifies it against the stored `file_state.hash_blake3` (data-safety: a wrong
 # decrypt / corrupted object is refused). Same crate the executor hashes with.
 blake3 = "1"
+# M9b (SPEC s16): the telemetry-send seam (`TelemetrySink`) is an async trait used
+# in NON-test code (the periodic ping task takes `&dyn TelemetrySink`), so
+# async-trait must be a regular dependency, not just a dev-dependency.
+async-trait.workspace = true
 
 driven-core = { path = "../crates/driven-core" }
 driven-drive = { path = "../crates/driven-drive" }
@@ -102,9 +106,8 @@ windows-sys = { version = "0.59", features = [
 ] }
 
 [dev-dependencies]
-# R-P1-1 shutdown test: a no-op `Orchestrator` impl to build an `AccountHandle`
-# and assert every per-account task is joined after `shutdown()`.
-async-trait.workspace = true
+# (async-trait is a regular dependency - see [dependencies] - used by both the
+# M9b telemetry-send seam and the R-P1-1 shutdown test's no-op Orchestrator impl.)
 # M8-P1-1 restore-cancel test: seed an InMemoryRemoteStore object via UploadBody::Bytes.
 bytes.workspace = true
 # R2-P2-1 run-loop drain-budget test: `tokio::time::pause` for virtual time so
