@@ -168,12 +168,13 @@ describe("SourceTable", () => {
     );
   });
 
-  it("exposes a post-restart reveal/ack action that enables a pending source (R5-P1-2)", async () => {
+  it("exposes a post-restart reveal/ack action that enables a pending source (R5-P1-2, R7-P2-1)", async () => {
     // R5-P1-2 (DATA-SAFETY): a first-encrypted source that survived a restart is
-    // durably pending; the table must expose a reachable reveal/ack action. Clicking
-    // it records the backend reveal (reveal_recovery_phrase) + shows the words, then
-    // a successful ack (ack_recovery_phrase_saved) enables the source and clears the
-    // pending state - reachable WITHOUT the volatile wizard.
+    // durably pending; the table must expose a reachable reveal/ack action.
+    // R7-P2-1 (DATA-SAFETY): opening the panel must NOT record the backend reveal -
+    // the reveal_recovery_phrase IPC fires only when the user clicks Reveal inside
+    // RecoveryPhraseReveal. A successful ack (ack_recovery_phrase_saved) then enables
+    // the source and clears the pending state - reachable WITHOUT the volatile wizard.
     const words = Array.from({ length: 24 }, (_, i) => `word${i + 1}`);
     let acked = false;
     invokeMock.mockImplementation((cmd: string) => {
@@ -198,22 +199,27 @@ describe("SourceTable", () => {
     const wrapper = mount(SourceTable, { global: globalMountOptions });
     await flushPromises();
 
-    // The pending-recovery row action is present; clicking it reveals the phrase.
+    // Opening the panel must NOT record a reveal (R7-P2-1).
     const revealBtn = wrapper.get('[data-testid="reveal-ack-button"]');
     await revealBtn.trigger("click");
     await flushPromises();
-    expect(invokeMock).toHaveBeenCalledWith("reveal_recovery_phrase", {
-      sourceId: "src-1",
-    });
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "reveal_recovery_phrase",
+      expect.anything(),
+    );
 
-    // The reveal/ack panel is open. Reveal the words inside RecoveryPhraseReveal so
-    // the ack checkbox unlocks (the gate requires the user to actually see them).
+    // The reveal/ack panel is open. Clicking Reveal inside RecoveryPhraseReveal is
+    // what records the backend reveal AND fetches the words (so the ack checkbox
+    // unlocks). The gate requires the user to actually click Reveal.
     const panel = wrapper.get('[data-testid="reveal-ack-panel"]');
     const showButton = panel
       .findAll("button")
       .find((b) => b.text() === i18n.global.t("recoveryPhrase.revealButton"));
     await showButton!.trigger("click");
     await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("reveal_recovery_phrase", {
+      sourceId: "src-1",
+    });
 
     // Tick the acknowledgement checkbox, then confirm -> ack enables the source.
     await panel.get('[data-testid="phrase-ack"]').setValue(true);
@@ -225,6 +231,47 @@ describe("SourceTable", () => {
       sourceId: "src-1",
     });
     // The panel closed (pending state cleared after the refresh).
+    expect(wrapper.find('[data-testid="reveal-ack-panel"]').exists()).toBe(false);
+  });
+
+  it("opening + cancelling the reveal panel never records a backend reveal (R7-P2-1)", async () => {
+    // R7-P2-1 (DATA-SAFETY): the durable revealed=1 state may only be set after the
+    // user clicks Reveal. Opening the panel then cancelling (without ever clicking
+    // Reveal) must NOT call reveal_recovery_phrase - so a user who backs out never
+    // weakens the "revealed == the user actually saw the phrase" invariant.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources")
+        return Promise.resolve([
+          makeSource({
+            encryptionEnabled: true,
+            enabled: false,
+            pendingRecoveryAck: true,
+          }),
+        ]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+
+    // Open the panel.
+    await wrapper.get('[data-testid="reveal-ack-button"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="reveal-ack-panel"]').exists()).toBe(true);
+
+    // Cancel WITHOUT clicking Reveal.
+    const panel = wrapper.get('[data-testid="reveal-ack-panel"]');
+    const cancelButton = panel
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("common.cancel"));
+    await cancelButton!.trigger("click");
+    await flushPromises();
+
+    // No backend reveal was recorded, and the panel is closed.
+    expect(invokeMock).not.toHaveBeenCalledWith(
+      "reveal_recovery_phrase",
+      expect.anything(),
+    );
     expect(wrapper.find('[data-testid="reveal-ack-panel"]').exists()).toBe(false);
   });
 

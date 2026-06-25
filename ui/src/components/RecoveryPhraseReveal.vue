@@ -52,6 +52,21 @@ const copied = ref(false);
 
 const hasPhrase = computed(() => props.phrase.length > 0);
 
+// M9c D4 / R7-P2-1: a backend reveal action is supplied. When present, the reveal
+// click itself FETCHES + records the phrase (the post-restart SourceTable case),
+// so the Reveal button must be clickable even before any phrase is loaded - the
+// action populates `phrase`. Without an action, reveal is purely client-side and
+// still requires a phrase to be present.
+const hasRevealAction = computed(
+  () => typeof props.revealAction === "function",
+);
+
+// The Reveal button is usable when there is a phrase to show OR a backend action
+// that will supply one. (Re-hiding stays available once revealed.)
+const canReveal = computed(
+  () => revealed.value || hasPhrase.value || hasRevealAction.value,
+);
+
 // R3-P1-1: the acknowledge checkbox is usable only once the phrase has been
 // revealed AND a real phrase is present.
 const ackEnabled = computed(() => everRevealed.value && hasPhrase.value);
@@ -63,16 +78,15 @@ async function toggle(): Promise<void> {
     return;
   }
   // Revealing for the FIRST time with a backend reveal action: await it so the
-  // backend records the reveal (the ack gate depends on it). Only latch on
-  // success; a rejected backend reveal leaves the phrase hidden + un-latched.
-  if (
-    !everRevealed.value &&
-    hasPhrase.value &&
-    typeof props.revealAction === "function"
-  ) {
+  // backend records the reveal AND (post-restart) returns the phrase the action
+  // stores into `phrase` (the ack gate depends on the recorded reveal). Only
+  // latch on success; a rejected backend reveal leaves the phrase hidden +
+  // un-latched. The phrase need NOT be present yet - the action supplies it.
+  if (!everRevealed.value && hasRevealAction.value) {
     revealing.value = true;
     try {
-      await props.revealAction();
+      // props.revealAction is guaranteed a function by hasRevealAction.
+      await props.revealAction!();
     } catch (e) {
       revealing.value = false;
       emit("reveal-error", e);
@@ -81,6 +95,8 @@ async function toggle(): Promise<void> {
     revealing.value = false;
   }
   revealed.value = true;
+  // Latch only once a real phrase is present (the action above may have just
+  // populated it). A reveal action that yielded no phrase does not unlock ack.
   if (hasPhrase.value && !everRevealed.value) {
     everRevealed.value = true;
     emit("update:revealed", true);
@@ -145,7 +161,7 @@ watch(
       <button
         type="button"
         class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
-        :disabled="!hasPhrase || revealing"
+        :disabled="!canReveal || revealing"
         @click="toggle"
       >
         {{

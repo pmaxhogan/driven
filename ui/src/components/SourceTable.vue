@@ -44,7 +44,6 @@ const revealingId = ref<string | null>(null);
 const revealPhrase = ref<string[]>([]);
 const revealConfirmed = ref(false);
 const revealEverShown = ref(false);
-const revealLoading = ref(false);
 const revealAcking = ref(false);
 const revealError = ref<string | null>(null);
 
@@ -150,12 +149,14 @@ async function confirmRemove(sourceId: string): Promise<void> {
   deleteRemote.value = false;
 }
 
-// R5-P1-2 (DATA-SAFETY): open the post-restart reveal/ack panel for a pending
-// first-encrypted source. Fetch + record the backend reveal FIRST (it returns the
-// 24 words and durably marks the reveal so the ack can proceed), then show them via
-// RecoveryPhraseReveal gated on the user attesting they saved them. Any other inline
-// panel (edit / remove) is closed so only one is open at a time.
-async function beginRevealAck(source: SourceDto): Promise<void> {
+// R5-P1-2 / R7-P2-1 (DATA-SAFETY): open the post-restart reveal/ack panel for a
+// pending first-encrypted source. Opening the panel must NOT record a backend
+// reveal - the durable `revealed=1` state may only be set once the user actually
+// clicks Reveal. So this only resets state + opens the panel; the actual
+// revealRecoveryPhrase IPC happens in `revealPhraseAction` (threaded into
+// RecoveryPhraseReveal as its reveal-action, fired on the Reveal click). Any
+// other inline panel (edit / remove) is closed so only one is open at a time.
+function beginRevealAck(source: SourceDto): void {
   editingId.value = null;
   confirmingRemoveId.value = null;
   revealError.value = null;
@@ -163,15 +164,22 @@ async function beginRevealAck(source: SourceDto): Promise<void> {
   revealEverShown.value = false;
   revealPhrase.value = [];
   revealingId.value = source.id;
-  revealLoading.value = true;
-  try {
-    revealPhrase.value = await sources.revealRecoveryPhrase(source.id);
-  } catch (e) {
-    revealError.value = String(e);
-    revealingId.value = null;
-  } finally {
-    revealLoading.value = false;
-  }
+}
+
+// R7-P2-1: the reveal action threaded into RecoveryPhraseReveal - the BACKEND
+// reveal the ack gate depends on. Fired only when the user clicks Reveal. It
+// fetches + durably records the reveal and stores the 24 words for display; if it
+// rejects, RecoveryPhraseReveal surfaces the error and leaves the phrase hidden +
+// the ack locked, and the backend reveal is never recorded.
+async function revealPhraseAction(): Promise<void> {
+  const id = revealingId.value;
+  if (id === null) return;
+  revealPhrase.value = await sources.revealRecoveryPhrase(id);
+}
+
+// R7-P2-1: surface a backend reveal error from RecoveryPhraseReveal.
+function onRevealError(code: unknown): void {
+  revealError.value = String(code);
 }
 
 function cancelRevealAck(): void {
@@ -442,17 +450,12 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
                 <p class="text-amber-700 dark:text-amber-400">
                   {{ t("settings.sources.revealAckIntro") }}
                 </p>
-                <p
-                  v-if="revealLoading"
-                  class="text-zinc-500"
-                >
-                  {{ t("common.loading") }}
-                </p>
                 <RecoveryPhraseReveal
-                  v-else
                   v-model:confirmed="revealConfirmed"
                   :phrase="revealPhrase"
+                  :reveal-action="revealPhraseAction"
                   @update:revealed="onRevealShown"
+                  @reveal-error="onRevealError"
                 />
                 <p
                   v-if="revealError"
