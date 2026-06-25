@@ -26,6 +26,9 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use clap::{Parser, Subcommand};
+
+mod inspect;
+
 use driven_drive::google::oauth::{run_pkce_loopback_flow, OAuthProgress};
 use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
 use driven_drive::google::{md5_hex, parse_installed_client_config, GoogleDriveStore, UploadBytes};
@@ -57,6 +60,14 @@ enum Command {
     /// Run one sync cycle of a local folder to a real Drive destination
     /// folder (ROADMAP M4 acceptance).
     Sync(SyncArgs),
+    /// Show each backup source and its file-state counts from the local
+    /// state database (no Drive / network access).
+    Status(inspect::InspectArgs),
+    /// Print recent activity-log entries from the local state database.
+    History(inspect::HistoryArgs),
+    /// Check the local state database for files in a corrupt / error state;
+    /// exits non-zero when any are found.
+    Verify(inspect::InspectArgs),
 }
 
 /// Arguments for `driven-cli auth`.
@@ -124,6 +135,9 @@ async fn main() -> anyhow::Result<()> {
         Command::Auth(args) => run_auth(args).await,
         Command::DumpRefreshToken(args) => run_dump_refresh_token(args).await,
         Command::Sync(args) => run_sync(args).await,
+        Command::Status(args) => inspect::run_status(args).await,
+        Command::History(args) => inspect::run_history(args).await,
+        Command::Verify(args) => inspect::run_verify(args).await,
     }
 }
 
