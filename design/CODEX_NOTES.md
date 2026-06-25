@@ -2712,3 +2712,63 @@ Single sole-actor.
   install + lint + test:unit + build (vue-tsc clean). worker: pnpm install + tsc + eslint + vitest green.
   Stub sweep on the touched surface (src-tauri/src, ui, telemetry-worker): zero non-test
   `todo!(`/`unimplemented!(`/`unreachable!(`.
+
+## M9b fix round 1
+
+  Codex M9b xhigh review (`.claude/codex-reviews/M9b-20260625-025031.md`, baseline 8bb3fe9, M9b @ 6da67ab):
+  4 P1 + 3 P2 telemetry findings, all legit, all fixed as ONE sole-actor pass (client + worker are a
+  COUPLED payload contract, kept byte-consistent). Spec: `.claude/m9b-fix-spec.md`.
+
+  - P1-1 (PUBLIC worker hardening, `telemetry-worker/src/index.ts`): the endpoint is public, so
+    `validatePing` now REJECTS anything that could persist PII / high-cardinality junk into Analytics
+    Engine. `install_id` must match a UUID v4 regex (`UUID_V4`); `channel`/`os`/`arch` must be in closed
+    whitelists (`{stable,dev}` / `{windows,macos,linux}` / `{x86_64,aarch64}`); `version` + `os_version`
+    are length-bounded (64); `errors_by_class` keys must be in the SPEC s24 dotted-code set (`ERROR_CODES`,
+    mirrors `crates/driven-core/src/types.rs` `ErrorCode::code()` exactly - 41 codes), with the key COUNT
+    capped (`MAX_ERROR_CLASSES = 64`) and each value a bounded non-negative integer
+    (`MAX_ERROR_COUNT = 1e9`). Any violation -> 400, no AE write. Negative tests added: path-shaped +
+    email-shaped + non-v4 `install_id`, junk `channel`/`os`/`arch`, a path-shaped + email-shaped
+    `errors_by_class` key, a high-cardinality flood, an out-of-range value, over-long `version`/`os_version`.
+  - P1-2 (honor disable immediately, `telemetry.rs` `maybe_send_once` + `app_state.rs`): the pref is now
+    RE-READ immediately before `sink.send` (abort with no network call if disabled mid-build), AND an
+    `AppState` `TelemetryRuntime.cancel` `AtomicBool` is checked at entry + right before send;
+    `set_telemetry_enabled(false)` flips it to `true` BEFORE the write (re-armed to `false` on re-enable),
+    so a disable during the id-ensure / aggregate / build window aborts the in-flight send. Tests:
+    `disabling_between_initial_check_and_send_aborts_the_send` (cancel flag) +
+    `disabling_pref_mid_build_is_honored_by_the_immediate_reread`.
+  - P1-3 (install_id is a UUID v4, migration 0002 + `telemetry.rs`): the seed now builds a canonical UUID
+    v4 in SQL from `hex(randomblob(16))` (version nibble forced to `4`, variant nibble from `89ab`), and
+    `ensure_install_id` REPLACES any empty / legacy non-UUID-v4 value (e.g. the old bare
+    `hex(randomblob(16))`) with a fresh UUID v4 ONCE, leaving a valid v4 untouched (stable). New
+    `is_uuid_v4` byte-checker (no regex crate) shared in spirit with the worker. Tests:
+    `seeded_install_id_is_a_uuid_v4`, `legacy_non_uuid_install_id_is_replaced_with_uuid_v4_then_stable`,
+    `is_uuid_v4_accepts_canonical_and_rejects_junk`, and `settings_round_trip` now asserts the 36-char v4
+    shape.
+  - P1-4 (update_applied is a BOOLEAN per SPEC s16, client + worker): `Events24h.update_applied` is now
+    `bool` (`aggregate.update_applied > 0`); the worker validates `typeof === "boolean"` and maps it to the
+    `0/1` AE double. SPEC unchanged. Tests assert the JSON serializes as a literal boolean on both sides.
+  - P2-1 (coarse os_version, `telemetry.rs` + `Cargo.toml` + `deny.toml`): added the `os_info` crate (MIT,
+    `default-features = false`; covered by the existing MIT deny allowance - no new allowance needed) and a
+    `coarse_os_version()` helper that returns a bounded (<=64), non-"Unknown" version string or `None`.
+    `os_version` is now ALWAYS serialized (the `skip_serializing_if` was removed) - present when known,
+    `null` otherwise - so the wire contract is stable. The worker persists it as a 5th blob (`""` when
+    absent). Tests: `os_version_always_serialized_even_when_none`,
+    `coarse_os_version_is_a_short_non_path_string_or_none`, worker `persists a coarse os_version blob`.
+  - P2-2 + P2-3 (bound-at-now + DELTAS, `state/mod.rs` + `sqlite.rs` + `telemetry.rs`): `telemetry_events_24h`
+    is renamed to `telemetry_events_since(since_ms, now_ms)` and every sub-query now bounds the UPPER end at
+    `now_ms` (`ts >= ?since AND ts <= ?now`, incl. the `last_deep_verify_at` query), excluding clock-skewed
+    future rows (P2-2). The client records `telemetry.last_sent_at` on each SUCCESSFUL send and computes the
+    next window via `delta_since_ms(now, last_sent) = max(now-24h, last_sent+1)`, so each ping reports only
+    events in `(last_sent, now]` (capped at 24h for the first send / after a long gap), and a same-instant
+    restart double-counts NOTHING (P2-3 subsumes P2-2's upper bound). Tests:
+    `delta_since_caps_first_window_and_excludes_last_sent`,
+    `delta_aggregation_does_not_double_count_across_restarts`, and the renamed
+    `telemetry_events_since_aggregates_uploads_errors_and_deep_verify` (now asserts both a future activity
+    row AND a future deep-verify source are excluded, plus a degenerate `since > now` window yields zero).
+
+  Gates (all green): SQLX_OFFLINE cargo build --workspace --all-targets + clippy --workspace --all-targets
+  -D warnings + test --workspace (208+ pass) + build -p driven-app + deny check + fmt --all --check + git
+  diff --check; sqlx-prepare re-run (4 telemetry query files swapped for the bounded versions, 0 drift). ui
+  pnpm install + lint + test:unit (157) + build (vue-tsc clean). worker: pnpm install + tsc + eslint +
+  vitest (27 tests, incl. the new PII-rejection negatives). Stub sweep on the touched surface: zero
+  non-test `todo!(`/`unimplemented!(`/`unreachable!(`.
