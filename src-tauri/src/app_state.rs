@@ -282,24 +282,32 @@ pub struct AppState {
     /// app-quit drain joins it with NO orphan (mirrors the M5 no-orphan
     /// bookkeeping).
     updater: UpdaterRuntime,
-    /// M9c D4 (M6 R4-P1-1, DATA-SAFETY): per-source recovery-phrase ACK gate. The
-    /// FIRST encrypted source for an account is persisted DISABLED (excluded from
-    /// the scheduler + manual sync, which filter on `enabled`) and a pending-ack
-    /// entry is registered here. The source is only ENABLED once
-    /// `ack_recovery_phrase_saved` lands - and that ack is REJECTED unless a real
-    /// backend `reveal_recovery_phrase` was recorded first (`revealed == true`). So
-    /// a user can never tick "I saved it" without the backend having actually
-    /// revealed the phrase, and no encrypted backups run before the recovery phrase
-    /// is durably saveable - closing the unrestorable-backup window. Behind a sync
-    /// `Mutex` (only ever held for a quick insert / read / take, never across an
-    /// await).
+    /// M9c D4 (M6 R4-P1-1, DATA-SAFETY); R4-P1-1 made DURABLE: per-source
+    /// recovery-phrase ACK gate, a reconstructed-on-startup MIRROR of the durable
+    /// `recovery_phrase_acks` table. The FIRST encrypted source for an account is
+    /// persisted DISABLED (excluded from the scheduler + manual sync, which filter
+    /// on `enabled`) and a pending-ack record is written DURABLY in the same
+    /// transaction as the source insert + master-key stamp. The source is only
+    /// ENABLED once `ack_recovery_phrase_saved` lands - and that ack is REJECTED
+    /// unless a real backend `reveal_recovery_phrase` was recorded first
+    /// (`revealed == true`). So a user can never tick "I saved it" without the
+    /// backend having actually revealed the phrase, and no encrypted backups run
+    /// before the recovery phrase is durably saveable - closing the
+    /// unrestorable-backup window EVEN ACROSS A CRASH/RESTART.
+    ///
+    /// R4-P1-1: the DURABLE table is the source of truth for every gate decision
+    /// (the command layer reads/writes it via [`StateRepo`]); this in-memory map is
+    /// a reconstructed mirror so a fresh process resumes the exact pending-ack gate,
+    /// kept in sync as the commands mutate the durable state. Behind a sync `Mutex`
+    /// (only ever held for a quick insert / read / take, never across an await).
     recovery_acks: std::sync::Mutex<HashMap<driven_core::types::SourceId, RecoveryAckState>>,
 }
 
 /// M9c D4: one pending recovery-phrase ack - the owning account (so the ack can
 /// reconfigure it once the source is enabled) and whether the backend has actually
 /// REVEALED the phrase (`reveal_recovery_phrase`). `ack_recovery_phrase_saved` is
-/// rejected unless `revealed` is true.
+/// rejected unless `revealed` is true. R4-P1-1: a mirror of the durable
+/// `recovery_phrase_acks` row.
 struct RecoveryAckState {
     /// The account owning the pending-ack source (used to reconfigure on enable).
     account_id: AccountId,
@@ -476,11 +484,47 @@ impl AppState {
         self.recovery_acks.lock().unwrap_or_else(|e| e.into_inner())
     }
 
-    /// M9c D4: register that `source` (on `account`) was persisted DISABLED and is
-    /// awaiting a recovery-phrase ack. Called by `add_source` on the FIRST encrypted
-    /// source (the one that generated the account master key). Until the ack lands
-    /// the source stays disabled, so the scheduler + manual sync (which filter on
-    /// `enabled`) never back it up.
+    /// R4-P1-1: reconstruct the in-memory recovery-ack mirror from the DURABLE
+    /// `recovery_phrase_acks` table on startup, so a process that restarts mid
+    /// onboarding (after the first encrypted source + master key were persisted but
+    /// before reveal+ack) resumes the EXACT pending-ack gate - the disabled source
+    /// is still reveal/ackable and no second encrypted source can enable without the
+    /// durable ack. Called once after assembly builds [`AppState`]. Errors reading
+    /// the table are logged and treated as "no pending acks" (the durable table is
+    /// still the gate source of truth for the command layer; the mirror is a
+    /// convenience), but a healthy boot always succeeds.
+    pub async fn reconstruct_recovery_acks_from_db(&self) {
+        match self.state.list_pending_recovery_acks().await {
+            Ok(rows) => {
+                let mut map = self.lock_recovery_acks();
+                map.clear();
+                for r in rows {
+                    map.insert(
+                        r.source_id,
+                        RecoveryAckState {
+                            account_id: r.account_id,
+                            revealed: r.revealed,
+                        },
+                    );
+                }
+                tracing::info!(
+                    pending_recovery_acks = map.len(),
+                    "reconstructed durable recovery-phrase ack gate from SQLite (R4-P1-1)"
+                );
+            }
+            Err(err) => {
+                tracing::error!(%err, "failed to reconstruct recovery-phrase ack gate from SQLite; the durable table still gates the commands");
+            }
+        }
+    }
+
+    /// M9c D4 / R4-P1-1: register in the in-memory MIRROR that `source` (on
+    /// `account`) was persisted DISABLED and is awaiting a recovery-phrase ack. The
+    /// DURABLE record is written atomically with the source insert by
+    /// `add_source` (via [`StateRepo::insert_first_encrypted_source_pending_ack`]);
+    /// this only mirrors that durable state into the in-memory map. Until the ack
+    /// lands the source stays disabled, so the scheduler + manual sync (which filter
+    /// on `enabled`) never back it up.
     pub fn register_pending_recovery_ack(
         &self,
         source: driven_core::types::SourceId,

@@ -318,6 +318,14 @@ pub fn run() {
                 let db_path = state_db_path(&handle)?;
                 let state = migrations::run(&db_path).await?;
                 let app_state = assembly::build_and_spawn(&handle, state).await?;
+                // R4-P1-1 (DATA-SAFETY): reconstruct the recovery-phrase ACK gate
+                // from the DURABLE `recovery_phrase_acks` table, so a process that
+                // restarts mid-onboarding (after the first encrypted source +
+                // master key were persisted but before reveal+ack) resumes the
+                // exact pending-ack gate - the disabled source is still
+                // reveal/ackable and no second encrypted source can enable without
+                // the durable ack.
+                app_state.reconstruct_recovery_acks_from_db().await;
                 handle.manage(app_state);
                 tray::build(&handle)?;
                 // M9a (SPEC s15.2): start the periodic update-check task (an

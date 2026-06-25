@@ -143,6 +143,15 @@ pub struct SourceDto {
     pub last_full_scan_at: Option<i64>,
     /// `backup_sources.created_at`.
     pub created_at: i64,
+    /// R4-P1-2 (DATA-SAFETY): `true` when this is the FIRST encrypted source that
+    /// is still awaiting a recovery-phrase ack (it is persisted DISABLED and has a
+    /// durable `recovery_phrase_acks` record). The UI uses this to DISABLE the
+    /// enable toggle (with an explanatory tooltip) - the user must finish the
+    /// reveal+ack step before the source can be enabled. The BACKEND
+    /// (`update_source`) is the real guard; this only drives the affordance.
+    /// Defaults to `false` for every non-pending source.
+    #[serde(default)]
+    pub pending_recovery_ack: bool,
 }
 
 /// Request body for `add_source` (SPEC s11.2 `AddSourceRequest`).

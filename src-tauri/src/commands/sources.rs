@@ -52,6 +52,11 @@ const FOLDER_MIME: &str = "application/vnd.google-apps.folder";
 const PREVIEW_SAMPLE_CAP: usize = 50;
 
 /// `list_sources()` - every configured backup source (SPEC s11.2).
+///
+/// R4-P1-2: each DTO is enriched with `pending_recovery_ack` from the durable
+/// `recovery_phrase_acks` table so the UI can DISABLE the enable toggle for a
+/// first-encrypted source still awaiting its recovery-phrase ack (the backend
+/// `update_source` is the real guard, but the UI should not even offer the toggle).
 #[tauri::command]
 pub async fn list_sources(state: State<'_, AppState>) -> CommandResult<Vec<SourceDto>> {
     let rows = state
@@ -59,12 +64,31 @@ pub async fn list_sources(state: State<'_, AppState>) -> CommandResult<Vec<Sourc
         .list_sources()
         .await
         .map_err(CommandError::from)?;
-    Ok(rows.iter().map(source_row_to_dto).collect())
+    let pending: std::collections::HashSet<SourceId> = state
+        .state()
+        .list_pending_recovery_acks()
+        .await
+        .map_err(CommandError::from)?
+        .into_iter()
+        .map(|r| r.source_id)
+        .collect();
+    Ok(rows
+        .iter()
+        .map(|r| source_row_to_dto_with_pending(r, pending.contains(&r.id)))
+        .collect())
 }
 
 /// Map a [`SourceRow`] to the webview-facing [`SourceDto`] (the wrapped
 /// per-source key is never exposed; `encryption_enabled` is the row flag).
+/// `pending_recovery_ack` defaults to `false`; use
+/// [`source_row_to_dto_with_pending`] when the durable pending-ack state is known.
 fn source_row_to_dto(row: &SourceRow) -> SourceDto {
+    source_row_to_dto_with_pending(row, false)
+}
+
+/// R4-P1-2: map a [`SourceRow`] to a [`SourceDto`], setting `pending_recovery_ack`
+/// from the caller's knowledge of the durable `recovery_phrase_acks` table.
+fn source_row_to_dto_with_pending(row: &SourceRow, pending_recovery_ack: bool) -> SourceDto {
     SourceDto {
         id: row.id.to_string(),
         account_id: row.account_id.to_string(),
@@ -80,6 +104,7 @@ fn source_row_to_dto(row: &SourceRow) -> SourceDto {
         deep_verify_interval_secs: row.deep_verify_interval_secs,
         last_full_scan_at: row.last_full_scan_at,
         created_at: row.created_at,
+        pending_recovery_ack,
     }
 }
 
@@ -222,24 +247,33 @@ pub async fn add_source(
         created_at: now,
     };
 
-    // R1-P1-1 / R2-P1-1: ATOMIC account-stamp + source-insert. On the FIRST
-    // encrypted source the account's `encryption_master_key_id` is stamped IN THE
-    // SAME transaction as the source insert (a COMPARE-AND-SET: it only stamps
-    // when the column is still NULL, so a concurrent stamp can never be
-    // overwritten), so the two can never diverge. The phrase (and the keychain
-    // key) is only "kept" once this commits; if it fails AND we just generated a
-    // key, delete the keychain entry so the account is left unprovisioned and a
-    // retry re-reveals the phrase.
-    let stamp = if newly_generated_key {
-        Some((req.account_id, req.account_id.to_string()))
+    // R1-P1-1 / R2-P1-1 / R4-P1-1: ATOMIC account-stamp + source-insert (+ durable
+    // pending-ack record on the first encrypted source). On the FIRST encrypted
+    // source the account's `encryption_master_key_id` is stamped IN THE SAME
+    // transaction as the source insert (a COMPARE-AND-SET: it only stamps when the
+    // column is still NULL, so a concurrent stamp can never be overwritten) AND the
+    // DURABLE `recovery_phrase_acks` pending record is written in that same
+    // transaction (R4-P1-1) - so a durable encrypted (disabled) source can never
+    // exist without its durable pending-ack gate record, EVEN ACROSS A CRASH. The
+    // phrase (and the keychain key) is only "kept" once this commits; if it fails
+    // AND we just generated a key, delete the keychain entry so the account is left
+    // unprovisioned and a retry re-reveals the phrase.
+    let insert_result = if pending_recovery_ack {
+        // First encrypted source: atomic stamp + (disabled) insert + durable
+        // pending-ack record.
+        state
+            .state()
+            .insert_first_encrypted_source_pending_ack(&row, req.account_id.to_string(), now)
+            .await
     } else {
-        None
+        // Unencrypted, or a SUBSEQUENT encrypted source (account already
+        // provisioned): no stamp, no pending-ack record.
+        state
+            .state()
+            .insert_source_with_optional_master_key_stamp(&row, None)
+            .await
     };
-    if let Err(err) = state
-        .state()
-        .insert_source_with_optional_master_key_stamp(&row, stamp)
-        .await
-    {
+    if let Err(err) = insert_result {
         if newly_generated_key {
             // Roll back the just-stored master key so the account is NOT left
             // provisioned-without-a-revealed-phrase (R1-P1-1).
@@ -278,7 +312,7 @@ pub async fn add_source(
 
     tracing::info!(target: TARGET, source_id = %source_id, account_id = %req.account_id, encrypted = req.encryption_enabled, revealed_phrase = recovery_phrase.is_some(), pending_recovery_ack, "source added");
     Ok(AddSourceResult {
-        source: source_row_to_dto(&row),
+        source: source_row_to_dto_with_pending(&row, pending_recovery_ack),
         recovery_phrase,
         pending_recovery_ack,
     })
@@ -301,11 +335,13 @@ pub async fn reveal_recovery_phrase(
     state: State<'_, AppState>,
     source_id: SourceId,
 ) -> CommandResult<Vec<String>> {
-    // Only a source that is awaiting an ack may have its phrase revealed here. An
-    // unknown / already-acked source is rejected (the phrase is shown ONCE during
-    // onboarding; it is never a general "show me my phrase" API).
-    let account_id = state
-        .pending_recovery_ack_account(source_id)
+    // R4-P1-1: only a source with a DURABLE pending-ack record may have its phrase
+    // revealed here (the durable table is the gate source of truth, so a restart
+    // mid-onboarding can still reveal). An unknown / already-acked source is
+    // rejected (the phrase is shown ONCE during onboarding; it is never a general
+    // "show me my phrase" API). Look the owning account up from the durable record.
+    let account_id = find_pending_recovery_ack_account(state.state().as_ref(), source_id)
+        .await?
         .ok_or_else(|| {
             CommandError::with_code(
                 ErrorCode::InvalidInput,
@@ -325,11 +361,17 @@ pub async fn reveal_recovery_phrase(
     })?;
     let words: Vec<String> = phrase.split_whitespace().map(|w| w.to_string()).collect();
 
-    // Record the backend reveal so the ack can proceed.
-    let recorded = state.record_recovery_reveal(source_id);
-    debug_assert!(recorded, "pending-ack source must record a reveal");
+    // R4-P1-1: DURABLY record the backend reveal so the ack can proceed even after
+    // a restart. Also mirror it into the in-memory gate.
+    let recorded = state
+        .state()
+        .mark_recovery_phrase_revealed(source_id)
+        .await
+        .map_err(CommandError::from)?;
+    debug_assert!(recorded, "pending-ack source must record a durable reveal");
     let _ = recorded;
-    tracing::info!(target: TARGET, source_id = %source_id, account_id = %account_id, "recovery phrase revealed by backend (D4)");
+    state.record_recovery_reveal(source_id);
+    tracing::info!(target: TARGET, source_id = %source_id, account_id = %account_id, "recovery phrase revealed by backend; durably recorded (D4 / R4-P1-1)");
     Ok(words)
 }
 
@@ -349,10 +391,16 @@ pub async fn ack_recovery_phrase_saved(
     state: State<'_, AppState>,
     source_id: SourceId,
 ) -> CommandResult<SourceDto> {
-    // DATA-SAFETY gate: the ack is ineffective unless the backend actually revealed
-    // the phrase first. `None` = no pending ack (unknown / already enabled);
-    // `Some(false)` = pending but never revealed (reject); `Some(true)` = ok.
-    match state.recovery_reveal_recorded(source_id) {
+    // R4-P1-1 DATA-SAFETY gate: the ack is ineffective unless the backend actually
+    // revealed the phrase first, read from the DURABLE record (so the gate survives
+    // a restart). `None` = no pending ack (unknown / already enabled); `Some(false)`
+    // = pending but never revealed (reject); `Some(true)` = ok.
+    match state
+        .state()
+        .recovery_ack_revealed(source_id)
+        .await
+        .map_err(CommandError::from)?
+    {
         None => {
             return Err(CommandError::with_code(
                 ErrorCode::InvalidInput,
@@ -368,24 +416,27 @@ pub async fn ack_recovery_phrase_saved(
         Some(true) => {}
     }
 
-    // Enable the source (it was persisted disabled). Read by id, flip `enabled`,
-    // persist via the same upsert `update_source` uses.
-    let mut row = find_source(state.state().as_ref(), source_id).await?;
-    row.enabled = true;
+    // R4-P1-1: ATOMICALLY enable the (until-now disabled) source AND delete its
+    // durable pending-ack record in one transaction - a crash can never leave the
+    // source enabled with a stale pending record or cleared but still disabled.
     state
         .state()
-        .upsert_source(&row)
+        .enable_source_and_clear_recovery_ack(source_id)
         .await
         .map_err(CommandError::from)?;
 
-    // The ack is durable; clear the pending entry so a replay is a no-op.
+    // Mirror the cleared durable state into the in-memory gate (idempotent).
     state.clear_pending_recovery_ack(source_id);
+
+    // Read the now-enabled row by id (strongly consistent) for the DTO + the
+    // owning account for the reconfigure.
+    let row = find_source(state.state().as_ref(), source_id).await?;
 
     // Reconfigure so the now-enabled (encrypted) source is picked up + its key
     // resolves on the next tick (B2), without a restart.
     reconfigure_account(&state, row.account_id).await;
 
-    tracing::info!(target: TARGET, source_id = %source_id, account_id = %row.account_id, "recovery phrase acknowledged; first encrypted source ENABLED (D4)");
+    tracing::info!(target: TARGET, source_id = %source_id, account_id = %row.account_id, "recovery phrase acknowledged; first encrypted source ENABLED + durable ack cleared (D4 / R4-P1-1)");
     Ok(source_row_to_dto(&row))
 }
 
@@ -428,6 +479,16 @@ pub async fn update_source(
         row.display_name = display_name;
     }
     if let Some(enabled) = patch.enabled {
+        // R4-P1-2 (DATA-SAFETY): REJECT enabling a source that still has a DURABLE
+        // pending recovery-phrase ack. `update_source` (and any sync-trigger path
+        // that toggles `enabled`) must NOT be a back door around the
+        // `ack_recovery_phrase_saved` gate - a disabled first-encrypted source can
+        // only be enabled once the durable ack succeeds, so its encrypted backups
+        // are never armed before the recovery phrase is durably saveable. The
+        // durable record is the source of truth (so this holds across a restart);
+        // `ack_recovery_phrase_saved` is the ONLY enable path for a pending source.
+        reject_enable_of_pending_encrypted_source(state.state().as_ref(), source_id, enabled)
+            .await?;
         row.enabled = enabled;
     }
     if let Some(respect_gitignore) = patch.respect_gitignore {
@@ -785,6 +846,54 @@ async fn find_source(state: &dyn StateRepo, id: SourceId) -> CommandResult<Sourc
     rows.into_iter().find(|r| r.id == id).ok_or_else(|| {
         CommandError::with_code(ErrorCode::InternalBug, format!("unknown source id: {id}"))
     })
+}
+
+/// R4-P1-1: the account owning `source`'s DURABLE pending recovery-ack record,
+/// if one exists. Reads the `recovery_phrase_acks` table (the gate source of
+/// truth) so a reveal works even after a restart mid-onboarding. `None` for a
+/// source with no durable pending record (unknown / already acked + enabled).
+async fn find_pending_recovery_ack_account(
+    state: &dyn StateRepo,
+    source: SourceId,
+) -> CommandResult<Option<AccountId>> {
+    let rows = state
+        .list_pending_recovery_acks()
+        .await
+        .map_err(CommandError::from)?;
+    Ok(rows
+        .into_iter()
+        .find(|r| r.source_id == source)
+        .map(|r| r.account_id))
+}
+
+/// R4-P1-2 (DATA-SAFETY): reject ENABLING `source` while it still has a DURABLE
+/// pending recovery-phrase ack. `enabling == false` (a disable, or no change of
+/// state) is always allowed; only flipping a pending source to `enabled=true` is
+/// rejected (the `ack_recovery_phrase_saved` flow is the ONLY enable path for a
+/// pending source). The durable `recovery_phrase_acks` record is the source of
+/// truth, so this holds across a restart. Returns the stable s24
+/// `internal.invalid_input` code on rejection.
+async fn reject_enable_of_pending_encrypted_source(
+    state: &dyn StateRepo,
+    source: SourceId,
+    enabling: bool,
+) -> CommandResult<()> {
+    if !enabling {
+        return Ok(());
+    }
+    if state
+        .recovery_ack_revealed(source)
+        .await
+        .map_err(CommandError::from)?
+        .is_some()
+    {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "this encrypted source cannot be enabled until you reveal and save its \
+             recovery phrase; finish that step first",
+        ));
+    }
+    Ok(())
 }
 
 /// The prepared account master key for an encrypted source add (R1-P1-1).
@@ -1251,6 +1360,131 @@ mod tests {
             Arc::new(std::sync::Mutex::new(HashMap::new())),
         );
         (app_state, dir)
+    }
+
+    #[tokio::test]
+    async fn reject_enable_of_pending_encrypted_source_gate() {
+        // R4-P1-2 (DATA-SAFETY): enabling a source that still has a durable pending
+        // recovery-phrase ack is REJECTED until the ack succeeds; after the durable
+        // ack (the record is gone) the enable is allowed. A non-pending source
+        // toggles freely. This is the exact predicate `update_source` enforces.
+        let (repo, dir) = temp_repo().await;
+
+        // Seed a pending first-encrypted source (disabled + durable pending-ack).
+        let account_id = AccountId::new_v4();
+        let account = AccountRow {
+            id: account_id,
+            email: "u@example.com".to_string(),
+            display_name: None,
+            state: driven_core::types::AccountState::Ok,
+            encryption_master_key_id: None,
+            created_at: 0,
+            last_synced_at: None,
+        };
+        repo.upsert_account(&account).await.expect("upsert account");
+        let source_id = SourceId::new_v4();
+        let row = SourceRow {
+            id: source_id,
+            account_id,
+            display_name: "Secret".to_string(),
+            enabled: false,
+            local_path: "/home/u/secret".to_string(),
+            drive_folder_id: String::new(),
+            drive_folder_path: String::new(),
+            encryption_enabled: true,
+            wrapped_source_key: Some(vec![1, 2, 3]),
+            respect_gitignore: true,
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: default_deep_verify_secs(),
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            created_at: 0,
+        };
+        repo.insert_first_encrypted_source_pending_ack(&row, account_id.to_string(), 0)
+            .await
+            .expect("seed pending source");
+
+        // Disabling / no-enable is always allowed.
+        reject_enable_of_pending_encrypted_source(&repo, source_id, false)
+            .await
+            .expect("disabling a pending source is allowed");
+
+        // Enabling the pending source is REJECTED (s24 invalid-input).
+        let err = reject_enable_of_pending_encrypted_source(&repo, source_id, true)
+            .await
+            .expect_err("enabling a pending encrypted source must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+
+        // After the durable ack (reveal + atomic enable+clear), the record is gone
+        // and enabling is allowed.
+        repo.mark_recovery_phrase_revealed(source_id).await.unwrap();
+        repo.enable_source_and_clear_recovery_ack(source_id)
+            .await
+            .unwrap();
+        reject_enable_of_pending_encrypted_source(&repo, source_id, true)
+            .await
+            .expect("after the durable ack, enabling is allowed");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn find_pending_recovery_ack_account_resolves_durable_record() {
+        // R4-P1-1: the reveal path resolves the owning account from the DURABLE
+        // pending-ack record (so a reveal works even after a restart). An unknown
+        // / non-pending source resolves to None.
+        let (repo, dir) = temp_repo().await;
+        let account_id = AccountId::new_v4();
+        let account = AccountRow {
+            id: account_id,
+            email: "u@example.com".to_string(),
+            display_name: None,
+            state: driven_core::types::AccountState::Ok,
+            encryption_master_key_id: None,
+            created_at: 0,
+            last_synced_at: None,
+        };
+        repo.upsert_account(&account).await.expect("upsert account");
+        let source_id = SourceId::new_v4();
+        let row = SourceRow {
+            id: source_id,
+            account_id,
+            display_name: "Secret".to_string(),
+            enabled: false,
+            local_path: "/home/u/secret2".to_string(),
+            drive_folder_id: String::new(),
+            drive_folder_path: String::new(),
+            encryption_enabled: true,
+            wrapped_source_key: Some(vec![9]),
+            respect_gitignore: true,
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: default_deep_verify_secs(),
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            created_at: 0,
+        };
+        repo.insert_first_encrypted_source_pending_ack(&row, account_id.to_string(), 0)
+            .await
+            .expect("seed pending source");
+
+        assert_eq!(
+            find_pending_recovery_ack_account(&repo, source_id)
+                .await
+                .unwrap(),
+            Some(account_id)
+        );
+        assert_eq!(
+            find_pending_recovery_ack_account(&repo, SourceId::new_v4())
+                .await
+                .unwrap(),
+            None
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[tokio::test]
