@@ -272,6 +272,39 @@ fn should_restore_pending(install_was_err: bool) -> bool {
     install_was_err
 }
 
+/// What a check / channel switch should do to the recorded pending update
+/// (R5-P2-1). Factored out so the clear-vs-keep policy is unit-tested without a
+/// real `AppState` / a constructible `tauri_plugin_updater::Update`.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum PendingAction {
+    /// Record the freshly-found update as the pending one.
+    SetFound,
+    /// Clear any recorded pending update (it is stale / no longer applicable).
+    Clear,
+}
+
+/// Pure: the [`PendingAction`] for a completed check (R5-P2-1). An AVAILABLE
+/// update (`update_found = true`) is recorded; an UpToDate result (`false`)
+/// CLEARS any prior pending update so `get_pending_update_info` /
+/// `install_update` never refer to an already-installed or superseded update.
+#[must_use]
+fn pending_action_for_check(update_found: bool) -> PendingAction {
+    if update_found {
+        PendingAction::SetFound
+    } else {
+        PendingAction::Clear
+    }
+}
+
+/// Pure: a successful channel switch ALWAYS clears the pending update (R5-P2-1) -
+/// any update recorded on the old channel is invalid on the new one. Kept as a
+/// named predicate so the "channel switch clears pending" invariant is explicit
+/// and unit-asserted rather than implied by an inline `set_pending_update(None)`.
+#[must_use]
+fn pending_action_for_channel_switch() -> PendingAction {
+    PendingAction::Clear
+}
+
 /// The outcome of an update check, as the pure dispatch path sees it.
 #[derive(Debug, Clone)]
 enum CheckOutcome {
@@ -400,10 +433,20 @@ async fn periodic_check_once(app: &AppHandle) {
     };
     match run_check(app, channel).await {
         Ok((outcome, update)) => {
-            if let Some(update) = update {
-                // Stash the raw Update + its channel so install_update can apply
-                // it directly and emit the real channel on downloaded.
-                state.set_pending_update(Some((update, channel.as_str().to_string())));
+            // R5-P2-1: SetFound on an available update, Clear on UpToDate. The
+            // UpToDate clear drops any stale pending update from an earlier check
+            // (e.g. already installed, or left over from before a channel switch)
+            // so get_pending_update_info / install_update never refer to a
+            // no-longer-available update.
+            match (pending_action_for_check(update.is_some()), update) {
+                (PendingAction::SetFound, Some(update)) => {
+                    // Stash the raw Update + its channel so install_update can
+                    // apply it directly and emit the real channel on downloaded.
+                    state.set_pending_update(Some((update, channel.as_str().to_string())));
+                }
+                _ => {
+                    state.set_pending_update(None);
+                }
             }
             let app_for_emit = app.clone();
             let info = dispatch_check_outcome(outcome, |info| {
@@ -577,6 +620,14 @@ pub async fn set_update_channel(
         }
     };
     write_channel(state.state().as_ref(), parsed).await?;
+    // R5-P2-1: a channel switch invalidates any pending update recorded on the
+    // OLD channel - get_pending_update_info / install_update must not still offer
+    // an old-channel update after the switch. Clear it; the next periodic /
+    // manual check on the new channel records a fresh one if applicable.
+    match pending_action_for_channel_switch() {
+        PendingAction::Clear => state.set_pending_update(None),
+        PendingAction::SetFound => {}
+    }
     tracing::info!(target: TARGET, channel = parsed.as_str(), "update channel changed");
     Ok(parsed.as_str().to_string())
 }
@@ -757,6 +808,37 @@ mod tests {
         assert_eq!(stable.channel, "stable");
         assert!(stable.notes.is_none());
         assert!(stable.published_at.is_none());
+    }
+
+    #[test]
+    fn up_to_date_check_clears_pending_available_update_sets() {
+        // R5-P2-1: periodic_check_once must CLEAR a prior pending update on an
+        // UpToDate result (so a no-longer-available / already-installed update is
+        // not offered), and SET the new one when a check finds an update. This is
+        // the pure clear-vs-keep policy that branch routes through.
+        assert_eq!(
+            pending_action_for_check(false),
+            PendingAction::Clear,
+            "UpToDate (no update found) must clear any stale pending update"
+        );
+        assert_eq!(
+            pending_action_for_check(true),
+            PendingAction::SetFound,
+            "an available update must be recorded as pending"
+        );
+    }
+
+    #[test]
+    fn channel_switch_always_clears_pending() {
+        // R5-P2-1: set_update_channel must clear the pending update after a
+        // successful channel write - an update recorded on the old channel must
+        // not still be offered by get_pending_update_info / install_update after
+        // the switch. The action is unconditional Clear.
+        assert_eq!(
+            pending_action_for_channel_switch(),
+            PendingAction::Clear,
+            "a channel switch invalidates any old-channel pending update"
+        );
     }
 
     #[test]
