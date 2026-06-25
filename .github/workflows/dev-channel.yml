@@ -424,13 +424,17 @@ jobs:
       - name: Smoke test deployed dev manifests
         run: |
           set -euo pipefail
-          # Cloudflare Pages propagation can lag the deploy by a few seconds; a
-          # bounded curl retry (NOT a sleep/poll loop) rides that out.
+          # Cloudflare Pages propagation can lag the deploy by a few seconds and is
+          # NOT atomic across files/edges, so a freshly-deployed manifest can 404
+          # briefly. curl --retry-all-errors only retries an HTTP 404 when -f/--fail
+          # is also set (a 404 is otherwise a "successful" fetch to curl and is NOT
+          # retried). So -f makes the 404 a retryable error; curl's own bounded retry
+          # (8 attempts, 5s apart) rides out propagation - no bash sleep/poll loop.
           fail=0
           for t in windows/x86_64 darwin/x86_64 darwin/aarch64 linux/x86_64; do
             url="${UPDATES_BASE}/dev/${t}/update.json"
             body="$(mktemp)"
-            code="$(curl -sSL --retry 5 --retry-delay 4 --retry-all-errors \
+            code="$(curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors \
               --connect-timeout 15 --max-time 120 \
               -o "$body" -w '%{http_code}' "$url" 2>/dev/null || true)"
             code="${code:-000}"
