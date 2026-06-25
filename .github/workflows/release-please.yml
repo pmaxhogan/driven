@@ -1,0 +1,28 @@
+name: release-please
+
+# Maintains the "chore: release" PR (SPEC s19.2). On every push to main it
+# updates a release PR with the conventional-commits changelog + version bumps
+# (Cargo workspace version, tauri.conf.json, ui/package.json - see
+# release-please-config.json). Merging that PR creates the `v*` git tag, which
+# fires release.yml (the actual build/sign/publish pipeline).
+
+on:
+  push:
+    branches: [main]
+
+permissions:
+  contents: write
+  pull-requests: write
+
+concurrency:
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+jobs:
+  release-please:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: googleapis/release-please-action@v4
+        with:
+          config-file: release-please-config.json
+          manifest-file: .release-please-manifest.json
