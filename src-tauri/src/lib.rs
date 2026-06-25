@@ -396,6 +396,24 @@ pub fn run() {
                 // shutdown sender are tracked on AppState so the quit drain joins
                 // it with no orphan.
                 updater::spawn_periodic_check(&handle);
+                // M9b R2-P2-3 (SPEC s16): record an `update_applied` activity row
+                // when the running version differs from the last-recorded one, so
+                // the telemetry `update_applied` aggregate is driven by a real
+                // production path. Done BEFORE the first ping is spawned so the
+                // startup ping window can already include it. Cheap + idempotent +
+                // non-fatal: on a fresh install it merely seeds the version (no
+                // event), and any error is logged + swallowed (never blocks boot).
+                if let Some(app_state) = handle.try_state::<AppState>() {
+                    use driven_core::time::Clock;
+                    let running_version = handle.package_info().version.to_string();
+                    let now_ms = driven_core::time::SystemClock.now_ms();
+                    let _ = telemetry::record_update_applied_if_changed(
+                        app_state.state().as_ref(),
+                        &running_version,
+                        now_ms,
+                    )
+                    .await;
+                }
                 // M9b (SPEC s16): start the anonymous-telemetry ping task (an
                 // immediate ping on startup if enabled, then every 24h). Spawned
                 // here - INSIDE the Tauri async runtime's `block_on` so

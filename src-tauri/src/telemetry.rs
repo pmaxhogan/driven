@@ -217,6 +217,116 @@ async fn write_enabled(state: &dyn StateRepo, enabled: bool) -> CommandResult<()
         .map_err(CommandError::from)
 }
 
+/// The `telemetry` settings key that records the app version last observed at
+/// startup (R2-P2-3). On boot, if the running version differs from this, an
+/// `update_applied` activity row is written and this is updated, so the telemetry
+/// `update_applied` aggregate is actually driven by a production path.
+const KEY_LAST_RECORDED_VERSION: &str = "last_recorded_version";
+
+/// Read the persisted last-recorded app version from the `telemetry` group, or
+/// `None` if absent / malformed.
+async fn read_last_recorded_version(state: &dyn StateRepo) -> CommandResult<Option<String>> {
+    let value = state
+        .get_setting(KEY_TELEMETRY)
+        .await
+        .map_err(CommandError::from)?;
+    Ok(value
+        .as_ref()
+        .and_then(|v| v.get(KEY_LAST_RECORDED_VERSION))
+        .and_then(|v| v.as_str())
+        .filter(|s| !s.is_empty())
+        .map(ToString::to_string))
+}
+
+/// Persist `telemetry.last_recorded_version`, PRESERVING all sibling fields
+/// (read-modify-write the raw object so this never wipes `install_id` / `enabled`
+/// / `endpoint` / `last_sent_at`).
+async fn write_last_recorded_version(state: &dyn StateRepo, version: &str) -> CommandResult<()> {
+    let mut group = match state
+        .get_setting(KEY_TELEMETRY)
+        .await
+        .map_err(CommandError::from)?
+    {
+        Some(serde_json::Value::Object(map)) => map,
+        _ => serde_json::Map::new(),
+    };
+    group.insert(
+        KEY_LAST_RECORDED_VERSION.to_string(),
+        serde_json::Value::String(version.to_string()),
+    );
+    state
+        .set_setting(KEY_TELEMETRY, &serde_json::Value::Object(group))
+        .await
+        .map_err(CommandError::from)
+}
+
+/// Record an `update_applied` activity event on startup IFF the running app
+/// version differs from the last-recorded version (R2-P2-3). This is the ONLY
+/// production path that writes an `activity_log` row with
+/// `event_type = 'update_applied'`, which the telemetry aggregate counts (so the
+/// `update_applied` ping field is finally driven by a real signal). Cheap +
+/// idempotent: on the FIRST run (no recorded version) it just records the current
+/// version WITHOUT writing an event (a fresh install is not an update); on a later
+/// boot whose version changed it writes exactly ONE event and updates the stored
+/// version; an unchanged version writes nothing. All failures are non-fatal
+/// (logged + swallowed) - telemetry bookkeeping must never block startup.
+///
+/// Returns `true` if an `update_applied` event was written (for tests).
+pub async fn record_update_applied_if_changed(
+    state: &dyn StateRepo,
+    running_version: &str,
+    now_ms: i64,
+) -> bool {
+    let last = match read_last_recorded_version(state).await {
+        Ok(v) => v,
+        Err(e) => {
+            tracing::debug!(target: TARGET, error = %e, "telemetry: could not read last_recorded_version; skipping update_applied check");
+            return false;
+        }
+    };
+    match last {
+        // Version unchanged: nothing to record.
+        Some(ref prev) if prev == running_version => false,
+        // A recorded version that differs: an in-app update was applied. Write the
+        // event, then advance the stored version.
+        Some(prev) => {
+            let wrote = match state
+                .write_activity(driven_core::state::NewActivity {
+                    ts: now_ms,
+                    source_id: None,
+                    level: driven_core::state::ActivityLevel::Info,
+                    event_type: "update_applied".to_string(),
+                    file_count: None,
+                    bytes: None,
+                    message: None,
+                })
+                .await
+            {
+                Ok(_) => {
+                    tracing::info!(target: TARGET, from = %prev, to = %running_version, "telemetry: recorded update_applied event");
+                    true
+                }
+                Err(e) => {
+                    tracing::debug!(target: TARGET, error = %e, "telemetry: could not write update_applied activity row");
+                    false
+                }
+            };
+            if let Err(e) = write_last_recorded_version(state, running_version).await {
+                tracing::debug!(target: TARGET, error = %e, "telemetry: could not persist last_recorded_version");
+            }
+            wrote
+        }
+        // First run (no recorded version): seed the current version WITHOUT an
+        // event - a fresh install is not an update.
+        None => {
+            if let Err(e) = write_last_recorded_version(state, running_version).await {
+                tracing::debug!(target: TARGET, error = %e, "telemetry: could not seed last_recorded_version");
+            }
+            false
+        }
+    }
+}
+
 /// Ensure the stable anonymous `install_id` is a valid UUID v4 (SPEC s16 / P1-3:
 /// a UUID v4 minted on FIRST run, stable across restarts). The migration 0002 seed
 /// now writes a UUID v4, but a DB that predates the seed, a cleared field, OR a
@@ -656,22 +766,45 @@ pub async fn get_telemetry_enabled(state: State<'_, AppState>) -> CommandResult<
     Ok(read_prefs(state.state().as_ref()).await?.enabled)
 }
 
+/// Apply a telemetry enabled/disabled change through the SINGLE cancel-preserving
+/// code path (M9b R2-P1-1). EVERY renderer path that toggles telemetry - the
+/// dedicated `set_telemetry_enabled` command AND the generic `update_settings`
+/// telemetry branch - routes through here, so opt-out is honored IMMEDIATELY no
+/// matter which IPC the UI called.
+///
+/// When DISABLING it flips the AppState cancel flag FIRST (so an in-flight ping
+/// checking the flag right before its send sees the cancellation even if the pref
+/// write has not landed yet, P1-2); when ENABLING it re-arms (clears) the flag.
+/// Then it commits the pref via the preserving `write_enabled` (which mutates ONLY
+/// `enabled`, keeping `install_id`, `endpoint`, AND `last_sent_at` intact - so a
+/// toggle never wipes the stable id or the delta checkpoint, R2-P2-1).
+pub async fn apply_enabled_change(
+    state: &dyn StateRepo,
+    cancel: &std::sync::atomic::AtomicBool,
+    enabled: bool,
+) -> CommandResult<()> {
+    use std::sync::atomic::Ordering;
+    // P1-2: flip the cancel flag BEFORE the write when disabling.
+    cancel.store(!enabled, Ordering::SeqCst);
+    write_enabled(state, enabled).await?;
+    tracing::info!(target: TARGET, enabled, "telemetry enabled toggled");
+    Ok(())
+}
+
 /// `set_telemetry_enabled(enabled)` - toggle anonymous usage stats (SPEC s16).
-/// Persists the flag (preserving the stable `install_id`), honored IMMEDIATELY:
-/// when turning OFF it flips the AppState cancel flag FIRST (so any in-flight ping
-/// that has not yet sent aborts before its network call, P1-2), then commits the
-/// pref; when turning ON it re-arms the flag. Returns the stored value.
+/// Persists the flag (preserving the stable `install_id` + the `last_sent_at`
+/// delta checkpoint), honored IMMEDIATELY via the shared [`apply_enabled_change`]
+/// path: when turning OFF it flips the AppState cancel flag FIRST (so any
+/// in-flight ping that has not yet sent aborts before its network call, P1-2),
+/// then commits the pref; when turning ON it re-arms the flag. Returns the stored
+/// value.
 #[tauri::command]
 pub async fn set_telemetry_enabled(
     state: State<'_, AppState>,
     enabled: bool,
 ) -> CommandResult<bool> {
-    // P1-2: flip the cancel flag BEFORE the write when disabling, so an in-flight
-    // ping checking the flag right before its send sees the cancellation even if
-    // the pref write has not landed yet. When enabling, re-arm (clear) the flag.
-    state.set_telemetry_cancelled(!enabled);
-    write_enabled(state.state().as_ref(), enabled).await?;
-    tracing::info!(target: TARGET, enabled, "telemetry enabled toggled");
+    let cancel = state.telemetry_cancel();
+    apply_enabled_change(state.state().as_ref(), &cancel, enabled).await?;
     Ok(enabled)
 }
 
@@ -1145,6 +1278,103 @@ mod tests {
         let prefs = read_prefs(&repo).await.unwrap();
         assert!(prefs.enabled);
         assert_eq!(prefs.install_id, id, "toggle preserves the install_id");
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn apply_enabled_change_off_trips_cancel_flag_and_persists() {
+        // R2-P1-1: the SHARED path update_settings now routes through flips the
+        // in-flight cancel flag immediately when disabling, so a disable via the
+        // generic settings save honors opt-out exactly like set_telemetry_enabled.
+        let (repo, dir) = temp_repo().await;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+
+        apply_enabled_change(&repo, &cancel, false).await.unwrap();
+        assert!(
+            cancel.load(Ordering::SeqCst),
+            "disabling trips the cancel flag (in-flight ping aborts)"
+        );
+        assert!(
+            !read_prefs(&repo).await.unwrap().enabled,
+            "disabling persists enabled=false"
+        );
+
+        // Re-enabling re-arms (clears) the flag.
+        apply_enabled_change(&repo, &cancel, true).await.unwrap();
+        assert!(
+            !cancel.load(Ordering::SeqCst),
+            "enabling clears the cancel flag"
+        );
+        assert!(read_prefs(&repo).await.unwrap().enabled);
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn update_settings_telemetry_patch_preserves_last_sent_at() {
+        // R2-P2-1: a telemetry enabled-toggle routed through apply_enabled_change
+        // (the SAME helper update_settings now calls) must PRESERVE a prior
+        // last_sent_at delta checkpoint - no clobber that would re-report a window.
+        let (repo, dir) = temp_repo().await;
+        // Seed a successful-send checkpoint.
+        write_last_sent_at(&repo, 1_700_000_000_000).await.unwrap();
+        assert_eq!(
+            read_prefs(&repo).await.unwrap().last_sent_at,
+            Some(1_700_000_000_000)
+        );
+
+        // Toggle enabled off then on via the shared path.
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        apply_enabled_change(&repo, &cancel, false).await.unwrap();
+        apply_enabled_change(&repo, &cancel, true).await.unwrap();
+
+        assert_eq!(
+            read_prefs(&repo).await.unwrap().last_sent_at,
+            Some(1_700_000_000_000),
+            "the delta checkpoint survives an enabled toggle"
+        );
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn update_applied_recorded_exactly_once_on_version_change() {
+        // R2-P2-3: a version change records EXACTLY one update_applied activity
+        // row; an unchanged version records none; a fresh install (no recorded
+        // version) records none (it just seeds the version).
+        let (repo, dir) = temp_repo().await;
+        let now = 1_700_000_000_000i64;
+
+        // FIRST run: no recorded version -> seed only, NO event.
+        let wrote_first = record_update_applied_if_changed(&repo, "0.1.0", now).await;
+        assert!(
+            !wrote_first,
+            "fresh install records no update_applied event"
+        );
+
+        // Same version on the next boot -> NO event.
+        let wrote_same = record_update_applied_if_changed(&repo, "0.1.0", now + 1).await;
+        assert!(!wrote_same, "unchanged version records no event");
+
+        // A new version -> EXACTLY one event.
+        let wrote_changed = record_update_applied_if_changed(&repo, "0.2.0", now + 2).await;
+        assert!(
+            wrote_changed,
+            "a version change records an update_applied event"
+        );
+
+        // Re-booting on the new version records nothing more (idempotent).
+        let wrote_again = record_update_applied_if_changed(&repo, "0.2.0", now + 3).await;
+        assert!(
+            !wrote_again,
+            "no further event once the version is recorded"
+        );
+
+        // Exactly ONE update_applied row landed across all boots, and the telemetry
+        // aggregate counts it as 1.
+        let agg = repo.telemetry_events_since(0, now + 100).await.unwrap();
+        assert_eq!(
+            agg.update_applied, 1,
+            "exactly one update_applied event recorded across the boots"
+        );
         cleanup(dir);
     }
 
