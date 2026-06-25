@@ -1269,6 +1269,31 @@ impl SyncOrchestrator {
         {
             tracing::warn!(target: TARGET, source_id = %source.id, %err, "failed to persist scan/verify timestamps");
         }
+        // M9b R3-P2-1: write a DURABLE per-RUN `deep_verify_done` activity row at
+        // the deep-verify completion site (mirroring the `update_applied` pattern).
+        // The telemetry aggregate counts these rows, so two deep verifies for the
+        // SAME source inside the 24h window count as 2 - not collapsed to 1 by the
+        // single `backup_sources.last_deep_verify_at` metadata timestamp. Only on a
+        // genuine deep-verify cycle (deep_verify == true) that reached this all-ops-
+        // succeeded point. Best-effort: a write failure is logged + swallowed (it
+        // must never fail the cycle), exactly like the timestamp stamp above.
+        if deep_verify {
+            if let Err(err) = self
+                .state
+                .write_activity(crate::state::NewActivity {
+                    ts: now,
+                    source_id: Some(source.id),
+                    level: crate::state::ActivityLevel::Info,
+                    event_type: "deep_verify_done".to_string(),
+                    file_count: None,
+                    bytes: None,
+                    message: None,
+                })
+                .await
+            {
+                tracing::warn!(target: TARGET, source_id = %source.id, %err, "failed to record deep_verify_done activity row (telemetry count may undercount)");
+            }
+        }
         if let Err(err) = self.state.mark_account_synced(self.account_id, now).await {
             tracing::warn!(target: TARGET, account_id = %self.account_id, %err, "failed to persist account last_synced_at");
         }
@@ -2241,6 +2266,26 @@ mod tests {
                 .insert(key.to_string(), value.clone());
             Ok(())
         }
+        async fn patch_setting_field(
+            &self,
+            key: &str,
+            field: &str,
+            value: &serde_json::Value,
+        ) -> anyhow::Result<()> {
+            // Field-level patch mirroring the SQLite `json_set` semantics: mutate
+            // ONLY `field`, preserve every sibling (R3-P1-1).
+            let mut map = self.settings.lock().unwrap();
+            let entry = map
+                .entry(key.to_string())
+                .or_insert_with(|| serde_json::Value::Object(serde_json::Map::new()));
+            if !entry.is_object() {
+                *entry = serde_json::Value::Object(serde_json::Map::new());
+            }
+            if let Some(obj) = entry.as_object_mut() {
+                obj.insert(field.to_string(), value.clone());
+            }
+            Ok(())
+        }
         async fn search_files(
             &self,
             _source: Option<SourceId>,
@@ -3124,6 +3169,29 @@ mod tests {
             state.account_synced.lock().unwrap().as_slice(),
             &[(account, now)],
             "account last_synced_at is stamped on a successful source run"
+        );
+
+        // M9b R3-P2-1: a successful deep-verify cycle writes EXACTLY one durable
+        // `deep_verify_done` activity row (at `now`, for this source) so the
+        // telemetry aggregate counts RUNS, not sources.
+        let deep_verify_rows: Vec<_> = state
+            .activity_rows()
+            .into_iter()
+            .filter(|r| r.event_type == "deep_verify_done")
+            .collect();
+        assert_eq!(
+            deep_verify_rows.len(),
+            1,
+            "exactly one deep_verify_done activity row per completed deep-verify cycle"
+        );
+        assert_eq!(
+            deep_verify_rows[0].ts, now,
+            "stamped at the completion time"
+        );
+        assert_eq!(
+            deep_verify_rows[0].source_id,
+            Some(src_id),
+            "the row carries the source id"
         );
 
         // The whole point: the NEXT cycle is NOT immediately due again.

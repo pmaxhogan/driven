@@ -1,0 +1,20 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT COUNT(*) AS \"n!: i64\"\n            FROM activity_log\n            WHERE ts >= ?1 AND ts <= ?2 AND event_type = 'deep_verify_done'\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "n!: i64",
+        "ordinal": 0,
+        "type_info": "Integer"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "1f8d5569c1029f0b8ece3046857cfbcb860e467b2d1f91bbd54abf5e394faa4b"
+}
