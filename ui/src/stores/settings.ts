@@ -2,6 +2,7 @@ import { defineStore } from "pinia";
 import { ref } from "vue";
 
 import * as ipc from "../ipc/commands";
+import { toErrorCode } from "../ipc/errors";
 import type { SettingsDto, SettingsPatch } from "../ipc/types";
 
 // Settings store (SPEC s11.6, s22; DESIGN s8.2 Rules + About tabs). Holds the
@@ -10,29 +11,36 @@ import type { SettingsDto, SettingsPatch } from "../ipc/types";
 // snapshot with the authoritative result the backend returns (so derived /
 // clamped values - e.g. an out-of-range concurrent-uploads override - reflect
 // what was actually stored).
+//
+// Errors are stored as the stable SPEC s24 CODE (via toErrorCode), never
+// `String(e)`: a Tauri structured `{ code, message }` error stringifies to the
+// literal "[object Object]", which a previous version rendered straight into the
+// Rules tab - so a rejected value showed "[object Object]" AND (via the template's
+// v-else-if chain) hid the entire form until an app restart. The view localizes
+// the code via t(`errors.${code}.long`) and keeps the form visible.
 export const useSettingsStore = defineStore("settings", () => {
   const settings = ref<SettingsDto | null>(null);
   const loading = ref(false);
-  const error = ref<string | null>(null);
+  const errorCode = ref<string | null>(null);
 
   async function refresh(): Promise<void> {
     loading.value = true;
-    error.value = null;
+    errorCode.value = null;
     try {
       settings.value = await ipc.getSettings();
     } catch (e) {
-      error.value = String(e);
+      errorCode.value = toErrorCode(e);
     } finally {
       loading.value = false;
     }
   }
 
   async function patch(p: SettingsPatch): Promise<void> {
-    error.value = null;
+    errorCode.value = null;
     try {
       settings.value = await ipc.updateSettings(p);
     } catch (e) {
-      error.value = String(e);
+      errorCode.value = toErrorCode(e);
       throw e;
     }
   }
@@ -45,7 +53,7 @@ export const useSettingsStore = defineStore("settings", () => {
   // backend also routes update_settings' telemetry branch through the same
   // cancel-preserving path, so either route is safe; this is the explicit one.)
   async function setTelemetryEnabled(enabled: boolean): Promise<void> {
-    error.value = null;
+    errorCode.value = null;
     try {
       await ipc.setTelemetryEnabled(enabled);
       if (settings.value) {
@@ -54,10 +62,10 @@ export const useSettingsStore = defineStore("settings", () => {
         await refresh();
       }
     } catch (e) {
-      error.value = String(e);
+      errorCode.value = toErrorCode(e);
       throw e;
     }
   }
 
-  return { settings, loading, error, refresh, patch, setTelemetryEnabled };
+  return { settings, loading, errorCode, refresh, patch, setTelemetryEnabled };
 });

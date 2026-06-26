@@ -533,9 +533,9 @@ describe("AddSourceWizard", () => {
       await flushPromises();
     };
 
-    // -> Drive step: root listing loaded, path empty.
+    // -> Drive step: root listing loaded, destination shows My Drive root.
     await clickNext();
-    const driveLabel = i18n.global.t("settings.addSource.step.driveFolder");
+    const driveLabel = i18n.global.t("drivePicker.destinationLabel");
     expect(wrapper.text()).toContain(`${driveLabel}:`);
 
     // Click the "Docs" folder to descend; the rendered path must now be "Docs",
@@ -759,6 +759,61 @@ describe("Settings Rules tab", () => {
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
       patch: { global: { bandwidthCapMbps: null } },
     });
+  });
+
+  it("clamps out-of-range numeric inputs to the backend range before patching", async () => {
+    // Regression: a plausible out-of-range value (100 concurrent uploads, a 10s
+    // scan interval) must be clamped client-side so it never round-trips to a
+    // backend rejection - that rejection used to brick the entire Rules form.
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, { props: { tab: "rules" }, global: globalMountOptions });
+    await flushPromises();
+    const nums = wrapper.get('[data-testid="rules-form"]').findAll('input[type="number"]');
+    // Order in the form: [bandwidth, concurrent, scan, deepVerify, hook].
+    await nums[1].setValue("100"); // concurrent uploads, backend max 32
+    await nums[1].trigger("change");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { defaultConcurrentUploads: 32 } },
+    });
+    await nums[2].setValue("10"); // scan interval, backend min 30
+    await nums[2].trigger("change");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { scanIntervalSecs: 30 } },
+    });
+  });
+
+  it("keeps the Rules form visible with a localized banner when a patch is rejected", async () => {
+    // Regression: a rejected patch must NOT replace the whole form with the raw
+    // error ("[object Object]") and brick the page. The form stays mounted and an
+    // inline, localized error banner appears so the user can correct the value.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings")
+        return Promise.reject({ code: "internal.invalid_input", message: "out of range" });
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, { props: { tab: "rules" }, global: globalMountOptions });
+    await flushPromises();
+    // Any commit that patches: toggle "pause on battery".
+    const battery = wrapper.get('[data-testid="rules-form"]').findAll('input[type="checkbox"]')[0];
+    await battery.setValue(false);
+    await battery.trigger("change");
+    await flushPromises();
+    // The form is STILL mounted (not bricked) ...
+    expect(wrapper.find('[data-testid="rules-form"]').exists()).toBe(true);
+    // ... and a localized banner shows the error - never "[object Object]".
+    const banner = wrapper.get('[data-testid="rules-error"]');
+    expect(banner.text().length).toBeGreaterThan(0);
+    expect(banner.text()).not.toContain("[object Object]");
   });
 
   it("changes the Windows VSS mode when the windows settings group is present", async () => {

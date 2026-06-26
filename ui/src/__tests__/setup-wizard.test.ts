@@ -378,12 +378,13 @@ describe("SetupWizard walks all five steps (DESIGN s8.5)", () => {
     await flushPromises();
     expect(setup.localPath).toBe("/home/user/Docs");
 
-    const chooseDrive = wrapper
-      .findAll("button")
-      .find((b) => b.text() === i18n.global.t("settings.addSource.chooseDriveButton"));
-    await chooseDrive!.trigger("click");
+    // Drive destination: the shared DriveFolderPicker auto-loads My Drive root on
+    // mount and selects it (no button click needed - that missing feedback was the
+    // bug). The fake backend returns drive-folder-1 as the current folder id.
     await flushPromises();
     expect(setup.driveFolderId).toBe("drive-folder-1");
+    // The picker surfaces the chosen destination instead of a dead button.
+    expect(wrapper.find('[data-testid="drive-folder-picker"]').exists()).toBe(true);
 
     await wrapper.get("footer button:last-child").trigger("click");
     expect(setup.step).toBe("encryption");

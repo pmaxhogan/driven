@@ -37,6 +37,11 @@
     "no": "No",
     "none": "None"
   },
+  "drivePicker": {
+    "rootName": "My Drive",
+    "destinationLabel": "Backing up to",
+    "empty": "No subfolders here - this folder is the destination."
+  },
   "wizard": {
     "title": "Set up Driven",
     "stepLabel": "Step {current} of {total}",
@@ -308,6 +313,8 @@
       "upload_done": "Uploaded",
       "trash_done": "Removed",
       "scan_done": "Scan complete",
+      "deep_verify_done": "Deep verify complete",
+      "update_applied": "App updated",
       "paused": "Paused",
       "error": "Error",
       "local.unicode_collision": "Name collision",
