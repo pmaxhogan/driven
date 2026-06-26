@@ -68,6 +68,17 @@ jobs:
       - name: Overlay live dev manifests (do not wipe dev)
         run: bash scripts/fetch-live-channel.sh dev site/updates "$UPDATES_BASE"
 
+      # dev-channel floor: this whole-site redeploy must not REPUBLISH a below-
+      # stable dev manifest (which would undo a release-time floor). Floor the
+      # overlaid live dev up to the overlaid live stable and assert dev>=stable
+      # before deploy. Self-healing regardless of deploy order
+      # (docs/superpowers/specs/2026-06-25-dev-channel-floor-design.md).
+      - name: Floor dev channel to stable (dev must never be below stable)
+        run: |
+          node scripts/floor-dev-channel.mjs \
+            --stable-dir site/updates/stable \
+            --dev-dir site/updates/dev
+
       - name: Show assembled site tree
         run: |
           set -euo pipefail

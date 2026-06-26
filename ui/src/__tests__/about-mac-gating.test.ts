@@ -122,6 +122,32 @@ describe("About.vue macOS updater gating", () => {
     expect(link.attributes("href")).toBe("https://github.com/pmaxhogan/driven/releases/tag/dev");
   });
 
+  // dev-channel floor: when the dev channel is floored up to stable, a macOS dev
+  // user is offered a CLEAN release version (no `-dev`) whose assets live on the
+  // stable tag, not the rolling `dev` release. The manual link must follow the
+  // version SHAPE and point at `/releases/latest`, not `/tag/dev` (which lacks the
+  // floored assets). See docs/superpowers/specs/2026-06-25-dev-channel-floor-design.md.
+  it("on macOS a floored dev-channel update (clean version) links to the latest release", async () => {
+    setUserAgent(MAC_UA);
+    const settings = useSettingsStore();
+    settings.settings = FAKE_SETTINGS as never;
+    const wrapper = mountAbout();
+    await flushPromises();
+
+    const updater = useUpdaterStore();
+    updater.available = {
+      version: "0.2.0",
+      notes: "Stable, served on the dev channel via the floor.",
+      publishedAt: "2026-06-24T00:00:00Z",
+      channel: "dev",
+    };
+    await flushPromises();
+
+    const link = wrapper.find('[data-testid="download-latest-dmg"]');
+    expect(link.exists()).toBe(true);
+    expect(link.attributes("href")).toBe("https://github.com/pmaxhogan/driven/releases/latest");
+  });
+
   it("on macOS a stable-channel update links to the latest release", async () => {
     setUserAgent(MAC_UA);
     const settings = useSettingsStore();

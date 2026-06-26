@@ -273,6 +273,19 @@ jobs:
       - name: Overlay live dev manifests (do not wipe the other channel)
         run: bash scripts/fetch-live-channel.sh dev site/updates "$UPDATES_BASE"
 
+      # dev-channel floor: dev must NEVER advertise a version below stable
+      # (docs/superpowers/specs/2026-06-25-dev-channel-floor-design.md). The
+      # overlay above brought the live dev manifests into the deploy tree; this
+      # floors them up to the freshly-generated stable manifests (copy stable->dev
+      # per target when stable is newer, seed when dev is absent) and ASSERTS
+      # dev>=stable on the LOCAL tree before the whole-site deploy - the hard gate
+      # that is immune to Cloudflare propagation lag.
+      - name: Floor dev channel to stable (dev must never be below stable)
+        run: |
+          node scripts/floor-dev-channel.mjs \
+            --stable-dir site/updates/stable \
+            --dev-dir site/updates/dev
+
       # M12: copy the root landing page into the site/ deploy root BEFORE the
       # whole-site `pages deploy`. The deploy is a whole-site snapshot, so without
       # this the release deploy would WIPE the live landing at driven.maxhogan.dev
@@ -330,7 +343,33 @@ jobs:
               echo "::error::stable smoke: ${url} returned 200 but not a valid update manifest (no version)"
               fail=1
             else
-              echo "stable smoke OK: ${url} (version $(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$body"))"
+              stbver="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$body")"
+              echo "stable smoke OK: ${url} (version ${stbver})"
+              # Secondary (eventual) dev-floor check: the dev channel must not be
+              # BELOW stable for this target. The AUTHORITATIVE gate already ran
+              # LOCALLY before deploy (the "Floor dev channel to stable" step calls
+              # assertFloored); this just verifies the deployed result, tolerating
+              # Pages propagation via the same bounded curl retry. A propagation
+              # 404/lag is a WARNING here, not a hard failure - the local gate
+              # already proved the tree correct.
+              devurl="${UPDATES_BASE}/dev/${t}/update.json"
+              devbody="$(mktemp)"
+              devcode="$(curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors \
+                --connect-timeout 15 --max-time 120 \
+                -o "$devbody" -w '%{http_code}' "$devurl" 2>/dev/null || true)"
+              devcode="${devcode:-000}"
+              if [ "$devcode" = "200" ]; then
+                devver="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$devbody")"
+                if node scripts/floor-dev-channel.mjs --ge "$devver" "$stbver"; then
+                  echo "dev>=stable OK: ${t} (dev ${devver} >= stable ${stbver})"
+                else
+                  echo "::error::dev smoke: dev ${devver} is BELOW stable ${stbver} for ${t}"
+                  fail=1
+                fi
+              else
+                echo "::warning::dev smoke: ${devurl} returned HTTP ${devcode}; skipping dev>=stable check (propagation lag; the local pre-deploy gate already enforced it)"
+              fi
+              rm -f "$devbody"
             fi
             rm -f "$body"
           done
