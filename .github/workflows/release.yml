@@ -348,28 +348,46 @@ jobs:
               # Secondary (eventual) dev-floor check: the dev channel must not be
               # BELOW stable for this target. The AUTHORITATIVE gate already ran
               # LOCALLY before deploy (the "Floor dev channel to stable" step calls
-              # assertFloored); this just verifies the deployed result, tolerating
-              # Pages propagation via the same bounded curl retry. A propagation
-              # 404/lag is a WARNING here, not a hard failure - the local gate
-              # already proved the tree correct.
+              # assertFloored), so a deployed dev<stable here can ONLY be Cloudflare
+              # Pages propagation lag still serving the PREVIOUS dev manifest. That
+              # lag has TWO shapes: a 404 (the new file is not yet at the edge),
+              # which curl's --retry rides out, AND a stale HTTP 200 carrying the OLD
+              # (below-stable) version, which curl does NOT retry (200 is "success"
+              # to curl). So re-fetch in a bounded loop until the new dev manifest
+              # (>= stable) propagates; if it never catches up in the window, WARN -
+              # do NOT fail. The local pre-deploy gate already proved the tree
+              # correct, so failing the whole release on this eventual-consistency
+              # double-check is a false positive (a stale edge serving dev 0.2.0
+              # red-X'd the otherwise-correct v0.3.0 release).
               devurl="${UPDATES_BASE}/dev/${t}/update.json"
-              devbody="$(mktemp)"
-              devcode="$(curl -fsSL --retry 8 --retry-delay 5 --retry-all-errors \
-                --connect-timeout 15 --max-time 120 \
-                -o "$devbody" -w '%{http_code}' "$devurl" 2>/dev/null || true)"
-              devcode="${devcode:-000}"
-              if [ "$devcode" = "200" ]; then
-                devver="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$devbody")"
-                if node scripts/floor-dev-channel.mjs --ge "$devver" "$stbver"; then
-                  echo "dev>=stable OK: ${t} (dev ${devver} >= stable ${stbver})"
+              devok=0
+              devseen=""
+              for devattempt in $(seq 1 8); do
+                devbody="$(mktemp)"
+                devcode="$(curl -fsSL --retry 5 --retry-delay 5 --retry-all-errors \
+                  --connect-timeout 15 --max-time 120 \
+                  -o "$devbody" -w '%{http_code}' "$devurl" 2>/dev/null || true)"
+                devcode="${devcode:-000}"
+                if [ "$devcode" = "200" ]; then
+                  devver="$(node -e 'console.log(JSON.parse(require("fs").readFileSync(process.argv[1],"utf8")).version)' "$devbody" 2>/dev/null || true)"
+                  devseen="${devver:-200/unparseable}"
+                  if [ -n "$devver" ] && node scripts/floor-dev-channel.mjs --ge "$devver" "$stbver"; then
+                    devok=1
+                    rm -f "$devbody"
+                    break
+                  fi
                 else
-                  echo "::error::dev smoke: dev ${devver} is BELOW stable ${stbver} for ${t}"
-                  fail=1
+                  devseen="HTTP ${devcode}"
                 fi
+                rm -f "$devbody"
+                echo "dev-floor not yet propagated for ${t} (attempt ${devattempt}/8: dev='${devseen}' vs stable ${stbver})"
+                [ "$devattempt" -lt 8 ] && sleep 15
+              done
+              if [ "$devok" = "1" ]; then
+                echo "dev>=stable OK: ${t} (dev ${devver} >= stable ${stbver})"
               else
-                echo "::warning::dev smoke: ${devurl} returned HTTP ${devcode}; skipping dev>=stable check (propagation lag; the local pre-deploy gate already enforced it)"
+                echo "::warning::dev smoke: dev for ${t} still '${devseen}' (not >= stable ${stbver}) after retries - treating as Cloudflare propagation lag, NOT a release failure (the authoritative pre-deploy floor gate already enforced dev>=stable)."
               fi
-              rm -f "$devbody"
             fi
             rm -f "$body"
           done
