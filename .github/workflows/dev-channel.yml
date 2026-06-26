@@ -405,6 +405,19 @@ jobs:
       - name: Overlay live stable manifests (do not wipe the other channel)
         run: bash scripts/fetch-live-channel.sh stable site/updates "$UPDATES_BASE"
 
+      # dev-channel floor: a dev build whose checkout predates a stable release
+      # computes a STALE (below-stable) dev version, and this workflow is in a
+      # separate concurrency group from release.yml, so without this it could
+      # publish a below-stable dev manifest (re-burying dev under stable). Floor the
+      # freshly-built dev manifests up to the overlaid LIVE stable, and assert
+      # dev>=stable locally before deploy
+      # (docs/superpowers/specs/2026-06-25-dev-channel-floor-design.md).
+      - name: Floor dev channel to stable (dev must never be below stable)
+        run: |
+          node scripts/floor-dev-channel.mjs \
+            --stable-dir site/updates/stable \
+            --dev-dir site/updates/dev
+
       # M12: copy the root landing page into the site/ deploy root BEFORE the
       # whole-site `pages deploy`. The deploy is a whole-site snapshot, so without
       # this a dev-channel deploy would WIPE the live landing at

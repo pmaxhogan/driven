@@ -34,15 +34,20 @@ const channels = ["stable", "dev"] as const;
 // in-app install.
 const isMac = isMacOS();
 // The GitHub releases page the macOS user downloads the DMG from.
-// R9-P2-3: this must follow the CHANNEL of the update being offered, not always
-// point at stable. A dev-channel macOS user shown a dev update banner must be sent
-// to the rolling dev pre-release (`/releases/tag/dev`, the tag dev-channel.yml
-// publishes), not to `/releases/latest` (the stable release). Derive it from
-// `updater.available.channel`; default to the stable latest page when no update is
-// in hand (e.g. before any check).
+// R9-P2-3 / dev-channel floor: derive this from the offered VERSION SHAPE, not the
+// endpoint channel. A `-dev` prerelease build lives on the rolling dev pre-release
+// (`/releases/tag/dev`, the tag dev-channel.yml publishes). Any clean release -
+// INCLUDING a dev-channel manifest that was FLOORED up to stable
+// (docs/superpowers/specs/2026-06-25-dev-channel-floor-design.md), whose assets
+// live on the stable tag and NOT on the rolling dev release - must point at the
+// stable latest release. Keying off the channel would send a floored dev user to
+// `/releases/tag/dev`, which lacks the offered stable assets. Default to the
+// stable latest page when no update is in hand (e.g. before any check).
 const releasesBase = "https://github.com/pmaxhogan/driven/releases";
 const macDownloadUrl = computed(() =>
-  updater.available?.channel === "dev" ? `${releasesBase}/tag/dev` : `${releasesBase}/latest`
+  (updater.available?.version ?? "").includes("-dev")
+    ? `${releasesBase}/tag/dev`
+    : `${releasesBase}/latest`
 );
 
 const exporting = ref(false);
