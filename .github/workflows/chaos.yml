@@ -102,32 +102,36 @@ jobs:
         run: cargo run -p driven-chaos -- run-all --fault-injection
 
   chaos-real-drive:
-    name: chaos real-drive (tag-only)
-    # Real-Drive E2E chaos suite. The DRIVEN_E2E_REFRESH_TOKEN +
-    # DRIVEN_E2E_DEST_FOLDER_ID secrets now exist (provisioned post-M4), so this
-    # job is LIVE - but, per the chaos COST POLICY above, it runs ONLY on a `v*`
-    # tag push (release gate), never on per-PR / per-main-push runs. The
-    # `secrets` context is not available in a job-level `if`, so we gate on the
-    # ref instead; the cap:real_drive_creds rows inside the harness still skip
-    # cleanly (never red) if the creds are ever absent. This does NOT expand the
-    # chaos matrix: the hermetic / fake-drive jobs keep their windows-only-on-
-    # PR, 3-OS-only-on-tag policy; this job is a single ubuntu real-Drive leg
-    # added only on tags.
+    name: real-drive e2e (tag-only)
+    # REAL Google Drive contract suite (driven-drive/tests/google_e2e.rs). The
+    # previous step here ran the HERMETIC chaos harness despite the real-drive
+    # name + env (it never touched real Drive); this now runs the actual
+    # env-gated real-Drive suite so the OAuth/Drive REST surface gets regression
+    # coverage. Per the chaos COST POLICY above it runs ONLY on a `v*` tag push
+    # (real Google traffic on every push is too costly). google_e2e.rs gates
+    # itself on the DRIVEN_E2E_* env: when the creds are absent it prints a clear
+    # "skipping real-Drive e2e" line and returns Ok (never red), so a fork / a
+    # missing secret degrades to a clean skip, not a failure.
     if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
     env:
       DRIVEN_E2E_REFRESH_TOKEN: ${{ secrets.DRIVEN_E2E_REFRESH_TOKEN }}
       DRIVEN_E2E_DEST_FOLDER_ID: ${{ secrets.DRIVEN_E2E_DEST_FOLDER_ID }}
+      # The OAuth client the refresh token was minted with. CLIENT_SECRET is
+      # REQUIRED by google_e2e.rs's gate; CLIENT_ID is optional (the suite falls
+      # back to the public installed-app client id when unset). Both must match
+      # the client that issued DRIVEN_E2E_REFRESH_TOKEN or the token exchange fails.
+      DRIVEN_OAUTH_CLIENT_SECRET: ${{ secrets.DRIVEN_OAUTH_CLIENT_SECRET }}
+      DRIVEN_OAUTH_CLIENT_ID: ${{ secrets.DRIVEN_OAUTH_CLIENT_ID }}
     steps:
       - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Install Linux Tauri deps
+      - name: Install Linux build deps (libssl for the Drive HTTP client)
         run: |
           sudo apt-get update
-          sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
-            libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
+          sudo apt-get install -y libssl-dev
       - uses: Swatinem/rust-cache@v2
-      # With real creds present, the cap:real_drive_creds rows run against a
-      # throwaway Drive folder; everything else runs as in the hermetic job.
-      - name: chaos run-all (real Drive)
-        run: cargo run -p driven-chaos -- run-all --hermetic
+      # Real Drive round-trip against a throwaway UUID folder under the dest
+      # folder. Gate-skips cleanly (Ok, never red) when the creds are absent.
+      - name: real-drive e2e (google_e2e)
+        run: cargo test -p driven-drive --test google_e2e -- --nocapture

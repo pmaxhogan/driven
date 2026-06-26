@@ -19,8 +19,12 @@ _ui-test:
 test-e2e-fake:
     cargo test --test e2e_fake
 
+# Real Google Drive end-to-end suite (driven-drive/tests/google_e2e.rs). It is
+# ENV-GATED (not #[ignore]d): it no-ops unless the DRIVEN_E2E_* creds are set.
+# See design/E2E_REAL.md for the required env (refresh token + dest folder, or a
+# BYO client id/secret). Same suite the tags-only chaos-real-drive CI job runs.
 test-e2e-real:
-    cargo test --test e2e_real -- --include-ignored
+    cargo test -p driven-drive --test google_e2e -- --nocapture
 
 watch:
     cargo watch -x "test -p driven-core" -x "test -p driven-drive"

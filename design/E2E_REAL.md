@@ -117,10 +117,14 @@ cargo test -p driven-drive --test google_e2e -- --nocapture
 
 ## CI: the chaos-real-drive job
 
-The real-Drive e2e job in CI runs the SAME `google_e2e` target with the gate
-supplied from GitHub Actions secrets. Because the suite no-op-passes without the
-gate, it is safe to run on every relevant build; it only does real Drive I/O
-when the secrets are configured.
+The real-Drive e2e job (`chaos-real-drive` in `.github/workflows/chaos.yml`) runs
+the SAME `google_e2e` target with the gate supplied from GitHub Actions secrets.
+Because the suite no-op-passes without the gate, it is safe anywhere; it only does
+real Drive I/O when the secrets are configured. Per the chaos COST POLICY it is
+gated to `v*` TAG pushes only (`if: startsWith(github.ref, 'refs/tags/')`) - real
+Google traffic on every push/PR is too costly - so real-Drive coverage runs at
+release time, not per-PR. The snippet below is illustrative (the live job also
+carries the tag gate + `libssl-dev`).
 
 Configure these repository (or environment) secrets in GitHub:
 

@@ -60,3 +60,11 @@ gcp-oauth-*.json
 
 # Tauri build outputs not under src-tauri/target
 /release
+
+# Mobile icon output from `cargo tauri icon` - Driven is desktop-only, so these
+# are regenerable cruft, not source.
+/src-tauri/icons/android
+/src-tauri/icons/ios
+
+# gstack skill scratch
+/.gstack
