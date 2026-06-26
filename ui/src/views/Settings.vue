@@ -32,6 +32,14 @@ const active = computed(() => props.tab);
 const ioPriorities = ["normal", "low", "idle"] as const;
 const vssModes = ["auto", "always", "never"] as const;
 
+// Shared design-system class strings (DRIVEN UI design system). Native controls
+// MUST carry explicit light/dark surface + text colors so they stay readable on a
+// dark-theme OS; teal is the accent for focus rings.
+const inputCls =
+  "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
+const cardCls =
+  "rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900";
+
 // Local editable mirrors of the numeric "nullable = special" fields, so the
 // bound <input> can be empty (= the special value) without fighting the store.
 const bandwidthCapText = ref("");
@@ -249,17 +257,18 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
       {{ t("settings.title") }}
     </h1>
 
-    <nav class="flex gap-2 border-b text-sm">
+    <nav class="flex gap-1 border-b border-zinc-200 text-sm dark:border-zinc-800">
       <button
         v-for="tabItem in tabs"
         :key="tabItem.key"
         type="button"
-        class="px-3 py-2"
+        class="-mb-px rounded-t px-3 py-2 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500"
         :class="
           active === tabItem.key
-            ? 'border-b-2 border-zinc-900 dark:border-zinc-100 font-medium'
-            : 'text-zinc-500'
+            ? 'border-b-2 border-teal-600 font-medium text-teal-700 dark:text-teal-300'
+            : 'text-zinc-600 hover:text-teal-700 dark:text-zinc-400 dark:hover:text-teal-300'
         "
+        :aria-current="active === tabItem.key ? 'page' : undefined"
         @click="go(tabItem.route)"
       >
         {{ t(tabItem.label) }}
@@ -281,73 +290,88 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
       </p>
       <div
         v-else-if="settings.settings"
-        class="max-w-md space-y-4 text-sm"
+        class="max-w-2xl space-y-4 text-sm"
         data-testid="rules-form"
       >
-        <label class="flex items-center gap-2">
-          <input
-            type="checkbox"
-            :checked="settings.settings.global.skipOnBattery"
-            @change="setSkipOnBattery"
-          />
-          {{ t("settings.rules.skipOnBatteryLabel") }}
-        </label>
-
-        <label class="flex items-center gap-2">
-          <input
-            type="checkbox"
-            :checked="settings.settings.global.skipOnMetered"
-            @change="setSkipOnMetered"
-          />
-          {{ t("settings.rules.skipOnMeteredLabel") }}
-        </label>
-
-        <div
-          v-if="settings.settings.global.skipOnMetered"
-          class="space-y-2 pl-6"
-          data-testid="metered-setting"
-        >
-          <label class="block space-y-1">
-            <span class="text-zinc-600 dark:text-zinc-400">{{
-              t("settings.rules.metered.modeLabel")
-            }}</span>
-            <select
-              data-testid="metered-mode"
-              :value="meteredMode"
-              class="w-full rounded border px-2 py-1"
-              @change="setMeteredMode"
-            >
-              <option v-for="mode in meteredModes" :key="mode" :value="mode">
-                {{ t(`settings.rules.metered.mode.${mode}`) }}
-              </option>
-            </select>
-          </label>
-          <label v-if="meteredMode === 'throttle'" class="block space-y-1">
-            <span class="text-zinc-600 dark:text-zinc-400">{{
-              t("settings.rules.metered.capLabel")
-            }}</span>
-            <input
-              v-model="meteredCapText"
-              type="number"
-              min="1"
-              :placeholder="t('settings.rules.bandwidthCapUnlimited')"
-              class="w-full rounded border px-2 py-1"
-              @change="commitMeteredCap"
-            />
-          </label>
-        </div>
-
-        <div class="space-y-2 border-t pt-4" data-testid="schedule-setting">
+        <!-- Power and network -->
+        <section class="space-y-3" :class="cardCls">
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("settings.rules.sections.powerNetwork") }}
+          </h3>
           <label class="flex items-center gap-2">
             <input
               type="checkbox"
+              class="accent-teal-600"
+              :checked="settings.settings.global.skipOnBattery"
+              @change="setSkipOnBattery"
+            />
+            {{ t("settings.rules.skipOnBatteryLabel") }}
+          </label>
+
+          <label class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              class="accent-teal-600"
+              :checked="settings.settings.global.skipOnMetered"
+              @change="setSkipOnMetered"
+            />
+            {{ t("settings.rules.skipOnMeteredLabel") }}
+          </label>
+
+          <div
+            v-if="settings.settings.global.skipOnMetered"
+            class="space-y-2 border-l-2 border-teal-600/40 pl-4"
+            data-testid="metered-setting"
+          >
+            <label class="block space-y-1">
+              <span class="text-zinc-600 dark:text-zinc-400">{{
+                t("settings.rules.metered.modeLabel")
+              }}</span>
+              <select
+                data-testid="metered-mode"
+                class="w-full"
+                :class="inputCls"
+                :value="meteredMode"
+                @change="setMeteredMode"
+              >
+                <option v-for="mode in meteredModes" :key="mode" :value="mode">
+                  {{ t(`settings.rules.metered.mode.${mode}`) }}
+                </option>
+              </select>
+            </label>
+            <label v-if="meteredMode === 'throttle'" class="block space-y-1">
+              <span class="text-zinc-600 dark:text-zinc-400">{{
+                t("settings.rules.metered.capLabel")
+              }}</span>
+              <input
+                v-model="meteredCapText"
+                type="number"
+                min="1"
+                class="w-full"
+                :class="inputCls"
+                :placeholder="t('settings.rules.bandwidthCapUnlimited')"
+                @change="commitMeteredCap"
+              />
+            </label>
+          </div>
+        </section>
+
+        <!-- Schedule window -->
+        <section class="space-y-2" :class="cardCls" data-testid="schedule-setting">
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("settings.rules.sections.schedule") }}
+          </h3>
+          <label class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              class="accent-teal-600"
               data-testid="schedule-enabled"
               :checked="scheduleEnabled"
               @change="setScheduleEnabled"
             />
             {{ t("settings.rules.schedule.label") }}
           </label>
-          <div v-if="scheduleEnabled" class="space-y-2 pl-6">
+          <div v-if="scheduleEnabled" class="space-y-3 border-l-2 border-teal-600/40 pl-4">
             <div class="flex gap-3">
               <label class="block space-y-1">
                 <span class="text-zinc-600 dark:text-zinc-400">{{
@@ -356,7 +380,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
                 <input
                   v-model="scheduleStart"
                   type="time"
-                  class="rounded border px-2 py-1"
+                  :class="inputCls"
                   @change="commitSchedule"
                 />
               </label>
@@ -367,7 +391,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
                 <input
                   v-model="scheduleEnd"
                   type="time"
-                  class="rounded border px-2 py-1"
+                  :class="inputCls"
                   @change="commitSchedule"
                 />
               </label>
@@ -376,17 +400,18 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
               <span class="text-zinc-600 dark:text-zinc-400">{{
                 t("settings.rules.schedule.daysLabel")
               }}</span>
-              <div class="flex gap-1">
+              <div class="flex flex-wrap gap-1">
                 <button
                   v-for="i in dayIndices"
                   :key="i"
                   type="button"
-                  class="rounded border px-2 py-1 text-xs"
+                  class="rounded-md border px-2 py-1 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500"
                   :class="
                     scheduleDays[i]
-                      ? 'bg-zinc-900 text-white dark:bg-zinc-100 dark:text-zinc-900'
-                      : 'text-zinc-500'
+                      ? 'border-teal-600 bg-teal-700 text-white'
+                      : 'border-zinc-300 text-zinc-600 hover:border-teal-500 hover:text-teal-700 dark:border-zinc-700 dark:text-zinc-300 dark:hover:text-teal-300'
                   "
+                  :aria-pressed="scheduleDays[i]"
                   @click="toggleScheduleDay(i)"
                 >
                   {{ t(`settings.rules.schedule.day.${i}`) }}
@@ -397,95 +422,110 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
               {{ t("settings.rules.schedule.note") }}
             </p>
           </div>
-        </div>
+        </section>
 
-        <label class="block space-y-1">
-          <span class="text-zinc-600 dark:text-zinc-400">{{
-            t("settings.rules.bandwidthCapLabel")
-          }}</span>
-          <input
-            v-model="bandwidthCapText"
-            type="number"
-            min="1"
-            :placeholder="t('settings.rules.bandwidthCapUnlimited')"
-            class="w-full rounded border px-2 py-1"
-            @change="commitBandwidthCap"
-          />
-        </label>
+        <!-- Performance and bandwidth -->
+        <section class="space-y-3" :class="cardCls">
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("settings.rules.sections.performance") }}
+          </h3>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.bandwidthCapLabel")
+            }}</span>
+            <input
+              v-model="bandwidthCapText"
+              type="number"
+              min="1"
+              class="w-full"
+              :class="inputCls"
+              :placeholder="t('settings.rules.bandwidthCapUnlimited')"
+              @change="commitBandwidthCap"
+            />
+          </label>
 
-        <label class="block space-y-1">
-          <span class="text-zinc-600 dark:text-zinc-400">{{
-            t("settings.rules.concurrentUploadsLabel")
-          }}</span>
-          <input
-            v-model="concurrentUploadsText"
-            type="number"
-            min="1"
-            max="32"
-            :placeholder="t('settings.rules.concurrentUploadsAuto')"
-            class="w-full rounded border px-2 py-1"
-            @change="commitConcurrentUploads"
-          />
-        </label>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.concurrentUploadsLabel")
+            }}</span>
+            <input
+              v-model="concurrentUploadsText"
+              type="number"
+              min="1"
+              max="32"
+              class="w-full"
+              :class="inputCls"
+              :placeholder="t('settings.rules.concurrentUploadsAuto')"
+              @change="commitConcurrentUploads"
+            />
+          </label>
 
-        <label class="block space-y-1">
-          <span class="text-zinc-600 dark:text-zinc-400">{{
-            t("settings.rules.scanIntervalLabel")
-          }}</span>
-          <input
-            type="number"
-            min="1"
-            :value="settings.settings.global.scanIntervalSecs"
-            class="w-full rounded border px-2 py-1"
-            @change="commitScanInterval"
-          />
-        </label>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.scanIntervalLabel")
+            }}</span>
+            <input
+              type="number"
+              min="1"
+              class="w-full"
+              :class="inputCls"
+              :value="settings.settings.global.scanIntervalSecs"
+              @change="commitScanInterval"
+            />
+          </label>
 
-        <label class="block space-y-1">
-          <span class="text-zinc-600 dark:text-zinc-400">{{
-            t("settings.rules.deepVerifyIntervalLabel")
-          }}</span>
-          <input
-            type="number"
-            min="1"
-            :value="settings.settings.global.deepVerifyIntervalSecs"
-            class="w-full rounded border px-2 py-1"
-            @change="commitDeepVerifyInterval"
-          />
-        </label>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.deepVerifyIntervalLabel")
+            }}</span>
+            <input
+              type="number"
+              min="1"
+              class="w-full"
+              :class="inputCls"
+              :value="settings.settings.global.deepVerifyIntervalSecs"
+              @change="commitDeepVerifyInterval"
+            />
+          </label>
 
-        <label class="block space-y-1">
-          <span class="text-zinc-600 dark:text-zinc-400">{{
-            t("settings.rules.ioPriorityLabel")
-          }}</span>
-          <select
-            :value="settings.settings.global.ioPriority"
-            class="w-full rounded border px-2 py-1"
-            @change="setIoPriority"
-          >
-            <option v-for="priority in ioPriorities" :key="priority" :value="priority">
-              {{ t(`settings.rules.ioPriority.${priority}`) }}
-            </option>
-          </select>
-        </label>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.ioPriorityLabel")
+            }}</span>
+            <select
+              class="w-full"
+              :class="inputCls"
+              :value="settings.settings.global.ioPriority"
+              @change="setIoPriority"
+            >
+              <option v-for="priority in ioPriorities" :key="priority" :value="priority">
+                {{ t(`settings.rules.ioPriority.${priority}`) }}
+              </option>
+            </select>
+          </label>
 
-        <label v-if="settings.settings.windows" class="block space-y-1">
-          <span class="text-zinc-600 dark:text-zinc-400">{{
-            t("settings.rules.vssModeLabel")
-          }}</span>
-          <select
-            :value="settings.settings.windows.vssMode"
-            class="w-full rounded border px-2 py-1"
-            @change="setVssMode"
-          >
-            <option v-for="mode in vssModes" :key="mode" :value="mode">
-              {{ t(`settings.rules.vssMode.${mode}`) }}
-            </option>
-          </select>
-        </label>
+          <label v-if="settings.settings.windows" class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.vssModeLabel")
+            }}</span>
+            <select
+              class="w-full"
+              :class="inputCls"
+              :value="settings.settings.windows.vssMode"
+              @change="setVssMode"
+            >
+              <option v-for="mode in vssModes" :key="mode" :value="mode">
+                {{ t(`settings.rules.vssMode.${mode}`) }}
+              </option>
+            </select>
+          </label>
+        </section>
 
-        <div class="space-y-2 border-t pt-4" data-testid="hooks-setting">
-          <h3 class="font-medium">{{ t("settings.rules.hooks.title") }}</h3>
+        <!-- Backup hooks -->
+        <section class="space-y-2" :class="cardCls" data-testid="hooks-setting">
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("settings.rules.hooks.title") }}
+          </h3>
           <label class="block space-y-1">
             <span class="text-zinc-600 dark:text-zinc-400">{{
               t("settings.rules.hooks.preLabel")
@@ -494,8 +534,9 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
               v-model="preBackupHook"
               type="text"
               data-testid="pre-hook"
+              class="w-full font-mono"
+              :class="inputCls"
               :placeholder="t('settings.rules.hooks.placeholder')"
-              class="w-full rounded border px-2 py-1 font-mono"
               @change="commitPreHook"
             />
           </label>
@@ -507,8 +548,9 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
               v-model="postBackupHook"
               type="text"
               data-testid="post-hook"
+              class="w-full font-mono"
+              :class="inputCls"
               :placeholder="t('settings.rules.hooks.placeholder')"
-              class="w-full rounded border px-2 py-1 font-mono"
               @change="commitPostHook"
             />
           </label>
@@ -519,20 +561,26 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             <input
               type="number"
               min="1"
+              class="w-full"
+              :class="inputCls"
               :value="hookTimeoutSecs"
-              class="w-full rounded border px-2 py-1"
               @change="commitHookTimeout"
             />
           </label>
           <p class="text-xs text-zinc-500">
             {{ t("settings.rules.hooks.note") }}
           </p>
-        </div>
+        </section>
 
-        <div class="space-y-1 border-t pt-4" data-testid="telemetry-setting">
+        <!-- Privacy -->
+        <section class="space-y-1" :class="cardCls" data-testid="telemetry-setting">
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("settings.rules.sections.privacy") }}
+          </h3>
           <label class="flex items-center gap-2">
             <input
               type="checkbox"
+              class="accent-teal-600"
               data-testid="telemetry-toggle"
               :checked="settings.settings.telemetry.enabled"
               @change="setTelemetryEnabled"
@@ -542,7 +590,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
           <p class="text-xs text-zinc-500">
             {{ t("settings.rules.telemetryNote") }}
           </p>
-        </div>
+        </section>
       </div>
     </div>
   </section>

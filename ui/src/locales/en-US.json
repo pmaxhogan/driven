@@ -84,6 +84,8 @@
     "accounts": {
       "title": "Connected accounts",
       "empty": "No accounts connected yet.",
+      "emptyTitle": "No accounts connected yet",
+      "emptyHint": "Connect a Google account to start backing up your folders.",
       "addButton": "Add account",
       "removeButton": "Remove",
       "reauthButton": "Reconnect",
@@ -99,6 +101,8 @@
     "sources": {
       "title": "Backup sources",
       "empty": "No backup sources yet.",
+      "emptyTitle": "No backup sources yet",
+      "emptyHint": "Add a local folder to back it up to Google Drive.",
       "addButton": "Add source",
       "column": {
         "name": "Name",
@@ -122,6 +126,7 @@
     },
     "addSource": {
       "title": "Add backup source",
+      "noAccounts": "No accounts yet - connect one first.",
       "step": {
         "localFolder": "Local folder",
         "driveFolder": "Drive folder",
@@ -143,6 +148,12 @@
     },
     "rules": {
       "title": "Global rules",
+      "sections": {
+        "powerNetwork": "Power and network",
+        "schedule": "Schedule",
+        "performance": "Performance and bandwidth",
+        "privacy": "Privacy"
+      },
       "skipOnBatteryLabel": "Pause backups while on battery",
       "skipOnMeteredLabel": "Limit backups on metered networks",
       "metered": {
@@ -201,6 +212,9 @@
   },
   "about": {
     "title": "About Driven",
+    "updatesTitle": "Updates",
+    "privacyTitle": "Privacy",
+    "diagnosticsTitle": "Diagnostics",
     "version": "Version {version}",
     "channelLabel": "Update channel",
     "channel": {
