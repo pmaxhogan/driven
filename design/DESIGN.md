@@ -1869,17 +1869,27 @@ Rust-side i18n:
 
 ## 17. Open questions deferred to V2+
 
+> NOTE (2026-06-25): several items once deferred here SHIPPED in **0.2.0** -
+> **schedule windows** (#12), **pre/post backup shell hooks** (#16), and
+> **bandwidth throttle by network type / metered** (#17) - plus **CLI local-state
+> inspection** (`status`/`history`/`verify`, #13). They are annotated "(SHIPPED
+> 0.2.0)" below; the surrounding design text is retained as historical context.
+> Metered detection is real on Windows only; macOS/Linux return a conservative
+> "unmetered" default (tracked residual).
+
 - **rclone-crypt-format compatibility** as opt-in second format.
 - **Block-level dedup** (CDC) for huge frequently-rewritten files.
 - **Restore-by-date / point-in-time** (requires versioning).
-- **Pre/post backup shell hooks.**
+- **Pre/post backup shell hooks.** (SHIPPED 0.2.0, #16)
 - **Backends beyond Google Drive** (OneDrive, S3, Backblaze B2).
 - **Schedule windows** (time-of-day rules, e.g. "only sync 23:00-06:00").
-  Per the locked decision in §3.5, V1 does NOT ship this — the DB
-  column is reserved as `schedule_json_v2_reserved` and the Settings UI
-  hides the Schedule section entirely.
+  (SHIPPED 0.2.0, #12 - time-of-day backup gating; the §3.5 "V1 does NOT ship
+  this" decision was reversed post-GA. The original reservation note is kept for
+  history: the DB column `schedule_json_v2_reserved` and a hidden Settings section
+  were the V1 placeholder before the feature landed.)
 - **Bandwidth throttle by network type** (slower on metered, full on
-  unmetered).
+  unmetered). (SHIPPED 0.2.0, #17 - metered pause/throttle; real metered
+  detection on Windows only, conservative "unmetered" default on macOS/Linux.)
 - **macOS Spotlight integration** (`mdimport` of restored files).
 - **Small-file bundling (tar.gz batches).** When a directory contains many
   small files, Drive's per-file API overhead dominates and bandwidth sits
