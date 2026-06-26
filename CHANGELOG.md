@@ -5,6 +5,14 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.1](https://github.com/pmaxhogan/driven/compare/v0.3.0...v0.3.1) (2026-06-26)
+
+
+### Bug Fixes
+
+* **settings:** allow resetting nullable settings to Auto/Unlimited ([#50](https://github.com/pmaxhogan/driven/issues/50)) ([4108c13](https://github.com/pmaxhogan/driven/commit/4108c13ae4f45d6349c39cb875159b7a245a6347))
+* **ui:** onboarding Drive picker, settings error handling, dark titlebar, and activity labels ([#48](https://github.com/pmaxhogan/driven/issues/48)) ([cca1cf9](https://github.com/pmaxhogan/driven/commit/cca1cf986149b5cac43b2512c5cd14ffafa927fd))
+
 ## [0.3.0](https://github.com/pmaxhogan/driven/compare/v0.2.0...v0.3.0) (2026-06-26)
 
 
