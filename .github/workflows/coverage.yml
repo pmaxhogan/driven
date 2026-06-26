@@ -64,7 +64,13 @@ jobs:
         with: { components: llvm-tools-preview }
       - uses: taiki-e/install-action@v2
         with: { tool: cargo-llvm-cov }
+      # This is an instrumented (coverage) build with its own RUSTFLAGS, so it
+      # gets its own cache key and deliberately does NOT share the `workspace`
+      # key. Restore-only on PRs; only main writes it (main coverage runs never
+      # cancel, so the cache stays warm).
       - uses: Swatinem/rust-cache@v2
+        with:
+          save-if: ${{ github.ref == 'refs/heads/main' }}
 
       - uses: pnpm/action-setup@v4
         with: { version: 10 }
