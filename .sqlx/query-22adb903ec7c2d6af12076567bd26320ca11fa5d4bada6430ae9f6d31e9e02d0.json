@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "INSERT INTO recovery_phrase_acks (source_id, account_id, revealed, created_at) SELECT s.id, s.account_id, 0, ?2 FROM backup_sources s WHERE s.account_id = ?1 AND s.encryption_enabled = 1 AND s.enabled = 1 ON CONFLICT(source_id) DO NOTHING",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "22adb903ec7c2d6af12076567bd26320ca11fa5d4bada6430ae9f6d31e9e02d0"
+}

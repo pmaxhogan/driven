@@ -3225,3 +3225,18 @@ query json files replaced; 0 drift). Gates green: cargo build/clippy/test --work
 driven-app, deny check, fmt --all --check, git diff --check, sqlx 0-drift; ui pnpm lint/test:unit/build
 (vue-tsc) unaffected (no UI surface touched). Anti-fake-green stub sweep over the touched surface: zero
 non-test todo!/unimplemented!/unreachable!.
+
+### Capstone fix recheck (post-fix codex high, baseline 3de2cf7..4236724)
+
+A codex recheck of the capstone fix found 1 P1 (DATA-SAFETY/PRIVACY) in the CAP-P1 repair: the
+`recovery_phrase_acks` seed query seeded a pending ack for EVERY encrypted source on the account
+(`WHERE encryption_enabled = 1`), including sources the USER had disabled (enabled = 0, no ack row).
+Because `enable_source_and_clear_recovery_ack` re-enables every source on the account that has a
+pending ack row, acking the recovery phrase would silently RE-ENABLE a user-disabled source and start
+backing it up - a privacy violation of the source enabled toggle. FIX: seed acks ONLY for the
+gate-disabled set (currently-ENABLED encrypted sources) by adding `AND s.enabled = 1` to the seed and
+running the seed BEFORE the disable (so the enabled=1 predicate still sees the about-to-be-gated set);
+a user-disabled source (enabled=0, no ack) is excluded and therefore never resurrected on ack, while
+an onboarding source (enabled=0 WITH an ack) keeps its row. New regression test
+`upgrade_repair_never_re_enables_a_user_disabled_encrypted_source`. All 5 upgrade_repair tests + full
+gates green (sqlx 0.9; 1 query json replaced).
