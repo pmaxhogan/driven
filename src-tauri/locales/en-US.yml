@@ -1,4 +1,16 @@
-_version: 2
+# rust-i18n locale-file format version (NOT the crate version).
+#   _version: 1 -> per-locale file: the filename ("en-US") IS the locale and the
+#   tree below is that locale's translations as direct string leaves (nested maps
+#   are flattened to dotted keys, e.g. `tray.tooltip.idle`). This is the format
+#   this file is actually written in.
+#   _version: 2 -> a single consolidated file whose leaves are locale-keyed maps
+#   (`hello: { en: ..., zh-CN: ... }`). We are NOT in that format.
+# The file previously declared `_version: 2` while holding v1 (direct-string)
+# content, so rust-i18n's v2 parser treated each leaf key (e.g. "name") as a
+# LOCALE name, no key resolved under "en-US", and every `t!()` returned the raw
+# key (the tray showed "tray.sync_now" etc.). Declaring v1 - the format this file
+# is in - makes lookups resolve. Covered by the i18n_resolution tests in tray.rs.
+_version: 1
 
 app:
   name: "Driven"
