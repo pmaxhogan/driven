@@ -1,0 +1,74 @@
+name: deploy-telemetry
+
+# Deploy the Driven anonymous-telemetry ingest Worker (SPEC s16) to Cloudflare.
+# The Worker owns the path-scoped route driven.maxhogan.dev/telemetry/* (it takes
+# precedence over the CF Pages site for that prefix); shipped clients POST an
+# anonymous ping there every 24h. Deploys on a change to telemetry-worker/ (or
+# this workflow), plus workflow_dispatch. Independent of the app/release pipeline.
+
+on:
+  push:
+    branches: [main]
+    paths:
+      - "telemetry-worker/**"
+      - ".github/workflows/deploy-telemetry.yml"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: deploy-telemetry
+  cancel-in-progress: false
+
+jobs:
+  deploy:
+    name: deploy telemetry worker
+    runs-on: ubuntu-latest
+    defaults:
+      run:
+        working-directory: telemetry-worker
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v4
+        with:
+          version: 10
+
+      - uses: actions/setup-node@v6
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: telemetry-worker/pnpm-lock.yaml
+
+      - name: pnpm install
+        run: pnpm install --frozen-lockfile
+
+      - name: Typecheck + test
+        run: |
+          pnpm run typecheck
+          pnpm test
+
+      - name: Deploy worker
+        env:
+          CLOUDFLARE_API_TOKEN: ${{ secrets.CLOUDFLARE_API_TOKEN }}
+          CLOUDFLARE_ACCOUNT_ID: ${{ secrets.CLOUDFLARE_ACCOUNT_ID }}
+        run: npx wrangler deploy
+
+      # Post-deploy smoke: a GET must hit the WORKER (405 method_not_allowed),
+      # NOT the CF Pages site (404) - i.e. the /telemetry/* route is bound. Uses a
+      # GET so the smoke never writes a real Analytics Engine row. Bounded curl
+      # retry rides Cloudflare route propagation; no bash sleep/poll loop.
+      - name: Smoke test the telemetry route
+        run: |
+          set -euo pipefail
+          url="https://driven.maxhogan.dev/telemetry/v1/ping"
+          code="$(curl -sS --retry 8 --retry-delay 5 --retry-all-errors \
+            --connect-timeout 15 --max-time 120 \
+            -o /dev/null -w '%{http_code}' "$url" 2>/dev/null || true)"
+          code="${code:-000}"
+          if [ "$code" != "405" ]; then
+            echo "::error::telemetry smoke: GET ${url} returned HTTP ${code} (expected 405 from the worker; 404 means the route is not bound and Pages is serving it)"
+            exit 1
+          fi
+          echo "telemetry smoke OK: GET ${url} -> 405 (worker route is live)"

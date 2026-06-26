@@ -1,9 +1,10 @@
 {
   // Driven anonymous-telemetry ingest Worker (SPEC s16, ROADMAP M9b).
   //
-  // DEPLOYMENT IS DEFERRED to M10/ops (needs `wrangler deploy` + CF creds). This
-  // config is committed + statically validated (`wrangler types` / `tsc`) now; the
-  // live deploy happens at M10. See design/CODEX_NOTES.md "## M9b - telemetry".
+  // DEPLOYED (2026-06-25): live at driven.maxhogan.dev/telemetry/* on the Driven
+  // CF account. Auto-deploys via .github/workflows/deploy-telemetry.yml on any
+  // change under telemetry-worker/ (or manual `npx wrangler deploy` from here).
+  // See design/CODEX_NOTES.md "## M9b - telemetry".
   "$schema": "node_modules/wrangler/config-schema.json",
   "name": "driven-telemetry",
   "main": "src/index.ts",
