@@ -1,3 +1,27 @@
 @tailwind base;
 @tailwind components;
 @tailwind utilities;
+
+/*
+ * Design-system foundation (UI-CORE). Before this layer existed the app never
+ * declared its own background, text color, or color-scheme, so the webview fell
+ * back to the OS-dark native defaults - which made dropdowns and text unreadable
+ * on a dark-theme OS. Declaring all three here is the single most important
+ * contrast fix: the app now owns its light/dark surfaces and tells the browser
+ * how to render native controls (selects, checkboxes, scrollbars). Teal is the
+ * app accent, so native checkboxes/radios get the teal accent-color too.
+ */
+@layer base {
+  :root {
+    color-scheme: light dark;
+  }
+  html,
+  body,
+  #app {
+    @apply bg-zinc-50 text-zinc-900 dark:bg-zinc-950 dark:text-zinc-100;
+  }
+  input[type="checkbox"],
+  input[type="radio"] {
+    @apply accent-teal-600;
+  }
+}
