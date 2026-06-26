@@ -8,7 +8,9 @@
     }
   },
   "nav": {
+    "primary": "Primary navigation",
     "activity": "Activity",
+    "settings": "Settings",
     "accounts": "Accounts",
     "sources": "Sources",
     "rules": "Rules",
