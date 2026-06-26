@@ -5,6 +5,19 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.3.0](https://github.com/pmaxhogan/driven/compare/v0.2.0...v0.3.0) (2026-06-26)
+
+
+### Features
+
+* comprehensive UI/UX overhaul + tray i18n/icon fix + CLI tests ([#37](https://github.com/pmaxhogan/driven/issues/37)) ([542e276](https://github.com/pmaxhogan/driven/commit/542e276c8e1ed14113b49d66b8693bff4505e403))
+* **updater:** floor the dev channel to stable so dev never falls behind ([#20](https://github.com/pmaxhogan/driven/issues/20)) ([1ebd52e](https://github.com/pmaxhogan/driven/commit/1ebd52e8e36e7e1faa9d0236155eea5f094d8444))
+
+
+### Bug Fixes
+
+* **capstone:** recovery-repair must not re-enable user-disabled encrypted sources ([04c9ba9](https://github.com/pmaxhogan/driven/commit/04c9ba9ec032e273ba69250f6a026ee5af23de35))
+
 ## [0.2.0](https://github.com/pmaxhogan/driven/compare/v0.1.0...v0.2.0) (2026-06-25)
 
 
