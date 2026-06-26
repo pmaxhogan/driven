@@ -23,6 +23,7 @@ jobs:
     runs-on: ubuntu-latest
     steps:
       - uses: googleapis/release-please-action@v5
+        id: release
         with:
           # RELEASE_PLEASE_TOKEN (a PAT / App token) IS configured, so the
           # release PR is authored by a real identity. This matters beyond the
@@ -36,3 +37,37 @@ jobs:
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
+
+      # release-please's `simple` releaser bumps the workspace version in
+      # Cargo.toml (+ tauri.conf.json / ui/package.json) but does NOT touch the
+      # generated Cargo.lock, so the committed lockfile's workspace-member
+      # versions drift behind every release and a `cargo build --locked` /
+      # `cargo install --locked` would fail. Re-sync the lock on the open release
+      # PR after each bump so it stays consistent going forward (not a one-off).
+      # `cargo update --workspace` updates ONLY the path/workspace members to
+      # their new manifest version - external dependencies stay pinned, so this is
+      # deterministic and a no-op once already synced; it never silently upgrades
+      # unrelated crates.
+      - name: Check out the release PR branch
+        if: ${{ steps.release.outputs.pr }}
+        uses: actions/checkout@v4
+        with:
+          ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
+          # Push with the PAT so the lock-sync commit re-triggers the release
+          # PR's required checks on the new HEAD (a GITHUB_TOKEN push would not).
+          token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
+
+      - name: Sync Cargo.lock with the release version bump
+        if: ${{ steps.release.outputs.pr }}
+        run: |
+          set -euo pipefail
+          cargo update --workspace
+          if git diff --quiet -- Cargo.lock; then
+            echo "Cargo.lock already in sync with the release version."
+            exit 0
+          fi
+          git config user.name "pmaxhogan"
+          git config user.email "max@maxhogan.dev"
+          git add Cargo.lock
+          git commit -m "chore: sync Cargo.lock with the release version bump"
+          git push

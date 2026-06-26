@@ -4,8 +4,9 @@ import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
 
 import CredentialsWalkthrough from "../components/CredentialsWalkthrough.vue";
+import DriveFolderPicker from "../components/DriveFolderPicker.vue";
 import RecoveryPhraseReveal from "../components/RecoveryPhraseReveal.vue";
-import { pickDriveFolder, pickFolderDialog } from "../ipc/commands";
+import { pickFolderDialog } from "../ipc/commands";
 import { useSetupStore, WIZARD_STEPS } from "../stores/setup";
 
 // Setup wizard (SPEC s25 /setup; DESIGN s8.5 5-step wizard). Drives the whole
@@ -37,7 +38,6 @@ const total = WIZARD_STEPS.length;
 const current = computed(() => setup.stepIndex + 1);
 
 const pickingFolder = ref(false);
-const loadingDrive = ref(false);
 
 // Design-system class strings (shared verbatim across slices for consistency):
 // teal primary CTAs (Next / Finish / Start backup), zinc secondary (Back / file
@@ -120,23 +120,15 @@ async function chooseLocalFolder(): Promise<void> {
   }
 }
 
-async function chooseDriveFolder(): Promise<void> {
-  const acct = setup.accountId;
-  if (!acct) return;
-  loadingDrive.value = true;
-  setup.clearError();
-  try {
-    const result = await pickDriveFolder(acct, null);
-    setup.driveFolderId = result.currentFolderId;
-    setup.driveFolderPath = result.currentFolderPath;
-  } catch (e) {
-    setup.errorCode =
-      e && typeof e === "object" && "code" in e
-        ? String((e as { code: unknown }).code)
-        : "drive.unreachable";
-  } finally {
-    loadingDrive.value = false;
-  }
+// The Drive destination is chosen via the shared DriveFolderPicker (breadcrumb
+// browser), which writes setup.driveFolderId / setup.driveFolderPath through
+// v-model. A listing failure is surfaced here as a stable SPEC s24 code (mapped
+// to errors.${code}.long), falling back to drive.unreachable.
+function onDrivePickerError(e: unknown): void {
+  setup.errorCode =
+    e && typeof e === "object" && "code" in e
+      ? String((e as { code: unknown }).code)
+      : "drive.unreachable";
 }
 
 // --- Navigation --------------------------------------------------------------
@@ -274,17 +266,12 @@ function baseName(p: string): string {
         <span class="block text-sm font-medium text-zinc-700 dark:text-zinc-200">{{
           t("wizard.step3.driveDestinationLabel")
         }}</span>
-        <button
-          type="button"
-          :class="SECONDARY_BTN"
-          :disabled="loadingDrive || !setup.accountId"
-          @click="chooseDriveFolder"
-        >
-          {{ t("settings.addSource.chooseDriveButton") }}
-        </button>
-        <p v-if="setup.driveFolderPath" class="break-all text-sm text-zinc-600 dark:text-zinc-400">
-          {{ setup.driveFolderPath }}
-        </p>
+        <DriveFolderPicker
+          v-model:folder-id="setup.driveFolderId"
+          v-model:folder-path="setup.driveFolderPath"
+          :account-id="setup.accountId"
+          @error="onDrivePickerError"
+        />
       </div>
     </div>
 

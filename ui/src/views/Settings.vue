@@ -6,6 +6,7 @@ import { useI18n } from "vue-i18n";
 import AccountList from "../components/AccountList.vue";
 import SourceTable from "../components/SourceTable.vue";
 import { useSettingsStore } from "../stores/settings";
+import type { SettingsPatch } from "../ipc/types";
 
 // Settings view (SPEC s25 /accounts, /sources, /rules; DESIGN s8.2). One view
 // hosts the three routed tabs; the active tab comes from the route (router
@@ -122,90 +123,156 @@ watch(
   { immediate: true }
 );
 
+// Backend-enforced numeric ranges (mirror of src-tauri/src/commands/settings.rs:
+// check_range bounds). We clamp every numeric field to its range BEFORE patching
+// so a typed out-of-range value (e.g. 100 concurrent uploads, a 10s scan
+// interval) is corrected in place and never round-trips to a backend rejection -
+// the rejection used to brick the whole Rules form. The backend still validates;
+// this just keeps the UI from ever sending a value it will refuse.
+const RANGES = {
+  bandwidthCapMbps: [1, 100_000],
+  meteredBandwidthCapMbps: [1, 100_000],
+  defaultConcurrentUploads: [1, 32],
+  scanIntervalSecs: [30, 604_800],
+  deepVerifyIntervalSecs: [3_600, 31_536_000],
+  hookTimeoutSecs: [1, 86_400],
+} as const;
+
+function clampToRange(value: number, [min, max]: readonly [number, number]): number {
+  return Math.min(max, Math.max(min, value));
+}
+
 // Accept `string | number`: an `<input type="number">` bound with `v-model`
 // yields a number, while an `event.target.value` read yields a string. Coerce
 // to a trimmed string first so neither call site crashes on `.trim()`.
-function parseOptionalPositiveInt(input: string | number): number | null {
+//
+// Parse an OPTIONAL field ("" = the special "null"/unlimited/auto value), clamped
+// to its backend range when a value is present.
+function parseOptionalClamped(
+  input: string | number,
+  range: readonly [number, number]
+): number | null {
   const trimmed = String(input).trim();
   if (trimmed === "") return null;
   const value = Number(trimmed);
-  if (!Number.isFinite(value) || value <= 0) return null;
-  return Math.floor(value);
+  if (!Number.isFinite(value)) return null;
+  return clampToRange(Math.floor(value), range);
 }
 
-function parsePositiveInt(input: string | number, fallback: number): number {
+// Parse a REQUIRED field, clamped to its backend range; a non-numeric input
+// keeps the current value (fallback).
+function parseRequiredClamped(
+  input: string | number,
+  range: readonly [number, number],
+  fallback: number
+): number {
   const value = Number(String(input).trim());
-  if (!Number.isFinite(value) || value <= 0) return fallback;
-  return Math.floor(value);
+  if (!Number.isFinite(value)) return fallback;
+  return clampToRange(Math.floor(value), range);
+}
+
+// All Rules commits route through here. The store records the failure as
+// `errorCode` (rendered as the inline banner above the form), so we SWALLOW the
+// rejection rather than let it escape the @change handler as an unhandled promise
+// rejection (which produced a Vue "Unhandled error during execution of native
+// event handler" warning). The form stays usable; the banner explains the error.
+async function commitPatch(p: SettingsPatch): Promise<void> {
+  try {
+    await settings.patch(p);
+  } catch {
+    // errorCode is set on the store and surfaced as the banner.
+  }
 }
 
 async function setSkipOnBattery(event: Event): Promise<void> {
   const checked = (event.target as HTMLInputElement).checked;
-  await settings.patch({ global: { skipOnBattery: checked } });
+  await commitPatch({ global: { skipOnBattery: checked } });
 }
 
 async function setSkipOnMetered(event: Event): Promise<void> {
   const checked = (event.target as HTMLInputElement).checked;
-  await settings.patch({ global: { skipOnMetered: checked } });
+  await commitPatch({ global: { skipOnMetered: checked } });
 }
 
 async function setMeteredMode(event: Event): Promise<void> {
   const value = (event.target as HTMLSelectElement).value;
-  await settings.patch({ global: { meteredMode: value } });
+  await commitPatch({ global: { meteredMode: value } });
 }
 
 async function commitMeteredCap(): Promise<void> {
-  await settings.patch({
-    global: { meteredBandwidthCapMbps: parseOptionalPositiveInt(meteredCapText.value) },
+  await commitPatch({
+    global: {
+      meteredBandwidthCapMbps: parseOptionalClamped(
+        meteredCapText.value,
+        RANGES.meteredBandwidthCapMbps
+      ),
+    },
   });
 }
 
 async function commitBandwidthCap(): Promise<void> {
-  await settings.patch({
-    global: { bandwidthCapMbps: parseOptionalPositiveInt(bandwidthCapText.value) },
+  await commitPatch({
+    global: {
+      bandwidthCapMbps: parseOptionalClamped(bandwidthCapText.value, RANGES.bandwidthCapMbps),
+    },
   });
 }
 
 async function commitConcurrentUploads(): Promise<void> {
-  await settings.patch({
+  await commitPatch({
     global: {
-      defaultConcurrentUploads: parseOptionalPositiveInt(concurrentUploadsText.value),
+      defaultConcurrentUploads: parseOptionalClamped(
+        concurrentUploadsText.value,
+        RANGES.defaultConcurrentUploads
+      ),
     },
   });
 }
 
 async function commitScanInterval(event: Event): Promise<void> {
   const current = settings.settings?.global.scanIntervalSecs ?? 600;
-  const value = parsePositiveInt((event.target as HTMLInputElement).value, current);
-  await settings.patch({ global: { scanIntervalSecs: value } });
+  const value = parseRequiredClamped(
+    (event.target as HTMLInputElement).value,
+    RANGES.scanIntervalSecs,
+    current
+  );
+  await commitPatch({ global: { scanIntervalSecs: value } });
 }
 
 async function commitDeepVerifyInterval(event: Event): Promise<void> {
   const current = settings.settings?.global.deepVerifyIntervalSecs ?? 604800;
-  const value = parsePositiveInt((event.target as HTMLInputElement).value, current);
-  await settings.patch({ global: { deepVerifyIntervalSecs: value } });
+  const value = parseRequiredClamped(
+    (event.target as HTMLInputElement).value,
+    RANGES.deepVerifyIntervalSecs,
+    current
+  );
+  await commitPatch({ global: { deepVerifyIntervalSecs: value } });
 }
 
 // Backup hooks (DESIGN s17). A blank command clears the hook (sent as null).
 async function commitPreHook(): Promise<void> {
   const cmd = preBackupHook.value.trim();
-  await settings.patch({ global: { preBackupHook: cmd === "" ? null : cmd } });
+  await commitPatch({ global: { preBackupHook: cmd === "" ? null : cmd } });
 }
 
 async function commitPostHook(): Promise<void> {
   const cmd = postBackupHook.value.trim();
-  await settings.patch({ global: { postBackupHook: cmd === "" ? null : cmd } });
+  await commitPatch({ global: { postBackupHook: cmd === "" ? null : cmd } });
 }
 
 async function commitHookTimeout(event: Event): Promise<void> {
   const current = settings.settings?.global.hookTimeoutSecs ?? 60;
-  const value = parsePositiveInt((event.target as HTMLInputElement).value, current);
-  await settings.patch({ global: { hookTimeoutSecs: value } });
+  const value = parseRequiredClamped(
+    (event.target as HTMLInputElement).value,
+    RANGES.hookTimeoutSecs,
+    current
+  );
+  await commitPatch({ global: { hookTimeoutSecs: value } });
 }
 
 async function setIoPriority(event: Event): Promise<void> {
   const value = (event.target as HTMLSelectElement).value;
-  await settings.patch({ global: { ioPriority: value } });
+  await commitPatch({ global: { ioPriority: value } });
 }
 
 // Persist the whole schedule window. The UTC offset is captured fresh from
@@ -213,7 +280,7 @@ async function setIoPriority(event: Event): Promise<void> {
 // and reasons from a fixed offset). `getTimezoneOffset()` returns minutes to
 // SUBTRACT to reach UTC, so negate it to get "minutes to add to UTC".
 async function commitSchedule(): Promise<void> {
-  await settings.patch({
+  await commitPatch({
     global: {
       schedule: {
         enabled: scheduleEnabled.value,
@@ -238,7 +305,7 @@ async function toggleScheduleDay(index: number): Promise<void> {
 
 async function setVssMode(event: Event): Promise<void> {
   const value = (event.target as HTMLSelectElement).value;
-  await settings.patch({ windows: { vssMode: value } });
+  await commitPatch({ windows: { vssMode: value } });
 }
 
 // SPEC s16 (M9b R2-P1-1): toggle anonymous usage telemetry (default ON) via the
@@ -247,7 +314,12 @@ async function setVssMode(event: Event): Promise<void> {
 // that send (the generic update_settings path would too, but this is explicit).
 async function setTelemetryEnabled(event: Event): Promise<void> {
   const checked = (event.target as HTMLInputElement).checked;
-  await settings.setTelemetryEnabled(checked);
+  try {
+    await settings.setTelemetryEnabled(checked);
+  } catch {
+    // errorCode is set on the store and surfaced as the banner; swallow so the
+    // toggle's @change handler never escapes as an unhandled rejection.
+  }
 }
 </script>
 
@@ -282,17 +354,35 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
         {{ t("settings.rules.title") }}
       </h2>
 
-      <p v-if="settings.loading" class="text-sm text-zinc-500">
+      <p v-if="settings.loading && !settings.settings" class="text-sm text-zinc-500">
         {{ t("common.loading") }}
       </p>
-      <p v-else-if="settings.error" class="text-sm text-red-600">
-        {{ settings.error }}
+      <p
+        v-else-if="!settings.settings && settings.errorCode"
+        class="text-sm text-red-600"
+        role="alert"
+      >
+        {{ t(`errors.${settings.errorCode}.long`) }}
       </p>
       <div
         v-else-if="settings.settings"
         class="max-w-2xl space-y-4 text-sm"
         data-testid="rules-form"
       >
+        <!-- A rejected patch shows here as an inline banner WITHOUT hiding the
+             form, so the user can correct the value. Previously the v-else-if
+             chain replaced the entire form with the raw error ("[object Object]")
+             and the page was unrecoverable until an app restart. Client-side
+             clamping (below) makes a backend rejection rare; this is the safety
+             net for the non-numeric cases. -->
+        <p
+          v-if="settings.errorCode"
+          class="rounded-md bg-red-50 px-3 py-2 text-sm text-red-700 dark:bg-red-950/40 dark:text-red-300"
+          role="alert"
+          data-testid="rules-error"
+        >
+          {{ t(`errors.${settings.errorCode}.long`) }}
+        </p>
         <!-- Power and network -->
         <section class="space-y-3" :class="cardCls">
           <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
@@ -347,6 +437,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
                 v-model="meteredCapText"
                 type="number"
                 min="1"
+                max="100000"
                 class="w-full"
                 :class="inputCls"
                 :placeholder="t('settings.rules.bandwidthCapUnlimited')"
@@ -437,6 +528,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
               v-model="bandwidthCapText"
               type="number"
               min="1"
+              max="100000"
               class="w-full"
               :class="inputCls"
               :placeholder="t('settings.rules.bandwidthCapUnlimited')"
@@ -466,7 +558,8 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             }}</span>
             <input
               type="number"
-              min="1"
+              min="30"
+              max="604800"
               class="w-full"
               :class="inputCls"
               :value="settings.settings.global.scanIntervalSecs"
@@ -480,7 +573,8 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             }}</span>
             <input
               type="number"
-              min="1"
+              min="3600"
+              max="31536000"
               class="w-full"
               :class="inputCls"
               :value="settings.settings.global.deepVerifyIntervalSecs"
@@ -561,6 +655,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
             <input
               type="number"
               min="1"
+              max="86400"
               class="w-full"
               :class="inputCls"
               :value="hookTimeoutSecs"

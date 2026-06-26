@@ -119,6 +119,9 @@ windows-sys = { version = "0.61", features = [
     # `CreateFileW` (and the other handle-open APIs) take a `SECURITY_ATTRIBUTES`
     # pointer and are gated behind `Win32_Security` in windows-sys 0.59.
     "Win32_Security",
+    # DwmSetWindowAttribute: force a dark titlebar/border so the native window
+    # chrome matches Driven's dark theme instead of the user's Windows accent.
+    "Win32_Graphics_Dwm",
 ] }
 
 [dev-dependencies]
