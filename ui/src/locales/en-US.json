@@ -53,7 +53,26 @@
       "openingBrowser": "Opening your browser...",
       "awaitingCallback": "Waiting for you to finish signing in...",
       "exchangingCode": "Completing sign-in...",
-      "complete": "Signed in."
+      "complete": "Signed in.",
+      "guide": {
+        "summary": "How do I get a Client ID and secret? (about 5 minutes)",
+        "intro": "Driven never sees your Google password, and your files never pass through anyone else's servers. You create a free OAuth client in your own Google Cloud account and paste its ID and secret below. Here is exactly how:",
+        "step1": "Open the Google Cloud Console at console.cloud.google.com and sign in. Click the project menu in the top bar, click \"New Project\", give it a name (for example \"Driven Backup\"), click \"Create\", then select the new project.",
+        "step2": "In the left menu, open \"APIs & Services\", then \"Library\". Search for \"Google Drive API\", open it, and click \"Enable\".",
+        "step3": "Open \"Google Auth Platform\", then \"Branding\", and click \"Get started\". Enter an \"App name\", pick your address for \"User support email\", then click \"Next\".",
+        "step4": "For \"Audience\", choose \"External\" and click \"Next\". Enter your email under \"Contact Information\", click \"Next\", agree to the policy, then click \"Create\".",
+        "step5": "Open the \"Audience\" page. Under \"Test users\", click \"Add users\", enter your own Google email, and click \"Save\". Only test users can sign in until the app is published.",
+        "step6": "Open \"Google Auth Platform\", then \"Clients\" (or \"APIs & Services\" > \"Credentials\" > \"Create credentials\" > \"OAuth client ID\"). Click \"Create client\", set \"Application type\" to \"Desktop app\", then click \"Create\".",
+        "step7": "Copy the \"Client ID\" and \"Client secret\" shown in the dialog and paste them into the fields below. The secret is only shown once, so copy it now.",
+        "testingCaveat": "Note: while your project stays in the \"Testing\" publishing status, Google expires the sign-in after about 7 days, so you will occasionally have to sign in again. To make it permanent, click \"Publish app\" on the \"Audience\" page once everything works."
+      },
+      "manualOpen": {
+        "prompt": "Your browser should have opened a Google sign-in page. If it did not open:",
+        "openButton": "Open the sign-in page",
+        "copyButton": "Copy sign-in link",
+        "copied": "Copied",
+        "linkLabel": "Sign-in link"
+      }
     },
     "step3": {
       "title": "Pick your first backup source",
@@ -353,6 +372,10 @@
   },
   "errors": {
     "auth": {
+      "browser_open_failed": {
+        "short": "Browser did not open",
+        "long": "Driven could not open your browser for Google sign-in. Use the \"Open the sign-in page\" button below, or copy the link into your browser to continue."
+      },
       "invalid_grant": {
         "short": "Reconnect required",
         "long": "Your Google sign-in expired or was revoked. Reconnect the account to continue backing up."
