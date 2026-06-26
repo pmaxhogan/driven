@@ -20,9 +20,17 @@ type(optional-scope): short imperative summary
   `build`, `ci`, `chore`, `style`, `revert`.
 - **Version impact (pre-1.0, `bump-minor-pre-major`):** `feat` -> minor
   (0.x.0), `fix`/`perf` -> patch. A breaking change uses a `!`
-  (`feat!:` / `fix(core)!:`) or a `BREAKING CHANGE:` footer in the PR body.
-- Only `feat`, `fix`, and `perf` show up in the changelog by default; the
-  others are valid but hidden. Use the most accurate type regardless.
+  (`feat!:` / `fix(core)!:`) or a `BREAKING CHANGE:` footer in the PR body;
+  pre-1.0 a breaking change still bumps only the **minor** (0.x.0), NOT a
+  major 1.0.0 - that is what `bump-minor-pre-major` means.
+- Changelog-visible by default: `feat` (Features), `fix` (Bug Fixes), `perf`,
+  `revert`, and `deps` (Dependencies). The rest - `docs`, `chore`, `ci`,
+  `build`, `refactor`, `style`, `test` - are valid but **hidden**: a PR titled
+  with one of those passes the title gate yet produces no changelog entry and
+  no version bump. So pick the *accurate* type - do NOT downgrade a real
+  feature/fix to `chore:`/`docs:` just to clear the red X, or the change
+  silently vanishes from the release notes (the same failure that hit #37,
+  only self-inflicted).
 - Scope is optional. Common scopes here: `core`, `cli`, `ui`, `updater`,
   `telemetry`, `ci`, `landing`, `capstone`.
 - Subject after the colon may use any case (so `OAuth`, `CLI`, `macOS` are
@@ -34,8 +42,9 @@ Good: `feat(ui): redesign the setup wizard`,
 Bad: `Comprehensive UI/UX overhaul`, `Update stuff`, `WIP`.
 
 Individual commits on a feature branch do **not** need to be conventional -
-they are squashed away; only the PR title reaches `main`. Don't waste effort
-rewriting branch commit messages.
+they are squashed away (squash is the only merge method enabled on this repo),
+so only the PR title reaches `main`. Don't waste effort rewriting branch commit
+messages.
 
 ### Enforcement
 
