@@ -19,10 +19,6 @@ import { useI18n } from "vue-i18n";
 // and the acknowledgement are reset (re-locked).
 const { t } = useI18n();
 
-// Design-system class strings (shared verbatim across slices for consistency).
-const SECONDARY_BTN =
-  "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
-
 const props = withDefaults(
   defineProps<{
     phrase?: string[];
@@ -214,20 +210,18 @@ watch(
 </script>
 
 <template>
-  <div
-    class="space-y-3 rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900"
-  >
-    <h3 class="text-sm font-medium text-zinc-900 dark:text-zinc-100">
+  <div class="space-y-3 rounded border p-4">
+    <h3 class="text-sm font-medium">
       {{ t("recoveryPhrase.title") }}
     </h3>
-    <p class="text-xs text-zinc-500 dark:text-zinc-400">
+    <p class="text-xs text-zinc-500">
       {{ t("recoveryPhrase.instructions") }}
     </p>
 
-    <div class="flex flex-wrap gap-2">
+    <div class="flex gap-2">
       <button
         type="button"
-        :class="SECONDARY_BTN"
+        class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
         :disabled="!canReveal || revealing"
         @click="toggle"
       >
@@ -242,7 +236,7 @@ watch(
       <button
         v-if="revealed"
         type="button"
-        :class="SECONDARY_BTN"
+        class="rounded border px-3 py-1.5 text-sm"
         :disabled="!hasPhrase"
         @click="copy"
       >
@@ -252,25 +246,17 @@ watch(
 
     <ol
       v-if="revealed && hasPhrase"
-      class="grid grid-cols-2 gap-1 rounded-md border border-zinc-200 bg-zinc-50 p-3 text-sm sm:grid-cols-3 dark:border-zinc-800 dark:bg-zinc-950"
+      class="grid grid-cols-3 gap-1 text-sm"
       data-testid="phrase-words"
     >
-      <li
-        v-for="(word, index) in props.phrase"
-        :key="index"
-        class="font-mono text-zinc-900 dark:text-zinc-100"
-      >
-        <span class="text-zinc-400 dark:text-zinc-500">{{ index + 1 }}.</span> {{ word }}
+      <li v-for="(word, index) in props.phrase" :key="index" class="font-mono">
+        {{ index + 1 }}. {{ word }}
       </li>
     </ol>
 
-    <label
-      class="flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-200"
-      :class="{ 'opacity-50': !ackEnabled }"
-    >
+    <label class="flex items-center gap-2 text-sm" :class="{ 'opacity-50': !ackEnabled }">
       <input
         type="checkbox"
-        class="h-4 w-4 accent-teal-600"
         :checked="props.confirmed"
         :disabled="!ackEnabled"
         data-testid="phrase-ack"
@@ -278,7 +264,7 @@ watch(
       />
       {{ t("recoveryPhrase.confirmedLabel") }}
     </label>
-    <p v-if="!ackEnabled" class="text-xs text-zinc-500 dark:text-zinc-400">
+    <p v-if="!ackEnabled" class="text-xs text-zinc-500">
       {{ t("recoveryPhrase.revealFirstHint") }}
     </p>
   </div>

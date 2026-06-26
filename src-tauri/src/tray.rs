@@ -12,35 +12,22 @@
 //! on every desktop environment, so EVERY action must also be reachable from
 //! the right-click menu - the menu is the canonical surface.
 //!
-//! ## Icon assets (real brand mark + per-state status badge)
+//! ## Icon assets (documented minimal approach)
 //!
-//! The base tray icon is the REAL Driven brand mark - the white road-to-cloud
-//! glyph on deep teal - decoded from the committed `icons/64x64.png` (compiled
-//! into the binary with `include_bytes!`) via
-//! [`tauri::image::Image::from_bytes`] (gated by the `image-png` Cargo feature).
-//! It is decoded once and cached in [`brand_base`].
-//!
-//! Each non-idle [`OrchestratorState`] keeps that recognisable brand mark and
-//! overlays a solid STATUS BADGE - a filled colour disc with a white contrast
-//! ring in the bottom-right corner (drawn by [`draw_badge`]): blue = syncing,
-//! amber = paused, orange = network attention (the yellow-with-`!` reachability
-//! case), red = error. Idle shows the plain brand mark (no badge). The badge
-//! colours are the same per-state palette used elsewhere, so the icon conveys
-//! the live state at a glance while staying on-brand.
-//!
-//! `set_icon_as_template(false)` is forced on the live tray so macOS does not
-//! recolour these colour-bearing icons to monochrome (which would erase the
-//! teal + the badge colours); the committed `tauri.conf.json` keeps
-//! `iconAsTemplate: true` only for the static boot icon.
-//!
-//! HONEST LIMITATION, not faked: `TrayIcon::Syncing` is a STATIC blue-badged
-//! mark, not an animated spinner. If the brand PNG ever fails to decode (it is
-//! compiled in, so this should not happen) the code falls back to the flat
-//! [`TrayIcon::rgba_buffer`] colour tile rather than panicking. The state
-//! machine, tooltip text, and notification routing are all real.
+//! Rather than shipping five binary PNG variants, the per-state icons are
+//! generated programmatically as flat RGBA tiles via
+//! [`tauri::image::Image::new_owned`] (no image-decoding crate feature needed,
+//! and Cargo.toml is frozen this milestone). Each state gets a distinct solid
+//! colour with `set_icon_as_template(false)` so the colour survives macOS's
+//! template-monochrome recolouring (the committed `tauri.conf.json` sets
+//! `iconAsTemplate: true` for the static boot icon). HONEST LIMITATIONS, not
+//! faked: `TrayIcon::Syncing` is a STATIC blue tile, not a real animated
+//! spinner; `TrayIcon::NetworkAttention` is a distinct amber tile that
+//! APPROXIMATES the yellow-with-`!` badge - no glyph is drawn into the tile.
+//! The state machine, tooltip text, and notification routing are all real.
 
 use std::collections::HashMap;
-use std::sync::{Mutex, OnceLock};
+use std::sync::Mutex;
 
 use driven_core::types::{AccountId, ErrorCode, OrchestratorState, PauseReason};
 use tauri::image::Image;
@@ -158,10 +145,8 @@ impl TrayIcon {
         }
     }
 
-    /// The flat `TILE x TILE` RGBA byte buffer for this state's tile (row-major,
-    /// top-to-bottom; the shape [`Image::new_owned`] wants). This is the FALLBACK
-    /// visual used only if the brand PNG fails to decode (see [`brand_base`]);
-    /// the normal path is the brand mark from [`TrayIcon::image`].
+    /// The flat `TILE x TILE` RGBA byte buffer for this state's tile
+    /// (row-major, top-to-bottom; the shape [`Image::new_owned`] wants).
     fn rgba_buffer(self) -> Vec<u8> {
         let [r, g, b, a] = self.rgba();
         let mut buf = Vec::with_capacity((TILE * TILE * 4) as usize);
@@ -171,110 +156,9 @@ impl TrayIcon {
         buf
     }
 
-    /// The status-badge colour for this state, or `None` for [`TrayIcon::Idle`]
-    /// (idle shows the plain brand mark, no badge). The RGB matches this state's
-    /// [`TrayIcon::rgba`] palette so the badge and the flat-tile fallback agree.
-    fn badge_color(self) -> Option<[u8; 3]> {
-        match self {
-            TrayIcon::Idle => None,
-            other => {
-                let [r, g, b, _] = other.rgba();
-                Some([r, g, b])
-            }
-        }
-    }
-
-    /// The brand-mark RGBA for this state: the decoded base mark with this
-    /// state's status badge drawn on for every non-idle state (idle is the plain
-    /// mark). Row-major top-to-bottom RGBA at the base mark's dimensions.
-    fn brand_rgba(self, base: &BrandImage) -> Vec<u8> {
-        let mut rgba = base.rgba.clone();
-        if let Some(color) = self.badge_color() {
-            draw_badge(&mut rgba, base.width, base.height, color);
-        }
-        rgba
-    }
-
-    /// A freshly-allocated owned [`Image`] for this state's tray icon: the real
-    /// Driven brand mark (badged per state), or - only if the compiled-in brand
-    /// PNG fails to decode - the flat [`TrayIcon::rgba_buffer`] colour tile.
+    /// A freshly-allocated owned [`Image`] tile for this state's icon.
     fn image(self) -> Image<'static> {
-        match brand_base() {
-            Some(base) => Image::new_owned(self.brand_rgba(base), base.width, base.height),
-            None => Image::new_owned(self.rgba_buffer(), TILE, TILE),
-        }
-    }
-}
-
-/// The compiled-in Driven brand mark (white road-to-cloud on deep teal) used as
-/// the base for every tray icon. 64x64 is a crisp source the OS scales down to
-/// the platform tray size; rendered from `icons/icon.svg` (see `icons/64x64.png`).
-const BRAND_PNG: &[u8] = include_bytes!("../icons/64x64.png");
-
-/// A decoded RGBA image (row-major, top-to-bottom) plus its dimensions.
-struct BrandImage {
-    rgba: Vec<u8>,
-    width: u32,
-    height: u32,
-}
-
-/// The decoded brand mark, decoded exactly once and cached for the process.
-///
-/// Returns `None` (logged once) if decoding ever fails - the bytes are compiled
-/// in so this is not expected, but callers fall back to a flat colour tile
-/// rather than panicking (HARD RULE: no panics in the tray path).
-fn brand_base() -> Option<&'static BrandImage> {
-    static BASE: OnceLock<Option<BrandImage>> = OnceLock::new();
-    BASE.get_or_init(|| match Image::from_bytes(BRAND_PNG) {
-        Ok(img) => Some(BrandImage {
-            rgba: img.rgba().to_vec(),
-            width: img.width(),
-            height: img.height(),
-        }),
-        Err(err) => {
-            tracing::error!(
-                target: TARGET,
-                "decode tray brand PNG failed; falling back to flat tile: {err}"
-            );
-            None
-        }
-    })
-    .as_ref()
-}
-
-/// Draw a filled status-badge disc (with a white contrast ring) into the
-/// bottom-right corner of an RGBA buffer, in place. Marks the brand tray icon
-/// with the live state's colour while keeping the mark recognisable. The disc is
-/// sized as a fraction of the smaller dimension so it scales with the source
-/// resolution; the white ring keeps it visible against both the teal background
-/// and the white cloud.
-fn draw_badge(rgba: &mut [u8], width: u32, height: u32, color: [u8; 3]) {
-    let w = width as i32;
-    let h = height as i32;
-    let min = w.min(h) as f32;
-    // Centre the badge in the bottom-right quadrant, fully inside the canvas.
-    let cx = width as f32 * 0.72;
-    let cy = height as f32 * 0.72;
-    let r_fill = min * 0.24;
-    let r_ring = r_fill + (min * 0.06).max(1.0);
-    for y in 0..h {
-        for x in 0..w {
-            let dx = x as f32 + 0.5 - cx;
-            let dy = y as f32 + 0.5 - cy;
-            let dist = (dx * dx + dy * dy).sqrt();
-            let idx = ((y * w + x) as usize) * 4;
-            if dist <= r_fill {
-                rgba[idx] = color[0];
-                rgba[idx + 1] = color[1];
-                rgba[idx + 2] = color[2];
-                rgba[idx + 3] = 0xff;
-            } else if dist <= r_ring {
-                rgba[idx] = 0xff;
-                rgba[idx + 1] = 0xff;
-                rgba[idx + 2] = 0xff;
-                rgba[idx + 3] = 0xff;
-            }
-        }
+        Image::new_owned(self.rgba_buffer(), TILE, TILE)
     }
 }
 
@@ -1312,228 +1196,6 @@ mod tests {
             for j in (i + 1)..colours.len() {
                 assert_ne!(colours[i], colours[j], "icons {i} and {j} share a colour");
             }
-        }
-    }
-
-    // -------------------------------------------------------------------------
-    // i18n resolution regression (the tray/menu/notification raw-key bug)
-    // -------------------------------------------------------------------------
-
-    /// REGRESSION (the raw-key bug): every tray menu label must resolve to real
-    /// localized TEXT, never the raw lookup key.
-    ///
-    /// `locales/en-US.yml` previously declared `_version: 2` while written in the
-    /// v1 (per-locale, direct-string) format, so rust-i18n's v2 parser found no
-    /// translations under "en-US" and `t!()` returned the raw key - the tray menu
-    /// showed "tray.sync_now" / "tray.settings" etc. The pre-existing tray tests
-    /// never caught this because they compared `t!()` to `t!()` (key == key passes
-    /// even when nothing resolves). These assert the ACTUAL resolved text AND that
-    /// it differs from the key, so the bug can never silently ship again.
-    #[test]
-    fn i18n_resolves_tray_menu_labels_to_real_text() {
-        // The exact strings from locales/en-US.yml (the user-visible menu).
-        let cases = [
-            ("tray.sync_now", "Sync now"),
-            ("tray.pause_30m", "Pause for 30 minutes"),
-            ("tray.resume", "Resume sync"),
-            ("tray.settings", "Settings"),
-            ("tray.activity", "Activity"),
-            ("tray.restore", "Restore"),
-            ("tray.quit", "Quit Driven"),
-        ];
-        for (key, expected) in cases {
-            let got = rust_i18n::t!(key);
-            assert_eq!(got, expected, "menu key {key} must resolve to its label");
-            assert_ne!(got, key, "menu key {key} must NOT resolve to the raw key");
-        }
-    }
-
-    /// The app name (tray tooltip), a NESTED tooltip key (proving nested YAML
-    /// maps flatten to dotted keys under `_version: 1`), and a notification title
-    /// all resolve to real text.
-    #[test]
-    fn i18n_resolves_app_name_tooltip_and_notification() {
-        assert_eq!(rust_i18n::t!("app.name"), "Driven");
-        assert_ne!(rust_i18n::t!("app.name"), "app.name");
-        assert_eq!(
-            rust_i18n::t!("tray.tooltip.idle"),
-            "Driven - idle, last sync OK"
-        );
-        assert_ne!(rust_i18n::t!("tray.tooltip.idle"), "tray.tooltip.idle");
-        assert_eq!(
-            rust_i18n::t!("notifications.first_sync_complete.title"),
-            "First sync complete"
-        );
-    }
-
-    /// Broad sweep: every key the tray/menu/notification code actually looks up
-    /// must resolve to non-key, non-empty text - so a future key added in code
-    /// but missing or mis-nested in the YAML is caught here, not in a screenshot.
-    #[test]
-    fn i18n_no_tray_key_resolves_to_itself() {
-        let keys = [
-            "app.name",
-            "tray.sync_now",
-            "tray.pause_30m",
-            "tray.resume",
-            "tray.settings",
-            "tray.activity",
-            "tray.restore",
-            "tray.quit",
-            "tray.tooltip.idle",
-            "tray.tooltip.syncing",
-            "tray.tooltip.service_down",
-            "tray.tooltip.needs_reauth",
-            "tray.tooltip.error",
-            "tray.tooltip.suspending",
-            "notifications.first_sync_complete.title",
-            "notifications.first_sync_complete.body",
-            "notifications.error.title",
-            "notifications.needs_reauth.title",
-        ];
-        for key in keys {
-            let got = rust_i18n::t!(key);
-            assert_ne!(got, key, "key {key} resolved to the raw key (i18n broken)");
-            assert!(!got.is_empty(), "key {key} resolved to empty text");
-        }
-    }
-
-    /// The OS-detected-locale path: a NON-en locale (what `sys_locale` may report
-    /// on a non-English host, fed straight into `set_locale` by `i18n::init`) must
-    /// FALL BACK to the en-US strings, never raw keys - guaranteed by
-    /// `i18n!(.., fallback = "en-US")` since we currently ship only en-US.
-    #[test]
-    fn i18n_non_en_locale_falls_back_to_english() {
-        let prev = rust_i18n::locale().to_string();
-        rust_i18n::set_locale("de-DE");
-        let got = rust_i18n::t!("tray.sync_now");
-        // Restore before asserting so a failure cannot leave a non-en locale set
-        // for other (parallel) tests.
-        rust_i18n::set_locale(&prev);
-        assert_eq!(
-            got, "Sync now",
-            "a non-en locale must fall back to the en-US label, not a raw key"
-        );
-        assert_ne!(got, "tray.sync_now");
-    }
-
-    // -------------------------------------------------------------------------
-    // Brand tray icon (real mark + per-state status badge)
-    // -------------------------------------------------------------------------
-
-    /// The committed brand PNG must decode - this is the NORMAL tray-icon path.
-    /// If it ever fails the tray silently falls back to flat colour tiles, so
-    /// guard it explicitly here.
-    #[test]
-    fn brand_base_decodes() {
-        let Some(base) = brand_base() else {
-            panic!("brand PNG (icons/64x64.png) must decode for the tray icon");
-        };
-        assert!(
-            base.width >= 16 && base.height >= 16,
-            "brand mark must be at least 16x16 ({}x{})",
-            base.width,
-            base.height
-        );
-        assert_eq!(
-            base.rgba.len(),
-            (base.width * base.height * 4) as usize,
-            "decoded brand RGBA length must be width*height*4"
-        );
-    }
-
-    /// Idle shows the PLAIN brand mark (no badge); every other state draws its
-    /// status badge onto the same mark - so the icon stays recognisable while the
-    /// non-idle variants differ from idle AND from each other (per-state colours).
-    #[test]
-    fn each_state_icon_is_the_branded_mark_and_distinct() {
-        let Some(base) = brand_base() else {
-            panic!("brand PNG must decode");
-        };
-        let expected_len = (base.width * base.height * 4) as usize;
-
-        // Idle == the untouched base mark (no badge drawn).
-        let idle = TrayIcon::Idle.brand_rgba(base);
-        assert_eq!(
-            idle, base.rgba,
-            "Idle must be the plain brand mark (no badge)"
-        );
-
-        let states = [
-            TrayIcon::Syncing,
-            TrayIcon::Paused,
-            TrayIcon::NetworkAttention,
-            TrayIcon::Error,
-        ];
-        let mut variants: Vec<(TrayIcon, Vec<u8>)> = Vec::new();
-        for s in states {
-            let v = s.brand_rgba(base);
-            assert_eq!(
-                v.len(),
-                expected_len,
-                "{s:?} icon must keep brand dimensions"
-            );
-            assert_ne!(v, base.rgba, "{s:?} must badge the mark (differ from idle)");
-            variants.push((s, v));
-        }
-        // The non-idle badged marks must all be visually distinct from each other.
-        for i in 0..variants.len() {
-            for j in (i + 1)..variants.len() {
-                assert_ne!(
-                    variants[i].1, variants[j].1,
-                    "{:?} and {:?} icons must be visually distinct",
-                    variants[i].0, variants[j].0
-                );
-            }
-        }
-    }
-
-    /// The badge actually PAINTS this state's colour into the icon (it is real,
-    /// not a no-op): after badging, at least one pixel equals the state's opaque
-    /// badge colour. That colour is from the per-state palette, which the plain
-    /// teal+white brand mark never contains, so its presence proves the badge.
-    #[test]
-    fn badge_paints_the_state_colour_onto_the_mark() {
-        let Some(base) = brand_base() else {
-            panic!("brand PNG must decode");
-        };
-        for s in [
-            TrayIcon::Syncing,
-            TrayIcon::Paused,
-            TrayIcon::NetworkAttention,
-            TrayIcon::Error,
-        ] {
-            let Some([r, g, b]) = s.badge_color() else {
-                panic!("non-idle state {s:?} must have a badge colour");
-            };
-            let target = [r, g, b, 0xff];
-            let v = s.brand_rgba(base);
-            let painted = v.chunks_exact(4).any(|px| px == target);
-            assert!(painted, "{s:?} badge colour must appear in the icon");
-        }
-        // Idle carries no badge colour.
-        assert_eq!(TrayIcon::Idle.badge_color(), None);
-    }
-
-    /// `TrayIcon::image` builds an Image at the brand mark's dimensions for every
-    /// state - i.e. the real-icon path, not the flat-tile fallback.
-    #[test]
-    fn image_uses_the_brand_dimensions() {
-        let Some(base) = brand_base() else {
-            panic!("brand PNG must decode");
-        };
-        let expected_len = (base.width * base.height * 4) as usize;
-        for s in [
-            TrayIcon::Idle,
-            TrayIcon::Syncing,
-            TrayIcon::Paused,
-            TrayIcon::NetworkAttention,
-            TrayIcon::Error,
-        ] {
-            let img = s.image();
-            assert_eq!(img.width(), base.width, "{s:?} width");
-            assert_eq!(img.height(), base.height, "{s:?} height");
-            assert_eq!(img.rgba().len(), expected_len, "{s:?} rgba length");
         }
     }
 }

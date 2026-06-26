@@ -28,18 +28,6 @@ const license = ref<string>("MIT OR Apache-2.0");
 
 const channels = ["stable", "dev"] as const;
 
-// Shared design-system class strings (DRIVEN UI design system). Teal is the
-// accent for primary/interactive affordances; native controls carry explicit
-// light/dark surfaces so they stay readable on a dark-theme OS.
-const primaryBtn =
-  "inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-teal-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50";
-const secondaryBtn =
-  "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
-const inputCls =
-  "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
-const cardCls =
-  "rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900";
-
 // R1-P2-1: the V1 macOS in-app updater is not expected to work cleanly, so on
 // macOS we hide the in-app "Install update" action and surface a manual DMG
 // download link to the GitHub releases page instead. Windows + Linux keep the
@@ -137,29 +125,23 @@ function viewReleaseChangelog(release: ReleaseDto): void {
 </script>
 
 <template>
-  <section class="max-w-2xl space-y-6">
+  <section class="space-y-6">
     <h1 class="text-2xl font-semibold">
       {{ t("about.title") }}
     </h1>
 
-    <!-- Update-available banner (listens to updater:available via the store). An
-         available update is actionable, not a success state, so it uses the teal
-         accent (emerald is reserved for "done" status). -->
+    <!-- Update-available banner (listens to updater:available via the store). -->
     <div
       v-if="updater.bannerVisible && updater.available"
-      class="space-y-3 rounded-lg border border-teal-300 bg-teal-50 p-4 text-sm dark:border-teal-800 dark:bg-teal-950"
+      class="space-y-2 rounded border border-emerald-300 bg-emerald-50 p-4 text-sm dark:border-emerald-700 dark:bg-emerald-950"
       data-testid="update-banner"
     >
-      <p class="font-medium text-teal-800 dark:text-teal-200">
+      <p class="font-medium">
         {{ t("about.updateAvailable", { version: updater.available.version }) }}
       </p>
       <!-- macOS: the V1 in-app updater is not reliable, so offer a manual DMG
            download instead of in-app install (R1-P2-1). -->
-      <p
-        v-if="isMac"
-        class="text-sm text-zinc-600 dark:text-zinc-300"
-        data-testid="install-mac-unsupported"
-      >
+      <p v-if="isMac" class="text-sm" data-testid="install-mac-unsupported">
         {{ t("about.installUpdateMacUnsupported") }}
       </p>
       <div class="flex flex-wrap items-center gap-2">
@@ -168,7 +150,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
           :href="macDownloadUrl"
           target="_blank"
           rel="noopener noreferrer"
-          :class="primaryBtn"
+          class="rounded bg-emerald-600 px-3 py-1.5 text-white"
           data-testid="download-latest-dmg"
         >
           {{ t("about.downloadLatestDmgButton") }}
@@ -176,19 +158,23 @@ function viewReleaseChangelog(release: ReleaseDto): void {
         <button
           v-else
           type="button"
-          :class="primaryBtn"
+          class="rounded bg-emerald-600 px-3 py-1.5 text-white disabled:opacity-50"
           :disabled="updater.installing"
           data-testid="install-update"
           @click="updater.install()"
         >
           {{ t("about.installUpdateButton") }}
         </button>
-        <button type="button" :class="secondaryBtn" @click="updater.openAvailableChangelog()">
+        <button
+          type="button"
+          class="rounded border px-3 py-1.5"
+          @click="updater.openAvailableChangelog()"
+        >
           {{ t("about.viewChangelogButton") }}
         </button>
         <button
           type="button"
-          class="rounded-md px-3 py-2 text-sm text-zinc-500 transition-colors hover:text-zinc-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:hover:text-zinc-300"
+          class="rounded px-3 py-1.5 text-zinc-500"
           @click="updater.dismissBanner()"
         >
           {{ t("common.close") }}
@@ -197,9 +183,9 @@ function viewReleaseChangelog(release: ReleaseDto): void {
 
       <!-- Download progress while installing (Windows/Linux only). -->
       <div v-if="!isMac && updater.installing" class="space-y-1" data-testid="install-progress">
-        <div class="h-2 w-full overflow-hidden rounded bg-teal-200 dark:bg-teal-900">
+        <div class="h-2 w-full overflow-hidden rounded bg-emerald-200 dark:bg-emerald-900">
           <div
-            class="h-full bg-teal-600 transition-all"
+            class="h-full bg-emerald-600 transition-all"
             :style="{
               width:
                 updater.downloadFraction !== null
@@ -217,8 +203,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       </p>
     </div>
 
-    <!-- App version + license -->
-    <div class="space-y-1 text-sm" :class="cardCls">
+    <div class="space-y-1 text-sm">
       <p>{{ t("about.version", { version }) }}</p>
       <p>
         <span class="text-zinc-500">{{ t("about.licenseLabel") }}:</span>
@@ -226,17 +211,12 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       </p>
     </div>
 
-    <!-- Updates: channel + check action + status -->
-    <div class="space-y-3" :class="cardCls">
-      <h2 class="text-lg font-medium">
-        {{ t("about.updatesTitle") }}
-      </h2>
-      <label class="block max-w-xs space-y-1 text-sm">
+    <div class="max-w-xs space-y-1 text-sm">
+      <label class="block space-y-1">
         <span class="text-zinc-600 dark:text-zinc-400">{{ t("about.channelLabel") }}</span>
         <select
           :value="updater.channel"
-          class="w-full"
-          :class="inputCls"
+          class="w-full rounded border px-2 py-1"
           data-testid="channel-select"
           @change="onChannelChange"
         >
@@ -245,66 +225,48 @@ function viewReleaseChangelog(release: ReleaseDto): void {
           </option>
         </select>
       </label>
-
-      <div class="space-y-2">
-        <button
-          type="button"
-          :class="primaryBtn"
-          :disabled="updater.checking"
-          data-testid="check-updates"
-          @click="updater.check()"
-        >
-          {{ t("about.checkForUpdatesButton") }}
-        </button>
-        <p v-if="updater.checking" class="text-sm text-zinc-500">
-          {{ t("common.loading") }}
-        </p>
-        <p
-          v-else-if="updater.checkErrorCode"
-          class="text-sm text-red-600"
-          data-testid="check-error"
-        >
-          {{ localizeError(updater.checkErrorCode) }}
-        </p>
-        <p
-          v-else-if="updater.checked && updater.available"
-          class="text-sm"
-          data-testid="check-available"
-        >
-          {{ t("about.updateAvailable", { version: updater.available.version }) }}
-        </p>
-        <p v-else-if="updater.checked" class="text-sm text-zinc-500" data-testid="check-uptodate">
-          {{ t("about.upToDate") }}
-        </p>
-      </div>
     </div>
 
-    <!-- Privacy: telemetry opt-out + display language -->
-    <div class="space-y-3" :class="cardCls">
-      <h2 class="text-lg font-medium">
-        {{ t("about.privacyTitle") }}
-      </h2>
-      <label class="flex items-center gap-2 text-sm">
-        <input
-          type="checkbox"
-          class="accent-teal-600"
-          :checked="telemetryEnabled"
-          @change="setTelemetry"
-        />
-        {{ t("about.telemetryLabel") }}
-      </label>
-      <p class="text-sm text-zinc-500">
-        <span class="text-zinc-600 dark:text-zinc-400">{{ t("about.displayLanguageLabel") }}:</span>
-        {{ t("about.moreLanguagesComing") }}
+    <div class="space-y-2">
+      <button
+        type="button"
+        class="rounded border px-3 py-1.5 text-sm"
+        :disabled="updater.checking"
+        data-testid="check-updates"
+        @click="updater.check()"
+      >
+        {{ t("about.checkForUpdatesButton") }}
+      </button>
+      <p v-if="updater.checking" class="text-sm text-zinc-500">
+        {{ t("common.loading") }}
+      </p>
+      <p v-else-if="updater.checkErrorCode" class="text-sm text-red-600" data-testid="check-error">
+        {{ localizeError(updater.checkErrorCode) }}
+      </p>
+      <p
+        v-else-if="updater.checked && updater.available"
+        class="text-sm"
+        data-testid="check-available"
+      >
+        {{ t("about.updateAvailable", { version: updater.available.version }) }}
+      </p>
+      <p v-else-if="updater.checked" class="text-sm text-zinc-500" data-testid="check-uptodate">
+        {{ t("about.upToDate") }}
       </p>
     </div>
 
-    <!-- Diagnostics: export bundle -->
-    <div class="space-y-2" :class="cardCls">
-      <h2 class="text-lg font-medium">
-        {{ t("about.diagnosticsTitle") }}
-      </h2>
-      <button type="button" :class="secondaryBtn" :disabled="exporting" @click="exportDiagnostics">
+    <label class="flex max-w-md items-center gap-2 text-sm">
+      <input type="checkbox" :checked="telemetryEnabled" @change="setTelemetry" />
+      {{ t("about.telemetryLabel") }}
+    </label>
+
+    <div class="space-y-2">
+      <button
+        type="button"
+        class="rounded border px-3 py-1.5 text-sm"
+        :disabled="exporting"
+        @click="exportDiagnostics"
+      >
         {{ t("about.exportDiagnosticsButton") }}
       </button>
       <p v-if="exportError" class="text-sm text-red-600">
@@ -319,8 +281,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       </p>
     </div>
 
-    <!-- Release notes -->
-    <div class="space-y-3" :class="cardCls">
+    <div class="space-y-2">
       <h2 class="text-lg font-medium">
         {{ t("about.releaseNotesTitle") }}
       </h2>
@@ -341,7 +302,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
         <li
           v-for="release in updater.releases"
           :key="release.version"
-          class="space-y-1 border-b border-zinc-200 pb-3 dark:border-zinc-800"
+          class="space-y-1 border-b pb-3"
         >
           <p class="text-sm font-medium">
             {{ release.name }}
@@ -351,7 +312,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
           </p>
           <button
             type="button"
-            class="rounded-sm text-sm font-medium text-teal-700 underline transition-colors hover:text-teal-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-teal-300"
+            class="text-sm text-emerald-700 underline dark:text-emerald-400"
             @click="viewReleaseChangelog(release)"
           >
             {{ t("about.viewChangelogButton") }}
@@ -361,7 +322,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       <button
         v-if="updater.hasMoreReleases"
         type="button"
-        :class="secondaryBtn"
+        class="rounded border px-3 py-1.5 text-sm"
         :disabled="updater.releasesLoading"
         data-testid="load-more-releases"
         @click="updater.loadMoreReleases()"
@@ -369,6 +330,11 @@ function viewReleaseChangelog(release: ReleaseDto): void {
         {{ t("about.loadMoreReleasesButton") }}
       </button>
     </div>
+
+    <p class="text-sm text-zinc-500">
+      <span class="text-zinc-600 dark:text-zinc-400">{{ t("about.displayLanguageLabel") }}:</span>
+      {{ t("about.moreLanguagesComing") }}
+    </p>
 
     <ChangelogModal :release="updater.changelogRelease" @close="updater.closeChangelog()" />
   </section>

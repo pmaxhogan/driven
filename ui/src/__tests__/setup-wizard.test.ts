@@ -16,15 +16,6 @@ vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: unknown) => invokeMock(cmd, args),
 }));
 
-// The sign-in fix opens the system browser via the Tauri v2 opener plugin
-// (NOT window.open, which does not reliably reach the system browser in a Tauri
-// webview). Mock the plugin so the default opener is asserted without launching a
-// real browser; the store still accepts an injectable opener for direct stubbing.
-const openUrlMock = vi.fn();
-vi.mock("@tauri-apps/plugin-opener", () => ({
-  openUrl: (url: string) => openUrlMock(url),
-}));
-
 // Capture the registered `oauth:complete` handler so the test can fire the event
 // the way the Rust loopback server would.
 let oauthCompleteHandler: ((e: { payload: unknown }) => void) | null = null;
@@ -144,10 +135,8 @@ beforeEach(() => {
   oauthCompleteHandler = null;
   setActivePinia(createPinia());
   installFakeBackend();
-  // The opener plugin is the browser-open seam; default it to resolve so the
-  // default sign-in path "opens" without launching a real browser.
-  openUrlMock.mockReset();
-  openUrlMock.mockResolvedValue(undefined);
+  // window.open is the browser opener seam; stub it so no real window opens.
+  vi.stubGlobal("open", vi.fn());
 });
 
 describe("setup store OAuth sequence (SPEC s11.1)", () => {
@@ -176,54 +165,6 @@ describe("setup store OAuth sequence (SPEC s11.1)", () => {
     await setup.connectAccount("cid", "csec", opener);
     expect(opener).toHaveBeenCalledWith("https://accounts.google.com/o/x");
     expect(setup.oauthStatus).toEqual({ kind: "awaitingCallback" });
-    // The auth URL is captured so the manual fallback can re-open / copy it.
-    expect(setup.authUrl).toBe("https://accounts.google.com/o/x");
-  });
-
-  it("connectAccount uses the Tauri opener plugin (not window.open) by default", async () => {
-    // The sign-in bug was window.open not reaching the system browser. With no
-    // opener injected, the store must route through the opener plugin's openUrl.
-    const setup = useSetupStore();
-    await setup.begin();
-    await setup.connectAccount("cid", "csec");
-    expect(openUrlMock).toHaveBeenCalledWith("https://accounts.google.com/o/x");
-    expect(setup.oauthStatus).toEqual({ kind: "awaitingCallback" });
-  });
-
-  it("connectAccount records browser_open_failed when the opener throws (not a dead end)", async () => {
-    // A blocked auto-open must NOT wedge the wizard: the loopback server is still
-    // listening, the auth URL stays captured, and a clear error code tells the
-    // user to use the manual link. connectAccount must not reject in this case.
-    const setup = useSetupStore();
-    const failingOpener = vi.fn().mockRejectedValue(new Error("no browser"));
-    await setup.begin();
-    await expect(setup.connectAccount("cid", "csec", failingOpener)).resolves.toBeUndefined();
-    expect(setup.errorCode).toBe("auth.browser_open_failed");
-    // Still awaiting the callback, with the URL available for the fallback.
-    expect(setup.oauthStatus).toEqual({ kind: "awaitingCallback" });
-    expect(setup.authUrl).toBe("https://accounts.google.com/o/x");
-  });
-
-  it("openAuthUrl re-opens the captured auth URL via the injected opener", async () => {
-    const setup = useSetupStore();
-    await setup.begin();
-    await setup.connectAccount("cid", "csec");
-    // Simulate the first open failing so an error is showing.
-    setup.errorCode = "auth.browser_open_failed";
-    const opener = vi.fn();
-    await setup.openAuthUrl(opener);
-    expect(opener).toHaveBeenCalledWith("https://accounts.google.com/o/x");
-    // A successful re-open clears the prior error.
-    expect(setup.errorCode).toBeNull();
-  });
-
-  it("openAuthUrl records browser_open_failed when the manual re-open also fails", async () => {
-    const setup = useSetupStore();
-    await setup.begin();
-    await setup.connectAccount("cid", "csec");
-    const failingOpener = vi.fn().mockRejectedValue(new Error("still blocked"));
-    await setup.openAuthUrl(failingOpener);
-    expect(setup.errorCode).toBe("auth.browser_open_failed");
   });
 
   it("createFirstSource adds the source with its encryption flag + captures the phrase", async () => {

@@ -302,13 +302,6 @@ pub fn run() {
         // round-trip a dialog-derived path so the webview can never inject an
         // arbitrary local path (the untrusted-webview path-confinement rule).
         .plugin(tauri_plugin_dialog::init())
-        // Sign-in flow: open the Google OAuth consent URL in the user's default
-        // system browser. The setup wizard (frontend) calls
-        // `@tauri-apps/plugin-opener` `openUrl(consentUrl)`; this registers the
-        // Rust half so that webview command is served. The webview is granted
-        // only `opener:default` (http/https/mailto/tel), so it can launch the
-        // browser but cannot open arbitrary local paths.
-        .plugin(tauri_plugin_opener::init())
         // M9a (SPEC s15): the in-app updater + the process plugin (for the
         // post-install relaunch via `app.restart()`). The updater fetches the
         // signed per-target `update.json` and verifies the ed25519 signature

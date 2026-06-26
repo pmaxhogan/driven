@@ -10,13 +10,9 @@ folders stay the single source of truth. With per-source client-side encryption
 turned on, file names and contents are encrypted on your machine before they
 ever leave it, so Google stores only ciphertext.
 
-![Driven's first-run setup wizard in dark mode: a teal-accented welcome step with the top navigation (Activity, Settings, Restore, About).](docs/screenshots/setup-wizard-dark.png)
-
-Driven uses your own Google OAuth credentials, so your files never pass through
-anyone else's servers. The first-run wizard includes a step-by-step, plain-English
-guide to creating that credential in the Google Cloud Console:
-
-![The credentials step with an expanded, numbered walkthrough for creating a Google OAuth client ID and secret.](docs/screenshots/oauth-walkthrough-dark.png)
+> Screenshot placeholder: a labelled screenshot of the main window and the
+> restore browser will be added here. For now, see the design docs under
+> `design/` for the intended UI.
 
 ## Features
 

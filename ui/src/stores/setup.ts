@@ -1,6 +1,5 @@
 import { defineStore } from "pinia";
 import { computed, ref } from "vue";
-import { openUrl } from "@tauri-apps/plugin-opener";
 
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
@@ -32,11 +31,6 @@ export const useSetupStore = defineStore("setup", () => {
   const stepIndex = ref(0);
   const session = ref<AddAccountWizardSessionId | null>(null);
   const oauthStatus = ref<OAuthStatus | null>(null);
-  // The loopback consent URL returned by start_oauth_signin. Held so the
-  // credentials step can offer a manual "open / copy this link" fallback when the
-  // automatic system-browser open is blocked - a failed auto-open is never a dead
-  // end. Cleared by reset(); set each time connectAccount starts a sign-in.
-  const authUrl = ref<string | null>(null);
 
   // Cross-step staged inputs. Kept here (not component-local) so navigating
   // back/forward preserves what the user already entered.
@@ -143,24 +137,14 @@ export const useSetupStore = defineStore("setup", () => {
   /**
    * Drive the full credential -> sign-in handoff for the credentials step:
    * submit the pasted client id/secret, start the loopback OAuth flow, and hand
-   * the returned auth URL to `open` (defaults to the Tauri opener plugin, which
-   * opens the system browser reliably; `window.open` in a Tauri v2 webview does
-   * NOT reliably reach the system browser, so the consent page never opened).
-   * The opener is awaited and may be async; it stays injectable so unit tests can
-   * stub it. The browser round-trip then resolves via the `oauth:complete` event
-   * or a manual `poll()`.
-   *
-   * The auth URL is captured into `authUrl` BEFORE the open is attempted and the
-   * status is moved to `awaitingCallback` (the loopback server is already
-   * listening), so even if the auto-open fails the credentials step can offer a
-   * manual "open / copy this link" fallback - a failed open is recoverable, not a
-   * dead end. An open failure records the dedicated `auth.browser_open_failed`
-   * code (the view tells the user to use the link) rather than throwing.
+   * the returned auth URL to `openUrl` (defaults to the webview `window.open`,
+   * overridable for tests). The browser round-trip then resolves via the
+   * `oauth:complete` event or a manual `poll()`.
    */
   async function connectAccount(
     clientId: string,
     clientSecret: string,
-    open: (url: string) => void | Promise<void> = defaultOpenUrl
+    openUrl: (url: string) => void = defaultOpenUrl
   ): Promise<void> {
     busy.value = true;
     errorCode.value = null;
@@ -169,43 +153,14 @@ export const useSetupStore = defineStore("setup", () => {
         await begin();
       }
       await submitCredentials(clientId, clientSecret);
-      const url = await startSignin();
-      authUrl.value = url;
+      const authUrl = await startSignin();
+      openUrl(authUrl);
       oauthStatus.value = { kind: "awaitingCallback" };
-      try {
-        await open(url);
-      } catch {
-        // The auto-open failed (no system browser, blocked, opener error). The
-        // loopback server is still listening and `authUrl` is captured, so the
-        // user can finish via the manual fallback. Surface a clear code instead
-        // of wedging on a silent "waiting" state.
-        errorCode.value = "auth.browser_open_failed";
-      }
     } catch (e) {
       errorCode.value = toErrorCode(e);
       throw e;
     } finally {
       busy.value = false;
-    }
-  }
-
-  /**
-   * Re-open (or first-open) the captured consent URL via the system browser,
-   * powering the credentials step's manual "open the sign-in page" fallback.
-   * Injectable opener (defaults to the Tauri opener plugin) so it stays testable.
-   * Clears any prior error on success; records `auth.browser_open_failed` if the
-   * open is still blocked.
-   */
-  async function openAuthUrl(
-    open: (url: string) => void | Promise<void> = defaultOpenUrl
-  ): Promise<void> {
-    const url = authUrl.value;
-    if (!url) return;
-    try {
-      await open(url);
-      errorCode.value = null;
-    } catch {
-      errorCode.value = "auth.browser_open_failed";
     }
   }
 
@@ -356,7 +311,6 @@ export const useSetupStore = defineStore("setup", () => {
     stepIndex.value = 0;
     session.value = null;
     oauthStatus.value = null;
-    authUrl.value = null;
     accountId.value = null;
     accountEmail.value = null;
     localPath.value = null;
@@ -403,7 +357,6 @@ export const useSetupStore = defineStore("setup", () => {
     step,
     session,
     oauthStatus,
-    authUrl,
     accountId,
     accountEmail,
     localPath,
@@ -434,7 +387,6 @@ export const useSetupStore = defineStore("setup", () => {
     poll,
     finish,
     connectAccount,
-    openAuthUrl,
     checkSigninComplete,
     createFirstSource,
     acknowledgePhrase,
@@ -448,14 +400,12 @@ export const useSetupStore = defineStore("setup", () => {
 });
 
 /**
- * Default browser opener. Uses the official Tauri v2 opener plugin, which opens
- * the system default browser reliably from the webview. (The previous
- * `window.open(url, "_blank")` does NOT reliably reach the system browser in a
- * Tauri v2 webview, so the OAuth consent page never opened - the sign-in bug.)
- * Awaited by callers; rejects if the open fails so they can fall back to the
- * manual link. This is the dependency the credentials step overrides in tests so
- * no real browser is opened.
+ * Default browser opener. In a Tauri webview `window.open` is intercepted and
+ * routed to the system browser; this is the dependency the credentials step
+ * overrides in tests so no real window is opened.
  */
-async function defaultOpenUrl(url: string): Promise<void> {
-  await openUrl(url);
+function defaultOpenUrl(url: string): void {
+  if (typeof window !== "undefined" && typeof window.open === "function") {
+    window.open(url, "_blank");
+  }
 }

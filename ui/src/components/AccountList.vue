@@ -17,17 +17,6 @@ const { t, locale } = useI18n();
 const accounts = useAccountsStore();
 const router = useRouter();
 
-// Shared design-system class strings (DRIVEN UI design system). Teal is the
-// accent for primary affordances; red is reserved for destructive actions.
-const primaryBtn =
-  "inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-teal-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50";
-const secondaryBtn =
-  "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
-const destructiveBtn =
-  "inline-flex items-center justify-center gap-2 rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-red-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-500 disabled:cursor-not-allowed disabled:opacity-50";
-const cardCls =
-  "rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900";
-
 // Per-row remove confirmation state: the id of the account whose remove is
 // being confirmed, plus the "delete remote too" choice for that row.
 const confirmingRemoveId = ref<string | null>(null);
@@ -129,19 +118,14 @@ function formatLastSynced(ms: number | null): string {
       <h2 class="text-lg font-medium">
         {{ t("settings.accounts.title") }}
       </h2>
-      <button
-        v-if="accounts.accounts.length > 0"
-        type="button"
-        :class="primaryBtn"
-        @click="addAccount"
-      >
+      <button type="button" class="rounded border px-3 py-1.5 text-sm" @click="addAccount">
         {{ t("settings.accounts.addButton") }}
       </button>
     </div>
 
     <div
       v-if="accounts.needsReauth.length > 0"
-      class="rounded-lg border border-amber-400 bg-amber-50 p-3 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-200"
+      class="rounded border border-amber-400 bg-amber-50 p-3 text-sm dark:bg-amber-950/40"
       data-testid="reauth-banner"
     >
       {{ t("errors.auth.invalid_grant.long") }}
@@ -157,32 +141,14 @@ function formatLastSynced(ms: number | null): string {
     <p v-else-if="accounts.error" class="text-sm text-red-600">
       {{ accounts.error }}
     </p>
-    <div
-      v-else-if="accounts.accounts.length === 0"
-      class="rounded-lg border border-dashed border-zinc-300 p-8 text-center dark:border-zinc-700"
-      data-testid="accounts-empty"
-    >
-      <p class="text-sm font-medium text-zinc-600 dark:text-zinc-300">
-        {{ t("settings.accounts.emptyTitle") }}
-      </p>
-      <p class="mt-1 text-sm text-zinc-500">
-        {{ t("settings.accounts.emptyHint") }}
-      </p>
-      <button
-        type="button"
-        class="mt-4"
-        :class="primaryBtn"
-        data-testid="accounts-empty-add"
-        @click="addAccount"
-      >
-        {{ t("settings.accounts.addButton") }}
-      </button>
-    </div>
-    <ul v-else class="space-y-2">
-      <li v-for="account in accounts.accounts" :key="account.id" class="space-y-2" :class="cardCls">
-        <div class="flex items-center justify-between gap-3">
-          <div class="min-w-0">
-            <p class="truncate text-sm font-medium">
+    <p v-else-if="accounts.accounts.length === 0" class="text-sm text-zinc-500">
+      {{ t("settings.accounts.empty") }}
+    </p>
+    <ul v-else class="divide-y">
+      <li v-for="account in accounts.accounts" :key="account.id" class="space-y-2 py-2">
+        <div class="flex items-center justify-between">
+          <div>
+            <p class="text-sm font-medium">
               {{ account.email }}
             </p>
             <p class="text-xs text-zinc-500">
@@ -192,16 +158,20 @@ function formatLastSynced(ms: number | null): string {
               {{ formatLastSynced(account.lastSyncedAt) }}
             </p>
           </div>
-          <div class="flex shrink-0 gap-2">
+          <div class="flex gap-2">
             <button
               v-if="account.state === 'needs_reauth'"
               type="button"
-              :class="primaryBtn"
+              class="rounded border px-2 py-1 text-xs"
               @click="reconnect(account.id)"
             >
               {{ t("settings.accounts.reauthButton") }}
             </button>
-            <button type="button" :class="secondaryBtn" @click="beginRemove(account.id)">
+            <button
+              type="button"
+              class="rounded border px-2 py-1 text-xs"
+              @click="beginRemove(account.id)"
+            >
               {{ t("settings.accounts.removeButton") }}
             </button>
           </div>
@@ -209,18 +179,22 @@ function formatLastSynced(ms: number | null): string {
 
         <div
           v-if="confirmingRemoveId === account.id"
-          class="space-y-2 rounded-lg border border-red-300 bg-red-50 p-3 text-sm dark:border-red-800 dark:bg-red-950/30"
+          class="space-y-2 rounded border border-red-300 bg-red-50 p-3 text-sm dark:bg-red-950/30"
           data-testid="remove-confirm"
         >
           <label class="flex items-center gap-2">
-            <input v-model="deleteRemote" type="checkbox" class="accent-teal-600" />
+            <input v-model="deleteRemote" type="checkbox" />
             {{ t("settings.accounts.deleteRemoteLabel") }}
           </label>
           <div class="flex gap-2">
-            <button type="button" :class="destructiveBtn" @click="confirmRemove(account.id)">
+            <button
+              type="button"
+              class="rounded border border-red-400 px-2 py-1 text-xs text-red-700"
+              @click="confirmRemove(account.id)"
+            >
               {{ t("settings.accounts.removeButton") }}
             </button>
-            <button type="button" :class="secondaryBtn" @click="cancelRemove">
+            <button type="button" class="rounded border px-2 py-1 text-xs" @click="cancelRemove">
               {{ t("common.cancel") }}
             </button>
           </div>

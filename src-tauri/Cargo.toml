@@ -16,18 +16,8 @@ crate-type = ["staticlib", "cdylib", "rlib"]
 tauri-build = { version = "2", features = [] }
 
 [dependencies]
-# `image-png` enables `tauri::image::Image::from_bytes`, which decodes the
-# committed brand PNG (icons/64x64.png) compiled into the binary so the tray
-# shows the real Driven road-to-cloud mark instead of a flat colour tile
-# (tray.rs `brand_base`). Without this feature `Image::from_bytes`/`from_path`
-# are not compiled in.
-tauri = { version = "2", features = ["tray-icon", "image-png"] }
+tauri = { version = "2", features = ["tray-icon"] }
 tauri-plugin-notification = "2"
-# Sign-in flow (OAuth): the setup wizard opens the Google consent URL in the
-# user's default system browser via `@tauri-apps/plugin-opener` (frontend). This
-# is the matching Rust half - registered in lib.rs and granted `opener:default`
-# in capabilities/default.json so the webview `openUrl()` call is permitted.
-tauri-plugin-opener = "2"
 # M5 plugins (SPEC s13, s14): single-instance MUST be registered first so
 # deep-link can hook its second-launch callback; autostart for login start.
 tauri-plugin-single-instance = "2"
