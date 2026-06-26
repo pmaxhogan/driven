@@ -17,15 +17,14 @@ use serde::{Deserialize, Deserializer, Serialize};
 
 use driven_core::types::AccountId;
 
-/// serde helper for an `Option<Option<T>>` patch field that must distinguish
-/// THREE inbound states (the "double option" pattern):
-///   - key ABSENT     -> `None`        ("leave unchanged"), via `#[serde(default)]`
-///   - key present `null` -> `Some(None)` ("reset to the default": auto / unlimited /
-///     cleared) - WITHOUT this helper plain serde collapses `null` to the outer
-///     `None`, so a reset was indistinguishable from "no change" and the UI could
-///     never clear these fields back to their special value (the bug this fixes).
-///   - key present value  -> `Some(Some(v))` ("set to v")
-/// Pair with `#[serde(default, deserialize_with = "double_option")]` on the field.
+/// serde helper for an `Option<Option<T>>` "double option" patch field, which
+/// must distinguish three inbound JSON states that plain serde cannot. An ABSENT
+/// key stays `None` (leave unchanged); a present `null` becomes `Some(None)`
+/// (reset to the default - auto / unlimited / cleared); a present value becomes
+/// `Some(Some(v))` (set). Without this, serde collapses `null` to the OUTER
+/// `None`, so "reset" is indistinguishable from "no change" and the UI can never
+/// clear the field back to its special value (the bug this fixes). Pair with
+/// `#[serde(default, deserialize_with = "double_option")]` on the field.
 fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
 where
     T: Deserialize<'de>,
