@@ -1,0 +1,7 @@
+# Issue template chooser configuration.
+# GitHub Issues is the source of truth for not-yet-done Driven tasks.
+blank_issues_enabled: true
+contact_links:
+  - name: Driven backlog (tracking)
+    url: https://github.com/pmaxhogan/driven/issues
+    about: Browse existing backlog issues before filing a new one to avoid duplicates.
