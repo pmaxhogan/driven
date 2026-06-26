@@ -20,6 +20,16 @@ const { t, locale } = useI18n();
 const accounts = useAccountsStore();
 const sources = useSourcesStore();
 
+// Shared design-system class strings (DRIVEN UI design system). Teal is the
+// accent for primary affordances; native controls carry explicit light/dark
+// surfaces so they stay readable on a dark-theme OS.
+const primaryBtn =
+  "inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-teal-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50";
+const secondaryBtn =
+  "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
+const inputCls =
+  "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
+
 const emit = defineEmits<{ created: [source: SourceDto] }>();
 
 // B3: a post-confirm "reveal" step is appended when an encrypted add returned a
@@ -352,17 +362,23 @@ defineExpose({ start });
 </script>
 
 <template>
-  <div v-if="open" class="fixed inset-0 flex items-center justify-center bg-black/40">
-    <div class="w-full max-w-lg space-y-4 rounded bg-white p-6 dark:bg-zinc-900">
+  <div v-if="open" class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
+    <div
+      class="w-full max-w-lg space-y-4 rounded-lg border border-zinc-200 bg-white p-6 shadow-xl dark:border-zinc-800 dark:bg-zinc-900"
+    >
       <h2 class="text-lg font-medium">
         {{ t("settings.addSource.title") }}
       </h2>
 
-      <ol class="flex flex-wrap gap-2 text-xs text-zinc-500">
+      <ol class="flex flex-wrap gap-2 text-xs">
         <li
           v-for="(s, i) in STEPS"
           :key="s"
-          :class="i === stepIndex ? 'font-medium text-zinc-900 dark:text-zinc-100' : ''"
+          :class="
+            i === stepIndex
+              ? 'font-medium text-teal-700 dark:text-teal-300'
+              : 'text-zinc-500 dark:text-zinc-400'
+          "
         >
           {{ t(`settings.addSource.step.${s}`) }}
         </li>
@@ -374,14 +390,22 @@ defineExpose({ start });
           <span class="text-zinc-600 dark:text-zinc-400">{{
             t("settings.sources.column.account")
           }}</span>
-          <select v-model="accountId" class="w-full rounded border px-2 py-1.5 text-sm">
+          <select
+            v-model="accountId"
+            class="w-full"
+            :class="inputCls"
+            :disabled="accounts.accounts.length === 0"
+          >
+            <option v-if="accounts.accounts.length === 0" value="" disabled>
+              {{ t("settings.addSource.noAccounts") }}
+            </option>
             <option v-for="account in accounts.accounts" :key="account.id" :value="account.id">
               {{ account.email }}
             </option>
           </select>
         </label>
 
-        <button type="button" class="rounded border px-3 py-1.5 text-sm" @click="chooseLocalFolder">
+        <button type="button" :class="secondaryBtn" @click="chooseLocalFolder">
           {{ t("settings.addSource.chooseLocalButton") }}
         </button>
         <p
@@ -400,7 +424,7 @@ defineExpose({ start });
             v-for="(crumb, i) in crumbs"
             :key="i"
             type="button"
-            class="rounded px-1 py-0.5 hover:underline"
+            class="rounded px-1 py-0.5 text-zinc-600 transition-colors hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500 dark:text-zinc-400 dark:hover:text-teal-300"
             @click="goToCrumb(i)"
           >
             {{ i === 0 ? t("settings.addSource.step.driveFolder") : crumb.path.split("/").pop() }}
@@ -409,11 +433,14 @@ defineExpose({ start });
         <p v-if="drivePickerLoading" class="text-sm text-zinc-500">
           {{ t("common.loading") }}
         </p>
-        <ul v-else class="max-h-56 divide-y overflow-auto rounded border">
+        <ul
+          v-else
+          class="max-h-56 divide-y divide-zinc-200 overflow-auto rounded-md border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-700"
+        >
           <li v-for="folder in driveFolders" :key="folder.id">
             <button
               type="button"
-              class="w-full px-3 py-2 text-left text-sm hover:bg-zinc-100 dark:hover:bg-zinc-800"
+              class="w-full px-3 py-2 text-left text-sm transition-colors hover:bg-teal-50 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500 dark:hover:bg-zinc-800"
               @click="descendInto(folder)"
             >
               {{ folder.name }}
@@ -428,7 +455,12 @@ defineExpose({ start });
       <!-- Step 3: exclusions preview -->
       <div v-else-if="step === 'exclusions'" class="space-y-3">
         <label class="flex items-center gap-2 text-sm">
-          <input v-model="respectGitignore" type="checkbox" @change="loadPreview" />
+          <input
+            v-model="respectGitignore"
+            type="checkbox"
+            class="accent-teal-600"
+            @change="loadPreview"
+          />
           {{ t("settings.addSource.respectGitignoreLabel") }}
         </label>
         <label class="block space-y-1 text-sm">
@@ -438,7 +470,8 @@ defineExpose({ start });
           <textarea
             v-model="includePatternsText"
             rows="2"
-            class="w-full rounded border px-2 py-1 text-sm"
+            class="w-full"
+            :class="inputCls"
             @blur="loadPreview"
           />
         </label>
@@ -449,7 +482,8 @@ defineExpose({ start });
           <textarea
             v-model="excludePatternsText"
             rows="2"
-            class="w-full rounded border px-2 py-1 text-sm"
+            class="w-full"
+            :class="inputCls"
             @blur="loadPreview"
           />
         </label>
@@ -499,7 +533,7 @@ defineExpose({ start });
       <!-- Step 4: encryption opt-in (phrase is revealed AFTER confirm, B3) -->
       <div v-else-if="step === 'encryption'" class="space-y-3">
         <label class="flex items-center gap-2 text-sm">
-          <input v-model="encryptionEnabled" type="checkbox" />
+          <input v-model="encryptionEnabled" type="checkbox" class="accent-teal-600" />
           {{ t("wizard.step4.enableLabel") }}
         </label>
         <p v-if="encryptionEnabled" class="text-xs text-amber-700 dark:text-amber-400">
@@ -540,7 +574,7 @@ defineExpose({ start });
       </p>
 
       <div class="flex justify-between gap-2">
-        <button type="button" class="rounded border px-3 py-1.5 text-sm" @click="close">
+        <button type="button" :class="secondaryBtn" @click="close">
           {{ t("common.cancel") }}
         </button>
         <div class="flex gap-2">
@@ -549,7 +583,7 @@ defineExpose({ start });
           <button
             v-if="step === 'reveal'"
             type="button"
-            class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
+            :class="primaryBtn"
             :disabled="!phraseConfirmed || !phraseRevealed"
             data-testid="reveal-done"
             @click="finishReveal"
@@ -557,18 +591,13 @@ defineExpose({ start });
             {{ t("common.done") }}
           </button>
           <template v-else>
-            <button
-              v-if="stepIndex > 0"
-              type="button"
-              class="rounded border px-3 py-1.5 text-sm"
-              @click="back"
-            >
+            <button v-if="stepIndex > 0" type="button" :class="secondaryBtn" @click="back">
               {{ t("common.back") }}
             </button>
             <button
               v-if="step !== 'confirm'"
               type="button"
-              class="rounded border px-3 py-1.5 text-sm"
+              :class="primaryBtn"
               :disabled="
                 (step === 'localFolder' && !canLeaveLocal) ||
                 (step === 'driveFolder' && !canLeaveDrive)
@@ -580,7 +609,7 @@ defineExpose({ start });
             <button
               v-else
               type="button"
-              class="rounded border px-3 py-1.5 text-sm"
+              :class="primaryBtn"
               :disabled="submitting"
               @click="confirm"
             >

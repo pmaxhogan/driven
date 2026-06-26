@@ -46,7 +46,7 @@ function close(): void {
     @click.self="close"
   >
     <div
-      class="max-h-[80vh] w-full max-w-lg overflow-y-auto rounded-lg bg-white p-6 shadow-xl dark:bg-zinc-900"
+      class="max-h-[80vh] w-full max-w-lg overflow-y-auto rounded-lg border border-zinc-200 bg-white p-6 shadow-xl dark:border-zinc-800 dark:bg-zinc-900"
     >
       <div class="mb-4 flex items-start justify-between gap-4">
         <div>
@@ -59,7 +59,7 @@ function close(): void {
         </div>
         <button
           type="button"
-          class="rounded px-2 py-1 text-sm text-zinc-500 hover:text-zinc-800 dark:hover:text-zinc-200"
+          class="rounded-md px-2 py-1 text-sm text-zinc-500 transition-colors hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:hover:text-teal-300"
           :aria-label="t('common.close')"
           @click="close"
         >

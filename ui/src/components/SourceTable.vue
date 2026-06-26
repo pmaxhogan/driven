@@ -19,6 +19,23 @@ const { t, locale } = useI18n();
 const sources = useSourcesStore();
 const accounts = useAccountsStore();
 
+// Shared design-system class strings (DRIVEN UI design system). Teal is the
+// accent for primary affordances; red is destructive; amber is the warning
+// accent for the data-safety recovery-phrase remediation action. Native controls
+// carry explicit light/dark surfaces so they stay readable on a dark-theme OS.
+const primaryBtn =
+  "inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-teal-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50";
+const secondaryBtn =
+  "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
+const destructiveBtn =
+  "inline-flex items-center justify-center gap-2 rounded-md bg-red-600 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-red-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-red-500 disabled:cursor-not-allowed disabled:opacity-50";
+const warningBtn =
+  "inline-flex items-center justify-center gap-2 rounded-md border border-amber-400 bg-amber-50 px-4 py-2 text-sm font-medium text-amber-800 transition-colors hover:bg-amber-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200 dark:hover:bg-amber-900/40";
+const inputCls =
+  "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
+const cardCls =
+  "rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900";
+
 const wizard = ref<InstanceType<typeof AddSourceWizard> | null>(null);
 
 // Inline exclusion-editor state, keyed by the source being edited.
@@ -236,7 +253,12 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
       <h2 class="text-lg font-medium">
         {{ t("settings.sources.title") }}
       </h2>
-      <button type="button" class="rounded border px-3 py-1.5 text-sm" @click="openWizard">
+      <button
+        v-if="sources.sources.length > 0"
+        type="button"
+        :class="primaryBtn"
+        @click="openWizard"
+      >
         {{ t("settings.sources.addButton") }}
       </button>
     </div>
@@ -247,44 +269,57 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
     <p v-else-if="sources.error" class="text-sm text-red-600">
       {{ sources.error }}
     </p>
-    <p v-else-if="sources.sources.length === 0" class="text-sm text-zinc-500">
-      {{ t("settings.sources.empty") }}
-    </p>
-    <table v-else class="w-full text-left text-sm">
-      <thead class="text-xs text-zinc-500">
-        <tr>
-          <th class="py-1">
-            {{ t("settings.sources.column.name") }}
-          </th>
-          <th class="py-1">
-            {{ t("settings.sources.column.enabled") }}
-          </th>
-          <th class="py-1">
-            {{ t("settings.sources.column.localPath") }}
-          </th>
-          <th class="py-1">
-            {{ t("settings.sources.column.driveDestination") }}
-          </th>
-          <th class="py-1">
-            {{ t("settings.sources.column.account") }}
-          </th>
-          <th class="py-1">
-            {{ t("settings.sources.column.encryption") }}
-          </th>
-          <th class="py-1">
-            {{ t("settings.sources.column.actions") }}
-          </th>
-        </tr>
-      </thead>
-      <tbody class="divide-y">
-        <template v-for="source in sources.sources" :key="source.id">
-          <tr>
-            <td class="py-2">
+    <div
+      v-else-if="sources.sources.length === 0"
+      class="rounded-lg border border-dashed border-zinc-300 p-8 text-center dark:border-zinc-700"
+      data-testid="sources-empty"
+    >
+      <p class="text-sm font-medium text-zinc-600 dark:text-zinc-300">
+        {{ t("settings.sources.emptyTitle") }}
+      </p>
+      <p class="mt-1 text-sm text-zinc-500">
+        {{ t("settings.sources.emptyHint") }}
+      </p>
+      <button
+        type="button"
+        class="mt-4"
+        :class="primaryBtn"
+        data-testid="sources-empty-add"
+        @click="openWizard"
+      >
+        {{ t("settings.sources.addButton") }}
+      </button>
+    </div>
+    <ul v-else class="space-y-3">
+      <li v-for="source in sources.sources" :key="source.id" class="space-y-3" :class="cardCls">
+        <div class="flex items-start justify-between gap-3">
+          <div class="min-w-0 space-y-2">
+            <p class="text-sm font-medium">
               {{ source.displayName }}
-            </td>
-            <td class="py-2">
+            </p>
+            <dl class="grid grid-cols-[auto,1fr] gap-x-3 gap-y-1 text-xs">
+              <dt class="text-zinc-500">{{ t("settings.sources.column.localPath") }}</dt>
+              <dd class="break-all text-zinc-700 dark:text-zinc-300">{{ source.localPath }}</dd>
+              <dt class="text-zinc-500">{{ t("settings.sources.column.driveDestination") }}</dt>
+              <dd class="break-all text-zinc-700 dark:text-zinc-300">
+                {{ source.driveFolderPath }}
+              </dd>
+              <dt class="text-zinc-500">{{ t("settings.sources.column.account") }}</dt>
+              <dd class="break-all text-zinc-700 dark:text-zinc-300">
+                {{ accountEmailById[source.accountId] ?? source.accountId }}
+              </dd>
+              <dt class="text-zinc-500">{{ t("settings.sources.column.encryption") }}</dt>
+              <dd class="text-zinc-700 dark:text-zinc-300">
+                {{ source.encryptionEnabled ? t("common.yes") : t("common.no") }}
+              </dd>
+            </dl>
+          </div>
+          <div class="flex shrink-0 flex-col items-end gap-1">
+            <label class="flex items-center gap-2 text-xs text-zinc-600 dark:text-zinc-400">
+              {{ t("settings.sources.column.enabled") }}
               <input
                 type="checkbox"
+                class="accent-teal-600"
                 :checked="source.enabled"
                 :disabled="source.pendingRecoveryAck"
                 :aria-label="t('settings.sources.column.enabled')"
@@ -295,212 +330,168 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
                 "
                 @change="toggleEnabled(source)"
               />
-              <span
-                v-if="source.pendingRecoveryAck"
-                class="ml-2 text-xs text-amber-600 dark:text-amber-500"
-                data-testid="pending-recovery-ack-badge"
-              >
-                {{ t("settings.sources.pendingRecoveryAckBadge") }}
-              </span>
-            </td>
-            <td class="break-all py-2">
-              {{ source.localPath }}
-            </td>
-            <td class="break-all py-2">
-              {{ source.driveFolderPath }}
-            </td>
-            <td class="break-all py-2">
-              {{ accountEmailById[source.accountId] ?? source.accountId }}
-            </td>
-            <td class="py-2">
-              {{ source.encryptionEnabled ? t("common.yes") : t("common.no") }}
-            </td>
-            <td class="py-2">
-              <div class="flex flex-wrap gap-1">
-                <button
-                  v-if="source.pendingRecoveryAck"
-                  type="button"
-                  class="rounded border border-amber-400 px-2 py-1 text-xs text-amber-700 dark:text-amber-400"
-                  data-testid="reveal-ack-button"
-                  @click="beginRevealAck(source)"
-                >
-                  {{ t("settings.sources.revealAckButton") }}
-                </button>
-                <button
-                  type="button"
-                  class="rounded border px-2 py-1 text-xs"
-                  @click="beginEditExclusions(source)"
-                >
-                  {{ t("settings.sources.editExclusionsButton") }}
-                </button>
-                <button
-                  type="button"
-                  class="rounded border px-2 py-1 text-xs"
-                  @click="runNow(source)"
-                >
-                  {{ t("settings.sources.runNowButton") }}
-                </button>
-                <button
-                  type="button"
-                  class="rounded border px-2 py-1 text-xs"
-                  @click="beginRemove(source.id)"
-                >
-                  {{ t("settings.sources.removeButton") }}
-                </button>
-              </div>
-            </td>
-          </tr>
+            </label>
+            <span
+              v-if="source.pendingRecoveryAck"
+              class="rounded bg-amber-100 px-2 py-0.5 text-xs font-medium text-amber-800 dark:bg-amber-950/50 dark:text-amber-300"
+              data-testid="pending-recovery-ack-badge"
+            >
+              {{ t("settings.sources.pendingRecoveryAckBadge") }}
+            </span>
+          </div>
+        </div>
 
-          <tr v-if="editingId === source.id">
-            <td colspan="7" class="py-2">
-              <div class="space-y-2 rounded border p-3" data-testid="exclusion-editor">
-                <label class="flex items-center gap-2 text-sm">
-                  <input
-                    v-model="editRespectGitignore"
-                    type="checkbox"
-                    @change="loadEditPreview(source)"
-                  />
-                  {{ t("settings.addSource.respectGitignoreLabel") }}
-                </label>
-                <label class="block space-y-1 text-sm">
-                  <span class="text-zinc-600 dark:text-zinc-400">{{
-                    t("settings.addSource.includePatternsLabel")
-                  }}</span>
-                  <textarea
-                    v-model="editIncludeText"
-                    rows="2"
-                    class="w-full rounded border px-2 py-1 text-sm"
-                    @blur="loadEditPreview(source)"
-                  />
-                </label>
-                <label class="block space-y-1 text-sm">
-                  <span class="text-zinc-600 dark:text-zinc-400">{{
-                    t("settings.addSource.excludePatternsLabel")
-                  }}</span>
-                  <textarea
-                    v-model="editExcludeText"
-                    rows="2"
-                    class="w-full rounded border px-2 py-1 text-sm"
-                    @blur="loadEditPreview(source)"
-                  />
-                </label>
-                <p v-if="editPreviewLoading" class="text-sm text-zinc-500">
-                  {{ t("common.loading") }}
-                </p>
-                <p v-else-if="editPreview" class="text-sm">
-                  {{
-                    t("settings.addSource.preview.included", {
-                      count: numberFormatter.format(editPreview.includedCount),
-                    })
-                  }}
-                  -
-                  {{
-                    t("settings.addSource.preview.excluded", {
-                      count: numberFormatter.format(editPreview.excludedCount),
-                    })
-                  }}
-                </p>
-                <div class="flex gap-2">
-                  <button
-                    type="button"
-                    class="rounded border px-3 py-1.5 text-sm"
-                    :disabled="savingEdit"
-                    @click="saveEdit(source)"
-                  >
-                    {{ t("common.save") }}
-                  </button>
-                  <button
-                    type="button"
-                    class="rounded border px-3 py-1.5 text-sm"
-                    @click="cancelEdit"
-                  >
-                    {{ t("common.cancel") }}
-                  </button>
-                </div>
-              </div>
-            </td>
-          </tr>
+        <div class="flex flex-wrap gap-2">
+          <button
+            v-if="source.pendingRecoveryAck"
+            type="button"
+            :class="warningBtn"
+            data-testid="reveal-ack-button"
+            @click="beginRevealAck(source)"
+          >
+            {{ t("settings.sources.revealAckButton") }}
+          </button>
+          <button type="button" :class="secondaryBtn" @click="beginEditExclusions(source)">
+            {{ t("settings.sources.editExclusionsButton") }}
+          </button>
+          <button type="button" :class="secondaryBtn" @click="runNow(source)">
+            {{ t("settings.sources.runNowButton") }}
+          </button>
+          <button type="button" :class="secondaryBtn" @click="beginRemove(source.id)">
+            {{ t("settings.sources.removeButton") }}
+          </button>
+        </div>
 
-          <tr v-if="revealingId === source.id">
-            <td colspan="7" class="py-2">
-              <div
-                class="space-y-2 rounded border border-amber-300 bg-amber-50 p-3 text-sm dark:bg-amber-950/30"
-                data-testid="reveal-ack-panel"
-              >
-                <p class="text-amber-700 dark:text-amber-400">
-                  {{ t("settings.sources.revealAckIntro") }}
-                </p>
-                <RecoveryPhraseReveal
-                  v-model:confirmed="revealConfirmed"
-                  :phrase="revealPhrase"
-                  :reveal-action="revealPhraseAction"
-                  @update:revealed="onRevealShown"
-                  @reveal-error="onRevealError"
-                />
-                <p v-if="revealErrorCode" class="text-red-600">
-                  {{ t(`errors.${revealErrorCode}.long`) }}
-                </p>
-                <div class="flex gap-2">
-                  <button
-                    type="button"
-                    class="rounded border border-amber-400 px-2 py-1 text-xs text-amber-700 disabled:opacity-50 dark:text-amber-400"
-                    :disabled="!revealConfirmed || !revealEverShown || revealAcking"
-                    data-testid="reveal-ack-confirm"
-                    @click="confirmRevealAck(source.id)"
-                  >
-                    {{ t("settings.sources.revealAckConfirmButton") }}
-                  </button>
-                  <button
-                    type="button"
-                    class="rounded border px-2 py-1 text-xs"
-                    @click="cancelRevealAck"
-                  >
-                    {{ t("common.cancel") }}
-                  </button>
-                </div>
-              </div>
-            </td>
-          </tr>
+        <div
+          v-if="editingId === source.id"
+          class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-700"
+          data-testid="exclusion-editor"
+        >
+          <label class="flex items-center gap-2 text-sm">
+            <input
+              v-model="editRespectGitignore"
+              type="checkbox"
+              class="accent-teal-600"
+              @change="loadEditPreview(source)"
+            />
+            {{ t("settings.addSource.respectGitignoreLabel") }}
+          </label>
+          <label class="block space-y-1 text-sm">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.addSource.includePatternsLabel")
+            }}</span>
+            <textarea
+              v-model="editIncludeText"
+              rows="2"
+              class="w-full"
+              :class="inputCls"
+              @blur="loadEditPreview(source)"
+            />
+          </label>
+          <label class="block space-y-1 text-sm">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.addSource.excludePatternsLabel")
+            }}</span>
+            <textarea
+              v-model="editExcludeText"
+              rows="2"
+              class="w-full"
+              :class="inputCls"
+              @blur="loadEditPreview(source)"
+            />
+          </label>
+          <p v-if="editPreviewLoading" class="text-sm text-zinc-500">
+            {{ t("common.loading") }}
+          </p>
+          <p v-else-if="editPreview" class="text-sm">
+            {{
+              t("settings.addSource.preview.included", {
+                count: numberFormatter.format(editPreview.includedCount),
+              })
+            }}
+            -
+            {{
+              t("settings.addSource.preview.excluded", {
+                count: numberFormatter.format(editPreview.excludedCount),
+              })
+            }}
+          </p>
+          <div class="flex gap-2">
+            <button
+              type="button"
+              :class="primaryBtn"
+              :disabled="savingEdit"
+              @click="saveEdit(source)"
+            >
+              {{ t("common.save") }}
+            </button>
+            <button type="button" :class="secondaryBtn" @click="cancelEdit">
+              {{ t("common.cancel") }}
+            </button>
+          </div>
+        </div>
 
-          <tr v-if="confirmingRemoveId === source.id">
-            <td colspan="7" class="py-2">
-              <div
-                class="space-y-2 rounded border border-red-300 bg-red-50 p-3 text-sm dark:bg-red-950/30"
-                data-testid="source-remove-confirm"
-              >
-                <p
-                  v-if="source.pendingRecoveryAck"
-                  class="text-red-700 dark:text-red-400"
-                  data-testid="pending-remove-warning"
-                >
-                  {{ t("settings.sources.pendingRemoveWarning") }}
-                </p>
-                <label class="flex items-center gap-2">
-                  <input v-model="deleteRemote" type="checkbox" />
-                  {{ t("settings.sources.deleteRemoteLabel") }}
-                </label>
-                <div class="flex gap-2">
-                  <button
-                    type="button"
-                    class="rounded border border-red-400 px-2 py-1 text-xs text-red-700"
-                    @click="confirmRemove(source.id)"
-                  >
-                    {{ t("settings.sources.removeButton") }}
-                  </button>
-                  <button
-                    type="button"
-                    class="rounded border px-2 py-1 text-xs"
-                    @click="cancelRemove"
-                  >
-                    {{ t("common.cancel") }}
-                  </button>
-                </div>
-              </div>
-            </td>
-          </tr>
-        </template>
-      </tbody>
-    </table>
+        <div
+          v-if="revealingId === source.id"
+          class="space-y-2 rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800 dark:bg-amber-950/30"
+          data-testid="reveal-ack-panel"
+        >
+          <p class="text-amber-700 dark:text-amber-300">
+            {{ t("settings.sources.revealAckIntro") }}
+          </p>
+          <RecoveryPhraseReveal
+            v-model:confirmed="revealConfirmed"
+            :phrase="revealPhrase"
+            :reveal-action="revealPhraseAction"
+            @update:revealed="onRevealShown"
+            @reveal-error="onRevealError"
+          />
+          <p v-if="revealErrorCode" class="text-red-600">
+            {{ t(`errors.${revealErrorCode}.long`) }}
+          </p>
+          <div class="flex gap-2">
+            <button
+              type="button"
+              :class="primaryBtn"
+              :disabled="!revealConfirmed || !revealEverShown || revealAcking"
+              data-testid="reveal-ack-confirm"
+              @click="confirmRevealAck(source.id)"
+            >
+              {{ t("settings.sources.revealAckConfirmButton") }}
+            </button>
+            <button type="button" :class="secondaryBtn" @click="cancelRevealAck">
+              {{ t("common.cancel") }}
+            </button>
+          </div>
+        </div>
+
+        <div
+          v-if="confirmingRemoveId === source.id"
+          class="space-y-2 rounded-lg border border-red-300 bg-red-50 p-3 text-sm dark:border-red-800 dark:bg-red-950/30"
+          data-testid="source-remove-confirm"
+        >
+          <p
+            v-if="source.pendingRecoveryAck"
+            class="text-red-700 dark:text-red-400"
+            data-testid="pending-remove-warning"
+          >
+            {{ t("settings.sources.pendingRemoveWarning") }}
+          </p>
+          <label class="flex items-center gap-2">
+            <input v-model="deleteRemote" type="checkbox" class="accent-teal-600" />
+            {{ t("settings.sources.deleteRemoteLabel") }}
+          </label>
+          <div class="flex gap-2">
+            <button type="button" :class="destructiveBtn" @click="confirmRemove(source.id)">
+              {{ t("settings.sources.removeButton") }}
+            </button>
+            <button type="button" :class="secondaryBtn" @click="cancelRemove">
+              {{ t("common.cancel") }}
+            </button>
+          </div>
+        </div>
+      </li>
+    </ul>
 
     <AddSourceWizard ref="wizard" @created="sources.refresh()" />
   </div>
