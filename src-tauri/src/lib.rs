@@ -117,9 +117,9 @@ fn apply_dark_titlebar(window: &tauri::WebviewWindow) {
     let caption: u32 = 0x000b_0909; // #09090b (zinc-950) - the app's dark surface
     let border: u32 = 0x0046_3f3f; // #3f3f46 (zinc-700) - a subtle neutral edge
     let dark: i32 = 1; // BOOL TRUE -> light caption text + window buttons
-    // SAFETY: hwnd is a live top-level window handle for the duration of the call;
-    // each pointer references a stack value valid across the synchronous call.
     unsafe {
+        // SAFETY: hwnd is a live top-level window handle for the duration of the
+        // call; each pointer references a stack value valid across the call.
         DwmSetWindowAttribute(
             hwnd,
             DWMWA_USE_IMMERSIVE_DARK_MODE,
