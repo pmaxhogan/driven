@@ -188,6 +188,28 @@ describe("floor-dev-channel.mjs floorChannel", () => {
     expect(await readVersion(root, "dev", "linux/x86_64")).toBe("0.2.1-dev.5.abc");
     await fs.rm(root, { recursive: true, force: true });
   });
+
+  it("refuses to propagate a malformed stable manifest (version but no platforms) into dev", async () => {
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "floor-"));
+    const plat = "windows/x86_64";
+    const dir = path.join(root, "stable", plat);
+    await fs.mkdir(dir, { recursive: true });
+    // A stable manifest with a valid version but NO platforms - would pass a
+    // version-only check and be copied blindly without the shape guard.
+    await fs.writeFile(path.join(dir, "update.json"), JSON.stringify({ version: "0.2.0" }), "utf8");
+    await writeManifest(root, "dev", plat, "0.1.1-dev.24.ac5e487");
+    await expect(
+      mod.floorChannel({
+        stableDir: path.join(root, "stable"),
+        devDir: path.join(root, "dev"),
+        platforms: [plat],
+        log: silent,
+      })
+    ).rejects.toThrow(/no platforms/);
+    // The dev manifest is left untouched (not overwritten with the bad stable one).
+    expect(await readVersion(root, "dev", plat)).toBe("0.1.1-dev.24.ac5e487");
+    await fs.rm(root, { recursive: true, force: true });
+  });
 });
 
 describe("floor-dev-channel.mjs assertFloored", () => {

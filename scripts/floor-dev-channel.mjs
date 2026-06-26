@@ -130,6 +130,38 @@ async function readManifestVersion(file) {
   return obj.version;
 }
 
+/** Assert a parsed manifest carries the fields the updater needs - a non-empty
+ * `platforms` map whose every entry has a non-empty `signature` + `url`. Guards
+ * the copy paths so a malformed STABLE manifest (e.g. a corrupt live fetch) is
+ * never propagated into the dev channel; a manifest carrying only a valid
+ * `version` would otherwise pass the version check and be copied blindly. */
+function assertServeable(obj, file) {
+  const plats = obj && obj.platforms;
+  if (!plats || typeof plats !== "object" || Object.keys(plats).length === 0) {
+    throw new Error(`manifest ${file} has no platforms`);
+  }
+  for (const [key, entry] of Object.entries(plats)) {
+    if (!entry || typeof entry.url !== "string" || entry.url.length === 0) {
+      throw new Error(`manifest ${file} platform ${key} has no url`);
+    }
+    if (typeof entry.signature !== "string" || entry.signature.length === 0) {
+      throw new Error(`manifest ${file} platform ${key} has no signature`);
+    }
+  }
+}
+
+/** Read a STABLE manifest about to be copied into the dev channel, validating
+ * both its version AND its serveable shape. Returns its version. */
+async function readServeableStableVersion(file) {
+  const raw = await fs.readFile(file, "utf8");
+  const obj = JSON.parse(raw);
+  if (typeof obj.version !== "string" || obj.version.length === 0) {
+    throw new Error(`manifest ${file} has no version string`);
+  }
+  assertServeable(obj, file);
+  return obj.version;
+}
+
 /** Floor the dev channel to stable across `platforms`, operating on LOCAL files.
  *
  * Per target:
@@ -153,7 +185,9 @@ export async function floorChannel({ stableDir, devDir, platforms = V1_PLATFORMS
       log.warn?.(`no stable manifest for ${plat}; leaving dev as-is`);
       continue;
     }
-    const stableVersion = await readManifestVersion(stableFile);
+    // Validate the stable manifest's serveable shape BEFORE any copy below, so a
+    // malformed stable manifest is never seeded/floored into the dev channel.
+    const stableVersion = await readServeableStableVersion(stableFile);
     if (!(await pathExists(devFile))) {
       await fs.mkdir(path.dirname(devFile), { recursive: true });
       await fs.copyFile(stableFile, devFile);

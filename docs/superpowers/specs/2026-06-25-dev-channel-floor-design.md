@@ -79,16 +79,16 @@ the three workflows gets one added step:
 ```
 node scripts/floor-dev-channel.mjs \
   --stable-dir site/updates/stable \
-  --dev-dir    site/updates/dev \
-  [--stable-version <known stable version>]   # release.yml passes it; the
-                                              # others read it from the local
-                                              # stable manifest tree
+  --dev-dir    site/updates/dev
 ```
 
-`dev-channel.yml` and `deploy-landing.yml` do not generate stable manifests, so
-they rely on the **overlaid live stable** tree (`fetch-live-channel.sh stable`)
-as the floor reference; `release.yml` has freshly generated stable manifests.
-In all three, the floor compares per target and acts on the **local** tree about
+All three workflows pass the SAME invocation: the floor reads each target's
+stable version straight from `--stable-dir` (the local stable tree), so no
+`--stable-version` flag is needed. `release.yml` has freshly generated stable
+manifests there; `dev-channel.yml` and `deploy-landing.yml` do not generate
+stable manifests, so their `--stable-dir` is the **overlaid live stable** tree
+(`fetch-live-channel.sh stable`). In all three, the floor compares per target
+and acts on the **local** tree about
 to be deployed.
 
 For each of the four GA targets (`windows/x86_64`, `darwin/x86_64`,
@@ -144,16 +144,19 @@ Pure-Node, no network, mirroring the tested-helper style of
   files only. Reads each `devDir/<plat>/update.json` and
   `stableDir/<plat>/update.json`, compares versions, copies the stable manifest
   verbatim into the dev path when stable is newer or dev is missing.
+  The copy paths validate the stable manifest's serveable shape (non-empty
+  `platforms` with `url` + `signature`) before copying, so a malformed stable
+  manifest is never propagated into dev.
 - `assertFloored({ stableDir, devDir, platforms })` - the hard gate: throws if
   any target has dev `<` stable after flooring.
-- CLI entry parsing `--stable-dir`, `--dev-dir`, optional `--stable-version`
-  (release path) and `--platforms`, wired into all three workflows.
+- CLI entry parsing `--stable-dir`, `--dev-dir`, `--platforms`, and a
+  `--ge <a> <b>` compare mode (exit 0 if `a >= b` by precedence, used by the
+  release smoke). Wired into all three workflows.
 
 ### Changed: `.github/workflows/release.yml`
 
 1. Add the `floor-dev-channel.mjs` step after `Overlay live dev manifests` and
-   before the Cloudflare Pages deploy (passing the freshly-built
-   `--stable-version`).
+   before the Cloudflare Pages deploy.
 2. Extend the post-deploy stable smoke to also assert each deployed
    `dev/<plat>` version is `>=` stable (secondary check, existing retry).
 
@@ -176,8 +179,10 @@ The macOS manual-download link (`macDownloadUrl`) currently keys off
 build (clean version, assets on the stable tag), so the dev-tag link would send
 them to the rolling dev release page that lacks those assets. Fix: derive the
 link from the **offered version shape** - a prerelease (`-dev`) offer keeps the
-`/releases/tag/dev` link; a clean-release offer (the floored case) links to that
-release (`/releases/tag/v<version>`, falling back to `/releases/latest`). This
+`/releases/tag/dev` link; any clean-release offer (the floored case) links to
+`/releases/latest`. `/releases/latest` (rather than `/releases/tag/v<version>`)
+is intentional: it is always the current stable release, matches the existing
+stable-channel link behavior, and never points at a since-superseded tag. This
 makes the floored update actually obtainable on macOS, where in-app install is
 disabled.
 
@@ -195,7 +200,9 @@ tests:
 - `assertFloored`: passes when all dev >= stable; throws naming the offending
   target when one is below.
 - `About.vue` `macDownloadUrl`: a `-dev` offer -> `/tag/dev`; a clean-release
-  offer -> `/tag/v<version>`; no offer -> `/latest`.
+  offer (incl. a floored dev offer) -> `/releases/latest`.
+- `floorChannel` also refuses to propagate a malformed stable manifest (valid
+  version but no `platforms`) into dev.
 
 ## Out of scope (YAGNI)
 
