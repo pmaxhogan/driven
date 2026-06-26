@@ -8,7 +8,11 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Only cancel a SUPERSEDED PR run (newer commit on the same PR). NEVER cancel a
+  # push-to-main run: main is the ONLY branch that writes the shared rust-cache
+  # (see save-if below), so a cancelled main run leaves the cache cold/stale and
+  # every later PR pays a full rebuild. Matches coverage.yml's reasoning.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -46,6 +50,18 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Share ONE dependency cache (per-OS) across the jobs that compile the
+          # workspace in the normal dev profile: this rust-test job plus the two
+          # chaos jobs. `--workspace --all-targets` here is the superset build, so
+          # whichever runs first on main warms a cache the others reuse, instead of
+          # each job hoarding its own ~0.8 GiB copy.
+          shared-key: "workspace"
+          # Only `main` writes caches; PRs are restore-only. A PR-event cache is
+          # scoped to that PR's ref and can't be read by main or other PRs, so
+          # saving it just burns the repo cache budget and evicts the reusable
+          # main caches. PRs still RESTORE the main cache normally.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cargo build (compile-only)
         run: cargo build --workspace --all-targets
       - name: cargo clippy
@@ -113,6 +129,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
         with:
           prefix-key: "v1-rust"
+          # Restore-only on PRs; only main warms this cache (see rust-test above).
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: pnpm install
         working-directory: ui
         run: pnpm install --frozen-lockfile

@@ -38,7 +38,10 @@ on:
 
 concurrency:
   group: ${{ github.workflow }}-${{ github.ref }}
-  cancel-in-progress: true
+  # Cancel only superseded PR runs. Never cancel a push to main (warms the shared
+  # rust-cache) or a `v*` tag push (the release-gate 3-OS run). Matches ci.yml /
+  # coverage.yml.
+  cancel-in-progress: ${{ github.event_name == 'pull_request' }}
 
 env:
   CARGO_TERM_COLOR: always
@@ -70,6 +73,12 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Same dependency cache as ci.yml's rust-test (per-OS). chaos builds a
+          # subset of the workspace, so it reuses the rust-test-warmed cache.
+          shared-key: "workspace"
+          # Restore-only on PRs; only main (and not `v*` tags) writes the cache.
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # run-all capability-gates every scenario: on a stock non-elevated runner
       # the admin / real-Drive rows SKIP (recorded, never red); the rest run
       # against the headless core + InMemoryRemoteStore.
@@ -98,6 +107,9 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
       - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: chaos run-all (fault-injection)
         run: cargo run -p driven-chaos -- run-all --fault-injection
 
@@ -131,6 +143,12 @@ jobs:
           sudo apt-get update
           sudo apt-get install -y libssl-dev
       - uses: Swatinem/rust-cache@v2
+        with:
+          # Builds driven-drive's test target - a subset of the workspace - so it
+          # restores the same per-OS `workspace` cache. This job only runs on `v*`
+          # tags (save-if false there), so it is purely restore-only.
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
       # Real Drive round-trip against a throwaway UUID folder under the dest
       # folder. Gate-skips cleanly (Ok, never red) when the creds are absent.
       - name: real-drive e2e (google_e2e)
