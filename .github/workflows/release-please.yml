@@ -24,11 +24,15 @@ jobs:
     steps:
       - uses: googleapis/release-please-action@v5
         with:
-          # Prefer a PAT / App token (RELEASE_PLEASE_TOKEN) so the release PR is
-          # authored by a real identity and its CI runs WITHOUT the manual
-          # "approve workflows" gate GitHub forces on GITHUB_TOKEN-created PRs.
-          # Falls back to GITHUB_TOKEN when the secret is absent (current
-          # behaviour, approval still required) so the workflow never breaks.
+          # RELEASE_PLEASE_TOKEN (a PAT / App token) IS configured, so the
+          # release PR is authored by a real identity. This matters beyond the
+          # manual "approve workflows" gate: GitHub's recursion guard suppresses
+          # `pull_request` workflows on GITHUB_TOKEN-created PRs, so without the
+          # PAT the required "Validate PR title" check (and the rest of CI)
+          # would never run on the release PR and it could only merge via the
+          # ruleset admin bypass. Falls back to GITHUB_TOKEN if the secret is
+          # ever removed (degraded: release-PR checks won't run) so the workflow
+          # never hard-breaks.
           token: ${{ secrets.RELEASE_PLEASE_TOKEN || secrets.GITHUB_TOKEN }}
           config-file: release-please-config.json
           manifest-file: .release-please-manifest.json
