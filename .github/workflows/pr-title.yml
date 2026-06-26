@@ -1,0 +1,55 @@
+name: PR Title
+
+# This repo squash-merges, and the squash commit subject is the PR title
+# (repo setting: "Pull request title and description"). release-please parses
+# that subject as a Conventional Commit to build the CHANGELOG and choose the
+# version bump - a non-conventional title is silently dropped from the
+# changelog (this is what happened to #37: subject "Comprehensive UI/UX
+# overhaul ..." failed release-please's parser with a non-fatal
+# "commit could not be parsed" warning, so it never reached the 0.3.0 notes).
+#
+# This check fails the PR when its title is not a valid Conventional Commit.
+# Adding the "Validate PR title" context to the "main protection" ruleset's
+# required status checks makes a bad title block the merge.
+
+on:
+  pull_request:
+    # `edited` is load-bearing: it re-runs the check when the title is fixed,
+    # so a corrected title clears the red X without any other push.
+    types: [opened, edited, synchronize, reopened]
+
+permissions:
+  pull-requests: read
+
+concurrency:
+  group: pr-title-${{ github.event.pull_request.number }}
+  cancel-in-progress: true
+
+jobs:
+  validate:
+    name: Validate PR title
+    runs-on: ubuntu-latest
+    steps:
+      - uses: amannn/action-semantic-pull-request@v5
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        with:
+          # Keep in sync with the Conventional Commit types release-please
+          # understands (release-please-config.json, release-type "simple").
+          types: |
+            feat
+            fix
+            perf
+            refactor
+            docs
+            test
+            build
+            ci
+            chore
+            style
+            revert
+          # Scope is optional (e.g. `feat(core):` and `feat:` both pass).
+          requireScope: false
+          # The subject after the colon may use any case so proper nouns
+          # (OAuth, CLI, macOS) are not flagged; only the type prefix is
+          # mandatory. Default rules still reject an empty subject.
