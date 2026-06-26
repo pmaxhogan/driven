@@ -18,6 +18,19 @@ const { t, te, locale } = useI18n();
 const activity = useActivityStore();
 const sources = useSourcesStore();
 
+// Design-system class strings (DRIVEN UI). Defined once so every control in this
+// view stays visually consistent with the rest of the app: teal accent, dark-mode
+// readable surfaces, teal focus rings. The exact strings are shared verbatim
+// across slices so all views match.
+const CARD =
+  "rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900";
+const STAT_TILE =
+  "rounded-lg border border-zinc-200 bg-white p-3 shadow-sm dark:border-zinc-800 dark:bg-zinc-900";
+const SELECT_INPUT =
+  "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
+const SECONDARY_BTN =
+  "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
+
 // Filter form state (bound to the controls; applied via the store on change).
 const filterSourceId = ref<string>("");
 const filterLevel = ref<string>("");
@@ -79,6 +92,13 @@ function statusLabel(status: FileStateStatus): string {
 // history but not in the currently-loaded rows - the loaded-rows-only derivation
 // made the backend event-type filter unreachable for older types.
 const eventTypeOptions = computed<string[]>(() => activity.eventTypeOptions);
+
+// Empty-dropdown guards: a filter <select> with zero real options renders a
+// disabled, self-explaining placeholder instead of a blank/confusing control,
+// and the <select> itself is disabled. The source list comes from Settings; the
+// event-type facets come from the backend's DISTINCT query over the log.
+const hasSources = computed(() => sources.sources.length > 0);
+const hasEventTypes = computed(() => eventTypeOptions.value.length > 0);
 
 const sourceNameById = computed<Record<string, string>>(() => {
   const map: Record<string, string> = {};
@@ -183,7 +203,7 @@ onUnmounted(() => {
 
 <template>
   <section class="space-y-4">
-    <header class="space-y-1">
+    <header class="space-y-3">
       <div class="flex items-start justify-between gap-3">
         <div class="space-y-1">
           <h1 class="text-2xl font-semibold">
@@ -195,7 +215,8 @@ onUnmounted(() => {
         </div>
         <button
           type="button"
-          class="shrink-0 rounded border px-3 py-1.5 text-sm"
+          class="shrink-0"
+          :class="SECONDARY_BTN"
           :disabled="exporting"
           data-testid="activity-export-bundle"
           @click="exportBundle"
@@ -203,49 +224,53 @@ onUnmounted(() => {
           {{ exporting ? t("activity.exporting") : t("activity.exportBundleButton") }}
         </button>
       </div>
-      <p v-if="exportErrorCode" class="text-sm text-red-600" data-testid="activity-export-error">
+      <p
+        v-if="exportErrorCode"
+        class="text-sm text-red-600 dark:text-red-400"
+        data-testid="activity-export-error"
+      >
         {{ t(`errors.${exportErrorCode}.long`) }}
       </p>
-      <p v-else-if="exportedPath" class="text-sm text-green-700 dark:text-green-400">
+      <p v-else-if="exportedPath" class="text-sm text-emerald-700 dark:text-emerald-400">
         {{ t("activity.exportedTo", { path: exportedPath }) }}
       </p>
 
       <!-- M7-P2-5 (DESIGN s8.3): header aggregate stats. -->
       <dl
         v-if="activity.summary"
-        class="grid grid-cols-2 gap-3 pt-2 sm:grid-cols-4"
+        class="grid grid-cols-2 gap-3 sm:grid-cols-4"
         data-testid="activity-summary"
       >
-        <div class="rounded border p-3">
-          <dt class="text-xs text-zinc-500">
+        <div :class="STAT_TILE">
+          <dt class="text-xs text-zinc-500 dark:text-zinc-400">
             {{ t("activity.summary.bytesToday") }}
           </dt>
-          <dd class="text-lg font-semibold">
+          <dd class="mt-1 text-lg font-semibold">
             {{ bytesToday }}
           </dd>
         </div>
-        <div class="rounded border p-3">
-          <dt class="text-xs text-zinc-500">
+        <div :class="STAT_TILE">
+          <dt class="text-xs text-zinc-500 dark:text-zinc-400">
             {{ t("activity.summary.bytesWeek") }}
           </dt>
-          <dd class="text-lg font-semibold">
+          <dd class="mt-1 text-lg font-semibold">
             {{ bytesWeek }}
           </dd>
         </div>
-        <div class="rounded border p-3">
-          <dt class="text-xs text-zinc-500">
+        <div :class="STAT_TILE">
+          <dt class="text-xs text-zinc-500 dark:text-zinc-400">
             {{ t("activity.summary.throughput") }}
           </dt>
-          <dd class="text-lg font-semibold">
+          <dd class="mt-1 text-lg font-semibold">
             {{ t("activity.summary.perSecond", { rate: throughput }) }}
           </dd>
         </div>
-        <div class="rounded border p-3">
-          <dt class="text-xs text-zinc-500">
+        <div :class="STAT_TILE">
+          <dt class="text-xs text-zinc-500 dark:text-zinc-400">
             {{ t("activity.summary.byStatus") }}
           </dt>
-          <dd class="text-sm">
-            <span v-if="statusCounts.length === 0" class="text-zinc-400">
+          <dd class="mt-1 text-sm">
+            <span v-if="statusCounts.length === 0" class="text-zinc-400 dark:text-zinc-500">
               {{ t("activity.summary.noFiles") }}
             </span>
             <span
@@ -261,71 +286,107 @@ onUnmounted(() => {
       </dl>
     </header>
 
-    <div class="flex flex-wrap items-end gap-3 rounded border p-3" data-testid="activity-filters">
-      <label class="block space-y-1 text-sm">
-        <span class="text-zinc-600 dark:text-zinc-400">{{ t("activity.filters.source") }}</span>
-        <select
-          v-model="filterSourceId"
-          class="block rounded border px-2 py-1 text-sm"
-          @change="applyFilters"
-        >
-          <option value="">
-            {{ t("activity.filters.allSources") }}
-          </option>
-          <option v-for="s in sources.sources" :key="s.id" :value="s.id">
-            {{ s.displayName }}
-          </option>
-        </select>
-      </label>
+    <div :class="CARD" data-testid="activity-filters">
+      <h2 class="mb-3 text-sm font-semibold text-zinc-700 dark:text-zinc-300">
+        {{ t("activity.filters.title") }}
+      </h2>
+      <div class="flex flex-wrap items-end gap-3">
+        <label class="block space-y-1 text-sm">
+          <span class="text-zinc-600 dark:text-zinc-400">{{ t("activity.filters.source") }}</span>
+          <select
+            v-model="filterSourceId"
+            class="block w-full"
+            :class="SELECT_INPUT"
+            :disabled="!hasSources"
+            :aria-label="t('activity.filters.source')"
+            data-testid="activity-filter-source"
+            @change="applyFilters"
+          >
+            <template v-if="hasSources">
+              <option value="">
+                {{ t("activity.filters.allSources") }}
+              </option>
+              <option v-for="s in sources.sources" :key="s.id" :value="s.id">
+                {{ s.displayName }}
+              </option>
+            </template>
+            <option v-else value="" disabled>
+              {{ t("activity.filters.noSourcesYet") }}
+            </option>
+          </select>
+        </label>
 
-      <label class="block space-y-1 text-sm">
-        <span class="text-zinc-600 dark:text-zinc-400">{{ t("activity.filters.level") }}</span>
-        <select
-          v-model="filterLevel"
-          class="block rounded border px-2 py-1 text-sm"
-          @change="applyFilters"
-        >
-          <option value="">
-            {{ t("activity.filters.allLevels") }}
-          </option>
-          <option value="info">
-            {{ t("activity.level.info") }}
-          </option>
-          <option value="warn">
-            {{ t("activity.level.warn") }}
-          </option>
-          <option value="error">
-            {{ t("activity.level.error") }}
-          </option>
-        </select>
-      </label>
+        <label class="block space-y-1 text-sm">
+          <span class="text-zinc-600 dark:text-zinc-400">{{ t("activity.filters.level") }}</span>
+          <select
+            v-model="filterLevel"
+            class="block w-full"
+            :class="SELECT_INPUT"
+            :aria-label="t('activity.filters.level')"
+            data-testid="activity-filter-level"
+            @change="applyFilters"
+          >
+            <option value="">
+              {{ t("activity.filters.allLevels") }}
+            </option>
+            <option value="info">
+              {{ t("activity.level.info") }}
+            </option>
+            <option value="warn">
+              {{ t("activity.level.warn") }}
+            </option>
+            <option value="error">
+              {{ t("activity.level.error") }}
+            </option>
+          </select>
+        </label>
 
-      <label class="block space-y-1 text-sm">
-        <span class="text-zinc-600 dark:text-zinc-400">{{ t("activity.filters.eventType") }}</span>
-        <select
-          v-model="filterEventType"
-          class="block rounded border px-2 py-1 text-sm"
-          @change="applyFilters"
-        >
-          <option value="">
-            {{ t("activity.filters.allEventTypes") }}
-          </option>
-          <option v-for="et in eventTypeOptions" :key="et" :value="et" :title="et">
-            {{ eventLabel(et) }}
-          </option>
-        </select>
-      </label>
+        <label class="block space-y-1 text-sm">
+          <span class="text-zinc-600 dark:text-zinc-400">{{
+            t("activity.filters.eventType")
+          }}</span>
+          <select
+            v-model="filterEventType"
+            class="block w-full"
+            :class="SELECT_INPUT"
+            :disabled="!hasEventTypes"
+            :aria-label="t('activity.filters.eventType')"
+            data-testid="activity-filter-event-type"
+            @change="applyFilters"
+          >
+            <template v-if="hasEventTypes">
+              <option value="">
+                {{ t("activity.filters.allEventTypes") }}
+              </option>
+              <option v-for="et in eventTypeOptions" :key="et" :value="et" :title="et">
+                {{ eventLabel(et) }}
+              </option>
+            </template>
+            <option v-else value="" disabled>
+              {{ t("activity.filters.noEventsYet") }}
+            </option>
+          </select>
+        </label>
 
-      <button type="button" class="rounded border px-3 py-1.5 text-sm" @click="clearFilters">
-        {{ t("activity.filters.clear") }}
-      </button>
+        <button type="button" :class="SECONDARY_BTN" @click="clearFilters">
+          {{ t("activity.filters.clear") }}
+        </button>
+      </div>
     </div>
 
-    <p v-if="activity.errorCode" class="text-sm text-red-600" data-testid="activity-error">
+    <p
+      v-if="activity.errorCode"
+      class="text-sm text-red-600 dark:text-red-400"
+      data-testid="activity-error"
+    >
       {{ t(`errors.${activity.errorCode}.long`) }}
     </p>
 
-    <p v-if="!activity.errorCode" class="text-sm text-zinc-500" data-testid="activity-count">
+    <p
+      v-if="!activity.errorCode"
+      class="text-sm text-zinc-500 dark:text-zinc-400"
+      data-testid="activity-count"
+    >
       {{
         t("activity.countSummary", {
           shown: numberFormatter.format(shownCount),
@@ -336,68 +397,66 @@ onUnmounted(() => {
 
     <p
       v-if="activity.isEmpty"
-      class="rounded border border-dashed p-6 text-center text-sm text-zinc-500"
+      class="rounded-lg border border-dashed border-zinc-300 p-8 text-center text-sm text-zinc-500 dark:border-zinc-700"
       data-testid="activity-empty"
     >
       {{ t("activity.empty") }}
     </p>
 
-    <table
-      v-else-if="activity.entries.length > 0"
-      class="w-full text-left text-sm"
-      data-testid="activity-table"
-    >
-      <thead class="text-xs text-zinc-500">
-        <tr>
-          <th class="py-1">
-            {{ t("activity.column.time") }}
-          </th>
-          <th class="py-1">
-            {{ t("activity.column.level") }}
-          </th>
-          <th class="py-1">
-            {{ t("activity.column.event") }}
-          </th>
-          <th class="py-1">
-            {{ t("activity.column.source") }}
-          </th>
-          <th class="py-1">
-            {{ t("activity.column.details") }}
-          </th>
-        </tr>
-      </thead>
-      <tbody class="divide-y">
-        <tr v-for="entry in activity.entries" :key="entry.id" data-testid="activity-row">
-          <td class="whitespace-nowrap py-2">
-            {{ formatTime(entry) }}
-          </td>
-          <td class="py-2 font-medium" :class="levelClass(entry.level)">
-            {{ levelLabel(entry.level) }}
-          </td>
-          <td class="break-all py-2" :title="entry.eventType">
-            {{ eventLabel(entry.eventType) }}
-          </td>
-          <td class="break-all py-2">
-            {{ sourceLabel(entry) }}
-          </td>
-          <td class="break-all py-2">
-            <span v-if="entry.message">{{ entry.message }}</span>
-            <span v-else-if="entry.fileCount != null" class="text-zinc-500">
-              {{
-                t("activity.files", {
-                  count: numberFormatter.format(entry.fileCount),
-                })
-              }}
-            </span>
-          </td>
-        </tr>
-      </tbody>
-    </table>
+    <div v-else-if="activity.entries.length > 0" class="overflow-x-auto" :class="CARD">
+      <table class="w-full text-left text-sm" data-testid="activity-table">
+        <thead class="text-xs text-zinc-500 dark:text-zinc-400">
+          <tr>
+            <th class="py-1 pr-3 font-medium">
+              {{ t("activity.column.time") }}
+            </th>
+            <th class="py-1 pr-3 font-medium">
+              {{ t("activity.column.level") }}
+            </th>
+            <th class="py-1 pr-3 font-medium">
+              {{ t("activity.column.event") }}
+            </th>
+            <th class="py-1 pr-3 font-medium">
+              {{ t("activity.column.source") }}
+            </th>
+            <th class="py-1 font-medium">
+              {{ t("activity.column.details") }}
+            </th>
+          </tr>
+        </thead>
+        <tbody class="divide-y divide-zinc-200 dark:divide-zinc-800">
+          <tr v-for="entry in activity.entries" :key="entry.id" data-testid="activity-row">
+            <td class="whitespace-nowrap py-2 pr-3 align-top">
+              {{ formatTime(entry) }}
+            </td>
+            <td class="py-2 pr-3 align-top font-medium" :class="levelClass(entry.level)">
+              {{ levelLabel(entry.level) }}
+            </td>
+            <td class="break-all py-2 pr-3 align-top" :title="entry.eventType">
+              {{ eventLabel(entry.eventType) }}
+            </td>
+            <td class="break-all py-2 pr-3 align-top">
+              {{ sourceLabel(entry) }}
+            </td>
+            <td class="break-all py-2 align-top text-zinc-600 dark:text-zinc-300">
+              <span v-if="entry.message">{{ entry.message }}</span>
+              <span v-else-if="entry.fileCount != null" class="text-zinc-500 dark:text-zinc-400">
+                {{
+                  t("activity.files", {
+                    count: numberFormatter.format(entry.fileCount),
+                  })
+                }}
+              </span>
+            </td>
+          </tr>
+        </tbody>
+      </table>
+    </div>
 
     <div v-if="activity.hasMore" class="flex justify-center">
       <button
         type="button"
-        class="rounded border px-3 py-1.5 text-sm"
+        :class="SECONDARY_BTN"
         :disabled="activity.loading"
         data-testid="activity-load-more"
         @click="activity.loadMore()"
@@ -405,7 +464,10 @@ onUnmounted(() => {
         {{ activity.loading ? t("activity.loadingMore") : t("activity.loadMore") }}
       </button>
     </div>
-    <p v-else-if="activity.entries.length > 0" class="text-center text-xs text-zinc-400">
+    <p
+      v-else-if="activity.entries.length > 0"
+      class="text-center text-xs text-zinc-400 dark:text-zinc-500"
+    >
       {{ t("activity.allLoaded") }}
     </p>
   </section>

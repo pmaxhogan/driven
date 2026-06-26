@@ -39,6 +39,16 @@ const current = computed(() => setup.stepIndex + 1);
 const pickingFolder = ref(false);
 const loadingDrive = ref(false);
 
+// Design-system class strings (shared verbatim across slices for consistency):
+// teal primary CTAs (Next / Finish / Start backup), zinc secondary (Back / file
+// pickers), card panels, and teal focus rings - all readable in dark mode.
+const PRIMARY_BTN =
+  "inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-teal-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50";
+const SECONDARY_BTN =
+  "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
+const CARD =
+  "rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900";
+
 // Begin the wizard session up front so the credentials step has a session id
 // (SPEC s11.1 begin_add_account_wizard). Idempotent: only begins once.
 onMounted(async () => {
@@ -204,17 +214,24 @@ function baseName(p: string): string {
 <template>
   <section class="mx-auto max-w-2xl space-y-6">
     <header class="space-y-1">
-      <h1 class="text-2xl font-semibold">
+      <h1 class="text-2xl font-semibold text-zinc-900 dark:text-zinc-100">
         {{ t("wizard.title") }}
       </h1>
-      <p class="text-sm text-zinc-500">
+      <p class="text-sm text-teal-700 dark:text-teal-300">
         {{ t("wizard.stepLabel", { current, total }) }}
       </p>
+      <!-- Step progress: a teal bar that fills as the wizard advances. -->
+      <div class="mt-1 h-1.5 w-full overflow-hidden rounded-full bg-zinc-200 dark:bg-zinc-800">
+        <div
+          class="h-full rounded-full bg-teal-600 transition-all"
+          :style="{ width: `${(current / total) * 100}%` }"
+        />
+      </div>
     </header>
 
     <!-- Step 1: Welcome -->
-    <div v-if="setup.step === 'welcome'" class="space-y-2">
-      <h2 class="text-lg font-medium">
+    <div v-if="setup.step === 'welcome'" :class="CARD" class="space-y-2">
+      <h2 class="text-lg font-medium text-zinc-900 dark:text-zinc-100">
         {{ t("wizard.step1.title") }}
       </h2>
       <p class="text-zinc-600 dark:text-zinc-400">
@@ -223,16 +240,16 @@ function baseName(p: string): string {
     </div>
 
     <!-- Step 2: BYO credentials + sign-in -->
-    <div v-else-if="setup.step === 'credentials'" class="space-y-3">
-      <h2 class="text-lg font-medium">
+    <div v-else-if="setup.step === 'credentials'" :class="CARD" class="space-y-3">
+      <h2 class="text-lg font-medium text-zinc-900 dark:text-zinc-100">
         {{ t("wizard.step2.title") }}
       </h2>
       <CredentialsWalkthrough @complete="onCredentialsComplete" />
     </div>
 
     <!-- Step 3: First backup source -->
-    <div v-else-if="setup.step === 'source'" class="space-y-3">
-      <h2 class="text-lg font-medium">
+    <div v-else-if="setup.step === 'source'" :class="CARD" class="space-y-4">
+      <h2 class="text-lg font-medium text-zinc-900 dark:text-zinc-100">
         {{ t("wizard.step3.title") }}
       </h2>
       <p class="text-zinc-600 dark:text-zinc-400">
@@ -242,7 +259,7 @@ function baseName(p: string): string {
       <div class="space-y-2">
         <button
           type="button"
-          class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
+          :class="SECONDARY_BTN"
           :disabled="pickingFolder"
           @click="chooseLocalFolder"
         >
@@ -254,10 +271,12 @@ function baseName(p: string): string {
       </div>
 
       <div class="space-y-2">
-        <span class="block text-sm font-medium">{{ t("wizard.step3.driveDestinationLabel") }}</span>
+        <span class="block text-sm font-medium text-zinc-700 dark:text-zinc-200">{{
+          t("wizard.step3.driveDestinationLabel")
+        }}</span>
         <button
           type="button"
-          class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
+          :class="SECONDARY_BTN"
           :disabled="loadingDrive || !setup.accountId"
           @click="chooseDriveFolder"
         >
@@ -270,20 +289,23 @@ function baseName(p: string): string {
     </div>
 
     <!-- Step 4: Encryption opt-in + recovery phrase -->
-    <div v-else-if="setup.step === 'encryption'" class="space-y-3">
-      <h2 class="text-lg font-medium">
+    <div v-else-if="setup.step === 'encryption'" :class="CARD" class="space-y-3">
+      <h2 class="text-lg font-medium text-zinc-900 dark:text-zinc-100">
         {{ t("wizard.step4.title") }}
       </h2>
       <p class="text-zinc-600 dark:text-zinc-400">
         {{ t("wizard.step4.body") }}
       </p>
 
-      <label class="flex items-center gap-2 text-sm">
-        <input v-model="setup.encryptionEnabled" type="checkbox" />
+      <label class="flex items-center gap-2 text-sm text-zinc-700 dark:text-zinc-200">
+        <input v-model="setup.encryptionEnabled" type="checkbox" class="h-4 w-4 accent-teal-600" />
         <span>{{ t("wizard.step4.enableLabel") }}</span>
       </label>
 
-      <p v-if="setup.encryptionEnabled" class="text-sm text-amber-700 dark:text-amber-500">
+      <p
+        v-if="setup.encryptionEnabled"
+        class="rounded-md bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
+      >
         {{ t("wizard.step4.recoveryWarning") }}
       </p>
       <!-- B3: the phrase is NOT shown here - it does not exist until the source
@@ -291,8 +313,8 @@ function baseName(p: string): string {
     </div>
 
     <!-- Step 5: Confirm + recovery-phrase reveal + start initial sync -->
-    <div v-else class="space-y-3">
-      <h2 class="text-lg font-medium">
+    <div v-else :class="CARD" class="space-y-3">
+      <h2 class="text-lg font-medium text-zinc-900 dark:text-zinc-100">
         {{ t("wizard.step5.title") }}
       </h2>
       <p class="text-zinc-600 dark:text-zinc-400">
@@ -320,7 +342,7 @@ function baseName(p: string): string {
     <footer class="flex justify-between">
       <button
         type="button"
-        class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
+        :class="SECONDARY_BTN"
         :disabled="!setup.canGoBack || setup.busy"
         @click="setup.back()"
       >
@@ -330,7 +352,7 @@ function baseName(p: string): string {
       <button
         v-if="setup.step === 'confirm'"
         type="button"
-        class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
+        :class="PRIMARY_BTN"
         :disabled="setup.busy || !setup.canFinish"
         @click="onFinish"
       >
@@ -339,7 +361,7 @@ function baseName(p: string): string {
       <button
         v-else
         type="button"
-        class="rounded border px-3 py-1.5 text-sm disabled:opacity-50"
+        :class="PRIMARY_BTN"
         :disabled="!canAdvance || setup.busy"
         @click="onNext"
       >
