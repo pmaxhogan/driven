@@ -2,12 +2,13 @@
 import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
+import DriveFolderPicker from "./DriveFolderPicker.vue";
 import RecoveryPhraseReveal from "./RecoveryPhraseReveal.vue";
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
 import { useAccountsStore } from "../stores/accounts";
 import { useSourcesStore } from "../stores/sources";
-import type { DriveFolderEntry, ExclusionPreview, SourceDto } from "../ipc/types";
+import type { ExclusionPreview, SourceDto } from "../ipc/types";
 
 // Add-source wizard (SPEC s11.2; DESIGN s8.5 step 3 / s8.2 add-source wizard).
 // Five steps: pick a LOCAL folder (tauri-plugin-dialog, dialog-derived path
@@ -75,15 +76,8 @@ const createdSource = ref<SourceDto | null>(null);
 // calls revealRecoveryPhrase (the backend reveal the ack gate requires).
 const pendingRecoveryAck = ref(false);
 
-// Drive picker state: a breadcrumb stack of the folders descended into, so "up"
-// can re-fetch the parent. The first entry (null id) is the Drive root.
-interface Crumb {
-  id: string | null;
-  path: string;
-}
-const crumbs = ref<Crumb[]>([]);
-const driveFolders = ref<DriveFolderEntry[]>([]);
-const drivePickerLoading = ref(false);
+// Drive destination (id + human path) is owned by the shared DriveFolderPicker
+// via v-model; this component only stages the chosen values for add_source.
 
 const preview = ref<ExclusionPreview | null>(null);
 const previewLoading = ref(false);
@@ -151,8 +145,6 @@ function reset(): void {
   recoveryPhrase.value = [];
   createdSource.value = null;
   pendingRecoveryAck.value = false;
-  crumbs.value = [];
-  driveFolders.value = [];
   preview.value = null;
   errorMessage.value = null;
   revealErrorCode.value = null;
@@ -176,47 +168,9 @@ async function chooseLocalFolder(): Promise<void> {
   }
 }
 
-async function loadDriveFolder(crumb: Crumb): Promise<void> {
-  if (accountId.value === null) return;
-  drivePickerLoading.value = true;
-  errorMessage.value = null;
-  try {
-    const listing = await ipc.pickDriveFolder(accountId.value, crumb.id);
-    driveFolders.value = listing.folders;
-    driveFolderId.value = listing.currentFolderId;
-    // R4-P2-2: the backend cannot derive the full breadcrumb (it lists one
-    // folder's children, not the ancestor chain), so it returns an empty
-    // `currentFolderPath`. The wizard maintains the breadcrumb itself in the
-    // `crumbs` stack (descend appends `parent/name`), so persist THAT path -
-    // using the empty backend value here was what left `drive_folder_path` blank
-    // in SQLite. Fall back to the backend value only if the crumb has no path
-    // (root), keeping "My Drive" root as empty.
-    driveFolderPath.value = crumb.path || listing.currentFolderPath;
-  } catch (e) {
-    errorMessage.value = String(e);
-  } finally {
-    drivePickerLoading.value = false;
-  }
-}
-
-async function openDriveRoot(): Promise<void> {
-  crumbs.value = [{ id: null, path: "" }];
-  await loadDriveFolder(crumbs.value[0]);
-}
-
-async function descendInto(folder: DriveFolderEntry): Promise<void> {
-  const parentPath = driveFolderPath.value;
-  const crumb: Crumb = {
-    id: folder.id,
-    path: parentPath ? `${parentPath}/${folder.name}` : folder.name,
-  };
-  crumbs.value.push(crumb);
-  await loadDriveFolder(crumb);
-}
-
-async function goToCrumb(index: number): Promise<void> {
-  crumbs.value = crumbs.value.slice(0, index + 1);
-  await loadDriveFolder(crumbs.value[index]);
+/** Surface a Drive-picker failure on the wizard's shared error line. */
+function onDrivePickerError(e: unknown): void {
+  errorMessage.value = String(e);
 }
 
 async function loadPreview(): Promise<void> {
@@ -242,10 +196,9 @@ async function loadPreview(): Promise<void> {
 async function next(): Promise<void> {
   if (stepIndex.value >= STEPS.length - 1) return;
   stepIndex.value += 1;
-  // Lazily load each step's data as it becomes active.
-  if (step.value === "driveFolder" && crumbs.value.length === 0) {
-    await openDriveRoot();
-  } else if (step.value === "exclusions") {
+  // Lazily load each step's data as it becomes active. The Drive step
+  // self-loads its root listing when the shared DriveFolderPicker mounts.
+  if (step.value === "exclusions") {
     await loadPreview();
   }
 }
@@ -417,39 +370,14 @@ defineExpose({ start });
         </p>
       </div>
 
-      <!-- Step 2: Drive folder picker -->
+      <!-- Step 2: Drive folder picker (shared with the first-run setup wizard) -->
       <div v-else-if="step === 'driveFolder'" class="space-y-3">
-        <nav class="flex flex-wrap items-center gap-1 text-xs">
-          <button
-            v-for="(crumb, i) in crumbs"
-            :key="i"
-            type="button"
-            class="rounded px-1 py-0.5 text-zinc-600 transition-colors hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500 dark:text-zinc-400 dark:hover:text-teal-300"
-            @click="goToCrumb(i)"
-          >
-            {{ i === 0 ? t("settings.addSource.step.driveFolder") : crumb.path.split("/").pop() }}
-          </button>
-        </nav>
-        <p v-if="drivePickerLoading" class="text-sm text-zinc-500">
-          {{ t("common.loading") }}
-        </p>
-        <ul
-          v-else
-          class="max-h-56 divide-y divide-zinc-200 overflow-auto rounded-md border border-zinc-200 dark:divide-zinc-800 dark:border-zinc-700"
-        >
-          <li v-for="folder in driveFolders" :key="folder.id">
-            <button
-              type="button"
-              class="w-full px-3 py-2 text-left text-sm transition-colors hover:bg-teal-50 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500 dark:hover:bg-zinc-800"
-              @click="descendInto(folder)"
-            >
-              {{ folder.name }}
-            </button>
-          </li>
-        </ul>
-        <p class="text-sm text-zinc-600 dark:text-zinc-400">
-          {{ t("settings.addSource.step.driveFolder") }}: {{ driveFolderPath }}
-        </p>
+        <DriveFolderPicker
+          v-model:folder-id="driveFolderId"
+          v-model:folder-path="driveFolderPath"
+          :account-id="accountId"
+          @error="onDrivePickerError"
+        />
       </div>
 
       <!-- Step 3: exclusions preview -->

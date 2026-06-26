@@ -37,6 +37,11 @@
     "no": "No",
     "none": "None"
   },
+  "drivePicker": {
+    "rootName": "My Drive",
+    "destinationLabel": "Backing up to",
+    "empty": "No subfolders here - this folder is the destination."
+  },
   "wizard": {
     "title": "Set up Driven",
     "stepLabel": "Step {current} of {total}",

@@ -533,9 +533,9 @@ describe("AddSourceWizard", () => {
       await flushPromises();
     };
 
-    // -> Drive step: root listing loaded, path empty.
+    // -> Drive step: root listing loaded, destination shows My Drive root.
     await clickNext();
-    const driveLabel = i18n.global.t("settings.addSource.step.driveFolder");
+    const driveLabel = i18n.global.t("drivePicker.destinationLabel");
     expect(wrapper.text()).toContain(`${driveLabel}:`);
 
     // Click the "Docs" folder to descend; the rendered path must now be "Docs",
