@@ -13,9 +13,25 @@
 
 use std::path::PathBuf;
 
-use serde::{Deserialize, Serialize};
+use serde::{Deserialize, Deserializer, Serialize};
 
 use driven_core::types::AccountId;
+
+/// serde helper for an `Option<Option<T>>` "double option" patch field, which
+/// must distinguish three inbound JSON states that plain serde cannot. An ABSENT
+/// key stays `None` (leave unchanged); a present `null` becomes `Some(None)`
+/// (reset to the default - auto / unlimited / cleared); a present value becomes
+/// `Some(Some(v))` (set). Without this, serde collapses `null` to the OUTER
+/// `None`, so "reset" is indistinguishable from "no change" and the UI can never
+/// clear the field back to its special value (the bug this fixes). Pair with
+/// `#[serde(default, deserialize_with = "double_option")]` on the field.
+fn double_option<'de, T, D>(deserializer: D) -> Result<Option<Option<T>>, D::Error>
+where
+    T: Deserialize<'de>,
+    D: Deserializer<'de>,
+{
+    Deserialize::deserialize(deserializer).map(Some)
+}
 
 // -----------------------------------------------------------------------------
 // Accounts (SPEC s11.1)
@@ -476,10 +492,14 @@ pub struct SettingsPatch {
 pub struct GlobalSettingsPatch {
     /// See [`GlobalSettings::auto_start_on_login`].
     pub auto_start_on_login: Option<bool>,
-    /// See [`GlobalSettings::default_concurrent_uploads`]. Note: `Some(None)`
-    /// vs `None` distinguishes "set to auto" from "leave unchanged".
+    /// See [`GlobalSettings::default_concurrent_uploads`]. `double_option` so an
+    /// inbound `null` is `Some(None)` ("reset to auto"), distinct from an absent
+    /// key `None` ("leave unchanged").
+    #[serde(default, deserialize_with = "double_option")]
     pub default_concurrent_uploads: Option<Option<u32>>,
-    /// See [`GlobalSettings::bandwidth_cap_mbps`].
+    /// See [`GlobalSettings::bandwidth_cap_mbps`]. `double_option`: `null` =
+    /// `Some(None)` ("reset to unlimited").
+    #[serde(default, deserialize_with = "double_option")]
     pub bandwidth_cap_mbps: Option<Option<u32>>,
     /// See [`GlobalSettings::skip_on_battery`].
     pub skip_on_battery: Option<bool>,
@@ -495,15 +515,21 @@ pub struct GlobalSettingsPatch {
     pub log_level: Option<String>,
     /// See [`GlobalSettings::schedule`]. Present = replace the whole schedule.
     pub schedule: Option<ScheduleSettings>,
-    /// See [`GlobalSettings::pre_backup_hook`]. `Some(None)` clears it.
+    /// See [`GlobalSettings::pre_backup_hook`]. `double_option`: `null` =
+    /// `Some(None)` clears it.
+    #[serde(default, deserialize_with = "double_option")]
     pub pre_backup_hook: Option<Option<String>>,
-    /// See [`GlobalSettings::post_backup_hook`]. `Some(None)` clears it.
+    /// See [`GlobalSettings::post_backup_hook`]. `double_option`: `null` =
+    /// `Some(None)` clears it.
+    #[serde(default, deserialize_with = "double_option")]
     pub post_backup_hook: Option<Option<String>>,
     /// See [`GlobalSettings::hook_timeout_secs`].
     pub hook_timeout_secs: Option<u32>,
     /// See [`GlobalSettings::metered_mode`].
     pub metered_mode: Option<String>,
-    /// See [`GlobalSettings::metered_bandwidth_cap_mbps`]. `Some(None)` clears it.
+    /// See [`GlobalSettings::metered_bandwidth_cap_mbps`]. `double_option`:
+    /// `null` = `Some(None)` clears it.
+    #[serde(default, deserialize_with = "double_option")]
     pub metered_bandwidth_cap_mbps: Option<Option<u32>>,
 }
 
@@ -840,4 +866,52 @@ pub struct RestoreJobStatus {
     pub cancelled: bool,
     /// Per-file progress entries.
     pub files: Vec<RestoreFileProgress>,
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    // #7: the `double_option` patch fields must distinguish ABSENT / null / value
+    // so the UI can reset a nullable setting (concurrent uploads, bandwidth cap,
+    // hooks, metered cap) back to its default. Plain serde collapsed an inbound
+    // `null` to the outer `None`, making "reset to auto/unlimited/cleared"
+    // indistinguishable from "leave unchanged" - so the field could never be
+    // cleared from the webview.
+    #[test]
+    fn global_patch_double_option_distinguishes_absent_null_and_value() {
+        // ABSENT key -> None ("leave unchanged").
+        let absent: GlobalSettingsPatch = serde_json::from_str("{}").unwrap();
+        assert_eq!(absent.default_concurrent_uploads, None);
+        assert_eq!(absent.bandwidth_cap_mbps, None);
+        assert_eq!(absent.pre_backup_hook, None);
+        assert_eq!(absent.metered_bandwidth_cap_mbps, None);
+
+        // Present `null` -> Some(None) ("reset to auto / unlimited / cleared").
+        let cleared: GlobalSettingsPatch = serde_json::from_str(
+            r#"{
+                "defaultConcurrentUploads": null,
+                "bandwidthCapMbps": null,
+                "preBackupHook": null,
+                "postBackupHook": null,
+                "meteredBandwidthCapMbps": null
+            }"#,
+        )
+        .unwrap();
+        assert_eq!(cleared.default_concurrent_uploads, Some(None));
+        assert_eq!(cleared.bandwidth_cap_mbps, Some(None));
+        assert_eq!(cleared.pre_backup_hook, Some(None));
+        assert_eq!(cleared.post_backup_hook, Some(None));
+        assert_eq!(cleared.metered_bandwidth_cap_mbps, Some(None));
+
+        // Present value -> Some(Some(v)) ("set to v").
+        let set: GlobalSettingsPatch = serde_json::from_str(
+            r#"{"defaultConcurrentUploads": 8, "preBackupHook": "./hook.sh"}"#,
+        )
+        .unwrap();
+        assert_eq!(set.default_concurrent_uploads, Some(Some(8)));
+        assert_eq!(set.pre_backup_hook, Some(Some("./hook.sh".to_string())));
+        // Untouched double-option keys stay None ("leave unchanged").
+        assert_eq!(set.bandwidth_cap_mbps, None);
+    }
 }
