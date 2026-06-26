@@ -260,6 +260,8 @@
       "allLevels": "All levels",
       "eventType": "Event type",
       "allEventTypes": "All event types",
+      "noSourcesYet": "No sources yet - add one in Settings",
+      "noEventsYet": "No events logged yet",
       "clear": "Clear filters"
     },
     "level": {
@@ -308,7 +310,9 @@
   },
   "restore": {
     "title": "Restore",
+    "subtitle": "Browse your backups and restore files to any folder.",
     "source": "Source",
+    "noSourcesYet": "No sources yet - add one in Settings",
     "loading": "Loading...",
     "search": {
       "label": "Search",
@@ -322,7 +326,8 @@
     },
     "empty": {
       "tree": "No backed-up files in this folder yet.",
-      "search": "No files match your search."
+      "search": "No files match your search.",
+      "noSources": "No backup sources to restore from yet. Add one in Settings."
     },
     "truncated": "Showing the first {count} items in this folder. Use search to find more.",
     "node": {
