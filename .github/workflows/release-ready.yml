@@ -1,0 +1,88 @@
+name: release-ready
+
+# Signal-only release readiness - NEVER merges anything (chosen 2026-06-26; see
+# the roadmap in github.com/users/pmaxhogan/projects/1 and the V2 epic #34).
+#
+# Versions are tracked as GitHub milestones (v0.3.0, v1.0.0, v2.0.0, ...). When
+# every issue in a version milestone is closed, this comments on + labels the
+# open release-please PR and @-pings the maintainer so they review the computed
+# version + CHANGELOG and merge it themselves. release-please.yml (opens the
+# release PR) and release.yml (builds/signs/publishes on the v* tag) stay the
+# human gate.
+#
+# Why signal-only and not auto-merge: a bot merging the release PR with
+# GITHUB_TOKEN does NOT trigger release-please.yml/release.yml (token-authored
+# events start no new workflow run), so no tag is cut and nothing ships - it
+# would look merged while releasing nothing. Plus a milestone title is not
+# guaranteed to equal release-please's commit-computed version, and milestone
+# 100% says nothing about main being green. Keep the merge a human click.
+
+on:
+  issues:
+    types: [closed]
+  schedule:
+    # Daily backstop (14:17 UTC) in case an issues:closed event is missed or a
+    # milestone completes by other means.
+    - cron: "17 14 * * *"
+  workflow_dispatch:
+
+permissions:
+  contents: read
+  issues: write
+  pull-requests: write
+
+concurrency:
+  group: release-ready
+  cancel-in-progress: false
+
+jobs:
+  signal:
+    runs-on: ubuntu-latest
+    steps:
+      - name: Signal readiness on completed version milestones
+        env:
+          GH_TOKEN: ${{ github.token }}
+          REPO: ${{ github.repository }}
+          MAINTAINER: pmaxhogan
+        run: |
+          set -euo pipefail
+
+          # Find the open release-please PR (branch prefixed "release-please--",
+          # and/or carrying an "autorelease:" label). Nothing to do if none open.
+          pr="$(gh pr list --repo "$REPO" --state open \
+            --json number,headRefName,labels \
+            --jq '[.[] | select((.headRefName | startswith("release-please--")) or (any(.labels[]?; .name | startswith("autorelease:"))))][0].number // empty')"
+          if [ -z "$pr" ]; then
+            echo "No open release PR; nothing to signal."
+            exit 0
+          fi
+          echo "Open release PR: #$pr"
+
+          # Completed milestone = open state, has issues, zero still open.
+          completed="$(gh api "repos/$REPO/milestones?state=open&per_page=100" \
+            --jq '.[] | select(.open_issues == 0 and .closed_issues > 0) | .title')"
+          if [ -z "$completed" ]; then
+            echo "No fully-completed milestones."
+            exit 0
+          fi
+
+          # Existing PR comments, to dedup via a hidden per-milestone sentinel.
+          existing="$(gh api "repos/$REPO/issues/$pr/comments?per_page=100" --jq '.[].body' || true)"
+
+          signalled=0
+          while IFS= read -r ms; do
+            [ -z "$ms" ] && continue
+            marker="<!-- release-ready:${ms} -->"
+            if printf '%s' "$existing" | grep -qF "$marker"; then
+              echo "Already signalled ${ms}."
+              continue
+            fi
+            echo "Signalling ${ms} on PR #${pr}."
+            body="${marker}"$'\n'"@${MAINTAINER} every issue in the **${ms}** milestone is now closed - this release looks ready. Review the version + CHANGELOG in this PR and merge when you are happy (nothing is auto-merged). If release-please computed a version other than ${ms}, that is expected: the milestone title is just a planning label."
+            gh pr comment "$pr" --repo "$REPO" --body "$body"
+            signalled=1
+          done <<< "$completed"
+
+          if [ "$signalled" = "1" ]; then
+            gh pr edit "$pr" --repo "$REPO" --add-label ready-to-release || true
+          fi
