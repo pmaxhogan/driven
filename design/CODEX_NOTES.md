@@ -3240,3 +3240,21 @@ a user-disabled source (enabled=0, no ack) is excluded and therefore never resur
 an onboarding source (enabled=0 WITH an ack) keeps its row. New regression test
 `upgrade_repair_never_re_enables_a_user_disabled_encrypted_source`. All 5 upgrade_repair tests + full
 gates green (sqlx 0.9; 1 query json replaced).
+
+### Capstone recheck-2 - ACCEPTED RESIDUAL (pre-1.0 no-compat policy)
+
+A second codex recheck (high, HEAD~1..04c9ba9) flagged 1 P1: after the recheck-1 fix, the repair
+treats `enabled = 0 AND no ack row` as "user-disabled" and skips it, but a hypothetical pre-0004
+crash shape (first encrypted source persisted DISABLED with the gate in-memory-only) has the same
+DB signature - so the repair would skip it, write the marker, and `update_source` could later enable
+it (its guard only rejects sources that HAVE a pending ack row), arming encrypted backups with no
+saved phrase. ACCEPTED as a residual, NOT fixed. Reachability proof: (1) the repair is one-time
+marker-gated (`recovery.ack_backfill_v1`, written unconditionally on first boot), and v0.1.0 shipped
+that code, so the repair never runs for any v0.1.0+ field DB - only pre-v0.1.0 dev DBs, of which there
+are none in the wild; (2) in the field every encrypted source is either pending-acked (the
+`update_source` + `add_source` account-level guards block enabling it) or already-acked (ack row
+deleted -> phrase was saved -> safe to enable). The proper fix (a `resume_on_ack` column via a new
+migration) would add data-safety-migration surface to harden an unreachable upgrade path. Per the
+Driven **pre-1.0 no-compat policy** (set 2026-06-25: upgrade data loss is an acceptable casualty
+until v1.0.0; do not invest in backwards/forward compat pre-1.0), this is deliberately deferred. Revisit
+when bumping to v1.0.0.
