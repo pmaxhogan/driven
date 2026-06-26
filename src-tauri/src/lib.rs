@@ -88,6 +88,59 @@ fn state_db_path(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
     Ok(config_dir.join("driven").join("state.db"))
 }
 
+/// Force a dark titlebar + window border on Windows so the native chrome matches
+/// Driven's dark theme. Without this the caption + border inherit the user's
+/// Windows ACCENT color ("show accent color on title bars and window borders"),
+/// which renders the chrome in an arbitrary per-machine color that clashes with
+/// the teal/dark UI. We set immersive dark mode (light caption text/buttons) plus
+/// a near-black caption and a subtle neutral border via the DWM window attributes.
+/// Win10 ignores the color attributes (graceful no-op); Win11 honors them. Applied
+/// before the first `show()` so there is no flash of accent-colored chrome.
+#[cfg(windows)]
+fn apply_dark_titlebar(window: &tauri::WebviewWindow) {
+    use std::mem::size_of;
+    use windows_sys::Win32::Foundation::HWND;
+    use windows_sys::Win32::Graphics::Dwm::DwmSetWindowAttribute;
+
+    // DWMWINDOWATTRIBUTE values (windows-sys takes the attribute as a u32).
+    // Spelled out as literals so we depend only on DwmSetWindowAttribute, not the
+    // constant set.
+    const DWMWA_USE_IMMERSIVE_DARK_MODE: u32 = 20;
+    const DWMWA_BORDER_COLOR: u32 = 34;
+    const DWMWA_CAPTION_COLOR: u32 = 35;
+
+    let hwnd = match window.hwnd() {
+        Ok(h) => h.0 as isize as HWND,
+        Err(_) => return,
+    };
+    // COLORREF byte order is 0x00BBGGRR.
+    let caption: u32 = 0x000b_0909; // #09090b (zinc-950) - the app's dark surface
+    let border: u32 = 0x0046_3f3f; // #3f3f46 (zinc-700) - a subtle neutral edge
+    let dark: i32 = 1; // BOOL TRUE -> light caption text + window buttons
+    // SAFETY: hwnd is a live top-level window handle for the duration of the call;
+    // each pointer references a stack value valid across the synchronous call.
+    unsafe {
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_USE_IMMERSIVE_DARK_MODE,
+            (&dark as *const i32).cast(),
+            size_of::<i32>() as u32,
+        );
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_CAPTION_COLOR,
+            (&caption as *const u32).cast(),
+            size_of::<u32>() as u32,
+        );
+        DwmSetWindowAttribute(
+            hwnd,
+            DWMWA_BORDER_COLOR,
+            (&border as *const u32).cast(),
+            size_of::<u32>() as u32,
+        );
+    }
+}
+
 /// Show + focus the main window (a normal launch, a tray/dock click, or a
 /// second-launch surface). No-op if the window is not present.
 fn show_main_window(app: &tauri::AppHandle) {
@@ -459,6 +512,13 @@ pub fn run() {
                 Err(err) => {
                     tracing::debug!(target: "driven::app", %err, "deep_link().get_current() cold-start drain failed");
                 }
+            }
+
+            // Force a dark titlebar/border (Windows) BEFORE the first show so the
+            // native chrome never flashes the user's clashing Windows accent color.
+            #[cfg(windows)]
+            if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+                apply_dark_titlebar(&window);
             }
 
             // SPEC s13 / s20: the main window is declared hidden in

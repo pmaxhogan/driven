@@ -275,11 +275,23 @@ describe("settings store", () => {
     expect(store.settings?.global.skipOnBattery).toBe(false);
   });
 
-  it("patch surfaces the error and rethrows", async () => {
+  it("patch surfaces the stable error CODE (not String(e)) and rethrows", async () => {
+    // Regression: the store must store the SPEC s24 code via toErrorCode, never
+    // String(e) - a structured `{ code, message }` error stringifies to the
+    // literal "[object Object]", which used to render straight into the Rules tab.
     const store = useSettingsStore();
-    invokeMock.mockRejectedValueOnce(new Error("write failed"));
-    await expect(store.patch({ updater: { channel: "dev" } })).rejects.toThrow("write failed");
-    expect(store.error).toContain("write failed");
+    invokeMock.mockRejectedValueOnce({ code: "internal.invalid_input", message: "out of range" });
+    await expect(store.patch({ updater: { channel: "dev" } })).rejects.toMatchObject({
+      code: "internal.invalid_input",
+    });
+    expect(store.errorCode).toBe("internal.invalid_input");
+  });
+
+  it("patch falls back to internal.bug for a code-less error", async () => {
+    const store = useSettingsStore();
+    invokeMock.mockRejectedValueOnce(new Error("boom"));
+    await expect(store.patch({ updater: { channel: "dev" } })).rejects.toThrow("boom");
+    expect(store.errorCode).toBe("internal.bug");
   });
 
   it("setTelemetryEnabled calls set_telemetry_enabled and updates the snapshot (R2-P1-1)", async () => {
@@ -303,10 +315,10 @@ describe("settings store", () => {
     });
   });
 
-  it("setTelemetryEnabled surfaces the error and rethrows", async () => {
+  it("setTelemetryEnabled surfaces the error code and rethrows", async () => {
     const store = useSettingsStore();
-    invokeMock.mockRejectedValueOnce(new Error("toggle failed"));
-    await expect(store.setTelemetryEnabled(false)).rejects.toThrow("toggle failed");
-    expect(store.error).toContain("toggle failed");
+    invokeMock.mockRejectedValueOnce({ code: "internal.bug", message: "toggle failed" });
+    await expect(store.setTelemetryEnabled(false)).rejects.toMatchObject({ code: "internal.bug" });
+    expect(store.errorCode).toBe("internal.bug");
   });
 });

@@ -22,6 +22,11 @@ describe("activityEventLabel (R1-P2-3)", () => {
     expect(label("scan_done")).toBe("Scan complete");
     expect(label("paused")).toBe("Paused");
     expect(label("local.unicode_collision")).toBe("Name collision");
+    // Every backend-emitted event type must be humanized - not shown as the raw
+    // snake_case code (the inconsistency: deep_verify_done / update_applied used
+    // to render raw in the table + filter while upload_done showed "Uploaded").
+    expect(label("deep_verify_done")).toBe("Deep verify complete");
+    expect(label("update_applied")).toBe("App updated");
   });
 
   it("falls back to errors.<code>.short for error/skip code event types", () => {

@@ -82,11 +82,13 @@ const pendingRecoveryAck = ref(false);
 const preview = ref<ExclusionPreview | null>(null);
 const previewLoading = ref(false);
 const submitting = ref(false);
-const errorMessage = ref<string | null>(null);
-// R8-P2-1: the recovery reveal/ack error on the reveal step as a stable SPEC s24
-// CODE (not a raw String(e), which renders a Tauri structured error as
-// `[object Object]` and can leak backend English). The reveal step localizes it
-// via t(`errors.${code}.long`).
+// The wizard's general error as a stable SPEC s24 CODE (not a raw String(e),
+// which renders a Tauri structured `{ code, message }` error as the literal
+// "[object Object]" and can leak backend English). The template localizes it via
+// t(`errors.${code}.long`).
+const errorCode = ref<string | null>(null);
+// R8-P2-1: the recovery reveal/ack error on the reveal step, same stable-code
+// treatment, localized on the reveal step.
 const revealErrorCode = ref<string | null>(null);
 
 const includePatterns = computed(() => splitPatterns(includePatternsText.value));
@@ -146,7 +148,7 @@ function reset(): void {
   createdSource.value = null;
   pendingRecoveryAck.value = false;
   preview.value = null;
-  errorMessage.value = null;
+  errorCode.value = null;
   revealErrorCode.value = null;
   submitting.value = false;
 }
@@ -156,7 +158,7 @@ function close(): void {
 }
 
 async function chooseLocalFolder(): Promise<void> {
-  errorMessage.value = null;
+  errorCode.value = null;
   try {
     // C1: the BACKEND owns the folder dialog and returns { path, token }. We
     // never accept a typed path - only this dialog result + its token.
@@ -170,7 +172,7 @@ async function chooseLocalFolder(): Promise<void> {
 
 /** Surface a Drive-picker failure on the wizard's shared error line. */
 function onDrivePickerError(e: unknown): void {
-  errorMessage.value = String(e);
+  errorCode.value = toErrorCode(e);
 }
 
 async function loadPreview(): Promise<void> {
@@ -178,7 +180,7 @@ async function loadPreview(): Promise<void> {
   // token is peeked non-consumingly, so add_source still gets its single use.
   if (localPathToken.value === null) return;
   previewLoading.value = true;
-  errorMessage.value = null;
+  errorCode.value = null;
   try {
     preview.value = await ipc.previewExclusions({
       localPathToken: localPathToken.value,
@@ -187,7 +189,7 @@ async function loadPreview(): Promise<void> {
       excludePatterns: excludePatterns.value,
     });
   } catch (e) {
-    errorMessage.value = String(e);
+    errorCode.value = toErrorCode(e);
   } finally {
     previewLoading.value = false;
   }
@@ -217,7 +219,7 @@ async function confirm(): Promise<void> {
     return;
   }
   submitting.value = true;
-  errorMessage.value = null;
+  errorCode.value = null;
   try {
     const displayName = localPath.value.split(/[\\/]/).filter(Boolean).pop();
     const result = await sources.add({
@@ -250,7 +252,7 @@ async function confirm(): Promise<void> {
       close();
     }
   } catch (e) {
-    errorMessage.value = String(e);
+    errorCode.value = toErrorCode(e);
   } finally {
     submitting.value = false;
   }
@@ -497,8 +499,8 @@ defineExpose({ start });
         </p>
       </div>
 
-      <p v-if="errorMessage" class="text-sm text-red-600">
-        {{ errorMessage }}
+      <p v-if="errorCode" class="text-sm text-red-600" role="alert">
+        {{ t(`errors.${errorCode}.long`) }}
       </p>
 
       <div class="flex justify-between gap-2">

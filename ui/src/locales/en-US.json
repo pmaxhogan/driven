@@ -313,6 +313,8 @@
       "upload_done": "Uploaded",
       "trash_done": "Removed",
       "scan_done": "Scan complete",
+      "deep_verify_done": "Deep verify complete",
+      "update_applied": "App updated",
       "paused": "Paused",
       "error": "Error",
       "local.unicode_collision": "Name collision",
