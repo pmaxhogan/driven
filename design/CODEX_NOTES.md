@@ -3258,3 +3258,26 @@ migration) would add data-safety-migration surface to harden an unreachable upgr
 Driven **pre-1.0 no-compat policy** (set 2026-06-25: upgrade data loss is an acceptable casualty
 until v1.0.0; do not invest in backwards/forward compat pre-1.0), this is deliberately deferred. Revisit
 when bumping to v1.0.0.
+
+## VSS elevation - least-privilege helper (post-V1 backlog)
+
+The whole-app elevation module (`src-tauri/src/elevation.rs`) was REMOVED pre-V1 (2026-06-25). It
+worked and was injection-safe, but it elevated the ENTIRE app: a `schtasks /RL HIGHEST /SC ONLOGON`
+logon task (silent admin auto-start) + a `powershell Start-Process -Verb RunAs` UAC restart. That is
+not the least-privilege posture we want, and the module was dead code (wired to nothing).
+
+DESIRED V1.x DESIGN (not yet built): a small PRIVILEGED HELPER that elevates ONLY the VSS snapshot
+operation, leaving the main backup app un-elevated. The main (un-elevated) app requests a shadow copy
+from the helper over a secured local IPC channel; the helper creates the VSS snapshot and returns the
+shadow path. SECURITY-CRITICAL design points to settle before building: (1) authenticate the calling
+client so an arbitrary local non-admin process cannot drive the helper into snapshotting / exposing
+paths it should not (named-pipe ACL + caller-PID/signature check); (2) constrain what the helper will
+snapshot (only configured Driven source roots); (3) helper install/uninstall + lifecycle (one-time
+admin to install a service, or an on-demand elevated broker); (4) whether the un-elevated app can even
+READ the resulting shadow device without admin (may need the helper to stream/copy). This deserves its
+own milestone + threat model - do NOT rush it into V1.
+
+V1 STANCE: locked-file VSS requires launching Driven as Administrator manually; the `VssProvider`
+degrade path already handles the un-elevated case (skips locked files, surfaces the degrade). The old
+whole-app code remains in git history (pre-2026-06-25) as reference only - the helper is a fresh design,
+not a restore.

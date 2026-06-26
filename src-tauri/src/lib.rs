@@ -23,14 +23,14 @@ mod assembly;
 // `DialogToken`) against the real implementation.
 pub mod commands;
 mod crypto_provider_impl;
-// The elevation module is the complete M5-shipped "run elevated on login" /
-// "restart elevated" public API (ROADMAP M3.5 deferred to M5). Its callers are
-// the Settings IPC commands, which land in M6 (ROADMAP M6 "IPC commands per
-// SPEC s11.1/s11.2/s11.6 fully wired"); M5's IPC surface is sync-only. The
-// module is therefore reachable-but-uncalled until M6, so allow dead_code here
-// rather than registering an M6-scope settings command early.
-#[allow(dead_code)]
-mod elevation;
+// NOTE: the "run elevated" module was removed pre-V1 (2026-06-25). It implemented
+// WHOLE-APP elevation (a /RL HIGHEST Task Scheduler logon task + a UAC restart),
+// which is not the least-privilege model we want. The intended V1.x design is a
+// small privileged HELPER that elevates ONLY the VSS snapshot operation, leaving
+// this app un-elevated - a security-sensitive IPC surface that needs its own
+// threat model. Tracked in design/CODEX_NOTES.md "VSS elevation - least-privilege
+// helper (post-V1)". Until then, locked-file VSS requires launching Driven as
+// administrator manually (the VssProvider degrade path handles the un-elevated case).
 mod events;
 mod hook_runner;
 mod i18n;
