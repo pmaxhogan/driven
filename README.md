@@ -152,6 +152,33 @@ just bundle  # cargo tauri build
 just deny    # cargo deny check
 ```
 
+## Run via Docker
+
+The headless tools - the debugging CLI (`driven-cli`) and the stress / chaos
+harness (`driven-chaos`) - ship as a public image at
+`ghcr.io/pmaxhogan/driven`. The image does **not** include the desktop GUI; use
+the native installers above for that.
+
+Tags:
+
+- `:latest` / `:stable` - the highest stable release.
+- `:dev` / `:nightly` - the latest `main` commit.
+- `:vX.Y.Z` - an exact release; `:vX` - the highest stable build of major `X`.
+
+```sh
+# Default (no args) prints the CLI help:
+docker run --rm ghcr.io/pmaxhogan/driven
+
+# Run the CLI as normal:
+docker run --rm ghcr.io/pmaxhogan/driven driven-cli --help
+
+# Run the long chaos soak (issue #23) - the hermetic sweep then a seeded fuzz:
+docker run --rm ghcr.io/pmaxhogan/driven:dev chaos-soak --duration 6h
+
+# Or invoke the chaos harness directly:
+docker run --rm ghcr.io/pmaxhogan/driven driven-chaos fuzz --duration 6h
+```
+
 ## Design docs
 
 - `design/DESIGN.md` - architecture, locked decisions, resolved defaults
