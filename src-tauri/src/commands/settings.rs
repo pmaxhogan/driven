@@ -815,6 +815,92 @@ fn apply_autostart(app: &AppHandle, enable: bool) -> CommandResult<()> {
     Ok(())
 }
 
+/// Decide what (if anything) the boot-time autostart reconciliation must do.
+///
+/// `desired` is the persisted `global.auto_start_on_login` preference; `actual`
+/// is what the OS autostart manager currently reports via `is_enabled()`.
+/// Returns `Some(true)` to register, `Some(false)` to unregister, or `None` when
+/// they already agree (no OS write needed). Pure + total so the reconciliation
+/// logic is unit-testable without a live Tauri app / OS registry.
+fn autostart_reconcile_action(desired: bool, actual: bool) -> Option<bool> {
+    if desired == actual {
+        None
+    } else {
+        Some(desired)
+    }
+}
+
+/// Boot-time reconciliation of the OS autostart registration with the persisted
+/// `global.auto_start_on_login` preference (SPEC s13, issue #58).
+///
+/// [`apply_autostart`] only fires on a settings *change*, so a DB default of
+/// `true` (migration 0005 / [`default_global`]) would never register the real OS
+/// startup entry - the app would claim "auto-start ON" while Task Manager's
+/// Startup tab (and the macOS LaunchAgent / Linux `.desktop` equivalent) showed
+/// nothing. This runs once at startup: it reads the stored preference, compares
+/// it to the autostart manager's actual `is_enabled()`, and enables/disables to
+/// match so the two never drift.
+///
+/// Best-effort: a malformed settings read, an `is_enabled()` failure, or an OS
+/// refusal is logged and swallowed - it must never abort boot.
+pub async fn reconcile_autostart_on_boot(app: &AppHandle, state: &dyn StateRepo) {
+    use tauri_plugin_autostart::ManagerExt;
+
+    let desired = match load_group::<storage::Global>(state, KEY_GLOBAL).await {
+        Ok(Some(g)) => GlobalSettings::from(g).auto_start_on_login,
+        Ok(None) => default_global().auto_start_on_login,
+        Err(err) => {
+            tracing::warn!(
+                target: TARGET,
+                %err,
+                "autostart boot-reconcile: could not read global settings; skipping"
+            );
+            return;
+        }
+    };
+
+    let manager = app.autolaunch();
+    let actual = match manager.is_enabled() {
+        Ok(v) => v,
+        Err(err) => {
+            tracing::warn!(
+                target: TARGET,
+                %err,
+                "autostart boot-reconcile: is_enabled() failed; skipping"
+            );
+            return;
+        }
+    };
+
+    let Some(enable) = autostart_reconcile_action(desired, actual) else {
+        tracing::debug!(
+            target: TARGET,
+            desired,
+            "autostart boot-reconcile: OS state already matches preference"
+        );
+        return;
+    };
+
+    let result = if enable {
+        manager.enable()
+    } else {
+        manager.disable()
+    };
+    match result {
+        Ok(()) => tracing::info!(
+            target: TARGET,
+            enabled = enable,
+            "autostart boot-reconcile: OS startup entry synced to persisted preference"
+        ),
+        Err(err) => tracing::warn!(
+            target: TARGET,
+            %err,
+            enabled = enable,
+            "autostart boot-reconcile: enable/disable failed (OS refused); leaving as-is"
+        ),
+    }
+}
+
 /// Apply a `tracing` max-level change at runtime (SPEC s22 `global.log_level`).
 ///
 /// The process installs a plain `tracing_subscriber::fmt` subscriber at boot
@@ -2045,7 +2131,10 @@ async fn fetch_releases(page: u32) -> CommandResult<Vec<GithubRelease>> {
 
 fn default_global() -> GlobalSettings {
     GlobalSettings {
-        auto_start_on_login: false,
+        // Default ON (issue #58): launch Driven at login. Mirrors migration
+        // 0005, which flips the seeded `global` blob's flag to `true`; this
+        // code default applies only when the `global` group is entirely absent.
+        auto_start_on_login: true,
         default_concurrent_uploads: None,
         bandwidth_cap_mbps: None,
         skip_on_battery: true,
@@ -2257,8 +2346,9 @@ mod tests {
     async fn get_settings_reads_seeded_groups() {
         let (repo, dir) = seeded_repo().await;
         let dto = load_settings_dto(&repo).await.expect("load settings");
-        // Seeded SPEC s22 defaults round-trip.
-        assert!(!dto.global.auto_start_on_login);
+        // Seeded SPEC s22 defaults round-trip. Auto-start defaults ON after
+        // migration 0005 (issue #58).
+        assert!(dto.global.auto_start_on_login);
         assert_eq!(dto.global.scan_interval_secs, 600);
         assert_eq!(dto.updater.channel, "stable");
         assert_eq!(dto.ui.locale, "en-US");
@@ -2273,6 +2363,46 @@ mod tests {
             assert!(dto.windows.is_none());
         }
         cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn migration_0005_defaults_autostart_on_for_new_installs() {
+        // A freshly migrated DB (0002 seeds the `global` blob, 0005 flips the
+        // flag) must report auto-start ON - the issue #58 headline default.
+        let (repo, dir) = seeded_repo().await;
+        let raw = repo
+            .get_setting(KEY_GLOBAL)
+            .await
+            .expect("read global")
+            .expect("global seeded");
+        let stored: storage::Global = serde_json::from_value(raw).expect("parse stored global");
+        assert!(
+            stored.auto_start_on_login,
+            "migration 0005 must flip the seeded global auto_start_on_login to true"
+        );
+        // And it surfaces through the DTO read path the IPC layer uses.
+        let dto = load_settings_dto(&repo).await.expect("load settings");
+        assert!(dto.global.auto_start_on_login);
+        cleanup(dir);
+    }
+
+    #[test]
+    fn default_global_defaults_autostart_on() {
+        // The code default (used when the `global` group is entirely absent)
+        // mirrors migration 0005 so an unseeded read still defaults ON.
+        assert!(default_global().auto_start_on_login);
+    }
+
+    #[test]
+    fn autostart_reconcile_action_only_acts_on_drift() {
+        // No-op when the OS state already matches the preference.
+        assert_eq!(autostart_reconcile_action(true, true), None);
+        assert_eq!(autostart_reconcile_action(false, false), None);
+        // Default ON but OS entry missing -> register (the issue #58 case the
+        // boot reconciliation must fix).
+        assert_eq!(autostart_reconcile_action(true, false), Some(true));
+        // Preference off but OS entry present -> unregister.
+        assert_eq!(autostart_reconcile_action(false, true), Some(false));
     }
 
     #[tokio::test]

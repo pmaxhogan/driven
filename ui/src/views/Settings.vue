@@ -184,6 +184,13 @@ async function commitPatch(p: SettingsPatch): Promise<void> {
   }
 }
 
+// Issue #58: launch Driven at login (default ON). Patches the persisted
+// preference; the backend registers/unregisters the real OS startup entry.
+async function setAutoStartOnLogin(event: Event): Promise<void> {
+  const checked = (event.target as HTMLInputElement).checked;
+  await commitPatch({ global: { autoStartOnLogin: checked } });
+}
+
 async function setSkipOnBattery(event: Event): Promise<void> {
   const checked = (event.target as HTMLInputElement).checked;
   await commitPatch({ global: { skipOnBattery: checked } });
@@ -383,6 +390,26 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
         >
           {{ t(`errors.${settings.errorCode}.long`) }}
         </p>
+        <!-- Startup -->
+        <section class="space-y-3" :class="cardCls" data-testid="startup-setting">
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("settings.rules.sections.startup") }}
+          </h3>
+          <label class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              class="accent-teal-600"
+              data-testid="autostart-toggle"
+              :checked="settings.settings.global.autoStartOnLogin"
+              @change="setAutoStartOnLogin"
+            />
+            {{ t("settings.rules.autoStartOnLoginLabel") }}
+          </label>
+          <p class="text-xs text-zinc-500 dark:text-zinc-400">
+            {{ t("settings.rules.autoStartOnLoginNote") }}
+          </p>
+        </section>
+
         <!-- Power and network -->
         <section class="space-y-3" :class="cardCls">
           <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">

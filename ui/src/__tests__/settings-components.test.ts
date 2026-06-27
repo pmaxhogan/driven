@@ -581,8 +581,9 @@ describe("Settings Rules tab", () => {
     expect(invokeMock).toHaveBeenCalledWith("get_settings", undefined);
     const form = wrapper.get('[data-testid="rules-form"]');
 
-    // Toggle skip-on-battery off.
-    const batteryCheckbox = form.get('input[type="checkbox"]');
+    // Toggle skip-on-battery off. The first checkbox in the form is the
+    // Startup auto-start toggle; skip-on-battery is the next one.
+    const batteryCheckbox = form.findAll('input[type="checkbox"]')[1];
     await batteryCheckbox.setValue(false);
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
@@ -597,6 +598,42 @@ describe("Settings Rules tab", () => {
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
       patch: { global: { bandwidthCapMbps: 50 } },
+    });
+  });
+
+  it("startup: auto-start renders ON by default and toggling it patches the preference", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(
+          makeSettings({ global: { ...makeSettings().global, autoStartOnLogin: true } })
+        );
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: { global?: Record<string, unknown> } }).patch;
+        const base = makeSettings();
+        return Promise.resolve({
+          ...base,
+          global: { ...base.global, ...(patch.global ?? {}) },
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    // Default ON: the toggle reflects the persisted preference.
+    const toggle = wrapper.get('[data-testid="autostart-toggle"]');
+    expect((toggle.element as HTMLInputElement).checked).toBe(true);
+
+    // Turning it off patches the persisted preference (the backend then
+    // unregisters the OS startup entry).
+    await toggle.setValue(false);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { autoStartOnLogin: false } },
     });
   });
 

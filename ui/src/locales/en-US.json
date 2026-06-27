@@ -179,11 +179,14 @@
     "rules": {
       "title": "Global rules",
       "sections": {
+        "startup": "Startup",
         "powerNetwork": "Power and network",
         "schedule": "Schedule",
         "performance": "Performance and bandwidth",
         "privacy": "Privacy"
       },
+      "autoStartOnLoginLabel": "Launch Driven when I sign in",
+      "autoStartOnLoginNote": "Starts Driven in the background at login so backups keep running. Registers as a real startup app (Windows Task Manager, macOS Login Items, Linux autostart).",
       "skipOnBatteryLabel": "Pause backups while on battery",
       "skipOnMeteredLabel": "Limit backups on metered networks",
       "metered": {
