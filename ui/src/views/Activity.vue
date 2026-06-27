@@ -5,7 +5,7 @@ import { useI18n } from "vue-i18n";
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
 import { activityEventLabel } from "../stores/activityEventLabel";
-import { useActivityStore } from "../stores/activity";
+import { ACTIVITY_PAGE_SIZE, ACTIVITY_RENDER_WINDOW, useActivityStore } from "../stores/activity";
 import { useSourcesStore } from "../stores/sources";
 import type { ActivityEntry, ActivityLevel, FileStateStatus } from "../ipc/types";
 
@@ -106,7 +106,38 @@ const sourceNameById = computed<Record<string, string>>(() => {
   return map;
 });
 
-const shownCount = computed(() => activity.entries.length);
+// Issue #45: bound the rendered DOM. The store can accumulate up to ~1000 live
+// entries plus paged history; mounting every row makes the page janky while an
+// upload streams new rows in. Render only the newest `renderLimit` rows and grow
+// the window on demand, so the mounted row count never grows with the live tail.
+const renderLimit = ref(ACTIVITY_RENDER_WINDOW);
+const visibleEntries = computed(() => activity.entries.slice(0, renderLimit.value));
+
+// Issue #45 (codex P2): "Showing N of total" must reflect the rows actually
+// mounted, not everything buffered in the store - otherwise it claims e.g. 290
+// shown while only the windowed `renderLimit` rows are in the DOM (with a "load
+// more" control present).
+const shownCount = computed(() => visibleEntries.value.length);
+
+// More accumulated (in-memory) entries exist than are currently rendered.
+const canShowMore = computed(() => renderLimit.value < activity.entries.length);
+// The "load more" control is available when there are more buffered rows to
+// reveal OR more history pages to fetch from the backend.
+const canLoadMore = computed(() => canShowMore.value || activity.hasMore);
+
+/** One progressive-disclosure "load more": first reveal any already-loaded rows
+ * beyond the render window (instant, no fetch), then page older history from the
+ * backend (growing the window to keep the freshly fetched page visible). */
+async function loadMoreRows(): Promise<void> {
+  if (canShowMore.value) {
+    renderLimit.value += ACTIVITY_RENDER_WINDOW;
+    return;
+  }
+  if (activity.hasMore) {
+    await activity.loadMore();
+    renderLimit.value += ACTIVITY_PAGE_SIZE;
+  }
+}
 
 function formatTime(entry: ActivityEntry): string {
   return dateTimeFormatter.value.format(new Date(entry.ts));
@@ -143,6 +174,8 @@ function sourceLabel(entry: ActivityEntry): string {
 // Build the filter DTO from the form and apply it (re-query from page 0).
 async function applyFilters(): Promise<void> {
   const eventTypes = filterEventType.value.length > 0 ? [filterEventType.value] : [];
+  // A re-query resets the accumulated rows, so collapse the render window too.
+  renderLimit.value = ACTIVITY_RENDER_WINDOW;
   await activity.applyFilter({
     sourceId: filterSourceId.value.length > 0 ? filterSourceId.value : null,
     minLevel: filterLevel.value.length > 0 ? (filterLevel.value as ActivityLevel) : null,
@@ -154,6 +187,7 @@ async function clearFilters(): Promise<void> {
   filterSourceId.value = "";
   filterLevel.value = "";
   filterEventType.value = "";
+  renderLimit.value = ACTIVITY_RENDER_WINDOW;
   await activity.applyFilter({});
 }
 
@@ -425,7 +459,7 @@ onUnmounted(() => {
           </tr>
         </thead>
         <tbody class="divide-y divide-zinc-200 dark:divide-zinc-800">
-          <tr v-for="entry in activity.entries" :key="entry.id" data-testid="activity-row">
+          <tr v-for="entry in visibleEntries" :key="entry.id" data-testid="activity-row">
             <td class="whitespace-nowrap py-2 pr-3 align-top">
               {{ formatTime(entry) }}
             </td>
@@ -453,13 +487,13 @@ onUnmounted(() => {
       </table>
     </div>
 
-    <div v-if="activity.hasMore" class="flex justify-center">
+    <div v-if="canLoadMore" class="flex justify-center">
       <button
         type="button"
         :class="SECONDARY_BTN"
         :disabled="activity.loading"
         data-testid="activity-load-more"
-        @click="activity.loadMore()"
+        @click="loadMoreRows"
       >
         {{ activity.loading ? t("activity.loadingMore") : t("activity.loadMore") }}
       </button>

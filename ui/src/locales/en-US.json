@@ -17,6 +17,10 @@
     "restore": "Restore",
     "about": "About"
   },
+  "progress": {
+    "backingUp": "Backing up...",
+    "backingUpPercent": "Backing up - {percent}%"
+  },
   "common": {
     "next": "Next",
     "back": "Back",

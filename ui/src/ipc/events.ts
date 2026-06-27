@@ -6,13 +6,28 @@
 
 import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 
-import type { ActivityEntry, GlobalSyncStatus, RestoreJobStatus, UpdateInfo } from "./types";
+import type {
+  AccountSyncStatus,
+  ActivityEntry,
+  GlobalSyncStatus,
+  RestoreJobStatus,
+  UpdateInfo,
+} from "./types";
 
-/** `sync:status_changed` payload: GlobalSyncStatus (SPEC s11.7). */
+/** The live payload of `sync:status_changed`. SPEC s11.7 documents the aggregate
+ * `GlobalSyncStatus`, but the backend CURRENTLY emits a SINGLE-account snapshot
+ * per orchestrator transition (src-tauri/src/assembly.rs `AccountSyncStatusEvent`
+ * = `{ account_id, state }`, i.e. an `AccountSyncStatus`); the aggregate shape is
+ * reserved for a later milestone. Consumers must handle BOTH and discriminate on
+ * the presence of the `accounts` array. */
+export type SyncStatusChangedPayload = GlobalSyncStatus | AccountSyncStatus;
+
+/** `sync:status_changed` payload: a per-account `AccountSyncStatus` snapshot today
+ * (the aggregate `GlobalSyncStatus` is reserved; see `SyncStatusChangedPayload`). */
 export function onSyncStatusChanged(
-  handler: (status: GlobalSyncStatus) => void
+  handler: (status: SyncStatusChangedPayload) => void
 ): Promise<UnlistenFn> {
-  return listen<GlobalSyncStatus>("sync:status_changed", (e) => handler(e.payload));
+  return listen<SyncStatusChangedPayload>("sync:status_changed", (e) => handler(e.payload));
 }
 
 /** `sync:source_progress` payload: { sourceId, progress } (SPEC s11.7). */

@@ -362,8 +362,24 @@ export interface ActivitySummaryDto {
 // --- Sync (SPEC s11.3) - mirrors src-tauri/src/commands/sync.rs ---
 
 /** Mirrors the Rust `OrchestratorState` (driven_core::types). Carried as an
- * opaque tagged object; the UI reads the discriminant for the status pill. */
+ * opaque tagged object; the UI reads the discriminant for the status pill.
+ * On the wire it is internally tagged on a snake_case `state` field (e.g.
+ * `{ state: "executing", progress: ExecProgress }`, `{ state: "idle", last_run_at }`). */
 export type OrchestratorState = Record<string, unknown>;
+
+/** Mirrors the Rust `ExecProgress` (driven_core::types) - the `progress` payload
+ * of an `executing` OrchestratorState. Plain snake_case on the wire (the Rust
+ * struct has no `rename_all`). The global progress bar aggregates these across
+ * executing accounts to compute a determinate completion percent. */
+export interface ExecProgress {
+  files_done: number;
+  files_total: number;
+  bytes_done: number;
+  bytes_total: number;
+  trashes_done: number;
+  trashes_total: number;
+  errors: number;
+}
 
 // NOTE: the Rust GlobalSyncStatus / AccountSyncStatus (M5, sync.rs) do NOT use
 // `rename_all = "camelCase"`, so this DTO is snake_case on the wire (unlike the
