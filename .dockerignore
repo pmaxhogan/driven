@@ -1,0 +1,9 @@
+# Keep the build context minimal but DO NOT drop anything the build needs.
+# In particular the .sqlx/ offline cache MUST stay in context (SQLX_OFFLINE)
+# and every workspace member manifest (incl. src-tauri/Cargo.toml) must remain,
+# because a virtual-workspace build parses all members even when building only
+# two crates. So exclude only host build artifacts and VCS metadata.
+target/
+ui/node_modules
+ui/dist
+.git
