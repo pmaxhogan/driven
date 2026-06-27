@@ -5,6 +5,15 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.5.0](https://github.com/pmaxhogan/driven/compare/v0.4.0...v0.5.0) (2026-06-27)
+
+
+### Features
+
+* auto-open on startup setting ([#66](https://github.com/pmaxhogan/driven/issues/66)) ([3dbae06](https://github.com/pmaxhogan/driven/commit/3dbae06f0f23751ac2a08854979b2019c676a4ea)), closes [#58](https://github.com/pmaxhogan/driven/issues/58)
+* per-state tray glyph icons and animated syncing ([#64](https://github.com/pmaxhogan/driven/issues/64)) ([2c2755f](https://github.com/pmaxhogan/driven/commit/2c2755f1cb38098d2b5aab3bc0203a903982f32a))
+* publish Docker images for the CLI and chaos-soak ([#60](https://github.com/pmaxhogan/driven/issues/60)) ([8df71e6](https://github.com/pmaxhogan/driven/commit/8df71e6fbe4ce33d8db22ffb7a76e726b16d2788))
+
 ## [0.4.0](https://github.com/pmaxhogan/driven/compare/v0.3.1...v0.4.0) (2026-06-27)
 
 
