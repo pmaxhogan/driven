@@ -2,6 +2,7 @@
 import { computed, onMounted, onUnmounted, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 
+import { useVirtualList } from "../composables/useVirtualList";
 import { useRestoreStore } from "../stores/restore";
 
 // Restore browser (SPEC s11.5; DESIGN s8.4). Browse the backed-up tree (lazy
@@ -61,6 +62,22 @@ const overallPercent = computed(() => {
   return Math.min(100, Math.round((j.bytesDone / j.totalBytes) * 100));
 });
 
+// List virtualization (windowing). A backed-up folder can hold thousands of
+// rows; rendering one <li> each makes the page crawl. Each row is laid out at a
+// FIXED height so the windowing math (top/bottom spacer paddings on the <ul>)
+// lines up exactly, and only the visible window (+ overscan) is mounted. The
+// same ROW_HEIGHT drives both the composable and the per-row style binding.
+const ROW_HEIGHT = 40;
+const { containerRef: listRef, range: virtualRange } = useVirtualList(
+  () => restore.rows.length,
+  ROW_HEIGHT
+);
+// The mounted slice of `restore.rows`. Slicing preserves each row's identity and
+// keyOf keying (the key is derived from the row, not its position).
+const visibleRows = computed(() =>
+  restore.rows.slice(virtualRange.value.startIndex, virtualRange.value.endIndex)
+);
+
 onMounted(async () => {
   await restore.subscribeProgress();
   await restore.loadSources();
@@ -98,7 +115,9 @@ async function onClearSearch(): Promise<void> {
 </script>
 
 <template>
-  <section class="space-y-4">
+  <!-- pb-4 keeps a small buffer below the sticky action bar so the very last
+       rows clear it when scrolled to the bottom. -->
+  <section class="space-y-4 pb-4">
     <header class="space-y-1">
       <h1 class="text-2xl font-semibold">
         {{ t("restore.title") }}
@@ -232,15 +251,25 @@ async function onClearSearch(): Promise<void> {
       {{ t("restore.truncated", { count: restore.nodes.length }) }}
     </p>
 
-    <!-- File / folder list -->
+    <!-- File / folder list (virtualized). Only the rows in the visible window
+         (+ overscan) are mounted; the top/bottom paddings stand in for the rest
+         so the scrollbar still reflects the full list. Each <li> renders at a
+         FIXED ROW_HEIGHT so the spacer math lines up exactly. -->
     <ul
       v-if="!restore.loading && !restore.isEmpty"
+      ref="listRef"
+      data-testid="restore-list"
       class="divide-y divide-zinc-200 overflow-hidden rounded-lg border border-zinc-200 bg-white dark:divide-zinc-800 dark:border-zinc-800 dark:bg-zinc-900"
+      :style="{
+        paddingTop: virtualRange.paddingTop + 'px',
+        paddingBottom: virtualRange.paddingBottom + 'px',
+      }"
     >
       <li
-        v-for="row in restore.rows"
+        v-for="row in visibleRows"
         :key="restore.keyOf(restore.sourceId ?? '', row.relativePath)"
-        class="flex items-center gap-3 px-3 py-2 text-sm"
+        class="flex items-center gap-3 px-3 text-sm"
+        :style="{ height: ROW_HEIGHT + 'px' }"
       >
         <!-- A folder node (tree only): click to descend. -->
         <template v-if="!restore.isSearching && 'isDir' in row && row.isDir">
@@ -249,7 +278,8 @@ async function onClearSearch(): Promise<void> {
           >
           <button
             type="button"
-            class="flex-1 rounded text-left font-medium text-zinc-900 transition-colors hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-zinc-100 dark:hover:text-teal-300"
+            class="min-w-0 flex-1 truncate rounded text-left font-medium text-zinc-900 transition-colors hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-zinc-100 dark:hover:text-teal-300"
+            :title="row.name"
             @click="restore.openFolder(row.relativePath)"
           >
             {{ row.name }}
@@ -290,9 +320,14 @@ async function onClearSearch(): Promise<void> {
       </li>
     </ul>
 
-    <!-- Action bar: selection + destination + restore -->
+    <!-- Action bar: selection + destination + restore. Sticky to the bottom of
+         the scroll viewport so the Restore / Cancel actions stay reachable
+         without scrolling a huge folder all the way down. The page-matching
+         background + top border + z-index keep it readable over the list (in
+         both light and dark mode) as rows scroll beneath it. -->
     <div
-      class="flex flex-wrap items-center gap-3 border-t border-zinc-200 pt-3 dark:border-zinc-800"
+      data-testid="restore-action-bar"
+      class="sticky bottom-0 z-10 flex flex-wrap items-center gap-3 border-t border-zinc-200 bg-zinc-50 py-3 dark:border-zinc-800 dark:bg-zinc-950"
     >
       <span class="text-sm text-zinc-600 dark:text-zinc-400">
         {{ t("restore.selectedCount", { count: restore.selectedCount }) }}
