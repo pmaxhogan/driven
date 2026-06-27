@@ -173,6 +173,39 @@ jobs:
         with:
           node-version: 22
 
+      # Issue #29: drop the stray `latest.json` updater manifest tauri-action
+      # attaches to the GitHub Release. `uploadUpdaterJson: false` (set on the
+      # build job's tauri-action step, verified the correct input name) is SUPPOSED
+      # to suppress it, but it does not reliably do so on the floating
+      # `tauri-apps/tauri-action@v0` tag: tauri.conf.json sets
+      # `createUpdaterArtifacts: true`, so the bundler emits updater artifacts and
+      # the pinned `@v0` build still uploads a generated `latest.json` (a
+      # tauri-action version quirk - the current `dev` branch gates the upload on
+      # the flag, but the resolved `@v0` build's behavior differs). Driven serves
+      # its own channel-in-path manifests from Cloudflare Pages
+      # (updates/<channel>/<os>/<arch>/update.json), so a target-flat `latest.json`
+      # on the Release is just confusing clutter. Delete it post-publish. This job
+      # runs ONCE (needs: build) after every matrix build's tauri-action upload has
+      # completed and has the tag (RELEASE_TAG) + GITHUB_TOKEN, so the cleanup
+      # happens exactly once after all assets exist. Idempotent: a no-op (exit 0)
+      # when no `latest.json` asset is present.
+      - name: Remove stray latest.json from the release
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -euo pipefail
+          has_latest="$(gh release view "$RELEASE_TAG" \
+            --repo "$GITHUB_REPOSITORY" \
+            --json assets \
+            --jq '[.assets[] | select(.name == "latest.json")] | length')"
+          if [ "${has_latest:-0}" -gt 0 ]; then
+            echo "deleting stray latest.json from release $RELEASE_TAG"
+            gh release delete-asset "$RELEASE_TAG" latest.json --yes \
+              --repo "$GITHUB_REPOSITORY"
+          else
+            echo "no latest.json asset on release $RELEASE_TAG (nothing to clean up)"
+          fi
+
       # R1-P1-2: the generator reads bundles + `.sig` from a local dir, but the
       # matrix build artifacts live as GitHub Release assets. Download the
       # just-published release's assets into a flat dir so the generator has real
