@@ -1,5 +1,6 @@
 import { describe, it, expect, vi, beforeEach } from "vitest";
 import { createPinia, setActivePinia } from "pinia";
+import { watch } from "vue";
 
 // Activity store tests (SPEC s11.4; DESIGN s8.3). The seams are
 // `@tauri-apps/api/core`'s `invoke` (every typed IPC wrapper routes through it)
@@ -50,7 +51,12 @@ vi.mock("@tauri-apps/api/event", () => ({
   }),
 }));
 
-import { useActivityStore, ACTIVITY_PAGE_SIZE, LIVE_TAIL_CAP } from "../stores/activity";
+import {
+  useActivityStore,
+  ACTIVITY_PAGE_SIZE,
+  ACTIVITY_RENDER_WINDOW,
+  LIVE_TAIL_CAP,
+} from "../stores/activity";
 import type { ActivityEntry } from "../ipc/types";
 
 function makeEntry(over: Partial<ActivityEntry> = {}): ActivityEntry {
@@ -164,8 +170,11 @@ describe("activity store: pagination", () => {
     await store.subscribeLive();
     await store.loadInitial();
 
-    // A live event arrives for id 150 before it is paged in.
+    // A live event arrives for id 150 before it is paged in. Issue #45: live
+    // events are buffered + coalesced, so flush to apply the burst before
+    // asserting the rendered tail.
     liveHandler?.(makeEntry({ id: 150, ts: 900 }));
+    store.flushLive();
     expect(store.entries.map((e) => e.id)).toEqual([150, 200]);
 
     // Page 1 includes id 150 again - it must NOT be duplicated.
@@ -188,6 +197,8 @@ describe("activity store: live tail", () => {
     expect(store.total).toBe(1);
 
     liveHandler?.(makeEntry({ id: 2, ts: 2000 }));
+    // Issue #45: the burst is buffered; flush to apply it in one update.
+    store.flushLive();
     expect(store.entries[0].id).toBe(2);
     expect(store.entries.map((e) => e.id)).toEqual([2, 1]);
     expect(store.total).toBe(2);
@@ -209,11 +220,13 @@ describe("activity store: live tail", () => {
     const store = useActivityStore();
     await store.subscribeLive();
     await store.applyFilter({ minLevel: "error" });
-    // An info-level live event must be dropped under a min-level=error filter.
+    // An info-level live event must be dropped under a min-level=error filter
+    // (filtered out at ingest, never buffered).
     liveHandler?.(makeEntry({ id: 9, level: "info" }));
     expect(store.entries).toHaveLength(0);
-    // A matching error-level event is kept.
+    // A matching error-level event is kept (buffered, applied on flush).
     liveHandler?.(makeEntry({ id: 10, level: "error" }));
+    store.flushLive();
     expect(store.entries.map((e) => e.id)).toEqual([10]);
   });
 
@@ -343,6 +356,7 @@ describe("activity store: lag reconcile (M7-P1-1)", () => {
     for (const row of allRows.slice(0, ACTIVITY_PAGE_SIZE)) {
       liveHandler?.(row);
     }
+    store.flushLive();
     expect(store.entries).toHaveLength(ACTIVITY_PAGE_SIZE);
 
     const pageOf = (p: number) =>
@@ -385,6 +399,8 @@ describe("activity store: live-tail cap (M7-P2-2)", () => {
     for (let i = 1; i <= LIVE_TAIL_CAP + overflow; i++) {
       liveHandler?.(makeEntry({ id: i, ts: i }));
     }
+    // Issue #45: apply the buffered burst, then assert the bound holds.
+    store.flushLive();
     // The store is bounded to the cap (oldest live entries evicted).
     expect(store.entries).toHaveLength(LIVE_TAIL_CAP);
     // Newest is the last pushed; the oldest retained is id overflow+1.
@@ -402,6 +418,7 @@ describe("activity store: live-tail cap (M7-P2-2)", () => {
     for (let i = 2; i <= LIVE_TAIL_CAP + 100; i++) {
       liveHandler?.(makeEntry({ id: i, ts: i }));
     }
+    store.flushLive();
     // Live tail capped at CAP, but the loaded history row survives at the tail.
     expect(store.entries.length).toBe(LIVE_TAIL_CAP + 1);
     expect(store.entries[store.entries.length - 1].id).toBe(1);
@@ -663,5 +680,164 @@ describe("activity store: recheck-3 polish (M7-R3-P2)", () => {
     await store.loadMore();
     expect(store.errorCode).toBeNull();
     expect(store.entries.map((e) => e.id)).toEqual([200, 100]);
+  });
+});
+
+describe("activity store: batched live ingestion (issue #45)", () => {
+  it("buffers a burst and applies it in ONE reactive update to entries AND total", async () => {
+    invokeMock.mockResolvedValueOnce(makePage([], 0, 0));
+    const store = useActivityStore();
+    await store.subscribeLive();
+    await store.loadInitial();
+
+    // Count how many times the rendered list and the total actually change.
+    // `flush: "sync"` fires the watcher on every reactive mutation, so a per-event
+    // mutation (the pre-fix behavior) would push N entries here, not 1.
+    const entriesUpdates: number[] = [];
+    const totalUpdates: number[] = [];
+    const stopEntries = watch(
+      () => store.entries.length,
+      (len) => entriesUpdates.push(len),
+      { flush: "sync" }
+    );
+    const stopTotal = watch(
+      () => store.total,
+      (t) => totalUpdates.push(t),
+      { flush: "sync" }
+    );
+
+    const N = 50;
+    for (let i = 1; i <= N; i++) {
+      liveHandler?.(makeEntry({ id: i, ts: i, eventType: "upload_done", bytes: null }));
+    }
+
+    // The whole burst is buffered: NOT yet reflected in the reactive state.
+    expect(entriesUpdates).toHaveLength(0);
+    expect(totalUpdates).toHaveLength(0);
+    expect(store.entries).toHaveLength(0);
+
+    // A single coalesced flush applies the burst as exactly ONE update each.
+    store.flushLive();
+    expect(entriesUpdates).toEqual([N]);
+    expect(totalUpdates).toEqual([N]);
+
+    // Ordering preserved (newest-first) and no rows dropped.
+    expect(store.entries).toHaveLength(N);
+    expect(store.entries[0].id).toBe(N);
+    expect(store.entries[N - 1].id).toBe(1);
+    expect(store.total).toBe(N);
+
+    stopEntries();
+    stopTotal();
+  });
+
+  it("dedups within a buffered burst (no duplicate rows, total counts once)", async () => {
+    invokeMock.mockResolvedValueOnce(makePage([], 0, 0));
+    const store = useActivityStore();
+    await store.subscribeLive();
+    await store.loadInitial();
+
+    // id 7 arrives twice in the same burst; the second is dropped at ingest.
+    liveHandler?.(makeEntry({ id: 7, ts: 700 }));
+    liveHandler?.(makeEntry({ id: 8, ts: 800 }));
+    liveHandler?.(makeEntry({ id: 7, ts: 700 }));
+    store.flushLive();
+
+    expect(store.entries.map((e) => e.id)).toEqual([8, 7]);
+    expect(store.total).toBe(2);
+  });
+
+  it("auto-flushes the buffer on the next frame via the scheduler", async () => {
+    vi.useFakeTimers();
+    try {
+      invokeMock.mockResolvedValue(undefined);
+      const store = useActivityStore();
+      await store.subscribeLive();
+
+      for (let i = 1; i <= 10; i++) {
+        liveHandler?.(makeEntry({ id: i, ts: i, bytes: null }));
+      }
+      // No frame has elapsed yet: still buffered.
+      expect(store.entries).toHaveLength(0);
+
+      // The node test env has no requestAnimationFrame, so the store falls back to
+      // a ~1-frame setTimeout; advancing past it flushes the burst once.
+      await vi.advanceTimersByTimeAsync(20);
+      expect(store.entries).toHaveLength(10);
+      expect(store.entries[0].id).toBe(10);
+      expect(store.total).toBe(10);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("eagerly flushes when the buffer reaches the cap, keeping newest-first + bound", async () => {
+    invokeMock.mockResolvedValueOnce(makePage([], 0, 0));
+    const store = useActivityStore();
+    await store.subscribeLive();
+    await store.loadInitial();
+
+    // Fire a burst LARGER than the cap WITHOUT any manual flush: the eager
+    // at-cap flush keeps memory bounded even if no frame fires mid-burst.
+    const overflow = 25;
+    for (let i = 1; i <= LIVE_TAIL_CAP + overflow; i++) {
+      liveHandler?.(makeEntry({ id: i, ts: i, bytes: null }));
+    }
+    // Drain the trailing partial buffer (the last < cap events).
+    store.flushLive();
+
+    expect(store.entries).toHaveLength(LIVE_TAIL_CAP);
+    // Newest retained at the front, oldest `overflow` evicted.
+    expect(store.entries[0].id).toBe(LIVE_TAIL_CAP + overflow);
+    expect(store.entries[store.entries.length - 1].id).toBe(overflow + 1);
+    // total counts every ingested event (eviction does not decrement it).
+    expect(store.total).toBe(LIVE_TAIL_CAP + overflow);
+  });
+
+  it("flushes the buffer on unsubscribe so state stays consistent", async () => {
+    invokeMock.mockResolvedValueOnce(makePage([], 0, 0));
+    const store = useActivityStore();
+    await store.subscribeLive();
+    await store.loadInitial();
+
+    liveHandler?.(makeEntry({ id: 1, ts: 1, bytes: null }));
+    liveHandler?.(makeEntry({ id: 2, ts: 2, bytes: null }));
+    // Not yet applied (buffered).
+    expect(store.entries).toHaveLength(0);
+
+    store.unsubscribeLive();
+    // Teardown drains the buffer so entries / total stay in sync.
+    expect(store.entries.map((e) => e.id)).toEqual([2, 1]);
+    expect(store.total).toBe(2);
+  });
+});
+
+describe("activity store: render window (issue #45)", () => {
+  it("ACTIVITY_RENDER_WINDOW bounds the rendered slice below the live-tail cap", () => {
+    // The view renders entries.slice(0, ACTIVITY_RENDER_WINDOW); that window must
+    // be well under the live-tail cap so the mounted DOM never grows to ~1000.
+    expect(ACTIVITY_RENDER_WINDOW).toBeGreaterThan(0);
+    expect(ACTIVITY_RENDER_WINDOW).toBeLessThan(LIVE_TAIL_CAP);
+  });
+
+  it("the windowed slice keeps the newest rows and is capped at the window size", async () => {
+    invokeMock.mockResolvedValueOnce(makePage([], 0, 0));
+    const store = useActivityStore();
+    await store.subscribeLive();
+    await store.loadInitial();
+
+    const burst = ACTIVITY_RENDER_WINDOW + 80;
+    for (let i = 1; i <= burst; i++) {
+      liveHandler?.(makeEntry({ id: i, ts: i, bytes: null }));
+    }
+    store.flushLive();
+
+    // The store holds more than one window of entries...
+    expect(store.entries.length).toBe(burst);
+    // ...but a render window slices only the newest ACTIVITY_RENDER_WINDOW rows.
+    const windowed = store.entries.slice(0, ACTIVITY_RENDER_WINDOW);
+    expect(windowed).toHaveLength(ACTIVITY_RENDER_WINDOW);
+    expect(windowed[0].id).toBe(burst);
+    expect(windowed[windowed.length - 1].id).toBe(burst - ACTIVITY_RENDER_WINDOW + 1);
   });
 });

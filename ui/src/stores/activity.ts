@@ -23,6 +23,14 @@ export const ACTIVITY_PAGE_SIZE = 100;
  * NOT subject to this cap (they live in a separate list). */
 export const LIVE_TAIL_CAP = 1000;
 
+/** Issue #45: the number of activity rows the view mounts at once. The store can
+ * hold up to LIVE_TAIL_CAP (1000) live entries plus paged history, but rendering
+ * that many table rows makes the page janky while an upload streams new rows in.
+ * The view renders only the newest `slice(0, ACTIVITY_RENDER_WINDOW)` of the
+ * accumulated entries and grows the window on demand (the "load more" control),
+ * so the mounted DOM stays bounded no matter how large the live tail grows. */
+export const ACTIVITY_RENDER_WINDOW = 200;
+
 /** M7-P2-5: the recent-throughput window the header summary uses (ms). The
  * backend sums `activity_log.bytes` over this window; the UI divides by the
  * window seconds for a current bytes/sec rate. */
@@ -51,6 +59,12 @@ const LEVEL_RANK: Record<ActivityLevel, number> = {
  *   within 500ms; M7 acceptance), capped to `LIVE_TAIL_CAP` (M7-P2-2) by evicting
  *   the oldest live entry on overflow - so an error storm can never grow the
  *   store / DOM unbounded, while loaded history pages are preserved.
+ *
+ * Issue #45: `activity:new` events do NOT mutate `liveEntries` (or `total`)
+ * per event - a high-rate upload would re-render the table once per event. They
+ * are appended to a non-reactive buffer and a single coalesced flush per
+ * animation frame applies the whole burst in ONE reactive update (newest-first,
+ * deduped, capped), so a burst costs one render, not one per row.
  *
  * The rendered `entries` is `liveEntries` (newest, deduped against history)
  * followed by `historyEntries`; both ingestion paths dedup by row id so a row
@@ -99,8 +113,107 @@ export const useActivityStore = defineStore("activity", () => {
   // M7-P2-5: the header aggregate summary (null until first load).
   const summary = ref<ActivitySummaryDto | null>(null);
 
-  // Membership index by row id so dedup is O(1) across both lists.
+  // Membership index by row id so dedup is O(1) across both lists. A plain Set
+  // (NOT reactive) so the per-event dedup bookkeeping never triggers a render.
   const seenIds = new Set<number>();
+
+  // --- Issue #45: batched live-event ingestion -----------------------------
+  // A high-rate upload emits many `activity:new` events, each arriving in its
+  // OWN event-loop task. Applying each one straight to the reactive `liveEntries`
+  // (and bumping the reactive `total`) re-queues the component render per event,
+  // so a burst of N events costs N renders + N v-for diffs -> jank, especially
+  // while scrolling. Instead each event is appended to a NON-reactive buffer and
+  // a single coalesced flush per animation frame applies the whole burst in ONE
+  // reactive update (one `liveEntries` assignment + one `total` write). Ordering,
+  // the seenIds dedup, the lagged-reconcile path, and the LIVE_TAIL_CAP eviction
+  // are all preserved; no event is dropped or duplicated.
+  //
+  // The buffer holds entries in ARRIVAL order (oldest arrival first, newest
+  // last), mirroring the backend's emission order; the flush reverses it so the
+  // newest arrival lands at the FRONT of the newest-first tail.
+  const pendingLive: ActivityEntry[] = [];
+  // The not-yet-applied increment to `total` for the buffered events (applied in
+  // the same synchronous flush as the `liveEntries` assignment, so `total` - a
+  // render dependency via the count summary - mutates ONCE per burst, not once
+  // per event).
+  let pendingTotalDelta = 0;
+  // True while a frame flush is queued (flag-based so a stale frame callback that
+  // fires after a manual flush / cancel simply no-ops; no handle to track).
+  let flushScheduled = false;
+
+  // Schedule a callback for the next paint. `requestAnimationFrame` aligns the
+  // flush with rendering in the app (browser); under vitest's node environment
+  // rAF is undefined, so fall back to a ~1-frame timer that fake timers drive.
+  const scheduleFrame: (cb: () => void) => void =
+    typeof requestAnimationFrame === "function"
+      ? (cb) => {
+          requestAnimationFrame(cb);
+        }
+      : (cb) => {
+          setTimeout(cb, 16);
+        };
+
+  /** Trim `list` (newest-first) to LIVE_TAIL_CAP, returning the kept newest
+   * slice and dropping each evicted id from the dedup index unless it is also in
+   * loaded history. Eviction is from the END (the oldest live entries). */
+  function trimLiveTail(list: ActivityEntry[]): ActivityEntry[] {
+    if (list.length <= LIVE_TAIL_CAP) return list;
+    const kept = list.slice(0, LIVE_TAIL_CAP);
+    for (const evicted of list.slice(LIVE_TAIL_CAP)) {
+      if (!historyEntries.value.some((e) => e.id === evicted.id)) {
+        seenIds.delete(evicted.id);
+      }
+    }
+    return kept;
+  }
+
+  /** Apply the buffered live events to the reactive tail in ONE update: prepend
+   * them newest-first, apply the accumulated `total` delta, and cap the tail.
+   * Idempotent - a no-op when nothing is buffered. Exposed so the view can drain
+   * the buffer on teardown and tests can flush deterministically. */
+  function flushLive(): void {
+    flushScheduled = false;
+    if (pendingLive.length === 0) {
+      // Still settle any count delta accrued by dropped-then-empty edge paths.
+      if (pendingTotalDelta !== 0) {
+        total.value += pendingTotalDelta;
+        pendingTotalDelta = 0;
+      }
+      return;
+    }
+    // Arrival order is oldest-first; reverse so the newest arrival leads, then
+    // prepend the existing newest-first tail. A single reactive assignment.
+    const incoming = pendingLive.splice(0).reverse();
+    liveEntries.value = trimLiveTail([...incoming, ...liveEntries.value]);
+    if (pendingTotalDelta !== 0) {
+      total.value += pendingTotalDelta;
+      pendingTotalDelta = 0;
+    }
+  }
+
+  /** Queue a coalesced flush for the next frame (idempotent). If the buffer
+   * reaches a full tail's worth before a frame fires (e.g. the window is
+   * backgrounded so rAF is throttled), flush eagerly so memory stays bounded -
+   * no event is dropped, the flush trims to LIVE_TAIL_CAP exactly as a
+   * steady-state flush would. */
+  function scheduleFlush(): void {
+    if (pendingLive.length >= LIVE_TAIL_CAP) {
+      flushLive();
+      return;
+    }
+    if (flushScheduled) return;
+    flushScheduled = true;
+    scheduleFrame(() => {
+      if (flushScheduled) flushLive();
+    });
+  }
+
+  /** Drop a pending flush and clear the buffer (used on reset/teardown). */
+  function discardPendingLive(): void {
+    flushScheduled = false;
+    pendingLive.length = 0;
+    pendingTotalDelta = 0;
+  }
 
   // M7-P2-1: the request generation. Bumped on every (re)load; a response whose
   // token is stale (a newer load started) or whose filter snapshot no longer
@@ -120,6 +233,7 @@ export const useActivityStore = defineStore("activity", () => {
 
   /** Reset all accumulated state (entries, dedup index, paging, live tail). */
   function reset(): void {
+    discardPendingLive();
     historyEntries.value = [];
     liveEntries.value = [];
     seenIds.clear();
@@ -164,26 +278,6 @@ export const useActivityStore = defineStore("activity", () => {
     return true;
   }
 
-  /** Evict oldest live entries until the tail is within `LIVE_TAIL_CAP`,
-   * dropping each evicted id from the dedup index unless it is also in loaded
-   * history. The live tail is kept newest-first, so eviction is from the END. */
-  function capLiveTail(): void {
-    while (liveEntries.value.length > LIVE_TAIL_CAP) {
-      const evicted = liveEntries.value.pop();
-      if (evicted && !historyEntries.value.some((e) => e.id === evicted.id)) {
-        seenIds.delete(evicted.id);
-      }
-    }
-  }
-
-  /** Prepend a live entry (it is the newest, from `activity:new`), capping the
-   * live tail to `LIVE_TAIL_CAP`. */
-  function pushLive(entry: ActivityEntry): void {
-    seenIds.add(entry.id);
-    liveEntries.value.unshift(entry);
-    capLiveTail();
-  }
-
   /** M7-R3-P2 (recheck-3): record an event type seen on a live / recovered row
    * into the filter dropdown source if it is not already there. Without this a
    * NEW event type that first appears live (or via lag reconcile) shows up in
@@ -197,23 +291,30 @@ export const useActivityStore = defineStore("activity", () => {
 
   /** R2-P1-1: merge reconciled `rows` (recovered durable rows that the live
    * broadcast dropped) into the live tail, keeping it strictly newest-first.
-   * Unlike `pushLive`, recovered rows can be OLDER than rows already in the tail
-   * (a ring-buffer drop evicts the OLDEST of a burst, so the recovered rows sit
-   * below the latest delivered), so they must be INSERTED in sort order, not
+   * Unlike a live prepend, recovered rows can be OLDER than rows already in the
+   * tail (a ring-buffer drop evicts the OLDEST of a burst, so the recovered rows
+   * sit below the latest delivered), so they must be INSERTED in sort order, not
    * blindly prepended. Dedup by id; then re-sort + cap. */
   function mergeRecoveredLive(rows: ActivityEntry[]): void {
+    // Issue #45: apply any buffered live events FIRST so the merge operates on
+    // an up-to-date tail (and the pending `total` delta settles) - the recovered
+    // rows are then sorted into a consistent newest-first order. Unconditional so
+    // the buffer never lingers across a reconcile even when nothing is recovered.
+    flushLive();
+    const merged = [...liveEntries.value];
     let added = false;
     for (const row of rows) {
       if (seenIds.has(row.id)) continue;
       seenIds.add(row.id);
-      liveEntries.value.push(row);
+      merged.push(row);
       added = true;
     }
     if (!added) return;
     // Newest-first: ts desc, then id desc (the same total order the backend
-    // keyset uses), so the rendered tail stays globally ordered.
-    liveEntries.value.sort((a, b) => b.ts - a.ts || b.id - a.id);
-    capLiveTail();
+    // keyset uses), so the rendered tail stays globally ordered. One reactive
+    // assignment, trimmed to the cap.
+    merged.sort((a, b) => b.ts - a.ts || b.id - a.id);
+    liveEntries.value = trimLiveTail(merged);
   }
 
   /** Load the first history page for the current filter (resets accumulation).
@@ -300,12 +401,19 @@ export const useActivityStore = defineStore("activity", () => {
     }
     // M7-R3-P2 (recheck-3): expose a brand-new event type to the filter dropdown
     // even when the row itself is filtered out of the current view, so the user
-    // can then select it. Done before the dedup / filter gate below.
+    // can then select it. Done before the dedup / filter gate below. (noteEventType
+    // only writes on a genuinely NEW type, so a same-type burst stays a no-op.)
     noteEventType(entry.eventType);
     if (seenIds.has(entry.id)) return;
     if (!matchesFilter(entry)) return;
-    pushLive(entry);
-    total.value += 1;
+    // Issue #45: reserve the id (synchronous dedup) and BUFFER the row + its
+    // count; a single coalesced flush per frame applies the whole burst in one
+    // reactive update. seenIds + the dropdown facets stay synchronously correct;
+    // only the reactive tail + total apply on the flush.
+    seenIds.add(entry.id);
+    pendingLive.push(entry);
+    pendingTotalDelta += 1;
+    scheduleFlush();
   }
 
   /** M7-P1-1 / R1-P1-2 / R2-P1-1: reconcile from the durable `activity_log`
@@ -346,9 +454,9 @@ export const useActivityStore = defineStore("activity", () => {
     );
 
     // Collect all NEW (not-yet-held, filter-matching) rows across the pages
-    // FIRST, preserving global newest-first order. They are pushed at the end in
-    // reverse (oldest first) so the newest overall lands at the FRONT of the live
-    // tail - pushLive prepends, so pushing oldest-first yields newest-first.
+    // FIRST, preserving global newest-first order. `mergeRecoveredLive` then
+    // dedup-merges them into the live tail and re-sorts newest-first, so the
+    // collection order here only needs to be the natural keyset (newest-first).
     const recovered: ActivityEntry[] = [];
     let lastTotal: number | null = null;
     let cursor: { ts: number; id: number } | null = null;
@@ -512,6 +620,9 @@ export const useActivityStore = defineStore("activity", () => {
       unlistenLagged();
       unlistenLagged = null;
     }
+    // Issue #45: apply any buffered live events on teardown so liveEntries /
+    // total / seenIds stay mutually consistent (and cancel the pending frame).
+    flushLive();
     // R1-P2-1: cancel any pending debounced summary refresh on teardown.
     if (summaryRefreshTimer != null) {
       clearTimeout(summaryRefreshTimer);
@@ -534,6 +645,7 @@ export const useActivityStore = defineStore("activity", () => {
     loadMore,
     applyFilter,
     onLiveEvent,
+    flushLive,
     reconcileFromHistory,
     loadEventTypeOptions,
     loadSummary,
