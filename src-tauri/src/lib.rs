@@ -461,6 +461,21 @@ pub fn run() {
                 if !assembly::repair_allows_spawn(&repair_result) {
                     tray::notify_repair_failed(&handle);
                 }
+                // SPEC s13 / issue #58: reconcile the OS autostart registration
+                // with the persisted `global.auto_start_on_login` preference.
+                // `apply_autostart` only fires on a settings *change*, so the
+                // default-ON seed (migration 0005) would never register the real
+                // OS startup entry (Windows Task Manager Startup tab / macOS
+                // LaunchAgent / Linux .desktop) without this boot-time sync.
+                // Best-effort: never aborts boot. Runs after `manage` so it can
+                // read the preference from the state DB via AppState.
+                if let Some(app_state) = handle.try_state::<AppState>() {
+                    commands::settings::reconcile_autostart_on_boot(
+                        &handle,
+                        app_state.state().as_ref(),
+                    )
+                    .await;
+                }
                 // M9a (SPEC s15.2): start the periodic update-check task (an
                 // immediate check on startup, then every 6h). Spawned here -
                 // INSIDE the Tauri async runtime's `block_on` so `tokio::spawn`
