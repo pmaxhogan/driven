@@ -911,14 +911,26 @@ fn navigate_hint(app: &AppHandle, route: &str) {
 /// panicking (HARD RULE: no panics in the tray path).
 static SYNC_ANIM: Mutex<Option<tauri::async_runtime::JoinHandle<()>>> = Mutex::new(None);
 
+/// Monotonic "generation" guard that serialises spinner frame writes against
+/// [`stop_sync_animation`] (codex P2: abort alone cannot stop a frame already
+/// being written, so a stale syncing frame could land AFTER the static icon and
+/// freeze the tray as syncing). Each [`start_sync_animation`] claims a fresh
+/// generation; the task holds this lock ACROSS its `set_icon` and only writes
+/// while the live generation is still its own. [`stop_sync_animation`] bumps the
+/// generation under the SAME lock, which (a) makes any in-flight write complete
+/// before stop returns and (b) makes any later tick see a changed generation and
+/// break without writing. So once stop returns, no syncing frame can be written,
+/// and the static icon the caller sets next is guaranteed to be the last write.
+static SYNC_GEN: Mutex<u64> = Mutex::new(0);
+
 /// Start the syncing-spinner animation if it is not already running (idempotent).
 ///
 /// Spawns a timer-driven task that, every [`SYNC_FRAME_INTERVAL`], advances the
 /// frame counter and swaps the tray icon to the next [`TrayIcon::Syncing`] frame
 /// ([`TrayIcon::image_frame`]). The FIRST `interval` tick fires immediately, so
 /// the spinner's frame 0 paints right away. The task loops until
-/// [`stop_sync_animation`] aborts it (when the aggregate leaves syncing or on
-/// quit), so it never outlives the syncing state.
+/// [`stop_sync_animation`] retires its generation (and aborts it) when the
+/// aggregate leaves syncing or on quit, so it never outlives the syncing state.
 ///
 /// Idempotent: if an animation is already running this is a no-op, so a burst of
 /// `StateChanged` events while syncing does NOT restart (and stutter) the
@@ -930,6 +942,14 @@ fn start_sync_animation(app: &AppHandle) {
         // Already animating - keep the existing smooth cycle running.
         return;
     }
+    // Claim a fresh generation for THIS task. Done while holding `SYNC_ANIM` and
+    // only after the is_some() check, so claiming a generation never retires a
+    // still-running task's generation (which would make it stop writing).
+    let my_gen = {
+        let mut g = SYNC_GEN.lock().unwrap_or_else(|e| e.into_inner());
+        *g = g.wrapping_add(1);
+        *g
+    };
     let app = app.clone();
     let handle = tauri::async_runtime::spawn(async move {
         let mut frame: u32 = 0;
@@ -945,12 +965,22 @@ fn start_sync_animation(app: &AppHandle) {
                 tracing::trace!(target: TARGET, "tray {TRAY_ID} absent during sync animation tick; skipping frame");
                 continue;
             };
-            if let Err(err) = tray.set_icon(Some(TrayIcon::Syncing.image_frame(frame))) {
-                tracing::debug!(target: TARGET, "set sync animation frame failed: {err}");
-            }
-            // Colour-bearing frames must never be recoloured to a macOS template.
-            if let Err(err) = tray.set_icon_as_template(false) {
-                tracing::trace!(target: TARGET, "set_icon_as_template(false) during animation failed: {err}");
+            // Write the frame under the generation lock so it is serialised with
+            // `stop_sync_animation`: if our generation has been retired, stop
+            // writing immediately (a static icon is taking over). NB: no `.await`
+            // inside this block - the lock is never held across a suspend point.
+            {
+                let gen = SYNC_GEN.lock().unwrap_or_else(|e| e.into_inner());
+                if *gen != my_gen {
+                    break;
+                }
+                if let Err(err) = tray.set_icon(Some(TrayIcon::Syncing.image_frame(frame))) {
+                    tracing::debug!(target: TARGET, "set sync animation frame failed: {err}");
+                }
+                // Colour-bearing frames must never be recoloured to a macOS template.
+                if let Err(err) = tray.set_icon_as_template(false) {
+                    tracing::trace!(target: TARGET, "set_icon_as_template(false) during animation failed: {err}");
+                }
             }
             // Advance to the next spinner frame, wrapping each full rotation.
             frame = (frame + 1) % SYNC_FRAMES;
@@ -959,11 +989,23 @@ fn start_sync_animation(app: &AppHandle) {
     *guard = Some(handle);
 }
 
-/// Stop the syncing-spinner animation if it is running (idempotent). Aborts the
-/// task and clears the handle so the next [`start_sync_animation`] can start a
-/// fresh spinner. Called whenever the aggregate leaves syncing, and on quit.
-/// Recovers a poisoned lock instead of panicking.
+/// Stop the syncing-spinner animation if it is running (idempotent).
+///
+/// Retires the current generation under [`SYNC_GEN`] FIRST so that, once this
+/// returns, no spinner frame can be written (the running task either already
+/// finished its in-flight write before we took the lock, or will see the changed
+/// generation on its next tick and break) - this closes the race where an
+/// aborted task's last synchronous `set_icon` lands after the caller's static
+/// icon. Then takes + aborts the task handle so it does not linger. Called
+/// whenever the aggregate leaves syncing, on suspend, and on quit. Recovers a
+/// poisoned lock instead of panicking.
 pub fn stop_sync_animation() {
+    // Retire the live generation (releases the lock before touching SYNC_ANIM, so
+    // start/stop never hold both locks at once -> no lock-ordering deadlock).
+    {
+        let mut g = SYNC_GEN.lock().unwrap_or_else(|e| e.into_inner());
+        *g = g.wrapping_add(1);
+    }
     let mut guard = SYNC_ANIM.lock().unwrap_or_else(|e| e.into_inner());
     if let Some(handle) = guard.take() {
         handle.abort();
@@ -1966,6 +2008,24 @@ mod tests {
         assert!(
             whiteish_count(&frame0) > base_white,
             "the spinner must paint white dots onto its disc"
+        );
+    }
+
+    /// The animation-vs-static race fix (codex P2): `stop_sync_animation` must
+    /// RETIRE the live generation (bump [`SYNC_GEN`]) so the spinner task stops
+    /// writing frames before the caller publishes a static icon. Asserting the
+    /// generation moves on every stop is the invariant the in-task guard relies
+    /// on. (With no animation running, stop is a no-op on the handle but still
+    /// retires the generation - and is idempotent/safe to call.)
+    #[test]
+    fn stop_sync_animation_retires_the_generation() {
+        let before = *SYNC_GEN.lock().unwrap_or_else(|e| e.into_inner());
+        stop_sync_animation();
+        let after = *SYNC_GEN.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            after,
+            before.wrapping_add(1),
+            "stop must retire (bump) the live generation so no further frame is written"
         );
     }
 }
