@@ -213,6 +213,10 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: &[String]) {
 /// aborted handle), so every per-account drain completes on its own; we let them
 /// all finish instead of racing an outer cancellation that could orphan a task.
 fn shutdown_orchestrators(app: &tauri::AppHandle) {
+    // Stop the cosmetic tray syncing-spinner task first so the explicit quit
+    // leaves no orphaned animation task (it is a detached timer loop, not joined
+    // by the orchestrator drain below). Idempotent + no-op if not animating.
+    tray::stop_sync_animation();
     let Some(state) = app.try_state::<AppState>() else {
         return;
     };

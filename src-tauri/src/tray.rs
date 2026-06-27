@@ -22,25 +22,39 @@
 //!
 //! Each non-idle [`OrchestratorState`] keeps that recognisable brand mark and
 //! overlays a solid STATUS BADGE - a filled colour disc with a white contrast
-//! ring in the bottom-right corner (drawn by [`draw_badge`]): blue = syncing,
-//! amber = paused, orange = network attention (the yellow-with-`!` reachability
-//! case), red = error. Idle shows the plain brand mark (no badge). The badge
-//! colours are the same per-state palette used elsewhere, so the icon conveys
-//! the live state at a glance while staying on-brand.
+//! ring in the bottom-right corner (drawn by [`draw_badge`]) PLUS a distinct
+//! white GLYPH drawn inside the disc ([`draw_glyph`]) so each state is readable
+//! by SHAPE, not colour alone (accessible to colour-blind users / tiny trays):
+//! blue spinner = syncing, amber pause-bars = paused, orange `!` = network
+//! attention, red `X` = error. Idle shows the plain brand mark (no badge). The
+//! badge colours are the same per-state palette used elsewhere, so the icon
+//! conveys the live state at a glance while staying on-brand.
 //!
 //! `set_icon_as_template(false)` is forced on the live tray so macOS does not
 //! recolour these colour-bearing icons to monochrome (which would erase the
 //! teal + the badge colours); the committed `tauri.conf.json` keeps
 //! `iconAsTemplate: true` only for the static boot icon.
 //!
-//! HONEST LIMITATION, not faked: `TrayIcon::Syncing` is a STATIC blue-badged
-//! mark, not an animated spinner. If the brand PNG ever fails to decode (it is
-//! compiled in, so this should not happen) the code falls back to the flat
-//! [`TrayIcon::rgba_buffer`] colour tile rather than panicking. The state
-//! machine, tooltip text, and notification routing are all real.
+//! ## Animated Syncing (real, not faked)
+//!
+//! `TrayIcon::Syncing` is a REAL animated spinner: while the aggregate state is
+//! syncing, [`apply_state`] starts a timer-driven task ([`start_sync_animation`])
+//! that swaps the tray icon through [`SYNC_FRAMES`] spinner frames (rendered by
+//! [`TrayIcon::brand_rgba_frame`]) on a fixed cadence, then STOPS and cleans up
+//! ([`stop_sync_animation`]) the instant the aggregate leaves syncing (or on
+//! quit). Only one animation runs at a time (idempotent start). The frame
+//! buffers genuinely differ frame-to-frame and repeat every [`SYNC_FRAMES`]
+//! ticks (asserted in the tests), so the spinner actually cycles - it is not a
+//! still icon dressed up as animated.
+//!
+//! If the brand PNG ever fails to decode (it is compiled in, so this should not
+//! happen) the code falls back to the flat [`TrayIcon::rgba_buffer`] colour tile
+//! rather than panicking. The state machine, tooltip text, and notification
+//! routing are all real.
 
 use std::collections::HashMap;
 use std::sync::{Mutex, OnceLock};
+use std::time::Duration;
 
 use driven_core::types::{AccountId, ErrorCode, OrchestratorState, PauseReason};
 use tauri::image::Image;
@@ -74,6 +88,20 @@ mod menu_id {
 /// Tiny generated-tile dimensions. A 16x16 RGBA tile is a valid tray icon on
 /// all three platforms; the OS scales it for HiDPI trays.
 const TILE: u32 = 16;
+
+/// Number of dots in the syncing spinner ring (also the number of distinct
+/// frames in one full rotation - the "head" dot advances by one dot per frame).
+const SYNC_DOTS: u32 = 8;
+
+/// Number of distinct frames in one syncing-spinner animation cycle. Equal to
+/// [`SYNC_DOTS`] so frame `f` and frame `f + SYNC_FRAMES` render identically
+/// (the spinner has come full circle) while every frame WITHIN a cycle differs.
+const SYNC_FRAMES: u32 = SYNC_DOTS;
+
+/// Cadence of the syncing-spinner animation (~8 fps). A `tokio::time::interval`
+/// tick swaps to the next frame; slow enough to be light on CPU, fast enough to
+/// read as motion.
+const SYNC_FRAME_INTERVAL: Duration = Duration::from_millis(125);
 
 /// The tray icon to display for a given orchestrator state (DESIGN s8.1).
 ///
@@ -184,23 +212,54 @@ impl TrayIcon {
         }
     }
 
-    /// The brand-mark RGBA for this state: the decoded base mark with this
-    /// state's status badge drawn on for every non-idle state (idle is the plain
-    /// mark). Row-major top-to-bottom RGBA at the base mark's dimensions.
-    fn brand_rgba(self, base: &BrandImage) -> Vec<u8> {
+    /// The brand-mark RGBA for this state at animation `frame`: the decoded base
+    /// mark with this state's status badge + glyph drawn on for every non-idle
+    /// state (idle is the plain mark). Row-major top-to-bottom RGBA at the base
+    /// mark's dimensions.
+    ///
+    /// `frame` only affects [`TrayIcon::Syncing`] (it advances the spinner);
+    /// every other state is static and ignores it. The frame value wraps mod
+    /// [`SYNC_FRAMES`], so callers may pass a monotonically increasing tick.
+    fn brand_rgba_frame(self, base: &BrandImage, frame: u32) -> Vec<u8> {
         let mut rgba = base.rgba.clone();
         if let Some(color) = self.badge_color() {
             draw_badge(&mut rgba, base.width, base.height, color);
+            self.draw_glyph(&mut rgba, base.width, base.height, frame);
         }
         rgba
     }
 
-    /// A freshly-allocated owned [`Image`] for this state's tray icon: the real
-    /// Driven brand mark (badged per state), or - only if the compiled-in brand
-    /// PNG fails to decode - the flat [`TrayIcon::rgba_buffer`] colour tile.
+    /// Draw this state's distinct white GLYPH inside the badge disc, in place
+    /// (no-op for [`TrayIcon::Idle`], which carries no badge). The glyph encodes
+    /// the state by SHAPE so the icon is readable without relying on colour:
+    /// a spinner (syncing), pause bars (paused), an `!` (network attention), and
+    /// an `X` (error).
+    fn draw_glyph(self, rgba: &mut [u8], width: u32, height: u32, frame: u32) {
+        match self {
+            TrayIcon::Idle => {}
+            TrayIcon::Syncing => draw_spinner_glyph(rgba, width, height, frame),
+            TrayIcon::Paused => draw_pause_glyph(rgba, width, height),
+            TrayIcon::NetworkAttention => draw_bang_glyph(rgba, width, height),
+            TrayIcon::Error => draw_cross_glyph(rgba, width, height),
+        }
+    }
+
+    /// A freshly-allocated owned [`Image`] for this state's STILL tray icon
+    /// (animation frame 0). See [`TrayIcon::image_frame`].
     fn image(self) -> Image<'static> {
+        self.image_frame(0)
+    }
+
+    /// A freshly-allocated owned [`Image`] for this state's tray icon at
+    /// animation `frame`: the real Driven brand mark (badged + glyphed per
+    /// state), or - only if the compiled-in brand PNG fails to decode - the flat
+    /// [`TrayIcon::rgba_buffer`] colour tile (which has no animation). The
+    /// syncing animation calls this each tick with an advancing `frame`.
+    fn image_frame(self, frame: u32) -> Image<'static> {
         match brand_base() {
-            Some(base) => Image::new_owned(self.brand_rgba(base), base.width, base.height),
+            Some(base) => {
+                Image::new_owned(self.brand_rgba_frame(base, frame), base.width, base.height)
+            }
             None => Image::new_owned(self.rgba_buffer(), TILE, TILE),
         }
     }
@@ -242,20 +301,83 @@ fn brand_base() -> Option<&'static BrandImage> {
     .as_ref()
 }
 
+/// The geometry of the status badge for a `width x height` icon: the disc
+/// centre (`cx`, `cy`) in the bottom-right quadrant and its filled radius
+/// (`r_fill`). Both [`draw_badge`] and the per-state glyph painters derive their
+/// positions from this so the glyph always lands inside the disc, at any source
+/// resolution.
+struct BadgeGeom {
+    cx: f32,
+    cy: f32,
+    r_fill: f32,
+}
+
+/// Compute the shared badge geometry (see [`BadgeGeom`]). The disc is sized as a
+/// fraction of the smaller dimension so it scales with the source resolution.
+fn badge_geometry(width: u32, height: u32) -> BadgeGeom {
+    let min = width.min(height) as f32;
+    BadgeGeom {
+        cx: width as f32 * 0.72,
+        cy: height as f32 * 0.72,
+        r_fill: min * 0.24,
+    }
+}
+
+/// Paint a single opaque pixel at (`x`, `y`) to grayscale `intensity` (white at
+/// 255), bounds-checked. Used by the glyph painters to draw white-ish marks onto
+/// the coloured badge disc.
+fn put_pixel(rgba: &mut [u8], width: u32, height: u32, x: i32, y: i32, intensity: u8) {
+    if x < 0 || y < 0 || x >= width as i32 || y >= height as i32 {
+        return;
+    }
+    let idx = ((y as u32 * width + x as u32) as usize) * 4;
+    rgba[idx] = intensity;
+    rgba[idx + 1] = intensity;
+    rgba[idx + 2] = intensity;
+    rgba[idx + 3] = 0xff;
+}
+
+/// Fill a disc of radius `r` centred at (`cx`, `cy`) with grayscale `intensity`.
+fn fill_disc(rgba: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, r: f32, intensity: u8) {
+    let r2 = r * r;
+    let x0 = (cx - r).floor() as i32;
+    let x1 = (cx + r).ceil() as i32;
+    let y0 = (cy - r).floor() as i32;
+    let y1 = (cy + r).ceil() as i32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx * dx + dy * dy <= r2 {
+                put_pixel(rgba, width, height, x, y, intensity);
+            }
+        }
+    }
+}
+
+/// Fill an axis-aligned rectangle (centred at (`cx`, `cy`), half-extents
+/// `hw`/`hh`) with grayscale `intensity`.
+fn fill_rect(rgba: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, hw: f32, hh: f32) {
+    let x0 = (cx - hw).floor() as i32;
+    let x1 = (cx + hw).ceil() as i32;
+    let y0 = (cy - hh).floor() as i32;
+    let y1 = (cy + hh).ceil() as i32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            put_pixel(rgba, width, height, x, y, 0xff);
+        }
+    }
+}
+
 /// Draw a filled status-badge disc (with a white contrast ring) into the
 /// bottom-right corner of an RGBA buffer, in place. Marks the brand tray icon
-/// with the live state's colour while keeping the mark recognisable. The disc is
-/// sized as a fraction of the smaller dimension so it scales with the source
-/// resolution; the white ring keeps it visible against both the teal background
-/// and the white cloud.
+/// with the live state's colour while keeping the mark recognisable; the white
+/// ring keeps it visible against both the teal background and the white cloud.
 fn draw_badge(rgba: &mut [u8], width: u32, height: u32, color: [u8; 3]) {
     let w = width as i32;
     let h = height as i32;
     let min = w.min(h) as f32;
-    // Centre the badge in the bottom-right quadrant, fully inside the canvas.
-    let cx = width as f32 * 0.72;
-    let cy = height as f32 * 0.72;
-    let r_fill = min * 0.24;
+    let BadgeGeom { cx, cy, r_fill } = badge_geometry(width, height);
     let r_ring = r_fill + (min * 0.06).max(1.0);
     for y in 0..h {
         for x in 0..w {
@@ -273,6 +395,81 @@ fn draw_badge(rgba: &mut [u8], width: u32, height: u32, color: [u8; 3]) {
                 rgba[idx + 1] = 0xff;
                 rgba[idx + 2] = 0xff;
                 rgba[idx + 3] = 0xff;
+            }
+        }
+    }
+}
+
+/// Draw the SYNCING spinner glyph: a ring of [`SYNC_DOTS`] dots inside the badge
+/// disc, the "head" dot (at `frame % SYNC_DOTS`) painted brightest and the trail
+/// fading behind it. Advancing `frame` rotates the bright head one dot per tick,
+/// so consecutive frames render distinct buffers (a real spinning motion) and
+/// frame `f == f + SYNC_FRAMES` (full circle). White-on-blue.
+fn draw_spinner_glyph(rgba: &mut [u8], width: u32, height: u32, frame: u32) {
+    let BadgeGeom { cx, cy, r_fill } = badge_geometry(width, height);
+    let orbit = r_fill * 0.55;
+    let dot_r = (r_fill * 0.20).max(1.0);
+    let head = frame % SYNC_DOTS;
+    for i in 0..SYNC_DOTS {
+        // Start the ring at the top (12 o'clock) and go clockwise.
+        let angle =
+            std::f32::consts::TAU * (i as f32) / (SYNC_DOTS as f32) - std::f32::consts::FRAC_PI_2;
+        let dx = cx + orbit * angle.cos();
+        let dy = cy + orbit * angle.sin();
+        // `lead` = how far this dot trails the head (0 = head). The head is the
+        // brightest; each dot behind it is dimmer, giving the comet-tail look.
+        let lead = (head + SYNC_DOTS - i) % SYNC_DOTS;
+        let intensity = 255u32.saturating_sub(lead * 22).max(80) as u8;
+        fill_disc(rgba, width, height, dx, dy, dot_r, intensity);
+    }
+}
+
+/// Draw the PAUSED glyph: two vertical white bars (the universal pause symbol)
+/// centred in the badge disc.
+fn draw_pause_glyph(rgba: &mut [u8], width: u32, height: u32) {
+    let BadgeGeom { cx, cy, r_fill } = badge_geometry(width, height);
+    let bar_hw = (r_fill * 0.16).max(1.0);
+    let bar_hh = r_fill * 0.5;
+    let offset = r_fill * 0.4;
+    fill_rect(rgba, width, height, cx - offset, cy, bar_hw, bar_hh);
+    fill_rect(rgba, width, height, cx + offset, cy, bar_hw, bar_hh);
+}
+
+/// Draw the NETWORK-ATTENTION glyph: a white exclamation mark (`!`) - a vertical
+/// stem above a dot - centred in the badge disc (the DESIGN s8.1
+/// "yellow-with-`!`" reachability mark, now drawn for real).
+fn draw_bang_glyph(rgba: &mut [u8], width: u32, height: u32) {
+    let BadgeGeom { cx, cy, r_fill } = badge_geometry(width, height);
+    let stem_hw = (r_fill * 0.13).max(1.0);
+    // Stem: from near the top of the disc to just above centre.
+    let stem_top = cy - r_fill * 0.55;
+    let stem_bottom = cy + r_fill * 0.12;
+    let stem_cy = (stem_top + stem_bottom) / 2.0;
+    let stem_hh = (stem_bottom - stem_top) / 2.0;
+    fill_rect(rgba, width, height, cx, stem_cy, stem_hw, stem_hh);
+    // Dot: below the stem.
+    let dot_r = stem_hw * 1.15;
+    fill_disc(rgba, width, height, cx, cy + r_fill * 0.45, dot_r, 0xff);
+}
+
+/// Draw the ERROR glyph: a white `X` (two diagonal strokes) centred in the badge
+/// disc - reads as "attention / failure" without relying on the red colour.
+fn draw_cross_glyph(rgba: &mut [u8], width: u32, height: u32) {
+    let BadgeGeom { cx, cy, r_fill } = badge_geometry(width, height);
+    let reach = r_fill * 0.5;
+    let thick = (r_fill * 0.18).max(1.0);
+    let x0 = (cx - reach).floor() as i32;
+    let x1 = (cx + reach).ceil() as i32;
+    let y0 = (cy - reach).floor() as i32;
+    let y1 = (cy + reach).ceil() as i32;
+    for y in y0..=y1 {
+        for x in x0..=x1 {
+            let dx = x as f32 + 0.5 - cx;
+            let dy = y as f32 + 0.5 - cy;
+            if dx.abs().max(dy.abs()) <= reach
+                && ((dx - dy).abs() <= thick || (dx + dy).abs() <= thick)
+            {
+                put_pixel(rgba, width, height, x, y, 0xff);
             }
         }
     }
@@ -704,6 +901,76 @@ fn navigate_hint(app: &AppHandle, route: &str) {
 }
 
 // -----------------------------------------------------------------------------
+// Syncing animation (timer-driven spinner)
+// -----------------------------------------------------------------------------
+
+/// Handle to the running syncing-spinner animation task, if any. Process-global
+/// because the single tray serves ALL accounts: exactly one spinner runs while
+/// the AGGREGATE state is syncing, regardless of how many accounts are syncing.
+/// `None` when no animation is running. Recovers a poisoned lock instead of
+/// panicking (HARD RULE: no panics in the tray path).
+static SYNC_ANIM: Mutex<Option<tauri::async_runtime::JoinHandle<()>>> = Mutex::new(None);
+
+/// Start the syncing-spinner animation if it is not already running (idempotent).
+///
+/// Spawns a timer-driven task that, every [`SYNC_FRAME_INTERVAL`], advances the
+/// frame counter and swaps the tray icon to the next [`TrayIcon::Syncing`] frame
+/// ([`TrayIcon::image_frame`]). The FIRST `interval` tick fires immediately, so
+/// the spinner's frame 0 paints right away. The task loops until
+/// [`stop_sync_animation`] aborts it (when the aggregate leaves syncing or on
+/// quit), so it never outlives the syncing state.
+///
+/// Idempotent: if an animation is already running this is a no-op, so a burst of
+/// `StateChanged` events while syncing does NOT restart (and stutter) the
+/// spinner. Best-effort: a missing tray on a given tick is logged and skipped,
+/// not panicked.
+fn start_sync_animation(app: &AppHandle) {
+    let mut guard = SYNC_ANIM.lock().unwrap_or_else(|e| e.into_inner());
+    if guard.is_some() {
+        // Already animating - keep the existing smooth cycle running.
+        return;
+    }
+    let app = app.clone();
+    let handle = tauri::async_runtime::spawn(async move {
+        let mut frame: u32 = 0;
+        let mut ticker = tokio::time::interval(SYNC_FRAME_INTERVAL);
+        // If a tick is missed (e.g. the runtime was busy), skip ahead rather
+        // than burst-firing catch-up frames.
+        ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+        loop {
+            ticker.tick().await;
+            let Some(tray) = app.tray_by_id(TRAY_ID) else {
+                // Tray not built yet / being rebuilt: skip this frame, keep
+                // ticking (a rebuild re-creates the same id).
+                tracing::trace!(target: TARGET, "tray {TRAY_ID} absent during sync animation tick; skipping frame");
+                continue;
+            };
+            if let Err(err) = tray.set_icon(Some(TrayIcon::Syncing.image_frame(frame))) {
+                tracing::debug!(target: TARGET, "set sync animation frame failed: {err}");
+            }
+            // Colour-bearing frames must never be recoloured to a macOS template.
+            if let Err(err) = tray.set_icon_as_template(false) {
+                tracing::trace!(target: TARGET, "set_icon_as_template(false) during animation failed: {err}");
+            }
+            // Advance to the next spinner frame, wrapping each full rotation.
+            frame = (frame + 1) % SYNC_FRAMES;
+        }
+    });
+    *guard = Some(handle);
+}
+
+/// Stop the syncing-spinner animation if it is running (idempotent). Aborts the
+/// task and clears the handle so the next [`start_sync_animation`] can start a
+/// fresh spinner. Called whenever the aggregate leaves syncing, and on quit.
+/// Recovers a poisoned lock instead of panicking.
+pub fn stop_sync_animation() {
+    let mut guard = SYNC_ANIM.lock().unwrap_or_else(|e| e.into_inner());
+    if let Some(handle) = guard.take() {
+        handle.abort();
+    }
+}
+
+// -----------------------------------------------------------------------------
 // apply_state + notifications
 // -----------------------------------------------------------------------------
 
@@ -724,13 +991,28 @@ pub fn apply_state(app: &AppHandle, account_id: AccountId, state: OrchestratorSt
     let aggregate = aggregate_state(account_id, state.clone());
     let icon = TrayIcon::for_state(&aggregate);
 
+    // Drive the animation purely off the aggregate icon: start the spinner when
+    // the aggregate is syncing (the animation task owns the icon then), and stop
+    // it the instant the aggregate is anything else. Done before touching the
+    // tray so a stale spinner frame can never race a static icon set below.
+    if icon == TrayIcon::Syncing {
+        start_sync_animation(app);
+    } else {
+        stop_sync_animation();
+    }
+
     if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        if let Err(err) = tray.set_icon(Some(icon.image())) {
-            tracing::warn!(target: TARGET, "set tray icon failed: {err}");
-        }
-        // Generated tiles are colour-bearing; never let the OS recolour them.
-        if let Err(err) = tray.set_icon_as_template(false) {
-            tracing::debug!(target: TARGET, "set_icon_as_template(false) failed: {err}");
+        // While syncing, the animation task sets the icon every frame - do NOT
+        // also set a still icon here (it would fight the spinner). For every
+        // other state, set the static per-state glyph icon.
+        if icon != TrayIcon::Syncing {
+            if let Err(err) = tray.set_icon(Some(icon.image())) {
+                tracing::warn!(target: TARGET, "set tray icon failed: {err}");
+            }
+            // Generated tiles are colour-bearing; never let the OS recolour them.
+            if let Err(err) = tray.set_icon_as_template(false) {
+                tracing::debug!(target: TARGET, "set_icon_as_template(false) failed: {err}");
+            }
         }
         if let Err(err) = tray.set_tooltip(Some(tooltip_for(&aggregate))) {
             tracing::warn!(target: TARGET, "set tray tooltip failed: {err}");
@@ -947,6 +1229,9 @@ pub fn notify_repair_failed(app: &AppHandle) {
 /// implemented and ready; allow dead_code until that power-edge seam exists.
 #[allow(dead_code)]
 pub fn apply_suspending(app: &AppHandle) {
+    // Suspending is a static yellow icon - stop any running spinner so the
+    // animation task cannot overwrite it on its next tick.
+    stop_sync_animation();
     let Some(tray) = app.tray_by_id(TRAY_ID) else {
         tracing::warn!(target: TARGET, "tray {TRAY_ID} not found; cannot show suspending");
         return;
@@ -1453,7 +1738,7 @@ mod tests {
         let expected_len = (base.width * base.height * 4) as usize;
 
         // Idle == the untouched base mark (no badge drawn).
-        let idle = TrayIcon::Idle.brand_rgba(base);
+        let idle = TrayIcon::Idle.brand_rgba_frame(base, 0);
         assert_eq!(
             idle, base.rgba,
             "Idle must be the plain brand mark (no badge)"
@@ -1467,7 +1752,7 @@ mod tests {
         ];
         let mut variants: Vec<(TrayIcon, Vec<u8>)> = Vec::new();
         for s in states {
-            let v = s.brand_rgba(base);
+            let v = s.brand_rgba_frame(base, 0);
             assert_eq!(
                 v.len(),
                 expected_len,
@@ -1507,7 +1792,7 @@ mod tests {
                 panic!("non-idle state {s:?} must have a badge colour");
             };
             let target = [r, g, b, 0xff];
-            let v = s.brand_rgba(base);
+            let v = s.brand_rgba_frame(base, 0);
             let painted = v.chunks_exact(4).any(|px| px == target);
             assert!(painted, "{s:?} badge colour must appear in the icon");
         }
@@ -1535,5 +1820,152 @@ mod tests {
             assert_eq!(img.height(), base.height, "{s:?} height");
             assert_eq!(img.rgba().len(), expected_len, "{s:?} rgba length");
         }
+    }
+
+    // -------------------------------------------------------------------------
+    // Per-state glyphs + animated syncing (anti-fake-green)
+    // -------------------------------------------------------------------------
+
+    /// Count opaque white-ish (grayscale >= 0xc0) pixels - the glyph ink the
+    /// painters lay over the coloured badge disc. The plain teal+white brand mark
+    /// has its own white cloud, so this is only meaningful as a DELTA between a
+    /// glyphed icon and the badge-only baseline (see below), not as an absolute.
+    fn whiteish_count(rgba: &[u8]) -> usize {
+        rgba.chunks_exact(4)
+            .filter(|px| px[3] == 0xff && px[0] >= 0xc0 && px[1] >= 0xc0 && px[2] >= 0xc0)
+            .count()
+    }
+
+    /// Every non-idle state draws a real glyph: rendering the badge WITHOUT the
+    /// glyph vs WITH it must change the pixel buffer (the glyph is not a no-op),
+    /// and the four glyphs must be visually distinct from one another. This is
+    /// the "glyphs go beyond colour-only variants" guarantee.
+    #[test]
+    fn each_non_idle_state_draws_a_distinct_glyph() {
+        let Some(base) = brand_base() else {
+            panic!("brand PNG must decode");
+        };
+        let mut glyphed: Vec<(TrayIcon, Vec<u8>)> = Vec::new();
+        for s in [
+            TrayIcon::Syncing,
+            TrayIcon::Paused,
+            TrayIcon::NetworkAttention,
+            TrayIcon::Error,
+        ] {
+            // Badge-only baseline (disc + ring, no glyph) vs the full glyphed icon.
+            let mut badge_only = base.rgba.clone();
+            let color = s.badge_color().expect("non-idle state has a badge colour");
+            draw_badge(&mut badge_only, base.width, base.height, color);
+            let with_glyph = s.brand_rgba_frame(base, 0);
+            assert_ne!(
+                with_glyph, badge_only,
+                "{s:?} must draw a glyph on top of its badge (not colour-only)"
+            );
+            glyphed.push((s, with_glyph));
+        }
+        for i in 0..glyphed.len() {
+            for j in (i + 1)..glyphed.len() {
+                assert_ne!(
+                    glyphed[i].1, glyphed[j].1,
+                    "{:?} and {:?} glyphs must be visually distinct",
+                    glyphed[i].0, glyphed[j].0
+                );
+            }
+        }
+    }
+
+    /// The static (non-syncing) states IGNORE the animation frame - rendering at
+    /// frame 0 and frame 5 must be byte-identical (they are not animated).
+    #[test]
+    fn static_states_ignore_the_animation_frame() {
+        let Some(base) = brand_base() else {
+            panic!("brand PNG must decode");
+        };
+        for s in [
+            TrayIcon::Idle,
+            TrayIcon::Paused,
+            TrayIcon::NetworkAttention,
+            TrayIcon::Error,
+        ] {
+            let f0 = s.brand_rgba_frame(base, 0);
+            let f5 = s.brand_rgba_frame(base, 5);
+            assert_eq!(f0, f5, "{s:?} is static and must ignore the frame index");
+        }
+    }
+
+    /// REAL animation guard (anti-fake-green): the syncing spinner must actually
+    /// CYCLE. Every frame within one [`SYNC_FRAMES`] cycle must differ from the
+    /// frame before it (the head dot moved), consecutive frames are not all the
+    /// same buffer, and the cycle REPEATS - frame `f` equals frame `f +
+    /// SYNC_FRAMES` (a full rotation), proving it is a finite rotating animation
+    /// and not a still icon mislabelled as animated.
+    #[test]
+    fn syncing_animation_cycles_distinct_frames() {
+        let Some(base) = brand_base() else {
+            panic!("brand PNG must decode");
+        };
+        let frames: Vec<Vec<u8>> = (0..SYNC_FRAMES)
+            .map(|f| TrayIcon::Syncing.brand_rgba_frame(base, f))
+            .collect();
+
+        // Consecutive frames differ (the spinner is moving every tick).
+        for f in 0..SYNC_FRAMES as usize {
+            let next = (f + 1) % SYNC_FRAMES as usize;
+            assert_ne!(
+                frames[f], frames[next],
+                "syncing frame {f} and {next} must differ (the spinner must move)"
+            );
+        }
+
+        // All frames in a cycle are pairwise distinct (no two ticks render the
+        // same picture - a genuinely rotating spinner).
+        for i in 0..frames.len() {
+            for j in (i + 1)..frames.len() {
+                assert_ne!(
+                    frames[i], frames[j],
+                    "syncing frames {i} and {j} must be distinct within one cycle"
+                );
+            }
+        }
+
+        // The animation REPEATS: one full cycle later renders identically, and a
+        // wrapped frame index matches its in-range equivalent.
+        assert_eq!(
+            frames[0],
+            TrayIcon::Syncing.brand_rgba_frame(base, SYNC_FRAMES),
+            "frame 0 must equal frame SYNC_FRAMES (the spinner came full circle)"
+        );
+        assert_eq!(
+            frames[1],
+            TrayIcon::Syncing.brand_rgba_frame(base, SYNC_FRAMES + 1),
+            "the cycle must repeat exactly every SYNC_FRAMES frames"
+        );
+    }
+
+    /// The syncing spinner glyph paints white ink that no static badge state's
+    /// glyph happens to replicate frame-for-frame: at least one frame differs
+    /// from the still paused/error icons. Guards against the spinner silently
+    /// degrading to a fixed glyph.
+    #[test]
+    fn syncing_frames_are_not_a_fixed_glyph() {
+        let Some(base) = brand_base() else {
+            panic!("brand PNG must decode");
+        };
+        // The spinner must lay down white ink (the dots) on its blue disc.
+        let mut badge_only = base.rgba.clone();
+        draw_badge(
+            &mut badge_only,
+            base.width,
+            base.height,
+            TrayIcon::Syncing
+                .badge_color()
+                .expect("syncing has a badge colour"),
+        );
+        let base_white = whiteish_count(&badge_only);
+        let frame0 = TrayIcon::Syncing.brand_rgba_frame(base, 0);
+        assert!(
+            whiteish_count(&frame0) > base_white,
+            "the spinner must paint white dots onto its disc"
+        );
     }
 }
