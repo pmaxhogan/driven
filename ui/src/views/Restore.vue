@@ -278,7 +278,8 @@ async function onClearSearch(): Promise<void> {
           >
           <button
             type="button"
-            class="flex-1 rounded text-left font-medium text-zinc-900 transition-colors hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-zinc-100 dark:hover:text-teal-300"
+            class="min-w-0 flex-1 truncate rounded text-left font-medium text-zinc-900 transition-colors hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-zinc-100 dark:hover:text-teal-300"
+            :title="row.name"
             @click="restore.openFolder(row.relativePath)"
           >
             {{ row.name }}
