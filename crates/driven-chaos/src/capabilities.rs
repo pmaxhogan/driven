@@ -208,7 +208,14 @@ impl CapabilitySet {
 /// best-effort so the probes have an existing path to stat, and falls back to
 /// the temp dir when it cannot be created (for example, a read-only checkout).
 fn fixture_root_dir() -> std::path::PathBuf {
-    let root = std::path::PathBuf::from("target/chaos-fixtures");
+    // Absolute, so the Windows volume/NTFS probe can read the real drive letter
+    // from the path's first component. A relative "target/chaos-fixtures"
+    // mis-parses the leading 't' as the drive letter (probing a nonexistent
+    // `T:\`), so `cap:ntfs_volume` was never detected and every NTFS scenario
+    // silently skipped on Windows (and in CI).
+    let root = std::env::current_dir()
+        .map(|d| d.join("target/chaos-fixtures"))
+        .unwrap_or_else(|_| std::path::PathBuf::from("target/chaos-fixtures"));
     match std::fs::create_dir_all(&root) {
         Ok(()) => root,
         Err(_) => std::env::temp_dir(),
