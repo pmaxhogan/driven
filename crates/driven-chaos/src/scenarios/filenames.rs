@@ -1151,7 +1151,7 @@ impl Scenario for NameTrailingSpaceAndDot {
             invariants: Some(invariants),
             notes: vec![format!(
                 "{matched} of {} trailing-space/dot names round-tripped; the trailing-dot name \
-                 collapses on the M3 scanner (documented V1 gap, tracked in CODEX_NOTES)",
+                 collapses on the M3 scanner (documented V1 gap)",
                 expected.len()
             )],
         })

@@ -982,7 +982,7 @@ impl SyncOrchestrator {
 
     /// Writes a durable `activity_log` ERROR row per NFC collision the planner
     /// dropped (SPEC s24 `local.unicode_collision`, the M2-deferred item in
-    /// CODEX_NOTES.md).
+    /// design/CODEX_NOTES.md).
     ///
     /// One row per colliding path so the Activity dashboard can list each
     /// clash; `event_type` carries the stable code and `message` carries the

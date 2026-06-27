@@ -320,7 +320,7 @@ impl Scenario for DiskFullTarget {
         // VSS-temp spool on the source volume) that V1 does not have. Rather
         // than fabricate a pass or assert a code the read-only path cannot
         // emit, the row stays an honest documented known-gap (recorded in
-        // CODEX_NOTES.md) behind the mount-privilege gate.
+        // design/CODEX_NOTES.md) behind the mount-privilege gate.
         anyhow::bail!(
             "disk-full-target: core ENOSPC->local.disk_full mapping is implemented + unit-tested, \
              but V1's read-only source path never writes to the source volume, so a full source \
