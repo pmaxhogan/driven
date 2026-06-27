@@ -68,3 +68,6 @@ gcp-oauth-*.json
 
 # gstack skill scratch
 /.gstack
+
+# codex review stderr capture (transient, never source)
+/codex-err.txt

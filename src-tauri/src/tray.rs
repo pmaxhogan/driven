@@ -923,6 +923,19 @@ static SYNC_ANIM: Mutex<Option<tauri::async_runtime::JoinHandle<()>>> = Mutex::n
 /// and the static icon the caller sets next is guaranteed to be the last write.
 static SYNC_GEN: Mutex<u64> = Mutex::new(0);
 
+/// Serialises the WHOLE tray-effect section of [`apply_state`] (and
+/// [`apply_suspending`]): computing the aggregate, deciding the icon, starting
+/// or stopping the spinner, and writing the icon + tooltip. The per-account
+/// event bridges call `apply_state` from independent tasks, so two transitions
+/// can run concurrently; without this, account A's "leave syncing" could compute
+/// a stale (pre-B) aggregate and `stop` the spinner that account B's concurrent
+/// "enter syncing" just started, leaving the aggregate syncing with NO animation
+/// and no static icon (codex P2). Holding this across the decision AND the action
+/// makes each transition atomic, so the last one to run leaves a consistent tray
+/// (animation running iff the aggregate is syncing). Notifications stay OUTSIDE
+/// this lock (they are per-account and independently deduped).
+static TRAY_APPLY: Mutex<()> = Mutex::new(());
+
 /// Start the syncing-spinner animation if it is not already running (idempotent).
 ///
 /// Spawns a timer-driven task that, every [`SYNC_FRAME_INTERVAL`], advances the
@@ -1025,46 +1038,53 @@ pub fn stop_sync_animation() {
 /// panicked. `apply_state` returns `()` (the committed signature) so all
 /// errors are swallowed with a `tracing` line.
 pub fn apply_state(app: &AppHandle, account_id: AccountId, state: OrchestratorState) {
-    // R-P2-1: the single process tray icon serves ALL accounts. Update the
-    // app-level per-account state map and derive ONE aggregate state by
-    // severity, so a live error on account A is NOT masked when account B goes
-    // idle (the old last-writer-wins bug). The icon + tooltip reflect the
-    // aggregate; the notification below stays PER ACCOUNT (dedup is per-account).
-    let aggregate = aggregate_state(account_id, state.clone());
-    let icon = TrayIcon::for_state(&aggregate);
+    // Serialise the entire aggregate-decide-act section so concurrent per-account
+    // transitions cannot tear the spinner start/stop decision (see `TRAY_APPLY`).
+    {
+        let _apply = TRAY_APPLY.lock().unwrap_or_else(|e| e.into_inner());
 
-    // Drive the animation purely off the aggregate icon: start the spinner when
-    // the aggregate is syncing (the animation task owns the icon then), and stop
-    // it the instant the aggregate is anything else. Done before touching the
-    // tray so a stale spinner frame can never race a static icon set below.
-    if icon == TrayIcon::Syncing {
-        start_sync_animation(app);
-    } else {
-        stop_sync_animation();
-    }
+        // R-P2-1: the single process tray icon serves ALL accounts. Update the
+        // app-level per-account state map and derive ONE aggregate state by
+        // severity, so a live error on account A is NOT masked when account B
+        // goes idle (the old last-writer-wins bug). The icon + tooltip reflect
+        // the aggregate; the notification below stays PER ACCOUNT.
+        let aggregate = aggregate_state(account_id, state.clone());
+        let icon = TrayIcon::for_state(&aggregate);
 
-    if let Some(tray) = app.tray_by_id(TRAY_ID) {
-        // While syncing, the animation task sets the icon every frame - do NOT
-        // also set a still icon here (it would fight the spinner). For every
-        // other state, set the static per-state glyph icon.
-        if icon != TrayIcon::Syncing {
-            if let Err(err) = tray.set_icon(Some(icon.image())) {
-                tracing::warn!(target: TARGET, "set tray icon failed: {err}");
-            }
-            // Generated tiles are colour-bearing; never let the OS recolour them.
-            if let Err(err) = tray.set_icon_as_template(false) {
-                tracing::debug!(target: TARGET, "set_icon_as_template(false) failed: {err}");
-            }
+        // Drive the animation purely off the aggregate icon: start the spinner
+        // when the aggregate is syncing (the animation task owns the icon then),
+        // and stop it the instant the aggregate is anything else. Under
+        // `TRAY_APPLY`, so a concurrent transition cannot start/stop in between.
+        if icon == TrayIcon::Syncing {
+            start_sync_animation(app);
+        } else {
+            stop_sync_animation();
         }
-        if let Err(err) = tray.set_tooltip(Some(tooltip_for(&aggregate))) {
-            tracing::warn!(target: TARGET, "set tray tooltip failed: {err}");
+
+        if let Some(tray) = app.tray_by_id(TRAY_ID) {
+            // While syncing, the animation task sets the icon every frame - do
+            // NOT also set a still icon here (it would fight the spinner). For
+            // every other state, set the static per-state glyph icon.
+            if icon != TrayIcon::Syncing {
+                if let Err(err) = tray.set_icon(Some(icon.image())) {
+                    tracing::warn!(target: TARGET, "set tray icon failed: {err}");
+                }
+                // Generated tiles are colour-bearing; never let the OS recolour them.
+                if let Err(err) = tray.set_icon_as_template(false) {
+                    tracing::debug!(target: TARGET, "set_icon_as_template(false) failed: {err}");
+                }
+            }
+            if let Err(err) = tray.set_tooltip(Some(tooltip_for(&aggregate))) {
+                tracing::warn!(target: TARGET, "set tray tooltip failed: {err}");
+            }
+        } else {
+            tracing::warn!(target: TARGET, "tray {TRAY_ID} not found; cannot apply state");
         }
-    } else {
-        tracing::warn!(target: TARGET, "tray {TRAY_ID} not found; cannot apply state");
     }
 
     // Per-account notification (first-sync-complete / red error), keyed +
-    // deduped by THIS account - independent of the aggregate icon above.
+    // deduped by THIS account - independent of the aggregate icon above. Done
+    // OUTSIDE `TRAY_APPLY` (it is per-account and must not serialise on the tray).
     notify_for_state(app, account_id, &state);
 }
 
@@ -1271,6 +1291,10 @@ pub fn notify_repair_failed(app: &AppHandle) {
 /// implemented and ready; allow dead_code until that power-edge seam exists.
 #[allow(dead_code)]
 pub fn apply_suspending(app: &AppHandle) {
+    // Serialise with `apply_state` so a concurrent transition cannot (re)start
+    // the spinner after we stop it, nor overwrite the suspend icon (see
+    // `TRAY_APPLY`).
+    let _apply = TRAY_APPLY.lock().unwrap_or_else(|e| e.into_inner());
     // Suspending is a static yellow icon - stop any running spinner so the
     // animation task cannot overwrite it on its next tick.
     stop_sync_animation();
