@@ -213,11 +213,9 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: &[String]) {
 /// aborted handle), so every per-account drain completes on its own; we let them
 /// all finish instead of racing an outer cancellation that could orphan a task.
 fn shutdown_orchestrators(app: &tauri::AppHandle) {
-    // Stop the cosmetic tray syncing-spinner task first so the explicit quit
-    // leaves no orphaned animation task (it is a detached timer loop, not joined
-    // by the orchestrator drain below). Idempotent + no-op if not animating.
-    tray::stop_sync_animation();
     let Some(state) = app.try_state::<AppState>() else {
+        // No managed state => no orchestrators ran => no event bridge => the
+        // syncing spinner was never started, so there is nothing to stop.
         return;
     };
     // Signal every orchestrator to stop AFTER its current cycle up front, so the
@@ -293,6 +291,16 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
             drain_restore_handle(handle).await;
             tracing::info!(target: "driven::app", "telemetry ping task drained (no orphan)");
         }
+
+        // Stop the cosmetic tray syncing-spinner LAST - AFTER every orchestrator
+        // is dropped (so the per-account event bridges' broadcasts are closed and
+        // no further `StateChanged` can drive `apply_state` -> restart the
+        // spinner). Stopping it earlier would race a still-queued syncing event
+        // that could re-spawn the detached timer task after the stop. It is a
+        // pure timer loop (set_icon only) that the process exit then tears down;
+        // stopping it here keeps the no-orphan drain honest.
+        tray::stop_sync_animation();
+        tracing::info!(target: "driven::app", "tray syncing animation stopped (no orphan)");
     });
 }
 
