@@ -506,6 +506,37 @@ describe("activity store: request token (M7-P2-1)", () => {
     expect(store.total).toBe(1);
     expect(store.loadedPage).toBe(0);
   });
+
+  it("does NOT double-count total when a live event arrives during loadInitial (issue #45 codex P2)", async () => {
+    const store = useActivityStore();
+    await store.subscribeLive();
+
+    // loadInitial's query is slow; capture its resolver so we can inject a live
+    // event while the page is still in flight.
+    let resolvePage: (v: unknown) => void = () => {};
+    invokeMock.mockImplementationOnce(
+      () =>
+        new Promise((res) => {
+          resolvePage = res;
+        })
+    );
+    const load = store.loadInitial();
+
+    // A live `activity:new` lands while the page query is awaiting; its durable
+    // row is already part of the backend's authoritative total below.
+    liveHandler!(makeEntry({ id: 7, ts: 5000 }));
+
+    // The page shows 2 of 10 total rows; the live row (id 7) is one of the other
+    // 8 the backend already counted in `total: 10`.
+    resolvePage(makePage([makeEntry({ id: 6, ts: 600 }), makeEntry({ id: 5, ts: 500 })], 0, 10));
+    await load;
+    store.flushLive();
+
+    // The authoritative server total must win - NOT total + the live delta (11).
+    expect(store.total).toBe(10);
+    // ...and the buffered live row is not lost from the tail.
+    expect(store.entries.map((e) => e.id)).toContain(7);
+  });
 });
 
 describe("activity store: backend facets + summary (M7-P2-4, P2-5)", () => {

@@ -334,6 +334,12 @@ export const useActivityStore = defineStore("activity", () => {
       if (token !== requestToken || !sameFilter(snapshot, filter.value)) return;
       appendHistoryUnique(pageDto.entries);
       loadedPage.value = 0;
+      // Issue #45 (codex P2): a live `activity:new` buffered during the await
+      // above would otherwise have its count added on top of this authoritative
+      // page total on the next frame, double-counting. Drain the buffer now (so
+      // no row is lost from the tail) and let the server total supersede the
+      // pending delta - same flush-first idiom as mergeRecoveredLive.
+      flushLive();
       total.value = pageDto.total;
       hasMore.value = pageDto.hasMore;
     } catch (e) {
@@ -370,6 +376,10 @@ export const useActivityStore = defineStore("activity", () => {
       if (token !== requestToken || !sameFilter(snapshot, filter.value)) return;
       appendHistoryUnique(pageDto.entries);
       loadedPage.value = next;
+      // Issue #45 (codex P2): drain any live event buffered during the await so
+      // the authoritative page total supersedes the pending delta (no double
+      // count); see loadInitial.
+      flushLive();
       total.value = pageDto.total;
       hasMore.value = pageDto.hasMore;
     } catch (e) {

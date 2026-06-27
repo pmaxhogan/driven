@@ -106,14 +106,18 @@ const sourceNameById = computed<Record<string, string>>(() => {
   return map;
 });
 
-const shownCount = computed(() => activity.entries.length);
-
 // Issue #45: bound the rendered DOM. The store can accumulate up to ~1000 live
 // entries plus paged history; mounting every row makes the page janky while an
 // upload streams new rows in. Render only the newest `renderLimit` rows and grow
 // the window on demand, so the mounted row count never grows with the live tail.
 const renderLimit = ref(ACTIVITY_RENDER_WINDOW);
 const visibleEntries = computed(() => activity.entries.slice(0, renderLimit.value));
+
+// Issue #45 (codex P2): "Showing N of total" must reflect the rows actually
+// mounted, not everything buffered in the store - otherwise it claims e.g. 290
+// shown while only the windowed `renderLimit` rows are in the DOM (with a "load
+// more" control present).
+const shownCount = computed(() => visibleEntries.value.length);
 
 // More accumulated (in-memory) entries exist than are currently rendered.
 const canShowMore = computed(() => renderLimit.value < activity.entries.length);
