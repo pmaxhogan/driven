@@ -19,8 +19,7 @@
   },
   "progress": {
     "backingUp": "Backing up...",
-    "backingUpPercent": "Backing up - {percent}%",
-    "backingUpFiles": "Backing up - {done} of {total} files"
+    "backingUpPercent": "Backing up - {percent}%"
   },
   "common": {
     "next": "Next",

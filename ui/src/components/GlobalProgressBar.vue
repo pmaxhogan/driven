@@ -21,21 +21,14 @@ const widthPct = computed<number | null>(() =>
   progress.percent === null ? null : Math.round(progress.percent * 100)
 );
 
-// Accessible label + hover tooltip. Determinate -> "Backing up - 42%";
-// otherwise with a known file count -> "Backing up - 3 of 12 files"; else just
-// "Backing up...". Bound (not literal) so the i18n no-raw-text rule is satisfied.
-const label = computed<string>(() => {
-  if (widthPct.value !== null) {
-    return t("progress.backingUpPercent", { percent: widthPct.value });
-  }
-  if (progress.filesTotal > 0) {
-    return t("progress.backingUpFiles", {
-      done: progress.filesDone,
-      total: progress.filesTotal,
-    });
-  }
-  return t("progress.backingUp");
-});
+// Accessible label + hover tooltip. Determinate -> "Backing up - 42%"; otherwise
+// (scan / plan / verify, no measurable total) just "Backing up...". Bound (not a
+// literal) so the i18n no-raw-text rule is satisfied.
+const label = computed<string>(() =>
+  widthPct.value !== null
+    ? t("progress.backingUpPercent", { percent: widthPct.value })
+    : t("progress.backingUp")
+);
 </script>
 
 <template>
