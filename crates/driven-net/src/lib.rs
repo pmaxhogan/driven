@@ -230,36 +230,59 @@ impl ReqwestBackend {
     /// The whole resolve is bounded by [`DNS_TIMEOUT`] so a black-holed
     /// resolver cannot exceed the 3s DNS budget.
     async fn resolve(&self, host: &str) -> Result<(), ProbeOutcome> {
-        let lookup =
-            tokio::time::timeout(DNS_TIMEOUT, tokio::net::lookup_host((host, DNS_PROBE_PORT)))
-                .await;
-        match lookup {
-            // Bounding timeout elapsed: the resolver black-holed. The DNS
-            // budget is exceeded -> treat as DNS failure (DESIGN s5.8.1).
-            Err(_elapsed) => {
-                tracing::warn!(target: TARGET, host, "DNS resolve exceeded {DNS_TIMEOUT:?}");
+        resolve_within(
+            DNS_TIMEOUT,
+            host,
+            tokio::net::lookup_host((host, DNS_PROBE_PORT)),
+        )
+        .await
+    }
+}
+
+/// Bounds a DNS-lookup future by `budget` and classifies its result per the
+/// DESIGN s5.8.1 "DNS broken" contract (see [`ReqwestBackend::resolve`]).
+///
+/// Extracted from [`ReqwestBackend::resolve`] over a generic `lookup` future
+/// so the 3s no-hang bound is *deterministically* testable against the real
+/// production classification logic: a never-resolving lookup must surface
+/// [`ProbeOutcome::DnsFailed`] once `budget` elapses rather than hang, and the
+/// success / empty-answer / error arms are each exercised without touching a
+/// real resolver. The production call site passes a real
+/// `tokio::net::lookup_host` future; tests pass a `pending()` /
+/// `ready(...)` future on a paused tokio clock.
+///
+/// Returns `Ok(())` only when the lookup resolves at least one address within
+/// the budget; every other path (timeout, empty answer, or `io::Error` -
+/// NXDOMAIN / SERVFAIL / no-nameserver / transport failure) is the DESIGN
+/// s5.8.1 "DNS broken" condition, kept deliberately distinct from a *connect*
+/// failure to an already-resolved IP (which the HTTP layer classifies as
+/// [`ProbeOutcome::NetworkError`] so the orchestrator can use the 60s DNS
+/// re-probe cadence vs the 30s no-Internet cadence).
+async fn resolve_within<F, I>(budget: Duration, host: &str, lookup: F) -> Result<(), ProbeOutcome>
+where
+    F: std::future::Future<Output = std::io::Result<I>>,
+    I: Iterator<Item = SocketAddr>,
+{
+    match tokio::time::timeout(budget, lookup).await {
+        // Bounding timeout elapsed: the resolver black-holed. The DNS budget
+        // is exceeded -> treat as DNS failure (DESIGN s5.8.1 "must not hang").
+        Err(_elapsed) => {
+            tracing::warn!(target: TARGET, host, "DNS resolve exceeded {budget:?}");
+            Err(ProbeOutcome::DnsFailed)
+        }
+        Ok(Ok(mut addrs)) => {
+            if addrs.next().is_some() {
+                Ok(())
+            } else {
+                // An empty answer (no A/AAAA records) is the DESIGN s5.8.1
+                // "DNS broken" condition just like an error.
+                tracing::warn!(target: TARGET, host, "DNS resolve returned no records");
                 Err(ProbeOutcome::DnsFailed)
             }
-            Ok(Ok(mut addrs)) => {
-                if addrs.next().is_some() {
-                    Ok(())
-                } else {
-                    // An empty answer (no A/AAAA records) is the DESIGN s5.8.1
-                    // "DNS broken" condition just like an error.
-                    tracing::warn!(target: TARGET, host, "DNS resolve returned no records");
-                    Err(ProbeOutcome::DnsFailed)
-                }
-            }
-            Ok(Err(err)) => {
-                // `lookup_host` surfaces NXDOMAIN / SERVFAIL / no-nameserver /
-                // transport failures uniformly as an `io::Error`; all are the
-                // DESIGN s5.8.1 "DNS broken" condition (distinct from a connect
-                // failure to a resolved IP, which the HTTP layer surfaces as
-                // NetworkError so the orchestrator can use the 60s DNS re-probe
-                // cadence vs the 30s no-Internet cadence).
-                tracing::warn!(target: TARGET, host, error = %err, "DNS resolve failed");
-                Err(ProbeOutcome::DnsFailed)
-            }
+        }
+        Ok(Err(err)) => {
+            tracing::warn!(target: TARGET, host, error = %err, "DNS resolve failed");
+            Err(ProbeOutcome::DnsFailed)
         }
     }
 }
@@ -598,5 +621,79 @@ mod tests {
         let backend = ReqwestBackend::new().expect("construct backend");
         let outcome = backend.resolve("localhost").await;
         assert_eq!(outcome, Ok(()), "localhost must resolve via lookup_host");
+    }
+
+    // --- DNS-no-hang: a black-holed resolver is bounded by the DNS budget ---
+    //
+    // The M3 acceptance row "DNS fails -> classified, must not hang beyond 3s"
+    // (DESIGN s5.8.1). Driven deterministically: a `pending()` lookup that
+    // *never* answers is run on a PAUSED tokio clock, so virtual time only
+    // advances when the runtime is idle - it jumps straight to the bounding
+    // timeout's deadline. The probe must return `DnsFailed` at exactly the DNS
+    // budget, proving the `tokio::time::timeout` wrapper - not the resolver -
+    // is what stops the hang.
+    //
+    // Mutation check (proves the test is real, not a no-op): drop the
+    // `tokio::time::timeout` in `resolve_within` (await the lookup directly)
+    // and this test hangs forever; flip the `Err(_elapsed)` arm to `Ok(())`
+    // and the `assert_eq!` below fails. Either way it goes RED.
+    #[tokio::test(start_paused = true)]
+    async fn resolve_within_bounds_a_blackholed_lookup() {
+        let lookup = std::future::pending::<std::io::Result<std::vec::IntoIter<SocketAddr>>>();
+        let started = tokio::time::Instant::now();
+        let outcome = resolve_within(DNS_TIMEOUT, "black.hole.invalid", lookup).await;
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            outcome,
+            Err(ProbeOutcome::DnsFailed),
+            "a never-answering resolver must surface DnsFailed, not hang"
+        );
+        assert_eq!(
+            elapsed, DNS_TIMEOUT,
+            "the bounding timeout must fire at exactly the DNS budget (no longer)"
+        );
+    }
+
+    // --- DNS classification: success / empty-answer / error arms ---
+    //
+    // Each non-timeout arm of `resolve_within` is exercised deterministically
+    // with a `ready(...)` lookup (no resolver, no clock advance):
+    //   - at least one address  -> Ok(())
+    //   - an empty answer        -> DnsFailed (DESIGN s5.8.1)
+    //   - an io::Error           -> DnsFailed (NXDOMAIN / SERVFAIL / transport)
+    //
+    // Mutation check: collapse any arm into another (e.g. map the empty-answer
+    // case to `Ok(())`) and the matching assertion below fails RED.
+    #[tokio::test]
+    async fn resolve_within_classifies_each_outcome() {
+        let addr: SocketAddr = "127.0.0.1:443".parse().expect("valid socket addr");
+
+        let ok = resolve_within(
+            DNS_TIMEOUT,
+            "ok.example",
+            std::future::ready(Ok::<_, std::io::Error>(vec![addr].into_iter())),
+        )
+        .await;
+        assert_eq!(ok, Ok(()), "a resolved address must be Ok");
+
+        let empty: std::io::Result<std::vec::IntoIter<SocketAddr>> = Ok(Vec::new().into_iter());
+        let none = resolve_within(DNS_TIMEOUT, "empty.example", std::future::ready(empty)).await;
+        assert_eq!(
+            none,
+            Err(ProbeOutcome::DnsFailed),
+            "an empty answer is DNS broken"
+        );
+
+        let err: std::io::Result<std::vec::IntoIter<SocketAddr>> = Err(std::io::Error::new(
+            std::io::ErrorKind::NotFound,
+            "nxdomain",
+        ));
+        let failed = resolve_within(DNS_TIMEOUT, "nx.invalid", std::future::ready(err)).await;
+        assert_eq!(
+            failed,
+            Err(ProbeOutcome::DnsFailed),
+            "a resolver io::Error is DNS broken"
+        );
     }
 }
