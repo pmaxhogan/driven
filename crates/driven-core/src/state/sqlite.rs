@@ -3444,8 +3444,7 @@ mod tests {
         // (enabled = 0, no ack row) must NOT be seeded an ack row by the repair -
         // otherwise the per-account ack path (which re-enables every source with a
         // pending ack) would silently RE-ENABLE it and start backing it up the next
-        // time the recovery phrase is acked. This is the exact regression the
-        // post-fix codex recheck flagged.
+        // time the recovery phrase is acked.
         let (repo, _dir) = temp_repo().await;
 
         let acct = sample_account(); // stamped (encryption_master_key_id = kc:alice)
