@@ -18,10 +18,13 @@
 //!   encryption round-trip) drive the [`DefaultExecutor`] directly with a
 //!   hand-built `Plan`, mirroring the proven in-crate unit-test patterns.
 //!
-//! Rows that are genuinely infeasible against an in-memory fake (the
-//! quantitative throughput multipliers, and the DNS-no-hang timeout row that
-//! needs a real transport) are `#[ignore]`d with a reason rather than faked;
-//! see the `ignored_*` tests at the bottom and the integration report.
+//! The quantitative perf-multiplier rows (throughput >=5x, blake3 >=2x,
+//! adaptive parallelism) are kept as explicitly-named `#[ignore]`d benchmarks
+//! with real bodies + how-to-run reasons (issue #28) rather than faked; see the
+//! bottom of this file. The DNS-no-hang and lossy/intermittent breaker rows are
+//! NOT here: they need the `#[cfg(test)]`-private FakeBackend/FakeClock/breaker
+//! seam, so they live as real deterministic tests in driven-net (`resolve_within_*`)
+//! and driven-core `network.rs` (`lossy_spread_loss_*`, `intermittent_link_*`).
 
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -1761,21 +1764,166 @@ async fn vss_frozen_snapshot_uses_effective_size_no_false_changed() {
 }
 
 // ---------------------------------------------------------------------------
-// Ignored rows: genuinely infeasible against the in-memory fake (documented).
+// Perf-multiplier benchmark rows (ROADMAP M3 acceptance, tracking issue #28).
+//
+// These three rows are QUANTITATIVE perf multipliers, not behavioral
+// assertions. They are kept as explicitly-named `#[ignore]`d *benchmarks* with
+// a real, non-empty body (the prior empty `async fn x() {}` stubs were
+// fake-green: even `--ignored` ran nothing). They are excluded from the
+// default `cargo test` run (the multiplier is environment-sensitive and the
+// 5x / adaptive rows are not assertable against the zero-latency in-memory
+// fake), and each `#[ignore]` reason states exactly how to run it. Behavioral
+// coverage of the same code paths is NOT skipped - it lives in the un-ignored
+// rows above (fresh_sync_of_100_files, parallel_uploads_no_corruption,
+// pipeline_streaming_keeps_memory_bounded) and in pacer.rs (AIMD reaction).
 // ---------------------------------------------------------------------------
 
+/// blake3 `update_rayon` (multi-core) must beat single-threaded `update` by
+/// >=2x on a large buffer (DESIGN s11.4.4). Run it with:
+///
+/// ```text
+/// cargo test -p driven-core --test e2e_fake -- --ignored blake3_rayon_2x
+/// ```
+///
+/// The body is real: it always asserts the two hashers agree on the digest
+/// (correctness of the multi-core path - a regression here would corrupt
+/// `file_state` hashes), and on a machine with >=4 cores it additionally
+/// asserts the >=2x speedup. On fewer cores it prints the measured ratio
+/// instead of asserting (the 2x target needs real parallelism). Tracking: #28.
 #[tokio::test]
-#[ignore = "Quantitative throughput multiplier (>=5x serial) is a perf benchmark, \
-            not a behavioral assertion; meaningless against an instantaneous \
-            in-memory fake with no real upload cost. Behavioral coverage: \
-            fresh_sync_of_100_files + parallel_uploads_no_corruption."]
-async fn throughput_5x_serial_baseline() {}
+#[ignore = "perf benchmark: blake3 update_rayon >=2x vs single-threaded update; \
+            run with `cargo test -p driven-core --test e2e_fake -- --ignored \
+            blake3_rayon_2x` on a multi-core box. Tracking #28."]
+async fn blake3_rayon_2x() {
+    // 256 MiB so the rayon fan-out amortizes over real work (well above the
+    // 100 MiB RAYON_HASH_THRESHOLD the executor uses).
+    let len = 256 * 1024 * 1024usize;
+    let buf: Vec<u8> = (0..len).map(|i| (i % 251) as u8).collect();
 
+    let t0 = std::time::Instant::now();
+    let serial = {
+        let mut h = blake3::Hasher::new();
+        h.update(&buf);
+        h.finalize()
+    };
+    let serial_elapsed = t0.elapsed();
+
+    let t1 = std::time::Instant::now();
+    let rayon = {
+        let mut h = blake3::Hasher::new();
+        h.update_rayon(&buf);
+        h.finalize()
+    };
+    let rayon_elapsed = t1.elapsed();
+
+    // Correctness: the multi-core path must produce the identical digest.
+    assert_eq!(
+        serial, rayon,
+        "update_rayon must produce the same blake3 digest as update"
+    );
+
+    let ratio = serial_elapsed.as_secs_f64() / rayon_elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+    let cores = std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(1);
+    eprintln!(
+        "blake3 {len} bytes: serial {serial_elapsed:?}, rayon {rayon_elapsed:?}, \
+         speedup {ratio:.2}x on {cores} cores"
+    );
+    if cores >= 4 {
+        assert!(
+            ratio >= 2.0,
+            "update_rayon must be >=2x faster on {cores} cores (got {ratio:.2}x)"
+        );
+    }
+}
+
+/// Parallel sync throughput must beat a serial baseline by >=5x (DESIGN
+/// s11.4.2). Run it with:
+///
+/// ```text
+/// cargo test -p driven-core --test e2e_fake -- --ignored throughput_5x_serial_baseline
+/// ```
+///
+/// The body is real: it runs a genuine multi-file plan end to end through the
+/// `DefaultExecutor` (real hash -> upload pipeline against the in-memory
+/// remote), asserts every op completed and every object landed, and prints the
+/// measured files/sec + MiB/s. The >=5x-vs-serial multiplier itself is NOT
+/// asserted here: it needs a latency-shaping remote and a serial (pool=1)
+/// baseline that the zero-latency in-memory fake + fixed pool size cannot
+/// provide, so this remains a benchmark pointer. Tracking: #28.
 #[tokio::test]
-#[ignore = "blake3 update_rayon >=2x single-threaded throughput is a CPU \
-            micro-benchmark requiring a multi-core timing harness and a >100 MiB \
-            file; flaky/infeasible as a correctness test against the fake."]
-async fn blake3_rayon_2x() {}
+#[ignore = "perf benchmark: parallel sync >=5x serial throughput; run with \
+            `cargo test -p driven-core --test e2e_fake -- --ignored \
+            throughput_5x_serial_baseline`. The 5x multiplier needs a \
+            latency-shaping remote (not the zero-latency fake); this body \
+            measures + asserts a correct parallel run. Tracking #28."]
+async fn throughput_5x_serial_baseline() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
+
+    let n_files = 64u32;
+    let file_bytes = 256 * 1024usize; // 256 KiB each
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+    let mut ops = Vec::new();
+    for i in 0..n_files {
+        let name = format!("f{i}.bin");
+        let contents: Vec<u8> = (0..file_bytes)
+            .map(|j| ((i as usize + j) % 251) as u8)
+            .collect();
+        write_file(src_dir.path(), &name, &contents);
+        let rel = RelativePath::try_from(name).unwrap();
+        ops.push(Op::HashThenUpload {
+            source_id: src.id,
+            relative_path: rel,
+            size: file_bytes as u64,
+        });
+    }
+    let plan = Plan {
+        ops,
+        collisions: vec![],
+    };
+
+    let clock = Arc::new(FakeClock::new());
+    let exec = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote: remote.clone(),
+            state: state.clone(),
+            pacer: test_pacer(clock.clone()),
+            crypto: None,
+            vss: None,
+            network: None,
+        },
+        clock,
+    );
+
+    let t0 = std::time::Instant::now();
+    let out = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
+    let elapsed = t0.elapsed();
+
+    assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        n_files as usize,
+        "every file landed"
+    );
+    let secs = elapsed.as_secs_f64().max(f64::MIN_POSITIVE);
+    let mib = (n_files as f64 * file_bytes as f64) / (1024.0 * 1024.0);
+    eprintln!(
+        "throughput: {n_files} files in {elapsed:?} = {:.0} files/s, {:.1} MiB/s \
+         (parallel pool); 5x-vs-serial needs a latency-shaping remote, see #28",
+        n_files as f64 / secs,
+        mib / secs
+    );
+}
 
 // ---------------------------------------------------------------------------
 // Row: bounded-memory streaming pipeline (P1-4, DESIGN s11.4.3 / s11.4.6).
@@ -1898,26 +2046,103 @@ async fn pipeline_streaming_keeps_memory_bounded() {
     );
 }
 
+/// Adaptive-parallelism: the upload pool must shrink under induced latency and
+/// recover when it clears (DESIGN s11.4.2 AIMD). Run it with:
+///
+/// ```text
+/// cargo test -p driven-core --test e2e_fake -- --ignored adaptive_parallelism_reacts_to_latency
+/// ```
+///
+/// The body is real: it runs a genuine multi-file plan end to end and asserts
+/// every op completed correctly + prints the measured throughput. The pool's
+/// reaction to *induced latency* is NOT asserted here: it is driven by the
+/// `ThroughputProbe` loop in the app-shell `Orchestrator::run` select loop
+/// (not wired into core) over a latency-shaping remote, neither of which this
+/// harness provides. The AIMD step logic itself is unit-tested in pacer.rs.
+/// Tracking: #28.
 #[tokio::test]
-#[ignore = "Adaptive-parallelism pool reaction to induced latency needs the real \
-            ThroughputProbe loop in Orchestrator::run (app-shell select loop, not \
-            wired in core) + a latency-shaping remote; the pacer AIMD reaction is \
-            unit-tested in pacer.rs."]
-async fn adaptive_parallelism_reacts_to_latency() {}
+#[ignore = "perf benchmark: adaptive-parallelism pool reaction to induced \
+            latency; run with `cargo test -p driven-core --test e2e_fake -- \
+            --ignored adaptive_parallelism_reacts_to_latency`. The pool \
+            reaction needs the app-shell ThroughputProbe loop + a \
+            latency-shaping remote (not in core); AIMD steps are unit-tested \
+            in pacer.rs. Tracking #28."]
+async fn adaptive_parallelism_reacts_to_latency() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
 
-#[tokio::test]
-#[ignore = "DNS-fail no-hang-beyond-3s asserts a real reqwest/hickory connect \
-            timeout; InMemoryRemoteStore has no transport to time out. The probe \
-            classification (DnsFail) is unit-tested in network.rs."]
-async fn dns_fail_no_hang() {}
+    let n_files = 32u32;
+    let file_bytes = 256 * 1024usize;
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+    let mut ops = Vec::new();
+    for i in 0..n_files {
+        let name = format!("a{i}.bin");
+        let contents: Vec<u8> = (0..file_bytes)
+            .map(|j| ((i as usize + j) % 251) as u8)
+            .collect();
+        write_file(src_dir.path(), &name, &contents);
+        let rel = RelativePath::try_from(name).unwrap();
+        ops.push(Op::HashThenUpload {
+            source_id: src.id,
+            relative_path: rel,
+            size: file_bytes as u64,
+        });
+    }
+    let plan = Plan {
+        ops,
+        collisions: vec![],
+    };
 
-#[tokio::test]
-#[ignore = "Lossy (30% drop +500ms) and intermittent (60s up/down) circuit-breaker \
-            open/close cycles are exercised against the real Prober + FakeBackend \
-            in network.rs unit tests (five_consecutive_failures_open_breaker, \
-            intermittent_opens_then_closes_breaker); re-testing the breaker \
-            mechanics at integration scope needs those private internals."]
-async fn lossy_and_intermittent_breaker_cycles() {}
+    let clock = Arc::new(FakeClock::new());
+    let exec = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote: remote.clone(),
+            state: state.clone(),
+            pacer: test_pacer(clock.clone()),
+            crypto: None,
+            vss: None,
+            network: None,
+        },
+        clock,
+    );
+
+    let out = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
+    assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        n_files as usize,
+        "every file landed under the parallel pool"
+    );
+    eprintln!(
+        "adaptive-parallelism: {n_files} files synced; pool-shrink-under-latency \
+         needs the app-shell ThroughputProbe loop (see #28)"
+    );
+}
+
+// The DNS-no-hang and lossy/intermittent breaker-cycle acceptance rows used to
+// live here as empty `#[ignore]` stubs (fake-green: they asserted nothing).
+// They have been replaced by real, deterministic, mutation-checked tests where
+// the controllable seam + clock are reachable (issue #28):
+//   - DNS no-hang (bounded by the 3s budget, classified DnsFailed):
+//       driven-net `resolve_within_bounds_a_blackholed_lookup`
+//       + `resolve_within_classifies_each_outcome`
+//       + `resolve_invalid_tld_is_dns_failed_and_bounded`.
+//   - Lossy (spread loss never trips the breaker) + intermittent (open during a
+//     down window, close during an up window) circuit-breaker cycles:
+//       driven-core `network::tests::lossy_spread_loss_never_opens_breaker`
+//       + `network::tests::intermittent_link_opens_during_down_closes_during_up`
+//       (alongside five_consecutive_failures_open_breaker / open_breaker_defers_probe_until_retry_at).
+// These could not be honestly forced through the integration boundary: the
+// FakeBackend / FakeClock / breaker seam they need is `#[cfg(test)]`-private to
+// network.rs, and e2e_fake.rs is an external crate seeing only the public API.
 
 // ---------------------------------------------------------------------------
 // shared no-op progress sink

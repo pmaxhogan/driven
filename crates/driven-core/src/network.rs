@@ -601,6 +601,18 @@ mod tests {
         /// services regardless of the [`FakeNetwork`] state - used to
         /// drive the breaker-open and pool-teardown tests deterministically.
         force_service: Mutex<Option<ProbeOutcome>>,
+        /// Clock shared with the [`Prober`], read by the `Intermittent` model
+        /// to compute the up/down phase. `None` for [`Self::new`] (the
+        /// non-intermittent tests do not need it).
+        clock: Option<FakeClock>,
+        /// Per-service request counter driving the `Lossy` model's
+        /// deterministic Bresenham-spread drop schedule (an independent
+        /// schedule per service, so a lossy link never deterministically drops
+        /// two probes of the SAME service back to back at <50% loss).
+        lossy_seq: Mutex<std::collections::HashMap<ServiceName, u64>>,
+        /// Count of probes the `Lossy` model dropped, so a test can prove its
+        /// drop schedule actually fired (a non-vacuous "stays Closed" assert).
+        lossy_drops: AtomicUsize,
     }
 
     impl FakeBackend {
@@ -611,8 +623,57 @@ mod tests {
             })
         }
 
+        /// Like [`Self::new`] but wires the shared [`FakeClock`] so the
+        /// `Intermittent { up_secs, down_secs }` model can read the current
+        /// time to decide its up/down phase.
+        fn with_clock(state: FakeState, clock: FakeClock) -> Arc<Self> {
+            Arc::new(Self {
+                net: FakeNetwork::with_state(state),
+                clock: Some(clock),
+                ..Default::default()
+            })
+        }
+
         fn force_service_outcome(&self, outcome: Option<ProbeOutcome>) {
             *self.force_service.lock().unwrap() = outcome;
+        }
+
+        /// Total probes dropped by the `Lossy` model so far.
+        fn lossy_drops(&self) -> usize {
+            self.lossy_drops.load(Ordering::SeqCst)
+        }
+
+        /// Whether the `Intermittent { up_secs, down_secs }` link is UP at the
+        /// shared clock's current time: UP for the first `up_secs` of each
+        /// `up_secs + down_secs` cycle, DOWN for the rest. With no clock wired
+        /// the link defaults to UP.
+        fn link_up(&self, up_secs: u32, down_secs: u32) -> bool {
+            let cycle = (up_secs as i64 + down_secs as i64).max(1);
+            let now_ms = self.clock.as_ref().map(|c| c.now_ms()).unwrap_or(0);
+            (now_ms / 1000).rem_euclid(cycle) < up_secs as i64
+        }
+
+        /// Deterministic per-service drop decision for the `Lossy` model: a
+        /// Bresenham-spread schedule that drops ~`drop_pct`% of THIS service's
+        /// probes, evenly spaced. Below 50% loss the integer accumulator
+        /// advances at most once per probe, so two consecutive drops of the
+        /// same service never occur - which is exactly the property the
+        /// "spread loss does not trip the breaker" test relies on.
+        fn lossy_drop(&self, service: ServiceName, drop_pct: u8) -> bool {
+            let n = {
+                let mut seq = self.lossy_seq.lock().unwrap_or_else(|e| e.into_inner());
+                let entry = seq.entry(service).or_insert(0);
+                let cur = *entry;
+                *entry = entry.wrapping_add(1);
+                cur
+            };
+            let pct = drop_pct as u64;
+            let dropped =
+                (n.wrapping_mul(pct)) / 100 != (n.wrapping_add(1).wrapping_mul(pct)) / 100;
+            if dropped {
+                self.lossy_drops.fetch_add(1, Ordering::SeqCst);
+            }
+            dropped
         }
     }
 
@@ -626,10 +687,20 @@ mod tests {
         async fn probe_captive(&self) -> ProbeOutcome {
             self.captive_calls.fetch_add(1, Ordering::SeqCst);
             match self.net.state() {
-                FakeState::Online
-                | FakeState::ServiceDown { .. }
-                | FakeState::Lossy { .. }
-                | FakeState::Intermittent { .. } => ProbeOutcome::Ok,
+                // A lossy-but-present link still answers the captive probe
+                // (the loss is absorbed per-service, not at the link probe).
+                FakeState::Online | FakeState::ServiceDown { .. } | FakeState::Lossy { .. } => {
+                    ProbeOutcome::Ok
+                }
+                // The intermittent link's captive probe tracks the up/down
+                // phase: a down window reads as no-Internet.
+                FakeState::Intermittent { up_secs, down_secs } => {
+                    if self.link_up(up_secs, down_secs) {
+                        ProbeOutcome::Ok
+                    } else {
+                        ProbeOutcome::NetworkError
+                    }
+                }
                 FakeState::Offline => ProbeOutcome::NetworkError,
                 FakeState::NoInternet => ProbeOutcome::NetworkError,
                 FakeState::DnsFail => ProbeOutcome::DnsFailed,
@@ -650,6 +721,25 @@ mod tests {
                     ProbeOutcome::ServiceError
                 }
                 FakeState::DnsFail => ProbeOutcome::DnsFailed,
+                // Lossy: drop this service's probe per its deterministic
+                // Bresenham schedule (a dropped probe is a network-level
+                // failure); kept probes succeed.
+                FakeState::Lossy { drop_pct, .. } => {
+                    if self.lossy_drop(service, drop_pct) {
+                        ProbeOutcome::NetworkError
+                    } else {
+                        ProbeOutcome::Ok
+                    }
+                }
+                // Intermittent: every service fails during a down window and
+                // succeeds during an up window (clock-phase driven).
+                FakeState::Intermittent { up_secs, down_secs } => {
+                    if self.link_up(up_secs, down_secs) {
+                        ProbeOutcome::Ok
+                    } else {
+                        ProbeOutcome::NetworkError
+                    }
+                }
                 _ => ProbeOutcome::Ok,
             }
         }
@@ -882,6 +972,132 @@ mod tests {
         backend.force_service_outcome(Some(ProbeOutcome::Ok));
         let _ = p.probe().await;
         assert_eq!(p.service_health(ServiceName::Drive), ServiceHealth::Closed);
+    }
+
+    // --- DESIGN s5.8.1 "lossy" row: spread packet loss must NOT trip the
+    //     breaker (each success resets the consecutive-failure run) ---
+    //
+    // Models `FakeState::Lossy { drop_pct: 30, added_latency_ms: 500 }`
+    // deterministically: each probed service drops ~30% of its probes on a
+    // Bresenham-spread schedule that never strings two drops together, so the
+    // consecutive-failure count is reset by the next kept probe and never
+    // reaches BREAKER_OPEN_THRESHOLD. Latency is irrelevant to the
+    // failure-count breaker, so the fake does not sleep; the drop schedule is
+    // what the breaker reacts to.
+    //
+    // Mutation check (proves it is real): set `drop_pct` to 100 (every probe
+    // drops) and the breakers open within 5 cycles -> the `Closed` asserts go
+    // RED; break `record_success` so it stops resetting and the accumulated
+    // drops eventually open the breaker -> also RED.
+    #[tokio::test]
+    async fn lossy_spread_loss_never_opens_breaker() {
+        let backend = FakeBackend::new(FakeState::Lossy {
+            drop_pct: 30,
+            added_latency_ms: 500,
+        });
+        let p = prober(backend.clone(), FakeClock::new());
+
+        for cycle in 0..200u32 {
+            let _ = p.probe().await;
+            for svc in Prober::<FakeBackend>::PROBED_SERVICES {
+                assert_eq!(
+                    p.service_health(svc),
+                    ServiceHealth::Closed,
+                    "{svc:?} breaker must stay Closed under spread 30% loss (cycle {cycle})"
+                );
+            }
+        }
+
+        // Non-vacuous: the schedule actually dropped probes (otherwise every
+        // `Closed` above would be trivially true on an all-Ok link).
+        assert!(
+            backend.lossy_drops() > 0,
+            "the lossy schedule must actually drop probes"
+        );
+        // Single isolated drops never reach the pool-teardown run of 3 either.
+        assert_eq!(
+            backend.pool_drops.load(Ordering::SeqCst),
+            0,
+            "spread single-drop loss must not trip the pool teardown"
+        );
+    }
+
+    // --- DESIGN s5.8.1 "intermittent" row: a flapping link opens the breaker
+    //     during a down window and closes it again during an up window ---
+    //
+    // Models `FakeState::Intermittent { up_secs: 60, down_secs: 60 }` against
+    // the shared FakeClock: the link is DOWN for a 60s window (every probe
+    // fails) then UP for 60s (every probe succeeds), repeating. The full
+    // open -> fail-fast -> half-open -> close -> re-open cycle is driven purely
+    // by advancing the clock across phase boundaries - no `force_service`.
+    //
+    // Mutation check: shorten the down-phase loop to BREAKER_OPEN_THRESHOLD - 1
+    // and the breaker never opens (`expect Open` panics); skip the
+    // `clock.advance` into the up window and the half-open probe fails, leaving
+    // it Open instead of Closed. Either goes RED.
+    #[tokio::test]
+    async fn intermittent_link_opens_during_down_closes_during_up() {
+        let clock = FakeClock::new();
+        let backend = FakeBackend::with_clock(
+            FakeState::Intermittent {
+                up_secs: 60,
+                down_secs: 60,
+            },
+            clock.clone(),
+        );
+        let p = prober(backend.clone(), clock.clone());
+
+        // ---- DOWN window [60s, 120s): drive the breaker Open ----
+        clock.advance(Duration::from_secs(60));
+        for _ in 0..BREAKER_OPEN_THRESHOLD {
+            let _ = p.probe().await;
+        }
+        let retry_at = match p.service_health(ServiceName::Drive) {
+            ServiceHealth::Open { retry_at } => retry_at,
+            other => panic!("the down window must open the breaker, got {other:?}"),
+        };
+        // Opened at t=60s, so the first backoff schedules the half-open probe
+        // 30s later (DESIGN s5.8.3).
+        assert_eq!(retry_at, 60_000 + BACKOFF_SCHEDULE_MS[0]);
+
+        // While Open and still inside the down window, probe() fails fast: the
+        // Drive service probe is skipped (P1-5), so its counter is unchanged.
+        let drive_before = backend.drive_probe_calls.load(Ordering::SeqCst);
+        let _ = p.probe().await;
+        assert_eq!(
+            backend.drive_probe_calls.load(Ordering::SeqCst),
+            drive_before,
+            "an Open breaker defers the Drive probe while still down"
+        );
+
+        // ---- UP window: advance past retry_at into an up phase, close it ----
+        // t = 120s: phase (120 % 120 = 0) < 60 -> UP, and 120s > retry_at(90s)
+        // -> the breaker reads HalfOpen and its next probe is allowed.
+        clock.advance(Duration::from_secs(60));
+        assert_eq!(
+            p.service_health(ServiceName::Drive),
+            ServiceHealth::HalfOpen,
+            "past retry_at the breaker half-opens"
+        );
+        let _ = p.probe().await;
+        assert_eq!(
+            p.service_health(ServiceName::Drive),
+            ServiceHealth::Closed,
+            "a successful up-window probe closes the breaker"
+        );
+
+        // ---- next DOWN window [180s, 240s): the cycle repeats ----
+        clock.advance(Duration::from_secs(60));
+        for _ in 0..BREAKER_OPEN_THRESHOLD {
+            let _ = p.probe().await;
+        }
+        assert!(
+            matches!(
+                p.service_health(ServiceName::Drive),
+                ServiceHealth::Open { .. }
+            ),
+            "the next down window re-opens the breaker (intermittent cycle)"
+        );
     }
 
     // --- DESIGN s5.8.5: pool teardown at 3 network-level failures,

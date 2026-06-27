@@ -25,3 +25,11 @@ futures.workspace = true
 # not a dedicated resolver crate; `hickory-resolver` is only the optional
 # s5.8.5 escalation and is not wired in V1.
 reqwest.workspace = true
+
+[dev-dependencies]
+# `test-util` enables `#[tokio::test(start_paused = true)]` so the DNS-no-hang
+# acceptance test drives `tokio::time::timeout` on virtual time (no wall-clock
+# wait) - see resolve_within_bounds_a_blackholed_lookup. `test-util` is NOT in
+# tokio's `full` feature, so it must be enabled explicitly here; no new crate
+# is pulled in (it is an internal tokio feature).
+tokio = { workspace = true, features = ["test-util"] }
