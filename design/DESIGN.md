@@ -1680,7 +1680,16 @@ and real backup, with fast debugging for as fast iteration as possible."*
 | End-to-end (fake)    | `cargo test --test e2e_fake`         | < 60s   |
 | End-to-end (real)    | `cargo test --test e2e_real` (gated) | < 5min  |
 | UI component         | `pnpm test:unit` (Vitest)            | < 10s   |
-| UI E2E               | `pnpm test:e2e` (Playwright on built Tauri binary) | < 5min |
+| UI E2E (V1.1)        | `pnpm test:e2e` (Playwright on built Tauri binary) - DEFERRED to V1.1 | < 5min |
+
+> **UI E2E (Playwright) is DEFERRED to V1.1** - there is intentionally no
+> Playwright in the repo for V1. The first-run setup wizard, the flow the
+> `pnpm test:e2e` row was meant to gate, is covered in V1 by a Vitest jsdom +
+> Vue Test Utils mount test (`ui/src/__tests__/setup-wizard.test.ts`) that
+> walks all five DESIGN §8.5 steps against the fake remote (the mocked IPC
+> seam). That jsdom mount is the ACCEPTED V1 substitute; a browser-driven
+> wizard smoke on the built bundle lands in V1.1. See the M6 acceptance
+> criteria in ROADMAP.md and "Beyond V1 (V1.1+)".
 
 ### 14.2 The DriveClient seam
 
@@ -1852,7 +1861,8 @@ Frontend:
 - `@intlify/eslint-plugin-vue-i18n` 4.x (provides `no-raw-text` rule).
 - `@tauri-apps/api` 2.x.
 - Vitest 2.x + Vue Test Utils 2.x.
-- Playwright 1.x (e2e UI tests against built bundle).
+- Playwright 1.x (e2e UI tests against built bundle) - DEFERRED to V1.1; not a
+  V1 dependency (see §14.1). In V1 the wizard e2e is the Vitest jsdom mount.
 - ESLint 9.x + Prettier 3.x.
 
 Dev tooling:

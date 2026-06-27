@@ -123,8 +123,9 @@ Because the suite no-op-passes without the gate, it is safe anywhere; it only do
 real Drive I/O when the secrets are configured. Per the chaos COST POLICY it is
 gated to `v*` TAG pushes only (`if: startsWith(github.ref, 'refs/tags/')`) - real
 Google traffic on every push/PR is too costly - so real-Drive coverage runs at
-release time, not per-PR. The snippet below is illustrative (the live job also
-carries the tag gate + `libssl-dev`).
+release time, not per-PR. The job has the display name `real-drive e2e
+(tag-only)`. The block below mirrors the live job verbatim (kept in sync with
+`.github/workflows/chaos.yml`).
 
 Configure these repository (or environment) secrets in GitHub:
 
@@ -133,20 +134,32 @@ Configure these repository (or environment) secrets in GitHub:
 - `DRIVEN_OAUTH_CLIENT_SECRET`
 - (optional) `DRIVEN_OAUTH_CLIENT_ID`
 
-The job step maps the secrets into the process env and runs the target:
+The job maps the secrets into the process env at the JOB level (so every step
+sees them) and runs the target. It also installs `libssl-dev` for the Drive HTTP
+client and restores the shared `workspace` rust-cache:
 
 ```yaml
   chaos-real-drive:
+    name: real-drive e2e (tag-only)
+    if: ${{ startsWith(github.ref, 'refs/tags/') }}
     runs-on: ubuntu-latest
+    env:
+      DRIVEN_E2E_REFRESH_TOKEN: ${{ secrets.DRIVEN_E2E_REFRESH_TOKEN }}
+      DRIVEN_E2E_DEST_FOLDER_ID: ${{ secrets.DRIVEN_E2E_DEST_FOLDER_ID }}
+      DRIVEN_OAUTH_CLIENT_SECRET: ${{ secrets.DRIVEN_OAUTH_CLIENT_SECRET }}
+      DRIVEN_OAUTH_CLIENT_ID: ${{ secrets.DRIVEN_OAUTH_CLIENT_ID }}
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
       - uses: dtolnay/rust-toolchain@stable
-      - name: Real-Drive e2e (gate flips on only when secrets are set)
-        env:
-          DRIVEN_E2E_REFRESH_TOKEN: ${{ secrets.DRIVEN_E2E_REFRESH_TOKEN }}
-          DRIVEN_E2E_DEST_FOLDER_ID: ${{ secrets.DRIVEN_E2E_DEST_FOLDER_ID }}
-          DRIVEN_OAUTH_CLIENT_SECRET: ${{ secrets.DRIVEN_OAUTH_CLIENT_SECRET }}
-          DRIVEN_OAUTH_CLIENT_ID: ${{ secrets.DRIVEN_OAUTH_CLIENT_ID }}
+      - name: Install Linux build deps (libssl for the Drive HTTP client)
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+      - uses: Swatinem/rust-cache@v2
+        with:
+          shared-key: "workspace"
+          save-if: ${{ github.ref == 'refs/heads/main' }}
+      - name: real-drive e2e (google_e2e)
         run: cargo test -p driven-drive --test google_e2e -- --nocapture
 ```
 

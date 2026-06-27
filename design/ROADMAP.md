@@ -453,8 +453,13 @@ sources, configure exclusions and rules.
 - Re-auth banner appears when a refresh token is revoked (manually
   simulated by revoking in the Google Account permissions page).
 - Vitest unit tests for each store + component pass.
-- Playwright test boots the app and walks through the wizard against
-  the fake remote.
+- Wizard end-to-end coverage (ACCEPTED V1 substitute): a Vitest jsdom + Vue
+  Test Utils mount test (`ui/src/__tests__/setup-wizard.test.ts`) boots the
+  wizard and walks all five DESIGN §8.5 steps against the fake remote (the
+  mocked IPC seam). This jsdom mount is the accepted V1 acceptance for this
+  line. A real browser-driven (Playwright / WebDriver + `tauri-driver`) wizard
+  smoke on the built Tauri bundle is DEFERRED to V1.1 (see "Beyond V1
+  (V1.1+)"); there is intentionally no Playwright in the repo pre-V1.1.
 
 ---
 
@@ -608,6 +613,10 @@ Tracked as separate roadmap items, no fixed sequence yet:
 - **Web admin / status page** for users who want to monitor multiple
   machines.
 - **mobile companion app** (Tauri mobile) for read-only restore.
+- **Browser-driven wizard e2e smoke** (Playwright / WebDriver + `tauri-driver`
+  on the built Tauri bundle) for the first-run setup wizard. V1 accepts the
+  Vitest jsdom mount (`ui/src/__tests__/setup-wizard.test.ts`) as the
+  substitute - see the M6 acceptance criteria and DESIGN §14.1.
 
 ---
 
