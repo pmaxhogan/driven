@@ -3,6 +3,8 @@ import { onMounted } from "vue";
 import { useRoute } from "vue-router";
 import { useI18n } from "vue-i18n";
 
+import GlobalProgressBar from "./components/GlobalProgressBar.vue";
+import { useProgressStore } from "./stores/progress";
 import { useUpdaterStore } from "./stores/updater";
 
 // M6 shell: the app is a router host. Each SPEC s25 route renders its own view
@@ -29,6 +31,12 @@ const route = useRoute();
 // update so an emit that fired before the webview attached is still reflected.
 const updater = useUpdaterStore();
 
+// Global backup progress bar (issue #46): own the `sync:status_changed`
+// subscription at the app root - just like the updater above - so the thin top
+// bar reflects a backup/sync run in progress on ANY route, even one that started
+// before the active view mounted.
+const progress = useProgressStore();
+
 // R4-P2-1: subscribe() can reject on a partial listener-registration failure (it
 // now cleans up + resets state so a later retry can re-subscribe). A failed
 // subscribe must NOT skip pending-update hydration: the backend's startup check
@@ -43,6 +51,17 @@ onMounted(async () => {
     console.error("updater subscribe failed at app boot", e);
   } finally {
     await updater.hydratePending();
+  }
+  // Same pattern for the global progress bar: subscribe first so no live status
+  // event is missed, then hydrate from the current aggregate so a run already
+  // underway at boot shows immediately. A subscribe failure must not skip
+  // hydration (get_sync_status is an independent path), so hydrate in `finally`.
+  try {
+    await progress.subscribe();
+  } catch (e) {
+    console.error("progress subscribe failed at app boot", e);
+  } finally {
+    await progress.hydrate();
   }
 });
 
@@ -76,6 +95,7 @@ const NAV_LINK_ACTIVE = "text-teal-700 dark:text-teal-300 font-semibold";
 
 <template>
   <div class="min-h-screen flex flex-col">
+    <GlobalProgressBar />
     <nav
       class="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-zinc-200 bg-white px-6 py-3 text-sm dark:border-zinc-800 dark:bg-zinc-900"
       :aria-label="t('nav.primary')"

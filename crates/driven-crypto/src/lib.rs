@@ -272,4 +272,81 @@ mod suite_tests {
             Err(CryptoError::Protocol(_))
         ));
     }
+
+    #[test]
+    fn full_keychain_loss_recovery_decrypts_old_ciphertext() {
+        // The end-to-end disaster-recovery promise (DESIGN s7.3): a user whose OS
+        // keychain is wiped (machine reformat) can paste back their 24-word BIP39
+        // phrase and STILL decrypt everything previously uploaded. This ties
+        // together the four pieces each unit-tested in isolation - master-key
+        // recovery phrase, master-wraps-source, content STREAM, and filename
+        // encryption - in the exact order the recovery flow exercises them.
+        //
+        // 1. Original install: a master key wraps a fresh per-source key; the
+        //    wrapped blob is what persists in SQLite (`wrapped_source_key`), the
+        //    master key is what lived ONLY in the now-lost keychain.
+        let master = MasterKey::generate();
+        let (source_key, wrapped) = master.wrap_new_source_key().unwrap();
+        let wrapped_blob = wrapped.to_bytes(); // the on-disk form
+        let phrase = master_key_to_phrase(&master).unwrap(); // what the user wrote down
+
+        // 2. Encrypt a file + its path under the original source key, capturing the
+        //    header, ciphertext chunks, and the encrypted folder/leaf names.
+        let suite = DrivenCryptoSuite::new(source_key);
+        let dir_name = suite.encrypt_filename("Taxes", &[]).unwrap();
+        let leaf_name = suite
+            .encrypt_filename("2023-return.pdf", dir_name.as_bytes())
+            .unwrap();
+        let mut enc = suite.content_encryptor();
+        let header = enc.header();
+        let c0 = enc.encrypt_chunk(b"page one of the return").unwrap();
+        let (c1, _md5) = enc.finalize_last(b"and the final page").unwrap();
+        // Drop the original suite + source key, modelling the wiped keychain: from
+        // here on ONLY the phrase and the on-disk wrapped blob exist.
+        drop(suite);
+
+        // 3. Recover: phrase -> master key -> unwrap the SAME source key from the
+        //    persisted blob -> rebuild the suite.
+        let recovered_master = phrase_to_master_key(&phrase).unwrap();
+        let restored_wrapped = WrappedSourceKey::from_bytes(&wrapped_blob).unwrap();
+        let recovered_source = recovered_master
+            .unwrap_source_key(&restored_wrapped)
+            .unwrap();
+        let recovered_suite = DrivenCryptoSuite::new(recovered_source);
+
+        // 4. The recovered suite decrypts both the plaintext path components and
+        //    the file content that the lost-key suite produced.
+        assert_eq!(
+            recovered_suite.decrypt_filename(&dir_name, &[]).unwrap(),
+            "Taxes"
+        );
+        assert_eq!(
+            recovered_suite
+                .decrypt_filename(&leaf_name, dir_name.as_bytes())
+                .unwrap(),
+            "2023-return.pdf"
+        );
+        let mut dec = recovered_suite.content_decryptor(&header).unwrap();
+        let mut out = Vec::new();
+        out.extend_from_slice(&dec.decrypt_chunk(&c0).unwrap());
+        out.extend_from_slice(&dec.decrypt_last(&c1).unwrap());
+        assert_eq!(out, b"page one of the returnand the final page");
+    }
+
+    #[test]
+    fn wrong_recovery_phrase_cannot_unwrap_the_source_key() {
+        // A DIFFERENT (valid) recovery phrase reconstructs a different master key,
+        // which must FAIL to unwrap the source key (AEAD tag mismatch) - so a
+        // mistyped-but-checksum-valid phrase can never silently yield garbage.
+        let master = MasterKey::generate();
+        let (_source_key, wrapped) = master.wrap_new_source_key().unwrap();
+
+        let other_master = MasterKey::generate();
+        let other_phrase = master_key_to_phrase(&other_master).unwrap();
+        let wrong = phrase_to_master_key(&other_phrase).unwrap();
+        assert!(matches!(
+            wrong.unwrap_source_key(&wrapped),
+            Err(CryptoError::DecryptFailed)
+        ));
+    }
 }
