@@ -128,9 +128,18 @@ export const useProgressStore = defineStore("progress", () => {
   const percent = computed<number | null>(() => {
     if (!active.value) return null;
     const e = exec.value;
-    if (e.bytesTotal > 0) return clamp01(e.bytesDone / e.bytesTotal);
+    // Bytes are the smoothest signal, but ONLY for an upload-only plan. In a
+    // MIXED upload+delete plan, deletes move no bytes, so a pure byte fraction
+    // would hit 100% the instant uploads finish while trash ops are still
+    // pending (codex P2). When the plan has trash ops, fall through to op counts
+    // (uploads + trashes) so the bar cannot read 100% until BOTH are done.
+    if (e.bytesTotal > 0 && e.trashesTotal === 0) {
+      return clamp01(e.bytesDone / e.bytesTotal);
+    }
     const opsTotal = e.filesTotal + e.trashesTotal;
     if (opsTotal > 0) return clamp01((e.filesDone + e.trashesDone) / opsTotal);
+    // Active with measurable bytes but no op counts (rare): use the byte fraction.
+    if (e.bytesTotal > 0) return clamp01(e.bytesDone / e.bytesTotal);
     return null;
   });
 

@@ -153,6 +153,28 @@ describe("progress store - determinate percent", () => {
     expect(store.percent).toBeCloseTo(0.75, 5);
   });
 
+  it("does NOT report 100% on a mixed upload+delete plan while deletes are pending", () => {
+    const store = useProgressStore();
+    // Uploads fully done (bytes 1000/1000, files 2/2) but 0 of 2 trash ops done.
+    // A pure byte fraction would read 100%; op counts keep the bar honest.
+    store.ingest(
+      perAccount(
+        "a",
+        executing({
+          bytes_done: 1000,
+          bytes_total: 1000,
+          files_done: 2,
+          files_total: 2,
+          trashes_done: 0,
+          trashes_total: 2,
+        })
+      )
+    );
+    // (2 files + 0 trashes) / (2 files + 2 trashes) = 0.5, NOT 1.0.
+    expect(store.percent).toBeCloseTo(0.5, 5);
+    expect(store.percent!).toBeLessThan(1);
+  });
+
   it("is indeterminate (null) while executing with no measurable total yet", () => {
     const store = useProgressStore();
     store.ingest(perAccount("a", executing({})));
