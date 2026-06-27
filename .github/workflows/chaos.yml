@@ -20,10 +20,15 @@ name: Chaos
 #                      runs ONLY the s3.7 Drive-side hazards + s4.2/s5 drive-side
 #                      mutator faults against InMemoryRemoteStore
 #                      (`run-all --fault-injection`).
-#   chaos-real-drive - WIRED but SKIPPED until M4: gated on the
-#                      DRIVEN_E2E_REFRESH_TOKEN secret, which is absent until
-#                      the GoogleDriveStore (M4) lands. It skips cleanly, it
-#                      does NOT fail (STRESS_HARNESS s7 "Gating on M4").
+#   chaos-real-drive - `v*` TAG pushes ONLY: runs the REAL Google Drive contract
+#                      suite (driven-drive/tests/google_e2e.rs) against a live
+#                      GoogleDriveStore. The suite gates itself on three required
+#                      secrets - DRIVEN_E2E_REFRESH_TOKEN, DRIVEN_E2E_DEST_FOLDER_ID
+#                      and DRIVEN_OAUTH_CLIENT_SECRET (CLIENT_ID is optional) - and
+#                      when ANY of them is absent it prints a "skipping real-Drive
+#                      e2e" line and returns Ok (clean skip, never red). Real Google
+#                      traffic on every push/PR is too costly, so it runs at release
+#                      time only. See design/E2E_REAL.md.
 #
 # The long fuzz soak + soak-gated massive-input rows (million-files-nested,
 # tiny-files-100k) run LOCALLY via the justfile (`just chaos-soak`,
