@@ -5,6 +5,19 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [0.4.0](https://github.com/pmaxhogan/driven/compare/v0.3.1...v0.4.0) (2026-06-27)
+
+
+### Features
+
+* **ui:** global backup progress bar in the app header ([#55](https://github.com/pmaxhogan/driven/issues/55)) ([b7513b5](https://github.com/pmaxhogan/driven/commit/b7513b55bf1614bcef1081857389f57118bb8ae2))
+* **ui:** sticky restore action bar and virtualized large lists ([#54](https://github.com/pmaxhogan/driven/issues/54)) ([4631225](https://github.com/pmaxhogan/driven/commit/4631225cc7fda29e8348e3bb00915a0a47b81e31))
+
+
+### Bug Fixes
+
+* **ui:** keep the activity screen smooth during uploads ([#56](https://github.com/pmaxhogan/driven/issues/56)) ([44f3853](https://github.com/pmaxhogan/driven/commit/44f38539f00e0cccf8d4b7501b79cefbf4f41cc2))
+
 ## [0.3.1](https://github.com/pmaxhogan/driven/compare/v0.3.0...v0.3.1) (2026-06-26)
 
 
