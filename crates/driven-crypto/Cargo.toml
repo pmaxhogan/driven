@@ -36,4 +36,4 @@ md5 = { workspace = true }
 # `getrandom`-backed RNG for the per-file STREAM nonce, the wrapped-key
 # nonce, and fresh master / per-source key material (DESIGN s7.1). Pinned to
 # 0.8 to match `chacha20poly1305` 0.10's `rand_core` 0.6 `OsRng`.
-rand = "0.8"
+rand = "0.10"
