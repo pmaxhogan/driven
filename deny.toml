@@ -32,6 +32,24 @@ ignore = [
     "RUSTSEC-2025-0081",
     "RUSTSEC-2025-0098",
     "RUSTSEC-2025-0100",
+    # quick-xml DoS advisories, both fixed in quick-xml >=0.41.0:
+    #   RUSTSEC-2026-0194 - quadratic run time when checking a start tag for
+    #     duplicate attribute names.
+    #   RUSTSEC-2026-0195 - unbounded namespace-declaration allocation in
+    #     `NsReader` enables a memory-exhaustion denial of service.
+    # We carry two vulnerable copies, each transitively pinned via an
+    # intermediate that is ALREADY at its latest published crates.io version and
+    # has not yet bumped its quick-xml requirement to >=0.41:
+    #   quick-xml 0.37.5 <- tauri-winrt-notification 0.7.2 <- notify-rust
+    #     <- tauri-plugin-notification <- driven-app
+    #   quick-xml 0.39.4 <- plist 1.9.0 <- tauri-utils <- tauri <- driven-app
+    # No bump path exists at our layer: quick-xml >=0.41 crosses 0.x incompat
+    # boundaries upstream, so tauri-winrt-notification / plist must move first.
+    # Exposure is low - these paths only parse local / OS-generated XML (Windows
+    # toast notifications, macOS plists), never untrusted network input.
+    # Added 2026-07-03; remove when #89 closes.
+    "RUSTSEC-2026-0194",
+    "RUSTSEC-2026-0195",
 ]
 
 [licenses]
