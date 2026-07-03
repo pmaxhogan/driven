@@ -28,7 +28,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
-use crate::network::detect_metered_and_reachable;
+use crate::network::{reachable_hint, MacosMeteredMonitor, MeteredStatus};
 use crate::{PowerSource, PowerState};
 
 /// Poll cadence for the OS power query (DESIGN s5.7).
@@ -56,18 +56,29 @@ type CFTypeRefRaw = *const c_void;
 pub struct RealPowerSource {
     latest: Arc<Mutex<PowerState>>,
     tx: broadcast::Sender<PowerState>,
+    /// Live `NWPathMonitor` caching the active path's metered proxy
+    /// (`isExpensive` / `isConstrained`). Cloneable (shares an `Arc<AtomicU8>`)
+    /// so the poll loop reads the latest verdict cheaply each tick.
+    metered: MacosMeteredMonitor,
 }
 
 impl RealPowerSource {
     /// Builds the source with an initial snapshot read synchronously from
     /// IOKit. Never fails: a host with no battery / unreadable IOPS info
     /// resolves to "on AC, no battery".
+    ///
+    /// Starts the `NWPathMonitor` here; its first path arrives asynchronously,
+    /// so the initial snapshot may read metered as [`MeteredStatus::Unknown`]
+    /// (not metered) until the first update lands - a safe default that never
+    /// wrongly stalls sync.
     pub fn new() -> anyhow::Result<Self> {
-        let initial = read_power_state();
+        let metered = MacosMeteredMonitor::start();
+        let initial = read_power_state(metered.status());
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
             latest: Arc::new(Mutex::new(initial)),
             tx,
+            metered,
         })
     }
 
@@ -79,12 +90,13 @@ impl RealPowerSource {
     pub fn spawn_poller(&self) -> tokio::task::JoinHandle<()> {
         let latest = Arc::clone(&self.latest);
         let tx = self.tx.clone();
+        let metered = self.metered.clone();
         tokio::spawn(async move {
             let mut ticker = tokio::time::interval(POLL_INTERVAL);
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                let next = read_power_state();
+                let next = read_power_state(metered.status());
                 let mut guard = latest.lock().await;
                 if *guard != next {
                     tracing::debug!(?next, "power state transition");
@@ -107,15 +119,15 @@ impl PowerSource for RealPowerSource {
     }
 }
 
-/// Reads a full [`PowerState`] snapshot.
-fn read_power_state() -> PowerState {
+/// Reads a full [`PowerState`] snapshot. AC / battery come from IOKit; the
+/// `metered` verdict is the caller-supplied cached `NWPathMonitor` reading.
+fn read_power_state(metered: MeteredStatus) -> PowerState {
     let (ac_connected, battery_percent) = read_ac_and_battery();
-    let (on_metered_network, network_reachable) = detect_metered_and_reachable();
     PowerState {
         ac_connected,
         battery_percent,
-        on_metered_network,
-        network_reachable,
+        on_metered_network: metered.on_metered(),
+        network_reachable: reachable_hint(),
     }
 }
 

@@ -1502,6 +1502,7 @@ version = "1.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "block2",
  "core-foundation",
  "objc2",
  "thiserror 2.0.18",
