@@ -1471,7 +1471,7 @@ jobs:
           manifest-file: .release-please-manifest.json
 ```
 
-Maintains a "chore: release v0.x.y" PR with the changelog and version
+Maintains a "chore(main): release vX.Y.Z" PR with the changelog and version
 bumps. Merging the PR creates the `v*` tag, which fires `release.yml`.
 
 ### 19.3 `release.yml`

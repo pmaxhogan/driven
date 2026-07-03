@@ -18,11 +18,11 @@ type(optional-scope): short imperative summary
 
 - **Allowed types:** `feat`, `fix`, `perf`, `refactor`, `docs`, `test`,
   `build`, `ci`, `chore`, `style`, `revert`.
-- **Version impact (pre-1.0, `bump-minor-pre-major`):** `feat` -> minor
-  (0.x.0), `fix`/`perf` -> patch. A breaking change uses a `!`
-  (`feat!:` / `fix(core)!:`) or a `BREAKING CHANGE:` footer in the PR body;
-  pre-1.0 a breaking change still bumps only the **minor** (0.x.0), NOT a
-  major 1.0.0 - that is what `bump-minor-pre-major` means.
+- **Version impact (post-1.0):** `feat` -> minor (x.Y.0), `fix`/`perf` ->
+  patch. A breaking change uses a `!` (`feat!:` / `fix(core)!:`) or a
+  `BREAKING CHANGE:` footer in the PR body and bumps the **major** (X.0.0).
+  (`bump-minor-pre-major` is still set in `release-please-config.json` but
+  is inert now that the version is >= 1.0.0.)
 - Changelog-visible by default: `feat` (Features), `fix` (Bug Fixes), `perf`,
   `revert`, and `deps` (Dependencies). The rest - `docs`, `chore`, `ci`,
   `build`, `refactor`, `style`, `test` - are valid but **hidden**: a PR titled
