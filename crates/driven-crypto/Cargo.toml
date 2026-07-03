@@ -34,6 +34,11 @@ keyring = { workspace = true }
 # for the verify-on-upload comparison.
 md5 = { workspace = true }
 # `getrandom`-backed RNG for the per-file STREAM nonce, the wrapped-key
-# nonce, and fresh master / per-source key material (DESIGN s7.1). Pinned to
-# 0.8 to match `chacha20poly1305` 0.10's `rand_core` 0.6 `OsRng`.
-rand = "0.8"
+# nonce, and fresh master / per-source key material (DESIGN s7.1).
+# `chacha20poly1305` 0.10 pulls in `aead` 0.5's own `rand_core` 0.6 `OsRng`
+# internally, but this crate never calls an `aead`/`chacha20poly1305` API
+# that accepts a caller-supplied RNG (no `encrypt_in_place_with_rng` /
+# `KeyInit::generate_key`) - every call site here fills a raw byte buffer
+# directly via `RngCore`/`TryRngCore`, so the two `rand_core` major versions
+# never need to match.
+rand = "0.10"

@@ -10,7 +10,7 @@ use chacha20poly1305::{
     aead::{Aead, KeyInit},
     XChaCha20Poly1305, XNonce,
 };
-use rand::RngCore;
+use rand::TryRng;
 use zeroize::{Zeroize, ZeroizeOnDrop};
 
 use crate::CryptoError;
@@ -38,7 +38,13 @@ impl MasterKey {
     #[must_use]
     pub fn generate() -> Self {
         let mut bytes = [0u8; KEY_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        // See `content.rs::ContentEncryptorImpl::new` for why `SysRng` needs
+        // `try_fill_bytes` + `.expect()`: it's rand 0.10's fallible OS RNG,
+        // and `.expect()` preserves rand 0.8 `OsRng::fill_bytes`'s panic on
+        // the same underlying failure.
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("OS RNG (getrandom) failed to fill master key");
         Self(bytes)
     }
 
@@ -78,7 +84,9 @@ impl MasterKey {
     pub fn wrap_source_key(&self, source_key: &SourceKey) -> Result<WrappedSourceKey, CryptoError> {
         let cipher = XChaCha20Poly1305::new(self.0.as_ref().into());
         let mut nonce_bytes = [0u8; XNONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce_bytes);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut nonce_bytes)
+            .expect("OS RNG (getrandom) failed to fill wrap nonce");
         let nonce = XNonce::from_slice(&nonce_bytes);
         let ciphertext = cipher
             .encrypt(nonce, source_key.0.as_ref())
@@ -120,7 +128,9 @@ impl SourceKey {
     #[must_use]
     pub fn generate() -> Self {
         let mut bytes = [0u8; KEY_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut bytes);
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut bytes)
+            .expect("OS RNG (getrandom) failed to fill source key");
         Self(bytes)
     }
 
