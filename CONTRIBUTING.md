@@ -42,7 +42,7 @@ Format:
 
 Common types:
 
-- `feat`: a new user-facing feature (bumps the minor version pre-1.0)
+- `feat`: a new user-facing feature (bumps the minor version)
 - `fix`: a bug fix (bumps the patch version)
 - `docs`: documentation only
 - `refactor`: code change that neither fixes a bug nor adds a feature
@@ -52,7 +52,7 @@ Common types:
 - `perf`: a performance improvement
 
 Breaking changes: add a `!` after the type/scope (for example `feat!:`) and / or
-a `BREAKING CHANGE:` footer. Pre-1.0, a breaking change bumps the minor version.
+a `BREAKING CHANGE:` footer. A breaking change bumps the major version.
 
 Examples:
 
