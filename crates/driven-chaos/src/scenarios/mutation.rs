@@ -962,11 +962,40 @@ impl Scenario for AppendOnlyLog {
         mutator.stop_and_join();
         drain_to_steady_state(&h).await?;
 
-        // Drive must hold the FINAL local bytes exactly (a coherent snapshot of
-        // the fully-appended file, no torn write).
+        // #69: under load the first upload (a CREATE, no drive_file_id yet) can
+        // race a concurrent append and land as a changed-after-upload. By DESIGN
+        // s5.6 that leaves BOTH (a) an orphan remote object and (b) a surviving
+        // create op, reclaimed only by the adopt-by-op-uuid reconcile pass - which
+        // is startup-gated (`reconcile_once` runs once per process). So mid-session
+        // a duplicate object + an overdue create op can persist until the next
+        // restart, which is accepted behaviour. Simulate that restart here: run
+        // the reconcile pass, then drain - exactly what the next launch does - so
+        // the strict invariants below assert the engine's REAL post-restart
+        // contract (one object, no data loss, no overdue op) and still fail loudly
+        // if a restart does NOT converge.
+        {
+            let clock = Arc::new(FakeClock::new());
+            let pacer: Arc<dyn driven_core::pacer::Pacer> = Arc::new(NoopPacer);
+            let exec = DefaultExecutor::with_clock(
+                ExecutorDeps {
+                    remote: h.remote.clone(),
+                    state: h.handle.state.clone(),
+                    pacer,
+                    crypto: None,
+                    vss: None,
+                    network: None,
+                },
+                clock,
+            );
+            exec.reconcile(&h.source).await?;
+        }
+        drain_to_steady_state(&h).await?;
+
+        // Post-restart: Drive holds exactly one object with the final local bytes
+        // (orphan adopted, create op drained, no torn write).
         let count = h.live_object_count().await?;
         if count != 1 {
-            anyhow::bail!("expected exactly 1 log object, found {count}");
+            anyhow::bail!("after reconcile, expected exactly 1 log object, found {count}");
         }
         let live = h
             .remote
