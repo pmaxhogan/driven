@@ -5,6 +5,19 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [1.0.0](https://github.com/pmaxhogan/driven/compare/v0.5.0...v1.0.0) (2026-07-03)
+
+
+### Features
+
+* adopt v1.0.0 GA versioning and compatibility policy ([#92](https://github.com/pmaxhogan/driven/issues/92)) ([bdff783](https://github.com/pmaxhogan/driven/commit/bdff783d203aed02603086751acf2228eceabedc))
+
+
+### Bug Fixes
+
+* **chaos:** assert AppendOnlyLog post-restart contract via reconcile ([#86](https://github.com/pmaxhogan/driven/issues/86)) ([1c2da3b](https://github.com/pmaxhogan/driven/commit/1c2da3bc56b340cd3e55b3c34d7ad1566ed389b4))
+* **ci:** resolve cargo-deny advisories (anyhow 1.0.103, quick-xml ignores) ([#90](https://github.com/pmaxhogan/driven/issues/90)) ([8d85e62](https://github.com/pmaxhogan/driven/commit/8d85e623224b89b8aa4104a026e9a791d91a8eec))
+
 ## [0.5.0](https://github.com/pmaxhogan/driven/compare/v0.4.0...v0.5.0) (2026-06-27)
 
 
