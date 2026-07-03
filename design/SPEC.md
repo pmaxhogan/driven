@@ -1674,10 +1674,15 @@ Stored as JSON values in the `settings` KV table.
 
 // key: "windows" (Windows-only; absent on macOS/Linux)
 {
-  "vss_mode": "auto"                     // "auto" | "always" | "never"
+  "vss_mode": "auto",                    // "auto" | "always" | "never"
                                          //   auto:   try direct open first, fall back to VSS on ERROR_SHARING_VIOLATION (default)
                                          //   always: snapshot the volume per cycle even for non-locked files (paranoid)
                                          //   never:  never use VSS; locked files always skipped + surfaced (no-elevate)
+  "vss_helper": false                    // false (default) | true
+                                         //   true:  route VSS snapshots through the least-privilege elevated helper
+                                         //          (DESIGN s5.3.1) so the main app stays un-elevated; launches
+                                         //          driven-vss-helper.exe via one UAC prompt on first use
+                                         //   false: no helper; VSS needs the whole app launched as Administrator
 }
 
 // key: "ui"

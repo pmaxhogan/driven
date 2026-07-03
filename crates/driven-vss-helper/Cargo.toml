@@ -1,0 +1,60 @@
+[package]
+name = "driven-vss-helper"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Internal workspace crate (never published to crates.io); the `driven-vss`
+# path dependency is intentional and matches the other internal crates.
+publish = false
+
+# Least-privilege VSS elevation helper (DESIGN s5.3.1, issue #25). The main app
+# stays un-elevated; ONLY the shadow-copy operation runs in a small privileged
+# broker (`driven-vss-helper.exe`) the app talks to over a secured Windows named
+# pipe. The OS-independent surface (the wire protocol + framing, the boundary
+# input validation, the pipe security-descriptor + caller-identity DECISION
+# logic, and the elevated-launch argv construction) compiles + unit-tests on
+# every target; the real named-pipe server/client, the VSS snapshot, and the
+# `ShellExecute runas` launch are `#[cfg(windows)]` only.
+
+[lib]
+name = "driven_vss_helper"
+path = "src/lib.rs"
+
+# The elevated broker binary. Small: it parses `--pipe`/`--allowed-root`, refuses
+# to run un-elevated, and runs the pipe server loop.
+[[bin]]
+name = "driven-vss-helper"
+path = "src/bin/driven-vss-helper.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+driven-vss = { path = "../driven-vss" }
+
+# Windows-only: the named-pipe server/client, the pipe security descriptor +
+# caller-PID/image authentication, and the elevated `ShellExecute runas` launch.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_Security",
+    "Win32_Security_Authorization",
+    "Win32_Storage_FileSystem",
+    "Win32_System_Pipes",
+    "Win32_System_IO",
+    "Win32_System_Threading",
+    "Win32_System_Memory",
+    "Win32_System_Registry",
+    "Win32_UI_Shell",
+    "Win32_UI_WindowsAndMessaging",
+] }
+
+[dev-dependencies]
+tempfile = "3"
+driven-vss = { path = "../driven-vss" }

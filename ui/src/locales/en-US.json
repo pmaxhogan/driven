@@ -209,6 +209,10 @@
         "low": "Low",
         "idle": "Idle"
       },
+      "vssBanner": {
+        "title": "Locked files are being skipped",
+        "body": "Some files (Outlook data files, live databases, VM disks) are held open and need Volume Shadow Copy to back up, which requires elevation. Right-click Driven and choose Run as administrator to include them. A least-privilege helper that elevates only the snapshot (not the whole app) is on the way."
+      },
       "vssModeLabel": "Volume Shadow Copy (Windows)",
       "vssMode": {
         "auto": "Automatic",

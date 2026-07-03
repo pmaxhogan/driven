@@ -6,6 +6,7 @@ members = [
     "crates/driven-crypto",
     "crates/driven-power",
     "crates/driven-vss",
+    "crates/driven-vss-helper",
     "crates/driven-net",
     "crates/driven-cli",
     "crates/driven-test-fixtures",
