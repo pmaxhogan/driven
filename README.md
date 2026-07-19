@@ -20,12 +20,11 @@ guide to creating that credential in the Google Cloud Console:
 
 ## How Driven compares
 
-Driven's niche is a native, cross-platform desktop app that pairs end-to-end
-encryption with one-way backup to a cloud you already own, plus developer- and
-laptop-friendly touches (gitignore-aware excludes, battery / metered-network
-awareness) that the CLI backup tools and consumer cloud clients skip. Where
-Driven is thinner today (extra storage backends, block-level dedup) is called
-out honestly below.
+Driven is a native desktop app that pairs end-to-end encryption with one-way
+backup to a cloud you already own, plus laptop-friendly touches (gitignore-aware
+excludes, battery and metered-network awareness) that CLI backup tools and
+consumer sync clients skip. Where it is thinner today (more backends,
+block-level dedup) is marked honestly below.
 
 | Capability | Driven | rclone | Drive for desktop | Duplicati | restic | Backblaze |
 | --- | --- | --- | --- | --- | --- | --- |
