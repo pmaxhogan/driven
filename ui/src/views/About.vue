@@ -32,13 +32,13 @@ const channels = ["stable", "dev"] as const;
 // accent for primary/interactive affordances; native controls carry explicit
 // light/dark surfaces so they stay readable on a dark-theme OS.
 const primaryBtn =
-  "inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-teal-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50";
+  "inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-xs transition-colors hover:bg-teal-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50";
 const secondaryBtn =
-  "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
+  "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
 const inputCls =
-  "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
+  "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-hidden focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
 const cardCls =
-  "rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900";
+  "rounded-lg border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900";
 
 // R1-P2-1: the V1 macOS in-app updater is not expected to work cleanly, so on
 // macOS we hide the in-app "Install update" action and surface a manual DMG
@@ -188,7 +188,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
         </button>
         <button
           type="button"
-          class="rounded-md px-3 py-2 text-sm text-zinc-500 transition-colors hover:text-zinc-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:hover:text-zinc-300"
+          class="rounded-md px-3 py-2 text-sm text-zinc-500 transition-colors hover:text-zinc-700 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:hover:text-zinc-300"
           @click="updater.dismissBanner()"
         >
           {{ t("common.close") }}
@@ -197,7 +197,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
 
       <!-- Download progress while installing (Windows/Linux only). -->
       <div v-if="!isMac && updater.installing" class="space-y-1" data-testid="install-progress">
-        <div class="h-2 w-full overflow-hidden rounded bg-teal-200 dark:bg-teal-900">
+        <div class="h-2 w-full overflow-hidden rounded-sm bg-teal-200 dark:bg-teal-900">
           <div
             class="h-full bg-teal-600 transition-all"
             :style="{
@@ -351,7 +351,7 @@ function viewReleaseChangelog(release: ReleaseDto): void {
           </p>
           <button
             type="button"
-            class="rounded-sm text-sm font-medium text-teal-700 underline transition-colors hover:text-teal-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-teal-300"
+            class="rounded-xs text-sm font-medium text-teal-700 underline transition-colors hover:text-teal-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-teal-300"
             @click="viewReleaseChangelog(release)"
           >
             {{ t("about.viewChangelogButton") }}
