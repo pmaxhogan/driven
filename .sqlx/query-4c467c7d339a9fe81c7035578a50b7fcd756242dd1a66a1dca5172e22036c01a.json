@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n                SELECT\n                    source_id     AS \"source_id!: String\",\n                    relative_path AS \"relative_path!: String\",\n                    size          AS \"size!: i64\",\n                    status        AS \"status!: String\",\n                    drive_file_id AS \"drive_file_id: String\"\n                FROM file_state\n                WHERE source_id = ?1\n                  AND (\n                    relative_path = ?2\n                    OR (relative_path >= ?3 AND relative_path < ?4)\n                  )\n                ORDER BY relative_path ASC\n                LIMIT ?5\n                ",
+  "query": "\n                SELECT\n                    fs.source_id     AS \"source_id!: String\",\n                    fs.relative_path AS \"relative_path!: String\",\n                    fs.size          AS \"size!: i64\",\n                    fs.status        AS \"status!: String\",\n                    fs.drive_file_id AS \"drive_file_id: String\",\n                    bm.bundle_id     AS \"bundle_id: String\"\n                FROM file_state fs\n                LEFT JOIN bundle_members bm\n                    ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path\n                WHERE fs.source_id = ?1\n                  AND (\n                    fs.relative_path = ?2\n                    OR (fs.relative_path >= ?3 AND fs.relative_path < ?4)\n                  )\n                ORDER BY fs.relative_path ASC\n                LIMIT ?5\n                ",
   "describe": {
     "columns": [
       {
@@ -57,6 +57,17 @@
             "name": "drive_file_id"
           }
         }
+      },
+      {
+        "name": "bundle_id: String",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bundle_members",
+            "name": "bundle_id"
+          }
+        }
       }
     ],
     "parameters": {
@@ -67,8 +78,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "735a06db98bb8db7c967ba306f36deec9ce8ca499179ac6aae506fee3bc51052"
+  "hash": "4c467c7d339a9fe81c7035578a50b7fcd756242dd1a66a1dca5172e22036c01a"
 }

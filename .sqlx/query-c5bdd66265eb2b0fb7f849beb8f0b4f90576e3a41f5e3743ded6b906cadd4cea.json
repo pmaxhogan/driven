@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                b.id            AS \"id!: String\",\n                b.drive_file_id AS \"drive_file_id!: String\"\n            FROM bundles b\n            WHERE b.source_id = ?1\n              AND NOT EXISTS (\n                  SELECT 1 FROM bundle_members m WHERE m.bundle_id = b.id\n              )\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bundles",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "drive_file_id!: String",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bundles",
+            "name": "drive_file_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "c5bdd66265eb2b0fb7f849beb8f0b4f90576e3a41f5e3743ded6b906cadd4cea"
+}

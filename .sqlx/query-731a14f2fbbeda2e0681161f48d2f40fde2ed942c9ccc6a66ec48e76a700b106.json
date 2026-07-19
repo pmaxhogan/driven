@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO bundles (\n                id, source_id, drive_file_id, drive_md5, size, member_count, created_at\n            ) VALUES ( ?1, ?2, ?3, ?4, ?5, ?6, ?7 )\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 7
+    },
+    "nullable": []
+  },
+  "hash": "731a14f2fbbeda2e0681161f48d2f40fde2ed942c9ccc6a66ec48e76a700b106"
+}

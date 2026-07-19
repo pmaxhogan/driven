@@ -44,7 +44,7 @@ use tracing::{debug, warn};
 
 use crate::network::{NetworkProbe, ServiceName};
 use crate::pacer::{Pacer, ResponseClass};
-use crate::state::{FileStateRow, NewFileVersion, NewPendingOp, SourceRow, StateRepo};
+use crate::state::{BundleRow, FileStateRow, NewFileVersion, NewPendingOp, SourceRow, StateRepo};
 use crate::time::{Clock, SystemClock};
 use crate::types::{
     ErrorCode, ExecProgress, FileStateStatus, Op, PendingOpId, Plan, RelativePath, SourceId,
@@ -122,9 +122,26 @@ const SOURCE_ID_KEY: &str = "driven.source_id";
 /// `appProperties` key carrying the relative-path hash (SPEC s3 preamble).
 const RELATIVE_PATH_HASH_KEY: &str = "driven.relative_path_hash";
 
+/// `appProperties` key stamped on a `.tar.gz` bundle object marking it as a
+/// Driven bundle and naming its archive format (V2 small-file bundling, issue
+/// #35). Lets a future reader (and any DESIGN s18.9 folder-sweep) recognise the
+/// object as ours and pick the right extractor; the value is
+/// [`crate::bundle::BUNDLE_FORMAT`].
+const BUNDLE_FORMAT_KEY: &str = "driven.bundle_format";
+
 /// `pending_ops.op_type` value the executor finalizes via
 /// `commit_*_result` (SPEC s2; matches the SqliteStateRepo bound).
 const OP_TYPE_UPLOAD: &str = "upload";
+
+/// `pending_ops.op_type` value for a bundle upload (V2 small-file bundling,
+/// issue #35). A surviving `bundle` pending_op means the bundle's
+/// `commit_bundle_result` never ran, so reconcile trashes any orphaned object by
+/// its op-uuid and drops the op; the members (never committed) are re-detected +
+/// re-bundled by the next scan.
+const OP_TYPE_BUNDLE: &str = "bundle";
+
+/// MIME type for a `.tar.gz` bundle object.
+const BUNDLE_MIME: &str = "application/gzip";
 
 /// Max retries for transient 5xx / network failures (DESIGN s5.4 "5xx ->
 /// exponential backoff, max 6 retries").
@@ -420,6 +437,23 @@ pub enum OpOutcome {
         /// DESIGN s8.3 byte aggregates); `None` for a trash.
         bytes: Option<u64>,
     },
+    /// A bundle upload completed (V2 small-file bundling, issue #35): one
+    /// `.tar.gz` Drive object landed and its md5 verified, and N member
+    /// `file_state` rows + their membership were committed. Carried as ONE
+    /// outcome (with the aggregate file + byte counts) rather than N per-member
+    /// outcomes, so the orchestrator records a single `bundle_upload` activity
+    /// row and the progress bar advances by `files` at once.
+    BundleDone {
+        /// A representative member path (the first packed member), so
+        /// [`OpOutcome::relative_path`] has a value like every other variant.
+        relative_path: RelativePath,
+        /// Number of member files actually packed + committed (skipped members
+        /// are excluded).
+        files: u64,
+        /// Byte size of the uploaded bundle object (the bytes actually stored on
+        /// Drive; ciphertext size for an encrypted source).
+        bytes: u64,
+    },
     /// The op was skipped and re-queued (not an error); see [`SkipReason`].
     Skipped {
         /// The path the op acted on.
@@ -442,6 +476,7 @@ impl OpOutcome {
     fn relative_path(&self) -> &RelativePath {
         match self {
             OpOutcome::Done { relative_path, .. }
+            | OpOutcome::BundleDone { relative_path, .. }
             | OpOutcome::Skipped { relative_path, .. }
             | OpOutcome::Failed { relative_path, .. } => relative_path,
         }
@@ -1379,6 +1414,246 @@ impl DefaultExecutor {
             }
             Err(UploadError::Fatal(e)) => Err(e),
         }
+    }
+
+    /// Upload one small-file bundle (V2 small-file bundling, issue #35).
+    ///
+    /// Packs the (genuinely-new) member files into a single `.tar.gz` object and
+    /// commits N `file_state` rows (each `drive_file_id = NULL`) plus their bundle
+    /// membership in one transaction. Crash-safe like `hash_then_upload`: the
+    /// `client_op_uuid` is written into a `bundle` pending_op BEFORE the create,
+    /// and stamped on the object's appProperties, so a crash between the create
+    /// and the commit is recovered by `reconcile` (which trashes the orphan by
+    /// op-uuid and lets the next scan re-bundle the still-uncommitted members).
+    ///
+    /// The archive is bounded by the planner (a few MiB) and built + hashed on a
+    /// blocking task; the whole object is a single NON-RESUMABLE simple create
+    /// (bundles never exceed the simple-upload band), so no resumable session is
+    /// ever persisted.
+    async fn bundle_upload(
+        &self,
+        source: &SourceRow,
+        members: &[crate::types::BundleMemberPlan],
+    ) -> anyhow::Result<OpOutcome> {
+        // The planner never emits an empty bundle; guard so every outcome below
+        // has a representative path.
+        let Some(first_plan) = members.first() else {
+            return Err(anyhow::anyhow!(
+                "bundle op has no members (planner invariant)"
+            ));
+        };
+        let representative = first_plan.relative_path.clone();
+
+        // FAIL-CLOSED crypto resolution up front (mirrors hash_then_upload): an
+        // encryption-enabled source with no resolvable key uploads NOTHING.
+        let crypto = match self.resolve_source_crypto(source) {
+            Ok(crypto) => crypto,
+            Err(()) => {
+                return Ok(OpOutcome::Failed {
+                    relative_path: representative,
+                    code: ErrorCode::CryptoKeyMissing,
+                });
+            }
+        };
+
+        // --- build the .tar.gz on a blocking task (bundles are size-capped) ---
+        let inputs: Vec<(RelativePath, std::path::PathBuf)> = members
+            .iter()
+            .map(|m| {
+                (
+                    m.relative_path.clone(),
+                    join_source_path(&source.local_path, &m.relative_path),
+                )
+            })
+            .collect();
+        let built = match tokio::task::spawn_blocking(move || crate::bundle::build_bundle(&inputs))
+            .await
+        {
+            Ok(Ok(built)) => built,
+            Ok(Err(e)) => {
+                warn!(target: TARGET, source = %source.id, error = %e, "bundle build failed");
+                return Ok(OpOutcome::Failed {
+                    relative_path: representative,
+                    code: ErrorCode::LocalIoError,
+                });
+            }
+            Err(join_err) => {
+                warn!(target: TARGET, source = %source.id, error = %join_err, "bundle build task panicked");
+                return Ok(OpOutcome::Failed {
+                    relative_path: representative,
+                    code: ErrorCode::InternalBug,
+                });
+            }
+        };
+
+        if !built.skipped.is_empty() {
+            debug!(
+                target: TARGET,
+                source = %source.id,
+                skipped = built.skipped.len(),
+                "bundle: skipped members that vanished/changed mid-build; they stay pending"
+            );
+        }
+        if built.members.is_empty() {
+            // Every candidate vanished/changed between scan and build. Nothing to
+            // upload; the members stay uncommitted and the next scan retries them.
+            return Ok(OpOutcome::Skipped {
+                relative_path: representative,
+                reason: SkipReason::ChangedDuringUpload,
+            });
+        }
+
+        // --- produce the exact bytes to send (encrypt-or-plaintext + md5) -----
+        let sent = match bundle_sent_bytes(built.tar_gz, crypto.as_deref()) {
+            Ok(sent) => sent,
+            Err(e) => {
+                warn!(target: TARGET, source = %source.id, error = %e, "bundle encryption failed");
+                return Ok(OpOutcome::Failed {
+                    relative_path: representative,
+                    code: ErrorCode::InternalBug,
+                });
+            }
+        };
+        let object_size = sent.bytes.len() as u64;
+
+        // --- enqueue the crash-safe bundle pending_op (uuid BEFORE the create) -
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let now = self.clock.now_ms();
+        let payload = PendingOpPayload {
+            client_op_uuid: Some(op_uuid.clone()),
+            ..PendingOpPayload::default()
+        };
+        let op_id = self
+            .state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: source.id,
+                op_type: OP_TYPE_BUNDLE.to_string(),
+                // pending_ops.relative_path is NOT NULL; a bundle op carries a
+                // representative member path (used only for diagnostics - the
+                // bundle finalize/reconcile key off the id + op_type + uuid).
+                relative_path: representative.clone(),
+                payload_json: payload.to_value(),
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await?;
+
+        // --- upload as ONE non-resumable simple create -----------------------
+        let name = format!("driven-bundle-{op_uuid}.tar.gz");
+        let app_props = self.bundle_app_properties(source.id, &op_uuid);
+        let target = RemoteTarget {
+            parent_id: source.drive_folder_id.clone(),
+            name,
+            app_props,
+            encrypted_remote_path: None,
+        };
+        let mut payload = payload;
+        let upload = self
+            .upload_bytes(
+                &target,
+                None, // always a create - a bundle is a fresh object
+                sent,
+                BUNDLE_MIME,
+                op_id,
+                &mut payload,
+                false, // never resumable: bundles fit the simple-upload band
+            )
+            .await;
+
+        match upload {
+            Ok(entry) => {
+                // Verify already done inside upload_bytes (md5 vs local). Build the
+                // bundle row + member file_state rows and commit atomically.
+                let bundle_row = BundleRow {
+                    id: op_uuid.clone(),
+                    source_id: source.id,
+                    drive_file_id: entry.id.clone(),
+                    drive_md5: entry.md5,
+                    size: object_size,
+                    member_count: built.members.len() as u64,
+                    created_at: now,
+                };
+                let member_rows: Vec<FileStateRow> = built
+                    .members
+                    .iter()
+                    .map(|m| FileStateRow {
+                        source_id: source.id,
+                        relative_path: m.rel.clone(),
+                        size: m.size,
+                        mtime_ns: m.mtime_ns,
+                        hash_blake3: m.blake3,
+                        drive_file_id: None,
+                        drive_md5: None,
+                        encrypted_remote_path: None,
+                        status: FileStateStatus::Synced,
+                        last_uploaded_at: Some(now),
+                        last_verified_at: Some(now),
+                    })
+                    .collect();
+                self.state
+                    .commit_bundle_result(op_id, &bundle_row, &member_rows)
+                    .await?;
+                Ok(OpOutcome::BundleDone {
+                    relative_path: representative,
+                    files: built.members.len() as u64,
+                    bytes: object_size,
+                })
+            }
+            Err(UploadError::Failed(code)) => {
+                // A clean create failure (definitely no object landed): safe to
+                // drop the op; the members stay uncommitted and retry next scan.
+                self.state.delete_pending_op(op_id).await?;
+                Ok(OpOutcome::Failed {
+                    relative_path: representative,
+                    code,
+                })
+            }
+            Err(UploadError::DeferToReconcile(code)) => {
+                // Ambiguous create failure: the object MIGHT have landed. KEEP the
+                // pending op so reconcile trashes any orphan by its op-uuid (there
+                // is no folder sweep). Members stay uncommitted -> re-bundled next
+                // scan; the surviving op is the cleanup handle.
+                Ok(OpOutcome::Failed {
+                    relative_path: representative,
+                    code,
+                })
+            }
+            Err(UploadError::ChecksumMismatch { .. }) => {
+                // The bundle object's md5 did not verify. upload_bytes best-effort
+                // trashed the corrupt create; KEEP the op regardless so reconcile
+                // trashes it by op-uuid if the trash did not stick. Members stay
+                // uncommitted -> re-bundled next scan.
+                Ok(OpOutcome::Failed {
+                    relative_path: representative,
+                    code: ErrorCode::DriveChecksumMismatch,
+                })
+            }
+            Err(UploadError::Skip(reason)) | Err(UploadError::SkipPostUpload(reason)) => {
+                // The streaming read-path skip reasons cannot arise for an
+                // in-memory bundle body, but handle defensively: no object was
+                // created via this path, drop the op and let the next scan retry.
+                self.state.delete_pending_op(op_id).await?;
+                Ok(OpOutcome::Skipped {
+                    relative_path: representative,
+                    reason,
+                })
+            }
+            Err(UploadError::Fatal(e)) => Err(e),
+        }
+    }
+
+    /// Build the appProperties for a bundle object (issue #35): the crash-safe
+    /// op-uuid, the source id, and the `driven.bundle_format` marker. A bundle
+    /// carries no `relative_path_hash` (it holds many paths).
+    fn bundle_app_properties(&self, source_id: SourceId, op_uuid: &str) -> HashMap<String, String> {
+        let mut m = HashMap::new();
+        m.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.to_string());
+        m.insert(SOURCE_ID_KEY.to_string(), source_id.to_string());
+        m.insert(
+            BUNDLE_FORMAT_KEY.to_string(),
+            crate::bundle::BUNDLE_FORMAT.to_string(),
+        );
+        m
     }
 
     /// The read/hash/encrypt/upload/verify/commit inner loop. Split out so
@@ -2903,6 +3178,77 @@ impl DefaultExecutor {
         }
     }
 
+    /// Bundle GC (issue #35 item a): trash the Drive object of every bundle for
+    /// `source` that has no members left, then drop its `bundles` row.
+    ///
+    /// A bundle empties when all its members are deleted locally (their
+    /// `bundle_members` rows cascade away with the `file_state` rows) or promoted
+    /// to standalone objects (a changed member re-uploads on its own, clearing its
+    /// membership). The now-dead `.tar.gz` object is trashed by its stored
+    /// `drive_file_id` - a suite-FREE `remote.trash` needing no crypto, so this
+    /// runs even for an encryption-enabled source whose key is temporarily
+    /// unavailable (like the corrupt-create and orphan-bundle cleanup). It is
+    /// best-effort and never fatal: a per-bundle failure is logged and left for a
+    /// later reconcile sweep, EXCEPT an `invalid_grant` (a revoked token), which is
+    /// propagated as [`ReconcileError::AuthInvalidGrant`] so the orchestrator
+    /// stops hammering the dead credential (matching [`Self::retry_trash_corrupt`]).
+    async fn gc_empty_bundles(&self, source: &SourceRow) -> Result<(), ReconcileError> {
+        let empties = match self.state.list_empty_bundles(source.id).await {
+            Ok(e) => e,
+            Err(err) => {
+                warn!(
+                    target: TARGET,
+                    source = %source.id,
+                    "reconcile: could not list empty bundles for GC; skipping this sweep: {err}"
+                );
+                return Ok(());
+            }
+        };
+        for (bundle_id, drive_file_id) in empties {
+            self.pacer.permit_request().await;
+            match self.remote.trash(&drive_file_id).await {
+                Ok(()) => {
+                    self.pacer.note_response(ResponseClass::Ok);
+                    if let Err(err) = self.state.delete_bundle(&bundle_id).await {
+                        warn!(
+                            target: TARGET,
+                            source = %source.id,
+                            bundle_id = %bundle_id,
+                            "reconcile: GC trashed the empty bundle object but could not drop its row; a later sweep retries: {err}"
+                        );
+                    } else {
+                        debug!(
+                            target: TARGET,
+                            source = %source.id,
+                            bundle_id = %bundle_id,
+                            "reconcile: GC'd empty bundle (all members gone)"
+                        );
+                    }
+                }
+                Err(e) => {
+                    let class = classify_drive_error(&e);
+                    self.pacer.note_response(class.response_class());
+                    if class == DriveError::InvalidGrant {
+                        warn!(
+                            target: TARGET,
+                            source = %source.id,
+                            bundle_id = %bundle_id,
+                            "reconcile: bundle GC hit auth.invalid_grant; account needs reauth (stopping remote work): {e}"
+                        );
+                        return Err(ReconcileError::AuthInvalidGrant);
+                    }
+                    warn!(
+                        target: TARGET,
+                        source = %source.id,
+                        bundle_id = %bundle_id,
+                        "reconcile: bundle GC trash failed; leaving the bundle for a later sweep: {e}"
+                    );
+                }
+            }
+        }
+        Ok(())
+    }
+
     /// R2-P1-3 (DESIGN s5.4 lines 498-500) + R2-P1-1: handle a verified
     /// post-upload checksum mismatch for `(source, relative_path)`.
     ///
@@ -3312,6 +3658,45 @@ impl Executor for DefaultExecutor {
                 }
                 continue;
             }
+
+            // --- V2 bundling (issue #35): bundle op crash-recovery, suite-FREE --
+            // A surviving `bundle` pending_op means the bundle's
+            // `commit_bundle_result` never ran, so NO member file_state rows
+            // landed - the members are still "new" and the next scan re-bundles
+            // them (no data loss). If the create actually finalized on Drive (a
+            // crash between the create returning and the commit), the object is an
+            // orphan we must trash, since there is no folder sweep to catch it.
+            // Find it by its op-uuid under the source root and trash it, then drop
+            // the op. This is suite-FREE (find + trash are by appProperties + id,
+            // no crypto), so it runs before the per-source crypto gate and works
+            // for an encrypted source whose key is temporarily unavailable.
+            if op.op_type == OP_TYPE_BUNDLE {
+                if let Some(uuid) = payload.client_op_uuid.clone() {
+                    self.pacer.permit_request().await;
+                    let found = self
+                        .remote
+                        .find_by_op_uuid(&source.drive_folder_id, &uuid)
+                        .await
+                        .map_err(to_reconcile_err)?;
+                    self.pacer.note_response(ResponseClass::Ok);
+                    if let Some(entry) = found {
+                        self.pacer.permit_request().await;
+                        self.remote
+                            .trash(&entry.id)
+                            .await
+                            .map_err(to_reconcile_err)?;
+                        self.pacer.note_response(ResponseClass::Ok);
+                        debug!(
+                            target: TARGET,
+                            source = %source.id,
+                            "reconcile: trashed orphaned bundle object from an uncommitted bundle op"
+                        );
+                    }
+                }
+                self.state.delete_pending_op(op.id).await?;
+                continue;
+            }
+
             remaining.push(op);
         }
 
@@ -3333,6 +3718,15 @@ impl Executor for DefaultExecutor {
                 warn!(target: TARGET, source = %source.id, %err, "could not list un-trashed versions to sweep");
             }
         }
+
+        // --- V2 bundling (issue #35 item a): empty-bundle GC, suite-FREE -----
+        // Sweep away bundles whose members have all been deleted or promoted to
+        // standalone objects: trash the dead `.tar.gz` object and drop its row.
+        // Trash-by-id needs no crypto, so this runs BEFORE the per-source crypto
+        // gate (works for an encryption-enabled source whose key is temporarily
+        // unavailable). Best-effort; only a revoked token (AuthInvalidGrant)
+        // propagates, so the orchestrator runs its needs-reauth transition.
+        self.gc_empty_bundles(source).await?;
 
         // M5 per-source crypto (resolved ONCE for this source, FAIL-CLOSED).
         // Reconcile re-derives the encrypted parent chain / encrypted_remote_path
@@ -4016,6 +4410,10 @@ impl<'a> ExecOne<'a> {
                     .trash_op(self.source, relative_path, drive_file_id)
                     .await
             }
+            Op::UploadBundle { source_id, members } => {
+                debug_assert_eq!(*source_id, self.source.id);
+                self.this.bundle_upload(self.source, members).await
+            }
         };
         // Stream the per-op activity for a produced outcome (the op's durable
         // file-state commit already happened inside hash_then_upload / trash_op).
@@ -4037,6 +4435,9 @@ fn update_progress(progress: &mut ExecProgress, outcome: &OpOutcome, plan: &Plan
         Op::HashThenUpload { relative_path, .. } | Op::Trash { relative_path, .. } => {
             relative_path == path
         }
+        // A bundle op has no single path; a BundleDone outcome carries its own
+        // aggregate counts (handled below) so it never needs the op lookup.
+        Op::UploadBundle { .. } => false,
     });
     match outcome {
         OpOutcome::Done { .. } => match op {
@@ -4045,8 +4446,14 @@ fn update_progress(progress: &mut ExecProgress, outcome: &OpOutcome, plan: &Plan
                 progress.bytes_done += *size;
             }
             Some(Op::Trash { .. }) => progress.trashes_done += 1,
-            None => {}
+            Some(Op::UploadBundle { .. }) | None => {}
         },
+        // A bundle completes as one op but advances the file + byte counters by
+        // its aggregate (issue #35); the counts come from the outcome, not the op.
+        OpOutcome::BundleDone { files, bytes, .. } => {
+            progress.files_done += *files;
+            progress.bytes_done += *bytes;
+        }
         OpOutcome::Failed { .. } => progress.errors += 1,
         OpOutcome::Skipped { .. } => {}
     }
@@ -4364,6 +4771,65 @@ struct HashedBody {
     sent_bytes: SentBytes,
     /// The plaintext byte count read (for the unencrypted length guard).
     plaintext_len: u64,
+}
+
+/// Produce the exact bytes to send for a `.tar.gz` bundle already built in
+/// memory (V2 small-file bundling, issue #35), plus their md5.
+///
+/// The encryption is object-level and byte-identical to [`read_hash_encrypt`]'s
+/// encrypted path (same XChaCha20-Poly1305 STREAM: 40-byte header, fixed 64-KiB
+/// (`READ_BUF`) plaintext frames via `encrypt_chunk`, the FINAL frame - even if a
+/// full 64 KiB - via `finalize_last`), so the M8 restore decryptor (fixed
+/// 65552-byte frames) aligns exactly. Plaintext sources send the archive as-is
+/// with an md5 over it. The whole archive is in memory (planner-capped), so this
+/// is a simple fold, not a streaming pipeline.
+fn bundle_sent_bytes(
+    tar_gz: Vec<u8>,
+    crypto: Option<&dyn SourceCryptoSuite>,
+) -> Result<SentBytes, CryptoError> {
+    use md5::{Digest, Md5};
+
+    let Some(suite) = crypto else {
+        // Plaintext: body == archive, md5 over the archive bytes.
+        let mut md5 = Md5::new();
+        md5.update(&tar_gz);
+        let md5: [u8; 16] = md5.finalize().into();
+        return Ok(SentBytes {
+            bytes: Bytes::from(tar_gz),
+            md5,
+        });
+    };
+
+    let mut enc: Box<dyn ContentEncryptor> = suite.content_encryptor();
+    let header = enc.header();
+    let mut out = Vec::with_capacity(tar_gz.len() + header.len() + 64);
+    out.extend_from_slice(&header);
+
+    // Split into fixed 64-KiB plaintext frames; the LAST frame (even if a full
+    // 64 KiB) is finalized, all earlier frames are sealed with `encrypt_chunk`.
+    // An empty archive still emits one (empty) finalized frame so the header +
+    // trailer are well-formed.
+    let frames: Vec<&[u8]> = if tar_gz.is_empty() {
+        vec![&[][..]]
+    } else {
+        tar_gz.chunks(READ_BUF).collect()
+    };
+    let (last, prefix) = frames
+        .split_last()
+        .expect("frames is non-empty by construction");
+    for frame in prefix {
+        let ct = enc.encrypt_chunk(frame)?;
+        out.extend_from_slice(&ct);
+    }
+    // `finalize_last` returns the md5 over EVERY ciphertext byte it emitted
+    // (header + all frames), matching read_hash_encrypt's accumulated md5.
+    let (ct, md5) = enc.finalize_last(last)?;
+    out.extend_from_slice(&ct);
+
+    Ok(SentBytes {
+        bytes: Bytes::from(out),
+        md5,
+    })
 }
 
 /// Read the whole file, hashing blake3 over the plaintext and producing the
@@ -5318,6 +5784,351 @@ mod tests {
     /// streamed activity (returns an immediately-ready future).
     fn noop_outcome(_o: &OpOutcome) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(async {})
+    }
+
+    // --- V2 small-file bundling (issue #35) ---------------------------------
+
+    /// Build an `Op::UploadBundle` plan from `(rel, size)` members.
+    fn bundle_plan(source_id: SourceId, members: &[(RelativePath, u64)]) -> Plan {
+        Plan {
+            ops: vec![Op::UploadBundle {
+                source_id,
+                members: members
+                    .iter()
+                    .map(|(r, s)| crate::types::BundleMemberPlan {
+                        relative_path: r.clone(),
+                        size: *s,
+                    })
+                    .collect(),
+            }],
+            collisions: vec![],
+        }
+    }
+
+    /// A plaintext bundle upload lands ONE `.tar.gz` object marked
+    /// `driven.bundle_format`, commits N member `file_state` rows (each with a
+    /// NULL `drive_file_id`) + their membership, and every member restores
+    /// (extract-from-archive) byte-for-byte.
+    #[tokio::test]
+    async fn bundle_upload_plaintext_lands_and_members_restore() {
+        use tokio::io::AsyncReadExt;
+
+        let h = harness().await;
+        let mut contents: Vec<(RelativePath, u64, Vec<u8>)> = Vec::new();
+        for i in 0..5 {
+            let body = format!("bundle member {i} - some bytes {i}{i}{i}").into_bytes();
+            let (rel, size) = h.write_file(&format!("logs/f{i}.log"), &body);
+            contents.push((rel, size, body));
+        }
+        let members: Vec<(RelativePath, u64)> =
+            contents.iter().map(|(r, s, _)| (r.clone(), *s)).collect();
+
+        let exec = h.executor();
+        let out = exec
+            .execute(
+                &h.source,
+                &bundle_plan(h.source.id, &members),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out[0], OpOutcome::BundleDone { files: 5, .. }),
+            "expected BundleDone with 5 files, got {:?}",
+            out[0]
+        );
+
+        // Exactly one object on Drive, marked as a bundle.
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "a bundle is one Drive object");
+        assert_eq!(
+            children[0]
+                .app_properties
+                .get(BUNDLE_FORMAT_KEY)
+                .map(String::as_str),
+            Some(crate::bundle::BUNDLE_FORMAT),
+            "the object is stamped driven.bundle_format"
+        );
+        let bundle_id = children[0].id.clone();
+
+        // Each member: a synced file_state row with NULL drive_file_id + the
+        // plaintext hash, and a membership that resolves to the bundle object.
+        for (rel, size, body) in &contents {
+            let row = h
+                .state
+                .get_file_state(h.source.id, rel)
+                .await
+                .unwrap()
+                .expect("member file_state row");
+            assert!(
+                row.drive_file_id.is_none(),
+                "bundled member has NULL drive id"
+            );
+            assert!(row.drive_md5.is_none());
+            assert_eq!(row.status, FileStateStatus::Synced);
+            assert_eq!(row.size, *size);
+            assert_eq!(row.hash_blake3, *blake3::hash(body).as_bytes());
+            let bref = h
+                .state
+                .get_bundle_ref_for_member(h.source.id, rel)
+                .await
+                .unwrap()
+                .expect("membership resolves");
+            assert_eq!(bref.drive_file_id, bundle_id);
+        }
+
+        // Round-trip: download the object (a plaintext .tar.gz) and extract each
+        // member back out.
+        let mut blob = Vec::new();
+        h.remote
+            .download(&bundle_id)
+            .await
+            .unwrap()
+            .0
+            .read_to_end(&mut blob)
+            .await
+            .unwrap();
+        for (rel, _size, body) in &contents {
+            let name = crate::bundle::member_entry_name(rel);
+            let extracted = crate::bundle::extract_member(&blob, &name, 1 << 20)
+                .unwrap()
+                .expect("member present in archive");
+            assert_eq!(&extracted, body, "extracted member equals the original");
+        }
+    }
+
+    /// An encrypted bundle stores CIPHERTEXT (not the raw archive); decrypting the
+    /// object at the executor's frame boundary yields the `.tar.gz`, and each
+    /// member extracts + verifies.
+    #[tokio::test]
+    async fn bundle_upload_encrypted_roundtrips() {
+        use driven_crypto::{ContentDecryptor, DrivenCryptoSuite, HEADER_LEN};
+        use tokio::io::AsyncReadExt;
+
+        let h = harness().await;
+        let source = h.encrypted_source();
+        let source_key = driven_crypto::key::SourceKey::generate();
+        let suite = Arc::new(DrivenCryptoSuite::new(source_key.clone()));
+        let exec = h.executor_with_crypto(Some(suite));
+
+        let mut contents: Vec<(RelativePath, u64, Vec<u8>)> = Vec::new();
+        for i in 0..6 {
+            let body = format!("secret member {i} xxxxx {i}").into_bytes();
+            let (rel, size) = h.write_file(&format!("secret/f{i}.dat"), &body);
+            contents.push((rel, size, body));
+        }
+        let members: Vec<(RelativePath, u64)> =
+            contents.iter().map(|(r, s, _)| (r.clone(), *s)).collect();
+
+        let out = exec
+            .execute(
+                &source,
+                &bundle_plan(source.id, &members),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out[0], OpOutcome::BundleDone { files: 6, .. }),
+            "got {:?}",
+            out[0]
+        );
+
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1);
+        let bundle_id = children[0].id.clone();
+
+        // Download the ciphertext object and decrypt it at the 64-KiB+tag frame
+        // boundary the executor used -> the plaintext .tar.gz.
+        let mut blob = Vec::new();
+        h.remote
+            .download(&bundle_id)
+            .await
+            .unwrap()
+            .0
+            .read_to_end(&mut blob)
+            .await
+            .unwrap();
+        let restore = DrivenCryptoSuite::new(source_key);
+        let mut dec: Box<dyn ContentDecryptor> =
+            restore.content_decryptor(&blob[..HEADER_LEN]).unwrap();
+        let ct_chunk = READ_BUF + 16;
+        let body = &blob[HEADER_LEN..];
+        let mut tar_gz = Vec::new();
+        let mut off = 0;
+        while body.len() - off > ct_chunk {
+            tar_gz.extend_from_slice(&dec.decrypt_chunk(&body[off..off + ct_chunk]).unwrap());
+            off += ct_chunk;
+        }
+        tar_gz.extend_from_slice(&dec.decrypt_last(&body[off..]).unwrap());
+
+        // Every member extracts + verifies against the plaintext hash.
+        for (rel, _size, body) in &contents {
+            let name = crate::bundle::member_entry_name(rel);
+            let extracted = crate::bundle::extract_member(&tar_gz, &name, 1 << 20)
+                .unwrap()
+                .expect("member present");
+            assert_eq!(&extracted, body);
+            let row = h
+                .state
+                .get_file_state(h.source.id, rel)
+                .await
+                .unwrap()
+                .unwrap();
+            assert_eq!(row.hash_blake3, *blake3::hash(body).as_bytes());
+            assert!(row.drive_file_id.is_none());
+        }
+    }
+
+    /// Crash recovery: a surviving `bundle` pending_op means the commit never ran.
+    /// Reconcile finds any orphaned bundle object by its op-uuid, trashes it, and
+    /// drops the op (the members, never committed, are re-bundled by the next
+    /// scan).
+    #[tokio::test]
+    async fn reconcile_trashes_orphan_bundle_and_drops_op() {
+        let h = harness().await;
+        let uuid = uuid::Uuid::new_v4().to_string();
+
+        // Simulate a crash after the create landed but before the commit: an object
+        // with the op-uuid + bundle marker exists, and its bundle pending_op still
+        // sits in the queue.
+        let mut app = HashMap::new();
+        app.insert(CLIENT_OP_UUID_KEY.to_string(), uuid.clone());
+        app.insert(SOURCE_ID_KEY.to_string(), h.source.id.to_string());
+        app.insert(
+            BUNDLE_FORMAT_KEY.to_string(),
+            crate::bundle::BUNDLE_FORMAT.to_string(),
+        );
+        let entry = h
+            .remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "driven-bundle-orphan.tar.gz",
+                BUNDLE_MIME,
+                UploadBody::Bytes(Bytes::from_static(b"orphan bundle bytes")),
+                app,
+            )
+            .await
+            .unwrap();
+
+        let payload = PendingOpPayload {
+            client_op_uuid: Some(uuid.clone()),
+            ..PendingOpPayload::default()
+        };
+        let rel = RelativePath::try_from("logs/f0.log".to_string()).unwrap();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_BUNDLE.to_string(),
+                relative_path: rel,
+                payload_json: payload.to_value(),
+                scheduled_for: 0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+
+        let exec = h.executor();
+        exec.reconcile(&h.source).await.unwrap();
+
+        // The orphan object was trashed (list_folder omits trashed) and the op is
+        // gone.
+        let live = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert!(
+            live.iter().all(|e| e.id != entry.id),
+            "the orphaned bundle object must be trashed"
+        );
+        let ops = h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap();
+        assert!(ops.is_empty(), "reconcile drops the bundle pending op");
+    }
+
+    /// Bundle GC (issue #35 item a): once every member of a committed bundle is
+    /// gone, reconcile trashes the now-dead `.tar.gz` object and drops the
+    /// `bundles` row.
+    #[tokio::test]
+    async fn reconcile_gcs_empty_bundle() {
+        let h = harness().await;
+
+        // Commit a real 3-member bundle via the normal upload path.
+        let mut members: Vec<(RelativePath, u64)> = Vec::new();
+        for i in 0..3 {
+            let (rel, size) =
+                h.write_file(&format!("logs/f{i}.log"), format!("body {i}").as_bytes());
+            members.push((rel, size));
+        }
+        let exec = h.executor();
+        exec.execute(
+            &h.source,
+            &bundle_plan(h.source.id, &members),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+
+        // The one bundle object is live, and the bundle is NOT yet a GC candidate.
+        let before = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(before.iter().filter(|e| !e.trashed).count(), 1);
+        assert!(h
+            .state
+            .list_empty_bundles(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // All members are deleted locally: their file_state rows go, cascading the
+        // bundle_members rows away and leaving the bundle empty.
+        for (rel, _) in &members {
+            h.state.delete_file_state(h.source.id, rel).await.unwrap();
+        }
+        assert_eq!(
+            h.state.list_empty_bundles(h.source.id).await.unwrap().len(),
+            1,
+            "the bundle is now empty and a GC candidate"
+        );
+
+        // Reconcile sweeps it: the object is trashed and the row is dropped.
+        exec.reconcile(&h.source).await.unwrap();
+        let after = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(
+            after.iter().filter(|e| !e.trashed).count(),
+            0,
+            "the dead bundle object must be trashed"
+        );
+        assert!(
+            h.state
+                .list_empty_bundles(h.source.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the bundles row must be dropped after GC"
+        );
     }
 
     // --- fresh upload -------------------------------------------------------

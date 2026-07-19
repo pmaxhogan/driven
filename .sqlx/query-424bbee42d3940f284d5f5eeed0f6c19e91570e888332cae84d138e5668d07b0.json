@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                INSERT INTO file_state (\n                    source_id, relative_path, size, mtime_ns,\n                    hash_blake3, drive_file_id, drive_md5, encrypted_remote_path,\n                    status, last_uploaded_at, last_verified_at\n                ) VALUES ( ?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, ?6, ?7, ?8 )\n                ON CONFLICT(source_id, relative_path) DO UPDATE SET\n                    size                  = excluded.size,\n                    mtime_ns              = excluded.mtime_ns,\n                    hash_blake3           = excluded.hash_blake3,\n                    drive_file_id         = NULL,\n                    drive_md5             = NULL,\n                    encrypted_remote_path = NULL,\n                    status                = excluded.status,\n                    last_uploaded_at      = excluded.last_uploaded_at,\n                    last_verified_at      = excluded.last_verified_at\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 8
+    },
+    "nullable": []
+  },
+  "hash": "424bbee42d3940f284d5f5eeed0f6c19e91570e888332cae84d138e5668d07b0"
+}

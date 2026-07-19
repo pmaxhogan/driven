@@ -33,3 +33,14 @@ pub mod ntfs;
 pub mod permissions;
 pub mod reporting;
 pub mod storage;
+
+/// Wall-clock Unix milliseconds, for the `now` argument the planner takes (issue
+/// #35). Scenarios run against the real system clock; a clock read failure
+/// (pre-epoch) falls back to `0`, which only affects the coldness gate and never
+/// panics.
+pub(crate) fn now_ms() -> driven_core::types::UnixMs {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}

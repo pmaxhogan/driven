@@ -217,6 +217,14 @@ async function setSkipOnMetered(event: Event): Promise<void> {
   await commitPatch({ global: { skipOnMetered: checked } });
 }
 
+// Issue #35: opt-in small-file bundling (default OFF). A standalone advanced
+// toggle - the backend writes the `bundle_small_files` KV key the core planner
+// reads; the thresholds stay backend-only.
+async function setBundleSmallFiles(event: Event): Promise<void> {
+  const checked = (event.target as HTMLInputElement).checked;
+  await commitPatch({ bundleSmallFiles: checked });
+}
+
 async function setMeteredMode(event: Event): Promise<void> {
   const value = (event.target as HTMLSelectElement).value;
   await commitPatch({ global: { meteredMode: value } });
@@ -669,6 +677,26 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
               </option>
             </select>
           </label>
+        </section>
+
+        <!-- Advanced: small-file bundling (issue #35) -->
+        <section class="space-y-2" :class="cardCls" data-testid="bundling-setting">
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("settings.rules.sections.advanced") }}
+          </h3>
+          <label class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              class="accent-teal-600"
+              data-testid="bundle-small-files-toggle"
+              :checked="settings.settings.bundleSmallFiles"
+              @change="setBundleSmallFiles"
+            />
+            {{ t("settings.rules.bundleSmallFilesLabel") }}
+          </label>
+          <p class="text-xs text-zinc-500 dark:text-zinc-400">
+            {{ t("settings.rules.bundleSmallFilesNote") }}
+          </p>
         </section>
 
         <!-- Backup hooks -->

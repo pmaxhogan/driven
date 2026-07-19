@@ -1553,7 +1553,8 @@ async fn drive_executor_until_skip(
                         codes.push(code);
                     }
                 }
-                OpOutcome::Done { .. } => {}
+                // Bundling is off in this scenario (issue #35).
+                OpOutcome::Done { .. } | OpOutcome::BundleDone { .. } => {}
             }
         }
         if hit {

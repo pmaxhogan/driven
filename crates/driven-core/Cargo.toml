@@ -64,6 +64,13 @@ notify.workspace = true
 # plaintext upload path also hashes with MD5. Aliased to `md5` to match the
 # `use md5::{Digest, Md5}` call site.
 md5 = { workspace = true }
+# V2 small-file bundling (issue #35): the executor packs cold folders of many
+# tiny NEW files into one `.tar.gz` Drive object; the restore path (via
+# `driven_core::bundle`) extracts a single member back out. `tar` + `flate2`
+# (pure-Rust gzip backend) build/read the archive in a bounded spawn_blocking
+# task (bundles are size-capped, so the whole archive fits in memory).
+tar = { workspace = true }
+flate2 = { workspace = true }
 
 [dev-dependencies]
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the orchestrator

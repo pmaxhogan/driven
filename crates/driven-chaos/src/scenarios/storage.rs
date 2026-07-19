@@ -65,6 +65,7 @@ use driven_drive::remote_store::RemoteStore;
 use crate::capabilities::{Capability, CapabilityRequirements};
 use crate::handle::DrivenHandle;
 use crate::scenario::{ExpectedOutcome, Outcome, Scenario, ScenarioContext};
+use crate::scenarios::now_ms;
 use crate::scenarios::reporting;
 
 /// Every storage/disk scenario (STRESS_HARNESS s3.1).
@@ -156,7 +157,14 @@ async fn scan_plan_execute(
     source: &SourceRow,
 ) -> anyhow::Result<Vec<OpOutcome>> {
     let scan = scanner::scan(source, handle.state.as_ref(), ScanMode::FastPath).await?;
-    let plan = planner::plan(source, &scan, handle.state.as_ref()).await?;
+    let plan = planner::plan(
+        source,
+        &scan,
+        handle.state.as_ref(),
+        now_ms(),
+        &planner::BundleConfig::default(),
+    )
+    .await?;
     let exec = executor_over(handle, remote.clone());
     exec.execute(
         source,
@@ -595,6 +603,8 @@ impl Scenario for NoaccessFile {
         for o in &outcomes {
             match o {
                 OpOutcome::Done { .. } => done += 1,
+                // Bundling is off in this scenario (issue #35); count defensively.
+                OpOutcome::BundleDone { files, .. } => done += *files as u32,
                 OpOutcome::Failed { code, .. } if *code == ErrorCode::LocalIoError => {
                     io_errors += 1
                 }
@@ -766,7 +776,14 @@ impl Scenario for NoaccessFolder {
         }
 
         let scan = scanner::scan(&src, handle.state.as_ref(), ScanMode::FastPath).await?;
-        let plan = planner::plan(&src, &scan, handle.state.as_ref()).await?;
+        let plan = planner::plan(
+            &src,
+            &scan,
+            handle.state.as_ref(),
+            now_ms(),
+            &planner::BundleConfig::default(),
+        )
+        .await?;
 
         // The plan must contain ZERO trash ops for paths under `locked/`.
         let trash_under_locked = count_trash_under(&plan, "locked/");

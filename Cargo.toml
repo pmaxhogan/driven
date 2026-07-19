@@ -100,6 +100,13 @@ base64 = "0.22"
 # M4 CLI surface (ROADMAP M4 acceptance: `cargo run --bin driven-cli auth`).
 # `derive` for the `#[derive(Parser)]` command tree.
 clap = { version = "4", features = ["derive", "env"] }
+# V2 small-file bundling (issue #35): pack cold folders of many tiny files into a
+# single `.tar.gz` Drive object to cut round-trips / rate-limit pressure. `tar`
+# builds and reads the archive; `flate2` with the pure-Rust `rust_backend`
+# (miniz_oxide) does the gzip layer with NO C toolchain dependency (keeps the
+# reproducible cross-platform build; matches the app's no-native-deps posture).
+tar = "0.4"
+flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
 
 [profile.dev]
 opt-level = 1

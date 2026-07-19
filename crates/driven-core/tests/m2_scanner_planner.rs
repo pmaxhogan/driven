@@ -9,7 +9,7 @@
 //!
 //! ## Why no `RemoteStore` here
 //!
-//! `scan(source, state, mode)` and `plan(source, scan, state)` are both
+//! `scan(source, state, mode)` and `plan(source, scan, state, now, bundle)` are both
 //! remote-free: the scanner reads only the local tree + `file_state`, and the
 //! planner is a pure fold over the [`ScanResult`] plus two `file_state`
 //! lookups. A Drive `file_id` is just a `String` carried on a seeded
@@ -43,7 +43,7 @@ use std::collections::HashSet;
 use std::fs;
 use std::path::Path;
 
-use driven_core::planner::plan;
+use driven_core::planner::{plan, BundleConfig};
 use driven_core::scanner::scan;
 use driven_core::state::{AccountRow, FileStateRow, SourceRow, SqliteStateRepo, StateRepo};
 use driven_core::types::{
@@ -199,7 +199,9 @@ async fn first_scan_empty_remote_all_uploads() {
     let src = seed_source(&repo, dir.path(), true, &[], &[]).await;
 
     let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
 
     let summary = p.summary();
     assert_eq!(summary.uploads, 2, "both files upload: {:?}", p.ops);
@@ -232,7 +234,9 @@ async fn unchanged_scan_empty_plan() {
     .unwrap();
 
     let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
 
     assert!(
         p.ops.is_empty(),
@@ -264,7 +268,9 @@ async fn single_mtime_change_one_upload() {
     .unwrap();
 
     let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
 
     let summary = p.summary();
     assert_eq!(summary.uploads, 1, "{:?}", p.ops);
@@ -305,7 +311,9 @@ async fn single_local_delete_one_trash() {
     .unwrap();
 
     let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
 
     let summary = p.summary();
     assert_eq!(summary.uploads, 0, "present.txt is unchanged: {:?}", p.ops);
@@ -347,7 +355,9 @@ async fn rename_one_upload_one_trash() {
     .unwrap();
 
     let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
 
     let summary = p.summary();
     assert_eq!(summary.uploads, 1, "new path uploads: {:?}", p.ops);
@@ -384,7 +394,9 @@ async fn gitignore_respected_node_modules_excluded() {
     let src = seed_source(&repo, dir.path(), true, &[], &[]).await;
 
     let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
 
     let uploads = upload_paths(&p.ops);
     assert!(
@@ -420,7 +432,9 @@ async fn env_override_reincludes_dotenv() {
     let src = seed_source(&repo, dir.path(), true, &[".env"], &[]).await;
 
     let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
 
     let uploads = upload_paths(&p.ops);
     // Strengthened: an unrelated ordinary file MUST still back up. If the
@@ -449,7 +463,9 @@ async fn exclude_pattern_log_wins() {
     let src = seed_source(&repo, dir.path(), true, &[], &["*.log"]).await;
 
     let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
 
     let uploads = upload_paths(&p.ops);
     assert!(uploads.contains("keep.txt"), "{uploads:?}");
@@ -474,7 +490,9 @@ async fn gitignore_reinclude_beats_default_exclude() {
     let src = seed_source(&repo, dir.path(), true, &[], &[]).await;
 
     let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
 
     let uploads = upload_paths(&p.ops);
     assert!(uploads.contains("real.txt"), "{uploads:?}");
@@ -528,7 +546,9 @@ async fn ignore_change_yields_excluded_orphan_no_trash() {
         scanned.deleted
     );
 
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
     assert_eq!(
         p.summary().trashes,
         0,
@@ -563,7 +583,9 @@ async fn deep_verify_catches_bit_rot() {
 
     // FastPath: stat matches => unchanged => empty plan.
     let fast = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let fast_plan = plan(&src, &fast, &repo).await.unwrap();
+    let fast_plan = plan(&src, &fast, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
     assert!(
         fast_plan.ops.is_empty(),
         "FastPath cannot see bit-rot: {:?}",
@@ -572,7 +594,9 @@ async fn deep_verify_catches_bit_rot() {
 
     // DeepVerify: hash mismatch => one upload.
     let deep = scan(&src, &repo, ScanMode::DeepVerify).await.unwrap();
-    let deep_plan = plan(&src, &deep, &repo).await.unwrap();
+    let deep_plan = plan(&src, &deep, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
     assert_eq!(deep_plan.summary().uploads, 1, "{:?}", deep_plan.ops);
     assert_eq!(
         upload_paths(&deep_plan.ops),
@@ -599,7 +623,9 @@ async fn symlink_skipped() {
     let src = seed_source(&repo, dir.path(), true, &[], &[]).await;
 
     let scanned = scan(&src, &repo, ScanMode::FastPath).await.unwrap();
-    let p = plan(&src, &scanned, &repo).await.unwrap();
+    let p = plan(&src, &scanned, &repo, 0, &BundleConfig::default())
+        .await
+        .unwrap();
 
     let uploads = upload_paths(&p.ops);
     assert!(

@@ -366,6 +366,12 @@ pub struct SettingsDto {
     pub ui: UiSettings,
     /// SPEC s22 `windows` settings group; `None` on non-Windows hosts.
     pub windows: Option<WindowsSettings>,
+    /// V2 small-file bundling on/off (issue #35 item d). A standalone advanced
+    /// toggle, NOT part of any SPEC s22 group blob: it is backed by the
+    /// `bundle_small_files` settings KV key the core planner reads directly, so
+    /// it never rides a group round-trip. `false` (the frozen v1.0.0 behaviour)
+    /// unless the user turns it on. The bundling thresholds stay backend-only KV.
+    pub bundle_small_files: bool,
 }
 
 /// SPEC s22 `global` settings.
@@ -508,6 +514,10 @@ pub struct SettingsPatch {
     pub ui: Option<UiSettingsPatch>,
     /// Partial `windows` group (Windows-only).
     pub windows: Option<WindowsSettingsPatch>,
+    /// Toggle V2 small-file bundling (issue #35 item d). `None` = leave
+    /// unchanged; `Some(v)` writes the `bundle_small_files` settings KV key the
+    /// core reads. See [`SettingsDto::bundle_small_files`].
+    pub bundle_small_files: Option<bool>,
 }
 
 /// Partial SPEC s22 `global` settings.

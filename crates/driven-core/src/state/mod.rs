@@ -165,6 +165,46 @@ pub struct FileStateRow {
     pub last_verified_at: Option<UnixMs>,
 }
 
+/// One row of the `bundles` table (V2 small-file bundling, issue #35,
+/// migration 0007).
+///
+/// A bundle is a single `.tar.gz` Drive object that packs many genuinely-new
+/// tiny files (its "members"). One `bundles` row is written - transactionally
+/// with the member `file_state` rows and their `bundle_members` rows, in
+/// [`StateRepo::commit_bundle_result`] - only AFTER the object lands on Drive
+/// and its md5 verifies, so [`Self::drive_file_id`] is always populated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleRow {
+    /// Bundle uuid. Also the `driven.client_op_uuid` stamped on the Drive object
+    /// (the crash-safe reconcile key, DESIGN s5.6).
+    pub id: String,
+    /// FK to `backup_sources.id`.
+    pub source_id: SourceId,
+    /// Drive `file_id` of the `.tar.gz` object.
+    pub drive_file_id: String,
+    /// MD5 (16 bytes) of the exact bytes stored on Drive (ciphertext md5 if the
+    /// source is encrypted).
+    pub drive_md5: Option<[u8; 16]>,
+    /// Byte size of the stored object.
+    pub size: u64,
+    /// Number of members packed at creation time (may go cosmetically stale as
+    /// members leave; restore iterates the real `bundle_members` rows).
+    pub member_count: u64,
+    /// Wall-time the bundle was created (Unix epoch ms).
+    pub created_at: UnixMs,
+}
+
+/// A resolved reference to the bundle a member file lives inside, returned by
+/// [`StateRepo::get_bundle_ref_for_member`]. Carries just what the restore path
+/// needs: the bundle id (diagnostics) and the Drive object to download.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleRef {
+    /// The owning bundle's id.
+    pub bundle_id: String,
+    /// Drive `file_id` of the `.tar.gz` object to download + extract from.
+    pub drive_file_id: String,
+}
+
 /// Op-type discriminant stored in `pending_ops.op_type` (SPEC s2).
 ///
 /// Held as a plain string rather than the [`crate::types::Op`] enum to
@@ -418,8 +458,14 @@ pub struct FileSearchHit {
     pub relative_path: RelativePath,
     /// Current sync status (mirrors the `file_state` join).
     pub status: FileStateStatus,
-    /// Drive `file_id` if uploaded.
+    /// Drive `file_id` if uploaded as a standalone object.
     pub drive_file_id: Option<String>,
+    /// V2 bundling (issue #35): the owning bundle id when this file's bytes live
+    /// inside a `.tar.gz` bundle (its `file_state.drive_file_id` is then `None`).
+    /// `None` for a standalone / legacy per-file object. Used only to compute
+    /// restorability - a bundled member IS restorable even with a null
+    /// `drive_file_id` - and is not exposed on the wire DTO.
+    pub bundle_id: Option<String>,
 }
 
 /// M8: one `file_state` FILE row the Restore browser can restore (SPEC s11.5,
@@ -438,8 +484,14 @@ pub struct RestoreFileRow {
     pub size: u64,
     /// Current sync status.
     pub status: FileStateStatus,
-    /// Drive `file_id`; `None` if never uploaded (not restorable yet).
+    /// Drive `file_id`; `None` if never uploaded as a standalone object (or the
+    /// file's bytes live inside a bundle - see [`Self::bundle_id`]).
     pub drive_file_id: Option<String>,
+    /// V2 bundling (issue #35): the owning bundle id when this file's bytes live
+    /// inside a `.tar.gz` bundle. `None` for a standalone / legacy per-file
+    /// object. A row with `drive_file_id = None` but `bundle_id = Some(..)` IS
+    /// restorable (the byte source is the bundle). Not exposed on the wire DTO.
+    pub bundle_id: Option<String>,
 }
 
 /// Issue #36: the per-source point-in-time versioning configuration.
@@ -590,6 +642,9 @@ pub const KNOWN_STATE_TABLES: &[&str] = &[
     // Issue #36 (migration 0006): per-file superseded-version records for the
     // trash-as-version-store point-in-time restore.
     "file_versions",
+    // V2 small-file bundling (issue #35, migration 0007_bundles).
+    "bundles",
+    "bundle_members",
 ];
 
 /// Storage contract for the SQLite-backed state at
@@ -1252,6 +1307,80 @@ pub trait StateRepo: Send + Sync {
     /// store overrides with the actual `file_state` lookup.
     async fn drive_file_id_is_live(&self, _drive_file_id: &str) -> Result<bool> {
         Ok(true)
+    }
+
+    // --- bundles (V2 small-file bundling, issue #35) ------------------------
+
+    /// Atomically commit a successful bundle (`.tar.gz`) upload (issue #35).
+    ///
+    /// In ONE SQL transaction: inserts the [`BundleRow`]; upserts each member's
+    /// `file_state` row (with `drive_file_id = NULL` and `drive_md5 = NULL` - the
+    /// bytes live inside the bundle, not a standalone object); inserts the
+    /// `bundle_members` linkage rows; and deletes the `pending_op` that produced
+    /// the bundle. Mirrors the [`Self::commit_create_result`] crash-safe
+    /// invariant (DESIGN s5.6) for the multi-member case: a member is visible in
+    /// `file_state` IFF its membership row and the bundle row also landed, so a
+    /// `kill -9` at any point leaves either the whole bundle committed or nothing
+    /// (the pending op survives and reconcile trashes any orphaned object).
+    ///
+    /// The default impl errors so a non-bundle-aware in-memory fake need not
+    /// model it; the SQLite repo overrides it.
+    async fn commit_bundle_result(
+        &self,
+        op_id: PendingOpId,
+        bundle: &BundleRow,
+        members: &[FileStateRow],
+    ) -> Result<()> {
+        let _ = (op_id, bundle, members);
+        Err(anyhow::anyhow!(
+            "commit_bundle_result is not implemented by this StateRepo"
+        ))
+    }
+
+    /// Resolve the bundle a member file lives inside, for the restore path
+    /// (issue #35).
+    ///
+    /// Returns `Some(BundleRef)` when `(source, relative_path)` has a
+    /// `bundle_members` row - i.e. the file's bytes live inside a `.tar.gz`
+    /// bundle whose Drive object is [`BundleRef::drive_file_id`] - else `None`
+    /// (standalone / legacy per-file object, or not backed up). The default impl
+    /// returns `None` (a fake with no bundles has no members); the SQLite repo
+    /// joins `bundle_members` -> `bundles`.
+    async fn get_bundle_ref_for_member(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+    ) -> Result<Option<BundleRef>> {
+        let _ = (source, path);
+        Ok(None)
+    }
+
+    /// List every bundle for `source` that has ZERO surviving members - the
+    /// bundle GC candidates (issue #35 item a). A bundle empties when all of its
+    /// members are deleted locally (the composite FK cascades their
+    /// `bundle_members` rows away) or promoted to standalone objects (a changed
+    /// member re-uploads on its own and its membership row is cleared). Returns
+    /// `(bundle_id, drive_file_id)` for each, so reconcile can trash the now-dead
+    /// `.tar.gz` Drive object and drop the row.
+    ///
+    /// Emptiness is computed from the REAL `bundle_members` rows (a `NOT EXISTS`
+    /// anti-join), never the cosmetic `bundles.member_count`, which the migration
+    /// documents may drift as members leave. The default impl returns an empty
+    /// list (a fake with no bundles has none); the SQLite repo overrides it.
+    async fn list_empty_bundles(&self, source: SourceId) -> Result<Vec<(String, String)>> {
+        let _ = source;
+        Ok(Vec::new())
+    }
+
+    /// Delete one `bundles` row by id (issue #35 item a bundle GC). Called by
+    /// reconcile AFTER the bundle's Drive object has been trashed, so the row is
+    /// dropped only once the remote object is gone. Any lingering
+    /// `bundle_members` rows cascade away via the `bundle_id` FK, but an empty
+    /// bundle (the only kind GC deletes) has none. The default impl is a no-op
+    /// (a fake models no bundles); the SQLite repo overrides it.
+    async fn delete_bundle(&self, bundle_id: &str) -> Result<()> {
+        let _ = bundle_id;
+        Ok(())
     }
 
     // --- activity_log -------------------------------------------------------

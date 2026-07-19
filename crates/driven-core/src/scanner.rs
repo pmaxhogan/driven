@@ -1110,6 +1110,49 @@ mod tests {
         assert!(res.new_or_changed.is_empty(), "{:?}", res.new_or_changed);
     }
 
+    /// Issue #35 item e: a BUNDLED member - a `file_state` row with
+    /// `drive_file_id = NULL` (its bytes live inside a `.tar.gz` bundle), status
+    /// Synced, and a matching stored hash - must NOT be re-emitted as changed by a
+    /// deep-verify cycle. The verify path is purely local-content (re-hash vs the
+    /// stored blake3) and never consults `drive_file_id`, so a bundled member that
+    /// is byte-identical stays unchanged and is never spuriously re-uploaded.
+    #[tokio::test]
+    async fn deep_verify_does_not_touch_bundled_member() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("logs/app.log");
+        std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+        write(&p, b"bundled member bytes");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let (size, mtime) = stat_of(&p);
+        // The bundled-member shape: NULL drive_file_id, Synced, correct hash.
+        let mut r = row(
+            src.id,
+            "logs/app.log",
+            size,
+            mtime,
+            *blake3::hash(b"bundled member bytes").as_bytes(),
+        );
+        r.drive_file_id = None;
+        r.drive_md5 = None;
+        state.put(r);
+
+        // A deep-verify cycle re-hashes the local bytes; they match, so the
+        // member is unchanged - no re-upload op is produced for it.
+        let res = scan(&src, &state, ScanMode::DeepVerify).await.unwrap();
+        assert!(
+            res.new_or_changed.is_empty(),
+            "a byte-identical bundled member must not be re-emitted: {:?}",
+            res.new_or_changed
+        );
+        assert!(
+            res.deleted.is_empty(),
+            "the member must not be treated as deleted"
+        );
+    }
+
     #[cfg(unix)]
     #[tokio::test]
     async fn symlink_is_skipped() {

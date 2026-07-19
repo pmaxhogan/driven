@@ -189,8 +189,11 @@
         "powerNetwork": "Power and network",
         "schedule": "Schedule",
         "performance": "Performance and bandwidth",
+        "advanced": "Advanced",
         "privacy": "Privacy"
       },
+      "bundleSmallFilesLabel": "Bundle small files in cold folders",
+      "bundleSmallFilesNote": "Packs many tiny, unchanged files from the same folder into a single compressed archive before uploading, cutting round-trips and Drive rate-limit pressure. Only old files in dense folders are bundled; new or recently-changed files still upload individually. Off by default.",
       "autoStartOnLoginLabel": "Launch Driven when I sign in",
       "autoStartOnLoginNote": "Starts Driven in the background at login so backups keep running. Registers as a real startup app (Windows Task Manager, macOS Login Items, Linux autostart).",
       "skipOnBatteryLabel": "Pause backups while on battery",
