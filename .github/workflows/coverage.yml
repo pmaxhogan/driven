@@ -50,7 +50,7 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux Tauri deps
         # Some workspace crates pull in the GTK/webkit stack transitively; the

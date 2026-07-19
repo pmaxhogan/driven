@@ -50,7 +50,7 @@ jobs:
       # unrelated crates.
       - name: Check out the release PR branch
         if: ${{ steps.release.outputs.pr }}
-        uses: actions/checkout@v4
+        uses: actions/checkout@v7
         with:
           ref: ${{ fromJSON(steps.release.outputs.pr).headBranchName }}
           # Push with the PAT so the lock-sync commit re-triggers the release
