@@ -380,6 +380,10 @@ pub struct FakeVssProvider {
     recorder: Mutex<Option<SnapshotRecorder>>,
     /// A deterministic GUID the fake hands the recorder on create.
     recorder_guid: String,
+    /// When `true`, `map_for_volume` returns [`SnapshotOutcome::Pending`]
+    /// (simulating the least-privilege helper broker still launching), so an
+    /// executor test can exercise the transient retry-later path without COM.
+    pending: bool,
 }
 
 impl FakeVssProvider {
@@ -396,6 +400,7 @@ impl FakeVssProvider {
             recorded_calls: std::sync::atomic::AtomicUsize::new(0),
             recorder: Mutex::new(None),
             recorder_guid: "{fake-snapshot-guid}".to_string(),
+            pending: false,
         }
     }
 
@@ -413,6 +418,26 @@ impl FakeVssProvider {
             recorded_calls: std::sync::atomic::AtomicUsize::new(0),
             recorder: Mutex::new(None),
             recorder_guid: "{fake-snapshot-guid}".to_string(),
+            pending: false,
+        }
+    }
+
+    /// A provider that reports available (so the executor consults it) but whose
+    /// `map_for_volume` returns [`SnapshotOutcome::Pending`] - the helper broker
+    /// is launching. Lets an executor test exercise the transient retry-later
+    /// (skip-not-locked) path without real COM.
+    pub fn pending(mode: VssMode) -> Self {
+        Self {
+            mode: Mutex::new(mode),
+            available: std::sync::atomic::AtomicBool::new(true),
+            mapped_root: None,
+            recorded: Vec::new(),
+            end_cycle_calls: std::sync::atomic::AtomicUsize::new(0),
+            map_calls: std::sync::atomic::AtomicUsize::new(0),
+            recorded_calls: std::sync::atomic::AtomicUsize::new(0),
+            recorder: Mutex::new(None),
+            recorder_guid: "{fake-snapshot-guid}".to_string(),
+            pending: true,
         }
     }
 
@@ -448,6 +473,9 @@ impl VssProvider for FakeVssProvider {
     fn map_for_volume(&self, live_path: &Path) -> SnapshotOutcome {
         self.map_calls
             .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        if self.pending {
+            return SnapshotOutcome::Pending;
+        }
         match &self.mapped_root {
             Some(root) => {
                 // P1-A: a successful map simulates a created shadow, so fire the

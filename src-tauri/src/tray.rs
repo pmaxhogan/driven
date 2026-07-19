@@ -526,9 +526,12 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         | ErrorCode::DriveResumableSessionInvalid
         | ErrorCode::DriveDestFolderMissing
         | ErrorCode::DriveDestFolderPermissionDenied
-        // Local filesystem / VSS errors -> red error.
+        // Local filesystem / VSS errors -> red error. (The transient
+        // vss_helper_pending skip is not an error condition, but it is not a
+        // network one either, so it classifies here as non-network.)
         | ErrorCode::LocalFileLocked
         | ErrorCode::LocalVssUnavailable
+        | ErrorCode::LocalVssHelperPending
         | ErrorCode::LocalFileChangedDuringUpload
         | ErrorCode::LocalFileReplacedDuringUpload
         | ErrorCode::LocalIoError

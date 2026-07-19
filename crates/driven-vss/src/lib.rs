@@ -131,6 +131,12 @@ pub enum FallbackDecision {
     /// VSS could not help (unavailable, or the snapshot/mapping failed):
     /// skip the file and surface it as locked.
     SkipLocked,
+    /// VSS help is COMING but not ready yet (the least-privilege helper broker is
+    /// launching / awaiting elevation approval, DESIGN s5.3.1): skip this file for
+    /// now and retry it on the next cycle, WITHOUT surfacing it as a permanent
+    /// lock. Distinct from [`Self::SkipLocked`] so the transient
+    /// launch-in-progress window is not misreported as "file locked".
+    SkipRetryLater,
 }
 
 /// The result of a first, live open attempt that the open path feeds into
@@ -154,6 +160,11 @@ pub enum SnapshotOutcome {
     Mapped(PathBuf),
     /// VSS is unavailable or snapshot creation/mapping failed.
     Unavailable,
+    /// The least-privilege helper broker is still coming up (launch issued /
+    /// awaiting elevation approval, DESIGN s5.3.1) - VSS help is expected shortly
+    /// but is not ready THIS cycle. The caller skips the file transiently and
+    /// retries next cycle rather than reporting it as permanently locked.
+    Pending,
 }
 
 /// Decide what the executor's open path does for one file, given the live
@@ -196,6 +207,8 @@ pub fn fallback_decision(
                 match snapshot {
                     SnapshotOutcome::Mapped(p) => FallbackDecision::OpenSnapshot(p),
                     SnapshotOutcome::Unavailable => FallbackDecision::SkipLocked,
+                    // The helper is launching: retry next cycle, not "locked".
+                    SnapshotOutcome::Pending => FallbackDecision::SkipRetryLater,
                 }
             }
         },
@@ -218,6 +231,13 @@ pub fn fallback_decision(
                 SnapshotOutcome::Unavailable => match open {
                     OpenAttempt::Ok => FallbackDecision::OpenLive,
                     OpenAttempt::Locked => FallbackDecision::SkipLocked,
+                },
+                // The helper is launching: a readable file still reads live NOW
+                // (never block a readable file on the snapshot coming up); a
+                // locked one retries next cycle rather than reporting "locked".
+                SnapshotOutcome::Pending => match open {
+                    OpenAttempt::Ok => FallbackDecision::OpenLive,
+                    OpenAttempt::Locked => FallbackDecision::SkipRetryLater,
                 },
             }
         }
@@ -341,6 +361,45 @@ mod tests {
             ),
             FallbackDecision::SkipLocked,
             "elevated but snapshot creation failed -> degrade to skip"
+        );
+    }
+
+    #[test]
+    fn auto_mode_locked_elevated_pending_retries_later_not_locked() {
+        // DESIGN s5.3.1: while the helper broker is launching, a locked file must
+        // retry next cycle (SkipRetryLater), NOT be reported as permanently locked.
+        assert_eq!(
+            fallback_decision(
+                OpenAttempt::Locked,
+                VssMode::Auto,
+                true,
+                SnapshotOutcome::Pending
+            ),
+            FallbackDecision::SkipRetryLater
+        );
+    }
+
+    #[test]
+    fn always_mode_pending_reads_live_for_readable_retries_locked() {
+        // Paranoid mode with the helper launching: a readable file reads live NOW
+        // (never blocked on the snapshot coming up); a locked file retries later.
+        assert_eq!(
+            fallback_decision(
+                OpenAttempt::Ok,
+                VssMode::Always,
+                true,
+                SnapshotOutcome::Pending
+            ),
+            FallbackDecision::OpenLive
+        );
+        assert_eq!(
+            fallback_decision(
+                OpenAttempt::Locked,
+                VssMode::Always,
+                true,
+                SnapshotOutcome::Pending
+            ),
+            FallbackDecision::SkipRetryLater
         );
     }
 

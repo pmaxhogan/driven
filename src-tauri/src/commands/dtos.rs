@@ -502,6 +502,16 @@ pub struct VssHelperStatus {
     /// NOT degraded even though `helper_alive` is still `false`.
     #[serde(default)]
     pub helper_launchable: bool,
+    /// Issue #25: a launch is in progress - awaiting elevation (UAC) approval /
+    /// the broker's pipe coming up. The Settings UI shows a "waiting for elevation
+    /// approval" hint while this is `true` (it resolves to alive or declined).
+    #[serde(default)]
+    pub launch_pending: bool,
+    /// Issue #25: the user declined (or ignored) the elevation prompt this session.
+    /// Memoised - no further prompt until the app restarts or the toggle is
+    /// switched off then on. The UI shows a "declined" hint.
+    #[serde(default)]
+    pub launch_declined: bool,
     /// Locked-file backup is currently DEGRADED: on Windows, exclusively-locked
     /// files (Outlook PSTs, live databases, VM disks) are being skipped because
     /// Volume Shadow Copy is unavailable (the app is not elevated and neither an

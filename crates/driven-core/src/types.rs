@@ -1031,6 +1031,12 @@ pub enum ErrorCode {
     /// `local.vss_unavailable` - Driven needs elevation to use VSS but
     /// isn't elevated.
     LocalVssUnavailable,
+    /// `local.vss_helper_pending` - the least-privilege VSS helper broker is
+    /// still launching / awaiting elevation approval (DESIGN s5.3.1), so this
+    /// locked file is skipped TRANSIENTLY and retried on the next cycle. Not a
+    /// permanent lock - distinct from [`Self::LocalFileLocked`] so the brief
+    /// launch-in-progress window is not misreported as "file locked".
+    LocalVssHelperPending,
     /// `local.file_changed_during_upload` - pre/post fstat showed file
     /// mutated mid-upload; re-queued.
     LocalFileChangedDuringUpload,
@@ -1136,6 +1142,7 @@ impl ErrorCode {
             ErrorCode::DriveDestFolderPermissionDenied => "drive.dest_folder_permission_denied",
             ErrorCode::LocalFileLocked => "local.file_locked",
             ErrorCode::LocalVssUnavailable => "local.vss_unavailable",
+            ErrorCode::LocalVssHelperPending => "local.vss_helper_pending",
             ErrorCode::LocalFileChangedDuringUpload => "local.file_changed_during_upload",
             ErrorCode::LocalFileReplacedDuringUpload => "local.file_replaced_during_upload",
             ErrorCode::LocalIoError => "local.io_error",
@@ -1189,6 +1196,7 @@ impl ErrorCode {
             "drive.dest_folder_permission_denied" => ErrorCode::DriveDestFolderPermissionDenied,
             "local.file_locked" => ErrorCode::LocalFileLocked,
             "local.vss_unavailable" => ErrorCode::LocalVssUnavailable,
+            "local.vss_helper_pending" => ErrorCode::LocalVssHelperPending,
             "local.file_changed_during_upload" => ErrorCode::LocalFileChangedDuringUpload,
             "local.file_replaced_during_upload" => ErrorCode::LocalFileReplacedDuringUpload,
             "local.io_error" => ErrorCode::LocalIoError,

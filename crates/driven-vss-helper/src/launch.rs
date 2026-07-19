@@ -24,25 +24,50 @@ pub fn generate_pipe_name() -> String {
     format!(r"\\.\pipe\driven-vss-{}", uuid::Uuid::new_v4().simple())
 }
 
-/// The on-demand launch seam the app-side [`BrokeredVssProvider`] consults the
-/// FIRST time a locked file needs the helper (DESIGN s5.3.1).
+/// The readiness of the elevated helper broker for one locked-file open
+/// (DESIGN s5.3.1). Returned by [`HelperLauncher::launch_status`].
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum LaunchStatus {
+    /// The broker is up and serving - proceed to read the locked file through it.
+    Ready,
+    /// A launch is in progress: the broker has been asked to start and is
+    /// awaiting elevation approval / bringing its pipe up (within the attended
+    /// window). The caller skips this file TRANSIENTLY and retries next cycle -
+    /// it must NOT report the file as permanently locked, and must NOT block.
+    Pending,
+    /// The user declined (or ignored) the UAC prompt this session. Memoised: the
+    /// caller degrades to skip-the-locked-file and no further prompt is raised
+    /// until the app restarts (or the toggle is switched off then on again).
+    Declined,
+    /// The least-privilege helper is not in play (the `windows.vss_helper`
+    /// setting is off, or off Windows). The caller behaves exactly like the
+    /// historical un-elevated skip.
+    Disabled,
+}
+
+/// The on-demand launch seam the app-side [`BrokeredVssProvider`] consults on the
+/// locked-file path (DESIGN s5.3.1).
 ///
 /// The provider does not launch the elevated broker itself: launch is an
 /// app-level, at-most-once concern (one UAC prompt, one helper process, one
 /// pipe name shared across every account's provider), so the app owns a single
-/// launcher and hands the SAME `Arc<dyn HelperLauncher>` to each provider.
-/// [`Self::ensure_launched`] is called lazily on the locked-file path and MUST
-/// be idempotent + memoised: a first call launches the broker; later calls (and
-/// calls from other accounts' providers) return the cached verdict without
-/// re-prompting - a user who declined the UAC prompt is not asked again for the
-/// rest of the session.
+/// launcher and hands the SAME `Arc<dyn HelperLauncher>` to each provider. The
+/// eager path (the user enabling the setting) launches ahead of any sync; the
+/// lazy path (the setting already on at boot) launches on the first locked file.
 pub trait HelperLauncher: Send + Sync {
-    /// Ensure the elevated helper has been launched for this session, launching
-    /// it at most once. Returns `true` when the helper is believed up (launch
-    /// succeeded, or a prior call already launched it), `false` when it could
-    /// not be brought up (UAC declined, helper exe missing) so the caller
-    /// degrades to skip-the-locked-file.
-    fn ensure_launched(&self) -> bool;
+    /// Report the broker's readiness for a locked-file open, TRIGGERING an
+    /// at-most-once lazy launch (non-blocking) when the helper is enabled but no
+    /// launch has been attempted yet. Never blocks on the UAC prompt: a launch in
+    /// progress reports [`LaunchStatus::Pending`] so the caller skips-and-retries
+    /// rather than waiting.
+    fn launch_status(&self) -> LaunchStatus;
+
+    /// Capability: is helper-brokered VSS in play at all this run (the setting is
+    /// on AND the user has not declined)? The executor reads this as its
+    /// `elevated` input to `fallback_decision`, so it must be `true` whenever the
+    /// broker is up OR can still be brought up - and `false` once disabled or
+    /// declined, so a disabled/declined provider behaves like the un-elevated skip.
+    fn is_available(&self) -> bool;
 }
 
 /// Build the helper's argv (excluding the program path itself):
@@ -87,17 +112,50 @@ pub fn parse_helper_args(args: &[String]) -> Result<(String, Vec<PathBuf>), Stri
     Ok((pipe_name, roots))
 }
 
-/// Launch `helper_exe` elevated with `args` via the shell `runas` verb
-/// (raises one UAC prompt). Returns when the process has been STARTED, not when
-/// it exits (the helper runs for the session). On non-Windows this is
-/// unsupported.
+/// Why an elevated launch did not succeed (DESIGN s5.3.1). The distinction drives
+/// memoisation: [`Self::Declined`] is remembered for the session (never re-prompt);
+/// [`Self::Failed`] is transient and may be retried.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum LaunchError {
+    /// The user DECLINED or ignored the UAC prompt (`ERROR_CANCELLED`, 1223).
+    /// Because a cancel and a prompt-timeout both surface as `ERROR_CANCELLED`,
+    /// this means "the user did not approve" - memoise it and do not re-prompt.
+    Declined,
+    /// Any OTHER launch failure (the exe is missing, a shell error, etc). This is
+    /// transient - a later enable-toggle or app start may retry. Carries a
+    /// secret-free detail for logs.
+    Failed(String),
+}
+
+impl std::fmt::Display for LaunchError {
+    fn fmt(&self, f: &mut std::fmt::Formatter<'_>) -> std::fmt::Result {
+        match self {
+            LaunchError::Declined => write!(f, "elevation was declined at the UAC prompt"),
+            LaunchError::Failed(detail) => write!(f, "{detail}"),
+        }
+    }
+}
+
+/// Launch `helper_exe` elevated with `args` via the shell `runas` verb (raises
+/// one UAC prompt).
+///
+/// `SEE_MASK_NOASYNC` makes `ShellExecuteExW` WAIT for the elevation to resolve
+/// even on a thread with no message loop (e.g. a worker thread), so this returns
+/// only once the user has approved (the process is then starting) or the prompt
+/// was cancelled/ignored ([`LaunchError::Declined`]). Without that flag the call
+/// can return early while the prompt is still up and surface a spurious error -
+/// the root cause of the first-cut UAC race. It still returns as soon as the
+/// process is STARTED, not when it exits (the helper serves for the session). On
+/// non-Windows this is unsupported.
 #[cfg(windows)]
-pub fn launch_elevated(helper_exe: &std::path::Path, args: &[String]) -> Result<(), String> {
+pub fn launch_elevated(helper_exe: &std::path::Path, args: &[String]) -> Result<(), LaunchError> {
     use std::os::windows::ffi::OsStrExt;
 
     use windows::core::PCWSTR;
     use windows::Win32::Foundation::{CloseHandle, GetLastError, ERROR_CANCELLED};
-    use windows::Win32::UI::Shell::{ShellExecuteExW, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW};
+    use windows::Win32::UI::Shell::{
+        ShellExecuteExW, SEE_MASK_NOASYNC, SEE_MASK_NOCLOSEPROCESS, SHELLEXECUTEINFOW,
+    };
     use windows::Win32::UI::WindowsAndMessaging::SW_HIDE;
 
     fn wide(s: &std::ffi::OsStr) -> Vec<u16> {
@@ -119,7 +177,10 @@ pub fn launch_elevated(helper_exe: &std::path::Path, args: &[String]) -> Result<
 
     let mut info = SHELLEXECUTEINFOW {
         cbSize: std::mem::size_of::<SHELLEXECUTEINFOW>() as u32,
-        fMask: SEE_MASK_NOCLOSEPROCESS,
+        // NOASYNC: block until the elevation prompt resolves on a no-message-loop
+        // thread. NOCLOSEPROCESS: keep the started process handle so we can close
+        // it ourselves (we manage the helper over the pipe, not via this handle).
+        fMask: SEE_MASK_NOCLOSEPROCESS | SEE_MASK_NOASYNC,
         lpVerb: PCWSTR(verb.as_ptr()),
         lpFile: PCWSTR(file.as_ptr()),
         lpParameters: PCWSTR(params_w.as_ptr()),
@@ -144,9 +205,13 @@ pub fn launch_elevated(helper_exe: &std::path::Path, args: &[String]) -> Result<
             // SAFETY: reading the thread's last-error code.
             let code = unsafe { GetLastError() };
             if code == ERROR_CANCELLED {
-                Err("elevation was declined at the UAC prompt".to_string())
+                // Cancel OR prompt-timeout - both are "the user did not approve".
+                Err(LaunchError::Declined)
             } else {
-                Err(format!("ShellExecuteEx(runas) failed (error {})", code.0))
+                Err(LaunchError::Failed(format!(
+                    "ShellExecuteEx(runas) failed (error {})",
+                    code.0
+                )))
             }
         }
     }
@@ -154,8 +219,10 @@ pub fn launch_elevated(helper_exe: &std::path::Path, args: &[String]) -> Result<
 
 /// Non-Windows: elevated launch is unsupported (VSS is Windows-only).
 #[cfg(not(windows))]
-pub fn launch_elevated(_helper_exe: &std::path::Path, _args: &[String]) -> Result<(), String> {
-    Err("the VSS helper is only supported on Windows".to_string())
+pub fn launch_elevated(_helper_exe: &std::path::Path, _args: &[String]) -> Result<(), LaunchError> {
+    Err(LaunchError::Failed(
+        "the VSS helper is only supported on Windows".to_string(),
+    ))
 }
 
 /// Quote a single argv element for a Windows command-line parameter string.
