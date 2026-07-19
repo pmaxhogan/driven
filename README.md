@@ -18,6 +18,52 @@ guide to creating that credential in the Google Cloud Console:
 
 ![The credentials step with an expanded, numbered walkthrough for creating a Google OAuth client ID and secret.](docs/screenshots/oauth-walkthrough-dark.png)
 
+## How Driven compares
+
+Driven's niche is a native, cross-platform desktop app that pairs end-to-end
+encryption with one-way backup to a cloud you already own, plus developer- and
+laptop-friendly touches (gitignore-aware excludes, battery / metered-network
+awareness) that the CLI backup tools and consumer cloud clients skip. Where
+Driven is thinner today (extra storage backends, block-level dedup) is called
+out honestly below.
+
+| Capability | Driven | rclone | Drive for desktop | Duplicati | restic | Backblaze |
+| --- | --- | --- | --- | --- | --- | --- |
+| One-way backup, source stays the source of truth | Yes | Partial [1] | No [2] | Yes | Yes | Yes |
+| End-to-end (client-side) encryption | Yes | Yes | No [3] | Yes | Yes | Partial [4] |
+| Backs up to storage you own / control | Yes | Yes | Yes | Yes | Yes | No [5] |
+| No account with the tool's vendor, no vendor servers | Yes | Yes | No | Yes | Yes | No |
+| Choice of multiple storage backends | No [6] | Yes | No | Yes | Yes | No |
+| Point-in-time restore (an earlier version by date) | Yes | No | Partial [7] | Yes | Yes | Yes [8] |
+| Block-level deduplication | No [6] | No | No | Yes | Yes | No |
+| Locked / open-file backup (Windows VSS) | Yes | No | Partial [9] | Yes | Yes | Yes |
+| Automatic battery / metered-network / sleep awareness | Yes | No | No | No | No | No [10] |
+| Per-source include/exclude incl. .gitignore | Yes | Partial [11] | No | Partial [11] | Partial [11] | Partial [11] |
+| Native desktop GUI app | Yes | No [12] | Yes | Partial [13] | No [12] | Yes |
+| In-app file search + selective restore | Yes | No | Yes | Yes | Partial [14] | Yes |
+| Open source (permissive license) | Yes | Yes | No | Yes | Yes | No |
+| Cross-platform desktop (Windows, macOS, Linux) | Yes | Yes | No [15] | Yes | Yes | No [15] |
+
+Notes:
+
+1. rclone is a general-purpose sync/copy engine (including two-way `bisync`); backup direction is whatever you script.
+2. Drive for desktop is a two-way sync client, not a one-way backup.
+3. Drive uses server-side encryption; client-side encryption exists only for eligible Google Workspace accounts an admin configures, not consumer accounts.
+4. Backblaze defaults to provider-managed keys; a user-set private key is optional, and its passphrase is entered on Backblaze's servers during a web restore.
+5. Backblaze Personal Backup targets Backblaze's own cloud, not storage you supply.
+6. Google Drive is Driven's only backend today; additional backends and block-level dedup are on the post-v1 backlog ([issue #34](https://github.com/pmaxhogan/driven/issues/34)), not shipped.
+7. Google Drive keeps a limited recent version history; it is not a configurable point-in-time backup.
+8. Backblaze restores from within a retention window (30 days by default, extendable).
+9. Drive for desktop continuously syncs open files but does not take an application-consistent VSS snapshot.
+10. Several tools offer manual bandwidth limits or schedules; only Driven automatically defers on battery, metered, or offline networks and resumes on wake.
+11. rclone, Duplicati, restic, and Backblaze support custom include/exclude filter rules but not `.gitignore` semantics.
+12. rclone and restic are command-line tools; their GUIs are separate third-party projects (for example RcloneView, Backrest).
+13. Duplicati runs as a background service with a local web UI plus a tray helper, not a native desktop app.
+14. restic search and selective restore are driven from the CLI (or a mounted snapshot), not an in-app browser.
+15. Windows and macOS only; Linux needs third-party tools.
+
+Feature sets verified 2026-07; check each project's current docs before relying on a cell.
+
 ## Features
 
 - One-way backup to your own Google Drive (no second cloud bill, no two-way
