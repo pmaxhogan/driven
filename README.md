@@ -18,6 +18,62 @@ guide to creating that credential in the Google Cloud Console:
 
 ![The credentials step with an expanded, numbered walkthrough for creating a Google OAuth client ID and secret.](docs/screenshots/oauth-walkthrough-dark.png)
 
+## How Driven compares
+
+Driven is a native desktop app that pairs end-to-end encryption with one-way
+backup to a cloud you already own, plus laptop-friendly touches (gitignore-aware
+excludes, battery and metered-network awareness) that CLI backup tools and
+consumer sync clients skip. Where it is thinner today (more backends,
+block-level dedup) is marked honestly below.
+
+Legend: :white_check_mark: yes &nbsp; :large_orange_diamond: partial (see note) &nbsp; :x: no
+
+| Capability | Driven | rclone | Drive for desktop | Duplicati | restic | Backblaze |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: |
+| One-way backup, source stays the source of truth | :white_check_mark: | :large_orange_diamond:¹ | :x:² | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Automatic background sync (file-change watcher) | :white_check_mark: | :x:³ | :white_check_mark: | :x:³ | :x:³ | :white_check_mark: |
+| Resumable, crash-safe transfers | :white_check_mark: | :large_orange_diamond:⁴ | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Backs up to storage you own / control | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: | :x:⁵ |
+| No account with the tool's vendor, no vendor servers | :white_check_mark: | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
+| Choice of multiple storage backends | :x:⁶ | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
+| End-to-end (client-side) encryption | :white_check_mark: | :white_check_mark: | :x:⁷ | :white_check_mark: | :white_check_mark: | :large_orange_diamond:⁸ |
+| Encrypted file names, not just contents | :white_check_mark: | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
+| Recovery phrase for the encryption key | :white_check_mark: | :x:⁹ | :x: | :x:⁹ | :x:⁹ | :x:⁹ |
+| Point-in-time restore (an earlier version by date) | :white_check_mark: | :x: | :large_orange_diamond:¹⁰ | :white_check_mark: | :white_check_mark: | :white_check_mark:¹¹ |
+| Block-level deduplication | :x:⁶ | :x: | :x: | :white_check_mark: | :white_check_mark: | :x: |
+| Locked / open-file backup (Windows VSS) | :white_check_mark: | :x: | :large_orange_diamond:¹² | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Periodic integrity re-verification | :white_check_mark: | :large_orange_diamond:¹³ | :x: | :white_check_mark: | :large_orange_diamond:¹³ | :large_orange_diamond:¹³ |
+| Automatic battery / metered-network / sleep awareness | :white_check_mark: | :x: | :x: | :x: | :x: | :x:¹⁴ |
+| Per-source include/exclude incl. .gitignore | :white_check_mark: | :large_orange_diamond:¹⁵ | :x: | :large_orange_diamond:¹⁵ | :large_orange_diamond:¹⁵ | :large_orange_diamond:¹⁵ |
+| Native desktop GUI app | :white_check_mark: | :x:¹⁶ | :white_check_mark: | :large_orange_diamond:¹⁷ | :x:¹⁶ | :white_check_mark: |
+| In-app file search + selective restore | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :large_orange_diamond:¹⁸ | :white_check_mark: |
+| Open source (permissive license) | :white_check_mark: | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
+| Cross-platform desktop (Windows, macOS, Linux) | :white_check_mark: | :white_check_mark: | :x:¹⁹ | :white_check_mark: | :white_check_mark: | :x:¹⁹ |
+
+Notes:
+
+- ¹ rclone is a general-purpose sync/copy engine (including two-way `bisync`); backup direction is whatever you script.
+- ² Drive for desktop is a two-way sync client, not a one-way backup.
+- ³ rclone, restic, and Duplicati back up on a schedule (cron / systemd / built-in scheduler), not from a live file-change watcher.
+- ⁴ rclone resumes at file granularity on re-run; mid-file resume of a large object depends on the backend.
+- ⁵ Backblaze Personal Backup targets Backblaze's own cloud, not storage you supply.
+- ⁶ Google Drive is Driven's only backend today; additional backends and block-level dedup are on the post-v1 backlog ([issue #34](https://github.com/pmaxhogan/driven/issues/34)), not shipped.
+- ⁷ Drive uses server-side encryption; client-side encryption exists only for eligible Google Workspace accounts an admin configures, not consumer accounts.
+- ⁸ Backblaze defaults to provider-managed keys; a user-set private key is optional, and its passphrase is entered on Backblaze's servers during a web restore.
+- ⁹ These tools protect the key with a passphrase you must remember; only Driven generates a BIP39 recovery phrase you can write down to recover the key.
+- ¹⁰ Google Drive keeps a limited recent version history; it is not a configurable point-in-time backup.
+- ¹¹ Backblaze restores from within a retention window (30 days by default, extendable).
+- ¹² Drive for desktop continuously syncs open files but does not take an application-consistent VSS snapshot.
+- ¹³ rclone (`check` / `cryptcheck`) and restic (`check`) verify on demand rather than on an automatic schedule; Backblaze runs periodic server-side checks only.
+- ¹⁴ Several tools offer manual bandwidth limits or schedules; only Driven automatically defers on battery, metered, or offline networks and resumes on wake.
+- ¹⁵ rclone, Duplicati, restic, and Backblaze support custom include/exclude filter rules but not `.gitignore` semantics.
+- ¹⁶ rclone and restic are command-line tools; their GUIs are separate third-party projects (for example RcloneView, Backrest).
+- ¹⁷ Duplicati runs as a background service with a local web UI plus a tray helper, not a native desktop app.
+- ¹⁸ restic search and selective restore are driven from the CLI (or a mounted snapshot), not an in-app browser.
+- ¹⁹ Windows and macOS only; Linux needs third-party tools.
+
+Feature sets verified 2026-07; check each project's current docs before relying on a cell.
+
 ## Features
 
 - One-way backup to your own Google Drive (no second cloud bill, no two-way
