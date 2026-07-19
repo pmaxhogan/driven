@@ -176,6 +176,7 @@ fn code_from_message(msg: &str) -> Option<ErrorCode> {
         "crypto.key_missing",
         "state.db_corrupt",
         "state.db_locked",
+        "restore.no_version_as_of",
         "net.captive_portal",
         "net.dns_failed",
         "net.no_internet",

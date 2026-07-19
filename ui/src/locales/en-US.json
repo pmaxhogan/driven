@@ -595,6 +595,12 @@
         "long": "Driven found a remote file with no local record and reconciled it during startup."
       }
     },
+    "restore": {
+      "no_version_as_of": {
+        "short": "No version that far back",
+        "long": "One or more selected files have no backed-up version from before the selected date. Choose a later date, or clear the date to restore the latest backup."
+      }
+    },
     "harness": {
       "timeout": {
         "short": "Test timed out",

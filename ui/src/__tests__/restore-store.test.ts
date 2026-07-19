@@ -507,6 +507,31 @@ describe("restore store", () => {
     expect(store.restoring).toBe(false);
   });
 
+  it("surfaces a point-in-time rejection as the dedicated restore.no_version_as_of code (#36)", async () => {
+    // Issue #36 UX fix: an as-of restore rejected because a selected file has no
+    // backed-up version covering the chosen instant now carries the dedicated
+    // restore.no_version_as_of code (not the generic internal.invalid_input), so
+    // the view renders t(`errors.restore.no_version_as_of.long`) - a message that
+    // points at the DATE instead of a non-existent "highlighted field".
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree") return Promise.resolve(tree([file("foo.txt")]));
+      if (cmd === "restore_files") return Promise.reject({ code: "restore.no_version_as_of" });
+      return Promise.resolve([]);
+    });
+
+    const store = useRestoreStore();
+    await store.loadSources();
+    store.toggleSelect("s1", "foo.txt");
+    store.setDestination("/home/u/restored", "tok-asof");
+
+    await store.startRestore();
+
+    expect(store.errorCode).toBe("restore.no_version_as_of");
+    expect(store.activeJobId).toBeNull();
+    expect(store.restoring).toBe(false);
+  });
+
   it("clears a STALE activeJobId when a new restore is rejected (M9c D3, M8 R4-P2-2)", async () => {
     // M9c D3: startRestore must clear activeJobId BEFORE the new IPC, so a REJECTED
     // new restore does not leave the store tracking the PRIOR job id (a later

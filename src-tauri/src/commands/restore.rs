@@ -562,7 +562,7 @@ async fn resolve_restore_items(
                     Some(v) => (Some(v.drive_file_id), v.size, v.hash_blake3),
                     None => {
                         return Err(CommandError::with_code(
-                            ErrorCode::InvalidInput,
+                            ErrorCode::RestoreNoVersionAsOf,
                             format!(
                                 "no backed-up version of {} as of the selected date",
                                 item.relative_path
@@ -4563,6 +4563,37 @@ mod tests {
             resolved[0].drive_file_id.as_deref(),
             Some("cur-obj"),
             "the still-live current object holds the bytes that were live at the requested instant"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_restore_as_of_before_first_backup_rejects_with_dedicated_code() {
+        // Issue #36 UX fix: a point-in-time restore whose instant precedes the
+        // file's first backup (no recorded version covers it) rejects the WHOLE
+        // job fail-closed - and carries the dedicated `restore.no_version_as_of`
+        // code, NOT the generic `internal.invalid_input`, so the UI can point at
+        // the date instead of a non-existent "highlighted field". Mirrors the
+        // live QA repro (as-of one minute before the first backup).
+        let (state, src, dir) = state_with_source().await;
+        let mut row = file_state_row(src, "doc.txt", Some("cur-obj"), FileStateStatus::Synced);
+        // The current object became live at t0 = 10_000 (its window start); there
+        // is no earlier retained version.
+        row.last_uploaded_at = Some(10_000);
+        state.state().upsert_file_state(&row).await.unwrap();
+
+        let items = vec![RestoreItem {
+            source_id: src.to_string(),
+            relative_path: "doc.txt".to_string(),
+        }];
+        // Restore as-of t = 5_000 (< the window start, no version recorded).
+        let err = resolve_restore_items(&state, &items, Some(5_000))
+            .await
+            .expect_err("an as-of before the first backup must be rejected");
+        assert_eq!(
+            err.code,
+            ErrorCode::RestoreNoVersionAsOf,
+            "the rejection must carry the dedicated restore code, not internal.invalid_input"
         );
         let _ = std::fs::remove_dir_all(&dir);
     }
