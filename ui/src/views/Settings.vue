@@ -6,7 +6,8 @@ import { useI18n } from "vue-i18n";
 import AccountList from "../components/AccountList.vue";
 import SourceTable from "../components/SourceTable.vue";
 import { useSettingsStore } from "../stores/settings";
-import type { SettingsPatch } from "../ipc/types";
+import { getVssHelperStatus } from "../ipc/commands";
+import type { SettingsPatch, VssHelperStatus } from "../ipc/types";
 
 // Settings view (SPEC s25 /accounts, /sources, /rules; DESIGN s8.2). One view
 // hosts the three routed tabs; the active tab comes from the route (router
@@ -32,6 +33,12 @@ const active = computed(() => props.tab);
 
 const ioPriorities = ["normal", "low", "idle"] as const;
 const vssModes = ["auto", "always", "never"] as const;
+
+// Least-privilege locked-file backup status (DESIGN s5.3.1). Drives the Rules-tab
+// banner shown when locked files (Outlook / DB / VM disks) are being skipped
+// because Volume Shadow Copy is unavailable (no elevation, no active helper).
+const vssStatus = ref<VssHelperStatus | null>(null);
+const showVssBanner = computed(() => vssStatus.value?.lockedFileBackupDegraded ?? false);
 
 // Shared design-system class strings (DRIVEN UI design system). Native controls
 // MUST carry explicit light/dark surface + text colors so they stay readable on a
@@ -88,6 +95,15 @@ watch(
   (value) => {
     if (value === "rules" && settings.settings === null) {
       void settings.refresh();
+    }
+    if (value === "rules") {
+      void getVssHelperStatus()
+        .then((s) => (vssStatus.value = s))
+        .catch(() => {
+          // No status (e.g. IPC unavailable in a browser dev shell): hide the
+          // banner rather than surface an error on the Rules tab.
+          vssStatus.value = null;
+        });
     }
   },
   { immediate: true }
@@ -624,6 +640,19 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
               </option>
             </select>
           </label>
+
+          <div
+            v-if="showVssBanner"
+            data-testid="vss-degraded-banner"
+            class="rounded-lg border border-amber-300 bg-amber-50 p-3 text-sm dark:border-amber-800/60 dark:bg-amber-950/40"
+          >
+            <h4 class="font-semibold text-amber-800 dark:text-amber-300">
+              {{ t("settings.rules.vssBanner.title") }}
+            </h4>
+            <p class="mt-1 text-amber-700 dark:text-amber-200/80">
+              {{ t("settings.rules.vssBanner.body") }}
+            </p>
+          </div>
 
           <label v-if="settings.settings.windows" class="block space-y-1">
             <span class="text-zinc-600 dark:text-zinc-400">{{

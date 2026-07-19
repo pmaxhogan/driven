@@ -32,24 +32,47 @@ windows = { version = "0.62", features = [
     "Win32_System_Power",
     "Win32_System_Com",
     "Win32_Networking_NetworkListManager",
+    # PowerRegisterSuspendResumeNotification + DEVICE_NOTIFY_CALLBACK for the
+    # sleep/wake edge callback (DESIGN s5.10.1, issue #33). The Power fn is
+    # feature-gated on the WindowsAndMessaging module because its `flags`
+    # argument is `REGISTER_NOTIFICATION_FLAGS` (and `DEVICE_NOTIFY_CALLBACK`)
+    # from there.
+    "Win32_UI_WindowsAndMessaging",
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Battery/AC is read from /sys/class/power_supply with std only. zbus backs the
-# real metered-network read in network.rs: the aggregate `Metered` property on
-# org.freedesktop.NetworkManager over the system bus, via the default
-# (async-io) blocking API dispatched through tokio's spawn_blocking (DESIGN
-# s5.7). The systemd-logind PrepareForSleep sleep/wake signal remains a TODO
-# seam (linux.rs, s5.10.1).
-zbus = "5"
+# Battery/AC is read from /sys/class/power_supply with std only. zbus serves two
+# Linux consumers now:
+#   - the real metered-network read in network.rs (#95): the aggregate `Metered`
+#     property on org.freedesktop.NetworkManager over the system bus, via the
+#     BLOCKING API dispatched through tokio's spawn_blocking (DESIGN s5.7); and
+#   - the systemd-logind `PrepareForSleep` sleep/wake signal (#97, DESIGN
+#     s5.10.1, issue #33), subscribed via zbus's `#[proxy]`-generated async
+#     signal stream on a `tokio::spawn` task; `futures-util` drives that `Stream`.
+#
+# Feature set: KEEP the default features (`async-io` + `blocking-api`) and ADD
+# `tokio`. `blocking-api` (a default) is required by the metered blocking read,
+# and `async-io` (a default) keeps the block-on executor that read was validated
+# against; `tokio` integrates the async signal-stream task with our runtime (a
+# client signal subscriber is driven whether zbus uses tokio or its internal
+# async-io thread). We deliberately do NOT set `default-features = false` here -
+# that would drop `blocking-api` and break the metered read.
+zbus = { version = "5", features = ["tokio"] }
+futures-util = "0.3"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # IOKit IOPowerSources for AC/battery, read via CoreFoundation types
-# (DESIGN s5.7). block2 backs the real metered-network read in network.rs: an
-# NWPathMonitor whose update handler (an Objective-C block) caches
+# (DESIGN s5.7). block2 backs the real metered-network read in network.rs (#95):
+# an NWPathMonitor whose update handler (an Objective-C block) caches
 # nw_path_is_expensive / nw_path_is_constrained (DESIGN s5.7's NWPath.isExpensive
-# proxy). NSWorkspace sleep/wake bridging via objc2 is a TODO seam in macos.rs;
-# objc2 is declared now for when that hook lands (s5.10.1).
+# proxy). Sleep/wake edges (#97, DESIGN s5.10.1, issue #33) use IOKit's
+# IORegisterForSystemPower on a dedicated CFRunLoop thread (macos.rs) - the C
+# API that matches the existing IOKit power reader + the Windows callback shape,
+# and needs no AppKit main-thread run loop. `objc2` remains for any future
+# AppKit bridging.
 core-foundation = "0.10"
+# CFRunLoop bindings (typed, upstream) for the sleep/wake run-loop thread, so
+# the run-loop FFI is not hand-declared (issue #33).
+core-foundation-sys = "0.8"
 objc2 = "0.6"
 block2 = "0.6"

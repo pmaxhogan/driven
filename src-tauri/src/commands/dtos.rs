@@ -466,6 +466,30 @@ pub struct UiSettings {
 pub struct WindowsSettings {
     /// `auto` | `always` | `never` (VSS snapshot policy).
     pub vss_mode: String,
+    /// Route VSS snapshots through the least-privilege elevated helper (DESIGN
+    /// s5.3.1) so the main app stays un-elevated. `false` (default) keeps the
+    /// historical behaviour (VSS needs the whole app launched as Administrator).
+    #[serde(default)]
+    pub vss_helper: bool,
+}
+
+/// Status of least-privilege locked-file backup (DESIGN s5.3.1), surfaced to the
+/// Settings banner. All fields are `false` off Windows.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VssHelperStatus {
+    /// VSS (and thus locked-file backup) is a Windows-only capability.
+    pub supported: bool,
+    /// The main app is currently running elevated (Administrator) - the
+    /// historical way to get VSS without the helper.
+    pub elevated: bool,
+    /// The user has opted into the least-privilege helper (`windows.vss_helper`).
+    pub helper_enabled: bool,
+    /// Locked-file backup is currently DEGRADED: on Windows, exclusively-locked
+    /// files (Outlook PSTs, live databases, VM disks) are being skipped because
+    /// Volume Shadow Copy is unavailable (the app is not elevated and no
+    /// least-privilege helper is active).
+    pub locked_file_backup_degraded: bool,
 }
 
 /// Patch body for `update_settings` (SPEC s11.6 `SettingsPatch`). Each group is
@@ -569,6 +593,8 @@ pub struct UiSettingsPatch {
 pub struct WindowsSettingsPatch {
     /// See [`WindowsSettings::vss_mode`].
     pub vss_mode: Option<String>,
+    /// See [`WindowsSettings::vss_helper`].
+    pub vss_helper: Option<bool>,
 }
 
 /// An available update surfaced by `check_for_updates` (SPEC s11.6

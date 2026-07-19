@@ -92,7 +92,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     },
     updater: { channel: "stable", checkIntervalSecs: 21600 },
     ui: { trayLeftClickOpens: "activity", locale: "en-US", colorMode: "system" },
-    windows: { vssMode: "auto" },
+    windows: { vssMode: "auto", vssHelper: false },
     ...over,
   };
 }
@@ -669,6 +669,54 @@ describe("Settings Rules tab", () => {
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
       patch: { global: { bandwidthCapMbps: 50 } },
     });
+  });
+
+  it("shows the degraded locked-file-backup banner when the helper status says so", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_vss_helper_status")
+        return Promise.resolve({
+          supported: true,
+          elevated: false,
+          helperEnabled: false,
+          lockedFileBackupDegraded: true,
+        });
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("get_vss_helper_status", undefined);
+    expect(wrapper.find('[data-testid="vss-degraded-banner"]').exists()).toBe(true);
+    expect(wrapper.get('[data-testid="vss-degraded-banner"]').text()).toContain(
+      "Locked files are being skipped"
+    );
+  });
+
+  it("hides the degraded banner when locked-file backup is available", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_vss_helper_status")
+        return Promise.resolve({
+          supported: true,
+          elevated: true,
+          helperEnabled: false,
+          lockedFileBackupDegraded: false,
+        });
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="vss-degraded-banner"]').exists()).toBe(false);
   });
 
   it("startup: auto-start renders ON by default and toggling it patches the preference", async () => {

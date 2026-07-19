@@ -3298,3 +3298,38 @@ V1 STANCE: locked-file VSS requires launching Driven as Administrator manually; 
 degrade path already handles the un-elevated case (skips locked files, surfaces the degrade). The old
 whole-app code remains in git history (pre-2026-06-25) as reference only - the helper is a fresh design,
 not a restore.
+
+### V1.x update (issue #25) - helper broker + IPC LANDED, app-launch lifecycle DEFERRED
+
+The security-critical CORE of the least-privilege helper is now built + tested in the new
+`driven-vss-helper` crate (DESIGN s5.3.1). What landed:
+
+- `driven-vss-helper` crate: the wire `protocol` (length-prefixed, 1-byte-kind framing, capped),
+  boundary `validate` (volume normalise + allowed-roots + `..`-traversal + component-wise within-root),
+  `auth` (pipe DACL SDDL `D:P(A;;GA;;;<user>)(A;;GA;;;BA)` + process-image sibling-directory identity),
+  the Windows `server` (accept -> authenticate client image -> validate -> per-volume `VssSnapshot`
+  create/reuse -> STREAM the locked file's bytes; the un-elevated client never opens the
+  `\\?\GLOBALROOT` device), the `client`, the `launch` (`ShellExecute runas` argv + random pipe name),
+  and the `driven-vss-helper.exe` bin. All four security requirements from the original note are met:
+  (1) client auth (pipe ACL + caller PID/image), (2) constrained to configured roots, (3) on-demand
+  elevated broker lifecycle, (4) the READ problem solved by streaming bytes (not exposing the device).
+- `BrokeredVssProvider` implements the existing `driven_vss::VssProvider` seam via a temp-copy
+  (streams the helper's bytes into an app-owned temp file, returns THAT path), so the executor's
+  `read_path` pipeline is unchanged. Degrades to `Unavailable` off Windows / when the helper is not
+  reachable, exactly like the un-elevated path.
+- Elevated integration test (`tests/helper_integration.rs`): spins the real server + client + real VSS
+  snapshot of an exclusively-locked file, asserts streamed bytes match, and asserts the boundary
+  rejects out-of-root + traversal requests. Gate-skips on `!is_elevated()` (NOT `#[ignore]`-faked);
+  verified elevated locally via `sudo` (both cases PASS, ~38s incl. two real `DoSnapshotSet`s).
+- `windows.vss_helper` setting (SPEC s22, default `false`) + `get_vss_helper_status` command + a
+  Settings Rules-tab banner shown when locked-file backup is degraded.
+
+DEFERRED (own follow-up): wiring the app to actually LAUNCH + swap to the `BrokeredVssProvider` in
+production - i.e. `assembly::build_vss` constructing the brokered provider when `vss_helper` is enabled,
+coordinating ONE process-global session pipe name across accounts, launching the helper elevated on
+first locked-file need (one UAC prompt), probing, and health/relaunch. That path's only untestable
+piece is the literal UAC `ShellExecute` prompt (the argv is unit-tested); the provider/launch/server/
+client are all tested. Until it lands, `build_vss` still returns the in-process `RealVssProvider`
+(default app behaviour unchanged) and the banner is informational. A Windows SERVICE install (silent,
+no per-session UAC) remains the documented alternative to the on-demand broker; the same IPC + auth +
+validation contract applies unchanged.

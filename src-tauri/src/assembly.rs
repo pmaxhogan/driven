@@ -402,14 +402,32 @@ async fn build_account(
     let power = Arc::new(RealPowerSource::new()?);
     // Spawn the 30s poller so `current()` / `subscribe()` reflect live OS power
     // transitions (battery<->AC, metered, reachability). The orchestrator's run
-    // loop subscribes to this internally (DESIGN s5.7 gate re-evaluation); the
-    // sleep/wake suspend/resume EDGES (DESIGN s5.10) arrive on a separate OS
-    // message-pump seam that does not exist yet, so they are not bridged here.
+    // loop subscribes to this internally (DESIGN s5.7 gate re-evaluation).
     //
     // R-P1-1: the poller loops FOREVER (no natural end), so its handle is KEPT
     // and stored in `AccountHandle` to be aborted on quit. Dropping it (the old
     // bug) detached the task and orphaned it past shutdown.
     let power_poller = power.spawn_poller();
+    // Start the OS sleep/wake EDGE monitor (DESIGN s5.10.1, issue #33): the
+    // per-OS backend (Win32 suspend/resume callback / macOS IOKit CFRunLoop /
+    // Linux logind DBus) broadcasts suspend/resume edges the orchestrator's run
+    // loop consumes via `subscribe_sleep_wake` to run the s5.10.2 / s5.10.3
+    // sequences at the edge instead of waiting for the 30 s poll. Best-effort:
+    // a registration failure is logged and the app degrades to the poll (the
+    // account still syncs). The returned monitor is stored in `AccountHandle`
+    // and torn down on quit so no OS handle / thread / task is orphaned.
+    let sleep_wake_monitor = match power.spawn_sleep_wake_monitor() {
+        Ok(monitor) => Some(monitor),
+        Err(err) => {
+            tracing::warn!(
+                target: TARGET,
+                account_id = %account.id,
+                %err,
+                "OS sleep/wake monitor unavailable; relying on the 30s power poll"
+            );
+            None
+        }
+    };
     let power: Arc<dyn driven_power::PowerSource> = power;
 
     // --- network: real ReqwestBackend-backed prober (Some, V-G) --------------
@@ -525,6 +543,7 @@ async fn build_account(
             watcher_bridge,
             event_bridge,
             power_poller,
+            sleep_wake_monitor,
             bridge_shutdown,
         },
     ))))

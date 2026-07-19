@@ -205,6 +205,15 @@ export interface UiSettings {
 
 export interface WindowsSettings {
   vssMode: string;
+  vssHelper: boolean;
+}
+
+/** Status of least-privilege locked-file backup (DESIGN s5.3.1). */
+export interface VssHelperStatus {
+  supported: boolean;
+  elevated: boolean;
+  helperEnabled: boolean;
+  lockedFileBackupDegraded: boolean;
 }
 
 export interface SettingsDto {
@@ -252,6 +261,7 @@ export interface UiSettingsPatch {
 
 export interface WindowsSettingsPatch {
   vssMode?: string;
+  vssHelper?: boolean;
 }
 
 export interface SettingsPatch {
@@ -333,12 +343,7 @@ export interface ActivityPageDto {
 
 /** `file_state.status` serialized form (mirrors driven_core FileStateStatus). */
 export type FileStateStatus =
-  | "synced"
-  | "pending"
-  | "corrupt"
-  | "locked"
-  | "error"
-  | "excluded_orphan";
+  "synced" | "pending" | "corrupt" | "locked" | "error" | "excluded_orphan";
 
 /** One per-status file count for the Activity header (M7-P2-5; mirrors src-tauri
  * FileStatusCountDto / DESIGN s8.3 "file count by status"). */

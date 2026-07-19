@@ -16,6 +16,7 @@ use driven_core::orchestrator::Orchestrator;
 use driven_core::state::StateRepo;
 use driven_core::types::AccountId;
 use driven_drive::fake::InMemoryRemoteStore;
+use driven_power::SleepWakeMonitor;
 use tokio::sync::{watch, Mutex};
 use tokio::task::JoinHandle;
 
@@ -70,6 +71,13 @@ pub struct AccountHandle {
     event_bridge: Mutex<Option<JoinHandle<()>>>,
     /// The power-source poller task. Looped forever; ABORTED on shutdown.
     power_poller: Mutex<Option<JoinHandle<()>>>,
+    /// The OS sleep/wake EDGE monitor (DESIGN s5.10.1, issue #33), or `None`
+    /// when its per-OS registration failed at build time (the app then degrades
+    /// to the 30 s poll). TORN DOWN on shutdown - its `stop()` unregisters the
+    /// Win32 suspend/resume callback / stops the macOS `CFRunLoop` thread /
+    /// aborts the Linux logind DBus task - so no OS handle, thread, or task
+    /// outlives the account.
+    sleep_wake_monitor: Mutex<Option<SleepWakeMonitor>>,
     /// Shutdown signal the watcher + event bridges `select!` on (R-P1-1). Set to
     /// `true` by [`Self::shutdown`] so a bridge whose source never closes
     /// (the watcher owns its `Sender`) still exits promptly.
@@ -113,6 +121,9 @@ pub struct AccountTasks {
     pub event_bridge: JoinHandle<()>,
     /// Power-source poll loop.
     pub power_poller: JoinHandle<()>,
+    /// The OS sleep/wake EDGE monitor (DESIGN s5.10.1, issue #33), or `None`
+    /// when its per-OS registration failed (degrade to the 30 s poll).
+    pub sleep_wake_monitor: Option<SleepWakeMonitor>,
     /// The sender the watcher + event bridges `select!` on for shutdown.
     pub bridge_shutdown: watch::Sender<bool>,
 }
@@ -129,6 +140,7 @@ impl AccountHandle {
             watcher_bridge: Mutex::new(tasks.watcher_bridge),
             event_bridge: Mutex::new(Some(tasks.event_bridge)),
             power_poller: Mutex::new(Some(tasks.power_poller)),
+            sleep_wake_monitor: Mutex::new(tasks.sleep_wake_monitor),
             bridge_shutdown: tasks.bridge_shutdown,
         }
     }
@@ -175,6 +187,15 @@ impl AccountHandle {
         drain_or_abort(&self.watcher_bridge, TASK_DRAIN_TIMEOUT).await;
         drain_or_abort(&self.event_bridge, TASK_DRAIN_TIMEOUT).await;
         drain_or_abort(&self.power_poller, TASK_DRAIN_TIMEOUT).await;
+
+        // 4) Tear down the OS sleep/wake monitor (issue #33): its `stop()`
+        //    unregisters the Win32 suspend/resume callback / stops the macOS
+        //    CFRunLoop thread / aborts the Linux logind DBus task, so no OS
+        //    handle, thread, or task outlives the account. A `None` (registration
+        //    failed at build time) is a no-op.
+        if let Some(monitor) = self.sleep_wake_monitor.lock().await.take() {
+            monitor.stop();
+        }
     }
 }
 
@@ -1247,6 +1268,7 @@ mod tests {
                 watcher_bridge: Some(watcher_bridge),
                 event_bridge,
                 power_poller,
+                sleep_wake_monitor: None,
                 bridge_shutdown,
             },
         );
@@ -1381,6 +1403,7 @@ mod tests {
                 watcher_bridge: None,
                 event_bridge,
                 power_poller,
+                sleep_wake_monitor: None,
                 bridge_shutdown,
             },
         );
@@ -1447,6 +1470,7 @@ mod tests {
                 watcher_bridge: None,
                 event_bridge,
                 power_poller,
+                sleep_wake_monitor: None,
                 bridge_shutdown,
             },
         );

@@ -6,13 +6,16 @@
 //! detection is delegated to [`crate::network`]. The source polls every
 //! 30 s (DESIGN s5.7) and broadcasts a fresh [`PowerState`] on change.
 //!
-//! Sleep / wake (DESIGN s5.10.1: the systemd-logind
-//! `org.freedesktop.login1.Manager.PrepareForSleep(bool)` DBus signal via
-//! `zbus`) is intentionally *not* wired here. Subscribing to that signal
-//! from a long-running task is a sizeable per-OS hook; the orchestrator
-//! consumes the resulting `PowerEvent`s on the same channel as
-//! power-source events and exercises that path against `FakePowerSource` in
-//! tests. See the TODO in [`RealPowerSource`].
+//! Sleep / wake (DESIGN s5.10.1) IS wired here (issue #33) via the
+//! systemd-logind `org.freedesktop.login1.Manager.PrepareForSleep(bool)` DBus
+//! signal, subscribed through a `zbus` `#[proxy]`-generated signal stream on a
+//! spawned task. `PrepareForSleep(true)` is the suspend edge, `(false)` the
+//! resume edge; the task maps each to a [`SleepWakeEvent`] and broadcasts it.
+//! The orchestrator subscribes via [`PowerSource::subscribe_sleep_wake`] and
+//! runs the s5.10.2 / s5.10.3 sequences at the edge instead of waiting for the
+//! 30 s poll. This backend is COMPILE-VERIFIED via CI's Linux job (the
+//! implementer builds on Windows); it is written against the documented logind
+//! interface + `zbus` signal-stream API.
 
 use std::path::Path;
 use std::path::PathBuf;
@@ -24,7 +27,7 @@ use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
 use crate::network::{detect_metered_blocking, reachable_hint, MeteredStatus};
-use crate::{PowerSource, PowerState};
+use crate::{PowerSource, PowerState, SleepWakeEvent, SleepWakeMonitor};
 
 /// Poll cadence for the sysfs power read (DESIGN s5.7).
 const POLL_INTERVAL: Duration = Duration::from_secs(30);
@@ -39,6 +42,25 @@ const BROADCAST_CAPACITY: usize = 16;
 /// to [`MeteredStatus::Unknown`] (not metered) and the poll proceeds.
 const METERED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
+/// Capacity of the sleep/wake edge broadcast channel. Edges are extremely
+/// rare (one per real suspend / resume), so a tiny buffer is ample.
+const SLEEP_WAKE_CAPACITY: usize = 8;
+
+/// The systemd-logind `Manager` DBus interface. `zbus`'s `#[proxy]` generates
+/// `LogindManagerProxy` (with `receive_prepare_for_sleep()` -> a signal
+/// `Stream`) and the `PrepareForSleepArgs` struct carrying the `start` bool.
+#[zbus::proxy(
+    interface = "org.freedesktop.login1.Manager",
+    default_service = "org.freedesktop.login1",
+    default_path = "/org/freedesktop/login1"
+)]
+trait LogindManager {
+    /// Emitted with `start = true` right before sleep/hibernate and
+    /// `start = false` right after resume (logind `PrepareForSleep`).
+    #[zbus(signal)]
+    fn prepare_for_sleep(&self, start: bool) -> zbus::Result<()>;
+}
+
 /// sysfs root for power-supply devices. A constant so tests can reason
 /// about the layout; the reader takes the root as a parameter.
 const POWER_SUPPLY_ROOT: &str = "/sys/class/power_supply";
@@ -48,6 +70,10 @@ const POWER_SUPPLY_ROOT: &str = "/sys/class/power_supply";
 pub struct RealPowerSource {
     latest: Arc<Mutex<PowerState>>,
     tx: broadcast::Sender<PowerState>,
+    /// Broadcasts OS sleep/wake edges (DESIGN s5.10.1). The monitor started by
+    /// [`Self::spawn_sleep_wake_monitor`] sends on a clone of this; subscribers
+    /// read via [`PowerSource::subscribe_sleep_wake`].
+    sleep_wake_tx: broadcast::Sender<SleepWakeEvent>,
 }
 
 impl RealPowerSource {
@@ -62,17 +88,18 @@ impl RealPowerSource {
     pub fn new() -> anyhow::Result<Self> {
         let initial = read_power_state(MeteredStatus::Unknown);
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
+        let (sleep_wake_tx, _sw_rx) = broadcast::channel(SLEEP_WAKE_CAPACITY);
         Ok(Self {
             latest: Arc::new(Mutex::new(initial)),
             tx,
+            sleep_wake_tx,
         })
     }
 
     /// Spawns the 30 s polling loop, broadcasting on change.
     ///
-    /// TODO(DESIGN s5.10.1): subscribe to the logind `PrepareForSleep` DBus
-    /// signal via `zbus` to emit `Suspending` / `Resumed`. Until then the
-    /// orchestrator relies on the 30 s poll plus network re-probe on wake.
+    /// The sleep/wake EDGE seam (DESIGN s5.10.1) is separate; start it via
+    /// [`Self::spawn_sleep_wake_monitor`].
     pub fn spawn_poller(&self) -> tokio::task::JoinHandle<()> {
         let latest = Arc::clone(&self.latest);
         let tx = self.tx.clone();
@@ -91,6 +118,82 @@ impl RealPowerSource {
                 }
             }
         })
+    }
+
+    /// Starts the OS sleep/wake monitor (DESIGN s5.10.1, issue #33).
+    ///
+    /// Spawns a task that connects to the SYSTEM bus, subscribes to logind's
+    /// `PrepareForSleep` signal, and broadcasts the mapped [`SleepWakeEvent`]
+    /// on a clone of this source's `sleep_wake_tx` for each edge; subscribers
+    /// read them via [`PowerSource::subscribe_sleep_wake`].
+    ///
+    /// Best-effort: if the system bus / logind is unavailable (e.g. a container
+    /// without a session bus), the task logs and exits, and the app degrades to
+    /// the 30 s poll - so this never returns an error. The returned
+    /// [`SleepWakeMonitor`] aborts the task on drop / [`SleepWakeMonitor::stop`],
+    /// leaving no orphaned task on a clean quit.
+    ///
+    /// Must be called from within a Tokio runtime (the app-shell does, exactly
+    /// as it calls [`Self::spawn_poller`]).
+    pub fn spawn_sleep_wake_monitor(&self) -> anyhow::Result<SleepWakeMonitor> {
+        let tx = self.sleep_wake_tx.clone();
+        let handle = tokio::spawn(run_sleep_wake_task(tx));
+        Ok(SleepWakeMonitor::new(move || handle.abort()))
+    }
+}
+
+/// Maps a logind `PrepareForSleep(start)` argument to a [`SleepWakeEvent`]:
+/// `start = true` is the suspend edge, `false` the resume edge. Pure, so it is
+/// unit-tested without a DBus bus.
+fn sleep_wake_from_prepare(start: bool) -> SleepWakeEvent {
+    if start {
+        SleepWakeEvent::Suspending
+    } else {
+        SleepWakeEvent::Resumed
+    }
+}
+
+/// The sleep/wake task body: subscribe to logind `PrepareForSleep` and
+/// broadcast each mapped edge. Any setup error (no system bus, no logind) is
+/// logged and ends the task - the 30 s poll remains the fallback.
+async fn run_sleep_wake_task(tx: broadcast::Sender<SleepWakeEvent>) {
+    use futures_util::stream::StreamExt;
+
+    let conn = match zbus::Connection::system().await {
+        Ok(c) => c,
+        Err(err) => {
+            tracing::warn!(%err, "sleep/wake: cannot reach the system DBus; relying on the 30s poll");
+            return;
+        }
+    };
+    let proxy = match LogindManagerProxy::new(&conn).await {
+        Ok(p) => p,
+        Err(err) => {
+            tracing::warn!(%err, "sleep/wake: cannot build the logind proxy; relying on the 30s poll");
+            return;
+        }
+    };
+    let mut stream = match proxy.receive_prepare_for_sleep().await {
+        Ok(s) => s,
+        Err(err) => {
+            tracing::warn!(%err, "sleep/wake: cannot subscribe to logind PrepareForSleep; relying on the 30s poll");
+            return;
+        }
+    };
+
+    tracing::debug!("sleep/wake: subscribed to logind PrepareForSleep");
+    while let Some(signal) = stream.next().await {
+        let start = match signal.args() {
+            Ok(args) => args.start,
+            Err(err) => {
+                tracing::warn!(%err, "sleep/wake: malformed PrepareForSleep signal; ignoring");
+                continue;
+            }
+        };
+        let event = sleep_wake_from_prepare(start);
+        tracing::debug!(?event, "sleep/wake: logind PrepareForSleep edge");
+        // A send error only means no live subscribers - benign.
+        let _ = tx.send(event);
     }
 }
 
@@ -123,6 +226,10 @@ impl PowerSource for RealPowerSource {
 
     fn subscribe(&self) -> broadcast::Receiver<PowerState> {
         self.tx.subscribe()
+    }
+
+    fn subscribe_sleep_wake(&self) -> broadcast::Receiver<SleepWakeEvent> {
+        self.sleep_wake_tx.subscribe()
     }
 }
 
@@ -245,5 +352,24 @@ mod tests {
         if let Some(pct) = state.battery_percent {
             assert!(pct <= 100);
         }
+    }
+
+    /// The pure logind `PrepareForSleep(start)` -> [`SleepWakeEvent`] mapping,
+    /// tested without a DBus bus: `true` (about to sleep) -> `Suspending`,
+    /// `false` (just woke) -> `Resumed`.
+    #[test]
+    fn prepare_for_sleep_maps_to_sleep_wake_events() {
+        assert_eq!(sleep_wake_from_prepare(true), SleepWakeEvent::Suspending);
+        assert_eq!(sleep_wake_from_prepare(false), SleepWakeEvent::Resumed);
+    }
+
+    /// A `SleepWakeEvent` sent on the source's own sleep/wake channel reaches a
+    /// `subscribe_sleep_wake` subscriber - the plumbing the DBus task drives.
+    #[tokio::test]
+    async fn subscribe_sleep_wake_delivers_edges() {
+        let src = RealPowerSource::new().expect("construct RealPowerSource");
+        let mut rx = src.subscribe_sleep_wake();
+        let _ = src.sleep_wake_tx.send(SleepWakeEvent::Resumed);
+        assert_eq!(rx.recv().await.unwrap(), SleepWakeEvent::Resumed);
     }
 }
