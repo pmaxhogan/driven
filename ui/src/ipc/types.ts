@@ -437,6 +437,34 @@ export interface RestoreItem {
   relativePath: string;
 }
 
+/** Issue #36: per-source point-in-time versioning config (mirrors src-tauri /
+ * driven-core VersioningConfig). Stored in the settings KV, not a source column. */
+export interface VersioningConfig {
+  /** When true, a content change creates a NEW backup version and keeps the old
+   * one restorable, instead of overwriting in place. */
+  enabled: boolean;
+  /** Max retained versions per file (server-clamped to [1, 1000]). */
+  countCap: number;
+  /** Size guard in bytes: changes to files larger than this are not versioned.
+   * `0` disables the guard. */
+  maxBytes: number;
+}
+
+/** Issue #36: one retained point-in-time version of a file (mirrors src-tauri
+ * FileVersionDto). It was the file's current content during
+ * `[createdAt, supersededAt)` (Unix ms). */
+export interface FileVersionDto {
+  /** Plaintext size in bytes. */
+  size: number;
+  /** When this version first became the current backup (Unix ms). */
+  createdAt: number;
+  /** When it was superseded by the next version (Unix ms). */
+  supersededAt: number;
+  /** True once the old Drive object was moved to trash (restorable by date until
+   * Drive purges its trash). */
+  trashed: boolean;
+}
+
 /** The opaque id of a spawned restore job (mirrors src-tauri RestoreJobId). */
 export type RestoreJobId = string;
 

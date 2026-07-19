@@ -442,6 +442,109 @@ pub struct RestoreFileRow {
     pub drive_file_id: Option<String>,
 }
 
+/// Issue #36: the per-source point-in-time versioning configuration.
+///
+/// Stored in the `settings` KV table (NOT a `backup_sources` column) under key
+/// `versioning:<source_id>` so the change is purely additive and never touches
+/// the crash-safety-critical source-insert SQL. Absent / unparsable settings
+/// decode to [`VersioningConfig::default`] (versioning OFF), so an existing
+/// install behaves exactly as before until the user opts in.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct VersioningConfig {
+    /// When `true`, a content change to an already-uploaded file creates a NEW
+    /// Drive object, flips the `file_state` pointer, and trashes the old object
+    /// (retained as a restorable version). When `false`, the change is an
+    /// in-place `update` (the pre-#36 behaviour); no versions are kept.
+    pub enabled: bool,
+    /// Max superseded versions retained per file. Once a file has more than this
+    /// many stored versions the OLDEST are pruned (hard-deleted from Drive).
+    /// Clamped to at least 1 on read. Default 10.
+    pub count_cap: u32,
+    /// Size guard: a change whose OLD (to-be-retained) version is larger than
+    /// this many bytes is NOT versioned (it falls back to an in-place update), so
+    /// a per-source cap bounds the cost of versioning very large files. `0` (the
+    /// default) disables the guard (version regardless of size).
+    pub max_bytes: u64,
+}
+
+impl Default for VersioningConfig {
+    fn default() -> Self {
+        Self {
+            enabled: false,
+            count_cap: 10,
+            max_bytes: 0,
+        }
+    }
+}
+
+impl VersioningConfig {
+    /// The `settings` key holding a source's versioning config.
+    pub fn settings_key(source: SourceId) -> String {
+        format!("versioning:{source}")
+    }
+
+    /// The effective retained-version cap (never below 1).
+    pub fn effective_cap(&self) -> u32 {
+        self.count_cap.max(1)
+    }
+}
+
+/// Issue #36: a superseded version to record during a versioned supersede - the
+/// OLD `file_state` identity captured at the moment a NEW object replaces it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewFileVersion {
+    /// Source the version belongs to.
+    pub source_id: SourceId,
+    /// Plaintext relative path (the `file_state` key).
+    pub relative_path: RelativePath,
+    /// The OLD Drive `file_id` this version's bytes live under (now trashed).
+    pub drive_file_id: String,
+    /// Plaintext size in bytes.
+    pub size: u64,
+    /// Plaintext BLAKE3 (32 bytes) - restore verifies the decrypted plaintext
+    /// against this.
+    pub hash_blake3: [u8; 32],
+    /// Ciphertext md5 (16 bytes) for an encrypted source; `None` otherwise.
+    pub drive_md5: Option<[u8; 16]>,
+    /// Cached encrypted remote path for an encrypted source; `None` otherwise.
+    pub encrypted_remote_path: Option<String>,
+    /// Wall-time this version first became current (the old `last_uploaded_at`).
+    pub created_at: UnixMs,
+    /// Wall-time it was superseded (the replacing upload's time).
+    pub superseded_at: UnixMs,
+}
+
+/// Issue #36: one stored `file_versions` row - a superseded version retained for
+/// point-in-time restore. It was the file's current content during the half-open
+/// window `[created_at, superseded_at)`.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FileVersionRow {
+    /// Auto-increment id.
+    pub id: i64,
+    /// Source the version belongs to.
+    pub source_id: SourceId,
+    /// Plaintext relative path.
+    pub relative_path: RelativePath,
+    /// The Drive `file_id` this version's bytes live under (trashed once
+    /// `trashed` is set).
+    pub drive_file_id: String,
+    /// Plaintext size in bytes.
+    pub size: u64,
+    /// Plaintext BLAKE3 (32 bytes).
+    pub hash_blake3: [u8; 32],
+    /// Ciphertext md5 (16 bytes) for an encrypted source; `None` otherwise.
+    pub drive_md5: Option<[u8; 16]>,
+    /// Cached encrypted remote path for an encrypted source; `None` otherwise.
+    pub encrypted_remote_path: Option<String>,
+    /// Wall-time this version first became current.
+    pub created_at: UnixMs,
+    /// Wall-time it was superseded.
+    pub superseded_at: UnixMs,
+    /// `true` once the old Drive object has been moved to trash.
+    pub trashed: bool,
+}
+
 /// R3-P2-3: the IMMEDIATE children of one Restore-tree folder, computed in SQL
 /// (not derived from a capped scan of all descendants). The Restore browser opens
 /// one folder at a time and needs only its direct sub-folders + direct files; the
@@ -484,6 +587,9 @@ pub const KNOWN_STATE_TABLES: &[&str] = &[
     "settings",
     "file_checksum_mismatch",
     "recovery_phrase_acks",
+    // Issue #36 (migration 0006): per-file superseded-version records for the
+    // trash-as-version-store point-in-time restore.
+    "file_versions",
 ];
 
 /// Storage contract for the SQLite-backed state at
@@ -990,6 +1096,163 @@ pub trait StateRepo: Send + Sync {
         op_id: PendingOpId,
         file_state: &FileStateRow,
     ) -> Result<()>;
+
+    // --- versioning (issue #36) ---------------------------------------------
+
+    /// The per-source versioning config, read from the `settings` KV under
+    /// [`VersioningConfig::settings_key`]. An absent / unparsable value decodes
+    /// to [`VersioningConfig::default`] (versioning OFF), so an existing install
+    /// behaves as before until the user opts in. Default impl over `get_setting`
+    /// (no bespoke SQL).
+    async fn versioning_config(&self, source: SourceId) -> Result<VersioningConfig> {
+        match self
+            .get_setting(&VersioningConfig::settings_key(source))
+            .await?
+        {
+            Some(v) => Ok(serde_json::from_value(v).unwrap_or_default()),
+            None => Ok(VersioningConfig::default()),
+        }
+    }
+
+    /// Persist a source's versioning config into the `settings` KV. Default impl
+    /// over `set_setting`.
+    async fn set_versioning_config(&self, source: SourceId, cfg: &VersioningConfig) -> Result<()> {
+        let value = serde_json::to_value(cfg)?;
+        self.set_setting(&VersioningConfig::settings_key(source), &value)
+            .await
+    }
+
+    /// Delete a `settings` KV entry by key (used to clean up a source's
+    /// `versioning:<id>` config on source removal). Idempotent - deleting an
+    /// absent key succeeds. Default is a no-op so test fakes need not implement
+    /// it; the real SQLite store overrides it.
+    async fn delete_setting(&self, _key: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Atomically commit a VERSIONED supersede (issue #36): in ONE transaction,
+    /// (1) insert the `file_versions` row for the OLD object, (2) upsert
+    /// `file_state` to the NEW object (the pointer flip), and (3) delete the
+    /// finalizing `upload` pending_op. Same load-bearing atomicity as
+    /// [`Self::commit_create_result`]: a crash cannot leave the version recorded
+    /// without the pointer flipped, or vice versa.
+    ///
+    /// The default SAFELY degrades to a plain create-commit (the pointer flip
+    /// WITHOUT recording the version) so a `StateRepo` that does not support
+    /// versioning still commits correctly; the real SQLite store overrides it to
+    /// record the version too.
+    async fn commit_versioned_create_result(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+        _superseded: &NewFileVersion,
+    ) -> Result<()> {
+        self.commit_create_result(op_id, file_state).await
+    }
+
+    /// Insert a `file_versions` row on its own (used by the reconcile adopt path,
+    /// where the pointer flip is committed separately by `commit_create_result`).
+    /// Returns the new row id. Default no-op (returns 0); the real store overrides.
+    async fn insert_file_version(&self, _version: &NewFileVersion) -> Result<i64> {
+        Ok(0)
+    }
+
+    /// Atomically commit an IDENTICAL-CONTENT touch (issue #36): an mtime-only
+    /// re-upload produced a byte-for-byte DUPLICATE Drive object, so the OLD
+    /// object stays current and the redundant NEW object must be trashed. In ONE
+    /// transaction, (1) upsert `file_state` to `file_state` (the OLD pointer, with
+    /// the touch's new size/mtime) and (2) REWRITE the finalizing `upload`
+    /// pending_op's payload to `marker_payload_json` - which carries the redundant
+    /// object's id so the reconcile sweep can RETRY its trash if the immediate
+    /// best-effort trash fails or the process crashes. Unlike
+    /// [`Self::commit_create_result`] the op is KEPT (as a durable cleanup
+    /// handle), not deleted; the caller drops it only once the redundant object is
+    /// confirmed trashed. Same load-bearing atomicity: a crash cannot upsert the
+    /// pointer without persisting the retry handle, or vice versa.
+    ///
+    /// The default SAFELY degrades to a plain create-commit (the pointer upsert,
+    /// dropping the op WITHOUT persisting the retry handle) so a `StateRepo` that
+    /// does not support versioning still commits correctly; the real SQLite store
+    /// overrides it to keep the op with the marker payload.
+    async fn commit_identical_touch_result(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+        _marker_payload_json: &serde_json::Value,
+    ) -> Result<()> {
+        self.commit_create_result(op_id, file_state).await
+    }
+
+    /// Mark the stored version whose old Drive object is `drive_file_id` as
+    /// trashed (`trashed = 1`). Keyed by drive id (each superseded object appears
+    /// in at most one version row); a no-op when the id is not a tracked version
+    /// (e.g. a redundant duplicate from an identical-content touch). Default
+    /// no-op; the real store overrides.
+    async fn mark_version_trashed(&self, _drive_file_id: &str) -> Result<()> {
+        Ok(())
+    }
+
+    /// Delete a `file_versions` row by id (used by the count-cap prune after the
+    /// old Drive object is hard-deleted). Default no-op; the real store overrides.
+    async fn delete_version_row(&self, _version_id: i64) -> Result<()> {
+        Ok(())
+    }
+
+    /// All stored versions of one file, newest-first (by `superseded_at`).
+    /// Default empty; the real store overrides.
+    async fn list_file_versions(
+        &self,
+        _source: SourceId,
+        _path: &RelativePath,
+    ) -> Result<Vec<FileVersionRow>> {
+        Ok(Vec::new())
+    }
+
+    /// The stored version whose validity window contains `as_of`
+    /// (`created_at <= as_of < superseded_at`), if any. Used by the Restore
+    /// "as of <date>" resolver for a still-tracked file whose CURRENT bytes
+    /// post-date `as_of`. Default `None`; the real store overrides.
+    async fn resolve_version_at(
+        &self,
+        _source: SourceId,
+        _path: &RelativePath,
+        _as_of: UnixMs,
+    ) -> Result<Option<FileVersionRow>> {
+        Ok(None)
+    }
+
+    /// The versions of one file BEYOND the newest `cap` (i.e. the ones the
+    /// count-cap prune should hard-delete). Empty when the file has `<= cap`
+    /// versions. Order within the returned set is unspecified (the prune deletes
+    /// all of them). Default empty; the real store overrides.
+    async fn versions_over_cap(
+        &self,
+        _source: SourceId,
+        _path: &RelativePath,
+        _cap: u32,
+    ) -> Result<Vec<FileVersionRow>> {
+        Ok(Vec::new())
+    }
+
+    /// Every stored version of a source whose old object is not yet trashed
+    /// (`trashed = 0`), for the reconcile sweep that retries a best-effort trash
+    /// that previously failed. Default empty; the real store overrides.
+    async fn untrashed_versions_for_source(
+        &self,
+        _source: SourceId,
+    ) -> Result<Vec<FileVersionRow>> {
+        Ok(Vec::new())
+    }
+
+    /// `true` iff ANY `file_state` row (across ALL sources) still points at
+    /// `drive_file_id`. The global guard before trashing / hard-deleting a
+    /// superseded object: a shared object (e.g. a future small-file bundle, #35)
+    /// or one still referenced as a live pointer must never be removed. Default
+    /// is the SAFE, conservative `true` (treat as live -> never remove); the real
+    /// store overrides with the actual `file_state` lookup.
+    async fn drive_file_id_is_live(&self, _drive_file_id: &str) -> Result<bool> {
+        Ok(true)
+    }
 
     // --- activity_log -------------------------------------------------------
 

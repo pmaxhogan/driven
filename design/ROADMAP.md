@@ -603,8 +603,12 @@ Tracked as separate roadmap items, no fixed sequence yet:
 - **Pre/post backup shell hooks.**
 - **rclone-crypt-format compatibility** (opt-in second format).
 - **Block-level dedup (CDC)** for huge frequently-rewritten files.
-- **Restore-by-date / point-in-time** (requires per-file version history
-  in `file_state`).
+- **Restore-by-date / point-in-time** - LANDED (issue #36) as an opt-in
+  per-source trash-as-version-store: a new `file_versions` table + an executor
+  create-flip-trash path + a `restore_files(as_of)` resolver + a Restore
+  "as of <date>" picker. See DESIGN §5.5.1. Follow-up: point-in-time restore of
+  files that were locally DELETED (this slice covers older versions of
+  still-tracked files).
 - **Small-file bundling (tar.gz batches)** — pack dirs of many tiny files
   into a single bundle per scan to escape Drive's per-file API overhead;
   see DESIGN.md §17 for the heuristic and tradeoffs.

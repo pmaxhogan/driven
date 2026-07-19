@@ -642,6 +642,53 @@ on Drive / move to Driven trash / permanently delete?") with explicit user
 action. The implicit-deletion path is reserved for *actual local file
 deletions* only.
 
+### 5.5.1 Point-in-time versioning (trash-as-version-store, issue #36)
+
+Opt-in per source. When a source has versioning ENABLED, a content change to
+an already-uploaded file is applied as a CREATE of a NEW Drive object followed
+by an atomic pointer flip and a trash of the OLD object, instead of the default
+in-place `update` (PATCH). The OLD object survives - retrievable by id from
+Drive's trash - as a prior VERSION, so the user can "restore as of <date>".
+
+Mechanism (executor `upload_and_commit`):
+- The change routes through the existing, crash-safe CREATE path (fresh
+  `client_op_uuid`; `pending_ops.payload_json.drive_file_id` stays `null` so
+  reconciliation treats it as a pure create). The old id rides in a new
+  additive payload field `supersedes_drive_file_id`.
+- On success, `commit_versioned_create_result` runs ONE transaction: insert a
+  `file_versions` row for the OLD object (`created_at` = the old
+  `last_uploaded_at`, `superseded_at` = now), upsert `file_state` to the NEW
+  object (the atomic pointer flip), delete the finalizing `upload` op.
+- The OLD object is then best-effort trashed (guarded by a GLOBAL "no live
+  `file_state` pointer references this id" check, so a shared object - e.g. a
+  future small-file bundle - is never trashed); a reconcile startup sweep
+  retries any left un-trashed.
+- Cost is bounded per source: a **count cap** (`versions_over_cap` +
+  `delete_permanent` hard-deletes the oldest excess, also guarded) and an
+  optional **size guard** (`max_bytes`; a larger old object falls back to an
+  in-place update). Config lives in the `settings` KV under
+  `versioning:<source_id>` - additive, no `backup_sources` schema change.
+- An identical-content touch (new plaintext BLAKE3 == old) keeps the old object
+  and trashes the redundant new one WITHOUT recording a version, so a repeated
+  mtime-only touch cannot evict real history via the cap.
+
+Data-format note (post-1.0): additive `file_versions` table (migration 0006)
+plus the KV config; versioning is OFF by default, so existing installs are
+byte-for-byte unchanged. This is a `feat` (minor), not a `feat!`.
+
+Restore-by-date (`restore_files(..., as_of)`): per selected file, if the current
+bytes were already in place at `as_of` restore them, else resolve the
+`file_versions` row whose `[created_at, superseded_at)` window contains `as_of`
+and download THAT object (Drive downloads work on trashed objects), verifying
+against the version's plaintext BLAKE3 + size. A missing version (predates
+versioning, size-guarded, pruned, or purged from trash) rejects the job with a
+clear message; a version whose object was purged surfaces the normal per-file
+download error. **Limitations (documented follow-ups):** the version store is
+bounded by Drive's ~30-day trash retention (and a manual "empty trash" wipes
+it); and files that were *deleted* locally are out of scope for point-in-time
+restore in this slice (the tree browses current `file_state` only) - restoring
+a since-deleted file as of a past date is the primary follow-up.
+
 ### 5.6 Crash-safe execution & reconciliation
 
 The hard problem: a `pending_op` row + an external Drive create are two

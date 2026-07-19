@@ -264,6 +264,40 @@ pub async fn scenario_trash_idempotent(store: &dyn RemoteStore, root: &str) {
         .expect("404 on stale id is success");
 }
 
+/// Issue #36: `delete_permanent` hard-deletes by id and is idempotent - a
+/// second delete and a delete of an unknown/already-purged id both succeed
+/// (404 == success), and after a delete the object is gone (metadata errors).
+pub async fn scenario_delete_permanent(store: &dyn RemoteStore, root: &str) {
+    let created = store
+        .create(
+            root,
+            "purge-me.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"purge")),
+            props(&[]),
+        )
+        .await
+        .expect("create");
+    store
+        .delete_permanent(&created.id)
+        .await
+        .expect("delete_permanent once");
+    // Gone: metadata for a permanently-deleted object must fail.
+    assert!(
+        store.metadata(&created.id).await.is_err(),
+        "a permanently-deleted object must no longer be fetchable"
+    );
+    // Idempotent: deleting the already-gone id, and an unknown id, both succeed.
+    store
+        .delete_permanent(&created.id)
+        .await
+        .expect("delete_permanent twice idempotent");
+    store
+        .delete_permanent("00000000-0000-0000-0000-000000000000")
+        .await
+        .expect("404 on unknown id is success");
+}
+
 /// `find_by_op_uuid`: None when never used, Some(unique) when set,
 /// most-recent + warning when duplicated (SPEC s3 + DESIGN s5.6).
 pub async fn scenario_find_by_op_uuid(store: &dyn RemoteStore, root: &str) {

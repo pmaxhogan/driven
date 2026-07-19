@@ -18,6 +18,7 @@ import type {
   ExclusionPreview,
   ExclusionPreviewRequest,
   FileSearchHitDto,
+  FileVersionDto,
   GlobalSyncStatus,
   OAuthAuthUrl,
   OAuthStatus,
@@ -35,6 +36,7 @@ import type {
   SourceDto,
   SourcePatch,
   UpdateInfo,
+  VersioningConfig,
   VssHelperStatus,
 } from "./types";
 
@@ -118,6 +120,20 @@ export function pickDriveFolder(
 
 export function previewExclusions(req: ExclusionPreviewRequest): Promise<ExclusionPreview> {
   return invoke("preview_exclusions", { req });
+}
+
+/** Issue #36: the per-source point-in-time versioning config (absent -> OFF). */
+export function getSourceVersioning(sourceId: string): Promise<VersioningConfig> {
+  return invoke("get_source_versioning", { sourceId });
+}
+
+/** Issue #36: enable/configure per-source point-in-time versioning. `countCap` is
+ * clamped server-side to `[1, 1000]`. Returns the persisted config. */
+export function setSourceVersioning(
+  sourceId: string,
+  config: VersioningConfig
+): Promise<VersioningConfig> {
+  return invoke("set_source_versioning", { sourceId, config });
 }
 
 /** M9c D4 (M6 R4-P1-1, DATA-SAFETY): backend-reveal the recovery phrase for a
@@ -322,8 +338,25 @@ export function searchFiles(
  * `destToken` is a one-shot token from `pickFolderDialog` (the webview never
  * supplies a raw path). Returns the spawned job id; progress arrives on
  * `restore:progress` (subscribe via `onRestoreProgress`). */
-export function restoreFiles(items: RestoreItem[], destToken: string): Promise<RestoreJobId> {
-  return invoke("restore_files", { items, destToken });
+export function restoreFiles(
+  items: RestoreItem[],
+  destToken: string,
+  /** Issue #36: optional point-in-time (Unix ms). When set, each file is
+   * restored as it was backed up as of that instant (the current bytes if they
+   * were already in place, else the retained version whose window covers it). */
+  asOf?: number | null
+): Promise<RestoreJobId> {
+  return invoke("restore_files", { items, destToken, asOf: asOf ?? null });
+}
+
+/** Issue #36: the retained point-in-time versions of one file, newest-first.
+ * Reads local `file_versions` metadata (never Drive). Powers the version-history
+ * view so the user can see which dates have a restorable version. */
+export function listFileVersions(
+  sourceId: string,
+  relativePath: string
+): Promise<FileVersionDto[]> {
+  return invoke("list_file_versions", { sourceId, relativePath });
 }
 
 /** The current status snapshot of a restore job (SPEC s11.5), for a late /

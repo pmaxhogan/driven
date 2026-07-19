@@ -112,6 +112,29 @@ describe("Restore virtualization + sticky action bar (UI #47)", () => {
     wrapper.unmount();
   });
 
+  it("exposes a point-in-time as-of picker that drives the store (issue #36)", async () => {
+    const wrapper = mount(Restore, { global: { plugins: [i18n] } });
+    await flushPromises();
+
+    const asOf = wrapper.get('[data-testid="restore-as-of"]');
+    // Default: latest (no point-in-time), so the active notice is hidden.
+    expect(wrapper.find('[data-testid="restore-as-of-note"]').exists()).toBe(false);
+
+    // Setting a datetime activates point-in-time and shows the TTL notice.
+    await asOf.setValue("2026-01-02T03:04");
+    await asOf.trigger("change");
+    await flushPromises();
+    const note = wrapper.get('[data-testid="restore-as-of-note"]');
+    expect(note.text()).toContain(i18n.global.t("restore.asOf.ttlHint"));
+
+    // Clearing returns to latest and hides the notice.
+    await wrapper.get('[data-testid="restore-as-of-clear"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="restore-as-of-note"]').exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
   it("renders the action bar as a sticky bottom footer", async () => {
     const wrapper = mount(Restore, { global: { plugins: [i18n] } });
     await flushPromises();

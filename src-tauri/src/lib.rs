@@ -586,6 +586,9 @@ pub fn run() {
             commands::sources::remove_source,
             commands::sources::pick_drive_folder,
             commands::sources::preview_exclusions,
+            // Issue #36: per-source point-in-time versioning config.
+            commands::sources::get_source_versioning,
+            commands::sources::set_source_versioning,
             // M9c D4 (M6 R4-P1-1, DATA-SAFETY): backend recovery-phrase reveal +
             // ack gate. The first encrypted source is persisted disabled until the
             // phrase is revealed by the backend AND acknowledged.
@@ -627,6 +630,8 @@ pub fn run() {
             commands::restore::restore_files,
             commands::restore::get_restore_job,
             commands::restore::cancel_restore_job,
+            // Issue #36: per-file point-in-time version history.
+            commands::restore::list_file_versions,
         ])
         .build(tauri::generate_context!());
 

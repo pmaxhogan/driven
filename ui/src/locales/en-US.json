@@ -145,6 +145,12 @@
       },
       "editExclusionsButton": "Edit exclusions",
       "runNowButton": "Run now",
+      "versioningButton": "Versioning",
+      "versioning": {
+        "intro": "Keep previous versions so you can restore this source's files as they were on an earlier date. Older versions are kept in Drive's trash (which Drive may purge after ~30 days).",
+        "enabledLabel": "Keep previous versions of changed files",
+        "capLabel": "Versions to keep per file"
+      },
       "removeButton": "Remove",
       "deleteRemoteLabel": "Also delete backed-up files from Drive",
       "pendingRecoveryAckBadge": "Awaiting recovery phrase",
@@ -391,6 +397,12 @@
     "selectedCount": "{count} selected",
     "clearSelection": "Clear selection",
     "pickDestination": "Choose destination...",
+    "asOf": {
+      "label": "Restore as of",
+      "clear": "Latest",
+      "active": "Restoring files as they were backed up on {date}.",
+      "ttlHint": "Older versions are kept in Drive's trash and may be purged after ~30 days."
+    },
     "start": "Restore selected",
     "cancel": "Cancel restore",
     "cancelling": "Cancelling...",

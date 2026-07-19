@@ -42,6 +42,18 @@ const hasSources = computed(() => restore.sources.length > 0);
 // The search box model (applied to the store on input).
 const searchInput = ref("");
 
+// Issue #36: point-in-time "as of" control. A native datetime-local input; its
+// value is pushed to the store (parsed to a Unix-ms instant) so the next restore
+// fetches each file as it was backed up at that moment. Empty = restore latest.
+const asOfInput = ref("");
+function onAsOfChange(): void {
+  restore.setAsOf(asOfInput.value || null);
+}
+function onClearAsOf(): void {
+  asOfInput.value = "";
+  restore.setAsOf(null);
+}
+
 // Locale-aware byte formatting (DESIGN s8.7: never a hand-rolled formatter).
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"] as const;
 function formatBytes(bytes: number): string {
@@ -341,6 +353,30 @@ async function onClearSearch(): Promise<void> {
         {{ t("restore.clearSelection") }}
       </button>
 
+      <!-- Issue #36: point-in-time "as of" picker. When set, the restore fetches
+           each file as it was backed up at that instant. -->
+      <label class="flex items-center gap-1.5 text-sm">
+        <span class="text-zinc-600 dark:text-zinc-400">{{ t("restore.asOf.label") }}</span>
+        <input
+          v-model="asOfInput"
+          type="datetime-local"
+          class="w-52"
+          :class="SELECT_INPUT"
+          :aria-label="t('restore.asOf.label')"
+          data-testid="restore-as-of"
+          @change="onAsOfChange"
+        />
+        <button
+          v-if="restore.asOf !== null"
+          type="button"
+          :class="LINK_BTN"
+          data-testid="restore-as-of-clear"
+          @click="onClearAsOf"
+        >
+          {{ t("restore.asOf.clear") }}
+        </button>
+      </label>
+
       <span class="flex-1" />
 
       <button type="button" :class="SECONDARY_BTN" @click="restore.pickDestination">
@@ -374,6 +410,17 @@ async function onClearSearch(): Promise<void> {
         {{ restore.cancelling ? t("restore.cancelling") : t("restore.cancel") }}
       </button>
     </div>
+
+    <!-- Issue #36: active point-in-time notice + the ~30-day trash-retention
+         caveat (older versions live in Drive's trash, which Drive purges). -->
+    <p
+      v-if="restore.asOf !== null"
+      data-testid="restore-as-of-note"
+      class="rounded-lg border border-teal-300 bg-teal-50 px-3 py-2 text-sm text-teal-800 dark:border-teal-800 dark:bg-teal-950 dark:text-teal-300"
+    >
+      {{ t("restore.asOf.active", { date: new Date(restore.asOf).toLocaleString(locale) }) }}
+      {{ t("restore.asOf.ttlHint") }}
+    </p>
 
     <!-- Live restore progress -->
     <div v-if="restore.job" :class="CARD" class="space-y-2">

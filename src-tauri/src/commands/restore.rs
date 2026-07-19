@@ -234,6 +234,13 @@ pub async fn restore_files(
     state: State<'_, AppState>,
     items: Vec<RestoreItem>,
     dest_token: String,
+    // Issue #36: optional point-in-time. When `Some(unix_ms)`, each file is
+    // restored AS OF that instant: the current bytes if they were already in
+    // place then, else the retained version whose validity window contains it. A
+    // selected file with no backed-up version as of that instant rejects the
+    // whole job with a clear message (so the user never silently gets current
+    // or wrong-era content). `None` restores the latest bytes (pre-#36 behaviour).
+    as_of: Option<i64>,
 ) -> CommandResult<RestoreJobId> {
     if items.is_empty() {
         return Err(CommandError::with_code(
@@ -285,7 +292,7 @@ pub async fn restore_files(
     // is spawned, rather than flowing in and failing later as `internal.bug`. This
     // resolution + the R3-P1-1 collision pre-check are token-INDEPENDENT, so they
     // run BEFORE the dialog token is consumed (R3-P2-1).
-    let resolved = resolve_restore_items(state.inner(), &items).await?;
+    let resolved = resolve_restore_items(state.inner(), &items, as_of).await?;
 
     // R2-P2-1: build ALL fallible setup (the per-account remote stores + crypto
     // suites the job will use) BEFORE seeding/emitting the job, so an early Err
@@ -432,6 +439,7 @@ pub async fn restore_files(
 async fn resolve_restore_items(
     state: &AppState,
     items: &[RestoreItem],
+    as_of: Option<i64>,
 ) -> CommandResult<Vec<ResolvedRestore>> {
     let mut resolved: Vec<ResolvedRestore> = Vec::with_capacity(items.len());
     for item in items {
@@ -483,12 +491,43 @@ async fn resolve_restore_items(
                 ),
             ));
         }
+        // Issue #36: pick the effective (drive_file_id, size, hash) for the
+        // requested instant. Without `as_of`, or when the current bytes were
+        // already in place at `as_of`, restore the current object; otherwise
+        // restore the retained version whose window covers `as_of`. A missing
+        // version rejects the whole job with a clear message.
+        let (drive_file_id, size, hash_blake3) = match as_of {
+            None => (row.drive_file_id.clone(), row.size, row.hash_blake3),
+            Some(t) if row.last_uploaded_at.is_some_and(|c| t >= c) => {
+                // The current bytes were already the live version at `t`.
+                (row.drive_file_id.clone(), row.size, row.hash_blake3)
+            }
+            Some(t) => {
+                match state
+                    .state()
+                    .resolve_version_at(source_id, &relative_path, t)
+                    .await
+                    .map_err(CommandError::from)?
+                {
+                    Some(v) => (Some(v.drive_file_id), v.size, v.hash_blake3),
+                    None => {
+                        return Err(CommandError::with_code(
+                            ErrorCode::InvalidInput,
+                            format!(
+                                "no backed-up version of {} as of the selected date",
+                                item.relative_path
+                            ),
+                        ))
+                    }
+                }
+            }
+        };
         resolved.push(ResolvedRestore {
             source_id,
             relative_path: row.relative_path.as_str().to_string(),
-            size: row.size,
-            drive_file_id: row.drive_file_id.clone(),
-            hash_blake3: row.hash_blake3,
+            size,
+            drive_file_id,
+            hash_blake3,
         });
     }
 
@@ -541,6 +580,38 @@ pub async fn get_restore_job(
             format!("unknown restore job: {}", job.0),
         )
     })
+}
+
+/// `list_file_versions(source_id, relative_path)` - the retained point-in-time
+/// versions of one file, newest-first (issue #36). Reads `file_versions` (LOCAL
+/// metadata), never Drive. Powers the Restore version-history view so the user
+/// can see which dates have a restorable version before choosing an "as of" date.
+#[tauri::command]
+pub async fn list_file_versions(
+    state: State<'_, AppState>,
+    source_id: SourceId,
+    relative_path: String,
+) -> CommandResult<Vec<crate::commands::dtos::FileVersionDto>> {
+    let rp = driven_core::types::RelativePath::try_from(relative_path).map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::InvalidInput,
+            format!("invalid relative path: {e}"),
+        )
+    })?;
+    let versions = state
+        .state()
+        .list_file_versions(source_id, &rp)
+        .await
+        .map_err(CommandError::from)?;
+    Ok(versions
+        .into_iter()
+        .map(|v| crate::commands::dtos::FileVersionDto {
+            size: v.size,
+            created_at: v.created_at,
+            superseded_at: v.superseded_at,
+            trashed: v.trashed,
+        })
+        .collect())
 }
 
 /// R2-P2-1: build the per-file [`RestorePlan`]s (the fallible job SETUP) WITHOUT
@@ -2504,7 +2575,7 @@ mod tests {
             source_id: src.to_string(),
             relative_path: "stale.txt".to_string(),
         }];
-        let err = resolve_restore_items(&state, &items)
+        let err = resolve_restore_items(&state, &items, None)
             .await
             .expect_err("the same predicate must reject the stale row at resolution");
         assert_eq!(err.code, ErrorCode::InvalidInput);
@@ -3774,7 +3845,7 @@ mod tests {
                 relative_path: "never.bin".to_string(),
             },
         ];
-        let err = resolve_restore_items(&state, &items)
+        let err = resolve_restore_items(&state, &items, None)
             .await
             .expect_err("a NULL-drive_file_id selection must be rejected");
         assert_eq!(
@@ -3804,7 +3875,7 @@ mod tests {
             source_id: src.to_string(),
             relative_path: "stale.txt".to_string(),
         }];
-        let err = resolve_restore_items(&state, &items)
+        let err = resolve_restore_items(&state, &items, None)
             .await
             .expect_err("a non-synced row must be rejected");
         assert_eq!(err.code, ErrorCode::InvalidInput);
@@ -3838,10 +3909,44 @@ mod tests {
                 relative_path: "sub/b.txt".to_string(),
             },
         ];
-        let resolved = resolve_restore_items(&state, &items)
+        let resolved = resolve_restore_items(&state, &items, None)
             .await
             .expect("a clean synced selection must resolve");
         assert_eq!(resolved.len(), 2);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_restore_as_of_inside_the_current_window_returns_current_object() {
+        // Issue #36 (defect 1, downstream): the current bytes' validity window
+        // starts at `file_state.last_uploaded_at`. A restore as-of any instant at or
+        // after that start - with NO recorded version covering it - must resolve to
+        // the CURRENT object, not be rejected. This is what an identical-content
+        // touch's PRESERVED window start buys: without it the touch would advance
+        // last_uploaded_at past the requested instant and this same selection would
+        // wrongly fail with "no backed-up version as of the selected date".
+        let (state, src, dir) = state_with_source().await;
+        let mut row = file_state_row(src, "doc.txt", Some("cur-obj"), FileStateStatus::Synced);
+        // The current object became live at t0 = 1_000 (its window start).
+        row.last_uploaded_at = Some(1_000);
+        state.state().upsert_file_state(&row).await.unwrap();
+
+        let items = vec![RestoreItem {
+            source_id: src.to_string(),
+            relative_path: "doc.txt".to_string(),
+        }];
+        // Restore as-of t = 5_000 (>= the window start, no version recorded).
+        let resolved = resolve_restore_items(&state, &items, Some(5_000))
+            .await
+            .expect(
+                "as-of at/after the window start must resolve to the current object, not reject",
+            );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].drive_file_id.as_deref(),
+            Some("cur-obj"),
+            "the still-live current object holds the bytes that were live at the requested instant"
+        );
         let _ = std::fs::remove_dir_all(&dir);
     }
 

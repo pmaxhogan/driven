@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use driven_core::exclude::{build_source_matcher, validate_patterns};
-use driven_core::state::{AccountRow, SourceRow, StateRepo};
+use driven_core::state::{AccountRow, SourceRow, StateRepo, VersioningConfig};
 use driven_core::time::{Clock, SystemClock};
 use driven_core::types::{AccountId, ErrorCode, SourceId};
 
@@ -638,9 +638,63 @@ pub async fn remove_source(
         .await
         .map_err(CommandError::from)?;
 
+    // Issue #36: clean up the source's `versioning:<id>` settings entry (the
+    // per-source config lives in the KV, not a cascaded FK). Best-effort - a
+    // stale key is harmless (it just decodes to the default for a now-absent
+    // source), so a failure here does not fail the removal.
+    if let Err(err) = state
+        .state()
+        .delete_setting(&VersioningConfig::settings_key(source_id))
+        .await
+    {
+        tracing::warn!(target: TARGET, source_id = %source_id, %err, "failed to clean up versioning config on source removal");
+    }
+
     reconfigure_account(&state, account_id).await;
     tracing::info!(target: TARGET, source_id = %source_id, "source removed");
     Ok(())
+}
+
+/// `get_source_versioning(source_id)` - the per-source point-in-time versioning
+/// config (issue #36). Absent config decodes to the default (OFF).
+#[tauri::command]
+pub async fn get_source_versioning(
+    state: State<'_, AppState>,
+    source_id: SourceId,
+) -> CommandResult<VersioningConfig> {
+    // Validate the source exists (strongly consistent read by id).
+    find_source(state.state().as_ref(), source_id).await?;
+    state
+        .state()
+        .versioning_config(source_id)
+        .await
+        .map_err(CommandError::from)
+}
+
+/// `set_source_versioning(source_id, config)` - enable/configure per-source
+/// point-in-time versioning (issue #36). `count_cap` is clamped to `[1, 1000]`
+/// (a cap of 0 would prune every version away). Returns the persisted config.
+#[tauri::command]
+pub async fn set_source_versioning(
+    state: State<'_, AppState>,
+    source_id: SourceId,
+    config: VersioningConfig,
+) -> CommandResult<VersioningConfig> {
+    find_source(state.state().as_ref(), source_id).await?;
+    // Clamp the cap to a sane range so a bad value cannot prune all versions
+    // (cap 0) or track an unbounded history.
+    let cfg = VersioningConfig {
+        enabled: config.enabled,
+        count_cap: config.count_cap.clamp(1, 1000),
+        max_bytes: config.max_bytes,
+    };
+    state
+        .state()
+        .set_versioning_config(source_id, &cfg)
+        .await
+        .map_err(CommandError::from)?;
+    tracing::info!(target: TARGET, source_id = %source_id, enabled = cfg.enabled, count_cap = cfg.count_cap, "source versioning config updated");
+    Ok(cfg)
 }
 
 /// `pick_drive_folder(account_id, start_folder_id?)` - list a Drive folder's

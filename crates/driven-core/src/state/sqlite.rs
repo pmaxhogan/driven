@@ -34,9 +34,9 @@ use uuid::Uuid;
 
 use super::{
     AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
-    DiscardPendingOutcome, FileSearchHit, FileStateRow, FileStatusCount, ImmediateTreeChildren,
-    NewActivity, NewPendingOp, PageRequest, PendingOpRow, PendingRecoveryAck, RestoreFileRow,
-    SourceRow, StateRepo, TelemetryAggregate,
+    DiscardPendingOutcome, FileSearchHit, FileStateRow, FileStatusCount, FileVersionRow,
+    ImmediateTreeChildren, NewActivity, NewFileVersion, NewPendingOp, PageRequest, PendingOpRow,
+    PendingRecoveryAck, RestoreFileRow, SourceRow, StateRepo, TelemetryAggregate,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -334,6 +334,38 @@ fn md5_from_bytes(b: Option<Vec<u8>>) -> Result<Option<[u8; 16]>> {
 
 fn uuid_from_str(s: &str) -> Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| anyhow!("invalid uuid {s:?}: {e}"))
+}
+
+/// Decode a raw `file_versions` row (issue #36) into a [`FileVersionRow`]. Shared
+/// by the four SELECTs (list / resolve / over-cap / untrashed) so the BLOB +
+/// uuid + path decoding lives in one place.
+#[allow(clippy::too_many_arguments)]
+fn file_version_from_parts(
+    id: i64,
+    source_id: String,
+    relative_path: String,
+    drive_file_id: String,
+    size: i64,
+    hash_blake3: Vec<u8>,
+    drive_md5: Option<Vec<u8>>,
+    encrypted_remote_path: Option<String>,
+    created_at: i64,
+    superseded_at: i64,
+    trashed: i64,
+) -> Result<FileVersionRow> {
+    Ok(FileVersionRow {
+        id,
+        source_id: SourceId(uuid_from_str(&source_id)?),
+        relative_path: relative_path_from_string(relative_path)?,
+        drive_file_id,
+        size: size as u64,
+        hash_blake3: hash32_from_bytes(hash_blake3)?,
+        drive_md5: md5_from_bytes(drive_md5)?,
+        encrypted_remote_path,
+        created_at,
+        superseded_at,
+        trashed: trashed != 0,
+    })
 }
 
 /// Build a safe FTS5 MATCH string from raw user input (see
@@ -2177,6 +2209,482 @@ impl StateRepo for SqliteStateRepo {
             .await
     }
 
+    // --- versioning (issue #36) ---------------------------------------------
+
+    async fn delete_setting(&self, key: &str) -> Result<()> {
+        sqlx::query!("DELETE FROM settings WHERE key = ?1", key)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn commit_versioned_create_result(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+        superseded: &NewFileVersion,
+    ) -> Result<()> {
+        // Issue #36: the atomic VERSIONED supersede. In ONE transaction:
+        // (1) record the OLD object as a `file_versions` row, (2) upsert
+        // `file_state` to the NEW object (the pointer flip), (3) delete the
+        // finalizing `upload` pending_op. Same load-bearing atomicity as
+        // `commit_op_result_inner` - a crash cannot split the three writes.
+        let source_id = file_state.source_id.to_string();
+        let relative_path = file_state.relative_path.as_str().to_string();
+        let size = file_state.size as i64;
+        let hash: &[u8] = &file_state.hash_blake3[..];
+        let md5_owned: Option<Vec<u8>> = file_state.drive_md5.map(|m| m.to_vec());
+        let md5: Option<&[u8]> = md5_owned.as_deref();
+        let status = file_state_status_to_str(file_state.status);
+        let op_id_v = op_id.0;
+
+        // Superseded (old) version fields.
+        let v_source = superseded.source_id.to_string();
+        let v_path = superseded.relative_path.as_str().to_string();
+        let v_size = superseded.size as i64;
+        let v_hash: &[u8] = &superseded.hash_blake3[..];
+        let v_md5_owned: Option<Vec<u8>> = superseded.drive_md5.map(|m| m.to_vec());
+        let v_md5: Option<&[u8]> = v_md5_owned.as_deref();
+
+        let mut tx = self.pool.begin().await?;
+
+        // (1) Record the OLD object as a retained version.
+        sqlx::query!(
+            r#"
+            INSERT INTO file_versions (
+                source_id, relative_path, drive_file_id, size,
+                hash_blake3, drive_md5, encrypted_remote_path,
+                created_at, superseded_at, trashed
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+            "#,
+            v_source,
+            v_path,
+            superseded.drive_file_id,
+            v_size,
+            v_hash,
+            v_md5,
+            superseded.encrypted_remote_path,
+            superseded.created_at,
+            superseded.superseded_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // (2) Flip the pointer: upsert `file_state` to the NEW object.
+        sqlx::query!(
+            r#"
+            INSERT INTO file_state (
+                source_id, relative_path, size, mtime_ns,
+                hash_blake3, drive_file_id, drive_md5, encrypted_remote_path,
+                status, last_uploaded_at, last_verified_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11
+            )
+            ON CONFLICT(source_id, relative_path) DO UPDATE SET
+                size                  = excluded.size,
+                mtime_ns              = excluded.mtime_ns,
+                hash_blake3           = excluded.hash_blake3,
+                drive_file_id         = excluded.drive_file_id,
+                drive_md5             = excluded.drive_md5,
+                encrypted_remote_path = excluded.encrypted_remote_path,
+                status                = excluded.status,
+                last_uploaded_at      = excluded.last_uploaded_at,
+                last_verified_at      = excluded.last_verified_at
+            "#,
+            source_id,
+            relative_path,
+            size,
+            file_state.mtime_ns,
+            hash,
+            file_state.drive_file_id,
+            md5,
+            file_state.encrypted_remote_path,
+            status,
+            file_state.last_uploaded_at,
+            file_state.last_verified_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // (3) Delete the exact finalizing upload op (same guard as
+        // `commit_op_result_inner`: EXACTLY one row, else roll back).
+        let deleted = sqlx::query!(
+            "DELETE FROM pending_ops \
+             WHERE id = ?1 AND source_id = ?2 AND relative_path = ?3 AND op_type = 'upload'",
+            op_id_v,
+            source_id,
+            relative_path,
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if deleted != 1 {
+            return Err(anyhow!(
+                "state.reconcile_op_missing: pending_op id {op_id_v} not found \
+                 (DELETE affected {deleted} rows); refusing to commit versioned file_state"
+            ));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn commit_identical_touch_result(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+        marker_payload_json: &serde_json::Value,
+    ) -> Result<()> {
+        // Issue #36: the atomic IDENTICAL-CONTENT touch commit. In ONE
+        // transaction: (1) upsert `file_state` to the OLD object (kept current),
+        // and (2) REWRITE the finalizing `upload` op's payload to the redundant-
+        // duplicate cleanup marker - KEEPING the op (unlike `commit_op_result_inner`,
+        // which deletes it) so a failed/crash-interrupted trash of the redundant
+        // NEW object is retried by the reconcile sweep. A crash cannot upsert the
+        // pointer without persisting the retry handle, or vice versa.
+        let source_id = file_state.source_id.to_string();
+        let relative_path = file_state.relative_path.as_str().to_string();
+        let size = file_state.size as i64;
+        let hash: &[u8] = &file_state.hash_blake3[..];
+        let md5_owned: Option<Vec<u8>> = file_state.drive_md5.map(|m| m.to_vec());
+        let md5: Option<&[u8]> = md5_owned.as_deref();
+        let status = file_state_status_to_str(file_state.status);
+        let op_id_v = op_id.0;
+        let marker = serde_json::to_string(marker_payload_json)?;
+
+        let mut tx = self.pool.begin().await?;
+
+        // (1) Keep the OLD object current (with the touch's new size/mtime).
+        sqlx::query!(
+            r#"
+            INSERT INTO file_state (
+                source_id, relative_path, size, mtime_ns,
+                hash_blake3, drive_file_id, drive_md5, encrypted_remote_path,
+                status, last_uploaded_at, last_verified_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11
+            )
+            ON CONFLICT(source_id, relative_path) DO UPDATE SET
+                size                  = excluded.size,
+                mtime_ns              = excluded.mtime_ns,
+                hash_blake3           = excluded.hash_blake3,
+                drive_file_id         = excluded.drive_file_id,
+                drive_md5             = excluded.drive_md5,
+                encrypted_remote_path = excluded.encrypted_remote_path,
+                status                = excluded.status,
+                last_uploaded_at      = excluded.last_uploaded_at,
+                last_verified_at      = excluded.last_verified_at
+            "#,
+            source_id,
+            relative_path,
+            size,
+            file_state.mtime_ns,
+            hash,
+            file_state.drive_file_id,
+            md5,
+            file_state.encrypted_remote_path,
+            status,
+            file_state.last_uploaded_at,
+            file_state.last_verified_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // (2) Rewrite the exact finalizing upload op's payload to the cleanup
+        // marker, KEEPING the op (same EXACTLY-one-row guard as the delete arms).
+        let updated = sqlx::query!(
+            "UPDATE pending_ops SET payload_json = ?1 \
+             WHERE id = ?2 AND source_id = ?3 AND relative_path = ?4 AND op_type = 'upload'",
+            marker,
+            op_id_v,
+            source_id,
+            relative_path,
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(anyhow!(
+                "state.reconcile_op_missing: pending_op id {op_id_v} not found \
+                 (UPDATE affected {updated} rows); refusing to commit identical-touch file_state"
+            ));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn insert_file_version(&self, version: &NewFileVersion) -> Result<i64> {
+        let v_source = version.source_id.to_string();
+        let v_path = version.relative_path.as_str().to_string();
+        let v_size = version.size as i64;
+        let v_hash: &[u8] = &version.hash_blake3[..];
+        let v_md5_owned: Option<Vec<u8>> = version.drive_md5.map(|m| m.to_vec());
+        let v_md5: Option<&[u8]> = v_md5_owned.as_deref();
+        let id = sqlx::query!(
+            r#"
+            INSERT INTO file_versions (
+                source_id, relative_path, drive_file_id, size,
+                hash_blake3, drive_md5, encrypted_remote_path,
+                created_at, superseded_at, trashed
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)
+            "#,
+            v_source,
+            v_path,
+            version.drive_file_id,
+            v_size,
+            v_hash,
+            v_md5,
+            version.encrypted_remote_path,
+            version.created_at,
+            version.superseded_at,
+        )
+        .execute(&self.pool)
+        .await?
+        .last_insert_rowid();
+        Ok(id)
+    }
+
+    async fn mark_version_trashed(&self, drive_file_id: &str) -> Result<()> {
+        sqlx::query!(
+            "UPDATE file_versions SET trashed = 1 WHERE drive_file_id = ?1",
+            drive_file_id
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn delete_version_row(&self, version_id: i64) -> Result<()> {
+        sqlx::query!("DELETE FROM file_versions WHERE id = ?1", version_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
+    async fn list_file_versions(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+    ) -> Result<Vec<FileVersionRow>> {
+        let source_str = source.to_string();
+        let path_str = path.as_str().to_string();
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id                    AS "id!: i64",
+                source_id             AS "source_id!: String",
+                relative_path         AS "relative_path!: String",
+                drive_file_id         AS "drive_file_id!: String",
+                size                  AS "size!: i64",
+                hash_blake3           AS "hash_blake3!: Vec<u8>",
+                drive_md5             AS "drive_md5: Vec<u8>",
+                encrypted_remote_path AS "encrypted_remote_path: String",
+                created_at            AS "created_at!: i64",
+                superseded_at         AS "superseded_at!: i64",
+                trashed               AS "trashed!: i64"
+            FROM file_versions
+            WHERE source_id = ?1 AND relative_path = ?2
+            ORDER BY superseded_at DESC, id DESC
+            "#,
+            source_str,
+            path_str,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                file_version_from_parts(
+                    r.id,
+                    r.source_id,
+                    r.relative_path,
+                    r.drive_file_id,
+                    r.size,
+                    r.hash_blake3,
+                    r.drive_md5,
+                    r.encrypted_remote_path,
+                    r.created_at,
+                    r.superseded_at,
+                    r.trashed,
+                )
+            })
+            .collect()
+    }
+
+    async fn resolve_version_at(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+        as_of: UnixMs,
+    ) -> Result<Option<FileVersionRow>> {
+        let source_str = source.to_string();
+        let path_str = path.as_str().to_string();
+        // The version whose half-open window [created_at, superseded_at) contains
+        // `as_of`. Windows are contiguous + non-overlapping, so at most one row
+        // matches; pick the newest defensively.
+        let opt = sqlx::query!(
+            r#"
+            SELECT
+                id                    AS "id!: i64",
+                source_id             AS "source_id!: String",
+                relative_path         AS "relative_path!: String",
+                drive_file_id         AS "drive_file_id!: String",
+                size                  AS "size!: i64",
+                hash_blake3           AS "hash_blake3!: Vec<u8>",
+                drive_md5             AS "drive_md5: Vec<u8>",
+                encrypted_remote_path AS "encrypted_remote_path: String",
+                created_at            AS "created_at!: i64",
+                superseded_at         AS "superseded_at!: i64",
+                trashed               AS "trashed!: i64"
+            FROM file_versions
+            WHERE source_id = ?1 AND relative_path = ?2
+              AND created_at <= ?3 AND superseded_at > ?3
+            ORDER BY created_at DESC
+            LIMIT 1
+            "#,
+            source_str,
+            path_str,
+            as_of,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        match opt {
+            None => Ok(None),
+            Some(r) => Ok(Some(file_version_from_parts(
+                r.id,
+                r.source_id,
+                r.relative_path,
+                r.drive_file_id,
+                r.size,
+                r.hash_blake3,
+                r.drive_md5,
+                r.encrypted_remote_path,
+                r.created_at,
+                r.superseded_at,
+                r.trashed,
+            )?)),
+        }
+    }
+
+    async fn versions_over_cap(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+        cap: u32,
+    ) -> Result<Vec<FileVersionRow>> {
+        let source_str = source.to_string();
+        let path_str = path.as_str().to_string();
+        let cap_i = cap as i64;
+        // The versions BEYOND the newest `cap` (by supersede time), i.e. the ones
+        // the count-cap prune should hard-delete. `OFFSET cap` skips the newest
+        // `cap` retained versions; the remainder (returned newest-first here) is
+        // the whole prune set, whose internal order does not matter.
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id                    AS "id!: i64",
+                source_id             AS "source_id!: String",
+                relative_path         AS "relative_path!: String",
+                drive_file_id         AS "drive_file_id!: String",
+                size                  AS "size!: i64",
+                hash_blake3           AS "hash_blake3!: Vec<u8>",
+                drive_md5             AS "drive_md5: Vec<u8>",
+                encrypted_remote_path AS "encrypted_remote_path: String",
+                created_at            AS "created_at!: i64",
+                superseded_at         AS "superseded_at!: i64",
+                trashed               AS "trashed!: i64"
+            FROM file_versions
+            WHERE source_id = ?1 AND relative_path = ?2
+            ORDER BY superseded_at DESC, id DESC
+            LIMIT -1 OFFSET ?3
+            "#,
+            source_str,
+            path_str,
+            cap_i,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                file_version_from_parts(
+                    r.id,
+                    r.source_id,
+                    r.relative_path,
+                    r.drive_file_id,
+                    r.size,
+                    r.hash_blake3,
+                    r.drive_md5,
+                    r.encrypted_remote_path,
+                    r.created_at,
+                    r.superseded_at,
+                    r.trashed,
+                )
+            })
+            .collect()
+    }
+
+    async fn untrashed_versions_for_source(&self, source: SourceId) -> Result<Vec<FileVersionRow>> {
+        let source_str = source.to_string();
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                id                    AS "id!: i64",
+                source_id             AS "source_id!: String",
+                relative_path         AS "relative_path!: String",
+                drive_file_id         AS "drive_file_id!: String",
+                size                  AS "size!: i64",
+                hash_blake3           AS "hash_blake3!: Vec<u8>",
+                drive_md5             AS "drive_md5: Vec<u8>",
+                encrypted_remote_path AS "encrypted_remote_path: String",
+                created_at            AS "created_at!: i64",
+                superseded_at         AS "superseded_at!: i64",
+                trashed               AS "trashed!: i64"
+            FROM file_versions
+            WHERE source_id = ?1 AND trashed = 0
+            ORDER BY id ASC
+            "#,
+            source_str,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        rows.into_iter()
+            .map(|r| {
+                file_version_from_parts(
+                    r.id,
+                    r.source_id,
+                    r.relative_path,
+                    r.drive_file_id,
+                    r.size,
+                    r.hash_blake3,
+                    r.drive_md5,
+                    r.encrypted_remote_path,
+                    r.created_at,
+                    r.superseded_at,
+                    r.trashed,
+                )
+            })
+            .collect()
+    }
+
+    async fn drive_file_id_is_live(&self, drive_file_id: &str) -> Result<bool> {
+        // The global guard: ANY live `file_state` pointer (across all sources)
+        // still referencing this Drive object. Never trash / hard-delete an id
+        // that a live row - or a future shared small-file bundle (#35) - points at.
+        let row = sqlx::query!(
+            r#"SELECT EXISTS(
+                   SELECT 1 FROM file_state WHERE drive_file_id = ?1
+               ) AS "live!: i64""#,
+            drive_file_id,
+        )
+        .fetch_one(&self.pool)
+        .await?;
+        Ok(row.live != 0)
+    }
+
     async fn schema_version(&self) -> Result<i64> {
         // PRAGMA returns a non-standard row shape the `query!` macro cannot
         // describe, so use the dynamic query API (mirrors the wal_checkpoint
@@ -2782,6 +3290,401 @@ mod tests {
             last_uploaded_at: None,
             last_verified_at: None,
         }
+    }
+
+    // --- issue #36: versioning (file_versions + config) ---------------------
+
+    /// Seed an account + a source with one SYNCED file already uploaded under
+    /// `old_id`, plus a pending `upload` op finalizing a supersede to `new_id`.
+    /// Returns (repo, dir, source_id, op_id).
+    async fn seed_for_supersede(old_id: &str) -> (SqliteStateRepo, TempDir, SourceId, PendingOpId) {
+        let (repo, dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        let mut old = sample_file(src.id, "a.txt", 0x11);
+        old.status = FileStateStatus::Synced;
+        old.drive_file_id = Some(old_id.to_string());
+        old.last_uploaded_at = Some(1_000);
+        repo.upsert_file_state(&old).await.unwrap();
+        let op_id = repo
+            .enqueue_pending_op(NewPendingOp {
+                source_id: src.id,
+                op_type: "upload".into(),
+                relative_path: rp("a.txt"),
+                payload_json: serde_json::json!({}),
+                scheduled_for: 2_000,
+                created_at: 2_000,
+            })
+            .await
+            .unwrap();
+        (repo, dir, src.id, op_id)
+    }
+
+    #[tokio::test]
+    async fn versioned_commit_records_version_flips_pointer_and_deletes_op() {
+        let (repo, _dir, source_id, op_id) = seed_for_supersede("old-1").await;
+        let new_row = FileStateRow {
+            source_id,
+            relative_path: rp("a.txt"),
+            size: 2048,
+            mtime_ns: 5_000,
+            hash_blake3: [0x22; 32],
+            drive_file_id: Some("new-1".into()),
+            drive_md5: Some([0x33; 16]),
+            encrypted_remote_path: None,
+            status: FileStateStatus::Synced,
+            last_uploaded_at: Some(3_000),
+            last_verified_at: Some(3_000),
+        };
+        let superseded = NewFileVersion {
+            source_id,
+            relative_path: rp("a.txt"),
+            drive_file_id: "old-1".into(),
+            size: 1024,
+            hash_blake3: [0x11; 32],
+            drive_md5: None,
+            encrypted_remote_path: None,
+            created_at: 1_000,
+            superseded_at: 3_000,
+        };
+        repo.commit_versioned_create_result(op_id, &new_row, &superseded)
+            .await
+            .unwrap();
+
+        // Pointer flipped to the new object.
+        let cur = repo
+            .get_file_state(source_id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(cur.drive_file_id.as_deref(), Some("new-1"));
+        // The op is gone (atomic).
+        assert!(repo
+            .get_pending_ops_for_source(source_id)
+            .await
+            .unwrap()
+            .is_empty());
+        // The old object is recorded as a version with its window + untrashed.
+        let versions = repo
+            .list_file_versions(source_id, &rp("a.txt"))
+            .await
+            .unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_eq!(versions[0].drive_file_id, "old-1");
+        assert_eq!(versions[0].created_at, 1_000);
+        assert_eq!(versions[0].superseded_at, 3_000);
+        assert_eq!(versions[0].size, 1024);
+        assert!(!versions[0].trashed);
+    }
+
+    #[tokio::test]
+    async fn versioned_commit_rolls_back_when_op_missing() {
+        let (repo, _dir, source_id, _op_id) = seed_for_supersede("old-2").await;
+        let new_row = FileStateRow {
+            source_id,
+            relative_path: rp("a.txt"),
+            size: 2048,
+            mtime_ns: 5_000,
+            hash_blake3: [0x22; 32],
+            drive_file_id: Some("new-2".into()),
+            drive_md5: None,
+            encrypted_remote_path: None,
+            status: FileStateStatus::Synced,
+            last_uploaded_at: Some(3_000),
+            last_verified_at: Some(3_000),
+        };
+        let superseded = NewFileVersion {
+            source_id,
+            relative_path: rp("a.txt"),
+            drive_file_id: "old-2".into(),
+            size: 1024,
+            hash_blake3: [0x11; 32],
+            drive_md5: None,
+            encrypted_remote_path: None,
+            created_at: 1_000,
+            superseded_at: 3_000,
+        };
+        // A wrong (nonexistent) op id must abort the whole tx: no version row,
+        // no pointer flip.
+        let bogus = PendingOpId(999_999);
+        assert!(repo
+            .commit_versioned_create_result(bogus, &new_row, &superseded)
+            .await
+            .is_err());
+        let cur = repo
+            .get_file_state(source_id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cur.drive_file_id.as_deref(),
+            Some("old-2"),
+            "pointer unchanged"
+        );
+        assert!(repo
+            .list_file_versions(source_id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn resolve_version_at_picks_window_and_respects_boundaries() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        let mk = |id: &str, created: i64, superseded: i64| NewFileVersion {
+            source_id: src.id,
+            relative_path: rp("a.txt"),
+            drive_file_id: id.into(),
+            size: 1,
+            hash_blake3: [0; 32],
+            drive_md5: None,
+            encrypted_remote_path: None,
+            created_at: created,
+            superseded_at: superseded,
+        };
+        // Two contiguous windows: v1 [100,200), v2 [200,300).
+        repo.insert_file_version(&mk("v1", 100, 200)).await.unwrap();
+        repo.insert_file_version(&mk("v2", 200, 300)).await.unwrap();
+
+        // created_at is INCLUSIVE, superseded_at EXCLUSIVE.
+        async fn at(repo: &SqliteStateRepo, src: SourceId, t: i64) -> Option<String> {
+            repo.resolve_version_at(src, &rp("a.txt"), t)
+                .await
+                .unwrap()
+                .map(|v| v.drive_file_id)
+        }
+        assert_eq!(at(&repo, src.id, 150).await.as_deref(), Some("v1"));
+        assert_eq!(
+            at(&repo, src.id, 100).await.as_deref(),
+            Some("v1"),
+            "created_at inclusive"
+        );
+        assert_eq!(
+            at(&repo, src.id, 200).await.as_deref(),
+            Some("v2"),
+            "superseded_at exclusive"
+        );
+        assert_eq!(at(&repo, src.id, 250).await.as_deref(), Some("v2"));
+        assert_eq!(at(&repo, src.id, 99).await, None, "before oldest window");
+        assert_eq!(
+            at(&repo, src.id, 300).await,
+            None,
+            "at/after newest supersede"
+        );
+    }
+
+    #[tokio::test]
+    async fn versions_over_cap_returns_oldest_excess_only() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        for i in 0..5i64 {
+            repo.insert_file_version(&NewFileVersion {
+                source_id: src.id,
+                relative_path: rp("a.txt"),
+                drive_file_id: format!("v{i}"),
+                size: 1,
+                hash_blake3: [0; 32],
+                drive_md5: None,
+                encrypted_remote_path: None,
+                created_at: i * 10,
+                superseded_at: (i + 1) * 10,
+            })
+            .await
+            .unwrap();
+        }
+        // cap=2 keeps the 2 NEWEST (v4, v3); over-cap = the 3 oldest (v0..v2).
+        // Prune deletes the whole set, so order within it is unspecified - assert
+        // the SET.
+        let over = repo
+            .versions_over_cap(src.id, &rp("a.txt"), 2)
+            .await
+            .unwrap();
+        let mut ids: Vec<&str> = over.iter().map(|v| v.drive_file_id.as_str()).collect();
+        ids.sort_unstable();
+        assert_eq!(ids, vec!["v0", "v1", "v2"]);
+        // cap >= count -> nothing to prune.
+        assert!(repo
+            .versions_over_cap(src.id, &rp("a.txt"), 5)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    #[tokio::test]
+    async fn drive_file_id_is_live_tracks_file_state_pointers() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        let mut f = sample_file(src.id, "a.txt", 0x11);
+        f.drive_file_id = Some("live-1".into());
+        f.status = FileStateStatus::Synced;
+        repo.upsert_file_state(&f).await.unwrap();
+        assert!(repo.drive_file_id_is_live("live-1").await.unwrap());
+        assert!(!repo.drive_file_id_is_live("gone-1").await.unwrap());
+    }
+
+    #[tokio::test]
+    async fn mark_version_trashed_and_delete_row() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        let id = repo
+            .insert_file_version(&NewFileVersion {
+                source_id: src.id,
+                relative_path: rp("a.txt"),
+                drive_file_id: "v0".into(),
+                size: 1,
+                hash_blake3: [0; 32],
+                drive_md5: None,
+                encrypted_remote_path: None,
+                created_at: 1,
+                superseded_at: 2,
+            })
+            .await
+            .unwrap();
+        assert_eq!(
+            repo.untrashed_versions_for_source(src.id)
+                .await
+                .unwrap()
+                .len(),
+            1
+        );
+        repo.mark_version_trashed("v0").await.unwrap();
+        assert!(repo
+            .untrashed_versions_for_source(src.id)
+            .await
+            .unwrap()
+            .is_empty());
+        // Marking a non-tracked id is a harmless no-op.
+        repo.mark_version_trashed("not-a-version").await.unwrap();
+        repo.delete_version_row(id).await.unwrap();
+        assert!(repo
+            .list_file_versions(src.id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Both hot-path lookups BY `drive_file_id` - `drive_file_id_is_live`
+    /// (file_state, the global no-live-pointer guard, run before every trash /
+    /// hard-delete) and `mark_version_trashed` (file_versions, run after every
+    /// best-effort trash) - must be INDEX-backed (migration 0006), never a full
+    /// table scan. Assert via `EXPLAIN QUERY PLAN` that each query SEARCHES its
+    /// table via the drive_file_id index rather than SCANning it; a large backup
+    /// would otherwise degrade to minutes of pure table scanning per sync cycle.
+    #[tokio::test]
+    async fn drive_file_id_lookups_are_index_backed_not_full_scans() {
+        use sqlx::Row as _;
+
+        let (repo, _dir) = temp_repo().await;
+
+        async fn plan(pool: &SqlitePool, sql: &'static str) -> String {
+            let rows = sqlx::query(sql).fetch_all(pool).await.unwrap();
+            rows.iter()
+                .map(|r| r.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }
+
+        // `drive_file_id_is_live`'s existence probe over file_state.
+        let state_plan = plan(
+            &repo.pool,
+            "EXPLAIN QUERY PLAN \
+             SELECT EXISTS(SELECT 1 FROM file_state WHERE drive_file_id = 'x')",
+        )
+        .await;
+        assert!(
+            state_plan.contains("idx_file_state_drive_file_id"),
+            "drive_file_id_is_live must use idx_file_state_drive_file_id; plan was: {state_plan}"
+        );
+        assert!(
+            !state_plan.to_uppercase().contains("SCAN FILE_STATE"),
+            "drive_file_id_is_live must NOT full-scan file_state; plan was: {state_plan}"
+        );
+
+        // `mark_version_trashed`'s update over file_versions.
+        let versions_plan = plan(
+            &repo.pool,
+            "EXPLAIN QUERY PLAN \
+             UPDATE file_versions SET trashed = 1 WHERE drive_file_id = 'x'",
+        )
+        .await;
+        assert!(
+            versions_plan.contains("idx_file_versions_drive_file_id"),
+            "mark_version_trashed must use idx_file_versions_drive_file_id; plan was: {versions_plan}"
+        );
+        assert!(
+            !versions_plan.to_uppercase().contains("SCAN FILE_VERSIONS"),
+            "mark_version_trashed must NOT full-scan file_versions; plan was: {versions_plan}"
+        );
+    }
+
+    #[tokio::test]
+    async fn versioning_config_round_trips_and_defaults_off() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        // Absent -> default (OFF).
+        let def = repo.versioning_config(src.id).await.unwrap();
+        assert!(!def.enabled);
+        assert_eq!(def.count_cap, 10);
+        // Round-trips.
+        let cfg = crate::state::VersioningConfig {
+            enabled: true,
+            count_cap: 3,
+            max_bytes: 4096,
+        };
+        repo.set_versioning_config(src.id, &cfg).await.unwrap();
+        assert_eq!(repo.versioning_config(src.id).await.unwrap(), cfg);
+        // delete_setting clears it back to the default.
+        repo.delete_setting(&crate::state::VersioningConfig::settings_key(src.id))
+            .await
+            .unwrap();
+        assert!(!repo.versioning_config(src.id).await.unwrap().enabled);
+    }
+
+    #[tokio::test]
+    async fn file_versions_cascade_on_source_delete() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        repo.insert_file_version(&NewFileVersion {
+            source_id: src.id,
+            relative_path: rp("a.txt"),
+            drive_file_id: "v0".into(),
+            size: 1,
+            hash_blake3: [0; 32],
+            drive_md5: None,
+            encrypted_remote_path: None,
+            created_at: 1,
+            superseded_at: 2,
+        })
+        .await
+        .unwrap();
+        repo.delete_source(src.id).await.unwrap();
+        // ON DELETE CASCADE (foreign_keys ON) drops the versions with the source.
+        assert!(repo
+            .list_file_versions(src.id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]
