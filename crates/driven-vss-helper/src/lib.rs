@@ -33,6 +33,7 @@ pub mod protocol;
 pub mod validate;
 
 mod provider;
+pub use launch::HelperLauncher;
 pub use provider::BrokeredVssProvider;
 
 #[cfg(windows)]

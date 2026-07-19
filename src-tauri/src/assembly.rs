@@ -45,10 +45,16 @@ use driven_net::ReqwestBackend;
 
 use driven_power::RealPowerSource;
 
+// The brokered provider + launcher trait are only referenced in the Windows
+// `build_vss` arm; off Windows they would be unused imports (clippy -D warnings).
+#[cfg(windows)]
+use driven_vss_helper::{BrokeredVssProvider, HelperLauncher};
+
 use crate::app_state::{
     fake_remote_store_in, AccountHandle, AccountTasks, AppState, FakeRemoteStores, RemoteMode,
 };
 use crate::crypto_provider_impl::KeystoreCryptoProvider;
+use crate::vss_helper::VssHelperManager;
 use crate::{events, tray};
 
 /// Tracing target for the app-shell assembly.
@@ -90,11 +96,20 @@ pub async fn build_and_spawn(
     let accounts = state.list_accounts().await?;
     let all_sources = state.list_sources().await?;
 
+    // Issue #25 (DESIGN s5.3.1): build the least-privilege VSS helper broker
+    // manager ONCE (Windows + un-elevated + `windows.vss_helper` on). The SAME
+    // `Arc` is handed to every account's BrokeredVssProvider below, so there is a
+    // single launch / UAC prompt / pipe across all accounts. `None` off Windows,
+    // when elevated, or when the setting is off.
+    let helper_enabled = crate::commands::settings::load_vss_helper_enabled(state.as_ref()).await;
+    let vss_helper = build_vss_helper_manager(&all_sources, helper_enabled);
+
     tracing::info!(
         target: TARGET,
         accounts = accounts.len(),
         sources = all_sources.len(),
         fake_remote = use_fake,
+        vss_helper = vss_helper.is_some(),
         "assembling per-account orchestrators"
     );
 
@@ -139,7 +154,17 @@ pub async fn build_and_spawn(
             .cloned()
             .collect();
 
-        match build_account(app, &state, account, sources, use_fake, &fake_remote_stores).await {
+        match build_account(
+            app,
+            &state,
+            account,
+            sources,
+            use_fake,
+            &fake_remote_stores,
+            vss_helper.as_ref(),
+        )
+        .await
+        {
             Ok(BuildOutcome::Spawned(handle)) => {
                 handles.insert(account.id, *handle);
                 tracing::info!(
@@ -174,12 +199,13 @@ pub async fn build_and_spawn(
         }
     }
 
-    Ok(AppState::new(
-        state,
-        handles,
-        remote_mode,
-        fake_remote_stores,
-    ))
+    let app_state = AppState::new(state, handles, remote_mode, fake_remote_stores);
+    // Issue #25: install the broker manager so the quit sweep can shut it down
+    // and `get_vss_helper_status` can report truthful liveness.
+    if let Some(manager) = vss_helper {
+        app_state.set_vss_helper_manager(manager);
+    }
+    Ok(app_state)
 }
 
 /// R8-P1-1 (DATA-SAFETY): the FAIL-CLOSED decision for the boot path. `true` iff
@@ -285,6 +311,10 @@ pub async fn spawn_account(
     // new orchestrator uploads into.
     let fake_remote_stores = app_state.fake_remote_stores();
 
+    // Issue #25: reuse the SAME broker manager the running AppState owns, so a
+    // hot-added account's BrokeredVssProvider shares the one launch / pipe.
+    let vss_helper = app_state.vss_helper_manager();
+
     match build_account(
         app,
         &state,
@@ -292,6 +322,7 @@ pub async fn spawn_account(
         sources,
         use_fake,
         &fake_remote_stores,
+        vss_helper.as_ref(),
     )
     .await?
     {
@@ -356,6 +387,7 @@ async fn build_account(
     sources: Vec<SourceRow>,
     use_fake: bool,
     fake_remote_stores: &FakeRemoteStores,
+    vss_helper: Option<&Arc<VssHelperManager>>,
 ) -> anyhow::Result<BuildOutcome> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -438,7 +470,9 @@ async fn build_account(
     let network: Arc<dyn NetworkProbe> = Arc::new(Prober::new(backend, clock.clone()));
 
     // --- VSS provider (Windows): SAME Arc into executor + orchestrator --------
-    let vss = build_vss(&config);
+    // Brokered through the least-privilege helper when `vss_helper` is present
+    // (un-elevated + setting on); in-process RealVssProvider otherwise (issue #25).
+    let vss = build_vss(&config, vss_helper);
 
     // --- crypto: per-source keystore resolver (FAIL CLOSED - GA blocker) -----
     // B2: keep the CONCRETE Arc so the AccountHandle can expose it for live
@@ -674,17 +708,94 @@ pub fn resolve_account_oauth_creds(account_id: AccountId) -> (String, String) {
     }
 }
 
-/// Build the Windows VSS snapshot provider (ROADMAP M3.5), or `None` off
-/// Windows. The returned `Arc` is threaded into BOTH the executor (snapshot
-/// reads) and the orchestrator (per-cycle release + orphan cleanup).
+/// Build the Windows VSS snapshot provider (ROADMAP M3.5; DESIGN s5.3.1), or
+/// `None` off Windows. The returned `Arc` is threaded into BOTH the executor
+/// (snapshot reads) and the orchestrator (per-cycle release + orphan cleanup).
+///
+/// Two Windows shapes (issue #25):
+/// - `vss_helper` present (un-elevated app + `windows.vss_helper` on): a
+///   [`BrokeredVssProvider`] that reads locked files THROUGH the elevated helper
+///   broker, launched on demand via the shared [`VssHelperManager`] launcher, so
+///   the main app stays un-elevated.
+/// - `vss_helper` absent (the app is already elevated, or the helper is off): the
+///   in-process [`RealVssProvider`] - which snapshots directly when elevated and
+///   reports unavailable (skip-the-locked-file) when not, exactly as before.
 #[cfg(windows)]
-fn build_vss(config: &OrchestratorConfig) -> Option<Arc<dyn driven_vss::VssProvider>> {
-    Some(Arc::new(driven_vss::RealVssProvider::new(config.vss_mode)))
+fn build_vss(
+    config: &OrchestratorConfig,
+    vss_helper: Option<&Arc<VssHelperManager>>,
+) -> Option<Arc<dyn driven_vss::VssProvider>> {
+    match vss_helper {
+        Some(manager) => {
+            let launcher: Arc<dyn HelperLauncher> = manager.clone();
+            let provider = BrokeredVssProvider::new(
+                config.vss_mode,
+                manager.pipe_name(),
+                manager.helper_dir(),
+                manager.temp_dir(),
+            )
+            .with_launcher(launcher);
+            Some(Arc::new(provider))
+        }
+        None => Some(Arc::new(driven_vss::RealVssProvider::new(config.vss_mode))),
+    }
 }
 
 /// Off Windows there is no VSS; the executor's locked-file path skips as before.
 #[cfg(not(windows))]
-fn build_vss(_config: &OrchestratorConfig) -> Option<Arc<dyn driven_vss::VssProvider>> {
+fn build_vss(
+    _config: &OrchestratorConfig,
+    _vss_helper: Option<&Arc<VssHelperManager>>,
+) -> Option<Arc<dyn driven_vss::VssProvider>> {
+    None
+}
+
+/// Build the app-side least-privilege VSS helper broker manager (DESIGN s5.3.1),
+/// or `None` when the helper is not in play. Built ONCE at boot and shared into
+/// every account's [`BrokeredVssProvider`], so there is a SINGLE launch / UAC
+/// prompt / pipe across all accounts.
+///
+/// `None` when: off Windows; the app is ALREADY elevated (it uses the in-process
+/// [`driven_vss::RealVssProvider`] and needs no broker); the `windows.vss_helper`
+/// setting is off; or the current-exe path cannot be resolved (so the bundled
+/// sidecar cannot be located). The broker's allow-list of snapshot-able roots is
+/// the union of the configured source roots at boot - a source ADDED mid-session
+/// is covered on the next app restart (the roots are fixed at broker launch per
+/// the DESIGN trust model).
+#[cfg(windows)]
+fn build_vss_helper_manager(
+    all_sources: &[SourceRow],
+    helper_enabled: bool,
+) -> Option<Arc<VssHelperManager>> {
+    if !helper_enabled || driven_vss::is_elevated() {
+        return None;
+    }
+    let helper_exe = VssHelperManager::bundled_helper_exe()?;
+    // Union of the configured source roots (dedup), fixed as the broker's
+    // snapshot-able allow-list at launch.
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for s in all_sources {
+        let p = std::path::PathBuf::from(&s.local_path);
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    }
+    // App-owned scratch dir where the provider streams locked-file temp copies.
+    let temp_dir = std::env::temp_dir().join("driven-vss-helper");
+    tracing::info!(
+        target: TARGET,
+        roots = roots.len(),
+        "issue #25: least-privilege VSS helper enabled (un-elevated); broker will launch on the first locked file"
+    );
+    Some(Arc::new(VssHelperManager::new(helper_exe, temp_dir, roots)))
+}
+
+/// Off Windows the helper does not exist.
+#[cfg(not(windows))]
+fn build_vss_helper_manager(
+    _all_sources: &[SourceRow],
+    _helper_enabled: bool,
+) -> Option<Arc<VssHelperManager>> {
     None
 }
 

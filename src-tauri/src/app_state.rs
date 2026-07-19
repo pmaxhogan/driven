@@ -327,6 +327,14 @@ pub struct AppState {
     /// kept in sync as the commands mutate the durable state. Behind a sync `Mutex`
     /// (only ever held for a quick insert / read / take, never across an await).
     recovery_acks: std::sync::Mutex<HashMap<driven_core::types::SourceId, RecoveryAckState>>,
+    /// Issue #25 (DESIGN s5.3.1): the app-side least-privilege VSS helper broker
+    /// lifecycle owner, or `None` when the helper is not in play (off Windows, the
+    /// app is already elevated, or the `windows.vss_helper` setting is off). Built
+    /// ONCE by `assembly::build_and_spawn` and installed here so (a) the quit sweep
+    /// can shut the broker down (no elevated process outlives the app) and (b)
+    /// `get_vss_helper_status` can report truthful liveness. Behind a sync `Mutex`
+    /// (set once at boot, read for status/shutdown - never held across an await).
+    vss_helper: std::sync::Mutex<Option<Arc<crate::vss_helper::VssHelperManager>>>,
 }
 
 /// M9c D4: one pending recovery-phrase ack - the owning account (so the ack can
@@ -528,6 +536,37 @@ impl AppState {
             updater: UpdaterRuntime::default(),
             telemetry: TelemetryRuntime::default(),
             recovery_acks: std::sync::Mutex::new(HashMap::new()),
+            vss_helper: std::sync::Mutex::new(None),
+        }
+    }
+
+    // --- issue #25: least-privilege VSS helper broker (DESIGN s5.3.1) --------
+
+    /// Install the VSS helper broker lifecycle manager built by
+    /// `assembly::build_and_spawn` (Windows + un-elevated + `windows.vss_helper`
+    /// on). Called once at boot before `.manage(..)`; a subsequent call replaces
+    /// it (defensive - boot installs exactly once).
+    pub fn set_vss_helper_manager(&self, manager: Arc<crate::vss_helper::VssHelperManager>) {
+        *self.vss_helper.lock().unwrap_or_else(|e| e.into_inner()) = Some(manager);
+    }
+
+    /// The installed VSS helper broker manager, if one is in play. `None` off
+    /// Windows / when elevated / when the setting is off. Returns a cloned `Arc`
+    /// so `get_vss_helper_status` can read liveness without holding the lock.
+    #[must_use]
+    pub fn vss_helper_manager(&self) -> Option<Arc<crate::vss_helper::VssHelperManager>> {
+        self.vss_helper
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Shut the VSS helper broker down at app quit (best-effort; a no-op if the
+    /// broker was never launched or no manager is in play), so no elevated
+    /// process outlives the app session. Mirrors the M9a/M9b task drains.
+    pub fn shutdown_vss_helper(&self) {
+        if let Some(manager) = self.vss_helper_manager() {
+            manager.shutdown();
         }
     }
 
@@ -1582,6 +1621,39 @@ mod tests {
         assert_eq!(app_state.take_dialog_token(&token), None);
         // An unknown token is rejected.
         assert_eq!(app_state.take_dialog_token("not-a-real-token"), None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn vss_helper_manager_installs_and_shutdown_is_noop() {
+        // Issue #25: AppState owns the least-privilege VSS helper broker manager -
+        // `None` until installed at boot, returned once set, and
+        // `shutdown_vss_helper` is a best-effort no-op both when no manager is in
+        // play and when the (never-launched) manager is installed.
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+        // No manager yet; shutdown is a safe no-op.
+        assert!(app_state.vss_helper_manager().is_none());
+        app_state.shutdown_vss_helper();
+
+        // Install one with an injected launch fn (no real UAC / process).
+        let manager = Arc::new(crate::vss_helper::VssHelperManager::with_launch_fn(
+            std::env::temp_dir().join("driven-vss-helper.exe"),
+            std::env::temp_dir(),
+            Vec::new(),
+            Box::new(|_exe, _args| Ok(())),
+        ));
+        app_state.set_vss_helper_manager(manager);
+        assert!(app_state.vss_helper_manager().is_some());
+        // The broker was never launched, so shutdown stays a no-op (no panic /
+        // no connect).
+        app_state.shutdown_vss_helper();
 
         let _ = std::fs::remove_dir_all(dir);
     }

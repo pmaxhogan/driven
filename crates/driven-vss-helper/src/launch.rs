@@ -24,6 +24,27 @@ pub fn generate_pipe_name() -> String {
     format!(r"\\.\pipe\driven-vss-{}", uuid::Uuid::new_v4().simple())
 }
 
+/// The on-demand launch seam the app-side [`BrokeredVssProvider`] consults the
+/// FIRST time a locked file needs the helper (DESIGN s5.3.1).
+///
+/// The provider does not launch the elevated broker itself: launch is an
+/// app-level, at-most-once concern (one UAC prompt, one helper process, one
+/// pipe name shared across every account's provider), so the app owns a single
+/// launcher and hands the SAME `Arc<dyn HelperLauncher>` to each provider.
+/// [`Self::ensure_launched`] is called lazily on the locked-file path and MUST
+/// be idempotent + memoised: a first call launches the broker; later calls (and
+/// calls from other accounts' providers) return the cached verdict without
+/// re-prompting - a user who declined the UAC prompt is not asked again for the
+/// rest of the session.
+pub trait HelperLauncher: Send + Sync {
+    /// Ensure the elevated helper has been launched for this session, launching
+    /// it at most once. Returns `true` when the helper is believed up (launch
+    /// succeeded, or a prior call already launched it), `false` when it could
+    /// not be brought up (UAC declined, helper exe missing) so the caller
+    /// degrades to skip-the-locked-file.
+    fn ensure_launched(&self) -> bool;
+}
+
 /// Build the helper's argv (excluding the program path itself):
 /// `--pipe <name> [--allowed-root <root>]...`.
 pub fn helper_args(pipe_name: &str, allowed_roots: &[PathBuf]) -> Vec<String> {

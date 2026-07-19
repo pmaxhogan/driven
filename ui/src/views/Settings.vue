@@ -339,6 +339,21 @@ async function setVssMode(event: Event): Promise<void> {
   await commitPatch({ windows: { vssMode: value } });
 }
 
+// Issue #25 (DESIGN s5.3.1): toggle the least-privilege VSS helper. When on (and
+// the app is not elevated), locked files are backed up through an on-demand
+// elevated broker instead of requiring the whole app to run as Administrator.
+// The broker is built at app start, so a change takes effect on the next launch;
+// we re-fetch the status so the `helperEnabled` reflects immediately.
+async function setVssHelper(event: Event): Promise<void> {
+  const checked = (event.target as HTMLInputElement).checked;
+  await commitPatch({ windows: { vssHelper: checked } });
+  void getVssHelperStatus()
+    .then((s) => (vssStatus.value = s))
+    .catch(() => {
+      vssStatus.value = null;
+    });
+}
+
 // SPEC s16 (M9b R2-P1-1): toggle anonymous usage telemetry (default ON) via the
 // DEDICATED set_telemetry_enabled command, so the backend flips the in-flight ping
 // cancel flag immediately - a disable click while a ping is building still aborts
@@ -676,6 +691,27 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
                 {{ t(`settings.rules.vssMode.${mode}`) }}
               </option>
             </select>
+          </label>
+
+          <!-- Issue #25: least-privilege VSS helper toggle (DESIGN s5.3.1). -->
+          <label
+            v-if="settings.settings.windows"
+            class="block space-y-1"
+            data-testid="vss-helper-setting"
+          >
+            <span class="flex items-center gap-2">
+              <input
+                type="checkbox"
+                class="accent-teal-600"
+                data-testid="vss-helper-toggle"
+                :checked="settings.settings.windows.vssHelper"
+                @change="setVssHelper"
+              />
+              {{ t("settings.rules.vssHelperLabel") }}
+            </span>
+            <p class="text-xs text-zinc-500 dark:text-zinc-400">
+              {{ t("settings.rules.vssHelperNote") }}
+            </p>
           </label>
         </section>
 

@@ -34,11 +34,19 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
+        # Issue #25: `helperConfig` merges the Windows-only externalBin (the VSS
+        # helper sidecar) at bundle time via `--config` - so the mac/linux bundles
+        # never reference (and never require) the Windows-only sidecar, and the
+        # cargo-only CI gates (which do not pass --config) stay free of it.
         include:
-          - { os: macos-latest, target: aarch64-apple-darwin }
-          - { os: macos-latest, target: x86_64-apple-darwin }
-          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc }
+          - { os: macos-latest, target: aarch64-apple-darwin, helperConfig: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, helperConfig: "" }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, helperConfig: "" }
+          - {
+              os: windows-latest,
+              target: x86_64-pc-windows-msvc,
+              helperConfig: "--config src-tauri/tauri.helper.conf.json",
+            }
     runs-on: ${{ matrix.os }}
     env:
       # The Tauri app boots the headless core whose state layer uses sqlx
@@ -105,6 +113,24 @@ jobs:
         working-directory: ui
         run: pnpm install --frozen-lockfile
 
+      # Issue #25 (DESIGN s5.3.1): build the least-privilege VSS helper broker
+      # binary and stage it as a Tauri externalBin sidecar (target-triple suffix)
+      # so `tauri build --config tauri.helper.conf.json` bundles it next to the
+      # app on Windows. `tauri build` does NOT build the helper bin itself (it is
+      # not a dependency of the app binary), so it must be prebuilt here. Windows
+      # only - the sidecar ships only in the Windows bundle.
+      - name: Build VSS helper sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --target ${{ matrix.target }} \
+            -p driven-vss-helper --bin driven-vss-helper
+          mkdir -p src-tauri/binaries
+          cp "target/${{ matrix.target }}/release/driven-vss-helper.exe" \
+             "src-tauri/binaries/driven-vss-helper-${{ matrix.target }}.exe"
+          echo "staged sidecar:"; ls -la src-tauri/binaries
+
       - name: Build + sign + release (tauri-action)
         uses: tauri-apps/tauri-action@v0
         env:
@@ -152,7 +178,10 @@ jobs:
           # a NON-numeric pre-release (`<next-patch>-dev.<run>.<sha>`) that WiX
           # rejects (MSI requires a numeric-only pre-release <=65535). Do NOT add
           # `--bundles nsis` here. See design/CODEX_NOTES.md "## M10 dev-build fix".
-          args: --target ${{ matrix.target }}
+          #
+          # Issue #25: `helperConfig` is `--config src-tauri/tauri.helper.conf.json`
+          # on Windows (merges the externalBin VSS-helper sidecar), empty elsewhere.
+          args: --target ${{ matrix.target }} ${{ matrix.helperConfig }}
 
   publish-updater-manifest:
     name: publish stable update manifests

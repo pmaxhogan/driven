@@ -100,11 +100,19 @@ jobs:
         # the full version through, so their bundleArgs stay empty. STABLE
         # (release.yml, no pre-release) is unaffected and keeps the full msi+nsis
         # bundle set. See design/CODEX_NOTES.md "## M10 dev-build fix".
+        # Issue #25: `helperConfig` merges the Windows-only externalBin (the VSS
+        # helper sidecar) at bundle time via `--config`; empty on mac/linux so
+        # their bundles never reference the Windows-only sidecar.
         include:
-          - { os: macos-latest, target: aarch64-apple-darwin, bundleArgs: "" }
-          - { os: macos-latest, target: x86_64-apple-darwin, bundleArgs: "" }
-          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, bundleArgs: "" }
-          - { os: windows-latest, target: x86_64-pc-windows-msvc, bundleArgs: "--bundles nsis" }
+          - { os: macos-latest, target: aarch64-apple-darwin, bundleArgs: "", helperConfig: "" }
+          - { os: macos-latest, target: x86_64-apple-darwin, bundleArgs: "", helperConfig: "" }
+          - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, bundleArgs: "", helperConfig: "" }
+          - {
+              os: windows-latest,
+              target: x86_64-pc-windows-msvc,
+              bundleArgs: "--bundles nsis",
+              helperConfig: "--config src-tauri/tauri.helper.conf.json",
+            }
     runs-on: ${{ matrix.os }}
     env:
       SQLX_OFFLINE: "true"
@@ -168,6 +176,21 @@ jobs:
         working-directory: ui
         run: pnpm install --frozen-lockfile
 
+      # Issue #25 (DESIGN s5.3.1): prebuild the VSS helper broker binary + stage
+      # it as a target-triple externalBin sidecar so the Windows dev bundle ships
+      # it (the app build does not build the helper bin itself). Windows only.
+      - name: Build VSS helper sidecar (Windows)
+        if: runner.os == 'Windows'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --target ${{ matrix.target }} \
+            -p driven-vss-helper --bin driven-vss-helper
+          mkdir -p src-tauri/binaries
+          cp "target/${{ matrix.target }}/release/driven-vss-helper.exe" \
+             "src-tauri/binaries/driven-vss-helper-${{ matrix.target }}.exe"
+          echo "staged sidecar:"; ls -la src-tauri/binaries
+
       # Build the bundle (no GitHub Release created here; tauri-action only
       # builds, then softprops/action-gh-release uploads to the rolling tag).
       - name: Build + sign (tauri-action)
@@ -196,7 +219,10 @@ jobs:
           # collect/generate steps still produce the windows-x86_64 manifest the
           # `--require-targets` guard expects. (Verified against Context7
           # tauri-action + tauri v2 docs.)
-          args: --target ${{ matrix.target }} ${{ matrix.bundleArgs }}
+          #
+          # Issue #25: `helperConfig` merges the externalBin VSS-helper sidecar on
+          # Windows (empty on mac/linux).
+          args: --target ${{ matrix.target }} ${{ matrix.bundleArgs }} ${{ matrix.helperConfig }}
 
       # The exact bundle paths vary per OS/target; collect everything the
       # bundler produced (installers + .sig) under the target dir.

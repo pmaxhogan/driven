@@ -680,6 +680,8 @@ describe("Settings Rules tab", () => {
           supported: true,
           elevated: false,
           helperEnabled: false,
+          helperAlive: false,
+          helperLaunchable: false,
           lockedFileBackupDegraded: true,
         });
       return Promise.resolve(undefined);
@@ -706,6 +708,8 @@ describe("Settings Rules tab", () => {
           supported: true,
           elevated: true,
           helperEnabled: false,
+          helperAlive: false,
+          helperLaunchable: false,
           lockedFileBackupDegraded: false,
         });
       return Promise.resolve(undefined);
@@ -1024,6 +1028,85 @@ describe("Settings Rules tab", () => {
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
       patch: { windows: { vssMode: "never" } },
     });
+  });
+
+  it("issue #25: renders the VSS helper toggle and toggling it patches windows.vssHelper", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_vss_helper_status")
+        return Promise.resolve({
+          supported: true,
+          elevated: false,
+          helperEnabled: false,
+          helperAlive: false,
+          helperLaunchable: true,
+          lockedFileBackupDegraded: false,
+        });
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const toggle = wrapper.get('[data-testid="vss-helper-toggle"]');
+    // Reflects the stored setting (default off).
+    expect((toggle.element as HTMLInputElement).checked).toBe(false);
+    await toggle.setValue(true);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { windows: { vssHelper: true } },
+    });
+  });
+
+  it("issue #25: toggling the VSS helper survives a failing status re-fetch", async () => {
+    // The setVssHelper handler re-fetches get_vss_helper_status after committing;
+    // a rejection there must be swallowed (no unhandled rejection, no crash) - the
+    // commit still lands.
+    let statusCalls = 0;
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_vss_helper_status") {
+        statusCalls += 1;
+        // First call (on tab activation) resolves; the post-toggle re-fetch rejects.
+        return statusCalls === 1
+          ? Promise.resolve({
+              supported: true,
+              elevated: false,
+              helperEnabled: false,
+              helperAlive: false,
+              helperLaunchable: true,
+              lockedFileBackupDegraded: false,
+            })
+          : Promise.reject(new Error("status unavailable"));
+      }
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const toggle = wrapper.get('[data-testid="vss-helper-toggle"]');
+    await toggle.setValue(true);
+    await flushPromises();
+
+    // The commit still happened despite the failing status re-fetch.
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { windows: { vssHelper: true } },
+    });
+    // The degraded banner is not shown (status went null on the rejection).
+    expect(wrapper.find('[data-testid="vss-degraded-banner"]').exists()).toBe(false);
   });
 
   it("reflects telemetry default ON and toggling it calls set_telemetry_enabled (SPEC s16 R2-P1-1)", async () => {

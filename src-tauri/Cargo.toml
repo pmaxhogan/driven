@@ -92,6 +92,13 @@ driven-power = { path = "../crates/driven-power" }
 # M5 assembly seams: real network breaker backend + Windows VSS provider.
 driven-net = { path = "../crates/driven-net" }
 driven-vss = { path = "../crates/driven-vss" }
+# Issue #25 (DESIGN s5.3.1): the least-privilege VSS helper. The app-side
+# lifecycle manager (`vss_helper.rs`) launches the elevated broker on demand and
+# hands each account a `BrokeredVssProvider` that reads locked files through it,
+# so the main app stays un-elevated. OS-independent surface (provider + launch
+# argv + `HelperLauncher`) compiles on every target; the pipe/VSS/`runas` bits
+# are Windows-gated inside the crate.
+driven-vss-helper = { path = "../crates/driven-vss-helper" }
 
 # R2-P1-1 (SPEC s11.6.1): handle-based restore confinement on Unix. The restore
 # sink opens a verified no-follow parent-directory fd and does BOTH the temp
