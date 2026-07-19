@@ -333,12 +333,7 @@ export interface ActivityPageDto {
 
 /** `file_state.status` serialized form (mirrors driven_core FileStateStatus). */
 export type FileStateStatus =
-  | "synced"
-  | "pending"
-  | "corrupt"
-  | "locked"
-  | "error"
-  | "excluded_orphan";
+  "synced" | "pending" | "corrupt" | "locked" | "error" | "excluded_orphan";
 
 /** One per-status file count for the Activity header (M7-P2-5; mirrors src-tauri
  * FileStatusCountDto / DESIGN s8.3 "file count by status"). */
