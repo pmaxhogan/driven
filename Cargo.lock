@@ -1354,7 +1354,7 @@ dependencies = [
 
 [[package]]
 name = "driven-app"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1399,7 +1399,7 @@ dependencies = [
 
 [[package]]
 name = "driven-chaos"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1424,7 +1424,7 @@ dependencies = [
 
 [[package]]
 name = "driven-cli"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1443,7 +1443,7 @@ dependencies = [
 
 [[package]]
 name = "driven-core"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1476,7 +1476,7 @@ dependencies = [
 
 [[package]]
 name = "driven-crypto"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "base32",
@@ -1494,7 +1494,7 @@ dependencies = [
 
 [[package]]
 name = "driven-drive"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1517,7 +1517,7 @@ dependencies = [
 
 [[package]]
 name = "driven-net"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1531,7 +1531,7 @@ dependencies = [
 
 [[package]]
 name = "driven-power"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1549,7 +1549,7 @@ dependencies = [
 
 [[package]]
 name = "driven-test-fixtures"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1565,7 +1565,7 @@ dependencies = [
 
 [[package]]
 name = "driven-vss"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "serde",
  "serde_json",
@@ -1577,7 +1577,7 @@ dependencies = [
 
 [[package]]
 name = "driven-vss-helper"
-version = "1.0.0"
+version = "2.0.0"
 dependencies = [
  "driven-vss",
  "serde",
