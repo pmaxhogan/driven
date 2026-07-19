@@ -1758,6 +1758,51 @@ async fn power_recv_opt(
     }
 }
 
+/// Awaits the next OS sleep/wake EDGE from an optional broadcast receiver inside
+/// a `tokio::select!` arm (DESIGN s5.10.1, issue #33).
+///
+/// The mirror of [`power_recv_opt`] for [`driven_power::SleepWakeEvent`]:
+/// `Closed` (the [`PowerSource`] was dropped) drops the receiver so the arm goes
+/// inert; `Lagged` is surfaced (benign); an absent receiver parks forever.
+async fn sleep_wake_recv_opt(
+    rx: &mut Option<broadcast::Receiver<driven_power::SleepWakeEvent>>,
+) -> Result<driven_power::SleepWakeEvent, broadcast::error::RecvError> {
+    match rx {
+        Some(receiver) => {
+            let result = receiver.recv().await;
+            if matches!(result, Err(broadcast::error::RecvError::Closed)) {
+                *rx = None;
+            }
+            result
+        }
+        None => std::future::pending().await,
+    }
+}
+
+/// Sleeps until `deadline` inside a `tokio::select!` arm, or parks forever when
+/// no resume is pending (`None`). Used to fire the DESIGN s5.10.3 30-second
+/// post-wake defer: [`SyncOrchestrator::on_power_event`] returns the deadline,
+/// the run loop arms this, and on elapse calls
+/// [`SyncOrchestrator::complete_resume`]. A fixed [`tokio::time::Instant`] so
+/// re-arming the `select!` each loop iteration does not reset the countdown.
+async fn resume_timer(deadline: Option<tokio::time::Instant>) {
+    match deadline {
+        Some(at) => tokio::time::sleep_until(at).await,
+        None => std::future::pending().await,
+    }
+}
+
+/// Maps a [`driven_power::SleepWakeEvent`] (the OS edge type) to the
+/// orchestrator's [`PowerEvent`] (DESIGN s5.10). The two crates carry distinct
+/// types - `driven-power` has no `driven-core` dependency - so the run loop
+/// translates at the boundary.
+fn power_event_from_sleep_wake(event: driven_power::SleepWakeEvent) -> PowerEvent {
+    match event {
+        driven_power::SleepWakeEvent::Suspending => PowerEvent::Suspending,
+        driven_power::SleepWakeEvent::Resumed => PowerEvent::Resumed,
+    }
+}
+
 /// Map a non-online [`NetworkState`] to the matching [`PauseReason`] so the
 /// orchestrator preserves the distinct network substates end to end instead
 /// of collapsing them to a single Offline banner (CODEX_NOTES P2-9; DESIGN
@@ -1832,22 +1877,33 @@ impl Orchestrator for SyncOrchestrator {
         //   (a) the scheduled-scan interval timer (the authoritative fallback),
         //   (b) debounced watcher scan-ticks (DESIGN s5.9.1),
         //   (c) the manual "Sync now" trigger (capacity-1, coalescing),
-        //   (d) OS power-state transitions (battery/AC, suspend/resume),
-        //   (e) network-state transitions (folded into the power branch for M3;
+        //   (d) OS power-state transitions (battery/AC steady state),
+        //   (e) OS sleep/wake EDGES (suspend/resume, DESIGN s5.10.1, issue #33)
+        //       plus the deferred post-wake resume completion (s5.10.3),
+        //   (f) network-state transitions (folded into the power branch for M3;
         //       the real probe-event seam is deferred to M4 - see CODEX_NOTES),
-        //   (f) the graceful-shutdown signal.
+        //   (g) the graceful-shutdown signal.
         //
         // In-flight guard: there is exactly ONE `run()` task, and each selected
-        // wake runs `run_cycle(..).await` INLINE. A single task awaiting inline
-        // can never overlap two cycles - while a cycle runs, further wakes
-        // simply buffer in their channels. The capacity-1 trigger channel caps
-        // a mid-cycle burst of "Sync now" clicks to exactly ONE queued
-        // follow-up. Shutdown is graceful: it is observed only between cycles
-        // (the select arms), so the current cycle always finishes first
-        // (DESIGN s5.10.2).
+        // wake runs `run_cycle(..).await` (or `complete_resume().await`) INLINE.
+        // A single task awaiting inline can never overlap two cycles - while a
+        // cycle runs, further wakes simply buffer in their channels. The
+        // capacity-1 trigger channel caps a mid-cycle burst of "Sync now" clicks
+        // to exactly ONE queued follow-up. Shutdown is graceful: it is observed
+        // only between cycles (the select arms), so the current cycle always
+        // finishes first (DESIGN s5.10.2).
         let mut watcher_rx = self.watcher_rx.lock().await.take();
         let mut trigger_rx = self.trigger_rx.lock().await.take();
         let mut power_rx = Some(self.power.subscribe());
+        // Sleep/wake EDGE stream (DESIGN s5.10.1). Separate from `power_rx`
+        // (steady state): the app-shell's per-OS monitor broadcasts suspend /
+        // resume edges here, and the orchestrator runs the s5.10.2 / s5.10.3
+        // sequences on them. `None` after the source closes (arm goes inert).
+        let mut sleep_wake_rx = Some(self.power.subscribe_sleep_wake());
+        // When `Some`, a post-wake resume is pending: the run loop fires
+        // `complete_resume` once this deadline elapses (the s5.10.3 30 s defer).
+        // A `tokio::time::Instant` so re-arming the `select!` never resets it.
+        let mut resume_deadline: Option<tokio::time::Instant> = None;
         let mut shutdown_rx = self.shutdown_rx.clone();
 
         // The scheduled interval reads the config at spawn time. A reconfigure
@@ -1907,6 +1963,56 @@ impl Orchestrator for SyncOrchestrator {
                     // the receiver to `None`, so this arm is now inert and the
                     // scheduled loop keeps running.
                     Err(broadcast::error::RecvError::Closed) => None,
+                },
+
+                // OS sleep/wake EDGE (DESIGN s5.10.1, issue #33). A genuine
+                // suspend/resume edge - distinct from the steady-state power
+                // transitions above - runs the strict s5.10.2 / s5.10.3
+                // sequences at the edge instead of waiting for the 30 s poll.
+                edge = sleep_wake_recv_opt(&mut sleep_wake_rx) => match edge {
+                    Ok(event) => {
+                        let power_event = power_event_from_sleep_wake(event);
+                        // `on_power_event` broadcasts OrchestratorEvent::Power,
+                        // gracefully pauses on suspend, and on resume returns the
+                        // 30 s defer deadline (measured on the injected Clock).
+                        match self.on_power_event(power_event).await {
+                            ResumePlan::None => {
+                                // Suspending: a suspend supersedes any pending
+                                // resume defer from a prior (spurious) wake.
+                                resume_deadline = None;
+                            }
+                            ResumePlan::DeferUntil(_deadline) => {
+                                // Resumed: arm the post-wake defer. The exact
+                                // clock-ms deadline is asserted by the direct
+                                // `on_power_event`/`complete_resume` unit tests;
+                                // the run loop waits `RESUME_DEFER_MS` of real
+                                // time (consistent with its `tokio::time`-based
+                                // scheduled interval) via a fixed Instant.
+                                resume_deadline = Some(
+                                    tokio::time::Instant::now()
+                                        + std::time::Duration::from_millis(RESUME_DEFER_MS as u64),
+                                );
+                            }
+                        }
+                        None
+                    }
+                    // Lagged: we missed an intermediate edge but the next real
+                    // edge (or the poll) recovers; nothing to run now.
+                    Err(broadcast::error::RecvError::Lagged(_)) => None,
+                    // Closed: the source was dropped; the arm is now inert.
+                    Err(broadcast::error::RecvError::Closed) => None,
+                },
+
+                // Post-wake resume completion (DESIGN s5.10.3 steps 2, 5-6). Once
+                // the 30 s defer elapses, re-probe the network and, if green, run
+                // a from-scratch Wake cycle - INLINE, so it respects the single-
+                // in-flight guard exactly like a normal cycle.
+                () = resume_timer(resume_deadline), if resume_deadline.is_some() => {
+                    resume_deadline = None;
+                    if let Err(err) = self.complete_resume().await {
+                        tracing::warn!(target: TARGET, account_id = %self.account_id, %err, "post-wake resume cycle failed; continuing");
+                    }
+                    None
                 },
 
                 res = shutdown_rx.changed() => {
@@ -4771,6 +4877,123 @@ mod tests {
             exec.executes.load(Ordering::SeqCst) >= 1,
             "AC resume ran at least one cycle after the battery pause"
         );
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn run_loop_consumes_sleep_wake_edges_and_completes_resume() {
+        // Issue #33: the run loop must CONSUME OS sleep/wake edges (not just the
+        // steady-state power channel) and drive the DESIGN s5.10.2 / s5.10.3
+        // sequences: a `Suspending` edge broadcasts OrchestratorEvent::Power and
+        // gracefully pauses; a `Resumed` edge broadcasts Power AND, after the
+        // 30 s defer, runs a from-scratch Wake cycle. Driven entirely through the
+        // run loop's new sleep/wake arm + resume-timer arm and asserted via the
+        // event stream. `start_paused` makes the 30 s defer deterministic (tokio
+        // auto-advances virtual time to the pending resume timer).
+        let exec = Arc::new(RecordingExecutor::default());
+        // Long interval so only the sleep/wake edges (not the scheduled tick)
+        // drive the observed cycles within the window.
+        let cfg = OrchestratorConfig {
+            scan_interval_secs: 3_600,
+            ..OrchestratorConfig::default()
+        };
+        let power = Arc::new(FakePowerSource::new(power_on_ac()));
+        let (orch, _dir) = build_arc(exec.clone(), power.clone(), cfg);
+
+        // Subscribe BEFORE spawning so we observe every event the loop emits.
+        let mut events = orch.subscribe();
+        let handle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run().await })
+        };
+
+        // The loop subscribes to the sleep/wake broadcast INSIDE `run()`, so a
+        // single push before that subscription lands would be missed. Re-push on
+        // a short cadence until the mapped Power event is observed (same race-
+        // free pattern the battery test uses), bounded by a timeout.
+        async fn observe_power_event(
+            power: &Arc<FakePowerSource>,
+            events: &mut broadcast::Receiver<OrchestratorEvent>,
+            push: driven_power::SleepWakeEvent,
+            want: PowerEvent,
+        ) -> bool {
+            tokio::time::timeout(std::time::Duration::from_secs(30), async {
+                loop {
+                    power.push_sleep_wake(push);
+                    match tokio::time::timeout(std::time::Duration::from_millis(50), events.recv())
+                        .await
+                    {
+                        Ok(Ok(OrchestratorEvent::Power { event })) if event == want => break true,
+                        Ok(Ok(_)) | Ok(Err(broadcast::error::RecvError::Lagged(_))) | Err(_) => {
+                            continue
+                        }
+                        Ok(Err(broadcast::error::RecvError::Closed)) => break false,
+                    }
+                }
+            })
+            .await
+            .unwrap_or(false)
+        }
+
+        // Suspend edge -> Power{Suspending} (graceful pause; no cycle runs).
+        assert!(
+            observe_power_event(
+                &power,
+                &mut events,
+                driven_power::SleepWakeEvent::Suspending,
+                PowerEvent::Suspending,
+            )
+            .await,
+            "the loop must consume the suspend edge and broadcast Power{{Suspending}}"
+        );
+        assert_eq!(
+            exec.executes.load(Ordering::SeqCst),
+            0,
+            "a suspend edge must not run a cycle"
+        );
+
+        // Resume edge -> Power{Resumed}; the 30 s defer then runs a Wake cycle.
+        assert!(
+            observe_power_event(
+                &power,
+                &mut events,
+                driven_power::SleepWakeEvent::Resumed,
+                PowerEvent::Resumed,
+            )
+            .await,
+            "the loop must consume the resume edge and broadcast Power{{Resumed}}"
+        );
+
+        // After the deferred resume completes, a from-scratch Wake cycle runs to
+        // Idle. With `start_paused`, tokio auto-advances virtual time to the
+        // pending 30 s resume timer, so this resolves without a real wait.
+        let resumed_to_idle = tokio::time::timeout(std::time::Duration::from_secs(120), async {
+            loop {
+                match events.recv().await {
+                    Ok(OrchestratorEvent::StateChanged {
+                        state:
+                            OrchestratorState::Idle {
+                                last_run_at: Some(_),
+                            },
+                    }) => break true,
+                    Ok(_) | Err(broadcast::error::RecvError::Lagged(_)) => continue,
+                    Err(broadcast::error::RecvError::Closed) => break false,
+                }
+            }
+        })
+        .await
+        .expect("the deferred resume must run a Wake cycle to Idle");
+        assert!(resumed_to_idle, "resume completion drives a cycle to Idle");
+        assert!(
+            exec.executes.load(Ordering::SeqCst) >= 1,
+            "the post-wake Wake cycle executes at least once (DESIGN s5.10.3 step 5-6)"
+        );
+
+        orch.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("run loop must exit after shutdown")
+            .expect("join")
+            .expect("run ok");
     }
 
     #[tokio::test]

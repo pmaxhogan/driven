@@ -827,16 +827,21 @@ Driven must detect resume from sleep and reset the relevant state
   `PBT_APMRESUMEAUTOMATIC` and `PBT_APMRESUMESUSPEND` = resume.
   Reached via the `windows` crate's `RegisterPowerSettingNotification` +
   message-pump on a dedicated hidden window owned by the tray thread.
-- **macOS:** `NSWorkspace.shared.notificationCenter` observers for
-  `NSWorkspaceWillSleepNotification` and `NSWorkspaceDidWakeNotification`.
-  Bridged via `objc2` from a long-running tokio task.
+- **macOS:** IOKit `IORegisterForSystemPower` on a dedicated `CFRunLoop`
+  thread, delivering `kIOMessageSystemWillSleep` / `kIOMessageSystemHasPoweredOn`
+  (and acking `kIOMessageCanSystemSleep` so the system never waits on us).
+  Chosen over `NSWorkspace` notifications: it is the documented C sleep/wake
+  API, matches both the existing IOKit power reader and the Windows callback
+  shape, and needs no AppKit main-thread run loop - so it is self-contained.
 - **Linux:** systemd-logind via DBus.
   `org.freedesktop.login1.Manager` signal `PrepareForSleep(bool start)`
   (`true` = about to sleep, `false` = just woke). Reached via the
-  `zbus` crate.
+  `zbus` crate's `#[proxy]`-generated signal stream.
 
-A `PowerEvent` enum (`Suspending`, `Resumed`) flows into the orchestrator
-event loop on the same channel as power-source and network events.
+A `SleepWakeEvent` enum (`Suspending`, `Resumed`) is emitted by the per-OS
+`driven-power` backend and mapped to the orchestrator's `PowerEvent` at the
+run-loop boundary, flowing into the event loop alongside power-source and
+network events (issue #33).
 
 #### 5.10.2 On `Suspending`
 

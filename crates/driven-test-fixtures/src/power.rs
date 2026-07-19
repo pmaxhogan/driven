@@ -22,7 +22,7 @@
 //! truth, snapshotted on `current()` and broadcast on every `set()`.
 
 use async_trait::async_trait;
-use driven_power::{PowerSource, PowerState};
+use driven_power::{PowerSource, PowerState, SleepWakeEvent};
 use parking_lot::Mutex;
 use std::sync::Arc;
 use tokio::sync::broadcast;
@@ -74,18 +74,35 @@ pub struct FakePowerSource {
 struct FakePowerInner {
     state: Mutex<PowerState>,
     tx: broadcast::Sender<PowerState>,
+    /// Sleep/wake EDGE broadcast (DESIGN s5.10.1), driven by
+    /// [`FakePowerSource::push_sleep_wake`], read via
+    /// [`PowerSource::subscribe_sleep_wake`].
+    sleep_wake_tx: broadcast::Sender<SleepWakeEvent>,
 }
 
 impl FakePowerSource {
     /// Constructs a fake holding `initial` as the starting state.
     pub fn new(initial: PowerState) -> Self {
         let (tx, _rx) = broadcast::channel(CHANNEL_CAPACITY);
+        let (sleep_wake_tx, _sw_rx) = broadcast::channel(CHANNEL_CAPACITY);
         Self {
             inner: Arc::new(FakePowerInner {
                 state: Mutex::new(initial),
                 tx,
+                sleep_wake_tx,
             }),
         }
+    }
+
+    /// Pushes an OS sleep/wake EDGE ([`SleepWakeEvent::Suspending`] /
+    /// [`SleepWakeEvent::Resumed`]) to every active
+    /// [`PowerSource::subscribe_sleep_wake`] subscriber, letting a test drive
+    /// the orchestrator's DESIGN s5.10.2 / s5.10.3 suspend / resume sequences
+    /// deterministically (the production per-OS monitor broadcasts these from
+    /// the real OS event). If no subscribers are active the send-result is
+    /// ignored (as with [`Self::set`]).
+    pub fn push_sleep_wake(&self, event: SleepWakeEvent) {
+        let _ = self.inner.sleep_wake_tx.send(event);
     }
 
     /// Pushes a new [`PowerState`], updating the snapshot and broadcasting
@@ -122,6 +139,10 @@ impl PowerSource for FakePowerSource {
 
     fn subscribe(&self) -> broadcast::Receiver<PowerState> {
         self.inner.tx.subscribe()
+    }
+
+    fn subscribe_sleep_wake(&self) -> broadcast::Receiver<SleepWakeEvent> {
+        self.inner.sleep_wake_tx.subscribe()
     }
 }
 
@@ -166,5 +187,15 @@ mod tests {
         let b = a.clone();
         a.set(state(false));
         assert!(!b.snapshot().ac_connected);
+    }
+
+    #[tokio::test]
+    async fn push_sleep_wake_reaches_subscriber() {
+        let p = FakePowerSource::new(state(true));
+        let mut rx = p.subscribe_sleep_wake();
+        p.push_sleep_wake(SleepWakeEvent::Suspending);
+        p.push_sleep_wake(SleepWakeEvent::Resumed);
+        assert_eq!(rx.recv().await.unwrap(), SleepWakeEvent::Suspending);
+        assert_eq!(rx.recv().await.unwrap(), SleepWakeEvent::Resumed);
     }
 }

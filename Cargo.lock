@@ -1534,6 +1534,8 @@ dependencies = [
  "async-trait",
  "block2",
  "core-foundation",
+ "core-foundation-sys",
+ "futures-util",
  "objc2",
  "thiserror 2.0.19",
  "tokio",
@@ -6172,6 +6174,7 @@ dependencies = [
  "signal-hook-registry",
  "socket2",
  "tokio-macros",
+ "tracing",
  "windows-sys 0.61.2",
 ]
 
@@ -7678,6 +7681,7 @@ dependencies = [
  "rustix",
  "serde",
  "serde_repr",
+ "tokio",
  "tracing",
  "uds_windows",
  "uuid",
