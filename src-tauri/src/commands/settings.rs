@@ -165,12 +165,23 @@ async fn load_settings_dto(state: &dyn StateRepo) -> CommandResult<SettingsDto> 
         None
     };
 
+    // V2 small-file bundling toggle (issue #35 item d): a standalone advanced
+    // setting backed by the `bundle_small_files` KV key the core planner reads
+    // directly (NOT a group blob field). Absent/malformed reads as `false`.
+    let bundle_small_files = state
+        .get_setting(driven_core::planner::SETTING_BUNDLE_ENABLED)
+        .await
+        .map_err(CommandError::from)?
+        .and_then(|v| v.as_bool())
+        .unwrap_or(false);
+
     Ok(SettingsDto {
         global,
         telemetry,
         updater,
         ui,
         windows,
+        bundle_small_files,
     })
 }
 
@@ -441,6 +452,20 @@ pub async fn update_settings(
             }
         }
         store_group(repo, KEY_WINDOWS, &storage::Windows::from(cur)).await?;
+    }
+
+    // --- bundling toggle (issue #35 item d) ---------------------------------
+    // A standalone advanced setting, not a group blob: write the
+    // `bundle_small_files` KV key the core planner reads directly. The change
+    // takes effect on the next scan cycle (the planner re-reads it per run), so
+    // no orchestrator reconfigure is needed.
+    if let Some(v) = patch.bundle_small_files {
+        repo.set_setting(
+            driven_core::planner::SETTING_BUNDLE_ENABLED,
+            &serde_json::Value::Bool(v),
+        )
+        .await
+        .map_err(CommandError::from)?;
     }
 
     // --- side effects (after persistence) -----------------------------------
@@ -2679,6 +2704,7 @@ mod tests {
             updater: default_updater(),
             ui: default_ui(),
             windows: None,
+            bundle_small_files: false,
         };
         let red = redact_settings(&dto);
         assert!(red.telemetry.install_id.starts_with("installid_"));

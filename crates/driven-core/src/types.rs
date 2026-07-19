@@ -770,6 +770,31 @@ pub enum Op {
         /// Drive `file_id` of the remote object to trash.
         drive_file_id: String,
     },
+    /// Pack many genuinely-new small files into ONE `.tar.gz` bundle object
+    /// (V2 small-file bundling, issue #35). The planner emits this ONLY for
+    /// files that have no existing `file_state` row (brand new), grouped and
+    /// size-capped; a changed or previously-uploaded file always stays a
+    /// [`Op::HashThenUpload`]. The executor reads + hashes every member,
+    /// uploads a single Drive object, and atomically commits N `file_state`
+    /// rows (each with `drive_file_id = NULL`) plus their bundle membership.
+    UploadBundle {
+        /// Source the members belong to.
+        source_id: SourceId,
+        /// The member files to pack (all under `source_id`).
+        members: Vec<BundleMemberPlan>,
+    },
+}
+
+/// One member of an [`Op::UploadBundle`] (V2 small-file bundling, issue #35):
+/// the member's relative path plus the pre-open size the scanner captured. The
+/// size feeds the progress denominator ([`Plan::summary`]); the executor
+/// re-stats and re-hashes each member at upload time.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct BundleMemberPlan {
+    /// Path relative to the source's `local_path`.
+    pub relative_path: RelativePath,
+    /// Local file size in bytes, captured pre-open by the scanner.
+    pub size: u64,
 }
 
 /// A batched list of [`Op`] values produced by the planner (SPEC s7).
@@ -804,6 +829,13 @@ impl Plan {
                     summary.bytes += *size;
                 }
                 Op::Trash { .. } => summary.trashes += 1,
+                // A bundle uploads ONE object but represents N member files: count
+                // each member so the progress "N of M files" denominator reflects
+                // real files, and sum their sizes for the byte total.
+                Op::UploadBundle { members, .. } => {
+                    summary.uploads += members.len();
+                    summary.bytes += members.iter().map(|m| m.size).sum::<u64>();
+                }
             }
         }
         summary

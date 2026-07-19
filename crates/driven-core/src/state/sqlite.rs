@@ -34,9 +34,9 @@ use uuid::Uuid;
 
 use super::{
     AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
-    DiscardPendingOutcome, FileSearchHit, FileStateRow, FileStatusCount, FileVersionRow,
-    ImmediateTreeChildren, NewActivity, NewFileVersion, NewPendingOp, PageRequest, PendingOpRow,
-    PendingRecoveryAck, RestoreFileRow, SourceRow, StateRepo, TelemetryAggregate,
+    BundleRef, BundleRow, DiscardPendingOutcome, FileSearchHit, FileStateRow, FileStatusCount,
+    FileVersionRow, ImmediateTreeChildren, NewActivity, NewFileVersion, NewPendingOp, PageRequest,
+    PendingOpRow, PendingRecoveryAck, RestoreFileRow, SourceRow, StateRepo, TelemetryAggregate,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -190,6 +190,26 @@ impl SqliteStateRepo {
             status,
             file_state.last_uploaded_at,
             file_state.last_verified_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // V2 bundling (issue #35) mutual-exclusion invariant: this commit gives
+        // the file a STANDALONE `drive_file_id`, so it must NOT also be recorded
+        // as a member of a `.tar.gz` bundle. Clear any stale membership in the
+        // SAME transaction. This is the path a previously-BUNDLED file takes when
+        // it later changes: the scanner re-emits it, the planner routes it to a
+        // standalone `HashThenUpload` (it already has a `file_state` row, so it is
+        // never re-bundled), and committing here drops its old membership so
+        // restore/reconcile use the fresh standalone object. A no-op (0 rows) for
+        // the common case of a file that was never bundled. The `file_state`
+        // upsert above is `ON CONFLICT DO UPDATE` (never a DELETE/REPLACE), so the
+        // membership FK cascade does NOT fire on its own - this explicit delete is
+        // required.
+        sqlx::query!(
+            "DELETE FROM bundle_members WHERE source_id = ?1 AND relative_path = ?2",
+            source_id,
+            relative_path,
         )
         .execute(&mut *tx)
         .await?;
@@ -2685,6 +2705,183 @@ impl StateRepo for SqliteStateRepo {
         Ok(row.live != 0)
     }
 
+    // --- bundles (V2 small-file bundling, issue #35) ------------------------
+
+    async fn commit_bundle_result(
+        &self,
+        op_id: PendingOpId,
+        bundle: &BundleRow,
+        members: &[FileStateRow],
+    ) -> Result<()> {
+        // V2 small-file bundling (issue #35). The crash-safe multi-member
+        // analogue of `commit_op_result_inner`: insert the bundle row, upsert
+        // every member's `file_state` row (drive_file_id / drive_md5 forced NULL:
+        // the bytes live inside the bundle object, not a standalone one), insert
+        // the `bundle_members` linkage, then delete the `bundle` pending_op - all
+        // in ONE transaction so a `kill -9` leaves either the whole bundle
+        // committed or nothing.
+        let bundle_id = bundle.id.clone();
+        let source_id = bundle.source_id.to_string();
+        let drive_file_id = bundle.drive_file_id.clone();
+        let md5_owned: Option<Vec<u8>> = bundle.drive_md5.map(|m| m.to_vec());
+        let md5: Option<&[u8]> = md5_owned.as_deref();
+        let size = bundle.size as i64;
+        let member_count = bundle.member_count as i64;
+        let op_id_v = op_id.0;
+
+        let mut tx = self.pool.begin().await?;
+
+        // 1. Bundle row first (FK parent of bundle_members.bundle_id).
+        sqlx::query!(
+            r#"
+            INSERT INTO bundles (
+                id, source_id, drive_file_id, drive_md5, size, member_count, created_at
+            ) VALUES ( ?1, ?2, ?3, ?4, ?5, ?6, ?7 )
+            "#,
+            bundle_id,
+            source_id,
+            drive_file_id,
+            md5,
+            size,
+            member_count,
+            bundle.created_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // 2. Each member: file_state row (bytes inside the bundle => NULL id/md5)
+        //    then its membership row (FK to the file_state PK we just wrote).
+        for m in members {
+            let m_source = m.source_id.to_string();
+            let m_path = m.relative_path.as_str().to_string();
+            let m_size = m.size as i64;
+            let m_hash: &[u8] = &m.hash_blake3[..];
+            let m_status = file_state_status_to_str(m.status);
+            sqlx::query!(
+                r#"
+                INSERT INTO file_state (
+                    source_id, relative_path, size, mtime_ns,
+                    hash_blake3, drive_file_id, drive_md5, encrypted_remote_path,
+                    status, last_uploaded_at, last_verified_at
+                ) VALUES ( ?1, ?2, ?3, ?4, ?5, NULL, NULL, NULL, ?6, ?7, ?8 )
+                ON CONFLICT(source_id, relative_path) DO UPDATE SET
+                    size                  = excluded.size,
+                    mtime_ns              = excluded.mtime_ns,
+                    hash_blake3           = excluded.hash_blake3,
+                    drive_file_id         = NULL,
+                    drive_md5             = NULL,
+                    encrypted_remote_path = NULL,
+                    status                = excluded.status,
+                    last_uploaded_at      = excluded.last_uploaded_at,
+                    last_verified_at      = excluded.last_verified_at
+                "#,
+                m_source,
+                m_path,
+                m_size,
+                m.mtime_ns,
+                m_hash,
+                m_status,
+                m.last_uploaded_at,
+                m.last_verified_at,
+            )
+            .execute(&mut *tx)
+            .await?;
+
+            sqlx::query!(
+                r#"
+                INSERT INTO bundle_members (source_id, relative_path, bundle_id)
+                VALUES ( ?1, ?2, ?3 )
+                ON CONFLICT(source_id, relative_path) DO UPDATE SET
+                    bundle_id = excluded.bundle_id
+                "#,
+                m_source,
+                m_path,
+                bundle_id,
+            )
+            .execute(&mut *tx)
+            .await?;
+        }
+
+        // 3. Finalize: delete the bundle pending_op (bind id + source + op_type so
+        //    a stale/mismatched id cannot delete an unrelated op). Require exactly
+        //    one row or roll the whole bundle back.
+        let deleted = sqlx::query!(
+            "DELETE FROM pending_ops WHERE id = ?1 AND source_id = ?2 AND op_type = ?3",
+            op_id_v,
+            source_id,
+            "bundle",
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if deleted != 1 {
+            return Err(anyhow!(
+                "state.reconcile_op_missing: bundle pending_op id {op_id_v} not found \
+                 (DELETE affected {deleted} rows); refusing to commit bundle"
+            ));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
+    async fn get_bundle_ref_for_member(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+    ) -> Result<Option<BundleRef>> {
+        let source_str = source.to_string();
+        let path_str = path.as_str().to_string();
+        let row = sqlx::query!(
+            r#"
+            SELECT
+                b.id            AS "bundle_id!: String",
+                b.drive_file_id AS "drive_file_id!: String"
+            FROM bundle_members m
+            JOIN bundles b ON b.id = m.bundle_id
+            WHERE m.source_id = ?1 AND m.relative_path = ?2
+            "#,
+            source_str,
+            path_str,
+        )
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(|r| BundleRef {
+            bundle_id: r.bundle_id,
+            drive_file_id: r.drive_file_id,
+        }))
+    }
+
+    async fn list_empty_bundles(&self, source: SourceId) -> Result<Vec<(String, String)>> {
+        let source_str = source.to_string();
+        // Anti-join against the REAL membership rows (not the cosmetic
+        // `member_count`): a bundle is a GC candidate iff no `bundle_members` row
+        // still references it.
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                b.id            AS "id!: String",
+                b.drive_file_id AS "drive_file_id!: String"
+            FROM bundles b
+            WHERE b.source_id = ?1
+              AND NOT EXISTS (
+                  SELECT 1 FROM bundle_members m WHERE m.bundle_id = b.id
+              )
+            "#,
+            source_str,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+        Ok(rows.into_iter().map(|r| (r.id, r.drive_file_id)).collect())
+    }
+
+    async fn delete_bundle(&self, bundle_id: &str) -> Result<()> {
+        sqlx::query!("DELETE FROM bundles WHERE id = ?1", bundle_id)
+            .execute(&self.pool)
+            .await?;
+        Ok(())
+    }
+
     async fn schema_version(&self) -> Result<i64> {
         // PRAGMA returns a non-standard row shape the `query!` macro cannot
         // describe, so use the dynamic query API (mirrors the wal_checkpoint
@@ -2829,9 +3026,12 @@ impl StateRepo for SqliteStateRepo {
                 fs.source_id     AS "source_id!: String",
                 fs.relative_path AS "relative_path!: String",
                 fs.status        AS "status!: String",
-                fs.drive_file_id AS "drive_file_id: String"
+                fs.drive_file_id AS "drive_file_id: String",
+                bm.bundle_id     AS "bundle_id: String"
             FROM file_state_fts
             JOIN file_state fs ON fs.rowid = file_state_fts.rowid
+            LEFT JOIN bundle_members bm
+                ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
             WHERE file_state_fts MATCH ?1
               AND (?2 IS NULL OR fs.source_id = ?2)
             ORDER BY rank
@@ -2851,6 +3051,7 @@ impl StateRepo for SqliteStateRepo {
                     relative_path: relative_path_from_string(r.relative_path)?,
                     status: file_state_status_from_str(&r.status)?,
                     drive_file_id: r.drive_file_id,
+                    bundle_id: r.bundle_id,
                 })
             })
             .collect()
@@ -2881,14 +3082,17 @@ impl StateRepo for SqliteStateRepo {
             sqlx::query!(
                 r#"
                 SELECT
-                    source_id     AS "source_id!: String",
-                    relative_path AS "relative_path!: String",
-                    size          AS "size!: i64",
-                    status        AS "status!: String",
-                    drive_file_id AS "drive_file_id: String"
-                FROM file_state
-                WHERE source_id = ?1
-                ORDER BY relative_path ASC
+                    fs.source_id     AS "source_id!: String",
+                    fs.relative_path AS "relative_path!: String",
+                    fs.size          AS "size!: i64",
+                    fs.status        AS "status!: String",
+                    fs.drive_file_id AS "drive_file_id: String",
+                    bm.bundle_id     AS "bundle_id: String"
+                FROM file_state fs
+                LEFT JOIN bundle_members bm
+                    ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
+                WHERE fs.source_id = ?1
+                ORDER BY fs.relative_path ASC
                 LIMIT ?2
                 "#,
                 source_str,
@@ -2904,6 +3108,7 @@ impl StateRepo for SqliteStateRepo {
                     r.size,
                     r.status,
                     r.drive_file_id,
+                    r.bundle_id,
                 )
             })
             .collect::<Vec<_>>()
@@ -2917,18 +3122,21 @@ impl StateRepo for SqliteStateRepo {
             sqlx::query!(
                 r#"
                 SELECT
-                    source_id     AS "source_id!: String",
-                    relative_path AS "relative_path!: String",
-                    size          AS "size!: i64",
-                    status        AS "status!: String",
-                    drive_file_id AS "drive_file_id: String"
-                FROM file_state
-                WHERE source_id = ?1
+                    fs.source_id     AS "source_id!: String",
+                    fs.relative_path AS "relative_path!: String",
+                    fs.size          AS "size!: i64",
+                    fs.status        AS "status!: String",
+                    fs.drive_file_id AS "drive_file_id: String",
+                    bm.bundle_id     AS "bundle_id: String"
+                FROM file_state fs
+                LEFT JOIN bundle_members bm
+                    ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
+                WHERE fs.source_id = ?1
                   AND (
-                    relative_path = ?2
-                    OR (relative_path >= ?3 AND relative_path < ?4)
+                    fs.relative_path = ?2
+                    OR (fs.relative_path >= ?3 AND fs.relative_path < ?4)
                   )
-                ORDER BY relative_path ASC
+                ORDER BY fs.relative_path ASC
                 LIMIT ?5
                 "#,
                 source_str,
@@ -2947,21 +3155,25 @@ impl StateRepo for SqliteStateRepo {
                     r.size,
                     r.status,
                     r.drive_file_id,
+                    r.bundle_id,
                 )
             })
             .collect::<Vec<_>>()
         };
 
         rows.into_iter()
-            .map(|(source_id, relative_path, size, status, drive_file_id)| {
-                Ok(RestoreFileRow {
-                    source_id: SourceId(uuid_from_str(&source_id)?),
-                    relative_path: relative_path_from_string(relative_path)?,
-                    size: size as u64,
-                    status: file_state_status_from_str(&status)?,
-                    drive_file_id,
-                })
-            })
+            .map(
+                |(source_id, relative_path, size, status, drive_file_id, bundle_id)| {
+                    Ok(RestoreFileRow {
+                        source_id: SourceId(uuid_from_str(&source_id)?),
+                        relative_path: relative_path_from_string(relative_path)?,
+                        size: size as u64,
+                        status: file_state_status_from_str(&status)?,
+                        drive_file_id,
+                        bundle_id,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -3013,15 +3225,18 @@ impl StateRepo for SqliteStateRepo {
             sqlx::query!(
                 r#"
                 SELECT
-                    source_id     AS "source_id!: String",
-                    relative_path AS "relative_path!: String",
-                    size          AS "size!: i64",
-                    status        AS "status!: String",
-                    drive_file_id AS "drive_file_id: String"
-                FROM file_state
-                WHERE source_id = ?1
-                  AND instr(substr(relative_path, ?2 + 1), '/') = 0
-                ORDER BY relative_path ASC
+                    fs.source_id     AS "source_id!: String",
+                    fs.relative_path AS "relative_path!: String",
+                    fs.size          AS "size!: i64",
+                    fs.status        AS "status!: String",
+                    fs.drive_file_id AS "drive_file_id: String",
+                    bm.bundle_id     AS "bundle_id: String"
+                FROM file_state fs
+                LEFT JOIN bundle_members bm
+                    ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
+                WHERE fs.source_id = ?1
+                  AND instr(substr(fs.relative_path, ?2 + 1), '/') = 0
+                ORDER BY fs.relative_path ASC
                 LIMIT ?3
                 "#,
                 source_str,
@@ -3038,6 +3253,7 @@ impl StateRepo for SqliteStateRepo {
                     r.size,
                     r.status,
                     r.drive_file_id,
+                    r.bundle_id,
                 )
             })
             .collect::<Vec<_>>()
@@ -3045,16 +3261,19 @@ impl StateRepo for SqliteStateRepo {
             sqlx::query!(
                 r#"
                 SELECT
-                    source_id     AS "source_id!: String",
-                    relative_path AS "relative_path!: String",
-                    size          AS "size!: i64",
-                    status        AS "status!: String",
-                    drive_file_id AS "drive_file_id: String"
-                FROM file_state
-                WHERE source_id = ?1
-                  AND relative_path >= ?2 AND relative_path < ?3
-                  AND instr(substr(relative_path, ?4 + 1), '/') = 0
-                ORDER BY relative_path ASC
+                    fs.source_id     AS "source_id!: String",
+                    fs.relative_path AS "relative_path!: String",
+                    fs.size          AS "size!: i64",
+                    fs.status        AS "status!: String",
+                    fs.drive_file_id AS "drive_file_id: String",
+                    bm.bundle_id     AS "bundle_id: String"
+                FROM file_state fs
+                LEFT JOIN bundle_members bm
+                    ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
+                WHERE fs.source_id = ?1
+                  AND fs.relative_path >= ?2 AND fs.relative_path < ?3
+                  AND instr(substr(fs.relative_path, ?4 + 1), '/') = 0
+                ORDER BY fs.relative_path ASC
                 LIMIT ?5
                 "#,
                 source_str,
@@ -3073,6 +3292,7 @@ impl StateRepo for SqliteStateRepo {
                     r.size,
                     r.status,
                     r.drive_file_id,
+                    r.bundle_id,
                 )
             })
             .collect::<Vec<_>>()
@@ -3151,15 +3371,18 @@ impl StateRepo for SqliteStateRepo {
         let files: Result<Vec<RestoreFileRow>> = file_rows
             .into_iter()
             .take(cap)
-            .map(|(source_id, relative_path, size, status, drive_file_id)| {
-                Ok(RestoreFileRow {
-                    source_id: SourceId(uuid_from_str(&source_id)?),
-                    relative_path: relative_path_from_string(relative_path)?,
-                    size: size as u64,
-                    status: file_state_status_from_str(&status)?,
-                    drive_file_id,
-                })
-            })
+            .map(
+                |(source_id, relative_path, size, status, drive_file_id, bundle_id)| {
+                    Ok(RestoreFileRow {
+                        source_id: SourceId(uuid_from_str(&source_id)?),
+                        relative_path: relative_path_from_string(relative_path)?,
+                        size: size as u64,
+                        status: file_state_status_from_str(&status)?,
+                        drive_file_id,
+                        bundle_id,
+                    })
+                },
+            )
             .collect();
         let folders: Vec<String> = folder_rows.into_iter().take(cap).collect();
 
@@ -3188,14 +3411,17 @@ impl StateRepo for SqliteStateRepo {
         let rows = sqlx::query!(
             r#"
             SELECT
-                source_id     AS "source_id!: String",
-                relative_path AS "relative_path!: String",
-                status        AS "status!: String",
-                drive_file_id AS "drive_file_id: String"
-            FROM file_state
-            WHERE relative_path GLOB ?1
-              AND (?2 IS NULL OR source_id = ?2)
-            ORDER BY relative_path ASC
+                fs.source_id     AS "source_id!: String",
+                fs.relative_path AS "relative_path!: String",
+                fs.status        AS "status!: String",
+                fs.drive_file_id AS "drive_file_id: String",
+                bm.bundle_id     AS "bundle_id: String"
+            FROM file_state fs
+            LEFT JOIN bundle_members bm
+                ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
+            WHERE fs.relative_path GLOB ?1
+              AND (?2 IS NULL OR fs.source_id = ?2)
+            ORDER BY fs.relative_path ASC
             LIMIT ?3
             "#,
             glob,
@@ -3212,6 +3438,7 @@ impl StateRepo for SqliteStateRepo {
                     relative_path: relative_path_from_string(r.relative_path)?,
                     status: file_state_status_from_str(&r.status)?,
                     drive_file_id: r.drive_file_id,
+                    bundle_id: r.bundle_id,
                 })
             })
             .collect()
@@ -3685,6 +3912,264 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A synced bundle member row: a `Synced` `file_state` row with a NULL
+    /// `drive_file_id` (its bytes live inside a bundle object).
+    fn synced_member(source_id: SourceId, path: &str, hash_byte: u8) -> FileStateRow {
+        FileStateRow {
+            status: FileStateStatus::Synced,
+            drive_file_id: None,
+            ..sample_file(source_id, path, hash_byte)
+        }
+    }
+
+    async fn enqueue_bundle_op(
+        repo: &SqliteStateRepo,
+        source_id: SourceId,
+        rel: &str,
+    ) -> PendingOpId {
+        repo.enqueue_pending_op(NewPendingOp {
+            source_id,
+            op_type: "bundle".into(),
+            relative_path: rp(rel),
+            payload_json: serde_json::json!({ "client_op_uuid": "u" }),
+            scheduled_for: 0,
+            created_at: 0,
+        })
+        .await
+        .unwrap()
+    }
+
+    /// `commit_bundle_result` transactionally writes the bundle row + member
+    /// `file_state` rows + membership and deletes the pending op; membership
+    /// resolves to the bundle object; and deleting a member's `file_state` row
+    /// cascades its membership away.
+    #[tokio::test]
+    async fn commit_bundle_result_persists_and_cascades() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let op_id = enqueue_bundle_op(&repo, src.id, "logs/a.log").await;
+        let members = vec![
+            synced_member(src.id, "logs/a.log", 1),
+            synced_member(src.id, "logs/b.log", 2),
+            synced_member(src.id, "logs/c.log", 3),
+        ];
+        let bundle = BundleRow {
+            id: "bundle-uuid-1".into(),
+            source_id: src.id,
+            drive_file_id: "drive-bundle-1".into(),
+            drive_md5: Some([9u8; 16]),
+            size: 4096,
+            member_count: members.len() as u64,
+            created_at: 1,
+        };
+        repo.commit_bundle_result(op_id, &bundle, &members)
+            .await
+            .unwrap();
+
+        // The pending op was finalized.
+        assert!(repo
+            .get_pending_ops_for_source(src.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Each member: a synced row with NULL drive id, resolving to the bundle.
+        for path in ["logs/a.log", "logs/b.log", "logs/c.log"] {
+            let row = repo
+                .get_file_state(src.id, &rp(path))
+                .await
+                .unwrap()
+                .expect("member row");
+            assert_eq!(row.status, FileStateStatus::Synced);
+            assert!(row.drive_file_id.is_none());
+            let bref = repo
+                .get_bundle_ref_for_member(src.id, &rp(path))
+                .await
+                .unwrap()
+                .expect("membership resolves");
+            assert_eq!(bref.bundle_id, "bundle-uuid-1");
+            assert_eq!(bref.drive_file_id, "drive-bundle-1");
+        }
+
+        // Deleting a member's file_state row cascades its membership away (the
+        // planner's delete path for a bundled member that is removed locally).
+        repo.delete_file_state(src.id, &rp("logs/a.log"))
+            .await
+            .unwrap();
+        assert!(repo
+            .get_bundle_ref_for_member(src.id, &rp("logs/a.log"))
+            .await
+            .unwrap()
+            .is_none());
+        // The siblings are untouched.
+        assert!(repo
+            .get_bundle_ref_for_member(src.id, &rp("logs/b.log"))
+            .await
+            .unwrap()
+            .is_some());
+    }
+
+    /// Mutual-exclusion invariant: committing a member as a STANDALONE object
+    /// (the path a bundled file takes when it later changes) clears its bundle
+    /// membership, so restore/reconcile use the fresh standalone object.
+    #[tokio::test]
+    async fn standalone_commit_clears_bundle_membership() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // Commit a bundle containing "a.txt".
+        let op_id = enqueue_bundle_op(&repo, src.id, "a.txt").await;
+        let bundle = BundleRow {
+            id: "b-1".into(),
+            source_id: src.id,
+            drive_file_id: "drive-bundle".into(),
+            drive_md5: None,
+            size: 100,
+            member_count: 1,
+            created_at: 1,
+        };
+        repo.commit_bundle_result(op_id, &bundle, &[synced_member(src.id, "a.txt", 7)])
+            .await
+            .unwrap();
+        assert!(repo
+            .get_bundle_ref_for_member(src.id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .is_some());
+
+        // Now the file changes and re-uploads standalone: an `upload` op finalized
+        // by commit_create_result with a real drive_file_id.
+        let up_id = repo
+            .enqueue_pending_op(NewPendingOp {
+                source_id: src.id,
+                op_type: "upload".into(),
+                relative_path: rp("a.txt"),
+                payload_json: serde_json::json!({}),
+                scheduled_for: 0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+        let standalone = FileStateRow {
+            status: FileStateStatus::Synced,
+            drive_file_id: Some("drive-standalone".into()),
+            drive_md5: Some([1u8; 16]),
+            ..sample_file(src.id, "a.txt", 8)
+        };
+        repo.commit_create_result(up_id, &standalone).await.unwrap();
+
+        // Membership was cleared; the row now points at the standalone object.
+        assert!(repo
+            .get_bundle_ref_for_member(src.id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .is_none());
+        let row = repo
+            .get_file_state(src.id, &rp("a.txt"))
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.drive_file_id.as_deref(), Some("drive-standalone"));
+    }
+
+    /// Bundle GC query (issue #35 item a): `list_empty_bundles` reports only
+    /// bundles whose members have all gone (computed from the real
+    /// `bundle_members` rows, not the cosmetic `member_count`), and
+    /// `delete_bundle` drops the row.
+    #[tokio::test]
+    async fn list_empty_bundles_reports_and_delete_drops() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // Commit a 2-member bundle.
+        let op_id = enqueue_bundle_op(&repo, src.id, "logs/a.log").await;
+        let bundle = BundleRow {
+            id: "b-gc-1".into(),
+            source_id: src.id,
+            drive_file_id: "drive-gc-1".into(),
+            drive_md5: None,
+            size: 100,
+            member_count: 2,
+            created_at: 1,
+        };
+        repo.commit_bundle_result(
+            op_id,
+            &bundle,
+            &[
+                synced_member(src.id, "logs/a.log", 1),
+                synced_member(src.id, "logs/b.log", 2),
+            ],
+        )
+        .await
+        .unwrap();
+
+        // Not yet empty: no GC candidates.
+        assert!(repo.list_empty_bundles(src.id).await.unwrap().is_empty());
+
+        // Delete both members locally; their membership rows cascade away.
+        repo.delete_file_state(src.id, &rp("logs/a.log"))
+            .await
+            .unwrap();
+        repo.delete_file_state(src.id, &rp("logs/b.log"))
+            .await
+            .unwrap();
+
+        // Now the bundle is empty and reported with its Drive object id.
+        let empties = repo.list_empty_bundles(src.id).await.unwrap();
+        assert_eq!(
+            empties,
+            vec![("b-gc-1".to_string(), "drive-gc-1".to_string())]
+        );
+
+        // delete_bundle drops the row; the candidate list is then empty.
+        repo.delete_bundle("b-gc-1").await.unwrap();
+        assert!(repo.list_empty_bundles(src.id).await.unwrap().is_empty());
+    }
+
+    /// Issue #35 finding 5: `load_bundle_config` fails CLOSED to the default when
+    /// a stored threshold is out of the narrowed type's range - an out-of-u32
+    /// `bundle_min_cold_age_days` must NOT wrap to 0 (which would disable the
+    /// coldness gate) - while an in-range value is honoured.
+    #[tokio::test]
+    async fn load_bundle_config_fails_closed_on_out_of_range_cold_age() {
+        let (repo, _dir) = temp_repo().await;
+        repo.set_setting("bundle_small_files", &serde_json::Value::Bool(true))
+            .await
+            .unwrap();
+
+        // 2^32 as u64 would truncate to 0 with a raw `as u32` cast.
+        repo.set_setting(
+            "bundle_min_cold_age_days",
+            &serde_json::json!(4_294_967_296u64),
+        )
+        .await
+        .unwrap();
+        let cfg = crate::planner::load_bundle_config(&repo).await;
+        assert!(cfg.enabled);
+        assert_eq!(
+            cfg.min_cold_age_days,
+            crate::planner::BUNDLE_MIN_COLD_AGE_DAYS,
+            "an out-of-range cold-age must fail closed to the default, not wrap to 0"
+        );
+
+        // An in-range value is honoured.
+        repo.set_setting("bundle_min_cold_age_days", &serde_json::json!(7u64))
+            .await
+            .unwrap();
+        let cfg = crate::planner::load_bundle_config(&repo).await;
+        assert_eq!(cfg.min_cold_age_days, 7);
     }
 
     #[tokio::test]

@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n                SELECT\n                    source_id     AS \"source_id!: String\",\n                    relative_path AS \"relative_path!: String\",\n                    size          AS \"size!: i64\",\n                    status        AS \"status!: String\",\n                    drive_file_id AS \"drive_file_id: String\"\n                FROM file_state\n                WHERE source_id = ?1\n                ORDER BY relative_path ASC\n                LIMIT ?2\n                ",
+  "query": "\n                SELECT\n                    fs.source_id     AS \"source_id!: String\",\n                    fs.relative_path AS \"relative_path!: String\",\n                    fs.size          AS \"size!: i64\",\n                    fs.status        AS \"status!: String\",\n                    fs.drive_file_id AS \"drive_file_id: String\",\n                    bm.bundle_id     AS \"bundle_id: String\"\n                FROM file_state fs\n                LEFT JOIN bundle_members bm\n                    ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path\n                WHERE fs.source_id = ?1\n                  AND instr(substr(fs.relative_path, ?2 + 1), '/') = 0\n                ORDER BY fs.relative_path ASC\n                LIMIT ?3\n                ",
   "describe": {
     "columns": [
       {
@@ -57,18 +57,30 @@
             "name": "drive_file_id"
           }
         }
+      },
+      {
+        "name": "bundle_id: String",
+        "ordinal": 5,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bundle_members",
+            "name": "bundle_id"
+          }
+        }
       }
     ],
     "parameters": {
-      "Right": 2
+      "Right": 3
     },
     "nullable": [
       false,
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "e1f97a14e3eb27b8a495496ea11cf01d815a8aa9c81972d4bd7a8d6f501b5409"
+  "hash": "d937a5e7784e25fbb20b7a26bab8f1fd75f805f4321ff18b0179420cb3fe9454"
 }

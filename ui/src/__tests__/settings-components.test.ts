@@ -93,6 +93,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     updater: { channel: "stable", checkIntervalSecs: 21600 },
     ui: { trayLeftClickOpens: "activity", locale: "en-US", colorMode: "system" },
     windows: { vssMode: "auto", vssHelper: false },
+    bundleSmallFiles: false,
     ...over,
   };
 }
@@ -752,6 +753,35 @@ describe("Settings Rules tab", () => {
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
       patch: { global: { autoStartOnLogin: false } },
+    });
+  });
+
+  it("advanced: small-file bundling renders OFF by default and toggling it patches the top-level flag", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Partial<SettingsDto> }).patch;
+        return Promise.resolve({ ...makeSettings(), ...patch });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    // Default OFF: the frozen v1.0.0 behaviour.
+    const toggle = wrapper.get('[data-testid="bundle-small-files-toggle"]');
+    expect((toggle.element as HTMLInputElement).checked).toBe(false);
+
+    // Turning it on patches the standalone top-level flag (NOT a global-group
+    // field), which the backend writes to the `bundle_small_files` KV key.
+    await toggle.setValue(true);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { bundleSmallFiles: true },
     });
   });
 

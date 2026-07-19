@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n            SELECT\n                source_id     AS \"source_id!: String\",\n                relative_path AS \"relative_path!: String\",\n                status        AS \"status!: String\",\n                drive_file_id AS \"drive_file_id: String\"\n            FROM file_state\n            WHERE relative_path GLOB ?1\n              AND (?2 IS NULL OR source_id = ?2)\n            ORDER BY relative_path ASC\n            LIMIT ?3\n            ",
+  "query": "\n            SELECT\n                fs.source_id     AS \"source_id!: String\",\n                fs.relative_path AS \"relative_path!: String\",\n                fs.status        AS \"status!: String\",\n                fs.drive_file_id AS \"drive_file_id: String\",\n                bm.bundle_id     AS \"bundle_id: String\"\n            FROM file_state fs\n            LEFT JOIN bundle_members bm\n                ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path\n            WHERE fs.relative_path GLOB ?1\n              AND (?2 IS NULL OR fs.source_id = ?2)\n            ORDER BY fs.relative_path ASC\n            LIMIT ?3\n            ",
   "describe": {
     "columns": [
       {
@@ -46,6 +46,17 @@
             "name": "drive_file_id"
           }
         }
+      },
+      {
+        "name": "bundle_id: String",
+        "ordinal": 4,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bundle_members",
+            "name": "bundle_id"
+          }
+        }
       }
     ],
     "parameters": {
@@ -55,8 +66,9 @@
       false,
       false,
       false,
+      true,
       true
     ]
   },
-  "hash": "611f8fe5888958c8410adf0ff9c66a164819b8d8f49cb7bbb2dd7759e3a8a70c"
+  "hash": "12cb8338a500850b553f7cf31bcbc705c6d98c7b834e0fe50284e28bbadcda02"
 }

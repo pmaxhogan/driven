@@ -1,0 +1,38 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                b.id            AS \"bundle_id!: String\",\n                b.drive_file_id AS \"drive_file_id!: String\"\n            FROM bundle_members m\n            JOIN bundles b ON b.id = m.bundle_id\n            WHERE m.source_id = ?1 AND m.relative_path = ?2\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "bundle_id!: String",
+        "ordinal": 0,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bundles",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "drive_file_id!: String",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "bundles",
+            "name": "drive_file_id"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true,
+      false
+    ]
+  },
+  "hash": "72c61f4ad706bae836fb3bdea007a3ab27e320f7b09078852c72cdad34138a64"
+}

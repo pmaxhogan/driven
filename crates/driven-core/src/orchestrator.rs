@@ -1084,7 +1084,7 @@ impl SyncOrchestrator {
         now: crate::types::UnixMs,
         outcome: &OpOutcome,
     ) -> NewActivity {
-        let (level, event_type, bytes, path) = match outcome {
+        let (level, event_type, file_count, bytes, path) = match outcome {
             OpOutcome::Done {
                 relative_path,
                 kind: crate::executor::DoneKind::Upload,
@@ -1092,6 +1092,7 @@ impl SyncOrchestrator {
             } => (
                 ActivityLevel::Info,
                 "upload_done".to_string(),
+                None,
                 *bytes,
                 relative_path,
             ),
@@ -1103,18 +1104,40 @@ impl SyncOrchestrator {
                 ActivityLevel::Info,
                 "trash_done".to_string(),
                 None,
+                None,
+                relative_path,
+            ),
+            // V2 bundling (issue #35): one bundle op uploaded N member files as a
+            // single object -> ONE `bundle_upload` Info row carrying the file
+            // count + the object byte size (feeds the DESIGN s8.3 aggregates).
+            OpOutcome::BundleDone {
+                relative_path,
+                files,
+                bytes,
+            } => (
+                ActivityLevel::Info,
+                "bundle_upload".to_string(),
+                Some(*files),
+                Some(*bytes),
                 relative_path,
             ),
             OpOutcome::Failed {
                 relative_path,
                 code,
-            } => (ActivityLevel::Error, code.to_string(), None, relative_path),
+            } => (
+                ActivityLevel::Error,
+                code.to_string(),
+                None,
+                None,
+                relative_path,
+            ),
             OpOutcome::Skipped {
                 relative_path,
                 reason,
             } => (
                 ActivityLevel::Warn,
                 reason.error_code().to_string(),
+                None,
                 None,
                 relative_path,
             ),
@@ -1124,7 +1147,7 @@ impl SyncOrchestrator {
             source_id: Some(source_id),
             level,
             event_type,
-            file_count: None,
+            file_count,
             bytes,
             message: Some(path.as_str().to_string()),
         }
@@ -1303,7 +1326,19 @@ impl SyncOrchestrator {
                 .await;
         }
 
-        let plan = crate::planner::plan(source, &scan, self.state.as_ref()).await?;
+        // V2 small-file bundling (issue #35): opt-in via the standalone
+        // `bundle_small_files` boolean setting (default off), surfaced as an
+        // Advanced settings toggle; the thresholds are backend-only KV keys. A
+        // STANDALONE key (not a field of the typed `global` group blob) so it
+        // never rides the settings-form round-trip - the UI PATCHes it directly.
+        // When off the planner behaves exactly as v1.0.0 (every new/changed file
+        // is an individual upload); a settings read failure degrades safely to
+        // "off"/defaults (see `load_bundle_config`). `now` gates the coldness
+        // filter (only files older than `min_cold_age_days` are bundled).
+        let bundle_cfg = crate::planner::load_bundle_config(self.state.as_ref()).await;
+        let now = self.clock.now_ms();
+        let plan =
+            crate::planner::plan(source, &scan, self.state.as_ref(), now, &bundle_cfg).await?;
         let summary = plan.summary();
         self.transition(OrchestratorState::Planning { plan: summary })
             .await;
@@ -1831,6 +1866,8 @@ fn exec_progress_from(summary: &crate::types::PlanSummary, outcomes: &[OpOutcome
     for outcome in outcomes {
         match outcome {
             OpOutcome::Done { .. } => files_done = files_done.saturating_add(1),
+            // A bundle completed N member files as one op (issue #35).
+            OpOutcome::BundleDone { files, .. } => files_done = files_done.saturating_add(*files),
             OpOutcome::Failed { .. } => errors = errors.saturating_add(1),
             OpOutcome::Skipped { .. } => {}
         }
@@ -1852,6 +1889,13 @@ fn log_outcomes(source: &SourceRow, outcomes: &[OpOutcome]) {
         match outcome {
             OpOutcome::Done { relative_path, .. } => {
                 tracing::debug!(target: TARGET, source_id = %source.id, path = %relative_path, "op done");
+            }
+            OpOutcome::BundleDone {
+                relative_path,
+                files,
+                bytes,
+            } => {
+                tracing::debug!(target: TARGET, source_id = %source.id, path = %relative_path, files = %files, bytes = %bytes, "bundle op done");
             }
             OpOutcome::Skipped {
                 relative_path,
@@ -2204,6 +2248,30 @@ mod tests {
                 .ops
                 .iter()
                 .map(|op| {
+                    // A bundle op produces a single BundleDone (issue #35).
+                    if let crate::types::Op::UploadBundle { members, .. } = op {
+                        let rel = members
+                            .first()
+                            .map(|m| m.relative_path.clone())
+                            .expect("bundle op has members");
+                        if auth_fail {
+                            return OpOutcome::Failed {
+                                relative_path: rel,
+                                code: crate::types::ErrorCode::AuthInvalidGrant,
+                            };
+                        }
+                        if fail {
+                            return OpOutcome::Failed {
+                                relative_path: rel,
+                                code: crate::types::ErrorCode::DriveChecksumMismatch,
+                            };
+                        }
+                        return OpOutcome::BundleDone {
+                            relative_path: rel,
+                            files: members.len() as u64,
+                            bytes: members.iter().map(|m| m.size).sum(),
+                        };
+                    }
                     let (relative_path, done_kind, bytes) = match op {
                         crate::types::Op::HashThenUpload {
                             relative_path,
@@ -2219,6 +2287,9 @@ mod tests {
                             crate::executor::DoneKind::Trash,
                             None,
                         ),
+                        crate::types::Op::UploadBundle { .. } => {
+                            unreachable!("bundle op handled above")
+                        }
                     };
                     if auth_fail {
                         OpOutcome::Failed {

@@ -2047,28 +2047,52 @@ Rust-side i18n:
   unmetered). (SHIPPED 0.2.0, #17 - metered pause/throttle; real metered
   detection on Windows only, conservative "unmetered" default on macOS/Linux.)
 - **macOS Spotlight integration** (`mdimport` of restored files).
-- **Small-file bundling (tar.gz batches).** When a directory contains many
-  small files, Drive's per-file API overhead dominates and bandwidth sits
-  idle (each file create is ~1 RTT to Drive + the pacer's `2 files/sec`
-  cap chews any large tree alive). Heuristic: any subdirectory whose
-  `file_state` rows show median size below a configurable threshold
-  (default 16 KiB) and count above another (default 200) gets packed into
-  a single `.driven-bundle.<hash>.tar.gz` per scan. Restore must
-  transparently unpack on download. Tradeoffs to design through:
-  - Granular change detection inside a bundle requires either re-uploading
-    the whole bundle on any inner file change (acceptable if the bundle
-    is genuinely cold data, painful otherwise) or content-addressed
-    chunking of the tarball itself (huge complexity, drifts toward
-    restic-style architecture).
-  - Drive UI browsability is lost — users can't see individual files
-    without restoring through Driven.
-  - Encrypted sources compose: the bundle is built first, then the whole
-    bundle is encrypted as a single stream — simpler than per-file
-    encryption inside the bundle.
-  - This unifies well with the same machinery needed for backup
-    versioning (M9 of the V1.x roadmap) and is the right time to revisit
-    `RemoteEntry` storage policy as a per-source choice (`one-file-per-file`
-    vs `bundle-cold-dirs` vs `chunked`).
+- **Small-file bundling (tar.gz batches).** (SHIPPED post-1.0, #35 - opt-in
+  via the Settings "Advanced" toggle, off by default so the frozen 1.0.0
+  behaviour is unchanged.) When a directory contains many small files, Drive's
+  per-file API overhead dominates and bandwidth sits idle (each file create is
+  ~1 RTT to Drive + the pacer's `2 files/sec` cap chews any large tree alive).
+  The planner packs many GENUINELY-NEW small files from one directory into a
+  single `.tar.gz` Drive object (archive format `tgz-1`, see `bundle.rs`);
+  restore transparently downloads the object and extracts the one member. As
+  actually shipped:
+  - **Eligibility gates (backend-only, config-tunable via settings KV,
+    fail-closed to defaults):** per-member size ceiling `max_file_size`
+    (default **256 KiB**); minimum eligible files per directory `min_files`
+    (default **100** - bundling only pays off for genuinely dense cold folders);
+    `max_files` per bundle (default **512**). Only files with NO existing
+    `file_state` row are eligible - a changed or previously-uploaded file always
+    stays an individual upload, so bundling never strands an old standalone
+    object and a bundled member that later changes simply re-uploads standalone
+    (clearing its membership).
+  - **Coldness gate:** a file is only bundled once its mtime is at least
+    `min_cold_age_days` old (default **30**). Fresh files are churn-prone, so
+    they upload individually; a file whose mtime is unknown is treated as fresh.
+  - **`max_bytes` / single simple-create rationale:** a bundle's uncompressed
+    bytes are capped (default **4 MiB**, clamped to stay a margin below the
+    executor's 5 MiB `RESUMABLE_THRESHOLD`) so the UPLOADED object - the gzip of
+    the tar, then for an encrypted source the ciphertext plus per-chunk framing -
+    always fits the single simple-create band and never needs a resumable
+    session. The whole archive is built and extracted in memory on a blocking
+    task, so the cap also bounds peak memory.
+  - **Change detection stays per-file:** a bundled member keeps a normal
+    `file_state` row (`drive_file_id = NULL`, bytes live inside the bundle) plus
+    a `bundle_members` linkage row (migration `0007_bundles.sql`). The scanner's
+    `(size, mtime)` detection, the planner's delete handling, and FTS5 search all
+    keep working unchanged; a deleted member lands in the planner's
+    "no drive_file_id -> drop the row" branch and its membership cascades away.
+  - **Bundle GC:** once a bundle's members are all deleted or promoted to
+    standalone objects it has no `bundle_members` rows left; the reconcile pass
+    trashes the now-dead `.tar.gz` object and drops the `bundles` row
+    (best-effort, retried by later sweeps).
+  - **Drive UI browsability is lost** for bundled files - users can't see
+    individual members without restoring through Driven (the cost of the
+    round-trip saving).
+  - **Encrypted sources compose:** the `.tar.gz` is built first, then the whole
+    object is encrypted as a single stream - simpler than per-file encryption
+    inside the bundle.
+  - Deferred: content-addressed chunking of the tarball, and per-source storage
+    policy (`one-file-per-file` vs `bundle-cold-dirs` vs `chunked`).
 
 ---
 

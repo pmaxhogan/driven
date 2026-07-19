@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "DELETE FROM bundle_members WHERE source_id = ?1 AND relative_path = ?2",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "ead84f8b9ab2b88ae48115fa8aecbcd8b70ef1def14be71626a7d0a0998fedde"
+}

@@ -528,6 +528,122 @@ async fn rate_limit_on_seventh_file_retries_and_completes() {
 }
 
 // ---------------------------------------------------------------------------
+// Row (issue #35): small-file bundling UPLOAD under a fault. Four cold small NEW
+// files plan as ONE `.tar.gz` bundle; the bundle create (the first remote
+// request) hits an injected 429, is retried in-executor, and commits - one
+// object, N NULL-drive-id members each resolving to the bundle. Hermetic
+// fake-Drive tier so CI runs it. The PRODUCTION restore path (download + decrypt
+// + extract + verify + confined write, plaintext AND encrypted) is exercised
+// end-to-end in `src-tauri` `commands::restore` tests (that path lives there, not
+// in driven-core), so this test no longer hand-rolls a restore.
+// ---------------------------------------------------------------------------
+#[tokio::test]
+async fn bundle_uploads_under_rate_limit_and_commits() {
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    // `with_rate_limit_after(0)`: the FIRST remote request (the bundle create)
+    // 429s once, then succeeds on the executor's internal retry.
+    let remote = Arc::new(InMemoryRemoteStore::new().with_rate_limit_after(0));
+    let folder = remote.root_id().to_string();
+
+    // Four small NEW files in one subfolder -> one bundle.
+    let bodies: Vec<(String, Vec<u8>)> = (0..4u32)
+        .map(|i| {
+            (
+                format!("logs/f{i}.log"),
+                format!("log line {i} - some bytes {i}{i}{i}").into_bytes(),
+            )
+        })
+        .collect();
+    for (rel, body) in &bodies {
+        write_file(src_dir.path(), rel, body);
+    }
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+
+    // Plan with bundling ENABLED: gate off (`min_cold_age_days = 0`) plus a `now`
+    // far in the future so the fresh fixtures still count as cold, and a low
+    // `min_files` for the compact fixture.
+    let scan =
+        driven_core::scanner::scan(&src, state.as_ref(), driven_core::types::ScanMode::FastPath)
+            .await
+            .unwrap();
+    let cfg = driven_core::planner::BundleConfig {
+        enabled: true,
+        min_files: 3,
+        min_cold_age_days: 0,
+        ..driven_core::planner::BundleConfig::enabled_defaults()
+    };
+    let plan = driven_core::planner::plan(&src, &scan, state.as_ref(), i64::MAX / 2, &cfg)
+        .await
+        .unwrap();
+    assert_eq!(
+        plan.ops
+            .iter()
+            .filter(|o| matches!(o, Op::UploadBundle { .. }))
+            .count(),
+        1,
+        "the four cold small files plan as one bundle: {:?}",
+        plan.ops
+    );
+
+    let clock = Arc::new(FakeClock::new());
+    let pacer = test_pacer(clock.clone());
+    let exec = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote: remote.clone(),
+            state: state.clone(),
+            pacer,
+            crypto: None,
+            vss: None,
+            network: None,
+        },
+        clock.clone(),
+    );
+    let out = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
+    assert!(
+        out.iter()
+            .any(|o| matches!(o, OpOutcome::BundleDone { .. })),
+        "the bundle committed despite the injected 429: {out:?}"
+    );
+
+    // Exactly ONE object landed (the `.tar.gz`), not one per member.
+    assert_eq!(live_object_count(&remote, &folder).await, 1);
+
+    // Each member: a NULL-drive-id file_state row; ALL resolve to the SAME single
+    // uploaded bundle object.
+    let mut resolved_ids: Vec<String> = Vec::new();
+    for (rel, _) in &bodies {
+        let rp = RelativePath::try_from(rel.clone()).unwrap();
+        let row = state
+            .get_file_state(src.id, &rp)
+            .await
+            .unwrap()
+            .expect("member row");
+        assert!(
+            row.drive_file_id.is_none(),
+            "a bundled member has no standalone Drive object"
+        );
+        let bref = state
+            .get_bundle_ref_for_member(src.id, &rp)
+            .await
+            .unwrap()
+            .expect("membership resolves");
+        resolved_ids.push(bref.drive_file_id);
+    }
+    assert_eq!(resolved_ids.len(), bodies.len(), "every member resolves");
+    assert!(
+        resolved_ids.windows(2).all(|w| w[0] == w[1]),
+        "every member resolves to the SAME single bundle object: {resolved_ids:?}"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Row: crash mid-upload -> next sync recovers. BOTH recovery mechanisms exist
 //      per DESIGN s5.4 (byte-level resumable resume) + s5.6 (client_op_uuid
 //      orphan adoption), and are covered by the two tests below.

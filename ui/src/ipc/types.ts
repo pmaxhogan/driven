@@ -222,6 +222,8 @@ export interface SettingsDto {
   updater: UpdaterSettings;
   ui: UiSettings;
   windows: WindowsSettings | null;
+  /** V2 small-file bundling on/off (issue #35). A standalone advanced toggle. */
+  bundleSmallFiles: boolean;
 }
 
 export interface GlobalSettingsPatch {
@@ -270,6 +272,8 @@ export interface SettingsPatch {
   updater?: UpdaterSettingsPatch;
   ui?: UiSettingsPatch;
   windows?: WindowsSettingsPatch;
+  /** Toggle V2 small-file bundling (issue #35). Absent = leave unchanged. */
+  bundleSmallFiles?: boolean;
 }
 
 export interface UpdateInfo {

@@ -609,9 +609,11 @@ Tracked as separate roadmap items, no fixed sequence yet:
   "as of <date>" picker. See DESIGN §5.5.1. Follow-up: point-in-time restore of
   files that were locally DELETED (this slice covers older versions of
   still-tracked files).
-- **Small-file bundling (tar.gz batches)** — pack dirs of many tiny files
-  into a single bundle per scan to escape Drive's per-file API overhead;
-  see DESIGN.md §17 for the heuristic and tradeoffs.
+- **Small-file bundling (tar.gz batches)** — SHIPPED post-1.0 (#35): packs
+  cold, dense dirs of many tiny NEW files into a single `.tar.gz` object to
+  escape Drive's per-file API overhead. Opt-in (Settings "Advanced" toggle, off
+  by default); coldness + density gated; a reconcile pass GCs emptied bundles.
+  See DESIGN.md §17 for the shipped thresholds and rationale.
 - **Backends beyond Google Drive** — OneDrive (Graph API), Backblaze B2,
   generic S3.
 - **Web admin / status page** for users who want to monitor multiple

@@ -100,6 +100,42 @@ const TAG_LEN: usize = 16;
 /// One ciphertext frame on disk: a full plaintext chunk plus its tag.
 const CIPHERTEXT_FRAME: usize = PLAINTEXT_CHUNK_LEN + TAG_LEN;
 
+/// V2 bundling (issue #35): cap on the bytes read for ONE bundle OBJECT
+/// (compressed, and ciphertext for an encrypted source). A memory bound plus a
+/// guard against a corrupt/tampered object; comfortably above a real bundle
+/// (planner-capped at 4 MiB uncompressed).
+const MAX_BUNDLE_OBJECT_BYTES: u64 = 32 * 1024 * 1024;
+
+/// Cap on the DECOMPRESSED bundle archive during member extraction - a gzip-bomb
+/// guard. Generous relative to the planner's 4 MiB uncompressed bundle cap.
+const MAX_BUNDLE_DECOMPRESSED: u64 = 64 * 1024 * 1024;
+
+/// A single-entry cache of the most-recently-downloaded, decrypted bundle
+/// archive, held for the duration of one restore job (issue #35). Restore
+/// iterates files in path order, so adjacent members of the same bundle hit the
+/// cache and the bundle object is downloaded + decrypted once rather than once
+/// per member. Bounded to ONE bundle so peak memory stays a single archive.
+#[derive(Default)]
+struct BundleCache {
+    entry: Option<(String, std::sync::Arc<Vec<u8>>)>,
+}
+
+impl BundleCache {
+    /// The cached decompressed `.tar.gz` bytes for `drive_file_id`, if it is the
+    /// currently-held bundle.
+    fn get(&self, drive_file_id: &str) -> Option<std::sync::Arc<Vec<u8>>> {
+        self.entry
+            .as_ref()
+            .filter(|(k, _)| k == drive_file_id)
+            .map(|(_, v)| v.clone())
+    }
+
+    /// Replace the held bundle (evicting any prior one).
+    fn put(&mut self, drive_file_id: String, bytes: std::sync::Arc<Vec<u8>>) {
+        self.entry = Some((drive_file_id, bytes));
+    }
+}
+
 /// `list_remote_tree(source_id, prefix)` - the immediate children (sub-folders +
 /// files) of `prefix` in the backed-up tree (SPEC s11.5; DESIGN s8.4).
 ///
@@ -208,7 +244,7 @@ pub async fn search_files(
             status: file_state_status_str(h.status).to_string(),
             // M9c D2: ONE shared predicate (status==Synced AND has a Drive id), so
             // the search surface never marks restorable a row resolution rejects.
-            restorable: is_restorable(h.status, h.drive_file_id.as_deref()),
+            restorable: is_restorable(h.status, h.drive_file_id.as_deref(), h.bundle_id.is_some()),
         })
         .collect();
 
@@ -467,13 +503,27 @@ async fn resolve_restore_items(
                     format!("unknown file to restore: {}", item.relative_path),
                 )
             })?;
+        // V2 bundling (issue #35): a row with a NULL `drive_file_id` may still be
+        // restorable if its bytes live inside a `.tar.gz` bundle. Look up its
+        // membership (only when there is no standalone object) so the gate + the
+        // restore both know the real byte source.
+        let bundle = if row.drive_file_id.is_none() {
+            state
+                .state()
+                .get_bundle_ref_for_member(source_id, &relative_path)
+                .await
+                .map_err(CommandError::from)?
+        } else {
+            None
+        };
+
         // M9c D2 (M8 R4-P2-1): gate resolution on the SAME `is_restorable`
         // predicate the tree/search DTOs use, so the UI never offers a row that is
         // rejected here. The granular branches below only choose the precise
         // bad-input MESSAGE (never-uploaded vs non-synced); the eligibility
         // DECISION is the single shared predicate.
-        if !is_restorable(row.status, row.drive_file_id.as_deref()) {
-            if row.drive_file_id.is_none() {
+        if !is_restorable(row.status, row.drive_file_id.as_deref(), bundle.is_some()) {
+            if row.drive_file_id.is_none() && bundle.is_none() {
                 return Err(CommandError::with_code(
                     ErrorCode::InvalidInput,
                     format!(
@@ -525,8 +575,14 @@ async fn resolve_restore_items(
         resolved.push(ResolvedRestore {
             source_id,
             relative_path: row.relative_path.as_str().to_string(),
+            // Issue #36 date-aware selection (current vs a retained version) picks
+            // these; issue #35 `bundle` is the byte source when the current row is
+            // a bundled member. They are mutually exclusive: a currently-bundled
+            // member has no standalone object and thus no versions, so a version
+            // restore always carries `bundle: None`.
             size,
             drive_file_id,
+            bundle,
             hash_blake3,
         });
     }
@@ -684,6 +740,10 @@ struct ResolvedRestore {
     relative_path: String,
     size: u64,
     drive_file_id: Option<String>,
+    /// V2 bundling (issue #35): `Some` when this file's bytes live inside a
+    /// `.tar.gz` bundle (its `drive_file_id` is then `None`); the restore path
+    /// downloads the bundle object and extracts this member.
+    bundle: Option<driven_core::state::BundleRef>,
     hash_blake3: [u8; 32],
 }
 
@@ -755,6 +815,9 @@ async fn run_restore_job(
     cancel: RestoreCancel,
 ) {
     let mut cancelled = false;
+    // V2 bundling (issue #35): a single-entry cache so adjacent members of the
+    // same bundle reuse one download + decrypt.
+    let mut bundle_cache = BundleCache::default();
     for (idx, plan) in plans.iter().enumerate() {
         // M8-P1-1: cancel observed BEFORE starting this file -> stop the loop; the
         // remaining (and this) files stay Pending -> marked Cancelled below.
@@ -776,6 +839,7 @@ async fn run_restore_job(
             &plan.crypto,
             &dest_root,
             &cancel,
+            &mut bundle_cache,
             |bytes_done| {
                 // Per-file streamed progress: update this file's bytes + the overall
                 // bytes-done, then emit so the UI advances the bar mid-file.
@@ -905,15 +969,11 @@ async fn restore_one_file<F: FnMut(u64)>(
     crypto: &SuiteVerdict,
     dest_root: &confine::ConfinedRoot,
     cancel: &RestoreCancel,
+    bundle_cache: &mut BundleCache,
     mut on_progress: F,
 ) -> FileOutcome {
-    // A file never uploaded has no Drive object to restore.
-    let drive_file_id = match file.drive_file_id.as_deref() {
-        Some(id) => id,
-        None => return FileOutcome::Failed(ErrorCode::InternalBug),
-    };
-
     // Fail closed: an encrypted source whose key is unavailable cannot decrypt.
+    // Resolved first so it gates BOTH the standalone and the bundle path.
     let suite: Option<&dyn SourceCryptoSuite> = match crypto {
         SuiteVerdict::Plaintext => None,
         SuiteVerdict::Suite(s) => Some(s.as_ref()),
@@ -928,6 +988,30 @@ async fn restore_one_file<F: FnMut(u64)>(
     if let Err(e) = validate_restore_dest(dest_root.token(), &file.relative_path) {
         return FileOutcome::Failed(e.code);
     }
+
+    // V2 bundling (issue #35): this file's bytes live inside a `.tar.gz` bundle.
+    // Download the bundle object (once per job via the cache), decrypt it, extract
+    // this member, verify its BLAKE3, and write it out.
+    if let Some(bundle_ref) = &file.bundle {
+        return restore_bundled_member(
+            file,
+            bundle_ref,
+            store,
+            suite,
+            dest_root,
+            cancel,
+            bundle_cache,
+            &mut on_progress,
+        )
+        .await;
+    }
+
+    // --- standalone / legacy per-file object ------------------------------------
+    // A file never uploaded (and not bundled) has no Drive object to restore.
+    let drive_file_id = match file.drive_file_id.as_deref() {
+        Some(id) => id,
+        None => return FileOutcome::Failed(ErrorCode::InternalBug),
+    };
 
     // Open the Drive download stream. M8-P2-5: classify the remote error into the
     // specific SPEC s24 code (auth / missing-object / rate-limit / quota / ...)
@@ -998,6 +1082,241 @@ async fn restore_one_file<F: FnMut(u64)>(
         StreamOutcome::Cancelled => FileOutcome::Cancelled,
         StreamOutcome::Failed(code) => FileOutcome::Failed(code),
     }
+}
+
+/// Restore ONE member out of a `.tar.gz` bundle (V2 small-file bundling, issue
+/// #35): download the bundle object (once per job via `bundle_cache`), decrypt it
+/// to the plaintext archive, extract this member by its deterministic entry name,
+/// verify its BLAKE3 + length against the `file_state` row, and write it into the
+/// confined destination (temp + fsync + handle-relative atomic rename). The
+/// destination parent chain was already created by `validate_restore_dest` in the
+/// caller.
+#[allow(clippy::too_many_arguments)]
+async fn restore_bundled_member<F: FnMut(u64)>(
+    file: &ResolvedRestore,
+    bundle_ref: &driven_core::state::BundleRef,
+    store: &dyn RemoteStore,
+    suite: Option<&dyn SourceCryptoSuite>,
+    dest_root: &confine::ConfinedRoot,
+    cancel: &RestoreCancel,
+    bundle_cache: &mut BundleCache,
+    on_progress: &mut F,
+) -> FileOutcome {
+    if cancel.load(Ordering::SeqCst) {
+        return FileOutcome::Cancelled;
+    }
+
+    // The member's tar entry name is derived from its relative path (the same
+    // function the executor packed it under). The path came from a validated
+    // `file_state` row, so re-parsing it cannot fail in practice.
+    let rel = match driven_core::types::RelativePath::try_from(file.relative_path.clone()) {
+        Ok(r) => r,
+        Err(_) => return FileOutcome::Failed(ErrorCode::InternalBug),
+    };
+    let entry_name = driven_core::bundle::member_entry_name(&rel);
+
+    // 1) Obtain the decrypted `.tar.gz` bytes: reuse the cached bundle if this is
+    //    the same object as the previous member, else download + decrypt once.
+    let tar_gz = match bundle_cache.get(&bundle_ref.drive_file_id) {
+        Some(bytes) => bytes,
+        None => {
+            let mut reader = match store.download(&bundle_ref.drive_file_id).await {
+                Ok(stream) => stream.0,
+                Err(e) => return FileOutcome::Failed(classify_download_error(&e)),
+            };
+            let bytes =
+                match download_object_to_bytes(&mut reader, suite, MAX_BUNDLE_OBJECT_BYTES, cancel)
+                    .await
+                {
+                    Ok(Some(b)) => std::sync::Arc::new(b),
+                    // Cancelled mid-download: nothing was written, so no partial state.
+                    Ok(None) => return FileOutcome::Cancelled,
+                    Err(code) => return FileOutcome::Failed(code),
+                };
+            bundle_cache.put(bundle_ref.drive_file_id.clone(), bytes.clone());
+            bytes
+        }
+    };
+
+    if cancel.load(Ordering::SeqCst) {
+        return FileOutcome::Cancelled;
+    }
+
+    // 2) Extract this member on a blocking task (gunzip + untar are CPU work).
+    let tar_for_task = tar_gz.clone();
+    let extracted = tokio::task::spawn_blocking(move || {
+        driven_core::bundle::extract_member(&tar_for_task, &entry_name, MAX_BUNDLE_DECOMPRESSED)
+    })
+    .await;
+    let member_bytes = match extracted {
+        Ok(Ok(Some(bytes))) => bytes,
+        Ok(Ok(None)) => {
+            tracing::warn!(
+                target: TARGET,
+                file = %file.relative_path,
+                "bundle member not found inside its bundle object; refusing"
+            );
+            return FileOutcome::Failed(ErrorCode::CryptoDecryptFailed);
+        }
+        Ok(Err(e)) => {
+            // A gzip/tar decode error or the decompressed-size (gzip-bomb) cap.
+            tracing::warn!(target: TARGET, file = %file.relative_path, error = %e, "bundle extract failed");
+            return FileOutcome::Failed(ErrorCode::CryptoDecryptFailed);
+        }
+        Err(_join) => return FileOutcome::Failed(ErrorCode::InternalBug),
+    };
+
+    // 3) DATA-SAFETY: verify the extracted member against the recorded identity.
+    if blake3::hash(&member_bytes).as_bytes() != &file.hash_blake3 {
+        tracing::warn!(
+            target: TARGET,
+            file = %file.relative_path,
+            "restored bundle member blake3 mismatch; refusing the file"
+        );
+        return FileOutcome::Failed(ErrorCode::CryptoDecryptFailed);
+    }
+    if member_bytes.len() as u64 != file.size {
+        tracing::warn!(
+            target: TARGET,
+            file = %file.relative_path,
+            written = member_bytes.len(),
+            expected = file.size,
+            "restored bundle member length mismatch"
+        );
+        return FileOutcome::Failed(ErrorCode::CryptoDecryptFailed);
+    }
+
+    // 4) Write into the handle-confined destination (temp + fsync + atomic rename),
+    //    exactly like the standalone path.
+    let (mut confined, temp_file) =
+        match confine::ConfinedDest::open(dest_root, &file.relative_path) {
+            Ok(pair) => pair,
+            Err(code) => return FileOutcome::Failed(code),
+        };
+    if let Err(code) = write_all_and_sync(temp_file, &member_bytes).await {
+        return FileOutcome::Failed(code);
+    }
+    on_progress(member_bytes.len() as u64);
+    match confined.commit().await {
+        Ok(()) => FileOutcome::Done,
+        Err(code) => {
+            tracing::warn!(
+                target: TARGET,
+                file = %file.relative_path,
+                code = %code.code(),
+                "restore bundle member commit failed"
+            );
+            FileOutcome::Failed(code)
+        }
+    }
+}
+
+/// Read a whole Drive object (a bundle) into memory, decrypting frame-by-frame
+/// when `suite` is set (issue #35). Mirrors [`stream_to_disk_inner`]'s framing
+/// exactly (40-byte header, fixed 64-KiB+tag frames, `decrypt_chunk` for all but
+/// the last frame, `decrypt_last` for the trailer) so the object decrypts at the
+/// same boundaries the executor encrypted it at - but collects the PLAINTEXT
+/// (the `.tar.gz`) into a `Vec` instead of writing it out, and does NOT verify a
+/// BLAKE3 (a bundle's archive hash is not stored; each MEMBER is verified after
+/// extraction). `max_bytes` bounds the collected plaintext (a memory + tamper
+/// guard); exceeding it fails rather than growing unboundedly.
+async fn download_object_to_bytes<R>(
+    reader: &mut R,
+    suite: Option<&dyn SourceCryptoSuite>,
+    max_bytes: u64,
+    cancel: &RestoreCancel,
+) -> Result<Option<Vec<u8>>, ErrorCode>
+where
+    R: tokio::io::AsyncRead + Unpin,
+{
+    use tokio::io::AsyncReadExt;
+
+    let mut out: Vec<u8> = Vec::new();
+    let push = |out: &mut Vec<u8>, bytes: &[u8]| -> Result<(), ErrorCode> {
+        if out.len() as u64 + bytes.len() as u64 > max_bytes {
+            return Err(ErrorCode::DriveChecksumMismatch);
+        }
+        out.extend_from_slice(bytes);
+        Ok(())
+    };
+
+    match suite {
+        None => {
+            let mut buf = vec![0u8; CIPHERTEXT_FRAME];
+            loop {
+                // M8-P1-1 parity (issue #35 finding 2): observe the job cancel flag
+                // between frames so a cancel mid-download aborts PROMPTLY rather
+                // than after the whole (up to 32 MiB) object drains. Returning
+                // `Ok(None)` signals cancellation; no temp/partial state exists yet.
+                if cancel.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                let n = reader.read(&mut buf).await.map_err(map_download_read_err)?;
+                if n == 0 {
+                    break;
+                }
+                push(&mut out, &buf[..n])?;
+            }
+        }
+        Some(suite) => {
+            let mut header = [0u8; HEADER_LEN];
+            reader.read_exact(&mut header).await.map_err(|e| {
+                if e.kind() == std::io::ErrorKind::UnexpectedEof {
+                    ErrorCode::CryptoDecryptFailed
+                } else {
+                    map_download_read_err(e)
+                }
+            })?;
+            let mut dec: Box<dyn ContentDecryptor> = suite
+                .content_decryptor(&header)
+                .map_err(|_| ErrorCode::CryptoDecryptFailed)?;
+
+            let mut buf: Vec<u8> = Vec::with_capacity(CIPHERTEXT_FRAME * 2);
+            let mut read_chunk = vec![0u8; CIPHERTEXT_FRAME];
+            let mut eof = false;
+            while !eof {
+                // Cancel check between frames (see the plaintext arm above).
+                if cancel.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
+                while buf.len() <= CIPHERTEXT_FRAME && !eof {
+                    let n = reader
+                        .read(&mut read_chunk)
+                        .await
+                        .map_err(map_download_read_err)?;
+                    if n == 0 {
+                        eof = true;
+                    } else {
+                        buf.extend_from_slice(&read_chunk[..n]);
+                    }
+                }
+                while buf.len() > CIPHERTEXT_FRAME {
+                    let frame: Vec<u8> = buf.drain(..CIPHERTEXT_FRAME).collect();
+                    let pt = dec
+                        .decrypt_chunk(&frame)
+                        .map_err(|_| ErrorCode::CryptoDecryptFailed)?;
+                    push(&mut out, &pt)?;
+                }
+            }
+            let pt = dec
+                .decrypt_last(&buf)
+                .map_err(|_| ErrorCode::CryptoDecryptFailed)?;
+            push(&mut out, &pt)?;
+        }
+    }
+    Ok(Some(out))
+}
+
+/// Write `bytes` to the confined temp file and fsync it, ready for the
+/// handle-relative atomic rename (issue #35 bundle-member restore).
+async fn write_all_and_sync(out: std::fs::File, bytes: &[u8]) -> Result<(), ErrorCode> {
+    use tokio::io::AsyncWriteExt;
+    let out = tokio::fs::File::from_std(out);
+    let mut writer = tokio::io::BufWriter::new(out);
+    writer.write_all(bytes).await.map_err(map_io_err)?;
+    writer.flush().await.map_err(map_io_err)?;
+    writer.get_ref().sync_all().await.map_err(map_io_err)?;
+    Ok(())
 }
 
 /// The outcome of streaming one file to disk: completed + verified, cancelled
@@ -1550,7 +1869,11 @@ fn immediate_children_to_entries(
             size: row.size,
             status: Some(file_state_status_str(row.status).to_string()),
             // M9c D2: ONE shared predicate (status==Synced AND has a Drive id).
-            restorable: is_restorable(row.status, row.drive_file_id.as_deref()),
+            restorable: is_restorable(
+                row.status,
+                row.drive_file_id.as_deref(),
+                row.bundle_id.is_some(),
+            ),
         });
     }
     out
@@ -1630,25 +1953,34 @@ fn derive_immediate_children(prefix: &str, rows: &[RestoreFileRow]) -> Vec<Remot
             size: row.size,
             status: Some(file_state_status_str(row.status).to_string()),
             // M9c D2: same shared predicate the production path uses.
-            restorable: is_restorable(row.status, row.drive_file_id.as_deref()),
+            restorable: is_restorable(
+                row.status,
+                row.drive_file_id.as_deref(),
+                row.bundle_id.is_some(),
+            ),
         });
     }
     out
 }
 
 /// M9c D2 (M8 R4-P2-1): the ONE shared restore-eligibility predicate. A backed-up
-/// file is restorable iff it has a Drive object id AND its status is `Synced`.
+/// file is restorable iff its status is `Synced` AND it has a byte source: either
+/// a standalone Drive object id OR (V2 bundling, issue #35) membership in a
+/// `.tar.gz` bundle. A bundled member legitimately has a NULL `drive_file_id`
+/// (its bytes live inside the bundle object), so it is restorable via `bundled`.
 ///
 /// Both the tree/search DTO `restorable` flag AND restore resolution
 /// ([`resolve_restore_items`]) go through this SAME predicate, so the UI can never
-/// offer a row that resolution would then reject. Before this fix the DTOs marked
-/// a row restorable on `drive_file_id.is_some()` ALONE, but resolution also
-/// requires `status == Synced` (R3-P2-2: a changed/pending/error row's recorded
-/// `hash_blake3` may not match the bytes currently on Drive), so a stale-status
-/// row LOOKED selectable then failed only at restore start. Folding both checks
-/// into one function keeps the two surfaces in lockstep.
-fn is_restorable(status: driven_core::types::FileStateStatus, drive_file_id: Option<&str>) -> bool {
-    drive_file_id.is_some() && status == driven_core::types::FileStateStatus::Synced
+/// offer a row that resolution would then reject. The `status == Synced` guard
+/// stays (R3-P2-2: a changed/pending/error row's recorded `hash_blake3` may not
+/// match the bytes currently on Drive). Folding all checks into one function keeps
+/// the two surfaces in lockstep.
+fn is_restorable(
+    status: driven_core::types::FileStateStatus,
+    drive_file_id: Option<&str>,
+    bundled: bool,
+) -> bool {
+    (drive_file_id.is_some() || bundled) && status == driven_core::types::FileStateStatus::Synced
 }
 
 /// The serialized (snake_case) discriminant of a [`FileStateStatus`], matching the
@@ -2440,6 +2772,7 @@ mod tests {
             size,
             status: FileStateStatus::Synced,
             drive_file_id: drive.map(|s| s.to_string()),
+            bundle_id: None,
         }
     }
 
@@ -2496,9 +2829,11 @@ mod tests {
     fn is_restorable_requires_synced_status_and_a_drive_id() {
         use FileStateStatus as S;
         // Eligible: synced + has a drive id.
-        assert!(is_restorable(S::Synced, Some("d1")));
+        assert!(is_restorable(S::Synced, Some("d1"), false));
+        // A bundled member (issue #35): NULL drive_file_id but bundled + synced.
+        assert!(is_restorable(S::Synced, None, true));
         // Ineligible: synced but never uploaded (no drive id).
-        assert!(!is_restorable(S::Synced, None));
+        assert!(!is_restorable(S::Synced, None, false));
         // Ineligible: has a drive id but a non-synced status (its recorded hash may
         // not match the bytes on Drive). EVERY non-synced status is rejected.
         for st in [
@@ -2509,7 +2844,7 @@ mod tests {
             S::ExcludedOrphan,
         ] {
             assert!(
-                !is_restorable(st, Some("d1")),
+                !is_restorable(st, Some("d1"), false),
                 "a {st:?} row must NOT be restorable even with a drive id"
             );
         }
@@ -2560,6 +2895,7 @@ mod tests {
             size: 3,
             status: FileStateStatus::Error,
             drive_file_id: Some("d-1".to_string()),
+            bundle_id: None,
         };
         let children = driven_core::state::ImmediateTreeChildren {
             folders: Vec::new(),
@@ -2671,6 +3007,7 @@ mod tests {
             relative_path: rel.to_string(),
             size: plaintext.len() as u64,
             drive_file_id: Some("d-test".to_string()),
+            bundle: None,
             hash_blake3: *blake3::hash(plaintext).as_bytes(),
         }
     }
@@ -3122,6 +3459,7 @@ mod tests {
             &SuiteVerdict::Plaintext,
             &root,
             &no_cancel(),
+            &mut BundleCache::default(),
             |_| {},
         )
         .await;
@@ -3132,6 +3470,281 @@ mod tests {
             "the committed file must equal the verified plaintext exactly (D1)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- issue #35 bundle-member restore: exercise the REAL restore path -------
+
+    /// Build a `.tar.gz` from `members` (each `(rel, body)`) the way the executor
+    /// does, store it in `store` (encrypting with `suite` when set), and return the
+    /// `BundleRef` plus the built members (for `ResolvedRestore` identity). Used by
+    /// the real-restore-path bundle tests (issue #35 finding 3).
+    async fn make_bundle_object(
+        store: &driven_drive::fake::InMemoryRemoteStore,
+        suite: Option<&DrivenCryptoSuite>,
+        members: &[(&str, &[u8])],
+    ) -> (
+        driven_core::state::BundleRef,
+        Vec<driven_core::bundle::BuiltMember>,
+    ) {
+        use driven_drive::remote_store::UploadBody;
+        let src = rand_tmp("bundle-src");
+        std::fs::create_dir_all(&src).unwrap();
+        let inputs: Vec<_> = members
+            .iter()
+            .map(|(rel, body)| {
+                let p = src.join(rel);
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(&p, body).unwrap();
+                (
+                    driven_core::types::RelativePath::try_from(rel.to_string()).unwrap(),
+                    p,
+                    body.len() as u64,
+                )
+            })
+            .collect();
+        let built = driven_core::bundle::build_bundle(
+            &inputs,
+            driven_core::planner::BUNDLE_MAX_BYTES_CEILING,
+        )
+        .unwrap();
+        // Plaintext source stores the archive as-is; an encrypted source stores the
+        // ciphertext with the SAME framing the executor / streaming decrypt use.
+        let object_bytes = match suite {
+            None => built.tar_gz.clone(),
+            Some(s) => encrypt_blob(s, &built.tar_gz),
+        };
+        let parent = store.root_id().to_string();
+        let entry = store
+            .create(
+                &parent,
+                "driven-bundle-x.tar.gz",
+                "application/gzip",
+                UploadBody::Bytes(bytes::Bytes::from(object_bytes)),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&src);
+        (
+            driven_core::state::BundleRef {
+                bundle_id: "b-test".to_string(),
+                drive_file_id: entry.id,
+            },
+            built.members,
+        )
+    }
+
+    fn resolved_bundled(
+        m: &driven_core::bundle::BuiltMember,
+        bref: &driven_core::state::BundleRef,
+    ) -> ResolvedRestore {
+        ResolvedRestore {
+            source_id: SourceId::new_v4(),
+            relative_path: m.rel.as_str().to_string(),
+            size: m.size,
+            drive_file_id: None, // a bundled member has no standalone object
+            bundle: Some(bref.clone()),
+            hash_blake3: m.blake3,
+        }
+    }
+
+    /// Issue #35 finding 3: a PLAINTEXT bundled member restores byte-for-byte
+    /// through the REAL path (`restore_one_file` -> `restore_bundled_member` ->
+    /// `download_object_to_bytes` + BundleCache + extract + blake3 verify + confined
+    /// commit), not a hand-rolled download+extract.
+    #[tokio::test]
+    async fn restore_bundled_member_plaintext_via_real_path() {
+        let dir = rand_tmp("bundle-restore-plain");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let store = driven_drive::fake::InMemoryRemoteStore::new();
+        let members: &[(&str, &[u8])] = &[
+            ("logs/a.log", b"alpha member bytes"),
+            ("logs/b.log", b"bravo member bytes - the restore target"),
+        ];
+        let (bref, built) = make_bundle_object(&store, None, members).await;
+        let target = built
+            .iter()
+            .find(|m| m.rel.as_str() == "logs/b.log")
+            .unwrap();
+        let file = resolved_bundled(target, &bref);
+        let root = confine::ConfinedRoot::bind(token).expect("bind root");
+        let outcome = restore_one_file(
+            &file,
+            &store,
+            &SuiteVerdict::Plaintext,
+            &root,
+            &no_cancel(),
+            &mut BundleCache::default(),
+            |_| {},
+        )
+        .await;
+        assert!(
+            matches!(outcome, FileOutcome::Done),
+            "real-path plaintext bundle restore must succeed"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("logs").join("b.log")).unwrap(),
+            b"bravo member bytes - the restore target",
+            "the committed member equals the original"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #35 finding 3: an ENCRYPTED bundled member restores byte-for-byte
+    /// through the REAL path - covering `download_object_to_bytes`' frame-by-frame
+    /// STREAM-decrypt (the hand-duplicated header + 64-KiB-frame + `decrypt_last`
+    /// framing) that had zero test coverage before.
+    #[tokio::test]
+    async fn restore_bundled_member_encrypted_via_real_path() {
+        let dir = rand_tmp("bundle-restore-enc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let store = driven_drive::fake::InMemoryRemoteStore::new();
+        let suite = DrivenCryptoSuite::new(driven_crypto::key::SourceKey::generate());
+        // A member large enough to span multiple ciphertext frames after gzip is
+        // not required for correctness, but use a non-trivial body.
+        let body = b"encrypted bundled member - decrypts frame-by-frame".to_vec();
+        let members: &[(&str, &[u8])] = &[("secret/x.dat", &body), ("secret/y.dat", b"sibling")];
+        let (bref, built) = make_bundle_object(&store, Some(&suite), members).await;
+        let target = built
+            .iter()
+            .find(|m| m.rel.as_str() == "secret/x.dat")
+            .unwrap();
+        let file = resolved_bundled(target, &bref);
+        let root = confine::ConfinedRoot::bind(token).expect("bind root");
+        let verdict = SuiteVerdict::Suite(Arc::new(suite) as Arc<dyn SourceCryptoSuite>);
+        let outcome = restore_one_file(
+            &file,
+            &store,
+            &verdict,
+            &root,
+            &no_cancel(),
+            &mut BundleCache::default(),
+            |_| {},
+        )
+        .await;
+        assert!(
+            matches!(outcome, FileOutcome::Done),
+            "real-path encrypted bundle restore must succeed"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("secret").join("x.dat")).unwrap(),
+            body,
+            "the decrypted+extracted member equals the original"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #35 finding 2 (D): a cancel that lands while a bundle object is
+    /// downloading aborts the real path PROMPTLY as `Cancelled`, leaving no
+    /// committed file and no orphan temp.
+    #[tokio::test]
+    async fn restore_bundled_member_cancel_aborts_with_no_partial() {
+        let dir = rand_tmp("bundle-restore-cancel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let store = driven_drive::fake::InMemoryRemoteStore::new();
+        let members: &[(&str, &[u8])] = &[
+            ("logs/c.log", b"charlie one"),
+            ("logs/d.log", b"delta two - target"),
+        ];
+        let (bref, built) = make_bundle_object(&store, None, members).await;
+        let target = built
+            .iter()
+            .find(|m| m.rel.as_str() == "logs/d.log")
+            .unwrap();
+        let file = resolved_bundled(target, &bref);
+        let root = confine::ConfinedRoot::bind(token).expect("bind root");
+        let cancel: RestoreCancel = Arc::new(AtomicBool::new(true)); // already cancelled
+        let outcome = restore_one_file(
+            &file,
+            &store,
+            &SuiteVerdict::Plaintext,
+            &root,
+            &cancel,
+            &mut BundleCache::default(),
+            |_| {},
+        )
+        .await;
+        assert!(
+            matches!(outcome, FileOutcome::Cancelled),
+            "a cancel must abort the bundle restore as Cancelled"
+        );
+        assert!(
+            !dir.join("logs").join("d.log").exists(),
+            "no final file may be written on cancel"
+        );
+        // No leftover temp anywhere under the dest root.
+        let leftover = std::fs::read_dir(dir.join("logs"))
+            .map(|rd| {
+                rd.filter_map(Result::ok).any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(".driven-restore-tmp.")
+                })
+            })
+            .unwrap_or(false);
+        assert!(!leftover, "no orphan temp may remain on cancel");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An `AsyncRead` (always-ready) that flips `cancel` to true once it has
+    /// delivered `flip_after` bytes, so a test can prove `download_object_to_bytes`
+    /// observes the cancel flag BETWEEN frames rather than only once at entry.
+    struct FlipCancelReader {
+        data: Vec<u8>,
+        pos: usize,
+        flip_after: usize,
+        cancel: RestoreCancel,
+    }
+    impl tokio::io::AsyncRead for FlipCancelReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let remaining = &self.data[self.pos..];
+            // Deliver at most one frame per read, like a real chunked stream.
+            let n = remaining.len().min(buf.remaining()).min(CIPHERTEXT_FRAME);
+            buf.put_slice(&remaining[..n]);
+            self.pos += n;
+            if self.pos >= self.flip_after {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Issue #35 finding 2 (D): the download loop observes the cancel flag BETWEEN
+    /// frames - a cancel that lands mid-download aborts (`Ok(None)`) WITHOUT
+    /// draining the rest of the object. This defeats a check-once-at-entry
+    /// implementation (which the old, cancel-unaware signature effectively was):
+    /// such an impl would read all four frames and return the full bytes.
+    #[tokio::test]
+    async fn download_object_to_bytes_observes_cancel_between_frames() {
+        let data = vec![0u8; CIPHERTEXT_FRAME * 4];
+        let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
+        let mut reader = FlipCancelReader {
+            data,
+            pos: 0,
+            // Flip after the first frame is delivered; the loop's NEXT top-of-
+            // iteration check must then abort.
+            flip_after: CIPHERTEXT_FRAME,
+            cancel: cancel.clone(),
+        };
+        let res =
+            download_object_to_bytes(&mut reader, None, MAX_BUNDLE_OBJECT_BYTES, &cancel).await;
+        assert!(
+            matches!(res, Ok(None)),
+            "a mid-stream cancel must abort the download with Ok(None)"
+        );
+        assert!(
+            reader.pos < reader.data.len(),
+            "the loop must abort WITHOUT draining the whole object (per-frame check, not check-once)"
+        );
     }
 
     #[tokio::test]
@@ -3210,6 +3823,7 @@ mod tests {
             &SuiteVerdict::Plaintext,
             &root,
             &no_cancel(),
+            &mut BundleCache::default(),
             |_| {},
         )
         .await;
@@ -3363,6 +3977,7 @@ mod tests {
             &SuiteVerdict::Plaintext,
             &root,
             &cancel,
+            &mut BundleCache::default(),
             |_| {},
         )
         .await;
@@ -3644,6 +4259,7 @@ mod tests {
             relative_path: "x.bin".to_string(),
             size: 3,
             drive_file_id: Some("d-x".to_string()),
+            bundle: None,
             hash_blake3: [0u8; 32],
         }];
 
@@ -3665,6 +4281,7 @@ mod tests {
             relative_path: rel.to_string(),
             size: 1,
             drive_file_id: Some("d".to_string()),
+            bundle: None,
             hash_blake3: [0u8; 32],
         }
     }

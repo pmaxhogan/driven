@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n                INSERT INTO bundle_members (source_id, relative_path, bundle_id)\n                VALUES ( ?1, ?2, ?3 )\n                ON CONFLICT(source_id, relative_path) DO UPDATE SET\n                    bundle_id = excluded.bundle_id\n                ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": []
+  },
+  "hash": "9455c01f7991d3a09d4f03c4571599900a5a60633320ccc0155086fc1035e123"
+}

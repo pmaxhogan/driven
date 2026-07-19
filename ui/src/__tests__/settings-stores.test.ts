@@ -88,6 +88,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     updater: { channel: "stable", checkIntervalSecs: 21600 },
     ui: { trayLeftClickOpens: "activity", locale: "en-US", colorMode: "system" },
     windows: { vssMode: "auto", vssHelper: false },
+    bundleSmallFiles: false,
     ...over,
   };
 }
