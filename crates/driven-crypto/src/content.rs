@@ -25,7 +25,7 @@ use chacha20poly1305::{
     KeyInit, XChaCha20Poly1305,
 };
 use md5::{Digest, Md5};
-use rand::RngCore;
+use rand::TryRng;
 
 use crate::key::{SourceKey, XNONCE_LEN};
 use crate::CryptoError;
@@ -65,7 +65,13 @@ impl ContentEncryptorImpl {
     /// Builds an encryptor for one file with a freshly generated nonce.
     pub(crate) fn new(source_key: &SourceKey) -> Self {
         let mut nonce = [0u8; XNONCE_LEN];
-        rand::rngs::OsRng.fill_bytes(&mut nonce);
+        // `SysRng` (rand 0.10's OS RNG, re-exported from `getrandom`) is
+        // fallible (`TryRng`, not the infallible `Rng`) since reading OS
+        // entropy can fail. `.expect()` preserves rand 0.8's `OsRng::fill_bytes`
+        // behavior, which panicked internally on the same failure.
+        rand::rngs::SysRng
+            .try_fill_bytes(&mut nonce)
+            .expect("OS RNG (getrandom) failed to fill content nonce");
         let cipher = XChaCha20Poly1305::new(source_key.as_bytes().as_ref().into());
         let stream_nonce = GenericArray::from_slice(&nonce[..STREAM_NONCE_LEN]);
         Self {
