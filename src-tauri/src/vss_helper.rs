@@ -36,7 +36,7 @@
 //! whole state machine is unit-tested cross-OS without a real `runas`/UAC prompt.
 
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU64, AtomicUsize, Ordering};
 use std::sync::{Arc, Mutex};
 use std::thread::JoinHandle;
 use std::time::Duration;
@@ -102,6 +102,16 @@ struct Inner {
     /// Whether the `windows.vss_helper` setting is on (gates all launching +
     /// capability). Updated live by [`VssHelperManager::set_enabled`].
     enabled: AtomicBool,
+    /// Monotonic launch generation. Bumped (under the `state` lock) on every
+    /// launch trigger AND on every shutdown/disable. A background launch captures
+    /// its generation; when it resolves it applies its result ONLY if the
+    /// generation is still current - otherwise it was ABANDONED (a quit/disable
+    /// happened while it was Pending) and it REAPS the elevated helper it brought
+    /// up instead of leaving an orphaned elevated process holding the pipe.
+    generation: AtomicU64,
+    /// Count of abandoned launches whose helper the resolver reaped (test
+    /// observability; cheap in production).
+    reap_count: AtomicUsize,
 }
 
 impl Inner {
@@ -197,6 +207,8 @@ impl VssHelperManager {
                 launch,
                 state: Mutex::new(LaunchState::NotAttempted),
                 enabled: AtomicBool::new(enabled),
+                generation: AtomicU64::new(0),
+                reap_count: AtomicUsize::new(0),
             }),
             launch_thread: Mutex::new(None),
         }
@@ -248,10 +260,10 @@ impl VssHelperManager {
                 *st = LaunchState::NotAttempted;
             }
         } else {
-            // Disabled: stop the broker (best-effort) and reset so re-enable
-            // relaunches cleanly.
+            // Disabled: stop the broker (best-effort), abandon any in-flight
+            // launch (so it reaps the helper it brings up), and reset the state so
+            // a later re-enable relaunches cleanly. `shutdown` does all three.
             self.shutdown();
-            *self.inner.lock_state() = LaunchState::NotAttempted;
         }
     }
 
@@ -272,38 +284,65 @@ impl VssHelperManager {
         if !self.is_enabled() {
             return;
         }
-        {
+        // Capture THIS launch's generation under the state lock, so a concurrent
+        // shutdown/disable that bumps the generation is ordered against it.
+        let my_gen = {
             let mut st = self.inner.lock_state();
             if *st != LaunchState::NotAttempted {
                 return; // already pending / ready / declined / transiently-failed
             }
             *st = LaunchState::Pending;
-        }
+            self.inner
+                .generation
+                .fetch_add(1, Ordering::SeqCst)
+                .wrapping_add(1)
+        };
         let inner = self.inner.clone();
         let handle = std::thread::Builder::new()
             .name("driven-vss-launch".to_string())
             .spawn(move || {
                 let outcome = (inner.launch)();
-                let next = match outcome {
-                    Ok(()) => {
-                        tracing::info!("VSS helper: elevated broker launched + serving");
-                        LaunchState::Ready
-                    }
-                    Err(LaunchError::Declined) => {
-                        tracing::warn!(
-                            "VSS helper: elevation declined/ignored; locked-file backup stays degraded this session (no re-prompt)"
-                        );
-                        LaunchState::Declined
-                    }
-                    Err(LaunchError::Failed(detail)) => {
-                        tracing::warn!(
-                            error = %detail,
-                            "VSS helper: launch did not come up (transient); will retry on the next enable/start"
-                        );
-                        LaunchState::FailedTransient
+                // Apply the result ONLY if this launch is still the current
+                // generation; the check + state write are atomic under the lock so
+                // a shutdown that bumped the generation cannot interleave.
+                let abandoned_ok = {
+                    let mut st = inner.lock_state();
+                    if inner.generation.load(Ordering::SeqCst) != my_gen {
+                        // Superseded / abandoned (a quit/disable happened while we
+                        // were Pending). Do NOT touch state; if we brought a helper
+                        // up, reap it below (outside the lock).
+                        outcome.is_ok()
+                    } else {
+                        *st = match &outcome {
+                            Ok(()) => {
+                                tracing::info!("VSS helper: elevated broker launched + serving");
+                                LaunchState::Ready
+                            }
+                            Err(LaunchError::Declined) => {
+                                tracing::warn!(
+                                    "VSS helper: elevation declined/ignored; locked-file backup stays degraded this session (no re-prompt)"
+                                );
+                                LaunchState::Declined
+                            }
+                            Err(LaunchError::Failed(detail)) => {
+                                tracing::warn!(
+                                    error = %detail,
+                                    "VSS helper: launch did not come up (transient); will retry on the next enable/start"
+                                );
+                                LaunchState::FailedTransient
+                            }
+                        };
+                        false
                     }
                 };
-                *inner.lock_state() = next;
+                if abandoned_ok {
+                    // The app quit / disabled the helper while this launch was in
+                    // flight, then it came up: SHUT IT DOWN so no orphaned elevated
+                    // process lingers on the pipe (the always-on elevated attack
+                    // surface the DESIGN model must not leave behind).
+                    inner.reap_count.fetch_add(1, Ordering::SeqCst);
+                    reap_helper(&inner);
+                }
             });
         match handle {
             Ok(h) => {
@@ -353,26 +392,26 @@ impl VssHelperManager {
     }
 
     /// Shut the broker down (release everything + exit) at app quit / on disable.
-    /// Best-effort + idempotent: a no-op unless the broker is up. Off Windows the
-    /// client is not compiled, so this is a no-op there too.
+    /// Best-effort + idempotent.
+    ///
+    /// Two jobs, both closing the orphaned-elevated-process hole: (1) bump the
+    /// launch generation so ANY in-flight launch that resolves AFTER this reaps
+    /// the helper it brings up instead of leaving it (the quit/disable-during-
+    /// Pending race); (2) if a helper is currently up (`Ready`), shut it down now.
+    /// Resets the state to `NotAttempted` so a later re-enable relaunches cleanly.
     pub fn shutdown(&self) {
-        #[cfg(windows)]
-        {
-            if *self.inner.lock_state() != LaunchState::Ready {
-                return;
-            }
-            match driven_vss_helper::HelperClient::connect(
-                &self.inner.pipe_name,
-                &self.inner.helper_dir,
-            ) {
-                Ok(mut c) => {
-                    let _ = c.shutdown();
-                    tracing::info!("VSS helper: shutdown requested");
-                }
-                Err(e) => {
-                    tracing::debug!(error = %e, "VSS helper: shutdown connect failed (broker may have already exited)");
-                }
-            }
+        // Bump the generation + read/reset the state atomically, so an in-flight
+        // resolver either already applied `Ready` (then we reap it below) or sees
+        // the new generation and reaps itself.
+        let was_ready = {
+            let mut st = self.inner.lock_state();
+            self.inner.generation.fetch_add(1, Ordering::SeqCst);
+            let ready = *st == LaunchState::Ready;
+            *st = LaunchState::NotAttempted;
+            ready
+        };
+        if was_ready {
+            reap_helper(&self.inner);
         }
     }
 
@@ -388,6 +427,12 @@ impl VssHelperManager {
         if let Some(h) = handle {
             let _ = h.join();
         }
+    }
+
+    /// Test-only: how many abandoned launches the resolver reaped.
+    #[cfg(test)]
+    fn reap_count(&self) -> usize {
+        self.inner.reap_count.load(Ordering::SeqCst)
     }
 }
 
@@ -424,6 +469,30 @@ impl HelperLauncher for VssHelperManager {
             *self.inner.lock_state(),
             LaunchState::NotAttempted | LaunchState::Pending | LaunchState::Ready
         )
+    }
+}
+
+/// Shut down a broker that an ABANDONED launch brought up (best-effort). Called
+/// off the state lock. Windows-only: the client is not compiled elsewhere, so
+/// this is a no-op there (and the manager is never in play off Windows anyway).
+fn reap_helper(inner: &Inner) {
+    #[cfg(windows)]
+    {
+        match driven_vss_helper::HelperClient::connect(&inner.pipe_name, &inner.helper_dir) {
+            Ok(mut c) => {
+                let _ = c.shutdown();
+                tracing::info!(
+                    "VSS helper: reaped an abandoned broker (quit/disable landed while it was launching)"
+                );
+            }
+            Err(e) => {
+                tracing::debug!(error = %e, "VSS helper: reap connect failed (broker may not have come up)");
+            }
+        }
+    }
+    #[cfg(not(windows))]
+    {
+        let _ = inner;
     }
 }
 
@@ -610,6 +679,59 @@ mod tests {
         let (launch, _) = counting_launch(Ok(()));
         let mgr = manager(true, launch);
         mgr.shutdown(); // NotAttempted -> no-op, must not panic/connect
+    }
+
+    #[test]
+    fn shutdown_during_pending_reaps_the_helper_that_resolves_after() {
+        // The quit/disable-during-Pending race: a launch is in flight (UAC up);
+        // shutdown lands; then the launch RESOLVES (the user approved late). The
+        // resolver must REAP the just-launched elevated helper instead of leaving
+        // it as an orphan holding the pipe - and NOT leave the state Ready.
+        let (tx, rx) = mpsc::channel::<()>();
+        let rx = Arc::new(Mutex::new(rx));
+        let launch: LaunchFn = Box::new(move || {
+            let _ = rx.lock().unwrap().recv(); // block until released
+            Ok(()) // then "come up"
+        });
+        let mgr = manager(true, launch);
+        mgr.launch_now();
+        assert!(mgr.launch_pending(), "launch is in flight");
+
+        // Quit/disable lands while Pending.
+        mgr.shutdown();
+
+        // The launch resolves AFTER the shutdown.
+        tx.send(()).unwrap();
+        mgr.join_launch_thread();
+
+        assert!(
+            !mgr.helper_alive(),
+            "an abandoned launch must NOT be left Ready"
+        );
+        assert_eq!(
+            mgr.reap_count(),
+            1,
+            "the resolver must reap the helper it brought up after the shutdown"
+        );
+    }
+
+    #[test]
+    fn shutdown_after_ready_reaps_without_double_counting() {
+        // The other ordering: the launch reaches Ready BEFORE shutdown. Shutdown
+        // reaps the running helper directly; the resolver already applied Ready and
+        // does not also reap (no double reap).
+        let (launch, _) = counting_launch(Ok(()));
+        let mgr = manager(true, launch);
+        mgr.launch_now();
+        mgr.join_launch_thread();
+        assert!(mgr.helper_alive());
+        mgr.shutdown();
+        assert!(!mgr.helper_alive(), "shutdown resets the state");
+        assert_eq!(
+            mgr.reap_count(),
+            0,
+            "a launch that reached Ready before shutdown is reaped BY shutdown, not the resolver"
+        );
     }
 
     /// Exercise the PRODUCTION constructor + launch path (`new` -> `production_launch`
