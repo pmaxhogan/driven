@@ -12,7 +12,7 @@
 //! re-running [`check_within_roots`] on the canonical path - defence in depth
 //! against a symlinked directory escaping a configured root.
 
-use std::path::{Component, Path, PathBuf};
+use std::path::{Path, PathBuf};
 
 /// Why an `OpenLocked` request was rejected at the boundary.
 #[derive(Debug, Clone, PartialEq, Eq, thiserror::Error)]
@@ -87,40 +87,47 @@ pub fn drive_of(path: &Path) -> Option<String> {
     }
 }
 
-/// `true` when any component of `path` is a `..` (parent-directory) reference.
+/// Split a Windows path into its non-empty segments, treating BOTH `\` and `/`
+/// as separators and dropping a leading `\\?\` / `\\.\` extended prefix.
+///
+/// Rust's `Path::components` is platform-separator-specific (a `\` is NOT a
+/// separator off Windows), so parsing segments ourselves makes this logic
+/// behave IDENTICALLY on the Windows helper and in the cross-OS unit tests /
+/// coverage run - the helper only ever handles Windows paths, so `\`/`/` are
+/// the separators regardless of the host we test on.
+pub(crate) fn path_segments(path: &Path) -> Vec<String> {
+    let s = path.to_string_lossy();
+    let s = s
+        .strip_prefix(r"\\?\")
+        .or_else(|| s.strip_prefix(r"\\.\"))
+        .unwrap_or(&s);
+    s.split(['/', '\\'])
+        .filter(|seg| !seg.is_empty())
+        .map(|seg| seg.to_string())
+        .collect()
+}
+
+/// `true` when any segment of `path` is a `..` (parent-directory) reference.
 /// A `.` (current dir) is harmless and allowed; only `..` can walk upward out
 /// of a configured root lexically.
 pub fn has_traversal(path: &Path) -> bool {
-    path.components().any(|c| matches!(c, Component::ParentDir))
-}
-
-/// Compare two path components for the platform. Windows paths are
-/// case-insensitive, so components are matched ASCII-case-insensitively there;
-/// elsewhere (only reachable in the cross-OS unit tests) they are matched
-/// exactly.
-fn components_eq(a: &std::ffi::OsStr, b: &std::ffi::OsStr) -> bool {
-    if cfg!(windows) {
-        a.to_string_lossy()
-            .eq_ignore_ascii_case(&b.to_string_lossy())
-    } else {
-        a == b
-    }
+    path_segments(path).iter().any(|seg| seg == "..")
 }
 
 /// `true` when `candidate` is `root` itself or lies underneath it, compared
-/// COMPONENT BY COMPONENT (so `C:\Docs` never "contains" `C:\DocsEvil`, the
-/// classic string-prefix trap). Both paths should be absolute; a `root` with
-/// more components than `candidate` can never contain it.
+/// SEGMENT BY SEGMENT (so `C:\Docs` never "contains" `C:\DocsEvil`, the classic
+/// string-prefix trap). Comparison is ASCII-case-insensitive because Windows
+/// paths are. A `root` with more segments than `candidate` can never contain it.
 pub fn is_within_root(root: &Path, candidate: &Path) -> bool {
-    let root_comps: Vec<_> = root.components().collect();
-    let cand_comps: Vec<_> = candidate.components().collect();
-    if root_comps.len() > cand_comps.len() {
+    let root_segs = path_segments(root);
+    let cand_segs = path_segments(candidate);
+    if root_segs.len() > cand_segs.len() {
         return false;
     }
-    root_comps
+    root_segs
         .iter()
-        .zip(cand_comps.iter())
-        .all(|(r, c)| components_eq(r.as_os_str(), c.as_os_str()))
+        .zip(cand_segs.iter())
+        .all(|(r, c)| r.eq_ignore_ascii_case(c))
 }
 
 /// `true` when `candidate` is within ANY of the configured roots.
@@ -145,12 +152,11 @@ pub fn validate_open_request(
         return Err(ValidateError::BadLength);
     }
 
-    // Must be an absolute path with a drive prefix.
+    // Must be an absolute path with a drive prefix. A drive-qualified path
+    // (`X:\...`) IS absolute; `drive_of` returning `None` (no `X:` prefix) is
+    // exactly the "not absolute" case, so we do NOT use the platform-specific
+    // `Path::is_absolute` (which is false for a Windows path off Windows).
     let drive = drive_of(live_path).ok_or(ValidateError::NotAbsolute)?;
-    if !live_path.is_absolute() && !path_str.starts_with(r"\\?\") && !path_str.starts_with(r"\\.\")
-    {
-        return Err(ValidateError::NotAbsolute);
-    }
 
     if has_traversal(live_path) {
         return Err(ValidateError::Traversal);
@@ -225,9 +231,10 @@ mod tests {
         assert!(!is_within_root(root, Path::new(r"C:\Users\me")));
     }
 
-    #[cfg(windows)]
     #[test]
-    fn within_root_is_case_insensitive_on_windows() {
+    fn within_root_is_case_insensitive() {
+        // Windows paths are case-insensitive; the helper only handles Windows
+        // paths, so the check is case-insensitive on every host it is tested on.
         let root = Path::new(r"C:\Users\me\Documents");
         assert!(is_within_root(
             root,

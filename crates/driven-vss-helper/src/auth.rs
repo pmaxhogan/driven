@@ -28,22 +28,26 @@ pub fn pipe_sddl(user_sid: &str) -> String {
     format!("D:P(A;;GA;;;{user_sid})(A;;GA;;;BA)")
 }
 
-/// The parent directory of an executable path, lowercased on Windows for a
-/// case-insensitive comparison.
+/// The directory portion of an executable path as a lowercased, `\`-joined key
+/// for case-insensitive comparison.
+///
+/// Treats BOTH `\` and `/` as separators (Rust's `Path::parent` is
+/// platform-separator-specific, and the helper only handles Windows paths), so
+/// this behaves identically on the Windows helper and in the cross-OS unit
+/// tests. A bare filename with no directory yields `None` so two directory-less
+/// images never count as siblings (fail-closed).
 fn image_dir_key(exe: &Path) -> Option<String> {
-    let parent = exe.parent()?;
-    let s = parent.to_string_lossy().into_owned();
-    // A bare filename (no directory) has an EMPTY parent on Windows
-    // (`Some("")`), not `None`. Treat "no directory" as un-verifiable so two
-    // bare filenames never count as siblings (fail-closed).
-    if s.is_empty() {
+    let s = exe.to_string_lossy();
+    let s = s
+        .strip_prefix(r"\\?\")
+        .or_else(|| s.strip_prefix(r"\\.\"))
+        .unwrap_or(&s);
+    let segs: Vec<&str> = s.split(['/', '\\']).filter(|seg| !seg.is_empty()).collect();
+    if segs.len() < 2 {
+        // No directory component (bare filename): un-verifiable.
         return None;
     }
-    Some(if cfg!(windows) {
-        s.to_ascii_lowercase()
-    } else {
-        s
-    })
+    Some(segs[..segs.len() - 1].join("\\").to_ascii_lowercase())
 }
 
 /// `true` when `other` is an executable in the SAME install directory as
@@ -239,9 +243,10 @@ mod tests {
         assert!(!is_sibling_image(&app, &evil));
     }
 
-    #[cfg(windows)]
     #[test]
-    fn sibling_image_is_case_insensitive_on_windows() {
+    fn sibling_image_is_case_insensitive() {
+        // Windows paths are case-insensitive; the helper only handles Windows
+        // image paths, so the check is case-insensitive on every test host.
         let a = PathBuf::from(r"C:\Program Files\Driven\driven.exe");
         let b = PathBuf::from(r"c:\program files\driven\driven-vss-helper.exe");
         assert!(is_sibling_image(&a, &b));

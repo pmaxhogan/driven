@@ -18,12 +18,27 @@
 
 use std::os::windows::fs::OpenOptionsExt;
 use std::path::PathBuf;
-use std::sync::Arc;
+use std::sync::{Arc, Mutex};
 use std::thread;
 
 use driven_vss::{SnapshotOutcome, VssMode, VssProvider};
 use driven_vss_helper::launch::generate_pipe_name;
 use driven_vss_helper::{BrokeredVssProvider, HelperClient};
+
+/// Serialises the two elevated real-VSS tests in THIS binary.
+///
+/// Creating a shadow copy is a system-wide, single-flight operation: Windows
+/// permits only one snapshot-set creation (`DoSnapshotSet`) in progress at a
+/// time, so if libtest runs both tests on its thread pool at once they race and
+/// one snapshot creation fails - degrading the brokered provider and tripping
+/// `provider degraded unexpectedly`. `cargo test` runs integration-test
+/// *binaries* sequentially (only tests WITHIN a binary parallelise), and the
+/// other real-snapshot test lives in a different binary (driven-core), so
+/// serialising just these two here is sufficient. Held for the WHOLE test so
+/// each snapshot is created AND released before the next one starts. Poison is
+/// tolerated (a panic in one test must not cascade a confusing poison panic
+/// into the other) - matching the `into_inner()` recovery used elsewhere.
+static VSS_SNAPSHOT_TEST_LOCK: Mutex<()> = Mutex::new(());
 
 /// Spawn the helper server on `pipe_name` allowing `roots`, returning the join
 /// handle. The server runs in-process (same integrity level as this elevated
@@ -56,6 +71,11 @@ fn helper_streams_a_locked_file_and_enforces_the_boundary() {
         );
         return;
     }
+    // Serialise real snapshot creation against the other elevated test in this
+    // binary (see VSS_SNAPSHOT_TEST_LOCK). Held for the whole test.
+    let _vss_guard = VSS_SNAPSHOT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let src = tempfile::tempdir().expect("temp source dir");
     let root = src.path().to_path_buf();
@@ -144,6 +164,11 @@ fn brokered_provider_maps_a_locked_file_to_a_readable_temp_copy() {
         );
         return;
     }
+    // Serialise real snapshot creation against the other elevated test in this
+    // binary (see VSS_SNAPSHOT_TEST_LOCK). Held for the whole test.
+    let _vss_guard = VSS_SNAPSHOT_TEST_LOCK
+        .lock()
+        .unwrap_or_else(|e| e.into_inner());
 
     let src = tempfile::tempdir().expect("temp source dir");
     let root = src.path().to_path_buf();
