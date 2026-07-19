@@ -213,6 +213,12 @@ export interface VssHelperStatus {
   supported: boolean;
   elevated: boolean;
   helperEnabled: boolean;
+  /** Issue #25: the elevated broker has been launched this session (lazy - it
+   * only launches on the first locked file, so usually false at Settings-open). */
+  helperAlive: boolean;
+  /** Issue #25: the broker can be brought up on demand (sidecar present, no prior
+   * launch failure), so locked-file backup is available even before the launch. */
+  helperLaunchable: boolean;
   lockedFileBackupDegraded: boolean;
 }
 

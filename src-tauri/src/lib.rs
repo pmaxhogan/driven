@@ -43,6 +43,9 @@ mod tray;
 // M9a (SPEC s15): the in-app updater - runtime channel selection, the periodic
 // check task, and the check/install/get-channel/set-channel IPC commands.
 mod updater;
+// Issue #25 (DESIGN s5.3.1): the app-side lifecycle owner for the
+// least-privilege VSS helper broker (on-demand elevated launch + shutdown).
+mod vss_helper;
 
 use std::path::PathBuf;
 
@@ -302,6 +305,13 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
         tray::stop_sync_animation();
         tracing::info!(target: "driven::app", "tray syncing animation stopped (no orphan)");
     });
+
+    // Issue #25 (DESIGN s5.3.1): shut the least-privilege VSS helper broker down
+    // (best-effort; no-op if it was never launched) so no elevated process
+    // outlives the app. Done AFTER the orchestrator drain above so no locked-file
+    // backup is mid-stream on the pipe. Sync (a quick pipe Shutdown), so it runs
+    // on this thread rather than the async runtime.
+    state.shutdown_vss_helper();
 }
 
 /// R2-P2-2: drive ONE cancelled restore task to a true stop with a bounded budget.

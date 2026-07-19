@@ -491,10 +491,21 @@ pub struct VssHelperStatus {
     pub elevated: bool,
     /// The user has opted into the least-privilege helper (`windows.vss_helper`).
     pub helper_enabled: bool,
+    /// Issue #25: the elevated broker has been LAUNCHED this session (its process
+    /// started). Lazy: the broker only launches on the first locked file, so this
+    /// is usually `false` at Settings-open time even when the helper is enabled.
+    #[serde(default)]
+    pub helper_alive: bool,
+    /// Issue #25: the broker can be brought up ON DEMAND - the bundled sidecar is
+    /// present and a prior launch did not fail. When `true`, locked-file backup is
+    /// available (the broker launches on the first locked file), so the banner is
+    /// NOT degraded even though `helper_alive` is still `false`.
+    #[serde(default)]
+    pub helper_launchable: bool,
     /// Locked-file backup is currently DEGRADED: on Windows, exclusively-locked
     /// files (Outlook PSTs, live databases, VM disks) are being skipped because
-    /// Volume Shadow Copy is unavailable (the app is not elevated and no
-    /// least-privilege helper is active).
+    /// Volume Shadow Copy is unavailable (the app is not elevated and neither an
+    /// active nor a launchable least-privilege helper can create the snapshot).
     pub locked_file_backup_degraded: bool,
 }
 

@@ -94,38 +94,63 @@ pub async fn get_settings(state: State<'_, AppState>) -> CommandResult<SettingsD
 /// behaviour), so the banner can explain why locked files are being skipped.
 #[tauri::command]
 pub async fn get_vss_helper_status(state: State<'_, AppState>) -> CommandResult<VssHelperStatus> {
-    let repo = state.state();
-    let helper_enabled = if cfg!(windows) {
-        load_group::<storage::Windows>(repo.as_ref(), KEY_WINDOWS)
-            .await?
-            .map(|w| w.vss_helper)
-            .unwrap_or(false)
-    } else {
-        false
+    let helper_enabled = load_vss_helper_enabled(state.state().as_ref()).await;
+    // Issue #25: consult the app-side broker manager (installed at boot when the
+    // helper is in play) for TRUTHFUL liveness. `helper_launched` = the broker
+    // process was started this session; `helper_launchable` = the bundled sidecar
+    // exists and a prior launch did not fail, so locked-file backup is available
+    // on the first locked file even before the lazy launch happens.
+    let (helper_alive, helper_launchable) = match state.vss_helper_manager() {
+        Some(manager) => (manager.helper_launched(), manager.helper_launchable()),
+        None => (false, false),
     };
     Ok(compute_vss_helper_status(
         cfg!(windows),
         driven_vss::is_elevated(),
         helper_enabled,
+        helper_alive,
+        helper_launchable,
     ))
 }
 
+/// Read the `windows.vss_helper` setting (SPEC s22): whether the user opted into
+/// the least-privilege elevated helper. `false` off Windows, or on any read/parse
+/// error (best-effort, like the cold-start config load). Shared by the boot
+/// assembly (which decides whether to build the broker manager) and the status
+/// command.
+pub async fn load_vss_helper_enabled(state: &dyn StateRepo) -> bool {
+    if !cfg!(windows) {
+        return false;
+    }
+    load_group::<storage::Windows>(state, KEY_WINDOWS)
+        .await
+        .ok()
+        .flatten()
+        .map(|w| w.vss_helper)
+        .unwrap_or(false)
+}
+
 /// Pure status derivation (unit-tested off Windows). Locked-file backup is
-/// degraded only where VSS is supported (Windows) and neither an elevated app
-/// nor an active least-privilege helper can create the snapshot.
+/// degraded only where VSS is supported (Windows) and NONE of the ways to create
+/// a snapshot apply: the app is not elevated (in-process VSS) AND the
+/// least-privilege helper is neither already launched (`helper_alive`) nor
+/// launchable on demand (`helper_launchable`). When the helper is launchable the
+/// banner is NOT degraded - the broker comes up on the first locked file.
 fn compute_vss_helper_status(
     supported: bool,
     elevated: bool,
     helper_enabled: bool,
+    helper_alive: bool,
+    helper_launchable: bool,
 ) -> VssHelperStatus {
-    // The brokered helper is not yet wired into the backup read path (DESIGN
-    // s5.3.1 productionisation is tracked separately), so an active-in-path
-    // helper never yet lifts the degrade; today VSS requires elevation.
-    let locked_file_backup_degraded = supported && !elevated;
+    let locked_file_backup_degraded =
+        supported && !elevated && !(helper_alive || helper_launchable);
     VssHelperStatus {
         supported,
         elevated,
         helper_enabled,
+        helper_alive,
+        helper_launchable,
         locked_file_backup_degraded,
     }
 }
@@ -2535,24 +2560,57 @@ mod tests {
     #[test]
     fn vss_helper_status_degrades_only_on_windows_when_unelevated() {
         // Off Windows: never supported, never degraded.
-        let off = compute_vss_helper_status(false, false, false);
+        let off = compute_vss_helper_status(false, false, false, false, false);
         assert!(!off.supported);
         assert!(!off.locked_file_backup_degraded);
 
-        // Windows + elevated: supported, not degraded (VSS works today).
-        let elevated = compute_vss_helper_status(true, true, false);
+        // Windows + elevated: supported, not degraded (in-process VSS works).
+        let elevated = compute_vss_helper_status(true, true, false, false, false);
         assert!(elevated.supported);
         assert!(elevated.elevated);
         assert!(!elevated.locked_file_backup_degraded);
 
-        // Windows + un-elevated: supported but DEGRADED (locked files skipped).
-        let degraded = compute_vss_helper_status(true, false, false);
+        // Windows + un-elevated + no helper: supported but DEGRADED (locked files
+        // skipped).
+        let degraded = compute_vss_helper_status(true, false, false, false, false);
         assert!(degraded.supported);
         assert!(!degraded.elevated);
         assert!(degraded.locked_file_backup_degraded);
 
         // The helper-enabled preference is surfaced verbatim.
-        assert!(compute_vss_helper_status(true, false, true).helper_enabled);
+        assert!(compute_vss_helper_status(true, false, true, false, false).helper_enabled);
+    }
+
+    /// Issue #25: truthful liveness. A LAUNCHABLE helper (bundled sidecar present,
+    /// no prior launch failure) lifts the degrade even before the lazy launch, and
+    /// an already-LAUNCHED helper does too - so an un-elevated Windows app with the
+    /// helper in play is NOT reported degraded.
+    #[test]
+    fn vss_helper_status_not_degraded_when_helper_launchable_or_alive() {
+        // Un-elevated + helper launchable (not yet launched): NOT degraded.
+        let launchable = compute_vss_helper_status(true, false, true, false, true);
+        assert!(!launchable.elevated);
+        assert!(launchable.helper_launchable);
+        assert!(!launchable.helper_alive);
+        assert!(
+            !launchable.locked_file_backup_degraded,
+            "a launchable helper means locked-file backup is available on demand"
+        );
+
+        // Un-elevated + helper already launched: NOT degraded.
+        let alive = compute_vss_helper_status(true, false, true, true, true);
+        assert!(alive.helper_alive);
+        assert!(!alive.locked_file_backup_degraded);
+
+        // Un-elevated + helper enabled but NOT launchable (sidecar missing / prior
+        // launch failed): DEGRADED - no snapshot path available.
+        let stuck = compute_vss_helper_status(true, false, true, false, false);
+        assert!(stuck.helper_enabled);
+        assert!(!stuck.helper_launchable);
+        assert!(
+            stuck.locked_file_backup_degraded,
+            "enabled but unlaunchable helper cannot create a snapshot -> degraded"
+        );
     }
 
     #[tokio::test]

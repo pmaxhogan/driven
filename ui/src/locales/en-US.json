@@ -220,7 +220,7 @@
       },
       "vssBanner": {
         "title": "Locked files are being skipped",
-        "body": "Some files (Outlook data files, live databases, VM disks) are held open and need Volume Shadow Copy to back up, which requires elevation. Right-click Driven and choose Run as administrator to include them. A least-privilege helper that elevates only the snapshot (not the whole app) is on the way."
+        "body": "Some files (Outlook data files, live databases, VM disks) are held open and need Volume Shadow Copy to back up, which requires elevation. Turn on the least-privilege helper below to elevate only the snapshot (not the whole app), or right-click Driven and choose Run as administrator to include them."
       },
       "vssModeLabel": "Volume Shadow Copy (Windows)",
       "vssMode": {
@@ -228,6 +228,8 @@
         "always": "Always",
         "never": "Never"
       },
+      "vssHelperLabel": "Use the least-privilege helper for locked files",
+      "vssHelperNote": "Back up locked files (Outlook data files, live databases, VM disks) by elevating only a small snapshot helper - the app itself stays un-elevated. You are prompted for elevation once, the first time a locked file needs it. Takes effect on the next app start.",
       "telemetryLabel": "Send anonymous usage stats",
       "telemetryNote": "Anonymous usage stats only - no file names or contents are ever sent. One click to disable.",
       "hooks": {

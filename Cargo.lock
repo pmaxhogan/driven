@@ -1368,6 +1368,7 @@ dependencies = [
  "driven-net",
  "driven-power",
  "driven-vss",
+ "driven-vss-helper",
  "dunce",
  "futures",
  "minisign-verify",

@@ -327,6 +327,14 @@ pub struct AppState {
     /// kept in sync as the commands mutate the durable state. Behind a sync `Mutex`
     /// (only ever held for a quick insert / read / take, never across an await).
     recovery_acks: std::sync::Mutex<HashMap<driven_core::types::SourceId, RecoveryAckState>>,
+    /// Issue #25 (DESIGN s5.3.1): the app-side least-privilege VSS helper broker
+    /// lifecycle owner, or `None` when the helper is not in play (off Windows, the
+    /// app is already elevated, or the `windows.vss_helper` setting is off). Built
+    /// ONCE by `assembly::build_and_spawn` and installed here so (a) the quit sweep
+    /// can shut the broker down (no elevated process outlives the app) and (b)
+    /// `get_vss_helper_status` can report truthful liveness. Behind a sync `Mutex`
+    /// (set once at boot, read for status/shutdown - never held across an await).
+    vss_helper: std::sync::Mutex<Option<Arc<crate::vss_helper::VssHelperManager>>>,
 }
 
 /// M9c D4: one pending recovery-phrase ack - the owning account (so the ack can
@@ -528,6 +536,37 @@ impl AppState {
             updater: UpdaterRuntime::default(),
             telemetry: TelemetryRuntime::default(),
             recovery_acks: std::sync::Mutex::new(HashMap::new()),
+            vss_helper: std::sync::Mutex::new(None),
+        }
+    }
+
+    // --- issue #25: least-privilege VSS helper broker (DESIGN s5.3.1) --------
+
+    /// Install the VSS helper broker lifecycle manager built by
+    /// `assembly::build_and_spawn` (Windows + un-elevated + `windows.vss_helper`
+    /// on). Called once at boot before `.manage(..)`; a subsequent call replaces
+    /// it (defensive - boot installs exactly once).
+    pub fn set_vss_helper_manager(&self, manager: Arc<crate::vss_helper::VssHelperManager>) {
+        *self.vss_helper.lock().unwrap_or_else(|e| e.into_inner()) = Some(manager);
+    }
+
+    /// The installed VSS helper broker manager, if one is in play. `None` off
+    /// Windows / when elevated / when the setting is off. Returns a cloned `Arc`
+    /// so `get_vss_helper_status` can read liveness without holding the lock.
+    #[must_use]
+    pub fn vss_helper_manager(&self) -> Option<Arc<crate::vss_helper::VssHelperManager>> {
+        self.vss_helper
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Shut the VSS helper broker down at app quit (best-effort; a no-op if the
+    /// broker was never launched or no manager is in play), so no elevated
+    /// process outlives the app session. Mirrors the M9a/M9b task drains.
+    pub fn shutdown_vss_helper(&self) {
+        if let Some(manager) = self.vss_helper_manager() {
+            manager.shutdown();
         }
     }
 
