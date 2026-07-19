@@ -2636,6 +2636,12 @@ mod tests {
         assert!(back.vss_helper, "vss_helper persisted");
         // vss_mode is untouched.
         assert_eq!(back.vss_mode, "auto");
+
+        // Issue #25: `load_vss_helper_enabled` (the boot-assembly reader) reflects
+        // the persisted flag on Windows; off Windows VSS is unsupported so it is
+        // always false regardless of the stored value.
+        let enabled = load_vss_helper_enabled(&repo).await;
+        assert_eq!(enabled, cfg!(windows));
         cleanup(dir);
     }
 

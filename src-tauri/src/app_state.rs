@@ -1626,6 +1626,39 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn vss_helper_manager_installs_and_shutdown_is_noop() {
+        // Issue #25: AppState owns the least-privilege VSS helper broker manager -
+        // `None` until installed at boot, returned once set, and
+        // `shutdown_vss_helper` is a best-effort no-op both when no manager is in
+        // play and when the (never-launched) manager is installed.
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+        // No manager yet; shutdown is a safe no-op.
+        assert!(app_state.vss_helper_manager().is_none());
+        app_state.shutdown_vss_helper();
+
+        // Install one with an injected launch fn (no real UAC / process).
+        let manager = Arc::new(crate::vss_helper::VssHelperManager::with_launch_fn(
+            std::env::temp_dir().join("driven-vss-helper.exe"),
+            std::env::temp_dir(),
+            Vec::new(),
+            Box::new(|_exe, _args| Ok(())),
+        ));
+        app_state.set_vss_helper_manager(manager);
+        assert!(app_state.vss_helper_manager().is_some());
+        // The broker was never launched, so shutdown stays a no-op (no panic /
+        // no connect).
+        app_state.shutdown_vss_helper();
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
     async fn recovery_ack_gate_requires_a_recorded_backend_reveal() {
         // M9c D4 (M6 R4-P1-1, DATA-SAFETY): the ack gate `ack_recovery_phrase_saved`
         // enforces is the AppState predicate `recovery_reveal_recorded`. A source

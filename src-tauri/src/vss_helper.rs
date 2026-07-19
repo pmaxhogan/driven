@@ -176,11 +176,15 @@ impl VssHelperManager {
     /// and idempotent: a no-op if the broker was never launched. Off Windows the
     /// client is not compiled, so this is a no-op there too.
     pub fn shutdown(&self) {
-        if *self.lock_state() != LaunchState::Launched {
-            return;
-        }
+        // The whole body is Windows-only (the pipe client is not compiled
+        // elsewhere), so the launched-guard lives INSIDE the cfg block - keeping
+        // it outside would leave a needless bare `return;` as the function's last
+        // statement on non-Windows.
         #[cfg(windows)]
         {
+            if *self.lock_state() != LaunchState::Launched {
+                return;
+            }
             match driven_vss_helper::HelperClient::connect(&self.pipe_name, &self.helper_dir) {
                 Ok(mut c) => {
                     let _ = c.shutdown();
@@ -289,15 +293,15 @@ mod tests {
 
     #[test]
     fn pipe_name_is_unguessable_and_dir_is_the_exe_parent() {
+        // Build the exe path from a real dir join so `.parent()` resolves on
+        // every OS (a literal `C:\...` string has no path separators on Linux and
+        // would yield an empty parent).
+        let dir = std::env::temp_dir().join("Driven");
+        let exe = dir.join("driven-vss-helper.exe");
         let (launch, _) = counting_launch(Ok(()));
-        let mgr = VssHelperManager::with_launch_fn(
-            r"C:\Program Files\Driven\driven-vss-helper.exe",
-            std::env::temp_dir(),
-            Vec::new(),
-            launch,
-        );
+        let mgr = VssHelperManager::with_launch_fn(&exe, std::env::temp_dir(), Vec::new(), launch);
         assert!(mgr.pipe_name().starts_with(r"\\.\pipe\driven-vss-"));
-        assert_eq!(mgr.helper_dir(), Path::new(r"C:\Program Files\Driven"));
+        assert_eq!(mgr.helper_dir(), dir);
     }
 
     #[test]
