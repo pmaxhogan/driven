@@ -1125,8 +1125,12 @@ async fn restore_bundled_member<F: FnMut(u64)>(
                 Err(e) => return FileOutcome::Failed(classify_download_error(&e)),
             };
             let bytes =
-                match download_object_to_bytes(&mut reader, suite, MAX_BUNDLE_OBJECT_BYTES).await {
-                    Ok(b) => std::sync::Arc::new(b),
+                match download_object_to_bytes(&mut reader, suite, MAX_BUNDLE_OBJECT_BYTES, cancel)
+                    .await
+                {
+                    Ok(Some(b)) => std::sync::Arc::new(b),
+                    // Cancelled mid-download: nothing was written, so no partial state.
+                    Ok(None) => return FileOutcome::Cancelled,
                     Err(code) => return FileOutcome::Failed(code),
                 };
             bundle_cache.put(bundle_ref.drive_file_id.clone(), bytes.clone());
@@ -1220,7 +1224,8 @@ async fn download_object_to_bytes<R>(
     reader: &mut R,
     suite: Option<&dyn SourceCryptoSuite>,
     max_bytes: u64,
-) -> Result<Vec<u8>, ErrorCode>
+    cancel: &RestoreCancel,
+) -> Result<Option<Vec<u8>>, ErrorCode>
 where
     R: tokio::io::AsyncRead + Unpin,
 {
@@ -1239,6 +1244,13 @@ where
         None => {
             let mut buf = vec![0u8; CIPHERTEXT_FRAME];
             loop {
+                // M8-P1-1 parity (issue #35 finding 2): observe the job cancel flag
+                // between frames so a cancel mid-download aborts PROMPTLY rather
+                // than after the whole (up to 32 MiB) object drains. Returning
+                // `Ok(None)` signals cancellation; no temp/partial state exists yet.
+                if cancel.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
                 let n = reader.read(&mut buf).await.map_err(map_download_read_err)?;
                 if n == 0 {
                     break;
@@ -1263,6 +1275,10 @@ where
             let mut read_chunk = vec![0u8; CIPHERTEXT_FRAME];
             let mut eof = false;
             while !eof {
+                // Cancel check between frames (see the plaintext arm above).
+                if cancel.load(Ordering::SeqCst) {
+                    return Ok(None);
+                }
                 while buf.len() <= CIPHERTEXT_FRAME && !eof {
                     let n = reader
                         .read(&mut read_chunk)
@@ -1288,7 +1304,7 @@ where
             push(&mut out, &pt)?;
         }
     }
-    Ok(out)
+    Ok(Some(out))
 }
 
 /// Write `bytes` to the confined temp file and fsync it, ready for the
@@ -3454,6 +3470,281 @@ mod tests {
             "the committed file must equal the verified plaintext exactly (D1)"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- issue #35 bundle-member restore: exercise the REAL restore path -------
+
+    /// Build a `.tar.gz` from `members` (each `(rel, body)`) the way the executor
+    /// does, store it in `store` (encrypting with `suite` when set), and return the
+    /// `BundleRef` plus the built members (for `ResolvedRestore` identity). Used by
+    /// the real-restore-path bundle tests (issue #35 finding 3).
+    async fn make_bundle_object(
+        store: &driven_drive::fake::InMemoryRemoteStore,
+        suite: Option<&DrivenCryptoSuite>,
+        members: &[(&str, &[u8])],
+    ) -> (
+        driven_core::state::BundleRef,
+        Vec<driven_core::bundle::BuiltMember>,
+    ) {
+        use driven_drive::remote_store::UploadBody;
+        let src = rand_tmp("bundle-src");
+        std::fs::create_dir_all(&src).unwrap();
+        let inputs: Vec<_> = members
+            .iter()
+            .map(|(rel, body)| {
+                let p = src.join(rel);
+                if let Some(parent) = p.parent() {
+                    std::fs::create_dir_all(parent).unwrap();
+                }
+                std::fs::write(&p, body).unwrap();
+                (
+                    driven_core::types::RelativePath::try_from(rel.to_string()).unwrap(),
+                    p,
+                    body.len() as u64,
+                )
+            })
+            .collect();
+        let built = driven_core::bundle::build_bundle(
+            &inputs,
+            driven_core::planner::BUNDLE_MAX_BYTES_CEILING,
+        )
+        .unwrap();
+        // Plaintext source stores the archive as-is; an encrypted source stores the
+        // ciphertext with the SAME framing the executor / streaming decrypt use.
+        let object_bytes = match suite {
+            None => built.tar_gz.clone(),
+            Some(s) => encrypt_blob(s, &built.tar_gz),
+        };
+        let parent = store.root_id().to_string();
+        let entry = store
+            .create(
+                &parent,
+                "driven-bundle-x.tar.gz",
+                "application/gzip",
+                UploadBody::Bytes(bytes::Bytes::from(object_bytes)),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .unwrap();
+        let _ = std::fs::remove_dir_all(&src);
+        (
+            driven_core::state::BundleRef {
+                bundle_id: "b-test".to_string(),
+                drive_file_id: entry.id,
+            },
+            built.members,
+        )
+    }
+
+    fn resolved_bundled(
+        m: &driven_core::bundle::BuiltMember,
+        bref: &driven_core::state::BundleRef,
+    ) -> ResolvedRestore {
+        ResolvedRestore {
+            source_id: SourceId::new_v4(),
+            relative_path: m.rel.as_str().to_string(),
+            size: m.size,
+            drive_file_id: None, // a bundled member has no standalone object
+            bundle: Some(bref.clone()),
+            hash_blake3: m.blake3,
+        }
+    }
+
+    /// Issue #35 finding 3: a PLAINTEXT bundled member restores byte-for-byte
+    /// through the REAL path (`restore_one_file` -> `restore_bundled_member` ->
+    /// `download_object_to_bytes` + BundleCache + extract + blake3 verify + confined
+    /// commit), not a hand-rolled download+extract.
+    #[tokio::test]
+    async fn restore_bundled_member_plaintext_via_real_path() {
+        let dir = rand_tmp("bundle-restore-plain");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let store = driven_drive::fake::InMemoryRemoteStore::new();
+        let members: &[(&str, &[u8])] = &[
+            ("logs/a.log", b"alpha member bytes"),
+            ("logs/b.log", b"bravo member bytes - the restore target"),
+        ];
+        let (bref, built) = make_bundle_object(&store, None, members).await;
+        let target = built
+            .iter()
+            .find(|m| m.rel.as_str() == "logs/b.log")
+            .unwrap();
+        let file = resolved_bundled(target, &bref);
+        let root = confine::ConfinedRoot::bind(token).expect("bind root");
+        let outcome = restore_one_file(
+            &file,
+            &store,
+            &SuiteVerdict::Plaintext,
+            &root,
+            &no_cancel(),
+            &mut BundleCache::default(),
+            |_| {},
+        )
+        .await;
+        assert!(
+            matches!(outcome, FileOutcome::Done),
+            "real-path plaintext bundle restore must succeed"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("logs").join("b.log")).unwrap(),
+            b"bravo member bytes - the restore target",
+            "the committed member equals the original"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #35 finding 3: an ENCRYPTED bundled member restores byte-for-byte
+    /// through the REAL path - covering `download_object_to_bytes`' frame-by-frame
+    /// STREAM-decrypt (the hand-duplicated header + 64-KiB-frame + `decrypt_last`
+    /// framing) that had zero test coverage before.
+    #[tokio::test]
+    async fn restore_bundled_member_encrypted_via_real_path() {
+        let dir = rand_tmp("bundle-restore-enc");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let store = driven_drive::fake::InMemoryRemoteStore::new();
+        let suite = DrivenCryptoSuite::new(driven_crypto::key::SourceKey::generate());
+        // A member large enough to span multiple ciphertext frames after gzip is
+        // not required for correctness, but use a non-trivial body.
+        let body = b"encrypted bundled member - decrypts frame-by-frame".to_vec();
+        let members: &[(&str, &[u8])] = &[("secret/x.dat", &body), ("secret/y.dat", b"sibling")];
+        let (bref, built) = make_bundle_object(&store, Some(&suite), members).await;
+        let target = built
+            .iter()
+            .find(|m| m.rel.as_str() == "secret/x.dat")
+            .unwrap();
+        let file = resolved_bundled(target, &bref);
+        let root = confine::ConfinedRoot::bind(token).expect("bind root");
+        let verdict = SuiteVerdict::Suite(Arc::new(suite) as Arc<dyn SourceCryptoSuite>);
+        let outcome = restore_one_file(
+            &file,
+            &store,
+            &verdict,
+            &root,
+            &no_cancel(),
+            &mut BundleCache::default(),
+            |_| {},
+        )
+        .await;
+        assert!(
+            matches!(outcome, FileOutcome::Done),
+            "real-path encrypted bundle restore must succeed"
+        );
+        assert_eq!(
+            std::fs::read(dir.join("secret").join("x.dat")).unwrap(),
+            body,
+            "the decrypted+extracted member equals the original"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// Issue #35 finding 2 (D): a cancel that lands while a bundle object is
+    /// downloading aborts the real path PROMPTLY as `Cancelled`, leaving no
+    /// committed file and no orphan temp.
+    #[tokio::test]
+    async fn restore_bundled_member_cancel_aborts_with_no_partial() {
+        let dir = rand_tmp("bundle-restore-cancel");
+        std::fs::create_dir_all(&dir).unwrap();
+        let token = DialogToken::for_root(dir.to_string_lossy().to_string());
+        let store = driven_drive::fake::InMemoryRemoteStore::new();
+        let members: &[(&str, &[u8])] = &[
+            ("logs/c.log", b"charlie one"),
+            ("logs/d.log", b"delta two - target"),
+        ];
+        let (bref, built) = make_bundle_object(&store, None, members).await;
+        let target = built
+            .iter()
+            .find(|m| m.rel.as_str() == "logs/d.log")
+            .unwrap();
+        let file = resolved_bundled(target, &bref);
+        let root = confine::ConfinedRoot::bind(token).expect("bind root");
+        let cancel: RestoreCancel = Arc::new(AtomicBool::new(true)); // already cancelled
+        let outcome = restore_one_file(
+            &file,
+            &store,
+            &SuiteVerdict::Plaintext,
+            &root,
+            &cancel,
+            &mut BundleCache::default(),
+            |_| {},
+        )
+        .await;
+        assert!(
+            matches!(outcome, FileOutcome::Cancelled),
+            "a cancel must abort the bundle restore as Cancelled"
+        );
+        assert!(
+            !dir.join("logs").join("d.log").exists(),
+            "no final file may be written on cancel"
+        );
+        // No leftover temp anywhere under the dest root.
+        let leftover = std::fs::read_dir(dir.join("logs"))
+            .map(|rd| {
+                rd.filter_map(Result::ok).any(|e| {
+                    e.file_name()
+                        .to_string_lossy()
+                        .starts_with(".driven-restore-tmp.")
+                })
+            })
+            .unwrap_or(false);
+        assert!(!leftover, "no orphan temp may remain on cancel");
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    /// An `AsyncRead` (always-ready) that flips `cancel` to true once it has
+    /// delivered `flip_after` bytes, so a test can prove `download_object_to_bytes`
+    /// observes the cancel flag BETWEEN frames rather than only once at entry.
+    struct FlipCancelReader {
+        data: Vec<u8>,
+        pos: usize,
+        flip_after: usize,
+        cancel: RestoreCancel,
+    }
+    impl tokio::io::AsyncRead for FlipCancelReader {
+        fn poll_read(
+            mut self: std::pin::Pin<&mut Self>,
+            _cx: &mut std::task::Context<'_>,
+            buf: &mut tokio::io::ReadBuf<'_>,
+        ) -> std::task::Poll<std::io::Result<()>> {
+            let remaining = &self.data[self.pos..];
+            // Deliver at most one frame per read, like a real chunked stream.
+            let n = remaining.len().min(buf.remaining()).min(CIPHERTEXT_FRAME);
+            buf.put_slice(&remaining[..n]);
+            self.pos += n;
+            if self.pos >= self.flip_after {
+                self.cancel.store(true, Ordering::SeqCst);
+            }
+            std::task::Poll::Ready(Ok(()))
+        }
+    }
+
+    /// Issue #35 finding 2 (D): the download loop observes the cancel flag BETWEEN
+    /// frames - a cancel that lands mid-download aborts (`Ok(None)`) WITHOUT
+    /// draining the rest of the object. This defeats a check-once-at-entry
+    /// implementation (which the old, cancel-unaware signature effectively was):
+    /// such an impl would read all four frames and return the full bytes.
+    #[tokio::test]
+    async fn download_object_to_bytes_observes_cancel_between_frames() {
+        let data = vec![0u8; CIPHERTEXT_FRAME * 4];
+        let cancel: RestoreCancel = Arc::new(AtomicBool::new(false));
+        let mut reader = FlipCancelReader {
+            data,
+            pos: 0,
+            // Flip after the first frame is delivered; the loop's NEXT top-of-
+            // iteration check must then abort.
+            flip_after: CIPHERTEXT_FRAME,
+            cancel: cancel.clone(),
+        };
+        let res =
+            download_object_to_bytes(&mut reader, None, MAX_BUNDLE_OBJECT_BYTES, &cancel).await;
+        assert!(
+            matches!(res, Ok(None)),
+            "a mid-stream cancel must abort the download with Ok(None)"
+        );
+        assert!(
+            reader.pos < reader.data.len(),
+            "the loop must abort WITHOUT draining the whole object (per-frame check, not check-once)"
+        );
     }
 
     #[tokio::test]

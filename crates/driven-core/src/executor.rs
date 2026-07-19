@@ -1457,17 +1457,26 @@ impl DefaultExecutor {
         };
 
         // --- build the .tar.gz on a blocking task (bundles are size-capped) ---
-        let inputs: Vec<(RelativePath, std::path::PathBuf)> = members
+        // Each member carries the size the planner grouped it at; build_bundle
+        // re-validates against it and skips any member that grew between scan and
+        // now (issue #35: never read a ballooned file into memory, never pack an
+        // object past the simple-create band). BUNDLE_MAX_BYTES_CEILING is the
+        // absolute plaintext ceiling that keeps the uploaded object a single
+        // non-resumable create regardless of the (config-tunable) planner cap.
+        let inputs: Vec<(RelativePath, std::path::PathBuf, u64)> = members
             .iter()
             .map(|m| {
                 (
                     m.relative_path.clone(),
                     join_source_path(&source.local_path, &m.relative_path),
+                    m.size,
                 )
             })
             .collect();
-        let built = match tokio::task::spawn_blocking(move || crate::bundle::build_bundle(&inputs))
-            .await
+        let built = match tokio::task::spawn_blocking(move || {
+            crate::bundle::build_bundle(&inputs, crate::planner::BUNDLE_MAX_BYTES_CEILING)
+        })
+        .await
         {
             Ok(Ok(built)) => built,
             Ok(Err(e)) => {
@@ -3672,25 +3681,80 @@ impl Executor for DefaultExecutor {
             // for an encrypted source whose key is temporarily unavailable.
             if op.op_type == OP_TYPE_BUNDLE {
                 if let Some(uuid) = payload.client_op_uuid.clone() {
+                    // R3-P1-2 / R2-P1-1 classification, mirroring the create-path
+                    // recovery below: a lookup/trash ERROR must NOT propagate
+                    // unclassified. A TRANSIENT / rate-limited / auth error keeps
+                    // the op (return -> retry next cycle; invalid_grant maps to
+                    // needs_reauth via to_reconcile_err); a DEFINITIVE non-retryable
+                    // error (404 already-gone, 403 can't-trash) drops the op so a
+                    // stuck bundle op can never WEDGE the account's whole sync
+                    // forever (reconcile runs before scan/execute). Every error
+                    // path accounts the response with the pacer/breaker, like every
+                    // other reconcile Drive call.
                     self.pacer.permit_request().await;
-                    let found = self
+                    let found = match self
                         .remote
                         .find_by_op_uuid(&source.drive_folder_id, &uuid)
                         .await
-                        .map_err(to_reconcile_err)?;
-                    self.pacer.note_response(ResponseClass::Ok);
+                    {
+                        Ok(found) => {
+                            self.pacer.note_response(ResponseClass::Ok);
+                            found
+                        }
+                        Err(e) => {
+                            let class = classify_drive_error(&e);
+                            self.pacer.note_response(class.response_class());
+                            if reconcile_metadata_error_is_retryable(class) {
+                                warn!(
+                                    target: TARGET,
+                                    source = %source.id,
+                                    "reconcile: bundle-op find_by_op_uuid failed transiently; keeping the op for retry next cycle: {e}"
+                                );
+                                return Err(to_reconcile_err(e));
+                            }
+                            warn!(
+                                target: TARGET,
+                                source = %source.id,
+                                "reconcile: bundle-op find_by_op_uuid returned a definitive failure; dropping the op (members re-bundle next scan): {e}"
+                            );
+                            self.state.delete_pending_op(op.id).await?;
+                            continue;
+                        }
+                    };
                     if let Some(entry) = found {
                         self.pacer.permit_request().await;
-                        self.remote
-                            .trash(&entry.id)
-                            .await
-                            .map_err(to_reconcile_err)?;
-                        self.pacer.note_response(ResponseClass::Ok);
-                        debug!(
-                            target: TARGET,
-                            source = %source.id,
-                            "reconcile: trashed orphaned bundle object from an uncommitted bundle op"
-                        );
+                        match self.remote.trash(&entry.id).await {
+                            Ok(()) => {
+                                self.pacer.note_response(ResponseClass::Ok);
+                                debug!(
+                                    target: TARGET,
+                                    source = %source.id,
+                                    "reconcile: trashed orphaned bundle object from an uncommitted bundle op"
+                                );
+                            }
+                            Err(e) => {
+                                let class = classify_drive_error(&e);
+                                self.pacer.note_response(class.response_class());
+                                if reconcile_metadata_error_is_retryable(class) {
+                                    warn!(
+                                        target: TARGET,
+                                        source = %source.id,
+                                        "reconcile: bundle-op orphan trash failed transiently; keeping the op for retry next cycle: {e}"
+                                    );
+                                    return Err(to_reconcile_err(e));
+                                }
+                                // Definitive: 404 (already gone = success) or a
+                                // permanent 403 we cannot fix. Drop the op either
+                                // way so the account is never wedged; a genuinely
+                                // untrashable orphan lingers harmlessly (no
+                                // file_state row references it).
+                                warn!(
+                                    target: TARGET,
+                                    source = %source.id,
+                                    "reconcile: bundle-op orphan trash hit a definitive error; dropping the op to avoid wedging the account: {e}"
+                                );
+                            }
+                        }
                     }
                 }
                 self.state.delete_pending_op(op.id).await?;
@@ -5902,6 +5966,74 @@ mod tests {
         }
     }
 
+    /// Issue #35 (findings 1+4): a member that GREW on disk between the scan
+    /// (planned size) and the bundle execute is skipped, NOT read into memory and
+    /// NOT packed; the rest of the bundle commits normally, and the grown member
+    /// stays uncommitted (no `file_state` row) so a later cycle re-detects it and
+    /// uploads it individually.
+    #[tokio::test]
+    async fn bundle_upload_skips_member_grown_since_scan() {
+        let h = harness().await;
+        // Plan four small members at their scan-time sizes.
+        let mut members: Vec<(RelativePath, u64)> = Vec::new();
+        for i in 0..4 {
+            let (rel, size) = h.write_file(&format!("logs/f{i}.log"), b"small original body");
+            members.push((rel, size));
+        }
+        // f1 grows massively AFTER the plan captured its size (simulating a
+        // reactivated log). Its planned size in the op is still the small one.
+        let grown_rel = members[1].0.clone();
+        std::fs::write(
+            join_source_path(&h.source.local_path, &grown_rel),
+            vec![7u8; 2 * 1024 * 1024],
+        )
+        .unwrap();
+
+        let exec = h.executor();
+        let out = exec
+            .execute(
+                &h.source,
+                &bundle_plan(h.source.id, &members),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out[0], OpOutcome::BundleDone { files: 3, .. }),
+            "the grown member is skipped; the other 3 commit: {:?}",
+            out[0]
+        );
+
+        // The grown member has NO file_state row - it was never committed, so the
+        // next scan retries it (individually, since it now exceeds the per-file
+        // ceiling).
+        assert!(
+            h.state
+                .get_file_state(h.source.id, &grown_rel)
+                .await
+                .unwrap()
+                .is_none(),
+            "the grown member must stay uncommitted"
+        );
+        // The other three committed as bundled members (NULL drive_file_id).
+        for (rel, _) in members.iter().filter(|(r, _)| r != &grown_rel) {
+            let row = h
+                .state
+                .get_file_state(h.source.id, rel)
+                .await
+                .unwrap()
+                .expect("committed member row");
+            assert!(row.drive_file_id.is_none());
+            assert!(h
+                .state
+                .get_bundle_ref_for_member(h.source.id, rel)
+                .await
+                .unwrap()
+                .is_some());
+        }
+    }
+
     /// An encrypted bundle stores CIPHERTEXT (not the raw archive); decrypting the
     /// object at the executor's frame boundary yields the `.tar.gz`, and each
     /// member extracts + verifies.
@@ -6058,6 +6190,225 @@ mod tests {
             .await
             .unwrap();
         assert!(ops.is_empty(), "reconcile drops the bundle pending op");
+    }
+
+    /// Enqueue a bundle pending_op for `uuid` and plant its orphan object in
+    /// `remote` (a crash-after-create-before-commit fixture). Shared by the
+    /// bundle-op reconcile error-classification tests below.
+    async fn plant_orphan_bundle(h: &Harness, remote: &InMemoryRemoteStore, uuid: &str) {
+        let mut app = HashMap::new();
+        app.insert(CLIENT_OP_UUID_KEY.to_string(), uuid.to_string());
+        app.insert(SOURCE_ID_KEY.to_string(), h.source.id.to_string());
+        app.insert(
+            BUNDLE_FORMAT_KEY.to_string(),
+            crate::bundle::BUNDLE_FORMAT.to_string(),
+        );
+        remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "driven-bundle-orphan.tar.gz",
+                BUNDLE_MIME,
+                UploadBody::Bytes(Bytes::from_static(b"orphan bundle bytes")),
+                app,
+            )
+            .await
+            .unwrap();
+        let payload = PendingOpPayload {
+            client_op_uuid: Some(uuid.to_string()),
+            ..PendingOpPayload::default()
+        };
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_BUNDLE.to_string(),
+                relative_path: RelativePath::try_from("logs/f0.log".to_string()).unwrap(),
+                payload_json: payload.to_value(),
+                scheduled_for: 0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// Issue #35 finding 6/7 (B/C): a revoked token during the bundle-op reconcile
+    /// lookup must surface as `ReconcileError::AuthInvalidGrant` (drives
+    /// needs_reauth) and KEEP the op - never drop it or wedge it silently.
+    #[tokio::test]
+    async fn reconcile_bundle_op_invalid_grant_maps_to_needs_reauth_and_keeps_op() {
+        // Request #1 plants the orphan (token valid); request #2 (the reconcile
+        // find_by_op_uuid) trips invalid_grant.
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_invalid_grant_after(1)).await;
+        let uuid = uuid::Uuid::new_v4().to_string();
+        plant_orphan_bundle(&h, &h.remote.clone(), &uuid).await;
+
+        let exec = h.executor();
+        let err = exec
+            .reconcile(&h.source)
+            .await
+            .expect_err("invalid_grant on the bundle lookup must fail the reconcile");
+        assert!(
+            reconcile_error_is_invalid_grant(&err),
+            "a revoked token during bundle-op reconcile must surface AuthInvalidGrant, got: {err:?}"
+        );
+        assert_eq!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "an auth failure must KEEP the bundle op for retry after re-link"
+        );
+    }
+
+    /// Issue #35 finding 6/7 (B/C): a TRANSIENT (rate-limited) error during the
+    /// bundle-op reconcile lookup keeps the op (reconcile errors -> retry next
+    /// cycle) AND accounts the response with the pacer/breaker (backoff recorded).
+    #[tokio::test]
+    async fn reconcile_bundle_op_transient_keeps_op_and_notes_pacer() {
+        // Request #2 (the find) is rate-limited.
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_rate_limit_after(1)).await;
+        let uuid = uuid::Uuid::new_v4().to_string();
+        plant_orphan_bundle(&h, &h.remote.clone(), &uuid).await;
+
+        let exec = h.executor();
+        let err = exec
+            .reconcile(&h.source)
+            .await
+            .expect_err("a transient error propagates so the source retries next cycle");
+        assert!(
+            !reconcile_error_is_invalid_grant(&err),
+            "a rate-limit is not an auth failure"
+        );
+        assert_eq!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .len(),
+            1,
+            "a transient error must KEEP the bundle op"
+        );
+        assert!(
+            h.pacer.backoff_hits.load(Ordering::SeqCst) >= 1,
+            "the rate-limit must be reported to the pacer (finding 7)"
+        );
+    }
+
+    /// Issue #35 finding 6 (B, the P1): a DEFINITIVE (non-retryable) trash failure
+    /// during bundle-op reconcile DROPS the op rather than propagating forever -
+    /// so a permanently-untrashable orphan can never wedge the whole account's
+    /// sync (reconcile runs before scan/execute).
+    #[tokio::test]
+    async fn reconcile_bundle_op_definitive_trash_error_drops_op_no_wedge() {
+        let h = harness().await;
+        let uuid = uuid::Uuid::new_v4().to_string();
+        // Plant the orphan in the shared store; the wrapper delegates lookup to it
+        // but fails every trash with a definitive (Other-class) error.
+        plant_orphan_bundle(&h, &h.remote.clone(), &uuid).await;
+        let store = Arc::new(BundleTrashFailsStore {
+            inner: h.remote.clone(),
+        });
+        let exec = DefaultExecutor::with_clock(
+            ExecutorDeps {
+                remote: store,
+                state: h.state.clone(),
+                pacer: h.pacer.clone(),
+                crypto: None,
+                vss: None,
+                network: None,
+            },
+            h.clock.clone(),
+        );
+
+        // Reconcile SUCCEEDS (no propagated error to wedge the account)...
+        exec.reconcile(&h.source)
+            .await
+            .expect("a definitive trash failure must not fail reconcile");
+        // ...and the stuck op is dropped so it never recurs every cycle.
+        assert!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a definitively-untrashable bundle orphan must drop its op (no wedge)"
+        );
+    }
+
+    /// A [`RemoteStore`] that delegates everything to an inner store EXCEPT
+    /// `trash`, which returns a DEFINITIVE (non-retryable, `Other`-class) error -
+    /// to prove the bundle-op reconcile recovery drops the op on a permanent trash
+    /// failure (issue #35 finding 6).
+    struct BundleTrashFailsStore {
+        inner: InMemoryRemoteStore,
+    }
+    #[async_trait::async_trait]
+    impl RemoteStore for BundleTrashFailsStore {
+        async fn ensure_folder(&self, parent_id: &str, name: &str) -> anyhow::Result<RemoteEntry> {
+            self.inner.ensure_folder(parent_id, name).await
+        }
+        async fn list_folder(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+            self.inner.list_folder(folder_id).await
+        }
+        async fn create(
+            &self,
+            parent_id: &str,
+            name: &str,
+            mime: &str,
+            body: UploadBody,
+            app_properties: HashMap<String, String>,
+        ) -> anyhow::Result<RemoteEntry> {
+            self.inner
+                .create(parent_id, name, mime, body, app_properties)
+                .await
+        }
+        async fn update(
+            &self,
+            file_id: &str,
+            body: UploadBody,
+            app_properties_patch: HashMap<String, String>,
+        ) -> anyhow::Result<RemoteEntry> {
+            self.inner.update(file_id, body, app_properties_patch).await
+        }
+        async fn resumable_session(
+            &self,
+            kind: ResumableKind,
+            mime: &str,
+            size: u64,
+        ) -> anyhow::Result<ResumableSession> {
+            self.inner.resumable_session(kind, mime, size).await
+        }
+        async fn resume_chunk(
+            &self,
+            session: &ResumableSession,
+            offset: u64,
+            chunk: Bytes,
+        ) -> anyhow::Result<ResumeProgress> {
+            self.inner.resume_chunk(session, offset, chunk).await
+        }
+        async fn trash(&self, _file_id: &str) -> anyhow::Result<()> {
+            // A permanent 4xx-class failure; the plain message matches no
+            // transient keyword, so classify_drive_error maps it to
+            // DriveError::Other (definitive / non-retryable).
+            anyhow::bail!("insufficientFilePermissions: cannot trash this object")
+        }
+        async fn metadata(&self, file_id: &str) -> anyhow::Result<RemoteEntry> {
+            self.inner.metadata(file_id).await
+        }
+        async fn download(&self, file_id: &str) -> anyhow::Result<DownloadStream> {
+            self.inner.download(file_id).await
+        }
+        async fn find_by_op_uuid(
+            &self,
+            parent_id: &str,
+            op_uuid: &str,
+        ) -> anyhow::Result<Option<RemoteEntry>> {
+            self.inner.find_by_op_uuid(parent_id, op_uuid).await
+        }
+        async fn about(&self) -> anyhow::Result<AboutInfo> {
+            self.inner.about().await
+        }
     }
 
     /// Bundle GC (issue #35 item a): once every member of a committed bundle is

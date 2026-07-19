@@ -133,8 +133,10 @@ const SETTING_BUNDLE_MIN_COLD_AGE_DAYS: &str = "bundle_min_cold_age_days";
 /// source the ciphertext plus its per-chunk framing - always stays inside the
 /// single simple-create band and never needs a resumable session. A bundle that
 /// crossed the threshold would demand the resumable path the executor
-/// deliberately never takes for bundles.
-const BUNDLE_MAX_BYTES_CEILING: u64 = crate::executor::RESUMABLE_THRESHOLD - 512 * 1024;
+/// deliberately never takes for bundles. Also the executor's hard accumulated-
+/// plaintext ceiling passed to `build_bundle` (issue #35), so a member that grew
+/// after the scan can never push the object past the simple-create band.
+pub const BUNDLE_MAX_BYTES_CEILING: u64 = crate::executor::RESUMABLE_THRESHOLD - 512 * 1024;
 
 /// Read one `u64`-valued setting, falling back to `default` when the key is
 /// absent, unreadable, or not a JSON number (fail-closed, issue #35 item c).
@@ -171,20 +173,35 @@ pub async fn load_bundle_config(state: &dyn StateRepo) -> BundleConfig {
     let max_bytes = read_u64_setting(state, SETTING_BUNDLE_MAX_BYTES, d.max_bytes)
         .await
         .min(BUNDLE_MAX_BYTES_CEILING);
-    BundleConfig {
-        enabled: true,
-        max_file_size: read_u64_setting(state, SETTING_BUNDLE_MAX_FILE_SIZE, d.max_file_size).await,
-        min_files: read_u64_setting(state, SETTING_BUNDLE_MIN_FILES, d.min_files as u64).await
-            as usize,
-        max_files: read_u64_setting(state, SETTING_BUNDLE_MAX_FILES, d.max_files as u64).await
-            as usize,
-        max_bytes,
-        min_cold_age_days: read_u64_setting(
+    // Narrowing casts fail CLOSED to the compile-time default when a stored value
+    // is out of the target type's range (issue #35 finding 5): a raw `as u32`
+    // WRAPS (e.g. 2^32 -> 0, which would silently disable the coldness gate), so
+    // use a checked conversion. `usize` is narrower than `u64` only on 32-bit
+    // hosts, but a checked conversion is correct there too.
+    let min_files = usize::try_from(
+        read_u64_setting(state, SETTING_BUNDLE_MIN_FILES, d.min_files as u64).await,
+    )
+    .unwrap_or(d.min_files);
+    let max_files = usize::try_from(
+        read_u64_setting(state, SETTING_BUNDLE_MAX_FILES, d.max_files as u64).await,
+    )
+    .unwrap_or(d.max_files);
+    let min_cold_age_days = u32::try_from(
+        read_u64_setting(
             state,
             SETTING_BUNDLE_MIN_COLD_AGE_DAYS,
             u64::from(d.min_cold_age_days),
         )
-        .await as u32,
+        .await,
+    )
+    .unwrap_or(d.min_cold_age_days);
+    BundleConfig {
+        enabled: true,
+        max_file_size: read_u64_setting(state, SETTING_BUNDLE_MAX_FILE_SIZE, d.max_file_size).await,
+        min_files,
+        max_files,
+        max_bytes,
+        min_cold_age_days,
     }
 }
 

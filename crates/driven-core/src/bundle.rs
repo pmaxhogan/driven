@@ -99,16 +99,40 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 }
 
 /// Build a `.tar.gz` bundle from `inputs` (each `(relative_path, absolute local
-/// path)`), reading and hashing every member. SYNCHRONOUS + fully in-memory:
-/// call it from a blocking task (`tokio::task::spawn_blocking`) - the planner
-/// caps a bundle's total size so the archive fits in memory comfortably.
+/// path, planned_size)`), reading and hashing every member. SYNCHRONOUS + fully
+/// in-memory: call it from a blocking task (`tokio::task::spawn_blocking`) - the
+/// planner caps a bundle's total size so the archive fits in memory comfortably.
 ///
-/// Per member: stat, read the whole file, re-stat, and skip it (recording it in
-/// [`BuildOutput::skipped`]) if the file vanished, could not be read, or its
-/// `(size, mtime)` changed between the two stats or disagreed with the bytes
-/// read, so only a coherent snapshot is ever packed. The gzip layer is written
-/// with a zeroed mtime for reproducibility.
-pub fn build_bundle(inputs: &[(RelativePath, PathBuf)]) -> Result<BuildOutput> {
+/// ## Execute-time size re-validation (issue #35 OOM / unrestorable-member guard)
+/// `planned_size` is the size the SCANNER captured when the planner grouped this
+/// member; `max_total_bytes` is a hard ceiling on the accumulated PLAINTEXT bytes
+/// packed (the caller passes a value that keeps the uploaded object inside the
+/// simple-create band). A file can grow between scan and this build (the plan is
+/// pacer-throttled and can execute much later), and the coherency stats below
+/// only prove the file was STABLE during the build - not that it still matches
+/// the plan. Reading a member that ballooned to gigabytes would spike memory
+/// (OOM) and pack an object that violates the size invariants (worst case: a
+/// highly-compressible grown member commits Synced but decompresses past the
+/// restore path's cap, making every member of that bundle permanently
+/// unrestorable). So BEFORE reading any bytes this stats the file and SKIPS it
+/// (recording it in [`BuildOutput::skipped`], same as a vanished/changed member)
+/// when its size no longer equals `planned_size`, or when packing it would push
+/// the accumulated plaintext past `max_total_bytes`. Checking size before the
+/// read is what bounds memory: a member that already grew by the time the op runs
+/// (the hours-later plan-lag case this guards) is never loaded. A file that grows
+/// in the microsecond window between this stat and the read is still caught for
+/// CORRECTNESS by the post-read coherency stat (skipped, not committed), though
+/// its bytes were momentarily read.
+///
+/// Per member: stat, verify size == plan and the running total stays under
+/// `max_total_bytes`, read the file, re-stat, and skip it if the file vanished,
+/// could not be read, or its `(size, mtime)` changed between the two stats or
+/// disagreed with the bytes read, so only a coherent snapshot is ever packed. The
+/// gzip layer is written with a zeroed mtime for reproducibility.
+pub fn build_bundle(
+    inputs: &[(RelativePath, PathBuf, u64)],
+    max_total_bytes: u64,
+) -> Result<BuildOutput> {
     use flate2::{Compression, GzBuilder};
 
     let gz = GzBuilder::new()
@@ -117,8 +141,9 @@ pub fn build_bundle(inputs: &[(RelativePath, PathBuf)]) -> Result<BuildOutput> {
     let mut tar = tar::Builder::new(gz);
     let mut members: Vec<BuiltMember> = Vec::with_capacity(inputs.len());
     let mut skipped: Vec<RelativePath> = Vec::new();
+    let mut accumulated: u64 = 0;
 
-    for (rel, path) in inputs {
+    for (rel, path, planned_size) in inputs {
         let pre = match std::fs::metadata(path) {
             Ok(m) => m,
             Err(_) => {
@@ -126,6 +151,22 @@ pub fn build_bundle(inputs: &[(RelativePath, PathBuf)]) -> Result<BuildOutput> {
                 continue;
             }
         };
+        // Execute-time re-validation, BEFORE any read (memory bound): a member
+        // whose current size differs from the plan (typically a growth after the
+        // scan) is skipped un-read, and a member that would push the accumulated
+        // plaintext past the ceiling is skipped so the object stays a single
+        // simple create. Skipped members are never committed, so the next scan
+        // re-detects and retries them (a grown file that now exceeds the planner's
+        // per-file ceiling simply uploads individually).
+        if pre.len() != *planned_size {
+            skipped.push(rel.clone());
+            continue;
+        }
+        if accumulated.saturating_add(pre.len()) > max_total_bytes {
+            skipped.push(rel.clone());
+            continue;
+        }
+
         let bytes = match std::fs::read(path) {
             Ok(b) => b,
             Err(_) => {
@@ -140,17 +181,20 @@ pub fn build_bundle(inputs: &[(RelativePath, PathBuf)]) -> Result<BuildOutput> {
                 continue;
             }
         };
-        // Coherency: the file must not have changed between the two stats, and the
-        // bytes we read must match the stat size. Any mismatch means we did not
-        // capture a single consistent snapshot - skip and let the next scan retry.
+        // Coherency: the file must not have changed between the two stats, must
+        // still match the planned size, and the bytes we read must match the stat
+        // size. Any mismatch means we did not capture a single consistent
+        // in-plan snapshot - skip and let the next scan retry.
         let size = post.len();
         if pre.len() != post.len()
+            || post.len() != *planned_size
             || mtime_ns(&pre) != mtime_ns(&post)
             || bytes.len() as u64 != size
         {
             skipped.push(rel.clone());
             continue;
         }
+        accumulated = accumulated.saturating_add(size);
 
         let hash = blake3::hash(&bytes);
         let mut header = tar::Header::new_gnu();
@@ -247,6 +291,10 @@ mod tests {
         assert_eq!(a, member_entry_name(&rel("a/b/c.txt")));
     }
 
+    /// Generous accumulated-plaintext ceiling for the roundtrip tests (well above
+    /// any fixture's total).
+    const TEST_MAX_TOTAL: u64 = 8 * 1024 * 1024;
+
     #[test]
     fn build_then_extract_roundtrips_each_member() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -256,11 +304,11 @@ mod tests {
             let name = format!("f{i}.txt");
             let body = format!("contents of file {i} - some bytes {i}{i}{i}").into_bytes();
             std::fs::write(dir.path().join(&name), &body).expect("write");
-            inputs.push((rel(&name), dir.path().join(&name)));
+            inputs.push((rel(&name), dir.path().join(&name), body.len() as u64));
             contents.push((rel(&name), body));
         }
 
-        let out = build_bundle(&inputs).expect("build");
+        let out = build_bundle(&inputs, TEST_MAX_TOTAL).expect("build");
         assert_eq!(out.members.len(), 12);
         assert!(out.skipped.is_empty());
 
@@ -289,8 +337,12 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         let body = vec![7u8; 64 * 1024];
         std::fs::write(dir.path().join("big.bin"), &body).expect("write");
-        let inputs = vec![(rel("big.bin"), dir.path().join("big.bin"))];
-        let out = build_bundle(&inputs).expect("build");
+        let inputs = vec![(
+            rel("big.bin"),
+            dir.path().join("big.bin"),
+            body.len() as u64,
+        )];
+        let out = build_bundle(&inputs, TEST_MAX_TOTAL).expect("build");
         // A cap below the member size must fail rather than return truncated bytes.
         let res = extract_member(&out.tar_gz, &member_entry_name(&rel("big.bin")), 1024);
         assert!(res.is_err(), "expected decompressed-cap error");
@@ -301,11 +353,67 @@ mod tests {
         let dir = tempfile::tempdir().expect("tempdir");
         std::fs::write(dir.path().join("present.txt"), b"hi").expect("write");
         let inputs = vec![
-            (rel("present.txt"), dir.path().join("present.txt")),
-            (rel("gone.txt"), dir.path().join("gone.txt")),
+            (rel("present.txt"), dir.path().join("present.txt"), 2),
+            (rel("gone.txt"), dir.path().join("gone.txt"), 2),
         ];
-        let out = build_bundle(&inputs).expect("build");
+        let out = build_bundle(&inputs, TEST_MAX_TOTAL).expect("build");
         assert_eq!(out.members.len(), 1);
         assert_eq!(out.skipped, vec![rel("gone.txt")]);
+    }
+
+    /// Issue #35 (findings 1+4): a member that GREW between the scan (planned
+    /// size) and this build is skipped WITHOUT being read - its on-disk size no
+    /// longer equals the planned size. The unaffected member still packs, so the
+    /// rest of the bundle commits and the grown file retries (individually) later.
+    #[test]
+    fn grown_member_is_skipped_not_packed() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        // On disk: "grown" is 5000 bytes now, but was planned at 100 (it grew).
+        std::fs::write(dir.path().join("grown.log"), vec![9u8; 5000]).expect("write");
+        std::fs::write(dir.path().join("stable.log"), b"stable bytes").expect("write");
+        let inputs = vec![
+            (rel("grown.log"), dir.path().join("grown.log"), 100),
+            (
+                rel("stable.log"),
+                dir.path().join("stable.log"),
+                "stable bytes".len() as u64,
+            ),
+        ];
+
+        let out = build_bundle(&inputs, TEST_MAX_TOTAL).expect("build");
+
+        assert_eq!(
+            out.skipped,
+            vec![rel("grown.log")],
+            "the grown member is skipped"
+        );
+        assert_eq!(out.members.len(), 1, "only the stable member packs");
+        assert_eq!(out.members[0].rel, rel("stable.log"));
+    }
+
+    /// Issue #35: the accumulated-plaintext ceiling is enforced - once packing a
+    /// member would push the running total past `max_total_bytes`, it is skipped
+    /// so the object can never exceed the simple-create band.
+    #[test]
+    fn accumulated_bytes_cap_skips_overflow() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        for i in 0..3u8 {
+            std::fs::write(dir.path().join(format!("f{i}.bin")), vec![1u8; 1000]).expect("write");
+        }
+        let inputs: Vec<_> = (0..3u8)
+            .map(|i| {
+                (
+                    rel(&format!("f{i}.bin")),
+                    dir.path().join(format!("f{i}.bin")),
+                    1000u64,
+                )
+            })
+            .collect();
+
+        // 2500-byte cap: the first two (1000 + 1000) pack; the third (would reach
+        // 3000) is skipped.
+        let out = build_bundle(&inputs, 2500).expect("build");
+        assert_eq!(out.members.len(), 2, "two members fit under the ceiling");
+        assert_eq!(out.skipped.len(), 1, "the overflowing member is skipped");
     }
 }

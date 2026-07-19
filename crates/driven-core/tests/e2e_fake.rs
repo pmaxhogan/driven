@@ -528,15 +528,17 @@ async fn rate_limit_on_seventh_file_retries_and_completes() {
 }
 
 // ---------------------------------------------------------------------------
-// Row (issue #35): small-file bundling under a fault. Four cold small NEW files
-// plan as ONE `.tar.gz` bundle; the bundle create (the first remote request)
-// hits an injected 429, is retried in-executor, and commits. A bundled member
-// then restores BYTE-FOR-BYTE by downloading the single object and extracting it
-// - exercising bundle upload + member restore under an injected fault, in the
-// hermetic fake-Drive tier so CI runs it.
+// Row (issue #35): small-file bundling UPLOAD under a fault. Four cold small NEW
+// files plan as ONE `.tar.gz` bundle; the bundle create (the first remote
+// request) hits an injected 429, is retried in-executor, and commits - one
+// object, N NULL-drive-id members each resolving to the bundle. Hermetic
+// fake-Drive tier so CI runs it. The PRODUCTION restore path (download + decrypt
+// + extract + verify + confined write, plaintext AND encrypted) is exercised
+// end-to-end in `src-tauri` `commands::restore` tests (that path lives there, not
+// in driven-core), so this test no longer hand-rolls a restore.
 // ---------------------------------------------------------------------------
 #[tokio::test]
-async fn bundle_uploads_under_rate_limit_and_member_restores() {
+async fn bundle_uploads_under_rate_limit_and_commits() {
     let dir = tempfile::tempdir().unwrap();
     let src_dir = tempfile::tempdir().unwrap();
     let state = open_state(dir.path()).await;
@@ -613,8 +615,9 @@ async fn bundle_uploads_under_rate_limit_and_member_restores() {
     // Exactly ONE object landed (the `.tar.gz`), not one per member.
     assert_eq!(live_object_count(&remote, &folder).await, 1);
 
-    // Each member: a NULL-drive-id file_state row resolving to the same bundle.
-    let mut bundle_file_id: Option<String> = None;
+    // Each member: a NULL-drive-id file_state row; ALL resolve to the SAME single
+    // uploaded bundle object.
+    let mut resolved_ids: Vec<String> = Vec::new();
     for (rel, _) in &bodies {
         let rp = RelativePath::try_from(rel.clone()).unwrap();
         let row = state
@@ -631,32 +634,12 @@ async fn bundle_uploads_under_rate_limit_and_member_restores() {
             .await
             .unwrap()
             .expect("membership resolves");
-        bundle_file_id = Some(bref.drive_file_id);
+        resolved_ids.push(bref.drive_file_id);
     }
-    let bundle_file_id = bundle_file_id.expect("at least one member");
-
-    // Restore one member: download the bundle object + extract it by entry name.
-    let (target_rel, target_body) = &bodies[2];
-    let rp = RelativePath::try_from(target_rel.clone()).unwrap();
-    let mut tar_gz = Vec::new();
-    remote
-        .download(&bundle_file_id)
-        .await
-        .unwrap()
-        .0
-        .read_to_end(&mut tar_gz)
-        .await
-        .unwrap();
-    let extracted = driven_core::bundle::extract_member(
-        &tar_gz,
-        &driven_core::bundle::member_entry_name(&rp),
-        8 * 1024 * 1024,
-    )
-    .expect("extract ok")
-    .expect("the member is present in the bundle");
-    assert_eq!(
-        &extracted, target_body,
-        "the restored member's bytes match the original"
+    assert_eq!(resolved_ids.len(), bodies.len(), "every member resolves");
+    assert!(
+        resolved_ids.windows(2).all(|w| w[0] == w[1]),
+        "every member resolves to the SAME single bundle object: {resolved_ids:?}"
     );
 }
 

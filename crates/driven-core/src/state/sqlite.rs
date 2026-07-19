@@ -194,6 +194,26 @@ impl SqliteStateRepo {
         .execute(&mut *tx)
         .await?;
 
+        // V2 bundling (issue #35) mutual-exclusion invariant: this commit gives
+        // the file a STANDALONE `drive_file_id`, so it must NOT also be recorded
+        // as a member of a `.tar.gz` bundle. Clear any stale membership in the
+        // SAME transaction. This is the path a previously-BUNDLED file takes when
+        // it later changes: the scanner re-emits it, the planner routes it to a
+        // standalone `HashThenUpload` (it already has a `file_state` row, so it is
+        // never re-bundled), and committing here drops its old membership so
+        // restore/reconcile use the fresh standalone object. A no-op (0 rows) for
+        // the common case of a file that was never bundled. The `file_state`
+        // upsert above is `ON CONFLICT DO UPDATE` (never a DELETE/REPLACE), so the
+        // membership FK cascade does NOT fire on its own - this explicit delete is
+        // required.
+        sqlx::query!(
+            "DELETE FROM bundle_members WHERE source_id = ?1 AND relative_path = ?2",
+            source_id,
+            relative_path,
+        )
+        .execute(&mut *tx)
+        .await?;
+
         // DESIGN s5.6 step 3: the pending_op delete is the load-bearing
         // reconciliation invariant. A wrong/already-committed op_id must NOT
         // be allowed to commit `file_state` (and must not silently delete an
@@ -3006,9 +3026,12 @@ impl StateRepo for SqliteStateRepo {
                 fs.source_id     AS "source_id!: String",
                 fs.relative_path AS "relative_path!: String",
                 fs.status        AS "status!: String",
-                fs.drive_file_id AS "drive_file_id: String"
+                fs.drive_file_id AS "drive_file_id: String",
+                bm.bundle_id     AS "bundle_id: String"
             FROM file_state_fts
             JOIN file_state fs ON fs.rowid = file_state_fts.rowid
+            LEFT JOIN bundle_members bm
+                ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
             WHERE file_state_fts MATCH ?1
               AND (?2 IS NULL OR fs.source_id = ?2)
             ORDER BY rank
@@ -3028,6 +3051,7 @@ impl StateRepo for SqliteStateRepo {
                     relative_path: relative_path_from_string(r.relative_path)?,
                     status: file_state_status_from_str(&r.status)?,
                     drive_file_id: r.drive_file_id,
+                    bundle_id: r.bundle_id,
                 })
             })
             .collect()
@@ -3058,14 +3082,17 @@ impl StateRepo for SqliteStateRepo {
             sqlx::query!(
                 r#"
                 SELECT
-                    source_id     AS "source_id!: String",
-                    relative_path AS "relative_path!: String",
-                    size          AS "size!: i64",
-                    status        AS "status!: String",
-                    drive_file_id AS "drive_file_id: String"
-                FROM file_state
-                WHERE source_id = ?1
-                ORDER BY relative_path ASC
+                    fs.source_id     AS "source_id!: String",
+                    fs.relative_path AS "relative_path!: String",
+                    fs.size          AS "size!: i64",
+                    fs.status        AS "status!: String",
+                    fs.drive_file_id AS "drive_file_id: String",
+                    bm.bundle_id     AS "bundle_id: String"
+                FROM file_state fs
+                LEFT JOIN bundle_members bm
+                    ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
+                WHERE fs.source_id = ?1
+                ORDER BY fs.relative_path ASC
                 LIMIT ?2
                 "#,
                 source_str,
@@ -3081,6 +3108,7 @@ impl StateRepo for SqliteStateRepo {
                     r.size,
                     r.status,
                     r.drive_file_id,
+                    r.bundle_id,
                 )
             })
             .collect::<Vec<_>>()
@@ -3094,18 +3122,21 @@ impl StateRepo for SqliteStateRepo {
             sqlx::query!(
                 r#"
                 SELECT
-                    source_id     AS "source_id!: String",
-                    relative_path AS "relative_path!: String",
-                    size          AS "size!: i64",
-                    status        AS "status!: String",
-                    drive_file_id AS "drive_file_id: String"
-                FROM file_state
-                WHERE source_id = ?1
+                    fs.source_id     AS "source_id!: String",
+                    fs.relative_path AS "relative_path!: String",
+                    fs.size          AS "size!: i64",
+                    fs.status        AS "status!: String",
+                    fs.drive_file_id AS "drive_file_id: String",
+                    bm.bundle_id     AS "bundle_id: String"
+                FROM file_state fs
+                LEFT JOIN bundle_members bm
+                    ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
+                WHERE fs.source_id = ?1
                   AND (
-                    relative_path = ?2
-                    OR (relative_path >= ?3 AND relative_path < ?4)
+                    fs.relative_path = ?2
+                    OR (fs.relative_path >= ?3 AND fs.relative_path < ?4)
                   )
-                ORDER BY relative_path ASC
+                ORDER BY fs.relative_path ASC
                 LIMIT ?5
                 "#,
                 source_str,
@@ -3124,21 +3155,25 @@ impl StateRepo for SqliteStateRepo {
                     r.size,
                     r.status,
                     r.drive_file_id,
+                    r.bundle_id,
                 )
             })
             .collect::<Vec<_>>()
         };
 
         rows.into_iter()
-            .map(|(source_id, relative_path, size, status, drive_file_id)| {
-                Ok(RestoreFileRow {
-                    source_id: SourceId(uuid_from_str(&source_id)?),
-                    relative_path: relative_path_from_string(relative_path)?,
-                    size: size as u64,
-                    status: file_state_status_from_str(&status)?,
-                    drive_file_id,
-                })
-            })
+            .map(
+                |(source_id, relative_path, size, status, drive_file_id, bundle_id)| {
+                    Ok(RestoreFileRow {
+                        source_id: SourceId(uuid_from_str(&source_id)?),
+                        relative_path: relative_path_from_string(relative_path)?,
+                        size: size as u64,
+                        status: file_state_status_from_str(&status)?,
+                        drive_file_id,
+                        bundle_id,
+                    })
+                },
+            )
             .collect()
     }
 
@@ -3190,15 +3225,18 @@ impl StateRepo for SqliteStateRepo {
             sqlx::query!(
                 r#"
                 SELECT
-                    source_id     AS "source_id!: String",
-                    relative_path AS "relative_path!: String",
-                    size          AS "size!: i64",
-                    status        AS "status!: String",
-                    drive_file_id AS "drive_file_id: String"
-                FROM file_state
-                WHERE source_id = ?1
-                  AND instr(substr(relative_path, ?2 + 1), '/') = 0
-                ORDER BY relative_path ASC
+                    fs.source_id     AS "source_id!: String",
+                    fs.relative_path AS "relative_path!: String",
+                    fs.size          AS "size!: i64",
+                    fs.status        AS "status!: String",
+                    fs.drive_file_id AS "drive_file_id: String",
+                    bm.bundle_id     AS "bundle_id: String"
+                FROM file_state fs
+                LEFT JOIN bundle_members bm
+                    ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
+                WHERE fs.source_id = ?1
+                  AND instr(substr(fs.relative_path, ?2 + 1), '/') = 0
+                ORDER BY fs.relative_path ASC
                 LIMIT ?3
                 "#,
                 source_str,
@@ -3215,6 +3253,7 @@ impl StateRepo for SqliteStateRepo {
                     r.size,
                     r.status,
                     r.drive_file_id,
+                    r.bundle_id,
                 )
             })
             .collect::<Vec<_>>()
@@ -3222,16 +3261,19 @@ impl StateRepo for SqliteStateRepo {
             sqlx::query!(
                 r#"
                 SELECT
-                    source_id     AS "source_id!: String",
-                    relative_path AS "relative_path!: String",
-                    size          AS "size!: i64",
-                    status        AS "status!: String",
-                    drive_file_id AS "drive_file_id: String"
-                FROM file_state
-                WHERE source_id = ?1
-                  AND relative_path >= ?2 AND relative_path < ?3
-                  AND instr(substr(relative_path, ?4 + 1), '/') = 0
-                ORDER BY relative_path ASC
+                    fs.source_id     AS "source_id!: String",
+                    fs.relative_path AS "relative_path!: String",
+                    fs.size          AS "size!: i64",
+                    fs.status        AS "status!: String",
+                    fs.drive_file_id AS "drive_file_id: String",
+                    bm.bundle_id     AS "bundle_id: String"
+                FROM file_state fs
+                LEFT JOIN bundle_members bm
+                    ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
+                WHERE fs.source_id = ?1
+                  AND fs.relative_path >= ?2 AND fs.relative_path < ?3
+                  AND instr(substr(fs.relative_path, ?4 + 1), '/') = 0
+                ORDER BY fs.relative_path ASC
                 LIMIT ?5
                 "#,
                 source_str,
@@ -3250,6 +3292,7 @@ impl StateRepo for SqliteStateRepo {
                     r.size,
                     r.status,
                     r.drive_file_id,
+                    r.bundle_id,
                 )
             })
             .collect::<Vec<_>>()
@@ -3328,15 +3371,18 @@ impl StateRepo for SqliteStateRepo {
         let files: Result<Vec<RestoreFileRow>> = file_rows
             .into_iter()
             .take(cap)
-            .map(|(source_id, relative_path, size, status, drive_file_id)| {
-                Ok(RestoreFileRow {
-                    source_id: SourceId(uuid_from_str(&source_id)?),
-                    relative_path: relative_path_from_string(relative_path)?,
-                    size: size as u64,
-                    status: file_state_status_from_str(&status)?,
-                    drive_file_id,
-                })
-            })
+            .map(
+                |(source_id, relative_path, size, status, drive_file_id, bundle_id)| {
+                    Ok(RestoreFileRow {
+                        source_id: SourceId(uuid_from_str(&source_id)?),
+                        relative_path: relative_path_from_string(relative_path)?,
+                        size: size as u64,
+                        status: file_state_status_from_str(&status)?,
+                        drive_file_id,
+                        bundle_id,
+                    })
+                },
+            )
             .collect();
         let folders: Vec<String> = folder_rows.into_iter().take(cap).collect();
 
@@ -3365,14 +3411,17 @@ impl StateRepo for SqliteStateRepo {
         let rows = sqlx::query!(
             r#"
             SELECT
-                source_id     AS "source_id!: String",
-                relative_path AS "relative_path!: String",
-                status        AS "status!: String",
-                drive_file_id AS "drive_file_id: String"
-            FROM file_state
-            WHERE relative_path GLOB ?1
-              AND (?2 IS NULL OR source_id = ?2)
-            ORDER BY relative_path ASC
+                fs.source_id     AS "source_id!: String",
+                fs.relative_path AS "relative_path!: String",
+                fs.status        AS "status!: String",
+                fs.drive_file_id AS "drive_file_id: String",
+                bm.bundle_id     AS "bundle_id: String"
+            FROM file_state fs
+            LEFT JOIN bundle_members bm
+                ON bm.source_id = fs.source_id AND bm.relative_path = fs.relative_path
+            WHERE fs.relative_path GLOB ?1
+              AND (?2 IS NULL OR fs.source_id = ?2)
+            ORDER BY fs.relative_path ASC
             LIMIT ?3
             "#,
             glob,
@@ -3389,6 +3438,7 @@ impl StateRepo for SqliteStateRepo {
                     relative_path: relative_path_from_string(r.relative_path)?,
                     status: file_state_status_from_str(&r.status)?,
                     drive_file_id: r.drive_file_id,
+                    bundle_id: r.bundle_id,
                 })
             })
             .collect()
@@ -3862,6 +3912,16 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// A synced bundle member row: a `Synced` `file_state` row with a NULL
+    /// `drive_file_id` (its bytes live inside a bundle object).
+    fn synced_member(source_id: SourceId, path: &str, hash_byte: u8) -> FileStateRow {
+        FileStateRow {
+            status: FileStateStatus::Synced,
+            drive_file_id: None,
+            ..sample_file(source_id, path, hash_byte)
+        }
     }
 
     async fn enqueue_bundle_op(
