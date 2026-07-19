@@ -205,6 +205,15 @@ export interface UiSettings {
 
 export interface WindowsSettings {
   vssMode: string;
+  vssHelper: boolean;
+}
+
+/** Status of least-privilege locked-file backup (DESIGN s5.3.1). */
+export interface VssHelperStatus {
+  supported: boolean;
+  elevated: boolean;
+  helperEnabled: boolean;
+  lockedFileBackupDegraded: boolean;
 }
 
 export interface SettingsDto {
@@ -252,6 +261,7 @@ export interface UiSettingsPatch {
 
 export interface WindowsSettingsPatch {
   vssMode?: string;
+  vssHelper?: boolean;
 }
 
 export interface SettingsPatch {

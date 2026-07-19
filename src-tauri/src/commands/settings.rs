@@ -40,7 +40,7 @@ use driven_vss::VssMode;
 use crate::app_state::AppState;
 use crate::commands::dtos::{
     GlobalSettings, ReleaseDto, ScheduleSettings, SettingsDto, SettingsPatch, TelemetrySettings,
-    UiSettings, UpdateInfo, UpdaterSettings, WindowsSettings,
+    UiSettings, UpdateInfo, UpdaterSettings, VssHelperStatus, WindowsSettings,
 };
 use crate::commands::{
     atomic_write, validate_writable_dest, CommandError, CommandResult, DialogToken,
@@ -81,6 +81,53 @@ const GITHUB_USER_AGENT: &str = concat!("driven-app/", env!("CARGO_PKG_VERSION")
 #[tauri::command]
 pub async fn get_settings(state: State<'_, AppState>) -> CommandResult<SettingsDto> {
     load_settings_dto(state.state().as_ref()).await
+}
+
+// ---------------------------------------------------------------------------
+// get_vss_helper_status (DESIGN s5.3.1, issue #25)
+// ---------------------------------------------------------------------------
+
+/// Report whether least-privilege locked-file backup is available or degraded,
+/// for the Settings banner. Truthful on every platform: off Windows VSS is
+/// unsupported (never degraded); on Windows, locked-file backup is DEGRADED when
+/// the app is not elevated and no least-privilege helper is active (the current
+/// behaviour), so the banner can explain why locked files are being skipped.
+#[tauri::command]
+pub async fn get_vss_helper_status(state: State<'_, AppState>) -> CommandResult<VssHelperStatus> {
+    let repo = state.state();
+    let helper_enabled = if cfg!(windows) {
+        load_group::<storage::Windows>(repo.as_ref(), KEY_WINDOWS)
+            .await?
+            .map(|w| w.vss_helper)
+            .unwrap_or(false)
+    } else {
+        false
+    };
+    Ok(compute_vss_helper_status(
+        cfg!(windows),
+        driven_vss::is_elevated(),
+        helper_enabled,
+    ))
+}
+
+/// Pure status derivation (unit-tested off Windows). Locked-file backup is
+/// degraded only where VSS is supported (Windows) and neither an elevated app
+/// nor an active least-privilege helper can create the snapshot.
+fn compute_vss_helper_status(
+    supported: bool,
+    elevated: bool,
+    helper_enabled: bool,
+) -> VssHelperStatus {
+    // The brokered helper is not yet wired into the backup read path (DESIGN
+    // s5.3.1 productionisation is tracked separately), so an active-in-path
+    // helper never yet lifts the degrade; today VSS requires elevation.
+    let locked_file_backup_degraded = supported && !elevated;
+    VssHelperStatus {
+        supported,
+        elevated,
+        helper_enabled,
+        locked_file_backup_degraded,
+    }
 }
 
 /// Read every SPEC s22 KV group into a [`SettingsDto`] (shared by `get_settings`
@@ -381,6 +428,14 @@ pub async fn update_settings(
         if let Some(v) = w.vss_mode {
             check_enum("vss_mode", &v, VSS_MODES)?;
             cur.vss_mode = v;
+            if cfg!(windows) {
+                orchestrator_affecting = true;
+            }
+        }
+        if let Some(v) = w.vss_helper {
+            cur.vss_helper = v;
+            // The brokered-helper preference takes effect when the orchestrator
+            // rebuilds its VSS provider (DESIGN s5.3.1).
             if cfg!(windows) {
                 orchestrator_affecting = true;
             }
@@ -772,12 +827,17 @@ mod storage {
     #[derive(Debug, Clone, Serialize, Deserialize)]
     pub struct Windows {
         pub vss_mode: String,
+        // Absent in DBs written before the least-privilege helper landed
+        // (DESIGN s5.3.1); default to `false` so an older row deserialises.
+        #[serde(default)]
+        pub vss_helper: bool,
     }
 
     impl From<Windows> for WindowsSettings {
         fn from(s: Windows) -> Self {
             WindowsSettings {
                 vss_mode: s.vss_mode,
+                vss_helper: s.vss_helper,
             }
         }
     }
@@ -786,6 +846,7 @@ mod storage {
         fn from(d: WindowsSettings) -> Self {
             Windows {
                 vss_mode: d.vss_mode,
+                vss_helper: d.vss_helper,
             }
         }
     }
@@ -2191,6 +2252,7 @@ fn default_ui() -> UiSettings {
 fn default_windows() -> WindowsSettings {
     WindowsSettings {
         vss_mode: "auto".to_string(),
+        vss_helper: false,
     }
 }
 
@@ -2442,6 +2504,55 @@ mod tests {
         // Untouched fields keep their seeded defaults.
         assert!(dto.global.skip_on_metered, "untouched field unchanged");
         assert_eq!(dto.global.log_level, "info", "untouched field unchanged");
+        cleanup(dir);
+    }
+
+    #[test]
+    fn vss_helper_status_degrades_only_on_windows_when_unelevated() {
+        // Off Windows: never supported, never degraded.
+        let off = compute_vss_helper_status(false, false, false);
+        assert!(!off.supported);
+        assert!(!off.locked_file_backup_degraded);
+
+        // Windows + elevated: supported, not degraded (VSS works today).
+        let elevated = compute_vss_helper_status(true, true, false);
+        assert!(elevated.supported);
+        assert!(elevated.elevated);
+        assert!(!elevated.locked_file_backup_degraded);
+
+        // Windows + un-elevated: supported but DEGRADED (locked files skipped).
+        let degraded = compute_vss_helper_status(true, false, false);
+        assert!(degraded.supported);
+        assert!(!degraded.elevated);
+        assert!(degraded.locked_file_backup_degraded);
+
+        // The helper-enabled preference is surfaced verbatim.
+        assert!(compute_vss_helper_status(true, false, true).helper_enabled);
+    }
+
+    #[tokio::test]
+    async fn windows_vss_helper_setting_round_trips() {
+        let (repo, dir) = seeded_repo().await;
+        // Merge just the vss_helper flag on the windows group.
+        let mut cur: WindowsSettings = load_group::<storage::Windows>(&repo, KEY_WINDOWS)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap_or_else(default_windows);
+        assert!(!cur.vss_helper, "default is off");
+        cur.vss_helper = true;
+        store_group(&repo, KEY_WINDOWS, &storage::Windows::from(cur))
+            .await
+            .unwrap();
+
+        let back: WindowsSettings = load_group::<storage::Windows>(&repo, KEY_WINDOWS)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap();
+        assert!(back.vss_helper, "vss_helper persisted");
+        // vss_mode is untouched.
+        assert_eq!(back.vss_mode, "auto");
         cleanup(dir);
     }
 

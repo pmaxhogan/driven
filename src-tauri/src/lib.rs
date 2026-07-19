@@ -596,6 +596,7 @@ pub fn run() {
             commands::dialogs::pick_save_zip_dialog,
             // SPEC s11.6 settings & misc (M6).
             commands::settings::get_settings,
+            commands::settings::get_vss_helper_status,
             commands::settings::update_settings,
             commands::settings::export_diagnostic_bundle,
             commands::settings::check_for_updates,

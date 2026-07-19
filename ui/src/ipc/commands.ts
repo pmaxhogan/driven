@@ -35,6 +35,7 @@ import type {
   SourceDto,
   SourcePatch,
   UpdateInfo,
+  VssHelperStatus,
 } from "./types";
 
 // --- Accounts (SPEC s11.1) ---
@@ -176,6 +177,11 @@ export function getSettings(): Promise<SettingsDto> {
 
 export function updateSettings(patch: SettingsPatch): Promise<SettingsDto> {
   return invoke("update_settings", { patch });
+}
+
+/** Least-privilege locked-file backup status for the Settings banner (DESIGN s5.3.1). */
+export function getVssHelperStatus(): Promise<VssHelperStatus> {
+  return invoke("get_vss_helper_status");
 }
 
 export function exportDiagnosticBundle(token: string): Promise<string> {
