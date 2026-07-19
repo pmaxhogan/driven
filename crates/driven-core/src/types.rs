@@ -1095,6 +1095,14 @@ pub enum ErrorCode {
     /// `state.reconcile_orphan` - startup found a remote object without a
     /// local row; adopted or cleaned.
     StateReconcileOrphan,
+    /// `restore.no_version_as_of` - a point-in-time restore ("restore as of
+    /// <date>", issue #36) was rejected because a selected file has no
+    /// backed-up version covering the chosen instant (e.g. the date is before
+    /// the file's first backup). A user-input-class rejection distinct from
+    /// [`Self::InvalidInput`]: the value is well-formed, but no version exists
+    /// for it, so the UI can point at the date rather than a "highlighted
+    /// field". Non-retryable - the user must pick a later date or clear it.
+    RestoreNoVersionAsOf,
     /// `harness.timeout` - a stress-harness scenario exceeded its budget
     /// (chaos crate only).
     HarnessTimeout,
@@ -1152,6 +1160,7 @@ impl ErrorCode {
             ErrorCode::StateDbLocked => "state.db_locked",
             ErrorCode::StateDbCorrupt => "state.db_corrupt",
             ErrorCode::StateReconcileOrphan => "state.reconcile_orphan",
+            ErrorCode::RestoreNoVersionAsOf => "restore.no_version_as_of",
             ErrorCode::HarnessTimeout => "harness.timeout",
             ErrorCode::InternalBug => "internal.bug",
             ErrorCode::InvalidInput => "internal.invalid_input",
@@ -1204,6 +1213,7 @@ impl ErrorCode {
             "state.db_locked" => ErrorCode::StateDbLocked,
             "state.db_corrupt" => ErrorCode::StateDbCorrupt,
             "state.reconcile_orphan" => ErrorCode::StateReconcileOrphan,
+            "restore.no_version_as_of" => ErrorCode::RestoreNoVersionAsOf,
             "harness.timeout" => ErrorCode::HarnessTimeout,
             "internal.bug" => ErrorCode::InternalBug,
             "internal.invalid_input" => ErrorCode::InvalidInput,
