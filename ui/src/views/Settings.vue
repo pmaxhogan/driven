@@ -44,9 +44,9 @@ const showVssBanner = computed(() => vssStatus.value?.lockedFileBackupDegraded ?
 // MUST carry explicit light/dark surface + text colors so they stay readable on a
 // dark-theme OS; teal is the accent for focus rings.
 const inputCls =
-  "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
+  "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-hidden focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
 const cardCls =
-  "rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900";
+  "rounded-lg border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900";
 
 // Local editable mirrors of the numeric "nullable = special" fields, so the
 // bound <input> can be empty (= the special value) without fighting the store.
@@ -357,7 +357,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
         v-for="tabItem in tabs"
         :key="tabItem.key"
         type="button"
-        class="-mb-px rounded-t px-3 py-2 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500"
+        class="-mb-px rounded-t px-3 py-2 transition-colors focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500"
         :class="
           active === tabItem.key
             ? 'border-b-2 border-teal-600 font-medium text-teal-700 dark:text-teal-300'
@@ -539,7 +539,7 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
                   v-for="i in dayIndices"
                   :key="i"
                   type="button"
-                  class="rounded-md border px-2 py-1 text-xs transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500"
+                  class="rounded-md border px-2 py-1 text-xs transition-colors focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500"
                   :class="
                     scheduleDays[i]
                       ? 'border-teal-600 bg-teal-700 text-white'

@@ -87,7 +87,7 @@ function isActive(matches: readonly string[]): boolean {
 // Shared NAV LINK class strings (design system). Identical strings across slices
 // keep the shell visually consistent; only active/inactive color + weight differ.
 const NAV_LINK_BASE =
-  "rounded px-1 py-0.5 transition-colors focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500";
+  "rounded-sm px-1 py-0.5 transition-colors focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500";
 const NAV_LINK_INACTIVE =
   "text-zinc-600 hover:text-teal-700 dark:text-zinc-400 dark:hover:text-teal-300";
 const NAV_LINK_ACTIVE = "text-teal-700 dark:text-teal-300 font-semibold";
@@ -102,7 +102,7 @@ const NAV_LINK_ACTIVE = "text-teal-700 dark:text-teal-300 font-semibold";
     >
       <RouterLink
         to="/activity"
-        class="mr-2 text-base font-bold tracking-tight text-teal-700 transition-colors hover:text-teal-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-teal-300 dark:hover:text-teal-200"
+        class="mr-2 text-base font-bold tracking-tight text-teal-700 transition-colors hover:text-teal-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-teal-300 dark:hover:text-teal-200"
       >
         {{ t("app.name") }}
       </RouterLink>

@@ -59,7 +59,7 @@ function close(): void {
         </div>
         <button
           type="button"
-          class="rounded-md px-2 py-1 text-sm text-zinc-500 transition-colors hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:hover:text-teal-300"
+          class="rounded-md px-2 py-1 text-sm text-zinc-500 transition-colors hover:text-teal-700 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:hover:text-teal-300"
           :aria-label="t('common.close')"
           @click="close"
         >

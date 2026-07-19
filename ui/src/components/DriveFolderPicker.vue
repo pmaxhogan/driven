@@ -106,7 +106,7 @@ watch(
         <span v-if="i > 0" class="text-zinc-400 dark:text-zinc-600" aria-hidden="true">/</span>
         <button
           type="button"
-          class="rounded px-1 py-0.5 text-zinc-600 transition-colors hover:text-teal-700 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500 dark:text-zinc-400 dark:hover:text-teal-300"
+          class="rounded-sm px-1 py-0.5 text-zinc-600 transition-colors hover:text-teal-700 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500 dark:text-zinc-400 dark:hover:text-teal-300"
           @click="goToCrumb(i)"
         >
           {{ i === 0 ? t("drivePicker.rootName") : crumb.path.split("/").pop() }}
@@ -125,7 +125,7 @@ watch(
         <li v-for="folder in folders" :key="folder.id">
           <button
             type="button"
-            class="w-full px-3 py-2 text-left text-sm transition-colors hover:bg-teal-50 focus-visible:outline focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500 dark:hover:bg-zinc-800"
+            class="w-full px-3 py-2 text-left text-sm transition-colors hover:bg-teal-50 focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500 dark:hover:bg-zinc-800"
             @click="descendInto(folder)"
           >
             {{ folder.name }}

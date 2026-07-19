@@ -12,10 +12,10 @@ Tailwind `teal-700`. Teal is THE accent color: use it for all primary,
 interactive, active, and focus affordances (brand wordmark, primary buttons,
 active nav/subtabs, focus rings).
 
-`tailwind.config.ts` aliases the whole teal scale as `brand` (`brand-700` ===
-`teal-700`), so a future rebrand is a one-line change (point `brand` at a
-different scale). `teal-*` utilities remain valid and are what the class strings
-below use directly.
+The `@theme` block in `src/style.css` aliases the whole teal scale as `brand`
+(`brand-700` === `teal-700`), so a future rebrand is a one-line change (repoint
+`--color-brand-*` at a different scale). `teal-*` utilities remain valid and are
+what the class strings below use directly.
 
 ### Semantic colors (do NOT use teal for these)
 
@@ -57,13 +57,13 @@ INPUT string below) and never rely on the browser default.
 PRIMARY BUTTON:
 
 ```
-inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-sm transition-colors hover:bg-teal-600 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50
+inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-xs transition-colors hover:bg-teal-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50
 ```
 
 SECONDARY BUTTON:
 
 ```
-inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800
+inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800
 ```
 
 DESTRUCTIVE BUTTON: the PRIMARY string with `bg-red-600 hover:bg-red-700` and
@@ -72,14 +72,21 @@ DESTRUCTIVE BUTTON: the PRIMARY string with `bg-red-600 hover:bg-red-700` and
 SELECT / TEXT INPUT / SEARCH:
 
 ```
-rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-none focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100
+rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-hidden focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100
 ```
 
 CARD / PANEL:
 
 ```
-rounded-lg border border-zinc-200 bg-white p-4 shadow-sm dark:border-zinc-800 dark:bg-zinc-900
+rounded-lg border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900
 ```
+
+Note (Tailwind v4 renames, see `src/style.css`): `focus-visible:outline` (bare,
+style-only) is now `focus-visible:outline-solid` because the bare `outline`
+utility defaults to setting only `outline-width` in v4; `outline-none` (the
+"remove focus ring" idiom) is now `outline-hidden`; `shadow-sm` is now
+`shadow-xs` (v4 shifted the shadow scale down a step). These are pure renames -
+the rendered pixels are unchanged.
 
 NAV LINK inactive: `text-zinc-600 hover:text-teal-700 dark:text-zinc-400 dark:hover:text-teal-300`
 
