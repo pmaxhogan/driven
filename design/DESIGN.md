@@ -1976,8 +1976,10 @@ Rust-side i18n:
 > **bandwidth throttle by network type / metered** (#17) - plus **CLI local-state
 > inspection** (`status`/`history`/`verify`, #13). They are annotated "(SHIPPED
 > 0.2.0)" below; the surrounding design text is retained as historical context.
-> Metered detection is real on Windows only; macOS/Linux return a conservative
-> "unmetered" default (tracked residual).
+> Metered detection is real on all three desktop OSes (#32): Windows
+> `INetworkCostManager::GetCost`, Linux NetworkManager `Metered` over D-Bus, and
+> macOS `NWPathMonitor` (`isExpensive` / `isConstrained` as the metered proxy,
+> since macOS exposes no literal "metered" bit).
 
 - **rclone-crypt-format compatibility** as opt-in second format.
 - **Block-level dedup** (CDC) for huge frequently-rewritten files.

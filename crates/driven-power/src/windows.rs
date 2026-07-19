@@ -22,7 +22,7 @@ use tokio::sync::Mutex;
 use windows::Win32::System::Power::GetSystemPowerStatus;
 use windows::Win32::System::Power::SYSTEM_POWER_STATUS;
 
-use crate::network::detect_metered_and_reachable;
+use crate::network::{detect_metered, reachable_hint};
 use crate::{PowerSource, PowerState};
 use async_trait::async_trait;
 
@@ -113,12 +113,11 @@ impl PowerSource for RealPowerSource {
 /// `GetSystemPowerStatus`, metered / reachability from [`crate::network`].
 fn read_power_state() -> anyhow::Result<PowerState> {
     let (ac_connected, battery_percent) = read_ac_and_battery()?;
-    let (on_metered_network, network_reachable) = detect_metered_and_reachable();
     Ok(PowerState {
         ac_connected,
         battery_percent,
-        on_metered_network,
-        network_reachable,
+        on_metered_network: detect_metered().on_metered(),
+        network_reachable: reachable_hint(),
     })
 }
 

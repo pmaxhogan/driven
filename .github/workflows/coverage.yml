@@ -50,7 +50,7 @@ jobs:
     name: coverage
     runs-on: ubuntu-latest
     steps:
-      - uses: actions/checkout@v4
+      - uses: actions/checkout@v7
 
       - name: Install Linux Tauri deps
         # Some workspace crates pull in the GTK/webkit stack transitively; the
@@ -112,7 +112,7 @@ jobs:
           cat "$BASELINE_FILE"
       - name: Save baseline to cache
         if: github.event_name == 'push'
-        uses: actions/cache/save@v4
+        uses: actions/cache/save@v6
         with:
           path: ${{ env.BASELINE_FILE }}
           # New key per commit; PRs restore the most recent via restore-keys.
@@ -121,7 +121,7 @@ jobs:
       # --- PR: restore baseline, comment the delta, gate ----------------------
       - name: Restore baseline from cache
         if: github.event_name == 'pull_request'
-        uses: actions/cache/restore@v4
+        uses: actions/cache/restore@v6
         with:
           path: ${{ env.BASELINE_FILE }}
           key: driven-cov-baseline-none
@@ -130,7 +130,7 @@ jobs:
 
       - name: Comment coverage + enforce gate
         if: github.event_name == 'pull_request'
-        uses: actions/github-script@v7
+        uses: actions/github-script@v9
         with:
           script: |
             const fs = require('fs');

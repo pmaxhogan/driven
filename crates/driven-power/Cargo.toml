@@ -16,9 +16,9 @@ tokio.workspace = true
 async-trait.workspace = true
 
 # Per-OS power / metered-network / sleep-wake backends (DESIGN s5.7,
-# s5.10.1). Declared now so the M3 implement phase has them; features are
-# kept minimal here (the impl widens them to the specific Win32 / DBus
-# modules it calls) to keep `cargo build --workspace` light.
+# s5.10.1). Features are kept minimal (the impl widens them only to the
+# specific Win32 / DBus / Network.framework modules it calls) to keep
+# `cargo build --workspace` light.
 [target.'cfg(windows)'.dependencies]
 # GetSystemPowerStatus (Win32_System_Power) for AC/battery (DESIGN s5.7).
 # Win32_Foundation pulls the shared BOOL/handle types its signature uses.
@@ -35,15 +35,21 @@ windows = { version = "0.62", features = [
 ] }
 
 [target.'cfg(target_os = "linux")'.dependencies]
-# Battery/AC is read from /sys/class/power_supply with std only. The
-# systemd-logind PrepareForSleep DBus signal + NetworkManager Metered /
-# Connectivity are TODO seams (linux.rs / network.rs); zbus is declared now
-# for when those DBus hooks land (DESIGN s5.7, s5.10.1).
+# Battery/AC is read from /sys/class/power_supply with std only. zbus backs the
+# real metered-network read in network.rs: the aggregate `Metered` property on
+# org.freedesktop.NetworkManager over the system bus, via the default
+# (async-io) blocking API dispatched through tokio's spawn_blocking (DESIGN
+# s5.7). The systemd-logind PrepareForSleep sleep/wake signal remains a TODO
+# seam (linux.rs, s5.10.1).
 zbus = "5"
 
 [target.'cfg(target_os = "macos")'.dependencies]
 # IOKit IOPowerSources for AC/battery, read via CoreFoundation types
-# (DESIGN s5.7). NSWorkspace sleep/wake bridging via objc2 is a TODO seam
-# in macos.rs; objc2 is declared now for when that hook lands (s5.10.1).
+# (DESIGN s5.7). block2 backs the real metered-network read in network.rs: an
+# NWPathMonitor whose update handler (an Objective-C block) caches
+# nw_path_is_expensive / nw_path_is_constrained (DESIGN s5.7's NWPath.isExpensive
+# proxy). NSWorkspace sleep/wake bridging via objc2 is a TODO seam in macos.rs;
+# objc2 is declared now for when that hook lands (s5.10.1).
 core-foundation = "0.10"
 objc2 = "0.6"
+block2 = "0.6"

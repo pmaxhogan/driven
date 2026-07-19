@@ -72,30 +72,47 @@ abstraction is in place.
 
 ### P2-10 per-OS metered detection + reachability (M4)
 
-M4 status:
-- **Windows metered detection is now REAL** (`crates/driven-power/src/network.rs`,
-  `detect_metered` Windows arm). It instantiates the `NetworkListManager` COM
-  object, queries `INetworkCostManager::GetCost`, and maps the
-  `NLM_CONNECTION_COST` bitmask (FIXED / VARIABLE / CONGESTED / OVERDATALIMIT /
-  APPROACHINGDATALIMIT / ROAMING -> metered; UNRESTRICTED / UNKNOWN / any COM
-  failure -> the safe `false`). The `windows` crate features
-  `Win32_Networking_NetworkListManager` + `Win32_System_Com` were added to
-  `crates/driven-power/Cargo.toml` to back it.
-- **macOS + Linux metered detection remain documented conservative defaults
-  (`false`)** - ACCEPTED RESIDUALS. macOS `NWPath.isExpensive` needs a live
-  `NWPathMonitor` on a dispatch queue (no one-shot synchronous read); Linux
-  NetworkManager's per-connection `Metered` property is DBus-only internal NM
-  state with no cheap synchronous `/sys`/`/proc` read, which does not fit the
-  synchronous 30 s-cadence probe. Both keep `false` (safe direction: a false
-  "not metered" only fails to skip a rare metered link; a false "metered" would
-  stall ALL sync) until a monitor-backed / DBus-backed async reader lands.
+Status (macOS + Linux wired in #32; all three OSes now REAL):
+- **Windows metered detection is REAL** (`crates/driven-power/src/network.rs`,
+  `detect_metered`). It instantiates the `NetworkListManager` COM object,
+  queries `INetworkCostManager::GetCost`, and classifies the
+  `NLM_CONNECTION_COST` bitmask via `classify_windows_cost` (FIXED / VARIABLE /
+  CONGESTED / OVERDATALIMIT / APPROACHINGDATALIMIT / ROAMING -> metered;
+  UNRESTRICTED -> not metered; UNKNOWN / any COM failure -> the safe `Unknown`).
+  The `windows` crate features `Win32_Networking_NetworkListManager` +
+  `Win32_System_Com` back it.
+- **Linux metered detection is REAL** (#32, `detect_metered_blocking`). It reads
+  NetworkManager's aggregate `Metered` property (`org.freedesktop.NetworkManager`)
+  over the system bus via zbus's blocking API, dispatched off the async executor
+  through `tokio::task::spawn_blocking` (zbus's blocking API must not be driven
+  from inside an async runtime) and bounded by a 5 s timeout so a wedged bus
+  cannot stall the AC/battery poll. The `NMMetered` enum is classified by
+  `classify_nm_metered` (YES / GUESS_YES -> metered; NO / GUESS_NO -> not
+  metered; UNKNOWN or a failed read -> the safe `Unknown`). No NetworkManager /
+  no system bus -> read fails -> `Unknown` -> not metered.
+- **macOS metered detection is REAL** (#32, `MacosMeteredMonitor`). macOS exposes
+  no literal "metered" bit, so a long-lived `NWPathMonitor` (Network.framework C
+  API, its update handler an Objective-C block via `block2`, on a libdispatch
+  global queue) caches `nw_path_is_expensive` (cellular / personal hotspot) ||
+  `nw_path_is_constrained` (Low Data Mode) - the documented proxies - into an
+  `AtomicU8`; the 30 s poll reads it cheaply. Classified by `classify_nw_path`.
+  The first path arrives asynchronously, so the pre-first-update reading is the
+  safe `Unknown`.
+- **Testability**: the three `classify_*` functions plus `MeteredStatus::on_metered`
+  are pure and compiled + unit-tested on EVERY OS (`#[cfg(any(test, target_os =
+  ...))]`), so the classification logic is CI-covered on Windows, macOS, and
+  Linux alike; only the thin OS-call adapters are compile-checked-only off their
+  native OS.
+- **Safe-default direction**: every OS read collapses ambiguity to
+  `MeteredStatus::Unknown`, which maps to `false` (not metered) - a false "not
+  metered" only fails to skip a rare metered link, whereas a false "metered"
+  would stall ALL sync.
 - **Reachability** is still the coarse `true` hint in `PowerState`; the
   authoritative classification is owned by the network-resilience subsystem
-  (DESIGN s5.8), which `driven-net`'s `ReqwestBackend` now implements for real
-  (three-probe topology, hickory DNS re-resolution per probe).
+  (DESIGN s5.8), which `driven-net`'s `ReqwestBackend` implements for real
+  (three-probe topology, DNS re-resolution per probe).
 
-Net effect: `skip_on_metered` is now LIVE on Windows; on macOS/Linux it stays
-inert until those two arms are wired.
+Net effect: `skip_on_metered` is now LIVE on Windows, macOS, and Linux.
 
 ### CRYPTO SUITE PRODUCTION WIRING (M5/M6 - BEFORE GA)
 
