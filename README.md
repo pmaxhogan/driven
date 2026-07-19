@@ -26,22 +26,24 @@ excludes, battery and metered-network awareness) that CLI backup tools and
 consumer sync clients skip. Where it is thinner today (more backends,
 block-level dedup) is marked honestly below.
 
+Legend: :white_check_mark: yes &nbsp; :large_orange_diamond: partial (see note) &nbsp; :x: no
+
 | Capability | Driven | rclone | Drive for desktop | Duplicati | restic | Backblaze |
-| --- | --- | --- | --- | --- | --- | --- |
-| One-way backup, source stays the source of truth | Yes | Partial [1] | No [2] | Yes | Yes | Yes |
-| End-to-end (client-side) encryption | Yes | Yes | No [3] | Yes | Yes | Partial [4] |
-| Backs up to storage you own / control | Yes | Yes | Yes | Yes | Yes | No [5] |
-| No account with the tool's vendor, no vendor servers | Yes | Yes | No | Yes | Yes | No |
-| Choice of multiple storage backends | No [6] | Yes | No | Yes | Yes | No |
-| Point-in-time restore (an earlier version by date) | Yes | No | Partial [7] | Yes | Yes | Yes [8] |
-| Block-level deduplication | No [6] | No | No | Yes | Yes | No |
-| Locked / open-file backup (Windows VSS) | Yes | No | Partial [9] | Yes | Yes | Yes |
-| Automatic battery / metered-network / sleep awareness | Yes | No | No | No | No | No [10] |
-| Per-source include/exclude incl. .gitignore | Yes | Partial [11] | No | Partial [11] | Partial [11] | Partial [11] |
-| Native desktop GUI app | Yes | No [12] | Yes | Partial [13] | No [12] | Yes |
-| In-app file search + selective restore | Yes | No | Yes | Yes | Partial [14] | Yes |
-| Open source (permissive license) | Yes | Yes | No | Yes | Yes | No |
-| Cross-platform desktop (Windows, macOS, Linux) | Yes | Yes | No [15] | Yes | Yes | No [15] |
+| --- | :---: | :---: | :---: | :---: | :---: | :---: |
+| One-way backup, source stays the source of truth | :white_check_mark: | :large_orange_diamond: [1] | :x: [2] | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| End-to-end (client-side) encryption | :white_check_mark: | :white_check_mark: | :x: [3] | :white_check_mark: | :white_check_mark: | :large_orange_diamond: [4] |
+| Backs up to storage you own / control | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: | :x: [5] |
+| No account with the tool's vendor, no vendor servers | :white_check_mark: | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
+| Choice of multiple storage backends | :x: [6] | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
+| Point-in-time restore (an earlier version by date) | :white_check_mark: | :x: | :large_orange_diamond: [7] | :white_check_mark: | :white_check_mark: | :white_check_mark: [8] |
+| Block-level deduplication | :x: [6] | :x: | :x: | :white_check_mark: | :white_check_mark: | :x: |
+| Locked / open-file backup (Windows VSS) | :white_check_mark: | :x: | :large_orange_diamond: [9] | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Automatic battery / metered-network / sleep awareness | :white_check_mark: | :x: | :x: | :x: | :x: | :x: [10] |
+| Per-source include/exclude incl. .gitignore | :white_check_mark: | :large_orange_diamond: [11] | :x: | :large_orange_diamond: [11] | :large_orange_diamond: [11] | :large_orange_diamond: [11] |
+| Native desktop GUI app | :white_check_mark: | :x: [12] | :white_check_mark: | :large_orange_diamond: [13] | :x: [12] | :white_check_mark: |
+| In-app file search + selective restore | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :large_orange_diamond: [14] | :white_check_mark: |
+| Open source (permissive license) | :white_check_mark: | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
+| Cross-platform desktop (Windows, macOS, Linux) | :white_check_mark: | :white_check_mark: | :x: [15] | :white_check_mark: | :white_check_mark: | :x: [15] |
 
 Notes:
 
