@@ -5,6 +5,30 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.0.0](https://github.com/pmaxhogan/driven/compare/v1.0.0...v2.0.0) (2026-07-19)
+
+
+### Features
+
+* **core:** pack cold small-file folders into tar.gz bundles ([#110](https://github.com/pmaxhogan/driven/issues/110)) ([95b573a](https://github.com/pmaxhogan/driven/commit/95b573a6203cd156e904cbcb95e3ef8f72554b87))
+* **core:** restore-by-date point-in-time restore via trash-as-version-store ([#109](https://github.com/pmaxhogan/driven/issues/109)) ([aed3f11](https://github.com/pmaxhogan/driven/commit/aed3f1183be3da09ca6f923a0ae8d4d9cfa30891))
+* least-privilege VSS elevation helper broker + secured IPC ([#96](https://github.com/pmaxhogan/driven/issues/96)) ([d8886be](https://github.com/pmaxhogan/driven/commit/d8886beb7d887939b0ac7bcf760d7f70afa8d180))
+* **power:** real metered-network detection on macOS and Linux ([#95](https://github.com/pmaxhogan/driven/issues/95)) ([c475ac1](https://github.com/pmaxhogan/driven/commit/c475ac10178a8bb1f6718eb915ac65e77d46dac5))
+* wire OS sleep/wake power events (suspend-edge session snapshot) ([#97](https://github.com/pmaxhogan/driven/issues/97)) ([bcbfed6](https://github.com/pmaxhogan/driven/commit/bcbfed62f0e4de469e2375fd73180ad8064a9847))
+* wire the least-privilege VSS helper into locked-file backup ([#112](https://github.com/pmaxhogan/driven/issues/112)) ([70ffbcb](https://github.com/pmaxhogan/driven/commit/70ffbcb2192932c9323e75acb21be0b6e2f8afbb))
+
+
+### Bug Fixes
+
+* **core:** dedicated restore.no_version_as_of error code for point-in-time rejections ([#111](https://github.com/pmaxhogan/driven/issues/111)) ([64a23b5](https://github.com/pmaxhogan/driven/commit/64a23b505ba4db44cab90afc584a9b5aaefce865))
+* **deps:** bump crossbeam-epoch to 0.9.20 and spin to 0.9.9 to clear cargo-deny advisories ([62f3356](https://github.com/pmaxhogan/driven/commit/62f33567309bfd6e3ac28c5efeae2cc55149081e))
+* eager VSS helper launch with attended UAC window and decline-only memoisation ([#113](https://github.com/pmaxhogan/driven/issues/113)) ([3c6b029](https://github.com/pmaxhogan/driven/commit/3c6b0295b97c2e0086766e329772283fd331c463))
+
+
+### Miscellaneous Chores
+
+* release 2.0.0 ([871492f](https://github.com/pmaxhogan/driven/commit/871492f17dff48e81a8d930f8bfb3e7f8139ac3f))
+
 ## [1.0.0](https://github.com/pmaxhogan/driven/compare/v0.5.0...v1.0.0) (2026-07-03)
 
 
