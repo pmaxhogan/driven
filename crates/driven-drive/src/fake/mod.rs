@@ -1259,6 +1259,23 @@ impl RemoteStore for InMemoryRemoteStore {
         Ok(())
     }
 
+    async fn delete_permanent(&self, file_id: &str) -> anyhow::Result<()> {
+        // Issue #36: hard-delete. Remove the object entirely (freeing its bytes),
+        // so the version-store prune actually reclaims space rather than leaving
+        // it in trash. Idempotent: an absent object (already gone) is success.
+        self.check_request_faults(RequestKind::WriteTarget).await?;
+        let mut guard = self.inner.lock();
+        let freed = match guard.objects.remove(file_id) {
+            Some(entry) if !entry.trashed => entry.content_len().unwrap_or(0),
+            // An already-trashed object's bytes were already subtracted at trash
+            // time; removing it now frees nothing further. A missing object (404)
+            // frees nothing. Both are success.
+            Some(_) | None => 0,
+        };
+        guard.bytes_stored = guard.bytes_stored.saturating_sub(freed);
+        Ok(())
+    }
+
     async fn metadata(&self, file_id: &str) -> anyhow::Result<RemoteEntry> {
         self.check_request_faults(RequestKind::Read).await?;
         let guard = self.inner.lock();

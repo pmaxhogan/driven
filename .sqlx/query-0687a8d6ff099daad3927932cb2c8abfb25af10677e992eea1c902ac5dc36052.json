@@ -1,0 +1,146 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                id                    AS \"id!: i64\",\n                source_id             AS \"source_id!: String\",\n                relative_path         AS \"relative_path!: String\",\n                drive_file_id         AS \"drive_file_id!: String\",\n                size                  AS \"size!: i64\",\n                hash_blake3           AS \"hash_blake3!: Vec<u8>\",\n                drive_md5             AS \"drive_md5: Vec<u8>\",\n                encrypted_remote_path AS \"encrypted_remote_path: String\",\n                created_at            AS \"created_at!: i64\",\n                superseded_at         AS \"superseded_at!: i64\",\n                trashed               AS \"trashed!: i64\"\n            FROM file_versions\n            WHERE source_id = ?1 AND relative_path = ?2\n            ORDER BY superseded_at DESC, id DESC\n            LIMIT -1 OFFSET ?3\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "id!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "id"
+          }
+        }
+      },
+      {
+        "name": "source_id!: String",
+        "ordinal": 1,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "source_id"
+          }
+        }
+      },
+      {
+        "name": "relative_path!: String",
+        "ordinal": 2,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "relative_path"
+          }
+        }
+      },
+      {
+        "name": "drive_file_id!: String",
+        "ordinal": 3,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "drive_file_id"
+          }
+        }
+      },
+      {
+        "name": "size!: i64",
+        "ordinal": 4,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "size"
+          }
+        }
+      },
+      {
+        "name": "hash_blake3!: Vec<u8>",
+        "ordinal": 5,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "hash_blake3"
+          }
+        }
+      },
+      {
+        "name": "drive_md5: Vec<u8>",
+        "ordinal": 6,
+        "type_info": "Blob",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "drive_md5"
+          }
+        }
+      },
+      {
+        "name": "encrypted_remote_path: String",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "encrypted_remote_path"
+          }
+        }
+      },
+      {
+        "name": "created_at!: i64",
+        "ordinal": 8,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "created_at"
+          }
+        }
+      },
+      {
+        "name": "superseded_at!: i64",
+        "ordinal": 9,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "superseded_at"
+          }
+        }
+      },
+      {
+        "name": "trashed!: i64",
+        "ordinal": 10,
+        "type_info": "Integer",
+        "origin": {
+          "Table": {
+            "table": "file_versions",
+            "name": "trashed"
+          }
+        }
+      }
+    ],
+    "parameters": {
+      "Right": 3
+    },
+    "nullable": [
+      false,
+      false,
+      false,
+      false,
+      false,
+      false,
+      true,
+      true,
+      false,
+      false,
+      false
+    ]
+  },
+  "hash": "0687a8d6ff099daad3927932cb2c8abfb25af10677e992eea1c902ac5dc36052"
+}

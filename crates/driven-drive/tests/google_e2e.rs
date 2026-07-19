@@ -211,3 +211,11 @@ async fn google_find_by_op_uuid() {
     })
     .await;
 }
+
+#[tokio::test]
+async fn google_delete_permanent() {
+    run_gated("google_delete_permanent", |store, root| {
+        Box::pin(common::scenario_delete_permanent(store, root))
+    })
+    .await;
+}

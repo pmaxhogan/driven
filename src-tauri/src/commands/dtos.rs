@@ -791,6 +791,24 @@ pub struct RestoreItem {
     pub relative_path: String,
 }
 
+/// Issue #36: one retained point-in-time version of a file, for the Restore
+/// version-history view. Mirrors [`driven_core::state::FileVersionRow`] over the
+/// camelCase wire, minus the internal Drive id. The version was the file's
+/// current content during `[created_at, superseded_at)` (Unix ms).
+#[derive(Debug, Clone, Serialize, Deserialize, PartialEq, Eq)]
+#[serde(rename_all = "camelCase")]
+pub struct FileVersionDto {
+    /// Plaintext size in bytes of this version.
+    pub size: u64,
+    /// Wall-time (Unix ms) this version first became the current backup.
+    pub created_at: i64,
+    /// Wall-time (Unix ms) it was superseded by the next version.
+    pub superseded_at: i64,
+    /// `true` once the old Drive object has been moved to trash (it remains
+    /// restorable by date until Drive purges its trash).
+    pub trashed: bool,
+}
+
 /// The opaque id of a spawned restore job (SPEC s11.5 `RestoreJobId`). A
 /// transparent UUID-string newtype so a stale / forged id surfaces as a command
 /// error rather than resolving the wrong job.

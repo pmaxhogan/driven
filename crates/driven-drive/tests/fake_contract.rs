@@ -85,6 +85,13 @@ async fn fake_find_by_op_uuid_warns_on_dup() {
     common::scenario_find_by_op_uuid(&store, &root).await;
 }
 
+#[tokio::test]
+async fn fake_delete_permanent() {
+    let store = fake();
+    let root = store.root_id().to_string();
+    common::scenario_delete_permanent(&store, &root).await;
+}
+
 // ---------------------------------------------------------------------------
 // Fake-only tests: list-with-trashed flag, fault-injection invalidation,
 // parallel uploads.

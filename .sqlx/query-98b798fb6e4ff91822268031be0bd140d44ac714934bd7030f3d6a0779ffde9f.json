@@ -1,0 +1,21 @@
+{
+  "db_name": "SQLite",
+  "query": "SELECT EXISTS(\n                   SELECT 1 FROM file_state WHERE drive_file_id = ?1\n               ) AS \"live!: i64\"",
+  "describe": {
+    "columns": [
+      {
+        "name": "live!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": [
+      false
+    ]
+  },
+  "hash": "98b798fb6e4ff91822268031be0bd140d44ac714934bd7030f3d6a0779ffde9f"
+}

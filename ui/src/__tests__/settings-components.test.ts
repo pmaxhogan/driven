@@ -149,6 +149,41 @@ describe("SourceTable", () => {
     });
   });
 
+  it("opens the versioning panel and saves the per-source config (issue #36)", async () => {
+    let saved: unknown = null;
+    invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "list_sources") return Promise.resolve([makeSource()]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      if (cmd === "get_source_versioning")
+        return Promise.resolve({ enabled: false, countCap: 10, maxBytes: 0 });
+      if (cmd === "set_source_versioning") {
+        saved = args;
+        return Promise.resolve({ enabled: true, countCap: 5, maxBytes: 0 });
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+
+    // Open the panel (loads the current config).
+    await wrapper.get('[data-testid="versioning-button"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="versioning-editor"]').exists()).toBe(true);
+
+    // Enable + set a keep-N cap, then save.
+    await wrapper.get('[data-testid="versioning-enabled"]').setValue(true);
+    await wrapper.get('[data-testid="versioning-cap"]').setValue(5);
+    await wrapper.get('[data-testid="versioning-save"]').trigger("click");
+    await flushPromises();
+
+    expect(saved).toMatchObject({
+      sourceId: "src-1",
+      config: { enabled: true, countCap: 5, maxBytes: 0 },
+    });
+    // The panel closes after a successful save.
+    expect(wrapper.find('[data-testid="versioning-editor"]').exists()).toBe(false);
+  });
+
   it("disables the enable toggle for a pending-recovery-ack source (R4-P1-2)", async () => {
     // R4-P1-2 (DATA-SAFETY): a first-encrypted source still awaiting its recovery
     // phrase ack must not be enableable from the table - the toggle is disabled

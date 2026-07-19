@@ -198,6 +198,52 @@ describe("restore store", () => {
     expect(store.selectedCount).toBe(0);
   });
 
+  it("passes the point-in-time as-of instant to restore_files (issue #36)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources") return Promise.resolve([source("s1", "Documents")]);
+      if (cmd === "list_remote_tree") return Promise.resolve(tree([file("a.txt")]));
+      if (cmd === "restore_files") return Promise.resolve("job-x");
+      if (cmd === "get_restore_job")
+        return Promise.resolve({
+          jobId: "job-x",
+          totalFiles: 1,
+          completedFiles: 0,
+          failedFiles: 0,
+          totalBytes: 0,
+          bytesDone: 0,
+          currentFile: null,
+          done: false,
+          cancelled: false,
+          files: [],
+        } satisfies RestoreJobStatus);
+      return Promise.resolve([]);
+    });
+    const store = useRestoreStore();
+    await store.loadSources();
+    store.toggleSelect("s1", "a.txt");
+    store.setDestination("/home/u/restored", "tok-t");
+
+    // Default: no point-in-time -> asOf is null.
+    expect(store.asOf).toBeNull();
+    await store.startRestore();
+    let call = invokeMock.mock.calls.find((c) => c[0] === "restore_files");
+    expect(call?.[1]).toMatchObject({ destToken: "tok-t", asOf: null });
+
+    // setAsOf parses an ISO datetime string into a Unix-ms instant that flows to
+    // the backend on the next restore.
+    store.setAsOf("2026-01-02T03:04");
+    const expectedMs = Date.parse("2026-01-02T03:04");
+    expect(store.asOf).toBe(expectedMs);
+    store.setDestination("/home/u/restored", "tok-t2");
+    await store.startRestore();
+    call = invokeMock.mock.calls.filter((c) => c[0] === "restore_files").at(-1);
+    expect(call?.[1]).toMatchObject({ destToken: "tok-t2", asOf: expectedMs });
+
+    // Clearing returns to "latest".
+    store.setAsOf(null);
+    expect(store.asOf).toBeNull();
+  });
+
   it("restores selected files with a dialog token and accumulates progress to done", async () => {
     // The seeded snapshot getRestoreJob returns right after start (before any
     // live tick) - the reconcile path (M8-P2-4).

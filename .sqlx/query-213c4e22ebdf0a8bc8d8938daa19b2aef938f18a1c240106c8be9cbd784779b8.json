@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE file_versions SET trashed = 1 WHERE drive_file_id = ?1",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 1
+    },
+    "nullable": []
+  },
+  "hash": "213c4e22ebdf0a8bc8d8938daa19b2aef938f18a1c240106c8be9cbd784779b8"
+}

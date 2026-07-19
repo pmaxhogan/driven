@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO file_versions (\n                source_id, relative_path, drive_file_id, size,\n                hash_blake3, drive_md5, encrypted_remote_path,\n                created_at, superseded_at, trashed\n            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, 0)\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 9
+    },
+    "nullable": []
+  },
+  "hash": "0670097d87c381247e03df06749a4dcece8d918a6ec26e697685417211453ae7"
+}

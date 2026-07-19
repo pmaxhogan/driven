@@ -60,6 +60,11 @@ export const useRestoreStore = defineStore("restore", () => {
   // The destination folder path (display echo) + its one-shot dialog token.
   const destPath = ref<string | null>(null);
   const destToken = ref<string | null>(null);
+  // Issue #36: optional point-in-time restore. `null` = restore the latest
+  // backup (default). When set to a Unix-ms instant, each file is restored as it
+  // was backed up as of that instant (its current bytes if already in place
+  // then, else the retained version whose window covers it).
+  const asOf = ref<number | null>(null);
   // The active restore job status (null until a restore starts).
   const job = ref<RestoreJobStatus | null>(null);
   // M8-P2-4: the active restore job id, persisted so a view remount / missed
@@ -222,6 +227,18 @@ export const useRestoreStore = defineStore("restore", () => {
     destToken.value = token;
   }
 
+  /** Issue #36: set (or clear, with `null`) the point-in-time "as of" instant
+   * applied to the next restore. Accepts a Unix-ms number, an ISO date/datetime
+   * string (from a native date input), or `null`/empty to restore the latest. */
+  function setAsOf(value: number | string | null): void {
+    if (value === null || value === "") {
+      asOf.value = null;
+      return;
+    }
+    const ms = typeof value === "number" ? value : Date.parse(value);
+    asOf.value = Number.isNaN(ms) ? null : ms;
+  }
+
   /** Open the backend folder dialog and record the chosen destination. */
   async function pickDestination(): Promise<void> {
     try {
@@ -272,7 +289,8 @@ export const useRestoreStore = defineStore("restore", () => {
     try {
       // M8-P2-4: keep the returned job id so a remount / missed terminal event
       // can reconcile current state via getRestoreJob(jobId).
-      const jobId = await ipc.restoreFiles(items, destToken.value);
+      // Issue #36: pass the optional point-in-time instant (null = latest).
+      const jobId = await ipc.restoreFiles(items, destToken.value, asOf.value);
       activeJobId.value = jobId;
       // The backend consumes the one-shot token; require a fresh pick for a
       // subsequent restore.
@@ -369,6 +387,7 @@ export const useRestoreStore = defineStore("restore", () => {
     selectedKeys,
     destPath,
     destToken,
+    asOf,
     job,
     activeJobId,
     loading,
@@ -391,6 +410,7 @@ export const useRestoreStore = defineStore("restore", () => {
     toggleSelect,
     clearSelection,
     setDestination,
+    setAsOf,
     pickDestination,
     selectedItems,
     startRestore,

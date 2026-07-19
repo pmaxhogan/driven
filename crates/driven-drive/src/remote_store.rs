@@ -266,6 +266,23 @@ pub trait RemoteStore: Send + Sync {
     /// (already-gone is the desired state).
     async fn trash(&self, file_id: &str) -> anyhow::Result<()>;
 
+    /// PERMANENTLY deletes an object (issue #36 version-store count-cap prune).
+    ///
+    /// Unlike [`trash`](Self::trash) this bypasses the trash and frees the
+    /// storage immediately. Idempotent: a 404 (already gone) is treated as
+    /// success. The caller MUST only ever pass an id it has proven is no longer
+    /// a live pointer (a superseded version whose `file_state` row has already
+    /// been flipped to a different object) - the store does not re-check.
+    ///
+    /// The default SAFELY degrades to [`trash`](Self::trash) (a soft-delete
+    /// instead of a hard-delete) so a store that does not implement a permanent
+    /// delete never over-deletes; the production `GoogleDriveStore` and the test
+    /// `InMemoryRemoteStore` override it with a real hard-delete, and the
+    /// `BreakerReportingStore` wrapper delegates to its inner store.
+    async fn delete_permanent(&self, file_id: &str) -> anyhow::Result<()> {
+        self.trash(file_id).await
+    }
+
     /// Returns metadata for one Drive object by id.
     async fn metadata(&self, file_id: &str) -> anyhow::Result<RemoteEntry>;
 

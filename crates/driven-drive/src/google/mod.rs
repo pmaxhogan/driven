@@ -1452,6 +1452,33 @@ impl RemoteStore for GoogleDriveStore {
         }
     }
 
+    async fn delete_permanent(&self, file_id: &str) -> anyhow::Result<()> {
+        // Issue #36: hard-delete by id (`DELETE /files/{id}`), used ONLY to prune
+        // a superseded version beyond the per-source count cap. `files.delete` by
+        // id is idempotent, so the transient-class retry is safe (mirrors
+        // `trash`); the 204 No Content success body is ignored. A 404 (already
+        // gone / already purged) is treated as success.
+        let result = retry::with_retry(|| async {
+            self.send_json_attempt(&|token: String| {
+                self.http
+                    .delete(format!("{DRIVE_API_BASE}/files/{file_id}"))
+                    .bearer_auth(token)
+            })
+            .await
+        })
+        .await;
+        match result {
+            Ok(_) => Ok(()),
+            Err(e) => {
+                if is_not_found(&e) {
+                    Ok(())
+                } else {
+                    Err(e)
+                }
+            }
+        }
+    }
+
     async fn metadata(&self, file_id: &str) -> anyhow::Result<RemoteEntry> {
         let file: DriveFile = self
             .send_json(|token| {

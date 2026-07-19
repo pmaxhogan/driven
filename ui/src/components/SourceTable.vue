@@ -154,6 +154,50 @@ async function saveEdit(source: SourceDto): Promise<void> {
   }
 }
 
+// Issue #36: per-source point-in-time versioning panel state. The config lives
+// in the settings KV (not a SourceRow field), so it is loaded / saved via its own
+// IPC (getSourceVersioning / setSourceVersioning), not the sources store patch.
+const versioningId = ref<string | null>(null);
+const versioningEnabled = ref(false);
+const versioningCap = ref(10);
+const versioningLoading = ref(false);
+const savingVersioning = ref(false);
+
+async function beginVersioning(source: SourceDto): Promise<void> {
+  editingId.value = null;
+  confirmingRemoveId.value = null;
+  versioningId.value = source.id;
+  versioningLoading.value = true;
+  try {
+    const cfg = await ipc.getSourceVersioning(source.id);
+    versioningEnabled.value = cfg.enabled;
+    versioningCap.value = cfg.countCap;
+  } finally {
+    versioningLoading.value = false;
+  }
+}
+
+function cancelVersioning(): void {
+  versioningId.value = null;
+}
+
+async function saveVersioning(source: SourceDto): Promise<void> {
+  savingVersioning.value = true;
+  try {
+    // Preserve the existing size guard (maxBytes) rather than resetting it - the
+    // panel only edits enabled + the count cap. The backend clamps countCap.
+    const current = await ipc.getSourceVersioning(source.id);
+    await ipc.setSourceVersioning(source.id, {
+      enabled: versioningEnabled.value,
+      countCap: Math.max(1, Math.round(versioningCap.value)),
+      maxBytes: current.maxBytes,
+    });
+    versioningId.value = null;
+  } finally {
+    savingVersioning.value = false;
+  }
+}
+
 function beginRemove(sourceId: string): void {
   confirmingRemoveId.value = sourceId;
   deleteRemote.value = false;
@@ -357,9 +401,71 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
           <button type="button" :class="secondaryBtn" @click="runNow(source)">
             {{ t("settings.sources.runNowButton") }}
           </button>
+          <button
+            type="button"
+            :class="secondaryBtn"
+            data-testid="versioning-button"
+            @click="beginVersioning(source)"
+          >
+            {{ t("settings.sources.versioningButton") }}
+          </button>
           <button type="button" :class="secondaryBtn" @click="beginRemove(source.id)">
             {{ t("settings.sources.removeButton") }}
           </button>
+        </div>
+
+        <!-- Issue #36: per-source point-in-time versioning editor. -->
+        <div
+          v-if="versioningId === source.id"
+          class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-700"
+          data-testid="versioning-editor"
+        >
+          <p class="text-sm text-zinc-600 dark:text-zinc-400">
+            {{ t("settings.sources.versioning.intro") }}
+          </p>
+          <p v-if="versioningLoading" class="text-sm text-zinc-500">
+            {{ t("common.loading") }}
+          </p>
+          <template v-else>
+            <label class="flex items-center gap-2 text-sm">
+              <input
+                v-model="versioningEnabled"
+                type="checkbox"
+                class="accent-teal-600"
+                data-testid="versioning-enabled"
+              />
+              {{ t("settings.sources.versioning.enabledLabel") }}
+            </label>
+            <label class="flex items-center gap-2 text-sm">
+              <span class="text-zinc-600 dark:text-zinc-400">{{
+                t("settings.sources.versioning.capLabel")
+              }}</span>
+              <input
+                v-model.number="versioningCap"
+                type="number"
+                min="1"
+                max="1000"
+                class="w-24"
+                :class="inputCls"
+                :disabled="!versioningEnabled"
+                data-testid="versioning-cap"
+              />
+            </label>
+          </template>
+          <div class="flex gap-2">
+            <button
+              type="button"
+              :class="primaryBtn"
+              :disabled="savingVersioning || versioningLoading"
+              data-testid="versioning-save"
+              @click="saveVersioning(source)"
+            >
+              {{ t("common.save") }}
+            </button>
+            <button type="button" :class="secondaryBtn" @click="cancelVersioning">
+              {{ t("common.cancel") }}
+            </button>
+          </div>
         </div>
 
         <div
