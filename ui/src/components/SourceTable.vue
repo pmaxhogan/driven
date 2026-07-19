@@ -162,16 +162,25 @@ const versioningEnabled = ref(false);
 const versioningCap = ref(10);
 const versioningLoading = ref(false);
 const savingVersioning = ref(false);
+// The versioning-load error as a stable SPEC s24 CODE (localized in the template
+// via t(`errors.${code}.long`)), same contract as the recovery reveal error.
+const versioningErrorCode = ref<string | null>(null);
 
 async function beginVersioning(source: SourceDto): Promise<void> {
   editingId.value = null;
   confirmingRemoveId.value = null;
+  versioningErrorCode.value = null;
   versioningId.value = source.id;
   versioningLoading.value = true;
   try {
     const cfg = await ipc.getSourceVersioning(source.id);
     versioningEnabled.value = cfg.enabled;
     versioningCap.value = cfg.countCap;
+  } catch (e) {
+    // The load failed: DO NOT render the editor over the PREVIOUS panel's stale
+    // enabled/cap (Save would persist those to THIS source). Surface the error in
+    // place of the inputs; the template hides the inputs + Save while it is set.
+    versioningErrorCode.value = toErrorCode(e);
   } finally {
     versioningLoading.value = false;
   }
@@ -179,6 +188,7 @@ async function beginVersioning(source: SourceDto): Promise<void> {
 
 function cancelVersioning(): void {
   versioningId.value = null;
+  versioningErrorCode.value = null;
 }
 
 async function saveVersioning(source: SourceDto): Promise<void> {
@@ -426,6 +436,13 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
           <p v-if="versioningLoading" class="text-sm text-zinc-500">
             {{ t("common.loading") }}
           </p>
+          <p
+            v-else-if="versioningErrorCode"
+            class="text-sm text-red-600"
+            data-testid="versioning-error"
+          >
+            {{ t(`errors.${versioningErrorCode}.long`) }}
+          </p>
           <template v-else>
             <label class="flex items-center gap-2 text-sm">
               <input
@@ -454,6 +471,7 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
           </template>
           <div class="flex gap-2">
             <button
+              v-if="!versioningErrorCode"
               type="button"
               :class="primaryBtn"
               :disabled="savingVersioning || versioningLoading"

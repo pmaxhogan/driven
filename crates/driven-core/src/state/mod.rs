@@ -1157,6 +1157,32 @@ pub trait StateRepo: Send + Sync {
         Ok(0)
     }
 
+    /// Atomically commit an IDENTICAL-CONTENT touch (issue #36): an mtime-only
+    /// re-upload produced a byte-for-byte DUPLICATE Drive object, so the OLD
+    /// object stays current and the redundant NEW object must be trashed. In ONE
+    /// transaction, (1) upsert `file_state` to `file_state` (the OLD pointer, with
+    /// the touch's new size/mtime) and (2) REWRITE the finalizing `upload`
+    /// pending_op's payload to `marker_payload_json` - which carries the redundant
+    /// object's id so the reconcile sweep can RETRY its trash if the immediate
+    /// best-effort trash fails or the process crashes. Unlike
+    /// [`Self::commit_create_result`] the op is KEPT (as a durable cleanup
+    /// handle), not deleted; the caller drops it only once the redundant object is
+    /// confirmed trashed. Same load-bearing atomicity: a crash cannot upsert the
+    /// pointer without persisting the retry handle, or vice versa.
+    ///
+    /// The default SAFELY degrades to a plain create-commit (the pointer upsert,
+    /// dropping the op WITHOUT persisting the retry handle) so a `StateRepo` that
+    /// does not support versioning still commits correctly; the real SQLite store
+    /// overrides it to keep the op with the marker payload.
+    async fn commit_identical_touch_result(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+        _marker_payload_json: &serde_json::Value,
+    ) -> Result<()> {
+        self.commit_create_result(op_id, file_state).await
+    }
+
     /// Mark the stored version whose old Drive object is `drive_file_id` as
     /// trashed (`trashed = 1`). Keyed by drive id (each superseded object appears
     /// in at most one version row); a no-op when the id is not a tracked version

@@ -49,3 +49,17 @@ CREATE TABLE file_versions (
 -- count-cap prune walks the same order. A single covering index serves all three.
 CREATE INDEX idx_file_versions_path
   ON file_versions(source_id, relative_path, superseded_at DESC);
+
+-- Every versioned change / prune candidate / reconcile-sweep entry looks a Drive
+-- object up BY id: `mark_version_trashed` (file_versions) after a best-effort
+-- trash, and `drive_file_id_is_live` (file_state, the global no-live-pointer
+-- guard) before every trash / hard-delete. Without these indexes both queries
+-- full-scan their table on every such call, so a large backup degrades to
+-- minutes of pure table scanning per sync cycle (growing with backup size).
+-- Amended into this unreleased migration (0006 has never shipped) so both
+-- lookups are index-backed from the versioning feature's first release; the
+-- `file_state` index is additive over the table created in 0001.
+CREATE INDEX idx_file_versions_drive_file_id
+  ON file_versions(drive_file_id);
+CREATE INDEX idx_file_state_drive_file_id
+  ON file_state(drive_file_id);

@@ -2331,6 +2331,93 @@ impl StateRepo for SqliteStateRepo {
         Ok(())
     }
 
+    async fn commit_identical_touch_result(
+        &self,
+        op_id: PendingOpId,
+        file_state: &FileStateRow,
+        marker_payload_json: &serde_json::Value,
+    ) -> Result<()> {
+        // Issue #36: the atomic IDENTICAL-CONTENT touch commit. In ONE
+        // transaction: (1) upsert `file_state` to the OLD object (kept current),
+        // and (2) REWRITE the finalizing `upload` op's payload to the redundant-
+        // duplicate cleanup marker - KEEPING the op (unlike `commit_op_result_inner`,
+        // which deletes it) so a failed/crash-interrupted trash of the redundant
+        // NEW object is retried by the reconcile sweep. A crash cannot upsert the
+        // pointer without persisting the retry handle, or vice versa.
+        let source_id = file_state.source_id.to_string();
+        let relative_path = file_state.relative_path.as_str().to_string();
+        let size = file_state.size as i64;
+        let hash: &[u8] = &file_state.hash_blake3[..];
+        let md5_owned: Option<Vec<u8>> = file_state.drive_md5.map(|m| m.to_vec());
+        let md5: Option<&[u8]> = md5_owned.as_deref();
+        let status = file_state_status_to_str(file_state.status);
+        let op_id_v = op_id.0;
+        let marker = serde_json::to_string(marker_payload_json)?;
+
+        let mut tx = self.pool.begin().await?;
+
+        // (1) Keep the OLD object current (with the touch's new size/mtime).
+        sqlx::query!(
+            r#"
+            INSERT INTO file_state (
+                source_id, relative_path, size, mtime_ns,
+                hash_blake3, drive_file_id, drive_md5, encrypted_remote_path,
+                status, last_uploaded_at, last_verified_at
+            ) VALUES (
+                ?1, ?2, ?3, ?4,
+                ?5, ?6, ?7, ?8,
+                ?9, ?10, ?11
+            )
+            ON CONFLICT(source_id, relative_path) DO UPDATE SET
+                size                  = excluded.size,
+                mtime_ns              = excluded.mtime_ns,
+                hash_blake3           = excluded.hash_blake3,
+                drive_file_id         = excluded.drive_file_id,
+                drive_md5             = excluded.drive_md5,
+                encrypted_remote_path = excluded.encrypted_remote_path,
+                status                = excluded.status,
+                last_uploaded_at      = excluded.last_uploaded_at,
+                last_verified_at      = excluded.last_verified_at
+            "#,
+            source_id,
+            relative_path,
+            size,
+            file_state.mtime_ns,
+            hash,
+            file_state.drive_file_id,
+            md5,
+            file_state.encrypted_remote_path,
+            status,
+            file_state.last_uploaded_at,
+            file_state.last_verified_at,
+        )
+        .execute(&mut *tx)
+        .await?;
+
+        // (2) Rewrite the exact finalizing upload op's payload to the cleanup
+        // marker, KEEPING the op (same EXACTLY-one-row guard as the delete arms).
+        let updated = sqlx::query!(
+            "UPDATE pending_ops SET payload_json = ?1 \
+             WHERE id = ?2 AND source_id = ?3 AND relative_path = ?4 AND op_type = 'upload'",
+            marker,
+            op_id_v,
+            source_id,
+            relative_path,
+        )
+        .execute(&mut *tx)
+        .await?
+        .rows_affected();
+        if updated != 1 {
+            return Err(anyhow!(
+                "state.reconcile_op_missing: pending_op id {op_id_v} not found \
+                 (UPDATE affected {updated} rows); refusing to commit identical-touch file_state"
+            ));
+        }
+
+        tx.commit().await?;
+        Ok(())
+    }
+
     async fn insert_file_version(&self, version: &NewFileVersion) -> Result<i64> {
         let v_source = version.source_id.to_string();
         let v_path = version.relative_path.as_str().to_string();
@@ -3489,6 +3576,60 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// Both hot-path lookups BY `drive_file_id` - `drive_file_id_is_live`
+    /// (file_state, the global no-live-pointer guard, run before every trash /
+    /// hard-delete) and `mark_version_trashed` (file_versions, run after every
+    /// best-effort trash) - must be INDEX-backed (migration 0006), never a full
+    /// table scan. Assert via `EXPLAIN QUERY PLAN` that each query SEARCHES its
+    /// table via the drive_file_id index rather than SCANning it; a large backup
+    /// would otherwise degrade to minutes of pure table scanning per sync cycle.
+    #[tokio::test]
+    async fn drive_file_id_lookups_are_index_backed_not_full_scans() {
+        use sqlx::Row as _;
+
+        let (repo, _dir) = temp_repo().await;
+
+        async fn plan(pool: &SqlitePool, sql: &'static str) -> String {
+            let rows = sqlx::query(sql).fetch_all(pool).await.unwrap();
+            rows.iter()
+                .map(|r| r.get::<String, _>("detail"))
+                .collect::<Vec<_>>()
+                .join(" | ")
+        }
+
+        // `drive_file_id_is_live`'s existence probe over file_state.
+        let state_plan = plan(
+            &repo.pool,
+            "EXPLAIN QUERY PLAN \
+             SELECT EXISTS(SELECT 1 FROM file_state WHERE drive_file_id = 'x')",
+        )
+        .await;
+        assert!(
+            state_plan.contains("idx_file_state_drive_file_id"),
+            "drive_file_id_is_live must use idx_file_state_drive_file_id; plan was: {state_plan}"
+        );
+        assert!(
+            !state_plan.to_uppercase().contains("SCAN FILE_STATE"),
+            "drive_file_id_is_live must NOT full-scan file_state; plan was: {state_plan}"
+        );
+
+        // `mark_version_trashed`'s update over file_versions.
+        let versions_plan = plan(
+            &repo.pool,
+            "EXPLAIN QUERY PLAN \
+             UPDATE file_versions SET trashed = 1 WHERE drive_file_id = 'x'",
+        )
+        .await;
+        assert!(
+            versions_plan.contains("idx_file_versions_drive_file_id"),
+            "mark_version_trashed must use idx_file_versions_drive_file_id; plan was: {versions_plan}"
+        );
+        assert!(
+            !versions_plan.to_uppercase().contains("SCAN FILE_VERSIONS"),
+            "mark_version_trashed must NOT full-scan file_versions; plan was: {versions_plan}"
+        );
     }
 
     #[tokio::test]

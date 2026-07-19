@@ -3916,6 +3916,40 @@ mod tests {
         let _ = std::fs::remove_dir_all(&dir);
     }
 
+    #[tokio::test]
+    async fn resolve_restore_as_of_inside_the_current_window_returns_current_object() {
+        // Issue #36 (defect 1, downstream): the current bytes' validity window
+        // starts at `file_state.last_uploaded_at`. A restore as-of any instant at or
+        // after that start - with NO recorded version covering it - must resolve to
+        // the CURRENT object, not be rejected. This is what an identical-content
+        // touch's PRESERVED window start buys: without it the touch would advance
+        // last_uploaded_at past the requested instant and this same selection would
+        // wrongly fail with "no backed-up version as of the selected date".
+        let (state, src, dir) = state_with_source().await;
+        let mut row = file_state_row(src, "doc.txt", Some("cur-obj"), FileStateStatus::Synced);
+        // The current object became live at t0 = 1_000 (its window start).
+        row.last_uploaded_at = Some(1_000);
+        state.state().upsert_file_state(&row).await.unwrap();
+
+        let items = vec![RestoreItem {
+            source_id: src.to_string(),
+            relative_path: "doc.txt".to_string(),
+        }];
+        // Restore as-of t = 5_000 (>= the window start, no version recorded).
+        let resolved = resolve_restore_items(&state, &items, Some(5_000))
+            .await
+            .expect(
+                "as-of at/after the window start must resolve to the current object, not reject",
+            );
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].drive_file_id.as_deref(),
+            Some("cur-obj"),
+            "the still-live current object holds the bytes that were live at the requested instant"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
     // --- R3-P1-2: atomic seed+handle vs a quit in the seed->release window -----
 
     #[tokio::test]

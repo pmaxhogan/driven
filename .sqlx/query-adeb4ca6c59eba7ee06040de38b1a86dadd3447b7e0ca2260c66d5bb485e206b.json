@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "UPDATE pending_ops SET payload_json = ?1 WHERE id = ?2 AND source_id = ?3 AND relative_path = ?4 AND op_type = 'upload'",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 4
+    },
+    "nullable": []
+  },
+  "hash": "adeb4ca6c59eba7ee06040de38b1a86dadd3447b7e0ca2260c66d5bb485e206b"
+}

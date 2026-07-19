@@ -238,6 +238,17 @@ struct PendingOpPayload {
     /// (non-versioned) create or update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supersedes_drive_file_id: Option<String>,
+    /// Issue #36: the Drive file id of a redundant DUPLICATE object created by an
+    /// identical-content (mtime-only) touch, whose immediate best-effort trash
+    /// FAILED (or was interrupted by a crash before it ran). The OLD object stays
+    /// current, so this NEW object is a live untracked duplicate; persisted so the
+    /// reconcile pass RETRIES the trash (mirrors [`Self::corrupt_file_id`]). The op
+    /// is KEPT (not dropped) while this is set, and dropped once the object is
+    /// confirmed gone. When set, ALL other recovery fields (`client_op_uuid`,
+    /// `supersedes_drive_file_id`, ...) are cleared - the op is a pure cleanup
+    /// handle, never re-adopted or re-uploaded.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    redundant_duplicate_file_id: Option<String>,
     /// The resume-safe file IDENTITY captured at session start (P1-2). The
     /// streaming upload produces the plaintext blake3 only DURING the upload,
     /// so a crash mid-stream leaves no `uploaded_blake3_hex` to validate a
@@ -1244,6 +1255,12 @@ impl DefaultExecutor {
         // the next cycle re-snapshots + re-uploads from scratch.
         let from_vss = read_path != live_path;
         let app_props = self.app_properties(source.id, relative_path, &op_uuid);
+        // Defect 5: the versioned OLD object id, captured BEFORE `version_supersede`
+        // is moved into the upload, so a checksum-mismatch corrupt row can preserve
+        // the still-live OLD pointer (never NULL) rather than orphaning it.
+        let versioned_old_id = version_supersede
+            .as_ref()
+            .map(|v| v.old_drive_file_id.clone());
         let outcome = self
             .upload_and_commit(
                 source,
@@ -1312,12 +1329,23 @@ impl DefaultExecutor {
                 // NEW create orphan; `effective_existing_id` is None so it is
                 // trashed as a stranded create and the OLD (good) object is left
                 // as the current pointer, exactly as a first-time create mismatch.
+                //
+                // Defect 5: BUT the corrupt `file_state` row must still POINT at the
+                // OLD, still-live object - so a later corrupt-threshold row keeps
+                // `drive_file_id = old_id` (the eventual recovery re-uploads as an
+                // UPDATE against it, never a duplicate) rather than NULL, which would
+                // orphan the last-good object as a permanent live leak. So pass the
+                // versioned OLD id (falling back to `effective_existing_id` for a
+                // non-versioned change / first create).
+                let existing_for_corrupt = versioned_old_id
+                    .as_deref()
+                    .or(effective_existing_id.as_deref());
                 self.handle_checksum_mismatch(
                     source,
                     relative_path,
                     &live_path,
                     op_id,
-                    effective_existing_id.as_deref(),
+                    existing_for_corrupt,
                     stranded_file_id,
                 )
                 .await
@@ -1549,19 +1577,39 @@ impl DefaultExecutor {
                     // version (it would pollute history and evict a genuine older
                     // version via the count cap). Keep the OLD object as current
                     // (update only mtime/size) and trash the redundant new object.
+                    //
+                    // Defect 1: PRESERVE the OLD `last_uploaded_at` - `..row` would
+                    // advance it to `now`, but the old object's validity window
+                    // START must not move: bumping it wrongly rejects a restore-as-of
+                    // any instant before this touch (the current bytes ARE those
+                    // bytes), and makes the NEXT real change record its version with
+                    // the touched (wrong) created_at, leaving that window forever
+                    // unrestorable.
                     let keep_row = FileStateRow {
                         drive_file_id: Some(vs.old_drive_file_id.clone()),
                         drive_md5: vs.old_drive_md5,
                         encrypted_remote_path: vs.old_encrypted_remote_path.clone(),
+                        last_uploaded_at: Some(vs.old_created_at),
                         ..row
                     };
+                    // Defect 2/6: persist the redundant object's id onto the KEPT op
+                    // (a durable cleanup handle) ATOMICALLY with the pointer upsert,
+                    // so a failed / crash-interrupted trash is retried by the
+                    // reconcile sweep and can never leak live. Then trash best-effort;
+                    // on a confirmed trash, drop the now-finished cleanup op.
+                    let marker = PendingOpPayload {
+                        redundant_duplicate_file_id: Some(entry.id.clone()),
+                        ..PendingOpPayload::default()
+                    };
                     self.state
-                        .commit_create_result(op_id, &keep_row)
+                        .commit_identical_touch_result(op_id, &keep_row, &marker.to_value())
                         .await
                         .map_err(UploadError::Fatal)?;
-                    // Best-effort trash of the redundant NEW object (guarded; it
-                    // is not a live pointer, so the guard passes).
-                    self.guarded_trash_and_mark(&entry.id).await;
+                    if self.guarded_trash_and_mark(&entry.id).await {
+                        if let Err(err) = self.state.delete_pending_op(op_id).await {
+                            warn!(target: TARGET, id = %entry.id, %err, "trashed the redundant identical-touch duplicate but failed to drop its cleanup op; reconcile will re-confirm and drop it");
+                        }
+                    }
                 } else {
                     // Real content change: atomically record the OLD object as a
                     // version, flip the pointer to the NEW object, and drop the op.
@@ -2807,6 +2855,54 @@ impl DefaultExecutor {
         }
     }
 
+    /// Issue #36 (defect 2/6): reconcile-time retry of trashing a redundant
+    /// DUPLICATE object left by an identical-content touch whose immediate trash
+    /// failed (or was interrupted by a crash). Suite-FREE (a `remote.trash` by id),
+    /// so it runs even when the per-source crypto gate fails closed. Returns `true`
+    /// once the object is confirmed gone (drop the cleanup op); `false` to keep the
+    /// op for the next cycle; propagates an `invalid_grant` as
+    /// [`ReconcileError::AuthInvalidGrant`] (do NOT keep hammering a dead token).
+    /// Mirrors [`Self::retry_trash_corrupt`].
+    async fn retry_trash_redundant(
+        &self,
+        file_id: &str,
+        context: &str,
+    ) -> Result<bool, ReconcileError> {
+        self.pacer.permit_request().await;
+        match self.remote.trash(file_id).await {
+            Ok(()) => {
+                self.pacer.note_response(ResponseClass::Ok);
+                warn!(
+                    target: TARGET,
+                    name = %context,
+                    file_id = %file_id,
+                    "reconcile: trashed the previously-stranded redundant identical-touch duplicate"
+                );
+                Ok(true)
+            }
+            Err(e) => {
+                let class = classify_drive_error(&e);
+                self.pacer.note_response(class.response_class());
+                if class == DriveError::InvalidGrant {
+                    warn!(
+                        target: TARGET,
+                        name = %context,
+                        file_id = %file_id,
+                        "reconcile: re-trash of the redundant duplicate hit auth.invalid_grant; account needs reauth (stopping remote work): {e}"
+                    );
+                    return Err(ReconcileError::AuthInvalidGrant);
+                }
+                warn!(
+                    target: TARGET,
+                    name = %context,
+                    file_id = %file_id,
+                    "reconcile: re-trash of the redundant duplicate failed again; keeping the op: {e}"
+                );
+                Ok(false)
+            }
+        }
+    }
+
     /// R2-P1-3 (DESIGN s5.4 lines 498-500) + R2-P1-1: handle a verified
     /// post-upload checksum mismatch for `(source, relative_path)`.
     ///
@@ -2979,16 +3075,21 @@ impl DefaultExecutor {
     /// (a no-op if the id is not a tracked version, e.g. a redundant duplicate
     /// from an identical-content touch). Any failure is logged, never fatal: the
     /// reconcile sweep retries an un-trashed version.
-    async fn guarded_trash_and_mark(&self, drive_file_id: &str) {
+    ///
+    /// Returns `true` iff the object was confirmed trashed on this call (so a
+    /// caller holding a durable cleanup handle may drop it); `false` when the
+    /// guard skipped it (still live), the liveness check errored, or the trash
+    /// failed - in all of which the caller must KEEP its handle for a retry.
+    async fn guarded_trash_and_mark(&self, drive_file_id: &str) -> bool {
         match self.state.drive_file_id_is_live(drive_file_id).await {
             Ok(true) => {
                 debug!(target: TARGET, id = %drive_file_id, "superseded object still referenced by a live pointer; not trashing");
-                return;
+                return false;
             }
             Ok(false) => {}
             Err(err) => {
                 warn!(target: TARGET, id = %drive_file_id, %err, "could not verify a superseded object is unreferenced; skipping trash");
-                return;
+                return false;
             }
         }
         self.pacer.permit_request().await;
@@ -2998,11 +3099,13 @@ impl DefaultExecutor {
                 if let Err(err) = self.state.mark_version_trashed(drive_file_id).await {
                     warn!(target: TARGET, id = %drive_file_id, %err, "trashed a superseded object but failed to mark the version row");
                 }
+                true
             }
             Err(e) => {
                 let class = classify_drive_error(&e);
                 self.pacer.note_response(class.response_class());
                 warn!(target: TARGET, id = %drive_file_id, err = %e, "best-effort trash of a superseded object failed; the reconcile sweep will retry");
+                false
             }
         }
     }
@@ -3189,6 +3292,24 @@ impl Executor for DefaultExecutor {
                 // Either way (other than the propagated auth error above), this
                 // op is fully handled; never falls through to the crypto-
                 // dependent upload-recovery paths.
+                continue;
+            }
+            // Issue #36 (defect 2/6): an op carrying a `redundant_duplicate_file_id`
+            // is the recovery handle for an identical-content touch's redundant
+            // DUPLICATE object whose immediate trash FAILED (or was interrupted by a
+            // crash before it ran). Retry the trash here - suite-FREE (a
+            // `remote.trash` by id) so it runs even when the per-source crypto gate
+            // below fails closed - and drop the op once the object is confirmed gone;
+            // otherwise a live untracked duplicate would leak forever (no version row
+            // => the un-trashed-versions sweep never sees it; op already the only
+            // handle). Same shape as the corrupt-create cleanup above.
+            if let Some(redundant_id) = payload.redundant_duplicate_file_id.clone() {
+                if self
+                    .retry_trash_redundant(&redundant_id, op.relative_path.as_str())
+                    .await?
+                {
+                    self.state.delete_pending_op(op.id).await?;
+                }
                 continue;
             }
             remaining.push(op);
@@ -3647,50 +3768,117 @@ impl DefaultExecutor {
         };
 
         let now = self.clock.now_ms();
+
+        // Issue #36 (defect 3): the OLD object recorded as a retained version when
+        // this adopt supersedes it - built ONCE and used by BOTH the identity
+        // (real-change) arm AND the requeue arm, so a crash-recovery adopt never
+        // silently drops the last good version from point-in-time history (the
+        // requeue arm previously flipped the pointer + trashed the old object with
+        // NO version row). Guarded exactly like the inline commit: only when the
+        // payload names an OLD id, the pre-flip row still points at it, and it has a
+        // known window start.
+        let superseded_version = match (&supersedes, &pre_flip_old) {
+            (Some(old_id), Some(old_row))
+                if old_row.drive_file_id.as_deref() == Some(old_id.as_str())
+                    && old_row.last_uploaded_at.is_some() =>
+            {
+                Some(NewFileVersion {
+                    source_id: source.id,
+                    relative_path: op.relative_path.clone(),
+                    drive_file_id: old_id.clone(),
+                    size: old_row.size,
+                    hash_blake3: old_row.hash_blake3,
+                    drive_md5: old_row.drive_md5,
+                    encrypted_remote_path: old_row.encrypted_remote_path.clone(),
+                    created_at: old_row.last_uploaded_at.unwrap_or(now),
+                    superseded_at: now,
+                })
+            }
+            _ => None,
+        };
+
+        // Whether the trailing block should guarded-trash the OLD superseded
+        // object. A real supersede (identity real-change / requeue) flips the
+        // pointer away from it, so it is trashed. An identical-content adopt
+        // (defect 4) instead KEEPS the old object live and trashes the redundant
+        // NEW orphan, so it clears this.
+        let mut trash_old = supersedes.is_some();
+
         match (local, expected_hex) {
             (Some((cur_hash, size, mtime_ns)), Some(expected_hex))
                 if hex::encode(cur_hash) == expected_hex =>
             {
-                // Identity proven: the local bytes match what was uploaded.
-                let row = FileStateRow {
-                    source_id: source.id,
-                    relative_path: op.relative_path.clone(),
-                    size,
-                    mtime_ns,
-                    hash_blake3: cur_hash,
-                    drive_file_id: Some(entry.id.clone()),
-                    drive_md5: entry.md5,
-                    encrypted_remote_path: encrypted_remote_path.clone(),
-                    status: FileStateStatus::Synced,
-                    last_uploaded_at: Some(now),
-                    last_verified_at: Some(now),
-                };
-                // Issue #36: for a versioned adopt, record the OLD object as a
-                // version AND flip in ONE transaction (so history survives a
-                // crash-in-the-window). Falls back to a plain commit if the OLD
-                // row is missing / no longer points at the superseded id.
-                match (&supersedes, &pre_flip_old) {
-                    (Some(old_id), Some(old_row))
-                        if old_row.drive_file_id.as_deref() == Some(old_id.as_str())
-                            && old_row.last_uploaded_at.is_some() =>
-                    {
-                        let superseded = NewFileVersion {
-                            source_id: source.id,
-                            relative_path: op.relative_path.clone(),
-                            drive_file_id: old_id.clone(),
-                            size: old_row.size,
-                            hash_blake3: old_row.hash_blake3,
-                            drive_md5: old_row.drive_md5,
-                            encrypted_remote_path: old_row.encrypted_remote_path.clone(),
-                            created_at: old_row.last_uploaded_at.unwrap_or(now),
-                            superseded_at: now,
-                        };
-                        self.state
-                            .commit_versioned_create_result(op.id, &row, &superseded)
-                            .await?;
+                // Defect 4: a crashed mtime-only touch - the adopted NEW object is
+                // byte-for-byte identical to the OLD one (`cur_hash` already equals
+                // the uploaded hash by the guard above, so equality with the old
+                // hash means the "content change" changed nothing). Extend the inline
+                // path's identical-content guard to crash recovery: KEEP the OLD
+                // object current (record NO version, so a repeated touch cannot evict
+                // genuine history via the count cap) and trash the redundant NEW
+                // orphan via the same retryable cleanup handle as the inline path.
+                let identical_old = pre_flip_old
+                    .as_ref()
+                    .filter(|old_row| old_row.hash_blake3 == cur_hash);
+                if let Some(old_row) = identical_old {
+                    let keep_row = FileStateRow {
+                        source_id: source.id,
+                        relative_path: op.relative_path.clone(),
+                        size,
+                        mtime_ns,
+                        hash_blake3: cur_hash,
+                        drive_file_id: old_row.drive_file_id.clone(),
+                        drive_md5: old_row.drive_md5,
+                        encrypted_remote_path: old_row.encrypted_remote_path.clone(),
+                        status: FileStateStatus::Synced,
+                        // Preserve the OLD window start (defect 1's invariant on the
+                        // crash-recovery path): the old object stays current, so its
+                        // validity window must not move.
+                        last_uploaded_at: old_row.last_uploaded_at,
+                        last_verified_at: Some(now),
+                    };
+                    let marker = PendingOpPayload {
+                        redundant_duplicate_file_id: Some(entry.id.clone()),
+                        ..PendingOpPayload::default()
+                    };
+                    self.state
+                        .commit_identical_touch_result(op.id, &keep_row, &marker.to_value())
+                        .await?;
+                    // The redundant object is the adopted orphan (entry.id), not the
+                    // old object; trash it retryably and leave the old one live.
+                    trash_old = false;
+                    if self.guarded_trash_and_mark(&entry.id).await {
+                        if let Err(err) = self.state.delete_pending_op(op.id).await {
+                            warn!(target: TARGET, id = %entry.id, %err, "reconcile-adopt: trashed the redundant identical-touch duplicate but failed to drop its cleanup op; reconcile will re-confirm and drop it");
+                        }
                     }
-                    _ => {
-                        self.state.commit_create_result(op.id, &row).await?;
+                } else {
+                    // Identity proven: the local bytes match what was uploaded.
+                    let row = FileStateRow {
+                        source_id: source.id,
+                        relative_path: op.relative_path.clone(),
+                        size,
+                        mtime_ns,
+                        hash_blake3: cur_hash,
+                        drive_file_id: Some(entry.id.clone()),
+                        drive_md5: entry.md5,
+                        encrypted_remote_path: encrypted_remote_path.clone(),
+                        status: FileStateStatus::Synced,
+                        last_uploaded_at: Some(now),
+                        last_verified_at: Some(now),
+                    };
+                    // Issue #36: for a versioned adopt, record the OLD object as a
+                    // version AND flip in ONE transaction (so history survives a
+                    // crash-in-the-window). Falls back to a plain commit if the OLD
+                    // row is missing / no longer points at the superseded id.
+                    match &superseded_version {
+                        Some(superseded) => {
+                            self.state
+                                .commit_versioned_create_result(op.id, &row, superseded)
+                                .await?;
+                        }
+                        None => {
+                            self.state.commit_create_result(op.id, &row).await?;
+                        }
                     }
                 }
             }
@@ -3733,22 +3921,37 @@ impl DefaultExecutor {
                     last_uploaded_at: None,
                     last_verified_at: None,
                 };
-                // Upsert the requeue row + drop the op atomically (the next
-                // scan re-enqueues a clean update). commit_create_result
-                // performs the same atomic upsert+delete for create + update.
-                self.state.commit_create_result(op.id, &row).await?;
+                // Upsert the requeue row + drop the op atomically (the next scan
+                // re-enqueues a clean update). Defect 3: if this requeue supersedes
+                // an OLD object, record that OLD object as a retained version
+                // ATOMICALLY with the flip (same as the identity arm) so the last
+                // good version is not silently dropped from history before the
+                // trailing trash removes its object. `commit_versioned_create_result`
+                // and `commit_create_result` perform the same atomic upsert+delete.
+                match &superseded_version {
+                    Some(superseded) => {
+                        self.state
+                            .commit_versioned_create_result(op.id, &row, superseded)
+                            .await?;
+                    }
+                    None => {
+                        self.state.commit_create_result(op.id, &row).await?;
+                    }
+                }
             }
         }
 
-        // Issue #36: whichever arm committed, the OLD (superseded) object is no
-        // longer the current pointer, so guarded-trash it - preventing the
-        // crash-recovery leak (the pointer flip destroyed the payload's own
-        // create/update signal, so without this the old object would linger live
-        // forever). The guard is a no-op if the pointer did not actually flip
-        // away from it, and marking is a no-op when no version row was recorded
-        // (the requeue arm).
-        if let Some(old_id) = &supersedes {
-            self.guarded_trash_and_mark(old_id).await;
+        // Issue #36: whichever arm flipped the pointer AWAY from the OLD
+        // (superseded) object, guarded-trash it - preventing the crash-recovery
+        // leak (the pointer flip destroyed the payload's own create/update signal,
+        // so without this the old object would linger live forever). The guard is a
+        // no-op if the pointer did not actually flip away from it, and marking is a
+        // no-op when no version row was recorded. Skipped for an identical-content
+        // adopt (defect 4), which keeps the old object live (`trash_old` cleared).
+        if trash_old {
+            if let Some(old_id) = &supersedes {
+                self.guarded_trash_and_mark(old_id).await;
+            }
         }
         Ok(())
     }
@@ -5375,6 +5578,543 @@ mod tests {
             .unwrap();
         assert_eq!(live.len(), 1);
         assert_eq!(live[0].id, first_id);
+    }
+
+    /// Defect 1 (issue #36): an identical-content (mtime-only) touch keeps the OLD
+    /// object current but must PRESERVE its `last_uploaded_at` - `..row` would
+    /// advance it to `now`, wrongly rejecting a restore-as-of any instant before
+    /// the touch and mis-stamping the next real version's `created_at`.
+    #[tokio::test]
+    async fn versioned_identical_touch_preserves_last_uploaded_at() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("a.txt", b"same-bytes");
+        let exec = h.executor();
+        // First upload at clock 0 -> last_uploaded_at = 0 (the window start).
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel, size),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+        let before = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            before.last_uploaded_at,
+            Some(0),
+            "sanity: first upload stamps t0"
+        );
+
+        enable_versioning(&h, 10, 0).await;
+        h.clock.advance(std::time::Duration::from_millis(1_000));
+
+        // A byte-identical touch at clock 1000.
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel, size),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+
+        let after = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.drive_file_id, before.drive_file_id,
+            "the touch keeps the old object"
+        );
+        assert_eq!(
+            after.last_uploaded_at,
+            Some(0),
+            "the identical touch must PRESERVE the old window start (t0), not advance it to the touch time (t1)"
+        );
+    }
+
+    /// Defect 2/6 (issue #36): if the redundant NEW object's best-effort trash
+    /// FAILS during an identical-content touch, the op is KEPT carrying the
+    /// duplicate's id (a durable cleanup handle) so the reconcile sweep retries the
+    /// trash - the duplicate can never leak live. No `file_versions` row is created
+    /// (it is not real history, so the count cap never sees it).
+    #[tokio::test]
+    async fn versioned_identical_touch_failed_trash_is_durably_cleaned_via_reconcile() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("a.txt", b"same-bytes");
+        // A store that delegates to the harness's remote but FAILS `trash`.
+        let store = TrashFailStore::new(h.remote.clone());
+        let exec = exec_with_store(&h, store.clone());
+
+        // First upload (a plain create; no trash) -> the OLD object.
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel, size),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+        let old_id = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap()
+            .drive_file_id
+            .unwrap();
+
+        enable_versioning(&h, 10, 0).await;
+        h.clock.advance(std::time::Duration::from_millis(1_000));
+
+        // A byte-identical touch: creates a duplicate, keeps the OLD object current,
+        // then tries to trash the duplicate -> the trash FAILS.
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel, size),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+        assert_eq!(
+            store.trash_calls.load(Ordering::SeqCst),
+            1,
+            "the redundant duplicate's trash was attempted once and failed"
+        );
+
+        // The OLD object is still current, with NO version recorded.
+        let cur = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cur.drive_file_id.as_deref(),
+            Some(old_id.as_str()),
+            "kept old id"
+        );
+        assert!(
+            h.state
+                .list_file_versions(h.source.id, &rel)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an identical touch records no version even when the trash fails"
+        );
+
+        // The op is KEPT, carrying the redundant duplicate's id as a cleanup handle.
+        let pending = h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap();
+        assert_eq!(
+            pending.len(),
+            1,
+            "a failed-trash identical touch KEEPS its op for durable cleanup (defect 2/6)"
+        );
+        let dup_id = pending[0]
+            .payload_json
+            .get("redundant_duplicate_file_id")
+            .and_then(|v| v.as_str())
+            .expect("the kept op persists the redundant duplicate id")
+            .to_string();
+        assert_ne!(dup_id, old_id, "the duplicate is a distinct NEW object");
+        // The duplicate is still LIVE on Drive (the leak, until reconcile cleans it).
+        assert!(
+            !h.remote.metadata(&dup_id).await.unwrap().trashed,
+            "the duplicate is live until the retry trashes it"
+        );
+
+        // --- reconcile with the trash now SUCCEEDING -> op dropped, dup trashed ---
+        store.trash_fails.store(false, Ordering::SeqCst);
+        exec.reconcile(&h.source).await.unwrap();
+        assert_eq!(
+            store.trash_calls.load(Ordering::SeqCst),
+            2,
+            "reconcile retries the redundant duplicate's trash"
+        );
+        assert!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "once the duplicate is confirmed trashed, the cleanup op is dropped"
+        );
+        assert!(
+            h.remote.metadata(&dup_id).await.unwrap().trashed,
+            "the redundant duplicate is now trashed"
+        );
+        // Exactly one live object remains (the OLD one).
+        let live = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1);
+        assert_eq!(live[0].id, old_id);
+    }
+
+    /// Defect 4 (issue #36): a crash during an mtime-only touch (the new object
+    /// landed byte-identical to the old, before the flip) must be adopted WITHOUT
+    /// recording a spurious version - the crash-recovery path gets the same
+    /// identical-content guard as the inline path, keeping the OLD object live and
+    /// trashing the redundant orphan via the retryable cleanup handle.
+    #[tokio::test]
+    async fn reconcile_identical_touch_adopt_keeps_old_live_and_records_no_version() {
+        let h = harness().await;
+        let (rel, _size) = h.write_file("a.txt", b"same-bytes");
+
+        // A pre-existing OLD object + synced row (a content change), versioning on.
+        let old = h
+            .remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "a.txt",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from_static(b"same-bytes")),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        h.state
+            .upsert_file_state(&FileStateRow {
+                source_id: h.source.id,
+                relative_path: rel.clone(),
+                size: 10,
+                mtime_ns: 1,
+                hash_blake3: *blake3::hash(b"same-bytes").as_bytes(),
+                drive_file_id: Some(old.id.clone()),
+                drive_md5: old.md5,
+                encrypted_remote_path: None,
+                status: FileStateStatus::Synced,
+                last_uploaded_at: Some(0),
+                last_verified_at: Some(0),
+            })
+            .await
+            .unwrap();
+
+        h.clock.advance(std::time::Duration::from_millis(1_000));
+
+        // Crash AFTER the versioned create landed but BEFORE the flip - the orphan
+        // is BYTE-IDENTICAL to the old object (a crashed mtime-only touch).
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let mut app = HashMap::new();
+        app.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.clone());
+        let orphan = h
+            .remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "a.txt",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from_static(b"same-bytes")),
+                app,
+            )
+            .await
+            .unwrap();
+        let now = h.clock.now_ms();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                payload_json: serde_json::json!({
+                    "client_op_uuid": op_uuid,
+                    "drive_file_id": null,
+                    "supersedes_drive_file_id": old.id,
+                    "uploaded_blake3_hex": hex::encode(blake3::hash(b"same-bytes").as_bytes()),
+                }),
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let exec = h.executor();
+        exec.reconcile(&h.source).await.unwrap();
+
+        // The OLD object stays current (no flip to the identical orphan) and NO
+        // version is recorded (a repeated touch cannot evict genuine history).
+        let cur = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            cur.drive_file_id.as_deref(),
+            Some(old.id.as_str()),
+            "an identical-touch adopt keeps the old object live"
+        );
+        assert!(
+            h.state
+                .list_file_versions(h.source.id, &rel)
+                .await
+                .unwrap()
+                .is_empty(),
+            "an identical-touch adopt records NO version (defect 4)"
+        );
+        // The redundant orphan is trashed; the OLD object is not.
+        assert!(
+            h.remote.metadata(&orphan.id).await.unwrap().trashed,
+            "the redundant identical orphan is trashed"
+        );
+        assert!(
+            !h.remote.metadata(&old.id).await.unwrap().trashed,
+            "the old object stays live"
+        );
+        // The cleanup op was dropped (the trash succeeded).
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Defect 3 (issue #36): a crash-recovery adopt that REQUEUES (the local file
+    /// changed after the versioned upload, so the orphan cannot be marked Synced)
+    /// must still record the superseded OLD object as a version before trashing it
+    /// - otherwise the last good version silently vanishes from point-in-time
+    /// history.
+    #[tokio::test]
+    async fn reconcile_adopt_requeue_records_superseded_version() {
+        let h = harness().await;
+        // The bytes uploaded pre-crash.
+        let (rel, _size) = h.write_file("a.txt", b"uploaded version");
+        let uploaded_hex = hex::encode(blake3::hash(b"uploaded version").as_bytes());
+
+        // A pre-existing OLD object + synced row (versioning on).
+        let old = h
+            .remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "a.txt",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from_static(b"old-bytes")),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        h.state
+            .upsert_file_state(&FileStateRow {
+                source_id: h.source.id,
+                relative_path: rel.clone(),
+                size: 9,
+                mtime_ns: 1,
+                hash_blake3: *blake3::hash(b"old-bytes").as_bytes(),
+                drive_file_id: Some(old.id.clone()),
+                drive_md5: old.md5,
+                encrypted_remote_path: None,
+                status: FileStateStatus::Synced,
+                last_uploaded_at: Some(0),
+                last_verified_at: Some(0),
+            })
+            .await
+            .unwrap();
+
+        h.clock.advance(std::time::Duration::from_millis(1_000));
+
+        // The versioned NEW object landed pre-crash...
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let mut app = HashMap::new();
+        app.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.clone());
+        let orphan = h
+            .remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "a.txt",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from_static(b"uploaded version")),
+                app,
+            )
+            .await
+            .unwrap();
+        // ...but the local file changed AGAIN before restart (the requeue path).
+        h.write_file("a.txt", b"locally edited NEW content - longer");
+
+        let now = h.clock.now_ms();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                payload_json: serde_json::json!({
+                    "client_op_uuid": op_uuid,
+                    "drive_file_id": null,
+                    "supersedes_drive_file_id": old.id,
+                    "uploaded_blake3_hex": uploaded_hex,
+                }),
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        let exec = h.executor();
+        exec.reconcile(&h.source).await.unwrap();
+
+        // Requeue: the file_state points at the orphan but is NOT Synced.
+        let cur = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_ne!(
+            cur.status,
+            FileStateStatus::Synced,
+            "a post-upload local change must not be marked Synced"
+        );
+        assert_eq!(
+            cur.drive_file_id.as_deref(),
+            Some(orphan.id.as_str()),
+            "requeue preserves the orphan id (re-upload as update, no duplicate)"
+        );
+
+        // Defect 3: the OLD object was recorded as a retained version (not silently
+        // dropped) and then trashed.
+        let versions = h.state.list_file_versions(h.source.id, &rel).await.unwrap();
+        assert_eq!(
+            versions.len(),
+            1,
+            "the superseded OLD object is recorded as a version even on the requeue path"
+        );
+        assert_eq!(versions[0].drive_file_id, old.id);
+        assert!(
+            versions[0].trashed,
+            "the recorded old version's object is trashed"
+        );
+        assert!(h.remote.metadata(&old.id).await.unwrap().trashed);
+        // The op drained.
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// Defect 5 (issue #36): a versioned change that hits the 3-consecutive-
+    /// checksum-mismatch corrupt threshold must write the Corrupt row pointing at
+    /// the still-live OLD object (not NULL), so the eventual recovery re-uploads as
+    /// an UPDATE against it rather than orphaning it and creating a duplicate.
+    #[tokio::test]
+    async fn versioned_corrupt_threshold_preserves_old_object_pointer() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("a.txt", b"old-bytes");
+        // Upload the OLD object via the real store.
+        let exec_ok = h.executor();
+        exec_ok
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        let old_id = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap()
+            .drive_file_id
+            .unwrap();
+
+        enable_versioning(&h, 10, 0).await;
+        h.clock.advance(std::time::Duration::from_millis(1_000));
+        // A real content change -> a versioned CREATE will be attempted.
+        let (_r, size2) = h.write_file("a.txt", b"new-bytes-longer");
+
+        // Every versioned create mismatches (trash of the stranded create succeeds),
+        // so each attempt leaves the OLD object as the current pointer.
+        let store = MismatchStore::new(false);
+        let exec_bad = exec_with_store(&h, store.clone());
+        for _ in 0..3u32 {
+            exec_bad
+                .execute(
+                    &h.source,
+                    &h.upload_plan(&rel, size2),
+                    &noop_progress,
+                    &noop_outcome,
+                )
+                .await
+                .unwrap();
+        }
+
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("a Corrupt row is written on the 3rd mismatch");
+        assert_eq!(
+            row.status,
+            FileStateStatus::Corrupt,
+            "3 consecutive mismatches mark the file corrupt"
+        );
+        assert_eq!(
+            row.drive_file_id.as_deref(),
+            Some(old_id.as_str()),
+            "defect 5: the Corrupt row must PRESERVE the still-live OLD object pointer, not NULL"
+        );
+
+        // Recovery: a healthy upload of the edited file UPDATES the old object in
+        // place (a Corrupt row is not Synced, so no versioned supersede; the old id
+        // is preserved, so it is an update - never a duplicate).
+        let (_r3, size3) = h.write_file("a.txt", b"recovered content here now");
+        exec_ok
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size3),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        let rec = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            rec.status,
+            FileStateStatus::Synced,
+            "the recovery upload marks the file synced again"
+        );
+        assert_eq!(
+            rec.drive_file_id.as_deref(),
+            Some(old_id.as_str()),
+            "recovery UPDATES the old object in place (no new object, no orphan)"
+        );
+        assert!(
+            h.state
+                .list_file_versions(h.source.id, &rel)
+                .await
+                .unwrap()
+                .is_empty(),
+            "corrupt-recovery records no version"
+        );
+        let live = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str())
+            .await
+            .unwrap();
+        assert_eq!(live.len(), 1, "recovery updates in place - no duplicate");
+        assert_eq!(live[0].id, old_id);
     }
 
     #[tokio::test]
@@ -7281,6 +8021,93 @@ mod tests {
         }
         async fn about(&self) -> anyhow::Result<AboutInfo> {
             anyhow::bail!("MismatchStore: about must not be called")
+        }
+    }
+
+    /// A store that DELEGATES everything to a real [`InMemoryRemoteStore`] but can
+    /// force `trash` to fail (and counts the calls), so a successful upload can be
+    /// followed by a failing trash - exactly the identical-content-touch cleanup
+    /// leak window (defect 2/6). Wrap a CLONE of the harness's remote so the
+    /// shared backing store (and the source's `drive_folder_id`) stay consistent.
+    struct TrashFailStore {
+        inner: InMemoryRemoteStore,
+        trash_fails: std::sync::atomic::AtomicBool,
+        trash_calls: AtomicU64,
+    }
+    impl TrashFailStore {
+        fn new(inner: InMemoryRemoteStore) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                trash_fails: std::sync::atomic::AtomicBool::new(true),
+                trash_calls: AtomicU64::new(0),
+            })
+        }
+    }
+    #[async_trait::async_trait]
+    impl RemoteStore for TrashFailStore {
+        async fn ensure_folder(&self, p: &str, n: &str) -> anyhow::Result<RemoteEntry> {
+            self.inner.ensure_folder(p, n).await
+        }
+        async fn list_folder(&self, f: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+            self.inner.list_folder(f).await
+        }
+        async fn create(
+            &self,
+            parent_id: &str,
+            name: &str,
+            mime: &str,
+            body: UploadBody,
+            app_properties: HashMap<String, String>,
+        ) -> anyhow::Result<RemoteEntry> {
+            self.inner
+                .create(parent_id, name, mime, body, app_properties)
+                .await
+        }
+        async fn update(
+            &self,
+            f: &str,
+            b: UploadBody,
+            a: HashMap<String, String>,
+        ) -> anyhow::Result<RemoteEntry> {
+            self.inner.update(f, b, a).await
+        }
+        async fn resumable_session(
+            &self,
+            k: ResumableKind,
+            m: &str,
+            s: u64,
+        ) -> anyhow::Result<ResumableSession> {
+            self.inner.resumable_session(k, m, s).await
+        }
+        async fn resume_chunk(
+            &self,
+            s: &ResumableSession,
+            o: u64,
+            c: Bytes,
+        ) -> anyhow::Result<ResumeProgress> {
+            self.inner.resume_chunk(s, o, c).await
+        }
+        async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
+            self.trash_calls.fetch_add(1, Ordering::SeqCst);
+            if self.trash_fails.load(Ordering::SeqCst) {
+                anyhow::bail!("TrashFailStore: forced trash failure")
+            }
+            self.inner.trash(file_id).await
+        }
+        async fn delete_permanent(&self, file_id: &str) -> anyhow::Result<()> {
+            self.inner.delete_permanent(file_id).await
+        }
+        async fn metadata(&self, f: &str) -> anyhow::Result<RemoteEntry> {
+            self.inner.metadata(f).await
+        }
+        async fn download(&self, f: &str) -> anyhow::Result<DownloadStream> {
+            self.inner.download(f).await
+        }
+        async fn find_by_op_uuid(&self, p: &str, u: &str) -> anyhow::Result<Option<RemoteEntry>> {
+            self.inner.find_by_op_uuid(p, u).await
+        }
+        async fn about(&self) -> anyhow::Result<AboutInfo> {
+            self.inner.about().await
         }
     }
 
