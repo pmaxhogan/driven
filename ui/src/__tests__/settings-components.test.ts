@@ -1109,6 +1109,83 @@ describe("Settings Rules tab", () => {
     expect(wrapper.find('[data-testid="vss-degraded-banner"]').exists()).toBe(false);
   });
 
+  it("issue #25: enabling the helper shows the waiting-for-approval hint, then resolves on poll", async () => {
+    vi.useFakeTimers();
+    try {
+      let statusCall = 0;
+      invokeMock.mockImplementation((cmd: string, args: unknown) => {
+        if (cmd === "get_settings") return Promise.resolve(makeSettings());
+        if (cmd === "get_vss_helper_status") {
+          statusCall += 1;
+          // On tab load: not degraded. After enabling: pending. On the first poll:
+          // declined (the user dismissed the UAC prompt).
+          if (statusCall === 1) {
+            return Promise.resolve({
+              supported: true,
+              elevated: false,
+              helperEnabled: false,
+              helperAlive: false,
+              helperLaunchable: true,
+              launchPending: false,
+              launchDeclined: false,
+              lockedFileBackupDegraded: false,
+            });
+          }
+          if (statusCall === 2) {
+            return Promise.resolve({
+              supported: true,
+              elevated: false,
+              helperEnabled: true,
+              helperAlive: false,
+              helperLaunchable: true,
+              launchPending: true,
+              launchDeclined: false,
+              lockedFileBackupDegraded: false,
+            });
+          }
+          return Promise.resolve({
+            supported: true,
+            elevated: false,
+            helperEnabled: true,
+            helperAlive: false,
+            helperLaunchable: false,
+            launchPending: false,
+            launchDeclined: true,
+            lockedFileBackupDegraded: true,
+          });
+        }
+        if (cmd === "update_settings") {
+          const patch = (args as { patch: Record<string, unknown> }).patch;
+          return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+        }
+        return Promise.resolve(undefined);
+      });
+      const wrapper = mount(Settings, {
+        props: { tab: "rules" },
+        global: globalMountOptions,
+      });
+      await flushPromises();
+
+      const toggle = wrapper.get('[data-testid="vss-helper-toggle"]');
+      await toggle.setValue(true);
+      await flushPromises();
+
+      // The eager enable committed and the pending hint is shown.
+      expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+        patch: { windows: { vssHelper: true } },
+      });
+      expect(wrapper.find('[data-testid="vss-helper-pending"]').exists()).toBe(true);
+
+      // Advance the poll: the launch resolves to declined -> declined hint shown.
+      await vi.advanceTimersByTimeAsync(1600);
+      await flushPromises();
+      expect(wrapper.find('[data-testid="vss-helper-pending"]').exists()).toBe(false);
+      expect(wrapper.find('[data-testid="vss-helper-declined"]').exists()).toBe(true);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("reflects telemetry default ON and toggling it calls set_telemetry_enabled (SPEC s16 R2-P1-1)", async () => {
     // M9b R2-P1-1: the "Send anonymous usage stats" toggle reflects the stored
     // telemetry.enabled (default ON) and unchecking it calls the DEDICATED

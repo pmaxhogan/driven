@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref, watch } from "vue";
+import { computed, onUnmounted, ref, watch } from "vue";
 import { useRouter } from "vue-router";
 import { useI18n } from "vue-i18n";
 
@@ -39,6 +39,42 @@ const vssModes = ["auto", "always", "never"] as const;
 // because Volume Shadow Copy is unavailable (no elevation, no active helper).
 const vssStatus = ref<VssHelperStatus | null>(null);
 const showVssBanner = computed(() => vssStatus.value?.lockedFileBackupDegraded ?? false);
+// Issue #25 (launch UX): while the helper is launching (awaiting UAC), show a
+// "waiting for approval" hint; once the user declines, show a "declined" hint.
+const showVssPending = computed(() => vssStatus.value?.launchPending ?? false);
+const showVssDeclined = computed(() => vssStatus.value?.launchDeclined ?? false);
+
+// Poll timer used to watch a pending launch resolve (pending -> ready/declined).
+// Bounded + cleared on unmount so no timer is orphaned.
+let vssPollTimer: ReturnType<typeof setTimeout> | null = null;
+function clearVssPoll(): void {
+  if (vssPollTimer !== null) {
+    clearTimeout(vssPollTimer);
+    vssPollTimer = null;
+  }
+}
+async function refreshVssStatus(): Promise<void> {
+  try {
+    vssStatus.value = await getVssHelperStatus();
+  } catch {
+    vssStatus.value = null;
+  }
+}
+// After the eager enable, the elevated launch resolves asynchronously; re-fetch
+// the status a few times so the Rules tab reflects pending -> ready/declined
+// without a manual refresh.
+function pollVssStatusWhilePending(attemptsLeft: number): void {
+  clearVssPoll();
+  if (attemptsLeft <= 0) return;
+  vssPollTimer = setTimeout(() => {
+    void refreshVssStatus().then(() => {
+      if (vssStatus.value?.launchPending) {
+        pollVssStatusWhilePending(attemptsLeft - 1);
+      }
+    });
+  }, 1500);
+}
+onUnmounted(clearVssPoll);
 
 // Shared design-system class strings (DRIVEN UI design system). Native controls
 // MUST carry explicit light/dark surface + text colors so they stay readable on a
@@ -340,18 +376,20 @@ async function setVssMode(event: Event): Promise<void> {
 }
 
 // Issue #25 (DESIGN s5.3.1): toggle the least-privilege VSS helper. When on (and
-// the app is not elevated), locked files are backed up through an on-demand
-// elevated broker instead of requiring the whole app to run as Administrator.
-// The broker is built at app start, so a change takes effect on the next launch;
-// we re-fetch the status so the `helperEnabled` reflects immediately.
+// the app is not elevated), enabling fires the ATTENDED elevation prompt right
+// away (the user is here to approve it); the launch resolves asynchronously, so
+// we re-fetch the status and poll while it is pending to show waiting -> ready /
+// declined without a manual refresh.
 async function setVssHelper(event: Event): Promise<void> {
   const checked = (event.target as HTMLInputElement).checked;
   await commitPatch({ windows: { vssHelper: checked } });
-  void getVssHelperStatus()
-    .then((s) => (vssStatus.value = s))
-    .catch(() => {
-      vssStatus.value = null;
-    });
+  await refreshVssStatus();
+  if (checked && vssStatus.value?.launchPending) {
+    // Watch the pending launch resolve (bounded; cleared on unmount).
+    pollVssStatusWhilePending(60);
+  } else {
+    clearVssPoll();
+  }
 }
 
 // SPEC s16 (M9b R2-P1-1): toggle anonymous usage telemetry (default ON) via the
@@ -713,6 +751,22 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
               {{ t("settings.rules.vssHelperNote") }}
             </p>
           </label>
+
+          <!-- Issue #25 (launch UX): attended-elevation launch feedback. -->
+          <p
+            v-if="showVssPending"
+            data-testid="vss-helper-pending"
+            class="text-xs text-teal-700 dark:text-teal-300"
+          >
+            {{ t("settings.rules.vssHelperPending") }}
+          </p>
+          <p
+            v-else-if="showVssDeclined"
+            data-testid="vss-helper-declined"
+            class="text-xs text-amber-700 dark:text-amber-300"
+          >
+            {{ t("settings.rules.vssHelperDeclined") }}
+          </p>
         </section>
 
         <!-- Advanced: small-file bundling (issue #35) -->

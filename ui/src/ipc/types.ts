@@ -219,6 +219,11 @@ export interface VssHelperStatus {
   /** Issue #25: the broker can be brought up on demand (sidecar present, no prior
    * launch failure), so locked-file backup is available even before the launch. */
   helperLaunchable: boolean;
+  /** Issue #25: a launch is in progress - awaiting elevation (UAC) approval; the
+   * Rules tab shows a "waiting for approval" hint until it resolves. */
+  launchPending: boolean;
+  /** Issue #25: the user declined the elevation prompt this session (memoised). */
+  launchDeclined: boolean;
   lockedFileBackupDegraded: boolean;
 }
 

@@ -713,13 +713,14 @@ pub fn resolve_account_oauth_creds(account_id: AccountId) -> (String, String) {
 /// (snapshot reads) and the orchestrator (per-cycle release + orphan cleanup).
 ///
 /// Two Windows shapes (issue #25):
-/// - `vss_helper` present (un-elevated app + `windows.vss_helper` on): a
-///   [`BrokeredVssProvider`] that reads locked files THROUGH the elevated helper
-///   broker, launched on demand via the shared [`VssHelperManager`] launcher, so
-///   the main app stays un-elevated.
-/// - `vss_helper` absent (the app is already elevated, or the helper is off): the
-///   in-process [`RealVssProvider`] - which snapshots directly when elevated and
-///   reports unavailable (skip-the-locked-file) when not, exactly as before.
+/// - `vss_helper` present (the app is UN-elevated): a [`BrokeredVssProvider`]
+///   that reads locked files THROUGH the elevated helper broker, launched via the
+///   shared [`VssHelperManager`] launcher, so the main app stays un-elevated. The
+///   `windows.vss_helper` SETTING gates the launcher (a disabled launcher reports
+///   unavailable, so the provider behaves like the historical skip), and the user
+///   can flip it on at runtime because the manager already exists and is shared.
+/// - `vss_helper` absent (the app is ALREADY elevated): the in-process
+///   [`RealVssProvider`] - which snapshots directly, exactly as before.
 #[cfg(windows)]
 fn build_vss(
     config: &OrchestratorConfig,
@@ -751,23 +752,31 @@ fn build_vss(
 }
 
 /// Build the app-side least-privilege VSS helper broker manager (DESIGN s5.3.1),
-/// or `None` when the helper is not in play. Built ONCE at boot and shared into
+/// or `None` when the helper cannot be in play. Built ONCE at boot and shared into
 /// every account's [`BrokeredVssProvider`], so there is a SINGLE launch / UAC
 /// prompt / pipe across all accounts.
 ///
+/// Built whenever the app is UN-elevated on Windows - REGARDLESS of the
+/// `windows.vss_helper` setting - so the user can flip the setting on at runtime
+/// and have the already-wired providers use the broker without an app restart.
+/// The `enabled` flag (the current setting) gates the manager's behaviour: a
+/// disabled manager never launches and reports itself unavailable, so the
+/// providers behave exactly like the historical un-elevated skip until the user
+/// enables it. Boot is LAZY (no UAC prompt at silent startup); the eager prompt
+/// only fires when the user toggles the setting on.
+///
 /// `None` when: off Windows; the app is ALREADY elevated (it uses the in-process
-/// [`driven_vss::RealVssProvider`] and needs no broker); the `windows.vss_helper`
-/// setting is off; or the current-exe path cannot be resolved (so the bundled
-/// sidecar cannot be located). The broker's allow-list of snapshot-able roots is
-/// the union of the configured source roots at boot - a source ADDED mid-session
-/// is covered on the next app restart (the roots are fixed at broker launch per
-/// the DESIGN trust model).
+/// [`driven_vss::RealVssProvider`] and needs no broker); or the current-exe path
+/// cannot be resolved (so the bundled sidecar cannot be located). The broker's
+/// allow-list of snapshot-able roots is the union of the configured source roots
+/// at boot - a source ADDED mid-session is covered on the next app restart (the
+/// roots are fixed at broker launch per the DESIGN trust model).
 #[cfg(windows)]
 fn build_vss_helper_manager(
     all_sources: &[SourceRow],
     helper_enabled: bool,
 ) -> Option<Arc<VssHelperManager>> {
-    if !helper_enabled || driven_vss::is_elevated() {
+    if driven_vss::is_elevated() {
         return None;
     }
     let helper_exe = VssHelperManager::bundled_helper_exe()?;
@@ -785,9 +794,15 @@ fn build_vss_helper_manager(
     tracing::info!(
         target: TARGET,
         roots = roots.len(),
-        "issue #25: least-privilege VSS helper enabled (un-elevated); broker will launch on the first locked file"
+        enabled = helper_enabled,
+        "issue #25: least-privilege VSS helper manager built (un-elevated); boot is lazy - the broker launches on the first locked file when enabled, or immediately when the user toggles it on"
     );
-    Some(Arc::new(VssHelperManager::new(helper_exe, temp_dir, roots)))
+    Some(Arc::new(VssHelperManager::new(
+        helper_exe,
+        temp_dir,
+        roots,
+        helper_enabled,
+    )))
 }
 
 /// Off Windows the helper does not exist.

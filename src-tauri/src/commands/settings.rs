@@ -95,21 +95,29 @@ pub async fn get_settings(state: State<'_, AppState>) -> CommandResult<SettingsD
 #[tauri::command]
 pub async fn get_vss_helper_status(state: State<'_, AppState>) -> CommandResult<VssHelperStatus> {
     let helper_enabled = load_vss_helper_enabled(state.state().as_ref()).await;
-    // Issue #25: consult the app-side broker manager (installed at boot when the
-    // helper is in play) for TRUTHFUL liveness. `helper_launched` = the broker
-    // process was started this session; `helper_launchable` = the bundled sidecar
-    // exists and a prior launch did not fail, so locked-file backup is available
-    // on the first locked file even before the lazy launch happens.
-    let (helper_alive, helper_launchable) = match state.vss_helper_manager() {
-        Some(manager) => (manager.helper_launched(), manager.helper_launchable()),
-        None => (false, false),
-    };
+    // Issue #25: consult the app-side broker manager for TRUTHFUL state.
+    // `helper_alive` = the broker is up + serving; `helper_launchable` = it is up /
+    // coming up / not-yet-tried (so locked-file backup is available on demand);
+    // `launch_pending` = a launch is awaiting elevation approval / pipe (the UI
+    // shows a "waiting for approval" hint); `launch_declined` = the user declined.
+    let (helper_alive, helper_launchable, launch_pending, launch_declined) =
+        match state.vss_helper_manager() {
+            Some(manager) => (
+                manager.helper_alive(),
+                manager.helper_launchable(),
+                manager.launch_pending(),
+                manager.launch_declined(),
+            ),
+            None => (false, false, false, false),
+        };
     Ok(compute_vss_helper_status(
         cfg!(windows),
         driven_vss::is_elevated(),
         helper_enabled,
         helper_alive,
         helper_launchable,
+        launch_pending,
+        launch_declined,
     ))
 }
 
@@ -136,12 +144,15 @@ pub async fn load_vss_helper_enabled(state: &dyn StateRepo) -> bool {
 /// least-privilege helper is neither already launched (`helper_alive`) nor
 /// launchable on demand (`helper_launchable`). When the helper is launchable the
 /// banner is NOT degraded - the broker comes up on the first locked file.
+#[allow(clippy::too_many_arguments)]
 fn compute_vss_helper_status(
     supported: bool,
     elevated: bool,
     helper_enabled: bool,
     helper_alive: bool,
     helper_launchable: bool,
+    launch_pending: bool,
+    launch_declined: bool,
 ) -> VssHelperStatus {
     let locked_file_backup_degraded =
         supported && !elevated && !(helper_alive || helper_launchable);
@@ -151,6 +162,8 @@ fn compute_vss_helper_status(
         helper_enabled,
         helper_alive,
         helper_launchable,
+        launch_pending,
+        launch_declined,
         locked_file_backup_degraded,
     }
 }
@@ -265,6 +278,10 @@ pub async fn update_settings(
     let mut new_log_level: Option<String> = None;
     let mut new_locale: Option<String> = None;
     let mut orchestrator_affecting = false;
+    // Issue #25: the `windows.vss_helper` toggle transition (Some(new) iff it
+    // actually changed), applied after persistence to (dis)arm + eagerly launch
+    // the least-privilege helper broker.
+    let mut vss_helper_target: Option<bool> = None;
 
     // --- global group -------------------------------------------------------
     if let Some(g) = patch.global {
@@ -469,12 +486,15 @@ pub async fn update_settings(
             }
         }
         if let Some(v) = w.vss_helper {
-            cur.vss_helper = v;
-            // The brokered-helper preference takes effect when the orchestrator
-            // rebuilds its VSS provider (DESIGN s5.3.1).
-            if cfg!(windows) {
-                orchestrator_affecting = true;
+            // Issue #25: on a real change, (dis)arm the shared broker manager
+            // AFTER persistence. Enabling fires the ATTENDED eager launch (the
+            // user is at the Settings screen to approve the one UAC prompt);
+            // disabling shuts the broker down. The already-wired providers pick
+            // this up live via the launcher - no orchestrator rebuild needed.
+            if v != cur.vss_helper {
+                vss_helper_target = Some(v);
             }
+            cur.vss_helper = v;
         }
         store_group(repo, KEY_WINDOWS, &storage::Windows::from(cur)).await?;
     }
@@ -516,6 +536,22 @@ pub async fn update_settings(
     // VSS mode takes effect on the next cycle without a restart (DESIGN s5.7).
     if orchestrator_affecting {
         reconfigure_all(&state).await;
+    }
+
+    // Issue #25: (dis)arm + eagerly launch the least-privilege helper broker on a
+    // `windows.vss_helper` change. Enabling fires the attended UAC prompt NOW
+    // (the user is present); disabling shuts the broker down. Best-effort: no
+    // manager (off Windows / elevated) is a no-op.
+    if let Some(enabled) = vss_helper_target {
+        if let Some(manager) = state.vss_helper_manager() {
+            manager.set_enabled(enabled);
+            if enabled {
+                // Eager, non-blocking: the launch runs on a background thread so
+                // this IPC returns at once; the UI polls get_vss_helper_status to
+                // show pending -> ready/declined.
+                manager.launch_now();
+            }
+        }
     }
 
     // Return the full, freshly-stored settings document.
@@ -2560,25 +2596,27 @@ mod tests {
     #[test]
     fn vss_helper_status_degrades_only_on_windows_when_unelevated() {
         // Off Windows: never supported, never degraded.
-        let off = compute_vss_helper_status(false, false, false, false, false);
+        let off = compute_vss_helper_status(false, false, false, false, false, false, false);
         assert!(!off.supported);
         assert!(!off.locked_file_backup_degraded);
 
         // Windows + elevated: supported, not degraded (in-process VSS works).
-        let elevated = compute_vss_helper_status(true, true, false, false, false);
+        let elevated = compute_vss_helper_status(true, true, false, false, false, false, false);
         assert!(elevated.supported);
         assert!(elevated.elevated);
         assert!(!elevated.locked_file_backup_degraded);
 
         // Windows + un-elevated + no helper: supported but DEGRADED (locked files
         // skipped).
-        let degraded = compute_vss_helper_status(true, false, false, false, false);
+        let degraded = compute_vss_helper_status(true, false, false, false, false, false, false);
         assert!(degraded.supported);
         assert!(!degraded.elevated);
         assert!(degraded.locked_file_backup_degraded);
 
         // The helper-enabled preference is surfaced verbatim.
-        assert!(compute_vss_helper_status(true, false, true, false, false).helper_enabled);
+        assert!(
+            compute_vss_helper_status(true, false, true, false, false, false, false).helper_enabled
+        );
     }
 
     /// Issue #25: truthful liveness. A LAUNCHABLE helper (bundled sidecar present,
@@ -2588,7 +2626,7 @@ mod tests {
     #[test]
     fn vss_helper_status_not_degraded_when_helper_launchable_or_alive() {
         // Un-elevated + helper launchable (not yet launched): NOT degraded.
-        let launchable = compute_vss_helper_status(true, false, true, false, true);
+        let launchable = compute_vss_helper_status(true, false, true, false, true, false, false);
         assert!(!launchable.elevated);
         assert!(launchable.helper_launchable);
         assert!(!launchable.helper_alive);
@@ -2598,18 +2636,33 @@ mod tests {
         );
 
         // Un-elevated + helper already launched: NOT degraded.
-        let alive = compute_vss_helper_status(true, false, true, true, true);
+        let alive = compute_vss_helper_status(true, false, true, true, true, false, false);
         assert!(alive.helper_alive);
         assert!(!alive.locked_file_backup_degraded);
 
         // Un-elevated + helper enabled but NOT launchable (sidecar missing / prior
         // launch failed): DEGRADED - no snapshot path available.
-        let stuck = compute_vss_helper_status(true, false, true, false, false);
+        let stuck = compute_vss_helper_status(true, false, true, false, false, false, false);
         assert!(stuck.helper_enabled);
         assert!(!stuck.helper_launchable);
         assert!(
             stuck.locked_file_backup_degraded,
             "enabled but unlaunchable helper cannot create a snapshot -> degraded"
+        );
+
+        // Issue #25 (launch-UX): a PENDING launch (awaiting UAC) surfaces
+        // launch_pending; a DECLINED launch surfaces launch_declined + degrades.
+        let pending = compute_vss_helper_status(true, false, true, false, true, true, false);
+        assert!(pending.launch_pending);
+        assert!(
+            !pending.locked_file_backup_degraded,
+            "a pending launch is still launchable -> not degraded"
+        );
+        let declined = compute_vss_helper_status(true, false, true, false, false, false, true);
+        assert!(declined.launch_declined);
+        assert!(
+            declined.locked_file_backup_degraded,
+            "a declined helper cannot snapshot -> degraded"
         );
     }
 

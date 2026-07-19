@@ -212,6 +212,9 @@ fn brokered_provider_maps_a_locked_file_to_a_readable_temp_copy() {
             assert!(!temp.exists(), "end_cycle must delete the temp copy");
         }
         SnapshotOutcome::Unavailable => panic!("provider degraded unexpectedly"),
+        SnapshotOutcome::Pending => {
+            panic!("a probed launcher-less provider must not report the helper as pending")
+        }
     }
 
     // The Arc<dyn VssProvider> path also degrades cleanly when unprobed.

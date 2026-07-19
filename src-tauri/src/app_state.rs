@@ -1642,12 +1642,13 @@ mod tests {
         assert!(app_state.vss_helper_manager().is_none());
         app_state.shutdown_vss_helper();
 
-        // Install one with an injected launch fn (no real UAC / process).
+        // Install one with an injected launch fn (no real UAC / process),
+        // disabled so it never spawns a launch thread.
         let manager = Arc::new(crate::vss_helper::VssHelperManager::with_launch_fn(
             std::env::temp_dir().join("driven-vss-helper.exe"),
             std::env::temp_dir(),
-            Vec::new(),
-            Box::new(|_exe, _args| Ok(())),
+            false,
+            Box::new(|| Ok(())),
         ));
         app_state.set_vss_helper_manager(manager);
         assert!(app_state.vss_helper_manager().is_some());

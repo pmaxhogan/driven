@@ -222,25 +222,35 @@ impl VssProvider for BrokeredVssProvider {
         }
         #[cfg(windows)]
         {
-            // Launch-on-demand (DESIGN s5.3.1): with a launcher, the FIRST locked
-            // file brings the elevated helper up (at-most-once, one UAC prompt).
-            // A declined/failed launch degrades this file to skip; the launcher
-            // memoises the failure so the next locked file does not re-prompt.
-            // Without a launcher (integration tests), require a prior `probe`.
+            // DESIGN s5.3.1: consult the launcher for the broker's readiness. The
+            // lazy first-locked-file launch is TRIGGERED here (non-blocking) for
+            // the boot-already-on case; the eager enable-toggle path launched
+            // ahead of time. Without a launcher (integration tests) require a prior
+            // `probe`.
             match &self.launcher {
                 Some(launcher) => {
-                    if !launcher.ensure_launched() {
-                        self.helper_live.store(false, Ordering::SeqCst);
-                        return SnapshotOutcome::Unavailable;
+                    use crate::launch::LaunchStatus;
+                    match launcher.launch_status() {
+                        // Broker up: read the locked file through it.
+                        LaunchStatus::Ready => self.map_via_helper(live_path),
+                        // Launch in progress (awaiting UAC / pipe coming up): retry
+                        // next cycle rather than reporting a permanent lock. Never
+                        // blocks here.
+                        LaunchStatus::Pending => SnapshotOutcome::Pending,
+                        // Declined or disabled: degrade to the historical skip.
+                        LaunchStatus::Declined | LaunchStatus::Disabled => {
+                            SnapshotOutcome::Unavailable
+                        }
                     }
                 }
                 None => {
-                    if !self.helper_live.load(Ordering::SeqCst) {
-                        return SnapshotOutcome::Unavailable;
+                    if self.helper_live.load(Ordering::SeqCst) {
+                        self.map_via_helper(live_path)
+                    } else {
+                        SnapshotOutcome::Unavailable
                     }
                 }
             }
-            self.map_via_helper(live_path)
         }
         #[cfg(not(windows))]
         {
@@ -261,17 +271,19 @@ impl VssProvider for BrokeredVssProvider {
     }
 
     fn available(&self) -> bool {
-        // CAPABILITY (not liveness): can VSS help for a locked file this run?
-        // The executor reads this as its `elevated` input to `fallback_decision`,
-        // so it must be `true` whenever the helper can be brought up on demand -
-        // BEFORE the lazy launch actually happens - or a locked file would be
-        // skipped before the launch is ever attempted. With a launcher attached,
-        // the helper is launchable, so capability is true (Windows, mode != never).
-        // Without a launcher (integration tests) fall back to observed liveness.
+        // CAPABILITY (not liveness): can VSS help for a locked file this run? The
+        // executor reads this as its `elevated` input to `fallback_decision`, so
+        // it must be `true` whenever the broker is up OR can still be brought up,
+        // and `false` once disabled / declined (so the provider then behaves like
+        // the un-elevated skip). With a launcher this is the launcher's capability;
+        // without one (integration tests) it is observed liveness.
         if !cfg!(windows) || self.current_mode() == VssMode::Never {
             return false;
         }
-        self.launcher.is_some() || self.helper_live.load(Ordering::SeqCst)
+        match &self.launcher {
+            Some(launcher) => launcher.is_available(),
+            None => self.helper_live.load(Ordering::SeqCst),
+        }
     }
 
     fn end_cycle(&self) {
@@ -309,6 +321,7 @@ impl VssProvider for BrokeredVssProvider {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::launch::LaunchStatus;
 
     #[test]
     fn never_mode_and_unprobed_are_unavailable_and_degrade() {
@@ -372,16 +385,17 @@ mod tests {
     }
 
     /// A deterministic [`HelperLauncher`] for the launch-seam tests: returns a
-    /// configured verdict and counts calls (so a test can assert `ensure_launched`
-    /// is memoised at the MANAGER, not re-fired per file).
+    /// configured [`LaunchStatus`] + capability, and counts `launch_status` calls.
     struct FakeLauncher {
-        verdict: bool,
+        status: LaunchStatus,
+        available: bool,
         calls: std::sync::atomic::AtomicUsize,
     }
     impl FakeLauncher {
-        fn new(verdict: bool) -> Arc<Self> {
+        fn new(status: LaunchStatus, available: bool) -> Arc<Self> {
             Arc::new(Self {
-                verdict,
+                status,
+                available,
                 calls: std::sync::atomic::AtomicUsize::new(0),
             })
         }
@@ -390,109 +404,127 @@ mod tests {
         }
     }
     impl HelperLauncher for FakeLauncher {
-        fn ensure_launched(&self) -> bool {
+        fn launch_status(&self) -> LaunchStatus {
             self.calls.fetch_add(1, Ordering::SeqCst);
-            self.verdict
+            self.status
+        }
+        fn is_available(&self) -> bool {
+            self.available
         }
     }
 
-    /// With a launcher attached, `available()` reports the CAPABILITY (VSS can be
-    /// brought up on demand) BEFORE any launch - on Windows it is true even with
-    /// `helper_live` still false, so the executor routes a locked file here rather
-    /// than pre-skipping it. `never` mode and non-Windows are still unavailable.
+    /// With a launcher attached, `available()` delegates to the launcher's
+    /// CAPABILITY (VSS can be brought up on demand) - on Windows, true when the
+    /// launcher reports available even before any launch. `never` mode and
+    /// non-Windows are still unavailable regardless.
     #[test]
-    fn launcher_makes_available_report_capability() {
-        let launcher = FakeLauncher::new(true);
+    fn launcher_available_delegates_to_capability() {
+        let launcher = FakeLauncher::new(LaunchStatus::Pending, true);
         let p = BrokeredVssProvider::new(VssMode::Auto, r"\\.\pipe\x", r"C:\app", "temp")
             .with_launcher(launcher);
-        // Liveness has NOT been established yet.
-        assert!(!p.helper_live.load(Ordering::SeqCst));
-        // Capability: true on Windows (launchable), false elsewhere.
+        // Capability: the launcher says available, so true on Windows (VSS is a
+        // Windows capability), false elsewhere.
         assert_eq!(p.available(), cfg!(windows));
+
+        // A launcher reporting NOT available (disabled/declined) is unavailable.
+        let d = BrokeredVssProvider::new(VssMode::Auto, r"\\.\pipe\x", r"C:\app", "temp")
+            .with_launcher(FakeLauncher::new(LaunchStatus::Declined, false));
+        assert!(
+            !d.available(),
+            "a declined/disabled launcher is not available"
+        );
 
         // `never` mode is never available regardless of the launcher.
         let n = BrokeredVssProvider::new(VssMode::Never, r"\\.\pipe\x", r"C:\app", "temp")
-            .with_launcher(FakeLauncher::new(true));
+            .with_launcher(FakeLauncher::new(LaunchStatus::Ready, true));
         assert!(!n.available(), "never mode is never available");
     }
 
-    /// A launcher whose `ensure_launched` returns `false` (UAC declined / helper
-    /// exe missing) degrades every `map_for_volume` to `Unavailable` - the
-    /// skip-the-locked-file path - and never establishes liveness.
+    /// A launcher reporting `Pending` maps to [`SnapshotOutcome::Pending`] (skip +
+    /// retry next cycle), while `Declined`/`Disabled` map to `Unavailable` (the
+    /// historical skip). Both are non-blocking.
     #[test]
-    fn declined_launch_degrades_map() {
-        let launcher = FakeLauncher::new(false);
-        let p = BrokeredVssProvider::new(VssMode::Auto, r"\\.\pipe\x", r"C:\app", "temp")
-            .with_launcher(launcher.clone());
-        assert_eq!(
-            p.map_for_volume(std::path::Path::new(r"C:\Users\me\Documents\f.pst")),
+    fn launch_status_maps_to_snapshot_outcome() {
+        let path = std::path::Path::new(r"C:\Users\me\Documents\f.pst");
+
+        // Pending -> Pending (only meaningful on Windows; off Windows the map
+        // short-circuits to Unavailable before consulting the launcher).
+        let pending = FakeLauncher::new(LaunchStatus::Pending, true);
+        let pp = BrokeredVssProvider::new(VssMode::Auto, r"\\.\pipe\x", r"C:\app", "temp")
+            .with_launcher(pending.clone());
+        let expect_pending = if cfg!(windows) {
+            SnapshotOutcome::Pending
+        } else {
             SnapshotOutcome::Unavailable
-        );
-        assert!(
-            !p.helper_live.load(Ordering::SeqCst),
-            "a declined launch must not mark the helper live"
-        );
-        // On Windows the launcher is consulted on the locked path; off Windows the
-        // map short-circuits before it (no real pipe), so only assert it was NOT
-        // over-called.
-        assert!(launcher.calls() <= 1);
+        };
+        assert_eq!(pp.map_for_volume(path), expect_pending);
+
+        // Declined -> Unavailable.
+        let declined = FakeLauncher::new(LaunchStatus::Declined, false);
+        let dp = BrokeredVssProvider::new(VssMode::Auto, r"\\.\pipe\x", r"C:\app", "temp")
+            .with_launcher(declined);
+        assert_eq!(dp.map_for_volume(path), SnapshotOutcome::Unavailable);
+
+        // On Windows the launcher IS consulted on the locked path; off Windows the
+        // map short-circuits before it.
+        assert!(pending.calls() <= 1);
     }
 
-    /// End-to-end executor DECISION for a locked file backed by a declined helper.
-    /// This mirrors the executor's `open_effective` locked-file path (driven-core
-    /// executor.rs): it reads `elevated = provider.available()` and
-    /// `provider.map_for_volume(..)`, then feeds BOTH into the REAL
-    /// [`driven_vss::fallback_decision`]. With a launcher attached the capability
-    /// is reported available (so the executor consults the provider instead of
-    /// pre-skipping), but a DECLINED launch degrades the map to `Unavailable`, so
-    /// the decision is `SkipLocked` - the graceful skip the executor emits. This
-    /// pins the executor -> brokered-provider -> skip wiring without inverting the
-    /// crate layering (driven-vss-helper already tests against `driven-vss`).
+    /// End-to-end executor DECISION for a locked file while the helper is PENDING.
+    /// Mirrors the executor's `open_effective`: read `elevated = provider.available()`
+    /// and `provider.map_for_volume(..)`, feed both into the REAL
+    /// [`driven_vss::fallback_decision`]. A pending launch yields `SkipRetryLater`
+    /// (retry next cycle) on Windows - NOT a permanent lock.
+    #[test]
+    fn executor_decision_for_locked_file_while_pending_retries_later() {
+        use driven_vss::{fallback_decision, FallbackDecision, OpenAttempt};
+
+        let p = BrokeredVssProvider::new(VssMode::Auto, r"\\.\pipe\x", r"C:\app", "temp")
+            .with_launcher(FakeLauncher::new(LaunchStatus::Pending, true));
+        let elevated = p.available();
+        let snapshot = p.map_for_volume(std::path::Path::new(r"C:\Users\me\Outlook.pst"));
+        let decision = fallback_decision(OpenAttempt::Locked, VssMode::Auto, elevated, snapshot);
+        if cfg!(windows) {
+            assert_eq!(
+                decision,
+                FallbackDecision::SkipRetryLater,
+                "a pending helper must retry next cycle, not report a permanent lock"
+            );
+        } else {
+            // Off Windows the provider is not available; a locked file skips.
+            assert_eq!(decision, FallbackDecision::SkipLocked);
+        }
+    }
+
+    /// A DECLINED helper degrades a locked file to the graceful skip (SkipLocked).
     #[test]
     fn executor_decision_for_locked_file_via_declined_helper_is_skip() {
         use driven_vss::{fallback_decision, FallbackDecision, OpenAttempt};
 
-        let launcher = FakeLauncher::new(false);
         let p = BrokeredVssProvider::new(VssMode::Auto, r"\\.\pipe\x", r"C:\app", "temp")
-            .with_launcher(launcher);
-
-        // The two inputs the executor captures for a locked file, in order.
+            .with_launcher(FakeLauncher::new(LaunchStatus::Declined, false));
         let elevated = p.available();
         let snapshot = p.map_for_volume(std::path::Path::new(r"C:\Users\me\Outlook.pst"));
-        assert_eq!(
-            snapshot,
-            SnapshotOutcome::Unavailable,
-            "a declined helper cannot map the locked file"
-        );
+        assert_eq!(snapshot, SnapshotOutcome::Unavailable);
         assert_eq!(
             fallback_decision(OpenAttempt::Locked, VssMode::Auto, elevated, snapshot),
             FallbackDecision::SkipLocked,
-            "a locked file through a declined helper must degrade to a skip"
+            "a declined helper degrades a locked file to a skip"
         );
     }
 
-    /// The positive executor DECISION: when the map SUCCEEDS (a `Mapped` outcome),
-    /// the executor opens the snapshot copy. Proven here with a fake mapped
-    /// outcome fed through the real `fallback_decision`, so the
-    /// capability-`available()` -> `OpenSnapshot` wiring is pinned cross-OS (the
-    /// real byte stream is the elevation-gated integration test).
+    /// The positive executor DECISION: a `Mapped` outcome + capability opens the
+    /// snapshot copy (cross-OS via the real `fallback_decision`).
     #[test]
     fn executor_decision_for_locked_file_with_mapped_snapshot_opens_snapshot() {
         use driven_vss::{fallback_decision, FallbackDecision, OpenAttempt};
 
-        // A provider that reports capability available (launcher attached).
         let p = BrokeredVssProvider::new(VssMode::Auto, r"\\.\pipe\x", r"C:\app", "temp")
-            .with_launcher(FakeLauncher::new(true));
+            .with_launcher(FakeLauncher::new(LaunchStatus::Ready, true));
         let elevated = p.available();
-        // Simulate the provider's successful map (the real map streams via the
-        // helper on Windows; here we assert the DECISION the executor makes given
-        // a Mapped outcome + the capability flag).
         let mapped = SnapshotOutcome::Mapped(std::path::PathBuf::from(
             r"C:\Users\me\driven-vss-tmp\Outlook.pst",
         ));
-        // On Windows the capability is true, so a Mapped snapshot opens the copy.
-        // Off Windows the capability is false (no VSS), so the same inputs skip -
-        // exactly the platform contract.
         let decision = fallback_decision(OpenAttempt::Locked, VssMode::Auto, elevated, mapped);
         if cfg!(windows) {
             assert!(matches!(decision, FallbackDecision::OpenSnapshot(_)));

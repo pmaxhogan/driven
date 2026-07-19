@@ -229,7 +229,9 @@
         "never": "Never"
       },
       "vssHelperLabel": "Use the least-privilege helper for locked files",
-      "vssHelperNote": "Back up locked files (Outlook data files, live databases, VM disks) by elevating only a small snapshot helper - the app itself stays un-elevated. You are prompted for elevation once, the first time a locked file needs it. Takes effect on the next app start.",
+      "vssHelperNote": "Back up locked files (Outlook data files, live databases, VM disks) by elevating only a small snapshot helper - the app itself stays un-elevated. Turning this on prompts you for elevation once, right now.",
+      "vssHelperPending": "Waiting for elevation approval - approve the Windows prompt to enable locked-file backup.",
+      "vssHelperDeclined": "Elevation was declined, so locked files are still skipped. Turn this off and on again to retry.",
       "telemetryLabel": "Send anonymous usage stats",
       "telemetryNote": "Anonymous usage stats only - no file names or contents are ever sent. One click to disable.",
       "hooks": {
@@ -491,6 +493,10 @@
       "vss_unavailable": {
         "short": "Elevation needed",
         "long": "Backing up locked files needs Volume Shadow Copy, which requires running Driven elevated."
+      },
+      "vss_helper_pending": {
+        "short": "Starting helper",
+        "long": "The least-privilege helper is starting to back up a locked file. Driven will retry it on the next cycle."
       },
       "file_changed_during_upload": {
         "short": "File changed",

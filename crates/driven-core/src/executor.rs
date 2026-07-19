@@ -388,6 +388,11 @@ pub enum SkipReason {
     /// up if Driven ran elevated" from "genuinely unreadable"
     /// (`local.vss_unavailable`, SPEC s24).
     VssUnavailable,
+    /// The file is locked and the least-privilege VSS helper broker is still
+    /// LAUNCHING / awaiting elevation approval (DESIGN s5.3.1). The file is
+    /// skipped TRANSIENTLY this cycle and retried next cycle (once the broker is
+    /// up) - NOT reported as a permanent lock (`local.vss_helper_pending`).
+    VssHelperPending,
 }
 
 impl SkipReason {
@@ -401,6 +406,7 @@ impl SkipReason {
             SkipReason::ChangedDuringUpload => ErrorCode::LocalFileChangedDuringUpload,
             SkipReason::Locked => ErrorCode::LocalFileLocked,
             SkipReason::VssUnavailable => ErrorCode::LocalVssUnavailable,
+            SkipReason::VssHelperPending => ErrorCode::LocalVssHelperPending,
         }
     }
 }
@@ -1135,6 +1141,14 @@ impl DefaultExecutor {
                         SkipReason::Locked
                     };
                 EffectiveOpen::Skip(reason)
+            }
+            FallbackDecision::SkipRetryLater => {
+                // DESIGN s5.3.1: the least-privilege helper broker is launching /
+                // awaiting elevation approval. Skip this locked file TRANSIENTLY
+                // (it re-queues like any skip) and classify it as helper-pending -
+                // NOT a permanent lock - so the brief launch-in-progress window is
+                // not misreported. The next cycle (broker up) backs it up.
+                EffectiveOpen::Skip(SkipReason::VssHelperPending)
             }
         }
     }
@@ -8633,6 +8647,67 @@ mod tests {
             .unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].size, Some(size));
+    }
+
+    /// Issue #25 (launch-UX): a LOCKED file while the least-privilege helper is
+    /// still LAUNCHING is skipped TRANSIENTLY (re-queued) and classified
+    /// `local.vss_helper_pending` - NOT the permanent `local.file_locked`. Windows
+    /// only (a real `ERROR_SHARING_VIOLATION` cannot be produced cross-OS) but
+    /// NON-elevated-safe: `FakeVssProvider::pending()` returns `Pending` without
+    /// any real COM, so this runs on the (non-elevated) Windows CI runner. The
+    /// pure decision is table-tested in `driven_vss::fallback_decision`.
+    #[cfg(windows)]
+    #[tokio::test]
+    async fn locked_file_while_helper_pending_skips_as_pending_not_locked() {
+        use std::os::windows::fs::OpenOptionsExt;
+
+        let h = harness().await;
+        let (rel, size) = h.write_file("locked-pending.dat", b"bytes-behind-a-launching-helper");
+        let live = h.tmp_src.path().join("locked-pending.dat");
+
+        const GENERIC_WRITE: u32 = 0x4000_0000;
+        let _exclusive = std::fs::OpenOptions::new()
+            .access_mode(GENERIC_WRITE)
+            .share_mode(0)
+            .write(true)
+            .open(&live)
+            .expect("open locked-pending.dat exclusively");
+        assert!(
+            matches!(
+                super::open_shared(&live).await,
+                Err(super::OpenError::Locked)
+            ),
+            "test setup: file must be locked"
+        );
+
+        // The helper is available (capability) but its snapshot is Pending.
+        let vss: Arc<dyn driven_vss::VssProvider> = Arc::new(driven_vss::FakeVssProvider::pending(
+            driven_vss::VssMode::Auto,
+        ));
+        let exec = h.executor_with_vss(vss);
+        let out = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out[0],
+                OpOutcome::Skipped {
+                    reason: SkipReason::VssHelperPending,
+                    ..
+                }
+            ),
+            "a pending helper must skip-as-pending (retry next cycle), not lock; got {:?}",
+            out[0]
+        );
+        // Not committed as Synced (it re-queues for the next cycle).
+        let row = h.state.get_file_state(h.source.id, &rel).await.unwrap();
+        assert!(row.is_none() || row.unwrap().status != FileStateStatus::Synced);
     }
 
     // --- resumable (large file) path ----------------------------------------
