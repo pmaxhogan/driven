@@ -23,7 +23,7 @@ use async_trait::async_trait;
 use tokio::sync::broadcast;
 use tokio::sync::Mutex;
 
-use crate::network::detect_metered_and_reachable;
+use crate::network::{detect_metered_blocking, reachable_hint, MeteredStatus};
 use crate::{PowerSource, PowerState};
 
 /// Poll cadence for the sysfs power read (DESIGN s5.7).
@@ -31,6 +31,13 @@ const POLL_INTERVAL: Duration = Duration::from_secs(30);
 
 /// Broadcast channel capacity (transitions are rare).
 const BROADCAST_CAPACITY: usize = 16;
+
+/// Upper bound on the per-poll NetworkManager D-Bus read. It runs on a blocking
+/// thread (via [`tokio::task::spawn_blocking`]) so it never parks a tokio
+/// worker, but this cap guarantees a wedged system bus can never stall the
+/// AC/battery poll for more than this: on timeout the metered value falls back
+/// to [`MeteredStatus::Unknown`] (not metered) and the poll proceeds.
+const METERED_READ_TIMEOUT: Duration = Duration::from_secs(5);
 
 /// sysfs root for power-supply devices. A constant so tests can reason
 /// about the layout; the reader takes the root as a parameter.
@@ -47,8 +54,13 @@ impl RealPowerSource {
     /// Builds the source with an initial snapshot read synchronously from
     /// sysfs. Never fails: a host with no power-supply devices (server /
     /// container) resolves to "on AC, no battery".
+    ///
+    /// The initial snapshot reports metered as [`MeteredStatus::Unknown`] (not
+    /// metered): the NetworkManager read is a blocking D-Bus call that cannot be
+    /// awaited here, so the first real metered verdict lands on the first poll
+    /// tick. The safe default in the meantime never wrongly stalls sync.
     pub fn new() -> anyhow::Result<Self> {
-        let initial = read_power_state();
+        let initial = read_power_state(MeteredStatus::Unknown);
         let (tx, _rx) = broadcast::channel(BROADCAST_CAPACITY);
         Ok(Self {
             latest: Arc::new(Mutex::new(initial)),
@@ -69,7 +81,8 @@ impl RealPowerSource {
             ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
             loop {
                 ticker.tick().await;
-                let next = read_power_state();
+                let metered = read_metered().await;
+                let next = read_power_state(metered);
                 let mut guard = latest.lock().await;
                 if *guard != next {
                     tracing::debug!(?next, "power state transition");
@@ -78,6 +91,27 @@ impl RealPowerSource {
                 }
             }
         })
+    }
+}
+
+/// Reads NetworkManager's metered state off the async executor, bounded by
+/// [`METERED_READ_TIMEOUT`]. The blocking D-Bus read runs on a
+/// [`tokio::task::spawn_blocking`] thread (zbus's blocking API must not be
+/// driven from within an async runtime); a join error or timeout resolves to
+/// [`MeteredStatus::Unknown`] (not metered) so the AC/battery poll is never
+/// blocked by a wedged bus.
+async fn read_metered() -> MeteredStatus {
+    let read = tokio::task::spawn_blocking(detect_metered_blocking);
+    match tokio::time::timeout(METERED_READ_TIMEOUT, read).await {
+        Ok(Ok(status)) => status,
+        Ok(Err(join_err)) => {
+            tracing::warn!(error = %join_err, "metered read task failed; treating as unknown");
+            MeteredStatus::Unknown
+        }
+        Err(_elapsed) => {
+            tracing::warn!("metered read timed out; treating as unknown");
+            MeteredStatus::Unknown
+        }
     }
 }
 
@@ -92,15 +126,17 @@ impl PowerSource for RealPowerSource {
     }
 }
 
-/// Reads a full [`PowerState`] snapshot.
-fn read_power_state() -> PowerState {
+/// Reads a full [`PowerState`] snapshot. AC / battery come from sysfs; the
+/// `metered` verdict is supplied by the caller (read separately off the async
+/// executor via [`read_metered`], or [`MeteredStatus::Unknown`] for the initial
+/// synchronous snapshot).
+fn read_power_state(metered: MeteredStatus) -> PowerState {
     let (ac_connected, battery_percent) = read_ac_and_battery(Path::new(POWER_SUPPLY_ROOT));
-    let (on_metered_network, network_reachable) = detect_metered_and_reachable();
     PowerState {
         ac_connected,
         battery_percent,
-        on_metered_network,
-        network_reachable,
+        on_metered_network: metered.on_metered(),
+        network_reachable: reachable_hint(),
     }
 }
 
