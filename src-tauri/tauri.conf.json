@@ -76,6 +76,9 @@
     "windows": {
       "wix": {
         "language": "en-US"
+      },
+      "nsis": {
+        "installerHooks": "installer-hooks.nsh"
       }
     }
   }

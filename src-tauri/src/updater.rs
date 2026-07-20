@@ -604,12 +604,28 @@ async fn silent_install_dev_update(
         }
     };
 
+    // Issue #125: shut the elevated VSS helper broker down BEFORE the installer
+    // runs (same reason as the manual `install_update` path). The dev-silent path
+    // ran `download_and_install` from the periodic task WITHOUT the app-quit
+    // sweep, so a live broker either blocked the install or was left orphaned when
+    // the installer restarted the app - the exact QA repro. Disabling also blocks
+    // a mid-download re-launch; re-armed on failure since the app keeps running.
+    let vss_disabled = app
+        .try_state::<AppState>()
+        .map(|s| s.shutdown_vss_helper_for_update())
+        .unwrap_or(false);
+
     match update.download_and_install(on_chunk, on_done).await {
         Ok(()) => {
             tracing::info!(target: TARGET, version = %info.version, "dev update installed silently; applies on next restart");
             crate::tray::notify_dev_update_installed(app, &info.version);
         }
         Err(e) => {
+            if vss_disabled {
+                if let Some(s) = app.try_state::<AppState>() {
+                    s.rearm_vss_helper_after_failed_update();
+                }
+            }
             tracing::warn!(target: TARGET, error = %e, version = %info.version, "dev silent update install failed (will retry next interval)");
         }
     }
@@ -688,6 +704,18 @@ pub async fn install_update(app: AppHandle, state: State<'_, AppState>) -> Comma
     // The display channel for the downloaded event (R1-P2-3).
     let channel = Channel::from_str_lenient(&downloaded_channel(&channel_str));
 
+    // Issue #125: shut the elevated VSS helper broker down BEFORE the installer
+    // runs. `download_and_install` executes the NSIS installer synchronously
+    // (`/P /R`), which overwrites the bundled `driven-vss-helper.exe` sidecar -
+    // but the stock installer only terminates the MAIN binary, so a live broker
+    // holds its own exe open and the install fails with "Error opening file for
+    // writing: ...driven-vss-helper.exe". Disabling (not a bare shutdown) also
+    // blocks a still-running sync from re-launching the broker mid-download. This
+    // ALSO stops the update path itself from seeding an orphan: the pre-fix path
+    // let `/R` restart the app WITHOUT ever sweeping the helper. Re-armed below
+    // if the install fails (the app keeps running).
+    let vss_disabled = state.shutdown_vss_helper_for_update();
+
     // The progress callback accumulates downloaded bytes and emits
     // `updater:download_progress`. `content_length` arrives once the server
     // reports it; until then `total` is None.
@@ -718,6 +746,12 @@ pub async fn install_update(app: AppHandle, state: State<'_, AppState>) -> Comma
         // R1-P2-2: restore the pending update (with its channel) so the user can
         // retry without re-checking.
         state.set_pending_update(Some((update, channel_str)));
+        // Issue #125: the install failed and the app keeps running - re-arm the
+        // VSS helper we disabled above so locked-file backup is not left silently
+        // degraded for the rest of the session.
+        if vss_disabled {
+            state.rearm_vss_helper_after_failed_update();
+        }
     }
     install_result.map_err(map_install_error)?;
 
