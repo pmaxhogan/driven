@@ -734,6 +734,48 @@ mod tests {
         );
     }
 
+    #[test]
+    fn update_sweep_reaps_ready_helper_and_blocks_relaunch() {
+        // Issue #125: the updater's pre-install sweep (AppState
+        // `shutdown_vss_helper_for_update`) calls `set_enabled(false)`. On a Ready
+        // broker this must (1) reap the running helper - directly, like the quit
+        // sweep - so it releases its exe handle before the NSIS installer
+        // overwrites it, AND (2) DISABLE the manager so a still-running sync that
+        // hits a locked file cannot RE-LAUNCH the elevated broker (re-locking the
+        // exe) during the `download_and_install` window.
+        let (launch, calls) = counting_launch(Ok(()));
+        let mgr = manager(true, launch);
+        mgr.launch_now();
+        mgr.join_launch_thread();
+        assert!(
+            mgr.helper_alive(),
+            "the broker is up before the update sweep"
+        );
+
+        // The pre-install sweep: disable + reap.
+        mgr.set_enabled(false);
+        assert!(
+            !mgr.helper_alive(),
+            "the broker is shut down before the installer runs"
+        );
+        assert!(!mgr.is_available(), "a disabled broker is not available");
+        assert_eq!(mgr.launch_status(), LaunchStatus::Disabled);
+        // A Ready broker is reaped by the shutdown path directly (not the
+        // abandoned-launch resolver), so no reap is counted there.
+        assert_eq!(mgr.reap_count(), 0);
+
+        // A locked file mid-download consults the launcher: it must NOT re-launch
+        // the elevated broker while the install is in flight.
+        let before = calls.load(Ordering::SeqCst);
+        mgr.launch_now();
+        mgr.join_launch_thread();
+        assert_eq!(
+            calls.load(Ordering::SeqCst),
+            before,
+            "a disabled broker must not re-launch during the install window"
+        );
+    }
+
     /// Exercise the PRODUCTION constructor + launch path (`new` -> `production_launch`
     /// -> `launch_elevated`) without a real UAC prompt. Gated to non-Windows: there
     /// `launch_elevated` reports "Windows only" immediately (no `runas`, no prompt),

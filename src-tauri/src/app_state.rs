@@ -570,6 +570,53 @@ impl AppState {
         }
     }
 
+    /// Shut the VSS helper broker down BEFORE an in-app update installer runs
+    /// (issue #125), returning whether a manager was disabled (so the caller can
+    /// RE-ARM it if the install then fails - see
+    /// [`Self::rearm_vss_helper_after_failed_update`]).
+    ///
+    /// The Windows NSIS updater overwrites the bundled `driven-vss-helper.exe`
+    /// sidecar, but its stock process-kill only targets the MAIN binary
+    /// (`driven-app.exe`) - never the sidecar. A running elevated broker holds an
+    /// open handle to its own exe, so the install fails with "Error opening file
+    /// for writing: ...driven-vss-helper.exe". `download_and_install` runs the
+    /// NSIS installer synchronously (`/P /R`), so the broker must be gone BEFORE
+    /// that call.
+    ///
+    /// Unlike the app-quit [`Self::shutdown_vss_helper`] (a bare `shutdown()`),
+    /// this uses `set_enabled(false)`, which is a SUPERSET: it performs the same
+    /// Shutdown+reap (including abandoning + reaping a `Pending` launch per the
+    /// #113 generation semantics) AND disables the manager so a still-running
+    /// sync that hits a locked file cannot RE-LAUNCH the elevated broker (and
+    /// re-lock the exe) during the potentially-long `download_and_install`
+    /// window. A memoised session decline is reset to `NotAttempted` by the
+    /// underlying shutdown; that is inherent to any shutdown-based sweep and
+    /// harmless here (an update is user-consented and a successful install
+    /// restarts the app anyway).
+    ///
+    /// Best-effort + idempotent: a no-op (returns `false`) when no manager is in
+    /// play (off Windows / elevated / setting off).
+    pub fn shutdown_vss_helper_for_update(&self) -> bool {
+        if let Some(manager) = self.vss_helper_manager() {
+            manager.set_enabled(false);
+            true
+        } else {
+            false
+        }
+    }
+
+    /// Re-arm the VSS helper broker after a FAILED update install (issue #125):
+    /// the app keeps running, so undo the
+    /// [`Self::shutdown_vss_helper_for_update`] disable so locked-file backup is
+    /// available again on demand (a LAZY re-launch on the next locked file - no
+    /// forced UAC prompt), rather than staying silently degraded until the next
+    /// app restart. Best-effort + idempotent; a no-op when no manager is in play.
+    pub fn rearm_vss_helper_after_failed_update(&self) {
+        if let Some(manager) = self.vss_helper_manager() {
+            manager.set_enabled(true);
+        }
+    }
+
     // --- M9c D4: recovery-phrase ACK gate (M6 R4-P1-1, DATA-SAFETY) ---------
 
     /// Lock the recovery-ack map, recovering a poisoned lock (house rule: never
@@ -1655,6 +1702,59 @@ mod tests {
         // The broker was never launched, so shutdown stays a no-op (no panic /
         // no connect).
         app_state.shutdown_vss_helper();
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn shutdown_vss_helper_for_update_disables_then_rearm_restores() {
+        // Issue #125: the updater path disables the broker BEFORE
+        // `download_and_install` so a live/relaunching elevated helper cannot hold
+        // its own exe open while the NSIS installer overwrites it. On a FAILED
+        // install (app keeps running) the caller re-arms it so locked-file backup
+        // is not left silently degraded.
+        use driven_vss_helper::HelperLauncher; // brings `is_available` into scope
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+
+        // No manager: both calls are safe no-ops; the pre-install sweep reports it
+        // disabled nothing.
+        assert!(!app_state.shutdown_vss_helper_for_update());
+        app_state.rearm_vss_helper_after_failed_update();
+
+        // Install an ENABLED manager with an injected launch (no real UAC /
+        // process). Not launched yet -> NotAttempted + enabled == launchable.
+        let manager = Arc::new(crate::vss_helper::VssHelperManager::with_launch_fn(
+            std::env::temp_dir().join("driven-vss-helper.exe"),
+            std::env::temp_dir(),
+            true,
+            Box::new(|| Ok(())),
+        ));
+        app_state.set_vss_helper_manager(manager.clone());
+        assert!(
+            manager.is_available(),
+            "an enabled, not-yet-tried broker is available on demand"
+        );
+
+        // The pre-install sweep disables it (so a mid-download locked file cannot
+        // re-launch the broker) and reports it acted.
+        assert!(app_state.shutdown_vss_helper_for_update());
+        assert!(
+            !manager.is_available(),
+            "disabled broker is not available -> cannot re-launch during the install"
+        );
+
+        // A failed install re-arms it so backup is available again on demand.
+        app_state.rearm_vss_helper_after_failed_update();
+        assert!(
+            manager.is_available(),
+            "re-arm after a failed install restores on-demand launchability"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }
