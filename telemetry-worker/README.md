@@ -36,12 +36,21 @@ One data point per ping (`writePing`):
 | `blob1..6` | `os`, `arch`, `channel`, `version`, `os_version` (`""` if absent), `errors_by_class` JSON |
 | `double1..6` | `files_uploaded`, `bytes_uploaded`, `deep_verify_runs`, `update_applied` (0/1), `total_errors`, `ts` (epoch ms) |
 | `double7..10` | `scan_p50`, `scan_p95`, `upload_per_mb_p50`, `upload_per_mb_p95` (ms) |
+| `double11` | `latency_schema_version` (schema marker, `1`) |
 
-The 4 latency doubles (DESIGN s13) are **appended** so the original columns keep
+The latency doubles (DESIGN s13) are **appended** so the original columns keep
 their positions. When the client had no samples for a metric this window (its
 array is empty), the pair is written as the sentinel **`-1`** so the rollup query
 can tell "no samples" apart from a legitimate `0 ms` (a sub-millisecond per-file
 scan rounds to 0).
+
+`double11` is a **schema marker** (`1`) written on every row that carries the
+latency doubles. It exists because the Analytics Engine SQL API has no NULLs and
+materializes any double a row never wrote as `0`: rows written by the pre-latency
+Worker have `scan_p50 == 0` (a materialized 0, not a real sample) and would
+otherwise pass the `>= 0` sentinel filter and pollute the rollup as fake `0 ms`
+samples. The rollup filters `WHERE double11 >= 1`, so pre-latency rows (marker
+materializes as `0`) are excluded.
 
 ## `GET /telemetry/v1/stats/latency`
 
@@ -68,10 +77,11 @@ Authorization: Bearer <QUERY_TOKEN>
 
 Per metric, per UTC day: `avg_p50_ms` (mean of the pinged p50s), `avg_p95_ms`
 (mean of the pinged p95s), `max_p95_ms` (worst pinged p95), and `samples` (number
-of pings that reported the metric). Empty-latency pings (the `-1` sentinel) are
-excluded per metric via `WHERE <p50col> >= 0`, so a real `0 ms` still counts. The
-two metrics are queried separately (each filters its own sentinel column) via the
-Analytics Engine SQL API.
+of pings that reported the metric). Each metric query excludes two kinds of
+non-sample rows (`WHERE double11 >= 1 AND <p50col> >= 0`): pre-latency rows (the
+schema marker materializes as `0`) and empty-latency pings (the `-1` sentinel),
+while keeping a real `0 ms`. The two metrics are queried separately (each filters
+its own sentinel column) via the Analytics Engine SQL API.
 
 Status codes: `200` success; `401` missing/wrong bearer; `405` non-GET;
 `502` upstream AE SQL query failed; `503` the endpoint is not configured

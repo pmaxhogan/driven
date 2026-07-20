@@ -386,17 +386,36 @@ function latencyPair(arr: number[]): [number, number] {
   return [NO_LATENCY, NO_LATENCY];
 }
 
+/// Schema-version marker written on EVERY row that carries the latency doubles
+/// (DESIGN s13). Load-bearing for the rollup: the Analytics Engine SQL API has NO
+/// NULLs and materializes any double a row never wrote as `0`, so rows written by
+/// the PRE-latency Worker have `scan_p50 == 0` (a materialized 0, not a real
+/// sample) and would otherwise pass the `>= 0` sentinel filter and pollute the
+/// rollup as fake `0 ms` samples. A row with this marker `>= 1` provably has the
+/// latency schema; a legacy row materializes the marker as `0`, so the rollup's
+/// `WHERE <marker> >= 1` excludes it. Bump this only if the latency-double LAYOUT
+/// changes (append-only, like the doubles themselves).
+const LATENCY_SCHEMA_VERSION = 1;
+
+/// The AE double column the schema marker occupies (double11, appended after the
+/// 4 latency percentiles). The rollup filters `>= 1` on this so pre-latency rows
+/// (which materialize it as 0) are excluded.
+const LATENCY_SCHEMA_COL = "double11";
+
 /// Write one validated ping to Analytics Engine (SPEC s16, DESIGN s13). Schema:
 /// - indexes: [install_id]   (the sampling/grouping key - anonymous)
 /// - blobs:   [os, arch, channel, version, os_version, errors_by_class JSON]
 ///            (low-card dims; os_version is "" when the client did not send one)
 /// - doubles: [files_uploaded, bytes_uploaded, deep_verify_runs, update_applied,
 ///             total_errors, ts,                              // double1..double6
-///             scan_p50, scan_p95, upload_per_mb_p50, upload_per_mb_p95]
+///             scan_p50, scan_p95, upload_per_mb_p50, upload_per_mb_p95,
 ///                                                            // double7..double10
-///   The 4 latency doubles are appended (never reordered) so existing columns keep
-///   their positions; an absent metric writes the NO_LATENCY (-1) sentinel.
-/// Writes are non-blocking (no await / waitUntil needed per the CF docs).
+///             latency_schema_version]                        // double11
+///   The latency doubles are appended (never reordered) so existing columns keep
+///   their positions; an absent metric writes the NO_LATENCY (-1) sentinel, and
+///   double11 marks the row as carrying the latency schema (LATENCY_SCHEMA_VERSION)
+///   so the rollup can exclude pre-latency rows (whose missing doubles AE
+///   materializes as 0). Writes are non-blocking (no await / waitUntil per CF docs).
 export function writePing(env: Env, p: PingPayload): void {
   const [scanP50, scanP95] = latencyPair(p.latency_p50_p95_ms.scan);
   const [upP50, upP95] = latencyPair(p.latency_p50_p95_ms.upload_per_mb);
@@ -427,6 +446,10 @@ export function writePing(env: Env, p: PingPayload): void {
       scanP95,
       upP50,
       upP95,
+      // DESIGN s13: schema-version marker (double11). Present (>= 1) on every row
+      // that carries the latency doubles above; a pre-latency row has no double11
+      // so AE materializes it as 0, letting the rollup exclude such rows.
+      LATENCY_SCHEMA_VERSION,
     ],
   });
 }
@@ -548,10 +571,13 @@ function clampStatsDays(raw: string | null): number {
 
 /// Query one latency metric's per-day aggregates over the AE SQL API. `p50Col` /
 /// `p95Col` are the AE double column names for this metric (e.g. `double7` /
-/// `double8`). Rows carrying the NO_LATENCY sentinel (`< 0`, an empty-latency
-/// ping) are excluded via `WHERE p50 >= 0`, so a legit `0 ms` still counts. The
-/// response is the CF `{ meta, data }` JSON (NOT ndjson); each `data[]` row's
-/// numeric columns arrive as strings, so they are coerced with `Number`.
+/// `double8`). Two `WHERE` filters exclude non-samples (both needed because AE has
+/// no NULLs - a never-written double reads as 0): the schema marker (excludes
+/// PRE-latency rows whose latency doubles materialize as 0) and the NO_LATENCY
+/// sentinel (`< 0`, excludes latency-schema rows with no samples this window, while
+/// keeping a legit `0 ms`). The response is the CF `{ meta, data }` JSON (NOT
+/// ndjson); each `data[]` row's numeric columns arrive as strings, coerced with
+/// `Number`.
 async function queryLatencyMetric(
   env: Env,
   accountId: string,
@@ -561,6 +587,15 @@ async function queryLatencyMetric(
 ): Promise<LatencyDayRow[]> {
   // `days` is a validated integer (clampStatsDays) and the column names are
   // internal constants, so this interpolation carries no injection surface.
+  //
+  // Two filters, both load-bearing (the AE SQL API has NO NULLs - a double a row
+  // never wrote is materialized as 0):
+  //   - `${LATENCY_SCHEMA_COL} >= 1`: exclude PRE-latency rows. Those rows never
+  //     wrote the latency doubles, so their `${p50Col}` materializes as 0 and
+  //     would otherwise pass the sentinel filter below as a fake `0 ms` sample.
+  //     Only rows carrying the latency schema wrote the marker (>= 1).
+  //   - `${p50Col} >= 0`: exclude latency-schema rows whose metric had NO samples
+  //     this window (written as the -1 sentinel), while KEEPING a legit 0 ms.
   const sql =
     `SELECT toDate(timestamp) AS day, ` +
     `AVG(${p50Col}) AS avg_p50, ` +
@@ -568,7 +603,8 @@ async function queryLatencyMetric(
     `MAX(${p95Col}) AS max_p95, ` +
     `COUNT() AS samples ` +
     `FROM ${DATASET} ` +
-    `WHERE timestamp > NOW() - INTERVAL '${days}' DAY AND ${p50Col} >= 0 ` +
+    `WHERE timestamp > NOW() - INTERVAL '${days}' DAY ` +
+    `AND ${LATENCY_SCHEMA_COL} >= 1 AND ${p50Col} >= 0 ` +
     `GROUP BY day ORDER BY day`;
 
   const resp = await fetch(
