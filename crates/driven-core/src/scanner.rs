@@ -234,16 +234,30 @@ pub async fn scan_with_latency(
     }
 
     // FS mtime-granularity (DESIGN s5.2 step 2). Read the persisted per-source
-    // value; on the FIRST scan of a source it is `None`, so probe the source
-    // filesystem now (write-stat probe on `spawn_blocking` - it may sleep on a
-    // coarse FS) and hand the result back to the orchestrator via
-    // `ScanResult::probed_granularity_ns` to persist. `granularity_ns` is the
-    // window used for THIS scan (0 = fine); a probe I/O failure degrades to fine
-    // for this cycle and is NOT persisted, so a later scan re-probes.
+    // value; when unprobed (`None`) the write-stat probe (on `spawn_blocking` -
+    // it may sleep on a coarse FS) measures it and hands the result back to the
+    // orchestrator via `ScanResult::probed_granularity_ns` to persist.
+    // `granularity_ns` is the window used for THIS scan (0 = fine); a probe I/O
+    // failure degrades to fine for this cycle and is NOT persisted, so a later
+    // scan re-probes.
+    //
+    // The probe is DEFERRED off the very first scan of a source. That first scan
+    // is the source's initial backup cycle, where every file is new and each
+    // path's FIRST upload must commit its `file_state` row cleanly; adding the
+    // probe's stat/sleep I/O (up to ~2.2s on a coarse FS) plus temp-file churn
+    // in the source root to that hot path is exactly the latency we don't want
+    // while the first creates are landing. So the first scan (no completed scan
+    // yet -> `last_full_scan_at` is `None`) TRUSTS mtime with no probe and no
+    // coarse fallback, persisting nothing; the probe runs on the NEXT scan, once
+    // a completed scan exists. This mirrors the probe-failure degradation below
+    // ("trust mtime this cycle, re-probe next") and costs at most a one-cycle
+    // delay before the coarse fallback first engages on a coarse FS.
     let (granularity_ns, probed_granularity_ns): (u64, Option<i64>) = match source
         .mtime_granularity_ns
     {
         Some(stored) => (u64::try_from(stored).unwrap_or(0), None),
+        // First scan of the source: defer the probe (see above).
+        None if source.last_full_scan_at.is_none() => (0, None),
         None => {
             let root_owned = root.to_path_buf();
             match tokio::task::spawn_blocking(move || probe_mtime_granularity(&root_owned)).await {
@@ -1798,8 +1812,10 @@ mod tests {
     }
 
     /// The scan reports the probed granularity via `ScanResult` when the source
-    /// has none persisted (the orchestrator persists it), and reports `None`
-    /// when the source already has a stored value (no re-probe).
+    /// has none persisted AND a prior scan exists (the orchestrator persists it),
+    /// and reports `None` when the source already has a stored value (no
+    /// re-probe). The first-scan deferral is covered by
+    /// [`first_scan_defers_probe_and_coarse_fallback`].
     #[tokio::test]
     async fn scan_reports_probe_only_when_unpersisted() {
         let dir = tempfile::tempdir().unwrap();
@@ -1807,19 +1823,89 @@ mod tests {
         write(&root.join("a.txt"), b"x");
         let state = FakeState::default();
 
-        // Unpersisted (None) => the scan probes and hands back Some(_).
+        // Unpersisted (None) but a prior scan exists => the scan probes and
+        // hands back Some(_).
         let mut src = source_at(root);
         src.mtime_granularity_ns = None;
+        src.last_full_scan_at = Some(1);
         let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
         assert_eq!(
             res.probed_granularity_ns,
             Some(0),
-            "an unprobed source is probed (fine, 0) and the result is surfaced"
+            "an unprobed source with a prior scan is probed (fine, 0) and surfaced"
         );
 
         // Already persisted => no re-probe, so nothing to hand back.
         src.mtime_granularity_ns = Some(0);
         let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
         assert_eq!(res.probed_granularity_ns, None);
+    }
+
+    /// Regression (chaos `frequent-edits`, PR #141): the FIRST scan of a source
+    /// (no completed scan yet) must NOT run the write-stat probe and must NOT
+    /// engage the coarse re-hash fallback - it is pure fast-path. Deferring the
+    /// probe keeps its latency + temp-file churn off the initial backup cycle,
+    /// where each path's first upload must commit cleanly; the probe runs from
+    /// the next scan. Before the deferral the probe ran inline on scan 1, and on
+    /// the windows-latest hermetic runner that first-scan cost tipped a
+    /// pre-existing create-during-upload race into a duplicate upload.
+    #[tokio::test]
+    async fn first_scan_defers_probe_and_coarse_fallback() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("a.txt");
+        write(&p, b"some-bytes");
+
+        // First scan: unprobed AND no prior completed scan.
+        let mut src = source_at(root);
+        src.mtime_granularity_ns = None;
+        assert!(src.last_full_scan_at.is_none(), "precondition: first scan");
+
+        // A stored row with the SAME (size, mtime) but a STALE hash. If the first
+        // scan probed-and-classified-coarse (or otherwise engaged the fallback)
+        // it would re-hash and flag this changed; the fast path must instead
+        // trust the stat match and emit nothing.
+        let (size, mtime) = stat_of(&p);
+        let state = FakeState::default();
+        state.put(row(
+            src.id,
+            "a.txt",
+            size,
+            mtime,
+            *blake3::hash(b"a-different-content").as_bytes(),
+        ));
+
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+        assert_eq!(
+            res.probed_granularity_ns, None,
+            "the first scan must not probe (nothing to persist)"
+        );
+        assert!(
+            res.new_or_changed.is_empty(),
+            "the first scan must be pure fast-path (no coarse fallback re-hash): {:?}",
+            res.new_or_changed
+        );
+        // The probe never ran, so no probe temp file was ever written.
+        let leaked: Vec<_> = fs::read_dir(root)
+            .unwrap()
+            .filter_map(|e| e.ok())
+            .filter(|e| {
+                e.file_name()
+                    .to_string_lossy()
+                    .starts_with(".driven-mtime-probe-")
+            })
+            .collect();
+        assert!(
+            leaked.is_empty(),
+            "no probe temp file on a deferred first scan"
+        );
+
+        // Once a scan has completed (last_full_scan_at set), the NEXT scan probes.
+        src.last_full_scan_at = Some(mtime / 1_000_000);
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+        assert!(
+            res.probed_granularity_ns.is_some(),
+            "the probe runs on the scan after the first"
+        );
     }
 }

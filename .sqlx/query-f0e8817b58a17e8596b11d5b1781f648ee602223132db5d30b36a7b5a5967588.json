@@ -1,10 +1,6 @@
 {
   "db_name": "SQLite",
-<<<<<<<< HEAD:.sqlx/query-ea24f36f62c84328655dbf258eb7422a1ac0bac4ea492559ec6229af2e94fe32.json
-  "query": "\n            SELECT\n                id                        AS \"id!: String\",\n                account_id                AS \"account_id!: String\",\n                display_name              AS \"display_name!: String\",\n                enabled                   AS \"enabled!: i64\",\n                local_path                AS \"local_path!: String\",\n                drive_folder_id           AS \"drive_folder_id!: String\",\n                drive_id                  AS \"drive_id: String\",\n                drive_folder_path         AS \"drive_folder_path!: String\",\n                encryption_enabled        AS \"encryption_enabled!: i64\",\n                wrapped_source_key        AS \"wrapped_source_key: Vec<u8>\",\n                respect_gitignore         AS \"respect_gitignore!: i64\",\n                include_patterns          AS \"include_patterns!: String\",\n                exclude_patterns          AS \"exclude_patterns!: String\",\n                placeholder_policy        AS \"placeholder_policy: String\",\n                schedule_json_v2_reserved AS \"schedule_json_v2_reserved: String\",\n                deep_verify_interval_secs AS \"deep_verify_interval_secs!: i64\",\n                last_full_scan_at         AS \"last_full_scan_at: i64\",\n                last_deep_verify_at       AS \"last_deep_verify_at: i64\",\n                created_at                AS \"created_at!: i64\"\n            FROM backup_sources\n            ORDER BY created_at ASC, id ASC\n            ",
-========
-  "query": "\n            SELECT\n                id                        AS \"id!: String\",\n                account_id                AS \"account_id!: String\",\n                display_name              AS \"display_name!: String\",\n                enabled                   AS \"enabled!: i64\",\n                local_path                AS \"local_path!: String\",\n                drive_folder_id           AS \"drive_folder_id!: String\",\n                drive_folder_path         AS \"drive_folder_path!: String\",\n                encryption_enabled        AS \"encryption_enabled!: i64\",\n                wrapped_source_key        AS \"wrapped_source_key: Vec<u8>\",\n                respect_gitignore         AS \"respect_gitignore!: i64\",\n                include_patterns          AS \"include_patterns!: String\",\n                exclude_patterns          AS \"exclude_patterns!: String\",\n                placeholder_policy        AS \"placeholder_policy: String\",\n                schedule_json_v2_reserved AS \"schedule_json_v2_reserved: String\",\n                deep_verify_interval_secs AS \"deep_verify_interval_secs!: i64\",\n                last_full_scan_at         AS \"last_full_scan_at: i64\",\n                last_deep_verify_at       AS \"last_deep_verify_at: i64\",\n                mtime_granularity_ns      AS \"mtime_granularity_ns: i64\",\n                created_at                AS \"created_at!: i64\"\n            FROM backup_sources\n            ORDER BY created_at ASC, id ASC\n            ",
->>>>>>>> a092fbd (feat(core): filesystem timestamp-granularity probe with ctime fallback and per-directory gitignore cascade):.sqlx/query-9bb8d62bf15caa9d869374db8c82ec622cae0d68d6cbe889121e44fb6f35b25f.json
+  "query": "\n            SELECT\n                id                        AS \"id!: String\",\n                account_id                AS \"account_id!: String\",\n                display_name              AS \"display_name!: String\",\n                enabled                   AS \"enabled!: i64\",\n                local_path                AS \"local_path!: String\",\n                drive_folder_id           AS \"drive_folder_id!: String\",\n                drive_id                  AS \"drive_id: String\",\n                drive_folder_path         AS \"drive_folder_path!: String\",\n                encryption_enabled        AS \"encryption_enabled!: i64\",\n                wrapped_source_key        AS \"wrapped_source_key: Vec<u8>\",\n                respect_gitignore         AS \"respect_gitignore!: i64\",\n                include_patterns          AS \"include_patterns!: String\",\n                exclude_patterns          AS \"exclude_patterns!: String\",\n                placeholder_policy        AS \"placeholder_policy: String\",\n                schedule_json_v2_reserved AS \"schedule_json_v2_reserved: String\",\n                deep_verify_interval_secs AS \"deep_verify_interval_secs!: i64\",\n                last_full_scan_at         AS \"last_full_scan_at: i64\",\n                last_deep_verify_at       AS \"last_deep_verify_at: i64\",\n                mtime_granularity_ns      AS \"mtime_granularity_ns: i64\",\n                created_at                AS \"created_at!: i64\"\n            FROM backup_sources\n            ORDER BY created_at ASC, id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -206,13 +202,8 @@
         }
       },
       {
-<<<<<<<< HEAD:.sqlx/query-ea24f36f62c84328655dbf258eb7422a1ac0bac4ea492559ec6229af2e94fe32.json
-        "name": "created_at!: i64",
-        "ordinal": 18,
-========
         "name": "mtime_granularity_ns: i64",
-        "ordinal": 17,
->>>>>>>> a092fbd (feat(core): filesystem timestamp-granularity probe with ctime fallback and per-directory gitignore cascade):.sqlx/query-9bb8d62bf15caa9d869374db8c82ec622cae0d68d6cbe889121e44fb6f35b25f.json
+        "ordinal": 18,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -223,7 +214,7 @@
       },
       {
         "name": "created_at!: i64",
-        "ordinal": 18,
+        "ordinal": 19,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -259,9 +250,5 @@
       false
     ]
   },
-<<<<<<<< HEAD:.sqlx/query-ea24f36f62c84328655dbf258eb7422a1ac0bac4ea492559ec6229af2e94fe32.json
-  "hash": "ea24f36f62c84328655dbf258eb7422a1ac0bac4ea492559ec6229af2e94fe32"
-========
-  "hash": "9bb8d62bf15caa9d869374db8c82ec622cae0d68d6cbe889121e44fb6f35b25f"
->>>>>>>> a092fbd (feat(core): filesystem timestamp-granularity probe with ctime fallback and per-directory gitignore cascade):.sqlx/query-9bb8d62bf15caa9d869374db8c82ec622cae0d68d6cbe889121e44fb6f35b25f.json
+  "hash": "f0e8817b58a17e8596b11d5b1781f648ee602223132db5d30b36a7b5a5967588"
 }
