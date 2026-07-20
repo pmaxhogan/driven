@@ -61,6 +61,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     global: {
       autoStartOnLogin: false,
       defaultConcurrentUploads: null,
+      adaptiveParallelismEnabled: true,
       bandwidthCapMbps: null,
       skipOnBattery: true,
       skipOnMetered: true,

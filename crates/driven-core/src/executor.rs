@@ -39,7 +39,6 @@ use driven_drive::remote_store::{
 use driven_vss::{fallback_decision, FallbackDecision, OpenAttempt, SnapshotOutcome, VssMode};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use tokio::sync::Semaphore;
 use tracing::{debug, warn};
 
 use crate::network::{NetworkProbe, ServiceName};
@@ -777,16 +776,6 @@ impl RemoteStore for BreakerReportingStore {
 // DefaultExecutor
 // -----------------------------------------------------------------------------
 
-/// The number of in-flight files permitted concurrently (DESIGN s11.4.2:
-/// `min(available_parallelism * 2, 16)`, hard cap 32). Computed once at
-/// construction.
-fn default_pool_size() -> usize {
-    let par = std::thread::available_parallelism()
-        .map(|n| n.get())
-        .unwrap_or(4);
-    (par.saturating_mul(2)).min(16).clamp(1, 32)
-}
-
 /// Test-only hook fired exactly once, between the pre-open `lstat`/open and
 /// the post-read `fstat` identity check, so a test can deterministically
 /// mutate or replace the file on disk and exercise the
@@ -806,8 +795,8 @@ type PostUploadHook = Arc<dyn Fn(&Path) + Send + Sync>;
 
 /// The production [`Executor`] (SPEC s8, DESIGN s5.4 / s5.6 / s11.4).
 ///
-/// Holds the injected seams plus an [`UploadPool`](Semaphore) bounding
-/// in-flight files (DESIGN s11.4.2) and a [`Clock`] for the timestamps
+/// Holds the injected seams plus an [`UploadPool`](crate::adaptive::UploadPool)
+/// bounding in-flight files (DESIGN s11.4.2) and a [`Clock`] for the timestamps
 /// written into `file_state` / `pending_ops`. Cheap to clone-by-`Arc`
 /// internally; the orchestrator holds it behind `Arc<dyn Executor>`.
 pub struct DefaultExecutor {
@@ -827,8 +816,18 @@ pub struct DefaultExecutor {
     /// Per-cycle VSS snapshot provider (ROADMAP M3.5), or `None` to disable
     /// the locked-file fallback (then a locked file is skipped as before).
     vss: Option<Arc<dyn driven_vss::VssProvider>>,
-    /// Inter-file concurrency gate (DESIGN s11.4.2). `acquire`d per op.
-    pool: Arc<Semaphore>,
+    /// Inter-file concurrency gate (DESIGN s11.4.2), RESIZABLE by the adaptive
+    /// controller (DESIGN s11.4.7). `acquire`d per op; the executor never resizes
+    /// it (that is the controller's job via the SAME shared `Arc`). Constructed
+    /// at the default size unless the app injects a pre-sized pool via
+    /// [`Self::with_upload_pool`].
+    pool: Arc<crate::adaptive::UploadPool>,
+    /// Aggregate-upload-throughput accumulator (DESIGN s11.4.7), or `None` when
+    /// adaptive parallelism is not wired (every test that does not exercise it +
+    /// the chaos harness). When `Some`, each completed upload records its byte
+    /// count here for the controller's throughput window. Mirrors the
+    /// `latency` reservoir seam.
+    throughput: Option<Arc<crate::adaptive::ThroughputProbe>>,
     /// Test-only peak-memory gauge for the streaming pipeline (P1-4
     /// acceptance). `None` in production (zero overhead beyond an
     /// `Option::is_none` check per chunk). Exposed via the doc-hidden
@@ -897,7 +896,7 @@ impl DefaultExecutor {
     /// Builds a [`DefaultExecutor`] with an explicit [`Clock`] (tests
     /// inject a `FakeClock` so the timestamps are deterministic).
     pub fn with_clock(deps: ExecutorDeps, clock: Arc<dyn Clock>) -> Self {
-        let pool = Arc::new(Semaphore::new(default_pool_size()));
+        let pool = crate::adaptive::UploadPool::new(crate::adaptive::default_pool_size());
         // CODEX_NOTES P2-9: when a NetworkProbe is injected, route every Drive
         // request through the BreakerReportingStore so the Drive circuit
         // breaker is driven by REAL request outcomes (not just probes). When
@@ -920,6 +919,7 @@ impl DefaultExecutor {
             clock,
             vss: deps.vss,
             pool,
+            throughput: None,
             mem_gauge: None,
             latency: None,
             #[cfg(test)]
@@ -941,6 +941,27 @@ impl DefaultExecutor {
         reservoir: Arc<crate::telemetry::LatencyReservoir>,
     ) -> Self {
         self.latency = Some(reservoir);
+        self
+    }
+
+    /// Inject the resizable [`UploadPool`](crate::adaptive::UploadPool) the
+    /// adaptive controller (DESIGN s11.4.7) also holds, sized at the account's
+    /// `default_concurrent_uploads` setting. The app wires the SAME `Arc` here
+    /// and into the controller so a resize is seen by this executor's acquire
+    /// path. Every other construction path keeps the default-sized internal pool.
+    #[must_use]
+    pub fn with_upload_pool(mut self, pool: Arc<crate::adaptive::UploadPool>) -> Self {
+        self.pool = pool;
+        self
+    }
+
+    /// Attach the [`ThroughputProbe`](crate::adaptive::ThroughputProbe) the
+    /// adaptive controller drains (DESIGN s11.4.7). Mirrors
+    /// [`Self::with_latency_reservoir`]: each completed upload records its byte
+    /// count into the probe. `None` (the default) makes the record a no-op.
+    #[must_use]
+    pub fn with_throughput_probe(mut self, probe: Arc<crate::adaptive::ThroughputProbe>) -> Self {
+        self.throughput = Some(probe);
         self
     }
 
@@ -1209,6 +1230,11 @@ impl DefaultExecutor {
         source: &SourceRow,
         relative_path: &RelativePath,
         size: u64,
+        // F2: per-op accumulator of wire bytes already credited to the
+        // throughput probe during a resumable stream (chunk-granular). The
+        // completion site subtracts it so those bytes are not counted twice; left
+        // at 0 for every non-streamed path.
+        recorded: &std::sync::atomic::AtomicU64,
     ) -> anyhow::Result<OpOutcome> {
         // --- GA-critical FAIL-CLOSED crypto resolution (M5, DESIGN s7) ------
         // Resolve this source's suite FIRST, before opening the file or
@@ -1369,6 +1395,7 @@ impl DefaultExecutor {
                 from_vss,
                 crypto,
                 version_supersede,
+                recorded,
             )
             .await;
 
@@ -1770,6 +1797,10 @@ impl DefaultExecutor {
         // object, and the old object is trashed. `None` for a normal create /
         // in-place update.
         version: Option<VersionSupersede>,
+        // F2: threaded through to the resumable streamer so each acked wire chunk
+        // credits the throughput probe as it lands; the op's completion site
+        // subtracts this to avoid double-counting. 0 for non-streamed paths.
+        recorded: &std::sync::atomic::AtomicU64,
     ) -> Result<OpOutcome, UploadError> {
         // M3.5: every FS recheck below reads the EFFECTIVE path (the VSS
         // snapshot copy for a locked file), so a frozen-vs-live stat mismatch
@@ -1846,6 +1877,7 @@ impl DefaultExecutor {
                 &mut payload,
                 allow_resumable,
                 crypto.clone(),
+                recorded,
             )
             .await?
         } else {
@@ -2134,6 +2166,9 @@ impl DefaultExecutor {
         // plaintext. Resolved (FAIL-CLOSED) per op by the caller; owned so the
         // cpu stage can move it.
         crypto: Option<Arc<dyn SourceCryptoSuite>>,
+        // F2: see `hash_then_upload` - wire bytes credited per chunk are added
+        // here so the op's completion site can avoid double-counting them.
+        recorded: &std::sync::atomic::AtomicU64,
     ) -> Result<UploadProduct, UploadError> {
         // Predict the exact number of bytes that will be sent to Drive.
         let encrypted = crypto.is_some();
@@ -2169,6 +2204,7 @@ impl DefaultExecutor {
             op_id,
             payload,
             allow_resumable,
+            recorded,
         );
 
         // Run all three concurrently. The cpu stage returns (blake3, md5);
@@ -2249,6 +2285,9 @@ impl DefaultExecutor {
         // P1-B: false for a VSS-snapshot read - never open a resumable session,
         // stream as a single simple upload even above RESUMABLE_THRESHOLD.
         allow_resumable: bool,
+        // F2: only the resumable branch streams per-chunk and credits `recorded`;
+        // the simple branch is a single request counted whole at op completion.
+        recorded: &std::sync::atomic::AtomicU64,
     ) -> Result<RemoteEntry, UploadError> {
         if allow_resumable && total >= RESUMABLE_THRESHOLD {
             self.upload_stage_resumable(
@@ -2259,6 +2298,7 @@ impl DefaultExecutor {
                 out_rx,
                 op_id,
                 payload,
+                recorded,
             )
             .await
         } else {
@@ -2349,6 +2389,9 @@ impl DefaultExecutor {
         mut out_rx: tokio::sync::mpsc::Receiver<Bytes>,
         op_id: PendingOpId,
         payload: &mut PendingOpPayload,
+        // F2: each acked wire chunk credits its bytes here (and to the throughput
+        // probe) as it lands, for in-window throughput on multi-window files.
+        recorded: &std::sync::atomic::AtomicU64,
     ) -> Result<RemoteEntry, UploadError> {
         let session = self
             .open_resumable_session(target, existing_file_id, mime, total, op_id, payload)
@@ -2376,7 +2419,7 @@ impl DefaultExecutor {
                         let wire = Bytes::copy_from_slice(&acc[..WIRE_CHUNK]);
                         acc.drain(..WIRE_CHUNK);
                         match self
-                            .push_one_wire_chunk(&session, offset, wire, op_id, payload)
+                            .push_one_wire_chunk(&session, offset, wire, op_id, payload, recorded)
                             .await?
                         {
                             PushOne::Acked(new_off) => offset = new_off,
@@ -2414,7 +2457,7 @@ impl DefaultExecutor {
             let wire = Bytes::copy_from_slice(&acc[..take]);
             acc.drain(..take);
             match self
-                .push_one_wire_chunk(&session, offset, wire, op_id, payload)
+                .push_one_wire_chunk(&session, offset, wire, op_id, payload, recorded)
                 .await?
             {
                 PushOne::Acked(new_off) => offset = new_off,
@@ -2447,6 +2490,8 @@ impl DefaultExecutor {
         wire: Bytes,
         op_id: PendingOpId,
         payload: &mut PendingOpPayload,
+        // F2: this chunk's wire bytes are credited here once Drive accepts it.
+        recorded: &std::sync::atomic::AtomicU64,
     ) -> Result<PushOne, UploadError> {
         let wire_len = wire.len() as u64;
         self.pacer.permit_request().await;
@@ -2504,6 +2549,16 @@ impl DefaultExecutor {
         if let Some(g) = self.mem_gauge.as_ref() {
             g.sub(wire_len);
         }
+        // F2: credit these wire bytes to the CURRENT throughput window as the
+        // chunk lands - not all at op completion - so a large file spanning
+        // multiple 30 s windows reports real in-window throughput instead of a
+        // completion-time spike (and 0-byte windows in between). `recorded`
+        // accumulates the same bytes so the op's completion site subtracts them
+        // and never double-counts.
+        if let Some(probe) = self.throughput.as_ref() {
+            probe.record_bytes(wire_len);
+        }
+        recorded.fetch_add(wire_len, std::sync::atomic::Ordering::Relaxed);
         match progress {
             ResumeProgress::Completed(entry) => Ok(PushOne::Done(entry)),
             ResumeProgress::InProgress { received } => {
@@ -4532,6 +4587,11 @@ impl<'a> ExecOne<'a> {
             Op::Trash { .. } => None,
         };
 
+        // F2: per-op tally of wire bytes already credited to the throughput probe
+        // mid-upload (chunk-granular, resumable path only). Stays 0 for every
+        // non-streamed path, so the completion site below credits the whole file.
+        let recorded = std::sync::atomic::AtomicU64::new(0);
+
         let out = match op {
             Op::HashThenUpload {
                 source_id,
@@ -4540,7 +4600,7 @@ impl<'a> ExecOne<'a> {
             } => {
                 debug_assert_eq!(*source_id, self.source.id);
                 self.this
-                    .hash_then_upload(self.source, relative_path, *size)
+                    .hash_then_upload(self.source, relative_path, *size, &recorded)
                     .await
             }
             Op::Trash {
@@ -4559,22 +4619,37 @@ impl<'a> ExecOne<'a> {
             }
         };
 
-        // Record the completed upload's per-MiB latency (DESIGN s13). Only a
-        // successful upload that moved bytes contributes a sample: a Done-Upload
-        // carries the uploaded byte count, a BundleDone carries the bundle object
-        // size; a trash, skip, or failure records nothing.
-        if let (Some(reservoir), Some(started)) = (self.this.latency.as_ref(), upload_timer) {
-            if let Ok(outcome) = &out {
-                let bytes = match outcome {
-                    OpOutcome::Done {
-                        kind: DoneKind::Upload,
-                        bytes: Some(bytes),
-                        ..
-                    } => Some(*bytes),
-                    OpOutcome::BundleDone { bytes, .. } => Some(*bytes),
-                    _ => None,
-                };
-                if let Some(bytes) = bytes {
+        // Record completed-upload metrics. Only a successful upload that moved
+        // bytes contributes: a Done-Upload carries the uploaded byte count, a
+        // BundleDone the bundle-object size; a trash, skip, or failure records
+        // nothing. Two independent sinks read the same byte count:
+        //   - the ThroughputProbe (adaptive parallelism, DESIGN s11.4.7) - fed
+        //     unconditionally whenever it is wired, no timer needed; and
+        //   - the per-MiB latency reservoir (DESIGN s13) - only when armed +
+        //     enabled (its `upload_timer` is `Some`).
+        if let Ok(outcome) = &out {
+            let bytes = match outcome {
+                OpOutcome::Done {
+                    kind: DoneKind::Upload,
+                    bytes: Some(bytes),
+                    ..
+                } => Some(*bytes),
+                OpOutcome::BundleDone { bytes, .. } => Some(*bytes),
+                _ => None,
+            };
+            if let Some(bytes) = bytes {
+                if let Some(probe) = self.this.throughput.as_ref() {
+                    // F2: subtract the bytes already credited per-chunk during a
+                    // resumable stream (`push_one_wire_chunk`), so a large
+                    // multi-window file is not counted twice. Non-streamed ops
+                    // (small / simple-band / VSS single-shot / bundle) left
+                    // `recorded` at 0, so the whole file is credited here, in its
+                    // completion window.
+                    let streamed = recorded.load(std::sync::atomic::Ordering::Relaxed);
+                    probe.record_bytes(bytes.saturating_sub(streamed));
+                }
+                if let (Some(reservoir), Some(started)) = (self.this.latency.as_ref(), upload_timer)
+                {
                     let elapsed_ms =
                         u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
                     if let Some(per_mb) = crate::telemetry::per_mb_ms(elapsed_ms, bytes) {

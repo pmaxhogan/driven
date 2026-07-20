@@ -19,3 +19,4 @@ pretty_assertions = "1"
 driven-core = { path = "../driven-core" }
 driven-drive = { path = "../driven-drive" }
 driven-power = { path = "../driven-power" }
+driven-diskstat = { path = "../driven-diskstat" }

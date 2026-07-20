@@ -197,6 +197,18 @@ pub struct OrchestratorConfig {
     /// [`MeteredMode::Throttle`]. `None` falls back to the normal
     /// [`bandwidth_cap_mbps`](Self::bandwidth_cap_mbps).
     pub metered_bandwidth_cap_mbps: Option<u32>,
+    /// Starting in-flight-file pool size (DESIGN s11.4.2 / s11.4.7), or `None`
+    /// to auto-pick `min(available_parallelism * 2, 16)`. The app wires this
+    /// into the executor's [`UploadPool`](crate::adaptive::UploadPool) as its
+    /// START size; with adaptive parallelism ON it then floats within
+    /// `[1, 32]`, and with it OFF the pool stays fixed here. (`default_concurrent_uploads`
+    /// in the SPEC s22 settings.)
+    pub default_concurrent_uploads: Option<u32>,
+    /// Whether the adaptive upload-parallelism controller runs (DESIGN s11.4.7).
+    /// `true` (default) builds the controller so the pool adapts; `false` is the
+    /// kill-switch - the pool stays FIXED at
+    /// [`default_concurrent_uploads`](Self::default_concurrent_uploads).
+    pub adaptive_parallelism_enabled: bool,
 }
 
 /// What Driven does on a metered network when
@@ -244,6 +256,8 @@ impl Default for OrchestratorConfig {
             hook_timeout_secs: 60,
             metered_mode: MeteredMode::Pause,
             metered_bandwidth_cap_mbps: None,
+            default_concurrent_uploads: None,
+            adaptive_parallelism_enabled: true,
         }
     }
 }
@@ -440,6 +454,13 @@ pub struct SyncOrchestrator {
     /// (via [`crate::executor::DefaultExecutor::with_latency_reservoir`]) for the
     /// upload-per-MB metric. Set via [`Self::with_latency_reservoir`].
     latency: Option<Arc<crate::telemetry::LatencyReservoir>>,
+    /// Adaptive upload-parallelism controller (DESIGN s11.4.7), or `None` when
+    /// adaptive parallelism is disabled (`adaptive_parallelism_enabled = false`)
+    /// or not wired (tests / chaos harness). When `Some`, the run loop ticks it
+    /// every [`crate::adaptive::SAMPLE_INTERVAL`] so it can sample the disk and,
+    /// once per throughput window, resize the SAME [`UploadPool`](crate::adaptive::UploadPool)
+    /// the executor acquires from. Set via [`Self::with_adaptive_controller`].
+    adaptive: Option<Arc<crate::adaptive::AdaptiveController>>,
 }
 
 impl SyncOrchestrator {
@@ -491,7 +512,25 @@ impl SyncOrchestrator {
             orphan_cleanup_done: Mutex::new(false),
             suspended: std::sync::atomic::AtomicBool::new(false),
             latency: None,
+            adaptive: None,
         }
+    }
+
+    /// Attach the adaptive upload-parallelism controller (DESIGN s11.4.7). The
+    /// controller resizes the SAME [`UploadPool`](crate::adaptive::UploadPool)
+    /// the executor acquires from (wired via
+    /// [`DefaultExecutor::with_upload_pool`](crate::executor::DefaultExecutor::with_upload_pool))
+    /// and drains the SAME [`ThroughputProbe`](crate::adaptive::ThroughputProbe)
+    /// the executor feeds. When present, the run loop ticks it every
+    /// [`crate::adaptive::SAMPLE_INTERVAL`]; when absent (the kill-switch is off,
+    /// or a test), the pool stays fixed at its construction size.
+    #[must_use]
+    pub fn with_adaptive_controller(
+        mut self,
+        controller: Arc<crate::adaptive::AdaptiveController>,
+    ) -> Self {
+        self.adaptive = Some(controller);
+        self
     }
 
     /// Attach the app-global latency reservoir (DESIGN s13 telemetry) so each
@@ -1992,6 +2031,46 @@ impl Orchestrator for SyncOrchestrator {
         // trigger or the next period drives the first real cycle).
         scheduled.tick().await;
 
+        // Adaptive upload-parallelism sampler (DESIGN s11.4.7 / s18.2). Spawned
+        // as a SEPARATE task - NOT a run-loop select arm - so it keeps ticking
+        // every SAMPLE_INTERVAL WHILE a cycle runs. A sync cycle is awaited INLINE
+        // below (the single-in-flight guard), so a select arm could only fire in
+        // the gaps BETWEEN cycles - starving the controller during the exact
+        // long-backup workload it targets (F1: DESIGN 11.4.7's pathological
+        // "16 in flight but Drive's edge is overloaded" case IS one long cycle).
+        // The task owns an `Arc<AdaptiveController>` whose seams are all
+        // `Arc`/`dyn` (pool, probe, pacer, clock, disk) - it borrows nothing of
+        // the orchestrator's `&self` - and resizes the SAME `Arc<UploadPool>` the
+        // executor (running inside the inline cycle, on a different task) acquires
+        // from. That cross-task resize is race-free: the pool is a `Semaphore`,
+        // the probe/pacer are atomics, and the controller's `WindowState` is
+        // touched only by this one sampler task. It observes the shared shutdown
+        // signal for a prompt cooperative stop (bounded by the <=100 ms shrink
+        // acquire) and is JOINED before `run` returns (below), so it can never be
+        // orphaned. Spawned only when a controller is wired (kill-switch on);
+        // disabled = no task at all.
+        let adaptive_sampler = self.adaptive.clone().map(|ctrl| {
+            let mut sampler_shutdown = self.shutdown_rx.clone();
+            tokio::spawn(async move {
+                let mut ticker = tokio::time::interval(crate::adaptive::SAMPLE_INTERVAL);
+                ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
+                ticker.tick().await; // consume the immediate first tick
+                loop {
+                    tokio::select! {
+                        _ = ticker.tick() => ctrl.tick().await,
+                        res = sampler_shutdown.changed() => {
+                            // Flip-to-set or sender-drop: stop cooperatively. (The
+                            // suspended-exit path, which never sets this signal, is
+                            // covered by the abort-join after the run loop.)
+                            if res.is_err() || *sampler_shutdown.borrow() {
+                                break;
+                            }
+                        }
+                    }
+                }
+            })
+        });
+
         loop {
             // Pick the next wake. Each arm yields an `Option<TickSource>`:
             // `Some(tick)` runs a cycle; `None` means "loop control only"
@@ -2123,6 +2202,18 @@ impl Orchestrator for SyncOrchestrator {
                     break;
                 }
             }
+        }
+
+        // Drain the adaptive sampler (F1): `run` never returns while it is still
+        // alive, so it can never be orphaned. A normal shutdown already told it to
+        // stop via the shared signal; the suspended-exit path (invalid_grant) did
+        // not, so `abort` covers both. Aborting mid-tick is safe - the
+        // `WindowState` mutex is dropped before any await, and a cancelled
+        // `shrink().await` forgets no permit, so the pool's accounting stays
+        // consistent.
+        if let Some(handle) = adaptive_sampler {
+            handle.abort();
+            let _ = handle.await;
         }
 
         Ok(())
@@ -5119,5 +5210,113 @@ mod tests {
             .expect("run loop must exit promptly on shutdown")
             .expect("join");
         assert!(result.is_ok(), "clean shutdown returns Ok(())");
+    }
+
+    #[tokio::test(start_paused = true)]
+    async fn adaptive_sampler_resizes_pool_during_an_inflight_cycle() {
+        // F1: the controller must keep sampling WHILE a sync cycle runs, not only
+        // in the gaps between cycles. A cycle is awaited INLINE in the run loop,
+        // so the old select-arm tick could never fire mid-cycle - exactly the
+        // long-backup workload the controller targets. Here a `BlockingExecutor`
+        // pins a cycle in-flight; the SPAWNED sampler must still tick and RESIZE
+        // the shared pool before the cycle is released. This proves sampler
+        // LIVENESS during a cycle (the regression F1 fixes); the byte/throughput
+        // math is covered by the `adaptive.rs` unit tests + the e2e transition
+        // test, so this window's throughput + contention are injected directly
+        // into the shared pool/probe rather than driven through the blocked
+        // executor.
+        use crate::adaptive::{AdaptiveController, ThroughputProbe, UploadPool, WINDOW};
+        use driven_test_fixtures::diskstat::FakeDiskBusyProbe;
+
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let mut src = source_in(account, dir.path());
+        src.last_deep_verify_at = None;
+        src.last_full_scan_at = None;
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+
+        // The SAME pool + probe the controller resizes (the executor would acquire
+        // from it in production) and the injected clock the window math reads.
+        let pool = UploadPool::new(4);
+        let probe = ThroughputProbe::new();
+        let clock = Arc::new(FakeClock::new());
+        let disk = Arc::new(FakeDiskBusyProbe::not_saturated());
+        let pacer = Arc::new(crate::pacer::AimdPacer::new(clock.clone(), None));
+        let ctrl = Arc::new(AdaptiveController::new(
+            pool.clone(),
+            probe.clone(),
+            disk,
+            pacer,
+            clock.clone(),
+        ));
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        let exec = Arc::new(BlockingExecutor {
+            executes: Arc::new(AtomicU64::new(0)),
+            entered_tx,
+            release_rx: tokio::sync::Mutex::new(release_rx),
+        });
+
+        let orch = Arc::new(
+            SyncOrchestrator::new(
+                account,
+                state,
+                exec,
+                Arc::new(FakePowerSource::new(power_on_ac())),
+                Arc::new(FakeNet::online()),
+                clock.clone(),
+                OrchestratorConfig::default(),
+            )
+            .with_adaptive_controller(ctrl),
+        );
+
+        let handle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run().await })
+        };
+        orch.trigger(TickSource::Manual).await;
+
+        // Wait until the cycle is IN-FLIGHT (blocked inside `execute`).
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("a cycle must enter execute")
+            .expect("entered channel open");
+
+        // Inject one representative window's worth of throughput + contention into
+        // the SHARED pool/probe, then advance the injected clock a full window so
+        // the next sampler tick reaches a decision boundary. (Earlier sampler ticks
+        // ran with the clock still at 0 and returned before the window boundary, so
+        // they neither decided nor drained this state.)
+        probe.record_bytes(64 * 1024 * 1024);
+        let held: Vec<_> = (0..pool.target())
+            .filter_map(|_| pool.try_acquire_owned())
+            .collect();
+        let _ =
+            tokio::time::timeout(std::time::Duration::from_millis(5), pool.acquire_owned()).await;
+        drop(held);
+        clock.advance(WINDOW);
+
+        // Let the SPAWNED sampler run while the cycle is still blocked: under
+        // `start_paused`, sleeping parks the test so tokio auto-advances virtual
+        // time, firing the sampler's SAMPLE_INTERVAL ticks; the first tick past the
+        // injected window boundary is a bootstrap Grow on the shared pool.
+        tokio::time::sleep(WINDOW).await;
+
+        // The resize happened DURING the in-flight cycle: the executor is still
+        // blocked (we have not sent `release_tx` yet), so this is unambiguously a
+        // mid-cycle resize, which the pre-F1 select-arm tick could never do.
+        assert!(
+            pool.target() > 4,
+            "the adaptive sampler must resize the pool DURING an in-flight cycle \
+             (F1); pool stayed at {}",
+            pool.target()
+        );
+
+        // Release the cycle and shut down cleanly; `run` joins the sampler on exit.
+        let _ = release_tx.send(());
+        orch.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), handle).await;
     }
 }

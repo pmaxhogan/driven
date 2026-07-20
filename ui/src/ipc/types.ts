@@ -194,6 +194,8 @@ export interface ScheduleSettings {
 export interface GlobalSettings {
   autoStartOnLogin: boolean;
   defaultConcurrentUploads: number | null;
+  /** Whether the adaptive upload-parallelism controller runs (DESIGN 11.4.7). */
+  adaptiveParallelismEnabled: boolean;
   bandwidthCapMbps: number | null;
   skipOnBattery: boolean;
   skipOnMetered: boolean;
@@ -272,6 +274,7 @@ export interface SettingsDto {
 export interface GlobalSettingsPatch {
   autoStartOnLogin?: boolean;
   defaultConcurrentUploads?: number | null;
+  adaptiveParallelismEnabled?: boolean;
   bandwidthCapMbps?: number | null;
   skipOnBattery?: boolean;
   skipOnMetered?: boolean;

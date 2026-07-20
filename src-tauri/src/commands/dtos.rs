@@ -34,6 +34,13 @@ where
     Deserialize::deserialize(deserializer).map(Some)
 }
 
+/// `serde(default)` helper: a bool field absent from a persisted blob defaults to
+/// `true`. Used for opt-out flags like `adaptive_parallelism_enabled` so a
+/// settings blob written before the field existed reads as enabled.
+fn default_true() -> bool {
+    true
+}
+
 // -----------------------------------------------------------------------------
 // Accounts (SPEC s11.1)
 // -----------------------------------------------------------------------------
@@ -412,8 +419,16 @@ pub struct SettingsDto {
 pub struct GlobalSettings {
     /// Launch Driven on login.
     pub auto_start_on_login: bool,
-    /// `null` = auto-pick concurrency; else a user override `1..=32`.
+    /// `null` = auto-pick concurrency; else a user override `1..=32`. With
+    /// [`Self::adaptive_parallelism_enabled`] on this is the STARTING pool size
+    /// (it then floats within `1..=32`); with it off the pool is fixed here.
     pub default_concurrent_uploads: Option<u32>,
+    /// Whether the adaptive upload-parallelism controller runs (DESIGN s11.4.7).
+    /// `true` (default) lets the in-flight pool grow/shrink with measured
+    /// throughput + disk-busy; `false` pins it at
+    /// [`Self::default_concurrent_uploads`].
+    #[serde(default = "default_true")]
+    pub adaptive_parallelism_enabled: bool,
     /// `null` = unlimited; else the cap in megabits/sec.
     pub bandwidth_cap_mbps: Option<u32>,
     /// Skip sync while on battery.
@@ -590,6 +605,8 @@ pub struct GlobalSettingsPatch {
     /// key `None` ("leave unchanged").
     #[serde(default, deserialize_with = "double_option")]
     pub default_concurrent_uploads: Option<Option<u32>>,
+    /// See [`GlobalSettings::adaptive_parallelism_enabled`]. Present = set it.
+    pub adaptive_parallelism_enabled: Option<bool>,
     /// See [`GlobalSettings::bandwidth_cap_mbps`]. `double_option`: `null` =
     /// `Some(None)` ("reset to unlimited").
     #[serde(default, deserialize_with = "double_option")]

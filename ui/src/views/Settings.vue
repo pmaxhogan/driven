@@ -304,6 +304,14 @@ async function commitConcurrentUploads(): Promise<void> {
   });
 }
 
+// DESIGN 11.4.7: adaptive upload parallelism (default ON). When on, the
+// in-flight pool grows/shrinks with measured throughput + disk-busy starting
+// from the concurrency setting above; when off, the pool is pinned at it.
+async function setAdaptiveParallelism(event: Event): Promise<void> {
+  const checked = (event.target as HTMLInputElement).checked;
+  await commitPatch({ global: { adaptiveParallelismEnabled: checked } });
+}
+
 async function commitScanInterval(event: Event): Promise<void> {
   const current = settings.settings?.global.scanIntervalSecs ?? 600;
   const value = parseRequiredClamped(
@@ -688,6 +696,20 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
               @change="commitConcurrentUploads"
             />
           </label>
+
+          <label class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              class="accent-teal-600"
+              data-testid="adaptive-parallelism-toggle"
+              :checked="settings.settings.global.adaptiveParallelismEnabled"
+              @change="setAdaptiveParallelism"
+            />
+            {{ t("settings.rules.adaptiveParallelismLabel") }}
+          </label>
+          <p class="text-xs text-zinc-500 dark:text-zinc-400">
+            {{ t("settings.rules.adaptiveParallelismNote") }}
+          </p>
 
           <label class="block space-y-1">
             <span class="text-zinc-600 dark:text-zinc-400">{{
