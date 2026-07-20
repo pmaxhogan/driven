@@ -861,8 +861,14 @@ dashboard. The user is never left wondering "is it stuck or working?".
 - **Detect & route around per-route IP-blacklisting.** If Google Drive
   is blocked at the network layer (corporate firewall, regional
   block), we treat that as "Drive unreachable" — Driven is not a VPN.
-- **Proxy autodetection (PAC).** V1 honours `HTTP_PROXY`/`HTTPS_PROXY`
-  env vars via `reqwest`'s built-in support; PAC and SOCKS are V2.
+- **Proxy autodetection (PAC).** V1 honoured `HTTP_PROXY`/`HTTPS_PROXY`
+  env vars via `reqwest`'s built-in support only. Implemented in V2 (issue
+  #34): a proxy setting (`system` | `none` | `manual` | `pac`) routes ALL
+  outbound clients through `driven_tls::apply_proxy` - a manual
+  `http`/`https`/`socks5`/`socks5h` URL, or a PAC file evaluated per-URL by
+  an embedded JS engine (`boa_engine`). Fail-closed: a configured-but-broken
+  proxy is rejected at settings-save and at client build, never silently
+  downgraded to a direct connection.
 - **mTLS / corporate-CA bundles.** V1 uses the OS's trust store via
   `rustls-native-certs`; pinning a corporate CA bundle is V2.
 

@@ -701,6 +701,9 @@ async fn build_restore_plans(
     let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
         .await
         .unwrap_or_default();
+    // Issue #34: resolve the proxy once too (fail-closed - a broken proxy blocks
+    // the restore rather than downloading direct).
+    let proxy = crate::commands::settings::load_proxy_config(state.state().as_ref()).await?;
     for r in resolved {
         let source = sources
             .iter()
@@ -715,7 +718,8 @@ async fn build_restore_plans(
         let store = match store_cache.get(&account_id) {
             Some(s) => s.clone(),
             None => {
-                let s = crate::commands::sources::build_restore_store(state, account_id, &ca)?;
+                let s =
+                    crate::commands::sources::build_restore_store(state, account_id, &ca, &proxy)?;
                 store_cache.insert(account_id, s.clone());
                 s
             }

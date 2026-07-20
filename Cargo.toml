@@ -66,6 +66,11 @@ reqwest = { version = "0.12", default-features = false, features = [
     "rustls-tls-native-roots",
     "http2",
     "stream",
+    # Issue #34 (SOCKS5 + PAC proxy support): the `socks` feature enables
+    # `socks5://` and `socks5h://` proxy URLs on `reqwest::Proxy` (the `h`
+    # variant does proxy-side DNS). Off by default; required for manual SOCKS5
+    # proxies and any PAC decision that returns a SOCKS proxy.
+    "socks",
 ] }
 # M3 encryption (DESIGN s7): XChaCha20-Poly1305 STREAM for content +
 # single-shot for filenames; BIP39 recovery phrase over the master key;

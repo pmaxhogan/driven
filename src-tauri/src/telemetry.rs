@@ -564,13 +564,16 @@ pub struct HttpTelemetrySink {
     /// Issue #34: the custom root CA (resolved once at task spawn) added to every
     /// telemetry POST client. Empty = system trust only.
     ca: driven_tls::CustomCaConfig,
+    /// Issue #34: the proxy config (resolved once at task spawn) applied to every
+    /// telemetry POST client. Default = honour env proxies.
+    proxy: driven_tls::ProxyConfig,
 }
 
 impl HttpTelemetrySink {
-    /// Build the sink with the resolved custom-CA config (issue #34).
+    /// Build the sink with the resolved custom-CA + proxy config (issue #34).
     #[must_use]
-    pub fn new(ca: driven_tls::CustomCaConfig) -> Self {
-        Self { ca }
+    pub fn new(ca: driven_tls::CustomCaConfig, proxy: driven_tls::ProxyConfig) -> Self {
+        Self { ca, proxy }
     }
 }
 
@@ -584,7 +587,8 @@ impl TelemetrySink for HttpTelemetrySink {
         let builder = reqwest::Client::builder()
             .user_agent(concat!("driven-app/", env!("CARGO_PKG_VERSION")))
             .timeout(SEND_TIMEOUT);
-        let client = driven_tls::apply_custom_ca(builder, &self.ca)?.build()?;
+        let builder = driven_tls::apply_custom_ca(builder, &self.ca)?;
+        let client = driven_tls::apply_proxy(builder, &self.proxy)?.build()?;
         let resp = client
             .post(endpoint)
             .header("Content-Type", "application/json")
@@ -806,15 +810,24 @@ pub fn spawn_periodic_ping(app: &AppHandle) {
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(PING_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        // Issue #34: resolve the custom root CA once for the process (restart to
-        // change), matching the long-lived Drive/network clients.
-        let ca = match app_handle.try_state::<AppState>() {
-            Some(st) => crate::commands::settings::load_custom_ca_config(st.state().as_ref())
-                .await
-                .unwrap_or_default(),
-            None => driven_tls::CustomCaConfig::none(),
+        // Issue #34: resolve the custom root CA + proxy once for the process
+        // (restart to change), matching the long-lived Drive/network clients.
+        let (ca, proxy) = match app_handle.try_state::<AppState>() {
+            Some(st) => {
+                let ca = crate::commands::settings::load_custom_ca_config(st.state().as_ref())
+                    .await
+                    .unwrap_or_default();
+                let proxy = crate::commands::settings::load_proxy_config(st.state().as_ref())
+                    .await
+                    .unwrap_or_default();
+                (ca, proxy)
+            }
+            None => (
+                driven_tls::CustomCaConfig::none(),
+                driven_tls::ProxyConfig::system(),
+            ),
         };
-        let sink = HttpTelemetrySink::new(ca);
+        let sink = HttpTelemetrySink::new(ca, proxy);
         loop {
             tokio::select! {
                 biased;
@@ -1935,7 +1948,7 @@ mod tests {
         let bad_ca = driven_tls::CustomCaConfig::from_path(Some(std::path::PathBuf::from(
             "/driven/no/such/telemetry-ca.pem",
         )));
-        let sink = HttpTelemetrySink::new(bad_ca);
+        let sink = HttpTelemetrySink::new(bad_ca, driven_tls::ProxyConfig::system());
         let result = sink.send("http://127.0.0.1:1/telemetry", &payload).await;
         assert!(
             result.is_err(),
@@ -2058,5 +2071,35 @@ mod tests {
             "preview must not reset/drain the latency reservoir"
         );
         cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn http_sink_fails_closed_on_a_bad_proxy() {
+        // Issue #34: a configured-but-invalid proxy URL fails the telemetry send
+        // CLOSED - `apply_proxy` errors at client build, BEFORE any POST, so this
+        // needs no server (the error is the proxy build, not the network).
+        let aggregate = driven_core::state::TelemetryAggregate {
+            files_uploaded: 0,
+            bytes_uploaded: 0,
+            errors_by_class: vec![],
+            deep_verify_runs: 0,
+            update_applied: 0,
+        };
+        let payload = build_payload(
+            "00000000-0000-4000-8000-000000000000".to_string(),
+            1_700_000_000_000,
+            "0.1.0".to_string(),
+            "stable".to_string(),
+            None,
+            aggregate,
+            LatencyP50P95::default(),
+        );
+        let bad_proxy = driven_tls::ProxyConfig::Manual("ftp://nope:21".to_string());
+        let sink = HttpTelemetrySink::new(driven_tls::CustomCaConfig::none(), bad_proxy);
+        let result = sink.send("http://127.0.0.1:1/telemetry", &payload).await;
+        assert!(
+            result.is_err(),
+            "a bad proxy must fail the telemetry send closed (no silent send)"
+        );
     }
 }

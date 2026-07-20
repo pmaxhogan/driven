@@ -192,6 +192,7 @@ fn build_updater(
     app: &AppHandle,
     channel: Channel,
     ca_certs: Vec<reqwest_updater::Certificate>,
+    proxy: &driven_tls::ProxyConfig,
 ) -> CommandResult<tauri_plugin_updater::Updater> {
     let url = channel.endpoint_url().parse::<tauri::Url>().map_err(|e| {
         CommandError::with_code(
@@ -208,20 +209,31 @@ fn build_updater(
             format!("could not set update endpoint: {e}"),
         )
     })?;
-    // Issue #34: add the user's custom root CA to the plugin's OWN download
-    // client (the signed-manifest + binary fetch). `configure_client` is
-    // infallible, so the fallible PEM load already happened in `run_check` (fail-
-    // closed); here we only add the pre-parsed certs. ADDITIVE - reqwest 0.13
+    // Issue #34: translate the resolved proxy into a reqwest-0.13 `Proxy` up front
+    // (fail-closed for a bad manual URL, mirroring the CA cert pre-parse), so the
+    // infallible `configure_client` closure only APPLIES the pre-built value.
+    let updater_proxy = build_updater_proxy(proxy)?;
+    let no_proxy = proxy.is_no_proxy();
+    // Issue #34: apply the user's custom root CA + proxy to the plugin's OWN
+    // download client (the signed-manifest + binary fetch) in ONE
+    // `configure_client` hook (the plugin keeps only the last closure, so certs
+    // and proxy must be applied together). ADDITIVE for the CA - reqwest 0.13
     // routes `add_root_certificate` through
     // `rustls_platform_verifier::Verifier::new_with_extra_roots(extra, platform)`
     // (reqwest-0.13 async_impl/client.rs), i.e. the OS/enterprise platform roots
     // PLUS our extra roots; the built-in roots are never disabled and TLS
     // verification is never bypassed (the plugin does not call `tls_certs_only`).
-    if !ca_certs.is_empty() {
+    if !ca_certs.is_empty() || updater_proxy.is_some() || no_proxy {
         builder = builder.configure_client(move |client_builder| {
             let mut cb = client_builder;
             for cert in &ca_certs {
                 cb = cb.add_root_certificate(cert.clone());
+            }
+            if no_proxy {
+                // Explicit `none` mode: bypass every proxy incl. env vars.
+                cb = cb.no_proxy();
+            } else if let Some(proxy) = &updater_proxy {
+                cb = cb.proxy(proxy.clone());
             }
             cb
         });
@@ -232,6 +244,34 @@ fn build_updater(
             format!("could not build updater: {e}"),
         )
     })
+}
+
+/// Issue #34: build the reqwest-**0.13** `Proxy` for the updater's download
+/// client from the resolved [`driven_tls::ProxyConfig`]. `System`/`None` return
+/// `None` (the caller handles `None` mode via `is_no_proxy`); a manual URL is
+/// parsed fail-closed; PAC drives the same [`driven_tls::PacEngine`] the
+/// 0.12 clients use, via a per-URL `Proxy::custom` closure.
+fn build_updater_proxy(
+    proxy: &driven_tls::ProxyConfig,
+) -> CommandResult<Option<reqwest_updater::Proxy>> {
+    if let Some(url) = proxy.manual_url() {
+        let proxy = reqwest_updater::Proxy::all(url).map_err(|e| {
+            CommandError::with_code(
+                ErrorCode::UpdateEndpointUnreachable,
+                format!("proxy URL is not usable for the updater: {e}"),
+            )
+        })?;
+        return Ok(Some(proxy));
+    }
+    if let Some(engine) = proxy.pac_engine() {
+        let proxy = reqwest_updater::Proxy::custom(move |url| {
+            engine
+                .evaluate_str(url.as_str())
+                .and_then(|proxy_url| reqwest_updater::Url::parse(&proxy_url).ok())
+        });
+        return Ok(Some(proxy));
+    }
+    Ok(None)
 }
 
 /// Issue #34: parse the configured custom root CA into reqwest-**0.13**
@@ -455,16 +495,20 @@ async fn run_check(
 ) -> CommandResult<(CheckOutcome, Option<tauri_plugin_updater::Update>)> {
     // Issue #34: resolve + parse the custom root CA (fail-closed) so the plugin's
     // download client trusts a corporate TLS-inspection CA.
-    let ca_certs = match app.try_state::<AppState>() {
+    // Issue #34: resolve the proxy too (fail-closed for a configured PAC/manual
+    // proxy). `System` = honour env proxies (the plugin's default).
+    let (ca_certs, proxy) = match app.try_state::<AppState>() {
         Some(state) => {
             let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
                 .await
                 .unwrap_or_default();
-            load_updater_ca_certs(&ca)?
+            let proxy =
+                crate::commands::settings::load_proxy_config(state.state().as_ref()).await?;
+            (load_updater_ca_certs(&ca)?, proxy)
         }
-        None => Vec::new(),
+        None => (Vec::new(), driven_tls::ProxyConfig::system()),
     };
-    let updater = build_updater(app, channel, ca_certs)?;
+    let updater = build_updater(app, channel, ca_certs, &proxy)?;
     let result = updater.check().await.map_err(|e| {
         CommandError::with_code(
             ErrorCode::UpdateEndpointUnreachable,

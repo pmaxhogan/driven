@@ -33,7 +33,7 @@ use driven_drive::google::oauth::{run_pkce_loopback_flow, OAuthProgress};
 use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
 use driven_drive::google::{md5_hex, parse_installed_client_config, GoogleDriveStore, UploadBytes};
 use driven_drive::remote_store::{RemoteStore, UploadBody};
-use driven_drive::CustomCaConfig;
+use driven_drive::{CustomCaConfig, ProxyConfig};
 
 /// The public installed-app client id (SPEC s4; M4 brief). Used when neither
 /// `--client-id`, the env var, nor `client_secret.json` supplies one.
@@ -272,6 +272,7 @@ async fn run_auth(args: AuthArgs) -> anyhow::Result<()> {
         open_system_browser,
         tx,
         &cli_custom_ca(),
+        &cli_proxy(),
     )
     .await?;
 
@@ -414,14 +415,16 @@ fn build_store(account: &str, creds: &ClientCreds) -> anyhow::Result<GoogleDrive
         )
     })?;
     let ca = cli_custom_ca();
+    let proxy = cli_proxy();
     let token_source = RefreshingTokenSource::from_stored_refresh_token(
         refresh_token,
         creds.client_id.clone(),
         creds.client_secret.clone(),
         &ca,
+        &proxy,
     )?
     .with_store(store);
-    GoogleDriveStore::with_default_clients(token_source, &ca)
+    GoogleDriveStore::with_default_clients(token_source, &ca, &proxy)
 }
 
 /// Issue #34: the dev/e2e CLI reads its custom root CA (if any) from the
@@ -432,6 +435,18 @@ fn cli_custom_ca() -> CustomCaConfig {
     match std::env::var_os("DRIVEN_CUSTOM_CA_PATH") {
         Some(v) if !v.is_empty() => CustomCaConfig::from_path(Some(PathBuf::from(v))),
         _ => CustomCaConfig::none(),
+    }
+}
+
+/// Issue #34: the dev/e2e CLI resolves its proxy from `DRIVEN_PROXY_URL` (an
+/// `http`/`https`/`socks5`/`socks5h` URL). Unset = `System` mode, which honours
+/// the standard `HTTP_PROXY`/`HTTPS_PROXY` env vars. PAC auto-config is a
+/// desktop-app-only feature (it needs an async fetch); the dev CLI supports only
+/// the env + manual forms. An invalid URL fails closed at client-build time.
+fn cli_proxy() -> ProxyConfig {
+    match std::env::var("DRIVEN_PROXY_URL") {
+        Ok(url) if !url.trim().is_empty() => ProxyConfig::Manual(url.trim().to_string()),
+        _ => ProxyConfig::system(),
     }
 }
 

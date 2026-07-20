@@ -87,6 +87,8 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       meteredMode: "pause",
       meteredBandwidthCapMbps: null,
       customRootCaPath: null,
+      proxyMode: "system",
+      proxyUrl: null,
     },
     telemetry: {
       enabled: true,
@@ -1175,6 +1177,143 @@ describe("Settings Rules tab", () => {
     expect(invokeMock.mock.calls.some((c) => c[0] === "validate_custom_ca")).toBe(false);
   });
 
+  it("proxy: switching to 'none' patches the mode and clears the URL (issue #34)", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const select = wrapper.get('[data-testid="proxy-mode"]');
+    await select.setValue("none");
+    await select.trigger("change");
+    await flushPromises();
+
+    // 'none' commits immediately (no URL) and does NOT validate.
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { proxyMode: "none", proxyUrl: null } },
+    });
+    expect(invokeMock.mock.calls.some((c) => c[0] === "validate_proxy")).toBe(false);
+  });
+
+  it("proxy: a valid manual URL validates and patches (issue #34)", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "validate_proxy") {
+        expect((args as { mode: string; url: string }).mode).toBe("manual");
+        expect((args as { mode: string; url: string }).url).toBe("socks5://127.0.0.1:1080");
+        return Promise.resolve(undefined);
+      }
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const select = wrapper.get('[data-testid="proxy-mode"]');
+    await select.setValue("manual");
+    await select.trigger("change");
+    await flushPromises();
+
+    // The URL field appears in manual mode.
+    const input = wrapper.get('[data-testid="proxy-url"]');
+    await input.setValue("socks5://127.0.0.1:1080");
+    await input.trigger("change");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("validate_proxy", {
+      mode: "manual",
+      url: "socks5://127.0.0.1:1080",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { proxyMode: "manual", proxyUrl: "socks5://127.0.0.1:1080" } },
+    });
+    expect(wrapper.get('[data-testid="proxy-feedback"]').classes()).toContain("text-teal-600");
+  });
+
+  it("proxy: an invalid manual URL surfaces an error and is NOT persisted (issue #34)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "validate_proxy") {
+        return Promise.reject({ code: "internal.invalid_input", message: "bad scheme" });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const select = wrapper.get('[data-testid="proxy-mode"]');
+    await select.setValue("manual");
+    await select.trigger("change");
+    await flushPromises();
+    const input = wrapper.get('[data-testid="proxy-url"]');
+    await input.setValue("ftp://nope:21");
+    await input.trigger("change");
+    await flushPromises();
+
+    // Error feedback shown; the bad proxy is NOT saved.
+    expect(wrapper.get('[data-testid="proxy-feedback"]').classes()).toContain("text-red-600");
+    expect(invokeMock.mock.calls.some((c) => c[0] === "update_settings")).toBe(false);
+  });
+
+  it("proxy: a valid PAC source validates and patches (issue #34)", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "validate_proxy") {
+        expect((args as { mode: string }).mode).toBe("pac");
+        return Promise.resolve(undefined);
+      }
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const select = wrapper.get('[data-testid="proxy-mode"]');
+    await select.setValue("pac");
+    await select.trigger("change");
+    await flushPromises();
+    const input = wrapper.get('[data-testid="proxy-url"]');
+    await input.setValue("http://wpad.example/proxy.pac");
+    await input.trigger("change");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("validate_proxy", {
+      mode: "pac",
+      url: "http://wpad.example/proxy.pac",
+    });
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { proxyMode: "pac", proxyUrl: "http://wpad.example/proxy.pac" } },
+    });
+  });
+
   it("an empty bandwidth cap patches null (unlimited)", async () => {
     invokeMock.mockImplementation((cmd: string, args: unknown) => {
       if (cmd === "get_settings")
@@ -1296,10 +1435,7 @@ describe("Settings Rules tab", () => {
       global: globalMountOptions,
     });
     await flushPromises();
-    const form = wrapper.get('[data-testid="rules-form"]');
-    const selects = form.findAll("select");
-    // [0] = io priority, [1] = vss mode (windows present in the fake).
-    const vssSelect = selects[selects.length - 1];
+    const vssSelect = wrapper.get('[data-testid="vss-mode"]');
     await vssSelect.setValue("never");
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {

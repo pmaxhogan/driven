@@ -107,6 +107,8 @@ driven-tls = { path = "../crates/driven-tls" }
 # already in the tree (pulled by the plugin), so this adds no new build.
 reqwest_updater = { package = "reqwest", version = "0.13", default-features = false, features = [
     "rustls-no-provider",
+    # Issue #34: SOCKS5 proxy URLs on the updater's own download client.
+    "socks",
 ] }
 driven-vss = { path = "../crates/driven-vss" }
 # Issue #25 (DESIGN s5.3.1): the least-privilege VSS helper. The app-side

@@ -20,3 +20,6 @@ pub mod remote_store;
 // it without a separate `driven-tls` dependency. `apply_custom_ca` /
 // `validate_ca_file` live in `driven_tls` for the crates that build clients.
 pub use driven_tls::CustomCaConfig;
+// Issue #34: likewise re-export the proxy config type (SOCKS5 + PAC support) so
+// the same callers can name it without a direct `driven-tls` dependency.
+pub use driven_tls::ProxyConfig;

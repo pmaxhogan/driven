@@ -17,3 +17,24 @@ publish = false
 # `driven-core` depends on, so no pre-existing crate could host this helper.
 reqwest.workspace = true
 thiserror.workspace = true
+tracing.workspace = true
+# Issue #34 (PAC proxy auto-config): a PAC file is arbitrary JavaScript whose
+# `FindProxyForURL(url, host)` we must evaluate per-URL. No maintained PAC-file
+# evaluator crate exists on crates.io (`pac` is a pacman wrapper, `pac-rs` is
+# Linux system-proxy tooling), so we embed the pure-Rust `boa_engine` JS engine
+# (no C toolchain - matches the workspace's rustls / rust_backend posture) and
+# expose the standard PAC helper fns. Pinned to 0.20 (0.21 requires rustc 1.88,
+# above the workspace MSRV 1.85). `url` parses proxy URIs; `lru` bounds the
+# per-host decision cache so the JS engine runs at most once per unique host.
+boa_engine = "0.20"
+url.workspace = true
+# >=0.16.3 fixes RUSTSEC-2026-0002 (IterMut soundness); we only use get/put.
+lru = "0.16"
+
+[dev-dependencies]
+# The async `resolve_proxy` / `validate_pac_source` tests run on a minimal
+# current-thread runtime.
+tokio = { workspace = true, features = ["macros", "rt"] }
+# Temp files for the PAC-from-local-file tests (the crate's established test temp
+# pattern; its paths are not treated as externally-controlled).
+tempfile = "3"
