@@ -666,7 +666,7 @@ mod tests {
     // native/fallback boundary.
     #[tokio::test]
     async fn os_online_is_total() {
-        let backend = ReqwestBackend::new().expect("construct backend");
+        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
         let _: bool = backend.os_online().await;
     }
 
