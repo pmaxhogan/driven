@@ -47,6 +47,7 @@ function makeSource(over: Partial<SourceDto> = {}): SourceDto {
     respectGitignore: true,
     includePatterns: [],
     excludePatterns: [],
+    placeholderPolicy: "skip",
     deepVerifyIntervalSecs: 604800,
     lastFullScanAt: null,
     createdAt: 0,

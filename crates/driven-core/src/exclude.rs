@@ -685,6 +685,7 @@ mod tests {
             respect_gitignore,
             include_patterns: include.iter().map(|s| s.to_string()).collect(),
             exclude_patterns: exclude.iter().map(|s| s.to_string()).collect(),
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: None,

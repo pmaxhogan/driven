@@ -48,6 +48,12 @@ export type OAuthStatus =
 
 // --- Sources (SPEC s11.2) ---
 
+/** Per-source policy for OneDrive / cloud-only placeholder files (issue #4).
+ * Serialized form of the Rust `PlaceholderPolicy` enum (snake_case). `"skip"`
+ * (the default) leaves cloud-only placeholders on Drive untouched; `"force_download"`
+ * backs them up, letting the read hydrate each file. Windows-only in effect. */
+export type PlaceholderPolicy = "skip" | "force_download";
+
 export interface SourceDto {
   id: string;
   accountId: string;
@@ -60,6 +66,8 @@ export interface SourceDto {
   respectGitignore: boolean;
   includePatterns: string[];
   excludePatterns: string[];
+  /** Issue #4: OneDrive / cloud-only placeholder policy. */
+  placeholderPolicy: PlaceholderPolicy;
   deepVerifyIntervalSecs: number;
   lastFullScanAt: number | null;
   createdAt: number;
@@ -84,6 +92,9 @@ export interface AddSourceRequest {
   respectGitignore: boolean;
   includePatterns: string[];
   excludePatterns: string[];
+  /** Issue #4: OneDrive / cloud-only placeholder policy. Optional; the backend
+   * defaults an omitted value to `"skip"`. */
+  placeholderPolicy?: PlaceholderPolicy;
 }
 
 /** B3: the result of `add_source` - the created source PLUS the one-time BIP39
@@ -114,6 +125,8 @@ export interface SourcePatch {
   respectGitignore?: boolean | null;
   includePatterns?: string[] | null;
   excludePatterns?: string[] | null;
+  /** Issue #4: change the OneDrive / cloud-only placeholder policy. */
+  placeholderPolicy?: PlaceholderPolicy | null;
   deepVerifyIntervalSecs?: number | null;
 }
 

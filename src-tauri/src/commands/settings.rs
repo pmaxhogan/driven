@@ -3228,6 +3228,7 @@ mod tests {
             respect_gitignore: true,
             include_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: None,

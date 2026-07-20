@@ -141,6 +141,7 @@ fn source_in(account: AccountId, root: &std::path::Path, folder_id: &str) -> Sou
         respect_gitignore: false,
         include_patterns: vec![],
         exclude_patterns: vec![],
+        placeholder_policy: Default::default(),
         schedule_json_v2_reserved: None,
         deep_verify_interval_secs: 604_800,
         last_full_scan_at: None,

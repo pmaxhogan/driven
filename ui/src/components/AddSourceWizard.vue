@@ -58,6 +58,9 @@ const driveFolderPath = ref<string>("");
 const respectGitignore = ref(true);
 const includePatternsText = ref("");
 const excludePatternsText = ref("");
+// Issue #4: when true, back up OneDrive / cloud-only placeholder files
+// (PlaceholderPolicy "force_download") instead of skipping them (the default).
+const backupCloudOnly = ref(false);
 const encryptionEnabled = ref(false);
 const phraseConfirmed = ref(false);
 // R3-P1-1: the user has actually REVEALED the phrase at least once. The reveal
@@ -141,6 +144,7 @@ function reset(): void {
   respectGitignore.value = true;
   includePatternsText.value = "";
   excludePatternsText.value = "";
+  backupCloudOnly.value = false;
   encryptionEnabled.value = false;
   phraseConfirmed.value = false;
   phraseRevealed.value = false;
@@ -233,6 +237,7 @@ async function confirm(): Promise<void> {
       respectGitignore: respectGitignore.value,
       includePatterns: includePatterns.value,
       excludePatterns: excludePatterns.value,
+      placeholderPolicy: backupCloudOnly.value ? "force_download" : "skip",
     });
     createdSource.value = result.source;
     // M9c D4: a pending-ack source was persisted DISABLED; the reveal step's Done
@@ -416,6 +421,21 @@ defineExpose({ start });
             :class="inputCls"
             @blur="loadPreview"
           />
+        </label>
+
+        <label class="flex items-start gap-2 text-sm">
+          <input
+            v-model="backupCloudOnly"
+            type="checkbox"
+            class="mt-0.5 accent-teal-600"
+            data-testid="placeholder-policy-toggle"
+          />
+          <span>
+            {{ t("settings.addSource.placeholderPolicyLabel") }}
+            <span class="mt-0.5 block text-xs text-zinc-500 dark:text-zinc-400">
+              {{ t("settings.addSource.placeholderPolicyCaption") }}
+            </span>
+          </span>
         </label>
 
         <p v-if="previewLoading" class="text-sm text-zinc-500">

@@ -52,6 +52,7 @@ function makeSource(over: Partial<SourceDto> = {}): SourceDto {
     respectGitignore: true,
     includePatterns: [],
     excludePatterns: [],
+    placeholderPolicy: "skip",
     deepVerifyIntervalSecs: 604800,
     lastFullScanAt: null,
     createdAt: 0,
@@ -435,8 +436,84 @@ describe("SourceTable", () => {
         respectGitignore: true,
         includePatterns: [],
         excludePatterns: ["node_modules", "*.log"],
+        // Issue #4: the edit patch always carries the placeholder policy; an
+        // unchanged source (default "skip") sends "skip".
+        placeholderPolicy: "skip",
       },
     });
+  });
+
+  it("issue #4: toggling the cloud-only backup checkbox patches placeholderPolicy", async () => {
+    // The edit-exclusions panel exposes the OneDrive / cloud-only placeholder
+    // toggle. It reflects the source's current policy ("skip" here) and, when the
+    // user turns it on, the saved patch carries "force_download".
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources") return Promise.resolve([makeSource()]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      if (cmd === "preview_exclusions")
+        return Promise.resolve({
+          includedCount: 1,
+          excludedCount: 0,
+          includedBytes: 1,
+          includedSample: ["a"],
+          excludedSample: [],
+          truncated: false,
+        });
+      if (cmd === "update_source")
+        return Promise.resolve(makeSource({ placeholderPolicy: "force_download" }));
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+    const editButton = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.sources.editExclusionsButton"));
+    await editButton!.trigger("click");
+    await flushPromises();
+    const editor = wrapper.get('[data-testid="exclusion-editor"]');
+
+    // The toggle starts unchecked (source policy is the default "skip").
+    const toggle = editor.get('[data-testid="placeholder-policy-toggle"]');
+    expect((toggle.element as HTMLInputElement).checked).toBe(false);
+
+    // Turn it on and save: the patch carries force_download.
+    await toggle.setValue(true);
+    const saveButton = editor
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("common.save"));
+    await saveButton!.trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_source", {
+      sourceId: "src-1",
+      patch: expect.objectContaining({ placeholderPolicy: "force_download" }),
+    });
+  });
+
+  it("issue #4: the edit toggle reflects an already-force_download source", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources")
+        return Promise.resolve([makeSource({ placeholderPolicy: "force_download" })]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      if (cmd === "preview_exclusions")
+        return Promise.resolve({
+          includedCount: 1,
+          excludedCount: 0,
+          includedBytes: 1,
+          includedSample: ["a"],
+          excludedSample: [],
+          truncated: false,
+        });
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+    const editButton = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.sources.editExclusionsButton"));
+    await editButton!.trigger("click");
+    await flushPromises();
+    const toggle = wrapper.get('[data-testid="placeholder-policy-toggle"]');
+    expect((toggle.element as HTMLInputElement).checked).toBe(true);
   });
 });
 
@@ -534,6 +611,87 @@ describe("AddSourceWizard", () => {
       }),
     });
     expect(wrapper.emitted("created")).toBeTruthy();
+  });
+
+  it("issue #4: checking the cloud-only toggle sends placeholderPolicy force_download; default is skip", async () => {
+    let addArgs: unknown = null;
+    invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "list_accounts")
+        return Promise.resolve([
+          {
+            id: "acc-1",
+            email: "user@example.com",
+            displayName: null,
+            state: "ok",
+            encryptionEnabled: false,
+            createdAt: 0,
+            lastSyncedAt: null,
+          },
+        ]);
+      if (cmd === "pick_drive_folder")
+        return Promise.resolve({
+          currentFolderId: "root",
+          currentFolderPath: "",
+          folders: [{ id: "f-docs", name: "Docs" }],
+        });
+      if (cmd === "preview_exclusions")
+        return Promise.resolve({
+          includedCount: 1,
+          excludedCount: 0,
+          includedBytes: 1,
+          includedSample: ["x"],
+          excludedSample: [],
+          truncated: false,
+        });
+      if (cmd === "pick_folder_dialog")
+        return Promise.resolve({ path: "/home/u/docs", token: "tok-folder" });
+      if (cmd === "add_source") {
+        addArgs = args;
+        return Promise.resolve({
+          source: makeSource({ id: "src-new", placeholderPolicy: "force_download" }),
+          recoveryPhrase: null,
+          pendingRecoveryAck: false,
+        });
+      }
+      if (cmd === "list_sources") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(AddSourceWizard, { global: globalMountOptions });
+    await (wrapper.vm as unknown as { start: () => Promise<void> }).start();
+    await flushPromises();
+
+    const chooseLocal = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.addSource.chooseLocalButton"));
+    await chooseLocal!.trigger("click");
+    await flushPromises();
+
+    const clickNext = async () => {
+      const next = wrapper.findAll("button").find((b) => b.text() === i18n.global.t("common.next"));
+      await next!.trigger("click");
+      await flushPromises();
+    };
+
+    await clickNext(); // -> drive
+    await clickNext(); // -> exclusions
+
+    // The toggle defaults unchecked; turn it on so the add carries force_download.
+    const toggle = wrapper.get('[data-testid="placeholder-policy-toggle"]');
+    expect((toggle.element as HTMLInputElement).checked).toBe(false);
+    await toggle.setValue(true);
+
+    await clickNext(); // -> encryption
+    await clickNext(); // -> confirm
+    const finish = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("common.finish"));
+    await finish!.trigger("click");
+    await flushPromises();
+
+    expect(addArgs).toMatchObject({
+      req: { placeholderPolicy: "force_download" },
+    });
   });
 
   it("does not accept a typed local path - only the dialog result", async () => {

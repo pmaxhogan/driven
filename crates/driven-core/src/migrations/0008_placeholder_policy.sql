@@ -1,0 +1,16 @@
+-- Issue #4: per-source policy for OneDrive / cloud-only placeholder files.
+--
+-- OneDrive Files-On-Demand (and similar cloud providers) mark a dehydrated
+-- placeholder with FILE_ATTRIBUTE_RECALL_ON_OPEN; opening it forces a network
+-- hydration. The scanner skips such files by default (DESIGN s5.2.1) so a backup
+-- never silently pulls down terabytes of cloud-only data. This column lets a
+-- source opt INTO backing them up instead ("force_download"), letting the normal
+-- read path hydrate each file on open.
+--
+-- Additive, backward compatible: nullable TEXT, one of 'skip' | 'force_download'.
+-- NULL (every pre-migration row) and any unrecognised value decode to 'skip', so
+-- existing sources keep the default skip behaviour with no data migration.
+--
+-- Data-format note (v1.0.0 stored-format stability): additive ADD COLUMN only,
+-- no existing column touched.
+ALTER TABLE backup_sources ADD COLUMN placeholder_policy TEXT;

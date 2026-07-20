@@ -144,6 +144,8 @@
         "actions": "Actions"
       },
       "editExclusionsButton": "Edit exclusions",
+      "placeholderPolicyLabel": "Back up OneDrive cloud-only files",
+      "placeholderPolicyCaption": "Applies to OneDrive / cloud-only placeholder files on Windows (harmless elsewhere). When on, Driven downloads and backs up files that are stored only in the cloud.",
       "runNowButton": "Run now",
       "versioningButton": "Versioning",
       "versioning": {
@@ -175,6 +177,8 @@
       "respectGitignoreLabel": "Respect .gitignore files",
       "includePatternsLabel": "Include patterns",
       "excludePatternsLabel": "Exclude patterns",
+      "placeholderPolicyLabel": "Back up OneDrive cloud-only files",
+      "placeholderPolicyCaption": "Applies to OneDrive / cloud-only placeholder files on Windows (harmless elsewhere). When on, Driven downloads and backs up files that are stored only in the cloud.",
       "preview": {
         "included": "{count} files included",
         "excluded": "{count} files excluded",
