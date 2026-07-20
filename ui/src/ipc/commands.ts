@@ -36,6 +36,7 @@ import type {
   SettingsPatch,
   SourceDto,
   SourcePatch,
+  TelemetryPreviewPayload,
   UpdateInfo,
   VersioningConfig,
   VssHelperStatus,
@@ -278,6 +279,15 @@ export function setTelemetryEnabled(enabled: boolean): Promise<boolean> {
  * absent. Anonymous - not linkable to a user; safe to show on the privacy note. */
 export function getTelemetryInstallId(): Promise<string> {
   return invoke("get_telemetry_install_id");
+}
+
+/** Preview EXACTLY what the next telemetry ping would send (SPEC s16
+ * preview), WITHOUT sending it: no network call, no advance of the delta
+ * checkpoint, no reset of the latency reservoir. Works even while telemetry
+ * is disabled - that is the point, letting a privacy-conscious user inspect
+ * the payload BEFORE opting in. */
+export function previewTelemetryPing(): Promise<TelemetryPreviewPayload> {
+  return invoke("preview_telemetry_ping");
 }
 
 // --- Activity (SPEC s11.4) ---

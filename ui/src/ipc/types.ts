@@ -226,6 +226,26 @@ export interface TelemetrySettings {
   endpoint: string;
 }
 
+/** The EXACT JSON payload a telemetry ping would POST (SPEC s16 preview),
+ * returned verbatim by `preview_telemetry_ping` for display. Field names are
+ * intentionally snake_case here (not the app's usual camelCase IPC
+ * convention) - this mirrors the telemetry-worker wire schema byte-for-byte,
+ * since showing the user anything reshaped would defeat the point of a
+ * preview. The nested groups are left loosely typed (`Record<string,
+ * unknown>`) since the UI only pretty-prints the whole payload; it does not
+ * read individual fields. */
+export interface TelemetryPreviewPayload {
+  install_id: string;
+  ts: number;
+  version: string;
+  os: string;
+  os_version: string | null;
+  arch: string;
+  channel: string;
+  events_24h: Record<string, unknown>;
+  latency_p50_p95_ms: Record<string, unknown>;
+}
+
 export interface UpdaterSettings {
   channel: string;
   checkIntervalSecs: number;

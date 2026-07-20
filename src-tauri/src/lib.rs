@@ -630,6 +630,9 @@ pub fn run() {
             telemetry::get_telemetry_enabled,
             telemetry::set_telemetry_enabled,
             telemetry::get_telemetry_install_id,
+            // SPEC s16 telemetry preview: inspect the exact next-ping payload
+            // without sending it (no network call, no side effects).
+            telemetry::preview_telemetry_ping,
             // SPEC s11.4 activity (M7).
             commands::activity::query_activity,
             commands::activity::clear_activity_older_than,

@@ -1498,4 +1498,54 @@ describe("Settings Rules tab", () => {
       patch: { telemetry: { enabled: false } },
     });
   });
+
+  it("SPEC s16 preview (#34): the Preview data button opens the payload modal, even while telemetry is disabled", async () => {
+    // The preview button must work regardless of the toggle state - a user
+    // opts to inspect the payload BEFORE turning telemetry on.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(
+          makeSettings({ telemetry: { enabled: false, installId: "id", endpoint: "e" } })
+        );
+      if (cmd === "preview_telemetry_ping")
+        return Promise.resolve({
+          install_id: "id",
+          ts: 1,
+          version: "0.1.0",
+          os: "windows",
+          os_version: null,
+          arch: "x86_64",
+          channel: "stable",
+          events_24h: {},
+          latency_p50_p95_ms: {},
+        });
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    // The modal is not rendered until opened.
+    expect(wrapper.find('[data-testid="telemetry-preview-modal"]').exists()).toBe(false);
+
+    await wrapper.get('[data-testid="telemetry-preview-open"]').trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("preview_telemetry_ping", undefined);
+    const modal = wrapper.get('[data-testid="telemetry-preview-modal"]');
+    expect(modal.get('[data-testid="telemetry-preview-json"]').text()).toContain(
+      '"install_id": "id"'
+    );
+    expect(modal.text()).toContain(i18n.global.t("telemetryPreview.caption"));
+
+    // Closing hides it again.
+    const closeBtn = modal
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("common.close"));
+    await closeBtn!.trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="telemetry-preview-modal"]').exists()).toBe(false);
+  });
 });

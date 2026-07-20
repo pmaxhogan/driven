@@ -28,6 +28,13 @@
 //! are pure functions the unit tests exercise directly; the production sink
 //! ([`HttpTelemetrySink`]) is the only part that touches the network and the
 //! tests never use it, so nothing here hits `driven.maxhogan.dev`.
+//!
+//! PREVIEW (SPEC s16 preview, #34): [`preview_telemetry_ping`] lets a
+//! privacy-conscious user inspect the EXACT next-ping payload from the
+//! Settings UI - even while telemetry is currently disabled - with NO network
+//! call and NO side effect (it never advances the delta checkpoint, never
+//! resets the latency reservoir). It shares [`resolve_payload`] with the live
+//! send path ([`maybe_send_once`]) so the two can never drift.
 
 use std::time::Duration;
 
@@ -614,17 +621,65 @@ fn delta_since_ms(now_ms: i64, last_sent_at: Option<i64>) -> i64 {
     }
 }
 
+/// Resolve the EXACT wire payload a ping would carry RIGHT NOW - the install
+/// id (ensuring one exists, P1-3), the active channel, the DELTA event window
+/// `(last_sent_at, now]` (P2-3, capped at 24h), the coarse OS version, and a
+/// READ-ONLY latency snapshot - then hands them to [`build_payload`] (the
+/// single serialization path; nothing here hand-rolls JSON). Both the live
+/// send path ([`maybe_send_once`]) and the SPEC s16 preview command
+/// ([`preview_telemetry_ping`]) call this so the two can never drift: preview
+/// shows literally the same payload a real ping would build for this instant.
+///
+/// Side-effect note: `ensure_install_id` may WRITE a freshly-minted UUID v4 if
+/// none is stored yet (idempotent, stable thereafter - the same one-time mint
+/// `get_telemetry_install_id` already performs). Everything else here is
+/// read-only: `latency.snapshot()` does NOT drain the reservoir (only
+/// `reset()`, called by the caller after a SUCCESSFUL send, does), and
+/// `telemetry_events_since` is a pure aggregate query. So calling this to
+/// preview a payload advances no delta checkpoint and drops no latency
+/// samples - the actual next ping still aggregates the full window.
+async fn resolve_payload(
+    state: &dyn StateRepo,
+    version: String,
+    now_ms: i64,
+    last_sent_at: Option<i64>,
+    latency: Option<&driven_core::telemetry::LatencyReservoir>,
+) -> CommandResult<TelemetryPayload> {
+    let install_id = ensure_install_id(state).await?;
+    let channel = read_channel(state)
+        .await
+        .unwrap_or_else(|_| "stable".to_string());
+    let since_ms = delta_since_ms(now_ms, last_sent_at);
+    let aggregate = state
+        .telemetry_events_since(since_ms, now_ms)
+        .await
+        .map_err(CommandError::from)?;
+    let os_version = coarse_os_version();
+    // DESIGN s13: a READ-ONLY snapshot of the latency percentiles for this
+    // window - never drains the reservoir (see doc comment above).
+    let latency_pcts: LatencyP50P95 = latency.map(|r| r.snapshot().into()).unwrap_or_default();
+    Ok(build_payload(
+        install_id,
+        now_ms,
+        version,
+        channel,
+        os_version,
+        aggregate,
+        latency_pcts,
+    ))
+}
+
 /// Gather + send ONE telemetry ping IF enabled (SPEC s16). Honors a disable
 /// IMMEDIATELY: it reads the pref at entry AND RE-READS it right before the send
 /// (P1-2), and also checks the optional `cancel` flag (flipped by
 /// `set_telemetry_enabled(false)`), so a toggle during the ensure-id / aggregate /
-/// build window aborts the send with NO network call. When enabled it ensures the
-/// install id, aggregates the DELTA window `(last_sent_at, now]` from the durable
-/// state (P2-3, capped at 24h), builds the payload, and sends it best-effort
-/// through `sink`. On a SUCCESSFUL send it records `last_sent_at = now` so the next
-/// ping reports only new events (restarts no longer double-count). Returns `true`
-/// if a send was attempted, `false` if telemetry was disabled / aborted (so tests
-/// can assert the no-network path).
+/// build window aborts the send with NO network call. When enabled it resolves
+/// the payload via [`resolve_payload`] (install id, DELTA window P2-3, latency
+/// snapshot) and sends it best-effort through `sink`. On a SUCCESSFUL send it
+/// records `last_sent_at = now` so the next ping reports only new events
+/// (restarts no longer double-count). Returns `true` if a send was attempted,
+/// `false` if telemetry was disabled / aborted (so tests can assert the
+/// no-network path).
 async fn maybe_send_once(
     state: &dyn StateRepo,
     version: String,
@@ -653,40 +708,13 @@ async fn maybe_send_once(
         tracing::debug!(target: TARGET, "telemetry cancelled before build; no ping sent");
         return false;
     }
-    let install_id = match ensure_install_id(state).await {
-        Ok(id) => id,
+    let payload = match resolve_payload(state, version, now_ms, prefs.last_sent_at, latency).await {
+        Ok(p) => p,
         Err(e) => {
-            tracing::debug!(target: TARGET, error = %e, "telemetry: could not ensure install_id; skipping ping");
+            tracing::debug!(target: TARGET, error = %e, "telemetry: could not resolve payload; skipping ping");
             return false;
         }
     };
-    let channel = read_channel(state)
-        .await
-        .unwrap_or_else(|_| "stable".to_string());
-    let since_ms = delta_since_ms(now_ms, prefs.last_sent_at);
-    let aggregate = match state.telemetry_events_since(since_ms, now_ms).await {
-        Ok(a) => a,
-        Err(e) => {
-            tracing::debug!(target: TARGET, error = %e, "telemetry: could not aggregate events; skipping ping");
-            return false;
-        }
-    };
-    let os_version = coarse_os_version();
-    // DESIGN s13: a READ-ONLY snapshot of the latency percentiles for this
-    // window. NOT reset here - only after a SUCCESSFUL send below, so a dropped
-    // or aborted ping re-uses the same window's samples on the next attempt
-    // (mirroring how the event-count aggregates re-send an un-checkpointed
-    // window keyed on `last_sent_at`).
-    let latency_pcts: LatencyP50P95 = latency.map(|r| r.snapshot().into()).unwrap_or_default();
-    let payload = build_payload(
-        install_id,
-        now_ms,
-        version,
-        channel,
-        os_version,
-        aggregate,
-        latency_pcts,
-    );
 
     // R3-P1-2 (SEND-ADMISSION GATE): acquire the shared gate, then do the final
     // cancel/pref re-check AND the network send WHILE HOLDING IT. The disable path
@@ -928,6 +956,47 @@ pub async fn set_telemetry_enabled(
 #[tauri::command]
 pub async fn get_telemetry_install_id(state: State<'_, AppState>) -> CommandResult<String> {
     ensure_install_id(state.state().as_ref()).await
+}
+
+/// `preview_telemetry_ping()` - the telemetry preview feature: return the EXACT
+/// JSON payload the NEXT telemetry ping would send, WITHOUT sending it. No
+/// network call, and no side effect a real send has - the `last_sent_at` delta
+/// checkpoint is never advanced (so the real next ping still aggregates the
+/// full un-checkpointed window) and the latency reservoir is only snapshotted,
+/// never reset (see [`resolve_payload`]'s doc comment for the read-only
+/// guarantee).
+///
+/// Built through the SAME [`resolve_payload`] step the live ping path uses -
+/// nothing here reimplements the aggregation or serialization - so preview can
+/// never drift from what would actually be sent.
+///
+/// Available even when telemetry is currently DISABLED: that is the whole
+/// point of a preview - a privacy-conscious user inspects the payload BEFORE
+/// opting in, rather than having to enable it first to see what it looks like.
+///
+/// Returned as `serde_json::Value` (not the typed [`TelemetryPayload`]) so the
+/// webview renders literally the same JSON bytes a real send would POST,
+/// without a second TypeScript shape to keep in sync with the wire schema.
+#[tauri::command]
+pub async fn preview_telemetry_ping(
+    app: AppHandle,
+    state: State<'_, AppState>,
+) -> CommandResult<serde_json::Value> {
+    let repo = state.state();
+    let prefs = read_prefs(repo.as_ref()).await?;
+    let version = app.package_info().version.to_string();
+    let now_ms = driven_core::time::SystemClock.now_ms();
+    let latency = state.telemetry_latency();
+    let payload = resolve_payload(
+        repo.as_ref(),
+        version,
+        now_ms,
+        prefs.last_sent_at,
+        Some(latency.as_ref()),
+    )
+    .await?;
+    serde_json::to_value(&payload)
+        .map_err(|e| CommandError::new(format!("could not serialize telemetry preview: {e}")))
 }
 
 #[cfg(test)]
@@ -1872,5 +1941,122 @@ mod tests {
             result.is_err(),
             "a bad custom CA must fail the telemetry send closed (no silent send)"
         );
+    }
+
+    // -----------------------------------------------------------------------
+    // Telemetry preview (SPEC s16 preview): `resolve_payload` is exactly what
+    // `preview_telemetry_ping` calls (see its doc comment), so these tests
+    // exercise it directly rather than needing a live `AppHandle`.
+    // -----------------------------------------------------------------------
+
+    #[tokio::test]
+    async fn preview_resolves_the_same_shape_as_a_real_ping_without_sending() {
+        // The resolved payload has the exact SPEC s16 wire shape - same keys as
+        // a real ping - built via `resolve_payload` with NO `TelemetrySink`
+        // involved at all (no network seam, so there is nothing to fake-out).
+        let (repo, dir) = temp_repo().await;
+        let reservoir = driven_core::telemetry::LatencyReservoir::new(true);
+        let prefs = read_prefs(&repo).await.unwrap();
+        let payload = resolve_payload(
+            &repo,
+            "0.1.0".to_string(),
+            1_700_000_000_000,
+            prefs.last_sent_at,
+            Some(&reservoir),
+        )
+        .await
+        .unwrap();
+        assert!(
+            !payload.install_id.is_empty(),
+            "preview carries a real install_id"
+        );
+        assert_eq!(payload.version, "0.1.0");
+        let json = serde_json::to_value(&payload).unwrap();
+        let obj = json.as_object().unwrap();
+        let mut keys: Vec<&str> = obj.keys().map(String::as_str).collect();
+        keys.sort_unstable();
+        assert_eq!(
+            keys,
+            vec![
+                "arch",
+                "channel",
+                "events_24h",
+                "install_id",
+                "latency_p50_p95_ms",
+                "os",
+                "os_version",
+                "ts",
+                "version",
+            ],
+            "preview payload has the exact SPEC s16 wire shape"
+        );
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn preview_works_when_telemetry_is_disabled() {
+        // SPEC s16 (telemetry preview): the whole point is letting a user
+        // inspect the payload BEFORE opting in, so `resolve_payload` must not
+        // gate on the enabled pref the way `maybe_send_once` does.
+        let (repo, dir) = temp_repo().await;
+        write_enabled(&repo, false).await.unwrap();
+        let prefs = read_prefs(&repo).await.unwrap();
+        assert!(!prefs.enabled);
+        let payload = resolve_payload(
+            &repo,
+            "0.1.0".to_string(),
+            1_700_000_000_000,
+            prefs.last_sent_at,
+            None,
+        )
+        .await
+        .unwrap();
+        assert!(
+            !payload.install_id.is_empty(),
+            "preview still builds a payload while telemetry is disabled"
+        );
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn preview_does_not_advance_the_delta_checkpoint_or_reset_the_reservoir() {
+        // The no-side-effect guarantee (SPEC s16 preview): resolving a payload
+        // (what preview_telemetry_ping does) must leave `last_sent_at`
+        // untouched and must NOT drain the latency reservoir - only a
+        // SUCCESSFUL send (`maybe_send_once`'s post-send branch) may do
+        // either. Otherwise a preview would silently steal events/samples from
+        // the real next ping's window.
+        let (repo, dir) = temp_repo().await;
+        let reservoir = driven_core::telemetry::LatencyReservoir::new(true);
+        reservoir.record_scan_ms(42);
+        reservoir.record_upload_per_mb_ms(7);
+        let before = reservoir.snapshot();
+        assert!(!before.scan.is_empty());
+
+        let prefs_before = read_prefs(&repo).await.unwrap();
+        assert_eq!(prefs_before.last_sent_at, None, "fresh repo: never sent");
+
+        let now = 1_700_000_000_000i64;
+        let _payload = resolve_payload(
+            &repo,
+            "0.1.0".to_string(),
+            now,
+            prefs_before.last_sent_at,
+            Some(&reservoir),
+        )
+        .await
+        .unwrap();
+
+        let prefs_after = read_prefs(&repo).await.unwrap();
+        assert_eq!(
+            prefs_after.last_sent_at, None,
+            "preview must not advance the delta checkpoint"
+        );
+        let after = reservoir.snapshot();
+        assert_eq!(
+            after, before,
+            "preview must not reset/drain the latency reservoir"
+        );
+        cleanup(dir);
     }
 }

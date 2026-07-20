@@ -241,6 +241,7 @@
       "vssHelperDeclined": "Elevation was declined, so locked files are still skipped. Turn this off and on again to retry.",
       "telemetryLabel": "Send anonymous usage stats",
       "telemetryNote": "Anonymous usage stats only - no file names or contents are ever sent. One click to disable.",
+      "telemetryPreviewButton": "Preview data",
       "hooks": {
         "title": "Backup hooks",
         "preLabel": "Before each backup (shell command)",
@@ -306,6 +307,12 @@
   "changelog": {
     "title": "What's new in {version}",
     "noNotes": "No release notes were provided for this version."
+  },
+  "telemetryPreview": {
+    "title": "Telemetry preview",
+    "caption": "This is exactly what would be sent. Nothing else.",
+    "copyButton": "Copy",
+    "copiedButton": "Copied!"
   },
   "accountList": {
     "title": "Accounts"
