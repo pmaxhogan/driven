@@ -5,6 +5,28 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.1.0](https://github.com/pmaxhogan/driven/compare/v2.0.1...v2.1.0) (2026-07-20)
+
+
+### Features
+
+* **core:** adaptive upload parallelism with throughput probe and disk-saturation gate ([#143](https://github.com/pmaxhogan/driven/issues/143)) ([8ecced6](https://github.com/pmaxhogan/driven/commit/8ecced61dcffa2dbaea4aaec8a4f2adb8e33b873))
+* **core:** filesystem timestamp-granularity probe with ctime fallback and per-directory gitignore cascade ([#141](https://github.com/pmaxhogan/driven/issues/141)) ([344262c](https://github.com/pmaxhogan/driven/commit/344262c142707aec4b7681c5da904e0cef19ee2e))
+* **drive:** support Google Shared Drive destinations end-to-end ([#142](https://github.com/pmaxhogan/driven/issues/142)) ([d9c3161](https://github.com/pmaxhogan/driven/commit/d9c3161cbcd8e7930f55b140365cb771b53892f1))
+* **net:** native OS reachability backends with automatic fallback ([#138](https://github.com/pmaxhogan/driven/issues/138)) ([319e85f](https://github.com/pmaxhogan/driven/commit/319e85f2f66258eaa152ab68c0e9cade88bf1cbf))
+* **net:** SOCKS5 and PAC proxy support for all outbound connections ([#145](https://github.com/pmaxhogan/driven/issues/145)) ([2f0b7d1](https://github.com/pmaxhogan/driven/commit/2f0b7d13f899d7b5d719508e3b317c8538647565))
+* **net:** support a custom corporate root CA for all outbound connections ([#134](https://github.com/pmaxhogan/driven/issues/134)) ([929e93d](https://github.com/pmaxhogan/driven/commit/929e93df72e8b35a4a394eb0d99ab6f90b66201d))
+* per-source toggle to back up OneDrive cloud-only placeholder files ([#133](https://github.com/pmaxhogan/driven/issues/133)) ([6863ea3](https://github.com/pmaxhogan/driven/commit/6863ea3db7985301e93955c951efee3186fe465a))
+* **telemetry:** capture latency percentiles and add rollup query endpoint ([#132](https://github.com/pmaxhogan/driven/issues/132)) ([4e9fde6](https://github.com/pmaxhogan/driven/commit/4e9fde6b2caea675930ca07b57edc5a6ed5db073))
+* **telemetry:** preview exactly what a telemetry ping sends ([#139](https://github.com/pmaxhogan/driven/issues/139)) ([95fbd9a](https://github.com/pmaxhogan/driven/commit/95fbd9a7c670b74e20898f6bd60c7ecd62a0d09b))
+
+
+### Bug Fixes
+
+* **deps:** bump tauri-winrt-notification to drop vulnerable quick-xml (closes [#89](https://github.com/pmaxhogan/driven/issues/89)) ([#129](https://github.com/pmaxhogan/driven/issues/129)) ([232fd8f](https://github.com/pmaxhogan/driven/commit/232fd8fee62a9bdcdf161165bcd8da55f11b04ed))
+* **telemetry:** exclude pre-schema rows from latency rollup ([#137](https://github.com/pmaxhogan/driven/issues/137)) ([1ae6220](https://github.com/pmaxhogan/driven/commit/1ae6220cf59a3fa2be8b46fff8001bfe35ca130a))
+* **ui:** add cursor pointer to buttons and link-buttons ([#136](https://github.com/pmaxhogan/driven/issues/136)) ([dbd4809](https://github.com/pmaxhogan/driven/commit/dbd48090cc77d7e09b616274ab54b0894ddc9af1))
+
 ## [2.0.1](https://github.com/pmaxhogan/driven/compare/v2.0.0...v2.0.1) (2026-07-20)
 
 
