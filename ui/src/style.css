@@ -54,4 +54,16 @@
   input[type="radio"] {
     @apply accent-teal-600;
   }
+
+  /*
+   * Tailwind v3+ dropped the old preflight `cursor: pointer` reset for
+   * buttons, so every <button> in the app (every button/link-button, tab
+   * header, and icon button here is a native <button>) fell back to the
+   * browser's default arrow cursor on hover. One global rule fixes all of
+   * them; :not(:disabled) keeps disabled buttons on their existing
+   * `disabled:cursor-not-allowed` utility instead of fighting it.
+   */
+  button:not(:disabled) {
+    cursor: pointer;
+  }
 }
