@@ -3,10 +3,16 @@ import viteConfig from "./vite.config";
 
 // Coverage / test config lives HERE, not in vite.config.ts, on purpose.
 // vue-tsc typechecks vite.config.ts (it is in tsconfig "include") but NOT this
-// file, so putting the `test` block here keeps vitest's vite-6 types from
-// clashing with the app's vite-5-typed plugins - the pnpm tree resolves both
-// vite 5 and vite 6, and importing vitest/config's defineConfig into a
-// typechecked file makes that clash a hard `vue-tsc` error.
+// file, so putting the `test` block here keeps vitest's own vite types from
+// clashing with the app's vite-typed plugins - vitest 2.x still pins
+// `vite: ^5.0.0 || ^6.0.0` (vitest 4 is the first line that declares vite 8
+// support, but its AST-aware v8 coverage remapping reports substantially
+// LOWER numbers - not a real regression, just a stricter measurement - which
+// the CI coverage gate can't clear without a baseline reset, so the vitest
+// bump is deliberately deferred; don't "helpfully" bump it), while the app
+// itself runs vite 8. The pnpm tree resolves vite 5, 6, AND 8 side by side as
+// a result, and importing vitest/config's defineConfig into a typechecked
+// file makes that clash a hard `vue-tsc` error.
 //
 // vitest auto-loads vitest.config.* ahead of vite.config.*; mergeConfig folds
 // in the vue / i18n plugins + alias so component tests keep working. The
