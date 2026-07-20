@@ -102,7 +102,10 @@ function close(): void {
         </button>
       </div>
 
-      <p class="mb-3 text-xs text-zinc-500 dark:text-zinc-400" data-testid="telemetry-preview-caption">
+      <p
+        class="mb-3 text-xs text-zinc-500 dark:text-zinc-400"
+        data-testid="telemetry-preview-caption"
+      >
         {{ t("telemetryPreview.caption") }}
       </p>
 
@@ -120,8 +123,7 @@ function close(): void {
         <pre
           class="max-h-96 overflow-auto rounded-md border border-zinc-200 bg-zinc-50 p-3 text-xs text-zinc-900 dark:border-zinc-800 dark:bg-zinc-950 dark:text-zinc-100"
           data-testid="telemetry-preview-json"
-          >{{ prettyPayload() }}</pre
-        >
+          >{{ prettyPayload() }}</pre>
         <div class="mt-3">
           <button type="button" :class="SECONDARY_BTN" @click="copy">
             {{ copied ? t("telemetryPreview.copiedButton") : t("telemetryPreview.copyButton") }}

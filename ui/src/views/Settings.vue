@@ -966,9 +966,6 @@ const showTelemetryPreview = ref(false);
       </div>
     </div>
 
-    <TelemetryPreviewModal
-      :open="showTelemetryPreview"
-      @close="showTelemetryPreview = false"
-    />
+    <TelemetryPreviewModal :open="showTelemetryPreview" @close="showTelemetryPreview = false" />
   </section>
 </template>
