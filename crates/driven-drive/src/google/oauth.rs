@@ -24,7 +24,7 @@
 use std::net::{Ipv4Addr, Ipv6Addr, SocketAddr};
 use std::time::Duration;
 
-use driven_tls::CustomCaConfig;
+use driven_tls::{CustomCaConfig, ProxyConfig};
 use oauth2::basic::BasicClient;
 use oauth2::{
     AuthUrl, AuthorizationCode, ClientId, ClientSecret, CsrfToken, PkceCodeChallenge, RedirectUrl,
@@ -118,6 +118,7 @@ pub async fn run_pkce_loopback_flow(
     open_browser: impl FnOnce(&str) -> anyhow::Result<()>,
     progress_tx: Sender<OAuthProgress>,
     ca: &CustomCaConfig,
+    proxy: &ProxyConfig,
 ) -> anyhow::Result<Tokens> {
     let (listener_v4, listener_v6, port) = bind_dual_loopback().await?;
     // The redirect URI we register with Google MUST be one literal string and
@@ -136,9 +137,11 @@ pub async fn run_pkce_loopback_flow(
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(EXCHANGE_CONNECT_TIMEOUT)
         .timeout(EXCHANGE_TOTAL_TIMEOUT);
-    // Issue #34: add the user's custom root CA additively (fail-closed) so the
-    // token exchange works behind a corporate TLS-inspecting proxy.
-    let http = driven_tls::apply_custom_ca(http_builder, ca)?.build()?;
+    // Issue #34: add the user's custom root CA additively then the configured
+    // proxy (fail-closed) so the token exchange works behind a corporate
+    // TLS-inspecting proxy or an explicit SOCKS/PAC proxy.
+    let http_builder = driven_tls::apply_custom_ca(http_builder, ca)?;
+    let http = driven_tls::apply_proxy(http_builder, proxy)?.build()?;
 
     let client = BasicClient::new(ClientId::new(client_id.to_string()))
         .set_client_secret(ClientSecret::new(client_secret.to_string()))

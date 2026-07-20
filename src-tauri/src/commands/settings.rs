@@ -430,6 +430,52 @@ pub async fn update_settings(
             // NOTE: applied to NEW client builds (restart / account re-add); the
             // long-lived Drive/network clients are not rebuilt in place here.
         }
+        // Issue #34 (SOCKS5 + PAC proxy): apply then VALIDATE the resulting
+        // (mode, url) pair up front so a broken proxy can never be persisted
+        // (which would fail-closed every outbound client), mirroring the CA save
+        // path. Applied to NEW client builds (restart / account re-add).
+        let mut proxy_touched = false;
+        if let Some(mode) = g.proxy_mode {
+            check_enum("proxy_mode", &mode, driven_tls::PROXY_MODES)?;
+            cur.proxy_mode = mode;
+            proxy_touched = true;
+        }
+        if let Some(url) = g.proxy_url {
+            cur.proxy_url = url.and_then(|s| {
+                let t = s.trim().to_string();
+                (!t.is_empty()).then_some(t)
+            });
+            proxy_touched = true;
+        }
+        if proxy_touched {
+            match cur.proxy_mode.as_str() {
+                "manual" => {
+                    let url = cur
+                        .proxy_url
+                        .as_deref()
+                        .ok_or_else(|| invalid_setting("manual proxy mode requires a proxy URL"))?;
+                    driven_tls::validate_manual_url(url)
+                        .map_err(|e| invalid_setting(format!("proxy URL is not usable: {e}")))?;
+                }
+                "pac" => {
+                    let source = cur.proxy_url.as_deref().ok_or_else(|| {
+                        invalid_setting("PAC proxy mode requires a PAC file URL or path")
+                    })?;
+                    // Validate the PAC with the (pending) custom CA applied to
+                    // its fetch, so a PAC served over an internal TLS-inspected
+                    // host validates the same way it will resolve.
+                    let ca = driven_tls::CustomCaConfig::from_path(normalize_ca_path(
+                        cur.custom_root_ca_path.clone(),
+                    ));
+                    driven_tls::validate_pac_source(source, &ca)
+                        .await
+                        .map_err(|e| invalid_setting(format!("PAC file is not usable: {e}")))?;
+                    tracing::info!(target: TARGET, "PAC proxy file validated on save");
+                }
+                // "system" / "none": no URL required.
+                _ => {}
+            }
+        }
         store_group(repo, KEY_GLOBAL, &storage::Global::from(cur)).await?;
     }
 
@@ -808,6 +854,13 @@ mod storage {
         // system trust only, the unchanged behaviour).
         #[serde(default)]
         pub custom_root_ca_path: Option<std::path::PathBuf>,
+        // Issue #34 (SOCKS5 + PAC proxy). `serde(default)` so a `global` blob
+        // persisted before these fields still deserialises (default `system` =
+        // honour HTTP(S)_PROXY env vars, the unchanged behaviour).
+        #[serde(default = "default_proxy_mode")]
+        pub proxy_mode: String,
+        #[serde(default)]
+        pub proxy_url: Option<String>,
     }
 
     /// Default hook timeout (seconds) for a pre-V2 `global` blob missing it.
@@ -819,6 +872,12 @@ mod storage {
     /// s11.4.7 ships default-on).
     fn default_adaptive_parallelism_enabled() -> bool {
         true
+    }
+
+    /// Default proxy mode (V1 behaviour: honour env proxies) for a `global` blob
+    /// persisted before the proxy fields existed.
+    fn default_proxy_mode() -> String {
+        "system".to_string()
     }
 
     /// Default metered mode (V1 behaviour: pause) for a pre-V2 `global` blob.
@@ -846,6 +905,8 @@ mod storage {
                 metered_mode: s.metered_mode,
                 metered_bandwidth_cap_mbps: s.metered_bandwidth_cap_mbps,
                 custom_root_ca_path: s.custom_root_ca_path,
+                proxy_mode: s.proxy_mode,
+                proxy_url: s.proxy_url,
             }
         }
     }
@@ -870,6 +931,8 @@ mod storage {
                 metered_mode: d.metered_mode,
                 metered_bandwidth_cap_mbps: d.metered_bandwidth_cap_mbps,
                 custom_root_ca_path: d.custom_root_ca_path,
+                proxy_mode: d.proxy_mode,
+                proxy_url: d.proxy_url,
             }
         }
     }
@@ -1215,6 +1278,24 @@ pub async fn load_custom_ca_config(
     Ok(driven_tls::CustomCaConfig::from_path(normalize_ca_path(
         global.custom_root_ca_path,
     )))
+}
+
+/// Issue #34: load + resolve the persisted proxy setting into a runtime
+/// [`driven_tls::ProxyConfig`] for the client-build sites (the same set as
+/// [`load_custom_ca_config`]). A read failure of the settings blob degrades to
+/// `System` (env-proxy, best-effort). For PAC mode this fetches + compiles the
+/// PAC script (fail-closed - a configured-but-unreachable PAC surfaces as an
+/// error rather than a silent direct connection); the custom CA is applied to
+/// the PAC fetch. Manual/PAC config is validated fail-closed at client build.
+pub async fn load_proxy_config(state: &dyn StateRepo) -> CommandResult<driven_tls::ProxyConfig> {
+    let global: GlobalSettings = load_group::<storage::Global>(state, KEY_GLOBAL)
+        .await?
+        .map(Into::into)
+        .unwrap_or_else(default_global);
+    let ca = load_custom_ca_config(state).await?;
+    driven_tls::resolve_proxy(&global.proxy_mode, global.proxy_url.as_deref(), &ca)
+        .await
+        .map_err(|e| invalid_setting(format!("proxy configuration is not usable: {e}")))
 }
 
 /// Map the persisted [`ScheduleSettings`] DTO onto the core
@@ -2162,7 +2243,8 @@ pub async fn check_for_updates(
     })?;
 
     let ca = load_custom_ca_config(state.state().as_ref()).await?;
-    let releases = fetch_releases(1, &ca).await?;
+    let proxy = load_proxy_config(state.state().as_ref()).await?;
+    let releases = fetch_releases(1, &ca, &proxy).await?;
 
     // Newest channel-eligible release with a parseable semver tag.
     let mut best: Option<(semver::Version, GithubRelease)> = None;
@@ -2215,7 +2297,8 @@ pub async fn list_releases(
     // buggy caller is clamped to the first page.
     let page = page.max(1);
     let ca = load_custom_ca_config(state.state().as_ref()).await?;
-    let releases = fetch_releases(page, &ca).await?;
+    let proxy = load_proxy_config(state.state().as_ref()).await?;
+    let releases = fetch_releases(page, &ca, &proxy).await?;
 
     let dtos = releases
         .into_iter()
@@ -2246,6 +2329,47 @@ pub async fn validate_custom_ca(path: String) -> CommandResult<CustomCaValidatio
         // A PEM cannot realistically hold > u32::MAX certs; clamp defensively.
         cert_count: u32::try_from(count).unwrap_or(u32::MAX),
     })
+}
+
+/// Issue #34: validate a candidate proxy configuration for the settings UI
+/// (mirrors [`validate_custom_ca`]). `mode` is one of the [`driven_tls::PROXY_MODES`];
+/// `url` is the manual proxy URL (manual mode) or PAC file URL/path (PAC mode).
+///
+/// - `system` / `none`: always valid (no URL needed).
+/// - `manual`: the URL must parse to a supported scheme (`http`/`https`/
+///   `socks5`/`socks5h`) with a host.
+/// - `pac`: the PAC file must fetch/read + compile (with the saved custom CA
+///   applied to the fetch).
+///
+/// Returns `Ok(())` when usable, or a `internal.invalid_input` error carrying the
+/// reason. Uses the exact same fail-closed rules as the client-build path.
+#[tauri::command]
+pub async fn validate_proxy(
+    state: State<'_, AppState>,
+    mode: String,
+    url: Option<String>,
+) -> CommandResult<()> {
+    check_enum("proxy_mode", &mode, driven_tls::PROXY_MODES)?;
+    let trimmed = url.as_deref().map(str::trim).filter(|s| !s.is_empty());
+    match mode.as_str() {
+        "manual" => {
+            let url =
+                trimmed.ok_or_else(|| invalid_setting("manual proxy mode requires a proxy URL"))?;
+            driven_tls::validate_manual_url(url)
+                .map_err(|e| invalid_setting(format!("proxy URL is not usable: {e}")))?;
+        }
+        "pac" => {
+            let source = trimmed
+                .ok_or_else(|| invalid_setting("PAC proxy mode requires a PAC file URL or path"))?;
+            let ca = load_custom_ca_config(state.state().as_ref()).await?;
+            driven_tls::validate_pac_source(source, &ca)
+                .await
+                .map_err(|e| invalid_setting(format!("PAC file is not usable: {e}")))?;
+        }
+        // "system" / "none".
+        _ => {}
+    }
+    Ok(())
 }
 
 /// Read the active updater channel (`stable` | `dev`) from the persisted
@@ -2321,6 +2445,7 @@ fn parse_tag(tag: &str) -> Option<semver::Version> {
 async fn fetch_releases(
     page: u32,
     ca: &driven_tls::CustomCaConfig,
+    proxy: &driven_tls::ProxyConfig,
 ) -> CommandResult<Vec<GithubRelease>> {
     let url = format!(
         "https://api.github.com/repos/{GITHUB_REPO}/releases?per_page={RELEASES_PER_PAGE}&page={page}"
@@ -2328,16 +2453,23 @@ async fn fetch_releases(
 
     // R4-P2-5: bound the request so a blackholed GitHub endpoint cannot hang the
     // IPC command forever (no timeout = wait indefinitely). 10s connect, 30s
-    // total. Issue #34: add the user's custom root CA additively (fail-closed).
+    // total. Issue #34: add the user's custom root CA additively then the
+    // configured proxy (both fail-closed).
     let builder = reqwest::Client::builder()
         .user_agent(GITHUB_USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30));
-    let client = driven_tls::apply_custom_ca(builder, ca)
+    let builder = driven_tls::apply_custom_ca(builder, ca).map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::InternalBug,
+            format!("custom root CA could not be applied: {e}"),
+        )
+    })?;
+    let client = driven_tls::apply_proxy(builder, proxy)
         .map_err(|e| {
             CommandError::with_code(
                 ErrorCode::InternalBug,
-                format!("custom root CA could not be applied: {e}"),
+                format!("proxy could not be applied: {e}"),
             )
         })?
         .build()
@@ -2411,6 +2543,9 @@ fn default_global() -> GlobalSettings {
         metered_bandwidth_cap_mbps: None,
         // Issue #34: system trust only by default (no custom corporate CA).
         custom_root_ca_path: None,
+        // Issue #34: honour HTTP(S)_PROXY env vars by default (unchanged V1).
+        proxy_mode: "system".to_string(),
+        proxy_url: None,
     }
 }
 

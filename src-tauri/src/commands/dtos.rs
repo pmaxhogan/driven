@@ -463,6 +463,14 @@ pub struct GlobalSettings {
     /// trust only (the default). Additive - it never replaces the OS roots and
     /// never disables verification.
     pub custom_root_ca_path: Option<PathBuf>,
+    /// Issue #34 (DESIGN s5.8.7): proxy mode for ALL outbound connections.
+    /// One of `system` (default; honour `HTTP_PROXY`/`HTTPS_PROXY` env vars),
+    /// `none` (bypass all proxies), `manual` (use `proxyUrl`), or `pac` (fetch +
+    /// evaluate the PAC file at `proxyUrl`).
+    pub proxy_mode: String,
+    /// Issue #34: the proxy URL (manual mode: `http`/`https`/`socks5`/`socks5h`)
+    /// or PAC file URL/path (PAC mode). `null` in `system`/`none` mode.
+    pub proxy_url: Option<String>,
 }
 
 /// V2 schedule-window settings (DESIGN s17). Mirrors
@@ -646,6 +654,12 @@ pub struct GlobalSettingsPatch {
     /// it unchanged.
     #[serde(default, deserialize_with = "double_option")]
     pub custom_root_ca_path: Option<Option<PathBuf>>,
+    /// See [`GlobalSettings::proxy_mode`]. Absent = unchanged.
+    pub proxy_mode: Option<String>,
+    /// See [`GlobalSettings::proxy_url`]. `double_option`: `null` = `Some(None)`
+    /// clears it; an absent key leaves it unchanged.
+    #[serde(default, deserialize_with = "double_option")]
+    pub proxy_url: Option<Option<String>>,
 }
 
 /// Partial SPEC s22 `telemetry` settings.

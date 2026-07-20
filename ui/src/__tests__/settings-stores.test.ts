@@ -82,6 +82,8 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       meteredMode: "pause",
       meteredBandwidthCapMbps: null,
       customRootCaPath: null,
+      proxyMode: "system",
+      proxyUrl: null,
     },
     telemetry: {
       enabled: true,

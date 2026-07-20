@@ -221,6 +221,14 @@ export function validateCustomCa(path: string): Promise<CustomCaValidation> {
   return invoke("validate_custom_ca", { path });
 }
 
+/** Issue #34: validate a candidate proxy configuration before saving it.
+ * `mode` is "system" | "none" | "manual" | "pac"; `url` is the manual proxy URL
+ * or PAC file URL/path (required for manual/pac). Resolves on success, or rejects
+ * with the reason (bad URL scheme, unreachable/uncompilable PAC file, etc.). */
+export function validateProxy(mode: string, url: string | null): Promise<void> {
+  return invoke("validate_proxy", { mode, url });
+}
+
 // --- In-app updater (SPEC s15.2; M9a) ---
 
 /** Manually check the active channel's signed `update.json` manifest for a newer

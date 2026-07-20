@@ -34,7 +34,7 @@
 use std::sync::Arc;
 use std::time::Duration;
 
-use driven_tls::CustomCaConfig;
+use driven_tls::{CustomCaConfig, ProxyConfig};
 use keyring::Entry;
 use serde::Deserialize;
 use tokio::sync::Mutex;
@@ -326,8 +326,9 @@ impl RefreshingTokenSource {
         client_id: impl Into<String>,
         client_secret: impl Into<String>,
         ca: &CustomCaConfig,
+        proxy: &ProxyConfig,
     ) -> anyhow::Result<Self> {
-        let http = build_refresh_client(ca)?;
+        let http = build_refresh_client(ca, proxy)?;
         let tokens = Tokens {
             access_token: String::new(),
             refresh_token: refresh_token.into(),
@@ -475,15 +476,20 @@ fn now_unix() -> i64 {
 /// time keeps a hung token endpoint from wedging every Drive request (the
 /// refresh holds the token mutex across the await); disabling redirects keeps
 /// the credential-bearing client from being steered to an attacker endpoint.
-fn build_refresh_client(ca: &CustomCaConfig) -> anyhow::Result<reqwest::Client> {
+fn build_refresh_client(
+    ca: &CustomCaConfig,
+    proxy: &ProxyConfig,
+) -> anyhow::Result<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .connect_timeout(REFRESH_CONNECT_TIMEOUT)
         .timeout(REFRESH_TOTAL_TIMEOUT)
         .redirect(reqwest::redirect::Policy::none());
-    // Issue #34: add the user's custom root CA additively; fail-closed if a
-    // configured CA cannot be loaded (a corporate proxy would break the refresh
-    // otherwise, and silently ignoring the CA is never correct).
-    driven_tls::apply_custom_ca(builder, ca)?
+    // Issue #34: add the user's custom root CA additively then the configured
+    // proxy; fail-closed if either cannot be applied (a corporate proxy would
+    // break the refresh otherwise, and silently ignoring the CA/proxy is never
+    // correct).
+    let builder = driven_tls::apply_custom_ca(builder, ca)?;
+    driven_tls::apply_proxy(builder, proxy)?
         .build()
         .map_err(|e| anyhow::anyhow!("drive: failed to build OAuth refresh client: {e}"))
 }
@@ -597,7 +603,7 @@ mod tests {
         // V-A1: the refresh client must build with timeouts + redirect::none.
         // Building it is offline (no network); a failure would be a TLS-init
         // bug, so this is a real assertion, not a skip.
-        let client = build_refresh_client(&CustomCaConfig::none());
+        let client = build_refresh_client(&CustomCaConfig::none(), &ProxyConfig::system());
         assert!(
             client.is_ok(),
             "refresh client must build offline: {:?}",
@@ -613,15 +619,26 @@ mod tests {
         let missing = std::path::PathBuf::from("/driven/no/such/ca-bundle.pem");
         let ca = CustomCaConfig::from_path(Some(missing));
         assert!(
-            build_refresh_client(&ca).is_err(),
+            build_refresh_client(&ca, &ProxyConfig::system()).is_err(),
             "a missing custom CA file must fail the refresh-client build"
+        );
+    }
+
+    #[test]
+    fn refresh_client_fails_closed_with_a_bad_proxy() {
+        // Issue #34: a configured-but-invalid proxy URL must FAIL the refresh
+        // client build closed, never building an unproxied credential client.
+        let bad = ProxyConfig::Manual("ftp://nope:21".to_string());
+        assert!(
+            build_refresh_client(&CustomCaConfig::none(), &bad).is_err(),
+            "an invalid proxy URL must fail the refresh-client build"
         );
     }
 
     #[test]
     fn with_store_wires_the_keychain_store() {
         // C-P2-4 / V-A3: with_store attaches a store; without it, none.
-        let http = build_refresh_client(&CustomCaConfig::none()).unwrap();
+        let http = build_refresh_client(&CustomCaConfig::none(), &ProxyConfig::system()).unwrap();
         let tokens = Tokens {
             access_token: String::new(),
             refresh_token: "rt".to_string(),

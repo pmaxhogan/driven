@@ -33,9 +33,13 @@
 //!   (discarding its pooled connections) after the pool-teardown threshold
 //!   (DESIGN s5.8.5).
 //!
-//! Proxy support (`HTTP_PROXY` / `HTTPS_PROXY`, DESIGN s5.8.7) is left to
-//! `reqwest`'s built-in env-proxy handling: the clients are built WITHOUT
-//! `.no_proxy()`, so the env vars are honoured.
+//! Proxy support (DESIGN s5.8.7, issue #34): every client is built through
+//! [`driven_tls::apply_proxy`] with the user-configured [`ProxyConfig`]. In the
+//! default `System` mode nothing is attached, so `reqwest`'s built-in
+//! `HTTP_PROXY`/`HTTPS_PROXY` env handling is honoured; the other modes attach an
+//! explicit manual proxy, a PAC evaluator, or an explicit `.no_proxy()`. The
+//! proxy is retained on the backend so a [`Backend::drop_pool`] rebuild
+//! re-applies it.
 
 mod classify;
 mod reachability;
@@ -47,7 +51,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use driven_core::network::{Backend, ProbeOutcome, ServiceName};
-use driven_tls::CustomCaConfig;
+use driven_tls::{CustomCaConfig, ProxyConfig};
 
 /// Tracing target for the production network backend.
 const TARGET: &str = "driven::net::backend";
@@ -172,6 +176,10 @@ pub struct ReqwestBackend {
     /// [`Self::drop_pool`] rebuild re-applies the SAME additive trust as the
     /// original client build. Empty (`None`) = system trust only.
     ca: CustomCaConfig,
+    /// Issue #34: the user-configured proxy (if any), retained so a
+    /// [`Self::drop_pool`] rebuild re-applies the SAME proxy as the original
+    /// client build. Defaults to [`ProxyConfig::System`] (honour env proxies).
+    proxy: ProxyConfig,
 }
 
 impl ReqwestBackend {
@@ -183,20 +191,23 @@ impl ReqwestBackend {
     ///
     /// `ca` is the user-configured custom root CA (issue #34): additive on top of
     /// the OS/enterprise trust store, retained for pool rebuilds. Pass
-    /// [`CustomCaConfig::none`] for system trust only.
+    /// [`CustomCaConfig::none`] for system trust only. `proxy` is the configured
+    /// proxy (issue #34), also retained for pool rebuilds; pass
+    /// [`ProxyConfig::system`] to honour the `HTTP(S)_PROXY` env vars.
     ///
     /// Returns an error if a client (TLS backend init) cannot be constructed, or
-    /// if a configured custom CA is missing / unreadable / unparseable
-    /// (fail-closed: the backend is not built with a silently-ignored CA).
-    pub fn new(ca: CustomCaConfig) -> anyhow::Result<Self> {
-        let captive = build_captive_client(&ca)?;
-        let drive = build_service_client(ServiceName::Drive, &ca)?;
-        let update_endpoint = build_service_client(ServiceName::UpdateEndpoint, &ca)?;
-        let github = build_service_client(ServiceName::Github, &ca)?;
+    /// if a configured custom CA / proxy is invalid (fail-closed: the backend is
+    /// not built with a silently-ignored CA or unproxied connection).
+    pub fn new(ca: CustomCaConfig, proxy: ProxyConfig) -> anyhow::Result<Self> {
+        let captive = build_captive_client(&ca, &proxy)?;
+        let drive = build_service_client(ServiceName::Drive, &ca, &proxy)?;
+        let update_endpoint = build_service_client(ServiceName::UpdateEndpoint, &ca, &proxy)?;
+        let github = build_service_client(ServiceName::Github, &ca, &proxy)?;
 
         tracing::debug!(
             target: TARGET,
             custom_ca = ca.is_enabled(),
+            proxy = ?proxy,
             "ReqwestBackend constructed (per-service clients + lookup_host DNS probe)"
         );
 
@@ -207,6 +218,7 @@ impl ReqwestBackend {
             github: Mutex::new(github),
             native_fallback_logged: AtomicBool::new(false),
             ca,
+            proxy,
         })
     }
 
@@ -505,7 +517,7 @@ impl Backend for ReqwestBackend {
             // Telemetry has no pooled client; nothing to drop.
             return;
         };
-        match build_service_client(service, &self.ca) {
+        match build_service_client(service, &self.ca, &self.proxy) {
             Ok(fresh) => {
                 *Self::lock(slot) = fresh;
                 tracing::info!(
@@ -532,7 +544,10 @@ impl Backend for ReqwestBackend {
 /// Builds the redirect-disabled captive-portal probe client (DESIGN s5.8.4
 /// captive row: 3s connect / 5s total). `ca` adds the user's custom root CA
 /// (issue #34) additively; fail-closed if a configured CA cannot be loaded.
-fn build_captive_client(ca: &CustomCaConfig) -> anyhow::Result<reqwest::Client> {
+fn build_captive_client(
+    ca: &CustomCaConfig,
+    proxy: &ProxyConfig,
+) -> anyhow::Result<reqwest::Client> {
     let builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         // Observe a portal's 30x rather than follow it (DESIGN s5.8.1).
@@ -541,8 +556,10 @@ fn build_captive_client(ca: &CustomCaConfig) -> anyhow::Result<reqwest::Client> 
         .timeout(CAPTIVE_TOTAL_TIMEOUT)
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
         .pool_idle_timeout(POOL_IDLE_TIMEOUT);
-    // Honour HTTP(S)_PROXY (DESIGN s5.8.7): do NOT call .no_proxy().
-    driven_tls::apply_custom_ca(builder, ca)?
+    // Issue #34: apply the user's custom CA (additive) then the configured proxy
+    // (System mode leaves reqwest's HTTP(S)_PROXY env pickup on - DESIGN s5.8.7).
+    let builder = driven_tls::apply_custom_ca(builder, ca)?;
+    driven_tls::apply_proxy(builder, proxy)?
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build captive-probe reqwest client: {e}"))
 }
@@ -553,6 +570,7 @@ fn build_captive_client(ca: &CustomCaConfig) -> anyhow::Result<reqwest::Client> 
 fn build_service_client(
     service: ServiceName,
     ca: &CustomCaConfig,
+    proxy: &ProxyConfig,
 ) -> anyhow::Result<reqwest::Client> {
     let (total, idle) = match service {
         ServiceName::Drive => (DRIVE_TOTAL_TIMEOUT, DRIVE_IDLE_TIMEOUT),
@@ -582,8 +600,10 @@ fn build_service_client(
         // which would break non-TLS / ALPN-less peers); adaptive window keeps
         // a single h2 connection from head-of-line-stalling large transfers.
         .http2_adaptive_window(true);
-    // Honour HTTP(S)_PROXY (DESIGN s5.8.7): do NOT call .no_proxy().
-    driven_tls::apply_custom_ca(builder, ca)?
+    // Issue #34: custom CA (additive) then the configured proxy (System mode
+    // keeps reqwest's HTTP(S)_PROXY env pickup on - DESIGN s5.8.7).
+    let builder = driven_tls::apply_custom_ca(builder, ca)?;
+    driven_tls::apply_proxy(builder, proxy)?
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build {service:?} probe reqwest client: {e}"))
 }
@@ -608,7 +628,7 @@ mod tests {
     // touches the network. This is a real assertion, not a skip.
     #[test]
     fn backend_constructs_offline() {
-        let backend = ReqwestBackend::new(CustomCaConfig::none());
+        let backend = ReqwestBackend::new(CustomCaConfig::none(), ProxyConfig::system());
         assert!(
             backend.is_ok(),
             "ReqwestBackend::new must succeed without network: {:?}",
@@ -624,18 +644,32 @@ mod tests {
         let bad =
             CustomCaConfig::from_path(Some(std::path::PathBuf::from("/driven/no/such/net-ca.pem")));
         assert!(
-            ReqwestBackend::new(bad.clone()).is_err(),
+            ReqwestBackend::new(bad.clone(), ProxyConfig::system()).is_err(),
             "a missing custom CA must fail the probe-backend build"
         );
-        assert!(build_captive_client(&bad).is_err());
-        assert!(build_service_client(ServiceName::Drive, &bad).is_err());
+        assert!(build_captive_client(&bad, &ProxyConfig::system()).is_err());
+        assert!(build_service_client(ServiceName::Drive, &bad, &ProxyConfig::system()).is_err());
+    }
+
+    #[test]
+    fn backend_fails_closed_with_a_bad_proxy() {
+        // Issue #34: a configured-but-invalid proxy URL must fail the backend
+        // build (fail-closed), never silently building an unproxied client.
+        let bad = ProxyConfig::Manual("ftp://not-a-supported-proxy:21".to_string());
+        assert!(
+            ReqwestBackend::new(CustomCaConfig::none(), bad.clone()).is_err(),
+            "an invalid proxy URL must fail the probe-backend build"
+        );
+        assert!(build_captive_client(&CustomCaConfig::none(), &bad).is_err());
+        assert!(build_service_client(ServiceName::Drive, &CustomCaConfig::none(), &bad).is_err());
     }
 
     #[tokio::test]
     async fn drop_pool_rebuilds_the_service_client_with_the_stored_ca() {
         // Issue #34: a pool teardown rebuilds the client re-applying the SAME CA
         // (here `none`, offline) - it must not panic or drop the client.
-        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
+        let backend = ReqwestBackend::new(CustomCaConfig::none(), ProxyConfig::system())
+            .expect("construct backend");
         backend.drop_pool(ServiceName::Drive).await;
         // Telemetry has no pooled client; drop is a no-op (early-return covered).
         backend.drop_pool(ServiceName::Telemetry).await;
@@ -646,7 +680,8 @@ mod tests {
 
     #[test]
     fn telemetry_has_no_probe_client() {
-        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
+        let backend = ReqwestBackend::new(CustomCaConfig::none(), ProxyConfig::system())
+            .expect("construct backend");
         assert!(backend.service_client(ServiceName::Telemetry).is_none());
         assert!(backend.service_client(ServiceName::Drive).is_some());
         assert!(backend
@@ -666,7 +701,8 @@ mod tests {
     // native/fallback boundary.
     #[tokio::test]
     async fn os_online_is_total() {
-        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
+        let backend = ReqwestBackend::new(CustomCaConfig::none(), ProxyConfig::system())
+            .expect("construct backend");
         let _: bool = backend.os_online().await;
     }
 
@@ -697,7 +733,8 @@ mod tests {
     // offline-safe test.
     #[tokio::test]
     async fn resolve_invalid_tld_is_dns_failed_and_bounded() {
-        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
+        let backend = ReqwestBackend::new(CustomCaConfig::none(), ProxyConfig::system())
+            .expect("construct backend");
         let started = std::time::Instant::now();
         let outcome = backend.resolve("driven-net-nonexistent.invalid").await;
         let elapsed = started.elapsed();
@@ -718,7 +755,8 @@ mod tests {
     // switch.
     #[tokio::test]
     async fn resolve_localhost_succeeds() {
-        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
+        let backend = ReqwestBackend::new(CustomCaConfig::none(), ProxyConfig::system())
+            .expect("construct backend");
         let outcome = backend.resolve("localhost").await;
         assert_eq!(outcome, Ok(()), "localhost must resolve via lookup_host");
     }

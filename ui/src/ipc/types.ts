@@ -218,6 +218,13 @@ export interface GlobalSettings {
    * inspection environments). null = system trust only. Additive - never
    * replaces the OS roots, never disables verification. */
   customRootCaPath: string | null;
+  /** Issue #34: proxy mode for ALL outbound connections - "system" (honour
+   * HTTP(S)_PROXY env vars, the default), "none" (bypass all proxies), "manual"
+   * (use proxyUrl), or "pac" (evaluate the PAC file at proxyUrl per-URL). */
+  proxyMode: string;
+  /** Issue #34: the manual proxy URL (http/https/socks5/socks5h) or PAC file
+   * URL/path. null in system/none mode. */
+  proxyUrl: string | null;
 }
 
 export interface TelemetrySettings {
@@ -313,6 +320,10 @@ export interface GlobalSettingsPatch {
   /** Issue #34: present = set (validated on save); null clears it back to
    * system-trust-only. */
   customRootCaPath?: string | null;
+  /** Issue #34: present = set the proxy mode ("system"|"none"|"manual"|"pac"). */
+  proxyMode?: string;
+  /** Issue #34: present = set the proxy URL / PAC source; null clears it. */
+  proxyUrl?: string | null;
 }
 
 /** Issue #34: result of validating a candidate custom root CA PEM file. */

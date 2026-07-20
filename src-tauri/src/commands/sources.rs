@@ -33,7 +33,7 @@ use driven_crypto::{master_key_to_phrase, Keystore, MasterKey};
 use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
 use driven_drive::google::GoogleDriveStore;
 use driven_drive::remote_store::{DriveContext, RemoteStore};
-use driven_drive::CustomCaConfig;
+use driven_drive::{CustomCaConfig, ProxyConfig};
 
 use crate::app_state::{AppState, RemoteMode};
 use crate::commands::dtos::{
@@ -743,7 +743,10 @@ pub async fn pick_drive_folder(
     let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
         .await
         .unwrap_or_default();
-    let (store, default_folder_id) = select_picker_store(state.inner(), account_id, &ca)?;
+    // Issue #34: resolve the proxy too (fail-closed - a configured-but-broken
+    // proxy blocks the picker rather than connecting direct).
+    let proxy = crate::commands::settings::load_proxy_config(state.state().as_ref()).await?;
+    let (store, default_folder_id) = select_picker_store(state.inner(), account_id, &ca, &proxy)?;
 
     // Issue #7: the drive context for this listing. `None`/"my-drive" is My
     // Drive; any other value is the Shared Drive being browsed. The webview
@@ -1485,8 +1488,9 @@ pub(crate) fn build_restore_store(
     state: &AppState,
     account_id: AccountId,
     ca: &CustomCaConfig,
+    proxy: &ProxyConfig,
 ) -> CommandResult<Arc<dyn RemoteStore>> {
-    select_picker_store(state, account_id, ca).map(|(store, _root)| store)
+    select_picker_store(state, account_id, ca, proxy).map(|(store, _root)| store)
 }
 
 /// R1-P1-3 / R2-P1-2: select the Drive-folder-picker store + its root id.
@@ -1503,20 +1507,22 @@ fn select_picker_store(
     state: &AppState,
     account_id: AccountId,
     ca: &CustomCaConfig,
+    proxy: &ProxyConfig,
 ) -> CommandResult<(Arc<dyn RemoteStore>, String)> {
     match state.remote_mode() {
         RemoteMode::Fake => {
             // R2-P1-2: the SAME per-account fake store the orchestrator uploads
             // into (the picker and the uploader must agree on folder ids). The
-            // fake never builds an HTTP client, so `ca` is unused here.
-            let _ = ca;
+            // fake never builds an HTTP client, so `ca`/`proxy` are unused here.
+            let _ = (ca, proxy);
             let fake = state.fake_remote_store(account_id);
             let root = fake.root_id().to_string();
             Ok((Arc::new(fake), root))
         }
-        RemoteMode::RealGoogleDrive => {
-            Ok((build_account_store(account_id, ca)?, "root".to_string()))
-        }
+        RemoteMode::RealGoogleDrive => Ok((
+            build_account_store(account_id, ca, proxy)?,
+            "root".to_string(),
+        )),
     }
 }
 
@@ -1527,6 +1533,7 @@ fn select_picker_store(
 fn build_account_store(
     account_id: AccountId,
     ca: &CustomCaConfig,
+    proxy: &ProxyConfig,
 ) -> CommandResult<Arc<dyn RemoteStore>> {
     let token_store = Arc::new(KeyringTokenStore::new(account_id.to_string()));
     let refresh_token = token_store
@@ -1552,11 +1559,12 @@ fn build_account_store(
         client_id,
         client_secret,
         ca,
+        proxy,
     )
     .map_err(CommandError::from)?
     .with_store(token_store);
-    let store =
-        GoogleDriveStore::with_default_clients(token_source, ca).map_err(CommandError::from)?;
+    let store = GoogleDriveStore::with_default_clients(token_source, ca, proxy)
+        .map_err(CommandError::from)?;
     Ok(Arc::new(store))
 }
 
@@ -2277,8 +2285,13 @@ mod tests {
         // real mode; here it must succeed because the fake path is taken.
         let (app_state, dir) = fake_app_state().await;
         let account_id = AccountId::new_v4();
-        let (store, root) = select_picker_store(&app_state, account_id, &CustomCaConfig::none())
-            .expect("fake store builds");
+        let (store, root) = select_picker_store(
+            &app_state,
+            account_id,
+            &CustomCaConfig::none(),
+            &ProxyConfig::system(),
+        )
+        .expect("fake store builds");
         assert!(!root.is_empty(), "fake root id must be non-empty");
         // The fresh fake root lists (zero child folders) without error / creds.
         let children = store
@@ -2305,9 +2318,13 @@ mod tests {
         let account_id = AccountId::new_v4();
 
         // The picker resolves the account's fake store + root.
-        let (picker_store, picker_root) =
-            select_picker_store(&app_state, account_id, &CustomCaConfig::none())
-                .expect("picker store");
+        let (picker_store, picker_root) = select_picker_store(
+            &app_state,
+            account_id,
+            &CustomCaConfig::none(),
+            &ProxyConfig::system(),
+        )
+        .expect("picker store");
 
         // The orchestrator (uploader) holds the SAME shared store for the account.
         let uploader_store = app_state.fake_remote_store(account_id);

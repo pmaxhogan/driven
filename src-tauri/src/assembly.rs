@@ -423,9 +423,14 @@ async fn build_account(
     let ca = crate::commands::settings::load_custom_ca_config(state.as_ref())
         .await
         .unwrap_or_default();
+    // Issue #34: likewise resolve the proxy once (System = honour env proxies).
+    // For PAC mode this fetches + compiles the PAC file (fail-closed); a resolve
+    // failure means we cannot honour the configured proxy, so we surface it
+    // rather than silently connecting direct.
+    let proxy = crate::commands::settings::load_proxy_config(state.as_ref()).await?;
 
     // --- remote: real GoogleDriveStore or the in-memory fake -----------------
-    let remote = match build_remote(account, use_fake, fake_remote_stores, &ca)? {
+    let remote = match build_remote(account, use_fake, fake_remote_stores, &ca, &proxy)? {
         RemoteOutcome::Store(store) => store,
         RemoteOutcome::NeedsReauth => {
             // C5-P1-1: persist needs_reauth + emit the banner; do NOT build a
@@ -499,7 +504,7 @@ async fn build_account(
     // Passing `Some(..)` into `ExecutorDeps.network` routes every Drive request
     // through the breaker-reporting decorator so the Drive circuit breaker is
     // driven by REAL request outcomes, not probes alone (CODEX_NOTES P2-9 / V-G).
-    let backend = Arc::new(ReqwestBackend::new(ca.clone())?);
+    let backend = Arc::new(ReqwestBackend::new(ca.clone(), proxy.clone())?);
     let network: Arc<dyn NetworkProbe> = Arc::new(Prober::new(backend, clock.clone()));
 
     // --- VSS provider (Windows): SAME Arc into executor + orchestrator --------
@@ -699,6 +704,7 @@ fn build_remote(
     use_fake: bool,
     fake_remote_stores: &FakeRemoteStores,
     ca: &CustomCaConfig,
+    proxy: &driven_tls::ProxyConfig,
 ) -> anyhow::Result<RemoteOutcome> {
     if use_fake {
         tracing::info!(
@@ -743,9 +749,10 @@ fn build_remote(
         client_id,
         client_secret,
         ca,
+        proxy,
     )?
     .with_store(token_store);
-    let store = GoogleDriveStore::with_default_clients(token_source, ca)?;
+    let store = GoogleDriveStore::with_default_clients(token_source, ca, proxy)?;
     tracing::info!(
         target: TARGET,
         account_id = %account.id,

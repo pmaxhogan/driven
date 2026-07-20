@@ -348,6 +348,10 @@ pub async fn start_oauth_signin(
     let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
         .await
         .unwrap_or_default();
+    // Issue #34: resolve the proxy too (System = honour env proxies). For PAC
+    // mode this fetches + compiles the PAC file; fail-closed (a configured-but-
+    // unreachable proxy blocks sign-in rather than connecting direct).
+    let proxy = crate::commands::settings::load_proxy_config(state.state().as_ref()).await?;
     // Resolve creds + mark started under the lock; reject a missing / already-
     // started session.
     let (client_id, client_secret) = {
@@ -411,9 +415,15 @@ pub async fn start_oauth_signin(
         let session_id = session_id.clone();
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
-            let result =
-                run_pkce_loopback_flow(&client_id, &client_secret, open_browser, progress_tx, &ca)
-                    .await;
+            let result = run_pkce_loopback_flow(
+                &client_id,
+                &client_secret,
+                open_browser,
+                progress_tx,
+                &ca,
+                &proxy,
+            )
+            .await;
             let status = match result {
                 Ok(tokens) => {
                     let mut sessions = lock_sessions();
@@ -568,7 +578,10 @@ pub async fn finish_add_account(
     let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
         .await
         .unwrap_or_default();
-    let profile = fetch_google_userinfo(&tokens.access_token, &ca).await;
+    let proxy = crate::commands::settings::load_proxy_config(state.state().as_ref())
+        .await
+        .unwrap_or_default();
+    let profile = fetch_google_userinfo(&tokens.access_token, &ca, &proxy).await;
 
     let (account_id, dto) = if let Some(account_id) = reauth_account {
         // Reauth path: re-store the refresh token + client creds, THEN flip the
@@ -831,13 +844,14 @@ struct GoogleUserinfo {
 async fn fetch_google_userinfo(
     access_token: &str,
     ca: &driven_tls::CustomCaConfig,
+    proxy: &driven_tls::ProxyConfig,
 ) -> Option<GoogleUserinfo> {
     const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
     // R4-P2-5: bound the request so a blackholed endpoint cannot hang the IPC
     // command forever (no timeout = wait indefinitely). 10s connect, 30s total.
-    // Issue #34: add the user's custom root CA additively. Fail-closed: a bad CA
-    // returns None (a label fallback) rather than a client that ignores the CA -
-    // we never make the request over a mis-configured trust store.
+    // Issue #34: add the user's custom root CA + proxy. Fail-closed: a bad CA /
+    // proxy returns None (a label fallback) rather than a client that ignores
+    // them - we never make the request over a mis-configured trust store/proxy.
     let builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
         .timeout(std::time::Duration::from_secs(30));
@@ -845,6 +859,13 @@ async fn fetch_google_userinfo(
         Ok(b) => b,
         Err(e) => {
             tracing::warn!(target: TARGET, error = %e, "userinfo: custom root CA could not be applied; skipping profile fetch");
+            return None;
+        }
+    };
+    let builder = match driven_tls::apply_proxy(builder, proxy) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(target: TARGET, error = %e, "userinfo: proxy could not be applied; skipping profile fetch");
             return None;
         }
     };

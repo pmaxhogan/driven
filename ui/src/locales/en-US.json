@@ -258,6 +258,24 @@
         "validCount": "Valid - trusts {count} certificate(s).",
         "invalid": "Could not read this file as a PEM certificate bundle. Check the path and that the file contains PEM certificate(s)."
       },
+      "proxy": {
+        "title": "Proxy",
+        "modeLabel": "Proxy mode",
+        "mode": {
+          "system": "Use system / environment proxy",
+          "none": "No proxy (direct connection)",
+          "manual": "Manual proxy",
+          "pac": "Automatic (PAC file)"
+        },
+        "urlLabel": "Proxy URL",
+        "urlPlaceholder": "http://proxy.example:8080 or socks5://proxy:1080",
+        "pacLabel": "PAC file URL or path",
+        "pacPlaceholder": "http://wpad.example/proxy.pac or /etc/proxy.pac",
+        "valid": "Valid - this proxy configuration is usable.",
+        "invalid": "This proxy configuration is not usable. Check the URL scheme (http, https, socks5, socks5h) or that the PAC file can be reached and defines FindProxyForURL.",
+        "requiresUrl": "Enter a proxy URL (manual) or PAC file location (automatic).",
+        "note": "Routes ALL of Driven's outbound connections through a proxy. \"Use system / environment proxy\" honours the HTTP_PROXY / HTTPS_PROXY environment variables (the default). Manual takes one proxy URL (http, https, socks5, or socks5h - the 'h' resolves DNS at the proxy). Automatic evaluates a PAC (proxy auto-config) file per destination. Applies to new connections after an app restart. A broken proxy is rejected on save rather than silently connecting directly."
+      },
       "schedule": {
         "label": "Only back up during a schedule window",
         "startLabel": "From",

@@ -97,15 +97,17 @@ async fn setup_store(
     drive_context: &DriveContext,
 ) -> (GoogleDriveStore, String) {
     let ca = driven_drive::CustomCaConfig::none();
+    let proxy = driven_drive::ProxyConfig::system();
     let token_source = RefreshingTokenSource::from_stored_refresh_token(
         creds.refresh_token.clone(),
         creds.client_id.clone(),
         creds.client_secret.clone(),
         &ca,
+        &proxy,
     )
     .expect("build refreshing token source");
-    let store =
-        GoogleDriveStore::with_default_clients(token_source, &ca).expect("build GoogleDriveStore");
+    let store = GoogleDriveStore::with_default_clients(token_source, &ca, &proxy)
+        .expect("build GoogleDriveStore");
 
     // Each test operates inside a fresh UUID-named child folder so concurrent
     // runs never collide and cleanup is a single trash of that subtree

@@ -616,6 +616,7 @@ pub fn run() {
             commands::settings::list_releases,
             // Issue #34: validate a candidate corporate root-CA PEM before save.
             commands::settings::validate_custom_ca,
+            commands::settings::validate_proxy,
             // SPEC s15.2 updater (M9a): runtime channel selection + the
             // tauri-plugin-updater check/install path.
             updater::check_for_update,

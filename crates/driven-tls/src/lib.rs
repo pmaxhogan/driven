@@ -33,6 +33,13 @@ use std::path::{Path, PathBuf};
 
 use reqwest::{Certificate, ClientBuilder};
 
+pub mod proxy;
+
+pub use proxy::{
+    apply_proxy, resolve_proxy, validate_manual_url, validate_pac_source, PacEngine, ProxyConfig,
+    ProxyError, PROXY_MODES,
+};
+
 /// The resolved custom-root-CA setting: an optional path to a PEM file that may
 /// contain one or more certificates. `None` (the default) means system trust
 /// only - the unchanged behaviour.

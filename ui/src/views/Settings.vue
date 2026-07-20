@@ -7,7 +7,7 @@ import AccountList from "../components/AccountList.vue";
 import SourceTable from "../components/SourceTable.vue";
 import TelemetryPreviewModal from "../components/TelemetryPreviewModal.vue";
 import { useSettingsStore } from "../stores/settings";
-import { getVssHelperStatus, validateCustomCa } from "../ipc/commands";
+import { getVssHelperStatus, validateCustomCa, validateProxy } from "../ipc/commands";
 import type { SettingsPatch, VssHelperStatus } from "../ipc/types";
 
 // Settings view (SPEC s25 /accounts, /sources, /rules; DESIGN s8.2). One view
@@ -112,6 +112,12 @@ const meteredCapText = ref("");
 const customCaPath = ref("");
 const caFeedback = ref<{ ok: boolean; message: string } | null>(null);
 
+// Issue #34: proxy mode + URL/PAC source + inline validation feedback.
+const proxyModes = ["system", "none", "manual", "pac"] as const;
+const proxyMode = ref("system");
+const proxyUrl = ref("");
+const proxyFeedback = ref<{ ok: boolean; message: string } | null>(null);
+
 function minutesToHHMM(min: number): string {
   const m = ((Math.floor(min) % 1440) + 1440) % 1440;
   const hh = String(Math.floor(m / 60)).padStart(2, "0");
@@ -180,6 +186,9 @@ watch(
     // NOTE: do NOT reset `caFeedback` here - `commitCustomCa` updates the store,
     // which re-runs this loader, and clearing it would wipe the just-shown
     // validation result. `caFeedback` is owned solely by `commitCustomCa`.
+    proxyMode.value = s.global.proxyMode ?? "system";
+    proxyUrl.value = s.global.proxyUrl ?? "";
+    // As with `caFeedback`, `proxyFeedback` is owned solely by `commitProxy`.
   },
   { immediate: true }
 );
@@ -382,6 +391,51 @@ async function commitCustomCa(): Promise<void> {
     return;
   }
   await commitPatch({ global: { customRootCaPath: path } });
+}
+
+// Issue #34: change the proxy mode. system/none need no URL and commit straight
+// away (clearing the URL); manual/pac defer the commit to `commitProxy` once a
+// URL is entered (so we never persist a manual/pac mode with no proxy).
+async function setProxyMode(event: Event): Promise<void> {
+  const mode = (event.target as HTMLSelectElement).value;
+  proxyMode.value = mode;
+  proxyFeedback.value = null;
+  if (mode === "system" || mode === "none") {
+    await commitPatch({ global: { proxyMode: mode, proxyUrl: null } });
+  }
+  // manual / pac: wait for the URL field (commitProxy). A pre-existing valid URL
+  // (loaded from the store) is re-validated + committed when the user leaves the
+  // URL field, or immediately here if one is already present.
+  else if (proxyUrl.value.trim() !== "") {
+    await commitProxy();
+  }
+}
+
+// Issue #34: validate + save the proxy URL / PAC source for manual/pac mode. The
+// backend validation parses a manual URL or fetches + compiles a PAC file FIRST,
+// so a broken proxy is never persisted (which would fail-closed every outbound
+// connection); only a usable value is committed.
+async function commitProxy(): Promise<void> {
+  const mode = proxyMode.value;
+  if (mode === "system" || mode === "none") {
+    proxyFeedback.value = null;
+    await commitPatch({ global: { proxyMode: mode, proxyUrl: null } });
+    return;
+  }
+  const url = proxyUrl.value.trim();
+  if (url === "") {
+    proxyFeedback.value = { ok: false, message: t("settings.rules.proxy.requiresUrl") };
+    return;
+  }
+  try {
+    await validateProxy(mode, url);
+    proxyFeedback.value = { ok: true, message: t("settings.rules.proxy.valid") };
+  } catch {
+    // Do NOT persist an unusable proxy (it would fail-closed every connection).
+    proxyFeedback.value = { ok: false, message: t("settings.rules.proxy.invalid") };
+    return;
+  }
+  await commitPatch({ global: { proxyMode: mode, proxyUrl: url } });
 }
 
 // Persist the whole schedule window. The UTC offset is captured fresh from
@@ -781,6 +835,7 @@ const showTelemetryPreview = ref(false);
               t("settings.rules.vssModeLabel")
             }}</span>
             <select
+              data-testid="vss-mode"
               class="w-full"
               :class="inputCls"
               :value="settings.settings.windows.vssMode"
@@ -933,6 +988,64 @@ const showTelemetryPreview = ref(false);
           </p>
           <p class="text-xs text-zinc-500">
             {{ t("settings.rules.customCa.note") }}
+          </p>
+        </section>
+
+        <!-- Issue #34: proxy (SOCKS5 + PAC) -->
+        <section class="space-y-2" :class="cardCls" data-testid="proxy-setting">
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("settings.rules.proxy.title") }}
+          </h3>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.proxy.modeLabel")
+            }}</span>
+            <select
+              data-testid="proxy-mode"
+              class="w-full"
+              :class="inputCls"
+              :value="proxyMode"
+              @change="setProxyMode"
+            >
+              <option v-for="mode in proxyModes" :key="mode" :value="mode">
+                {{ t(`settings.rules.proxy.mode.${mode}`) }}
+              </option>
+            </select>
+          </label>
+          <label v-if="proxyMode === 'manual' || proxyMode === 'pac'" class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              proxyMode === "pac"
+                ? t("settings.rules.proxy.pacLabel")
+                : t("settings.rules.proxy.urlLabel")
+            }}</span>
+            <input
+              v-model="proxyUrl"
+              type="text"
+              data-testid="proxy-url"
+              class="w-full font-mono"
+              :class="inputCls"
+              :placeholder="
+                proxyMode === 'pac'
+                  ? t('settings.rules.proxy.pacPlaceholder')
+                  : t('settings.rules.proxy.urlPlaceholder')
+              "
+              @change="commitProxy"
+            />
+          </label>
+          <p
+            v-if="proxyFeedback"
+            data-testid="proxy-feedback"
+            class="text-xs"
+            :class="
+              proxyFeedback.ok
+                ? 'text-teal-600 dark:text-teal-400'
+                : 'text-red-600 dark:text-red-400'
+            "
+          >
+            {{ proxyFeedback.message }}
+          </p>
+          <p class="text-xs text-zinc-500">
+            {{ t("settings.rules.proxy.note") }}
           </p>
         </section>
 

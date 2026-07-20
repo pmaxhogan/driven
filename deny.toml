@@ -32,6 +32,11 @@ ignore = [
     "RUSTSEC-2025-0081",
     "RUSTSEC-2025-0098",
     "RUSTSEC-2025-0100",
+    # `paste` (proc-macro, build-time only, not shipped in the binary) is
+    # unmaintained but has no reported vulnerability and no safe replacement.
+    # Pulled in transitively by `boa_string` (the embedded JS engine used for
+    # PAC proxy evaluation, issue #34); nothing actionable at our layer.
+    "RUSTSEC-2024-0436",
 ]
 
 [licenses]
