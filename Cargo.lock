@@ -1521,12 +1521,15 @@ version = "2.0.1"
 dependencies = [
  "anyhow",
  "async-trait",
+ "block2",
  "driven-core",
  "futures",
  "reqwest 0.12.28",
  "thiserror 2.0.19",
  "tokio",
  "tracing",
+ "windows 0.62.2",
+ "zbus",
 ]
 
 [[package]]
