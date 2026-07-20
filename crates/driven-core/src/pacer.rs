@@ -145,6 +145,17 @@ pub trait Pacer: Send + Sync {
     /// The default is a no-op so simple test/fake pacers need not implement it;
     /// [`AimdPacer`] overrides it.
     fn set_bandwidth_cap(&self, _mbps: Option<f64>) {}
+
+    /// Wall-clock ms of the most recent throttle response (rate-limit or daily
+    /// quota), or `i64::MIN` if the pacer has never throttled. The adaptive
+    /// upload-parallelism controller (DESIGN s11.4.7) reads this to answer "did
+    /// the pacer throttle at any point during the last throughput window?" - a
+    /// throttle explains a throughput drop, so a shrink must be suppressed even
+    /// if the backoff has since cleared. The default `i64::MIN` (never) makes a
+    /// simple/fake pacer read as "not throttling"; [`AimdPacer`] overrides it.
+    fn last_throttle_ms(&self) -> i64 {
+        i64::MIN
+    }
 }
 
 /// `serde` helper: (de)serialise a [`Duration`] as integer milliseconds so
@@ -401,6 +412,14 @@ pub struct AimdPacer {
     /// current clean window (DESIGN s18.1). The additive increase fires
     /// once `CLEAN_WINDOW_MS` of clean time has accrued since this point.
     clean_window_start_ms: AtomicI64,
+    /// Wall-clock ms of the most recent THROTTLE response (rate-limit or daily
+    /// quota), or `i64::MIN` if the pacer has never throttled. Distinct from
+    /// `clean_window_start_ms` (which is ALSO seeded to `now` at construction, so
+    /// it cannot answer "has a throttle happened since time T"): this is set only
+    /// by an actual throttle. Read by the adaptive-parallelism controller
+    /// (DESIGN s11.4.7) via [`Pacer::last_throttle_ms`] to scope its "not
+    /// throttling" gate to the throughput window.
+    last_throttle_ms: AtomicI64,
     /// Bit-packed current ceilings, guarded for atomic snapshot/update.
     ceilings: Mutex<PacerCeilings>,
     clock: Arc<dyn Clock>,
@@ -468,6 +487,8 @@ impl AimdPacer {
             }),
             backoff_until_ms: AtomicI64::new(now),
             clean_window_start_ms: AtomicI64::new(now),
+            // Never-throttled sentinel: a genuine throttle overwrites it.
+            last_throttle_ms: AtomicI64::new(i64::MIN),
             ceilings: Mutex::new(ceilings),
             clock,
         }
@@ -660,10 +681,14 @@ impl Pacer for AimdPacer {
         match classification {
             ResponseClass::Ok => self.maybe_raise(now),
             ResponseClass::RateLimited { retry_after } => {
+                self.last_throttle_ms.store(now, Ordering::Release);
                 self.halve(now);
                 self.set_backoff(now, retry_after);
             }
-            ResponseClass::DailyQuota => self.pause_until_midnight_pacific(now),
+            ResponseClass::DailyQuota => {
+                self.last_throttle_ms.store(now, Ordering::Release);
+                self.pause_until_midnight_pacific(now);
+            }
             ResponseClass::OtherError => {
                 // Non-throttle: does not move the AIMD ceiling and does not
                 // count as a clean window tick (DESIGN s18.1 / SPEC s9).
@@ -673,6 +698,10 @@ impl Pacer for AimdPacer {
 
     fn ceilings(&self) -> PacerCeilings {
         *lock_recover(&self.ceilings)
+    }
+
+    fn last_throttle_ms(&self) -> i64 {
+        self.last_throttle_ms.load(Ordering::Acquire)
     }
 }
 

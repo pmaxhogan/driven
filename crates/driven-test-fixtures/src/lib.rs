@@ -6,6 +6,9 @@
 //!   declaratively.
 //! - [`clock`]: a [`FakeClock`](clock::FakeClock) implementing
 //!   [`driven_core::time::Clock`] with `advance()` + `now_set()`.
+//! - [`diskstat`]: a [`FakeDiskBusyProbe`](diskstat::FakeDiskBusyProbe)
+//!   implementing [`driven_diskstat::DiskBusyProbe`] for the adaptive
+//!   upload-parallelism controller tests.
 //! - [`power`]: a [`FakePowerSource`](power::FakePowerSource)
 //!   implementing [`driven_power::PowerSource`] with a `set()` driver
 //!   for state transitions.
@@ -22,6 +25,7 @@
 
 pub mod assert;
 pub mod clock;
+pub mod diskstat;
 pub mod network;
 pub mod power;
 pub mod tree;

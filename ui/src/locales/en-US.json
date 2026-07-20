@@ -215,6 +215,8 @@
       "bandwidthCapUnlimited": "Unlimited",
       "concurrentUploadsLabel": "Concurrent uploads",
       "concurrentUploadsAuto": "Auto",
+      "adaptiveParallelismLabel": "Adapt upload concurrency automatically",
+      "adaptiveParallelismNote": "Tunes how many files upload at once based on measured throughput and disk load, starting from the concurrent-uploads value above. Turn off to hold that number fixed.",
       "scanIntervalLabel": "Scan interval (seconds)",
       "deepVerifyIntervalLabel": "Deep-verify interval (seconds)",
       "ioPriorityLabel": "I/O priority",

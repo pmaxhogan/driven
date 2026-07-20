@@ -308,6 +308,9 @@ pub async fn update_settings(
             }
             cur.default_concurrent_uploads = v;
         }
+        if let Some(v) = g.adaptive_parallelism_enabled {
+            cur.adaptive_parallelism_enabled = v;
+        }
         if let Some(v) = g.bandwidth_cap_mbps {
             // `None` = unlimited (valid); `Some(n)` must be in range.
             if let Some(n) = v {
@@ -771,6 +774,11 @@ mod storage {
     pub struct Global {
         pub auto_start_on_login: bool,
         pub default_concurrent_uploads: Option<u32>,
+        // Added with adaptive parallelism (DESIGN s11.4.7). `serde(default)`
+        // returns `true` so a `global` blob persisted before this field still
+        // deserialises with adaptation ON (the default-on behaviour).
+        #[serde(default = "default_adaptive_parallelism_enabled")]
+        pub adaptive_parallelism_enabled: bool,
         pub bandwidth_cap_mbps: Option<u32>,
         pub skip_on_battery: bool,
         pub skip_on_metered: bool,
@@ -807,6 +815,12 @@ mod storage {
         60
     }
 
+    /// Default for a `global` blob predating adaptive parallelism: ON (DESIGN
+    /// s11.4.7 ships default-on).
+    fn default_adaptive_parallelism_enabled() -> bool {
+        true
+    }
+
     /// Default metered mode (V1 behaviour: pause) for a pre-V2 `global` blob.
     fn default_metered_mode() -> String {
         "pause".to_string()
@@ -817,6 +831,7 @@ mod storage {
             GlobalSettings {
                 auto_start_on_login: s.auto_start_on_login,
                 default_concurrent_uploads: s.default_concurrent_uploads,
+                adaptive_parallelism_enabled: s.adaptive_parallelism_enabled,
                 bandwidth_cap_mbps: s.bandwidth_cap_mbps,
                 skip_on_battery: s.skip_on_battery,
                 skip_on_metered: s.skip_on_metered,
@@ -840,6 +855,7 @@ mod storage {
             Global {
                 auto_start_on_login: d.auto_start_on_login,
                 default_concurrent_uploads: d.default_concurrent_uploads,
+                adaptive_parallelism_enabled: d.adaptive_parallelism_enabled,
                 bandwidth_cap_mbps: d.bandwidth_cap_mbps,
                 skip_on_battery: d.skip_on_battery,
                 skip_on_metered: d.skip_on_metered,
@@ -1168,6 +1184,8 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
             MeteredMode::Pause
         },
         metered_bandwidth_cap_mbps: global.metered_bandwidth_cap_mbps,
+        default_concurrent_uploads: global.default_concurrent_uploads,
+        adaptive_parallelism_enabled: global.adaptive_parallelism_enabled,
     })
 }
 
@@ -2376,6 +2394,8 @@ fn default_global() -> GlobalSettings {
         // code default applies only when the `global` group is entirely absent.
         auto_start_on_login: true,
         default_concurrent_uploads: None,
+        // Adaptive parallelism ships default-on (DESIGN s11.4.7).
+        adaptive_parallelism_enabled: true,
         bandwidth_cap_mbps: None,
         skip_on_battery: true,
         skip_on_metered: true,

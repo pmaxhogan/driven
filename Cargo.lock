@@ -1364,6 +1364,7 @@ dependencies = [
  "crc32fast",
  "driven-core",
  "driven-crypto",
+ "driven-diskstat",
  "driven-drive",
  "driven-net",
  "driven-power",
@@ -1452,6 +1453,7 @@ dependencies = [
  "blake3",
  "bytes",
  "driven-crypto",
+ "driven-diskstat",
  "driven-drive",
  "driven-power",
  "driven-test-fixtures",
@@ -1492,6 +1494,15 @@ dependencies = [
  "thiserror 2.0.19",
  "tracing",
  "zeroize",
+]
+
+[[package]]
+name = "driven-diskstat"
+version = "2.0.1"
+dependencies = [
+ "core-foundation",
+ "core-foundation-sys",
+ "windows 0.62.2",
 ]
 
 [[package]]
@@ -1561,6 +1572,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "driven-core",
+ "driven-diskstat",
  "driven-drive",
  "driven-power",
  "parking_lot",

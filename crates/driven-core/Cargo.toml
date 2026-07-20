@@ -47,6 +47,10 @@ sqlx = { version = "0.9", default-features = false, features = [
 driven-drive = { path = "../driven-drive" }
 driven-crypto = { path = "../driven-crypto" }
 driven-power = { path = "../driven-power" }
+# Per-OS disk-busy reader for the adaptive upload-parallelism controller
+# (DESIGN s11.4.7 / s18.2). Same acyclic shape as driven-power: it carries no
+# driven-core dep.
+driven-diskstat = { path = "../driven-diskstat" }
 # M3.5 Windows VSS reads for exclusively-locked files (ROADMAP M3.5, DESIGN
 # s5.3). The executor consults the `VssProvider` seam on its open path; the
 # orchestrator owns the per-cycle snapshot lifecycle + orphan cleanup. The

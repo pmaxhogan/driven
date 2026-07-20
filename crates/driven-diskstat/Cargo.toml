@@ -1,0 +1,39 @@
+[package]
+name = "driven-diskstat"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+
+# Per-OS disk-busy ("are we bottlenecked by the disk?") reader for the adaptive
+# upload-parallelism controller (DESIGN s11.4.7 / s18.2). Mirrors the
+# `driven-power` crate's shape exactly: a small trait + a pure classifier that is
+# unit-tested on every target, plus exactly ONE cfg-gated per-OS `Real*` backend
+# compiled per target. Kept a standalone crate (not folded into driven-core) so
+# the Windows PDH / macOS IOKit FFI dependencies stay isolated to their target
+# and `cargo build --workspace` on a foreign host never pulls them.
+[dependencies]
+
+# Windows: PDH (Performance Data Helper) counters - the `\PhysicalDisk(_Total)\
+# % Disk Time` rate counter (DESIGN s18.2). PDH computes the rate over the
+# interval between two `PdhCollectQueryData` calls internally, so the reader
+# holds one query + counter handle for the process lifetime.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Performance",
+] }
+
+# macOS: IOKit `IOBlockStorageDriver` `Statistics` dict, read via CoreFoundation
+# types (DESIGN s18.2). Mirrors the FFI style already validated in
+# `driven-power/src/macos.rs` (hand-declared `#[link(name = "IOKit")]` externs +
+# the `core-foundation` typed wrappers). BEST-EFFORT: the Statistics dict exposes
+# per-op latency / total-time counters, NOT a clean device-busy percentage, so
+# the reader approximates "busy fraction" from the Total-Time delta and returns
+# `Unknown` (fail-open) on any uncertainty.
+[target.'cfg(target_os = "macos")'.dependencies]
+core-foundation = "0.10"
+core-foundation-sys = "0.8"

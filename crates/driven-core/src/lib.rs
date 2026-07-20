@@ -19,6 +19,7 @@
 //! [`network::NetworkProbe`] traits - with no behaviour; the bodies land in
 //! the M3 implement phase.
 
+pub mod adaptive;
 pub mod bundle;
 pub mod crypto_provider;
 pub mod exclude;

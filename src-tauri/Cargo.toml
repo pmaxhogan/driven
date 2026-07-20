@@ -89,6 +89,9 @@ driven-core = { path = "../crates/driven-core" }
 driven-drive = { path = "../crates/driven-drive" }
 driven-crypto = { path = "../crates/driven-crypto" }
 driven-power = { path = "../crates/driven-power" }
+# Adaptive upload parallelism (DESIGN s11.4.7): the real per-OS disk-busy reader
+# wired into the AdaptiveController in assembly.
+driven-diskstat = { path = "../crates/driven-diskstat" }
 # M5 assembly seams: real network breaker backend + Windows VSS provider.
 driven-net = { path = "../crates/driven-net" }
 # Issue #34 corporate CA pinning: the shared helper that threads a user-configured

@@ -66,6 +66,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     global: {
       autoStartOnLogin: false,
       defaultConcurrentUploads: null,
+      adaptiveParallelismEnabled: true,
       bandwidthCapMbps: null,
       skipOnBattery: true,
       skipOnMetered: true,
@@ -1230,6 +1231,29 @@ describe("Settings Rules tab", () => {
     await flushPromises();
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
       patch: { global: { scanIntervalSecs: 30 } },
+    });
+  });
+
+  it("toggles adaptive upload parallelism (DESIGN 11.4.7)", async () => {
+    // The kill-switch reflects the persisted value and patches on toggle. Starts
+    // ON (makeSettings default), so unchecking it sends `false`.
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, { props: { tab: "rules" }, global: globalMountOptions });
+    await flushPromises();
+    const toggle = wrapper.get('[data-testid="adaptive-parallelism-toggle"]');
+    expect((toggle.element as HTMLInputElement).checked).toBe(true);
+    await toggle.setValue(false);
+    await toggle.trigger("change");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { adaptiveParallelismEnabled: false } },
     });
   });
 

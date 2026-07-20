@@ -514,26 +514,66 @@ async fn build_account(
     let crypto = Arc::new(KeystoreCryptoProvider::new(account.id, sources.clone()));
     let crypto_dyn: Arc<dyn driven_core::crypto_provider::CryptoProvider> = crypto.clone();
 
+    // --- adaptive upload parallelism (DESIGN s11.4.7) -----------------------
+    // Build the resizable upload pool sized at the user's
+    // `default_concurrent_uploads` setting (finally wired; `None` auto-picks
+    // `min(available_parallelism*2, 16)`), plus the throughput probe. Both are
+    // shared by `Arc` into the executor (which acquires + records bytes) AND, when
+    // adaptive is enabled, into the controller (which resizes + drains) - the same
+    // one-Arc-into-two-consumers pattern as the pacer + latency reservoir.
+    let pool_start = config
+        .default_concurrent_uploads
+        .map(|n| n as usize)
+        .unwrap_or_else(driven_core::adaptive::default_pool_size);
+    let upload_pool = driven_core::adaptive::UploadPool::new(pool_start);
+    let throughput = driven_core::adaptive::ThroughputProbe::new();
+    // Capture what the controller needs BEFORE `config` / `clock` / `pacer` are
+    // moved into the executor + orchestrator below. The disk-busy reader is bound
+    // to the first source's root (only the Linux backend uses it to pick the
+    // backing device; the Windows `_Total` / macOS aggregate backends ignore it);
+    // an account with no sources yet falls back to `.` and simply reads Unknown.
+    let adaptive_enabled = config.adaptive_parallelism_enabled;
+    let disk_root = sources
+        .first()
+        .map(|s| std::path::PathBuf::from(&s.local_path))
+        .unwrap_or_else(|| std::path::PathBuf::from("."));
+    let clock_for_adaptive = clock.clone();
+    let pacer_for_adaptive = pacer.clone();
+
     // --- executor -----------------------------------------------------------
-    let executor: Arc<dyn Executor> = Arc::new(
-        DefaultExecutor::with_clock(
-            ExecutorDeps {
-                remote,
-                state: state.clone(),
-                // Clone so the orchestrator can share the SAME pacer for the V2
-                // metered throttle (`with_pacer` below) - a runtime cap change must
-                // be seen by this executor's upload path.
-                pacer: pacer.clone(),
-                crypto: Some(crypto_dyn),
-                vss: vss.clone(),
-                network: Some(network.clone()),
-            },
-            clock.clone(),
-        )
-        // DESIGN s13: the SAME app-global reservoir the orchestrator's scans
-        // record into, for the upload-per-MB latency metric.
-        .with_latency_reservoir(latency.clone()),
-    );
+    // The upload pool is wired in BOTH modes: it carries the start size
+    // (`default_concurrent_uploads`, or the auto default) that the executor's
+    // per-file gate uses whether or not adaptation is on. The throughput probe,
+    // by contrast, is wired ONLY when adaptive is enabled (F4): with the
+    // kill-switch off nothing drains it, so feeding it would be pure hot-path
+    // overhead - and `record_bytes` is then skipped entirely (the executor's
+    // `throughput` stays `None`), so "disabled" truly means zero adaptive code on
+    // the upload path.
+    let mut exec = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote,
+            state: state.clone(),
+            // Clone so the orchestrator can share the SAME pacer for the V2
+            // metered throttle (`with_pacer` below) - a runtime cap change must
+            // be seen by this executor's upload path.
+            pacer: pacer.clone(),
+            crypto: Some(crypto_dyn),
+            vss: vss.clone(),
+            network: Some(network.clone()),
+        },
+        clock.clone(),
+    )
+    // DESIGN s13: the SAME app-global reservoir the orchestrator's scans
+    // record into, for the upload-per-MB latency metric.
+    .with_latency_reservoir(latency.clone())
+    // DESIGN s11.4.7: the SAME pool the controller resizes (fixed here when the
+    // kill-switch is off, honouring `default_concurrent_uploads` either way).
+    .with_upload_pool(upload_pool.clone());
+    if adaptive_enabled {
+        // DESIGN s11.4.7: the SAME probe the controller drains.
+        exec = exec.with_throughput_probe(throughput.clone());
+    }
+    let executor: Arc<dyn Executor> = Arc::new(exec);
 
     // --- orchestrator -------------------------------------------------------
     // Held as the CONCRETE `Arc<SyncOrchestrator>` (not `Arc<dyn Orchestrator>`)
@@ -565,6 +605,24 @@ async fn build_account(
     // DESIGN s13: the SAME reservoir the executor holds, so per-file scan latency
     // and upload-per-MB latency feed one app-global sampler.
     orchestrator = orchestrator.with_latency_reservoir(latency.clone());
+    // DESIGN s11.4.7: adaptive upload parallelism. Default-ON; when the kill-switch
+    // (`adaptive_parallelism_enabled`) is off, no controller is wired and the pool
+    // stays fixed at `default_concurrent_uploads`. The controller resizes the SAME
+    // `upload_pool` the executor acquires from and drains the SAME `throughput`
+    // probe it feeds, gated by the real per-OS disk-busy reader (DESIGN s18.2) and
+    // the account's pacer (for the window-scoped "not throttling" check).
+    if adaptive_enabled {
+        let disk: Arc<dyn driven_diskstat::DiskBusyProbe> =
+            Arc::new(driven_diskstat::RealDiskBusyProbe::new(disk_root));
+        let controller = Arc::new(driven_core::adaptive::AdaptiveController::new(
+            upload_pool.clone(),
+            throughput.clone(),
+            disk,
+            pacer_for_adaptive,
+            clock_for_adaptive,
+        ));
+        orchestrator = orchestrator.with_adaptive_controller(controller);
+    }
     let orchestrator = Arc::new(orchestrator);
 
     // R-P1-1: one shutdown signal both bridges select! on, so quit can stop the

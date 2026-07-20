@@ -2191,28 +2191,19 @@ async fn pipeline_streaming_keeps_memory_bounded() {
     );
 }
 
-/// Adaptive-parallelism: the upload pool must shrink under induced latency and
-/// recover when it clears (DESIGN s11.4.2 AIMD). Run it with:
-///
-/// ```text
-/// cargo test -p driven-core --test e2e_fake -- --ignored adaptive_parallelism_reacts_to_latency
-/// ```
-///
-/// The body is real: it runs a genuine multi-file plan end to end and asserts
-/// every op completed correctly + prints the measured throughput. The pool's
-/// reaction to *induced latency* is NOT asserted here: it is driven by the
-/// `ThroughputProbe` loop in the app-shell `Orchestrator::run` select loop
-/// (not wired into core) over a latency-shaping remote, neither of which this
-/// harness provides. The AIMD step logic itself is unit-tested in pacer.rs.
-/// Tracking: #28.
+/// Adaptive-parallelism wiring (DESIGN s11.4.7): a REAL executor running a REAL
+/// multi-file plan over the fake remote must feed the injected `ThroughputProbe`
+/// the total uploaded byte count, and the injected `UploadPool` (the SAME `Arc`
+/// the app-shell also hands the [`AdaptiveController`]) must be the gate those
+/// uploads pass through. This is the integration seam the pure control-loop unit
+/// tests in `driven_core::adaptive` cannot reach; the shrink/recover REACTION to
+/// a throughput change is exhaustively + deterministically covered there
+/// (`controller_shrinks_on_latency_then_recovers`) and does not need real time /
+/// a latency-shaping remote to assert. Tracking: #28.
 #[tokio::test]
-#[ignore = "perf benchmark: adaptive-parallelism pool reaction to induced \
-            latency; run with `cargo test -p driven-core --test e2e_fake -- \
-            --ignored adaptive_parallelism_reacts_to_latency`. The pool \
-            reaction needs the app-shell ThroughputProbe loop + a \
-            latency-shaping remote (not in core); AIMD steps are unit-tested \
-            in pacer.rs. Tracking #28."]
-async fn adaptive_parallelism_reacts_to_latency() {
+async fn adaptive_parallelism_executor_feeds_probe() {
+    use driven_core::adaptive::{ThroughputProbe, UploadPool};
+
     let dir = tempfile::tempdir().unwrap();
     let src_dir = tempfile::tempdir().unwrap();
     let state = open_state(dir.path()).await;
@@ -2243,6 +2234,11 @@ async fn adaptive_parallelism_reacts_to_latency() {
         collisions: vec![],
     };
 
+    // The SAME pool + probe the app-shell shares into the executor AND the
+    // adaptive controller.
+    let pool = UploadPool::new(4);
+    let probe = ThroughputProbe::new();
+
     let clock = Arc::new(FakeClock::new());
     let exec = DefaultExecutor::with_clock(
         ExecutorDeps {
@@ -2254,7 +2250,9 @@ async fn adaptive_parallelism_reacts_to_latency() {
             network: None,
         },
         clock,
-    );
+    )
+    .with_upload_pool(pool.clone())
+    .with_throughput_probe(probe.clone());
 
     let out = exec
         .execute(&src, &plan, &noop_progress, &noop_outcome)
@@ -2266,9 +2264,216 @@ async fn adaptive_parallelism_reacts_to_latency() {
         n_files as usize,
         "every file landed under the parallel pool"
     );
-    eprintln!(
-        "adaptive-parallelism: {n_files} files synced; pool-shrink-under-latency \
-         needs the app-shell ThroughputProbe loop (see #28)"
+
+    // Wiring proof: the executor fed the injected probe the full uploaded byte
+    // total (this is what the adaptive controller drains each window). Uploads
+    // may be plaintext or ciphertext; here crypto is None so bytes == plaintext.
+    let expected_bytes = u64::from(n_files) * file_bytes as u64;
+    assert_eq!(
+        probe.peek_bytes(),
+        expected_bytes,
+        "executor must record every uploaded byte into the throughput probe"
+    );
+    // The injected pool's size is untouched by the executor (only the controller
+    // resizes it), so the app-shell's controller-shared handle is intact.
+    assert_eq!(
+        pool.target(),
+        4,
+        "the executor must not resize the pool itself"
+    );
+}
+
+/// Adaptive-parallelism TRANSITION through the real wiring (DESIGN s11.4.7, the
+/// ROADMAP M3 adaptive-parallelism acceptance row): a REAL [`DefaultExecutor`]
+/// uploading REAL plans over the fake remote feeds the SHARED `ThroughputProbe`,
+/// and the SHARED `AdaptiveController` - the exact `Arc`s the app-shell wires -
+/// resizes the SHARED `UploadPool` in BOTH directions in response:
+///
+/// - a degraded-throughput window (far fewer uploaded bytes than the prior one)
+///   is observed to SHRINK the pool, and
+/// - a restored high-throughput window is observed to GROW it back.
+///
+/// Throughput is the genuine DESIGN signal: the bytes come from real executor
+/// uploads and the window duration from the injected [`FakeClock`], so bps is
+/// deterministic with no latency-shaping remote and no real time. The only
+/// element staged for determinism is the per-window "pool was the bottleneck"
+/// contention mark (natural contention depends on tokio scheduling; a 1-file
+/// window may never contend) - forced via the pool's public API, exactly as the
+/// pure-controller unit tests do. Disk is never saturated and the pacer never
+/// throttles, so throughput alone moves the pool. Tracking: #28.
+#[tokio::test]
+async fn adaptive_parallelism_transitions_pool_through_real_wiring() {
+    use driven_core::adaptive::{AdaptiveController, ThroughputProbe, UploadPool, WINDOW};
+    use driven_test_fixtures::diskstat::FakeDiskBusyProbe;
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+
+    // The SAME pool + probe shared into the executor AND the controller.
+    let pool = UploadPool::new(4);
+    let probe = ThroughputProbe::new();
+    let clock = Arc::new(FakeClock::new());
+    let exec = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote: remote.clone(),
+            state: state.clone(),
+            pacer: test_pacer(clock.clone()),
+            crypto: None,
+            vss: None,
+            network: None,
+        },
+        clock.clone(),
+    )
+    .with_upload_pool(pool.clone())
+    .with_throughput_probe(probe.clone());
+
+    // The controller over the SAME pool + probe (as the app-shell wires it), with
+    // a never-saturated disk and a never-throttling pacer so only throughput acts.
+    let disk = Arc::new(FakeDiskBusyProbe::not_saturated());
+    let ctrl = AdaptiveController::new(
+        pool.clone(),
+        probe.clone(),
+        disk,
+        test_pacer(clock.clone()),
+        clock.clone(),
+    );
+
+    // A BIG window uploads ~1 MiB across 16 files; a TINY window uploads 1 KiB in
+    // one file (so its throughput is far below 50% of a big window's).
+    const BIG_N: u32 = 16;
+    const BIG_SZ: usize = 64 * 1024;
+    const TINY_N: u32 = 1;
+    const TINY_SZ: usize = 1024;
+
+    // Two baseline windows: W1 bootstrap-grows, W2 settles - establishing a high
+    // previous-window throughput and a stable "before" size.
+    upload_batch(&exec, &src, src_dir.path(), "w1", BIG_N, BIG_SZ).await;
+    mark_pool_saturated(&pool).await;
+    clock.advance(WINDOW);
+    ctrl.tick().await;
+
+    upload_batch(&exec, &src, src_dir.path(), "w2", BIG_N, BIG_SZ).await;
+    mark_pool_saturated(&pool).await;
+    clock.advance(WINDOW);
+    ctrl.tick().await;
+    let before_shrink = pool.target();
+
+    // W3 degraded: a near-empty window collapses throughput below 50% of the
+    // baseline -> the controller SHRINKS the shared pool.
+    upload_batch(&exec, &src, src_dir.path(), "w3", TINY_N, TINY_SZ).await;
+    mark_pool_saturated(&pool).await;
+    clock.advance(WINDOW);
+    ctrl.tick().await;
+    let after_shrink = pool.target();
+    assert!(
+        after_shrink < before_shrink,
+        "a degraded-throughput window must shrink the pool through the real \
+         wiring: {before_shrink} -> {after_shrink}"
+    );
+
+    // W4 restored: throughput jumps back up (improving) -> the controller GROWS
+    // the shared pool again.
+    upload_batch(&exec, &src, src_dir.path(), "w4", BIG_N, BIG_SZ).await;
+    mark_pool_saturated(&pool).await;
+    clock.advance(WINDOW);
+    ctrl.tick().await;
+    let after_grow = pool.target();
+    assert!(
+        after_grow > after_shrink,
+        "a restored high-throughput window must regrow the pool through the real \
+         wiring: {after_shrink} -> {after_grow}"
+    );
+
+    // The uploads really happened over the fake remote (real wiring, not a
+    // simulated probe feed): every distinct filename across the four windows
+    // landed as an object.
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        (BIG_N + BIG_N + TINY_N + BIG_N) as usize,
+        "every uploaded file across all windows landed remotely"
+    );
+}
+
+/// Adaptive-parallelism F2: a RESUMABLE upload (above `RESUMABLE_THRESHOLD`, so
+/// it streams as several wire chunks) must credit the throughput probe its bytes
+/// EXACTLY ONCE - fed per wire chunk in `push_one_wire_chunk`, with the op's
+/// completion site subtracting what was already streamed so nothing is
+/// double-counted. This guards the F2 double-count regression and proves the
+/// resumable path feeds the probe end-to-end through the real executor. (The
+/// per-chunk IN-WINDOW attribution is structural - the record site is the
+/// chunk-ack point - and the window math is covered by the `adaptive.rs` unit
+/// tests.)
+#[tokio::test]
+async fn adaptive_parallelism_resumable_upload_credits_probe_once() {
+    use driven_core::adaptive::{ThroughputProbe, UploadPool};
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+
+    // One file well above the 5 MiB resumable threshold, so the executor streams
+    // it as multiple wire chunks through the resumable session protocol (the F2
+    // per-chunk recording path). crypto is None, so wire bytes == plaintext size.
+    let file_bytes = 6 * 1024 * 1024usize;
+    let name = "big.bin".to_string();
+    let contents: Vec<u8> = (0..file_bytes).map(|j| (j % 251) as u8).collect();
+    write_file(src_dir.path(), &name, &contents);
+    let plan = Plan {
+        ops: vec![Op::HashThenUpload {
+            source_id: src.id,
+            relative_path: RelativePath::try_from(name).unwrap(),
+            size: file_bytes as u64,
+        }],
+        collisions: vec![],
+    };
+
+    let pool = UploadPool::new(4);
+    let probe = ThroughputProbe::new();
+    let clock = Arc::new(FakeClock::new());
+    let exec = DefaultExecutor::with_clock(
+        ExecutorDeps {
+            remote: remote.clone(),
+            state: state.clone(),
+            pacer: test_pacer(clock.clone()),
+            crypto: None,
+            vss: None,
+            network: None,
+        },
+        clock,
+    )
+    .with_upload_pool(pool.clone())
+    .with_throughput_probe(probe.clone());
+
+    let out = exec
+        .execute(&src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
+    assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        1,
+        "the resumable upload finalized exactly one object"
+    );
+
+    // Exactly once: a double-count (completion failing to subtract the streamed
+    // bytes) would read 2x here; a missing per-chunk feed would still read the
+    // full size via the completion catch-all, so the discriminating failure this
+    // guards is the double-count.
+    assert_eq!(
+        probe.peek_bytes(),
+        file_bytes as u64,
+        "a resumable upload must credit the throughput probe its wire bytes exactly once"
     );
 }
 
@@ -2298,4 +2503,53 @@ fn noop_progress(_p: driven_core::types::ExecProgress) {}
 /// R2-P2-1: a no-op per-op outcome sink for the e2e fakes.
 fn noop_outcome(_o: &OpOutcome) -> futures::future::BoxFuture<'static, ()> {
     Box::pin(async {})
+}
+
+/// Upload `n` fresh `sz`-byte files (names prefixed with `prefix`, so every call
+/// is new work the executor really uploads rather than a no-op skip) through a
+/// REAL executor over the fake remote. Used by the adaptive-parallelism
+/// transition test to feed the shared `ThroughputProbe` a controllable byte
+/// volume per window.
+async fn upload_batch(
+    exec: &DefaultExecutor,
+    src: &SourceRow,
+    src_root: &std::path::Path,
+    prefix: &str,
+    n: u32,
+    sz: usize,
+) {
+    let mut ops = Vec::new();
+    for i in 0..n {
+        let name = format!("{prefix}_{i}.bin");
+        let contents: Vec<u8> = (0..sz).map(|j| ((i as usize + j) % 251) as u8).collect();
+        write_file(src_root, &name, &contents);
+        ops.push(Op::HashThenUpload {
+            source_id: src.id,
+            relative_path: RelativePath::try_from(name).unwrap(),
+            size: sz as u64,
+        });
+    }
+    let plan = Plan {
+        ops,
+        collisions: vec![],
+    };
+    exec.execute(src, &plan, &noop_progress, &noop_outcome)
+        .await
+        .unwrap();
+}
+
+/// Force the adaptive pool's "the pool was the bottleneck this window"
+/// (contention) signal deterministically: pin every current permit, then contend
+/// once - `UploadPool::acquire_owned` bumps the contention counter BEFORE it
+/// awaits, so the count rises even though this acquire times out - then release
+/// the pinned permits, leaving the pool size unchanged. Natural contention
+/// depends on tokio scheduling timing (a tiny window may never contend), so the
+/// transition test stages just this representative-window mark while the actual
+/// throughput signal flows through the real executor.
+async fn mark_pool_saturated(pool: &driven_core::adaptive::UploadPool) {
+    let held: Vec<_> = (0..pool.target())
+        .filter_map(|_| pool.try_acquire_owned())
+        .collect();
+    let _ = tokio::time::timeout(std::time::Duration::from_millis(5), pool.acquire_owned()).await;
+    drop(held);
 }
