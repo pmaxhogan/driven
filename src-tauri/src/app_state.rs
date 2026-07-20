@@ -401,6 +401,14 @@ pub struct TelemetryRuntime {
     /// the cancel flag already set and aborts. A `tokio::Mutex` so it can be held
     /// across the awaited send. Shared via [`AppState::telemetry_send_gate`].
     send_gate: Arc<Mutex<()>>,
+    /// DESIGN s13: the app-global latency sampler shared into every account's
+    /// executor + orchestrator (the SAME `Arc`), read at ping-build time for the
+    /// scan / upload-per-MB percentiles. Default-ON; boot replaces it via
+    /// [`AppState::install_telemetry_latency`] with one initialized from the
+    /// persisted `telemetry.enabled` pref BEFORE any capture, and the enable/
+    /// disable toggle flips it in lockstep with the pref
+    /// (`telemetry::apply_enabled_change`). Shared via [`AppState::telemetry_latency`].
+    latency: Arc<driven_core::telemetry::LatencyReservoir>,
 }
 
 /// M8 (P2-3): max number of TERMINAL restore-job records retained for late
@@ -852,6 +860,27 @@ impl AppState {
     #[must_use]
     pub fn telemetry_send_gate(&self) -> Arc<Mutex<()>> {
         Arc::clone(&self.telemetry.send_gate)
+    }
+
+    /// DESIGN s13: the app-global latency reservoir. The ping task snapshots it at
+    /// build time (and resets it after a successful send); the enable/disable
+    /// toggle flips its capture gate via `telemetry::apply_enabled_change`. Returns
+    /// a cloned `Arc` - the SAME instance every account's executor + orchestrator
+    /// records into.
+    #[must_use]
+    pub fn telemetry_latency(&self) -> Arc<driven_core::telemetry::LatencyReservoir> {
+        Arc::clone(&self.telemetry.latency)
+    }
+
+    /// DESIGN s13: install the boot-built latency reservoir (initialized from the
+    /// persisted `telemetry.enabled` pref) so [`AppState`] shares the SAME `Arc`
+    /// the executors + orchestrators were wired with in assembly. Called once
+    /// before `.manage(..)`, replacing the default-ON placeholder.
+    pub fn install_telemetry_latency(
+        &mut self,
+        latency: Arc<driven_core::telemetry::LatencyReservoir>,
+    ) {
+        self.telemetry.latency = latency;
     }
 
     /// M9b: signal the periodic-ping task to stop and TAKE its handle so the

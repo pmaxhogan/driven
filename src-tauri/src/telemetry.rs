@@ -169,6 +169,21 @@ async fn read_prefs(state: &dyn StateRepo) -> CommandResult<TelemetryPrefs> {
     })
 }
 
+/// Read the persisted `telemetry.enabled` pref (DEFAULT ON per SPEC s16). Public
+/// so the assembly can initialize the app-global latency reservoir's capture gate
+/// BEFORE any executor / scanner is wired, so a user who opted out gets no startup
+/// capture window. A read error degrades to `true` (default ON) - the same
+/// default the ping path applies.
+pub async fn read_enabled(state: &dyn StateRepo) -> bool {
+    match read_prefs(state).await {
+        Ok(p) => p.enabled,
+        Err(e) => {
+            tracing::debug!(target: TARGET, error = %e, "telemetry: could not read enabled pref for reservoir init; defaulting ON");
+            true
+        }
+    }
+}
+
 /// Persist `telemetry.last_sent_at` (Unix ms) after a SUCCESSFUL send.
 ///
 /// R3-P1-1 (CONSENT INTEGRITY): this is an ATOMIC, COMMUTING field-level patch
@@ -478,6 +493,7 @@ fn build_payload(
     channel: String,
     os_version: Option<String>,
     aggregate: driven_core::state::TelemetryAggregate,
+    latency: LatencyP50P95,
 ) -> TelemetryPayload {
     let errors_by_class = aggregate.errors_by_class.into_iter().collect();
     TelemetryPayload {
@@ -500,9 +516,20 @@ fn build_payload(
             // window or not), not a count.
             update_applied: aggregate.update_applied > 0,
         },
-        // No per-op latency is recorded in durable state in V1; emit empty
-        // arrays (the keys are present) rather than fabricating percentiles.
-        latency_p50_p95_ms: LatencyP50P95::default(),
+        // DESIGN s13: the [p50, p95] scan + upload-per-MB latencies snapshotted
+        // from the app-global reservoir at build time (empty arrays when no
+        // samples were captured this window - the reservoir yields empty vecs,
+        // preserving the original wire shape).
+        latency_p50_p95_ms: latency,
+    }
+}
+
+impl From<driven_core::telemetry::LatencyPercentiles> for LatencyP50P95 {
+    fn from(p: driven_core::telemetry::LatencyPercentiles) -> Self {
+        LatencyP50P95 {
+            scan: p.scan,
+            upload_per_mb: p.upload_per_mb,
+        }
     }
 }
 
@@ -590,6 +617,7 @@ async fn maybe_send_once(
     sink: &dyn TelemetrySink,
     cancel: Option<&std::sync::atomic::AtomicBool>,
     gate: Option<&tokio::sync::Mutex<()>>,
+    latency: Option<&driven_core::telemetry::LatencyReservoir>,
 ) -> bool {
     use std::sync::atomic::Ordering;
 
@@ -629,7 +657,21 @@ async fn maybe_send_once(
         }
     };
     let os_version = coarse_os_version();
-    let payload = build_payload(install_id, now_ms, version, channel, os_version, aggregate);
+    // DESIGN s13: a READ-ONLY snapshot of the latency percentiles for this
+    // window. NOT reset here - only after a SUCCESSFUL send below, so a dropped
+    // or aborted ping re-uses the same window's samples on the next attempt
+    // (mirroring how the event-count aggregates re-send an un-checkpointed
+    // window keyed on `last_sent_at`).
+    let latency_pcts: LatencyP50P95 = latency.map(|r| r.snapshot().into()).unwrap_or_default();
+    let payload = build_payload(
+        install_id,
+        now_ms,
+        version,
+        channel,
+        os_version,
+        aggregate,
+        latency_pcts,
+    );
 
     // R3-P1-2 (SEND-ADMISSION GATE): acquire the shared gate, then do the final
     // cancel/pref re-check AND the network send WHILE HOLDING IT. The disable path
@@ -678,6 +720,14 @@ async fn maybe_send_once(
             // next window overlaps - the upper bound still caps it at 24h).
             if let Err(e) = write_last_sent_at(state, now_ms).await {
                 tracing::debug!(target: TARGET, error = %e, "telemetry: could not record last_sent_at");
+            }
+            // DESIGN s13: reset the latency window ONLY after a successful send,
+            // so the next ping's percentiles cover only new samples. A dropped
+            // send leaves the reservoir intact to re-send next tick. (A handful
+            // of samples captured between the snapshot above and this reset are
+            // dropped - an acceptable best-effort loss for a latency signal.)
+            if let Some(r) = latency {
+                r.reset();
             }
         }
         Err(e) => {
@@ -752,6 +802,7 @@ async fn ping_once(app: &AppHandle, sink: &dyn TelemetrySink) {
     // disable path.
     let cancel = state.telemetry_cancel();
     let gate = state.telemetry_send_gate();
+    let latency = state.telemetry_latency();
     let _ = maybe_send_once(
         state.state().as_ref(),
         version,
@@ -759,6 +810,7 @@ async fn ping_once(app: &AppHandle, sink: &dyn TelemetrySink) {
         sink,
         Some(&cancel),
         Some(&gate),
+        Some(latency.as_ref()),
     )
     .await;
 }
@@ -798,12 +850,18 @@ pub async fn apply_enabled_change(
     state: &dyn StateRepo,
     cancel: &std::sync::atomic::AtomicBool,
     gate: &tokio::sync::Mutex<()>,
+    latency: &driven_core::telemetry::LatencyReservoir,
     enabled: bool,
 ) -> CommandResult<()> {
     use std::sync::atomic::Ordering;
     // P1-2: flip the cancel flag BEFORE anything else when disabling, so an
     // in-flight ping's under-gate re-check observes the cancellation.
     cancel.store(!enabled, Ordering::SeqCst);
+    // DESIGN s13 / SPEC s16 (consent): flip the latency-capture gate in lockstep.
+    // Turning telemetry OFF stops new samples AND drops any already captured, so
+    // opting out never leaves latency data lingering; turning it back ON starts a
+    // fresh window.
+    latency.set_enabled(enabled);
     // R3-P1-2: coordinate with the send-admission gate. Acquiring it serializes
     // this disable against an in-flight send's admission+send section: we cannot
     // proceed until any in-progress send releases the gate, and by then cancel is
@@ -829,7 +887,15 @@ pub async fn set_telemetry_enabled(
 ) -> CommandResult<bool> {
     let cancel = state.telemetry_cancel();
     let gate = state.telemetry_send_gate();
-    apply_enabled_change(state.state().as_ref(), &cancel, &gate, enabled).await?;
+    let latency = state.telemetry_latency();
+    apply_enabled_change(
+        state.state().as_ref(),
+        &cancel,
+        &gate,
+        latency.as_ref(),
+        enabled,
+    )
+    .await?;
     Ok(enabled)
 }
 
@@ -922,6 +988,7 @@ mod tests {
             "dev".to_string(),
             Some("11.26200".to_string()),
             aggregate,
+            LatencyP50P95::default(),
         );
         assert_eq!(p.install_id, "00000000-0000-4000-8000-000000000000");
         assert_eq!(p.version, "0.1.0");
@@ -984,6 +1051,7 @@ mod tests {
             "stable".to_string(),
             None,
             driven_core::state::TelemetryAggregate::default(),
+            LatencyP50P95::default(),
         );
         let json = serde_json::to_value(&p).unwrap();
         let obj = json.as_object().unwrap();
@@ -1068,6 +1136,7 @@ mod tests {
             &sink,
             None,
             None,
+            None,
         )
         .await;
 
@@ -1092,6 +1161,7 @@ mod tests {
             "0.1.0".to_string(),
             1_700_000_000_000,
             &sink,
+            None,
             None,
             None,
         )
@@ -1119,6 +1189,7 @@ mod tests {
             "0.1.0".to_string(),
             1_700_000_000_000,
             &sink,
+            None,
             None,
             None,
         )
@@ -1168,6 +1239,7 @@ mod tests {
             &sink,
             Some(&cancel),
             None,
+            None,
         )
         .await;
         assert!(!attempted, "a cancelled ping is not attempted");
@@ -1199,6 +1271,7 @@ mod tests {
             &sink,
             None,
             None,
+            None,
         )
         .await;
         assert!(!attempted, "disabled pref aborts the send");
@@ -1226,9 +1299,15 @@ mod tests {
         // Step 2: the disable lands (the user opted out) while a ping is mid-flight.
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let gate = tokio::sync::Mutex::new(());
-        apply_enabled_change(&repo, &cancel, &gate, false)
-            .await
-            .unwrap();
+        apply_enabled_change(
+            &repo,
+            &cancel,
+            &gate,
+            &driven_core::telemetry::LatencyReservoir::new(true),
+            false,
+        )
+        .await
+        .unwrap();
 
         // Step 3: the (already-in-flight) ping commits its delta checkpoint. This is
         // the write that, under the old RMW, would resurrect enabled=true.
@@ -1289,6 +1368,7 @@ mod tests {
                 sink_c.as_ref(),
                 Some(cancel_c.as_ref()),
                 Some(gate_c.as_ref()),
+                None,
             )
             .await
         });
@@ -1387,7 +1467,7 @@ mod tests {
 
         let sink = RecordingSink::default();
         // First ping at `now` sends the 1 upload, records last_sent_at = now.
-        assert!(maybe_send_once(&repo, "0.1.0".to_string(), now, &sink, None, None).await);
+        assert!(maybe_send_once(&repo, "0.1.0".to_string(), now, &sink, None, None, None).await);
         {
             let sent = sink.sent.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(sent.len(), 1);
@@ -1402,7 +1482,7 @@ mod tests {
 
         // Second ping at the SAME instant (a restart) - the delta window
         // (last_sent, now] is empty -> 0 uploads (NOT 1 again).
-        assert!(maybe_send_once(&repo, "0.1.0".to_string(), now, &sink, None, None).await);
+        assert!(maybe_send_once(&repo, "0.1.0".to_string(), now, &sink, None, None, None).await);
         {
             let sent = sink.sent.lock().unwrap_or_else(|e| e.into_inner());
             assert_eq!(sent.len(), 2);
@@ -1458,9 +1538,15 @@ mod tests {
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let gate = tokio::sync::Mutex::new(());
 
-        apply_enabled_change(&repo, &cancel, &gate, false)
-            .await
-            .unwrap();
+        apply_enabled_change(
+            &repo,
+            &cancel,
+            &gate,
+            &driven_core::telemetry::LatencyReservoir::new(true),
+            false,
+        )
+        .await
+        .unwrap();
         assert!(
             cancel.load(Ordering::SeqCst),
             "disabling trips the cancel flag (in-flight ping aborts)"
@@ -1471,9 +1557,15 @@ mod tests {
         );
 
         // Re-enabling re-arms (clears) the flag.
-        apply_enabled_change(&repo, &cancel, &gate, true)
-            .await
-            .unwrap();
+        apply_enabled_change(
+            &repo,
+            &cancel,
+            &gate,
+            &driven_core::telemetry::LatencyReservoir::new(true),
+            true,
+        )
+        .await
+        .unwrap();
         assert!(
             !cancel.load(Ordering::SeqCst),
             "enabling clears the cancel flag"
@@ -1498,12 +1590,24 @@ mod tests {
         // Toggle enabled off then on via the shared path.
         let cancel = std::sync::atomic::AtomicBool::new(false);
         let gate = tokio::sync::Mutex::new(());
-        apply_enabled_change(&repo, &cancel, &gate, false)
-            .await
-            .unwrap();
-        apply_enabled_change(&repo, &cancel, &gate, true)
-            .await
-            .unwrap();
+        apply_enabled_change(
+            &repo,
+            &cancel,
+            &gate,
+            &driven_core::telemetry::LatencyReservoir::new(true),
+            false,
+        )
+        .await
+        .unwrap();
+        apply_enabled_change(
+            &repo,
+            &cancel,
+            &gate,
+            &driven_core::telemetry::LatencyReservoir::new(true),
+            true,
+        )
+        .await
+        .unwrap();
 
         assert_eq!(
             read_prefs(&repo).await.unwrap().last_sent_at,
@@ -1565,6 +1669,153 @@ mod tests {
             read_prefs(&repo).await.unwrap().enabled,
             "telemetry is default ON"
         );
+        cleanup(dir);
+    }
+
+    #[test]
+    fn build_payload_carries_the_captured_latency_percentiles() {
+        // DESIGN s13: the drained [p50, p95] pairs flow into the wire payload
+        // (replacing the old hardcoded empty default).
+        let latency = LatencyP50P95 {
+            scan: vec![3, 12],
+            upload_per_mb: vec![40, 110],
+        };
+        let p = build_payload(
+            "00000000-0000-4000-8000-000000000000".to_string(),
+            1_700_000_000_000,
+            "0.1.0".to_string(),
+            "stable".to_string(),
+            None,
+            driven_core::state::TelemetryAggregate::default(),
+            latency,
+        );
+        assert_eq!(p.latency_p50_p95_ms.scan, vec![3, 12]);
+        assert_eq!(p.latency_p50_p95_ms.upload_per_mb, vec![40, 110]);
+    }
+
+    #[tokio::test]
+    async fn successful_send_snapshots_then_resets_the_latency_window() {
+        // DESIGN s13: an enabled ping snapshots the reservoir into the payload
+        // and, on a SUCCESSFUL send, resets it so the next window starts fresh.
+        let (repo, dir) = temp_repo().await;
+        let reservoir = driven_core::telemetry::LatencyReservoir::new(true);
+        reservoir.record_scan_ms(10);
+        reservoir.record_scan_ms(20);
+        reservoir.record_upload_per_mb_ms(100);
+
+        let sink = RecordingSink::default();
+        let attempted = maybe_send_once(
+            &repo,
+            "0.1.0".to_string(),
+            1_700_000_000_000,
+            &sink,
+            None,
+            None,
+            Some(&reservoir),
+        )
+        .await;
+        assert!(attempted);
+        // The ping carried the captured percentiles ([10,20]: p50 rank 1 -> 10,
+        // p95 rank 2 -> 20; the single upload sample repeats).
+        let sent = sink.sent.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(sent[0].latency_p50_p95_ms.scan, vec![10, 20]);
+        assert_eq!(sent[0].latency_p50_p95_ms.upload_per_mb, vec![100, 100]);
+        drop(sent);
+        // ...and the reservoir was reset after the successful send.
+        let snap = reservoir.snapshot();
+        assert!(snap.scan.is_empty(), "window reset after a successful send");
+        assert!(snap.upload_per_mb.is_empty());
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn failed_send_keeps_the_latency_window_for_retry() {
+        // DESIGN s13: a dropped send must NOT reset the reservoir, so the same
+        // samples re-send on the next tick (mirroring the event-count delta reuse).
+        let (repo, dir) = temp_repo().await;
+        let reservoir = driven_core::telemetry::LatencyReservoir::new(true);
+        reservoir.record_scan_ms(7);
+
+        let sink = FailingSink;
+        let attempted = maybe_send_once(
+            &repo,
+            "0.1.0".to_string(),
+            1_700_000_000_000,
+            &sink,
+            None,
+            None,
+            Some(&reservoir),
+        )
+        .await;
+        assert!(attempted, "a failed send is still an attempt");
+        assert_eq!(
+            reservoir.snapshot().scan,
+            vec![7, 7],
+            "a failed send leaves the window intact for the next tick"
+        );
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn disabled_ping_does_not_touch_the_reservoir() {
+        // SPEC s16: a disabled ping makes no send AND does not reset the window
+        // (nothing is captured while off anyway, but the guard must hold).
+        let (repo, dir) = temp_repo().await;
+        write_enabled(&repo, false).await.unwrap();
+        // A reservoir that (defensively) still holds a stray sample.
+        let reservoir = driven_core::telemetry::LatencyReservoir::new(true);
+        reservoir.record_scan_ms(5);
+
+        let sink = RecordingSink::default();
+        let attempted = maybe_send_once(
+            &repo,
+            "0.1.0".to_string(),
+            1_700_000_000_000,
+            &sink,
+            None,
+            None,
+            Some(&reservoir),
+        )
+        .await;
+        assert!(!attempted, "disabled telemetry sends nothing");
+        assert_eq!(
+            sink.calls.load(Ordering::SeqCst),
+            0,
+            "no network call when disabled"
+        );
+        assert_eq!(
+            reservoir.snapshot().scan,
+            vec![5, 5],
+            "a disabled ping does not reset the reservoir"
+        );
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn apply_enabled_change_off_clears_the_reservoir() {
+        // DESIGN s13 / SPEC s16 (consent): disabling telemetry through the shared
+        // path drops any captured latency samples; re-enabling starts fresh.
+        let (repo, dir) = temp_repo().await;
+        let cancel = std::sync::atomic::AtomicBool::new(false);
+        let gate = tokio::sync::Mutex::new(());
+        let reservoir = driven_core::telemetry::LatencyReservoir::new(true);
+        reservoir.record_scan_ms(9);
+        reservoir.record_upload_per_mb_ms(50);
+        assert!(!reservoir.snapshot().scan.is_empty());
+
+        apply_enabled_change(&repo, &cancel, &gate, &reservoir, false)
+            .await
+            .unwrap();
+        assert!(!reservoir.is_enabled(), "capture gate flipped off");
+        let snap = reservoir.snapshot();
+        assert!(snap.scan.is_empty(), "disable drops captured samples");
+        assert!(snap.upload_per_mb.is_empty());
+
+        // Re-enable re-arms capture.
+        apply_enabled_change(&repo, &cancel, &gate, &reservoir, true)
+            .await
+            .unwrap();
+        assert!(reservoir.is_enabled(), "capture gate flipped back on");
         cleanup(dir);
     }
 }

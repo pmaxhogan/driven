@@ -20,14 +20,46 @@
 // against a mocked AE binding) now; the live deploy + e2e telemetry validation
 // happen at M10. See design/CODEX_NOTES.md "## M9b - telemetry".
 
-/// The Worker environment bindings (wrangler.jsonc). `TELEMETRY` is the Analytics
-/// Engine dataset the validated ping is written to.
+/// The Worker environment bindings (wrangler.jsonc + secrets). `TELEMETRY` is the
+/// Analytics Engine dataset the validated ping is WRITTEN to (the binding).
+///
+/// The `/stats/latency` rollup READ path (DESIGN s13) cannot read the AE dataset
+/// through the write binding - AE reads go through the SQL HTTP API - so it needs:
+/// - `QUERY_TOKEN`: the bearer secret gating the endpoint (it exposes aggregate
+///   telemetry, so it is NEVER served unauthenticated). Unset => the endpoint 503s.
+/// - `CF_API_TOKEN`: a Cloudflare API token with Account Analytics read, used to
+///   call the AE SQL API. Unset => the endpoint 503s.
+/// - `CF_ACCOUNT_ID`: the account id for the SQL API URL; defaults to the Driven
+///   account when unset.
+/// All three are wrangler secrets/vars set post-deploy (see the worker README);
+/// they are optional in the type so the ingest path keeps working without them.
 export interface Env {
   TELEMETRY: AnalyticsEngineDataset;
+  QUERY_TOKEN?: string;
+  CF_API_TOKEN?: string;
+  CF_ACCOUNT_ID?: string;
 }
 
-/// The only path this Worker serves (SPEC s16). Anything else is 404.
+/// The ingest path (SPEC s16): POST a ping here.
 const PING_PATH = "/telemetry/v1/ping";
+
+/// The latency-rollup read path (DESIGN s13): GET per-day aggregates here. Scoped
+/// under `/telemetry/*` because that is the only prefix the Worker route serves
+/// (wrangler.jsonc); the documented `GET /stats/latency` maps here.
+const STATS_LATENCY_PATH = "/telemetry/v1/stats/latency";
+
+/// The Analytics Engine dataset name (matches wrangler.jsonc `dataset`). Used in
+/// the SQL API `FROM` clause for the rollup query.
+const DATASET = "driven_telemetry";
+
+/// The Driven Cloudflare account id (wrangler.jsonc `account_id`), the default
+/// target for the AE SQL API when `CF_ACCOUNT_ID` is not set.
+const DEFAULT_ACCOUNT_ID = "9c20c14daa20466a2d761a47162f719a";
+
+/// `/stats/latency` `days` window: default and hard cap (SPEC/DESIGN s13). The
+/// query looks back `days` days; the value is clamped to `[1, 90]`.
+const DEFAULT_STATS_DAYS = 7;
+const MAX_STATS_DAYS = 90;
 
 /// Max accepted request body size (bytes). The real ping is well under 4 KB; this
 /// cap rejects a hostile / malformed oversized body before parsing (SPEC s16
@@ -341,14 +373,33 @@ function totalErrors(errors: Record<string, number>): number {
   return sum;
 }
 
-/// Write one validated ping to Analytics Engine (SPEC s16). The dataset schema:
+/// The value written to a latency percentile double when the client reported NO
+/// samples for that metric this window (its array is empty). A NEGATIVE sentinel
+/// so the rollup query can distinguish "no samples" (`< 0`) from a LEGIT `0 ms`
+/// (a sub-millisecond per-file scan rounds to 0) - the query filters `>= 0`.
+const NO_LATENCY = -1;
+
+/// Extract `[p50, p95]` from a client latency array, mapping an empty (or
+/// malformed short) array to the [`NO_LATENCY`] sentinel pair (DESIGN s13).
+function latencyPair(arr: number[]): [number, number] {
+  if (arr.length >= 2) return [arr[0], arr[1]];
+  return [NO_LATENCY, NO_LATENCY];
+}
+
+/// Write one validated ping to Analytics Engine (SPEC s16, DESIGN s13). Schema:
 /// - indexes: [install_id]   (the sampling/grouping key - anonymous)
 /// - blobs:   [os, arch, channel, version, os_version, errors_by_class JSON]
 ///            (low-card dims; os_version is "" when the client did not send one)
 /// - doubles: [files_uploaded, bytes_uploaded, deep_verify_runs, update_applied,
-///             total_errors, ts]  (the numeric measures; update_applied is 0/1)
+///             total_errors, ts,                              // double1..double6
+///             scan_p50, scan_p95, upload_per_mb_p50, upload_per_mb_p95]
+///                                                            // double7..double10
+///   The 4 latency doubles are appended (never reordered) so existing columns keep
+///   their positions; an absent metric writes the NO_LATENCY (-1) sentinel.
 /// Writes are non-blocking (no await / waitUntil needed per the CF docs).
 export function writePing(env: Env, p: PingPayload): void {
+  const [scanP50, scanP95] = latencyPair(p.latency_p50_p95_ms.scan);
+  const [upP50, upP95] = latencyPair(p.latency_p50_p95_ms.upload_per_mb);
   env.TELEMETRY.writeDataPoint({
     indexes: [p.install_id],
     blobs: [
@@ -370,6 +421,12 @@ export function writePing(env: Env, p: PingPayload): void {
       p.events_24h.update_applied ? 1 : 0,
       totalErrors(p.events_24h.errors_by_class),
       p.ts,
+      // DESIGN s13: the client-reported [p50, p95] latency percentiles (ms), or
+      // the NO_LATENCY sentinel when the client had no samples this window.
+      scanP50,
+      scanP95,
+      upP50,
+      upP95,
     ],
   });
 }
@@ -441,16 +498,161 @@ async function readBodyCapped(
   return { ok: true, text };
 }
 
-/// The Worker request handler (SPEC s16). Pure-ish: takes `request` + `env`, so a
-/// unit test drives it with a mocked AE binding (no live runtime, no network).
+// --------------------------------------------------------------------------
+// LATENCY ROLLUP (DESIGN s13): a gated, read-only per-day aggregate of the
+// client-reported scan / upload-per-MB percentiles, over the Analytics Engine
+// SQL API. NEVER served unauthenticated (it exposes aggregate telemetry).
+// --------------------------------------------------------------------------
+
+/// One metric's per-day aggregate row returned by `GET /stats/latency`.
+interface LatencyDayRow {
+  /// The UTC day, `YYYY-MM-DD`.
+  day: string;
+  /// Mean of the pinged p50s that day (ms).
+  avg_p50_ms: number;
+  /// Mean of the pinged p95s that day (ms).
+  avg_p95_ms: number;
+  /// Worst pinged p95 that day (ms).
+  max_p95_ms: number;
+  /// Number of pings that reported this metric that day.
+  samples: number;
+}
+
+/// Constant-time-ish string equality (avoids leaking the token via early-exit
+/// timing on a per-char compare). Length difference is not hidden - fine for a
+/// random bearer token.
+function safeEqual(a: string, b: string): boolean {
+  if (a.length !== b.length) return false;
+  let mismatch = 0;
+  for (let i = 0; i < a.length; i++) {
+    mismatch |= a.charCodeAt(i) ^ b.charCodeAt(i);
+  }
+  return mismatch === 0;
+}
+
+/// Clamp the `days` query param to a validated integer in `[1, MAX_STATS_DAYS]`,
+/// defaulting to [`DEFAULT_STATS_DAYS`] when absent / non-numeric. Interpolated
+/// into the SQL string, so it MUST be a bounded integer (there are no bind params
+/// on the AE SQL API).
+function clampStatsDays(raw: string | null): number {
+  // Absent / blank -> default (note `Number(null)` and `Number("")` are 0, NOT
+  // NaN, so these must be handled before the numeric parse).
+  if (raw === null || raw.trim() === "") return DEFAULT_STATS_DAYS;
+  const n = Number(raw);
+  if (!Number.isFinite(n)) return DEFAULT_STATS_DAYS;
+  const i = Math.trunc(n);
+  if (i < 1) return 1;
+  if (i > MAX_STATS_DAYS) return MAX_STATS_DAYS;
+  return i;
+}
+
+/// Query one latency metric's per-day aggregates over the AE SQL API. `p50Col` /
+/// `p95Col` are the AE double column names for this metric (e.g. `double7` /
+/// `double8`). Rows carrying the NO_LATENCY sentinel (`< 0`, an empty-latency
+/// ping) are excluded via `WHERE p50 >= 0`, so a legit `0 ms` still counts. The
+/// response is the CF `{ meta, data }` JSON (NOT ndjson); each `data[]` row's
+/// numeric columns arrive as strings, so they are coerced with `Number`.
+async function queryLatencyMetric(
+  env: Env,
+  accountId: string,
+  days: number,
+  p50Col: string,
+  p95Col: string,
+): Promise<LatencyDayRow[]> {
+  // `days` is a validated integer (clampStatsDays) and the column names are
+  // internal constants, so this interpolation carries no injection surface.
+  const sql =
+    `SELECT toDate(timestamp) AS day, ` +
+    `AVG(${p50Col}) AS avg_p50, ` +
+    `AVG(${p95Col}) AS avg_p95, ` +
+    `MAX(${p95Col}) AS max_p95, ` +
+    `COUNT() AS samples ` +
+    `FROM ${DATASET} ` +
+    `WHERE timestamp > NOW() - INTERVAL '${days}' DAY AND ${p50Col} >= 0 ` +
+    `GROUP BY day ORDER BY day`;
+
+  const resp = await fetch(
+    `https://api.cloudflare.com/client/v4/accounts/${accountId}/analytics_engine/sql`,
+    {
+      method: "POST",
+      headers: { Authorization: `Bearer ${env.CF_API_TOKEN}` },
+      body: sql,
+    },
+  );
+  if (!resp.ok) {
+    throw new Error(`analytics_engine sql query failed: ${resp.status}`);
+  }
+  const body = (await resp.json()) as { data?: Array<Record<string, unknown>> };
+  const rows = Array.isArray(body.data) ? body.data : [];
+  return rows.map((r) => ({
+    day: String(r.day),
+    avg_p50_ms: Number(r.avg_p50),
+    avg_p95_ms: Number(r.avg_p95),
+    max_p95_ms: Number(r.max_p95),
+    samples: Number(r.samples),
+  }));
+}
+
+/// Handle `GET /stats/latency?days=N` (DESIGN s13). AUTH: a `Bearer QUERY_TOKEN`
+/// header. Misconfiguration (no `QUERY_TOKEN` or no `CF_API_TOKEN`) is a 503 -
+/// the endpoint is NEVER served open. Returns per-day aggregates for both metrics.
+export async function handleStatsLatency(request: Request, env: Env): Promise<Response> {
+  // Misconfigured => 503 (never fall through to an unauthenticated / broken read).
+  if (!env.QUERY_TOKEN || !env.CF_API_TOKEN) {
+    return json(503, { error: "stats_not_configured" });
+  }
+  // Bearer auth against the QUERY_TOKEN secret.
+  const auth = request.headers.get("authorization");
+  if (!auth || !safeEqual(auth, `Bearer ${env.QUERY_TOKEN}`)) {
+    return new Response(JSON.stringify({ error: "unauthorized" }), {
+      status: 401,
+      headers: { "content-type": "application/json", "www-authenticate": "Bearer" },
+    });
+  }
+
+  const url = new URL(request.url);
+  const days = clampStatsDays(url.searchParams.get("days"));
+  const accountId = env.CF_ACCOUNT_ID ?? DEFAULT_ACCOUNT_ID;
+
+  try {
+    // Two queries (one per metric) so each filters its OWN sentinel column - a
+    // shared WHERE could not exclude an empty-scan ping without also dropping its
+    // (present) upload sample, and vice versa. Runs them concurrently.
+    const [scan, uploadPerMb] = await Promise.all([
+      queryLatencyMetric(env, accountId, days, "double7", "double8"),
+      queryLatencyMetric(env, accountId, days, "double9", "double10"),
+    ]);
+    return json(200, { days, metrics: { scan, upload_per_mb: uploadPerMb } });
+  } catch {
+    // Never echo the query / token; a generic upstream-failure signal.
+    console.error("telemetry: stats/latency AE query failed");
+    return json(502, { error: "query_failed" });
+  }
+}
+
+/// The Worker request handler (SPEC s16, DESIGN s13). Pure-ish: takes `request` +
+/// `env`, so a unit test drives it with a mocked AE binding + mocked `fetch` (no
+/// live runtime, no network).
 ///
 /// Contract:
 /// - POST /telemetry/v1/ping with a valid JSON body -> write to AE, 204.
 /// - POST /telemetry/v1/ping with a malformed body / oversized body -> 400.
+/// - GET  /telemetry/v1/stats/latency (Bearer QUERY_TOKEN) -> per-day rollup, 200.
 /// - the right path but the wrong method -> 405.
 /// - any other path -> 404.
 export async function handle(request: Request, env: Env): Promise<Response> {
   const url = new URL(request.url);
+
+  // DESIGN s13: the gated latency-rollup read path. GET only (405 otherwise).
+  if (url.pathname === STATS_LATENCY_PATH) {
+    if (request.method !== "GET") {
+      return new Response(JSON.stringify({ error: "method_not_allowed" }), {
+        status: 405,
+        headers: { "content-type": "application/json", allow: "GET" },
+      });
+    }
+    return handleStatsLatency(request, env);
+  }
 
   // Only the ping path exists; everything else is 404 (the CF Pages site serves
   // the root + /updates; this Worker owns only /telemetry/*).

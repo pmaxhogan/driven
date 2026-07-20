@@ -424,7 +424,9 @@ pub async fn update_settings(
         if let Some(v) = t.enabled {
             let cancel = state.telemetry_cancel();
             let gate = state.telemetry_send_gate();
-            crate::telemetry::apply_enabled_change(repo, &cancel, &gate, v).await?;
+            let latency = state.telemetry_latency();
+            crate::telemetry::apply_enabled_change(repo, &cancel, &gate, latency.as_ref(), v)
+                .await?;
         }
     }
 
