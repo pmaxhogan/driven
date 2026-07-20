@@ -26,6 +26,37 @@ futures.workspace = true
 # s5.8.5 escalation and is not wired in V1.
 reqwest.workspace = true
 
+# Native per-OS reachability backends for the DESIGN s5.8.2 probe-1 read
+# (reachability.rs), tried before the generic anycast-DNS TCP probe. Features
+# are kept minimal (only the Win32 / D-Bus / Network.framework surface the reads
+# call) to keep `cargo build --workspace` light, mirroring driven-power.
+[target.'cfg(windows)'.dependencies]
+# INetworkListManager::GetConnectivity, instantiated via CoCreateInstance after
+# CoInitializeEx (Win32_System_Com), classified in reachability.rs. Win32_Foundation
+# pulls the shared handle/HRESULT types the COM signatures use.
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Com",
+    "Win32_Networking_NetworkListManager",
+] }
+
+[target.'cfg(target_os = "linux")'.dependencies]
+# NetworkManager's aggregate `Connectivity` property on org.freedesktop.NetworkManager
+# over the system bus, read via zbus's BLOCKING API dispatched through
+# tokio::spawn_blocking (reachability.rs). Same crate + `tokio` feature as
+# driven-power so the workspace resolves ONE zbus version; the default features
+# (`async-io` + `blocking-api`) are kept because the blocking read needs
+# `blocking-api`.
+zbus = { version = "5", features = ["tokio"] }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+# NWPathMonitor whose update handler (an Objective-C block) caches
+# nw_path_get_status (reachability.rs). block2 supplies the block type; the
+# Network.framework and libdispatch C functions are declared via `extern "C"`
+# and linked with `#[link(name = "Network", kind = "framework")]`, so no
+# core-foundation / objc2 crates are needed for this read.
+block2 = "0.6"
+
 [dev-dependencies]
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the DNS-no-hang
 # acceptance test drives `tokio::time::timeout` on virtual time (no wall-clock

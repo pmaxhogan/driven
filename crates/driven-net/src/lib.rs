@@ -6,13 +6,16 @@
 //! stays I/O-free. This crate fills the [`Backend`] seam with the concrete
 //! clients (DESIGN s5.8.2 probe topology, s5.8.4 per-service timeouts):
 //!
-//! - [`Backend::os_online`] - a lightweight, honest reachability check
-//!   (documented on the method): a fast dual-stack TCP connect to a
-//!   well-known anycast resolver within the 3s OS-probe budget. It does NOT
-//!   read `INetworkListManager` / `NWPathMonitor` / NetworkManager (a real
-//!   OS-API integration is deferred); a hard connect failure short-circuits
-//!   the topology to offline, and any softer ambiguity defers to the captive
-//!   + service probes.
+//! - [`Backend::os_online`] - the DESIGN s5.8.2 probe-1 reachability check. It
+//!   consults the NATIVE per-OS connectivity API FIRST
+//!   (`INetworkListManager::GetConnectivity` on Windows, NetworkManager's
+//!   `Connectivity` enum on Linux, `NWPathMonitor` on macOS - see
+//!   [`reachability`]); a confident native verdict (online / offline) is used
+//!   directly, and when the native read is unavailable or ambiguous it FALLS
+//!   BACK transparently to a fast dual-stack TCP connect to a well-known anycast
+//!   resolver within the 3s OS-probe budget. A hard offline verdict
+//!   short-circuits the topology to offline; any softer ambiguity defers to the
+//!   captive + service probes.
 //! - [`Backend::probe_captive`] - an HTTP GET to
 //!   `http://www.gstatic.com/generate_204` via a redirect-disabled
 //!   `reqwest::Client` with the 3s-connect / 5s-total captive-portal
@@ -35,8 +38,10 @@
 //! `.no_proxy()`, so the env vars are honoured.
 
 mod classify;
+mod reachability;
 
 use std::net::SocketAddr;
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Mutex;
 use std::time::Duration;
 
@@ -157,6 +162,11 @@ pub struct ReqwestBackend {
     drive: Mutex<reqwest::Client>,
     update_endpoint: Mutex<reqwest::Client>,
     github: Mutex<reqwest::Client>,
+    /// Latches `true` the first time [`Backend::os_online`] falls back from the
+    /// native reachability read to the TCP probe, so the fallback is logged at
+    /// debug level exactly ONCE (not per-probe) on a host whose native API is
+    /// permanently unavailable (e.g. no NetworkManager).
+    native_fallback_logged: AtomicBool,
 }
 
 impl ReqwestBackend {
@@ -183,6 +193,7 @@ impl ReqwestBackend {
             drive: Mutex::new(drive),
             update_endpoint: Mutex::new(update_endpoint),
             github: Mutex::new(github),
+            native_fallback_logged: AtomicBool::new(false),
         })
     }
 
@@ -210,6 +221,48 @@ impl ReqwestBackend {
     /// the lock across `.await`.
     fn clone_service_client(&self, service: ServiceName) -> Option<reqwest::Client> {
         self.service_client(service).map(|m| Self::lock(m).clone())
+    }
+
+    /// The TCP-probe fallback for [`Backend::os_online`]: a fast dual-stack TCP
+    /// connect to a small set of well-known anycast DNS resolvers (Google
+    /// `8.8.8.8` / Cloudflare `1.1.1.1`, both IPv4 and IPv6) within the 3s
+    /// OS-probe budget.
+    ///
+    /// If ANY connect succeeds, routing to the Internet exists -> `true`. If ALL
+    /// fail (no route / refused / timeout on every endpoint and address family),
+    /// there is no working route -> `false`. Endpoints span IPv4 + IPv6 so a
+    /// single-stack outage does not read as fully offline (DESIGN s5.8.1 "No
+    /// IPv4 / no IPv6" row). This is the transparent fallback used whenever the
+    /// native OS connectivity read is unavailable or ambiguous.
+    async fn tcp_os_online(&self) -> bool {
+        // Try each endpoint with the 3s connect budget; the first success wins.
+        for endpoint in OS_ONLINE_ENDPOINTS {
+            let addr: SocketAddr = match endpoint.parse() {
+                Ok(a) => a,
+                // A malformed constant is a programming error, not a runtime
+                // network condition; skip it rather than panic.
+                Err(_) => continue,
+            };
+            match tokio::time::timeout(PROBE_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr))
+                .await
+            {
+                Ok(Ok(_stream)) => {
+                    tracing::trace!(target: TARGET, %addr, "tcp_os_online: reachable");
+                    return true;
+                }
+                Ok(Err(e)) => {
+                    tracing::trace!(target: TARGET, %addr, error = %e, "tcp_os_online: connect failed");
+                }
+                Err(_elapsed) => {
+                    tracing::trace!(target: TARGET, %addr, "tcp_os_online: connect timed out");
+                }
+            }
+        }
+        tracing::debug!(
+            target: TARGET,
+            "tcp_os_online: all reachability endpoints failed -> offline"
+        );
+        false
     }
 
     /// Re-resolves `host` via `tokio::net::lookup_host` with no application-
@@ -289,56 +342,42 @@ where
 
 #[async_trait]
 impl Backend for ReqwestBackend {
-    /// A lightweight, HONEST reachability check (DESIGN s5.8.2 probe 1).
+    /// The DESIGN s5.8.2 probe-1 reachability check: native OS connectivity
+    /// API first, TCP probe as the transparent fallback.
     ///
-    /// What this actually does: attempts a fast TCP connect to a small set of
-    /// well-known anycast DNS resolvers (Google `8.8.8.8` / Cloudflare
-    /// `1.1.1.1`, both IPv4 and IPv6) within the 3s OS-probe budget. If ANY
-    /// connect succeeds, routing to the Internet exists -> `true`. If ALL
-    /// fail (no route / refused / timeout on every endpoint and address
-    /// family), there is no working route -> `false`, and the prober
-    /// short-circuits to [`NetworkState::Offline`](driven_core::network::NetworkState)
-    /// without firing the captive / service probes (DESIGN s5.8.2).
+    /// Consults the native per-OS connectivity API
+    /// ([`reachability::detect_reachability`]:
+    /// `INetworkListManager::GetConnectivity` on Windows, NetworkManager's
+    /// `Connectivity` enum on Linux, `NWPathMonitor` on macOS) FIRST. A
+    /// confident native verdict is used directly - an active connection
+    /// (internet, or link-local / limited / captive-portal) returns `true` so
+    /// the captive + service probes (DESIGN s5.8.2 probes 2-3) classify Online
+    /// vs NoInternet vs CaptivePortal; a confident no-connection verdict returns
+    /// `false`, short-circuiting the topology to
+    /// [`NetworkState::Offline`](driven_core::network::NetworkState) without
+    /// firing them (airplane mode / rfkill / no interface, DESIGN s5.8.1).
     ///
-    /// What this deliberately does NOT do: it does NOT read the OS
-    /// connectivity API (`INetworkListManager::IsConnectedToInternet` on
-    /// Windows, `NWPathMonitor` on macOS, NetworkManager `Connectivity` on
-    /// Linux). A native OS-API integration is deferred to a later phase; this
-    /// V1 check is a real cheap probe, not a stub, and is documented as such
-    /// so the topology's "cheapest first probe" remains honest. The downstream
-    /// captive + service probes (DESIGN s5.8.2 probes 2-3) provide the
-    /// authoritative classification when this returns `true`.
+    /// When the native read is unavailable or ambiguous (no NetworkManager, a
+    /// COM error, a not-yet-delivered `NWPath`, or a target with no native
+    /// backend), it FALLS BACK transparently to [`Self::tcp_os_online`] - a fast
+    /// dual-stack TCP connect to well-known anycast resolvers. The fallback is
+    /// logged once at debug level, never per-call.
     async fn os_online(&self) -> bool {
-        // Try each endpoint with the 3s connect budget; the first success
-        // wins. Endpoints span IPv4 + IPv6 so a single-stack outage does not
-        // read as fully offline (DESIGN s5.8.1 "No IPv4 / no IPv6" row).
-        for endpoint in OS_ONLINE_ENDPOINTS {
-            let addr: SocketAddr = match endpoint.parse() {
-                Ok(a) => a,
-                // A malformed constant is a programming error, not a runtime
-                // network condition; skip it rather than panic.
-                Err(_) => continue,
-            };
-            match tokio::time::timeout(PROBE_CONNECT_TIMEOUT, tokio::net::TcpStream::connect(addr))
-                .await
-            {
-                Ok(Ok(_stream)) => {
-                    tracing::trace!(target: TARGET, %addr, "os_online: reachable");
-                    return true;
+        match reachability::resolve_native(reachability::detect_reachability().await) {
+            Some(online) => online,
+            None => {
+                // Native read inconclusive (API unavailable or an ambiguous
+                // verdict): fall back to the TCP probe. Log the switch once so a
+                // host with no native API does not spam the log every probe.
+                if !self.native_fallback_logged.swap(true, Ordering::Relaxed) {
+                    tracing::debug!(
+                        target: TARGET,
+                        "native reachability inconclusive, using TCP probe (logged once)"
+                    );
                 }
-                Ok(Err(e)) => {
-                    tracing::trace!(target: TARGET, %addr, error = %e, "os_online: connect failed");
-                }
-                Err(_elapsed) => {
-                    tracing::trace!(target: TARGET, %addr, "os_online: connect timed out");
-                }
+                self.tcp_os_online().await
             }
         }
-        tracing::debug!(
-            target: TARGET,
-            "os_online: all reachability endpoints failed -> offline"
-        );
-        false
     }
 
     /// Runs the captive-portal `generate_204` probe (DESIGN s5.8.2 probe 2).
@@ -568,6 +607,21 @@ mod tests {
             .service_client(ServiceName::UpdateEndpoint)
             .is_some());
         assert!(backend.service_client(ServiceName::Github).is_some());
+    }
+
+    // --- os_online is total: native read (+ TCP fallback) returns a bool ---
+    //
+    // Exercises the DESIGN s5.8.2 probe-1 path end to end: the native OS
+    // reachability read (on this Windows host, the live
+    // `INetworkListManager::GetConnectivity` COM call) resolved via
+    // `resolve_native`, falling back to the TCP probe only on an inconclusive
+    // verdict. The value is environment-dependent (a connected host yields
+    // `true`), so we only assert the call is total and never panics across the
+    // native/fallback boundary.
+    #[tokio::test]
+    async fn os_online_is_total() {
+        let backend = ReqwestBackend::new().expect("construct backend");
+        let _: bool = backend.os_online().await;
     }
 
     // --- the os_online endpoint constants are well-formed + dual-stack ---
