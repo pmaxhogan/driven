@@ -572,6 +572,8 @@ const SCAN_P50 = 6;
 const SCAN_P95 = 7;
 const UP_P50 = 8;
 const UP_P95 = 9;
+/// The schema-version marker double (double11), appended after the 4 percentiles.
+const SCHEMA_MARKER = 10;
 
 describe("telemetry worker latency doubles (DESIGN s13)", () => {
   it("writes the client-reported [p50, p95] latency doubles", async () => {
@@ -587,6 +589,31 @@ describe("telemetry worker latency doubles (DESIGN s13)", () => {
     expect(dp.doubles[SCAN_P95]).toBe(12);
     expect(dp.doubles[UP_P50]).toBe(40);
     expect(dp.doubles[UP_P95]).toBe(110);
+  });
+
+  it("marks every new latency-schema row with the schema-version marker (double11)", async () => {
+    // The marker (>= 1) is what lets the rollup exclude pre-latency rows: AE
+    // materializes a missing double as 0, so a legacy row reads double11 == 0.
+    const { env, writes } = mockEnv();
+    const p = validPayload();
+    p.latency_p50_p95_ms = { scan: [3, 12], upload_per_mb: [40, 110] };
+    const res = await handle(postPing(JSON.stringify(p)), env);
+    expect(res.status).toBe(204);
+    const dp = writes[0] as { doubles: number[] };
+    expect(dp.doubles[SCHEMA_MARKER]).toBe(1);
+  });
+
+  it("marks a new row EVEN WHEN its latency is empty (marker present, sentinels -1)", async () => {
+    // A new-but-empty row is marked as latency-schema (double11 == 1) yet still
+    // carries the -1 sentinels, so the rollup's sentinel filter (not the marker)
+    // is what excludes it - the two filters are independent.
+    const { env, writes } = mockEnv();
+    const res = await handle(postPing(JSON.stringify(validPayload())), env);
+    expect(res.status).toBe(204);
+    const dp = writes[0] as { doubles: number[] };
+    expect(dp.doubles[SCHEMA_MARKER]).toBe(1); // marked new...
+    expect(dp.doubles[SCAN_P50]).toBe(-1); // ...but sentinel-excluded from the rollup
+    expect(dp.doubles[UP_P50]).toBe(-1);
   });
 
   it("writes the -1 sentinel for a metric with no samples (empty array)", async () => {
@@ -701,6 +728,9 @@ describe("telemetry worker GET /stats/latency (DESIGN s13)", () => {
     expect(fetchMock).toHaveBeenCalledTimes(2);
     expect(sqls.some((s) => s.includes("double7") && s.includes("double7 >= 0"))).toBe(true);
     expect(sqls.some((s) => s.includes("double9") && s.includes("double9 >= 0"))).toBe(true);
+    // BOTH queries also filter the schema marker (excludes pre-latency rows whose
+    // missing latency doubles AE materializes as 0).
+    expect(sqls.every((s) => s.includes("double11 >= 1"))).toBe(true);
     // The default 7-day window is in the SQL.
     expect(sqls.every((s) => s.includes("INTERVAL '7' DAY"))).toBe(true);
   });
