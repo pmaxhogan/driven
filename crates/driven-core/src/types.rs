@@ -923,6 +923,17 @@ pub struct ScanResult {
     /// warning is what keeps it from being a silent omission. Stored as a lossy
     /// `String` because there is, by definition, no valid `RelativePath` for it.
     pub invalid_filenames: Vec<String>,
+    /// The source filesystem's mtime granularity window (in nanoseconds) that
+    /// THIS scan measured via the write-stat probe, `Some` only when the scan
+    /// actually probed - i.e. the source had no persisted granularity yet
+    /// (`SourceRow::mtime_granularity_ns` was `None`), which is normally the
+    /// first scan of a source (DESIGN s5.2 step 2). The orchestrator persists it
+    /// via [`crate::state::StateRepo::set_source_mtime_granularity`]; every later
+    /// scan reads the stored value and leaves this `None`. `Some(0)` means the
+    /// probe classified the FS as fine (trusted mtime); `Some(n > 0)` is the
+    /// measured coarse window. Mirrors how `excluded_orphans` / `ads_skipped`
+    /// hand the orchestrator findings it persists.
+    pub probed_granularity_ns: Option<i64>,
 }
 
 /// One local file the scanner observed (SPEC s6 `LocalEntry`).

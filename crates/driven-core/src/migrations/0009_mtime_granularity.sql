@@ -1,0 +1,22 @@
+-- Item #3 (DESIGN s5.2): persist each source filesystem's effective mtime
+-- granularity, measured once by the scanner's write-stat probe at first scan.
+--
+-- Change detection is normally (size, mtime_ns) equality. On a coarse-resolution
+-- filesystem (FAT32 = 2s, some network mounts) an in-place edit that preserves
+-- byte count WITHIN the same mtime quantum reports an unchanged mtime and would
+-- be missed. The scanner probes the source FS granularity once and, when it is
+-- coarser than one second, re-hashes any stat-matched file whose mtime falls
+-- within one granularity window of the last-scan-end (and whose ctime / inode
+-- birth time post-dates it) - see DESIGN s5.2 step 2.
+--
+-- Stored as the measured window in nanoseconds:
+--   NULL = not yet probed (the scanner probes on the next scan and persists);
+--   0    = probed and fine (sub-second / trusted mtime; no fallback);
+--   > 0  = the measured granularity window in ns (fallback engaged when > 1e9).
+--
+-- Additive, backward compatible: nullable INTEGER, no existing column touched.
+-- Every pre-migration row decodes to NULL = unprobed, so it is probed on the
+-- next scan with no data migration.
+--
+-- Data-format note (v1.0.0 stored-format stability): additive ADD COLUMN only.
+ALTER TABLE backup_sources ADD COLUMN mtime_granularity_ns INTEGER;

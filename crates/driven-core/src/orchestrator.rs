@@ -1364,6 +1364,21 @@ impl SyncOrchestrator {
         )
         .await?;
 
+        // DESIGN s5.2 step 2: the scan probed this source's FS mtime granularity
+        // (it had none persisted - the first scan). Persist it so later scans
+        // read it instead of re-probing. FS metadata, so persist regardless of
+        // op success and even on a dry run; non-fatal on error (a failed persist
+        // just re-probes next cycle).
+        if let Some(granularity_ns) = scan.probed_granularity_ns {
+            if let Err(err) = self
+                .state
+                .set_source_mtime_granularity(source.id, granularity_ns)
+                .await
+            {
+                tracing::warn!(target: TARGET, source_id = %source.id, %err, "failed to persist probed mtime granularity");
+            }
+        }
+
         // DESIGN s5.5: flag still-present-but-now-excluded paths so the UI can
         // surface them; never a trash. Non-fatal - a flag write failure must
         // not abort the upload pipeline.
@@ -2674,6 +2689,21 @@ mod tests {
             }
             Ok(())
         }
+        async fn set_source_mtime_granularity(
+            &self,
+            id: SourceId,
+            granularity_ns: i64,
+        ) -> anyhow::Result<()> {
+            // Persist into the in-memory rows so a later read observes it,
+            // mirroring the sqlite single-column UPDATE.
+            let mut sources = self.sources.lock().unwrap();
+            for source in sources.iter_mut() {
+                if source.id == id {
+                    source.mtime_granularity_ns = Some(granularity_ns);
+                }
+            }
+            Ok(())
+        }
         async fn delete_source(&self, _id: SourceId) -> anyhow::Result<()> {
             unimplemented!()
         }
@@ -2878,6 +2908,7 @@ mod tests {
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: None,
             last_deep_verify_at: Some(0),
+            mtime_granularity_ns: None,
             created_at: 0,
         }
     }

@@ -151,6 +151,13 @@ pub struct SourceRow {
     pub last_full_scan_at: Option<UnixMs>,
     /// Wall-time of last completed deep-verify.
     pub last_deep_verify_at: Option<UnixMs>,
+    /// Effective mtime granularity of the source filesystem, in nanoseconds,
+    /// measured once by the scanner's write-stat probe (DESIGN s5.2 step 2):
+    /// `None` = not yet probed, `Some(0)` = probed fine (trusted mtime), and
+    /// `Some(n > 0)` = the measured granularity window (the coarse-FS re-hash
+    /// fallback engages when it exceeds one second). Persisted in the nullable
+    /// `mtime_granularity_ns` column.
+    pub mtime_granularity_ns: Option<i64>,
     /// `backup_sources.created_at`.
     pub created_at: UnixMs,
 }
@@ -1069,6 +1076,15 @@ pub trait StateRepo: Send + Sync {
         full_scan_at: UnixMs,
         deep_verify_at: Option<UnixMs>,
     ) -> Result<()>;
+
+    /// Persists the source filesystem's probed mtime granularity window (in
+    /// nanoseconds; `0` = fine, `> 0` = coarse) into `mtime_granularity_ns`
+    /// (DESIGN s5.2 step 2). Called by the orchestrator after a scan whose
+    /// `ScanResult::probed_granularity_ns` is `Some` - i.e. the first scan of a
+    /// source, which measured its granularity. A targeted single-column UPDATE
+    /// (like [`Self::mark_source_scanned`]) so it never clobbers a concurrent
+    /// settings edit; a no-op if the source row is gone.
+    async fn set_source_mtime_granularity(&self, id: SourceId, granularity_ns: i64) -> Result<()>;
 
     /// Deletes a `backup_sources` row and (via `ON DELETE CASCADE`) every
     /// dependent `file_state` and `pending_ops` row.

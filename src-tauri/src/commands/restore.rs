@@ -4398,6 +4398,7 @@ mod tests {
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: None,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 1_700_000_000_000,
         };
         repo.upsert_source(&source).await.unwrap();
