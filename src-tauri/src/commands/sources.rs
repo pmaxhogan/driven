@@ -784,23 +784,12 @@ pub async fn pick_drive_folder(
         .collect();
 
     // Issue #7: at the My Drive root, surface the account's Shared Drive roots
-    // above the My Drive folders so the user can descend into one. Each Shared
-    // Drive root's id IS its driveId; descending passes that driveId back so the
-    // listing switches to `corpora=drive` scope.
+    // above the My Drive folders so the user can descend into one. A drives.list
+    // failure DEGRADES GRACEFULLY to a My-Drive-only picker (the roots the user
+    // actually wants) instead of failing the whole picker - see
+    // [`shared_drive_root_entries`].
     if start_folder_id.is_none() && !drive_context.is_shared_drive() {
-        let shared = store
-            .list_shared_drives()
-            .await
-            .map_err(CommandError::from)?;
-        let mut shared_entries: Vec<DriveFolderEntry> = shared
-            .into_iter()
-            .map(|d| DriveFolderEntry {
-                drive_id: Some(d.id.clone()),
-                id: d.id,
-                name: d.name,
-                is_shared_drive: true,
-            })
-            .collect();
+        let mut shared_entries = shared_drive_root_entries(store.as_ref()).await;
         // Shared Drive roots first, then the My Drive folders.
         shared_entries.append(&mut folders);
         folders = shared_entries;
@@ -818,6 +807,33 @@ pub async fn pick_drive_folder(
         current_folder_path,
         folders,
     })
+}
+
+/// Issue #7: the account's Shared Drive roots as picker entries, DEGRADING
+/// GRACEFULLY on a `drives.list` failure. A transient 5xx / rate limit / a
+/// Workspace policy that disables Shared Drives must NOT fail the whole picker -
+/// the user still wants their My Drive folders. On `Err` we log a single warning
+/// and return an empty list (a My-Drive-only picker); on success we map each
+/// drive to a badged root entry whose id IS its `driveId`.
+async fn shared_drive_root_entries(store: &dyn RemoteStore) -> Vec<DriveFolderEntry> {
+    match store.list_shared_drives().await {
+        Ok(shared) => shared
+            .into_iter()
+            .map(|d| DriveFolderEntry {
+                drive_id: Some(d.id.clone()),
+                id: d.id,
+                name: d.name,
+                is_shared_drive: true,
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "drives.list failed; showing a My-Drive-only picker (Shared Drives unavailable)"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// `preview_exclusions(req)` - preview which files the candidate rules would
@@ -2313,5 +2329,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Issue #7 (P2): a `drives.list` failure must DEGRADE GRACEFULLY - the
+    /// picker still returns the My-Drive folders. The helper returns an empty
+    /// Shared Drive list rather than propagating the error.
+    #[tokio::test]
+    async fn shared_drive_root_entries_degrades_on_drives_list_error() {
+        use driven_drive::fake::InMemoryRemoteStore;
+        // `with_network_drop_after(1)` makes the first Drive request (the sole
+        // `list_shared_drives` call here) fail.
+        let erroring = InMemoryRemoteStore::new().with_network_drop_after(1);
+        let entries = shared_drive_root_entries(&erroring).await;
+        assert!(
+            entries.is_empty(),
+            "a drives.list failure must degrade to an empty Shared Drive list, not an error"
+        );
+    }
+
+    /// Issue #7: configured Shared Drives map to badged root entries whose id is
+    /// their driveId.
+    #[tokio::test]
+    async fn shared_drive_root_entries_maps_configured_drives() {
+        use driven_drive::fake::InMemoryRemoteStore;
+        use driven_drive::remote_store::SharedDrive;
+        let store = InMemoryRemoteStore::new().with_shared_drives(vec![SharedDrive {
+            id: "0Ateam".into(),
+            name: "Team".into(),
+        }]);
+        let entries = shared_drive_root_entries(&store).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "0Ateam");
+        assert_eq!(entries[0].drive_id.as_deref(), Some("0Ateam"));
+        assert!(entries[0].is_shared_drive);
     }
 }
