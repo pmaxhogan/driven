@@ -631,6 +631,17 @@ mod tests {
         assert!(build_service_client(ServiceName::Drive, &bad).is_err());
     }
 
+    #[tokio::test]
+    async fn drop_pool_rebuilds_the_service_client_with_the_stored_ca() {
+        // Issue #34: a pool teardown rebuilds the client re-applying the SAME CA
+        // (here `none`, offline) - it must not panic or drop the client.
+        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
+        backend.drop_pool(ServiceName::Drive).await;
+        // Telemetry has no pooled client; drop is a no-op (early-return covered).
+        backend.drop_pool(ServiceName::Telemetry).await;
+        assert!(backend.service_client(ServiceName::Drive).is_some());
+    }
+
     // --- per-service client mapping covers exactly the probed services ---
 
     #[test]

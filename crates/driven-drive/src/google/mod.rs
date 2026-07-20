@@ -1873,6 +1873,27 @@ mod tests {
     use super::*;
 
     #[test]
+    fn google_store_new_builds_a_stream_client_with_the_ca() {
+        // Issue #34: `GoogleDriveStore::new` derives its streaming client via
+        // `build_stream_client(ca)` (here `none`, offline). Covers the ctor +
+        // stream-client build path without a network/keychain dependency.
+        let tokens = crate::google::oauth::Tokens {
+            access_token: String::new(),
+            refresh_token: "rt".to_string(),
+            expires_at: 0,
+        };
+        let http = build_meta_client(&CustomCaConfig::none()).expect("meta client");
+        let source = RefreshingTokenSource::new(tokens, http, "cid", "secret");
+        let store = GoogleDriveStore::new(
+            build_meta_client(&CustomCaConfig::none()).expect("meta client"),
+            source,
+            &CustomCaConfig::none(),
+        );
+        // The streaming client is a distinct, usable handle (no panic on build).
+        let _ = store.http_stream();
+    }
+
+    #[test]
     fn drive_clients_apply_custom_ca_fail_closed() {
         // Issue #34: the Drive metadata + stream clients add the custom CA
         // additively and fail closed on a bad one; `None` builds normally.
