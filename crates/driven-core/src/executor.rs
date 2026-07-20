@@ -815,6 +815,12 @@ pub struct DefaultExecutor {
     /// the file size - the one qualitative pipeline contract that IS
     /// deterministically measurable against the instantaneous fake.
     mem_gauge: Option<Arc<MemGauge>>,
+    /// App-global latency sampler (DESIGN s13 telemetry), or `None` when
+    /// telemetry latency capture is not wired (every test + the chaos harness).
+    /// When `Some`, each completed upload op records its wall-clock latency
+    /// normalized per MiB via [`crate::telemetry::per_mb_ms`]; the reservoir's
+    /// own enable gate makes the record a no-op when telemetry is off.
+    latency: Option<Arc<crate::telemetry::LatencyReservoir>>,
     #[cfg(test)]
     mid_upload_hook: Option<MidUploadHook>,
     #[cfg(test)]
@@ -893,11 +899,27 @@ impl DefaultExecutor {
             vss: deps.vss,
             pool,
             mem_gauge: None,
+            latency: None,
             #[cfg(test)]
             mid_upload_hook: None,
             #[cfg(test)]
             post_upload_hook: None,
         }
+    }
+
+    /// Attach the app-global latency reservoir (DESIGN s13 telemetry) so each
+    /// completed upload op records its per-MiB latency. Mirrors
+    /// [`Self::with_mem_gauge`]: a builder over the always-present `Option`
+    /// field, so no test / e2e struct-literal site changes. Production wires it
+    /// from the assembly; every other construction path leaves it `None` (zero
+    /// overhead).
+    #[must_use]
+    pub fn with_latency_reservoir(
+        mut self,
+        reservoir: Arc<crate::telemetry::LatencyReservoir>,
+    ) -> Self {
+        self.latency = Some(reservoir);
+        self
     }
 
     /// Resolve the crypto decision for one source (M5 GA-blocking surface).
@@ -4467,6 +4489,20 @@ impl<'a> ExecOne<'a> {
         permit: tokio::sync::OwnedSemaphorePermit,
         on_outcome: &OutcomeSink<'_>,
     ) -> anyhow::Result<OpOutcome> {
+        // Telemetry (DESIGN s13): time upload ops so a completed upload records
+        // its per-MiB latency. Only armed for the upload op kinds and only when a
+        // reservoir is wired + enabled (a trash op is not an "upload-per-MB"
+        // sample). Zero cost otherwise (not even an `Instant::now`).
+        let upload_timer = match op {
+            Op::HashThenUpload { .. } | Op::UploadBundle { .. } => self
+                .this
+                .latency
+                .as_ref()
+                .filter(|r| r.is_enabled())
+                .map(|_| std::time::Instant::now()),
+            Op::Trash { .. } => None,
+        };
+
         let out = match op {
             Op::HashThenUpload {
                 source_id,
@@ -4493,6 +4529,32 @@ impl<'a> ExecOne<'a> {
                 self.this.bundle_upload(self.source, members).await
             }
         };
+
+        // Record the completed upload's per-MiB latency (DESIGN s13). Only a
+        // successful upload that moved bytes contributes a sample: a Done-Upload
+        // carries the uploaded byte count, a BundleDone carries the bundle object
+        // size; a trash, skip, or failure records nothing.
+        if let (Some(reservoir), Some(started)) = (self.this.latency.as_ref(), upload_timer) {
+            if let Ok(outcome) = &out {
+                let bytes = match outcome {
+                    OpOutcome::Done {
+                        kind: DoneKind::Upload,
+                        bytes: Some(bytes),
+                        ..
+                    } => Some(*bytes),
+                    OpOutcome::BundleDone { bytes, .. } => Some(*bytes),
+                    _ => None,
+                };
+                if let Some(bytes) = bytes {
+                    let elapsed_ms =
+                        u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX);
+                    if let Some(per_mb) = crate::telemetry::per_mb_ms(elapsed_ms, bytes) {
+                        reservoir.record_upload_per_mb_ms(per_mb);
+                    }
+                }
+            }
+        }
+
         // Stream the per-op activity for a produced outcome (the op's durable
         // file-state commit already happened inside hash_then_upload / trash_op).
         // A hard error (Err) carries no OpOutcome and is handled by the caller.

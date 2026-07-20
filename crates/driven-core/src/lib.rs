@@ -30,6 +30,7 @@ pub mod pacer;
 pub mod planner;
 pub mod scanner;
 pub mod state;
+pub mod telemetry;
 pub mod time;
 pub mod types;
 pub mod watcher;

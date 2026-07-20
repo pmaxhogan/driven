@@ -433,6 +433,13 @@ pub struct SyncOrchestrator {
     /// token. An atomic so the cycle path can set it and the run loop can read it
     /// without holding a lock across the select.
     suspended: std::sync::atomic::AtomicBool,
+    /// App-global latency sampler (DESIGN s13 telemetry), or `None` when
+    /// telemetry latency capture is not wired (tests / the chaos harness).
+    /// Threaded into [`crate::scanner::scan_with_latency`] so each scan records
+    /// per-file processing latency; the SAME `Arc` is also given to the executor
+    /// (via [`crate::executor::DefaultExecutor::with_latency_reservoir`]) for the
+    /// upload-per-MB metric. Set via [`Self::with_latency_reservoir`].
+    latency: Option<Arc<crate::telemetry::LatencyReservoir>>,
 }
 
 impl SyncOrchestrator {
@@ -483,7 +490,23 @@ impl SyncOrchestrator {
             vss_create_ledger: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             orphan_cleanup_done: Mutex::new(false),
             suspended: std::sync::atomic::AtomicBool::new(false),
+            latency: None,
         }
+    }
+
+    /// Attach the app-global latency reservoir (DESIGN s13 telemetry) so each
+    /// scan records per-file processing latency. Pass the SAME `Arc` given to the
+    /// executor via
+    /// [`DefaultExecutor::with_latency_reservoir`](crate::executor::DefaultExecutor::with_latency_reservoir)
+    /// so both metrics feed one reservoir. Without this, scans capture nothing
+    /// (the tests / chaos harness path).
+    #[must_use]
+    pub fn with_latency_reservoir(
+        mut self,
+        reservoir: Arc<crate::telemetry::LatencyReservoir>,
+    ) -> Self {
+        self.latency = Some(reservoir);
+        self
     }
 
     /// Attach the per-cycle Windows VSS snapshot provider (ROADMAP M3.5).
@@ -1294,7 +1317,13 @@ impl SyncOrchestrator {
             scanned: 0,
         })
         .await;
-        let scan = crate::scanner::scan(source, self.state.as_ref(), mode).await?;
+        let scan = crate::scanner::scan_with_latency(
+            source,
+            self.state.as_ref(),
+            mode,
+            self.latency.as_deref(),
+        )
+        .await?;
 
         // DESIGN s5.5: flag still-present-but-now-excluded paths so the UI can
         // surface them; never a trash. Non-fatal - a flag write failure must

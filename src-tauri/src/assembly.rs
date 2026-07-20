@@ -120,6 +120,17 @@ pub async fn build_and_spawn(
     // account. A picker-minted folder id is therefore visible to the uploader.
     let fake_remote_stores: FakeRemoteStores = Arc::new(std::sync::Mutex::new(HashMap::new()));
 
+    // DESIGN s13 telemetry: the app-global latency reservoir, created ONCE with
+    // its capture gate initialized from the persisted `telemetry.enabled` pref
+    // (BEFORE any executor / scanner is wired, so an opted-out user gets no
+    // startup capture window). The SAME `Arc` is threaded into every account's
+    // executor + orchestrator below and installed on the AppState so the ping
+    // task reads the samples both write.
+    let telemetry_enabled = crate::telemetry::read_enabled(state.as_ref()).await;
+    let latency = Arc::new(driven_core::telemetry::LatencyReservoir::new(
+        telemetry_enabled,
+    ));
+
     let mut handles: HashMap<AccountId, AccountHandle> = HashMap::new();
 
     for account in &accounts {
@@ -162,6 +173,7 @@ pub async fn build_and_spawn(
             use_fake,
             &fake_remote_stores,
             vss_helper.as_ref(),
+            &latency,
         )
         .await
         {
@@ -199,7 +211,11 @@ pub async fn build_and_spawn(
         }
     }
 
-    let app_state = AppState::new(state, handles, remote_mode, fake_remote_stores);
+    let mut app_state = AppState::new(state, handles, remote_mode, fake_remote_stores);
+    // DESIGN s13: share the SAME reservoir the executors + orchestrators record
+    // into with the AppState so the ping task snapshots those samples (replaces
+    // the default-ON placeholder).
+    app_state.install_telemetry_latency(latency);
     // Issue #25: install the broker manager so the quit sweep can shut it down
     // and `get_vss_helper_status` can report truthful liveness.
     if let Some(manager) = vss_helper {
@@ -315,6 +331,10 @@ pub async fn spawn_account(
     // hot-added account's BrokeredVssProvider shares the one launch / pipe.
     let vss_helper = app_state.vss_helper_manager();
 
+    // DESIGN s13: a hot-added account records into the SAME app-global latency
+    // reservoir the running AppState + ping task already share.
+    let latency = app_state.telemetry_latency();
+
     match build_account(
         app,
         &state,
@@ -323,6 +343,7 @@ pub async fn spawn_account(
         use_fake,
         &fake_remote_stores,
         vss_helper.as_ref(),
+        &latency,
     )
     .await?
     {
@@ -380,6 +401,7 @@ enum RemoteOutcome {
 /// Build + spawn ONE account's orchestrator over the real seams. Returns a
 /// [`BuildOutcome`] (spawned, or needs-reauth) or an error that the caller
 /// logs + skips.
+#[allow(clippy::too_many_arguments)]
 async fn build_account(
     app: &AppHandle,
     state: &Arc<dyn StateRepo>,
@@ -388,6 +410,7 @@ async fn build_account(
     use_fake: bool,
     fake_remote_stores: &FakeRemoteStores,
     vss_helper: Option<&Arc<VssHelperManager>>,
+    latency: &Arc<driven_core::telemetry::LatencyReservoir>,
 ) -> anyhow::Result<BuildOutcome> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -482,20 +505,25 @@ async fn build_account(
     let crypto_dyn: Arc<dyn driven_core::crypto_provider::CryptoProvider> = crypto.clone();
 
     // --- executor -----------------------------------------------------------
-    let executor: Arc<dyn Executor> = Arc::new(DefaultExecutor::with_clock(
-        ExecutorDeps {
-            remote,
-            state: state.clone(),
-            // Clone so the orchestrator can share the SAME pacer for the V2
-            // metered throttle (`with_pacer` below) - a runtime cap change must
-            // be seen by this executor's upload path.
-            pacer: pacer.clone(),
-            crypto: Some(crypto_dyn),
-            vss: vss.clone(),
-            network: Some(network.clone()),
-        },
-        clock.clone(),
-    ));
+    let executor: Arc<dyn Executor> = Arc::new(
+        DefaultExecutor::with_clock(
+            ExecutorDeps {
+                remote,
+                state: state.clone(),
+                // Clone so the orchestrator can share the SAME pacer for the V2
+                // metered throttle (`with_pacer` below) - a runtime cap change must
+                // be seen by this executor's upload path.
+                pacer: pacer.clone(),
+                crypto: Some(crypto_dyn),
+                vss: vss.clone(),
+                network: Some(network.clone()),
+            },
+            clock.clone(),
+        )
+        // DESIGN s13: the SAME app-global reservoir the orchestrator's scans
+        // record into, for the upload-per-MB latency metric.
+        .with_latency_reservoir(latency.clone()),
+    );
 
     // --- orchestrator -------------------------------------------------------
     // Held as the CONCRETE `Arc<SyncOrchestrator>` (not `Arc<dyn Orchestrator>`)
@@ -524,6 +552,9 @@ async fn build_account(
     // Share the executor's pacer so the V2 metered throttle (DESIGN s17) can
     // lower / lift its bandwidth cap as the network goes on / off metered.
     orchestrator = orchestrator.with_pacer(pacer);
+    // DESIGN s13: the SAME reservoir the executor holds, so per-file scan latency
+    // and upload-per-MB latency feed one app-global sampler.
+    orchestrator = orchestrator.with_latency_reservoir(latency.clone());
     let orchestrator = Arc::new(orchestrator);
 
     // R-P1-1: one shutdown signal both bridges select! on, so quit can stop the

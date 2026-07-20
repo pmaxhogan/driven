@@ -1,4 +1,4 @@
-import { describe, it, expect, vi } from "vitest";
+import { describe, it, expect, vi, afterEach } from "vitest";
 
 import { handle, validatePing, writePing, type Env } from "../src/index";
 
@@ -558,5 +558,191 @@ describe("telemetry worker handler", () => {
     const r = validatePing(bad);
     expect(r.ok).toBe(false);
     if (!r.ok) expect(r.reason).toBe("ts");
+  });
+});
+
+// --------------------------------------------------------------------------
+// DESIGN s13: latency percentile doubles + the gated /stats/latency rollup.
+// --------------------------------------------------------------------------
+
+/// The AE double indices (0-based) the 4 latency percentiles occupy - appended
+/// after the original 6 measures (files, bytes, deep_verify, update_applied,
+/// total_errors, ts).
+const SCAN_P50 = 6;
+const SCAN_P95 = 7;
+const UP_P50 = 8;
+const UP_P95 = 9;
+
+describe("telemetry worker latency doubles (DESIGN s13)", () => {
+  it("writes the client-reported [p50, p95] latency doubles", async () => {
+    const { env, writes } = mockEnv();
+    const p = validPayload();
+    p.latency_p50_p95_ms = { scan: [3, 12], upload_per_mb: [40, 110] };
+    const res = await handle(postPing(JSON.stringify(p)), env);
+    expect(res.status).toBe(204);
+    const dp = writes[0] as { doubles: number[] };
+    // The original 6 measures keep their positions.
+    expect(dp.doubles[5]).toBe(1_700_000_000_000); // ts unchanged at double6
+    expect(dp.doubles[SCAN_P50]).toBe(3);
+    expect(dp.doubles[SCAN_P95]).toBe(12);
+    expect(dp.doubles[UP_P50]).toBe(40);
+    expect(dp.doubles[UP_P95]).toBe(110);
+  });
+
+  it("writes the -1 sentinel for a metric with no samples (empty array)", async () => {
+    const { env, writes } = mockEnv();
+    const p = validPayload();
+    // Scan has data; upload had no completed uploads this window (empty array).
+    p.latency_p50_p95_ms = { scan: [0, 5], upload_per_mb: [] };
+    const res = await handle(postPing(JSON.stringify(p)), env);
+    expect(res.status).toBe(204);
+    const dp = writes[0] as { doubles: number[] };
+    // A legit 0 ms p50 is preserved (NOT turned into the sentinel).
+    expect(dp.doubles[SCAN_P50]).toBe(0);
+    expect(dp.doubles[SCAN_P95]).toBe(5);
+    // The empty upload metric -> -1 sentinel (distinguishable from a real 0).
+    expect(dp.doubles[UP_P50]).toBe(-1);
+    expect(dp.doubles[UP_P95]).toBe(-1);
+  });
+
+  it("writes both sentinels when V1-style empty latency arrays arrive", async () => {
+    const { env, writes } = mockEnv();
+    // The default validPayload() carries empty latency arrays (the V1 wire shape).
+    const res = await handle(postPing(JSON.stringify(validPayload())), env);
+    expect(res.status).toBe(204);
+    const dp = writes[0] as { doubles: number[] };
+    expect(dp.doubles[SCAN_P50]).toBe(-1);
+    expect(dp.doubles[SCAN_P95]).toBe(-1);
+    expect(dp.doubles[UP_P50]).toBe(-1);
+    expect(dp.doubles[UP_P95]).toBe(-1);
+  });
+});
+
+describe("telemetry worker GET /stats/latency (DESIGN s13)", () => {
+  const STATS_URL = "https://driven.maxhogan.dev/telemetry/v1/stats/latency";
+
+  afterEach(() => {
+    vi.unstubAllGlobals();
+  });
+
+  /// A configured stats Env (both secrets present) plus a fetch stub returning
+  /// the given per-metric AE `{ data }` rows for the two metric queries in order.
+  function statsEnv(): Env {
+    return {
+      TELEMETRY: { writeDataPoint: () => undefined },
+      QUERY_TOKEN: "s3cret",
+      CF_API_TOKEN: "cf-token",
+      CF_ACCOUNT_ID: "acct-123",
+    } as unknown as Env;
+  }
+
+  function authed(): Request {
+    return new Request(STATS_URL, {
+      method: "GET",
+      headers: { authorization: "Bearer s3cret" },
+    });
+  }
+
+  it("503s when QUERY_TOKEN / CF_API_TOKEN are not configured", async () => {
+    const env = { TELEMETRY: { writeDataPoint: () => undefined } } as unknown as Env;
+    const res = await handle(authed(), env);
+    expect(res.status).toBe(503);
+    expect(await res.json()).toMatchObject({ error: "stats_not_configured" });
+  });
+
+  it("401s without a bearer token", async () => {
+    const res = await handle(new Request(STATS_URL, { method: "GET" }), statsEnv());
+    expect(res.status).toBe(401);
+    expect(res.headers.get("www-authenticate")).toBe("Bearer");
+  });
+
+  it("401s with the wrong bearer token", async () => {
+    const req = new Request(STATS_URL, {
+      method: "GET",
+      headers: { authorization: "Bearer nope" },
+    });
+    const res = await handle(req, statsEnv());
+    expect(res.status).toBe(401);
+  });
+
+  it("405s on the wrong method for the stats path", async () => {
+    const res = await handle(new Request(STATS_URL, { method: "POST" }), statsEnv());
+    expect(res.status).toBe(405);
+    expect(res.headers.get("allow")).toBe("GET");
+  });
+
+  it("returns per-day aggregates for both metrics on a valid authed request", async () => {
+    const sqls: string[] = [];
+    const fetchMock = vi.fn(async (_url: string, init: { body: string }) => {
+      sqls.push(init.body);
+      // First call (scan) then second (upload); return distinct rows.
+      const isScan = init.body.includes("double7");
+      const data = isScan
+        ? [{ day: "2026-07-14", avg_p50: "3", avg_p95: "12", max_p95: "40", samples: "9" }]
+        : [{ day: "2026-07-14", avg_p50: "50", avg_p95: "120", max_p95: "300", samples: "4" }];
+      return new Response(JSON.stringify({ meta: [], data }), { status: 200 });
+    });
+    vi.stubGlobal("fetch", fetchMock);
+
+    const res = await handle(authed(), statsEnv());
+    expect(res.status).toBe(200);
+    const body = (await res.json()) as {
+      days: number;
+      metrics: { scan: unknown[]; upload_per_mb: unknown[] };
+    };
+    expect(body.days).toBe(7); // default window
+    expect(body.metrics.scan).toEqual([
+      { day: "2026-07-14", avg_p50_ms: 3, avg_p95_ms: 12, max_p95_ms: 40, samples: 9 },
+    ]);
+    expect(body.metrics.upload_per_mb).toEqual([
+      { day: "2026-07-14", avg_p50_ms: 50, avg_p95_ms: 120, max_p95_ms: 300, samples: 4 },
+    ]);
+    // Two queries issued, one per metric, each filtering its own sentinel column.
+    expect(fetchMock).toHaveBeenCalledTimes(2);
+    expect(sqls.some((s) => s.includes("double7") && s.includes("double7 >= 0"))).toBe(true);
+    expect(sqls.some((s) => s.includes("double9") && s.includes("double9 >= 0"))).toBe(true);
+    // The default 7-day window is in the SQL.
+    expect(sqls.every((s) => s.includes("INTERVAL '7' DAY"))).toBe(true);
+  });
+
+  it("clamps the days param to [1, 90] and defaults to 7", async () => {
+    const seen: string[] = [];
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async (_url: string, init: { body: string }) => {
+        seen.push(init.body);
+        return new Response(JSON.stringify({ meta: [], data: [] }), { status: 200 });
+      }),
+    );
+    const call = async (q: string) =>
+      handle(
+        new Request(`${STATS_URL}?days=${q}`, {
+          method: "GET",
+          headers: { authorization: "Bearer s3cret" },
+        }),
+        statsEnv(),
+      );
+
+    await call("500"); // over the cap -> 90
+    await call("0"); // under the floor -> 1
+    await call("abc"); // non-numeric -> default 7
+    await call("30"); // valid pass-through
+
+    expect(seen.some((s) => s.includes("INTERVAL '90' DAY"))).toBe(true);
+    expect(seen.some((s) => s.includes("INTERVAL '1' DAY"))).toBe(true);
+    expect(seen.some((s) => s.includes("INTERVAL '7' DAY"))).toBe(true);
+    expect(seen.some((s) => s.includes("INTERVAL '30' DAY"))).toBe(true);
+  });
+
+  it("502s (not 200) when the AE SQL query fails upstream", async () => {
+    vi.stubGlobal(
+      "fetch",
+      vi.fn(async () => new Response("nope", { status: 403 })),
+    );
+    const errSpy = vi.spyOn(console, "error").mockImplementation(() => undefined);
+    const res = await handle(authed(), statsEnv());
+    expect(res.status).toBe(502);
+    expect(await res.json()).toMatchObject({ error: "query_failed" });
+    errSpy.mockRestore();
   });
 });

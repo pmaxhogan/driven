@@ -156,10 +156,29 @@ fn has_alternate_data_streams(path: &Path) -> bool {
 /// Pure aside from local filesystem reads and the `state` load; emits no
 /// ops and mutates no state - the planner (SPEC s7) and executor (SPEC s8)
 /// own those side effects.
+///
+/// Thin wrapper over [`scan_with_latency`] with no telemetry capture; the
+/// existing tests + callers that do not thread a reservoir use this.
 pub async fn scan(
     source: &SourceRow,
     state: &dyn StateRepo,
     mode: ScanMode,
+) -> anyhow::Result<ScanResult> {
+    scan_with_latency(source, state, mode, None).await
+}
+
+/// [`scan`] with an optional [`LatencyReservoir`](crate::telemetry::LatencyReservoir)
+/// for per-file scan-processing latency capture (DESIGN s13 telemetry). When
+/// `latency` is `Some` AND capture is enabled, each fully-processed file records
+/// its stat-through-change-detection wall-clock time (the dominant cost is the
+/// BLAKE3 re-hash on a deep-verify pass); when `None` there is zero overhead.
+/// The orchestrator passes its shared reservoir here; every other caller passes
+/// `None`.
+pub async fn scan_with_latency(
+    source: &SourceRow,
+    state: &dyn StateRepo,
+    mode: ScanMode,
+    latency: Option<&crate::telemetry::LatencyReservoir>,
 ) -> anyhow::Result<ScanResult> {
     let known = state
         .load_source_file_state(source.id)
@@ -292,6 +311,16 @@ pub async fn scan(
             continue;
         }
 
+        // Telemetry (DESIGN s13): time this file's stat-through-change-detection
+        // processing. Only armed when a reservoir is threaded in AND capture is
+        // enabled, so a scan with no telemetry pays nothing (not even the
+        // `Instant::now`). Recorded at the end of the iteration for a
+        // fully-processed file; the cheap early-`continue` skips below (cloud-only
+        // placeholder, NFC collision) intentionally record nothing.
+        let file_timer = latency
+            .filter(|r| r.is_enabled())
+            .map(|_| std::time::Instant::now());
+
         let meta = match entry.metadata() {
             Ok(m) => m,
             Err(err) => {
@@ -387,6 +416,14 @@ pub async fn scan(
                 size,
                 mtime_ns,
             });
+        }
+
+        // Telemetry (DESIGN s13): record this file's per-file scan-processing
+        // latency. `latency` is `Some` iff a reservoir was armed above; the
+        // `record_scan_ms` call re-checks the enable gate (a no-op if telemetry
+        // was disabled mid-scan).
+        if let (Some(res), Some(started)) = (latency, file_timer) {
+            res.record_scan_ms(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
         }
     }
 
