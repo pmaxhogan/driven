@@ -4387,6 +4387,7 @@ mod tests {
             respect_gitignore: true,
             include_patterns: vec!["**/*".into()],
             exclude_patterns: vec!["**/*.tmp".into()],
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: None,

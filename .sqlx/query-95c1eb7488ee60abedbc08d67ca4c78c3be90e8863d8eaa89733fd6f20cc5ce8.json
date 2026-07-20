@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n            SELECT\n                id                        AS \"id!: String\",\n                account_id                AS \"account_id!: String\",\n                display_name              AS \"display_name!: String\",\n                enabled                   AS \"enabled!: i64\",\n                local_path                AS \"local_path!: String\",\n                drive_folder_id           AS \"drive_folder_id!: String\",\n                drive_folder_path         AS \"drive_folder_path!: String\",\n                encryption_enabled        AS \"encryption_enabled!: i64\",\n                wrapped_source_key        AS \"wrapped_source_key: Vec<u8>\",\n                respect_gitignore         AS \"respect_gitignore!: i64\",\n                include_patterns          AS \"include_patterns!: String\",\n                exclude_patterns          AS \"exclude_patterns!: String\",\n                schedule_json_v2_reserved AS \"schedule_json_v2_reserved: String\",\n                deep_verify_interval_secs AS \"deep_verify_interval_secs!: i64\",\n                last_full_scan_at         AS \"last_full_scan_at: i64\",\n                last_deep_verify_at       AS \"last_deep_verify_at: i64\",\n                created_at                AS \"created_at!: i64\"\n            FROM backup_sources\n            ORDER BY created_at ASC, id ASC\n            ",
+  "query": "\n            SELECT\n                id                        AS \"id!: String\",\n                account_id                AS \"account_id!: String\",\n                display_name              AS \"display_name!: String\",\n                enabled                   AS \"enabled!: i64\",\n                local_path                AS \"local_path!: String\",\n                drive_folder_id           AS \"drive_folder_id!: String\",\n                drive_folder_path         AS \"drive_folder_path!: String\",\n                encryption_enabled        AS \"encryption_enabled!: i64\",\n                wrapped_source_key        AS \"wrapped_source_key: Vec<u8>\",\n                respect_gitignore         AS \"respect_gitignore!: i64\",\n                include_patterns          AS \"include_patterns!: String\",\n                exclude_patterns          AS \"exclude_patterns!: String\",\n                placeholder_policy        AS \"placeholder_policy: String\",\n                schedule_json_v2_reserved AS \"schedule_json_v2_reserved: String\",\n                deep_verify_interval_secs AS \"deep_verify_interval_secs!: i64\",\n                last_full_scan_at         AS \"last_full_scan_at: i64\",\n                last_deep_verify_at       AS \"last_deep_verify_at: i64\",\n                created_at                AS \"created_at!: i64\"\n            FROM backup_sources\n            ORDER BY created_at ASC, id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -136,8 +136,19 @@
         }
       },
       {
-        "name": "schedule_json_v2_reserved: String",
+        "name": "placeholder_policy: String",
         "ordinal": 12,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "placeholder_policy"
+          }
+        }
+      },
+      {
+        "name": "schedule_json_v2_reserved: String",
+        "ordinal": 13,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -148,7 +159,7 @@
       },
       {
         "name": "deep_verify_interval_secs!: i64",
-        "ordinal": 13,
+        "ordinal": 14,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -159,7 +170,7 @@
       },
       {
         "name": "last_full_scan_at: i64",
-        "ordinal": 14,
+        "ordinal": 15,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -170,7 +181,7 @@
       },
       {
         "name": "last_deep_verify_at: i64",
-        "ordinal": 15,
+        "ordinal": 16,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -181,7 +192,7 @@
       },
       {
         "name": "created_at!: i64",
-        "ordinal": 16,
+        "ordinal": 17,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -208,11 +219,12 @@
       false,
       false,
       true,
+      true,
       false,
       true,
       true,
       false
     ]
   },
-  "hash": "af709bab951a1b495c05e5f4179a9fbd6f7d1e66bdbe62fa84429740ef5cf9ba"
+  "hash": "95c1eb7488ee60abedbc08d67ca4c78c3be90e8863d8eaa89733fd6f20cc5ce8"
 }

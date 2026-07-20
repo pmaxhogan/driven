@@ -52,6 +52,12 @@ use anyhow::Context;
 
 use crate::exclude::{build_source_matcher, build_walker};
 use crate::state::{SourceRow, StateRepo};
+// `PlaceholderPolicy` is consumed only by `should_skip_placeholder`, which is
+// cfg-gated the same way; on a non-Windows, non-test lib build the fn (and thus
+// this import) is compiled out, so gate the import to match or it trips
+// `unused_imports` under `-D warnings` on the Linux/macOS CI legs.
+#[cfg(any(windows, test))]
+use crate::state::PlaceholderPolicy;
 use crate::types::{LocalEntry, RelativePath, ScanMode, ScanResult};
 
 static TARGET: &str = "driven::core::scanner";
@@ -61,8 +67,30 @@ static TARGET: &str = "driven::core::scanner";
 /// resident on disk. Reading such a file forces a network hydration, so the
 /// scanner skips these by default rather than pulling down TBs of cloud-only
 /// data. Matches the Win32 SDK constant `0x00400000`.
-#[cfg(windows)]
+///
+/// Compiled on Windows (where the attribute exists) and in test builds on every
+/// platform (so [`should_skip_placeholder`] can be exercised cross-OS - the real
+/// attribute cannot be synthesised on a temp file portably, mirrored by the
+/// chaos `onedrive-placeholder` scenario).
+#[cfg(any(windows, test))]
 const FILE_ATTRIBUTE_RECALL_ON_OPEN: u32 = 0x0040_0000;
+
+/// Decide whether the scanner skips a cloud-only (OneDrive Files-On-Demand)
+/// placeholder, given its Win32 file attributes and the source's
+/// [`PlaceholderPolicy`] (issue #4, DESIGN s5.2.1).
+///
+/// Pure (no I/O) so both policy branches are unit-testable on any OS, mirroring
+/// the repo's `classify_*` / `fallback_decision` pure-decision pattern:
+/// - [`PlaceholderPolicy::Skip`] (default): skip when the
+///   `FILE_ATTRIBUTE_RECALL_ON_OPEN` bit is set, so stat/hash never forces a
+///   network hydration of dehydrated cloud data.
+/// - [`PlaceholderPolicy::ForceDownload`]: never skip on this attribute; the file
+///   flows through the normal open/read path, which hydrates it on read.
+#[cfg(any(windows, test))]
+fn should_skip_placeholder(file_attributes: u32, policy: PlaceholderPolicy) -> bool {
+    matches!(policy, PlaceholderPolicy::Skip)
+        && file_attributes & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0
+}
 
 /// Whether `path` carries one or more NTFS Alternate Data Streams beyond its
 /// main unnamed `::$DATA` stream (DESIGN s5.2.1, STRESS_HARNESS s3.5
@@ -304,17 +332,19 @@ pub async fn scan(
             }
         };
 
-        // OneDrive Files-On-Demand skip (DESIGN s5.2.1): a cloud-only
+        // OneDrive Files-On-Demand policy (issue #4, DESIGN s5.2.1): a cloud-only
         // placeholder has FILE_ATTRIBUTE_RECALL_ON_OPEN set; opening it to
-        // stat/hash would force a network hydration. Skip it, but FIRST mark
-        // it `seen` so the deletion sweep below does NOT treat its existing
-        // `file_state` row as "known but missing" and trash the Drive backup
-        // - a placeholder is still present locally, just dehydrated.
+        // stat/hash would force a network hydration. Under the default
+        // `PlaceholderPolicy::Skip` we skip it, but FIRST mark it `seen` so the
+        // deletion sweep below does NOT treat its existing `file_state` row as
+        // "known but missing" and trash the Drive backup - a placeholder is still
+        // present locally, just dehydrated. Under `ForceDownload` we do NOT skip:
+        // the file falls through to the normal stat + change-detection path, and
+        // the subsequent read (deep-verify hash / upload) hydrates it on demand.
         #[cfg(windows)]
         {
             use std::os::windows::fs::MetadataExt;
-            if meta.file_attributes() & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0 {
-                // TODO(M6): per-source "include cloud-only OneDrive files" toggle (default skip)
+            if should_skip_placeholder(meta.file_attributes(), source.placeholder_policy) {
                 seen.insert(rel.clone());
                 skipped_cloud_only += 1;
                 tracing::trace!(target: TARGET, source_id = %source.id, path = %rel, "skipping cloud-only (OneDrive Files-On-Demand) placeholder");
@@ -561,6 +591,7 @@ mod tests {
             respect_gitignore: true,
             include_patterns: vec![],
             exclude_patterns: vec![],
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: None,
@@ -1253,9 +1284,50 @@ mod tests {
     /// `FILE_ATTRIBUTE_RECALL_ON_OPEN` (DESIGN s5.2.1). Synthesising the
     /// actual attribute on a temp file is not portably possible, so pin the
     /// bit value to guard against an accidental edit.
-    #[cfg(windows)]
     #[test]
     fn recall_on_open_bit_is_correct() {
         assert_eq!(super::FILE_ATTRIBUTE_RECALL_ON_OPEN, 0x0040_0000);
+    }
+
+    /// Issue #4: [`should_skip_placeholder`] honours the per-source policy. The
+    /// real `FILE_ATTRIBUTE_RECALL_ON_OPEN` bit cannot be set on a temp file
+    /// cross-platform, so this drives the pure decision fn directly (the same
+    /// bit the `#[cfg(windows)]` scanner path passes from `meta.file_attributes()`).
+    #[test]
+    fn placeholder_skip_policy_honoured() {
+        use crate::state::PlaceholderPolicy;
+        let recall = super::FILE_ATTRIBUTE_RECALL_ON_OPEN;
+        let plain = 0x0000_0020; // FILE_ATTRIBUTE_ARCHIVE - not a placeholder.
+
+        // Default Skip: a recall-on-open placeholder is skipped; an ordinary file
+        // (and a placeholder combined with other attribute bits) behaves as its
+        // recall bit dictates.
+        assert!(super::should_skip_placeholder(
+            recall,
+            PlaceholderPolicy::Skip
+        ));
+        assert!(super::should_skip_placeholder(
+            recall | plain,
+            PlaceholderPolicy::Skip
+        ));
+        assert!(!super::should_skip_placeholder(
+            plain,
+            PlaceholderPolicy::Skip
+        ));
+
+        // ForceDownload: a placeholder is NEVER skipped, so it flows through the
+        // normal read path and hydrates; an ordinary file is likewise not skipped.
+        assert!(!super::should_skip_placeholder(
+            recall,
+            PlaceholderPolicy::ForceDownload
+        ));
+        assert!(!super::should_skip_placeholder(
+            recall | plain,
+            PlaceholderPolicy::ForceDownload
+        ));
+        assert!(!super::should_skip_placeholder(
+            plain,
+            PlaceholderPolicy::ForceDownload
+        ));
     }
 }

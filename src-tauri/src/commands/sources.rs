@@ -24,7 +24,7 @@ use std::sync::Arc;
 use tauri::State;
 
 use driven_core::exclude::{build_source_matcher, validate_patterns};
-use driven_core::state::{AccountRow, SourceRow, StateRepo, VersioningConfig};
+use driven_core::state::{AccountRow, PlaceholderPolicy, SourceRow, StateRepo, VersioningConfig};
 use driven_core::time::{Clock, SystemClock};
 use driven_core::types::{AccountId, ErrorCode, SourceId};
 
@@ -101,6 +101,7 @@ fn source_row_to_dto_with_pending(row: &SourceRow, pending_recovery_ack: bool) -
         respect_gitignore: row.respect_gitignore,
         include_patterns: row.include_patterns.clone(),
         exclude_patterns: row.exclude_patterns.clone(),
+        placeholder_policy: row.placeholder_policy,
         deep_verify_interval_secs: row.deep_verify_interval_secs,
         last_full_scan_at: row.last_full_scan_at,
         created_at: row.created_at,
@@ -268,6 +269,7 @@ pub async fn add_source(
         respect_gitignore: req.respect_gitignore,
         include_patterns: req.include_patterns.clone(),
         exclude_patterns: req.exclude_patterns.clone(),
+        placeholder_policy: req.placeholder_policy,
         schedule_json_v2_reserved: None,
         deep_verify_interval_secs: default_deep_verify_secs(),
         last_full_scan_at: None,
@@ -530,6 +532,9 @@ pub async fn update_source(
     }
     if let Some(exclude_patterns) = patch.exclude_patterns {
         row.exclude_patterns = exclude_patterns;
+    }
+    if let Some(placeholder_policy) = patch.placeholder_policy {
+        row.placeholder_policy = placeholder_policy;
     }
     if let Some(secs) = patch.deep_verify_interval_secs {
         // R3-P2-2: a direct IPC patch must not set 0 (constant deep-verify churn)
@@ -822,6 +827,9 @@ pub async fn preview_exclusions(
         respect_gitignore: req.respect_gitignore,
         include_patterns: req.include_patterns.clone(),
         exclude_patterns: req.exclude_patterns.clone(),
+        // Placeholder policy does not affect the include/exclude preview; the
+        // default is fine for the synthetic matcher.
+        placeholder_policy: PlaceholderPolicy::Skip,
         schedule_json_v2_reserved: None,
         deep_verify_interval_secs: default_deep_verify_secs(),
         last_full_scan_at: None,
@@ -1464,6 +1472,7 @@ mod tests {
             respect_gitignore,
             include_patterns: include.iter().map(|s| s.to_string()).collect(),
             exclude_patterns: exclude.iter().map(|s| s.to_string()).collect(),
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
@@ -1544,6 +1553,7 @@ mod tests {
             respect_gitignore: true,
             include_patterns: vec!["*.md".to_string()],
             exclude_patterns: vec!["*.log".to_string()],
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: Some(99),
@@ -1605,6 +1615,7 @@ mod tests {
             respect_gitignore: true,
             include_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
@@ -1861,6 +1872,7 @@ mod tests {
             respect_gitignore: true,
             include_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
@@ -1933,6 +1945,7 @@ mod tests {
             respect_gitignore: true,
             include_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
@@ -2032,6 +2045,7 @@ mod tests {
             respect_gitignore: true,
             include_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
@@ -2102,6 +2116,7 @@ mod tests {
             respect_gitignore: true,
             include_patterns: Vec::new(),
             exclude_patterns: Vec::new(),
+            placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,

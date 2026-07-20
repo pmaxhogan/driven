@@ -52,6 +52,59 @@ pub struct AccountRow {
     pub last_synced_at: Option<UnixMs>,
 }
 
+/// Per-source policy for OneDrive / cloud-only placeholder files (issue #4,
+/// DESIGN s5.2.1).
+///
+/// A OneDrive Files-On-Demand placeholder carries `FILE_ATTRIBUTE_RECALL_ON_OPEN`;
+/// opening it forces a network hydration. This policy decides what the scanner
+/// does with such a file. Stored as the nullable TEXT column
+/// `backup_sources.placeholder_policy`; NULL (every pre-migration row) and any
+/// unrecognised value decode to [`PlaceholderPolicy::Skip`], so the default is
+/// backward compatible. Windows-only in effect - no other platform sets the
+/// attribute, so the policy is inert (and harmless) elsewhere.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "snake_case")]
+pub enum PlaceholderPolicy {
+    /// Skip cloud-only placeholders (the default): never stat/hash a dehydrated
+    /// file, so a backup never silently pulls down terabytes of cloud data.
+    #[default]
+    Skip,
+    /// Back cloud-only placeholders up: do NOT skip on the recall attribute; let
+    /// the normal open/read path hydrate each file on demand (the Windows Cloud
+    /// Files API hydrates on read).
+    ForceDownload,
+}
+
+impl PlaceholderPolicy {
+    /// The value stored in the `placeholder_policy` TEXT column (matches the
+    /// serde snake_case rename so the DB and JSON encodings agree).
+    pub fn as_db_str(self) -> &'static str {
+        match self {
+            PlaceholderPolicy::Skip => "skip",
+            PlaceholderPolicy::ForceDownload => "force_download",
+        }
+    }
+
+    /// Decode the `placeholder_policy` column. `NULL` (pre-migration rows) and any
+    /// unrecognised string map to [`PlaceholderPolicy::Skip`] for forward
+    /// compatibility - a newer stored value never errors an older reader, it just
+    /// falls back to the safe default.
+    pub fn from_db(value: Option<&str>) -> Self {
+        match value {
+            Some("force_download") => PlaceholderPolicy::ForceDownload,
+            Some("skip") | None => PlaceholderPolicy::Skip,
+            Some(other) => {
+                tracing::warn!(
+                    target: "driven::core::state",
+                    value = other,
+                    "unrecognised placeholder_policy; defaulting to skip"
+                );
+                PlaceholderPolicy::Skip
+            }
+        }
+    }
+}
+
 /// One row of `backup_sources` (SPEC s2).
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
 pub struct SourceRow {
@@ -80,6 +133,10 @@ pub struct SourceRow {
     pub include_patterns: Vec<String>,
     /// User-supplied exclude globs (JSON array in SQL).
     pub exclude_patterns: Vec<String>,
+    /// Policy for OneDrive / cloud-only placeholder files (issue #4). Defaults to
+    /// [`PlaceholderPolicy::Skip`]; stored in the nullable `placeholder_policy`
+    /// column (NULL decodes to `Skip`).
+    pub placeholder_policy: PlaceholderPolicy,
     /// V2 reserved schedule JSON; V1 code never reads this column.
     pub schedule_json_v2_reserved: Option<String>,
     /// Deep-verify cadence in seconds (default `604800` = 7 days).
@@ -1608,5 +1665,38 @@ pub trait StateRepo: Send + Sync {
     ) -> Result<Vec<FileSearchHit>> {
         let _ = (source, pattern, limit);
         Ok(Vec::new())
+    }
+}
+
+#[cfg(test)]
+mod placeholder_policy_tests {
+    use super::PlaceholderPolicy;
+
+    #[test]
+    fn decode_defaults_to_skip_for_null_and_unknown() {
+        // NULL (every pre-migration row) decodes to the backward-compatible Skip.
+        assert_eq!(PlaceholderPolicy::from_db(None), PlaceholderPolicy::Skip);
+        // Any unrecognised stored string also falls back to Skip (forward compat).
+        assert_eq!(
+            PlaceholderPolicy::from_db(Some("nonsense")),
+            PlaceholderPolicy::Skip
+        );
+    }
+
+    #[test]
+    fn decode_and_encode_round_trip() {
+        for policy in [PlaceholderPolicy::Skip, PlaceholderPolicy::ForceDownload] {
+            assert_eq!(PlaceholderPolicy::from_db(Some(policy.as_db_str())), policy);
+        }
+        assert_eq!(PlaceholderPolicy::Skip.as_db_str(), "skip");
+        assert_eq!(
+            PlaceholderPolicy::ForceDownload.as_db_str(),
+            "force_download"
+        );
+    }
+
+    #[test]
+    fn default_is_skip() {
+        assert_eq!(PlaceholderPolicy::default(), PlaceholderPolicy::Skip);
     }
 }

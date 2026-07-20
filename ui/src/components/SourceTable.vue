@@ -43,6 +43,9 @@ const editingId = ref<string | null>(null);
 const editRespectGitignore = ref(true);
 const editIncludeText = ref("");
 const editExcludeText = ref("");
+// Issue #4: when true, back up OneDrive / cloud-only placeholder files
+// (PlaceholderPolicy "force_download") instead of skipping them (the default).
+const editBackupCloudOnly = ref(false);
 const editPreview = ref<ExclusionPreview | null>(null);
 const editPreviewLoading = ref(false);
 const savingEdit = ref(false);
@@ -114,6 +117,7 @@ function beginEditExclusions(source: SourceDto): void {
   editRespectGitignore.value = source.respectGitignore;
   editIncludeText.value = source.includePatterns.join("\n");
   editExcludeText.value = source.excludePatterns.join("\n");
+  editBackupCloudOnly.value = source.placeholderPolicy === "force_download";
   editPreview.value = null;
   void loadEditPreview(source);
 }
@@ -146,6 +150,7 @@ async function saveEdit(source: SourceDto): Promise<void> {
       respectGitignore: editRespectGitignore.value,
       includePatterns: splitPatterns(editIncludeText.value),
       excludePatterns: splitPatterns(editExcludeText.value),
+      placeholderPolicy: editBackupCloudOnly.value ? "force_download" : "skip",
     });
     editingId.value = null;
     editPreview.value = null;
@@ -523,6 +528,20 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
               :class="inputCls"
               @blur="loadEditPreview(source)"
             />
+          </label>
+          <label class="flex items-start gap-2 text-sm">
+            <input
+              v-model="editBackupCloudOnly"
+              type="checkbox"
+              class="mt-0.5 accent-teal-600"
+              data-testid="placeholder-policy-toggle"
+            />
+            <span>
+              {{ t("settings.sources.placeholderPolicyLabel") }}
+              <span class="mt-0.5 block text-xs text-zinc-500 dark:text-zinc-400">
+                {{ t("settings.sources.placeholderPolicyCaption") }}
+              </span>
+            </span>
           </label>
           <p v-if="editPreviewLoading" class="text-sm text-zinc-500">
             {{ t("common.loading") }}

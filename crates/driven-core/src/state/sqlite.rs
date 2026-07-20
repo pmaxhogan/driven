@@ -36,7 +36,8 @@ use super::{
     AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
     BundleRef, BundleRow, DiscardPendingOutcome, FileSearchHit, FileStateRow, FileStatusCount,
     FileVersionRow, ImmediateTreeChildren, NewActivity, NewFileVersion, NewPendingOp, PageRequest,
-    PendingOpRow, PendingRecoveryAck, RestoreFileRow, SourceRow, StateRepo, TelemetryAggregate,
+    PendingOpRow, PendingRecoveryAck, PlaceholderPolicy, RestoreFileRow, SourceRow, StateRepo,
+    TelemetryAggregate,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -554,6 +555,7 @@ impl StateRepo for SqliteStateRepo {
                 respect_gitignore         AS "respect_gitignore!: i64",
                 include_patterns          AS "include_patterns!: String",
                 exclude_patterns          AS "exclude_patterns!: String",
+                placeholder_policy        AS "placeholder_policy: String",
                 schedule_json_v2_reserved AS "schedule_json_v2_reserved: String",
                 deep_verify_interval_secs AS "deep_verify_interval_secs!: i64",
                 last_full_scan_at         AS "last_full_scan_at: i64",
@@ -581,6 +583,7 @@ impl StateRepo for SqliteStateRepo {
                     respect_gitignore: r.respect_gitignore != 0,
                     include_patterns: serde_json::from_str(&r.include_patterns)?,
                     exclude_patterns: serde_json::from_str(&r.exclude_patterns)?,
+                    placeholder_policy: PlaceholderPolicy::from_db(r.placeholder_policy.as_deref()),
                     schedule_json_v2_reserved: r.schedule_json_v2_reserved,
                     deep_verify_interval_secs: u32::try_from(r.deep_verify_interval_secs)
                         .map_err(|_| anyhow!("deep_verify_interval_secs out of u32 range"))?,
@@ -609,6 +612,7 @@ impl StateRepo for SqliteStateRepo {
                 respect_gitignore         AS "respect_gitignore!: i64",
                 include_patterns          AS "include_patterns!: String",
                 exclude_patterns          AS "exclude_patterns!: String",
+                placeholder_policy        AS "placeholder_policy: String",
                 schedule_json_v2_reserved AS "schedule_json_v2_reserved: String",
                 deep_verify_interval_secs AS "deep_verify_interval_secs!: i64",
                 last_full_scan_at         AS "last_full_scan_at: i64",
@@ -638,6 +642,7 @@ impl StateRepo for SqliteStateRepo {
                     respect_gitignore: r.respect_gitignore != 0,
                     include_patterns: serde_json::from_str(&r.include_patterns)?,
                     exclude_patterns: serde_json::from_str(&r.exclude_patterns)?,
+                    placeholder_policy: PlaceholderPolicy::from_db(r.placeholder_policy.as_deref()),
                     schedule_json_v2_reserved: r.schedule_json_v2_reserved,
                     deep_verify_interval_secs: u32::try_from(r.deep_verify_interval_secs)
                         .map_err(|_| anyhow!("deep_verify_interval_secs out of u32 range"))?,
@@ -659,6 +664,7 @@ impl StateRepo for SqliteStateRepo {
         let exclude_patterns = serde_json::to_string(&row.exclude_patterns)?;
         let wrapped: Option<&[u8]> = row.wrapped_source_key.as_deref();
         let deep_verify_interval_secs = row.deep_verify_interval_secs as i64;
+        let placeholder_policy = row.placeholder_policy.as_db_str();
 
         sqlx::query!(
             r#"
@@ -668,14 +674,14 @@ impl StateRepo for SqliteStateRepo {
                 encryption_enabled, wrapped_source_key, respect_gitignore,
                 include_patterns, exclude_patterns, schedule_json_v2_reserved,
                 deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
-                created_at
+                created_at, placeholder_policy
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
-                ?17
+                ?17, ?18
             )
             ON CONFLICT(id) DO UPDATE SET
                 account_id                = excluded.account_id,
@@ -693,7 +699,8 @@ impl StateRepo for SqliteStateRepo {
                 deep_verify_interval_secs = excluded.deep_verify_interval_secs,
                 last_full_scan_at         = excluded.last_full_scan_at,
                 last_deep_verify_at       = excluded.last_deep_verify_at,
-                created_at                = excluded.created_at
+                created_at                = excluded.created_at,
+                placeholder_policy        = excluded.placeholder_policy
             "#,
             id,
             account_id,
@@ -712,6 +719,7 @@ impl StateRepo for SqliteStateRepo {
             row.last_full_scan_at,
             row.last_deep_verify_at,
             row.created_at,
+            placeholder_policy,
         )
         .execute(&self.pool)
         .await?;
@@ -793,6 +801,7 @@ impl StateRepo for SqliteStateRepo {
         let exclude_patterns = serde_json::to_string(&source.exclude_patterns)?;
         let wrapped: Option<&[u8]> = source.wrapped_source_key.as_deref();
         let deep_verify_interval_secs = source.deep_verify_interval_secs as i64;
+        let placeholder_policy = source.placeholder_policy.as_db_str();
 
         sqlx::query!(
             r#"
@@ -802,14 +811,14 @@ impl StateRepo for SqliteStateRepo {
                 encryption_enabled, wrapped_source_key, respect_gitignore,
                 include_patterns, exclude_patterns, schedule_json_v2_reserved,
                 deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
-                created_at
+                created_at, placeholder_policy
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
-                ?17
+                ?17, ?18
             )
             ON CONFLICT(id) DO UPDATE SET
                 account_id                = excluded.account_id,
@@ -827,7 +836,8 @@ impl StateRepo for SqliteStateRepo {
                 deep_verify_interval_secs = excluded.deep_verify_interval_secs,
                 last_full_scan_at         = excluded.last_full_scan_at,
                 last_deep_verify_at       = excluded.last_deep_verify_at,
-                created_at                = excluded.created_at
+                created_at                = excluded.created_at,
+                placeholder_policy        = excluded.placeholder_policy
             "#,
             id,
             account_id,
@@ -846,6 +856,7 @@ impl StateRepo for SqliteStateRepo {
             source.last_full_scan_at,
             source.last_deep_verify_at,
             source.created_at,
+            placeholder_policy,
         )
         .execute(&mut *tx)
         .await?;
@@ -914,6 +925,7 @@ impl StateRepo for SqliteStateRepo {
         let exclude_patterns = serde_json::to_string(&source.exclude_patterns)?;
         let wrapped: Option<&[u8]> = source.wrapped_source_key.as_deref();
         let deep_verify_interval_secs = source.deep_verify_interval_secs as i64;
+        let placeholder_policy = source.placeholder_policy.as_db_str();
 
         sqlx::query!(
             r#"
@@ -923,14 +935,14 @@ impl StateRepo for SqliteStateRepo {
                 encryption_enabled, wrapped_source_key, respect_gitignore,
                 include_patterns, exclude_patterns, schedule_json_v2_reserved,
                 deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
-                created_at
+                created_at, placeholder_policy
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
-                ?17
+                ?17, ?18
             )
             ON CONFLICT(id) DO UPDATE SET
                 account_id                = excluded.account_id,
@@ -948,7 +960,8 @@ impl StateRepo for SqliteStateRepo {
                 deep_verify_interval_secs = excluded.deep_verify_interval_secs,
                 last_full_scan_at         = excluded.last_full_scan_at,
                 last_deep_verify_at       = excluded.last_deep_verify_at,
-                created_at                = excluded.created_at
+                created_at                = excluded.created_at,
+                placeholder_policy        = excluded.placeholder_policy
             "#,
             id,
             src_account_id,
@@ -967,6 +980,7 @@ impl StateRepo for SqliteStateRepo {
             source.last_full_scan_at,
             source.last_deep_verify_at,
             source.created_at,
+            placeholder_policy,
         )
         .execute(&mut *tx)
         .await?;
@@ -3495,6 +3509,7 @@ mod tests {
             respect_gitignore: true,
             include_patterns: vec!["**/*".into()],
             exclude_patterns: vec!["**/*.tmp".into()],
+            placeholder_policy: PlaceholderPolicy::Skip,
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: None,
@@ -4220,6 +4235,49 @@ mod tests {
 
         repo.delete_source(src.id).await.unwrap();
         assert!(repo.list_sources().await.unwrap().is_empty());
+    }
+
+    /// Issue #4: the `placeholder_policy` column round-trips a non-default value,
+    /// and the default (`Skip`, written when the migration's nullable column is
+    /// absent from older rows) survives an upsert. `sample_source` defaults to
+    /// `Skip`, so this also covers the backward-compatible default path.
+    #[tokio::test]
+    async fn placeholder_policy_round_trip() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+
+        // Default Skip persists and reloads as Skip.
+        let skip_src = sample_source(acct.id);
+        assert_eq!(skip_src.placeholder_policy, PlaceholderPolicy::Skip);
+        repo.upsert_source(&skip_src).await.unwrap();
+
+        // A ForceDownload source persists and reloads unchanged.
+        let mut force_src = sample_source(acct.id);
+        force_src.placeholder_policy = PlaceholderPolicy::ForceDownload;
+        repo.upsert_source(&force_src).await.unwrap();
+
+        let all = repo.list_sources().await.unwrap();
+        assert_eq!(all.len(), 2);
+        let reload = |id| all.iter().find(|s| s.id == id).cloned().unwrap();
+        assert_eq!(reload(skip_src.id), skip_src);
+        assert_eq!(reload(force_src.id), force_src);
+
+        // Flipping the policy via upsert updates the stored column.
+        let mut flipped = skip_src.clone();
+        flipped.placeholder_policy = PlaceholderPolicy::ForceDownload;
+        repo.upsert_source(&flipped).await.unwrap();
+        let reloaded = repo
+            .list_sources()
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|s| s.id == skip_src.id)
+            .unwrap();
+        assert_eq!(
+            reloaded.placeholder_policy,
+            PlaceholderPolicy::ForceDownload
+        );
     }
 
     #[tokio::test]

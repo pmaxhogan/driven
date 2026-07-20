@@ -15,6 +15,7 @@ use std::path::PathBuf;
 
 use serde::{Deserialize, Deserializer, Serialize};
 
+use driven_core::state::PlaceholderPolicy;
 use driven_core::types::AccountId;
 
 /// serde helper for an `Option<Option<T>>` "double option" patch field, which
@@ -153,6 +154,8 @@ pub struct SourceDto {
     pub include_patterns: Vec<String>,
     /// User exclude globs.
     pub exclude_patterns: Vec<String>,
+    /// Policy for OneDrive / cloud-only placeholder files (issue #4).
+    pub placeholder_policy: PlaceholderPolicy,
     /// Deep-verify cadence in seconds.
     pub deep_verify_interval_secs: u32,
     /// Wall-time of last completed full scan; `None` until the first scan.
@@ -202,6 +205,11 @@ pub struct AddSourceRequest {
     pub include_patterns: Vec<String>,
     /// Exclude globs.
     pub exclude_patterns: Vec<String>,
+    /// Policy for OneDrive / cloud-only placeholder files (issue #4). Optional for
+    /// backward compatibility: an omitted field defaults to
+    /// [`PlaceholderPolicy::Skip`].
+    #[serde(default)]
+    pub placeholder_policy: PlaceholderPolicy,
 }
 
 /// The result of `add_source` (SPEC s11.2; B3 recovery-phrase reveal).
@@ -248,6 +256,8 @@ pub struct SourcePatch {
     pub include_patterns: Option<Vec<String>>,
     /// Replace the exclude globs.
     pub exclude_patterns: Option<Vec<String>>,
+    /// Change the OneDrive / cloud-only placeholder policy (issue #4).
+    pub placeholder_policy: Option<PlaceholderPolicy>,
     /// Change the deep-verify cadence.
     pub deep_verify_interval_secs: Option<u32>,
 }
