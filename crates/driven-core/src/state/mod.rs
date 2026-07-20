@@ -120,6 +120,11 @@ pub struct SourceRow {
     pub local_path: String,
     /// Drive `folder_id` the source uploads into.
     pub drive_folder_id: String,
+    /// The Google Shared Drive id the destination folder lives in, or `None`
+    /// for My Drive (issue #7). Persisted alongside `drive_folder_id`; decoded
+    /// into a [`DriveContext`](driven_drive::remote_store::DriveContext) via
+    /// [`SourceRow::drive_context`] to scope every Drive list/search request.
+    pub drive_id: Option<String>,
     /// Cached display path of the Drive folder for UI rendering.
     pub drive_folder_path: String,
     /// Whether per-source encryption is on.
@@ -148,6 +153,17 @@ pub struct SourceRow {
     pub last_deep_verify_at: Option<UnixMs>,
     /// `backup_sources.created_at`.
     pub created_at: UnixMs,
+}
+
+impl SourceRow {
+    /// The [`DriveContext`](driven_drive::remote_store::DriveContext) this
+    /// source's destination lives in (issue #7). Decodes the persisted
+    /// `drive_id` (`None` / `"my-drive"` => My Drive; any other value => that
+    /// Shared Drive). Every Drive list/search issued for this source is scoped
+    /// with it.
+    pub fn drive_context(&self) -> driven_drive::remote_store::DriveContext {
+        driven_drive::remote_store::DriveContext::from_stored(self.drive_id.as_deref())
+    }
 }
 
 /// One row of `recovery_phrase_acks` (M9 R4-P1-1, DATA-SAFETY; migration

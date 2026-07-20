@@ -141,6 +141,7 @@ fn flat_source(account: AccountId, root: &Path, folder_id: &str) -> SourceRow {
         enabled: true,
         local_path: root.to_string_lossy().into_owned(),
         drive_folder_id: folder_id.to_string(),
+        drive_id: None,
         drive_folder_path: "/mutator".into(),
         encryption_enabled: false,
         wrapped_source_key: None,

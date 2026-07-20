@@ -139,6 +139,7 @@ fn source_in(account: AccountId, root: &Path, folder_id: &str) -> SourceRow {
         enabled: true,
         local_path: root.to_string_lossy().into_owned(),
         drive_folder_id: folder_id.to_string(),
+        drive_id: None,
         drive_folder_path: "/file-size".into(),
         encryption_enabled: false,
         wrapped_source_key: None,
@@ -174,7 +175,12 @@ async fn boot_and_register(
 
 /// Count non-trashed objects under a folder of the fake.
 async fn live_object_count(remote: &InMemoryRemoteStore, folder_id: &str) -> anyhow::Result<u64> {
-    let entries = remote.list_folder(folder_id).await?;
+    let entries = remote
+        .list_folder(
+            folder_id,
+            &driven_drive::remote_store::DriveContext::MyDrive,
+        )
+        .await?;
     Ok(entries.iter().filter(|e| !e.trashed).count() as u64)
 }
 
@@ -185,7 +191,12 @@ async fn assert_no_duplicate_op_uuid(
     remote: &InMemoryRemoteStore,
     folder_id: &str,
 ) -> anyhow::Result<()> {
-    let entries = remote.list_folder(folder_id).await?;
+    let entries = remote
+        .list_folder(
+            folder_id,
+            &driven_drive::remote_store::DriveContext::MyDrive,
+        )
+        .await?;
     let mut seen: HashMap<String, String> = HashMap::new();
     for e in entries.iter().filter(|e| !e.trashed) {
         if let Some(uuid) = e.app_properties.get(CLIENT_OP_UUID_KEY) {
@@ -369,7 +380,9 @@ impl Scenario for ZeroByteFile {
 
         let live = live_object_count(&remote, &folder).await?;
         anyhow::ensure!(live == 1, "exactly one object uploaded, got {live}");
-        let entries = remote.list_folder(&folder).await?;
+        let entries = remote
+            .list_folder(&folder, &driven_drive::remote_store::DriveContext::MyDrive)
+            .await?;
         let entry = &entries[0];
         anyhow::ensure!(
             entry.size == Some(0) || entry.size.is_none(),
@@ -474,7 +487,9 @@ impl Scenario for SparseFileZeros {
 
         let live = live_object_count(&remote, &folder).await?;
         anyhow::ensure!(live == 1, "exactly one object uploaded, got {live}");
-        let entries = remote.list_folder(&folder).await?;
+        let entries = remote
+            .list_folder(&folder, &driven_drive::remote_store::DriveContext::MyDrive)
+            .await?;
         let logical = Self::logical_len();
         anyhow::ensure!(
             entries[0].size == Some(logical),
@@ -578,7 +593,9 @@ impl Scenario for HugeFile10Gb {
             live == 1,
             "exactly one object after the huge upload, got {live}"
         );
-        let entries = remote.list_folder(&folder).await?;
+        let entries = remote
+            .list_folder(&folder, &driven_drive::remote_store::DriveContext::MyDrive)
+            .await?;
         anyhow::ensure!(
             entries[0].size == Some(Self::file_len()),
             "the full 10 GB landed, got size {:?}",
@@ -745,7 +762,9 @@ impl Scenario for HugeFile50GbMidRunCrash {
 
         let live = live_object_count(&remote, &folder).await?;
         anyhow::ensure!(live == 1, "resume finalized exactly one object, got {live}");
-        let entries = remote.list_folder(&folder).await?;
+        let entries = remote
+            .list_folder(&folder, &driven_drive::remote_store::DriveContext::MyDrive)
+            .await?;
         anyhow::ensure!(
             entries[0].size == Some(Self::file_len()),
             "the resumed object carries the full 50 GB, got {:?}",

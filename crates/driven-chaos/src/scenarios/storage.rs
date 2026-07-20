@@ -117,6 +117,7 @@ fn source_in(account: AccountId, root: &Path, folder_id: &str) -> SourceRow {
         enabled: true,
         local_path: root.to_string_lossy().into_owned(),
         drive_folder_id: folder_id.to_string(),
+        drive_id: None,
         drive_folder_path: "/storage-chaos".into(),
         encryption_enabled: false,
         wrapped_source_key: None,
@@ -182,7 +183,10 @@ async fn live_object_count(remote: &InMemoryRemoteStore, folder_id: &str) -> any
     let mut total = 0u64;
     let mut stack = vec![folder_id.to_string()];
     while let Some(id) = stack.pop() {
-        for entry in remote.list_folder(&id).await? {
+        for entry in remote
+            .list_folder(&id, &driven_drive::remote_store::DriveContext::MyDrive)
+            .await?
+        {
             if entry.trashed {
                 continue;
             }

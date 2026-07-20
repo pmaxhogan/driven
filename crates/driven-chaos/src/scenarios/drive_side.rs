@@ -91,6 +91,7 @@ fn source_in(account: AccountId, root: &std::path::Path, folder_id: &str) -> Sou
         enabled: true,
         local_path: root.to_string_lossy().into_owned(),
         drive_folder_id: folder_id.to_string(),
+        drive_id: None,
         drive_folder_path: "/drive-side".into(),
         encryption_enabled: false,
         wrapped_source_key: None,
@@ -109,7 +110,10 @@ fn source_in(account: AccountId, root: &std::path::Path, folder_id: &str) -> Sou
 /// Count non-trashed objects under `folder_id`.
 async fn live_object_count(remote: &dyn RemoteStore, folder_id: &str) -> anyhow::Result<usize> {
     Ok(remote
-        .list_folder(folder_id)
+        .list_folder(
+            folder_id,
+            &driven_drive::remote_store::DriveContext::MyDrive,
+        )
         .await?
         .iter()
         .filter(|e| !e.trashed)
@@ -221,7 +225,10 @@ async fn check_invariants(
     folder: &str,
     source: &SourceRow,
 ) -> anyhow::Result<InvariantReport> {
-    let live = handle.remote.list_folder(folder).await?;
+    let live = handle
+        .remote
+        .list_folder(folder, &driven_drive::remote_store::DriveContext::MyDrive)
+        .await?;
     let live_objects = live.iter().filter(|e| !e.trashed).count();
     let mut notes = Vec::new();
 
@@ -717,7 +724,14 @@ impl Scenario for TrashEmptiedWithOurFile {
         let rel = RelativePath::try_from("keepme.txt".to_string())?;
 
         inst.handle.run_one_cycle().await?;
-        let children = inst.handle.remote.list_folder(&inst.folder).await?;
+        let children = inst
+            .handle
+            .remote
+            .list_folder(
+                &inst.folder,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
+            .await?;
         anyhow::ensure!(children.len() == 1, "one object uploaded");
         let original_id = children[0].id.clone();
 
@@ -736,7 +750,10 @@ impl Scenario for TrashEmptiedWithOurFile {
         let live: Vec<_> = inst
             .handle
             .remote
-            .list_folder(&inst.folder)
+            .list_folder(
+                &inst.folder,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
             .await?
             .into_iter()
             .filter(|e| !e.trashed)
@@ -1104,7 +1121,14 @@ impl Scenario for DriveFileidRecycled {
 
         // Upload X.
         inst.handle.run_one_cycle().await?;
-        let children = inst.handle.remote.list_folder(&inst.folder).await?;
+        let children = inst
+            .handle
+            .remote
+            .list_folder(
+                &inst.folder,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
+            .await?;
         anyhow::ensure!(children.len() == 1, "X uploaded");
         let id_x = children[0].id.clone();
         let uuid_x = children[0]
@@ -1126,7 +1150,10 @@ impl Scenario for DriveFileidRecycled {
         let live: Vec<_> = inst
             .handle
             .remote
-            .list_folder(&inst.folder)
+            .list_folder(
+                &inst.folder,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
             .await?
             .into_iter()
             .filter(|e| !e.trashed)
@@ -1230,7 +1257,14 @@ impl Scenario for ConcurrentRenameOnDrive {
         let rel = RelativePath::try_from("report.txt".to_string())?;
 
         inst.handle.run_one_cycle().await?;
-        let children = inst.handle.remote.list_folder(&inst.folder).await?;
+        let children = inst
+            .handle
+            .remote
+            .list_folder(
+                &inst.folder,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
+            .await?;
         anyhow::ensure!(children.len() == 1, "report.txt uploaded");
         let original_id = children[0].id.clone();
 
@@ -1248,7 +1282,10 @@ impl Scenario for ConcurrentRenameOnDrive {
         let live: Vec<_> = inst
             .handle
             .remote
-            .list_folder(&inst.folder)
+            .list_folder(
+                &inst.folder,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
             .await?
             .into_iter()
             .filter(|e| !e.trashed)

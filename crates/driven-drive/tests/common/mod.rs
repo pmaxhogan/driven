@@ -19,7 +19,9 @@ use std::collections::HashMap;
 
 use bytes::Bytes;
 use driven_drive::fake::{CHUNK_MULTIPLE, CLIENT_OP_UUID_KEY};
-use driven_drive::remote_store::{RemoteStore, ResumableKind, ResumeProgress, UploadBody};
+use driven_drive::remote_store::{
+    DriveContext, RemoteStore, ResumableKind, ResumeProgress, UploadBody,
+};
 use tokio::io::AsyncReadExt;
 
 /// Builds an `app_properties` map from `(key, value)` pairs.
@@ -45,8 +47,13 @@ pub async fn download_to_bytes(store: &dyn RemoteStore, file_id: &str) -> Vec<u8
     buf
 }
 
-/// Upload (small) -> list -> download round-trip.
-pub async fn scenario_round_trip(store: &dyn RemoteStore, root: &str) {
+/// Upload (small) -> list -> download round-trip. `drive_context` scopes the
+/// list call so this runs identically against My Drive and a Shared Drive.
+pub async fn scenario_round_trip(
+    store: &dyn RemoteStore,
+    root: &str,
+    drive_context: &DriveContext,
+) {
     let entry = store
         .create(
             root,
@@ -61,7 +68,10 @@ pub async fn scenario_round_trip(store: &dyn RemoteStore, root: &str) {
     assert_eq!(entry.size, Some(2));
     assert!(entry.md5.is_some(), "md5 set for files");
 
-    let listing = store.list_folder(root).await.expect("list root");
+    let listing = store
+        .list_folder(root, drive_context)
+        .await
+        .expect("list root");
     assert!(listing.iter().any(|e| e.id == entry.id));
 
     let bytes = download_to_bytes(store, &entry.id).await;
@@ -70,7 +80,11 @@ pub async fn scenario_round_trip(store: &dyn RemoteStore, root: &str) {
 
 /// Drive permits duplicate names within a folder. Two `create` calls
 /// with the same (parent, name) yield distinct file_ids (SPEC s3).
-pub async fn scenario_duplicate_names_create(store: &dyn RemoteStore, root: &str) {
+pub async fn scenario_duplicate_names_create(
+    store: &dyn RemoteStore,
+    root: &str,
+    drive_context: &DriveContext,
+) {
     let a = store
         .create(
             root,
@@ -95,7 +109,7 @@ pub async fn scenario_duplicate_names_create(store: &dyn RemoteStore, root: &str
         a.id, b.id,
         "Drive allows duplicate names within a folder; ids must differ"
     );
-    let listing = store.list_folder(root).await.expect("list");
+    let listing = store.list_folder(root, drive_context).await.expect("list");
     let dups: Vec<_> = listing.iter().filter(|e| e.name == "dup.txt").collect();
     assert_eq!(dups.len(), 2);
 }
@@ -300,10 +314,14 @@ pub async fn scenario_delete_permanent(store: &dyn RemoteStore, root: &str) {
 
 /// `find_by_op_uuid`: None when never used, Some(unique) when set,
 /// most-recent + warning when duplicated (SPEC s3 + DESIGN s5.6).
-pub async fn scenario_find_by_op_uuid(store: &dyn RemoteStore, root: &str) {
+pub async fn scenario_find_by_op_uuid(
+    store: &dyn RemoteStore,
+    root: &str,
+    drive_context: &DriveContext,
+) {
     let uuid = "11111111-2222-3333-4444-555555555555";
     let none = store
-        .find_by_op_uuid(root, uuid)
+        .find_by_op_uuid(root, uuid, drive_context)
         .await
         .expect("call succeeds");
     assert!(none.is_none(), "unused uuid yields None");
@@ -319,7 +337,7 @@ pub async fn scenario_find_by_op_uuid(store: &dyn RemoteStore, root: &str) {
         .await
         .expect("create with op uuid");
     let found = store
-        .find_by_op_uuid(root, uuid)
+        .find_by_op_uuid(root, uuid, drive_context)
         .await
         .expect("find succeeds")
         .expect("matches");
@@ -338,7 +356,7 @@ pub async fn scenario_find_by_op_uuid(store: &dyn RemoteStore, root: &str) {
         .await
         .expect("dup create");
     let dup_found = store
-        .find_by_op_uuid(root, uuid)
+        .find_by_op_uuid(root, uuid, drive_context)
         .await
         .expect("find with dup")
         .expect("matches");

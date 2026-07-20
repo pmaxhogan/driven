@@ -314,6 +314,7 @@ mod tests {
             enabled: true,
             local_path: "/tmp/x".to_string(),
             drive_folder_id: "root".to_string(),
+            drive_id: None,
             drive_folder_path: String::new(),
             encryption_enabled: encrypted,
             wrapped_source_key: wrapped,

@@ -56,8 +56,8 @@ use tokio::io::{AsyncRead, ReadBuf};
 use tracing::warn;
 
 use crate::remote_store::{
-    AboutInfo, DownloadStream, DriveErrorClassification, RemoteEntry, RemoteStore, ResumableKind,
-    ResumableSession, ResumeProgress, UploadBody,
+    AboutInfo, DownloadStream, DriveContext, DriveErrorClassification, RemoteEntry, RemoteStore,
+    ResumableKind, ResumableSession, ResumeProgress, SharedDrive, UploadBody,
 };
 
 use self::token_store::RefreshingTokenSource;
@@ -104,6 +104,13 @@ pub fn parse_installed_client_config(bytes: &[u8]) -> anyhow::Result<(String, St
 
 /// Drive v3 REST API base (metadata operations).
 pub(crate) const DRIVE_API_BASE: &str = "https://www.googleapis.com/drive/v3";
+
+/// The `supportsAllDrives=true` query pair sent on EVERY `files.*` request
+/// (get / create / update / delete / trash / list) so objects living in a
+/// Google Shared Drive are accepted (issue #7). Harmless for a My-Drive-only
+/// request, so it is unconditional. List/search paths additionally scope the
+/// corpus - see [`pagination::list_query_params`].
+pub(crate) const SUPPORTS_ALL_DRIVES: (&str, &str) = ("supportsAllDrives", "true");
 
 /// Drive v3 upload base (multipart + resumable content operations).
 pub(crate) const DRIVE_UPLOAD_BASE: &str = "https://www.googleapis.com/upload/drive/v3";
@@ -433,6 +440,23 @@ struct StorageQuota {
     usage_in_drive_trash: Option<String>,
 }
 
+/// The `drives.list` response page shape (issue #7 Shared Drives).
+#[derive(Debug, Deserialize)]
+struct DrivesListResponse {
+    #[serde(default)]
+    drives: Vec<DriveResource>,
+    #[serde(rename = "nextPageToken", default)]
+    next_page_token: Option<String>,
+}
+
+/// One Shared Drive as returned by `drives.list` (projected to `id,name`).
+#[derive(Debug, Deserialize)]
+struct DriveResource {
+    id: String,
+    #[serde(default)]
+    name: String,
+}
+
 /// Parses a 32-hex-char md5 string into 16 bytes; `None` if malformed.
 pub(crate) fn parse_md5_hex(s: &str) -> Option<[u8; 16]> {
     let bytes = hex::decode(s).ok()?;
@@ -674,10 +698,14 @@ impl GoogleDriveStore {
     /// the whole lookup (codex C-P2-5 / V-C: list previously bypassed retry).
     /// `list_all` re-runs the full pagination loop per attempt - safe because
     /// `files.list` is idempotent and deduped by id.
-    pub(crate) async fn list_query(&self, q: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+    pub(crate) async fn list_query(
+        &self,
+        q: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<Vec<RemoteEntry>> {
         retry::with_retry(|| async {
             let token = self.bearer().await?;
-            pagination::list_all(&self.http, &token, q).await
+            pagination::list_all(&self.http, &token, q, drive_context).await
         })
         .await
     }
@@ -701,7 +729,7 @@ impl GoogleDriveStore {
             .send_json_no_retry(|token| {
                 self.http
                     .post(format!("{DRIVE_API_BASE}/files"))
-                    .query(&[("fields", pagination::FILE_FIELDS)])
+                    .query(&[("fields", pagination::FILE_FIELDS), SUPPORTS_ALL_DRIVES])
                     .bearer_auth(token)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body.clone())
@@ -767,6 +795,7 @@ impl GoogleDriveStore {
                 .query(&[
                     ("uploadType", "multipart"),
                     ("fields", pagination::FILE_FIELDS),
+                    SUPPORTS_ALL_DRIVES,
                 ])
                 .bearer_auth(token)
                 .header(reqwest::header::CONTENT_TYPE, &content_type)
@@ -1220,17 +1249,23 @@ impl GoogleDriveStore {
 
 #[async_trait]
 impl RemoteStore for GoogleDriveStore {
-    async fn ensure_folder(&self, parent_id: &str, name: &str) -> anyhow::Result<RemoteEntry> {
+    async fn ensure_folder(
+        &self,
+        parent_id: &str,
+        name: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<RemoteEntry> {
         // Search by name under the parent (non-trashed folders only). SPEC s3:
         // prefer the Driven-marker folder, else the oldest non-trashed match,
-        // else create.
+        // else create. `drive_context` scopes the search to My Drive or the
+        // target Shared Drive (issue #7).
         let q = format!(
             "'{}' in parents and name = '{}' and mimeType = '{}' and trashed = false",
             escape_drive_query(parent_id),
             escape_drive_query(name),
             FOLDER_MIME
         );
-        let mut matches = self.list_query(&q).await?;
+        let mut matches = self.list_query(&q, drive_context).await?;
 
         if let Some(marked) = matches
             .iter()
@@ -1257,12 +1292,16 @@ impl RemoteStore for GoogleDriveStore {
         self.create_folder(parent_id, name).await
     }
 
-    async fn list_folder(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+    async fn list_folder(
+        &self,
+        folder_id: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<Vec<RemoteEntry>> {
         let q = format!(
             "'{}' in parents and trashed = false",
             escape_drive_query(folder_id)
         );
-        self.list_query(&q).await
+        self.list_query(&q, drive_context).await
     }
 
     async fn create(
@@ -1439,7 +1478,7 @@ impl RemoteStore for GoogleDriveStore {
             .send_json(|token| {
                 self.http
                     .patch(format!("{DRIVE_API_BASE}/files/{file_id}"))
-                    .query(&[("fields", "id,trashed")])
+                    .query(&[("fields", "id,trashed"), SUPPORTS_ALL_DRIVES])
                     .bearer_auth(token)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body.clone())
@@ -1468,6 +1507,7 @@ impl RemoteStore for GoogleDriveStore {
             self.send_json_attempt(&|token: String| {
                 self.http
                     .delete(format!("{DRIVE_API_BASE}/files/{file_id}"))
+                    .query(&[SUPPORTS_ALL_DRIVES])
                     .bearer_auth(token)
             })
             .await
@@ -1490,7 +1530,7 @@ impl RemoteStore for GoogleDriveStore {
             .send_json(|token| {
                 self.http
                     .get(format!("{DRIVE_API_BASE}/files/{file_id}"))
-                    .query(&[("fields", pagination::FILE_FIELDS)])
+                    .query(&[("fields", pagination::FILE_FIELDS), SUPPORTS_ALL_DRIVES])
                     .bearer_auth(token)
             })
             .await?;
@@ -1505,7 +1545,7 @@ impl RemoteStore for GoogleDriveStore {
         let resp = self
             .http_stream()
             .get(format!("{DRIVE_API_BASE}/files/{file_id}"))
-            .query(&[("alt", "media")])
+            .query(&[("alt", "media"), SUPPORTS_ALL_DRIVES])
             .bearer_auth(token)
             .send()
             .await
@@ -1533,17 +1573,20 @@ impl RemoteStore for GoogleDriveStore {
         &self,
         parent_id: &str,
         op_uuid: &str,
+        drive_context: &DriveContext,
     ) -> anyhow::Result<Option<RemoteEntry>> {
         // DESIGN s5.6 reconciliation: the orphan we adopt is a LIVE
         // (non-trashed) child of the parent whose appProperties carry the
         // op uuid. Drive supports `appProperties has { key='..' and value='..' }`.
+        // `drive_context` scopes the search to My Drive or the Shared Drive the
+        // source uploads into (issue #7).
         let q = format!(
             "'{}' in parents and trashed = false and appProperties has {{ key='{}' and value='{}' }}",
             escape_drive_query(parent_id),
             escape_drive_query(CLIENT_OP_UUID_KEY),
             escape_drive_query(op_uuid),
         );
-        let mut matches = self.list_query(&q).await?;
+        let mut matches = self.list_query(&q, drive_context).await?;
         if matches.is_empty() {
             return Ok(None);
         }
@@ -1590,6 +1633,41 @@ impl RemoteStore for GoogleDriveStore {
                 .unwrap_or(0),
         })
     }
+
+    async fn list_shared_drives(&self) -> anyhow::Result<Vec<SharedDrive>> {
+        // Drive `drives.list` (GET /drive/v3/drives): enumerate every Shared
+        // Drive this account can access, for the destination picker (issue #7).
+        // Paginates by `nextPageToken` like files.list. `pageSize` is capped at
+        // 100 by the API for this endpoint.
+        let mut out = Vec::new();
+        let mut page_token: Option<String> = None;
+        loop {
+            let mut query: Vec<(&str, String)> = vec![
+                ("pageSize", "100".to_string()),
+                ("fields", "nextPageToken,drives(id,name)".to_string()),
+            ];
+            if let Some(tok) = &page_token {
+                query.push(("pageToken", tok.clone()));
+            }
+            let resp: DrivesListResponse = self
+                .send_json(|token| {
+                    self.http
+                        .get(format!("{DRIVE_API_BASE}/drives"))
+                        .query(&query)
+                        .bearer_auth(token)
+                })
+                .await?;
+            out.extend(resp.drives.into_iter().map(|d| SharedDrive {
+                id: d.id,
+                name: d.name,
+            }));
+            match resp.next_page_token {
+                Some(tok) if !tok.is_empty() => page_token = Some(tok),
+                _ => break,
+            }
+        }
+        Ok(out)
+    }
 }
 
 impl GoogleDriveStore {
@@ -1613,7 +1691,7 @@ impl GoogleDriveStore {
             .send_json(|token| {
                 self.http
                     .patch(format!("{DRIVE_API_BASE}/files/{file_id}"))
-                    .query(&[("fields", pagination::FILE_FIELDS)])
+                    .query(&[("fields", pagination::FILE_FIELDS), SUPPORTS_ALL_DRIVES])
                     .bearer_auth(token)
                     .header(reqwest::header::CONTENT_TYPE, "application/json")
                     .body(body.clone())

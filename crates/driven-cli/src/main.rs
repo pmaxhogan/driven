@@ -108,6 +108,11 @@ struct SyncArgs {
     /// The destination Drive folder id to upload into.
     #[arg(long, env = "DRIVEN_E2E_DEST_FOLDER_ID")]
     dest_folder_id: String,
+    /// The Google Shared Drive id `dest_folder_id` lives in (issue #7). Omit
+    /// (or pass "my-drive") for a My Drive destination; a Shared Drive id scopes
+    /// the listing to that drive so a re-sync sees the existing objects.
+    #[arg(long, env = "DRIVEN_E2E_SHARED_DRIVE_ID")]
+    drive_id: Option<String>,
     /// The account whose stored refresh token authorizes the upload.
     #[arg(long)]
     account: String,
@@ -317,10 +322,17 @@ async fn run_sync(args: SyncArgs) -> anyhow::Result<()> {
 
     let store = build_store(&args.account, &creds)?;
 
+    // Issue #7: scope every listing to the destination's drive (My Drive or a
+    // Shared Drive) so a Shared-Drive dest does not list-empty and re-upload.
+    let drive_context =
+        driven_drive::remote_store::DriveContext::from_stored(args.drive_id.as_deref());
+
     // Map existing remote children (by name) so a re-sync UPDATES rather than
     // duplicates (Drive allows duplicate names; we must look up by name here
     // because this debug driver keeps no local state).
-    let existing = store.list_folder(&args.dest_folder_id).await?;
+    let existing = store
+        .list_folder(&args.dest_folder_id, &drive_context)
+        .await?;
     let mut by_name: HashMap<String, String> = HashMap::new();
     for e in &existing {
         // First occurrence wins (oldest in the listing order).

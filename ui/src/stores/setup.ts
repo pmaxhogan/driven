@@ -47,6 +47,9 @@ export const useSetupStore = defineStore("setup", () => {
   // came from the backend folder dialog). Required by add_source.
   const localPathToken = ref<string | null>(null);
   const driveFolderId = ref<string | null>(null);
+  // Issue #7: the Google Shared Drive id the destination lives in (null = My
+  // Drive), published by the DriveFolderPicker and persisted with the source.
+  const driveId = ref<string | null>(null);
   const driveFolderPath = ref<string>("");
   const sourceDisplayName = ref<string>("");
   const encryptionEnabled = ref(false);
@@ -268,6 +271,7 @@ export const useSetupStore = defineStore("setup", () => {
         localPathToken: token,
         localPath: local,
         driveFolderId: drive,
+        driveId: driveId.value,
         driveFolderPath: driveFolderPath.value,
         encryptionEnabled: encryptionEnabled.value,
         respectGitignore: true,
@@ -362,6 +366,7 @@ export const useSetupStore = defineStore("setup", () => {
     localPath.value = null;
     localPathToken.value = null;
     driveFolderId.value = null;
+    driveId.value = null;
     driveFolderPath.value = "";
     sourceDisplayName.value = "";
     encryptionEnabled.value = false;
@@ -409,6 +414,7 @@ export const useSetupStore = defineStore("setup", () => {
     localPath,
     localPathToken,
     driveFolderId,
+    driveId,
     driveFolderPath,
     sourceDisplayName,
     encryptionEnabled,

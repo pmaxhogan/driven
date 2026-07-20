@@ -549,6 +549,7 @@ impl StateRepo for SqliteStateRepo {
                 enabled                   AS "enabled!: i64",
                 local_path                AS "local_path!: String",
                 drive_folder_id           AS "drive_folder_id!: String",
+                drive_id                  AS "drive_id: String",
                 drive_folder_path         AS "drive_folder_path!: String",
                 encryption_enabled        AS "encryption_enabled!: i64",
                 wrapped_source_key        AS "wrapped_source_key: Vec<u8>",
@@ -577,6 +578,7 @@ impl StateRepo for SqliteStateRepo {
                     enabled: r.enabled != 0,
                     local_path: r.local_path,
                     drive_folder_id: r.drive_folder_id,
+                    drive_id: r.drive_id,
                     drive_folder_path: r.drive_folder_path,
                     encryption_enabled: r.encryption_enabled != 0,
                     wrapped_source_key: r.wrapped_source_key,
@@ -606,6 +608,7 @@ impl StateRepo for SqliteStateRepo {
                 enabled                   AS "enabled!: i64",
                 local_path                AS "local_path!: String",
                 drive_folder_id           AS "drive_folder_id!: String",
+                drive_id                  AS "drive_id: String",
                 drive_folder_path         AS "drive_folder_path!: String",
                 encryption_enabled        AS "encryption_enabled!: i64",
                 wrapped_source_key        AS "wrapped_source_key: Vec<u8>",
@@ -636,6 +639,7 @@ impl StateRepo for SqliteStateRepo {
                     enabled: r.enabled != 0,
                     local_path: r.local_path,
                     drive_folder_id: r.drive_folder_id,
+                    drive_id: r.drive_id,
                     drive_folder_path: r.drive_folder_path,
                     encryption_enabled: r.encryption_enabled != 0,
                     wrapped_source_key: r.wrapped_source_key,
@@ -665,6 +669,7 @@ impl StateRepo for SqliteStateRepo {
         let wrapped: Option<&[u8]> = row.wrapped_source_key.as_deref();
         let deep_verify_interval_secs = row.deep_verify_interval_secs as i64;
         let placeholder_policy = row.placeholder_policy.as_db_str();
+        let drive_id: Option<&str> = row.drive_id.as_deref();
 
         sqlx::query!(
             r#"
@@ -674,14 +679,14 @@ impl StateRepo for SqliteStateRepo {
                 encryption_enabled, wrapped_source_key, respect_gitignore,
                 include_patterns, exclude_patterns, schedule_json_v2_reserved,
                 deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
-                created_at, placeholder_policy
+                created_at, placeholder_policy, drive_id
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
-                ?17, ?18
+                ?17, ?18, ?19
             )
             ON CONFLICT(id) DO UPDATE SET
                 account_id                = excluded.account_id,
@@ -700,7 +705,8 @@ impl StateRepo for SqliteStateRepo {
                 last_full_scan_at         = excluded.last_full_scan_at,
                 last_deep_verify_at       = excluded.last_deep_verify_at,
                 created_at                = excluded.created_at,
-                placeholder_policy        = excluded.placeholder_policy
+                placeholder_policy        = excluded.placeholder_policy,
+                drive_id                  = excluded.drive_id
             "#,
             id,
             account_id,
@@ -720,6 +726,7 @@ impl StateRepo for SqliteStateRepo {
             row.last_deep_verify_at,
             row.created_at,
             placeholder_policy,
+            drive_id,
         )
         .execute(&self.pool)
         .await?;
@@ -802,6 +809,7 @@ impl StateRepo for SqliteStateRepo {
         let wrapped: Option<&[u8]> = source.wrapped_source_key.as_deref();
         let deep_verify_interval_secs = source.deep_verify_interval_secs as i64;
         let placeholder_policy = source.placeholder_policy.as_db_str();
+        let drive_id: Option<&str> = source.drive_id.as_deref();
 
         sqlx::query!(
             r#"
@@ -811,14 +819,14 @@ impl StateRepo for SqliteStateRepo {
                 encryption_enabled, wrapped_source_key, respect_gitignore,
                 include_patterns, exclude_patterns, schedule_json_v2_reserved,
                 deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
-                created_at, placeholder_policy
+                created_at, placeholder_policy, drive_id
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
-                ?17, ?18
+                ?17, ?18, ?19
             )
             ON CONFLICT(id) DO UPDATE SET
                 account_id                = excluded.account_id,
@@ -837,7 +845,8 @@ impl StateRepo for SqliteStateRepo {
                 last_full_scan_at         = excluded.last_full_scan_at,
                 last_deep_verify_at       = excluded.last_deep_verify_at,
                 created_at                = excluded.created_at,
-                placeholder_policy        = excluded.placeholder_policy
+                placeholder_policy        = excluded.placeholder_policy,
+                drive_id                  = excluded.drive_id
             "#,
             id,
             account_id,
@@ -857,6 +866,7 @@ impl StateRepo for SqliteStateRepo {
             source.last_deep_verify_at,
             source.created_at,
             placeholder_policy,
+            drive_id,
         )
         .execute(&mut *tx)
         .await?;
@@ -926,6 +936,7 @@ impl StateRepo for SqliteStateRepo {
         let wrapped: Option<&[u8]> = source.wrapped_source_key.as_deref();
         let deep_verify_interval_secs = source.deep_verify_interval_secs as i64;
         let placeholder_policy = source.placeholder_policy.as_db_str();
+        let drive_id: Option<&str> = source.drive_id.as_deref();
 
         sqlx::query!(
             r#"
@@ -935,14 +946,14 @@ impl StateRepo for SqliteStateRepo {
                 encryption_enabled, wrapped_source_key, respect_gitignore,
                 include_patterns, exclude_patterns, schedule_json_v2_reserved,
                 deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
-                created_at, placeholder_policy
+                created_at, placeholder_policy, drive_id
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
-                ?17, ?18
+                ?17, ?18, ?19
             )
             ON CONFLICT(id) DO UPDATE SET
                 account_id                = excluded.account_id,
@@ -961,7 +972,8 @@ impl StateRepo for SqliteStateRepo {
                 last_full_scan_at         = excluded.last_full_scan_at,
                 last_deep_verify_at       = excluded.last_deep_verify_at,
                 created_at                = excluded.created_at,
-                placeholder_policy        = excluded.placeholder_policy
+                placeholder_policy        = excluded.placeholder_policy,
+                drive_id                  = excluded.drive_id
             "#,
             id,
             src_account_id,
@@ -981,6 +993,7 @@ impl StateRepo for SqliteStateRepo {
             source.last_deep_verify_at,
             source.created_at,
             placeholder_policy,
+            drive_id,
         )
         .execute(&mut *tx)
         .await?;
@@ -3503,6 +3516,7 @@ mod tests {
             enabled: true,
             local_path: "/home/alice/docs".into(),
             drive_folder_id: "folder-1".into(),
+            drive_id: None,
             drive_folder_path: "/Driven/Docs".into(),
             encryption_enabled: false,
             wrapped_source_key: None,

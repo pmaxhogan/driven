@@ -195,6 +195,11 @@ pub struct AddSourceRequest {
     pub local_path: PathBuf,
     /// Drive destination folder id (from `pick_drive_folder`).
     pub drive_folder_id: String,
+    /// The Google Shared Drive id the destination folder lives in (issue #7),
+    /// from `pick_drive_folder`. `None` (or the sentinel "my-drive") means My
+    /// Drive. Optional for backward compatibility: an omitted field is My Drive.
+    #[serde(default)]
+    pub drive_id: Option<String>,
     /// Cached Drive destination display path.
     pub drive_folder_path: String,
     /// Whether to enable per-source encryption.
@@ -268,10 +273,21 @@ pub struct SourcePatch {
 #[derive(Debug, Clone, Serialize, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct DriveFolderEntry {
-    /// Drive folder id.
+    /// Drive folder id. For a Shared Drive root entry this is the `driveId`
+    /// (which doubles as the drive root folder id).
     pub id: String,
     /// Folder display name.
     pub name: String,
+    /// The Google Shared Drive this entry lives in (issue #7): the `driveId`
+    /// for a Shared Drive root or any folder inside one, `None` for a My Drive
+    /// folder. The picker carries it back into `pick_drive_folder` when
+    /// descending, and into `add_source` when the folder is selected.
+    #[serde(default)]
+    pub drive_id: Option<String>,
+    /// Whether this entry is a Shared Drive ROOT (vs an ordinary folder), so the
+    /// picker can badge it and know selecting it targets the drive root.
+    #[serde(default)]
+    pub is_shared_drive: bool,
 }
 
 /// The result of `pick_drive_folder` (SPEC s11.2 `DriveFolderListing`): the
@@ -281,6 +297,12 @@ pub struct DriveFolderEntry {
 pub struct DriveFolderListing {
     /// The folder whose children these are; `None` at the My Drive root.
     pub current_folder_id: Option<String>,
+    /// The Google Shared Drive the current folder lives in (issue #7): the
+    /// `driveId`, or `None` for My Drive. The picker persists this alongside
+    /// `current_folder_id` when the user selects the current folder as the
+    /// destination.
+    #[serde(default)]
+    pub drive_id: Option<String>,
     /// Cached display path of the current folder (for breadcrumbs).
     pub current_folder_path: String,
     /// Child folders the user can descend into / select.

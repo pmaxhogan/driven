@@ -32,7 +32,7 @@ use driven_crypto::{master_key_to_phrase, Keystore, MasterKey};
 
 use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
 use driven_drive::google::GoogleDriveStore;
-use driven_drive::remote_store::RemoteStore;
+use driven_drive::remote_store::{DriveContext, RemoteStore};
 use driven_drive::CustomCaConfig;
 
 use crate::app_state::{AppState, RemoteMode};
@@ -169,6 +169,10 @@ pub async fn add_source(
         &req.drive_folder_id,
         &req.drive_folder_path,
     )?;
+    // Issue #7: validate the optional Shared Drive id the same way as the folder
+    // id (bounded, no control/whitespace) so a junk renderer value cannot bloat
+    // the row or carry control chars.
+    validate_drive_id(req.drive_id.as_deref())?;
 
     let now = SystemClock.now_ms();
     let source_id = SourceId::new_v4();
@@ -264,6 +268,11 @@ pub async fn add_source(
         enabled: !pending_recovery_ack,
         local_path: canon.to_string_lossy().to_string(),
         drive_folder_id: req.drive_folder_id.clone(),
+        // Issue #7: normalise the picker's driveId - My Drive (None / "" /
+        // "my-drive") persists as NULL, a Shared Drive as its driveId.
+        drive_id: DriveContext::from_stored(req.drive_id.as_deref())
+            .drive_id()
+            .map(str::to_string),
         drive_folder_path: req.drive_folder_path.clone(),
         encryption_enabled: req.encryption_enabled,
         wrapped_source_key,
@@ -716,6 +725,7 @@ pub async fn pick_drive_folder(
     state: State<'_, AppState>,
     account_id: AccountId,
     start_folder_id: Option<String>,
+    drive_id: Option<String>,
 ) -> CommandResult<DriveFolderListing> {
     // The account must exist (so a stale webview id surfaces an error).
     let _ = find_account(state.state().as_ref(), account_id).await?;
@@ -734,27 +744,56 @@ pub async fn pick_drive_folder(
         .unwrap_or_default();
     let (store, default_folder_id) = select_picker_store(state.inner(), account_id, &ca)?;
 
+    // Issue #7: the drive context for this listing. `None`/"my-drive" is My
+    // Drive; any other value is the Shared Drive being browsed. The webview
+    // carries the driveId back in as it descends a Shared Drive.
+    let drive_context = DriveContext::from_stored(drive_id.as_deref());
+
     // B1: We resolve `None` to the mode-appropriate root for the listing AND echo
     // it back as the `current_folder_id`, so the user can SELECT the current
     // folder - including the root - as the backup destination. Before this fix
     // the backend echoed `None` at the top level, leaving the wizard with no
-    // selectable id.
-    let folder_id = start_folder_id.clone().unwrap_or(default_folder_id);
+    // selectable id. For a Shared Drive the driveId doubles as its root folder
+    // id, so an unset start folder inside a Shared Drive resolves to the drive
+    // root.
+    let folder_id = match (&start_folder_id, &drive_context) {
+        (Some(id), _) => id.clone(),
+        (None, DriveContext::SharedDrive { drive_id }) => drive_id.clone(),
+        (None, DriveContext::MyDrive) => default_folder_id,
+    };
 
     let children = store
-        .list_folder(&folder_id)
+        .list_folder(&folder_id, &drive_context)
         .await
         .map_err(CommandError::from)?;
 
+    // The persisted driveId to stamp on the listing + every folder entry: a
+    // concrete driveId while inside a Shared Drive, `None` for My Drive.
+    let listing_drive_id = drive_context.drive_id().map(str::to_string);
+
     // Only folders are descendable destinations.
-    let folders: Vec<DriveFolderEntry> = children
+    let mut folders: Vec<DriveFolderEntry> = children
         .into_iter()
         .filter(|e| e.mime_type == FOLDER_MIME && !e.trashed)
         .map(|e| DriveFolderEntry {
             id: e.id,
             name: e.name,
+            drive_id: listing_drive_id.clone(),
+            is_shared_drive: false,
         })
         .collect();
+
+    // Issue #7: at the My Drive root, surface the account's Shared Drive roots
+    // above the My Drive folders so the user can descend into one. A drives.list
+    // failure DEGRADES GRACEFULLY to a My-Drive-only picker (the roots the user
+    // actually wants) instead of failing the whole picker - see
+    // [`shared_drive_root_entries`].
+    if start_folder_id.is_none() && !drive_context.is_shared_drive() {
+        let mut shared_entries = shared_drive_root_entries(store.as_ref()).await;
+        // Shared Drive roots first, then the My Drive folders.
+        shared_entries.append(&mut folders);
+        folders = shared_entries;
+    }
 
     // The current folder's display path: the breadcrumb is maintained by the
     // webview (it tracks descent), so the backend returns an empty path here
@@ -764,9 +803,37 @@ pub async fn pick_drive_folder(
     Ok(DriveFolderListing {
         // B1: always a concrete, selectable id (never `None`).
         current_folder_id: Some(folder_id),
+        drive_id: listing_drive_id,
         current_folder_path,
         folders,
     })
+}
+
+/// Issue #7: the account's Shared Drive roots as picker entries, DEGRADING
+/// GRACEFULLY on a `drives.list` failure. A transient 5xx / rate limit / a
+/// Workspace policy that disables Shared Drives must NOT fail the whole picker -
+/// the user still wants their My Drive folders. On `Err` we log a single warning
+/// and return an empty list (a My-Drive-only picker); on success we map each
+/// drive to a badged root entry whose id IS its `driveId`.
+async fn shared_drive_root_entries(store: &dyn RemoteStore) -> Vec<DriveFolderEntry> {
+    match store.list_shared_drives().await {
+        Ok(shared) => shared
+            .into_iter()
+            .map(|d| DriveFolderEntry {
+                drive_id: Some(d.id.clone()),
+                id: d.id,
+                name: d.name,
+                is_shared_drive: true,
+            })
+            .collect(),
+        Err(e) => {
+            tracing::warn!(
+                error = %e,
+                "drives.list failed; showing a My-Drive-only picker (Shared Drives unavailable)"
+            );
+            Vec::new()
+        }
+    }
 }
 
 /// `preview_exclusions(req)` - preview which files the candidate rules would
@@ -827,6 +894,7 @@ pub async fn preview_exclusions(
         enabled: true,
         local_path: canon.to_string_lossy().to_string(),
         drive_folder_id: String::new(),
+        drive_id: None,
         drive_folder_path: String::new(),
         encryption_enabled: false,
         wrapped_source_key: None,
@@ -1041,6 +1109,28 @@ const MAX_DRIVE_FOLDER_PATH_LEN: usize = 4096;
 /// All rejections map to the stable s24 `internal.invalid_input` code so the
 /// wizard shows a "check your input" message. Shared by `add_source` and the
 /// `update_source` display-name patch.
+/// Issue #7: validate the optional Shared Drive id carried by `add_source`. A
+/// My Drive destination (`None` / "" / "my-drive") is always valid; a Shared
+/// Drive id must be a bounded, printable, whitespace-free token (a Google
+/// `driveId` is ~19 chars). Rejections map to the stable s24
+/// `internal.invalid_input` code.
+fn validate_drive_id(drive_id: Option<&str>) -> CommandResult<()> {
+    let invalid = |msg: &str| CommandError::with_code(ErrorCode::InvalidInput, msg.to_string());
+    // My Drive sentinels need no validation.
+    if !DriveContext::from_stored(drive_id).is_shared_drive() {
+        return Ok(());
+    }
+    // Safe to unwrap: `is_shared_drive()` is true only for a concrete id.
+    let id = drive_id.unwrap_or("").trim();
+    if id.chars().count() > MAX_DRIVE_FOLDER_ID_LEN {
+        return Err(invalid("Shared Drive id is too long"));
+    }
+    if id.chars().any(|c| c.is_control() || c.is_whitespace()) {
+        return Err(invalid("Shared Drive id has invalid characters"));
+    }
+    Ok(())
+}
+
 fn validate_source_metadata(
     display_name: &str,
     drive_folder_id: &str,
@@ -1486,6 +1576,7 @@ mod tests {
             enabled: true,
             local_path: root.to_string_lossy().to_string(),
             drive_folder_id: String::new(),
+            drive_id: None,
             drive_folder_path: String::new(),
             encryption_enabled: false,
             wrapped_source_key: None,
@@ -1567,6 +1658,7 @@ mod tests {
             enabled: true,
             local_path: "/tmp/docs".to_string(),
             drive_folder_id: "f".to_string(),
+            drive_id: None,
             drive_folder_path: "/Backups/Docs".to_string(),
             encryption_enabled: true,
             wrapped_source_key: Some(vec![1, 2, 3]),
@@ -1629,6 +1721,7 @@ mod tests {
             enabled: true,
             local_path: root.to_string_lossy().to_string(),
             drive_folder_id: String::new(),
+            drive_id: None,
             drive_folder_path: String::new(),
             encryption_enabled: false,
             wrapped_source_key: None,
@@ -1886,6 +1979,7 @@ mod tests {
             enabled: false,
             local_path: "/home/u/secret".to_string(),
             drive_folder_id: String::new(),
+            drive_id: None,
             drive_folder_path: String::new(),
             encryption_enabled: true,
             wrapped_source_key: Some(vec![1, 2, 3]),
@@ -1959,6 +2053,7 @@ mod tests {
             enabled: false,
             local_path: "/home/u/first".to_string(),
             drive_folder_id: String::new(),
+            drive_id: None,
             drive_folder_path: String::new(),
             encryption_enabled: true,
             wrapped_source_key: Some(vec![1, 2, 3]),
@@ -2059,6 +2154,7 @@ mod tests {
             enabled: false,
             local_path: "/home/u/secret-discard".to_string(),
             drive_folder_id: String::new(),
+            drive_id: None,
             drive_folder_path: String::new(),
             encryption_enabled: true,
             wrapped_source_key: Some(vec![7, 7, 7]),
@@ -2130,6 +2226,7 @@ mod tests {
             enabled: false,
             local_path: "/home/u/secret2".to_string(),
             drive_folder_id: String::new(),
+            drive_id: None,
             drive_folder_path: String::new(),
             encryption_enabled: true,
             wrapped_source_key: Some(vec![9]),
@@ -2175,7 +2272,10 @@ mod tests {
             .expect("fake store builds");
         assert!(!root.is_empty(), "fake root id must be non-empty");
         // The fresh fake root lists (zero child folders) without error / creds.
-        let children = store.list_folder(&root).await.expect("fake list_folder");
+        let children = store
+            .list_folder(&root, &DriveContext::MyDrive)
+            .await
+            .expect("fake list_folder");
         assert!(
             children.is_empty(),
             "a fresh fake remote has no child folders"
@@ -2214,13 +2314,13 @@ mod tests {
         // PICKER store must see it (same backing objects) - proving the parent id
         // the picker minted round-trips to the uploader and back.
         let created = uploader_store
-            .ensure_folder(&picker_root, "uploaded-folder")
+            .ensure_folder(&picker_root, "uploaded-folder", &DriveContext::MyDrive)
             .await
             .expect("uploader create under picker root");
 
         // The picker store, listing the SAME root, sees the created object.
         let listed = picker_store
-            .list_folder(&picker_root)
+            .list_folder(&picker_root, &DriveContext::MyDrive)
             .await
             .expect("picker list shared root");
         assert!(
@@ -2229,5 +2329,38 @@ mod tests {
         );
 
         let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Issue #7 (P2): a `drives.list` failure must DEGRADE GRACEFULLY - the
+    /// picker still returns the My-Drive folders. The helper returns an empty
+    /// Shared Drive list rather than propagating the error.
+    #[tokio::test]
+    async fn shared_drive_root_entries_degrades_on_drives_list_error() {
+        use driven_drive::fake::InMemoryRemoteStore;
+        // `with_network_drop_after(1)` makes the first Drive request (the sole
+        // `list_shared_drives` call here) fail.
+        let erroring = InMemoryRemoteStore::new().with_network_drop_after(1);
+        let entries = shared_drive_root_entries(&erroring).await;
+        assert!(
+            entries.is_empty(),
+            "a drives.list failure must degrade to an empty Shared Drive list, not an error"
+        );
+    }
+
+    /// Issue #7: configured Shared Drives map to badged root entries whose id is
+    /// their driveId.
+    #[tokio::test]
+    async fn shared_drive_root_entries_maps_configured_drives() {
+        use driven_drive::fake::InMemoryRemoteStore;
+        use driven_drive::remote_store::SharedDrive;
+        let store = InMemoryRemoteStore::new().with_shared_drives(vec![SharedDrive {
+            id: "0Ateam".into(),
+            name: "Team".into(),
+        }]);
+        let entries = shared_drive_root_entries(&store).await;
+        assert_eq!(entries.len(), 1);
+        assert_eq!(entries[0].id, "0Ateam");
+        assert_eq!(entries[0].drive_id.as_deref(), Some("0Ateam"));
+        assert!(entries[0].is_shared_drive);
     }
 }

@@ -135,6 +135,7 @@ fn source_in(account: AccountId, root: &std::path::Path, folder_id: &str) -> Sou
         enabled: true,
         local_path: root.to_string_lossy().into_owned(),
         drive_folder_id: folder_id.to_string(),
+        drive_id: None,
         drive_folder_path: "/concurrency".into(),
         encryption_enabled: false,
         wrapped_source_key: None,
@@ -184,7 +185,10 @@ fn noop_progress(_p: driven_core::types::ExecProgress) {}
 /// Count non-trashed objects under `folder_id`.
 async fn live_object_count(remote: &InMemoryRemoteStore, folder_id: &str) -> anyhow::Result<usize> {
     Ok(remote
-        .list_folder(folder_id)
+        .list_folder(
+            folder_id,
+            &driven_drive::remote_store::DriveContext::MyDrive,
+        )
         .await?
         .iter()
         .filter(|e| !e.trashed)
@@ -355,7 +359,9 @@ impl Scenario for PauseMidResumable5m {
 
         // The upload completed via byte-level resume: exactly one object, full
         // size, the SAME session consumed (not a from-zero re-do).
-        let children = remote.list_folder(&folder).await?;
+        let children = remote
+            .list_folder(&folder, &driven_drive::remote_store::DriveContext::MyDrive)
+            .await?;
         anyhow::ensure!(
             children.len() == 1,
             "resume must finalise exactly one object; got {}",
@@ -511,7 +517,9 @@ impl Scenario for PauseMidResumable7d {
         handle.run_one_cycle().await?;
 
         // Exactly one object, full size, no duplicate.
-        let children = remote.list_folder(&folder).await?;
+        let children = remote
+            .list_folder(&folder, &driven_drive::remote_store::DriveContext::MyDrive)
+            .await?;
         anyhow::ensure!(
             children.len() == 1,
             "restart must produce exactly one object; got {}",
@@ -718,7 +726,9 @@ impl Scenario for Kill9MidPipeline {
 
         // --- invariants -----------------------------------------------------
         // Every file backed up exactly once: 16 live objects, names unique.
-        let children = remote.list_folder(&folder).await?;
+        let children = remote
+            .list_folder(&folder, &driven_drive::remote_store::DriveContext::MyDrive)
+            .await?;
         let live: Vec<_> = children.iter().filter(|e| !e.trashed).collect();
         anyhow::ensure!(
             live.len() == expected.len(),

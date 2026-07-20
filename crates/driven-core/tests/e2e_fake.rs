@@ -45,7 +45,7 @@ use driven_crypto::key::SourceKey;
 use driven_crypto::{ContentDecryptor, DrivenCryptoSuite, SourceCryptoSuite, HEADER_LEN};
 
 use driven_drive::fake::{InMemoryRemoteStore, CLIENT_OP_UUID_KEY};
-use driven_drive::remote_store::{RemoteStore, UploadBody};
+use driven_drive::remote_store::{DriveContext, RemoteStore, UploadBody};
 
 use driven_power::{PowerSource, PowerState};
 use driven_test_fixtures::clock::FakeClock;
@@ -131,6 +131,7 @@ fn source_in(account: AccountId, root: &std::path::Path, folder_id: &str) -> Sou
         enabled: true,
         local_path: root.to_string_lossy().into_owned(),
         drive_folder_id: folder_id.to_string(),
+        drive_id: None,
         drive_folder_path: "/e2e".into(),
         encryption_enabled: false,
         wrapped_source_key: None,
@@ -289,7 +290,7 @@ async fn run_cycle_capture_progress(orch: &SyncOrchestrator) -> driven_core::typ
 /// Count non-trashed objects under a folder.
 async fn live_object_count(remote: &InMemoryRemoteStore, folder_id: &str) -> usize {
     remote
-        .list_folder(folder_id)
+        .list_folder(folder_id, &DriveContext::MyDrive)
         .await
         .unwrap()
         .iter()
@@ -714,7 +715,10 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
     // The object landed with its create-op UUID stamped in appProperties
     // (DESIGN s5.6 step 2). Pull it back from the remote - this self-validates
     // the executor's stamping.
-    let children = remote.list_folder(&folder).await.unwrap();
+    let children = remote
+        .list_folder(&folder, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert_eq!(
         children.len(),
         1,
@@ -956,7 +960,10 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
     // The upload completed via byte-level resume: exactly one object, and it
     // carries the full byte count (proving the resumed tail bytes landed, NOT a
     // truncated or from-zero re-do).
-    let children = remote.list_folder(&folder).await.unwrap();
+    let children = remote
+        .list_folder(&folder, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert_eq!(children.len(), 1, "resume finalized exactly one object");
     assert_eq!(
         children[0].size,
@@ -1114,7 +1121,10 @@ async fn reconcile_requeue_reuploads_changed_bytes_on_next_cycle() {
     assert_eq!(progress.errors, 0);
 
     // Still exactly one object (UPDATE against the same id, no duplicate)...
-    let children = remote.list_folder(&folder).await.unwrap();
+    let children = remote
+        .list_folder(&folder, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert_eq!(children.len(), 1, "re-upload was an UPDATE, not a CREATE");
     assert_eq!(
         children[0].id, created.id,
@@ -1219,7 +1229,10 @@ async fn parallel_uploads_no_corruption() {
     assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
 
     // Every object present with the right size, none duplicated/missing.
-    let children = remote.list_folder(&folder).await.unwrap();
+    let children = remote
+        .list_folder(&folder, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert_eq!(children.len(), 40, "no missing/duplicate objects");
     for (name, contents) in &expected {
         let entry = children.iter().find(|e| &e.name == name).expect("present");
@@ -1378,7 +1391,10 @@ async fn encryption_on_round_trip_bytes_match() {
     assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
 
     // The stored object is ciphertext, NOT plaintext.
-    let children = remote.list_folder(&folder).await.unwrap();
+    let children = remote
+        .list_folder(&folder, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert_eq!(children.len(), 1);
     let object_id = children[0].id.clone();
     let mut blob = Vec::new();
@@ -1491,7 +1507,10 @@ async fn encryption_nested_remote_is_ciphertext_and_restores() {
 
     // The source ROOT must contain a CIPHERTEXT folder named neither "docs"
     // nor anything plaintext - the first encrypted path component.
-    let root_children = remote.list_folder(&folder).await.unwrap();
+    let root_children = remote
+        .list_folder(&folder, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert_eq!(
         root_children.len(),
         1,
@@ -1510,7 +1529,10 @@ async fn encryption_nested_remote_is_ciphertext_and_restores() {
     let d1 = restore.decrypt_filename(&lvl1.name, &[]).unwrap();
     assert_eq!(d1, "docs", "level-1 ciphertext decrypts to 'docs'");
 
-    let lvl2_children = remote.list_folder(&lvl1.id).await.unwrap();
+    let lvl2_children = remote
+        .list_folder(&lvl1.id, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert_eq!(lvl2_children.len(), 1);
     let lvl2 = &lvl2_children[0];
     assert_ne!(lvl2.name, "private");
@@ -1519,7 +1541,10 @@ async fn encryption_nested_remote_is_ciphertext_and_restores() {
         .unwrap();
     assert_eq!(d2, "private", "level-2 ciphertext decrypts to 'private'");
 
-    let leaf_children = remote.list_folder(&lvl2.id).await.unwrap();
+    let leaf_children = remote
+        .list_folder(&lvl2.id, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert_eq!(leaf_children.len(), 1);
     let leaf = &leaf_children[0];
     assert_ne!(leaf.name, "big-secret.bin", "leaf name must be ciphertext");
@@ -1857,7 +1882,10 @@ async fn vss_frozen_snapshot_uses_effective_size_no_false_changed() {
     orch.run_cycle(TickSource::Scheduled).await.unwrap();
 
     // The file uploaded (no false ChangedDuringUpload skip) ...
-    let entries = remote.list_folder(&folder).await.unwrap();
+    let entries = remote
+        .list_folder(&folder, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     let live: Vec<_> = entries.iter().filter(|e| !e.trashed).collect();
     assert_eq!(
         live.len(),

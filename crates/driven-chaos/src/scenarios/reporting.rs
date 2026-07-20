@@ -323,6 +323,7 @@ fn source_in(account: AccountId, root: &std::path::Path, folder_id: &str) -> Sou
         enabled: true,
         local_path: root.to_string_lossy().into_owned(),
         drive_folder_id: folder_id.to_string(),
+        drive_id: None,
         drive_folder_path: "/reporting".into(),
         encryption_enabled: false,
         wrapped_source_key: None,
@@ -592,7 +593,7 @@ impl Scenario for NoDuplicateRemoteObjectsScenario {
             .run_cycle(TickSource::Scheduled)
             .await;
         let live_after_phase1 = remote
-            .list_folder(&folder)
+            .list_folder(&folder, &driven_drive::remote_store::DriveContext::MyDrive)
             .await?
             .into_iter()
             .filter(|e| !e.trashed)

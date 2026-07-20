@@ -14,7 +14,7 @@ use std::collections::HashSet;
 use serde::Deserialize;
 
 use super::{DriveError, DriveFile};
-use crate::remote_store::RemoteEntry;
+use crate::remote_store::{DriveContext, RemoteEntry};
 
 /// The `fields=` projection Driven requests for every `files.list` /
 /// `files.get` call (ROADMAP M4 "field selection so we don't pull more than
@@ -43,12 +43,14 @@ pub async fn list_all(
     http: &reqwest::Client,
     access_token: &str,
     q: &str,
+    drive_context: &DriveContext,
 ) -> anyhow::Result<Vec<RemoteEntry>> {
     let mut out = Vec::new();
     let mut seen: HashSet<String> = HashSet::new();
     let mut page_token: Option<String> = None;
     loop {
-        let (entries, next) = list_page(http, access_token, q, page_token.as_deref()).await?;
+        let (entries, next) =
+            list_page(http, access_token, q, page_token.as_deref(), drive_context).await?;
         for e in entries {
             if seen.insert(e.id.clone()) {
                 out.push(e);
@@ -62,6 +64,60 @@ pub async fn list_all(
     Ok(out)
 }
 
+/// Builds the `files.list` query parameters for one page (issue #7 Shared
+/// Drives). Split out as a PURE function so the exact wire params - and how
+/// they differ between My Drive and a Shared Drive - are unit-testable without
+/// standing up an HTTP server.
+///
+/// Common to both contexts: the `files(..)` field projection, `pageSize`,
+/// `spaces=drive` (the Drive space, orthogonal to My-Drive-vs-Shared-Drive),
+/// the query `q`, an optional `pageToken`, and `supportsAllDrives=true` (the
+/// caller supports both My Drives and Shared Drives; harmless for My Drive).
+///
+/// - [`DriveContext::MyDrive`]: adds `corpora=user` (the My-Drive default).
+/// - [`DriveContext::SharedDrive`]: adds `corpora=drive` + `driveId=<id>` +
+///   `includeItemsFromAllDrives=true`, which is the ONLY combination that
+///   returns objects living inside a Shared Drive (`corpora=user` hides them).
+pub fn list_query_params(
+    q: &str,
+    page_token: Option<&str>,
+    drive_context: &DriveContext,
+) -> Vec<(&'static str, String)> {
+    // Field selection for a LIST nests the file projection under `files(..)`
+    // and adds the page-token field.
+    let fields = format!("nextPageToken,files({FILE_FIELDS})");
+    let mut query: Vec<(&'static str, String)> = vec![
+        ("q", q.to_string()),
+        ("fields", fields),
+        ("pageSize", "1000".to_string()),
+        // The Drive `spaces` (not Photos / AppData) - orthogonal to whether the
+        // corpus is My Drive or a Shared Drive.
+        ("spaces", "drive".to_string()),
+        // Sent unconditionally: this client supports both My Drives and Shared
+        // Drives. Harmless for a My-Drive-only listing.
+        ("supportsAllDrives", "true".to_string()),
+    ];
+    match drive_context {
+        DriveContext::MyDrive => {
+            // The My-Drive corpus (the V1 default).
+            query.push(("corpora", "user".to_string()));
+        }
+        DriveContext::SharedDrive { drive_id } => {
+            // Confine the search to the one Shared Drive. `corpora=drive` +
+            // `driveId` + `includeItemsFromAllDrives=true` is the required
+            // combination for a Shared Drive listing (Drive API guide
+            // "Search for content on a shared drive").
+            query.push(("corpora", "drive".to_string()));
+            query.push(("driveId", drive_id.clone()));
+            query.push(("includeItemsFromAllDrives", "true".to_string()));
+        }
+    }
+    if let Some(tok) = page_token {
+        query.push(("pageToken", tok.to_string()));
+    }
+    query
+}
+
 /// Fetches a single `files.list` page, returning the entries and the
 /// `nextPageToken` (or `None` when this is the last page). The building block
 /// [`list_all`] loops over.
@@ -70,21 +126,9 @@ pub async fn list_page(
     access_token: &str,
     q: &str,
     page_token: Option<&str>,
+    drive_context: &DriveContext,
 ) -> anyhow::Result<(Vec<RemoteEntry>, Option<String>)> {
-    // Field selection for a LIST nests the file projection under `files(..)`
-    // and adds the page-token field.
-    let fields = format!("nextPageToken,files({FILE_FIELDS})");
-    let mut query: Vec<(&str, String)> = vec![
-        ("q", q.to_string()),
-        ("fields", fields),
-        ("pageSize", "1000".to_string()),
-        // Confine to My Drive (V1 scope; no Shared Drives, per fake docs).
-        ("spaces", "drive".to_string()),
-        ("corpora", "user".to_string()),
-    ];
-    if let Some(tok) = page_token {
-        query.push(("pageToken", tok.to_string()));
-    }
+    let query = list_query_params(q, page_token, drive_context);
 
     let resp = http
         .get(format!("{}/files", super::DRIVE_API_BASE))
@@ -118,6 +162,49 @@ pub async fn list_page(
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// Look up the single value for `key` in a built query param list.
+    fn param<'a>(query: &'a [(&'static str, String)], key: &str) -> Option<&'a str> {
+        query
+            .iter()
+            .find(|(k, _)| *k == key)
+            .map(|(_, v)| v.as_str())
+    }
+
+    #[test]
+    fn list_params_my_drive_uses_corpora_user_and_supports_all_drives() {
+        // Issue #7: My Drive keeps `corpora=user`, gains `supportsAllDrives=true`
+        // unconditionally, and NEVER carries a driveId / includeItemsFromAllDrives.
+        let q = "'root' in parents and trashed = false";
+        let query = list_query_params(q, None, &DriveContext::MyDrive);
+        assert_eq!(param(&query, "q"), Some(q));
+        assert_eq!(param(&query, "corpora"), Some("user"));
+        assert_eq!(param(&query, "supportsAllDrives"), Some("true"));
+        assert_eq!(param(&query, "spaces"), Some("drive"));
+        assert_eq!(param(&query, "driveId"), None);
+        assert_eq!(param(&query, "includeItemsFromAllDrives"), None);
+        assert_eq!(param(&query, "pageToken"), None);
+    }
+
+    #[test]
+    fn list_params_shared_drive_scopes_to_drive_id() {
+        // Issue #7: a Shared Drive listing switches to `corpora=drive` and adds
+        // `driveId` + `includeItemsFromAllDrives=true` (the only combination
+        // that returns objects inside a Shared Drive), keeping supportsAllDrives.
+        let q = "'FOLDER' in parents and trashed = false";
+        let ctx = DriveContext::SharedDrive {
+            drive_id: "0ADriveIdXYZ".to_string(),
+        };
+        let query = list_query_params(q, Some("tok42"), &ctx);
+        assert_eq!(param(&query, "corpora"), Some("drive"));
+        assert_eq!(param(&query, "driveId"), Some("0ADriveIdXYZ"));
+        assert_eq!(param(&query, "includeItemsFromAllDrives"), Some("true"));
+        assert_eq!(param(&query, "supportsAllDrives"), Some("true"));
+        assert_eq!(param(&query, "spaces"), Some("drive"));
+        // corpora=user must NOT be present alongside corpora=drive.
+        assert_eq!(param(&query, "corpora"), Some("drive"));
+        assert_eq!(param(&query, "pageToken"), Some("tok42"));
+    }
 
     #[test]
     fn list_response_parses_with_and_without_token() {

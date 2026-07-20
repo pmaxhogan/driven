@@ -2775,6 +2775,7 @@ mod tests {
             enabled: true,
             local_path: root.to_string_lossy().into_owned(),
             drive_folder_id: "f".into(),
+            drive_id: None,
             drive_folder_path: "/f".into(),
             encryption_enabled: false,
             wrapped_source_key: None,

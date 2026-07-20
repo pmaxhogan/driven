@@ -98,6 +98,7 @@ fn source_at(
         enabled: true,
         local_path: root.to_string_lossy().into_owned(),
         drive_folder_id: "folder-m2".into(),
+        drive_id: None,
         drive_folder_path: "/Driven/M2".into(),
         encryption_enabled: false,
         wrapped_source_key: None,

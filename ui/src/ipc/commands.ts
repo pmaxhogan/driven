@@ -114,9 +114,10 @@ export function removeSource(sourceId: string, deleteRemote: boolean): Promise<v
 
 export function pickDriveFolder(
   accountId: string,
-  startFolderId: string | null
+  startFolderId: string | null,
+  driveId: string | null = null
 ): Promise<DriveFolderListing> {
-  return invoke("pick_drive_folder", { accountId, startFolderId });
+  return invoke("pick_drive_folder", { accountId, startFolderId, driveId });
 }
 
 export function previewExclusions(req: ExclusionPreviewRequest): Promise<ExclusionPreview> {

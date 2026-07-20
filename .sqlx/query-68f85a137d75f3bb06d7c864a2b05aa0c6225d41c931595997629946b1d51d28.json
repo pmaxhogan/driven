@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO backup_sources (\n                id, account_id, display_name, enabled,\n                local_path, drive_folder_id, drive_folder_path,\n                encryption_enabled, wrapped_source_key, respect_gitignore,\n                include_patterns, exclude_patterns, schedule_json_v2_reserved,\n                deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,\n                created_at, placeholder_policy, drive_id\n            ) VALUES (\n                ?1, ?2, ?3, ?4,\n                ?5, ?6, ?7,\n                ?8, ?9, ?10,\n                ?11, ?12, ?13,\n                ?14, ?15, ?16,\n                ?17, ?18, ?19\n            )\n            ON CONFLICT(id) DO UPDATE SET\n                account_id                = excluded.account_id,\n                display_name              = excluded.display_name,\n                enabled                   = excluded.enabled,\n                local_path                = excluded.local_path,\n                drive_folder_id           = excluded.drive_folder_id,\n                drive_folder_path         = excluded.drive_folder_path,\n                encryption_enabled        = excluded.encryption_enabled,\n                wrapped_source_key        = excluded.wrapped_source_key,\n                respect_gitignore         = excluded.respect_gitignore,\n                include_patterns          = excluded.include_patterns,\n                exclude_patterns          = excluded.exclude_patterns,\n                schedule_json_v2_reserved = excluded.schedule_json_v2_reserved,\n                deep_verify_interval_secs = excluded.deep_verify_interval_secs,\n                last_full_scan_at         = excluded.last_full_scan_at,\n                last_deep_verify_at       = excluded.last_deep_verify_at,\n                created_at                = excluded.created_at,\n                placeholder_policy        = excluded.placeholder_policy,\n                drive_id                  = excluded.drive_id\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 19
+    },
+    "nullable": []
+  },
+  "hash": "68f85a137d75f3bb06d7c864a2b05aa0c6225d41c931595997629946b1d51d28"
+}

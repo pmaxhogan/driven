@@ -139,7 +139,10 @@ impl Fixture {
     async fn live_objects(&self) -> anyhow::Result<Vec<driven_drive::remote_store::RemoteEntry>> {
         Ok(self
             .remote
-            .list_folder(&self.folder_id)
+            .list_folder(
+                &self.folder_id,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
             .await?
             .into_iter()
             .filter(|e| !e.trashed)
@@ -234,6 +237,7 @@ fn source_row(account: driven_core::types::AccountId, root: &Path, folder_id: &s
         enabled: true,
         local_path: root.to_string_lossy().into_owned(),
         drive_folder_id: folder_id.to_string(),
+        drive_id: None,
         drive_folder_path: "/filenames".into(),
         encryption_enabled: false,
         wrapped_source_key: None,

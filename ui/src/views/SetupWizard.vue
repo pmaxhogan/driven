@@ -269,6 +269,7 @@ function baseName(p: string): string {
         <DriveFolderPicker
           v-model:folder-id="setup.driveFolderId"
           v-model:folder-path="setup.driveFolderPath"
+          v-model:drive-id="setup.driveId"
           :account-id="setup.accountId"
           @error="onDrivePickerError"
         />
