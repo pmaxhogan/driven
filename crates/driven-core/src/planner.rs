@@ -715,6 +715,7 @@ mod tests {
             enabled: true,
             local_path: "/tmp/src".into(),
             drive_folder_id: "folder-1".into(),
+            drive_id: None,
             drive_folder_path: "/Backups/test".into(),
             encryption_enabled: false,
             wrapped_source_key: None,

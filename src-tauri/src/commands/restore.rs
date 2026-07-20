@@ -4386,6 +4386,7 @@ mod tests {
             enabled: true,
             local_path: "/home/alice/docs".into(),
             drive_folder_id: "folder-1".into(),
+            drive_id: None,
             drive_folder_path: "/Driven/Docs".into(),
             encryption_enabled: false,
             wrapped_source_key: None,

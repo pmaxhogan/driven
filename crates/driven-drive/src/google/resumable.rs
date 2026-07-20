@@ -38,6 +38,23 @@ pub const CHUNK_MULTIPLE: u64 = 256 * 1024;
 /// 4 MiB)"). A multiple of [`CHUNK_MULTIPLE`].
 pub const CHUNK_BYTES: u64 = 4 * 1024 * 1024;
 
+/// The query parameters for opening a resumable upload session (issue #7).
+///
+/// `uploadType=resumable` selects the resumable protocol; `fields=` projects
+/// the completion response so it carries `md5Checksum` (codex C-P1-1); and
+/// `supportsAllDrives=true` is sent UNCONDITIONALLY so a session opened against
+/// a Shared Drive destination is accepted (it is harmless for My Drive). The
+/// session URL Drive returns already encodes the target drive, so the per-chunk
+/// `PUT`s to that URL need no further Shared-Drive params. Pure + `const`-shaped
+/// so the param set is unit-testable without a live session open.
+pub fn open_session_query_params() -> [(&'static str, &'static str); 3] {
+    [
+        ("uploadType", "resumable"),
+        ("fields", super::pagination::FILE_FIELDS),
+        ("supportsAllDrives", "true"),
+    ]
+}
+
 /// Opens a resumable upload session against Drive (SPEC s3
 /// `resumable_session`).
 ///
@@ -95,10 +112,7 @@ pub async fn open_session(
         // (codex C-P1-1). Requesting FILE_FIELDS makes the completion body
         // carry md5 (a belt-and-suspenders metadata fetch in
         // resumable_upload_bytes covers the rare case Drive still omits it).
-        .query(&[
-            ("uploadType", "resumable"),
-            ("fields", super::pagination::FILE_FIELDS),
-        ])
+        .query(&open_session_query_params())
         .bearer_auth(access_token)
         // `X-Upload-Content-Length` / `-Type` let Drive validate the declared
         // size + type up front (Drive resumable protocol).
@@ -386,6 +400,19 @@ fn now_unix_ms() -> i64 {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn open_session_query_carries_supports_all_drives() {
+        // Issue #7: the resumable session init MUST carry supportsAllDrives=true
+        // so a Shared Drive create/update session is accepted, alongside the
+        // resumable uploadType + the md5-bearing field projection.
+        let params = open_session_query_params();
+        assert!(params.contains(&("supportsAllDrives", "true")));
+        assert!(params.contains(&("uploadType", "resumable")));
+        assert!(params
+            .iter()
+            .any(|(k, v)| *k == "fields" && v.contains("md5Checksum")));
+    }
 
     #[test]
     fn parse_completed_entry_reads_files_resource() {

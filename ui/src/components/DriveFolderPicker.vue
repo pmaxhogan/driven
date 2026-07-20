@@ -37,12 +37,19 @@ const emit = defineEmits<{ (e: "error", err: unknown): void }>();
 
 const folderId = defineModel<string | null>("folderId", { default: null });
 const folderPath = defineModel<string>("folderPath", { default: "" });
+// Issue #7: the Google Shared Drive id the current destination lives in, or null
+// for My Drive. Published so the parent persists it into AddSourceRequest.driveId.
+const driveId = defineModel<string | null>("driveId", { default: null });
 
 // Breadcrumb stack of the folders descended into; the first entry (null id) is
-// My Drive root. "up" re-fetches an ancestor; descend appends a child.
+// My Drive root. "up" re-fetches an ancestor; descend appends a child. Each
+// crumb carries the Shared Drive id it lives in (issue #7): null for My Drive,
+// so a descent into a Shared Drive keeps the corpora=drive scope on the way
+// down and back up the breadcrumb.
 interface Crumb {
   id: string | null;
   path: string;
+  driveId: string | null;
 }
 const crumbs = ref<Crumb[]>([]);
 const folders = ref<DriveFolderEntry[]>([]);
@@ -52,11 +59,13 @@ async function loadFolder(crumb: Crumb): Promise<void> {
   if (props.accountId === null) return;
   loading.value = true;
   try {
-    const listing = await ipc.pickDriveFolder(props.accountId, crumb.id);
+    const listing = await ipc.pickDriveFolder(props.accountId, crumb.id, crumb.driveId);
     folders.value = listing.folders;
     // B1: the current folder is itself the selectable destination (the backend
     // echoes a concrete id - "root" for My Drive - never null).
     folderId.value = listing.currentFolderId;
+    // Issue #7: publish the current drive context so the parent persists it.
+    driveId.value = listing.driveId ?? null;
     // R4-P2-2: persist the client-maintained breadcrumb path (the backend
     // returns ""). Fall back to the backend value only at the root (empty crumb).
     folderPath.value = crumb.path || listing.currentFolderPath;
@@ -68,7 +77,7 @@ async function loadFolder(crumb: Crumb): Promise<void> {
 }
 
 async function openRoot(): Promise<void> {
-  crumbs.value = [{ id: null, path: "" }];
+  crumbs.value = [{ id: null, path: "", driveId: null }];
   await loadFolder(crumbs.value[0]);
 }
 
@@ -77,6 +86,10 @@ async function descendInto(folder: DriveFolderEntry): Promise<void> {
   const crumb: Crumb = {
     id: folder.id,
     path: parentPath ? `${parentPath}/${folder.name}` : folder.name,
+    // Descending a Shared Drive root switches the scope to that drive; an
+    // ordinary folder inherits the drive it lives in (both carried on the
+    // entry's driveId, which the backend stamps).
+    driveId: folder.driveId ?? null,
   };
   crumbs.value.push(crumb);
   await loadFolder(crumb);
@@ -125,9 +138,15 @@ watch(
         <li v-for="folder in folders" :key="folder.id">
           <button
             type="button"
-            class="w-full px-3 py-2 text-left text-sm transition-colors hover:bg-teal-50 focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500 dark:hover:bg-zinc-800"
+            class="flex w-full items-center gap-2 px-3 py-2 text-left text-sm transition-colors hover:bg-teal-50 focus-visible:outline-solid focus-visible:outline-2 focus-visible:-outline-offset-2 focus-visible:outline-teal-500 dark:hover:bg-zinc-800"
             @click="descendInto(folder)"
           >
+            <span
+              v-if="folder.isSharedDrive"
+              class="rounded-sm bg-teal-100 px-1.5 py-0.5 text-[0.65rem] font-medium text-teal-800 dark:bg-teal-900 dark:text-teal-200"
+            >
+              {{ t("drivePicker.sharedDriveBadge") }}
+            </span>
             {{ folder.name }}
           </button>
         </li>

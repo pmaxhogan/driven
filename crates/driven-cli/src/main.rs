@@ -320,7 +320,12 @@ async fn run_sync(args: SyncArgs) -> anyhow::Result<()> {
     // Map existing remote children (by name) so a re-sync UPDATES rather than
     // duplicates (Drive allows duplicate names; we must look up by name here
     // because this debug driver keeps no local state).
-    let existing = store.list_folder(&args.dest_folder_id).await?;
+    let existing = store
+        .list_folder(
+            &args.dest_folder_id,
+            &driven_drive::remote_store::DriveContext::MyDrive,
+        )
+        .await?;
     let mut by_name: HashMap<String, String> = HashMap::new();
     for e in &existing {
         // First occurrence wins (oldest in the listing order).

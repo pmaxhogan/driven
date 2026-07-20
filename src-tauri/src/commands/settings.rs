@@ -3315,6 +3315,7 @@ mod tests {
             enabled: true,
             local_path: root.to_string(),
             drive_folder_id: String::new(),
+            drive_id: None,
             drive_folder_path: String::new(),
             encryption_enabled: false,
             wrapped_source_key: None,

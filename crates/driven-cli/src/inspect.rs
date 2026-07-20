@@ -306,6 +306,7 @@ mod tests {
             enabled: true,
             local_path: format!("/data/{name}"),
             drive_folder_id: "f".into(),
+            drive_id: None,
             drive_folder_path: "/f".into(),
             encryption_enabled: false,
             wrapped_source_key: None,

@@ -33,8 +33,8 @@ use bytes::Bytes;
 use driven_crypto::{ContentEncryptor, CryptoError, SourceCryptoSuite};
 use driven_drive::google::{classification_of, DriveError as DriveStoreError};
 use driven_drive::remote_store::{
-    AboutInfo, DownloadStream, DriveErrorClassification, RemoteEntry, RemoteStore, ResumableKind,
-    ResumableSession, ResumeProgress, UploadBody,
+    AboutInfo, DownloadStream, DriveContext, DriveErrorClassification, RemoteEntry, RemoteStore,
+    ResumableKind, ResumableSession, ResumeProgress, SharedDrive, UploadBody,
 };
 use driven_vss::{fallback_decision, FallbackDecision, OpenAttempt, SnapshotOutcome, VssMode};
 use serde::{Deserialize, Serialize};
@@ -664,12 +664,25 @@ impl BreakerReportingStore {
 
 #[async_trait::async_trait]
 impl RemoteStore for BreakerReportingStore {
-    async fn ensure_folder(&self, parent_id: &str, name: &str) -> anyhow::Result<RemoteEntry> {
-        self.report(self.inner.ensure_folder(parent_id, name).await)
+    async fn ensure_folder(
+        &self,
+        parent_id: &str,
+        name: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<RemoteEntry> {
+        self.report(
+            self.inner
+                .ensure_folder(parent_id, name, drive_context)
+                .await,
+        )
     }
 
-    async fn list_folder(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
-        self.report(self.inner.list_folder(folder_id).await)
+    async fn list_folder(
+        &self,
+        folder_id: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<Vec<RemoteEntry>> {
+        self.report(self.inner.list_folder(folder_id, drive_context).await)
     }
 
     async fn create(
@@ -742,12 +755,21 @@ impl RemoteStore for BreakerReportingStore {
         &self,
         parent_id: &str,
         op_uuid: &str,
+        drive_context: &DriveContext,
     ) -> anyhow::Result<Option<RemoteEntry>> {
-        self.report(self.inner.find_by_op_uuid(parent_id, op_uuid).await)
+        self.report(
+            self.inner
+                .find_by_op_uuid(parent_id, op_uuid, drive_context)
+                .await,
+        )
     }
 
     async fn about(&self) -> anyhow::Result<AboutInfo> {
         self.report(self.inner.about().await)
+    }
+
+    async fn list_shared_drives(&self) -> anyhow::Result<Vec<SharedDrive>> {
+        self.report(self.inner.list_shared_drives().await)
     }
 }
 
@@ -3033,7 +3055,10 @@ impl DefaultExecutor {
                 .encrypt_filename(dir, &parent_aad)
                 .map_err(|e| anyhow::anyhow!("filename encrypt failed for a directory: {e}"))?;
             self.pacer.permit_request().await;
-            let folder = self.remote.ensure_folder(&parent_id, &enc_name).await?;
+            let folder = self
+                .remote
+                .ensure_folder(&parent_id, &enc_name, &source.drive_context())
+                .await?;
             self.pacer.note_response(ResponseClass::Ok);
             parent_id = folder.id;
             parent_aad = enc_name.as_bytes().to_vec();
@@ -3730,7 +3755,7 @@ impl Executor for DefaultExecutor {
                     self.pacer.permit_request().await;
                     let found = match self
                         .remote
-                        .find_by_op_uuid(&source.drive_folder_id, &uuid)
+                        .find_by_op_uuid(&source.drive_folder_id, &uuid, &source.drive_context())
                         .await
                     {
                         Ok(found) => {
@@ -3994,7 +4019,11 @@ impl Executor for DefaultExecutor {
                     .await
                     .map_err(to_reconcile_err)?;
                 self.pacer.permit_request().await;
-                let found = match self.remote.find_by_op_uuid(&parent_id, &uuid).await {
+                let found = match self
+                    .remote
+                    .find_by_op_uuid(&parent_id, &uuid, &source.drive_context())
+                    .await
+                {
                     Ok(found) => {
                         self.pacer.note_response(ResponseClass::Ok);
                         found
@@ -5812,6 +5841,7 @@ mod tests {
             enabled: true,
             local_path: tmp_src.path().to_string_lossy().to_string(),
             drive_folder_id: remote.root_id().to_string(),
+            drive_id: None,
             drive_folder_path: "/".into(),
             encryption_enabled: false,
             wrapped_source_key: None,
@@ -5983,7 +6013,7 @@ mod tests {
         // Exactly one object on Drive, marked as a bundle.
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1, "a bundle is one Drive object");
@@ -6151,7 +6181,7 @@ mod tests {
 
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -6254,7 +6284,7 @@ mod tests {
         // gone.
         let live = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert!(
@@ -6422,11 +6452,22 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl RemoteStore for BundleTrashFailsStore {
-        async fn ensure_folder(&self, parent_id: &str, name: &str) -> anyhow::Result<RemoteEntry> {
-            self.inner.ensure_folder(parent_id, name).await
+        async fn ensure_folder(
+            &self,
+            parent_id: &str,
+            name: &str,
+            drive_context: &DriveContext,
+        ) -> anyhow::Result<RemoteEntry> {
+            self.inner
+                .ensure_folder(parent_id, name, drive_context)
+                .await
         }
-        async fn list_folder(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
-            self.inner.list_folder(folder_id).await
+        async fn list_folder(
+            &self,
+            folder_id: &str,
+            drive_context: &DriveContext,
+        ) -> anyhow::Result<Vec<RemoteEntry>> {
+            self.inner.list_folder(folder_id, drive_context).await
         }
         async fn create(
             &self,
@@ -6480,8 +6521,11 @@ mod tests {
             &self,
             parent_id: &str,
             op_uuid: &str,
+            drive_context: &DriveContext,
         ) -> anyhow::Result<Option<RemoteEntry>> {
-            self.inner.find_by_op_uuid(parent_id, op_uuid).await
+            self.inner
+                .find_by_op_uuid(parent_id, op_uuid, drive_context)
+                .await
         }
         async fn about(&self) -> anyhow::Result<AboutInfo> {
             self.inner.about().await
@@ -6515,7 +6559,7 @@ mod tests {
         // The one bundle object is live, and the bundle is NOT yet a GC candidate.
         let before = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(before.iter().filter(|e| !e.trashed).count(), 1);
@@ -6541,7 +6585,7 @@ mod tests {
         exec.reconcile(&h.source).await.unwrap();
         let after = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(
@@ -6597,7 +6641,7 @@ mod tests {
         // remote has the bytes.
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -6654,7 +6698,7 @@ mod tests {
         // Only one object on Drive (no duplicate create).
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -6739,7 +6783,7 @@ mod tests {
         // Exactly one LIVE object on Drive (the new one); resolve-at picks the old.
         let live = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(live.len(), 1);
@@ -6812,7 +6856,7 @@ mod tests {
         // Still exactly one live object (the redundant new object was trashed).
         let live = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(live.len(), 1);
@@ -6997,7 +7041,7 @@ mod tests {
         // Exactly one live object remains (the OLD one).
         let live = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(live.len(), 1);
@@ -7349,7 +7393,7 @@ mod tests {
         );
         let live = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(live.len(), 1, "recovery updates in place - no duplicate");
@@ -8045,7 +8089,7 @@ mod tests {
         // Still exactly one object on Drive - no duplicate.
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -8100,7 +8144,7 @@ mod tests {
         assert_eq!(pending.len(), 1, "create op kept for reconcile to adopt");
         let before = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(before.len(), 1, "the post-upload orphan is on Drive");
@@ -8111,7 +8155,7 @@ mod tests {
         exec.reconcile(&h.source).await.unwrap();
         let after = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(after.len(), 1, "reconcile produced no duplicate");
@@ -8167,7 +8211,7 @@ mod tests {
         // download).
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 20);
@@ -8217,7 +8261,7 @@ mod tests {
         // would upload a duplicate).
         let live = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert!(
@@ -8340,7 +8384,7 @@ mod tests {
         // mutated live bytes.
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -8705,7 +8749,7 @@ mod tests {
         );
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -8794,7 +8838,7 @@ mod tests {
         assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -8887,7 +8931,7 @@ mod tests {
         // + per-chunk tags), proving the body sent was the ciphertext.
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -9002,7 +9046,7 @@ mod tests {
 
         let children = h
             .remote
-            .list_folder(source.drive_folder_id.as_str())
+            .list_folder(source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1, "exactly one object on the fake");
@@ -9058,7 +9102,7 @@ mod tests {
 
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -9280,10 +9324,19 @@ mod tests {
             }
             Ok(())
         }
-        async fn ensure_folder(&self, _p: &str, _n: &str) -> anyhow::Result<RemoteEntry> {
+        async fn ensure_folder(
+            &self,
+            _p: &str,
+            _n: &str,
+            _dc: &DriveContext,
+        ) -> anyhow::Result<RemoteEntry> {
             anyhow::bail!("MismatchStore: ensure_folder must not be called")
         }
-        async fn list_folder(&self, _f: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+        async fn list_folder(
+            &self,
+            _f: &str,
+            _dc: &DriveContext,
+        ) -> anyhow::Result<Vec<RemoteEntry>> {
             anyhow::bail!("MismatchStore: list_folder must not be called")
         }
         async fn update(
@@ -9316,7 +9369,12 @@ mod tests {
         async fn download(&self, _f: &str) -> anyhow::Result<DownloadStream> {
             anyhow::bail!("MismatchStore: download must not be called")
         }
-        async fn find_by_op_uuid(&self, _p: &str, _u: &str) -> anyhow::Result<Option<RemoteEntry>> {
+        async fn find_by_op_uuid(
+            &self,
+            _p: &str,
+            _u: &str,
+            _dc: &DriveContext,
+        ) -> anyhow::Result<Option<RemoteEntry>> {
             anyhow::bail!("MismatchStore: find_by_op_uuid must not be called")
         }
         async fn about(&self) -> anyhow::Result<AboutInfo> {
@@ -9345,11 +9403,20 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl RemoteStore for TrashFailStore {
-        async fn ensure_folder(&self, p: &str, n: &str) -> anyhow::Result<RemoteEntry> {
-            self.inner.ensure_folder(p, n).await
+        async fn ensure_folder(
+            &self,
+            p: &str,
+            n: &str,
+            dc: &DriveContext,
+        ) -> anyhow::Result<RemoteEntry> {
+            self.inner.ensure_folder(p, n, dc).await
         }
-        async fn list_folder(&self, f: &str) -> anyhow::Result<Vec<RemoteEntry>> {
-            self.inner.list_folder(f).await
+        async fn list_folder(
+            &self,
+            f: &str,
+            dc: &DriveContext,
+        ) -> anyhow::Result<Vec<RemoteEntry>> {
+            self.inner.list_folder(f, dc).await
         }
         async fn create(
             &self,
@@ -9403,8 +9470,13 @@ mod tests {
         async fn download(&self, f: &str) -> anyhow::Result<DownloadStream> {
             self.inner.download(f).await
         }
-        async fn find_by_op_uuid(&self, p: &str, u: &str) -> anyhow::Result<Option<RemoteEntry>> {
-            self.inner.find_by_op_uuid(p, u).await
+        async fn find_by_op_uuid(
+            &self,
+            p: &str,
+            u: &str,
+            dc: &DriveContext,
+        ) -> anyhow::Result<Option<RemoteEntry>> {
+            self.inner.find_by_op_uuid(p, u, dc).await
         }
         async fn about(&self) -> anyhow::Result<AboutInfo> {
             self.inner.about().await
@@ -9931,7 +10003,7 @@ mod tests {
         // Bytes landed intact.
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -10044,7 +10116,7 @@ mod tests {
         // The stored object's NAME is ciphertext, not "big-secret.bin".
         let children = h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
         assert_eq!(children.len(), 1);
@@ -10133,11 +10205,20 @@ mod tests {
         // op_uuid by walking the encrypted tree.
         let lvl1 = &h
             .remote
-            .list_folder(h.source.drive_folder_id.as_str())
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap()[0];
-        let lvl2 = &h.remote.list_folder(&lvl1.id).await.unwrap()[0];
-        let leaf = h.remote.list_folder(&lvl2.id).await.unwrap()[0].clone();
+        let lvl2 = &h
+            .remote
+            .list_folder(&lvl1.id, &DriveContext::MyDrive)
+            .await
+            .unwrap()[0];
+        let leaf = h
+            .remote
+            .list_folder(&lvl2.id, &DriveContext::MyDrive)
+            .await
+            .unwrap()[0]
+            .clone();
         let op_uuid = leaf
             .app_properties
             .get(CLIENT_OP_UUID_KEY)
@@ -10171,7 +10252,11 @@ mod tests {
 
         // The SAME object was adopted: still exactly one object in the leaf
         // folder, file_state restored Synced with that id, op drained.
-        let leaf_after = h.remote.list_folder(&lvl2.id).await.unwrap();
+        let leaf_after = h
+            .remote
+            .list_folder(&lvl2.id, &DriveContext::MyDrive)
+            .await
+            .unwrap();
         assert_eq!(
             leaf_after.len(),
             1,
@@ -10321,10 +10406,19 @@ mod tests {
                 }
             }
 
-            async fn ensure_folder(&self, _p: &str, _n: &str) -> anyhow::Result<RemoteEntry> {
+            async fn ensure_folder(
+                &self,
+                _p: &str,
+                _n: &str,
+                _dc: &DriveContext,
+            ) -> anyhow::Result<RemoteEntry> {
                 anyhow::bail!("ToggleStore: ensure_folder must not be called")
             }
-            async fn list_folder(&self, _f: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+            async fn list_folder(
+                &self,
+                _f: &str,
+                _dc: &DriveContext,
+            ) -> anyhow::Result<Vec<RemoteEntry>> {
                 anyhow::bail!("ToggleStore: list_folder must not be called")
             }
             async fn update(
@@ -10364,6 +10458,7 @@ mod tests {
                 &self,
                 _p: &str,
                 _u: &str,
+                _dc: &DriveContext,
             ) -> anyhow::Result<Option<RemoteEntry>> {
                 anyhow::bail!("ToggleStore: find_by_op_uuid must not be called")
             }

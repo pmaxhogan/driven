@@ -163,7 +163,10 @@ impl SoakHarness {
     async fn live_object_count(&self) -> anyhow::Result<usize> {
         Ok(self
             .remote
-            .list_folder(&self.folder)
+            .list_folder(
+                &self.folder,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
             .await?
             .iter()
             .filter(|e| !e.trashed)
@@ -182,6 +185,7 @@ fn source_in(account: driven_core::types::AccountId, root: &Path, folder_id: &st
         enabled: true,
         local_path: root.to_string_lossy().into_owned(),
         drive_folder_id: folder_id.to_string(),
+        drive_id: None,
         drive_folder_path: "/chaos".into(),
         encryption_enabled: false,
         wrapped_source_key: None,
@@ -357,7 +361,10 @@ async fn assert_cross_scenario_invariants_opts(
     // --- no duplicate Drive objects per client_op_uuid ---------------------
     let live: Vec<_> = h
         .remote
-        .list_folder(&h.folder)
+        .list_folder(
+            &h.folder,
+            &driven_drive::remote_store::DriveContext::MyDrive,
+        )
         .await?
         .into_iter()
         .filter(|e| !e.trashed)
@@ -535,7 +542,13 @@ impl Scenario for FrequentEdits {
         if count != 1 {
             anyhow::bail!("expected exactly 1 object after edit soak, found {count}");
         }
-        let children = h.remote.list_folder(&h.folder).await?;
+        let children = h
+            .remote
+            .list_folder(
+                &h.folder,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
+            .await?;
         let live = children
             .iter()
             .find(|e| !e.trashed)
@@ -1000,7 +1013,10 @@ impl Scenario for AppendOnlyLog {
         }
         let live = h
             .remote
-            .list_folder(&h.folder)
+            .list_folder(
+                &h.folder,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
             .await?
             .into_iter()
             .find(|e| !e.trashed)

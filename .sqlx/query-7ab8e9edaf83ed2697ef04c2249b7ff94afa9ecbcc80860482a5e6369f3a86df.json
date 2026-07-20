@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n            SELECT\n                id                        AS \"id!: String\",\n                account_id                AS \"account_id!: String\",\n                display_name              AS \"display_name!: String\",\n                enabled                   AS \"enabled!: i64\",\n                local_path                AS \"local_path!: String\",\n                drive_folder_id           AS \"drive_folder_id!: String\",\n                drive_folder_path         AS \"drive_folder_path!: String\",\n                encryption_enabled        AS \"encryption_enabled!: i64\",\n                wrapped_source_key        AS \"wrapped_source_key: Vec<u8>\",\n                respect_gitignore         AS \"respect_gitignore!: i64\",\n                include_patterns          AS \"include_patterns!: String\",\n                exclude_patterns          AS \"exclude_patterns!: String\",\n                placeholder_policy        AS \"placeholder_policy: String\",\n                schedule_json_v2_reserved AS \"schedule_json_v2_reserved: String\",\n                deep_verify_interval_secs AS \"deep_verify_interval_secs!: i64\",\n                last_full_scan_at         AS \"last_full_scan_at: i64\",\n                last_deep_verify_at       AS \"last_deep_verify_at: i64\",\n                created_at                AS \"created_at!: i64\"\n            FROM backup_sources\n            ORDER BY created_at ASC, id ASC\n            ",
+  "query": "\n            SELECT\n                id                        AS \"id!: String\",\n                account_id                AS \"account_id!: String\",\n                display_name              AS \"display_name!: String\",\n                enabled                   AS \"enabled!: i64\",\n                local_path                AS \"local_path!: String\",\n                drive_folder_id           AS \"drive_folder_id!: String\",\n                drive_id                  AS \"drive_id: String\",\n                drive_folder_path         AS \"drive_folder_path!: String\",\n                encryption_enabled        AS \"encryption_enabled!: i64\",\n                wrapped_source_key        AS \"wrapped_source_key: Vec<u8>\",\n                respect_gitignore         AS \"respect_gitignore!: i64\",\n                include_patterns          AS \"include_patterns!: String\",\n                exclude_patterns          AS \"exclude_patterns!: String\",\n                placeholder_policy        AS \"placeholder_policy: String\",\n                schedule_json_v2_reserved AS \"schedule_json_v2_reserved: String\",\n                deep_verify_interval_secs AS \"deep_verify_interval_secs!: i64\",\n                last_full_scan_at         AS \"last_full_scan_at: i64\",\n                last_deep_verify_at       AS \"last_deep_verify_at: i64\",\n                created_at                AS \"created_at!: i64\"\n            FROM backup_sources\n            WHERE account_id = ?1 AND enabled = 1\n            ORDER BY created_at ASC, id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -70,8 +70,19 @@
         }
       },
       {
-        "name": "drive_folder_path!: String",
+        "name": "drive_id: String",
         "ordinal": 6,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "backup_sources",
+            "name": "drive_id"
+          }
+        }
+      },
+      {
+        "name": "drive_folder_path!: String",
+        "ordinal": 7,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -82,7 +93,7 @@
       },
       {
         "name": "encryption_enabled!: i64",
-        "ordinal": 7,
+        "ordinal": 8,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -93,7 +104,7 @@
       },
       {
         "name": "wrapped_source_key: Vec<u8>",
-        "ordinal": 8,
+        "ordinal": 9,
         "type_info": "Blob",
         "origin": {
           "Table": {
@@ -104,7 +115,7 @@
       },
       {
         "name": "respect_gitignore!: i64",
-        "ordinal": 9,
+        "ordinal": 10,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -115,7 +126,7 @@
       },
       {
         "name": "include_patterns!: String",
-        "ordinal": 10,
+        "ordinal": 11,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -126,7 +137,7 @@
       },
       {
         "name": "exclude_patterns!: String",
-        "ordinal": 11,
+        "ordinal": 12,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -137,7 +148,7 @@
       },
       {
         "name": "placeholder_policy: String",
-        "ordinal": 12,
+        "ordinal": 13,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -148,7 +159,7 @@
       },
       {
         "name": "schedule_json_v2_reserved: String",
-        "ordinal": 13,
+        "ordinal": 14,
         "type_info": "Text",
         "origin": {
           "Table": {
@@ -159,7 +170,7 @@
       },
       {
         "name": "deep_verify_interval_secs!: i64",
-        "ordinal": 14,
+        "ordinal": 15,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -170,7 +181,7 @@
       },
       {
         "name": "last_full_scan_at: i64",
-        "ordinal": 15,
+        "ordinal": 16,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -181,7 +192,7 @@
       },
       {
         "name": "last_deep_verify_at: i64",
-        "ordinal": 16,
+        "ordinal": 17,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -192,7 +203,7 @@
       },
       {
         "name": "created_at!: i64",
-        "ordinal": 17,
+        "ordinal": 18,
         "type_info": "Integer",
         "origin": {
           "Table": {
@@ -203,7 +214,7 @@
       }
     ],
     "parameters": {
-      "Right": 0
+      "Right": 1
     },
     "nullable": [
       true,
@@ -212,6 +223,7 @@
       false,
       false,
       false,
+      true,
       false,
       false,
       true,
@@ -226,5 +238,5 @@
       false
     ]
   },
-  "hash": "95c1eb7488ee60abedbc08d67ca4c78c3be90e8863d8eaa89733fd6f20cc5ce8"
+  "hash": "7ab8e9edaf83ed2697ef04c2249b7ff94afa9ecbcc80860482a5e6369f3a86df"
 }

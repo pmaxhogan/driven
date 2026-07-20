@@ -87,6 +87,9 @@ export interface AddSourceRequest {
    * the path bound to `localPathToken`). */
   localPath: string;
   driveFolderId: string;
+  /** Issue #7: the Google Shared Drive id the destination folder lives in, from
+   * `pickDriveFolder`. `null` (or omitted) means My Drive. */
+  driveId?: string | null;
   driveFolderPath: string;
   encryptionEnabled: boolean;
   respectGitignore: boolean;
@@ -133,10 +136,21 @@ export interface SourcePatch {
 export interface DriveFolderEntry {
   id: string;
   name: string;
+  /** Issue #7: the Google Shared Drive this entry lives in - the `driveId` for a
+   * Shared Drive root or a folder inside one, `null`/absent for a My Drive
+   * folder. Carried back into `pickDriveFolder` when descending, and into
+   * `addSource` when the folder is selected. */
+  driveId?: string | null;
+  /** Issue #7: true when this entry is a Shared Drive ROOT (vs an ordinary
+   * folder), so the picker can badge it. */
+  isSharedDrive?: boolean;
 }
 
 export interface DriveFolderListing {
   currentFolderId: string | null;
+  /** Issue #7: the Google Shared Drive the current folder lives in (`driveId`),
+   * or `null` for My Drive. Persisted with `currentFolderId` on selection. */
+  driveId?: string | null;
   currentFolderPath: string;
   folders: DriveFolderEntry[];
 }

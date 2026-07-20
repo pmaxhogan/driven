@@ -17,7 +17,9 @@ use std::sync::Arc;
 
 use bytes::Bytes;
 use driven_drive::fake::{InMemoryRemoteStore, CHUNK_MULTIPLE, CLIENT_OP_UUID_KEY};
-use driven_drive::remote_store::{RemoteStore, ResumableKind, ResumeProgress, UploadBody};
+use driven_drive::remote_store::{
+    DriveContext, RemoteStore, ResumableKind, ResumeProgress, UploadBody,
+};
 
 mod common;
 use common::{download_to_bytes, props};
@@ -40,14 +42,14 @@ fn fake() -> InMemoryRemoteStore {
 async fn fake_round_trip() {
     let store = fake();
     let root = store.root_id().to_string();
-    common::scenario_round_trip(&store, &root).await;
+    common::scenario_round_trip(&store, &root, &DriveContext::MyDrive).await;
 }
 
 #[tokio::test]
 async fn fake_duplicate_names_create() {
     let store = fake();
     let root = store.root_id().to_string();
-    common::scenario_duplicate_names_create(&store, &root).await;
+    common::scenario_duplicate_names_create(&store, &root, &DriveContext::MyDrive).await;
 }
 
 #[tokio::test]
@@ -82,7 +84,96 @@ async fn fake_trash_idempotent() {
 async fn fake_find_by_op_uuid_warns_on_dup() {
     let store = fake();
     let root = store.root_id().to_string();
-    common::scenario_find_by_op_uuid(&store, &root).await;
+    common::scenario_find_by_op_uuid(&store, &root, &DriveContext::MyDrive).await;
+}
+
+// ---------------------------------------------------------------------------
+// Issue #7 - Shared Drive drive-context plumb-through.
+//
+// The fake is a single flat namespace (it does not model separate drives), but
+// it DOES record the `DriveContext` every list path was called with and can
+// advertise Shared Drive roots. These tests assert the context a caller passes
+// actually reaches the store per call, and that the picker's `drives.list`
+// surface works - the plumb-through half of the contract. The exact wire query
+// params (`corpora=drive` + `driveId` + `includeItemsFromAllDrives` vs
+// `corpora=user`, all with `supportsAllDrives=true`) are asserted directly on
+// the pure `pagination::list_query_params` / `resumable::open_session_query_params`
+// builders in the `driven-drive` unit tests.
+// ---------------------------------------------------------------------------
+
+/// A Shared Drive context reaches the store on EVERY list path (the same
+/// scenarios that pass under My Drive pass under a Shared Drive), and the fake
+/// records exactly that context for each call.
+#[tokio::test]
+async fn fake_shared_drive_context_reaches_every_list_path() {
+    let store = fake();
+    let root = store.root_id().to_string();
+    let ctx = DriveContext::SharedDrive {
+        drive_id: "0ASharedDriveXYZ".to_string(),
+    };
+
+    // Run the three list-touching scenarios under the Shared Drive context.
+    common::scenario_round_trip(&store, &root, &ctx).await;
+    common::scenario_duplicate_names_create(&store, &root, &ctx).await;
+    common::scenario_find_by_op_uuid(&store, &root, &ctx).await;
+
+    let seen = store.drive_contexts_seen();
+    assert!(
+        !seen.is_empty(),
+        "list paths must have recorded at least one drive context"
+    );
+    assert!(
+        seen.iter().all(|c| *c == ctx),
+        "every recorded list context must be the Shared Drive passed in, got {seen:?}"
+    );
+}
+
+/// A My Drive context is recorded distinctly from a Shared Drive context, so a
+/// mixed-drive account's per-source contexts do not bleed together.
+#[tokio::test]
+async fn fake_my_drive_and_shared_drive_contexts_are_distinct() {
+    let store = fake();
+    let root = store.root_id().to_string();
+
+    store
+        .list_folder(&root, &DriveContext::MyDrive)
+        .await
+        .expect("list my drive");
+    let shared = DriveContext::SharedDrive {
+        drive_id: "0AShared".to_string(),
+    };
+    store
+        .list_folder(&root, &shared)
+        .await
+        .expect("list shared");
+
+    let seen = store.drive_contexts_seen();
+    assert_eq!(seen, vec![DriveContext::MyDrive, shared]);
+}
+
+/// `list_shared_drives` returns whatever the fake was configured with (empty by
+/// default; the picker uses this to show Shared Drive roots).
+#[tokio::test]
+async fn fake_list_shared_drives_reflects_configuration() {
+    use driven_drive::remote_store::SharedDrive;
+
+    // Default: no Shared Drives.
+    let bare = fake();
+    assert!(bare.list_shared_drives().await.unwrap().is_empty());
+
+    // Configured: returned verbatim.
+    let drives = vec![
+        SharedDrive {
+            id: "0Aone".to_string(),
+            name: "Team A".to_string(),
+        },
+        SharedDrive {
+            id: "0Atwo".to_string(),
+            name: "Team B".to_string(),
+        },
+    ];
+    let store = InMemoryRemoteStore::new().with_shared_drives(drives.clone());
+    assert_eq!(store.list_shared_drives().await.unwrap(), drives);
 }
 
 #[tokio::test]
@@ -113,7 +204,10 @@ async fn fake_list_with_trashed_flag() {
         .unwrap();
     store.trash(&entry.id).await.unwrap();
 
-    let visible = store.list_folder(&root).await.unwrap();
+    let visible = store
+        .list_folder(&root, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert!(
         !visible.iter().any(|e| e.id == entry.id),
         "list_folder hides trashed children"
@@ -272,7 +366,10 @@ async fn fake_dest_folder_missing_latches_on_writes_only() {
     let root = store.root_id().to_string();
     // Read paths keep working...
     ping_read(&store).await.expect("read ok");
-    store.list_folder(&root).await.expect("list ok");
+    store
+        .list_folder(&root, &DriveContext::MyDrive)
+        .await
+        .expect("list ok");
     // ...write paths latch.
     let err = ping_write(&store, &root, "x")
         .await
@@ -337,7 +434,10 @@ async fn fake_md5_mismatch_latches_on_entry() {
     assert_eq!(meta.md5, created.md5, "md5 latched across reads");
 
     // ...and list_folder agrees.
-    let listing = store.list_folder(&root).await.expect("list ok");
+    let listing = store
+        .list_folder(&root, &DriveContext::MyDrive)
+        .await
+        .expect("list ok");
     let listed = listing
         .iter()
         .find(|e| e.id == created.id)
@@ -375,7 +475,7 @@ async fn fake_trashed_visible_in_find_by_op_uuid() {
     // Without the fault, find_by_op_uuid would skip trashed children
     // and return None. With the fault, the trashed entry surfaces.
     let found = store
-        .find_by_op_uuid(&root, uuid)
+        .find_by_op_uuid(&root, uuid, &DriveContext::MyDrive)
         .await
         .expect("find succeeds")
         .expect("trashed entry visible under fault");
@@ -394,7 +494,7 @@ async fn fake_create_under_trashed_folder_is_rejected() {
 
     // Create a live sub-folder, confirm a child can be created under it.
     let folder = store
-        .ensure_folder(&root, "sub")
+        .ensure_folder(&root, "sub", &DriveContext::MyDrive)
         .await
         .expect("ensure_folder ok");
     store
@@ -427,7 +527,7 @@ async fn fake_create_under_trashed_folder_is_rejected() {
 
     // ensure_folder under a trashed parent is likewise rejected.
     let err2 = store
-        .ensure_folder(&folder.id, "nested")
+        .ensure_folder(&folder.id, "nested", &DriveContext::MyDrive)
         .await
         .expect_err("ensure_folder under trashed parent must Err");
     assert!(
@@ -581,7 +681,10 @@ async fn fake_parallel_creates_under_same_parent() {
         produced.push(j.await.expect("task join"));
     }
 
-    let listing = store.list_folder(&root).await.unwrap();
+    let listing = store
+        .list_folder(&root, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert_eq!(
         listing.len(),
         n as usize,
@@ -634,7 +737,10 @@ async fn stream_shorter_than_len_rejected() {
         .await;
     assert!(res.is_err(), "truncated stream must be rejected");
     // And nothing was committed.
-    let listing = store.list_folder(&root).await.unwrap();
+    let listing = store
+        .list_folder(&root, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert!(
         listing.is_empty(),
         "no object created for a truncated stream"
@@ -672,7 +778,10 @@ async fn stream_longer_than_len_rejected() {
         )
         .await;
     assert!(res.is_err(), "over-long stream must be rejected");
-    let listing = store.list_folder(&root).await.unwrap();
+    let listing = store
+        .list_folder(&root, &DriveContext::MyDrive)
+        .await
+        .unwrap();
     assert!(
         listing.is_empty(),
         "no object created for an over-long stream"
@@ -798,7 +907,9 @@ async fn fake_create_under_file_parent_errs() {
     );
 
     // ensure_folder under a file-as-parent must also error.
-    let res2 = store.ensure_folder(&file.id, "sub").await;
+    let res2 = store
+        .ensure_folder(&file.id, "sub", &DriveContext::MyDrive)
+        .await;
     assert!(
         res2.is_err(),
         "ensure_folder under a file-as-parent must Err"
@@ -883,7 +994,10 @@ async fn fake_with_fileid_recycle_reuses_trashed_id() {
     assert_eq!(bytes, b"second");
 
     // The original object is gone (recycled = emptied from trash).
-    let listing = store.list_folder(&root).await.expect("list root");
+    let listing = store
+        .list_folder(&root, &DriveContext::MyDrive)
+        .await
+        .expect("list root");
     assert_eq!(
         listing.iter().filter(|e| e.id == first.id).count(),
         1,

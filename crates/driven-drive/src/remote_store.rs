@@ -29,6 +29,70 @@ use serde::{Deserialize, Serialize};
 // Value types.
 // -----------------------------------------------------------------------------
 
+/// Which Drive corpus a request is scoped to (issue #7 Shared Drives).
+///
+/// Every Drive object lives either in the authenticated user's My Drive or in
+/// exactly one Google Shared Drive. `supportsAllDrives=true` is sent on EVERY
+/// `files.*` request regardless of context (it is harmless for My Drive); the
+/// context only changes the LIST/search paths, which must additionally send
+/// `corpora=drive` + `driveId` + `includeItemsFromAllDrives=true` to see
+/// objects inside a Shared Drive (`corpora=user`, the My-Drive default, hides
+/// them).
+///
+/// Derived per source at config time from the folder picker (which returns the
+/// `driveId` or "my-drive") and persisted alongside the destination folder id;
+/// see [`DriveContext::from_stored`].
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum DriveContext {
+    /// The authenticated user's My Drive (the V1 default).
+    MyDrive,
+    /// A specific Google Shared Drive. `drive_id` is the shared drive's id,
+    /// which doubles as the file id of the drive's root folder.
+    SharedDrive {
+        /// The Shared Drive's `driveId`.
+        drive_id: String,
+    },
+}
+
+impl DriveContext {
+    /// The Shared Drive id when this context targets a Shared Drive, else
+    /// `None` (My Drive).
+    pub fn drive_id(&self) -> Option<&str> {
+        match self {
+            DriveContext::MyDrive => None,
+            DriveContext::SharedDrive { drive_id } => Some(drive_id.as_str()),
+        }
+    }
+
+    /// Whether this context targets a Shared Drive (vs My Drive).
+    pub fn is_shared_drive(&self) -> bool {
+        matches!(self, DriveContext::SharedDrive { .. })
+    }
+
+    /// Builds a context from a persisted optional drive id, as stored beside a
+    /// source's destination folder. `None`, an empty string, or the sentinel
+    /// `"my-drive"` all decode to [`DriveContext::MyDrive`]; any other value is
+    /// a Shared Drive id.
+    pub fn from_stored(drive_id: Option<&str>) -> Self {
+        match drive_id.map(str::trim) {
+            None | Some("") | Some("my-drive") => DriveContext::MyDrive,
+            Some(id) => DriveContext::SharedDrive {
+                drive_id: id.to_string(),
+            },
+        }
+    }
+}
+
+/// One Google Shared Drive root, surfaced by
+/// [`RemoteStore::list_shared_drives`] for the destination picker (issue #7).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct SharedDrive {
+    /// The Shared Drive's `driveId` (also the id of its root folder).
+    pub id: String,
+    /// Human-readable Shared Drive name for the picker UI.
+    pub name: String,
+}
+
 /// A Drive object (file or folder) as returned by list / metadata calls
 /// (SPEC s3).
 #[derive(Debug, Clone)]
@@ -210,10 +274,36 @@ pub trait RemoteStore: Send + Sync {
     /// exist, picks the one with our
     /// `app_properties["driven.folder_marker"]` if present, else the
     /// oldest non-trashed one and logs a warning. Creates if none.
-    async fn ensure_folder(&self, parent_id: &str, name: &str) -> anyhow::Result<RemoteEntry>;
+    ///
+    /// `drive_context` scopes the search: [`DriveContext::MyDrive`] confines it
+    /// to My Drive; [`DriveContext::SharedDrive`] scopes both the search and the
+    /// folder create to that Shared Drive (issue #7).
+    async fn ensure_folder(
+        &self,
+        parent_id: &str,
+        name: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<RemoteEntry>;
 
-    /// Lists every direct child of `folder_id`.
-    async fn list_folder(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>>;
+    /// Lists every direct child of `folder_id`. `drive_context` scopes the
+    /// listing: a [`DriveContext::SharedDrive`] lists children inside that
+    /// Shared Drive (issue #7).
+    async fn list_folder(
+        &self,
+        folder_id: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<Vec<RemoteEntry>>;
+
+    /// Enumerates the Shared Drives the authenticated account can access
+    /// (Drive `drives.list`), for the destination picker to show Shared Drive
+    /// roots beside My Drive (issue #7).
+    ///
+    /// The default returns an empty list, so a backend with no Shared Drive
+    /// notion (or that opts out) simply offers My Drive only. The production
+    /// `GoogleDriveStore` overrides it with a real `drives.list` call.
+    async fn list_shared_drives(&self) -> anyhow::Result<Vec<SharedDrive>> {
+        Ok(Vec::new())
+    }
 
     /// Creates a new file under `parent_id`. Always POST. The caller is
     /// responsible for ensuring no `file_state.drive_file_id` exists for
@@ -303,6 +393,7 @@ pub trait RemoteStore: Send + Sync {
         &self,
         parent_id: &str,
         op_uuid: &str,
+        drive_context: &DriveContext,
     ) -> anyhow::Result<Option<RemoteEntry>>;
 
     /// Returns quota / about info for the authenticated account. Cheap

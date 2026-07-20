@@ -32,9 +32,13 @@
 //!
 //! ## Drive quirks this fake intentionally skips ("narrow scope")
 //!
-//! - **Team / Shared Drives**: no `driveId`, no shared-with-me semantics.
-//!   The trait does not surface them and the production
-//!   `GoogleDriveStore` will (M4) confine itself to My Drive in V1.
+//! - **Team / Shared Drives content semantics**: no per-object `driveId`, no
+//!   shared-with-me ACLs. The fake DOES record the [`DriveContext`] every list
+//!   path is called with (so the contract can assert a source's context reaches
+//!   the store) and can advertise Shared Drive roots via
+//!   [`InMemoryRemoteStore::with_shared_drives`] for the picker flow (issue #7),
+//!   but its in-memory tree is a single flat namespace - it does not model a
+//!   file actually living inside one drive vs another.
 //! - **Advanced sharing / permissions**: every object is implicitly
 //!   owned by the authenticated user. No ACL evaluation, no
 //!   `permissions.list`.
@@ -72,8 +76,8 @@ use tracing::warn;
 use uuid::Uuid;
 
 use crate::remote_store::{
-    AboutInfo, DownloadStream, RemoteEntry, RemoteStore, ResumableKind, ResumableSession,
-    ResumeProgress, UploadBody,
+    AboutInfo, DownloadStream, DriveContext, RemoteEntry, RemoteStore, ResumableKind,
+    ResumableSession, ResumeProgress, SharedDrive, UploadBody,
 };
 
 /// Tracing target for the fake.
@@ -467,6 +471,17 @@ pub struct InMemoryRemoteStore {
     /// keep the configuration mutable while the cloned `RemoteStore`
     /// trait object sees the same state.
     pub(crate) faults: Arc<Faults>,
+    /// Shared Drives this fake advertises via [`RemoteStore::list_shared_drives`]
+    /// (issue #7). Empty by default (My Drive only); populated by
+    /// [`InMemoryRemoteStore::with_shared_drives`] so the destination-picker
+    /// flow can be exercised in fake mode.
+    shared_drives: Arc<Vec<SharedDrive>>,
+    /// Every [`DriveContext`] the three list paths (`list_folder`,
+    /// `ensure_folder`, `find_by_op_uuid`) were called with, in call order
+    /// (issue #7). Lets the contract fixtures assert a source's drive context
+    /// actually reaches the store. Wrapped in `Arc<Mutex>` so a cloned trait
+    /// object shares the log.
+    list_contexts: Arc<Mutex<Vec<DriveContext>>>,
 }
 
 /// Fault-injection counters / latches.
@@ -596,6 +611,8 @@ impl InMemoryRemoteStore {
             inner: Arc::new(Mutex::new(inner)),
             root_id,
             faults: Arc::new(Faults::default()),
+            shared_drives: Arc::new(Vec::new()),
+            list_contexts: Arc::new(Mutex::new(Vec::new())),
         }
     }
 
@@ -603,6 +620,26 @@ impl InMemoryRemoteStore {
     /// `parent_id` when emulating uploads into My Drive root.
     pub fn root_id(&self) -> &str {
         &self.root_id
+    }
+
+    /// Advertises `drives` from [`RemoteStore::list_shared_drives`] (issue #7),
+    /// so the destination-picker flow can list Shared Drive roots in fake mode.
+    /// Consumes and returns `self` for builder-style construction.
+    pub fn with_shared_drives(mut self, drives: Vec<SharedDrive>) -> Self {
+        self.shared_drives = Arc::new(drives);
+        self
+    }
+
+    /// Every [`DriveContext`] the list paths were invoked with, in call order
+    /// (issue #7). Used by the contract fixtures to assert a source's drive
+    /// context reaches the store.
+    pub fn drive_contexts_seen(&self) -> Vec<DriveContext> {
+        self.list_contexts.lock().clone()
+    }
+
+    /// Record a [`DriveContext`] a list path was called with (issue #7).
+    fn record_context(&self, ctx: &DriveContext) {
+        self.list_contexts.lock().push(ctx.clone());
     }
 
     /// Internal test hook: list every child of `parent_id` including
@@ -812,7 +849,13 @@ impl Default for InMemoryRemoteStore {
 
 #[async_trait]
 impl RemoteStore for InMemoryRemoteStore {
-    async fn ensure_folder(&self, parent_id: &str, name: &str) -> anyhow::Result<RemoteEntry> {
+    async fn ensure_folder(
+        &self,
+        parent_id: &str,
+        name: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<RemoteEntry> {
+        self.record_context(drive_context);
         self.check_request_faults(RequestKind::WriteTarget).await?;
         let mut guard = self.inner.lock();
         // Parent must be an existing FOLDER (not a file, not missing).
@@ -874,7 +917,12 @@ impl RemoteStore for InMemoryRemoteStore {
         Ok(out)
     }
 
-    async fn list_folder(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+    async fn list_folder(
+        &self,
+        folder_id: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<Vec<RemoteEntry>> {
+        self.record_context(drive_context);
         self.check_request_faults(RequestKind::Read).await?;
         let guard = self.inner.lock();
         if !guard.objects.contains_key(folder_id) {
@@ -1311,7 +1359,9 @@ impl RemoteStore for InMemoryRemoteStore {
         &self,
         parent_id: &str,
         op_uuid: &str,
+        drive_context: &DriveContext,
     ) -> anyhow::Result<Option<RemoteEntry>> {
+        self.record_context(drive_context);
         self.check_request_faults(RequestKind::Read).await?;
         let include_trashed = self.faults.trashed_visible_in_find.load(Ordering::Acquire);
         let guard = self.inner.lock();
@@ -1366,6 +1416,13 @@ impl RemoteStore for InMemoryRemoteStore {
             usage_in_drive: guard.bytes_stored,
             usage_in_drive_trash: trash_bytes,
         })
+    }
+
+    async fn list_shared_drives(&self) -> anyhow::Result<Vec<SharedDrive>> {
+        // Issue #7: return whatever Shared Drives this fake was configured with
+        // (via `with_shared_drives`); empty by default (My Drive only).
+        self.check_request_faults(RequestKind::Read).await?;
+        Ok((*self.shared_drives).clone())
     }
 }
 

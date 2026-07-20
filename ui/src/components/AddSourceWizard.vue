@@ -54,6 +54,9 @@ const localPath = ref<string | null>(null);
 // add_source so the backend can prove the path is dialog-derived).
 const localPathToken = ref<string | null>(null);
 const driveFolderId = ref<string | null>(null);
+// Issue #7: the Google Shared Drive id the chosen destination lives in (null =
+// My Drive), owned by the shared DriveFolderPicker.
+const driveId = ref<string | null>(null);
 const driveFolderPath = ref<string>("");
 const respectGitignore = ref(true);
 const includePatternsText = ref("");
@@ -140,6 +143,7 @@ function reset(): void {
   localPath.value = null;
   localPathToken.value = null;
   driveFolderId.value = null;
+  driveId.value = null;
   driveFolderPath.value = "";
   respectGitignore.value = true;
   includePatternsText.value = "";
@@ -232,6 +236,7 @@ async function confirm(): Promise<void> {
       localPathToken: localPathToken.value,
       localPath: localPath.value,
       driveFolderId: driveFolderId.value,
+      driveId: driveId.value,
       driveFolderPath: driveFolderPath.value,
       encryptionEnabled: encryptionEnabled.value,
       respectGitignore: respectGitignore.value,
@@ -382,6 +387,7 @@ defineExpose({ start });
         <DriveFolderPicker
           v-model:folder-id="driveFolderId"
           v-model:folder-path="driveFolderPath"
+          v-model:drive-id="driveId"
           :account-id="accountId"
           @error="onDrivePickerError"
         />

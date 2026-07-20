@@ -585,6 +585,7 @@ describe("AddSourceWizard", () => {
     expect(invokeMock).toHaveBeenCalledWith("pick_drive_folder", {
       accountId: "acc-1",
       startFolderId: null,
+      driveId: null,
     });
     // -> Exclusions step (loads preview).
     await clickNext();

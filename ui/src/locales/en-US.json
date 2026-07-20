@@ -44,7 +44,8 @@
   "drivePicker": {
     "rootName": "My Drive",
     "destinationLabel": "Backing up to",
-    "empty": "No subfolders here - this folder is the destination."
+    "empty": "No subfolders here - this folder is the destination.",
+    "sharedDriveBadge": "Shared drive"
   },
   "wizard": {
     "title": "Set up Driven",

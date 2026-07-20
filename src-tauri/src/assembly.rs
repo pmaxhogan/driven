@@ -1354,6 +1354,7 @@ mod tests {
             enabled: true,
             local_path: dir.join("src").to_string_lossy().into_owned(),
             drive_folder_id: "folder-1".to_string(),
+            drive_id: None,
             drive_folder_path: "/Backups".to_string(),
             encryption_enabled: true,
             wrapped_source_key: Some(vec![1, 2, 3, 4]),
