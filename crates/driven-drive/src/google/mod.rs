@@ -1873,6 +1873,26 @@ mod tests {
     use super::*;
 
     #[test]
+    fn drive_clients_apply_custom_ca_fail_closed() {
+        // Issue #34: the Drive metadata + stream clients add the custom CA
+        // additively and fail closed on a bad one; `None` builds normally.
+        let none = CustomCaConfig::none();
+        assert!(build_meta_client(&none).is_ok(), "no-CA meta client builds");
+        assert!(
+            build_stream_client(&none).is_ok(),
+            "no-CA stream client builds"
+        );
+        let bad = CustomCaConfig::from_path(Some(std::path::PathBuf::from(
+            "/driven/no/such/drive-ca.pem",
+        )));
+        assert!(build_meta_client(&bad).is_err(), "bad CA fails meta build");
+        assert!(
+            build_stream_client(&bad).is_err(),
+            "bad CA fails stream build"
+        );
+    }
+
+    #[test]
     fn rfc3339_parses_to_unix_ms() {
         // 2024-01-01T00:00:00Z == 1704067200000 ms.
         assert_eq!(

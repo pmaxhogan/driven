@@ -428,6 +428,25 @@ mod tests {
     use super::*;
 
     #[test]
+    fn cli_custom_ca_reads_the_env_var() {
+        // Issue #34: the dev CLI resolves its custom root CA from
+        // DRIVEN_CUSTOM_CA_PATH (unset / blank = system trust only). No other
+        // test touches this env var, so the set/remove here does not race.
+        std::env::remove_var("DRIVEN_CUSTOM_CA_PATH");
+        assert!(!cli_custom_ca().is_enabled(), "unset = system trust only");
+
+        std::env::set_var("DRIVEN_CUSTOM_CA_PATH", "");
+        assert!(!cli_custom_ca().is_enabled(), "blank = system trust only");
+
+        std::env::set_var("DRIVEN_CUSTOM_CA_PATH", "/etc/corp/ca.pem");
+        let ca = cli_custom_ca();
+        assert!(ca.is_enabled());
+        assert_eq!(ca.path(), Some(Path::new("/etc/corp/ca.pem")));
+
+        std::env::remove_var("DRIVEN_CUSTOM_CA_PATH");
+    }
+
+    #[test]
     fn resolve_creds_prefers_explicit_args() {
         let creds = resolve_creds(
             Some("id-arg".to_string()),

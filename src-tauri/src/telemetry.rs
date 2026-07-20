@@ -1841,4 +1841,36 @@ mod tests {
         assert!(reservoir.is_enabled(), "capture gate flipped back on");
         cleanup(dir);
     }
+
+    #[tokio::test]
+    async fn http_sink_fails_closed_on_a_bad_custom_ca() {
+        // Issue #34: a configured-but-unloadable custom CA fails the telemetry
+        // send CLOSED - `apply_custom_ca` errors at client build, BEFORE any POST,
+        // so this needs no server (the error is the CA load, not the network).
+        let aggregate = driven_core::state::TelemetryAggregate {
+            files_uploaded: 0,
+            bytes_uploaded: 0,
+            errors_by_class: vec![],
+            deep_verify_runs: 0,
+            update_applied: 0,
+        };
+        let payload = build_payload(
+            "00000000-0000-4000-8000-000000000000".to_string(),
+            1_700_000_000_000,
+            "0.1.0".to_string(),
+            "stable".to_string(),
+            None,
+            aggregate,
+            LatencyP50P95::default(),
+        );
+        let bad_ca = driven_tls::CustomCaConfig::from_path(Some(std::path::PathBuf::from(
+            "/driven/no/such/telemetry-ca.pem",
+        )));
+        let sink = HttpTelemetrySink::new(bad_ca);
+        let result = sink.send("http://127.0.0.1:1/telemetry", &payload).await;
+        assert!(
+            result.is_err(),
+            "a bad custom CA must fail the telemetry send closed (no silent send)"
+        );
+    }
 }

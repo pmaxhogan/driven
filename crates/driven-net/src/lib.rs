@@ -616,6 +616,21 @@ mod tests {
         );
     }
 
+    #[test]
+    fn backend_fails_closed_with_a_bad_custom_ca() {
+        // Issue #34: a configured-but-missing custom CA must fail the backend
+        // build (fail-closed) - both the captive and per-service build fns
+        // propagate the driven-tls error rather than silently dropping the CA.
+        let bad =
+            CustomCaConfig::from_path(Some(std::path::PathBuf::from("/driven/no/such/net-ca.pem")));
+        assert!(
+            ReqwestBackend::new(bad.clone()).is_err(),
+            "a missing custom CA must fail the probe-backend build"
+        );
+        assert!(build_captive_client(&bad).is_err());
+        assert!(build_service_client(ServiceName::Drive, &bad).is_err());
+    }
+
     // --- per-service client mapping covers exactly the probed services ---
 
     #[test]

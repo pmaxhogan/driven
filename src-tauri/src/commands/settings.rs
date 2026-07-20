@@ -1175,13 +1175,9 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
 /// whitespace-only string as `None` (system trust only). Kept in one place so
 /// the save path and any future callers agree on "blank == unset".
 fn normalize_ca_path(path: Option<PathBuf>) -> Option<PathBuf> {
-    path.and_then(|p| {
-        if p.as_os_str().is_empty() || p.to_string_lossy().trim().is_empty() {
-            None
-        } else {
-            Some(p)
-        }
-    })
+    // Keep the path only when it is non-blank; an empty / whitespace-only string
+    // (`to_string_lossy().trim()` also covers an empty `OsStr`) becomes `None`.
+    path.filter(|p| !p.to_string_lossy().trim().is_empty())
 }
 
 /// Issue #34: load the persisted custom-root-CA setting into a
