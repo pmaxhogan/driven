@@ -338,9 +338,16 @@ pub async fn submit_oauth_credentials(
 #[tauri::command]
 pub async fn start_oauth_signin(
     app: AppHandle,
-    _state: State<'_, AppState>,
+    state: State<'_, AppState>,
     session: SessionId,
 ) -> CommandResult<OAuthAuthUrl> {
+    // Issue #34: resolve the custom root CA once, up front, so the spawned OAuth
+    // flow (and the userinfo fetch it triggers) trusts a corporate TLS-inspection
+    // CA. Best-effort read of the settings blob; the PEM itself is opened - and
+    // fails closed - inside the client build.
+    let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
+        .await
+        .unwrap_or_default();
     // Resolve creds + mark started under the lock; reject a missing / already-
     // started session.
     let (client_id, client_secret) = {
@@ -405,7 +412,8 @@ pub async fn start_oauth_signin(
         let app = app.clone();
         tauri::async_runtime::spawn(async move {
             let result =
-                run_pkce_loopback_flow(&client_id, &client_secret, open_browser, progress_tx).await;
+                run_pkce_loopback_flow(&client_id, &client_secret, open_browser, progress_tx, &ca)
+                    .await;
             let status = match result {
                 Ok(tokens) => {
                     let mut sessions = lock_sessions();
@@ -555,8 +563,12 @@ pub async fn finish_add_account(
 
     // A5: fetch the real Google profile (email + display name) with the fresh
     // access token. Best-effort: on failure fall back to a stable label so the
-    // account is still usable (no fabricated Google address).
-    let profile = fetch_google_userinfo(&tokens.access_token).await;
+    // account is still usable (no fabricated Google address). Issue #34: route it
+    // through the user's custom root CA (fail-closed on a bad CA -> None profile).
+    let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
+        .await
+        .unwrap_or_default();
+    let profile = fetch_google_userinfo(&tokens.access_token, &ca).await;
 
     let (account_id, dto) = if let Some(account_id) = reauth_account {
         // Reauth path: re-store the refresh token + client creds, THEN flip the
@@ -816,15 +828,27 @@ struct GoogleUserinfo {
 /// the OpenID userinfo endpoint. Best-effort: any transport / non-2xx / parse
 /// failure returns `None` (the caller falls back to a label), and the access
 /// token is NEVER logged.
-async fn fetch_google_userinfo(access_token: &str) -> Option<GoogleUserinfo> {
+async fn fetch_google_userinfo(
+    access_token: &str,
+    ca: &driven_tls::CustomCaConfig,
+) -> Option<GoogleUserinfo> {
     const USERINFO_URL: &str = "https://www.googleapis.com/oauth2/v3/userinfo";
     // R4-P2-5: bound the request so a blackholed endpoint cannot hang the IPC
     // command forever (no timeout = wait indefinitely). 10s connect, 30s total.
-    let client = match reqwest::Client::builder()
+    // Issue #34: add the user's custom root CA additively. Fail-closed: a bad CA
+    // returns None (a label fallback) rather than a client that ignores the CA -
+    // we never make the request over a mis-configured trust store.
+    let builder = reqwest::Client::builder()
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
-        .build()
-    {
+        .timeout(std::time::Duration::from_secs(30));
+    let builder = match driven_tls::apply_custom_ca(builder, ca) {
+        Ok(b) => b,
+        Err(e) => {
+            tracing::warn!(target: TARGET, error = %e, "userinfo: custom root CA could not be applied; skipping profile fetch");
+            return None;
+        }
+    };
+    let client = match builder.build() {
         Ok(c) => c,
         Err(e) => {
             tracing::warn!(target: TARGET, error = %e, "userinfo: failed to build http client");

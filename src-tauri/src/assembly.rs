@@ -42,6 +42,7 @@ use driven_drive::google::GoogleDriveStore;
 use driven_drive::remote_store::RemoteStore;
 
 use driven_net::ReqwestBackend;
+use driven_tls::CustomCaConfig;
 
 use driven_power::RealPowerSource;
 
@@ -414,8 +415,17 @@ async fn build_account(
 ) -> anyhow::Result<BuildOutcome> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
+    // Issue #34: resolve the user's custom root CA once for this account's
+    // client builds (Drive metadata/stream, OAuth refresh, and the network
+    // probe backend below). Best-effort read of the settings blob; the PEM is
+    // opened - and fails closed - inside each client build. A change is picked up
+    // when the account is next assembled (app restart / account re-add).
+    let ca = crate::commands::settings::load_custom_ca_config(state.as_ref())
+        .await
+        .unwrap_or_default();
+
     // --- remote: real GoogleDriveStore or the in-memory fake -----------------
-    let remote = match build_remote(account, use_fake, fake_remote_stores)? {
+    let remote = match build_remote(account, use_fake, fake_remote_stores, &ca)? {
         RemoteOutcome::Store(store) => store,
         RemoteOutcome::NeedsReauth => {
             // C5-P1-1: persist needs_reauth + emit the banner; do NOT build a
@@ -489,7 +499,7 @@ async fn build_account(
     // Passing `Some(..)` into `ExecutorDeps.network` routes every Drive request
     // through the breaker-reporting decorator so the Drive circuit breaker is
     // driven by REAL request outcomes, not probes alone (CODEX_NOTES P2-9 / V-G).
-    let backend = Arc::new(ReqwestBackend::new()?);
+    let backend = Arc::new(ReqwestBackend::new(ca.clone())?);
     let network: Arc<dyn NetworkProbe> = Arc::new(Prober::new(backend, clock.clone()));
 
     // --- VSS provider (Windows): SAME Arc into executor + orchestrator --------
@@ -630,6 +640,7 @@ fn build_remote(
     account: &AccountRow,
     use_fake: bool,
     fake_remote_stores: &FakeRemoteStores,
+    ca: &CustomCaConfig,
 ) -> anyhow::Result<RemoteOutcome> {
     if use_fake {
         tracing::info!(
@@ -669,10 +680,14 @@ fn build_remote(
     // the account stored none (a default-client account). A refresh token is
     // bound to the client that minted it, so using the wrong client fails.
     let (client_id, client_secret) = resolve_account_oauth_creds(account.id);
-    let token_source =
-        RefreshingTokenSource::from_stored_refresh_token(refresh_token, client_id, client_secret)?
-            .with_store(token_store);
-    let store = GoogleDriveStore::with_default_clients(token_source)?;
+    let token_source = RefreshingTokenSource::from_stored_refresh_token(
+        refresh_token,
+        client_id,
+        client_secret,
+        ca,
+    )?
+    .with_store(token_store);
+    let store = GoogleDriveStore::with_default_clients(token_source, ca)?;
     tracing::info!(
         target: TARGET,
         account_id = %account.id,

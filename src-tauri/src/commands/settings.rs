@@ -39,8 +39,8 @@ use driven_vss::VssMode;
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    GlobalSettings, ReleaseDto, ScheduleSettings, SettingsDto, SettingsPatch, TelemetrySettings,
-    UiSettings, UpdateInfo, UpdaterSettings, VssHelperStatus, WindowsSettings,
+    CustomCaValidation, GlobalSettings, ReleaseDto, ScheduleSettings, SettingsDto, SettingsPatch,
+    TelemetrySettings, UiSettings, UpdateInfo, UpdaterSettings, VssHelperStatus, WindowsSettings,
 };
 use crate::commands::{
     atomic_write, validate_writable_dest, CommandError, CommandResult, DialogToken,
@@ -405,6 +405,27 @@ pub async fn update_settings(
             }
             cur.metered_bandwidth_cap_mbps = v;
             orchestrator_affecting = true;
+        }
+        if let Some(v) = g.custom_root_ca_path {
+            // Issue #34: normalise a blank path to `None` (system trust only),
+            // and VALIDATE a real path parses as a PEM cert bundle up front so a
+            // broken CA can never be persisted (which would then fail-closed
+            // every outbound client). The trust is only ever ADDED on top of the
+            // OS roots - this validation neither weakens nor bypasses TLS.
+            let normalized = normalize_ca_path(v);
+            if let Some(path) = &normalized {
+                let count = driven_tls::validate_ca_file(path).map_err(|e| {
+                    invalid_setting(format!("custom root CA file is not usable: {e}"))
+                })?;
+                tracing::info!(
+                    target: TARGET,
+                    certs = count,
+                    "custom root CA validated on save"
+                );
+            }
+            cur.custom_root_ca_path = normalized;
+            // NOTE: applied to NEW client builds (restart / account re-add); the
+            // long-lived Drive/network clients are not rebuilt in place here.
         }
         store_group(repo, KEY_GLOBAL, &storage::Global::from(cur)).await?;
     }
@@ -774,6 +795,11 @@ mod storage {
         pub metered_mode: String,
         #[serde(default)]
         pub metered_bandwidth_cap_mbps: Option<u32>,
+        // Issue #34 (corporate CA pinning). `serde(default)` so a `global` blob
+        // persisted before this field still deserialises (default = None =
+        // system trust only, the unchanged behaviour).
+        #[serde(default)]
+        pub custom_root_ca_path: Option<std::path::PathBuf>,
     }
 
     /// Default hook timeout (seconds) for a pre-V2 `global` blob missing it.
@@ -804,6 +830,7 @@ mod storage {
                 hook_timeout_secs: s.hook_timeout_secs,
                 metered_mode: s.metered_mode,
                 metered_bandwidth_cap_mbps: s.metered_bandwidth_cap_mbps,
+                custom_root_ca_path: s.custom_root_ca_path,
             }
         }
     }
@@ -826,6 +853,7 @@ mod storage {
                 hook_timeout_secs: d.hook_timeout_secs,
                 metered_mode: d.metered_mode,
                 metered_bandwidth_cap_mbps: d.metered_bandwidth_cap_mbps,
+                custom_root_ca_path: d.custom_root_ca_path,
             }
         }
     }
@@ -1141,6 +1169,34 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
         },
         metered_bandwidth_cap_mbps: global.metered_bandwidth_cap_mbps,
     })
+}
+
+/// Issue #34: normalise a webview-supplied custom-CA path, treating a blank /
+/// whitespace-only string as `None` (system trust only). Kept in one place so
+/// the save path and any future callers agree on "blank == unset".
+fn normalize_ca_path(path: Option<PathBuf>) -> Option<PathBuf> {
+    // Keep the path only when it is non-blank; an empty / whitespace-only string
+    // (`to_string_lossy().trim()` also covers an empty `OsStr`) becomes `None`.
+    path.filter(|p| !p.to_string_lossy().trim().is_empty())
+}
+
+/// Issue #34: load the persisted custom-root-CA setting into a
+/// [`driven_tls::CustomCaConfig`] for the client-build sites (assembly's Drive +
+/// network clients, the updater, the GitHub-releases + userinfo fetches, the
+/// telemetry sink). A read/parse failure of the settings blob degrades to
+/// "system trust only" (best-effort, like [`load_orchestrator_config`]); the
+/// PEM file itself is only opened at client-build time, where a bad file fails
+/// closed.
+pub async fn load_custom_ca_config(
+    state: &dyn StateRepo,
+) -> CommandResult<driven_tls::CustomCaConfig> {
+    let global: GlobalSettings = load_group::<storage::Global>(state, KEY_GLOBAL)
+        .await?
+        .map(Into::into)
+        .unwrap_or_else(default_global);
+    Ok(driven_tls::CustomCaConfig::from_path(normalize_ca_path(
+        global.custom_root_ca_path,
+    )))
 }
 
 /// Map the persisted [`ScheduleSettings`] DTO onto the core
@@ -2087,7 +2143,8 @@ pub async fn check_for_updates(
         )
     })?;
 
-    let releases = fetch_releases(1).await?;
+    let ca = load_custom_ca_config(state.state().as_ref()).await?;
+    let releases = fetch_releases(1, &ca).await?;
 
     // Newest channel-eligible release with a parseable semver tag.
     let mut best: Option<(semver::Version, GithubRelease)> = None;
@@ -2139,7 +2196,8 @@ pub async fn list_releases(
     // The webview paginates from 1; GitHub's `page` is also 1-based. A `0` from a
     // buggy caller is clamped to the first page.
     let page = page.max(1);
-    let releases = fetch_releases(page).await?;
+    let ca = load_custom_ca_config(state.state().as_ref()).await?;
+    let releases = fetch_releases(page, &ca).await?;
 
     let dtos = releases
         .into_iter()
@@ -2147,6 +2205,29 @@ pub async fn list_releases(
         .map(release_to_dto)
         .collect();
     Ok(dtos)
+}
+
+/// Issue #34: validate a candidate custom-root-CA PEM file for the settings UI.
+///
+/// Returns the number of certificates the file contains (so the UI can show
+/// "trusts N certificate(s)"), or a `internal.invalid_input` error carrying the
+/// read/parse detail. This only READS the user-supplied path to parse it - it
+/// returns a count, never file contents - and applies the exact same
+/// fail-closed rules as the client-build path, so "valid here" implies "will not
+/// fail-closed at build". A blank path is rejected (the UI only validates a
+/// non-empty candidate).
+#[tauri::command]
+pub async fn validate_custom_ca(path: String) -> CommandResult<CustomCaValidation> {
+    let normalized = normalize_ca_path(Some(PathBuf::from(path)));
+    let Some(path) = normalized else {
+        return Err(invalid_setting("no custom root CA path was provided"));
+    };
+    let count = driven_tls::validate_ca_file(&path)
+        .map_err(|e| invalid_setting(format!("custom root CA file is not usable: {e}")))?;
+    Ok(CustomCaValidation {
+        // A PEM cannot realistically hold > u32::MAX certs; clamp defensively.
+        cert_count: u32::try_from(count).unwrap_or(u32::MAX),
+    })
 }
 
 /// Read the active updater channel (`stable` | `dev`) from the persisted
@@ -2219,18 +2300,28 @@ fn parse_tag(tag: &str) -> Option<semver::Version> {
 /// - a transport (connect/timeout/DNS) failure -> `update.endpoint_unreachable`;
 /// - a non-2xx HTTP status -> `update.endpoint_unreachable` (the release source
 ///   is effectively unavailable).
-async fn fetch_releases(page: u32) -> CommandResult<Vec<GithubRelease>> {
+async fn fetch_releases(
+    page: u32,
+    ca: &driven_tls::CustomCaConfig,
+) -> CommandResult<Vec<GithubRelease>> {
     let url = format!(
         "https://api.github.com/repos/{GITHUB_REPO}/releases?per_page={RELEASES_PER_PAGE}&page={page}"
     );
 
     // R4-P2-5: bound the request so a blackholed GitHub endpoint cannot hang the
     // IPC command forever (no timeout = wait indefinitely). 10s connect, 30s
-    // total.
-    let client = reqwest::Client::builder()
+    // total. Issue #34: add the user's custom root CA additively (fail-closed).
+    let builder = reqwest::Client::builder()
         .user_agent(GITHUB_USER_AGENT)
         .connect_timeout(std::time::Duration::from_secs(10))
-        .timeout(std::time::Duration::from_secs(30))
+        .timeout(std::time::Duration::from_secs(30));
+    let client = driven_tls::apply_custom_ca(builder, ca)
+        .map_err(|e| {
+            CommandError::with_code(
+                ErrorCode::InternalBug,
+                format!("custom root CA could not be applied: {e}"),
+            )
+        })?
         .build()
         .map_err(|e| {
             CommandError::with_code(ErrorCode::InternalBug, format!("build http client: {e}"))
@@ -2298,6 +2389,8 @@ fn default_global() -> GlobalSettings {
         hook_timeout_secs: 60,
         metered_mode: "pause".to_string(),
         metered_bandwidth_cap_mbps: None,
+        // Issue #34: system trust only by default (no custom corporate CA).
+        custom_root_ca_path: None,
     }
 }
 
@@ -3302,6 +3395,87 @@ mod tests {
         assert_eq!(err.code, ErrorCode::InvalidInput);
         let err = check_locale("").expect_err("an empty locale is rejected");
         assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    // A single self-signed test CA (RSA-2048, CN "Driven Test CA 1"), embedded so
+    // the custom-CA settings tests need no runtime cert generation.
+    const TEST_CA_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIDFzCCAf+gAwIBAgIUB5Q41gPo/wu/gcL39WRKnSuXLUYwDQYJKoZIhvcNAQEL\n",
+        "BQAwGzEZMBcGA1UEAwwQRHJpdmVuIFRlc3QgQ0EgMTAeFw0yNjA3MjAxNTQ4NTFa\n",
+        "Fw0zNjA3MTcxNTQ4NTFaMBsxGTAXBgNVBAMMEERyaXZlbiBUZXN0IENBIDEwggEi\n",
+        "MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDwFFtyR6a9TV01KCQVU68OlKGf\n",
+        "YRiXaY+YWc6q0jql65FD7934nEBPNXaDEc/zsxUWqsioyW81gzgbK/RrE98cgSQC\n",
+        "tm5fsMPvL8H6nhKQHMuJwBgo4LawGsLqZR2uvICTOPDFw3f7J+/INgNDpJQ+LgOb\n",
+        "QqQtjcyHRFcRqhoWspOAdmc5NGKQ5eZxIAxvdK6P5wzbXUoW5xPi6TOLWeuQAn90\n",
+        "Bai+mZ0TfnxMauvfC5Mf96K9Y/CRkulRqnddT1KVbmeMhv2ilcOd20rVRu5mq9tb\n",
+        "FHmFfsCnbxs0JZA3OC0Fd6lCGgXR4yXxQZWH97WAzZOWVzYE9igGRZ/S38U9AgMB\n",
+        "AAGjUzBRMB0GA1UdDgQWBBR/xbCt2uzNY9bEXNd4nydqypUveDAfBgNVHSMEGDAW\n",
+        "gBR/xbCt2uzNY9bEXNd4nydqypUveDAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3\n",
+        "DQEBCwUAA4IBAQAK1E2Kewr22T/UvhppVdzEtzHFMi4psji31MlA2PfRVR5vhUFz\n",
+        "rAaZIBjG7E/3i+LeEKXJd6MZZ6+e0HFo+IGHSEMCLi9DvA+uAQhBflFI8uDBX8rb\n",
+        "ewjWzBB4j9JElIuVvUUlhzuWV9DfMGwWyX+8lpnVmpU5vjbb4C0/uSelu6EdoMYE\n",
+        "diyL/TNANqgBb+0vuAdO8ua5FPMjerNyIUSZSli9xxaHv82XJC+poD11nwBo8Tsh\n",
+        "s5w3VBWjhX/HCnoyVqioMbagxiBz4FzWoJPQjNnDb5LlMmFzGrHSekuem1D9Ol2P\n",
+        "TcSAr7WHM8cnvHrbKpGrZGfuL9wI7cnaDPSd\n",
+        "-----END CERTIFICATE-----\n",
+    );
+
+    #[test]
+    fn normalize_ca_path_treats_blank_as_none() {
+        // Issue #34: blank / whitespace = system trust only; a real path survives.
+        assert_eq!(normalize_ca_path(None), None);
+        assert_eq!(normalize_ca_path(Some(PathBuf::from(""))), None);
+        assert_eq!(normalize_ca_path(Some(PathBuf::from("   "))), None);
+        assert_eq!(
+            normalize_ca_path(Some(PathBuf::from("/etc/corp/ca.pem"))),
+            Some(PathBuf::from("/etc/corp/ca.pem"))
+        );
+    }
+
+    #[test]
+    fn global_serde_defaults_custom_ca_to_none_for_a_pre_field_blob() {
+        // Issue #34: a `global` blob persisted BEFORE the custom_root_ca_path
+        // field (no such key) must still deserialise, defaulting to None (system
+        // trust only) - not error.
+        let mut value =
+            serde_json::to_value(storage::Global::from(default_global())).expect("serialize");
+        value
+            .as_object_mut()
+            .expect("object")
+            .remove("custom_root_ca_path");
+        let restored: storage::Global =
+            serde_json::from_value(value).expect("pre-field blob deserialises");
+        assert_eq!(restored.custom_root_ca_path, None);
+    }
+
+    #[tokio::test]
+    async fn validate_custom_ca_reports_count_and_rejects_bad_input() {
+        // Issue #34: the settings-UI validation command reports the cert count on
+        // a good PEM and the stable invalid-input code on a blank / garbage path.
+        let dir = std::env::temp_dir().join(format!("driven-ca-cmd-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk tmp dir");
+        let good = dir.join("ca.pem");
+        std::fs::write(&good, TEST_CA_PEM).expect("write good pem");
+        let garbage = dir.join("garbage.pem");
+        std::fs::write(&garbage, b"not a certificate at all\n").expect("write garbage");
+
+        let ok = validate_custom_ca(good.to_string_lossy().into_owned())
+            .await
+            .expect("a valid PEM validates");
+        assert_eq!(ok.cert_count, 1);
+
+        let blank = validate_custom_ca("   ".to_string())
+            .await
+            .expect_err("blank path rejected");
+        assert_eq!(blank.code, ErrorCode::InvalidInput);
+
+        let bad = validate_custom_ca(garbage.to_string_lossy().into_owned())
+            .await
+            .expect_err("garbage rejected");
+        assert_eq!(bad.code, ErrorCode::InvalidInput);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]

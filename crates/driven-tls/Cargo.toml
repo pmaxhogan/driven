@@ -1,0 +1,19 @@
+[package]
+name = "driven-tls"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven shared custom-root-CA support for every outbound reqwest client (issue #34 corporate CA pinning, DESIGN s5.8.7)"
+publish = false
+
+[dependencies]
+# The one shared helper that threads a user-configured corporate / TLS-inspection
+# root CA into every workspace HTTP client. It depends ONLY on reqwest (for the
+# `ClientBuilder` / `Certificate` types it operates on) + thiserror, so it is a
+# leaf that sits BELOW the three HTTP-using crates (driven-net, driven-drive,
+# src-tauri) with no dependency cycle. `driven-drive` is itself a leaf that
+# `driven-core` depends on, so no pre-existing crate could host this helper.
+reqwest.workspace = true
+thiserror.workspace = true

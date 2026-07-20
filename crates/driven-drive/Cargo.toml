@@ -29,6 +29,10 @@ uuid.workspace = true
 oauth2.workspace = true
 keyring.workspace = true
 reqwest.workspace = true
+# Issue #34 corporate CA pinning: threads a user-configured custom root CA into
+# the Drive metadata/stream clients, the OAuth refresh client, and the PKCE
+# consent-exchange client (additive; see driven-tls).
+driven-tls = { path = "../driven-tls" }
 url.workspace = true
 hex.workspace = true
 # Direct deps (not yet in workspace.dependencies). parking_lot for an

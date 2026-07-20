@@ -47,6 +47,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use driven_core::network::{Backend, ProbeOutcome, ServiceName};
+use driven_tls::CustomCaConfig;
 
 /// Tracing target for the production network backend.
 const TARGET: &str = "driven::net::backend";
@@ -167,6 +168,10 @@ pub struct ReqwestBackend {
     /// debug level exactly ONCE (not per-probe) on a host whose native API is
     /// permanently unavailable (e.g. no NetworkManager).
     native_fallback_logged: AtomicBool,
+    /// Issue #34: the user-configured custom root CA (if any), retained so a
+    /// [`Self::drop_pool`] rebuild re-applies the SAME additive trust as the
+    /// original client build. Empty (`None`) = system trust only.
+    ca: CustomCaConfig,
 }
 
 impl ReqwestBackend {
@@ -176,15 +181,22 @@ impl ReqwestBackend {
     /// DNS re-resolution uses `tokio::net::lookup_host` directly (DESIGN
     /// s5.8.1), so there is no resolver object to build.
     ///
-    /// Returns an error if a client (TLS backend init) cannot be constructed.
-    pub fn new() -> anyhow::Result<Self> {
-        let captive = build_captive_client()?;
-        let drive = build_service_client(ServiceName::Drive)?;
-        let update_endpoint = build_service_client(ServiceName::UpdateEndpoint)?;
-        let github = build_service_client(ServiceName::Github)?;
+    /// `ca` is the user-configured custom root CA (issue #34): additive on top of
+    /// the OS/enterprise trust store, retained for pool rebuilds. Pass
+    /// [`CustomCaConfig::none`] for system trust only.
+    ///
+    /// Returns an error if a client (TLS backend init) cannot be constructed, or
+    /// if a configured custom CA is missing / unreadable / unparseable
+    /// (fail-closed: the backend is not built with a silently-ignored CA).
+    pub fn new(ca: CustomCaConfig) -> anyhow::Result<Self> {
+        let captive = build_captive_client(&ca)?;
+        let drive = build_service_client(ServiceName::Drive, &ca)?;
+        let update_endpoint = build_service_client(ServiceName::UpdateEndpoint, &ca)?;
+        let github = build_service_client(ServiceName::Github, &ca)?;
 
         tracing::debug!(
             target: TARGET,
+            custom_ca = ca.is_enabled(),
             "ReqwestBackend constructed (per-service clients + lookup_host DNS probe)"
         );
 
@@ -194,6 +206,7 @@ impl ReqwestBackend {
             update_endpoint: Mutex::new(update_endpoint),
             github: Mutex::new(github),
             native_fallback_logged: AtomicBool::new(false),
+            ca,
         })
     }
 
@@ -492,7 +505,7 @@ impl Backend for ReqwestBackend {
             // Telemetry has no pooled client; nothing to drop.
             return;
         };
-        match build_service_client(service) {
+        match build_service_client(service, &self.ca) {
             Ok(fresh) => {
                 *Self::lock(slot) = fresh;
                 tracing::info!(
@@ -517,24 +530,30 @@ impl Backend for ReqwestBackend {
 }
 
 /// Builds the redirect-disabled captive-portal probe client (DESIGN s5.8.4
-/// captive row: 3s connect / 5s total).
-fn build_captive_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
+/// captive row: 3s connect / 5s total). `ca` adds the user's custom root CA
+/// (issue #34) additively; fail-closed if a configured CA cannot be loaded.
+fn build_captive_client(ca: &CustomCaConfig) -> anyhow::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         // Observe a portal's 30x rather than follow it (DESIGN s5.8.1).
         .redirect(reqwest::redirect::Policy::none())
         .connect_timeout(PROBE_CONNECT_TIMEOUT)
         .timeout(CAPTIVE_TOTAL_TIMEOUT)
         .pool_max_idle_per_host(POOL_MAX_IDLE_PER_HOST)
-        .pool_idle_timeout(POOL_IDLE_TIMEOUT)
-        // Honour HTTP(S)_PROXY (DESIGN s5.8.7): do NOT call .no_proxy().
+        .pool_idle_timeout(POOL_IDLE_TIMEOUT);
+    // Honour HTTP(S)_PROXY (DESIGN s5.8.7): do NOT call .no_proxy().
+    driven_tls::apply_custom_ca(builder, ca)?
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build captive-probe reqwest client: {e}"))
 }
 
 /// Builds a per-service probe client with that service's DESIGN s5.8.4
-/// timeouts and the s5.8.5 pool hygiene baked in.
-fn build_service_client(service: ServiceName) -> anyhow::Result<reqwest::Client> {
+/// timeouts and the s5.8.5 pool hygiene baked in. `ca` adds the user's custom
+/// root CA (issue #34) additively; fail-closed if it cannot be loaded.
+fn build_service_client(
+    service: ServiceName,
+    ca: &CustomCaConfig,
+) -> anyhow::Result<reqwest::Client> {
     let (total, idle) = match service {
         ServiceName::Drive => (DRIVE_TOTAL_TIMEOUT, DRIVE_IDLE_TIMEOUT),
         ServiceName::UpdateEndpoint => (UPDATE_TOTAL_TIMEOUT, UPDATE_IDLE_TIMEOUT),
@@ -545,7 +564,7 @@ fn build_service_client(service: ServiceName) -> anyhow::Result<reqwest::Client>
         ServiceName::Telemetry => (UPDATE_TOTAL_TIMEOUT, UPDATE_IDLE_TIMEOUT),
     };
 
-    reqwest::Client::builder()
+    let builder = reqwest::Client::builder()
         .user_agent(USER_AGENT)
         .connect_timeout(SERVICE_CONNECT_TIMEOUT)
         // Total request cap (DESIGN s5.8.4). Probes are small metadata calls,
@@ -562,8 +581,9 @@ fn build_service_client(service: ServiceName) -> anyhow::Result<reqwest::Client>
         // We negotiate h2 via ALPN over TLS (do NOT force prior-knowledge,
         // which would break non-TLS / ALPN-less peers); adaptive window keeps
         // a single h2 connection from head-of-line-stalling large transfers.
-        .http2_adaptive_window(true)
-        // Honour HTTP(S)_PROXY (DESIGN s5.8.7): do NOT call .no_proxy().
+        .http2_adaptive_window(true);
+    // Honour HTTP(S)_PROXY (DESIGN s5.8.7): do NOT call .no_proxy().
+    driven_tls::apply_custom_ca(builder, ca)?
         .build()
         .map_err(|e| anyhow::anyhow!("failed to build {service:?} probe reqwest client: {e}"))
 }
@@ -588,7 +608,7 @@ mod tests {
     // touches the network. This is a real assertion, not a skip.
     #[test]
     fn backend_constructs_offline() {
-        let backend = ReqwestBackend::new();
+        let backend = ReqwestBackend::new(CustomCaConfig::none());
         assert!(
             backend.is_ok(),
             "ReqwestBackend::new must succeed without network: {:?}",
@@ -596,11 +616,37 @@ mod tests {
         );
     }
 
+    #[test]
+    fn backend_fails_closed_with_a_bad_custom_ca() {
+        // Issue #34: a configured-but-missing custom CA must fail the backend
+        // build (fail-closed) - both the captive and per-service build fns
+        // propagate the driven-tls error rather than silently dropping the CA.
+        let bad =
+            CustomCaConfig::from_path(Some(std::path::PathBuf::from("/driven/no/such/net-ca.pem")));
+        assert!(
+            ReqwestBackend::new(bad.clone()).is_err(),
+            "a missing custom CA must fail the probe-backend build"
+        );
+        assert!(build_captive_client(&bad).is_err());
+        assert!(build_service_client(ServiceName::Drive, &bad).is_err());
+    }
+
+    #[tokio::test]
+    async fn drop_pool_rebuilds_the_service_client_with_the_stored_ca() {
+        // Issue #34: a pool teardown rebuilds the client re-applying the SAME CA
+        // (here `none`, offline) - it must not panic or drop the client.
+        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
+        backend.drop_pool(ServiceName::Drive).await;
+        // Telemetry has no pooled client; drop is a no-op (early-return covered).
+        backend.drop_pool(ServiceName::Telemetry).await;
+        assert!(backend.service_client(ServiceName::Drive).is_some());
+    }
+
     // --- per-service client mapping covers exactly the probed services ---
 
     #[test]
     fn telemetry_has_no_probe_client() {
-        let backend = ReqwestBackend::new().expect("construct backend");
+        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
         assert!(backend.service_client(ServiceName::Telemetry).is_none());
         assert!(backend.service_client(ServiceName::Drive).is_some());
         assert!(backend
@@ -620,7 +666,7 @@ mod tests {
     // native/fallback boundary.
     #[tokio::test]
     async fn os_online_is_total() {
-        let backend = ReqwestBackend::new().expect("construct backend");
+        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
         let _: bool = backend.os_online().await;
     }
 
@@ -651,7 +697,7 @@ mod tests {
     // offline-safe test.
     #[tokio::test]
     async fn resolve_invalid_tld_is_dns_failed_and_bounded() {
-        let backend = ReqwestBackend::new().expect("construct backend");
+        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
         let started = std::time::Instant::now();
         let outcome = backend.resolve("driven-net-nonexistent.invalid").await;
         let elapsed = started.elapsed();
@@ -672,7 +718,7 @@ mod tests {
     // switch.
     #[tokio::test]
     async fn resolve_localhost_succeeds() {
-        let backend = ReqwestBackend::new().expect("construct backend");
+        let backend = ReqwestBackend::new(CustomCaConfig::none()).expect("construct backend");
         let outcome = backend.resolve("localhost").await;
         assert_eq!(outcome, Ok(()), "localhost must resolve via lookup_host");
     }

@@ -33,6 +33,7 @@ use driven_drive::google::oauth::{run_pkce_loopback_flow, OAuthProgress};
 use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
 use driven_drive::google::{md5_hex, parse_installed_client_config, GoogleDriveStore, UploadBytes};
 use driven_drive::remote_store::{RemoteStore, UploadBody};
+use driven_drive::CustomCaConfig;
 
 /// The public installed-app client id (SPEC s4; M4 brief). Used when neither
 /// `--client-id`, the env var, nor `client_secret.json` supplies one.
@@ -265,6 +266,7 @@ async fn run_auth(args: AuthArgs) -> anyhow::Result<()> {
         &creds.client_secret,
         open_system_browser,
         tx,
+        &cli_custom_ca(),
     )
     .await?;
 
@@ -399,18 +401,50 @@ fn build_store(account: &str, creds: &ClientCreds) -> anyhow::Result<GoogleDrive
             "no refresh token stored for account '{account}'; run `driven-cli auth --account {account}` first"
         )
     })?;
+    let ca = cli_custom_ca();
     let token_source = RefreshingTokenSource::from_stored_refresh_token(
         refresh_token,
         creds.client_id.clone(),
         creds.client_secret.clone(),
+        &ca,
     )?
     .with_store(store);
-    GoogleDriveStore::with_default_clients(token_source)
+    GoogleDriveStore::with_default_clients(token_source, &ca)
+}
+
+/// Issue #34: the dev/e2e CLI reads its custom root CA (if any) from the
+/// `DRIVEN_CUSTOM_CA_PATH` env var so it can run behind the same corporate
+/// TLS-inspecting proxy the desktop app supports via its settings. Unset =
+/// system trust only (unchanged behaviour).
+fn cli_custom_ca() -> CustomCaConfig {
+    match std::env::var_os("DRIVEN_CUSTOM_CA_PATH") {
+        Some(v) if !v.is_empty() => CustomCaConfig::from_path(Some(PathBuf::from(v))),
+        _ => CustomCaConfig::none(),
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn cli_custom_ca_reads_the_env_var() {
+        // Issue #34: the dev CLI resolves its custom root CA from
+        // DRIVEN_CUSTOM_CA_PATH (unset / blank = system trust only). No other
+        // test touches this env var, so the set/remove here does not race.
+        std::env::remove_var("DRIVEN_CUSTOM_CA_PATH");
+        assert!(!cli_custom_ca().is_enabled(), "unset = system trust only");
+
+        std::env::set_var("DRIVEN_CUSTOM_CA_PATH", "");
+        assert!(!cli_custom_ca().is_enabled(), "blank = system trust only");
+
+        std::env::set_var("DRIVEN_CUSTOM_CA_PATH", "/etc/corp/ca.pem");
+        let ca = cli_custom_ca();
+        assert!(ca.is_enabled());
+        assert_eq!(ca.path(), Some(Path::new("/etc/corp/ca.pem")));
+
+        std::env::remove_var("DRIVEN_CUSTOM_CA_PATH");
+    }
 
     #[test]
     fn resolve_creds_prefers_explicit_args() {

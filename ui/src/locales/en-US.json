@@ -246,6 +246,14 @@
         "placeholder": "(none)",
         "note": "Commands run in your shell once per backup cycle. A non-zero exit from the before-hook skips that backup. DRIVEN_HOOK, DRIVEN_ACCOUNT_ID, and (for the after-hook) DRIVEN_RESULT are set."
       },
+      "customCa": {
+        "title": "Corporate root certificate",
+        "label": "Custom root CA (PEM file path)",
+        "placeholder": "(none - system trust only)",
+        "note": "For corporate networks that inspect TLS traffic. Point this at a PEM file holding one or more trusted root CA certificates; Driven ADDS them to the operating system's trust store for every outbound connection - it never replaces the built-in roots or disables certificate checks. Applies to new connections after an app restart. Leave blank to trust only the system's roots.",
+        "validCount": "Valid - trusts {count} certificate(s).",
+        "invalid": "Could not read this file as a PEM certificate bundle. Check the path and that the file contains PEM certificate(s)."
+      },
       "schedule": {
         "label": "Only back up during a schedule window",
         "startLabel": "From",

@@ -8,6 +8,7 @@ members = [
     "crates/driven-vss",
     "crates/driven-vss-helper",
     "crates/driven-net",
+    "crates/driven-tls",
     "crates/driven-cli",
     "crates/driven-test-fixtures",
     "crates/driven-chaos",

@@ -85,14 +85,16 @@ fn e2e_creds(test_name: &str) -> Option<E2eCreds> {
 /// child folder id the scenario should operate under (ROADMAP M4: "each test
 /// uses a UUID-named child folder under the dest folder and cleans up").
 async fn setup_store(creds: &E2eCreds) -> (GoogleDriveStore, String) {
+    let ca = driven_drive::CustomCaConfig::none();
     let token_source = RefreshingTokenSource::from_stored_refresh_token(
         creds.refresh_token.clone(),
         creds.client_id.clone(),
         creds.client_secret.clone(),
+        &ca,
     )
     .expect("build refreshing token source");
     let store =
-        GoogleDriveStore::with_default_clients(token_source).expect("build GoogleDriveStore");
+        GoogleDriveStore::with_default_clients(token_source, &ca).expect("build GoogleDriveStore");
 
     // Each test operates inside a fresh UUID-named child folder so concurrent
     // runs never collide and cleanup is a single trash of that subtree

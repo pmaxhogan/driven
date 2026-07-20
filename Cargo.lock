@@ -1367,6 +1367,7 @@ dependencies = [
  "driven-drive",
  "driven-net",
  "driven-power",
+ "driven-tls",
  "driven-vss",
  "driven-vss-helper",
  "dunce",
@@ -1374,6 +1375,7 @@ dependencies = [
  "minisign-verify",
  "os_info",
  "reqwest 0.12.28",
+ "reqwest 0.13.4",
  "rust-i18n",
  "rustix",
  "semver",
@@ -1499,6 +1501,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "driven-tls",
  "futures",
  "hex",
  "keyring",
@@ -1523,6 +1526,7 @@ dependencies = [
  "async-trait",
  "block2",
  "driven-core",
+ "driven-tls",
  "futures",
  "reqwest 0.12.28",
  "thiserror 2.0.19",
@@ -1564,6 +1568,14 @@ dependencies = [
  "tempfile",
  "tokio",
  "tracing",
+]
+
+[[package]]
+name = "driven-tls"
+version = "2.0.1"
+dependencies = [
+ "reqwest 0.12.28",
+ "thiserror 2.0.19",
 ]
 
 [[package]]

@@ -420,6 +420,12 @@ pub struct GlobalSettings {
     /// Bandwidth cap (Mbps) used while metered in `throttle` mode; `null`
     /// falls back to `bandwidthCapMbps`.
     pub metered_bandwidth_cap_mbps: Option<u32>,
+    /// Issue #34 (DESIGN s5.8.7): path to a PEM file holding one or more custom
+    /// root CA certificates to ADD to the system trust store for ALL outbound
+    /// connections (corporate / TLS-inspection environments). `null` = system
+    /// trust only (the default). Additive - it never replaces the OS roots and
+    /// never disables verification.
+    pub custom_root_ca_path: Option<PathBuf>,
 }
 
 /// V2 schedule-window settings (DESIGN s17). Mirrors
@@ -596,6 +602,11 @@ pub struct GlobalSettingsPatch {
     /// `null` = `Some(None)` clears it.
     #[serde(default, deserialize_with = "double_option")]
     pub metered_bandwidth_cap_mbps: Option<Option<u32>>,
+    /// See [`GlobalSettings::custom_root_ca_path`]. `double_option`: `null` =
+    /// `Some(None)` clears it (back to system-trust-only); an absent key leaves
+    /// it unchanged.
+    #[serde(default, deserialize_with = "double_option")]
+    pub custom_root_ca_path: Option<Option<PathBuf>>,
 }
 
 /// Partial SPEC s22 `telemetry` settings.
@@ -636,6 +647,16 @@ pub struct WindowsSettingsPatch {
     pub vss_mode: Option<String>,
     /// See [`WindowsSettings::vss_helper`].
     pub vss_helper: Option<bool>,
+}
+
+/// Issue #34: the result of validating a candidate custom-root-CA PEM file for
+/// the settings UI. Returned by `validate_custom_ca`; a parse/read failure
+/// surfaces as a `CommandError` instead.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CustomCaValidation {
+    /// The number of certificates parsed from the PEM bundle (>= 1 on success).
+    pub cert_count: u32,
 }
 
 /// An available update surfaced by `check_for_updates` (SPEC s11.6

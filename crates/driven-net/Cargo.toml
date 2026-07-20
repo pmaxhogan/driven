@@ -13,6 +13,9 @@ publish = false
 # implements lives in driven-core::network (CODEX_NOTES P2-9: this is the
 # production "implementer crate" behind that seam).
 driven-core = { path = "../driven-core" }
+# Issue #34 corporate CA pinning: threads a user-configured custom root CA into
+# the captive-portal + per-service probe clients (additive; see driven-tls).
+driven-tls = { path = "../driven-tls" }
 anyhow.workspace = true
 thiserror.workspace = true
 tracing.workspace = true

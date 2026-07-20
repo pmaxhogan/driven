@@ -191,6 +191,7 @@ async fn write_channel(state: &dyn StateRepo, channel: Channel) -> CommandResult
 fn build_updater(
     app: &AppHandle,
     channel: Channel,
+    ca_certs: Vec<reqwest_updater::Certificate>,
 ) -> CommandResult<tauri_plugin_updater::Updater> {
     let url = channel.endpoint_url().parse::<tauri::Url>().map_err(|e| {
         CommandError::with_code(
@@ -201,21 +202,70 @@ fn build_updater(
             ),
         )
     })?;
-    app.updater_builder()
-        .endpoints(vec![url])
-        .map_err(|e| {
-            CommandError::with_code(
-                ErrorCode::UpdateEndpointUnreachable,
-                format!("could not set update endpoint: {e}"),
-            )
-        })?
-        .build()
-        .map_err(|e| {
-            CommandError::with_code(
-                ErrorCode::UpdateEndpointUnreachable,
-                format!("could not build updater: {e}"),
-            )
-        })
+    let mut builder = app.updater_builder().endpoints(vec![url]).map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::UpdateEndpointUnreachable,
+            format!("could not set update endpoint: {e}"),
+        )
+    })?;
+    // Issue #34: add the user's custom root CA to the plugin's OWN download
+    // client (the signed-manifest + binary fetch). `configure_client` is
+    // infallible, so the fallible PEM load already happened in `run_check` (fail-
+    // closed); here we only add the pre-parsed certs. ADDITIVE - reqwest 0.13
+    // routes `add_root_certificate` through
+    // `rustls_platform_verifier::Verifier::new_with_extra_roots(extra, platform)`
+    // (reqwest-0.13 async_impl/client.rs), i.e. the OS/enterprise platform roots
+    // PLUS our extra roots; the built-in roots are never disabled and TLS
+    // verification is never bypassed (the plugin does not call `tls_certs_only`).
+    if !ca_certs.is_empty() {
+        builder = builder.configure_client(move |client_builder| {
+            let mut cb = client_builder;
+            for cert in &ca_certs {
+                cb = cb.add_root_certificate(cert.clone());
+            }
+            cb
+        });
+    }
+    builder.build().map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::UpdateEndpointUnreachable,
+            format!("could not build updater: {e}"),
+        )
+    })
+}
+
+/// Issue #34: parse the configured custom root CA into reqwest-**0.13**
+/// certificates for the updater plugin's client (fail-closed). The workspace +
+/// `driven-tls` are on reqwest 0.12, but `tauri-plugin-updater` is on 0.13, so
+/// the plugin's `add_root_certificate` needs a 0.13 `Certificate` - we re-parse
+/// the same PEM here rather than mixing incompatible reqwest types. Returns an
+/// empty Vec when no CA is configured (the plugin keeps its default trust).
+fn load_updater_ca_certs(
+    ca: &driven_tls::CustomCaConfig,
+) -> CommandResult<Vec<reqwest_updater::Certificate>> {
+    let Some(path) = ca.path() else {
+        return Ok(Vec::new());
+    };
+    let pem = std::fs::read(path).map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::UpdateEndpointUnreachable,
+            format!("custom root CA file could not be read for the updater: {e}"),
+        )
+    })?;
+    let certs = reqwest_updater::Certificate::from_pem_bundle(&pem).map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::UpdateEndpointUnreachable,
+            format!("custom root CA file is not valid PEM for the updater: {e}"),
+        )
+    })?;
+    if certs.is_empty() {
+        // Fail closed: a configured CA that trusts nothing is a config error.
+        return Err(CommandError::with_code(
+            ErrorCode::UpdateEndpointUnreachable,
+            "custom root CA file contained no certificates".to_string(),
+        ));
+    }
+    Ok(certs)
 }
 
 // ---------------------------------------------------------------------------
@@ -403,7 +453,18 @@ async fn run_check(
     app: &AppHandle,
     channel: Channel,
 ) -> CommandResult<(CheckOutcome, Option<tauri_plugin_updater::Update>)> {
-    let updater = build_updater(app, channel)?;
+    // Issue #34: resolve + parse the custom root CA (fail-closed) so the plugin's
+    // download client trusts a corporate TLS-inspection CA.
+    let ca_certs = match app.try_state::<AppState>() {
+        Some(state) => {
+            let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
+                .await
+                .unwrap_or_default();
+            load_updater_ca_certs(&ca)?
+        }
+        None => Vec::new(),
+    };
+    let updater = build_updater(app, channel, ca_certs)?;
     let result = updater.check().await.map_err(|e| {
         CommandError::with_code(
             ErrorCode::UpdateEndpointUnreachable,
@@ -1087,5 +1148,59 @@ mod tests {
         });
         assert!(emitted.borrow().is_empty());
         assert!(returned.is_none());
+    }
+
+    // A single self-signed test CA (RSA-2048, CN "Driven Test CA 1").
+    const TEST_CA_PEM: &str = concat!(
+        "-----BEGIN CERTIFICATE-----\n",
+        "MIIDFzCCAf+gAwIBAgIUB5Q41gPo/wu/gcL39WRKnSuXLUYwDQYJKoZIhvcNAQEL\n",
+        "BQAwGzEZMBcGA1UEAwwQRHJpdmVuIFRlc3QgQ0EgMTAeFw0yNjA3MjAxNTQ4NTFa\n",
+        "Fw0zNjA3MTcxNTQ4NTFaMBsxGTAXBgNVBAMMEERyaXZlbiBUZXN0IENBIDEwggEi\n",
+        "MA0GCSqGSIb3DQEBAQUAA4IBDwAwggEKAoIBAQDwFFtyR6a9TV01KCQVU68OlKGf\n",
+        "YRiXaY+YWc6q0jql65FD7934nEBPNXaDEc/zsxUWqsioyW81gzgbK/RrE98cgSQC\n",
+        "tm5fsMPvL8H6nhKQHMuJwBgo4LawGsLqZR2uvICTOPDFw3f7J+/INgNDpJQ+LgOb\n",
+        "QqQtjcyHRFcRqhoWspOAdmc5NGKQ5eZxIAxvdK6P5wzbXUoW5xPi6TOLWeuQAn90\n",
+        "Bai+mZ0TfnxMauvfC5Mf96K9Y/CRkulRqnddT1KVbmeMhv2ilcOd20rVRu5mq9tb\n",
+        "FHmFfsCnbxs0JZA3OC0Fd6lCGgXR4yXxQZWH97WAzZOWVzYE9igGRZ/S38U9AgMB\n",
+        "AAGjUzBRMB0GA1UdDgQWBBR/xbCt2uzNY9bEXNd4nydqypUveDAfBgNVHSMEGDAW\n",
+        "gBR/xbCt2uzNY9bEXNd4nydqypUveDAPBgNVHRMBAf8EBTADAQH/MA0GCSqGSIb3\n",
+        "DQEBCwUAA4IBAQAK1E2Kewr22T/UvhppVdzEtzHFMi4psji31MlA2PfRVR5vhUFz\n",
+        "rAaZIBjG7E/3i+LeEKXJd6MZZ6+e0HFo+IGHSEMCLi9DvA+uAQhBflFI8uDBX8rb\n",
+        "ewjWzBB4j9JElIuVvUUlhzuWV9DfMGwWyX+8lpnVmpU5vjbb4C0/uSelu6EdoMYE\n",
+        "diyL/TNANqgBb+0vuAdO8ua5FPMjerNyIUSZSli9xxaHv82XJC+poD11nwBo8Tsh\n",
+        "s5w3VBWjhX/HCnoyVqioMbagxiBz4FzWoJPQjNnDb5LlMmFzGrHSekuem1D9Ol2P\n",
+        "TcSAr7WHM8cnvHrbKpGrZGfuL9wI7cnaDPSd\n",
+        "-----END CERTIFICATE-----\n",
+    );
+
+    #[test]
+    fn load_updater_ca_certs_covers_none_valid_and_bad() {
+        // Issue #34: the updater's reqwest-0.13 CA parse. `None` -> no certs (the
+        // plugin keeps its default trust); a valid PEM -> the certs; a garbage /
+        // missing file -> fail-closed error (mapped to the update error code).
+        assert!(load_updater_ca_certs(&driven_tls::CustomCaConfig::none())
+            .expect("none is ok")
+            .is_empty());
+
+        let dir = std::env::temp_dir().join(format!("driven-updater-ca-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).expect("mk dir");
+        let good = dir.join("ca.pem");
+        std::fs::write(&good, TEST_CA_PEM).expect("write pem");
+        let certs = load_updater_ca_certs(&driven_tls::CustomCaConfig::from_path(Some(good)))
+            .expect("valid pem parses");
+        assert_eq!(certs.len(), 1);
+
+        let garbage = dir.join("garbage.pem");
+        std::fs::write(&garbage, b"not a cert\n").expect("write garbage");
+        let err = load_updater_ca_certs(&driven_tls::CustomCaConfig::from_path(Some(garbage)))
+            .expect_err("garbage fails closed");
+        assert_eq!(err.code, ErrorCode::UpdateEndpointUnreachable);
+
+        let missing = dir.join("nope.pem");
+        let err = load_updater_ca_certs(&driven_tls::CustomCaConfig::from_path(Some(missing)))
+            .expect_err("missing fails closed");
+        assert_eq!(err.code, ErrorCode::UpdateEndpointUnreachable);
+
+        let _ = std::fs::remove_dir_all(&dir);
     }
 }

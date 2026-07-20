@@ -49,6 +49,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use driven_tls::CustomCaConfig;
 use futures::Stream;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -532,12 +533,14 @@ impl GoogleDriveStore {
     /// flows over (the caller builds it with the DESIGN s5.8.4 metadata
     /// timeouts). A second, no-overall-timeout streaming client is derived
     /// for the resumable chunk PUT + download paths.
-    pub fn new(http: reqwest::Client, tokens: RefreshingTokenSource) -> Self {
+    pub fn new(http: reqwest::Client, tokens: RefreshingTokenSource, ca: &CustomCaConfig) -> Self {
         let _ = TARGET;
-        // The streaming client mirrors `http`'s TLS/proxy config but drops
-        // the overall request cap; if the dedicated build fails we fall back
-        // to the provided client (correctness over a missing idle timeout).
-        let http_stream = build_stream_client().unwrap_or_else(|e| {
+        // The streaming client mirrors `http`'s TLS/proxy config (including the
+        // issue #34 custom root CA via `ca`) but drops the overall request cap;
+        // if the dedicated build fails we fall back to the provided client
+        // (correctness over a missing idle timeout - `http` already carries the
+        // same additive CA trust).
+        let http_stream = build_stream_client(ca).unwrap_or_else(|e| {
             warn!(
                 target: TARGET,
                 error = %e,
@@ -557,9 +560,12 @@ impl GoogleDriveStore {
     /// clients (DESIGN s5.8.4 timeouts) from a [`RefreshingTokenSource`].
     /// Convenience for the CLI / e2e paths that do not already hold a tuned
     /// client.
-    pub fn with_default_clients(tokens: RefreshingTokenSource) -> anyhow::Result<Self> {
-        let http = build_meta_client()?;
-        let http_stream = build_stream_client()?;
+    pub fn with_default_clients(
+        tokens: RefreshingTokenSource,
+        ca: &CustomCaConfig,
+    ) -> anyhow::Result<Self> {
+        let http = build_meta_client(ca)?;
+        let http_stream = build_stream_client(ca)?;
         Ok(Self {
             http,
             http_stream,
@@ -1621,26 +1627,31 @@ impl GoogleDriveStore {
 // Free helpers.
 // ---------------------------------------------------------------------------
 
-/// Builds the metadata Drive client with the DESIGN s5.8.4 timeouts.
-pub(crate) fn build_meta_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
+/// Builds the metadata Drive client with the DESIGN s5.8.4 timeouts. `ca` adds
+/// the user's custom root CA (issue #34) additively; fail-closed if it cannot be
+/// loaded.
+pub(crate) fn build_meta_client(ca: &CustomCaConfig) -> anyhow::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(META_TOTAL_TIMEOUT)
         .read_timeout(STREAM_IDLE_TIMEOUT)
         .pool_max_idle_per_host(4)
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(90));
+    driven_tls::apply_custom_ca(builder, ca)?
         .build()
         .map_err(|e| anyhow::anyhow!("drive: failed to build metadata client: {e}"))
 }
 
 /// Builds the streaming Drive client (resumable chunk PUT + download): no
 /// overall request cap, only the per-byte idle timeout (DESIGN s5.8.4 `*`).
-pub(crate) fn build_stream_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
+/// `ca` adds the user's custom root CA (issue #34) additively; fail-closed.
+pub(crate) fn build_stream_client(ca: &CustomCaConfig) -> anyhow::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(STREAM_IDLE_TIMEOUT)
         .pool_max_idle_per_host(4)
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(90));
+    driven_tls::apply_custom_ca(builder, ca)?
         .build()
         .map_err(|e| anyhow::anyhow!("drive: failed to build streaming client: {e}"))
 }
@@ -1860,6 +1871,47 @@ pub(crate) fn clone_kind(kind: &ResumableKind) -> ResumableKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    #[test]
+    fn google_store_new_builds_a_stream_client_with_the_ca() {
+        // Issue #34: `GoogleDriveStore::new` derives its streaming client via
+        // `build_stream_client(ca)` (here `none`, offline). Covers the ctor +
+        // stream-client build path without a network/keychain dependency.
+        let tokens = crate::google::oauth::Tokens {
+            access_token: String::new(),
+            refresh_token: "rt".to_string(),
+            expires_at: 0,
+        };
+        let http = build_meta_client(&CustomCaConfig::none()).expect("meta client");
+        let source = RefreshingTokenSource::new(tokens, http, "cid", "secret");
+        let store = GoogleDriveStore::new(
+            build_meta_client(&CustomCaConfig::none()).expect("meta client"),
+            source,
+            &CustomCaConfig::none(),
+        );
+        // The streaming client is a distinct, usable handle (no panic on build).
+        let _ = store.http_stream();
+    }
+
+    #[test]
+    fn drive_clients_apply_custom_ca_fail_closed() {
+        // Issue #34: the Drive metadata + stream clients add the custom CA
+        // additively and fail closed on a bad one; `None` builds normally.
+        let none = CustomCaConfig::none();
+        assert!(build_meta_client(&none).is_ok(), "no-CA meta client builds");
+        assert!(
+            build_stream_client(&none).is_ok(),
+            "no-CA stream client builds"
+        );
+        let bad = CustomCaConfig::from_path(Some(std::path::PathBuf::from(
+            "/driven/no/such/drive-ca.pem",
+        )));
+        assert!(build_meta_client(&bad).is_err(), "bad CA fails meta build");
+        assert!(
+            build_stream_client(&bad).is_err(),
+            "bad CA fails stream build"
+        );
+    }
 
     #[test]
     fn rfc3339_parses_to_unix_ms() {

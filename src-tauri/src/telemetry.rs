@@ -553,16 +553,31 @@ pub trait TelemetrySink: Send + Sync {
 /// (the caller logs + swallows it). Builds its own client (the workspace
 /// `reqwest` is rustls-only; no `json` feature, so the body is serialized
 /// manually like the GitHub-releases client in settings.rs).
-pub struct HttpTelemetrySink;
+pub struct HttpTelemetrySink {
+    /// Issue #34: the custom root CA (resolved once at task spawn) added to every
+    /// telemetry POST client. Empty = system trust only.
+    ca: driven_tls::CustomCaConfig,
+}
+
+impl HttpTelemetrySink {
+    /// Build the sink with the resolved custom-CA config (issue #34).
+    #[must_use]
+    pub fn new(ca: driven_tls::CustomCaConfig) -> Self {
+        Self { ca }
+    }
+}
 
 #[async_trait]
 impl TelemetrySink for HttpTelemetrySink {
     async fn send(&self, endpoint: &str, payload: &TelemetryPayload) -> anyhow::Result<()> {
         let body = serde_json::to_vec(payload)?;
-        let client = reqwest::Client::builder()
+        // Issue #34: add the user's custom root CA additively (fail-closed - a
+        // bad CA errors here and the best-effort caller swallows it, rather than
+        // sending over a mis-configured trust store).
+        let builder = reqwest::Client::builder()
             .user_agent(concat!("driven-app/", env!("CARGO_PKG_VERSION")))
-            .timeout(SEND_TIMEOUT)
-            .build()?;
+            .timeout(SEND_TIMEOUT);
+        let client = driven_tls::apply_custom_ca(builder, &self.ca)?.build()?;
         let resp = client
             .post(endpoint)
             .header("Content-Type", "application/json")
@@ -763,7 +778,15 @@ pub fn spawn_periodic_ping(app: &AppHandle) {
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(PING_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let sink = HttpTelemetrySink;
+        // Issue #34: resolve the custom root CA once for the process (restart to
+        // change), matching the long-lived Drive/network clients.
+        let ca = match app_handle.try_state::<AppState>() {
+            Some(st) => crate::commands::settings::load_custom_ca_config(st.state().as_ref())
+                .await
+                .unwrap_or_default(),
+            None => driven_tls::CustomCaConfig::none(),
+        };
+        let sink = HttpTelemetrySink::new(ca);
         loop {
             tokio::select! {
                 biased;
@@ -1817,5 +1840,37 @@ mod tests {
             .unwrap();
         assert!(reservoir.is_enabled(), "capture gate flipped back on");
         cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn http_sink_fails_closed_on_a_bad_custom_ca() {
+        // Issue #34: a configured-but-unloadable custom CA fails the telemetry
+        // send CLOSED - `apply_custom_ca` errors at client build, BEFORE any POST,
+        // so this needs no server (the error is the CA load, not the network).
+        let aggregate = driven_core::state::TelemetryAggregate {
+            files_uploaded: 0,
+            bytes_uploaded: 0,
+            errors_by_class: vec![],
+            deep_verify_runs: 0,
+            update_applied: 0,
+        };
+        let payload = build_payload(
+            "00000000-0000-4000-8000-000000000000".to_string(),
+            1_700_000_000_000,
+            "0.1.0".to_string(),
+            "stable".to_string(),
+            None,
+            aggregate,
+            LatencyP50P95::default(),
+        );
+        let bad_ca = driven_tls::CustomCaConfig::from_path(Some(std::path::PathBuf::from(
+            "/driven/no/such/telemetry-ca.pem",
+        )));
+        let sink = HttpTelemetrySink::new(bad_ca);
+        let result = sink.send("http://127.0.0.1:1/telemetry", &payload).await;
+        assert!(
+            result.is_err(),
+            "a bad custom CA must fail the telemetry send closed (no silent send)"
+        );
     }
 }

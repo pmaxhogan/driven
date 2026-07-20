@@ -85,6 +85,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       hookTimeoutSecs: 60,
       meteredMode: "pause",
       meteredBandwidthCapMbps: null,
+      customRootCaPath: null,
     },
     telemetry: {
       enabled: true,
@@ -1077,6 +1078,99 @@ describe("Settings Rules tab", () => {
     await post.trigger("change");
     await flushPromises();
     expect(lastGlobalPatch("postBackupHook")).toBeNull();
+  });
+
+  it("custom root CA: a valid path validates, shows the cert count, and patches (issue #34)", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "validate_custom_ca") {
+        expect((args as { path: string }).path).toBe("/etc/corp/ca.pem");
+        return Promise.resolve({ certCount: 2 });
+      }
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const input = wrapper.get('[data-testid="custom-ca-path"]');
+    await input.setValue("/etc/corp/ca.pem");
+    await input.trigger("change");
+    await flushPromises();
+
+    // Validated (cert count surfaced) AND persisted.
+    expect(invokeMock).toHaveBeenCalledWith("validate_custom_ca", { path: "/etc/corp/ca.pem" });
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { customRootCaPath: "/etc/corp/ca.pem" } },
+    });
+    const feedback = wrapper.get('[data-testid="custom-ca-feedback"]');
+    expect(feedback.text()).toContain("2");
+  });
+
+  it("custom root CA: an invalid file surfaces an error and is NOT persisted (issue #34)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "validate_custom_ca") {
+        return Promise.reject({ code: "internal.invalid_input", message: "bad pem" });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const input = wrapper.get('[data-testid="custom-ca-path"]');
+    await input.setValue("/etc/corp/broken.pem");
+    await input.trigger("change");
+    await flushPromises();
+
+    // Error feedback shown; the bad path is NOT saved (no update_settings call).
+    expect(wrapper.find('[data-testid="custom-ca-feedback"]').exists()).toBe(true);
+    const savedCa = invokeMock.mock.calls.some((c) => c[0] === "update_settings");
+    expect(savedCa).toBe(false);
+  });
+
+  it("custom root CA: clearing the path patches null (back to system trust) (issue #34)", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(
+          makeSettings({
+            global: { ...makeSettings().global, customRootCaPath: "/etc/corp/ca.pem" },
+          })
+        );
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const input = wrapper.get('[data-testid="custom-ca-path"]');
+    await input.setValue("   ");
+    await input.trigger("change");
+    await flushPromises();
+
+    // A blank path clears the setting (null) WITHOUT calling validate.
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { customRootCaPath: null } },
+    });
+    expect(invokeMock.mock.calls.some((c) => c[0] === "validate_custom_ca")).toBe(false);
   });
 
   it("an empty bandwidth cap patches null (unlimited)", async () => {

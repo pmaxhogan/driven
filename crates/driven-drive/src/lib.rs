@@ -14,3 +14,9 @@
 pub mod fake;
 pub mod google;
 pub mod remote_store;
+
+// Issue #34: re-export the custom-root-CA config type so callers that already
+// depend on `driven-drive` (the CLI, the google_e2e integration test) can name
+// it without a separate `driven-tls` dependency. `apply_custom_ca` /
+// `validate_ca_file` live in `driven_tls` for the crates that build clients.
+pub use driven_tls::CustomCaConfig;
