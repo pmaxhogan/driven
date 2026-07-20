@@ -14,6 +14,7 @@ import type {
   AddAccountWizardSessionId,
   AddSourceRequest,
   AddSourceResult,
+  CustomCaValidation,
   DriveFolderListing,
   ExclusionPreview,
   ExclusionPreviewRequest,
@@ -210,6 +211,12 @@ export function checkForUpdates(): Promise<UpdateInfo | null> {
 
 export function listReleases(page: number): Promise<ReleaseDto[]> {
   return invoke("list_releases", { page });
+}
+
+/** Issue #34: validate a candidate custom root CA PEM file before saving it.
+ * Resolves with the certificate count, or rejects with the parse/read error. */
+export function validateCustomCa(path: string): Promise<CustomCaValidation> {
+  return invoke("validate_custom_ca", { path });
 }
 
 // --- In-app updater (SPEC s15.2; M9a) ---

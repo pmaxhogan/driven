@@ -696,6 +696,11 @@ async fn build_restore_plans(
         .list_sources()
         .await
         .map_err(CommandError::from)?;
+    // Issue #34: resolve the custom root CA once for every restore store the
+    // real-mode download path builds (fail-closed inside the client build).
+    let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
+        .await
+        .unwrap_or_default();
     for r in resolved {
         let source = sources
             .iter()
@@ -710,7 +715,7 @@ async fn build_restore_plans(
         let store = match store_cache.get(&account_id) {
             Some(s) => s.clone(),
             None => {
-                let s = crate::commands::sources::build_restore_store(state, account_id)?;
+                let s = crate::commands::sources::build_restore_store(state, account_id, &ca)?;
                 store_cache.insert(account_id, s.clone());
                 s
             }

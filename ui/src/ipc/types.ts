@@ -197,6 +197,11 @@ export interface GlobalSettings {
   meteredMode: string;
   /** Bandwidth cap (Mbps) while metered in throttle mode; null falls back. */
   meteredBandwidthCapMbps: number | null;
+  /** Issue #34: path to a PEM file of custom root CA certificate(s) to ADD to
+   * the system trust store for ALL outbound connections (corporate / TLS-
+   * inspection environments). null = system trust only. Additive - never
+   * replaces the OS roots, never disables verification. */
+  customRootCaPath: string | null;
 }
 
 export interface TelemetrySettings {
@@ -268,6 +273,15 @@ export interface GlobalSettingsPatch {
   hookTimeoutSecs?: number;
   meteredMode?: string;
   meteredBandwidthCapMbps?: number | null;
+  /** Issue #34: present = set (validated on save); null clears it back to
+   * system-trust-only. */
+  customRootCaPath?: string | null;
+}
+
+/** Issue #34: result of validating a candidate custom root CA PEM file. */
+export interface CustomCaValidation {
+  /** Number of certificates the PEM bundle contains (>= 1 on success). */
+  certCount: number;
 }
 
 export interface TelemetrySettingsPatch {

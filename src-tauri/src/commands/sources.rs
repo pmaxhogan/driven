@@ -33,6 +33,7 @@ use driven_crypto::{master_key_to_phrase, Keystore, MasterKey};
 use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
 use driven_drive::google::GoogleDriveStore;
 use driven_drive::remote_store::RemoteStore;
+use driven_drive::CustomCaConfig;
 
 use crate::app_state::{AppState, RemoteMode};
 use crate::commands::dtos::{
@@ -726,7 +727,12 @@ pub async fn pick_drive_folder(
     // refresh token. The fake's root id is its synthetic root (not the literal
     // "root" alias), so `None` resolves to that; in real mode `None` resolves to
     // Drive's "root" alias (My Drive root).
-    let (store, default_folder_id) = select_picker_store(state.inner(), account_id)?;
+    // Issue #34: resolve the custom root CA for the one-off picker store's Drive
+    // clients (real mode only; the fake path never builds a client).
+    let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
+        .await
+        .unwrap_or_default();
+    let (store, default_folder_id) = select_picker_store(state.inner(), account_id, &ca)?;
 
     // B1: We resolve `None` to the mode-appropriate root for the listing AND echo
     // it back as the `current_folder_id`, so the user can SELECT the current
@@ -1386,8 +1392,9 @@ async fn reconfigure_account(state: &State<'_, AppState>, account_id: AccountId)
 pub(crate) fn build_restore_store(
     state: &AppState,
     account_id: AccountId,
+    ca: &CustomCaConfig,
 ) -> CommandResult<Arc<dyn RemoteStore>> {
-    select_picker_store(state, account_id).map(|(store, _root)| store)
+    select_picker_store(state, account_id, ca).map(|(store, _root)| store)
 }
 
 /// R1-P1-3 / R2-P1-2: select the Drive-folder-picker store + its root id.
@@ -1403,16 +1410,21 @@ pub(crate) fn build_restore_store(
 fn select_picker_store(
     state: &AppState,
     account_id: AccountId,
+    ca: &CustomCaConfig,
 ) -> CommandResult<(Arc<dyn RemoteStore>, String)> {
     match state.remote_mode() {
         RemoteMode::Fake => {
             // R2-P1-2: the SAME per-account fake store the orchestrator uploads
-            // into (the picker and the uploader must agree on folder ids).
+            // into (the picker and the uploader must agree on folder ids). The
+            // fake never builds an HTTP client, so `ca` is unused here.
+            let _ = ca;
             let fake = state.fake_remote_store(account_id);
             let root = fake.root_id().to_string();
             Ok((Arc::new(fake), root))
         }
-        RemoteMode::RealGoogleDrive => Ok((build_account_store(account_id)?, "root".to_string())),
+        RemoteMode::RealGoogleDrive => {
+            Ok((build_account_store(account_id, ca)?, "root".to_string()))
+        }
     }
 }
 
@@ -1420,7 +1432,10 @@ fn select_picker_store(
 /// refresh token (the assembly `build_remote` pattern), for the Drive-folder
 /// picker. An account with no stored refresh token surfaces `auth.invalid_grant`
 /// (it needs re-consent before its Drive can be listed).
-fn build_account_store(account_id: AccountId) -> CommandResult<Arc<dyn RemoteStore>> {
+fn build_account_store(
+    account_id: AccountId,
+    ca: &CustomCaConfig,
+) -> CommandResult<Arc<dyn RemoteStore>> {
     let token_store = Arc::new(KeyringTokenStore::new(account_id.to_string()));
     let refresh_token = token_store
         .load_refresh_token()
@@ -1440,11 +1455,16 @@ fn build_account_store(account_id: AccountId) -> CommandResult<Arc<dyn RemoteSto
     // A1: use the account's persisted BYO client creds (the client that minted
     // this refresh token), falling back to env/default only if none stored.
     let (client_id, client_secret) = crate::assembly::resolve_account_oauth_creds(account_id);
-    let token_source =
-        RefreshingTokenSource::from_stored_refresh_token(refresh_token, client_id, client_secret)
-            .map_err(CommandError::from)?
-            .with_store(token_store);
-    let store = GoogleDriveStore::with_default_clients(token_source).map_err(CommandError::from)?;
+    let token_source = RefreshingTokenSource::from_stored_refresh_token(
+        refresh_token,
+        client_id,
+        client_secret,
+        ca,
+    )
+    .map_err(CommandError::from)?
+    .with_store(token_store);
+    let store =
+        GoogleDriveStore::with_default_clients(token_source, ca).map_err(CommandError::from)?;
     Ok(Arc::new(store))
 }
 
@@ -2151,7 +2171,8 @@ mod tests {
         // real mode; here it must succeed because the fake path is taken.
         let (app_state, dir) = fake_app_state().await;
         let account_id = AccountId::new_v4();
-        let (store, root) = select_picker_store(&app_state, account_id).expect("fake store builds");
+        let (store, root) = select_picker_store(&app_state, account_id, &CustomCaConfig::none())
+            .expect("fake store builds");
         assert!(!root.is_empty(), "fake root id must be non-empty");
         // The fresh fake root lists (zero child folders) without error / creds.
         let children = store.list_folder(&root).await.expect("fake list_folder");
@@ -2176,7 +2197,8 @@ mod tests {
 
         // The picker resolves the account's fake store + root.
         let (picker_store, picker_root) =
-            select_picker_store(&app_state, account_id).expect("picker store");
+            select_picker_store(&app_state, account_id, &CustomCaConfig::none())
+                .expect("picker store");
 
         // The orchestrator (uploader) holds the SAME shared store for the account.
         let uploader_store = app_state.fake_remote_store(account_id);

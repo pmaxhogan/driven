@@ -553,16 +553,31 @@ pub trait TelemetrySink: Send + Sync {
 /// (the caller logs + swallows it). Builds its own client (the workspace
 /// `reqwest` is rustls-only; no `json` feature, so the body is serialized
 /// manually like the GitHub-releases client in settings.rs).
-pub struct HttpTelemetrySink;
+pub struct HttpTelemetrySink {
+    /// Issue #34: the custom root CA (resolved once at task spawn) added to every
+    /// telemetry POST client. Empty = system trust only.
+    ca: driven_tls::CustomCaConfig,
+}
+
+impl HttpTelemetrySink {
+    /// Build the sink with the resolved custom-CA config (issue #34).
+    #[must_use]
+    pub fn new(ca: driven_tls::CustomCaConfig) -> Self {
+        Self { ca }
+    }
+}
 
 #[async_trait]
 impl TelemetrySink for HttpTelemetrySink {
     async fn send(&self, endpoint: &str, payload: &TelemetryPayload) -> anyhow::Result<()> {
         let body = serde_json::to_vec(payload)?;
-        let client = reqwest::Client::builder()
+        // Issue #34: add the user's custom root CA additively (fail-closed - a
+        // bad CA errors here and the best-effort caller swallows it, rather than
+        // sending over a mis-configured trust store).
+        let builder = reqwest::Client::builder()
             .user_agent(concat!("driven-app/", env!("CARGO_PKG_VERSION")))
-            .timeout(SEND_TIMEOUT)
-            .build()?;
+            .timeout(SEND_TIMEOUT);
+        let client = driven_tls::apply_custom_ca(builder, &self.ca)?.build()?;
         let resp = client
             .post(endpoint)
             .header("Content-Type", "application/json")
@@ -763,7 +778,15 @@ pub fn spawn_periodic_ping(app: &AppHandle) {
     let task = tokio::spawn(async move {
         let mut ticker = tokio::time::interval(PING_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let sink = HttpTelemetrySink;
+        // Issue #34: resolve the custom root CA once for the process (restart to
+        // change), matching the long-lived Drive/network clients.
+        let ca = match app_handle.try_state::<AppState>() {
+            Some(st) => crate::commands::settings::load_custom_ca_config(st.state().as_ref())
+                .await
+                .unwrap_or_default(),
+            None => driven_tls::CustomCaConfig::none(),
+        };
+        let sink = HttpTelemetrySink::new(ca);
         loop {
             tokio::select! {
                 biased;

@@ -80,6 +80,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       hookTimeoutSecs: 60,
       meteredMode: "pause",
       meteredBandwidthCapMbps: null,
+      customRootCaPath: null,
     },
     telemetry: {
       enabled: true,

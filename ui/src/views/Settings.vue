@@ -6,7 +6,7 @@ import { useI18n } from "vue-i18n";
 import AccountList from "../components/AccountList.vue";
 import SourceTable from "../components/SourceTable.vue";
 import { useSettingsStore } from "../stores/settings";
-import { getVssHelperStatus } from "../ipc/commands";
+import { getVssHelperStatus, validateCustomCa } from "../ipc/commands";
 import type { SettingsPatch, VssHelperStatus } from "../ipc/types";
 
 // Settings view (SPEC s25 /accounts, /sources, /rules; DESIGN s8.2). One view
@@ -107,6 +107,10 @@ const meteredModes = ["pause", "throttle"] as const;
 const meteredMode = ref("pause");
 const meteredCapText = ref("");
 
+// Issue #34: custom corporate root CA path + inline validation feedback.
+const customCaPath = ref("");
+const caFeedback = ref<{ ok: boolean; message: string } | null>(null);
+
 function minutesToHHMM(min: number): string {
   const m = ((Math.floor(min) % 1440) + 1440) % 1440;
   const hh = String(Math.floor(m / 60)).padStart(2, "0");
@@ -171,6 +175,10 @@ watch(
     meteredMode.value = s.global.meteredMode ?? "pause";
     meteredCapText.value =
       s.global.meteredBandwidthCapMbps === null ? "" : String(s.global.meteredBandwidthCapMbps);
+    customCaPath.value = s.global.customRootCaPath ?? "";
+    // NOTE: do NOT reset `caFeedback` here - `commitCustomCa` updates the store,
+    // which re-runs this loader, and clearing it would wipe the just-shown
+    // validation result. `caFeedback` is owned solely by `commitCustomCa`.
   },
   { immediate: true }
 );
@@ -340,6 +348,31 @@ async function commitHookTimeout(event: Event): Promise<void> {
 async function setIoPriority(event: Event): Promise<void> {
   const value = (event.target as HTMLSelectElement).value;
   await commitPatch({ global: { ioPriority: value } });
+}
+
+// Issue #34: save the custom root CA path. A blank value clears it (system trust
+// only). A non-blank value is validated against the backend FIRST (which parses
+// the PEM) so the user gets an explicit cert-count / parse-error result and a
+// broken path is never persisted; only a valid file is committed.
+async function commitCustomCa(): Promise<void> {
+  const path = customCaPath.value.trim();
+  if (path === "") {
+    caFeedback.value = null;
+    await commitPatch({ global: { customRootCaPath: null } });
+    return;
+  }
+  try {
+    const res = await validateCustomCa(path);
+    caFeedback.value = {
+      ok: true,
+      message: t("settings.rules.customCa.validCount", { count: res.certCount }),
+    };
+  } catch {
+    // Do NOT persist an unparseable path (it would fail-closed every connection).
+    caFeedback.value = { ok: false, message: t("settings.rules.customCa.invalid") };
+    return;
+  }
+  await commitPatch({ global: { customRootCaPath: path } });
 }
 
 // Persist the whole schedule window. The UTC offset is captured fresh from
@@ -838,6 +871,40 @@ async function setTelemetryEnabled(event: Event): Promise<void> {
           </label>
           <p class="text-xs text-zinc-500">
             {{ t("settings.rules.hooks.note") }}
+          </p>
+        </section>
+
+        <!-- Issue #34: custom corporate root CA -->
+        <section class="space-y-2" :class="cardCls" data-testid="custom-ca-setting">
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("settings.rules.customCa.title") }}
+          </h3>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.customCa.label")
+            }}</span>
+            <input
+              v-model="customCaPath"
+              type="text"
+              data-testid="custom-ca-path"
+              class="w-full font-mono"
+              :class="inputCls"
+              :placeholder="t('settings.rules.customCa.placeholder')"
+              @change="commitCustomCa"
+            />
+          </label>
+          <p
+            v-if="caFeedback"
+            data-testid="custom-ca-feedback"
+            class="text-xs"
+            :class="
+              caFeedback.ok ? 'text-teal-600 dark:text-teal-400' : 'text-red-600 dark:text-red-400'
+            "
+          >
+            {{ caFeedback.message }}
+          </p>
+          <p class="text-xs text-zinc-500">
+            {{ t("settings.rules.customCa.note") }}
           </p>
         </section>
 

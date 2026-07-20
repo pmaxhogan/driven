@@ -91,6 +91,20 @@ driven-crypto = { path = "../crates/driven-crypto" }
 driven-power = { path = "../crates/driven-power" }
 # M5 assembly seams: real network breaker backend + Windows VSS provider.
 driven-net = { path = "../crates/driven-net" }
+# Issue #34 corporate CA pinning: the shared helper that threads a user-configured
+# custom root CA into every outbound reqwest client (assembly, telemetry,
+# GitHub-releases + userinfo fetches).
+driven-tls = { path = "../crates/driven-tls" }
+# Issue #34: the 10th outbound path is tauri-plugin-updater's OWN HTTP client
+# (the signed-manifest + binary DOWNLOAD - the connection that matters most in a
+# TLS-inspecting corporate environment). The plugin exposes `configure_client`
+# but on reqwest 0.13 (the workspace + driven-tls are on 0.12), so we parse the
+# same PEM into a 0.13 `Certificate` here under an aliased name. `rustls-no-provider`
+# matches the plugin's feature so the cert-parsing API is available; the crate is
+# already in the tree (pulled by the plugin), so this adds no new build.
+reqwest_updater = { package = "reqwest", version = "0.13", default-features = false, features = [
+    "rustls-no-provider",
+] }
 driven-vss = { path = "../crates/driven-vss" }
 # Issue #25 (DESIGN s5.3.1): the least-privilege VSS helper. The app-side
 # lifecycle manager (`vss_helper.rs`) launches the elevated broker on demand and

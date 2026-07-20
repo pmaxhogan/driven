@@ -49,6 +49,7 @@ use std::time::Duration;
 
 use async_trait::async_trait;
 use bytes::Bytes;
+use driven_tls::CustomCaConfig;
 use futures::Stream;
 use serde::Deserialize;
 use tokio::io::{AsyncRead, ReadBuf};
@@ -532,12 +533,14 @@ impl GoogleDriveStore {
     /// flows over (the caller builds it with the DESIGN s5.8.4 metadata
     /// timeouts). A second, no-overall-timeout streaming client is derived
     /// for the resumable chunk PUT + download paths.
-    pub fn new(http: reqwest::Client, tokens: RefreshingTokenSource) -> Self {
+    pub fn new(http: reqwest::Client, tokens: RefreshingTokenSource, ca: &CustomCaConfig) -> Self {
         let _ = TARGET;
-        // The streaming client mirrors `http`'s TLS/proxy config but drops
-        // the overall request cap; if the dedicated build fails we fall back
-        // to the provided client (correctness over a missing idle timeout).
-        let http_stream = build_stream_client().unwrap_or_else(|e| {
+        // The streaming client mirrors `http`'s TLS/proxy config (including the
+        // issue #34 custom root CA via `ca`) but drops the overall request cap;
+        // if the dedicated build fails we fall back to the provided client
+        // (correctness over a missing idle timeout - `http` already carries the
+        // same additive CA trust).
+        let http_stream = build_stream_client(ca).unwrap_or_else(|e| {
             warn!(
                 target: TARGET,
                 error = %e,
@@ -557,9 +560,12 @@ impl GoogleDriveStore {
     /// clients (DESIGN s5.8.4 timeouts) from a [`RefreshingTokenSource`].
     /// Convenience for the CLI / e2e paths that do not already hold a tuned
     /// client.
-    pub fn with_default_clients(tokens: RefreshingTokenSource) -> anyhow::Result<Self> {
-        let http = build_meta_client()?;
-        let http_stream = build_stream_client()?;
+    pub fn with_default_clients(
+        tokens: RefreshingTokenSource,
+        ca: &CustomCaConfig,
+    ) -> anyhow::Result<Self> {
+        let http = build_meta_client(ca)?;
+        let http_stream = build_stream_client(ca)?;
         Ok(Self {
             http,
             http_stream,
@@ -1621,26 +1627,31 @@ impl GoogleDriveStore {
 // Free helpers.
 // ---------------------------------------------------------------------------
 
-/// Builds the metadata Drive client with the DESIGN s5.8.4 timeouts.
-pub(crate) fn build_meta_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
+/// Builds the metadata Drive client with the DESIGN s5.8.4 timeouts. `ca` adds
+/// the user's custom root CA (issue #34) additively; fail-closed if it cannot be
+/// loaded.
+pub(crate) fn build_meta_client(ca: &CustomCaConfig) -> anyhow::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .timeout(META_TOTAL_TIMEOUT)
         .read_timeout(STREAM_IDLE_TIMEOUT)
         .pool_max_idle_per_host(4)
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(90));
+    driven_tls::apply_custom_ca(builder, ca)?
         .build()
         .map_err(|e| anyhow::anyhow!("drive: failed to build metadata client: {e}"))
 }
 
 /// Builds the streaming Drive client (resumable chunk PUT + download): no
 /// overall request cap, only the per-byte idle timeout (DESIGN s5.8.4 `*`).
-pub(crate) fn build_stream_client() -> anyhow::Result<reqwest::Client> {
-    reqwest::Client::builder()
+/// `ca` adds the user's custom root CA (issue #34) additively; fail-closed.
+pub(crate) fn build_stream_client(ca: &CustomCaConfig) -> anyhow::Result<reqwest::Client> {
+    let builder = reqwest::Client::builder()
         .connect_timeout(CONNECT_TIMEOUT)
         .read_timeout(STREAM_IDLE_TIMEOUT)
         .pool_max_idle_per_host(4)
-        .pool_idle_timeout(Duration::from_secs(90))
+        .pool_idle_timeout(Duration::from_secs(90));
+    driven_tls::apply_custom_ca(builder, ca)?
         .build()
         .map_err(|e| anyhow::anyhow!("drive: failed to build streaming client: {e}"))
 }
