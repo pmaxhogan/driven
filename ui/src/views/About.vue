@@ -7,6 +7,7 @@ import * as ipc from "../ipc/commands";
 import { useSettingsStore } from "../stores/settings";
 import { useUpdaterStore } from "../stores/updater";
 import ChangelogModal from "../components/ChangelogModal.vue";
+import TelemetryPreviewModal from "../components/TelemetryPreviewModal.vue";
 import { isMacOS } from "../platform";
 import type { ReleaseDto } from "../ipc/types";
 
@@ -67,6 +68,11 @@ const exportError = ref<string | null>(null);
 const exportedPath = ref<string | null>(null);
 
 const telemetryEnabled = computed(() => settings.settings?.telemetry.enabled ?? false);
+
+// SPEC s16 telemetry preview (#34): shows the exact next-ping JSON payload in a
+// modal, available regardless of the current enabled state - a privacy-
+// conscious user inspects it BEFORE opting in. Mirrors the Settings-tab link.
+const showTelemetryPreview = ref(false);
 
 function formatReleaseDate(iso: string): string {
   const date = new Date(iso);
@@ -293,6 +299,14 @@ function viewReleaseChangelog(release: ReleaseDto): void {
         />
         {{ t("about.telemetryLabel") }}
       </label>
+      <button
+        type="button"
+        class="rounded-xs text-xs font-medium text-teal-700 underline transition-colors hover:text-teal-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-teal-300"
+        data-testid="telemetry-preview-open"
+        @click="showTelemetryPreview = true"
+      >
+        {{ t("settings.rules.telemetryPreviewButton") }}
+      </button>
       <p class="text-sm text-zinc-500">
         <span class="text-zinc-600 dark:text-zinc-400">{{ t("about.displayLanguageLabel") }}:</span>
         {{ t("about.moreLanguagesComing") }}
@@ -371,5 +385,6 @@ function viewReleaseChangelog(release: ReleaseDto): void {
     </div>
 
     <ChangelogModal :release="updater.changelogRelease" @close="updater.closeChangelog()" />
+    <TelemetryPreviewModal :open="showTelemetryPreview" @close="showTelemetryPreview = false" />
   </section>
 </template>
