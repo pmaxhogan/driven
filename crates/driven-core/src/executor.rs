@@ -1413,22 +1413,26 @@ impl DefaultExecutor {
                 })
             }
             Err(UploadError::SkipPostUpload(reason)) => {
-                // P1-1: file changed/replaced AFTER the bytes landed on
-                // Drive. Do NOT mark synced. For an UPDATE the prior
-                // file_state row keeps the existing drive_file_id, so
-                // dropping the op is safe - the next scan re-enqueues a clean
-                // update. For a CREATE the bytes are an orphan with no
-                // file_state row; dropping the op would strand it (there is
-                // no general orphan sweep, only the pending_ops-driven
-                // reconcile pass). Leave the create op in place so reconcile
-                // adopts the orphan and re-hashes it (P1-2): if the orphan's
-                // bytes still match it is committed, otherwise it is requeued
-                // as an update against the SAME file_id (no duplicate).
+                // P1-1: file changed/replaced AFTER the bytes landed on Drive.
+                // Do NOT mark synced.
                 //
-                // Issue #36: a VERSIONED change runs as a CREATE (a NEW object),
-                // so `effective_existing_id` is None even though the file was
-                // already uploaded - keep the op so reconcile adopts the orphan
-                // (its supersede intent rides in the payload).
+                // Issue #144: a PLAIN first CREATE no longer surfaces here -
+                // `upload_and_commit`/`settle_post_upload_change` already
+                // committed a force-rescan `file_state` row (pointing at the
+                // just-created object) and dropped the op, returning
+                // `Ok(Skipped)`. So this arm now handles only:
+                //
+                // - UPDATE: the prior file_state row keeps the existing
+                //   drive_file_id, so dropping the op is safe - the next scan
+                //   re-enqueues a clean update against the same object.
+                // - Issue #36 VERSIONED create: the change ran as a CREATE of a
+                //   NEW object (`effective_existing_id` is None), but the prior
+                //   file_state row still points at the OLD object, so the next
+                //   scan updates/versions against it rather than re-creating the
+                //   path. The NEW object is an orphan carrying the op-uuid; keep
+                //   the op so reconcile adopts it (its supersede intent rides in
+                //   the payload) - the pre-#144 recovery for that case, which is
+                //   not the #144 re-create loop.
                 if effective_existing_id.is_some() {
                     self.state.delete_pending_op(op_id).await?;
                 }
@@ -1479,19 +1483,25 @@ impl DefaultExecutor {
                 // surviving op carries the recovery forward. This is the only
                 // Failed-shaped outcome that does NOT drop the op.
                 //
-                // Post-state (op kept, NO file_state row, create semantics) is
-                // byte-identical to the SkipPostUpload-create arm above, so the
-                // next scan re-plans the path the same way that already-shipped
-                // path does. Recovery is reconcile's job; reconcile iterates
-                // pending_ops (not file_state), so the surviving op IS the
-                // discovery handle. Writing a file_state row here would be
-                // wrong both ways: a sentinel-mtime row has no drive_file_id to
-                // update against (fresh create -> duplicate), and a real-mtime
-                // row makes the FastPath scanner treat the never-created file
-                // as handled (silent data loss). The mid-run-defer-before-next-
-                // reconcile window (reconcile is startup-gated) is the
-                // orchestrator's cadence concern, shared identically with
-                // SkipPostUpload - not fixable from inside the executor.
+                // Post-state (op kept, NO file_state row) mirrors the pre-#144
+                // SkipPostUpload-create recovery. Recovery is reconcile's job;
+                // reconcile iterates pending_ops (not file_state), so the
+                // surviving op IS the discovery handle. Writing a file_state row
+                // here would be wrong both ways: this is an AMBIGUOUS failure -
+                // the object MIGHT NOT have been created, so there is no known
+                // drive_file_id to point at. A sentinel-mtime row would have no
+                // id to update against (fresh create -> duplicate), and a
+                // real-mtime row makes the FastPath scanner treat the possibly-
+                // never-created file as handled (silent data loss).
+                //
+                // Issue #144 note: the SkipPostUpload PLAIN-create path CAN now
+                // commit a force-rescan row from inside the executor precisely
+                // because it KNOWS the created object id (the upload succeeded,
+                // only the local file then changed). That certainty is exactly
+                // what DeferToReconcile lacks, so the mid-run-defer-before-next-
+                // reconcile window here (reconcile is startup-gated) remains the
+                // orchestrator's cadence concern, not fixable from inside the
+                // executor.
                 Ok(OpOutcome::Failed {
                     relative_path: relative_path.clone(),
                     code,
@@ -1904,26 +1914,64 @@ impl DefaultExecutor {
         // it; but the bytes could still be mutated between the read and the
         // moment Drive finishes accepting them. Re-stat the open handle AND
         // the path now that the object is fully uploaded, before we commit it
-        // as Synced. On any change/replace, do NOT commit: the remote object
-        // is an orphan that reconcile adopts + re-hashes (P1-2), and the op
-        // is re-enqueued by the caller.
+        // as Synced. On any change/replace, do NOT commit as Synced.
+        //
+        // Issue #144: for a PLAIN first CREATE (no pre-existing `file_state`
+        // row, not a versioned change) the just-created object is otherwise a
+        // LIVE orphan with no row - left to the startup-gated reconcile pass, a
+        // mid-run scan re-CREATEs the path and duplicates the object. So
+        // `settle_post_upload_change` durably commits a force-rescan row
+        // pointing at the just-created object (dropping the op in the same
+        // transaction) so the next scan UPDATEs it instead. An in-place UPDATE
+        // (row already carries the id) and a versioned create (row still points
+        // at the OLD object) keep the pre-#144 orphan+reconcile path.
         self.fire_post_upload_hook(&full_path);
+        let plain_create = existing_file_id.is_none() && version.is_none();
         let post = fstat_identity(file).await.map_err(UploadError::Fatal)?;
         if (post.size, post.ctime_ns) != (pre.size, pre.ctime_ns) {
-            return Err(UploadError::SkipPostUpload(SkipReason::ChangedDuringUpload));
+            return self
+                .settle_post_upload_change(
+                    plain_create,
+                    source,
+                    relative_path,
+                    op_id,
+                    &entry,
+                    blake3,
+                    target.encrypted_remote_path.clone(),
+                    SkipReason::ChangedDuringUpload,
+                )
+                .await;
         }
         match lstat_identity(&full_path) {
             Ok(now_path) => {
                 if (now_path.dev, now_path.inode) != (pre.dev, pre.inode) {
-                    return Err(UploadError::SkipPostUpload(
-                        SkipReason::ReplacedDuringUpload,
-                    ));
+                    return self
+                        .settle_post_upload_change(
+                            plain_create,
+                            source,
+                            relative_path,
+                            op_id,
+                            &entry,
+                            blake3,
+                            target.encrypted_remote_path.clone(),
+                            SkipReason::ReplacedDuringUpload,
+                        )
+                        .await;
                 }
             }
             Err(_) => {
-                return Err(UploadError::SkipPostUpload(
-                    SkipReason::ReplacedDuringUpload,
-                ))
+                return self
+                    .settle_post_upload_change(
+                        plain_create,
+                        source,
+                        relative_path,
+                        op_id,
+                        &entry,
+                        blake3,
+                        target.encrypted_remote_path.clone(),
+                        SkipReason::ReplacedDuringUpload,
+                    )
+                    .await;
             }
         }
 
@@ -2047,6 +2095,86 @@ impl DefaultExecutor {
             relative_path: relative_path.clone(),
             kind: DoneKind::Upload,
             bytes: Some(post.size),
+        })
+    }
+
+    /// Settle a post-upload change/replace (SPEC s8) that the identity recheck
+    /// caught AFTER the bytes already landed on Drive - i.e. the object
+    /// `entry` exists on the remote but its bytes are valid-but-stale.
+    ///
+    /// Issue #144. `plain_create` is true only when this op created a
+    /// brand-new object with NO pre-existing `file_state` row (not an in-place
+    /// update, not a versioned supersede). That case is the one that strands a
+    /// LIVE orphan: with no row, the startup-gated reconcile is the only thing
+    /// that would adopt it by op-uuid, so a mid-run scan before the next
+    /// restart sees the row-less path and plans a SECOND create - duplicating
+    /// the object until the app restarts. To close that window we durably
+    /// commit the SAME force-rescan row reconcile's adopt-requeue arm would
+    /// eventually write (see `adopt_reconciled`): the just-created object id,
+    /// the `REQUEUE_FORCE_RESCAN_MTIME_NS` sentinel mtime the live file can
+    /// never match (so the next FastPath scan always re-emits the path), the
+    /// uploaded (now-stale) blake3, the on-Drive md5/size, and status
+    /// `Pending`. `commit_create_result` upserts that row and deletes the
+    /// finalizing `upload` op in ONE transaction, so the next scan re-uploads
+    /// the changed bytes as an UPDATE against the same object - exactly one
+    /// live object per path, no restart required.
+    ///
+    /// Crash-safety is preserved as the fallback: if the process dies before
+    /// this commit, the op survives (still carrying its op-uuid) with no row,
+    /// so the pre-#144 orphan+reconcile recovery runs on the next boot exactly
+    /// as before. Reconcile idempotency is vacuous here - the commit deletes
+    /// the op atomically with the row, so reconcile never finds this op again.
+    ///
+    /// For an in-place UPDATE (its row already carries the id) and a versioned
+    /// create (its row still points at the OLD object, so the next scan
+    /// updates/versions against it rather than re-creating the path), this
+    /// keeps the established `SkipPostUpload` return: the caller drops the op
+    /// for an update and keeps it for a versioned create's reconcile adopt.
+    #[allow(clippy::too_many_arguments)]
+    async fn settle_post_upload_change(
+        &self,
+        plain_create: bool,
+        source: &SourceRow,
+        relative_path: &RelativePath,
+        op_id: PendingOpId,
+        entry: &RemoteEntry,
+        // The uploaded plaintext blake3 (now stale - the local file changed
+        // after it was hashed). Stored so the row honestly reflects the bytes
+        // currently ON DRIVE, matching reconcile's requeue arm.
+        blake3: [u8; 32],
+        // `target.encrypted_remote_path` for an encrypted source, else `None` -
+        // the same value the success path would have committed.
+        encrypted_remote_path: Option<String>,
+        reason: SkipReason,
+    ) -> Result<OpOutcome, UploadError> {
+        if !plain_create {
+            // Update / versioned create: unchanged pre-#144 behaviour.
+            return Err(UploadError::SkipPostUpload(reason));
+        }
+        let row = FileStateRow {
+            source_id: source.id,
+            relative_path: relative_path.clone(),
+            // The on-Drive size (the local file changed, so its size is stale
+            // and irrelevant - the `i64::MIN` mtime forces a rescan regardless).
+            size: entry.size.unwrap_or(0),
+            mtime_ns: REQUEUE_FORCE_RESCAN_MTIME_NS,
+            hash_blake3: blake3,
+            drive_file_id: Some(entry.id.clone()),
+            drive_md5: entry.md5,
+            encrypted_remote_path,
+            status: FileStateStatus::Pending,
+            last_uploaded_at: None,
+            last_verified_at: None,
+        };
+        // Atomic upsert-row + delete-op (same helper the reconcile adopt-requeue
+        // arm uses). A Fatal on a state-write failure aborts the whole execute.
+        self.state
+            .commit_create_result(op_id, &row)
+            .await
+            .map_err(UploadError::Fatal)?;
+        Ok(OpOutcome::Skipped {
+            relative_path: relative_path.clone(),
+            reason,
         })
     }
 
@@ -8171,18 +8299,30 @@ mod tests {
         assert_eq!(children.len(), 1);
     }
 
-    // --- P1-1: file changed AFTER upload completes -> skip, no commit -------
+    // --- #144: file changed AFTER a plain CREATE's upload completes ---------
+    //
+    // The just-created object is a LIVE orphan with NO file_state row. Pre-#144
+    // the executor kept the create op and relied on the (startup-gated)
+    // reconcile pass to adopt it - so a mid-run scan before the next restart saw
+    // the row-less path and planned a SECOND create, duplicating the object
+    // (issue #144). The fix commits a force-rescan row pointing at the
+    // just-created object and drops the op IN THE EXECUTOR, so the very next
+    // scan updates that same object instead of re-creating it - no restart
+    // needed, exactly one live object throughout.
 
     #[tokio::test]
-    async fn changed_after_upload_skips_and_does_not_commit() {
+    async fn create_changed_after_upload_commits_force_rescan_row_no_duplicate() {
         let h = harness().await;
         let (rel, size) = h.write_file("post.txt", b"original-content");
         let src_path = h.tmp_src.path().to_path_buf();
-        // Hook fires AFTER upload_bytes returns, before the post-upload
-        // identity re-check: mutate the file so the second fstat detects it.
+        // Fires AFTER the bytes land on Drive, before the post-upload identity
+        // re-check: mutate the file so the second fstat detects it.
         let hook: PostUploadHook = Arc::new(move |_p: &Path| {
-            let full = src_path.join("post.txt");
-            std::fs::write(&full, b"original-content-MUTATED-AFTER-UPLOAD").unwrap();
+            std::fs::write(
+                src_path.join("post.txt"),
+                b"original-content-MUTATED-AFTER-UPLOAD",
+            )
+            .unwrap();
         });
         let exec = h.executor().with_post_upload_hook(hook);
         let out = exec
@@ -8205,51 +8345,334 @@ mod tests {
             "got {:?}",
             out[0]
         );
-        // Not committed as Synced.
-        let row = h.state.get_file_state(h.source.id, &rel).await.unwrap();
-        assert!(row.is_none() || row.unwrap().status != FileStateStatus::Synced);
 
-        // The bytes DID land on Drive (the change was detected post-upload),
-        // leaving an orphan create object + its pending_op for reconcile. The
-        // op must still be present so the orphan is not stranded (P1-1).
-        let pending = h
-            .state
-            .get_pending_ops_for_source(h.source.id)
-            .await
-            .unwrap();
-        assert_eq!(pending.len(), 1, "create op kept for reconcile to adopt");
-        let before = h
+        // The bytes DID land: exactly one live object, the create orphan.
+        let created = h
             .remote
             .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
             .await
             .unwrap();
-        assert_eq!(before.len(), 1, "the post-upload orphan is on Drive");
+        assert_eq!(created.len(), 1, "the post-upload orphan is on Drive");
+        let created_id = created[0].id.clone();
 
-        // Reconcile closes the loop: it finds the orphan, re-hashes the
-        // (now-changed) local file, sees a MISMATCH, and requeues it as an
-        // UPDATE against the SAME object id - never a duplicate.
-        exec.reconcile(&h.source).await.unwrap();
-        let after = h
-            .remote
-            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
-            .await
-            .unwrap();
-        assert_eq!(after.len(), 1, "reconcile produced no duplicate");
+        // #144 fix: the executor committed a force-rescan file_state row
+        // pointing at that object and DROPPED the op (pre-fix it kept the op and
+        // wrote no row). The i64::MIN sentinel mtime guarantees the next
+        // FastPath scan re-emits the path; the preserved drive_file_id makes the
+        // re-upload an UPDATE, never a duplicate create.
+        assert!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the create op is consumed by the durable force-rescan commit"
+        );
         let row = h
             .state
             .get_file_state(h.source.id, &rel)
             .await
             .unwrap()
-            .expect("requeued row");
+            .expect("a force-rescan row was committed for the orphan");
+        assert_eq!(
+            row.drive_file_id.as_deref(),
+            Some(created_id.as_str()),
+            "row points at the just-created object (re-upload becomes an update)"
+        );
+        assert_eq!(row.mtime_ns, i64::MIN, "force-rescan sentinel mtime");
         assert_ne!(
             row.status,
             FileStateStatus::Synced,
             "changed bytes must be re-uploaded, not adopted as Synced"
         );
+
+        // The very NEXT scan, in the SAME process (no restart, no reconcile),
+        // must re-emit the path and UPDATE the same object - the core #144
+        // regression (pre-fix it planned a second create -> two objects).
+        let scan = crate::scanner::scan(
+            &h.source,
+            h.state.as_ref(),
+            crate::types::ScanMode::FastPath,
+        )
+        .await
+        .unwrap();
+        assert!(
+            scan.new_or_changed.iter().any(|e| e.rel == rel),
+            "the sentinel row forces the next scan to re-emit the changed file"
+        );
+        let plan = crate::planner::plan(
+            &h.source,
+            &scan,
+            h.state.as_ref(),
+            h.clock.now_ms(),
+            &crate::planner::BundleConfig::default(),
+        )
+        .await
+        .unwrap();
+        // A clean executor (no hook) runs the follow-up cycle.
+        h.executor()
+            .execute(&h.source, &plan, &noop_progress, &noop_outcome)
+            .await
+            .unwrap();
+
+        let after = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "the next scan UPDATED the same object - exactly one live object, no duplicate"
+        );
+        assert_eq!(
+            after[0].id, created_id,
+            "updated the SAME object id, not a fresh create"
+        );
+        let synced = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("row after the follow-up update");
+        assert_eq!(synced.status, FileStateStatus::Synced, "now synced");
+        assert_eq!(synced.drive_file_id.as_deref(), Some(created_id.as_str()));
+    }
+
+    // --- #144: the committed force-rescan row survives a restart reconcile ---
+    //
+    // A restart mid-window: the fix committed the row and dropped the op, then
+    // the app restarts and runs the startup reconcile pass. Because the op is
+    // gone (dropped atomically with the row), reconcile finds nothing for the
+    // path and is a no-op - it must NOT adopt the object a second time or plan
+    // a duplicate. (A crash BEFORE the commit is the fallback: the op survives
+    // with no row and the pre-#144 orphan+reconcile adoption still runs, covered
+    // by `crash_mid_upload_adopts_orphan_without_duplicate`.)
+
+    #[tokio::test]
+    async fn create_skip_post_upload_row_survives_reconcile_no_double_adopt() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("post.txt", b"original-content");
+        let src_path = h.tmp_src.path().to_path_buf();
+        let hook: PostUploadHook = Arc::new(move |_p: &Path| {
+            std::fs::write(
+                src_path.join("post.txt"),
+                b"original-content-MUTATED-AFTER-UPLOAD",
+            )
+            .unwrap();
+        });
+        h.executor()
+            .with_post_upload_hook(hook)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+
+        let created = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 1);
+        let created_id = created[0].id.clone();
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Simulate a restart: a FRESH executor over the same state + remote runs
+        // reconcile. No op exists, so it must be a no-op.
+        h.executor().reconcile(&h.source).await.unwrap();
+
+        let after = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(
+            after.len(),
+            1,
+            "reconcile is a no-op; still exactly one live object"
+        );
+        assert_eq!(after[0].id, created_id, "no second object adopted");
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("row intact across the reconcile pass");
+        assert_eq!(row.drive_file_id.as_deref(), Some(created_id.as_str()));
+        assert_eq!(row.mtime_ns, i64::MIN, "still the force-rescan sentinel");
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    // --- #144 carve-out: an in-place UPDATE that changes post-upload keeps ---
+    // the pre-fix behaviour. Its existing row already points at the object, so
+    // the op is simply dropped and NO new force-rescan row is written; the next
+    // scan re-updates the same id. Only a PLAIN create needs the new commit.
+
+    #[tokio::test]
+    async fn update_changed_after_upload_keeps_existing_id_no_duplicate() {
+        let h = harness().await;
+        // A clean create so a Synced row with a drive_file_id exists.
+        let (rel, size) = h.write_file("u.txt", b"v1-content");
+        h.executor()
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        let created = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 1);
+        let created_id = created[0].id.clone();
+
+        // Change the file (so the op is a real UPDATE against the existing id),
+        // then mutate again post-upload so the UPDATE trips SkipPostUpload.
+        let (_, size2) = h.write_file("u.txt", b"v2-content-longer");
+        let src_path = h.tmp_src.path().to_path_buf();
+        let hook: PostUploadHook = Arc::new(move |_p: &Path| {
+            std::fs::write(
+                src_path.join("u.txt"),
+                b"v3-MUTATED-AFTER-UPLOAD-even-longer",
+            )
+            .unwrap();
+        });
+        let out = h
+            .executor()
+            .with_post_upload_hook(hook)
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size2),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out[0],
+                OpOutcome::Skipped {
+                    reason: SkipReason::ChangedDuringUpload,
+                    ..
+                }
+            ),
+            "got {:?}",
+            out[0]
+        );
+
+        // Update carve-out: op dropped, exactly one object, and the row still
+        // carries the SAME drive_file_id (the next scan re-updates it).
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+        let after = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(after.len(), 1, "no duplicate for an update either");
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("the pre-existing row is intact");
         assert_eq!(
             row.drive_file_id.as_deref(),
-            Some(before[0].id.as_str()),
-            "requeue preserves the orphan id so re-upload is an update"
+            Some(created_id.as_str()),
+            "the existing object id is preserved (no new object, no new row)"
+        );
+    }
+
+    // --- #144: the force-rescan commit works identically for an ENCRYPTED ----
+    // source - the created id + the ciphertext remote path flow into the row
+    // exactly as for a plaintext source.
+
+    #[tokio::test]
+    async fn create_changed_after_upload_encrypted_commits_force_rescan_row() {
+        use driven_crypto::DrivenCryptoSuite;
+        let h = harness().await;
+        let source = h.encrypted_source();
+        let suite = Arc::new(DrivenCryptoSuite::new(
+            driven_crypto::key::SourceKey::generate(),
+        ));
+        let (rel, size) = h.write_file("sec.dat", b"secret-original");
+        let src_path = h.tmp_src.path().to_path_buf();
+        let hook: PostUploadHook = Arc::new(move |_p: &Path| {
+            std::fs::write(
+                src_path.join("sec.dat"),
+                b"secret-MUTATED-AFTER-UPLOAD",
+            )
+            .unwrap();
+        });
+        let out = h
+            .executor_with_crypto(Some(suite))
+            .with_post_upload_hook(hook)
+            .execute(
+                &source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(
+                out[0],
+                OpOutcome::Skipped {
+                    reason: SkipReason::ChangedDuringUpload,
+                    ..
+                }
+            ),
+            "got {:?}",
+            out[0]
+        );
+
+        let created = h
+            .remote
+            .list_folder(source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(created.len(), 1);
+        let created_id = created[0].id.clone();
+        assert!(h
+            .state
+            .get_pending_ops_for_source(source.id)
+            .await
+            .unwrap()
+            .is_empty());
+        let row = h
+            .state
+            .get_file_state(source.id, &rel)
+            .await
+            .unwrap()
+            .expect("encrypted force-rescan row");
+        assert_eq!(row.drive_file_id.as_deref(), Some(created_id.as_str()));
+        assert_eq!(row.mtime_ns, i64::MIN);
+        assert!(
+            row.encrypted_remote_path.is_some(),
+            "the ciphertext remote path is preserved for the encrypted source"
         );
     }
 
