@@ -1716,6 +1716,69 @@ mod tests {
         );
     }
 
+    /// Issue #144 regression: `frequent-edits` racing a SLOW store (a 3ms
+    /// per-request delay, below the 4ms mutation cadence) must still converge to
+    /// EXACTLY ONE live object. The slow store widens the very first upload's
+    /// hash->upload->post-check window so the mutator reliably lands a change
+    /// mid-window: the first upload of `hot.txt` is a plain CREATE, so that
+    /// mutation trips create-`SkipPostUpload`. Pre-#144 the just-created object
+    /// was left a row-less orphan and the next scan re-created it (the #141
+    /// diagnosis saw ~20 duplicate `hot.txt` objects under this exact delay);
+    /// the fix commits a force-rescan row so the next scan UPDATES the same
+    /// object instead. The assertion holds whether or not the race trips on a
+    /// given machine (so it is not flaky), and went RED pre-fix whenever it did.
+    #[tokio::test]
+    async fn frequent_edits_slow_store_holds_one_object_144() {
+        let remote = Arc::new(
+            InMemoryRemoteStore::new().with_slow_responses(Duration::from_millis(3)),
+        );
+        let h = SoakHarness::boot(remote).await.unwrap();
+        write_file(&h.src_root, "hot.txt", b"v0").unwrap();
+
+        // Rewrite hot.txt with a size-varying body every 4ms (> the 3ms store
+        // delay) so the scanner's (size, mtime) fast-path sees every edit and a
+        // mutation reliably lands inside the widened upload window.
+        let hot = h.src_root.join("hot.txt");
+        let counter = Arc::new(AtomicU64::new(1));
+        let counter_t = counter.clone();
+        let mutator = MutatorThread::spawn(MUTATE_EVERY, move || {
+            let n = counter_t.fetch_add(1, Ordering::Relaxed);
+            let body = format!("edit-{n}-{}", "x".repeat((n % 37) as usize));
+            std::fs::write(&hot, body.as_bytes()).is_ok()
+        });
+
+        for _ in 0..SOAK_ITERATIONS {
+            run_cycle_capture(h.orch()).await.unwrap();
+        }
+        mutator.stop_and_join();
+
+        // Settle on a final body and drain the pipeline.
+        let final_body = b"final-frequent-edits-slow-store";
+        std::fs::write(h.src_root.join("hot.txt"), final_body).unwrap();
+        drain_to_steady_state(&h).await.unwrap();
+
+        // The #144 invariant: exactly one live object, holding the final bytes.
+        let count = h.live_object_count().await.unwrap();
+        assert_eq!(
+            count, 1,
+            "slow-store frequent-edits must converge to exactly 1 live object (no #144 duplicate), found {count}"
+        );
+        let children = h
+            .remote
+            .list_folder(
+                &h.folder,
+                &driven_drive::remote_store::DriveContext::MyDrive,
+            )
+            .await
+            .unwrap();
+        let live = children.iter().find(|e| !e.trashed).expect("the one object");
+        let remote_bytes = download_bytes(&h.remote, &live.id).await.unwrap();
+        assert_eq!(
+            remote_bytes, final_body,
+            "the single object must hold the final local edit"
+        );
+    }
+
     /// The lock rows gate on Windows; the rest run anywhere.
     #[test]
     fn lock_rows_require_windows() {
