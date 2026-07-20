@@ -222,20 +222,24 @@ fn scope_from_lines<'a>(
     })
 }
 
-/// Builds one directory-scoped [`Scope`] from a nested ignore FILE, rooted at
-/// that file's own directory (the true per-dir cascade). A missing/unreadable
-/// file or a parse error is non-fatal - the scope simply contributes no rules
-/// (or is skipped), never aborting the whole matcher (a scan must not fail
-/// because one `.gitignore` was malformed). Returns `None` when the scope could
-/// not be built at all.
+/// Builds one directory-scoped [`Scope`] from an ignore FILE, rooted at the
+/// EXPLICIT `scope_dir` its rules apply under. For a nested `.gitignore` /
+/// `.ignore` that is the file's own directory (the true per-dir cascade); for
+/// the repo-level `.git/info/exclude` and the global gitignore it is the SOURCE
+/// ROOT (git anchors both at the repo root, not at their on-disk location), so
+/// the caller passes the source root there rather than the file's parent
+/// (`.git/info`), which would scope the rules to a directory no real path lives
+/// under. A missing/unreadable file or a parse error is non-fatal - the scope
+/// simply contributes no rules (or is skipped), never aborting the whole matcher
+/// (a scan must not fail because one `.gitignore` was malformed). Returns `None`
+/// when the scope could not be built at all.
 fn scope_from_file(
     source: &SourceRow,
-    root: &Path,
+    scope_dir: &Path,
     ignore_file: &Path,
     label: &str,
 ) -> Option<Scope> {
-    let dir = ignore_file.parent().unwrap_or(root).to_path_buf();
-    let mut gb = GitignoreBuilder::new(&dir);
+    let mut gb = GitignoreBuilder::new(scope_dir);
     // `GitignoreBuilder::add` returns Some(err) on a partial/parse error; a
     // missing or unreadable file is non-fatal (no rules applied) so only log.
     if let Some(err) = gb.add(ignore_file) {
@@ -248,7 +252,10 @@ fn scope_from_file(
         );
     }
     match gb.build() {
-        Ok(matcher) => Some(Scope { dir, matcher }),
+        Ok(matcher) => Some(Scope {
+            dir: scope_dir.to_path_buf(),
+            matcher,
+        }),
         Err(err) => {
             tracing::warn!(
                 target: TARGET,
@@ -290,7 +297,12 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
     if source.respect_gitignore {
         for filename in [".gitignore", ".ignore"] {
             for ignore_file in collect_ignore_files(&root, filename) {
-                if let Some(scope) = scope_from_file(source, &root, &ignore_file, "an ignore file")
+                // A nested ignore file is scoped to its OWN directory (the
+                // per-dir cascade); fall back to the root if it somehow has no
+                // parent.
+                let scope_dir = ignore_file.parent().unwrap_or(&root).to_path_buf();
+                if let Some(scope) =
+                    scope_from_file(source, &scope_dir, &ignore_file, "an ignore file")
                 {
                     scopes.push(scope);
                 }
