@@ -318,6 +318,7 @@ mod tests {
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: Some(0),
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 0,
         }
     }

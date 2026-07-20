@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            UPDATE backup_sources\n            SET mtime_granularity_ns = ?1\n            WHERE id = ?2\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": []
+  },
+  "hash": "b38108b7bb9152533f8f85dcdfc45ec4d150f324ce9a22486a949a0fc062289a"
+}

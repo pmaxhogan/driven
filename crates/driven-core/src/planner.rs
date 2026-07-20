@@ -586,6 +586,13 @@ mod tests {
         ) -> Result<()> {
             unimplemented!()
         }
+        async fn set_source_mtime_granularity(
+            &self,
+            _id: SourceId,
+            _granularity_ns: i64,
+        ) -> Result<()> {
+            unimplemented!()
+        }
         async fn delete_source(&self, _id: SourceId) -> Result<()> {
             unimplemented!()
         }
@@ -727,6 +734,7 @@ mod tests {
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: None,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 0,
         }
     }
@@ -805,6 +813,7 @@ mod tests {
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
             invalid_filenames: Vec::new(),
+            probed_granularity_ns: None,
         };
         let state = FakeStateRepo::default();
 
@@ -863,6 +872,7 @@ mod tests {
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
             invalid_filenames: Vec::new(),
+            probed_granularity_ns: None,
         };
         let state = FakeStateRepo::default();
 
@@ -904,6 +914,7 @@ mod tests {
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
             invalid_filenames: Vec::new(),
+            probed_granularity_ns: None,
         };
         let state = FakeStateRepo::with_rows(vec![row]);
 
@@ -951,6 +962,7 @@ mod tests {
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
             invalid_filenames: Vec::new(),
+            probed_granularity_ns: None,
         };
         let state = FakeStateRepo::with_rows(vec![row]);
 
@@ -988,6 +1000,7 @@ mod tests {
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
             invalid_filenames: Vec::new(),
+            probed_granularity_ns: None,
         };
         let state = FakeStateRepo::with_rows(vec![old_row]);
 
@@ -1034,6 +1047,7 @@ mod tests {
             excluded_orphans: Vec::new(),
             ads_skipped: Vec::new(),
             invalid_filenames: Vec::new(),
+            probed_granularity_ns: None,
         }
     }
 

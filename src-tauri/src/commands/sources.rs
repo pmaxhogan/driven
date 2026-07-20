@@ -284,6 +284,7 @@ pub async fn add_source(
         deep_verify_interval_secs: default_deep_verify_secs(),
         last_full_scan_at: None,
         last_deep_verify_at: None,
+        mtime_granularity_ns: None,
         created_at: now,
     };
 
@@ -908,6 +909,7 @@ pub async fn preview_exclusions(
         deep_verify_interval_secs: default_deep_verify_secs(),
         last_full_scan_at: None,
         last_deep_verify_at: None,
+        mtime_granularity_ns: None,
         created_at: 0,
     };
 
@@ -1588,6 +1590,7 @@ mod tests {
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 0,
         }
     }
@@ -1671,6 +1674,7 @@ mod tests {
             last_full_scan_at: Some(99),
             created_at: 7,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
         };
         let dto = source_row_to_dto(&row);
         assert_eq!(dto.id, id.to_string());
@@ -1733,6 +1737,7 @@ mod tests {
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 0,
         };
         state.upsert_source(&row).await.expect("upsert source");
@@ -1991,6 +1996,7 @@ mod tests {
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 0,
         };
         repo.insert_first_encrypted_source_pending_ack(&row, account_id.to_string(), 0)
@@ -2065,6 +2071,7 @@ mod tests {
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 0,
         };
         repo.insert_first_encrypted_source_pending_ack(&row, account_a.to_string(), 0)
@@ -2166,6 +2173,7 @@ mod tests {
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 0,
         };
         repo.insert_first_encrypted_source_pending_ack(&row, "kc:u-master".into(), 0)
@@ -2238,6 +2246,7 @@ mod tests {
             deep_verify_interval_secs: default_deep_verify_secs(),
             last_full_scan_at: None,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 0,
         };
         repo.insert_first_encrypted_source_pending_ack(&row, account_id.to_string(), 0)

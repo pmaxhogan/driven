@@ -1,30 +1,52 @@
 //! gitignore + default + custom excludes; DESIGN s5.2.
 //!
-//! Builds ONE combined [`ignore::gitignore::Gitignore`] decision matcher
-//! ([`build_source_matcher`]) that the scanner (SPEC s6) consults for every
-//! entry, plus the plain [`ignore::WalkBuilder`] it walks with. ALL ignore
-//! decisions are made by our matcher; the walker does NO ignore logic of its
-//! own (its built-in gitignore / git-exclude / git-global layers are turned
-//! off).
+//! Builds the [`SourceMatcher`] ([`build_source_matcher`]) the scanner (SPEC
+//! s6) consults for every entry, plus the plain [`ignore::WalkBuilder`] it
+//! walks with. ALL ignore decisions are made by our matcher; the walker does
+//! NO ignore logic of its own (its built-in gitignore / git-exclude /
+//! git-global layers are turned off).
 //!
-//! ## Precedence (gitignore semantics: LAST matching rule wins)
+//! ## True per-directory cascade (DESIGN s5.2)
 //!
-//! Rules are added LOWEST-precedence FIRST, so a later rule overrides an
-//! earlier one (DESIGN s5.2):
+//! The matcher is a STACK of per-directory [`ignore::gitignore::Gitignore`]
+//! scopes rather than one matcher flattened at the source root. Each nested
+//! `.gitignore` / `.ignore` becomes its own scope rooted at that file's
+//! directory, and a scope is consulted ONLY for paths at or under its
+//! directory. This gives real gitignore scoping: a rule in `sub/.gitignore`
+//! applies only under `sub/` (an unanchored pattern matches at any depth BELOW
+//! its own file, an anchored `/foo` only at that directory) - it can no longer
+//! leak into a sibling `other/` tree the way the old single flattened matcher
+//! did. The matcher stays fully QUERYABLE for an arbitrary path (including one
+//! not on disk), which the scanner's deletion / excluded-orphan split (DESIGN
+//! s5.5) depends on - so ignore decisions are NOT delegated to the walker's
+//! native layer (that would only decide entries it actually visits).
+//!
+//! ## Precedence (LAST matching scope wins; permissive re-include)
+//!
+//! Scopes are ordered LOWEST-precedence FIRST; [`SourceMatcher::is_included`]
+//! evaluates a path against every applicable scope and the LAST non-`None`
+//! match decides (a deeper / higher-tier scope overrides a shallower one):
 //!
 //! 1. (lowest) the DESIGN s5.2 DEFAULT EXCLUDE list (OS noise / editor swap /
-//!    misc transient globs), each added as a bare exclude glob.
-//! 2. the source's `.gitignore` cascade, IF [`SourceRow::respect_gitignore`]:
-//!    every `.gitignore` under the source root, root-first, added in order so
-//!    a deeper file's rule wins over a shallower one. A user `!Thumbs.db` in
-//!    gitignore therefore beats the default Thumbs.db exclude (DESIGN s5.2:
-//!    "gitignore wins where they conflict").
-//! 3. (highest) the source's own `exclude_patterns` (bare globs = force-out,
+//!    misc transient globs), one root-rooted scope of bare exclude globs.
+//! 2. the `.gitignore` cascade, then the `.ignore` cascade, IF
+//!    [`SourceRow::respect_gitignore`]: every such file becomes a per-directory
+//!    scope, root-first, so a deeper file's rule wins over a shallower one. A
+//!    user `!Thumbs.db` in gitignore therefore beats the default Thumbs.db
+//!    exclude (DESIGN s5.2: "gitignore wins where they conflict").
+//! 3. the repo-local `<root>/.git/info/exclude`, then the global gitignore -
+//!    each a root-rooted scope above the cascade.
+//! 4. (highest) the source's own `exclude_patterns` (bare globs = force-out,
 //!    e.g. `*.log`) then `include_patterns` (`!`-prefixed = re-include, e.g.
-//!    a bare `.env` that opts a gitignored secret back in). These are the
-//!    user's source-level overrides and beat BOTH gitignore and the defaults
-//!    (DESIGN s5.2: `include_patterns` opt-back-in things gitignore excludes;
-//!    `exclude_patterns` force-out things gitignore includes).
+//!    a bare `.env` that opts a gitignored secret back in), one root-rooted
+//!    scope added LAST so it beats BOTH gitignore and the defaults.
+//!
+//! Note we DELIBERATELY do NOT replicate git's rule that "a file cannot be
+//! re-included if a parent directory is excluded": a nested `!keep.txt` under
+//! an excluded `vendor/` re-includes the file. That permissive choice is a
+//! backup-safety invariant (when in doubt, do not drop a backed-up file); the
+//! last-match-wins evaluation across scopes preserves it because the deeper
+//! whitelist scope is consulted after (and overrides) the shallower exclude.
 //!
 //! ## Glob semantics (true gitignore, NOT the inverted `Override` form)
 //!
@@ -33,21 +55,11 @@
 //! get a `!` prepended. A source whose intent is "re-include `.env`" stores
 //! the bare string `.env` in `include_patterns` (the matcher prepends the
 //! `!`); the "e.g. !.env" wording in the SPEC describes the user-facing
-//! *effect*, not the stored glob.
-//!
-//! ## Why a custom matcher (replaces the old single `Override`)
-//!
-//! The previous implementation packed defaults + user rules into one
-//! [`ignore::overrides::Override`]. That tier is WHITELIST-mode (one whitelist
-//! glob drops every unmatched file - a backup data-loss bug) and is evaluated
-//! ABOVE the gitignore cascade, inverting the DESIGN defaults-vs-gitignore
-//! precedence so a gitignore `!Thumbs.db` could not re-include over a default.
-//! A `Gitignore` matcher has neither problem: unmatched paths stay
-//! `Match::None` (included) and `!`-rules re-include naturally without
-//! flipping any global mode - which is what lets `!.env` (F2) and a gitignore
-//! `!Thumbs.db` (F5) work.
+//! *effect*, not the stored glob. Unmatched paths stay `Match::None`
+//! (included) and `!`-rules re-include naturally without any whitelist-only
+//! mode dropping unrelated files.
 
-use std::path::Path;
+use std::path::{Path, PathBuf};
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
@@ -99,25 +111,47 @@ pub const DEFAULT_EXCLUDES: &[&str] = &[
     ".git/",
 ];
 
-/// The combined include/exclude decision matcher for one source.
+/// One directory-scoped [`Gitignore`] in a [`SourceMatcher`]'s cascade.
 ///
-/// Thin wrapper over a single [`ignore::gitignore::Gitignore`] built by
-/// [`build_source_matcher`]. The scanner consults it for BOTH the walk filter
-/// and the excluded-orphan split (DESIGN s5.5) via [`SourceMatcher::is_included`],
-/// so include/exclude semantics are identical in both places.
+/// `matcher` is built rooted at `dir`, and it is consulted ONLY for paths at or
+/// under `dir` (the per-directory scoping). For the source-level tiers
+/// (defaults, `.git/info/exclude`, global, and the source's own
+/// include/exclude patterns) `dir` is the source root; for a nested
+/// `.gitignore` / `.ignore` it is that file's own directory.
+#[derive(Debug)]
+struct Scope {
+    /// Absolute directory this scope applies at or under.
+    dir: PathBuf,
+    /// The rules for this scope, rooted at `dir`.
+    matcher: Gitignore,
+}
+
+/// The per-directory include/exclude decision cascade for one source
+/// ([`build_source_matcher`]). A STACK of [`Scope`]s ordered lowest-precedence
+/// first; the scanner consults it for BOTH the walk filter and the
+/// excluded-orphan split (DESIGN s5.5) via [`SourceMatcher::is_included`], so
+/// include/exclude semantics are identical in both places (and queryable for
+/// paths that are not on disk).
 #[derive(Debug)]
 pub struct SourceMatcher {
-    inner: Gitignore,
-    /// True when ANY rule can RE-INCLUDE a path a broader rule excluded - i.e.
+    /// Absolute source root; every queried relative path is joined onto it so
+    /// each scope matches an absolute path (the form the `ignore` crate strips
+    /// against its scope root).
+    root: PathBuf,
+    /// Scopes in ascending precedence: defaults, the `.gitignore` cascade, the
+    /// `.ignore` cascade, `.git/info/exclude`, global, then the source's own
+    /// exclude/include overrides (highest). Last matching scope wins.
+    scopes: Vec<Scope>,
+    /// True when ANY scope can RE-INCLUDE a path a broader rule excluded - i.e.
     /// the source has `include_patterns` (each stored as a `!`-re-include) OR
     /// any tier (`.gitignore` / `.ignore` / `.git/info/exclude` / global /
     /// `core.excludesFile`) contributed a `!`-prefixed whitelist rule. Used to
     /// disable directory pruning in [`build_walker`]: a nested `!keep.txt`
-    /// under an excluded parent dir would be classified INCLUDED by the
-    /// flattened matcher, so pruning that parent (never walking it) would leave
-    /// the file unseen and the orphan split would false-classify it `deleted`
-    /// and trash a file that still exists (P1-1, data loss). When this is set
-    /// the walker prunes nothing and the per-file matcher decides every path,
+    /// under an excluded parent dir is classified INCLUDED (the permissive
+    /// re-include), so pruning that parent (never walking it) would leave the
+    /// file unseen and the orphan split would false-classify it `deleted` and
+    /// trash a file that still exists (P1-1, data loss). When this is set the
+    /// walker prunes nothing and the per-file matcher decides every path,
     /// keeping the walk filter and orphan split in lockstep.
     has_negations: bool,
 }
@@ -134,86 +168,154 @@ impl SourceMatcher {
     /// current rules. `is_dir` distinguishes a directory from a file so a
     /// trailing-slash gitignore rule (`node_modules/`) applies correctly.
     ///
-    /// Uses [`Gitignore::matched_path_or_any_parents`], NOT `matched`: a
-    /// directory-scoped rule such as `node_modules/` matches the *directory*,
-    /// and `matched("node_modules/foo.js", false)` would return `None`
-    /// (included) - the file would leak in. Walking ancestors catches the
-    /// excluded parent and returns `Ignore`. A `Whitelist` (a `!`-re-include)
-    /// or `None` (no rule) both mean INCLUDED; only `Ignore` excludes.
+    /// Joins `rel` onto the source root and evaluates the absolute path against
+    /// every scope whose directory is an ancestor (per-directory scoping); the
+    /// LAST non-`None` match decides (a deeper / higher-tier scope overrides a
+    /// shallower one), and only an `Ignore` excludes - a `Whitelist`
+    /// (`!`-re-include) or no match at all means INCLUDED. Each scope is
+    /// consulted with [`Gitignore::matched_path_or_any_parents`], NOT `matched`,
+    /// so a directory-scoped rule (`node_modules/`) excludes files beneath it;
+    /// the `starts_with` ancestor guard also keeps that call from panicking on a
+    /// path outside a scope's root.
     pub fn is_included(&self, rel: &Path, is_dir: bool) -> bool {
-        !self
-            .inner
-            .matched_path_or_any_parents(rel, is_dir)
-            .is_ignore()
+        let abs = self.root.join(rel);
+        // `None` = undecided so far; `Some(true)` = last match ignored;
+        // `Some(false)` = last match whitelisted (re-included).
+        let mut ignored: Option<bool> = None;
+        for scope in &self.scopes {
+            // A scope applies only to paths at or under its directory. This is
+            // the per-directory scoping AND it guards the call below, which
+            // panics if `abs` is not under the scope's root.
+            if !abs.starts_with(&scope.dir) {
+                continue;
+            }
+            let m = scope.matcher.matched_path_or_any_parents(&abs, is_dir);
+            if m.is_ignore() {
+                ignored = Some(true);
+            } else if m.is_whitelist() {
+                ignored = Some(false);
+            }
+            // `Match::None` leaves the running decision unchanged.
+        }
+        !matches!(ignored, Some(true))
     }
 }
 
-/// Builds the combined [`SourceMatcher`] for `source` (DESIGN s5.2).
-///
-/// Adds rules in LAST-MATCH-WINS order (see the module docs): defaults
-/// (lowest), then - if `respect_gitignore` - the gitignore tier (`.gitignore`
-/// cascade, then `.ignore` cascade, then `<root>/.git/info/exclude`, then the
-/// global gitignore), then the source's `exclude_patterns` and
-/// `include_patterns` (highest). The matcher is anchored at the source root so
-/// all rules match against root-relative paths - the same form the scanner
-/// strips each entry to.
-pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher> {
-    let root = Path::new(&source.local_path);
-    let mut gb = GitignoreBuilder::new(root);
-
-    // 1. (lowest) DESIGN s5.2 default excludes - bare gitignore globs.
-    for glob in DEFAULT_EXCLUDES {
-        gb.add_line(None, glob)
-            .map_err(|e| anyhow::anyhow!("adding default exclude `{glob}`: {e}"))?;
+/// Builds one directory-scoped [`Scope`] from a set of gitignore lines rooted at
+/// `dir` (the source-level tiers: defaults + the source's own patterns).
+fn scope_from_lines<'a>(
+    dir: &Path,
+    lines: impl IntoIterator<Item = &'a str>,
+    label: &str,
+) -> anyhow::Result<Scope> {
+    let mut gb = GitignoreBuilder::new(dir);
+    for line in lines {
+        gb.add_line(None, line)
+            .map_err(|e| anyhow::anyhow!("adding {label} `{line}`: {e}"))?;
     }
+    let matcher = gb
+        .build()
+        .map_err(|e| anyhow::anyhow!("building {label} matcher: {e}"))?;
+    Ok(Scope {
+        dir: dir.to_path_buf(),
+        matcher,
+    })
+}
+
+/// Builds one directory-scoped [`Scope`] from an ignore FILE, rooted at the
+/// EXPLICIT `scope_dir` its rules apply under. For a nested `.gitignore` /
+/// `.ignore` that is the file's own directory (the true per-dir cascade); for
+/// the repo-level `.git/info/exclude` and the global gitignore it is the SOURCE
+/// ROOT (git anchors both at the repo root, not at their on-disk location), so
+/// the caller passes the source root there rather than the file's parent
+/// (`.git/info`), which would scope the rules to a directory no real path lives
+/// under. A missing/unreadable file or a parse error is non-fatal - the scope
+/// simply contributes no rules (or is skipped), never aborting the whole matcher
+/// (a scan must not fail because one `.gitignore` was malformed). Returns `None`
+/// when the scope could not be built at all.
+fn scope_from_file(
+    source: &SourceRow,
+    scope_dir: &Path,
+    ignore_file: &Path,
+    label: &str,
+) -> Option<Scope> {
+    let mut gb = GitignoreBuilder::new(scope_dir);
+    // `GitignoreBuilder::add` returns Some(err) on a partial/parse error; a
+    // missing or unreadable file is non-fatal (no rules applied) so only log.
+    if let Some(err) = gb.add(ignore_file) {
+        tracing::warn!(
+            target: TARGET,
+            source_id = %source.id,
+            path = %ignore_file.display(),
+            %err,
+            "failed to parse {label}; ignoring its rules",
+        );
+    }
+    match gb.build() {
+        Ok(matcher) => Some(Scope {
+            dir: scope_dir.to_path_buf(),
+            matcher,
+        }),
+        Err(err) => {
+            tracing::warn!(
+                target: TARGET,
+                source_id = %source.id,
+                path = %ignore_file.display(),
+                %err,
+                "failed to build {label} scope; skipping it",
+            );
+            None
+        }
+    }
+}
+
+/// Builds the per-directory [`SourceMatcher`] cascade for `source` (DESIGN
+/// s5.2). Scopes are pushed in LAST-MATCH-WINS order (see the module docs):
+/// defaults (lowest), then - if `respect_gitignore` - the `.gitignore` cascade,
+/// the `.ignore` cascade, `<root>/.git/info/exclude`, and the global gitignore,
+/// then the source's `exclude_patterns` + `include_patterns` (highest). Each
+/// nested ignore file is its OWN scope rooted at that file's directory, so its
+/// rules apply only under that directory.
+pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher> {
+    let root = PathBuf::from(&source.local_path);
+    let mut scopes: Vec<Scope> = Vec::new();
+
+    // 1. (lowest) DESIGN s5.2 default excludes - one root-rooted scope of bare
+    //    gitignore globs, so they apply at every depth below the root.
+    scopes.push(scope_from_lines(
+        &root,
+        DEFAULT_EXCLUDES.iter().copied(),
+        "default exclude",
+    )?);
 
     // 2. the gitignore tier (DESIGN s5.2: respect .gitignore, .ignore,
-    //    .git/info/exclude, and the global gitignore). All four sub-sources sit
-    //    at the SAME precedence (above the defaults, below the source's own
-    //    exclude/include overrides). Within the tier they are added in the
-    //    order: `.gitignore` cascade, then `.ignore` cascade, then
-    //    `.git/info/exclude`, then global - each root-first so a deeper file's
-    //    rule wins over a shallower one (approximation of the per-directory
-    //    cascade for M2).
-    // TODO(perf/correctness): true per-directory gitignore scoping - rules in
-    //    a nested ignore file should apply only under that directory, and a
-    //    pattern with no slash should match at any depth below its file. This
-    //    flattens all rules into one matcher rooted at the source root, which
-    //    is a close-but-not-exact approximation accepted for M2.
+    //    .git/info/exclude, and the global gitignore), each ABOVE the defaults
+    //    and BELOW the source's own overrides. The `.gitignore` cascade then the
+    //    `.ignore` cascade (`.ignore` overrides `.gitignore`, matching the
+    //    `ignore` crate) - each file a per-directory scope, root-first so a
+    //    deeper file's rule wins over a shallower one.
     if source.respect_gitignore {
-        // `.gitignore` cascade, then `.ignore` cascade. `.ignore` uses the
-        // identical gitignore syntax and sits just above the `.gitignore`
-        // cascade at the same tier (matching the `ignore` crate's own
-        // precedence where `.ignore` overrides `.gitignore`).
-        for ignore_file in collect_ignore_files(root, ".gitignore")
-            .into_iter()
-            .chain(collect_ignore_files(root, ".ignore"))
-        {
-            // `GitignoreBuilder::add` returns Some(err) on a partial/parse
-            // error; a missing or unreadable ignore file is non-fatal (we
-            // simply apply no rules from it) so only log.
-            if let Some(err) = gb.add(&ignore_file) {
-                tracing::warn!(
-                    target: TARGET,
-                    source_id = %source.id,
-                    path = %ignore_file.display(),
-                    %err,
-                    "failed to parse an ignore file; ignoring its rules"
-                );
+        for filename in [".gitignore", ".ignore"] {
+            for ignore_file in collect_ignore_files(&root, filename) {
+                // A nested ignore file is scoped to its OWN directory (the
+                // per-dir cascade); fall back to the root if it somehow has no
+                // parent.
+                let scope_dir = ignore_file.parent().unwrap_or(&root).to_path_buf();
+                if let Some(scope) =
+                    scope_from_file(source, &scope_dir, &ignore_file, "an ignore file")
+                {
+                    scopes.push(scope);
+                }
             }
         }
 
-        // `<root>/.git/info/exclude` - the repo-local private exclude list.
+        // `<root>/.git/info/exclude` - the repo-local private exclude list,
+        // rooted at the source root.
         let info_exclude = root.join(".git").join("info").join("exclude");
         if info_exclude.is_file() {
-            if let Some(err) = gb.add(&info_exclude) {
-                tracing::warn!(
-                    target: TARGET,
-                    source_id = %source.id,
-                    path = %info_exclude.display(),
-                    %err,
-                    "failed to parse .git/info/exclude; ignoring its rules"
-                );
+            if let Some(scope) = scope_from_file(source, &root, &info_exclude, ".git/info/exclude")
+            {
+                scopes.push(scope);
             }
         }
 
@@ -223,46 +325,41 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
         // $XDG_CONFIG_HOME / $HOME and the machine-global git config would race
         // parallel tests (see the exclude tests' note); a focused unit test
         // instead proves the tier loads via `.git/info/exclude` + `.ignore`.
+        // Rooted at the source root so its rules apply tree-wide.
         if let Some(global) = global_gitignore_path() {
             if global.is_file() {
-                if let Some(err) = gb.add(&global) {
-                    tracing::warn!(
-                        target: TARGET,
-                        source_id = %source.id,
-                        path = %global.display(),
-                        %err,
-                        "failed to parse global gitignore; ignoring its rules"
-                    );
+                if let Some(scope) = scope_from_file(source, &root, &global, "global gitignore") {
+                    scopes.push(scope);
                 }
             }
         }
     }
 
-    // 3. (highest) the source's own overrides: exclude_patterns force-out
-    //    (bare glob), then include_patterns opt-back-in (`!`-prefixed). Added
-    //    LAST so they beat both gitignore and the defaults.
-    for exc in &source.exclude_patterns {
-        gb.add_line(None, exc)
-            .map_err(|e| anyhow::anyhow!("adding exclude_pattern `{exc}`: {e}"))?;
-    }
-    for inc in &source.include_patterns {
-        let reinclude = format!("!{inc}");
-        gb.add_line(None, &reinclude)
-            .map_err(|e| anyhow::anyhow!("adding include_pattern `{inc}`: {e}"))?;
-    }
-
-    let inner = gb
-        .build()
-        .map_err(|e| anyhow::anyhow!("building source matcher: {e}"))?;
+    // 3. (highest) the source's own overrides: exclude_patterns force-out (bare
+    //    glob), then include_patterns opt-back-in (`!`-prefixed), one root-rooted
+    //    scope added LAST so it beats both gitignore and the defaults. Built in a
+    //    single scope so the include (`!`) rules override the exclude rules
+    //    within it (last-match-wins inside the one Gitignore).
+    let override_lines: Vec<String> = source
+        .exclude_patterns
+        .iter()
+        .cloned()
+        .chain(source.include_patterns.iter().map(|inc| format!("!{inc}")))
+        .collect();
+    scopes.push(scope_from_lines(
+        &root,
+        override_lines.iter().map(String::as_str),
+        "source override pattern",
+    )?);
 
     // P1-1: a source has negations when it carries `include_patterns` (each
-    // added as a `!`-re-include) OR any tier contributed a `!`-prefixed
-    // whitelist rule. `Gitignore::num_whitelists` counts exactly those
-    // `!`-rules across every tier we added above (cheaper and more correct
-    // than re-reading each ignore file to scan for `!` lines - it handles
-    // escaped `\!`, the global / core.excludesFile tiers, and read failures
-    // identically to how the matcher itself parsed them).
-    let has_negations = !source.include_patterns.is_empty() || inner.num_whitelists() > 0;
+    // added as a `!`-re-include) OR any scope contributed a `!`-prefixed
+    // whitelist rule. `Gitignore::num_whitelists` counts exactly those `!`-rules
+    // per scope (cheaper and more correct than re-reading each ignore file to
+    // scan for `!` lines - it handles escaped `\!`, every tier, and read
+    // failures identically to how the matcher itself parsed them).
+    let num_whitelists: u64 = scopes.iter().map(|s| s.matcher.num_whitelists()).sum();
+    let has_negations = !source.include_patterns.is_empty() || num_whitelists > 0;
 
     tracing::debug!(
         target: TARGET,
@@ -270,13 +367,14 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
         respect_gitignore = source.respect_gitignore,
         includes = source.include_patterns.len(),
         excludes = source.exclude_patterns.len(),
-        num_ignores = inner.num_ignores(),
-        num_whitelists = inner.num_whitelists(),
+        num_scopes = scopes.len(),
+        num_whitelists,
         has_negations,
         "built source matcher"
     );
     Ok(SourceMatcher {
-        inner,
+        root,
+        scopes,
         has_negations,
     })
 }
@@ -691,6 +789,7 @@ mod tests {
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: None,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 0,
         }
     }
@@ -1037,6 +1136,113 @@ mod tests {
         assert!(
             !matcher.has_negations(),
             "plain excludes with no `!`-rule and no include_patterns must NOT set has_negations"
+        );
+    }
+
+    // --- true per-directory cascade (DESIGN s5.2) ---------------------------
+
+    #[test]
+    fn nested_gitignore_is_scoped_to_its_directory() {
+        // The core cascade fix: an unanchored rule in `sub/.gitignore` applies
+        // ONLY under `sub/`. The old flattened matcher rooted every rule at the
+        // source root, so `secret.txt` in `sub/.gitignore` wrongly excluded a
+        // sibling `other/secret.txt` too. With true per-dir scoping only the
+        // file under `sub/` is excluded.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("sub/.gitignore"), "secret.txt\n");
+        write(&root.join("sub/secret.txt"), "x");
+        write(&root.join("other/secret.txt"), "x");
+        write(&root.join("keep.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(
+            !matcher.is_included(Path::new("sub/secret.txt"), false),
+            "the rule must exclude the file under its own directory"
+        );
+        assert!(
+            matcher.is_included(Path::new("other/secret.txt"), false),
+            "a nested rule must NOT leak into a sibling directory"
+        );
+        assert!(matcher.is_included(Path::new("keep.txt"), false));
+
+        // And the same through the walk (belt-and-suspenders).
+        let names = walked_names(&src);
+        assert!(names.contains(&"other/secret.txt".to_string()), "{names:?}");
+        assert!(names.contains(&"keep.txt".to_string()), "{names:?}");
+        assert!(!names.contains(&"sub/secret.txt".to_string()), "{names:?}");
+    }
+
+    #[test]
+    fn deeper_gitignore_overrides_shallower() {
+        // A deeper `.gitignore` wins over a shallower one (last-match-wins across
+        // scopes): root excludes `*.log`, `sub/.gitignore` re-includes
+        // `important.log`. So `sub/important.log` survives, `sub/other.log` and
+        // the root-level `top.log` are excluded.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "*.log\n");
+        write(&root.join("sub/.gitignore"), "!important.log\n");
+        write(&root.join("sub/important.log"), "x");
+        write(&root.join("sub/other.log"), "x");
+        write(&root.join("top.log"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(
+            matcher.is_included(Path::new("sub/important.log"), false),
+            "deeper !important.log must re-include over the shallower *.log"
+        );
+        assert!(!matcher.is_included(Path::new("sub/other.log"), false));
+        assert!(!matcher.is_included(Path::new("top.log"), false));
+        // A negation in a nested tier must set has_negations (pruning off).
+        assert!(matcher.has_negations());
+    }
+
+    #[test]
+    fn anchored_rule_in_nested_dir_is_directory_local() {
+        // An ANCHORED rule (`/foo`) in a nested `.gitignore` matches only at that
+        // directory, not deeper - the per-dir scope roots the anchor at `sub/`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("sub/.gitignore"), "/foo\n");
+        write(&root.join("sub/foo"), "x");
+        write(&root.join("sub/deep/foo"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(
+            !matcher.is_included(Path::new("sub/foo"), false),
+            "the anchored /foo matches at the nested dir"
+        );
+        assert!(
+            matcher.is_included(Path::new("sub/deep/foo"), false),
+            "the anchored /foo must NOT match one level deeper"
+        );
+    }
+
+    #[test]
+    fn unanchored_nested_rule_matches_any_depth_below_its_dir() {
+        // An UNANCHORED rule in a nested `.gitignore` matches at any depth BELOW
+        // its own directory (but still not in a sibling tree).
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("sub/.gitignore"), "*.tmpx\n");
+        write(&root.join("sub/a.tmpx"), "x");
+        write(&root.join("sub/deep/b.tmpx"), "x");
+        write(&root.join("other/c.tmpx"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(!matcher.is_included(Path::new("sub/a.tmpx"), false));
+        assert!(
+            !matcher.is_included(Path::new("sub/deep/b.tmpx"), false),
+            "unanchored rule reaches any depth below its dir"
+        );
+        assert!(
+            matcher.is_included(Path::new("other/c.tmpx"), false),
+            "but never a sibling tree"
         );
     }
 }

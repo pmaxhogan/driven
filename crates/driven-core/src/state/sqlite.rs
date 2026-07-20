@@ -561,6 +561,7 @@ impl StateRepo for SqliteStateRepo {
                 deep_verify_interval_secs AS "deep_verify_interval_secs!: i64",
                 last_full_scan_at         AS "last_full_scan_at: i64",
                 last_deep_verify_at       AS "last_deep_verify_at: i64",
+                mtime_granularity_ns      AS "mtime_granularity_ns: i64",
                 created_at                AS "created_at!: i64"
             FROM backup_sources
             ORDER BY created_at ASC, id ASC
@@ -591,6 +592,7 @@ impl StateRepo for SqliteStateRepo {
                         .map_err(|_| anyhow!("deep_verify_interval_secs out of u32 range"))?,
                     last_full_scan_at: r.last_full_scan_at,
                     last_deep_verify_at: r.last_deep_verify_at,
+                    mtime_granularity_ns: r.mtime_granularity_ns,
                     created_at: r.created_at,
                 })
             })
@@ -620,6 +622,7 @@ impl StateRepo for SqliteStateRepo {
                 deep_verify_interval_secs AS "deep_verify_interval_secs!: i64",
                 last_full_scan_at         AS "last_full_scan_at: i64",
                 last_deep_verify_at       AS "last_deep_verify_at: i64",
+                mtime_granularity_ns      AS "mtime_granularity_ns: i64",
                 created_at                AS "created_at!: i64"
             FROM backup_sources
             WHERE account_id = ?1 AND enabled = 1
@@ -652,6 +655,7 @@ impl StateRepo for SqliteStateRepo {
                         .map_err(|_| anyhow!("deep_verify_interval_secs out of u32 range"))?,
                     last_full_scan_at: r.last_full_scan_at,
                     last_deep_verify_at: r.last_deep_verify_at,
+                    mtime_granularity_ns: r.mtime_granularity_ns,
                     created_at: r.created_at,
                 })
             })
@@ -679,14 +683,14 @@ impl StateRepo for SqliteStateRepo {
                 encryption_enabled, wrapped_source_key, respect_gitignore,
                 include_patterns, exclude_patterns, schedule_json_v2_reserved,
                 deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
-                created_at, placeholder_policy, drive_id
+                created_at, placeholder_policy, drive_id, mtime_granularity_ns
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
-                ?17, ?18, ?19
+                ?17, ?18, ?19, ?20
             )
             ON CONFLICT(id) DO UPDATE SET
                 account_id                = excluded.account_id,
@@ -706,7 +710,8 @@ impl StateRepo for SqliteStateRepo {
                 last_deep_verify_at       = excluded.last_deep_verify_at,
                 created_at                = excluded.created_at,
                 placeholder_policy        = excluded.placeholder_policy,
-                drive_id                  = excluded.drive_id
+                drive_id                  = excluded.drive_id,
+                mtime_granularity_ns      = excluded.mtime_granularity_ns
             "#,
             id,
             account_id,
@@ -727,6 +732,7 @@ impl StateRepo for SqliteStateRepo {
             row.created_at,
             placeholder_policy,
             drive_id,
+            row.mtime_granularity_ns,
         )
         .execute(&self.pool)
         .await?;
@@ -819,14 +825,14 @@ impl StateRepo for SqliteStateRepo {
                 encryption_enabled, wrapped_source_key, respect_gitignore,
                 include_patterns, exclude_patterns, schedule_json_v2_reserved,
                 deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
-                created_at, placeholder_policy, drive_id
+                created_at, placeholder_policy, drive_id, mtime_granularity_ns
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
-                ?17, ?18, ?19
+                ?17, ?18, ?19, ?20
             )
             ON CONFLICT(id) DO UPDATE SET
                 account_id                = excluded.account_id,
@@ -846,7 +852,8 @@ impl StateRepo for SqliteStateRepo {
                 last_deep_verify_at       = excluded.last_deep_verify_at,
                 created_at                = excluded.created_at,
                 placeholder_policy        = excluded.placeholder_policy,
-                drive_id                  = excluded.drive_id
+                drive_id                  = excluded.drive_id,
+                mtime_granularity_ns      = excluded.mtime_granularity_ns
             "#,
             id,
             account_id,
@@ -867,6 +874,7 @@ impl StateRepo for SqliteStateRepo {
             source.created_at,
             placeholder_policy,
             drive_id,
+            source.mtime_granularity_ns,
         )
         .execute(&mut *tx)
         .await?;
@@ -946,14 +954,14 @@ impl StateRepo for SqliteStateRepo {
                 encryption_enabled, wrapped_source_key, respect_gitignore,
                 include_patterns, exclude_patterns, schedule_json_v2_reserved,
                 deep_verify_interval_secs, last_full_scan_at, last_deep_verify_at,
-                created_at, placeholder_policy, drive_id
+                created_at, placeholder_policy, drive_id, mtime_granularity_ns
             ) VALUES (
                 ?1, ?2, ?3, ?4,
                 ?5, ?6, ?7,
                 ?8, ?9, ?10,
                 ?11, ?12, ?13,
                 ?14, ?15, ?16,
-                ?17, ?18, ?19
+                ?17, ?18, ?19, ?20
             )
             ON CONFLICT(id) DO UPDATE SET
                 account_id                = excluded.account_id,
@@ -973,7 +981,8 @@ impl StateRepo for SqliteStateRepo {
                 last_deep_verify_at       = excluded.last_deep_verify_at,
                 created_at                = excluded.created_at,
                 placeholder_policy        = excluded.placeholder_policy,
-                drive_id                  = excluded.drive_id
+                drive_id                  = excluded.drive_id,
+                mtime_granularity_ns      = excluded.mtime_granularity_ns
             "#,
             id,
             src_account_id,
@@ -994,6 +1003,7 @@ impl StateRepo for SqliteStateRepo {
             source.created_at,
             placeholder_policy,
             drive_id,
+            source.mtime_granularity_ns,
         )
         .execute(&mut *tx)
         .await?;
@@ -1350,6 +1360,26 @@ impl StateRepo for SqliteStateRepo {
             "#,
             full_scan_at,
             deep_verify_at,
+            id_str,
+        )
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn set_source_mtime_granularity(&self, id: SourceId, granularity_ns: i64) -> Result<()> {
+        let id_str = id.to_string();
+        // Targeted single-column UPDATE (DESIGN s5.2 step 2): persist the probed
+        // granularity without touching any other column a concurrent settings
+        // edit may have changed. Affecting zero rows (source deleted mid-scan) is
+        // a benign no-op.
+        sqlx::query!(
+            r#"
+            UPDATE backup_sources
+            SET mtime_granularity_ns = ?1
+            WHERE id = ?2
+            "#,
+            granularity_ns,
             id_str,
         )
         .execute(&self.pool)
@@ -3528,6 +3558,7 @@ mod tests {
             deep_verify_interval_secs: 604_800,
             last_full_scan_at: None,
             last_deep_verify_at: None,
+            mtime_granularity_ns: None,
             created_at: 1_700_000_000_000,
         }
     }
@@ -4292,6 +4323,54 @@ mod tests {
             reloaded.placeholder_policy,
             PlaceholderPolicy::ForceDownload
         );
+    }
+
+    /// Item #3 (DESIGN s5.2): the `mtime_granularity_ns` column round-trips.
+    /// A fresh source reloads as `None` (unprobed), `set_source_mtime_granularity`
+    /// persists a measured window without disturbing any other column, and the
+    /// value survives an `upsert_source` round-trip (via the INSERT bind).
+    #[tokio::test]
+    async fn mtime_granularity_round_trip() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+
+        async fn reload(repo: &SqliteStateRepo, id: SourceId) -> SourceRow {
+            repo.list_sources()
+                .await
+                .unwrap()
+                .into_iter()
+                .find(|s| s.id == id)
+                .unwrap()
+        }
+
+        // A brand-new source is unprobed -> NULL -> None.
+        let src = sample_source(acct.id);
+        assert_eq!(src.mtime_granularity_ns, None);
+        repo.upsert_source(&src).await.unwrap();
+        assert_eq!(reload(&repo, src.id).await.mtime_granularity_ns, None);
+
+        // The targeted UPDATE persists a coarse (2s) window and touches nothing
+        // else - the whole row is otherwise unchanged.
+        repo.set_source_mtime_granularity(src.id, 2_000_000_000)
+            .await
+            .unwrap();
+        let after = reload(&repo, src.id).await;
+        assert_eq!(after.mtime_granularity_ns, Some(2_000_000_000));
+        assert_eq!(
+            SourceRow {
+                mtime_granularity_ns: None,
+                ..after.clone()
+            },
+            src,
+            "only mtime_granularity_ns changed"
+        );
+
+        // A `Some(0)` (probed-fine) value also survives an upsert round-trip.
+        let mut fine = after.clone();
+        fine.mtime_granularity_ns = Some(0);
+        repo.upsert_source(&fine).await.unwrap();
+        assert_eq!(reload(&repo, src.id).await.mtime_granularity_ns, Some(0));
     }
 
     #[tokio::test]
