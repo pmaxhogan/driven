@@ -1568,6 +1568,27 @@ impl SyncOrchestrator {
             return Ok(true);
         }
 
+        // Issue #147: a manual pause raised mid-plan makes the executor stop
+        // dispatching, so `outcomes` covers only PART of the plan. Return
+        // WITHOUT advancing `last_full_scan_at` / `last_deep_verify_at` - the
+        // same data-safety rule as the failed-op path below. Advancing them
+        // here would be worse than a failed op: on a deep-verify cycle the
+        // unexecuted tail keeps its stale `file_state` row (matching
+        // size+mtime), so the fast scan skips it while the advanced
+        // `last_deep_verify_at` stops `deep_verify_due` re-checking it for a
+        // whole interval - changed bytes would not retry for days. The
+        // source-boundary check in `run_cycle` ends the cycle right after this.
+        if *self.pause_tx.borrow() {
+            tracing::info!(
+                target: TARGET,
+                source_id = %source.id,
+                completed_ops = outcomes.len(),
+                planned_ops = plan.ops.len(),
+                "manual pause stopped this source's plan part-way; leaving it scan-due for the next unpaused cycle"
+            );
+            return Ok(false);
+        }
+
         // Deep-verify (DESIGN s3.3): the verify *mode* already re-hashed via
         // the DeepVerify scan above and any mismatch was re-uploaded by the
         // executor; the Verifying state reflects that pass for the tray.
@@ -1819,6 +1840,20 @@ impl SyncOrchestrator {
         }
 
         loop_result?;
+
+        // Issue #147: a cycle that ended because of a manual pause must land in
+        // `Paused`, not `Idle`. `set_paused(true)` already transitioned to
+        // `Paused{Manual}`, but the still-running cycle would overwrite it here
+        // and the tray/UI would claim "up to date" until the NEXT tick's gate
+        // check re-derived the pause - up to a full scan interval (10 min at the
+        // shipped default) of showing not-paused while paused.
+        if *self.pause_tx.borrow() {
+            self.transition(OrchestratorState::Paused {
+                reason: PauseReason::Manual,
+            })
+            .await;
+            return Ok(());
+        }
 
         self.transition(OrchestratorState::Idle {
             last_run_at: Some(self.clock.now_ms()),
@@ -2332,6 +2367,13 @@ impl Orchestrator for SyncOrchestrator {
         // (the app-shell run loop subscribes only once it spawns), which would
         // silently leave the gate open. `send_replace` always writes.
         let _ = self.pause_tx.send_replace(paused);
+        // Issue #147: the gate above is only READ between cycles, so on its own
+        // it lets a pause raised during a big initial backup keep uploading for
+        // the rest of the plan (minutes to hours). Push the signal into the
+        // running executor so it stops dispatching new ops at the next op
+        // boundary. Done BEFORE the state transition so a `state()` read that
+        // observes `Paused` can never see an executor still dispatching.
+        self.executor.set_paused(paused);
         if paused {
             self.transition(OrchestratorState::Paused {
                 reason: PauseReason::Manual,
@@ -2366,7 +2408,7 @@ impl Orchestrator for SyncOrchestrator {
 #[cfg(test)]
 mod tests {
     use std::collections::HashMap;
-    use std::sync::atomic::{AtomicU64, Ordering};
+    use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
     use std::sync::Mutex as StdMutex;
 
     use async_trait::async_trait;
@@ -2400,6 +2442,10 @@ mod tests {
         /// decrements this counter WITHOUT recording the source as adopted -
         /// drives the P1-1 "first reconcile fails, retried next cycle" test.
         reconcile_failures_remaining: AtomicU64,
+        /// Issue #147: the last value the orchestrator pushed through
+        /// [`Executor::set_paused`], so a test can assert the manual pause
+        /// actually reaches the executor's dispatch gate.
+        paused: AtomicBool,
         /// When `> 0`, every `execute` op returns `OpOutcome::Failed` (a
         /// `DriveChecksumMismatch`) instead of `Done` - drives the recheck2
         /// "failed op defers the timestamp advance + records activity" test.
@@ -2554,6 +2600,10 @@ mod tests {
             }
             self.reconciled_sources.lock().unwrap().push(source.id);
             Ok(())
+        }
+
+        fn set_paused(&self, paused: bool) {
+            self.paused.store(paused, Ordering::SeqCst);
         }
     }
 
@@ -3808,6 +3858,7 @@ mod tests {
             executes: executes.clone(),
             entered_tx,
             release_rx: tokio::sync::Mutex::new(release_rx),
+            paused: Arc::new(AtomicBool::new(false)),
         });
 
         let state = Arc::new(FakeState::with_sources(sources));
@@ -3864,6 +3915,105 @@ mod tests {
         assert!(
             vss.end_cycle_calls() >= 1,
             "the mid-cycle pause must still release VSS at cycle exit"
+        );
+    }
+
+    /// Issue #147 (the tray "Pause for 30m" that kept uploading): pausing while
+    /// a cycle is in flight must (a) reach the EXECUTOR, so it stops
+    /// dispatching the rest of the plan instead of running it to completion,
+    /// (b) leave the orchestrator in `Paused{Manual}` rather than the `Idle`
+    /// the cycle's terminal transition would otherwise write, and (c) NOT
+    /// advance the source's scan timestamps, since the plan only partly ran.
+    ///
+    /// Before the fix all three failed: the manual-pause watch cell was read
+    /// only by `evaluate_gates` between cycles, so the in-flight plan uploaded
+    /// to the end, the cycle finished `Idle` (the tray claimed "up to date"
+    /// while paused, until the next tick - up to `scan_interval_secs`, 600 s in
+    /// the shipped default), and the timestamps advanced as if the source had
+    /// been fully backed up.
+    #[tokio::test]
+    async fn pause_mid_cycle_reaches_the_executor_and_ends_paused_not_idle() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"a").unwrap();
+        let src = source_in(account, dir.path());
+        let source_id = src.id;
+
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        let paused_seen = Arc::new(AtomicBool::new(false));
+        let exec = Arc::new(BlockingExecutor {
+            executes: Arc::new(AtomicU64::new(0)),
+            entered_tx,
+            release_rx: tokio::sync::Mutex::new(release_rx),
+            paused: paused_seen.clone(),
+        });
+
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let orch = Arc::new(SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec,
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            Arc::new(FakeClock::new()),
+            OrchestratorConfig::default(),
+        ));
+
+        let cycle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run_cycle(TickSource::Scheduled).await })
+        };
+
+        // The cycle is now parked INSIDE `execute` - exactly the state the user
+        // was in when they hit "Pause for 30m" during the initial backup.
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("the source must enter execute")
+            .expect("entered channel open");
+        orch.set_paused(true).await;
+
+        // (a) The pause reached the executor's dispatch gate WHILE it was
+        // mid-plan - not after the plan drained.
+        assert!(
+            paused_seen.load(Ordering::SeqCst),
+            "set_paused must reach the running executor, not only the between-cycles gate"
+        );
+
+        let _ = release_tx.send(());
+        tokio::time::timeout(std::time::Duration::from_secs(30), cycle)
+            .await
+            .expect("the cycle must finish promptly after the pause")
+            .expect("join")
+            .expect("run_cycle ok");
+
+        // (b) The cycle's terminal transition must not clobber the pause.
+        let final_state = orch.state().await;
+        assert!(
+            matches!(
+                final_state,
+                OrchestratorState::Paused {
+                    reason: PauseReason::Manual
+                }
+            ),
+            "a cycle ended by a manual pause lands in Paused{{Manual}}, not Idle: {final_state:?}"
+        );
+
+        // (c) The plan only partly ran, so the source stays scan-due and the
+        // account's last-synced stamp does not move.
+        let scanned_at = state
+            .sources_snapshot()
+            .iter()
+            .find(|s| s.id == source_id)
+            .expect("source present")
+            .last_full_scan_at;
+        assert!(
+            scanned_at.is_none(),
+            "a pause-truncated plan must not advance last_full_scan_at (got {scanned_at:?})"
+        );
+        assert!(
+            state.account_synced.lock().unwrap().is_empty(),
+            "a pause-truncated cycle must not stamp the account as synced"
         );
     }
 
@@ -4846,6 +4996,10 @@ mod tests {
         /// Awaited inside `execute`; the test sends one `()` to release each
         /// in-flight cycle.
         release_rx: tokio::sync::Mutex<tokio::sync::mpsc::UnboundedReceiver<()>>,
+        /// Issue #147: records the orchestrator's [`Executor::set_paused`]
+        /// pushes, so the mid-cycle-pause test can assert the signal reached
+        /// the executor WHILE a cycle was in flight.
+        paused: Arc<AtomicBool>,
     }
 
     #[async_trait]
@@ -4866,6 +5020,10 @@ mod tests {
 
         async fn reconcile(&self, _source: &SourceRow) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        fn set_paused(&self, paused: bool) {
+            self.paused.store(paused, Ordering::SeqCst);
         }
     }
 
@@ -4907,6 +5065,7 @@ mod tests {
             executes: executes.clone(),
             entered_tx,
             release_rx: tokio::sync::Mutex::new(release_rx),
+            paused: Arc::new(AtomicBool::new(false)),
         });
         let cfg = OrchestratorConfig {
             scan_interval_secs: 1,
@@ -4949,6 +5108,7 @@ mod tests {
             executes: executes.clone(),
             entered_tx,
             release_rx: tokio::sync::Mutex::new(release_rx),
+            paused: Arc::new(AtomicBool::new(false)),
         });
         // A long scan interval so the scheduled tick never fires during the test
         // - the watcher tick is the only thing that can run a cycle.
@@ -5010,6 +5170,7 @@ mod tests {
             executes: executes.clone(),
             entered_tx,
             release_rx: tokio::sync::Mutex::new(release_rx),
+            paused: Arc::new(AtomicBool::new(false)),
         });
         let cfg = OrchestratorConfig {
             scan_interval_secs: 3_600,
@@ -5355,6 +5516,7 @@ mod tests {
             executes: Arc::new(AtomicU64::new(0)),
             entered_tx,
             release_rx: tokio::sync::Mutex::new(release_rx),
+            paused: Arc::new(AtomicBool::new(false)),
         });
 
         let orch = Arc::new(
