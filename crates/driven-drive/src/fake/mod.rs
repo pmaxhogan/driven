@@ -656,6 +656,28 @@ impl InMemoryRemoteStore {
             .collect()
     }
 
+    /// Internal test hook: every descendant FILE entry under `folder_id`
+    /// (recursive, including trashed objects). Folders are traversed but not
+    /// returned. Fault-free like [`Self::list_folder_with_trashed`], so a
+    /// terminal-state invariant sweep works even with a latched fault.
+    /// Needed since plaintext sources mirror their local directory tree on
+    /// Drive (2.1.1) - a root-only listing no longer sees nested objects.
+    pub fn descendant_files_with_trashed(&self, folder_id: &str) -> Vec<RemoteEntry> {
+        let guard = self.inner.lock();
+        let mut out = Vec::new();
+        let mut stack = vec![folder_id.to_string()];
+        while let Some(id) = stack.pop() {
+            for e in guard.children(&id) {
+                if e.is_folder() {
+                    stack.push(e.file_id.clone());
+                } else {
+                    out.push(e.to_remote_entry());
+                }
+            }
+        }
+        out
+    }
+
     /// Internal test hook: count open resumable sessions. Used by the
     /// contract suite to assert that completed / invalidated sessions
     /// are released.
