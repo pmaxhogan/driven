@@ -38,9 +38,13 @@ permissions:
   contents: write
 
 concurrency:
-  # One rolling dev build at a time; cancel a superseded in-flight one.
+  # One rolling dev build at a time. Do NOT cancel an in-flight build: most
+  # main pushes spawn gate-only runs (build=false), and letting one of those
+  # cancel a 40-minute 4-target build kills real work for nothing (this
+  # exact footgun cancelled the first post-2.1.0 dev build when a merge
+  # landed mid-build). Superseded runs queue behind the build instead.
   group: ${{ github.workflow }}
-  cancel-in-progress: true
+  cancel-in-progress: false
 
 jobs:
   gate:
