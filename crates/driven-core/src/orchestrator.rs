@@ -1340,29 +1340,96 @@ impl SyncOrchestrator {
     /// On `dry_run` the pipeline stops after planning and issues no remote
     /// call (SPEC s5).
     ///
+    /// `tick` is the cycle's trigger; it only gates whether the scan phase
+    /// leaves durable `scan_started` / `scan_done` activity rows (see below).
+    ///
     /// Returns `Ok(true)` to signal the caller to STOP this account's cycle:
     /// the only such case is V-F (`auth.invalid_grant` -> the account was moved
     /// to `needs_reauth`), where pushing further sources through a dead
     /// credential is pointless (DESIGN s5.4). `Ok(false)` on the normal path.
-    async fn run_one_source(&self, source: &SourceRow, deep_verify: bool) -> anyhow::Result<bool> {
+    async fn run_one_source(
+        &self,
+        source: &SourceRow,
+        deep_verify: bool,
+        tick: TickSource,
+    ) -> anyhow::Result<bool> {
         let mode = if deep_verify {
             ScanMode::DeepVerify
         } else {
             ScanMode::FastPath
         };
 
+        // Immediate, durable "we started" evidence for a cycle the USER asked
+        // for. Before this, a cycle emitted NOTHING to the activity log until the
+        // executor's first per-op row, so "Run now" over a large tree looked dead
+        // for the whole scan phase (the only signal was a 4px indeterminate bar).
+        //
+        // Scoped to `TickSource::Manual` on purpose: the default 10-minute
+        // scheduled cycle would otherwise write two rows per source per tick
+        // (~576/day on two sources) and bury the real upload/error rows the
+        // Activity feed exists to show. A scheduled cycle still streams live
+        // `Scanning { scanned }` state for the progress bar - it just does not
+        // leave a durable row behind. Written with no message so the row needs no
+        // backend-side English (the webview localizes `activity.events.*`).
+        let user_initiated = tick == TickSource::Manual;
+        if user_initiated {
+            self.record_activity(NewActivity {
+                ts: self.clock.now_ms(),
+                source_id: Some(source.id),
+                level: ActivityLevel::Info,
+                event_type: "scan_started".to_string(),
+                file_count: None,
+                bytes: None,
+                message: None,
+            })
+            .await;
+        }
+
         self.transition(OrchestratorState::Scanning {
             source_id: source.id,
             scanned: 0,
         })
         .await;
-        let scan = crate::scanner::scan_with_latency(
-            source,
-            self.state.as_ref(),
-            mode,
-            self.latency.as_deref(),
-        )
-        .await?;
+
+        // Stream the walk's running file count into `Scanning { scanned }` so the
+        // UI's progress bar can render "Scanning... 12,401 files" live. The sink
+        // is awaited by the scanner (throttled to a few ticks per second), which
+        // is what both broadcasts the update AND yields the synchronous walk back
+        // to the runtime. `scanned_total` keeps the final count for the scan_done
+        // row below.
+        let source_id = source.id;
+        let scanned_total = std::sync::atomic::AtomicU64::new(0);
+        let scan = {
+            let on_scan_progress = |scanned: u64| -> futures::future::BoxFuture<'_, ()> {
+                scanned_total.store(scanned, std::sync::atomic::Ordering::Relaxed);
+                Box::pin(self.transition(OrchestratorState::Scanning { source_id, scanned }))
+            };
+            crate::scanner::scan_with_progress(
+                source,
+                self.state.as_ref(),
+                mode,
+                self.latency.as_deref(),
+                Some(&on_scan_progress),
+            )
+            .await?
+        };
+
+        // Durable "scan finished" row carrying the files visited, closing the
+        // pair opened above. Same manual-only scoping, so a user-initiated run
+        // that finds nothing to upload still ends with a visible result instead
+        // of silence.
+        if user_initiated {
+            self.record_activity(NewActivity {
+                ts: self.clock.now_ms(),
+                source_id: Some(source.id),
+                level: ActivityLevel::Info,
+                event_type: "scan_done".to_string(),
+                file_count: Some(scanned_total.load(std::sync::atomic::Ordering::Relaxed)),
+                bytes: None,
+                message: None,
+            })
+            .await;
+        }
 
         // DESIGN s5.2 step 2: the scan probed this source's FS mtime granularity
         // (it had none persisted - the first scan). Persist it so later scans
@@ -1695,7 +1762,7 @@ impl SyncOrchestrator {
         let loop_result: anyhow::Result<()> = async {
             for source in &sources {
                 let deep_verify = self.deep_verify_due(source);
-                let stop_account = self.run_one_source(source, deep_verify).await?;
+                let stop_account = self.run_one_source(source, deep_verify, tick).await?;
                 // P1-2 (M3.5 codex): durably record any shadow copy this source
                 // just created BEFORE moving to the next source, so a crash
                 // strands at most one source's snapshot rather than every
@@ -5350,4 +5417,157 @@ mod tests {
         orch.shutdown();
         let _ = tokio::time::timeout(std::time::Duration::from_secs(30), handle).await;
     }
+
+    // --- live scan feedback: "Run now" must not look dead during the scan ----
+
+    /// Writes `count` files under `root` so the scan has something to walk.
+    fn seed_files(root: &std::path::Path, count: usize) {
+        for i in 0..count {
+            let p = root.join(format!("sub{}/f{}.txt", i % 3, i));
+            std::fs::create_dir_all(p.parent().unwrap()).unwrap();
+            std::fs::write(&p, b"x").unwrap();
+        }
+    }
+
+    /// Every `Scanning` state the run broadcast, in order.
+    fn scanning_counts(events: &mut broadcast::Receiver<OrchestratorEvent>) -> Vec<u64> {
+        let mut out = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let OrchestratorEvent::StateChanged {
+                state: OrchestratorState::Scanning { scanned, .. },
+            } = ev
+            {
+                out.push(scanned);
+            }
+        }
+        out
+    }
+
+    #[tokio::test]
+    async fn manual_cycle_records_scan_started_and_scan_done() {
+        // The reported UX bug: clicking "Run now" over a large folder produced
+        // NOTHING in the activity feed until the first file finished uploading
+        // (~10s), because the whole scan phase wrote no activity row. A
+        // user-initiated cycle must bracket its scan with durable rows.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        seed_files(dir.path(), 5);
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            Arc::new(RecordingExecutor::default()),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            Arc::new(FakeClock::new()),
+            OrchestratorConfig::default(),
+        );
+
+        orch.run_cycle(TickSource::Manual).await.unwrap();
+
+        let rows = state.activity_rows();
+        let scan_rows: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_type.starts_with("scan_"))
+            .collect();
+        assert_eq!(
+            scan_rows.iter().map(|r| r.event_type.as_str()).collect::<Vec<_>>(),
+            vec!["scan_started", "scan_done"],
+            "a manual cycle brackets its scan with a started + done row"
+        );
+        assert!(scan_rows.iter().all(|r| r.source_id == Some(src_id)));
+        assert!(scan_rows.iter().all(|r| r.level == ActivityLevel::Info));
+        assert_eq!(
+            scan_rows[1].file_count,
+            Some(5),
+            "scan_done carries the files the walk visited"
+        );
+    }
+
+    #[tokio::test]
+    async fn scheduled_cycle_stays_quiet_in_the_activity_log() {
+        // The scan rows are scoped to user-initiated cycles on purpose: the
+        // default 10-minute scheduled tick would otherwise bury the upload /
+        // error rows the feed exists to show. A scheduled cycle still scans -
+        // it just leaves no durable row behind.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        seed_files(dir.path(), 3);
+        let src = source_in(account, dir.path());
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            Arc::new(RecordingExecutor::default()),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            Arc::new(FakeClock::new()),
+            OrchestratorConfig::default(),
+        );
+        let mut events = orch.subscribe();
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        assert!(
+            state
+                .activity_rows()
+                .iter()
+                .all(|r| !r.event_type.starts_with("scan_")),
+            "a scheduled cycle writes no scan rows"
+        );
+        assert!(
+            !scanning_counts(&mut events).is_empty(),
+            "but it still broadcasts live Scanning state for the progress bar"
+        );
+    }
+
+    #[tokio::test]
+    async fn scan_streams_a_rising_file_count_to_the_ui() {
+        // The other half of the bug: `Scanning { scanned }` was broadcast ONCE
+        // with a hard-coded 0 and never updated, so the progress bar had nothing
+        // to render for the whole walk. The scan must stream its running count.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        // More than one progress stride so an in-walk tick is guaranteed, not
+        // just the final settle tick.
+        let files = 600usize;
+        seed_files(dir.path(), files);
+        let src = source_in(account, dir.path());
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let orch = SyncOrchestrator::new(
+            account,
+            state,
+            Arc::new(RecordingExecutor::default()),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            Arc::new(FakeClock::new()),
+            OrchestratorConfig::default(),
+        );
+        let mut events = orch.subscribe();
+
+        orch.run_cycle(TickSource::Manual).await.unwrap();
+
+        let counts = scanning_counts(&mut events);
+        assert!(
+            counts.len() >= 3,
+            "expected the initial 0, at least one mid-walk tick, and the final              total; got {counts:?}"
+        );
+        assert_eq!(counts[0], 0, "the phase opens at zero");
+        assert!(
+            counts.windows(2).all(|w| w[0] <= w[1]),
+            "the streamed count only rises: {counts:?}"
+        );
+        assert_eq!(
+            *counts.last().unwrap(),
+            files as u64,
+            "the last tick settles on the true total"
+        );
+        assert!(
+            counts[1..counts.len() - 1].iter().any(|&c| c > 0 && c < files as u64),
+            "at least one tick lands mid-walk, so the UI updates DURING the scan: {counts:?}"
+        );
+    }
+
 }
