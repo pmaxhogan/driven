@@ -8620,11 +8620,7 @@ mod tests {
         let (rel, size) = h.write_file("sec.dat", b"secret-original");
         let src_path = h.tmp_src.path().to_path_buf();
         let hook: PostUploadHook = Arc::new(move |_p: &Path| {
-            std::fs::write(
-                src_path.join("sec.dat"),
-                b"secret-MUTATED-AFTER-UPLOAD",
-            )
-            .unwrap();
+            std::fs::write(src_path.join("sec.dat"), b"secret-MUTATED-AFTER-UPLOAD").unwrap();
         });
         let out = h
             .executor_with_crypto(Some(suite))

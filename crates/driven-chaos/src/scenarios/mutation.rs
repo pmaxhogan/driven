@@ -1729,9 +1729,8 @@ mod tests {
     /// given machine (so it is not flaky), and went RED pre-fix whenever it did.
     #[tokio::test]
     async fn frequent_edits_slow_store_holds_one_object_144() {
-        let remote = Arc::new(
-            InMemoryRemoteStore::new().with_slow_responses(Duration::from_millis(3)),
-        );
+        let remote =
+            Arc::new(InMemoryRemoteStore::new().with_slow_responses(Duration::from_millis(3)));
         let h = SoakHarness::boot(remote).await.unwrap();
         write_file(&h.src_root, "hot.txt", b"v0").unwrap();
 
@@ -1771,7 +1770,10 @@ mod tests {
             )
             .await
             .unwrap();
-        let live = children.iter().find(|e| !e.trashed).expect("the one object");
+        let live = children
+            .iter()
+            .find(|e| !e.trashed)
+            .expect("the one object");
         let remote_bytes = download_bytes(&h.remote, &live.id).await.unwrap();
         assert_eq!(
             remote_bytes, final_body,
