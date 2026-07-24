@@ -1718,12 +1718,18 @@ mod tests {
     }
 
     /// The write-stat probe on the test filesystem (a fast local FS) classifies
-    /// fine (window 0) and leaves no temp file behind before the walk.
+    /// non-coarse and leaves no temp file behind before the walk. NOT exactly 0:
+    /// NTFS stamps mtimes from the interrupt-time clock, so a burst of rewrites
+    /// landing inside one timer tick legitimately measures a millisecond-scale
+    /// window (~2.5ms seen on windows-latest) instead of 0.
     #[test]
     fn probe_classifies_local_fs_fine() {
         let dir = tempfile::tempdir().unwrap();
         let g = super::probe_mtime_granularity(dir.path()).expect("probe");
-        assert_eq!(g, 0, "a fast local FS must probe as fine");
+        assert!(
+            !super::granularity_is_coarse(g),
+            "a fast local FS must probe as non-coarse, got {g}ns"
+        );
         // No probe temp file leaked.
         let leaked: Vec<_> = fs::read_dir(dir.path())
             .unwrap()
@@ -1829,10 +1835,12 @@ mod tests {
         src.mtime_granularity_ns = None;
         src.last_full_scan_at = Some(1);
         let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
-        assert_eq!(
-            res.probed_granularity_ns,
-            Some(0),
-            "an unprobed source with a prior scan is probed (fine, 0) and surfaced"
+        let g = res
+            .probed_granularity_ns
+            .expect("an unprobed source with a prior scan is probed and surfaced");
+        assert!(
+            !super::granularity_is_coarse(u64::try_from(g).unwrap()),
+            "the test FS must probe as non-coarse, got {g}ns"
         );
 
         // Already persisted => no re-probe, so nothing to hand back.
