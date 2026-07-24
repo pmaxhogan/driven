@@ -219,9 +219,9 @@ pub async fn scan_with_latency(
 /// Mirrors the executor's [`OutcomeSink`](crate::executor::OutcomeSink): a boxed
 /// future so the sink may do async work (the orchestrator awaits a state
 /// transition + broadcast), with the borrow tied to the call so the closure can
-/// capture `&self` without a `'static` bound. Awaiting it is also what YIELDS
-/// the otherwise fully synchronous walk back to the runtime, so a joined
-/// consumer actually gets scheduled mid-scan.
+/// capture `&self` without a `'static` bound. Each tick is followed by an
+/// explicit `yield_now`, which is what hands the otherwise fully synchronous
+/// walk back to the runtime so the tick's consumers run mid-scan.
 ///
 /// The argument is the running count of regular files the walk has VISITED -
 /// counted before the include/exclude decision, so a long descent through an
@@ -424,6 +424,13 @@ pub async fn scan_with_progress(
                 reported = visited;
                 last_tick = Instant::now();
                 sink(visited).await;
+                // Awaiting the sink is NOT by itself a yield: the orchestrator's
+                // sink resolves without ever returning Pending (an uncontended
+                // lock write plus a broadcast send), so the walk would still hold
+                // the runtime thread for the whole tree. Yield explicitly so the
+                // consumers of the event we just emitted actually get scheduled
+                // mid-scan rather than after it.
+                tokio::task::yield_now().await;
             }
         }
 
@@ -601,6 +608,10 @@ pub async fn scan_with_progress(
     // than a stale partial one.
     if let Some(sink) = on_progress {
         sink(visited).await;
+        // Same reason as the in-walk ticks: hand control back so the settled
+        // count reaches its consumers BEFORE the plan/execute phases start
+        // emitting their own (far noisier) events.
+        tokio::task::yield_now().await;
     }
 
     // Split the known-but-not-seen paths into genuine deletions vs
@@ -2071,12 +2082,15 @@ mod tests {
         let res = scan_with_progress(&src, &state, ScanMode::FastPath, None, Some(&sink))
             .await
             .unwrap();
-        assert_eq!(res.new_or_changed.len(), 1, "only the included file uploads");
+        assert_eq!(
+            res.new_or_changed.len(),
+            1,
+            "only the included file uploads"
+        );
         assert_eq!(
             *ticks.lock().unwrap().last().unwrap(),
             3,
             "all three visited files count toward scan progress"
         );
     }
-
 }

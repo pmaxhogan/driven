@@ -5429,18 +5429,31 @@ mod tests {
         }
     }
 
-    /// Every `Scanning` state the run broadcast, in order.
-    fn scanning_counts(events: &mut broadcast::Receiver<OrchestratorEvent>) -> Vec<u64> {
-        let mut out = Vec::new();
-        while let Ok(ev) = events.try_recv() {
-            if let OrchestratorEvent::StateChanged {
-                state: OrchestratorState::Scanning { scanned, .. },
-            } = ev
-            {
-                out.push(scanned);
+    /// Collects every `Scanning { scanned }` the run broadcasts, draining
+    /// CONCURRENTLY with the cycle exactly as the app shell's event bridge does.
+    /// A post-hoc `try_recv` drain would be wrong here: the bounded broadcast
+    /// (capacity 256) overflows on a plan with hundreds of ops, and the first
+    /// `Lagged` would discard the scan ticks we are asserting on. The collector
+    /// ends when the orchestrator is dropped and closes the channel.
+    fn spawn_scanning_collector(
+        mut events: broadcast::Receiver<OrchestratorEvent>,
+    ) -> tokio::task::JoinHandle<Vec<u64>> {
+        tokio::spawn(async move {
+            let mut out = Vec::new();
+            loop {
+                match events.recv().await {
+                    Ok(OrchestratorEvent::StateChanged {
+                        state: OrchestratorState::Scanning { scanned, .. },
+                    }) => out.push(scanned),
+                    Ok(_) => {}
+                    // A later burst of per-op activity may lag us; that is not a
+                    // reason to stop listening.
+                    Err(broadcast::error::RecvError::Lagged(_)) => {}
+                    Err(broadcast::error::RecvError::Closed) => break,
+                }
             }
-        }
-        out
+            out
+        })
     }
 
     #[tokio::test]
@@ -5473,7 +5486,10 @@ mod tests {
             .filter(|r| r.event_type.starts_with("scan_"))
             .collect();
         assert_eq!(
-            scan_rows.iter().map(|r| r.event_type.as_str()).collect::<Vec<_>>(),
+            scan_rows
+                .iter()
+                .map(|r| r.event_type.as_str())
+                .collect::<Vec<_>>(),
             vec!["scan_started", "scan_done"],
             "a manual cycle brackets its scan with a started + done row"
         );
@@ -5506,7 +5522,7 @@ mod tests {
             Arc::new(FakeClock::new()),
             OrchestratorConfig::default(),
         );
-        let mut events = orch.subscribe();
+        let collector = spawn_scanning_collector(orch.subscribe());
 
         orch.run_cycle(TickSource::Scheduled).await.unwrap();
 
@@ -5517,8 +5533,9 @@ mod tests {
                 .all(|r| !r.event_type.starts_with("scan_")),
             "a scheduled cycle writes no scan rows"
         );
+        drop(orch);
         assert!(
-            !scanning_counts(&mut events).is_empty(),
+            !collector.await.unwrap().is_empty(),
             "but it still broadcasts live Scanning state for the progress bar"
         );
     }
@@ -5545,14 +5562,17 @@ mod tests {
             Arc::new(FakeClock::new()),
             OrchestratorConfig::default(),
         );
-        let mut events = orch.subscribe();
+        let collector = spawn_scanning_collector(orch.subscribe());
 
         orch.run_cycle(TickSource::Manual).await.unwrap();
+        // Dropping the orchestrator closes the broadcast, which ends the
+        // collector task and hands back everything it saw.
+        drop(orch);
+        let counts = collector.await.unwrap();
 
-        let counts = scanning_counts(&mut events);
         assert!(
             counts.len() >= 3,
-            "expected the initial 0, at least one mid-walk tick, and the final              total; got {counts:?}"
+            "expected the initial 0, at least one mid-walk tick, and the final total; got {counts:?}"
         );
         assert_eq!(counts[0], 0, "the phase opens at zero");
         assert!(
@@ -5565,9 +5585,10 @@ mod tests {
             "the last tick settles on the true total"
         );
         assert!(
-            counts[1..counts.len() - 1].iter().any(|&c| c > 0 && c < files as u64),
+            counts[1..counts.len() - 1]
+                .iter()
+                .any(|&c| c > 0 && c < files as u64),
             "at least one tick lands mid-walk, so the UI updates DURING the scan: {counts:?}"
         );
     }
-
 }
