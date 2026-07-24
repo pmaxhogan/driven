@@ -14,17 +14,24 @@ name: dev-channel
 # refactors, the release-please "chore: release" commits, etc.). So this
 # workflow does NOT fire on every main push: it is GATED to fire only when
 #   (a) it is manually dispatched (workflow_dispatch), OR
-#   (b) the head commit message contains the explicit marker `[dev-build]`.
+#   (b) the head commit message contains the explicit marker `[dev-build]`, OR
+#   (c) the nightly schedule fires AND main has moved since the commit the
+#       rolling `dev` release was last built from (skip otherwise - a quiet
+#       main costs zero build minutes).
 # It also explicitly SKIPS release-please's "chore(main): release" / "release"
 # commits so it never double-fires alongside the release.yml tag path.
-# To cut a dev build, either run it from the Actions tab or push a commit whose
-# message includes `[dev-build]`. If a future need arises for cadence-based dev
-# builds, prefer a `schedule:` (e.g. nightly) over an every-push trigger - that
-# bounds the cost to a known number of runs per week.
+# To cut a dev build immediately, either run it from the Actions tab or push a
+# commit whose message includes `[dev-build]`; otherwise the nightly schedule
+# picks up any new commits. The schedule bounds the cost to at most one 4-row
+# build per day.
 
 on:
   push:
     branches: [main]
+  schedule:
+    # Nightly at 09:00 UTC; the gate job skips the build when main has no new
+    # commits since the last published dev build.
+    - cron: "0 9 * * *"
   workflow_dispatch:
 
 permissions:
@@ -44,13 +51,33 @@ jobs:
     steps:
       - id: decide
         env:
-          # head_commit is null for workflow_dispatch; guard with the ||.
+          # head_commit is null for workflow_dispatch/schedule; guard with the ||.
           COMMIT_MSG: ${{ github.event.head_commit.message }}
           EVENT_NAME: ${{ github.event_name }}
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
         run: |
           build=false
           if [ "$EVENT_NAME" = "workflow_dispatch" ]; then
             build=true
+          elif [ "$EVENT_NAME" = "schedule" ]; then
+            # Nightly: build only if main has moved since the commit the rolling
+            # `dev` release was last built from. The release body embeds that
+            # commit's full sha ("Rolling dev channel build <ver> (<sha>). ...").
+            # Fail OPEN (build) if the release or the sha is missing/unparseable -
+            # a wasted build is cheaper than a silently-stale dev channel.
+            last_sha="$(gh release view dev --repo "$GITHUB_REPOSITORY" \
+              --json body --jq .body 2>/dev/null \
+              | grep -oE '\([0-9a-f]{40}\)' | head -n1 | tr -d '()' || true)"
+            if [ -z "$last_sha" ]; then
+              echo "no prior dev build sha found - building"
+              build=true
+            elif [ "$last_sha" = "$GITHUB_SHA" ]; then
+              echo "main unchanged since last dev build ($last_sha) - skipping"
+              build=false
+            else
+              echo "main moved since last dev build ($last_sha -> $GITHUB_SHA) - building"
+              build=true
+            fi
           elif printf '%s' "$COMMIT_MSG" | head -n1 | grep -qiE 'release-please|chore\(main\): release|chore: release'; then
             # release-please commits ride the tag path (release.yml); never a dev build.
             build=false
