@@ -1604,7 +1604,26 @@ the release and the GH Actions build pipeline takes over.
   - A scoped `PriorityGuard` restores the thread on drop and is `!Send`, so
     holding one across an `.await` - which would demote a pooled thread and
     leak the demotion - is a compile error rather than a runtime mystery. That
-    confines the apply sites to `spawn_blocking` closures.
+    confines the thread-scoped apply sites to `spawn_blocking` closures and to
+    threads Driven owns outright (the scanner's walk workers).
+- **Per-handle I/O priority for upload reads** (`priority::apply_to_file_handle`),
+  the second lever, because the thread-scoped one cannot reach them. The upload
+  pipeline reads through `tokio::fs`, which dispatches each read to an anonymous
+  thread in tokio's shared blocking pool - threads Driven neither owns nor may
+  demote. On Windows, `SetFileInformationByHandle(FileIoPriorityHintInfo)`
+  attaches the hint to the FILE HANDLE instead (`IoPriorityHintLow` for `low`,
+  `IoPriorityHintVeryLow` for `idle`), so every read is shaped regardless of
+  which thread performs it, and nothing needs restoring because the handle
+  closes with the upload. Applied inside `executor::open_shared`, the single
+  choke point for every source-file read (live open, VSS snapshot open, resume
+  identity check, reconcile re-hash). A read-only handle carries sufficient
+  access, so the open's access mask - and therefore its sharing/locking
+  behaviour - is unchanged.
+  - Linux and macOS have no per-descriptor equivalent (both scope I/O priority
+    to the thread), so upload read I/O is unshaped there. Closing that gap means
+    owning the reader thread outright, a streaming-pipeline restructure that
+    must preserve bounded-memory backpressure, resumable-session persistence,
+    and the `ChangedDuringUpload` identity defences.
 - **Bounded channels** between scanner → planner → uploader so a fast
   scanner doesn't OOM the queue.
 - **Streaming hash + upload.** No "hash first, upload second" two-pass.

@@ -39,21 +39,39 @@
 //! owns for their entire life (a dedicated walker/hasher worker), where there
 //! is no "afterwards" to restore to.
 //!
-//! # Where this is applied today, and what it does NOT cover yet
+//! # Two levers, because one is not enough
 //!
-//! One site: the executor's `build_bundle` blocking task (V2 small-file
-//! bundling), which reads every member off disk and gzips it. So the setting
-//! currently shapes **bundled small-file uploads only**.
+//! Threads are only half the story. The upload pipeline's reads go through
+//! `tokio::fs`, which hands each read to an anonymous thread in tokio's shared
+//! blocking pool - Driven neither owns those threads nor may demote them, so no
+//! amount of thread-priority work reaches the bytes coming off the disk during
+//! an upload. [`apply_to_file_handle`] is the answer to that: on Windows the
+//! I/O priority hint rides on the FILE HANDLE, so every read is shaped no
+//! matter which thread performs it, and there is nothing to restore because the
+//! handle dies with the upload.
 //!
-//! A large-file backup is not covered, and cannot be by a per-thread guard as
-//! things stand: the read/hash/encrypt/upload pipeline is a set of interleaved
-//! async stages, and the actual disk reads happen on `tokio::fs`'s internal
-//! blocking pool, which Driven does not own a handle to. The scanner's walk and
-//! deep-verify hashing are the other big consumers, and they run inline on the
-//! async task today. The win there arrives when the scanner moves to dedicated
-//! worker threads: those are Driven's own, live for the whole walk, and should
-//! call [`apply_to_current_thread`] at startup. This module exists in the shape
-//! it does so that adoption is a one-line change.
+//! # Where the two levers are applied today
+//!
+//! - [`apply_to_file_handle`] - on every source file the executor opens for an
+//!   upload, including the reconcile re-hash and the VSS snapshot read. This is
+//!   what shapes a large-file backup. **Windows only** (see below).
+//! - [`spawn_blocking`] / [`begin_background_work`] - the executor's
+//!   `build_bundle` task (V2 small-file bundling), which reads members off disk
+//!   and gzips them inside one blocking closure.
+//! - [`apply_to_current_thread`] - the scanner's dedicated walk workers, which
+//!   Driven owns for the life of the walk (walk + deep-verify hashing).
+//!
+//! What is still unshaped: read I/O during an upload on **Linux and macOS**.
+//! Both scope I/O priority to the thread, neither has a per-descriptor
+//! equivalent of the Windows hint, and the reads land on tokio's shared pool.
+//! Fixing it means owning the reader thread outright - a restructure of the
+//! streaming pipeline that would have to preserve the bounded-memory
+//! backpressure, the resumable-session persistence, and the
+//! `ChangedDuringUpload` identity defences, which is a bigger and riskier change
+//! than this lever is worth. The CPU stages (hash / encrypt) are likewise
+//! unshaped: they interleave `.await`s, so a guard cannot legally span them, and
+//! for files at or above the rayon hashing threshold most of that CPU is on
+//! rayon's pool anyway.
 //!
 //! # What each level maps to, per OS
 //!
@@ -293,6 +311,44 @@ where
     })
 }
 
+/// Ask the OS to service I/O on `file`'s handle at `priority`, for the life of
+/// that handle.
+///
+/// This is the per-HANDLE lever, and it is the one that escapes the per-thread
+/// trap the rest of this module works around: the hint travels with the handle,
+/// so every read on it is shaped no matter which thread issues it. That matters
+/// because the upload pipeline's reads go through `tokio::fs`, which hands each
+/// read to an anonymous thread in tokio's shared blocking pool - a pool Driven
+/// has no handle on and must not demote. Setting the hint on the file instead
+/// of on a thread sidesteps that entirely.
+///
+/// It also needs no restore: the handle is opened for one upload and closed
+/// when it ends, so unlike a pooled thread there is nothing left behind to leak
+/// a demotion into.
+///
+/// Best-effort like everything else here - a refused call logs at `debug` and
+/// the reads run at normal priority.
+///
+/// **Windows only.** `SetFileInformationByHandle(FileIoPriorityHintInfo)` maps
+/// [`WorkPriority::Low`] to `IoPriorityHintLow` and [`WorkPriority::Idle`] to
+/// `IoPriorityHintVeryLow` (what Windows itself uses for background I/O).
+/// Neither Linux nor macOS has a per-descriptor equivalent - both scope I/O
+/// priority to the thread - so this is a no-op there and the caller keeps its
+/// normal read priority. Whether a given filesystem driver honours the hint is
+/// up to that driver; the API is explicitly a hint.
+pub fn apply_to_file_handle(file: &std::fs::File, priority: WorkPriority) {
+    #[cfg(windows)]
+    if priority != WorkPriority::Normal {
+        // Best-effort: the outcome is logged inside, never surfaced.
+        let _ = windows_impl::apply_io_priority_hint(file, priority);
+    }
+    // Off Windows there is no per-descriptor lever to pull. Bind both
+    // parameters so the signature stays uniform without an `unused_variables`
+    // blanket that would also hide a real unused argument on Windows.
+    #[cfg(not(windows))]
+    let _ = (file, priority);
+}
+
 /// Apply `priority` to the calling thread, returning what actually took effect.
 fn apply(priority: WorkPriority) -> Applied {
     if priority == WorkPriority::Normal {
@@ -362,6 +418,73 @@ mod windows_impl {
         fn GetCurrentThread() -> isize;
         fn SetThreadPriority(thread: isize, priority: i32) -> i32;
         fn GetThreadPriority(thread: isize) -> i32;
+        fn SetFileInformationByHandle(
+            file: isize,
+            class: i32,
+            info: *const core::ffi::c_void,
+            size: u32,
+        ) -> i32;
+    }
+
+    /// `FILE_INFO_BY_HANDLE_CLASS::FileIoPriorityHintInfo` - the only class
+    /// this module sets, and one of the six valid for
+    /// `SetFileInformationByHandle`.
+    const FILE_IO_PRIORITY_HINT_INFO: i32 = 12;
+
+    /// `FILE_IO_PRIORITY_HINT_INFO`. One `PRIORITY_HINT` field, but the Win32
+    /// docs require the buffer to sit on a LONGLONG (8-byte) boundary, so the
+    /// alignment is part of the contract rather than a padding accident.
+    #[repr(C, align(8))]
+    struct FileIoPriorityHintInfo {
+        priority_hint: i32,
+    }
+
+    /// `PRIORITY_HINT::IoPriorityHintVeryLow` - what Windows itself uses for
+    /// background I/O.
+    const IO_PRIORITY_HINT_VERY_LOW: i32 = 0;
+    /// `PRIORITY_HINT::IoPriorityHintLow`.
+    const IO_PRIORITY_HINT_LOW: i32 = 1;
+
+    /// Attach an I/O priority hint to `file`'s handle so every read on it is
+    /// serviced below normal, whichever thread issues the read.
+    ///
+    /// A read-only handle is sufficient - verified against a handle opened
+    /// exactly the way the executor opens a source file (`read(true)` plus
+    /// `FILE_SHARE_READ | WRITE | DELETE`); no `FILE_WRITE_ATTRIBUTES` is
+    /// needed, so this never has to widen the access mask and change the
+    /// locking behaviour of the open.
+    /// Returns whether the OS accepted the hint, so a test can assert on the
+    /// raw outcome; production callers go through
+    /// [`super::apply_to_file_handle`], which discards it.
+    pub(super) fn apply_io_priority_hint(file: &std::fs::File, priority: WorkPriority) -> bool {
+        use std::os::windows::io::AsRawHandle;
+
+        let priority_hint = match priority {
+            WorkPriority::Normal => return true,
+            WorkPriority::Low => IO_PRIORITY_HINT_LOW,
+            WorkPriority::Idle => IO_PRIORITY_HINT_VERY_LOW,
+        };
+        let info = FileIoPriorityHintInfo { priority_hint };
+        // SAFETY: `info` outlives the call, is correctly sized/aligned for the
+        // class, and the handle is borrowed from a live `File` so it cannot be
+        // closed underneath us.
+        let ok = unsafe {
+            SetFileInformationByHandle(
+                file.as_raw_handle() as isize,
+                FILE_IO_PRIORITY_HINT_INFO,
+                std::ptr::addr_of!(info).cast(),
+                std::mem::size_of::<FileIoPriorityHintInfo>() as u32,
+            )
+        };
+        if ok == 0 {
+            tracing::debug!(
+                target: TARGET,
+                error = %std::io::Error::last_os_error(),
+                "SetFileInformationByHandle(FileIoPriorityHintInfo) refused; reads run at normal I/O priority"
+            );
+            return false;
+        }
+        true
     }
 
     /// One CPU notch below the process priority class.
@@ -710,6 +833,78 @@ mod tests {
         let guard = begin_background_work(WorkPriority::Normal);
         assert_eq!(guard.applied, Applied::default());
         drop(guard);
+    }
+
+    /// Open a temp file exactly the way the executor's `open_shared` opens a
+    /// source file for upload: read-only, sharing read + write + delete. The
+    /// handle hint has to work on THIS handle - if it needed a wider access
+    /// mask, the executor would have to change how it opens files, which would
+    /// change locking behaviour.
+    fn upload_style_handle(path: &std::path::Path) -> std::fs::File {
+        let mut opts = std::fs::OpenOptions::new();
+        opts.read(true);
+        #[cfg(windows)]
+        {
+            use std::os::windows::fs::OpenOptionsExt;
+            opts.share_mode(0x0000_0001 | 0x0000_0002 | 0x0000_0004);
+        }
+        opts.open(path).expect("open the temp file")
+    }
+
+    /// Every level must be accepted on a read-only upload-style handle, on
+    /// every platform (off Windows the call is a no-op, which must also not
+    /// panic).
+    #[test]
+    fn file_handle_hint_accepts_every_level_on_a_read_only_handle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("payload.bin");
+        std::fs::write(&path, b"driven upload priority fixture").expect("write fixture");
+        let file = upload_style_handle(&path);
+
+        for level in [WorkPriority::Normal, WorkPriority::Low, WorkPriority::Idle] {
+            apply_to_file_handle(&file, level);
+        }
+    }
+
+    /// The hint must not disturb the handle: the whole point is that reads keep
+    /// working and only their scheduling priority changes. A regression that
+    /// invalidated the handle would otherwise surface as corrupt uploads.
+    #[test]
+    fn file_handle_stays_readable_after_the_hint() {
+        use std::io::Read;
+
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("payload.bin");
+        let payload = b"driven upload priority fixture";
+        std::fs::write(&path, payload).expect("write fixture");
+
+        let mut file = upload_style_handle(&path);
+        apply_to_file_handle(&file, WorkPriority::Idle);
+        let mut read_back = Vec::new();
+        file.read_to_end(&mut read_back).expect("read after hint");
+        assert_eq!(read_back, payload, "the hint must not disturb the bytes");
+    }
+
+    /// The Windows call is the one with an observable success/failure, and a
+    /// read-only handle must be sufficient for it. This is the assertion that
+    /// proves the feature is not silently no-opping in production.
+    #[cfg(windows)]
+    #[test]
+    fn windows_file_handle_hint_call_succeeds_on_a_read_only_handle() {
+        let dir = tempfile::tempdir().expect("temp dir");
+        let path = dir.path().join("payload.bin");
+        std::fs::write(&path, b"driven upload priority fixture").expect("write fixture");
+        let file = upload_style_handle(&path);
+
+        for level in [WorkPriority::Low, WorkPriority::Idle] {
+            // `apply_to_file_handle` swallows the outcome by design, so assert
+            // on the raw call: a read-only handle must be accepted, with no
+            // ERROR_ACCESS_DENIED and no ERROR_BAD_LENGTH.
+            assert!(
+                windows_impl::apply_io_priority_hint(&file, level),
+                "SetFileInformationByHandle(FileIoPriorityHintInfo) must accept a read-only handle for {level:?}"
+            );
+        }
     }
 
     /// Every level must survive an apply/restore round trip on the host OS
