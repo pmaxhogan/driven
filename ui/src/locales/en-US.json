@@ -387,6 +387,7 @@
     },
     "events": {
       "upload_done": "Uploaded",
+      "bundle_upload": "Uploaded (bundled)",
       "trash_done": "Removed",
       "scan_started": "Scan started",
       "scan_done": "Scan complete",
@@ -394,9 +395,15 @@
       "update_applied": "App updated",
       "paused": "Paused",
       "error": "Error",
-      "local.unicode_collision": "Name collision",
-      "local.ads_skipped": "Stream skipped",
-      "local.invalid_filename": "Invalid name"
+      "hook": {
+        "pre": "Pre-backup hook",
+        "post": "Post-backup hook"
+      },
+      "local": {
+        "unicode_collision": "Name collision",
+        "ads_skipped": "Stream skipped",
+        "invalid_filename": "Invalid name"
+      }
     },
     "column": {
       "time": "Time",

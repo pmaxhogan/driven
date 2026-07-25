@@ -27,6 +27,14 @@ describe("activityEventLabel (R1-P2-3)", () => {
     // to render raw in the table + filter while upload_done showed "Uploaded").
     expect(label("deep_verify_done")).toBe("Deep verify complete");
     expect(label("update_applied")).toBe("App updated");
+    // The 2.2.0 bundling path emits `bundle_upload` (orchestrator's single Info
+    // row per committed bundle); it rendered as the raw snake_case code in the
+    // event-type filter dropdown and the table until this label landed.
+    expect(label("bundle_upload")).toBe("Uploaded (bundled)");
+    // Pre/post backup hook rows (`hook.pre` / `hook.post`) were the other two
+    // backend-emitted types with no curated label.
+    expect(label("hook.pre")).toBe("Pre-backup hook");
+    expect(label("hook.post")).toBe("Post-backup hook");
   });
 
   it("falls back to errors.<code>.short for error/skip code event types", () => {
