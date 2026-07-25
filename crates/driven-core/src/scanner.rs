@@ -65,6 +65,7 @@ use anyhow::Context;
 use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkState};
 
 use crate::exclude::{build_source_matcher, build_walker_with_matcher, SourceMatcher};
+use crate::priority::WorkPriority;
 use crate::state::{FileStateRow, SourceRow, StateRepo};
 // `PlaceholderPolicy` is consumed only by `should_skip_placeholder`, which is
 // cfg-gated the same way; on a non-Windows, non-test lib build the fn (and thus
@@ -310,6 +311,12 @@ struct WalkCtx {
     /// Whether to time each file (the reservoir itself lives on the consumer
     /// side, which is what actually records the sample).
     capture_latency: bool,
+    /// The backup-work priority (SPEC s22 `io_priority`) each walk worker
+    /// thread applies to itself on its first visit, so the scan's stat + hash
+    /// I/O yields to foreground applications. Walker threads live only for the
+    /// walk (spawned and joined inside `build_parallel().visit()`), so a
+    /// one-shot apply with no restore is correct - nothing pooled is demoted.
+    priority: WorkPriority,
 }
 
 /// What a worker concluded about ONE file. Deliberately excludes every
@@ -372,6 +379,10 @@ struct WalkVisitor {
     /// Set once the consumer has gone away, so the walk stops instead of
     /// traversing the rest of the tree with nowhere to send the results.
     consumer_gone: bool,
+    /// Whether this worker thread has applied [`WalkCtx::priority`] to itself
+    /// yet. `build()` may run on the coordinating thread, so the apply happens
+    /// on the first `visit()` call, which is guaranteed to run on the worker.
+    priority_applied: bool,
 }
 
 impl WalkVisitor {
@@ -423,6 +434,10 @@ impl Drop for WalkVisitor {
 
 impl ParallelVisitor for WalkVisitor {
     fn visit(&mut self, result: Result<DirEntry, ignore::Error>) -> WalkState {
+        if !self.priority_applied {
+            self.priority_applied = true;
+            crate::priority::apply_to_current_thread(self.ctx.priority);
+        }
         let ctx = Arc::clone(&self.ctx);
         let entry = match result {
             Ok(e) => e,
@@ -517,6 +532,7 @@ impl<'s> ParallelVisitorBuilder<'s> for WalkVisitorBuilder {
             items: 0,
             last_flush: Instant::now(),
             consumer_gone: false,
+            priority_applied: false,
         })
     }
 }
@@ -668,6 +684,33 @@ pub async fn scan_with_progress(
     latency: Option<&crate::telemetry::LatencyReservoir>,
     on_progress: Option<&ScanProgressSink<'_>>,
 ) -> anyhow::Result<ScanResult> {
+    scan_with_priority(
+        source,
+        state,
+        mode,
+        latency,
+        on_progress,
+        WorkPriority::Normal,
+    )
+    .await
+}
+
+/// [`scan_with_progress`] plus the backup-work [`WorkPriority`] (SPEC s22
+/// `io_priority`) the walk should run at. The blocking coordinator task takes an
+/// RAII [`begin_background_work`](crate::priority::begin_background_work) guard
+/// (its thread is POOLED, so the demotion must be undone), and each transient
+/// walk worker thread applies the priority once on its first visit (no restore
+/// needed - workers die with the walk). `Normal` is exactly the old behaviour;
+/// the orchestrator passes its live [`PriorityCell`](crate::priority::PriorityCell)
+/// value so a settings change applies from the next scan.
+pub async fn scan_with_priority(
+    source: &SourceRow,
+    state: &dyn StateRepo,
+    mode: ScanMode,
+    latency: Option<&crate::telemetry::LatencyReservoir>,
+    on_progress: Option<&ScanProgressSink<'_>>,
+    priority: WorkPriority,
+) -> anyhow::Result<ScanResult> {
     let known = state
         .load_source_file_state(source.id)
         .await
@@ -799,6 +842,10 @@ pub async fn scan_with_progress(
     let walk_known = Arc::clone(&known);
     let capture_latency = latency.is_some_and(|r| r.is_enabled());
     let walk_task = tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<SourceMatcher>> {
+        // This spawn_blocking thread is POOLED, so the demotion is held in an
+        // RAII guard that restores normal priority when the walk ends; the
+        // matcher build's ignore-file collection I/O runs demoted too.
+        let _priority_guard = crate::priority::begin_background_work(priority);
         // ONE matcher for the whole scan: the walker's prune predicate, every
         // per-entry include check, and the orphan split share this `Arc` rather
         // than each rebuilding the cascade (the walker used to build a second,
@@ -814,6 +861,7 @@ pub async fn scan_with_progress(
             is_coarse,
             last_scan_end_ns,
             capture_latency,
+            priority,
         });
         let mut wb = build_walker_with_matcher(&walk_source, Arc::clone(&matcher));
         wb.threads(walk_threads());
