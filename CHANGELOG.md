@@ -5,6 +5,21 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.2.0](https://github.com/pmaxhogan/driven/compare/v2.1.0...v2.2.0) (2026-07-25)
+
+
+### Features
+
+* **ui:** add an indefinite pause and a paused banner with one-click resume ([#151](https://github.com/pmaxhogan/driven/issues/151)) ([090d70c](https://github.com/pmaxhogan/driven/commit/090d70cb107fc68c65a9c661599794cf878a1459))
+* **ui:** last-5m throughput sparkline behind the current-throughput stat ([#153](https://github.com/pmaxhogan/driven/issues/153)) ([e60b27f](https://github.com/pmaxhogan/driven/commit/e60b27fecd05f867ca8752c610b4ddb7315b4f18))
+
+
+### Bug Fixes
+
+* **core:** make the manual pause actually halt in-flight upload dispatch ([#148](https://github.com/pmaxhogan/driven/issues/148)) ([d984826](https://github.com/pmaxhogan/driven/commit/d984826dddbc789fcb95ae3bc84c88fef0129280))
+* **core:** mirror local folder structure on Drive for plaintext sources ([#150](https://github.com/pmaxhogan/driven/issues/150)) ([a5d0673](https://github.com/pmaxhogan/driven/commit/a5d06738afdcfa9775cc1d8f98022d16a8301a5f))
+* **ui:** stream live scan progress from the moment Run Now is clicked ([#149](https://github.com/pmaxhogan/driven/issues/149)) ([12ddd1e](https://github.com/pmaxhogan/driven/commit/12ddd1ea17f752b1473e9f8ecc46c24dd652aa6c))
+
 ## [2.1.0](https://github.com/pmaxhogan/driven/compare/v2.0.1...v2.1.0) (2026-07-24)
 
 
