@@ -15,6 +15,7 @@ import {
 } from "../stores/activity";
 import { formatBytes as formatByteCount } from "../stores/formatBytes";
 import { useSourcesStore } from "../stores/sources";
+import { useToastsStore } from "../stores/toasts";
 import type { ActivityEntry, ActivityLevel, FileStateStatus } from "../ipc/types";
 
 // Activity dashboard (SPEC s11.4; DESIGN s8.3). A live tail (subscribes to
@@ -25,6 +26,7 @@ import type { ActivityEntry, ActivityLevel, FileStateStatus } from "../ipc/types
 const { t, te, locale } = useI18n();
 const activity = useActivityStore();
 const sources = useSourcesStore();
+const toasts = useToastsStore();
 
 // Design-system class strings (DRIVEN UI). Defined once so every control in this
 // view stays visually consistent with the rest of the app: teal accent, dark-mode
@@ -231,6 +233,10 @@ async function exportBundle(): Promise<void> {
   exporting.value = true;
   try {
     exportedPath.value = await ipc.exportDiagnosticBundle(token);
+    toasts.push({
+      kind: "success",
+      message: t("toast.diagnosticsSaved", { path: exportedPath.value }),
+    });
   } catch (e) {
     // M7-P2-6: normalize to the stable SPEC s24 code and localize via t().
     exportErrorCode.value = toErrorCode(e);

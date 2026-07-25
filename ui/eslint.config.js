@@ -154,6 +154,8 @@ export default [
             "/^about\\.channel\\./",
             // nav.<link>  - App.vue renders t(link.label) over a literal array
             "/^nav\\./",
+            // toast.kind.<kind>  - ToastHost.vue renders t(KIND_LABEL[kind])
+            "/^toast\\.kind\\./",
             // settings.tabs.<tab>  - Settings.vue renders t(tab.label)
             "/^settings\\.tabs\\./",
             // settings.accounts.state.<state>  - AccountList.vue

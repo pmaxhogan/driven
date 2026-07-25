@@ -5,6 +5,7 @@ import { getVersion } from "@tauri-apps/api/app";
 
 import * as ipc from "../ipc/commands";
 import { useSettingsStore } from "../stores/settings";
+import { useToastsStore } from "../stores/toasts";
 import { useUpdaterStore } from "../stores/updater";
 import ChangelogModal from "../components/ChangelogModal.vue";
 import TelemetryPreviewModal from "../components/TelemetryPreviewModal.vue";
@@ -21,6 +22,7 @@ import type { ReleaseDto } from "../ipc/types";
 // from the Tauri app metadata; the license is the workspace SPDX id (SPEC s23).
 const { t, locale } = useI18n();
 const settings = useSettingsStore();
+const toasts = useToastsStore();
 const updater = useUpdaterStore();
 
 const version = ref<string>("");
@@ -130,6 +132,10 @@ async function exportDiagnostics(): Promise<void> {
   exporting.value = true;
   try {
     exportedPath.value = await ipc.exportDiagnosticBundle(token);
+    toasts.push({
+      kind: "success",
+      message: t("toast.diagnosticsSaved", { path: exportedPath.value }),
+    });
   } catch (e) {
     exportError.value = String(e);
   } finally {

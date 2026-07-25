@@ -14,6 +14,7 @@ import {
   unconstrainedIncludePatterns,
 } from "../stores/exclusionPreview";
 import { useSourcesStore } from "../stores/sources";
+import { useToastsStore } from "../stores/toasts";
 import type { SourceDto } from "../ipc/types";
 
 // Sources settings tab body (SPEC s11.2; DESIGN s8.2). A table of sources with
@@ -24,6 +25,7 @@ import type { SourceDto } from "../ipc/types";
 const { t } = useI18n();
 const sources = useSourcesStore();
 const accounts = useAccountsStore();
+const toasts = useToastsStore();
 
 // Shared design-system class strings (DRIVEN UI design system). Teal is the
 // accent for primary affordances; red is destructive; amber is the warning
@@ -173,6 +175,9 @@ async function saveEdit(source: SourceDto): Promise<void> {
       placeholderPolicy: editBackupCloudOnly.value ? "force_download" : "skip",
     });
     editingId.value = null;
+    // Saving closes the editor, so without this the only feedback that the new
+    // patterns took is the panel disappearing.
+    toasts.push({ kind: "success", message: t("toast.rulesSaved") });
   } finally {
     savingEdit.value = false;
   }
