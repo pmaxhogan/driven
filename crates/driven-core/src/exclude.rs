@@ -731,6 +731,37 @@ fn scope_from_lines<'a>(
     })
 }
 
+/// Resolve `path` and confirm it still lives inside `boundary`, returning the
+/// canonical path to open.
+///
+/// Every ignore file this module reads is reached from the source's own
+/// `local_path`, which is user-chosen, so the path handed to `File::open` is
+/// only ever as trustworthy as the tree it was enumerated from. Canonicalising
+/// both sides and requiring the file to stay under its boundary means a
+/// symlinked (or raced) `.gitignore` pointing at, say, `/etc/shadow` is refused
+/// rather than read - the walk already refuses to FOLLOW symlinked directories,
+/// and this closes the same hole for the ignore files themselves.
+///
+/// A path that cannot be canonicalised (deleted mid-scan, a permission error) is
+/// an error too: the caller treats any failure the same way it treats an
+/// unreadable file - no rules, and no pruning under that scope.
+fn resolve_within(path: &Path, boundary: &Path) -> std::io::Result<PathBuf> {
+    let resolved = path.canonicalize()?;
+    let base = boundary.canonicalize()?;
+    if !resolved.starts_with(&base) {
+        return Err(std::io::Error::new(
+            std::io::ErrorKind::InvalidInput,
+            format!(
+                "{} resolves to {}, outside {}",
+                path.display(),
+                resolved.display(),
+                base.display()
+            ),
+        ));
+    }
+    Ok(resolved)
+}
+
 /// Cross-check our own whitelist parse against the `ignore` crate's count and
 /// degrade to `unknown` on any shortfall.
 ///
@@ -762,6 +793,7 @@ fn scope_from_file(
     source: &SourceRow,
     scope_dir: &Path,
     ignore_file: &Path,
+    boundary: &Path,
     label: &str,
 ) -> Option<Scope> {
     use std::io::BufRead;
@@ -774,7 +806,7 @@ fn scope_from_file(
     // re-reading the file for the `!`-rules. Mirrors `add`'s own handling: the
     // leading UTF-8 BOM is stripped from line 1, a read error stops the file
     // (partial rules stand), and a per-line parse error is logged, not fatal.
-    match std::fs::File::open(ignore_file) {
+    match resolve_within(ignore_file, boundary).and_then(std::fs::File::open) {
         Ok(file) => {
             for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
                 let line = match line {
@@ -895,7 +927,9 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
         // rooted at the source root.
         let info_exclude = root.join(".git").join("info").join("exclude");
         if info_exclude.is_file() {
-            if let Some(scope) = scope_from_file(source, &root, &info_exclude, ".git/info/exclude")
+            // The repo-local exclude list must live inside the source itself.
+            if let Some(scope) =
+                scope_from_file(source, &root, &info_exclude, &root, ".git/info/exclude")
             {
                 root_tiers.push(scope);
             }
@@ -910,7 +944,13 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
         // Rooted at the source root so its rules apply tree-wide.
         if let Some(global) = global_gitignore_path() {
             if global.is_file() {
-                if let Some(scope) = scope_from_file(source, &root, &global, "global gitignore") {
+                // The global gitignore lives OUTSIDE the source (git config /
+                // XDG), so its boundary is its own directory rather than the
+                // source root.
+                let global_dir = global.parent().unwrap_or(&global).to_path_buf();
+                if let Some(scope) =
+                    scope_from_file(source, &root, &global, &global_dir, "global gitignore")
+                {
                     root_tiers.push(scope);
                 }
             }
@@ -1201,7 +1241,9 @@ fn collect_ignore_scopes(
                     } else {
                         continue;
                     };
-                    if let Some(scope) = scope_from_file(source, &dir, &path, "an ignore file") {
+                    if let Some(scope) =
+                        scope_from_file(source, &dir, &path, root, "an ignore file")
+                    {
                         index
                             .entry(dir.clone())
                             .or_default()
@@ -2456,6 +2498,26 @@ mod tests {
                 ),
             }
         }
+    }
+
+    #[test]
+    fn resolve_within_refuses_a_path_outside_its_boundary() {
+        // Every ignore file is reached from the user-chosen source root, so the
+        // open is confined: a file that resolves outside its boundary (a
+        // symlinked or raced `.gitignore`) is refused rather than read.
+        let inside = tempfile::tempdir().unwrap();
+        let outside = tempfile::tempdir().unwrap();
+        write(&inside.path().join("sub/.gitignore"), "x\n");
+        write(&outside.path().join("elsewhere"), "x\n");
+
+        let ok = resolve_within(&inside.path().join("sub/.gitignore"), inside.path())
+            .expect("a file under the boundary resolves");
+        assert!(ok.ends_with(".gitignore"));
+
+        resolve_within(&outside.path().join("elsewhere"), inside.path())
+            .expect_err("a file outside the boundary is refused");
+        resolve_within(&inside.path().join("missing"), inside.path())
+            .expect_err("a path that cannot be resolved at all is an error");
     }
 
     #[test]
