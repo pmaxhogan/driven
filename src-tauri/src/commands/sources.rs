@@ -958,9 +958,9 @@ pub(crate) async fn resolve_preview_root_and_matcher(
 ///
 /// Uses `walkdir` semantics via a manual stack walk over `std::fs` (no extra
 /// dep): symlinks are not followed (matching the scanner's `Skip` policy); a
-/// directory the matcher excludes is still descended only when the matcher has
-/// negations (a `!`-re-include could live under it), mirroring the scanner's
-/// lockstep walk/decision.
+/// directory the matcher excludes is still descended only when a `!`-re-include
+/// could reach under that directory, mirroring the scanner's lockstep
+/// walk/decision.
 fn classify_tree(
     root: &Path,
     matcher: &driven_core::exclude::SourceMatcher,
@@ -970,8 +970,6 @@ fn classify_tree(
     let mut included_bytes: u64 = 0;
     let mut included_sample: Vec<String> = Vec::new();
     let mut excluded_sample: Vec<String> = Vec::new();
-
-    let prune_excluded_dirs = !matcher.has_negations();
 
     // Manual stack walk so we can prune excluded directories (when safe) and
     // never follow symlinks. Each entry is the absolute path; we strip `root`
@@ -1004,9 +1002,10 @@ fn classify_tree(
 
             if file_type.is_dir() {
                 let dir_included = matcher.is_included(rel, true);
-                // Descend unless this dir is excluded AND pruning is safe (no
-                // negation rule could re-include a child).
-                if dir_included || !prune_excluded_dirs {
+                // Descend unless this dir is excluded AND pruning it is safe -
+                // i.e. no `!`-rule anywhere could re-include something beneath
+                // THIS directory.
+                if dir_included || matcher.negations_could_match_under(rel) {
                     stack.push(path);
                 }
                 continue;
