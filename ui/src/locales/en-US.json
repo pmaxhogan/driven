@@ -191,6 +191,10 @@
       "respectGitignoreLabel": "Respect .gitignore files",
       "includePatternsLabel": "Include patterns",
       "excludePatternsLabel": "Exclude patterns",
+      "includeWarning": {
+        "title": "These include patterns slow scanning:",
+        "hint": "Patterns without a leading / (or containing **) force the scanner to search inside every excluded folder such as node_modules. Anchor them to fixed depths instead, e.g. /*/.env, /path/to/.env, or /path/*/deploy/.env."
+      },
       "placeholderPolicyLabel": "Back up OneDrive cloud-only files",
       "placeholderPolicyCaption": "Applies to OneDrive / cloud-only placeholder files on Windows (harmless elsewhere). When on, Driven downloads and backs up files that are stored only in the cloud.",
       "preview": {
