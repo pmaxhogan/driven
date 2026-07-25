@@ -1661,6 +1661,29 @@ impl SyncOrchestrator {
                 tracing::warn!(target: TARGET, source_id = %source.id, %err, "failed to record deep_verify_done activity row (telemetry count may undercount)");
             }
         }
+        // "Backup complete" row closing the run in the activity feed (before
+        // this, a run simply trailed off after its last per-file row with
+        // nothing saying it finished). Written only at this all-ops-succeeded
+        // point, carrying the run's upload totals. Scoping mirrors the scan
+        // rows above: a user-initiated cycle ALWAYS logs it (a "Run now" that
+        // found nothing to upload still ends with a visible result), a
+        // scheduled cycle only when it actually executed ops - the idle
+        // 10-minute ticks stay quiet. The summary/telemetry aggregates filter
+        // to upload_done/bundle_upload, so this byte-carrying row cannot
+        // double-count there.
+        if user_initiated || !outcomes.is_empty() {
+            let final_progress = exec_progress_from(&summary, &outcomes);
+            self.record_activity(NewActivity {
+                ts: now,
+                source_id: Some(source.id),
+                level: ActivityLevel::Info,
+                event_type: "backup_done".to_string(),
+                file_count: Some(final_progress.files_done),
+                bytes: Some(final_progress.bytes_done),
+                message: None,
+            })
+            .await;
+        }
         if let Err(err) = self.state.mark_account_synced(self.account_id, now).await {
             tracing::warn!(target: TARGET, account_id = %self.account_id, %err, "failed to persist account last_synced_at");
         }
@@ -5774,6 +5797,128 @@ mod tests {
         assert!(
             !collector.await.unwrap().is_empty(),
             "but it still broadcasts live Scanning state for the progress bar"
+        );
+    }
+
+    #[tokio::test]
+    async fn cycle_records_backup_done_with_totals() {
+        // The reported gap: the activity feed had no row marking a run's
+        // completion - it just trailed off after the last per-file row. A cycle
+        // whose ops all succeeded must close with a `backup_done` row carrying
+        // the run's upload totals. A SCHEDULED cycle that actually executed ops
+        // logs it too (the quiet-scheduled scoping only silences idle ticks).
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        seed_files(dir.path(), 3);
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            Arc::new(RecordingExecutor::default()),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            Arc::new(FakeClock::new()),
+            OrchestratorConfig::default(),
+        );
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        let rows = state.activity_rows();
+        let done: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_type == "backup_done")
+            .collect();
+        assert_eq!(done.len(), 1, "one backup_done row per completed run");
+        assert_eq!(done[0].source_id, Some(src_id));
+        assert_eq!(done[0].level, ActivityLevel::Info);
+        assert_eq!(
+            done[0].file_count,
+            Some(3),
+            "backup_done carries the files the run uploaded"
+        );
+        assert_eq!(
+            done[0].bytes,
+            Some(3),
+            "backup_done carries the bytes the run uploaded (3 one-byte seeds)"
+        );
+    }
+
+    #[tokio::test]
+    async fn idle_scheduled_cycle_writes_no_backup_done_but_manual_does() {
+        // Scoping mirrors the scan rows: an idle 10-minute tick (empty plan,
+        // nothing executed) must NOT add a completion row per tick (~144/day of
+        // noise), but a user-initiated "Run now" always ends with a visible
+        // result - even when there was nothing to upload.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap(); // empty source -> empty plan
+        let src = source_in(account, dir.path());
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            Arc::new(RecordingExecutor::default()),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            Arc::new(FakeClock::new()),
+            OrchestratorConfig::default(),
+        );
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert!(
+            state
+                .activity_rows()
+                .iter()
+                .all(|r| r.event_type != "backup_done"),
+            "an idle scheduled cycle stays quiet"
+        );
+
+        orch.run_cycle(TickSource::Manual).await.unwrap();
+        let rows = state.activity_rows();
+        let done: Vec<_> = rows
+            .iter()
+            .filter(|r| r.event_type == "backup_done")
+            .collect();
+        assert_eq!(
+            done.len(),
+            1,
+            "a manual run logs its completion even with nothing to upload"
+        );
+        assert_eq!(done[0].file_count, Some(0));
+        assert_eq!(done[0].bytes, Some(0));
+    }
+
+    #[tokio::test]
+    async fn failed_ops_suppress_backup_done() {
+        // A run with a failed op defers the timestamp advance and stays due for
+        // retry - claiming "Backup complete" for it would be a lie. The error
+        // rows recorded per-op are the visible evidence instead.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        seed_files(dir.path(), 2);
+        let src = source_in(account, dir.path());
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let exec = Arc::new(RecordingExecutor::default());
+        exec.fail_ops.store(1, Ordering::SeqCst);
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec,
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            Arc::new(FakeClock::new()),
+            OrchestratorConfig::default(),
+        );
+
+        orch.run_cycle(TickSource::Manual).await.unwrap();
+
+        assert!(
+            state
+                .activity_rows()
+                .iter()
+                .all(|r| r.event_type != "backup_done"),
+            "a run with failed ops must not claim completion"
         );
     }
 

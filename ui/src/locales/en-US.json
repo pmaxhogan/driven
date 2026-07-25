@@ -392,6 +392,7 @@
       "trash_done": "Removed",
       "scan_started": "Scan started",
       "scan_done": "Scan complete",
+      "backup_done": "Backup complete",
       "deep_verify_done": "Deep verify complete",
       "update_applied": "App updated",
       "paused": "Paused",
