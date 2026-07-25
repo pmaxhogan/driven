@@ -17,11 +17,7 @@ const VALUE = '[data-testid="files-uploaded-value"]';
 const HOVER = '[data-testid="files-uploaded-hover"]';
 const UNKNOWN = '[data-testid="files-uploaded-unknown"]';
 
-function mountTile(props: {
-  series: number[];
-  bucketMs?: number;
-  filesUploaded?: number | null;
-}) {
+function mountTile(props: { series: number[]; bucketMs?: number; filesUploaded?: number | null }) {
   return mount(FilesUploadedStatTile, {
     props: {
       bucketMs: 10_000,
@@ -70,10 +66,18 @@ describe("FilesUploadedStatTile", () => {
   });
 
   it("uses the singular form for exactly one file", () => {
-    expect(mountTile({ series: [0, 1], filesUploaded: 1 }).find(VALUE).text()).toBe("1 file");
+    expect(
+      mountTile({ series: [0, 1], filesUploaded: 1 })
+        .find(VALUE)
+        .text()
+    ).toBe("1 file");
     // Zero is plural in English ("0 files"), which is what the catalog's two
     // forms produce - a bare "0 file" would read as a bug.
-    expect(mountTile({ series: [0, 1], filesUploaded: 0 }).find(VALUE).text()).toBe("0 files");
+    expect(
+      mountTile({ series: [0, 1], filesUploaded: 0 })
+        .find(VALUE)
+        .text()
+    ).toBe("0 files");
   });
 
   it("groups a large count with Intl rather than printing raw digits", () => {

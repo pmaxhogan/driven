@@ -99,9 +99,17 @@ describe("SparklineStatTile", () => {
   it("draws nothing when every bucket is idle or the series is too short", () => {
     // A flat all-zero series must NOT plot a line pinned to the baseline - that
     // reads as "the measure is exactly this low" rather than "nothing happened".
-    expect(mountTile({ series: [0, 0, 0] }).find(SVG).exists()).toBe(false);
+    expect(
+      mountTile({ series: [0, 0, 0] })
+        .find(SVG)
+        .exists()
+    ).toBe(false);
     expect(mountTile({ series: [] }).find(SVG).exists()).toBe(false);
-    expect(mountTile({ series: [4096] }).find(SVG).exists()).toBe(false);
+    expect(
+      mountTile({ series: [4096] })
+        .find(SVG)
+        .exists()
+    ).toBe(false);
   });
 
   it("exposes the caller's chart description to assistive tech", () => {
