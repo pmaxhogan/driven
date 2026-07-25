@@ -8,9 +8,9 @@ import {
 
 import { listAccounts } from "./ipc/commands";
 
-// SPEC s25 route map. The Settings view hosts the Accounts / Sources / Rules
-// tabs (DESIGN s8.2); each tab has its own path so the tray menu + deep links
-// can target a specific tab directly. Activity (M7) and Restore (M8) are now
+// SPEC s25 route map. The Settings view hosts the Accounts / Sources / Rules /
+// About tabs (DESIGN s8.2); each tab has its own path so the tray menu + deep
+// links can target a specific tab directly. Activity (M7) and Restore (M8) are now
 // fully implemented views; /restore/:sourceId scopes the browser to one source.
 //
 // UI-CORE IA fix: /settings is the top-nav entry point to the Settings page; it
@@ -59,9 +59,15 @@ const routes: RouteRecordRaw[] = [
     props: { tab: "rules" },
   },
   {
+    // About is a Settings SUBTAB, not a top-nav surface. The path is unchanged
+    // so every existing deep link (and any future tray hint) keeps working -
+    // preserving the URL is strictly safer than redirecting it to a new one -
+    // and it follows the same flat per-tab shape as /accounts, /sources and
+    // /rules rather than inventing a nested /settings/about.
     path: "/about",
     name: "about",
-    component: () => import("./views/About.vue"),
+    component: () => import("./views/Settings.vue"),
+    props: { tab: "about" },
   },
   {
     path: "/restore",

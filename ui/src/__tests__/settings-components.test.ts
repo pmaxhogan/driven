@@ -444,6 +444,44 @@ describe("SourceTable", () => {
     );
   });
 
+  it("warns while typing an include pattern that defeats directory pruning", async () => {
+    // The scanner can only skip descending into an excluded folder when no
+    // include rule could match beneath it. A relative rule (or one with a
+    // double-star) forces it into every node_modules, so the editor calls that
+    // out AS THE USER TYPES - the preview walk only re-runs on blur, and the
+    // guidance must not wait for it.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources") return Promise.resolve([makeSource()]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+    await wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.sources.editExclusionsButton"))!
+      .trigger("click");
+    await flushPromises();
+
+    const editor = wrapper.get('[data-testid="exclusion-editor"]');
+    // A source with no include rules at all has nothing to warn about.
+    expect(wrapper.find('[data-testid="include-pattern-warning"]').exists()).toBe(false);
+
+    const includeArea = editor.findAll("textarea")[0];
+    await includeArea.setValue("/keep/.env\n.env\n/*/x/**/.env");
+    const warning = wrapper.get('[data-testid="include-pattern-warning"]');
+    expect(warning.text()).toContain(i18n.global.t("settings.addSource.includeWarning.title"));
+    // Only the offending rules are listed - the anchored, depth-bounded one is
+    // fine and must not be named.
+    const listed = warning.findAll("li").map((li) => li.text());
+    expect(listed).toEqual([".env", "/*/x/**/.env"]);
+
+    // Anchoring them clears the box without a blur or a re-preview.
+    await includeArea.setValue("/keep/.env\n/*/.env");
+    expect(wrapper.find('[data-testid="include-pattern-warning"]').exists()).toBe(false);
+  });
+
   it("Edit exclusions opens the inline editor and saves a patch", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources") return Promise.resolve([makeSource()]);
@@ -745,6 +783,61 @@ describe("AddSourceWizard", () => {
         }),
       })
     );
+  });
+
+  it("warns on the exclusions step when an include pattern defeats directory pruning", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_accounts")
+        return Promise.resolve([
+          {
+            id: "acc-1",
+            email: "user@example.com",
+            displayName: null,
+            state: "ok",
+            encryptionEnabled: false,
+            createdAt: 0,
+            lastSyncedAt: null,
+          },
+        ]);
+      if (cmd === "pick_drive_folder")
+        return Promise.resolve({ currentFolderId: "root", currentFolderPath: "", folders: [] });
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
+      if (cmd === "pick_folder_dialog")
+        return Promise.resolve({ path: "/home/u/docs", token: "tok-folder" });
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(AddSourceWizard, { global: globalMountOptions });
+    await (wrapper.vm as unknown as { start: () => Promise<void> }).start();
+    await flushPromises();
+    await wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.addSource.chooseLocalButton"))!
+      .trigger("click");
+    await flushPromises();
+    const clickNext = async () => {
+      await wrapper
+        .findAll("button")
+        .find((b) => b.text() === i18n.global.t("common.next"))!
+        .trigger("click");
+      await flushPromises();
+    };
+    await clickNext(); // -> Drive
+    await clickNext(); // -> Exclusions
+
+    // A fresh wizard starts with no rules, so nothing to warn about.
+    expect(wrapper.find('[data-testid="include-pattern-warning"]').exists()).toBe(false);
+
+    const includeArea = wrapper.findAll("textarea")[0];
+    await includeArea.setValue("blah/.env,/a/*/b/.env");
+    const warning = wrapper.get('[data-testid="include-pattern-warning"]');
+    expect(warning.text()).toContain(i18n.global.t("settings.addSource.includeWarning.hint"));
+    expect(warning.findAll("li").map((li) => li.text())).toEqual(["blah/.env"]);
+
+    // Anchoring the rule clears the box, and typing never triggered a re-walk
+    // (that still belongs to blur).
+    await includeArea.setValue("/blah/.env,/a/*/b/.env");
+    expect(wrapper.find('[data-testid="include-pattern-warning"]').exists()).toBe(false);
   });
 
   it("issue #4: checking the cloud-only toggle sends placeholderPolicy force_download; default is skip", async () => {
@@ -1796,5 +1889,66 @@ describe("Settings Rules tab", () => {
     await closeBtn!.trigger("click");
     await flushPromises();
     expect(wrapper.find('[data-testid="telemetry-preview-modal"]').exists()).toBe(false);
+  });
+});
+
+// About moved out of the top nav and into the Settings sub-bar as a fourth tab.
+// /about still resolves (the router points it at THIS view with `tab: "about"`),
+// so these cover the new branch: the tab is offered, it is the active one on
+// that route, and it renders the real About surface rather than the Rules form.
+describe("Settings About tab", () => {
+  function aboutTab(wrapper: ReturnType<typeof mount>) {
+    return wrapper
+      .findAll("nav button")
+      .find((b) => b.text() === i18n.global.t("settings.tabs.about"));
+  }
+
+  it("offers About as a subtab alongside Accounts / Sources / Rules", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, { props: { tab: "accounts" }, global: globalMountOptions });
+    await flushPromises();
+
+    const labels = wrapper.findAll("nav button").map((b) => b.text());
+    expect(labels).toEqual([
+      i18n.global.t("settings.tabs.accounts"),
+      i18n.global.t("settings.tabs.sources"),
+      i18n.global.t("settings.tabs.rules"),
+      i18n.global.t("settings.tabs.about"),
+    ]);
+  });
+
+  it("navigates to /about when the About subtab is clicked", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, { props: { tab: "accounts" }, global: globalMountOptions });
+    await flushPromises();
+
+    await aboutTab(wrapper)!.trigger("click");
+    expect(pushMock).toHaveBeenCalledWith("/about");
+  });
+
+  it("renders the About surface (not the Rules form) with the tab marked active", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_update_channel") return Promise.resolve("stable");
+      if (cmd === "list_releases") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, { props: { tab: "about" }, global: globalMountOptions });
+    await flushPromises();
+
+    expect(aboutTab(wrapper)!.classes()).toContain("border-teal-600");
+    // The About surface's own controls are present...
+    expect(wrapper.find('[data-testid="channel-select"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="check-updates"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain(i18n.global.t("about.updatesTitle"));
+    // ...and the Rules form is not rendered in its place.
+    expect(wrapper.find('[data-testid="rules-form"]').exists()).toBe(false);
   });
 });

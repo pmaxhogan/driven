@@ -97,11 +97,35 @@ export function anchoredPatternForPath(rel: string, isDir: boolean): string | nu
 
 /** Split a patterns textarea into the glob list the IPC layer takes. Mirrors the
  *  `splitPatterns` both editors already use (newline OR comma separated). */
-function splitPatterns(text: string): string[] {
+export function splitPatterns(text: string): string[] {
   return text
     .split(/[\n,]/)
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
+}
+
+/** Would this include pattern stop the scanner from PRUNING excluded folders?
+ *
+ * The walker skips descending into an excluded directory only when it can prove
+ * no include pattern could ever re-include something below it. That proof needs
+ * a pattern that is anchored to the source root AND bounded in depth, like
+ * `/repo/.env` or a leading-slash pattern whose wildcards each cover a single
+ * segment - those can only match at a known depth, so `node_modules` can be
+ * skipped outright. A relative pattern (`.env`, `blah/.env`) matches at ANY
+ * depth, and one containing a double-star spans any number of levels, so either
+ * forces the walker to descend into every excluded directory just in case -
+ * which is what makes a scan crawl.
+ */
+export function isUnconstrainedIncludePattern(pattern: string): boolean {
+  const trimmed = pattern.trim();
+  if (trimmed === "") return false;
+  return !trimmed.startsWith("/") || trimmed.includes("**");
+}
+
+/** The include patterns in a textarea's raw text that defeat directory pruning,
+ *  in the order the user typed them. Empty when the rules are all prune-safe. */
+export function unconstrainedIncludePatterns(text: string): string[] {
+  return splitPatterns(text).filter(isUnconstrainedIncludePattern);
 }
 
 /** Append `pattern` as a NEW LINE to a patterns textarea's text, skipping the
