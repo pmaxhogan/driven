@@ -1152,6 +1152,120 @@ pub trait StateRepo: Send + Sync {
         path: &RelativePath,
     ) -> Result<()>;
 
+    /// Every `(relative_path, drive_file_id)` pair this source records - i.e.
+    /// every file whose bytes are supposed to exist as a STANDALONE Drive
+    /// object right now.
+    ///
+    /// The recorded half of the remote-existence audit: the executor diffs
+    /// these ids against the live ids Drive reports
+    /// ([`driven_drive::remote_store::RemoteStore::list_source_object_ids`])
+    /// and heals whatever is recorded but no longer live. Rows with a NULL
+    /// `drive_file_id` are EXCLUDED - a bundled member (whose bytes live inside
+    /// a `.tar.gz`) and a never-uploaded row both have no standalone object to
+    /// audit, and treating their absence from Drive as damage would re-upload
+    /// them on every pass.
+    ///
+    /// Leaner than [`Self::load_source_file_state`] on purpose: the audit needs
+    /// two columns, and a source can hold hundreds of thousands of rows.
+    ///
+    /// The default returns an empty list, which reads as "this source records
+    /// no standalone objects" and makes the audit a no-op - the SAFE
+    /// degradation for a fake that models no `file_state` (mirrors
+    /// [`Self::list_empty_bundles`]).
+    async fn list_file_state_drive_ids(
+        &self,
+        source: SourceId,
+    ) -> Result<Vec<(RelativePath, String)>> {
+        let _ = source;
+        Ok(Vec::new())
+    }
+
+    /// Every `(bundle_id, drive_file_id)` this source records - the bundle half
+    /// of the remote-existence audit's recorded set.
+    ///
+    /// Distinct from [`Self::list_empty_bundles`], which returns only the
+    /// MEMBERLESS bundles that GC should trash. The audit needs ALL of them,
+    /// because a bundle whose Drive object was deleted out-of-band is still
+    /// full of members - members whose bytes are now nowhere. Default empty
+    /// (audit no-op), like the other bundle accessors.
+    async fn list_bundles_for_source(&self, source: SourceId) -> Result<Vec<(String, String)>> {
+        let _ = source;
+        Ok(Vec::new())
+    }
+
+    /// Re-queue one `file_state` row for a fresh upload after its recorded
+    /// Drive object was proven GONE.
+    ///
+    /// Three writes in one targeted UPDATE:
+    /// - `drive_file_id = NULL`, so the executor's next execution of this path
+    ///   takes the CREATE branch (it decides create-vs-update from this column,
+    ///   not from the plan) instead of a doomed UPDATE against a dead id;
+    /// - `drive_md5 = NULL`, since the md5 described bytes that no longer
+    ///   exist and would otherwise linger as a claim about a live object;
+    /// - `mtime_ns = force_rescan_mtime_ns`, the caller's sentinel. Clearing
+    ///   the id ALONE is not enough: the scanner treats a file as unchanged
+    ///   when its `(size, mtime_ns)` equals the stored row's, so an untouched
+    ///   file would never be re-emitted and the cleared id would sit there
+    ///   forever. A sentinel no real filesystem can produce guarantees the
+    ///   very next scan re-emits the path in EITHER scan mode.
+    ///
+    /// The row itself survives - only its remote pointer was wrong - so the
+    /// file's recorded history and its `bundle_members` linkage (if any) are
+    /// untouched. A missing row is an idempotent no-op.
+    ///
+    /// The default errors rather than silently succeeding: a repo that cannot
+    /// perform the heal must not report a file as healed when its row still
+    /// points at a dead object. Unreachable under the default listings above,
+    /// which return nothing to heal.
+    async fn requeue_file_state_for_reupload(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+        force_rescan_mtime_ns: i64,
+    ) -> Result<()> {
+        let _ = (source, path, force_rescan_mtime_ns);
+        Err(anyhow::anyhow!(
+            "requeue_file_state_for_reupload is not implemented by this StateRepo"
+        ))
+    }
+
+    /// Heal one bundle whose `.tar.gz` Drive object is GONE, returning the
+    /// member paths that were re-queued.
+    ///
+    /// In ONE transaction: read the bundle's members, re-queue each member's
+    /// `file_state` row exactly as
+    /// [`Self::requeue_file_state_for_reupload`] does, then delete the
+    /// `bundles` row (whose `bundle_id` FK cascades the now-meaningless
+    /// `bundle_members` rows away).
+    ///
+    /// The ordering is load-bearing and the reason this is one method rather
+    /// than a loop at the call site: deleting the bundle row cascades the
+    /// membership rows, so once it is gone the member list is UNRECOVERABLE.
+    /// Members must be read - and re-queued - first. Doing it in a transaction
+    /// additionally means a crash mid-heal cannot leave members orphaned from a
+    /// deleted bundle with no re-upload pending.
+    ///
+    /// Each member keeps `drive_file_id = NULL` (it never had a standalone
+    /// object), so the sentinel mtime is what does the work: the next scan
+    /// re-emits the path and the planner - seeing an existing `file_state` row,
+    /// which makes the file "changed" rather than "genuinely new" - schedules it
+    /// as an INDIVIDUAL upload. That is the same standalone promotion a bundled
+    /// member gets whenever it changes, so the recovery path is one the
+    /// executor already exercises rather than a bespoke re-bundle.
+    ///
+    /// Default errors, for the same reason as
+    /// [`Self::requeue_file_state_for_reupload`].
+    async fn heal_dead_bundle(
+        &self,
+        bundle_id: &str,
+        force_rescan_mtime_ns: i64,
+    ) -> Result<Vec<RelativePath>> {
+        let _ = (bundle_id, force_rescan_mtime_ns);
+        Err(anyhow::anyhow!(
+            "heal_dead_bundle is not implemented by this StateRepo"
+        ))
+    }
+
     /// R2-P1-3 (DESIGN s5.4): increment the CONSECUTIVE checksum-mismatch
     /// counter for `(source, path)` by one and return the NEW count. After the
     /// 3rd consecutive mismatch the executor marks the file

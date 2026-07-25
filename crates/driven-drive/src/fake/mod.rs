@@ -61,7 +61,7 @@
 
 pub mod fault_injection;
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::pin::Pin;
 use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::Arc;
@@ -97,6 +97,12 @@ pub const FOLDER_MARKER_KEY: &str = "driven.folder_marker";
 /// `app_properties` key Drive uses to carry the create-op UUID for the
 /// crash-safe reconciliation protocol (DESIGN s5.6).
 pub const CLIENT_OP_UUID_KEY: &str = "driven.client_op_uuid";
+
+/// `app_properties` key carrying the owning source's id. Re-exported from the
+/// google store so the fake's
+/// [`InMemoryRemoteStore::list_source_object_ids`] filters on the SAME key the
+/// executor stamps and the real store queries.
+pub use crate::google::SOURCE_ID_KEY;
 
 // ---------------------------------------------------------------------------
 // Internal value types.
@@ -532,6 +538,11 @@ pub(crate) struct Faults {
     /// re-upload the same path on the next cycle. Latches for the lifetime of
     /// the store; set by [`fault_injection::with_update_not_found`].
     pub(crate) update_not_found: std::sync::atomic::AtomicBool,
+    /// When true, `list_source_object_ids` fails. Scoped to that one call so a
+    /// test can let its setup uploads land and then break ONLY the
+    /// remote-existence audit's enumeration; set by
+    /// [`fault_injection::with_source_listing_broken`].
+    pub(crate) source_listing_broken: std::sync::atomic::AtomicBool,
     /// Dest-folder states are latched on construction by the builder.
     pub(crate) dest_folder_missing: std::sync::atomic::AtomicBool,
     pub(crate) dest_folder_readonly: std::sync::atomic::AtomicBool,
@@ -578,6 +589,7 @@ impl Default for Faults {
             response_delay_nanos: AtomicU64::new(0),
             invalid_grant_latched: AtomicBool::new(false),
             update_not_found: AtomicBool::new(false),
+            source_listing_broken: AtomicBool::new(false),
             dest_folder_missing: AtomicBool::new(false),
             dest_folder_readonly: AtomicBool::new(false),
             trashed_visible_in_find: AtomicBool::new(false),
@@ -685,6 +697,53 @@ impl InMemoryRemoteStore {
             }
         }
         out
+    }
+
+    /// Test hook modelling a USER deleting a folder in the Drive web UI and
+    /// emptying the trash: `folder_id` and EVERY descendant (files, bundles,
+    /// nested folders) are removed outright.
+    ///
+    /// Returns the ids removed, so a test can assert on exactly what died.
+    ///
+    /// Why this is not built out of the trait methods: `trash` flips one
+    /// object's flag and `delete_permanent` removes one object - neither
+    /// cascades, because neither models a folder deletion. Real Drive DOES
+    /// cascade (deleting a folder takes its whole subtree with it), and that
+    /// cascade is precisely the incident this exists to reproduce: the
+    /// children die with the folder, so every `file_state` row under it is
+    /// left pointing at a hard-deleted id. Hand-trashing each child instead
+    /// would leave the FOLDER alive and test nothing about ancestor recovery.
+    ///
+    /// It is an inherent test hook rather than a `RemoteStore` method on
+    /// purpose: this is a user action against Drive, not an operation Driven
+    /// ever performs.
+    pub fn delete_folder_tree(&self, folder_id: &str) -> Vec<String> {
+        let mut guard = self.inner.lock();
+        // Collect the subtree first (breadth of ids), then remove - removing
+        // while walking would drop parents out from under their children.
+        let mut doomed = vec![folder_id.to_string()];
+        let mut stack = vec![folder_id.to_string()];
+        while let Some(id) = stack.pop() {
+            for child in guard.children(&id) {
+                doomed.push(child.file_id.clone());
+                if child.is_folder() {
+                    stack.push(child.file_id.clone());
+                }
+            }
+        }
+        for id in &doomed {
+            if let Some(entry) = guard.objects.remove(id) {
+                // A live object's bytes are reclaimed; a trashed one's were
+                // already subtracted at trash time (mirrors `delete_permanent`).
+                let freed = if entry.trashed {
+                    0
+                } else {
+                    entry.content_len().unwrap_or(0)
+                };
+                guard.bytes_stored = guard.bytes_stored.saturating_sub(freed);
+            }
+        }
+        doomed
     }
 
     /// Internal test hook: count open resumable sessions. Used by the
@@ -1452,6 +1511,38 @@ impl RemoteStore for InMemoryRemoteStore {
         // Most-recent by monotonic seq (deterministic for tests).
         matches.sort_by_key(|e| std::cmp::Reverse(e.seq));
         Ok(Some(matches[0].to_remote_entry()))
+    }
+
+    async fn list_source_object_ids(
+        &self,
+        source_id: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<HashSet<String>> {
+        self.record_context(drive_context);
+        // A READ, so it honours the read-side faults (rate-limit / 5xx /
+        // network-drop / invalid-grant). That is what lets a test drive the
+        // audit's "listing failed -> abort with zero writes" rule.
+        self.check_request_faults(RequestKind::Read).await?;
+        if self.faults.source_listing_broken.load(Ordering::Acquire) {
+            // The enumeration could not be completed. Returning an `Err` - never
+            // a partial or empty set - is the contract: the caller must abort
+            // the audit rather than read the missing ids as deletions.
+            anyhow::bail!("fake: source object enumeration is unavailable");
+        }
+        let guard = self.inner.lock();
+        Ok(guard
+            .objects
+            .values()
+            // Trashed objects are gone for the audit's purposes, exactly as the
+            // real store's `trashed = false` query says.
+            .filter(|e| !e.trashed)
+            .filter(|e| {
+                e.app_properties
+                    .get(SOURCE_ID_KEY)
+                    .is_some_and(|v| v == source_id)
+            })
+            .map(|e| e.file_id.clone())
+            .collect())
     }
 
     async fn about(&self) -> anyhow::Result<AboutInfo> {

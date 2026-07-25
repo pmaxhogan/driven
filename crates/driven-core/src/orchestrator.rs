@@ -406,6 +406,13 @@ pub struct SyncOrchestrator {
     /// is fully done once every currently-enabled source is in the set.
     /// `Mutex` not `RwLock` because the read-check-and-insert must be atomic.
     reconciled: Mutex<ReconcileProgress>,
+    /// Source ids whose remote-existence audit has completed SUCCESSFULLY this
+    /// process lifetime, so the startup pass runs at most once per source.
+    ///
+    /// Same shape and rationale as [`Self::reconciled`]: a source whose audit
+    /// errored is absent from the set and is retried on the next cycle rather
+    /// than being skipped until restart.
+    audited: Mutex<std::collections::HashSet<crate::types::SourceId>>,
     /// Manual out-of-band trigger (SPEC s5 "Sync now", DESIGN s5.1).
     /// Capacity-1 mpsc: a `try_send` that finds the buffer full means a
     /// trigger is already pending, so the surplus is COALESCED into the one
@@ -526,6 +533,7 @@ impl SyncOrchestrator {
             pause_tx,
             events,
             reconciled: Mutex::new(ReconcileProgress::default()),
+            audited: Mutex::new(std::collections::HashSet::new()),
             trigger_tx,
             trigger_rx: Mutex::new(Some(trigger_rx)),
             watcher_tx,
@@ -1091,6 +1099,101 @@ impl SyncOrchestrator {
         }
     }
 
+    /// Runs the remote-existence audit for `source` when it is due, and
+    /// records what it healed.
+    ///
+    /// # When it runs
+    ///
+    /// Two triggers, deliberately:
+    /// - **Once per source per process**, on the first cycle that reaches this
+    ///   source. Damage appears out-of-band (a user deleting Drive folders),
+    ///   and the app is typically restarted long before a deep-verify interval
+    ///   elapses - waiting up to a week to notice that a backup stopped
+    ///   existing is not a backup tool.
+    /// - **Every deep-verify cycle**, the existing "check what we believe
+    ///   against what is true" pass. Deep-verify already re-hashes local bytes
+    ///   against `file_state`; this adds the remote half of the same question.
+    ///
+    /// A source is marked done only after a SUCCESSFUL audit, so a transient
+    /// Drive failure is retried on the next cycle rather than silently skipped
+    /// until restart (mirrors [`Self::reconcile_once`]).
+    ///
+    /// # Why it never fails the cycle
+    ///
+    /// An audit error means "we could not check", not "the backup is broken".
+    /// The pass writes nothing when it cannot enumerate, so the recorded state
+    /// is exactly as it was; propagating the error would abort a backup that
+    /// is otherwise perfectly able to run. It is logged and dropped.
+    async fn audit_remote_existence_if_due(&self, source: &SourceRow, deep_verify: bool) {
+        {
+            // Read-check-and-skip under the same lock discipline as
+            // `reconciled`: the startup pass must fire exactly once per source.
+            if !deep_verify && self.audited.lock().await.contains(&source.id) {
+                return;
+            }
+        }
+
+        let report = match self.executor.audit_remote_existence(source).await {
+            Ok(report) => {
+                self.audited.lock().await.insert(source.id);
+                report
+            }
+            Err(err) => {
+                tracing::warn!(
+                    target: TARGET,
+                    source_id = %source.id,
+                    %err,
+                    "remote-existence audit could not run this cycle; retrying next cycle (nothing was changed)"
+                );
+                return;
+            }
+        };
+
+        // SILENT GREEN. A clean audit - the overwhelmingly common case - writes
+        // no activity row at all. Logging "checked, all fine" every deep-verify
+        // would bury the rows that matter under noise the user must learn to
+        // ignore.
+        if !report.found_anything() {
+            return;
+        }
+
+        let now = self.clock.now_ms();
+        // Per-file WARN rows reusing the SAME `drive.remote_file_missing` code
+        // the live update-path self-heal emits: from the user's side both are
+        // "the backed-up copy of this file was missing and will be re-uploaded",
+        // and one code keeps the Activity filter honest. Capped - the incident
+        // that motivated this pass would have written 4,526 rows.
+        for path in &report.sample_paths {
+            self.record_activity(NewActivity {
+                ts: now,
+                source_id: Some(source.id),
+                level: ActivityLevel::Warn,
+                event_type: crate::types::ErrorCode::DriveRemoteFileMissing.to_string(),
+                file_count: None,
+                bytes: None,
+                message: Some(path.as_str().to_string()),
+            })
+            .await;
+        }
+
+        // The summary row carries the FULL healed count in `file_count`, so the
+        // capped per-file rows above never hide the true scale. `message` is
+        // deliberately `None`: every other orchestrator-written row leaves the
+        // English to the webview's `activity.events.*` localization rather than
+        // baking a backend-side string into a durable row (mirrors
+        // `deep_verify_done` / `backup_done`).
+        self.record_activity(NewActivity {
+            ts: now,
+            source_id: Some(source.id),
+            level: ActivityLevel::Info,
+            event_type: "remote_audit_done".to_string(),
+            file_count: Some(report.healed_paths()),
+            bytes: None,
+            message: None,
+        })
+        .await;
+    }
+
     /// Writes a durable `activity_log` ERROR row per NFC collision the planner
     /// dropped (SPEC s24 `local.unicode_collision`, the M2-deferred item in
     /// design/CODEX_NOTES.md).
@@ -1420,6 +1523,15 @@ impl SyncOrchestrator {
         // `Scanning { scanned }` state for the progress bar - it just does not
         // leave a durable row behind. Written with no message so the row needs no
         // backend-side English (the webview localizes `activity.events.*`).
+        // Remote-existence audit, BEFORE anything else this source does (see
+        // `audit_remote_existence` for why the pass exists at all). Running it
+        // ahead of the scan is what makes a heal complete in ONE cycle: the
+        // audit stamps the force-rescan sentinel on every damaged row, and the
+        // scan that follows immediately re-emits those paths for re-upload.
+        // After the scan they would sit unrepaired until the next cycle.
+        self.audit_remote_existence_if_due(source, deep_verify)
+            .await;
+
         let user_initiated = tick == TickSource::Manual;
         if user_initiated {
             self.record_activity(NewActivity {
@@ -2574,10 +2686,39 @@ mod tests {
         /// plan. Used to assert the committed ops' activity survives a mid-plan
         /// stop (rather than being lost in a post-pass).
         stream_then_fail_after: AtomicU64,
+        /// Sources passed to `audit_remote_existence`, in call order, so the
+        /// scheduling tests can assert the startup-once + deep-verify-due
+        /// triggers fire exactly when they should.
+        audited_sources: StdMutex<Vec<SourceId>>,
+        /// The report every `audit_remote_existence` call returns. `None`
+        /// (the default) yields a clean report, which must produce NO activity
+        /// rows at all.
+        audit_report: StdMutex<Option<crate::executor::RemoteAuditReport>>,
+        /// When `> 0`, the next `audit_remote_existence` call returns `Err` and
+        /// decrements this WITHOUT recording the source - drives the "a failed
+        /// audit is retried next cycle rather than skipped until restart" test.
+        audit_failures_remaining: AtomicU64,
     }
 
     #[async_trait]
     impl Executor for RecordingExecutor {
+        async fn audit_remote_existence(
+            &self,
+            source: &SourceRow,
+        ) -> anyhow::Result<crate::executor::RemoteAuditReport> {
+            if self.audit_failures_remaining.load(Ordering::SeqCst) > 0 {
+                self.audit_failures_remaining.fetch_sub(1, Ordering::SeqCst);
+                return Err(anyhow::anyhow!("transient audit error"));
+            }
+            self.audited_sources.lock().unwrap().push(source.id);
+            Ok(self
+                .audit_report
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default())
+        }
+
         async fn execute(
             &self,
             _source: &SourceRow,
@@ -3150,6 +3291,29 @@ mod tests {
         let orch =
             SyncOrchestrator::new(account, state, executor, power, net, clock.clone(), config);
         (orch, clock)
+    }
+
+    /// [`build`] with online/AC defaults, additionally handing back the
+    /// [`FakeState`] so a test can read the `activity_log` rows the cycle
+    /// wrote. `build` keeps its state private, and the audit's whole
+    /// user-visible contract is which rows it does (and does not) write.
+    fn build_with_state(
+        account: AccountId,
+        sources: Vec<SourceRow>,
+        executor: Arc<RecordingExecutor>,
+    ) -> (SyncOrchestrator, Arc<FakeState>, Arc<FakeClock>) {
+        let state = Arc::new(FakeState::with_sources(sources));
+        let clock = Arc::new(FakeClock::new());
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            executor,
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock.clone(),
+            OrchestratorConfig::default(),
+        );
+        (orch, state, clock)
     }
 
     /// One recorded hook invocation: the command and its env vars.
@@ -4261,6 +4425,277 @@ mod tests {
         );
     }
 
+    // --- remote-existence audit scheduling + reporting ----------------------
+
+    /// The startup trigger. The audit must run on the FIRST cycle that reaches
+    /// a source, not only when a deep verify happens to come due.
+    ///
+    /// The incident it exists for appeared overnight; `deep_verify_interval_secs`
+    /// defaults to a WEEK, and the app is restarted far more often than that.
+    /// An audit that only rode the deep-verify cycle could leave a source
+    /// un-backed-up for days without saying so.
+    #[tokio::test]
+    async fn remote_audit_runs_once_per_source_at_startup() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.audited_sources.lock().unwrap().as_slice(),
+            &[src_id],
+            "the first cycle audits the source"
+        );
+
+        // ...and not again on every subsequent tick. `source_in` sets
+        // `last_deep_verify_at = Some(0)` against a `FakeClock` that has not
+        // advanced a week, so no deep verify is due here - this isolates the
+        // startup trigger.
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.audited_sources.lock().unwrap().len(),
+            1,
+            "the startup audit is once per source per process, not per cycle"
+        );
+    }
+
+    /// The recurring trigger: every deep-verify cycle re-audits. Deep verify
+    /// already re-checks local bytes against `file_state`; this is the remote
+    /// half of the same question, and it must keep firing for a process that
+    /// stays up for weeks.
+    #[tokio::test]
+    async fn remote_audit_reruns_on_every_deep_verify_cycle() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        // Never deep-verified => `deep_verify_due` is true on every cycle.
+        let src = SourceRow {
+            last_deep_verify_at: None,
+            ..source_in(account, dir.path())
+        };
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _state, clock) = build_with_state(account, vec![src], exec.clone());
+
+        // Cycle 1 is deep-verify-due (never verified) AND the startup pass, so
+        // it proves nothing on its own; it also stamps `last_deep_verify_at`.
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(exec.audited_sources.lock().unwrap().len(), 1);
+
+        // A cycle before the interval elapses is NOT due, and the startup pass
+        // is spent - so this must not audit.
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.audited_sources.lock().unwrap().len(),
+            1,
+            "a non-deep-verify cycle after the startup pass must not re-audit"
+        );
+
+        // Push past `deep_verify_interval_secs` (a week): now due again.
+        clock.advance(std::time::Duration::from_secs(604_800 + 1));
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.audited_sources.lock().unwrap().as_slice(),
+            &[src_id, src_id],
+            "a deep-verify cycle re-audits even after the startup pass is done"
+        );
+    }
+
+    /// A failed audit must be RETRIED next cycle, not treated as done.
+    /// Marking a source audited on failure would mean one transient Drive
+    /// hiccup at startup silently disables the check until the app restarts -
+    /// the exact "silently un-backed-up" failure mode this pass exists to
+    /// prevent.
+    #[tokio::test]
+    async fn a_failed_remote_audit_is_retried_next_cycle() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        exec.audit_failures_remaining.store(1, Ordering::SeqCst);
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+
+        // The failure must NOT abort the cycle: being unable to check says
+        // nothing about the backup's ability to run.
+        orch.run_cycle(TickSource::Scheduled)
+            .await
+            .expect("an audit failure must not fail the cycle");
+        assert!(
+            exec.audited_sources.lock().unwrap().is_empty(),
+            "a failed audit records nothing"
+        );
+        assert!(
+            exec.executes.load(Ordering::SeqCst) > 0,
+            "the backup itself must still have run"
+        );
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.audited_sources.lock().unwrap().as_slice(),
+            &[src_id],
+            "the next cycle retries the audit"
+        );
+    }
+
+    /// SILENT GREEN. A clean audit - the overwhelmingly common case - writes no
+    /// activity row at all. A backup tool that logged "checked, nothing wrong"
+    /// on every cycle would train users to ignore the feed that carries the
+    /// rows that matter.
+    #[tokio::test]
+    async fn a_clean_remote_audit_writes_no_activity() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, state, _clock) = build_with_state(account, vec![src], exec.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        let events: Vec<String> = state
+            .activity_rows()
+            .into_iter()
+            .map(|r| r.event_type)
+            .collect();
+        assert!(
+            !events.iter().any(|e| e == "remote_audit_done"
+                || e == crate::types::ErrorCode::DriveRemoteFileMissing.code()),
+            "a clean audit must be silent, got: {events:?}"
+        );
+    }
+
+    /// What the user actually sees when the audit finds damage: a bounded
+    /// number of per-file WARN rows naming the affected paths, plus ONE
+    /// summary row whose `file_count` carries the TRUE total.
+    ///
+    /// The cap is why the summary count matters: the motivating incident would
+    /// have produced 4,526 per-file rows, so the enumeration is bounded while
+    /// the reported scale is not.
+    #[tokio::test]
+    async fn a_remote_audit_that_found_damage_reports_capped_warns_plus_a_full_count() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        // Far more healed files than sampled paths - the shape the executor
+        // produces once the cap bites.
+        let sample: Vec<RelativePath> = (0..crate::executor::REMOTE_AUDIT_WARN_ROW_CAP)
+            .map(|i| RelativePath::try_from(format!("docs/f{i}.pdf")).unwrap())
+            .collect();
+        *exec.audit_report.lock().unwrap() = Some(crate::executor::RemoteAuditReport {
+            healed_files: 4_526,
+            healed_bundles: 0,
+            healed_bundle_members: 0,
+            sample_paths: sample.clone(),
+        });
+        let (orch, state, _clock) = build_with_state(account, vec![src], exec.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        let rows = state.activity_rows();
+
+        let warns: Vec<&NewActivity> = rows
+            .iter()
+            .filter(|r| r.event_type == crate::types::ErrorCode::DriveRemoteFileMissing.code())
+            .collect();
+        assert_eq!(
+            warns.len(),
+            crate::executor::REMOTE_AUDIT_WARN_ROW_CAP,
+            "one WARN row per sampled path, capped"
+        );
+        assert!(
+            warns.iter().all(|r| r.level == ActivityLevel::Warn),
+            "a self-healed missing copy is a warning, not an error"
+        );
+        assert_eq!(
+            warns
+                .iter()
+                .filter_map(|r| r.message.clone())
+                .collect::<Vec<_>>(),
+            sample
+                .iter()
+                .map(|p| p.as_str().to_string())
+                .collect::<Vec<_>>(),
+            "each WARN row names its file"
+        );
+
+        let summary: Vec<&NewActivity> = rows
+            .iter()
+            .filter(|r| r.event_type == "remote_audit_done")
+            .collect();
+        assert_eq!(summary.len(), 1, "exactly one summary row per audit");
+        assert_eq!(summary[0].level, ActivityLevel::Info);
+        assert_eq!(
+            summary[0].file_count,
+            Some(4_526),
+            "the summary carries the FULL healed count, so the cap hides nothing"
+        );
+        assert_eq!(summary[0].source_id, Some(src_id));
+        assert_eq!(
+            summary[0].message, None,
+            "the row leaves its English to the webview's activity.events localization"
+        );
+    }
+
+    /// The audit must run BEFORE the scan, so a heal completes within ONE
+    /// cycle: the audit stamps the force-rescan sentinel, and the scan that
+    /// immediately follows re-emits those paths for re-upload. Running it after
+    /// the scan would leave every healed file waiting for the next cycle.
+    ///
+    /// Pinned via the activity ordering the cycle produces: on a user-initiated
+    /// run the `scan_started` row is written at the top of `run_one_source`,
+    /// and the audit's rows must precede it.
+    #[tokio::test]
+    async fn the_remote_audit_runs_before_the_scan() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        *exec.audit_report.lock().unwrap() = Some(crate::executor::RemoteAuditReport {
+            healed_files: 1,
+            healed_bundles: 0,
+            healed_bundle_members: 0,
+            sample_paths: vec![RelativePath::try_from("a.txt".to_string()).unwrap()],
+        });
+        let (orch, state, _clock) = build_with_state(account, vec![src], exec.clone());
+
+        // Manual tick so the scan boundary rows are written.
+        orch.run_cycle(TickSource::Manual).await.unwrap();
+        let events: Vec<String> = state
+            .activity_rows()
+            .into_iter()
+            .map(|r| r.event_type)
+            .collect();
+        let audit_at = events
+            .iter()
+            .position(|e| e == "remote_audit_done")
+            .expect("the audit summary row must be present");
+        let scan_at = events
+            .iter()
+            .position(|e| e == "scan_started")
+            .expect("a manual cycle writes scan_started");
+        assert!(
+            audit_at < scan_at,
+            "the audit must precede the scan so healed files re-upload in the SAME cycle, got: {events:?}"
+        );
+    }
+
     #[tokio::test]
     async fn first_reconcile_error_is_retried_not_permanently_disabled() {
         // P1-1: a transient error on the startup reconcile must NOT
@@ -5225,6 +5660,15 @@ mod tests {
 
         async fn reconcile(&self, _source: &SourceRow) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        async fn audit_remote_existence(
+            &self,
+            _source: &SourceRow,
+        ) -> anyhow::Result<crate::executor::RemoteAuditReport> {
+            // This double exists to block inside `execute`; a clean audit keeps
+            // it out of the way of the pause/shutdown timing it tests.
+            Ok(crate::executor::RemoteAuditReport::default())
         }
 
         fn set_paused(&self, paused: bool) {
