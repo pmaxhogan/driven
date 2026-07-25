@@ -30,7 +30,9 @@ use clap::{Parser, Subcommand};
 mod inspect;
 
 use driven_drive::google::oauth::{run_pkce_loopback_flow, OAuthProgress};
-use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
+use driven_drive::google::token_store::{
+    ClientCredsStore, KeyringTokenStore, RefreshingTokenSource,
+};
 use driven_drive::google::{md5_hex, parse_installed_client_config, GoogleDriveStore, UploadBytes};
 use driven_drive::remote_store::{RemoteStore, UploadBody};
 use driven_drive::{CustomCaConfig, ProxyConfig};
@@ -58,6 +60,10 @@ enum Command {
     /// Print the stored refresh token for the authenticated account so it can
     /// be exported as `DRIVEN_E2E_REFRESH_TOKEN` (ROADMAP M4).
     DumpRefreshToken(DumpRefreshTokenArgs),
+    /// Print the stored BYO OAuth client id + secret for an account (the pair
+    /// that minted its refresh token), for debugging refresh failures. The
+    /// GUI app stores these under the account's UUID.
+    DumpClientCreds(DumpClientCredsArgs),
     /// Run one sync cycle of a local folder to a real Drive destination
     /// folder (ROADMAP M4 acceptance).
     Sync(SyncArgs),
@@ -95,6 +101,16 @@ struct AuthArgs {
 #[derive(Debug, clap::Args)]
 struct DumpRefreshTokenArgs {
     /// The account whose stored refresh token to print (keychain lookup key).
+    #[arg(long)]
+    account: String,
+}
+
+/// Arguments for `driven-cli dump-client-creds`.
+#[derive(Debug, clap::Args)]
+struct DumpClientCredsArgs {
+    /// The account whose stored BYO client creds to print (keychain lookup
+    /// key; the GUI app keys by account UUID, `driven-cli auth` by the
+    /// account string given at auth time).
     #[arg(long)]
     account: String,
 }
@@ -140,6 +156,7 @@ async fn main() -> anyhow::Result<()> {
     match cli.command {
         Command::Auth(args) => run_auth(args).await,
         Command::DumpRefreshToken(args) => run_dump_refresh_token(args).await,
+        Command::DumpClientCreds(args) => run_dump_client_creds(args).await,
         Command::Sync(args) => run_sync(args).await,
         Command::Status(args) => inspect::run_status(args).await,
         Command::History(args) => inspect::run_history(args).await,
@@ -306,6 +323,27 @@ async fn run_dump_refresh_token(args: DumpRefreshTokenArgs) -> anyhow::Result<()
         None => Err(anyhow::anyhow!(
             "no refresh token stored for account '{}'; run `driven-cli auth --account {}` first",
             args.account,
+            args.account
+        )),
+    }
+}
+
+/// Handler for `driven-cli dump-client-creds`.
+///
+/// Mirrors [`run_dump_refresh_token`]: prints `client_id` then `client_secret`
+/// (one per line; the secret line is empty for a PKCE client) so a debugging
+/// session can refresh the account's token against the SAME client that minted
+/// it - a refresh against any other client fails with `invalid_client`.
+async fn run_dump_client_creds(args: DumpClientCredsArgs) -> anyhow::Result<()> {
+    let store = ClientCredsStore::new(args.account.clone());
+    match store.load()? {
+        Some(creds) => {
+            println!("{}", creds.client_id);
+            println!("{}", creds.client_secret);
+            Ok(())
+        }
+        None => Err(anyhow::anyhow!(
+            "no BYO client creds stored for account '{}'",
             args.account
         )),
     }
