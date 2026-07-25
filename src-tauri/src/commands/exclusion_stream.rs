@@ -201,10 +201,10 @@ impl Default for StreamConfig {
 ///
 /// Mirrors the scanner's walk policy exactly, because the preview's whole job is
 /// to predict it: symlinks are never followed (DESIGN s5.2.1 `Skip`), an
-/// excluded directory is descended anyway when the matcher has negations (a
-/// `!`-re-include could live under it - the same P1-1 lockstep rule
-/// `build_walker` applies), and an unreadable directory is logged and skipped
-/// rather than failing the preview.
+/// excluded directory is descended anyway when a `!`-re-include could reach
+/// under THAT directory (`SourceMatcher::negations_could_match_under` - the same
+/// per-directory P1-1 lockstep rule `build_walker` applies), and an unreadable
+/// directory is logged and skipped rather than failing the preview.
 pub fn stream_classify_tree(
     root: &Path,
     matcher: &SourceMatcher,
@@ -222,7 +222,6 @@ pub fn stream_classify_tree(
     let mut pending: Vec<ExclusionPreviewNode> = Vec::with_capacity(cfg.batch_max_nodes);
     let mut last_flush = Instant::now();
 
-    let prune_excluded_dirs = !matcher.has_negations();
     // BFS: a directory is emitted while scanning its PARENT and only descended
     // when it comes off the front of the queue, so every node's parent has
     // already been streamed by the time the node itself is.
@@ -277,9 +276,10 @@ pub fn stream_classify_tree(
             let rel_str = rel.to_string_lossy().replace('\\', "/");
 
             if is_dir {
-                // Descend unless this dir is excluded AND pruning is safe (no
-                // negation rule could re-include a child).
-                if included || !prune_excluded_dirs {
+                // Descend unless this dir is excluded AND pruning it is safe -
+                // i.e. no `!`-rule anywhere could re-include something beneath
+                // THIS directory (the scanner's own per-directory rule).
+                if included || matcher.negations_could_match_under(rel) {
                     queue.push_back(path);
                 }
             } else if included {
@@ -752,6 +752,26 @@ mod tests {
         assert!(!lib.included, "but stays excluded");
         assert_eq!(done.included_count, 2, "src/app.js + vendor/keep.js");
         assert_eq!(done.excluded_count, 1, "vendor/lib.js");
+
+        // And the per-DIRECTORY rule: a re-include that exists but cannot reach
+        // into this directory prunes it just the same. Before the per-directory
+        // check any `!`-rule anywhere disabled pruning for the whole tree, so a
+        // user re-including one file elsewhere paid a full descent of every
+        // excluded folder - the exact behaviour that made the preview crawl on
+        // a source with a `node_modules`.
+        let (batches, done) = run(
+            root,
+            &source_at(root, &["/src/app.js"], &["/vendor/"]),
+            &StreamConfig::default(),
+        );
+        let nodes = all_nodes(&batches);
+        assert!(nodes.iter().any(|n| n.path == "vendor" && !n.included));
+        assert!(
+            !nodes.iter().any(|n| n.path.starts_with("vendor/")),
+            "an unreachable negation must not defeat the prune"
+        );
+        assert_eq!(done.included_count, 1, "only src/app.js");
+        assert_eq!(done.excluded_count, 0, "vendor's files were never visited");
     }
 
     #[test]

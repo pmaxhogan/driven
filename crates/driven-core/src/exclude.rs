@@ -43,10 +43,36 @@
 //!
 //! Note we DELIBERATELY do NOT replicate git's rule that "a file cannot be
 //! re-included if a parent directory is excluded": a nested `!keep.txt` under
-//! an excluded `vendor/` re-includes the file. That permissive choice is a
-//! backup-safety invariant (when in doubt, do not drop a backed-up file); the
-//! last-match-wins evaluation across scopes preserves it because the deeper
-//! whitelist scope is consulted after (and overrides) the shallower exclude.
+//! an excluded `vendor/` re-includes the file, PROVIDED that nested ignore file
+//! was collected at all (see "Pruned ignore-file collection" below). That
+//! permissive choice is a backup-safety invariant (when in doubt, do not drop a
+//! backed-up file); the last-match-wins evaluation across scopes preserves it
+//! because the deeper whitelist scope is consulted after (and overrides) the
+//! shallower exclude.
+//!
+//! ## Pruned ignore-file collection (perf + the walk/matcher lockstep)
+//!
+//! [`build_source_matcher`] discovers the nested `.gitignore` / `.ignore` files
+//! with ONE breadth-first pass ([`collect_ignore_scopes`]) that PRUNES the
+//! subtrees it will never need: while descending, it evaluates each candidate
+//! directory against the cascade built SO FAR (defaults + the source's own
+//! patterns + `.git/info/exclude` + the global gitignore + every ignore file
+//! already discovered at an ancestor depth - which is exactly the set of scopes
+//! that can apply to that directory) and does not descend a directory that is
+//! excluded AND that no whitelist rule can reach under
+//! ([`SourceMatcher::negations_could_match_under`]). This is git's own rule -
+//! git never reads a `.gitignore` inside an ignored directory - and it is what
+//! keeps the matcher build off a 600k-file `node_modules` sweep.
+//!
+//! The consequence is deliberate and load-bearing: a `!keep.txt` inside a
+//! nested `.gitignore` that lives under a PRUNED directory is absent from the
+//! matcher, so `vendor/keep.txt` is classified EXCLUDED rather than re-included.
+//! That keeps the matcher and the walk in exact lockstep - both are derived
+//! from the same collected set - which is the P1-1 data-loss invariant: the
+//! scanner's orphan split reads such a stored `file_state` row as an
+//! `excluded_orphan` (no trash op) and NEVER as a deletion. A negation that
+//! lives at or above the excluded directory still disables pruning and is
+//! honoured exactly as before.
 //!
 //! ## Glob semantics (true gitignore, NOT the inverted `Override` form)
 //!
@@ -59,7 +85,9 @@
 //! (included) and `!`-rules re-include naturally without any whitelist-only
 //! mode dropping unrelated files.
 
+use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 
 use ignore::gitignore::{Gitignore, GitignoreBuilder};
 use ignore::WalkBuilder;
@@ -124,6 +152,391 @@ struct Scope {
     dir: PathBuf,
     /// The rules for this scope, rooted at `dir`.
     matcher: Gitignore,
+    /// The scope's `!`-whitelist rules, reduced to the shape
+    /// [`SourceMatcher::negations_could_match_under`] needs.
+    negations: Negations,
+}
+
+/// The `!`-whitelist rules of one [`Scope`], recorded at build time so the
+/// walker can ask "could a re-include reach under this directory?" without
+/// descending it (P2-1 negation-aware pruning).
+///
+/// ALWAYS conservative: `unknown` is set whenever the rules could not be read or
+/// parsed with confidence, and it makes every query answer "yes, a negation
+/// could match" - which only ever costs a directory we did not have to walk,
+/// never a file we should have backed up.
+#[derive(Debug, Default)]
+struct Negations {
+    /// The parsed whitelist rules, each relative to the scope's own directory.
+    patterns: Vec<NegationPattern>,
+    /// Set when the scope's rules could not be analysed exactly (an unreadable
+    /// ignore file, or a parse that disagreed with the `ignore` crate's own
+    /// whitelist count). Treated as "a negation could match anywhere at or under
+    /// this scope".
+    unknown: bool,
+}
+
+/// One `!`-whitelist rule, reduced to what the reachability check needs.
+#[derive(Debug)]
+struct NegationPattern {
+    /// `true` when gitignore lets the rule match at ANY depth below its scope
+    /// directory - i.e. it carries no leading and no interior `/` (a lone
+    /// TRAILING `/`, the directory marker, does not anchor a rule). Such a rule
+    /// can always reach under any directory in its scope.
+    unanchored: bool,
+    /// The `/`-split segments of an ANCHORED rule, relative to the scope
+    /// directory, with the leading `/` and the trailing `/` removed. Empty for
+    /// an unanchored rule (never consulted).
+    segments: Vec<String>,
+}
+
+impl Negations {
+    /// Whether this scope carries any whitelist rule at all (or is `unknown`).
+    fn any(&self) -> bool {
+        self.unknown || !self.patterns.is_empty()
+    }
+
+    /// Whether any whitelist rule here could match a path at or under the
+    /// directory whose path RELATIVE to this scope's directory is `rel`
+    /// (`rel` empty = the scope directory itself).
+    fn could_match_under(&self, rel: &[String]) -> bool {
+        if self.unknown {
+            return true;
+        }
+        self.patterns.iter().any(|p| p.could_match_under(rel))
+    }
+}
+
+impl NegationPattern {
+    /// Whether this rule could match some path at or under the directory
+    /// `rel` (segments relative to the rule's scope directory).
+    ///
+    /// Runs the pattern's segments as a tiny NFA over `rel`'s segments, with
+    /// `**` consuming zero or more segments and `*` / `?` / `[...]` matching
+    /// within one segment. Three outcomes count as "could match":
+    ///
+    /// - the pattern still has segments left after consuming all of `rel` - it
+    ///   can match something deeper;
+    /// - the pattern is consumed EXACTLY at `rel` - the directory itself is
+    ///   whitelisted, which re-includes everything beneath it;
+    /// - the pattern is consumed at an ANCESTOR of `rel` - same thing, reached
+    ///   through [`Gitignore::matched_path_or_any_parents`], which retries every
+    ///   parent as a directory.
+    ///
+    /// Only a pattern whose segments diverge from `rel` returns `false`, which
+    /// is what lets `/myrepo/.env` prune `node_modules/` while `.env` (matching
+    /// at any depth) prunes nothing.
+    fn could_match_under(&self, rel: &[String]) -> bool {
+        if self.unanchored {
+            return true;
+        }
+        if self.segments.is_empty() {
+            // A `!` rule that reduced to nothing matches broadly; be safe.
+            return true;
+        }
+        // Reachable pattern positions, kept sorted + deduped (patterns are tiny,
+        // so a Vec beats a set).
+        let mut pos = vec![0usize];
+        self.close_over_doublestars(&mut pos);
+        for seg in rel {
+            if pos.contains(&self.segments.len()) {
+                // Fully consumed at an ancestor: a whitelisted ancestor
+                // directory re-includes everything beneath it.
+                return true;
+            }
+            let mut next: Vec<usize> = Vec::with_capacity(pos.len() + 1);
+            for &p in &pos {
+                if p >= self.segments.len() {
+                    continue;
+                }
+                if self.segments[p] == "**" {
+                    // `**` consumes this segment and stays put; the
+                    // consume-zero case is handled by the closure below.
+                    push_unique(&mut next, p);
+                } else if segment_matches(&self.segments[p], seg) {
+                    push_unique(&mut next, p + 1);
+                }
+            }
+            self.close_over_doublestars(&mut next);
+            if next.is_empty() {
+                return false;
+            }
+            pos = next;
+        }
+        // Every segment of `rel` was consumed and the pattern is still alive:
+        // either it has more to match below, or it ended exactly here.
+        true
+    }
+
+    /// Epsilon-closure: a `**` segment may consume ZERO segments, so any
+    /// position sitting on one also reaches the position after it.
+    fn close_over_doublestars(&self, pos: &mut Vec<usize>) {
+        let mut i = 0;
+        while i < pos.len() {
+            let p = pos[i];
+            if p < self.segments.len() && self.segments[p] == "**" {
+                push_unique(pos, p + 1);
+            }
+            i += 1;
+        }
+    }
+}
+
+/// Push `value` unless it is already present (tiny vectors; no set needed).
+fn push_unique(v: &mut Vec<usize>, value: usize) {
+    if !v.contains(&value) {
+        v.push(value);
+    }
+}
+
+/// Parse one gitignore line into a [`NegationPattern`], or `None` when the line
+/// is not a `!`-whitelist rule (a comment, a blank line, an ordinary exclude, or
+/// an escaped `\!` literal).
+///
+/// Mirrors [`GitignoreBuilder::add_line`] step for step - the same
+/// trailing-whitespace trim (skipped for a `\ ` escape), the same `\!` / `\#`
+/// literal handling, the same leading-`/` anchor, the same single trailing-`/`
+/// directory marker (with its `\` unescape) - so the rules this sees are exactly
+/// the rules the matcher compiled. A build-time cross-check against
+/// [`Gitignore::num_whitelists`] catches any drift and degrades the scope to
+/// `unknown`.
+fn parse_negation_line(line: &str) -> Option<NegationPattern> {
+    let mut line = line;
+    if line.starts_with('#') {
+        return None;
+    }
+    if !line.ends_with("\\ ") {
+        line = line.trim_end();
+    }
+    if line.is_empty() {
+        return None;
+    }
+    // `\!` / `\#` escape the leading character: an ordinary rule, not a
+    // whitelist.
+    if line.starts_with("\\!") || line.starts_with("\\#") {
+        return None;
+    }
+    let mut rest = line.strip_prefix('!')?;
+
+    let mut anchored = false;
+    if let Some(stripped) = rest.strip_prefix('/') {
+        rest = stripped;
+        anchored = true;
+    }
+    // A single trailing `/` marks a directory-only rule and is otherwise not
+    // part of the glob; an escaped `\/` drops its escape too.
+    if let Some(stripped) = rest.strip_suffix('/') {
+        rest = stripped.strip_suffix('\\').unwrap_or(stripped);
+    }
+    // An interior slash anchors the rule to the scope directory just as a
+    // leading one does.
+    anchored |= rest.contains('/');
+
+    if !anchored {
+        return Some(NegationPattern {
+            unanchored: true,
+            segments: Vec::new(),
+        });
+    }
+    Some(NegationPattern {
+        unanchored: false,
+        segments: rest
+            .split('/')
+            .filter(|s| !s.is_empty())
+            .map(str::to_string)
+            .collect(),
+    })
+}
+
+/// Whether one glob SEGMENT matches one path segment.
+///
+/// Supports the gitignore/globset syntax that can appear inside a single
+/// segment: `*` (any run, never across a `/` - which cannot occur here because
+/// the caller already split on `/`), `?` (one char), `[...]` character classes
+/// (with a leading `!`/`^` negation and `a-z` ranges), and `\` escapes. A
+/// malformed class - an unterminated `[` - is treated as matching, which is the
+/// conservative direction (it can only suppress a prune).
+fn segment_matches(pat: &str, seg: &str) -> bool {
+    let p: Vec<char> = pat.chars().collect();
+    let s: Vec<char> = seg.chars().collect();
+    if has_unterminated_class(&p) {
+        return true;
+    }
+    glob_match(&p, &s)
+}
+
+/// Whether `pat` opens a `[` character class it never closes.
+fn has_unterminated_class(pat: &[char]) -> bool {
+    let mut i = 0;
+    while i < pat.len() {
+        match pat[i] {
+            '\\' => i += 2,
+            '[' => match class_end(pat, i) {
+                Some(end) => i = end,
+                None => return true,
+            },
+            _ => i += 1,
+        }
+    }
+    false
+}
+
+/// Index just PAST the `]` closing the class that opens at `start`, or `None`
+/// when it is unterminated. A `]` in the first position (after an optional
+/// `!`/`^`) is a literal, per POSIX/globset.
+fn class_end(pat: &[char], start: usize) -> Option<usize> {
+    let mut i = start + 1;
+    if i < pat.len() && (pat[i] == '!' || pat[i] == '^') {
+        i += 1;
+    }
+    if i < pat.len() && pat[i] == ']' {
+        i += 1;
+    }
+    while i < pat.len() {
+        match pat[i] {
+            '\\' => i += 2,
+            ']' => return Some(i + 1),
+            _ => i += 1,
+        }
+    }
+    None
+}
+
+/// Whether the character class opening at `start` matches `ch`. The caller has
+/// already verified the class is terminated.
+fn class_matches(pat: &[char], start: usize, ch: char) -> bool {
+    let end = match class_end(pat, start) {
+        Some(e) => e - 1, // index OF the closing `]`
+        None => return true,
+    };
+    let mut i = start + 1;
+    let mut negated = false;
+    if i < end && (pat[i] == '!' || pat[i] == '^') {
+        negated = true;
+        i += 1;
+    }
+    let mut matched = false;
+    let mut first = true;
+    while i < end {
+        let lo = if pat[i] == '\\' && i + 1 < end {
+            i += 1;
+            pat[i]
+        } else {
+            pat[i]
+        };
+        // A `]` immediately after the (optional) negation is a literal.
+        if lo == ']' && !first {
+            break;
+        }
+        first = false;
+        i += 1;
+        // A range `a-z`, unless the `-` is the last character in the class.
+        if i + 1 < end && pat[i] == '-' && pat[i + 1] != ']' {
+            i += 1;
+            let hi = if pat[i] == '\\' && i + 1 < end {
+                i += 1;
+                pat[i]
+            } else {
+                pat[i]
+            };
+            i += 1;
+            if lo <= ch && ch <= hi {
+                matched = true;
+            }
+        } else if lo == ch {
+            matched = true;
+        }
+    }
+    matched != negated
+}
+
+/// Backtracking glob matcher over one segment (see [`segment_matches`]).
+fn glob_match(pat: &[char], seg: &[char]) -> bool {
+    let (mut p, mut s) = (0usize, 0usize);
+    // The most recent `*` and the input position it was last matched against,
+    // for backtracking.
+    let mut star: Option<(usize, usize)> = None;
+    while s < seg.len() {
+        let step = if p < pat.len() {
+            match pat[p] {
+                '*' => {
+                    star = Some((p, s));
+                    p += 1;
+                    continue;
+                }
+                '?' => Some((p + 1, s + 1)),
+                '[' => {
+                    if class_matches(pat, p, seg[s]) {
+                        // `class_end` cannot be `None` here: the caller
+                        // pre-checked that every class is terminated.
+                        class_end(pat, p).map(|end| (end, s + 1))
+                    } else {
+                        None
+                    }
+                }
+                '\\' if p + 1 < pat.len() => {
+                    if pat[p + 1] == seg[s] {
+                        Some((p + 2, s + 1))
+                    } else {
+                        None
+                    }
+                }
+                c if c == seg[s] => Some((p + 1, s + 1)),
+                _ => None,
+            }
+        } else {
+            None
+        };
+        match step {
+            Some((np, ns)) => {
+                p = np;
+                s = ns;
+            }
+            None => match star {
+                // Let the last `*` swallow one more character and retry.
+                Some((sp, ss)) => {
+                    star = Some((sp, ss + 1));
+                    p = sp + 1;
+                    s = ss + 1;
+                }
+                None => return false,
+            },
+        }
+    }
+    while p < pat.len() && pat[p] == '*' {
+        p += 1;
+    }
+    p == pat.len()
+}
+
+/// The `/`-split segments of a relative path, for the negation reachability
+/// check. Empty for an empty path.
+fn rel_segments(rel: &Path) -> Vec<String> {
+    rel.components()
+        .filter_map(|c| match c {
+            std::path::Component::Normal(os) => Some(os.to_string_lossy().into_owned()),
+            _ => None,
+        })
+        .collect()
+}
+
+/// Whether a whitelist rule in `scope` could match some path at or under the
+/// absolute directory `abs_dir`.
+///
+/// Three cases: the scope sits at or above `abs_dir` (ask its rules, relative to
+/// the scope dir); the scope sits strictly INSIDE `abs_dir` (any whitelist it
+/// carries is by definition under `abs_dir`); or the two are disjoint (a scope
+/// never applies outside its own directory).
+fn scope_negations_reach(scope: &Scope, abs_dir: &Path) -> bool {
+    if !scope.negations.any() {
+        return false;
+    }
+    if let Ok(rel) = abs_dir.strip_prefix(&scope.dir) {
+        return scope.negations.could_match_under(&rel_segments(rel));
+    }
+    // A scope nested under the queried directory carries rules that apply only
+    // beneath it - i.e. beneath `abs_dir`.
+    scope.dir.starts_with(abs_dir)
 }
 
 /// The per-directory include/exclude decision cascade for one source
@@ -142,24 +555,37 @@ pub struct SourceMatcher {
     /// `.ignore` cascade, `.git/info/exclude`, global, then the source's own
     /// exclude/include overrides (highest). Last matching scope wins.
     scopes: Vec<Scope>,
+    /// Index from a scope's directory to the [`SourceMatcher::scopes`] entries
+    /// rooted there, so a query consults only the scopes on its own ancestor
+    /// chain instead of scanning all of them. A repo-of-repos can contribute
+    /// thousands of nested ignore files, and [`SourceMatcher::is_included`] runs
+    /// once per file - an O(scopes) sweep per file is the difference between a
+    /// scan that finishes and one that does not.
+    by_dir: HashMap<PathBuf, Vec<u32>>,
+    /// Every STRICT ancestor (down to the source root) of a scope that carries
+    /// whitelist rules. Lets [`SourceMatcher::negations_could_match_under`]
+    /// answer the "a negation lives somewhere below this directory" case with a
+    /// single hash lookup rather than a scan over every scope.
+    negation_subtree: std::collections::HashSet<PathBuf>,
     /// True when ANY scope can RE-INCLUDE a path a broader rule excluded - i.e.
     /// the source has `include_patterns` (each stored as a `!`-re-include) OR
     /// any tier (`.gitignore` / `.ignore` / `.git/info/exclude` / global /
-    /// `core.excludesFile`) contributed a `!`-prefixed whitelist rule. Used to
-    /// disable directory pruning in [`build_walker`]: a nested `!keep.txt`
-    /// under an excluded parent dir is classified INCLUDED (the permissive
-    /// re-include), so pruning that parent (never walking it) would leave the
-    /// file unseen and the orphan split would false-classify it `deleted` and
-    /// trash a file that still exists (P1-1, data loss). When this is set the
-    /// walker prunes nothing and the per-file matcher decides every path,
-    /// keeping the walk filter and orphan split in lockstep.
+    /// `core.excludesFile`) contributed a `!`-prefixed whitelist rule.
+    ///
+    /// This is now only a coarse "are there any negations at all" signal for
+    /// diagnostics and callers that want the cheap answer; directory pruning
+    /// itself asks the far more precise
+    /// [`SourceMatcher::negations_could_match_under`] per directory.
     has_negations: bool,
 }
 
 impl SourceMatcher {
     /// Whether any rule can re-include an otherwise-excluded path (see the
-    /// [`SourceMatcher::has_negations`] field docs). [`build_walker`] gates
-    /// excluded-directory pruning on this being `false`.
+    /// [`SourceMatcher::has_negations`] field docs).
+    ///
+    /// Pruning decisions should use [`SourceMatcher::negations_could_match_under`]
+    /// instead: this is the whole-source answer, so a single `!` rule anywhere
+    /// disables every prune in the tree.
     pub fn has_negations(&self) -> bool {
         self.has_negations
     }
@@ -175,20 +601,17 @@ impl SourceMatcher {
     /// (`!`-re-include) or no match at all means INCLUDED. Each scope is
     /// consulted with [`Gitignore::matched_path_or_any_parents`], NOT `matched`,
     /// so a directory-scoped rule (`node_modules/`) excludes files beneath it;
-    /// the `starts_with` ancestor guard also keeps that call from panicking on a
-    /// path outside a scope's root.
+    /// restricting the sweep to ancestor scopes also keeps that call from
+    /// panicking on a path outside a scope's root.
     pub fn is_included(&self, rel: &Path, is_dir: bool) -> bool {
         let abs = self.root.join(rel);
+        let mut applicable = Vec::new();
+        self.applicable_scopes(&abs, &mut applicable);
         // `None` = undecided so far; `Some(true)` = last match ignored;
         // `Some(false)` = last match whitelisted (re-included).
         let mut ignored: Option<bool> = None;
-        for scope in &self.scopes {
-            // A scope applies only to paths at or under its directory. This is
-            // the per-directory scoping AND it guards the call below, which
-            // panics if `abs` is not under the scope's root.
-            if !abs.starts_with(&scope.dir) {
-                continue;
-            }
+        for idx in applicable {
+            let scope = &self.scopes[idx as usize];
             let m = scope.matcher.matched_path_or_any_parents(&abs, is_dir);
             if m.is_ignore() {
                 ignored = Some(true);
@@ -199,6 +622,86 @@ impl SourceMatcher {
         }
         !matches!(ignored, Some(true))
     }
+
+    /// Whether ANY `!`-whitelist rule, in ANY scope, could re-include a path at
+    /// or under the directory `rel_dir` (source-root-relative).
+    ///
+    /// This is the precise replacement for the old all-or-nothing
+    /// [`SourceMatcher::has_negations`] prune gate (P2-1). The walk may prune an
+    /// excluded directory exactly when this returns `false`: nothing under it
+    /// can come back, so never walking it cannot hide an included file from the
+    /// scanner (and therefore cannot make the orphan split mistake a live file
+    /// for a deletion - the P1-1 data-loss hazard).
+    ///
+    /// CONSERVATIVE BY CONSTRUCTION: every uncertainty - an unreadable ignore
+    /// file, a rule shape we did not parse with confidence, an unanchored rule
+    /// that gitignore lets match at any depth - answers `true`, which only skips
+    /// a prune. It never answers `false` for a rule that could actually reach.
+    pub fn negations_could_match_under(&self, rel_dir: &Path) -> bool {
+        let abs = self.root.join(rel_dir);
+        // A negation-bearing scope living strictly BELOW this directory.
+        if self.negation_subtree.contains(&abs) {
+            return true;
+        }
+        // A negation in a scope at or ABOVE this directory that can reach down
+        // into it.
+        let mut applicable = Vec::new();
+        self.applicable_scopes(&abs, &mut applicable);
+        applicable
+            .into_iter()
+            .any(|idx| scope_negations_reach(&self.scopes[idx as usize], &abs))
+    }
+
+    /// Collect - in ascending precedence order - the indices of the scopes that
+    /// apply to the absolute path `abs`, i.e. those rooted at `abs` itself or at
+    /// one of its ancestors down to the source root.
+    fn applicable_scopes(&self, abs: &Path, out: &mut Vec<u32>) {
+        out.clear();
+        for ancestor in abs.ancestors() {
+            if let Some(idxs) = self.by_dir.get(ancestor) {
+                out.extend_from_slice(idxs);
+            }
+            if ancestor == self.root {
+                break;
+            }
+        }
+        // `scopes` is stored in ascending precedence, so index order IS
+        // precedence order; the ancestor walk visits deepest-first.
+        out.sort_unstable();
+    }
+}
+
+/// Assemble the by-directory index and the negation-subtree set for a finished
+/// scope list (see the [`SourceMatcher`] field docs).
+fn index_scopes(
+    root: &Path,
+    scopes: &[Scope],
+) -> (
+    HashMap<PathBuf, Vec<u32>>,
+    std::collections::HashSet<PathBuf>,
+) {
+    let mut by_dir: HashMap<PathBuf, Vec<u32>> = HashMap::new();
+    let mut negation_subtree: std::collections::HashSet<PathBuf> = std::collections::HashSet::new();
+    for (i, scope) in scopes.iter().enumerate() {
+        by_dir.entry(scope.dir.clone()).or_default().push(i as u32);
+        if !scope.negations.any() {
+            continue;
+        }
+        // Every STRICT ancestor of this scope, down to (and including) the
+        // source root, has a negation somewhere beneath it.
+        let mut cur = scope.dir.parent();
+        while let Some(dir) = cur {
+            if !dir.starts_with(root) {
+                break;
+            }
+            negation_subtree.insert(dir.to_path_buf());
+            if dir == root {
+                break;
+            }
+            cur = dir.parent();
+        }
+    }
+    (by_dir, negation_subtree)
 }
 
 /// Builds one directory-scoped [`Scope`] from a set of gitignore lines rooted at
@@ -209,17 +712,39 @@ fn scope_from_lines<'a>(
     label: &str,
 ) -> anyhow::Result<Scope> {
     let mut gb = GitignoreBuilder::new(dir);
+    let mut negations = Negations::default();
     for line in lines {
         gb.add_line(None, line)
             .map_err(|e| anyhow::anyhow!("adding {label} `{line}`: {e}"))?;
+        if let Some(pat) = parse_negation_line(line) {
+            negations.patterns.push(pat);
+        }
     }
     let matcher = gb
         .build()
         .map_err(|e| anyhow::anyhow!("building {label} matcher: {e}"))?;
+    reconcile_negations(&mut negations, &matcher);
     Ok(Scope {
         dir: dir.to_path_buf(),
         matcher,
+        negations,
     })
+}
+
+/// Cross-check our own whitelist parse against the `ignore` crate's count and
+/// degrade to `unknown` on any shortfall.
+///
+/// [`parse_negation_line`] deliberately mirrors [`GitignoreBuilder::add_line`],
+/// but the two are separate implementations, and pruning is only safe while they
+/// agree. [`Gitignore::num_whitelists`] is the authority on how many `!`-rules
+/// actually compiled: if we recorded FEWER than that, some rule exists that we
+/// cannot reason about, so the whole scope answers "a negation could match
+/// anywhere" and nothing under it is ever pruned. (Recording more is harmless -
+/// e.g. a line the builder rejected as an invalid glob - and only costs prunes.)
+fn reconcile_negations(negations: &mut Negations, matcher: &Gitignore) {
+    if (negations.patterns.len() as u64) < matcher.num_whitelists() {
+        negations.unknown = true;
+    }
 }
 
 /// Builds one directory-scoped [`Scope`] from an ignore FILE, rooted at the
@@ -239,23 +764,79 @@ fn scope_from_file(
     ignore_file: &Path,
     label: &str,
 ) -> Option<Scope> {
+    use std::io::BufRead;
+
     let mut gb = GitignoreBuilder::new(scope_dir);
-    // `GitignoreBuilder::add` returns Some(err) on a partial/parse error; a
-    // missing or unreadable file is non-fatal (no rules applied) so only log.
-    if let Some(err) = gb.add(ignore_file) {
-        tracing::warn!(
-            target: TARGET,
-            source_id = %source.id,
-            path = %ignore_file.display(),
-            %err,
-            "failed to parse {label}; ignoring its rules",
-        );
+    let mut negations = Negations::default();
+
+    // Read the file ONCE and feed each line to both the glob builder and the
+    // whitelist parser, rather than calling `GitignoreBuilder::add` and then
+    // re-reading the file for the `!`-rules. Mirrors `add`'s own handling: the
+    // leading UTF-8 BOM is stripped from line 1, a read error stops the file
+    // (partial rules stand), and a per-line parse error is logged, not fatal.
+    match std::fs::File::open(ignore_file) {
+        Ok(file) => {
+            for (i, line) in std::io::BufReader::new(file).lines().enumerate() {
+                let line = match line {
+                    Ok(line) => line,
+                    Err(err) => {
+                        tracing::warn!(
+                            target: TARGET,
+                            source_id = %source.id,
+                            path = %ignore_file.display(),
+                            %err,
+                            "failed to read {label}; applying the rules read so far",
+                        );
+                        // We cannot know what the unread tail held, so no prune
+                        // under this scope is safe.
+                        negations.unknown = true;
+                        break;
+                    }
+                };
+                const UTF8_BOM: &str = "\u{feff}";
+                let line = if i == 0 {
+                    line.trim_start_matches(UTF8_BOM)
+                } else {
+                    line.as_str()
+                };
+                if let Err(err) = gb.add_line(Some(ignore_file.to_path_buf()), line) {
+                    tracing::warn!(
+                        target: TARGET,
+                        source_id = %source.id,
+                        path = %ignore_file.display(),
+                        line = i + 1,
+                        %err,
+                        "failed to parse a {label} line; ignoring that rule",
+                    );
+                }
+                if let Some(pat) = parse_negation_line(line) {
+                    negations.patterns.push(pat);
+                }
+            }
+        }
+        Err(err) => {
+            // A missing or unreadable file is non-fatal (no rules applied), so
+            // only log - but its unknown contents must not enable a prune.
+            tracing::warn!(
+                target: TARGET,
+                source_id = %source.id,
+                path = %ignore_file.display(),
+                %err,
+                "failed to open {label}; ignoring its rules",
+            );
+            negations.unknown = true;
+        }
     }
+
     match gb.build() {
-        Ok(matcher) => Some(Scope {
-            dir: scope_dir.to_path_buf(),
-            matcher,
-        }),
+        Ok(matcher) => {
+            reconcile_negations(&mut negations, &matcher);
+            Some(Scope {
+                dir: scope_dir.to_path_buf(),
+                matcher,
+                negations,
+            })
+        }
         Err(err) => {
             tracing::warn!(
                 target: TARGET,
@@ -278,44 +859,45 @@ fn scope_from_file(
 /// rules apply only under that directory.
 pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher> {
     let root = PathBuf::from(&source.local_path);
-    let mut scopes: Vec<Scope> = Vec::new();
 
-    // 1. (lowest) DESIGN s5.2 default excludes - one root-rooted scope of bare
-    //    gitignore globs, so they apply at every depth below the root.
-    scopes.push(scope_from_lines(
+    // (lowest) DESIGN s5.2 default excludes - one root-rooted scope of bare
+    // gitignore globs, so they apply at every depth below the root.
+    let defaults = scope_from_lines(&root, DEFAULT_EXCLUDES.iter().copied(), "default exclude")?;
+
+    // (highest) the source's own overrides: exclude_patterns force-out (bare
+    // glob), then include_patterns opt-back-in (`!`-prefixed), one root-rooted
+    // scope added LAST so it beats both gitignore and the defaults. Built in a
+    // single scope so the include (`!`) rules override the exclude rules within
+    // it (last-match-wins inside the one Gitignore). Built up front because the
+    // pruned ignore-file collection below evaluates the same cascade.
+    let override_lines: Vec<String> = source
+        .exclude_patterns
+        .iter()
+        .cloned()
+        .chain(source.include_patterns.iter().map(|inc| format!("!{inc}")))
+        .collect();
+    let overrides = scope_from_lines(
         &root,
-        DEFAULT_EXCLUDES.iter().copied(),
-        "default exclude",
-    )?);
+        override_lines.iter().map(String::as_str),
+        "source override pattern",
+    )?;
 
-    // 2. the gitignore tier (DESIGN s5.2: respect .gitignore, .ignore,
-    //    .git/info/exclude, and the global gitignore), each ABOVE the defaults
-    //    and BELOW the source's own overrides. The `.gitignore` cascade then the
-    //    `.ignore` cascade (`.ignore` overrides `.gitignore`, matching the
-    //    `ignore` crate) - each file a per-directory scope, root-first so a
-    //    deeper file's rule wins over a shallower one.
+    // The gitignore tier (DESIGN s5.2: respect .gitignore, .ignore,
+    // .git/info/exclude, and the global gitignore), each ABOVE the defaults and
+    // BELOW the source's own overrides. The `.gitignore` cascade then the
+    // `.ignore` cascade (`.ignore` overrides `.gitignore`, matching the `ignore`
+    // crate) - each file a per-directory scope, root-first so a deeper file's
+    // rule wins over a shallower one.
+    let mut root_tiers: Vec<Scope> = Vec::new();
+    let (mut gitignores, mut ignores) = (Vec::new(), Vec::new());
     if source.respect_gitignore {
-        for filename in [".gitignore", ".ignore"] {
-            for ignore_file in collect_ignore_files(&root, filename) {
-                // A nested ignore file is scoped to its OWN directory (the
-                // per-dir cascade); fall back to the root if it somehow has no
-                // parent.
-                let scope_dir = ignore_file.parent().unwrap_or(&root).to_path_buf();
-                if let Some(scope) =
-                    scope_from_file(source, &scope_dir, &ignore_file, "an ignore file")
-                {
-                    scopes.push(scope);
-                }
-            }
-        }
-
         // `<root>/.git/info/exclude` - the repo-local private exclude list,
         // rooted at the source root.
         let info_exclude = root.join(".git").join("info").join("exclude");
         if info_exclude.is_file() {
             if let Some(scope) = scope_from_file(source, &root, &info_exclude, ".git/info/exclude")
             {
-                scopes.push(scope);
+                root_tiers.push(scope);
             }
         }
 
@@ -329,37 +911,38 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
         if let Some(global) = global_gitignore_path() {
             if global.is_file() {
                 if let Some(scope) = scope_from_file(source, &root, &global, "global gitignore") {
-                    scopes.push(scope);
+                    root_tiers.push(scope);
                 }
             }
         }
+
+        // ONE pruned breadth-first pass discovers both cascades (see the module
+        // docs): the two full-tree sweeps this replaced were the single largest
+        // cost of starting a scan on a big source, and they descended every
+        // excluded `node_modules` to do it.
+        let collected = collect_ignore_scopes(source, &root, &defaults, &root_tiers, &overrides);
+        gitignores = collected.gitignores;
+        ignores = collected.ignores;
     }
 
-    // 3. (highest) the source's own overrides: exclude_patterns force-out (bare
-    //    glob), then include_patterns opt-back-in (`!`-prefixed), one root-rooted
-    //    scope added LAST so it beats both gitignore and the defaults. Built in a
-    //    single scope so the include (`!`) rules override the exclude rules
-    //    within it (last-match-wins inside the one Gitignore).
-    let override_lines: Vec<String> = source
-        .exclude_patterns
-        .iter()
-        .cloned()
-        .chain(source.include_patterns.iter().map(|inc| format!("!{inc}")))
-        .collect();
-    scopes.push(scope_from_lines(
-        &root,
-        override_lines.iter().map(String::as_str),
-        "source override pattern",
-    )?);
+    // Assemble in ascending precedence: defaults, `.gitignore` cascade,
+    // `.ignore` cascade, the root-rooted tiers, then the source's own overrides.
+    let mut scopes: Vec<Scope> =
+        Vec::with_capacity(2 + gitignores.len() + ignores.len() + root_tiers.len());
+    scopes.push(defaults);
+    scopes.append(&mut gitignores);
+    scopes.append(&mut ignores);
+    scopes.append(&mut root_tiers);
+    scopes.push(overrides);
 
     // P1-1: a source has negations when it carries `include_patterns` (each
     // added as a `!`-re-include) OR any scope contributed a `!`-prefixed
     // whitelist rule. `Gitignore::num_whitelists` counts exactly those `!`-rules
-    // per scope (cheaper and more correct than re-reading each ignore file to
-    // scan for `!` lines - it handles escaped `\!`, every tier, and read
-    // failures identically to how the matcher itself parsed them).
+    // per scope, straight from the globs the matcher itself compiled.
     let num_whitelists: u64 = scopes.iter().map(|s| s.matcher.num_whitelists()).sum();
     let has_negations = !source.include_patterns.is_empty() || num_whitelists > 0;
+
+    let (by_dir, negation_subtree) = index_scopes(&root, &scopes);
 
     tracing::debug!(
         target: TARGET,
@@ -375,6 +958,8 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
     Ok(SourceMatcher {
         root,
         scopes,
+        by_dir,
+        negation_subtree,
         has_negations,
     })
 }
@@ -532,25 +1117,62 @@ fn check_one_pattern(pat: &str) -> Result<(), PatternValidationError> {
     Ok(())
 }
 
-/// Collects every file named `filename` (e.g. `.gitignore` or `.ignore`)
-/// under `root`, root-first (shallowest first), so [`build_source_matcher`]
-/// can add them in last-match-wins order where a deeper file's rule overrides
-/// a shallower one.
+/// The two per-directory cascades [`collect_ignore_scopes`] discovers, each
+/// root-first (shallowest first) so [`build_source_matcher`] can add them in
+/// last-match-wins order where a deeper file's rule overrides a shallower one.
+struct CollectedScopes {
+    /// Every nested `.gitignore`, as its own directory-rooted scope.
+    gitignores: Vec<Scope>,
+    /// Every nested `.ignore`, likewise (a higher tier than `.gitignore`).
+    ignores: Vec<Scope>,
+}
+
+/// Discovers the `.gitignore` and `.ignore` cascades under `root` with ONE
+/// pruned breadth-first pass (see the module docs' "Pruned ignore-file
+/// collection").
 ///
-/// A dependency-free breadth-first `std::fs::read_dir` walk: BFS visits
-/// shallower directories before deeper ones, giving the root-first ordering
-/// directly. Symlinked directories are NOT descended (mirrors the scanner's
-/// `follow_links(false)` policy, DESIGN s5.2.1, and avoids cycles). I/O errors
-/// on a directory are logged and that subtree skipped - never fatal, since a
-/// failed enumerate just means we apply fewer ignore rules, never that we
-/// wrongly back up or drop a file (the per-entry walk re-checks each path).
-// TODO(perf): prune directories the matcher already excludes (e.g.
-//   `node_modules`) so we do not descend them just to find an ignore file.
-fn collect_ignore_files(root: &Path, filename: &str) -> Vec<std::path::PathBuf> {
-    let target_name = std::ffi::OsStr::new(filename);
-    let mut found = Vec::new();
+/// A dependency-free `std::fs::read_dir` walk: BFS visits shallower directories
+/// before deeper ones, which gives the root-first ordering directly AND means
+/// that when a candidate subdirectory is considered, EVERY scope that can apply
+/// to it (its ancestors' ignore files, plus the root-rooted tiers) has already
+/// been built - so the prune decision here is exactly the decision the finished
+/// matcher would make.
+///
+/// A subdirectory is not descended when it is excluded by the cascade so far AND
+/// no whitelist rule in that cascade could reach under it - git's own rule, and
+/// what keeps a 600k-file `node_modules` off the matcher build. Both cascades
+/// come from this one pass, so a `!` rule inside a pruned directory is invisible
+/// to the matcher and the walk ALIKE (the P1-1 lockstep invariant; the scanner's
+/// orphan split then reads any stored row under it as an excluded-orphan, never
+/// a deletion).
+///
+/// Symlinked directories are NOT descended (mirrors the scanner's
+/// `follow_links(false)` policy, DESIGN s5.2.1, and avoids cycles). I/O errors on
+/// a directory are logged and that subtree skipped - never fatal, since a failed
+/// enumerate just means we apply fewer ignore rules, never that we wrongly back
+/// up or drop a file (the per-entry walk re-checks each path).
+fn collect_ignore_scopes(
+    source: &SourceRow,
+    root: &Path,
+    defaults: &Scope,
+    root_tiers: &[Scope],
+    overrides: &Scope,
+) -> CollectedScopes {
+    let gitignore_name = std::ffi::OsStr::new(".gitignore");
+    let ignore_name = std::ffi::OsStr::new(".ignore");
+
+    let mut collected = CollectedScopes {
+        gitignores: Vec::new(),
+        ignores: Vec::new(),
+    };
+    // Directory -> indices into `collected.gitignores` / `.ignores`, so the
+    // per-directory decision below consults only ancestor scopes.
+    let mut gi_by_dir: HashMap<PathBuf, Vec<u32>> = HashMap::new();
+    let mut ig_by_dir: HashMap<PathBuf, Vec<u32>> = HashMap::new();
+
     let mut queue = std::collections::VecDeque::new();
     queue.push_back(root.to_path_buf());
+    let mut pruned: u64 = 0;
 
     while let Some(dir) = queue.pop_front() {
         let entries = match std::fs::read_dir(&dir) {
@@ -560,19 +1182,132 @@ fn collect_ignore_files(root: &Path, filename: &str) -> Vec<std::path::PathBuf> 
                 continue;
             }
         };
+
+        // Collect this directory's own ignore files FIRST, so its children are
+        // judged with them in the cascade (a `.gitignore` governs its own
+        // directory's subtree).
+        let mut subdirs: Vec<PathBuf> = Vec::new();
         for entry in entries.flatten() {
             let path = entry.path();
             match entry.file_type() {
                 // Do not follow symlinks (cycle / out-of-root safety).
-                Ok(ft) if ft.is_dir() => queue.push_back(path),
-                Ok(ft) if ft.is_file() && entry.file_name() == target_name => {
-                    found.push(path);
+                Ok(ft) if ft.is_dir() => subdirs.push(path),
+                Ok(ft) if ft.is_file() => {
+                    let name = entry.file_name();
+                    let (bucket, index) = if name == gitignore_name {
+                        (&mut collected.gitignores, &mut gi_by_dir)
+                    } else if name == ignore_name {
+                        (&mut collected.ignores, &mut ig_by_dir)
+                    } else {
+                        continue;
+                    };
+                    if let Some(scope) = scope_from_file(source, &dir, &path, "an ignore file") {
+                        index
+                            .entry(dir.clone())
+                            .or_default()
+                            .push(bucket.len() as u32);
+                        bucket.push(scope);
+                    }
                 }
                 _ => {}
             }
         }
+
+        for sub in subdirs {
+            let cascade = PartialCascade {
+                defaults,
+                gitignores: &collected.gitignores,
+                gi_by_dir: &gi_by_dir,
+                ignores: &collected.ignores,
+                ig_by_dir: &ig_by_dir,
+                root_tiers,
+                overrides,
+                root,
+            };
+            if cascade.should_descend(&sub) {
+                queue.push_back(sub);
+            } else {
+                pruned += 1;
+                tracing::trace!(target: TARGET, source_id = %source.id, path = %sub.display(), "pruned an excluded directory while collecting ignore files");
+            }
+        }
     }
-    found
+
+    tracing::debug!(
+        target: TARGET,
+        source_id = %source.id,
+        gitignores = collected.gitignores.len(),
+        dot_ignores = collected.ignores.len(),
+        pruned_dirs = pruned,
+        "collected the ignore-file cascades"
+    );
+    collected
+}
+
+/// The cascade [`collect_ignore_scopes`] has built so far, in the exact
+/// precedence order [`build_source_matcher`] will assemble: defaults, the
+/// `.gitignore` cascade, the `.ignore` cascade, the root-rooted tiers, then the
+/// source's own overrides.
+///
+/// Only scopes rooted at an ANCESTOR of the queried directory can apply to it,
+/// and BFS has already discovered all of those, so this partial view answers
+/// exactly as the finished [`SourceMatcher`] would.
+struct PartialCascade<'a> {
+    defaults: &'a Scope,
+    gitignores: &'a [Scope],
+    gi_by_dir: &'a HashMap<PathBuf, Vec<u32>>,
+    ignores: &'a [Scope],
+    ig_by_dir: &'a HashMap<PathBuf, Vec<u32>>,
+    root_tiers: &'a [Scope],
+    overrides: &'a Scope,
+    root: &'a Path,
+}
+
+impl PartialCascade<'_> {
+    /// Whether the BFS should descend into the absolute directory `dir`:
+    /// always when it is included, and otherwise only when a whitelist rule
+    /// could re-include something beneath it.
+    fn should_descend(&self, dir: &Path) -> bool {
+        let mut included: Option<bool> = None;
+        let mut negation_reaches = false;
+        self.for_each_applicable(dir, |scope| {
+            let m = scope.matcher.matched_path_or_any_parents(dir, true);
+            if m.is_ignore() {
+                included = Some(false);
+            } else if m.is_whitelist() {
+                included = Some(true);
+            }
+            negation_reaches |= scope_negations_reach(scope, dir);
+        });
+        included != Some(false) || negation_reaches
+    }
+
+    /// Call `f` for every scope applicable to `dir`, in ascending precedence.
+    fn for_each_applicable(&self, dir: &Path, mut f: impl FnMut(&Scope)) {
+        f(self.defaults);
+        for (bucket, index) in [
+            (self.gitignores, self.gi_by_dir),
+            (self.ignores, self.ig_by_dir),
+        ] {
+            let mut idxs: Vec<u32> = Vec::new();
+            for ancestor in dir.ancestors() {
+                if let Some(found) = index.get(ancestor) {
+                    idxs.extend_from_slice(found);
+                }
+                if ancestor == self.root {
+                    break;
+                }
+            }
+            idxs.sort_unstable();
+            for idx in idxs {
+                f(&bucket[idx as usize]);
+            }
+        }
+        for scope in self.root_tiers {
+            f(scope);
+        }
+        f(self.overrides);
+    }
 }
 
 /// Resolves the global gitignore path (DESIGN s5.2).
@@ -684,26 +1419,39 @@ fn expand_tilde(path: &str) -> std::path::PathBuf {
 ///
 /// ## Excluded-directory pruning (perf)
 ///
-/// When the matcher has NO negations, a [`WalkBuilder::filter_entry`] closure
-/// prunes any directory the matcher excludes (e.g. `node_modules`, `build`),
-/// so the walk never descends it - the whole point of P2-1. The closure only
-/// ever prunes directories (files are still decided per-entry by the scanner's
-/// matcher check) and never prunes the root. It is GATED on
-/// [`SourceMatcher::has_negations`] being `false` (P1-1): ANY `!`-re-include -
-/// whether from `include_patterns` OR a nested `.gitignore`/`.ignore`
-/// negation - could re-include a file INSIDE an excluded directory, and
-/// pruning that directory would leave the file un-walked. Worse than a missed
-/// file: because the flattened matcher would still classify that path INCLUDED,
-/// the scanner's orphan split would read a stored `file_state` row for it as a
-/// genuine deletion and trash a file that still exists (data loss). With no
-/// negations, an excluded directory contains only excluded files, so pruning
-/// is safe and the walk filter / orphan split stay consistent. `has_negations`
-/// subsumes the old `include_patterns.is_empty()` gate (every include pattern
-/// becomes a `!`-rule, so it sets `has_negations`). The closure owns its own
-/// [`SourceMatcher`] because `filter_entry` requires a `'static + Send + Sync`
-/// predicate; the scanner builds a separate matcher for its per-entry /
-/// orphan-split checks.
+/// A [`WalkBuilder::filter_entry`] closure prunes any directory that the matcher
+/// EXCLUDES and that no whitelist rule could reach under - i.e. exactly when
+/// `!matcher.is_included(dir, true) && !matcher.negations_could_match_under(dir)`
+/// (P2-1). The closure only ever prunes directories (files are still decided
+/// per-entry by the scanner's matcher check) and never prunes the root.
+///
+/// The per-directory negation check replaced an all-or-nothing gate on
+/// [`SourceMatcher::has_negations`], which disabled pruning for the WHOLE source
+/// as soon as a single `!` rule existed anywhere - so one `include_patterns`
+/// entry (say `/myrepo/.env`) meant descending every `node_modules` in the tree.
+/// The invariant it protected (P1-1) is preserved exactly, and more precisely: a
+/// directory is pruned only when nothing under it can be re-included, so the
+/// walk can never hide a file the matcher would classify INCLUDED. That lockstep
+/// is what keeps the scanner's orphan split from reading a still-present file's
+/// stored `file_state` row as a deletion and trashing it on Drive.
+///
+/// The closure needs a `'static + Send + Sync` predicate, so it holds an
+/// [`Arc<SourceMatcher>`] - the SAME matcher the scanner uses for its per-entry
+/// and orphan-split checks when it calls [`build_walker_with_matcher`], rather
+/// than a second full build of the cascade.
 pub fn build_walker(source: &SourceRow) -> anyhow::Result<WalkBuilder> {
+    let matcher = Arc::new(build_source_matcher(source)?);
+    Ok(build_walker_with_matcher(source, matcher))
+}
+
+/// [`build_walker`] over an ALREADY-BUILT matcher.
+///
+/// Building the cascade means a full (pruned) breadth-first pass over the source
+/// to discover its nested ignore files, so a caller that already holds a matcher
+/// (the scanner does) must not pay for a second one just to get the walker's
+/// prune predicate. Sharing the same [`Arc`] also guarantees the walk filter and
+/// the per-entry / orphan-split decisions are made by literally the same rules.
+pub fn build_walker_with_matcher(source: &SourceRow, matcher: Arc<SourceMatcher>) -> WalkBuilder {
     let mut wb = WalkBuilder::new(&source.local_path);
     wb.git_ignore(false)
         .git_exclude(false)
@@ -715,33 +1463,27 @@ pub fn build_walker(source: &SourceRow) -> anyhow::Result<WalkBuilder> {
         .follow_links(false);
 
     // P2-1: prune excluded DIRECTORIES so the walk never descends e.g.
-    // node_modules just to discard each file. P1-1: only safe when the matcher
-    // has NO negations - any `!`-re-include (from include_patterns OR a nested
-    // .gitignore/.ignore) could live inside an excluded dir, and pruning that
-    // dir while the flattened matcher still classifies the re-included file as
-    // INCLUDED would make the orphan split false-delete a still-present file.
-    let prune_matcher = build_source_matcher(source)?;
-    if !prune_matcher.has_negations() {
-        // TODO(perf): prune excluded dirs even with negations (needs ancestor check)
-        let root = std::path::PathBuf::from(&source.local_path);
-        wb.filter_entry(move |entry| {
-            // Never prune the root, and only ever act on directories - files
-            // are decided per-entry by the scanner's matcher check.
-            if entry.depth() == 0 {
-                return true;
-            }
-            if !entry.file_type().is_some_and(|t| t.is_dir()) {
-                return true;
-            }
-            let rel = match entry.path().strip_prefix(&root) {
-                Ok(r) if !r.as_os_str().is_empty() => r,
-                // Not under root or empty - leave it to the per-entry check.
-                _ => return true,
-            };
-            // Keep (descend) iff the directory is included.
-            prune_matcher.is_included(rel, true)
-        });
-    }
+    // node_modules just to discard each file - unless a `!`-re-include could
+    // actually reach under this particular directory (P1-1).
+    let root = std::path::PathBuf::from(&source.local_path);
+    wb.filter_entry(move |entry| {
+        // Never prune the root, and only ever act on directories - files
+        // are decided per-entry by the scanner's matcher check.
+        if entry.depth() == 0 {
+            return true;
+        }
+        if !entry.file_type().is_some_and(|t| t.is_dir()) {
+            return true;
+        }
+        let rel = match entry.path().strip_prefix(&root) {
+            Ok(r) if !r.as_os_str().is_empty() => r,
+            // Not under root or empty - leave it to the per-entry check.
+            _ => return true,
+        };
+        // Descend an included directory, and an excluded one only while a
+        // negation could still re-include something beneath it.
+        matcher.is_included(rel, true) || matcher.negations_could_match_under(rel)
+    });
 
     tracing::debug!(
         target: TARGET,
@@ -751,7 +1493,7 @@ pub fn build_walker(source: &SourceRow) -> anyhow::Result<WalkBuilder> {
         excludes = source.exclude_patterns.len(),
         "built walker"
     );
-    Ok(wb)
+    wb
 }
 
 #[cfg(test)]
@@ -883,6 +1625,27 @@ mod tests {
             if entry.file_type().is_some_and(|t| t.is_file()) {
                 out.push(rel.to_string_lossy().replace('\\', "/"));
             }
+        }
+        out.sort();
+        out
+    }
+
+    /// Every path the WALKER yields, relative to the root and `/`-joined, with
+    /// NO matcher filtering. Lets a test distinguish "the matcher excluded it"
+    /// from "the walk never descended there" - i.e. prove a prune actually
+    /// happened rather than just that the file was filtered out afterwards.
+    fn raw_walked_paths(source: &SourceRow) -> Vec<String> {
+        let mut out = Vec::new();
+        for res in build_walker(source).expect("walker").build() {
+            let entry = res.expect("entry");
+            let rel = entry
+                .path()
+                .strip_prefix(&source.local_path)
+                .expect("under root");
+            if rel.as_os_str().is_empty() {
+                continue;
+            }
+            out.push(rel.to_string_lossy().replace('\\', "/"));
         }
         out.sort();
         out
@@ -1152,13 +1915,58 @@ mod tests {
     }
 
     #[test]
-    fn nested_negation_disables_pruning_and_keeps_reincluded_file() {
-        // P1-1: a nested `.gitignore` negation (`vendor/.gitignore: !keep.txt`)
-        // under an excluded parent (`vendor/`) sets has_negations, which MUST
-        // disable dir-pruning so `vendor/` is walked and `keep.txt` survives.
-        // If pruning stayed on, the walk would skip `vendor/` entirely and the
-        // file would be lost from the walk (and the scanner's orphan split
-        // would then false-delete its stored row - see the scanner test).
+    fn a_negation_above_an_excluded_dir_keeps_it_walked() {
+        // P1-1: a `!`-rule that can reach INTO an excluded directory must keep
+        // that directory walked, so the re-included file is seen and its stored
+        // row is never false-deleted. Here the negation lives at the ROOT (a
+        // scope at or above `vendor/`), which is exactly the case the
+        // per-directory reachability check must answer "yes" to.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "vendor/\n!vendor/keep.txt\n");
+        write(&root.join("vendor/keep.txt"), "x");
+        write(&root.join("vendor/drop.txt"), "x");
+        write(&root.join("top.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(
+            matcher.has_negations(),
+            "a `!`-negation in any tier must set has_negations"
+        );
+        assert!(
+            matcher.negations_could_match_under(Path::new("vendor")),
+            "the root-level !vendor/keep.txt reaches under vendor/"
+        );
+        assert!(
+            matcher.is_included(Path::new("vendor/keep.txt"), false),
+            "the !vendor/keep.txt must re-include the file in the matcher"
+        );
+
+        let names = walked_names(&src);
+        assert!(names.contains(&"top.txt".to_string()), "{names:?}");
+        assert!(
+            names.contains(&"vendor/keep.txt".to_string()),
+            "vendor/ must not be pruned, so the re-included file is still walked: {names:?}"
+        );
+        assert!(
+            !names.contains(&"vendor/drop.txt".to_string()),
+            "its excluded sibling stays out: {names:?}"
+        );
+    }
+
+    #[test]
+    fn a_negation_nested_inside_a_pruned_dir_is_not_collected() {
+        // The git-semantics half of the lockstep invariant (see the module
+        // docs): `vendor/` is excluded and NOTHING in the cascade above it can
+        // re-include anything beneath it, so the pruned collection never reads
+        // `vendor/.gitignore` - and the walk never descends `vendor/` either.
+        //
+        // The two staying in lockstep is the whole point. The matcher classifies
+        // `vendor/keep.txt` EXCLUDED, exactly as the walk (which never saw it)
+        // implies, so the scanner's orphan split reads a stored row for it as an
+        // excluded-orphan and NEVER as a deletion - see the scanner's
+        // `nested_negation_under_pruned_dir_is_orphan_not_deleted`.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
         write(&root.join(".gitignore"), "vendor/\n");
@@ -1169,19 +1977,26 @@ mod tests {
         let src = source_at(root, true, &[], &[]);
         let matcher = build_source_matcher(&src).expect("matcher");
         assert!(
-            matcher.has_negations(),
-            "a `!`-negation in any tier must set has_negations"
+            !matcher.negations_could_match_under(Path::new("vendor")),
+            "nothing at or above vendor/ carries a `!`-rule, so it is prunable"
         );
         assert!(
-            matcher.is_included(Path::new("vendor/keep.txt"), false),
-            "the nested !keep.txt must re-include the file in the matcher"
+            !matcher.is_included(Path::new("vendor/keep.txt"), false),
+            "the un-collected nested negation cannot re-include the file"
         );
 
         let names = walked_names(&src);
         assert!(names.contains(&"top.txt".to_string()), "{names:?}");
         assert!(
-            names.contains(&"vendor/keep.txt".to_string()),
-            "pruning must be disabled so the re-included file is still walked: {names:?}"
+            !names.contains(&"vendor/keep.txt".to_string()),
+            "the walk agrees with the matcher: nothing under vendor/ is backed up: {names:?}"
+        );
+        // And the walk really did prune - it never even yielded the directory's
+        // contents to be filtered.
+        let raw = raw_walked_paths(&src);
+        assert!(
+            !raw.iter().any(|p| p.starts_with("vendor/")),
+            "vendor/ must not be descended at all: {raw:?}"
         );
     }
 
@@ -1489,6 +2304,270 @@ mod tests {
             "an include pattern must disable directory pruning so the walk can \
              actually reach the re-included subtree"
         );
+    }
+
+    // --- negation reachability + per-directory pruning (P2-1) ---------------
+
+    /// The reachability answer for `dir` under a source whose only rule is the
+    /// include pattern `include` (gitignore tier off, so nothing else can add
+    /// whitelist rules and the answer is purely the pattern's own reach).
+    fn reaches(root: &Path, include: &str, dir: &str) -> bool {
+        let src = source_at(root, false, &[include], &[]);
+        build_source_matcher(&src)
+            .expect("matcher")
+            .negations_could_match_under(Path::new(dir))
+    }
+
+    #[test]
+    fn negations_could_match_under_truth_table() {
+        // The core of negation-aware pruning: which directories can a given
+        // `!`-rule still reach into? A `true` only costs a prune; a wrong
+        // `false` would hide a re-included file from the walk, so every
+        // uncertain shape must answer `true`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        // UNANCHORED (no leading or interior `/`): gitignore lets it match at
+        // any depth, so it reaches everywhere - this is why a bare `.env`
+        // include disables pruning across the whole source.
+        for probe in ["node_modules", "node_modules/sub", "a/b/c", ""] {
+            assert!(
+                reaches(root, ".env", probe),
+                "an unanchored `.env` reaches under {probe:?}"
+            );
+        }
+        // A trailing slash marks a directory but does NOT anchor.
+        assert!(reaches(root, "build/", "node_modules/sub"));
+
+        // ANCHORED, one wildcard segment: reaches every DEPTH-1 directory and
+        // nothing deeper.
+        for pattern in ["*/.env", "/*/.env"] {
+            assert!(
+                reaches(root, pattern, "node_modules"),
+                "{pattern} can match node_modules/.env"
+            );
+            assert!(
+                !reaches(root, pattern, "node_modules/sub"),
+                "{pattern} cannot match anything under node_modules/sub"
+            );
+        }
+
+        // ANCHORED, fully literal: only its own branch.
+        assert!(reaches(root, "/x/.env", "x"));
+        assert!(!reaches(root, "/x/.env", "node_modules"));
+        assert!(!reaches(root, "/x/.env", "x/y"));
+
+        // `**` consumes zero or more segments, so it reaches arbitrarily deep -
+        // but still only inside its own branch.
+        for probe in ["a", "a/b", "a/b/c"] {
+            assert!(reaches(root, "/a/**/.env", probe), "under {probe:?}");
+        }
+        assert!(!reaches(root, "/a/**/.env", "b"));
+
+        // A DIRECTORY rule re-includes everything beneath it, so it reaches the
+        // directory itself and every descendant.
+        for probe in ["a", "a/b", "a/b/c"] {
+            assert!(reaches(root, "/a/b/", probe), "under {probe:?}");
+        }
+        assert!(!reaches(root, "/a/b/", "a/c"));
+
+        // A fully-consumed FILE rule reaches its descendants too: the matcher
+        // retries every parent as a directory, so a whitelisted `x/.env` that
+        // turns out to BE a directory re-includes what is inside it.
+        assert!(reaches(root, "/x/.env", "x/.env"));
+
+        // Metacharacters inside a segment are honoured, not treated as literal.
+        assert!(reaches(root, "/node_modules?/keep", "node_modules1"));
+        assert!(!reaches(root, "/node_modules?/keep", "node_modules12"));
+        assert!(reaches(root, "/[ab]/keep", "a"));
+        assert!(!reaches(root, "/[ab]/keep", "c"));
+        assert!(reaches(root, "/[!ab]/keep", "c"));
+        assert!(!reaches(root, "/[!ab]/keep", "a"));
+        assert!(reaches(root, "/pre*post/keep", "prefixpost"));
+        assert!(!reaches(root, "/pre*post/keep", "prefix"));
+
+        // A source with NO whitelist rule at all reaches nothing - the common
+        // fast path where every excluded directory is prunable.
+        let plain = source_at(root, false, &[], &["/vendor/"]);
+        let plain = build_source_matcher(&plain).expect("matcher");
+        assert!(!plain.negations_could_match_under(Path::new("vendor")));
+        assert!(!plain.negations_could_match_under(Path::new("anything/else")));
+    }
+
+    #[test]
+    fn a_nested_scopes_negation_is_reachable_from_above() {
+        // A `!`-rule in a nested `.gitignore` must make every ancestor
+        // directory un-prunable (the walk has to reach the scope to honour it),
+        // and must not leak into a sibling branch.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("sub/deep/.gitignore"), "!keep.txt\n");
+        write(&root.join("sub/deep/keep.txt"), "x");
+        write(&root.join("other/file.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        for probe in ["", "sub", "sub/deep"] {
+            assert!(
+                matcher.negations_could_match_under(Path::new(probe)),
+                "the nested negation must be reachable from {probe:?}"
+            );
+        }
+        assert!(
+            !matcher.negations_could_match_under(Path::new("other")),
+            "but never from a sibling branch"
+        );
+    }
+
+    #[test]
+    fn parse_negation_line_vectors() {
+        // The whitelist-line parser mirrors `GitignoreBuilder::add_line`; a
+        // drift here is what the `num_whitelists` cross-check catches, but the
+        // shapes themselves are pinned right here.
+        /// `(line, Some((unanchored, segments)))`, or `None` when the line is
+        /// not a whitelist rule at all.
+        type Vector<'a> = (&'a str, Option<(bool, &'a [&'a str])>);
+        let cases: &[Vector<'_>] = &[
+            ("!foo", Some((true, &[]))),
+            ("!foo/", Some((true, &[]))), // a trailing `/` marks a dir, not an anchor
+            ("!/foo", Some((false, &["foo"]))),
+            ("!a/b", Some((false, &["a", "b"]))),
+            ("!/a/b/", Some((false, &["a", "b"]))),
+            ("!/a/**/c", Some((false, &["a", "**", "c"]))),
+            ("!foo   ", Some((true, &[]))), // trailing whitespace is trimmed
+            ("\\!foo", None),               // an escaped `!` is a literal
+            ("#!foo", None),                // a comment
+            ("foo", None),                  // an ordinary exclude
+            ("", None),
+            ("   ", None),
+        ];
+        for &(line, expected) in cases {
+            let parsed = parse_negation_line(line);
+            match (parsed, expected) {
+                (None, None) => {}
+                (Some(p), Some((unanchored, segments))) => {
+                    assert_eq!(p.unanchored, unanchored, "unanchored for {line:?}");
+                    assert_eq!(p.segments, segments, "segments for {line:?}");
+                }
+                (got, want) => panic!(
+                    "{line:?}: got {:?}, wanted {:?}",
+                    got.map(|p| (p.unanchored, p.segments)),
+                    want
+                ),
+            }
+        }
+    }
+
+    #[test]
+    fn segment_matches_handles_glob_syntax() {
+        // The single-segment glob matcher behind the anchored reachability
+        // walk. `*` never crosses a `/` because the caller already split there.
+        assert!(segment_matches("*", "anything"));
+        assert!(segment_matches("*", ""));
+        assert!(segment_matches("a*c", "abbbc"));
+        assert!(!segment_matches("a*c", "abbb"));
+        assert!(segment_matches("a?c", "abc"));
+        assert!(!segment_matches("a?c", "ac"));
+        assert!(segment_matches("[abc]", "b"));
+        assert!(!segment_matches("[abc]", "d"));
+        assert!(segment_matches("[!abc]", "d"));
+        assert!(!segment_matches("[!abc]", "a"));
+        assert!(segment_matches("[a-z]9", "c9"));
+        assert!(!segment_matches("[a-z]9", "C9"));
+        assert!(segment_matches("\\*lit", "*lit"));
+        assert!(!segment_matches("\\*lit", "xlit"));
+        assert!(segment_matches("node_modules", "node_modules"));
+        assert!(!segment_matches("node_modules", "node_module"));
+        // A malformed class cannot be reasoned about, so it matches - the
+        // conservative direction (it only ever suppresses a prune).
+        assert!(segment_matches("[abc", "anything at all"));
+    }
+
+    #[test]
+    fn an_anchored_include_prunes_unrelated_excluded_dirs() {
+        // The flagship case: a user with a 600k-file source, `node_modules`
+        // gitignored, who wants ONE file re-included. Before the per-directory
+        // check, that single `!`-rule disabled pruning everywhere and the walk
+        // descended all of node_modules; now the anchored pattern cannot reach
+        // there, so the whole subtree is pruned while the target file is still
+        // backed up.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "node_modules/\n");
+        write(&root.join("myrepo/.env"), "secret");
+        write(&root.join("myrepo/src.txt"), "x");
+        write(&root.join("node_modules/pkg/index.js"), "x");
+        write(&root.join("node_modules/pkg/deep/nested/file.js"), "x");
+
+        let src = source_at(root, true, &["/myrepo/.env"], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(
+            !matcher.negations_could_match_under(Path::new("node_modules")),
+            "an anchored /myrepo/.env cannot reach into node_modules"
+        );
+
+        let names = walked_names(&src);
+        assert!(
+            names.contains(&"myrepo/.env".to_string()),
+            "the re-included file is still backed up: {names:?}"
+        );
+        assert!(names.contains(&"myrepo/src.txt".to_string()), "{names:?}");
+
+        // `filter_entry` drops a pruned directory outright, so neither it nor
+        // anything beneath it is ever yielded - that whole subtree costs the
+        // walk one `read_dir` entry instead of a full descent.
+        let raw = raw_walked_paths(&src);
+        assert!(
+            !raw.iter().any(|p| p.starts_with("node_modules")),
+            "the excluded subtree is never visited: {raw:?}"
+        );
+    }
+
+    #[test]
+    fn a_depth_one_include_walks_only_the_depth_it_needs() {
+        // `/*/.env` re-includes a `.env` sitting DIRECTLY in any top-level
+        // directory. The walk must therefore descend one level into an excluded
+        // `node_modules` - and stop there, because the pattern cannot match any
+        // deeper.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "node_modules/\n");
+        write(&root.join("node_modules/.env"), "secret");
+        write(&root.join("node_modules/a/.env"), "deeper");
+        write(&root.join("node_modules/a/deep/file.js"), "x");
+
+        let src = source_at(root, true, &["/*/.env"], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(
+            matcher.is_included(Path::new("node_modules/.env"), false),
+            "the depth-1 .env is re-included"
+        );
+        assert!(
+            !matcher.is_included(Path::new("node_modules/a/.env"), false),
+            "a deeper .env is NOT - `/*/.env` is exactly one segment deep"
+        );
+
+        let names = walked_names(&src);
+        assert_eq!(
+            names,
+            // The `.gitignore` itself is an ordinary backed-up file.
+            vec![".gitignore".to_string(), "node_modules/.env".to_string()],
+            "only the depth-1 .env is backed up out of node_modules: {names:?}"
+        );
+
+        let raw = raw_walked_paths(&src);
+        assert!(
+            raw.contains(&"node_modules/.env".to_string()),
+            "node_modules itself is descended one level: {raw:?}"
+        );
+        assert!(
+            !raw.iter().any(|p| p.starts_with("node_modules/a/")),
+            "but its subdirectories are pruned: {raw:?}"
+        );
+        // The matcher still classifies the un-walked files EXCLUDED, which is
+        // what stops the scanner's orphan split from reading a stored row for
+        // one of them as a deletion.
+        assert!(!matcher.is_included(Path::new("node_modules/a/deep/file.js"), false));
     }
 
     #[test]

@@ -36,22 +36,36 @@
 //! `deleted` so a transient permission error can never cascade into
 //! trashing a whole subtree on Drive. Errors are logged via `tracing`.
 //!
-//! Blocking-I/O caveat (deferred past phase 2A): the walk and the
-//! deep-verify hashing are synchronous, blocking calls run inline on the
-//! async task. Ideally they would move to `spawn_blocking`, but the
-//! `&dyn StateRepo` / `&SourceRow` borrows make that awkward at this phase;
-//! left inline and noted for a later pass.
+//! Threading (DESIGN s5.2, "the app must stay responsive from t=0"): the walk
+//! phase runs entirely OFF the async runtime. One `spawn_blocking` task builds
+//! the [`crate::exclude::SourceMatcher`] (itself a full, pruned pass over the
+//! tree to find the nested ignore files) and then drives
+//! [`ignore::WalkParallel`] across several worker threads. Each worker does the
+//! per-entry heavy lifting - the include/exclude decision, `stat`, the Windows
+//! placeholder + ADS probes, and the BLAKE3 re-hash a deep-verify or coarse-FS
+//! pass needs - and streams typed results over a bounded channel.
+//!
+//! A single async consumer drains that channel and owns everything that is
+//! ORDER-SENSITIVE and therefore cannot be decided by a worker in isolation: the
+//! `seen` set, NFC collision detection (first path wins, the later collider is
+//! recorded and dropped), the throttled progress ticks, the errored-prefix
+//! bookkeeping, and the latency reservoir. Awaiting the channel is the yield
+//! point that keeps IPC responsive while the walk runs, so a scan over a
+//! 600k-file source no longer freezes the UI at t=0 - and multiple workers
+//! hashing at once is what finally saturates a fast disk.
 
-use std::collections::HashSet;
+use std::collections::{HashMap, HashSet};
 use std::fs::Metadata;
 use std::io::Read;
 use std::path::{Path, PathBuf};
+use std::sync::Arc;
 use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Context;
+use ignore::{DirEntry, ParallelVisitor, ParallelVisitorBuilder, WalkState};
 
-use crate::exclude::{build_source_matcher, build_walker};
-use crate::state::{SourceRow, StateRepo};
+use crate::exclude::{build_source_matcher, build_walker_with_matcher, SourceMatcher};
+use crate::state::{FileStateRow, SourceRow, StateRepo};
 // `PlaceholderPolicy` is consumed only by `should_skip_placeholder`, which is
 // cfg-gated the same way; on a non-Windows, non-test lib build the fn (and thus
 // this import) is compiled out, so gate the import to match or it trips
@@ -240,6 +254,400 @@ const SCAN_PROGRESS_FILE_STRIDE: u64 = 512;
 /// orchestrator's bounded event broadcast cannot be flooded by scan progress.
 const SCAN_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
 
+/// Entries a walk worker accumulates before handing its batch to the consumer.
+///
+/// Batching amortises the channel hand-off over ~100 entries instead of paying
+/// a send + wakeup per file, while staying well under
+/// [`SCAN_PROGRESS_FILE_STRIDE`] so the consumer's progress counter still
+/// advances in usefully small steps rather than jumping to the total.
+const WALK_BATCH_MAX_ENTRIES: usize = 128;
+
+/// How long a worker may hold a partial batch. Without this a worker that is
+/// hashing one multi-GB file would sit on the entries it already processed, and
+/// the progress readout would stall even though other workers are making
+/// progress.
+const WALK_BATCH_MAX_INTERVAL: Duration = Duration::from_millis(50);
+
+/// Depth of the bounded worker -> consumer channel, in batches. Bounded so a
+/// walk that outruns the consumer applies backpressure to the workers instead of
+/// buffering an entire 600k-file tree in memory.
+const WALK_CHANNEL_DEPTH: usize = 64;
+
+/// Ceiling on walk worker threads. Past a handful of threads a scan stops being
+/// limited by CPU and starts thrashing the disk queue (and competing with the
+/// upload pipeline), so the parallelism is capped rather than tracking core
+/// count on a 32-core machine.
+const WALK_MAX_THREADS: usize = 8;
+
+/// Floor on walk worker threads: even on a single-core box, one thread blocked
+/// in `stat` on a slow network share should not stop the rest of the walk.
+const WALK_MIN_THREADS: usize = 2;
+
+/// How many worker threads the parallel walk should use.
+fn walk_threads() -> usize {
+    std::thread::available_parallelism()
+        .map(|n| n.get())
+        .unwrap_or(WALK_MIN_THREADS)
+        .clamp(WALK_MIN_THREADS, WALK_MAX_THREADS)
+}
+
+/// Everything a walk worker needs to classify one file, shared read-only across
+/// the worker threads.
+struct WalkCtx {
+    /// The source being scanned (its id for logs, and its placeholder policy).
+    source: SourceRow,
+    /// Absolute source root, for stripping entries to relative paths.
+    root: PathBuf,
+    /// The SAME matcher the walker prunes with and the orphan split consults.
+    matcher: Arc<SourceMatcher>,
+    /// The stored `file_state` rows, read-only: a worker only ever looks a path
+    /// up to diff `(size, mtime_ns)` and read the stored hash.
+    known: Arc<HashMap<RelativePath, FileStateRow>>,
+    mode: ScanMode,
+    granularity_ns: u64,
+    is_coarse: bool,
+    last_scan_end_ns: Option<i64>,
+    /// Whether to time each file (the reservoir itself lives on the consumer
+    /// side, which is what actually records the sample).
+    capture_latency: bool,
+}
+
+/// What a worker concluded about ONE file. Deliberately excludes every
+/// order-sensitive decision: whether the path is a duplicate NFC key, and
+/// therefore whether any of this is kept, is the consumer's call.
+enum Outcome {
+    /// A cloud-only (OneDrive Files-On-Demand) placeholder: marked seen so its
+    /// stored row is not read as a deletion, then skipped before stat/hash.
+    Placeholder,
+    /// `metadata()` failed: NOT marked seen, and deletions under it suppressed.
+    StatFailed,
+    /// Stat-matched (and, where required, content-verified): nothing to emit.
+    Unchanged,
+    /// New (no stored row) or changed (stat differs, or a verify hash mismatch).
+    Changed { size: u64, mtime_ns: i64 },
+    /// The content-verify read failed: no evidence of a change, but deletions
+    /// under this path are suppressed.
+    VerifyFailed,
+}
+
+/// One fully-processed file as a worker hands it over.
+struct FileRecord {
+    rel: RelativePath,
+    outcome: Outcome,
+    /// The file carries named NTFS Alternate Data Streams (Windows only).
+    ads: bool,
+    /// Per-file processing time, when telemetry capture is armed.
+    latency_ms: Option<u64>,
+}
+
+/// A worker's accumulated results between two channel hand-offs.
+#[derive(Default)]
+struct WalkBatch {
+    /// Regular (non-symlink) files the walk yielded, counted BEFORE the
+    /// include/exclude decision so a long descent still moves the readout.
+    visited: u64,
+    /// Symlink entries skipped (DESIGN s5.2.1 `SymlinkPolicy::Skip`).
+    skipped_symlinks: u64,
+    files: Vec<FileRecord>,
+    /// Walk errors: `Some(prefix)` when the errored path is attributable to a
+    /// relative prefix, `None` when it is not (which suppresses ALL deletions).
+    errors: Vec<Option<RelativePath>>,
+    /// Paths not representable as a [`RelativePath`], as lossy strings.
+    invalid_filenames: Vec<String>,
+}
+
+/// Per-thread visitor for the parallel walk.
+struct WalkVisitor {
+    ctx: Arc<WalkCtx>,
+    tx: tokio::sync::mpsc::Sender<WalkBatch>,
+    batch: WalkBatch,
+    /// Entries accumulated since the last hand-off (the flush trigger).
+    items: usize,
+    last_flush: Instant,
+    /// Set once the consumer has gone away, so the walk stops instead of
+    /// traversing the rest of the tree with nowhere to send the results.
+    consumer_gone: bool,
+}
+
+impl WalkVisitor {
+    /// Hand the accumulated batch to the consumer, blocking while the bounded
+    /// channel is full (that backpressure is the point).
+    fn flush(&mut self) {
+        if self.items == 0 {
+            return;
+        }
+        self.items = 0;
+        self.last_flush = Instant::now();
+        // A closed channel means the consumer is already gone - the scan future
+        // was dropped mid-walk. Nobody is left to tell, so stop walking rather
+        // than burn a disk's worth of I/O on results nothing will read.
+        if self.tx.blocking_send(std::mem::take(&mut self.batch)).is_err() {
+            self.consumer_gone = true;
+        }
+    }
+
+    fn maybe_flush(&mut self) {
+        if self.items >= WALK_BATCH_MAX_ENTRIES
+            || self.last_flush.elapsed() >= WALK_BATCH_MAX_INTERVAL
+        {
+            self.flush();
+        }
+    }
+
+    /// [`WalkState::Quit`] once the consumer is gone, else `Continue`.
+    fn keep_going(&self) -> WalkState {
+        if self.consumer_gone {
+            WalkState::Quit
+        } else {
+            WalkState::Continue
+        }
+    }
+}
+
+impl Drop for WalkVisitor {
+    /// The last partial batch of a worker thread. Without this the tail of every
+    /// worker's work - up to `WALK_BATCH_MAX_ENTRIES` files each - would be lost.
+    fn drop(&mut self) {
+        self.flush();
+    }
+}
+
+impl ParallelVisitor for WalkVisitor {
+    fn visit(&mut self, result: Result<DirEntry, ignore::Error>) -> WalkState {
+        let ctx = Arc::clone(&self.ctx);
+        let entry = match result {
+            Ok(e) => e,
+            Err(err) => {
+                // DESIGN s5.2 step 3: never swallow walker errors. Record the
+                // errored path's relative prefix (when one is recoverable) so
+                // deletions under it are suppressed; with no attributable
+                // prefix the consumer suppresses ALL deletions this cycle.
+                let prefix = error_path(&err)
+                    .and_then(|p| p.strip_prefix(&ctx.root).ok())
+                    .and_then(|p| RelativePath::try_from(p).ok());
+                tracing::warn!(target: TARGET, source_id = %ctx.source.id, %err, "walk error; suppressing deletes under this subtree");
+                self.batch.errors.push(prefix);
+                self.items += 1;
+                self.maybe_flush();
+                return self.keep_going();
+            }
+        };
+
+        // Symlink check BEFORE the is_file filter: a link to a file can read
+        // as a file on some platforms, and we must skip + count it either
+        // way (DESIGN s5.2.1 SymlinkPolicy::Skip).
+        if entry.file_type().is_some_and(|t| t.is_symlink()) {
+            self.batch.skipped_symlinks += 1;
+            self.items += 1;
+            tracing::trace!(target: TARGET, source_id = %ctx.source.id, path = %entry.path().display(), "skipping symlink");
+            self.maybe_flush();
+            return self.keep_going();
+        }
+        // Files only; directories and other non-files are not backed up.
+        if !entry.file_type().is_some_and(|t| t.is_file()) {
+            return WalkState::Continue;
+        }
+
+        // Counted here - BEFORE the include/exclude decision and before the
+        // (possibly slow) stat + deep-verify hash - so descending a large
+        // excluded tree still moves the counter.
+        self.batch.visited += 1;
+        self.items += 1;
+
+        let abs = entry.path();
+        let rel = match abs
+            .strip_prefix(&ctx.root)
+            .ok()
+            .and_then(|p| RelativePath::try_from(p).ok())
+        {
+            Some(r) => r,
+            None => {
+                // Not representable as a RelativePath (e.g. an unpaired UTF-16
+                // surrogate that fails UTF-8 conversion). Record it so the
+                // orchestrator emits a local.invalid_filename warning (SPEC s24)
+                // rather than dropping the file silently; the scan continues.
+                let shown = abs.to_string_lossy().into_owned();
+                tracing::warn!(target: TARGET, source_id = %ctx.source.id, path = %shown, "local.invalid_filename: skipping path not representable as a relative path");
+                self.batch.invalid_filenames.push(shown);
+                self.maybe_flush();
+                return self.keep_going();
+            }
+        };
+
+        // Include/exclude decision (DESIGN s5.2): consult the same matcher the
+        // orphan split below uses, on the NFC `RelativePath` so both agree. We
+        // are past the is_file filter, so `is_dir = false`. An excluded file is
+        // simply not backed up - and, crucially, never lands in `seen`, so if a
+        // stored `file_state` row exists for it the orphan split classifies it
+        // as an excluded-orphan (no trash), not a deletion.
+        if !ctx.matcher.is_included(Path::new(rel.as_str()), false) {
+            tracing::trace!(target: TARGET, source_id = %ctx.source.id, path = %rel, "excluded by ignore rules");
+            self.maybe_flush();
+            return self.keep_going();
+        }
+
+        let record = process_file(&ctx, &entry, rel);
+        self.batch.files.push(record);
+        self.maybe_flush();
+        self.keep_going()
+    }
+}
+
+/// Builds one [`WalkVisitor`] per walk worker thread.
+struct WalkVisitorBuilder {
+    ctx: Arc<WalkCtx>,
+    tx: tokio::sync::mpsc::Sender<WalkBatch>,
+}
+
+impl<'s> ParallelVisitorBuilder<'s> for WalkVisitorBuilder {
+    fn build(&mut self) -> Box<dyn ParallelVisitor + 's> {
+        Box::new(WalkVisitor {
+            ctx: Arc::clone(&self.ctx),
+            tx: self.tx.clone(),
+            batch: WalkBatch::default(),
+            items: 0,
+            last_flush: Instant::now(),
+            consumer_gone: false,
+        })
+    }
+}
+
+/// Classify ONE included regular file: stat it, apply the placeholder policy,
+/// probe for alternate data streams, and run the change detection (including the
+/// BLAKE3 re-hash a deep-verify or coarse-FS pass calls for).
+///
+/// Runs on a walk worker thread and touches nothing shared but the read-only
+/// [`WalkCtx`], which is exactly what lets several files hash concurrently.
+fn process_file(ctx: &WalkCtx, entry: &DirEntry, rel: RelativePath) -> FileRecord {
+    // Telemetry (DESIGN s13): time this file's stat-through-change-detection
+    // processing. Only armed when a reservoir is threaded in AND capture is
+    // enabled, so a scan with no telemetry pays nothing (not even the
+    // `Instant::now`). The consumer records the sample for a fully-processed
+    // file; the early returns below (cloud-only placeholder, stat failure)
+    // intentionally record nothing, as does a collider the consumer drops.
+    let file_timer = ctx.capture_latency.then(Instant::now);
+    let elapsed_ms = |timer: Option<Instant>| {
+        timer.map(|t| u64::try_from(t.elapsed().as_millis()).unwrap_or(u64::MAX))
+    };
+    let abs = entry.path();
+
+    let meta = match entry.metadata() {
+        Ok(m) => m,
+        Err(err) => {
+            // A stat failure on a single file is a per-file error, not a
+            // subtree walk error; suppress this path from deletion (its row, if
+            // any, should not be trashed) and move on.
+            tracing::warn!(target: TARGET, source_id = %ctx.source.id, path = %abs.display(), %err, "metadata read failed; skipping file");
+            return FileRecord {
+                rel,
+                outcome: Outcome::StatFailed,
+                ads: false,
+                latency_ms: None,
+            };
+        }
+    };
+
+    // OneDrive Files-On-Demand policy (issue #4, DESIGN s5.2.1): a cloud-only
+    // placeholder has FILE_ATTRIBUTE_RECALL_ON_OPEN set; opening it to stat/hash
+    // would force a network hydration. Under the default
+    // `PlaceholderPolicy::Skip` we skip it, but the consumer FIRST marks it
+    // `seen` so the deletion sweep does NOT treat its existing `file_state` row
+    // as "known but missing" and trash the Drive backup - a placeholder is still
+    // present locally, just dehydrated. Under `ForceDownload` we do NOT skip:
+    // the file flows through the normal stat + change-detection path, and the
+    // subsequent read (deep-verify hash / upload) hydrates it on demand.
+    #[cfg(windows)]
+    {
+        use std::os::windows::fs::MetadataExt;
+        if should_skip_placeholder(meta.file_attributes(), ctx.source.placeholder_policy) {
+            tracing::trace!(target: TARGET, source_id = %ctx.source.id, path = %rel, "skipping cloud-only (OneDrive Files-On-Demand) placeholder");
+            return FileRecord {
+                rel,
+                outcome: Outcome::Placeholder,
+                ads: false,
+                latency_ms: None,
+            };
+        }
+    }
+
+    let size = meta.len();
+    let mtime_ns = mtime_ns(&meta);
+
+    // NTFS Alternate Data Stream detection (DESIGN s5.2.1, SPEC s24
+    // `local.ads_skipped`): this file is about to be backed up (main stream
+    // only), so if it carries any named data stream record the path. The
+    // orchestrator surfaces one warning per affected file; the named streams are
+    // NOT uploaded (a documented V1 limitation that must be visible, not
+    // silent). Windows-only; a no-op elsewhere.
+    #[cfg(windows)]
+    let ads = {
+        let found = has_alternate_data_streams(abs);
+        if found {
+            tracing::warn!(target: TARGET, source_id = %ctx.source.id, path = %rel, "local.ads_skipped: file has NTFS alternate data stream(s); only the main stream is backed up");
+        }
+        found
+    };
+    #[cfg(not(windows))]
+    let ads = false;
+
+    let stored = ctx.known.get(&rel);
+    let stat_match = matches!(stored, Some(row) if row.size == size && row.mtime_ns == mtime_ns);
+
+    let outcome = if stat_match {
+        // A stat-matched file is unchanged on the fast path UNLESS its content
+        // must be verified. Two triggers re-hash it (DESIGN s5.2 step 2):
+        // DeepVerify always re-hashes (bit-rot / mtime lies); and on a
+        // coarse-granularity filesystem the fallback re-hashes a stat-matched
+        // file whose ctime/birth post-dates the last scan or whose mtime is
+        // within one granularity window of it - a within-quantum in-place edit
+        // reports an unchanged mtime and would otherwise be missed. ctime/birth
+        // are read only when the FS is coarse, so a fine-FS fast scan pays
+        // nothing.
+        let coarse_suspect = ctx.is_coarse
+            && coarse_fs_needs_rehash(
+                ctx.granularity_ns,
+                mtime_ns,
+                ctime_ns(&meta),
+                birth_ns(&meta),
+                ctx.last_scan_end_ns,
+            );
+        if ctx.mode == ScanMode::DeepVerify || coarse_suspect {
+            let stored_hash = stored.map(|r| r.hash_blake3);
+            match hash_file(abs) {
+                Ok(hash) if stored_hash != Some(hash) => {
+                    let reason = if ctx.mode == ScanMode::DeepVerify {
+                        "deep-verify"
+                    } else {
+                        "coarse-fs mtime-granularity fallback"
+                    };
+                    tracing::info!(target: TARGET, source_id = %ctx.source.id, path = %rel, reason, "hash mismatch; marking changed");
+                    Outcome::Changed { size, mtime_ns }
+                }
+                Ok(_) => Outcome::Unchanged,
+                Err(err) => {
+                    // Could not read to verify: don't claim changed (no
+                    // evidence) but suppress this path from deletion.
+                    tracing::warn!(target: TARGET, source_id = %ctx.source.id, path = %rel, %err, "content-verify read failed; skipping file");
+                    Outcome::VerifyFailed
+                }
+            }
+        } else {
+            // A fast-path stat-match: unchanged, nothing to emit.
+            Outcome::Unchanged
+        }
+    } else {
+        // New (no row) or changed (stat differs).
+        Outcome::Changed { size, mtime_ns }
+    };
+
+    FileRecord {
+        rel,
+        outcome,
+        ads,
+        latency_ms: elapsed_ms(file_timer),
+    }
+}
+
 /// [`scan_with_latency`] plus an optional [`ScanProgressSink`] the walk ticks as
 /// it advances (throttled to [`SCAN_PROGRESS_FILE_STRIDE`] files /
 /// [`SCAN_PROGRESS_MIN_INTERVAL`], with a final tick carrying the total once the
@@ -328,13 +736,7 @@ pub async fn scan_with_progress(
         .last_full_scan_at
         .map(|ms| ms.saturating_mul(1_000_000));
 
-    // The include/exclude decision matcher (DESIGN s5.2). The walker itself
-    // does NO ignore logic now; we ask the matcher per entry here AND reuse it
-    // below to split not-seen known paths into genuine deletions vs
-    // excluded-orphans (DESIGN s5.5).
-    let matcher = build_source_matcher(source)?;
-
-    let walker = build_walker(source)?.build();
+    let known = Arc::new(known);
 
     let mut seen: HashSet<RelativePath> = HashSet::new();
     let mut new_or_changed: Vec<LocalEntry> = Vec::new();
@@ -344,9 +746,9 @@ pub async fn scan_with_progress(
     // and record the key here instead of emitting a duplicate op.
     let mut collisions: Vec<RelativePath> = Vec::new();
     // Count of cloud-only (OneDrive Files-On-Demand) placeholders skipped
-    // before stat/hash (DESIGN s5.2.1). Mutated only on Windows; the
-    // attribute (and thus the increment) never exists on other targets.
-    #[cfg_attr(not(windows), allow(unused_mut))]
+    // before stat/hash (DESIGN s5.2.1). Only Windows ever produces the
+    // `Outcome::Placeholder` that increments it; the attribute does not exist
+    // on other targets.
     let mut skipped_cloud_only: u64 = 0;
     // Directory prefixes (relative, `/`-joined) under which the walk hit an
     // error. Any known path under one of these is held back from `deleted`.
@@ -362,7 +764,6 @@ pub async fn scan_with_progress(
     // (DESIGN s5.2.1, SPEC s24 `local.ads_skipped`). Populated only on
     // Windows + NTFS; the orchestrator turns each into a one-per-file
     // warning so the dropped stream is not silent data loss.
-    #[cfg_attr(not(windows), allow(unused_mut))]
     let mut ads_skipped: Vec<RelativePath> = Vec::new();
     // Local paths skipped because they are not representable as a RelativePath
     // (e.g. an unpaired UTF-16 surrogate name, SPEC s24 `local.invalid_filename`).
@@ -377,230 +778,147 @@ pub async fn scan_with_progress(
     let mut reported: u64 = 0;
     let mut last_tick = Instant::now();
 
-    for result in walker {
-        let entry = match result {
-            Ok(e) => e,
-            Err(err) => {
-                // DESIGN s5.2 step 3: never swallow walker errors. Record
-                // the errored path's relative prefix (when one is
-                // recoverable) so deletions under it are suppressed; if no
-                // attributable prefix, suppress ALL deletions this cycle.
-                match error_path(&err)
-                    .and_then(|p| p.strip_prefix(root).ok())
-                    .and_then(|p| RelativePath::try_from(p).ok())
-                {
-                    Some(rel) => errored_prefixes.push(rel),
-                    None => unattributed_error = true,
+    // The walk phase runs entirely OFF the async runtime (see the module docs).
+    // The blocking task builds the matcher - a full (pruned) pass over the tree
+    // to discover its nested ignore files, easily seconds on a large source -
+    // and only then walks, so after the cheap root + probe checks the very next
+    // thing this function does is AWAIT. That is what keeps IPC responsive from
+    // t=0 instead of the app freezing at "Loading..." as a scan starts.
+    let (tx, mut rx) = tokio::sync::mpsc::channel::<WalkBatch>(WALK_CHANNEL_DEPTH);
+    let walk_source = source.clone();
+    let walk_root = root.to_path_buf();
+    let walk_known = Arc::clone(&known);
+    let capture_latency = latency.is_some_and(|r| r.is_enabled());
+    let walk_task = tokio::task::spawn_blocking(move || -> anyhow::Result<Arc<SourceMatcher>> {
+        // ONE matcher for the whole scan: the walker's prune predicate, every
+        // per-entry include check, and the orphan split share this `Arc` rather
+        // than each rebuilding the cascade (the walker used to build a second,
+        // identical one of its own).
+        let matcher = Arc::new(build_source_matcher(&walk_source)?);
+        let ctx = Arc::new(WalkCtx {
+            source: walk_source.clone(),
+            root: walk_root,
+            matcher: Arc::clone(&matcher),
+            known: walk_known,
+            mode,
+            granularity_ns,
+            is_coarse,
+            last_scan_end_ns,
+            capture_latency,
+        });
+        let mut wb = build_walker_with_matcher(&walk_source, Arc::clone(&matcher));
+        wb.threads(walk_threads());
+        let mut builder = WalkVisitorBuilder { ctx, tx };
+        wb.build_parallel().visit(&mut builder);
+        // The builder holds the last sender clone; dropping it closes the
+        // channel, which is what ends the consumer loop below.
+        drop(builder);
+        Ok(matcher)
+    });
+
+    // The single consumer. Everything ORDER-SENSITIVE lives here: the `seen`
+    // set, NFC collision detection, the progress throttle, the errored-prefix
+    // bookkeeping and the latency reservoir. Awaiting the channel is the yield
+    // point that lets the orchestrator's tick consumers run mid-scan.
+    while let Some(batch) = rx.recv().await {
+        visited += batch.visited;
+        skipped_symlinks += batch.skipped_symlinks;
+        for err in batch.errors {
+            match err {
+                Some(prefix) => errored_prefixes.push(prefix),
+                None => unattributed_error = true,
+            }
+        }
+        invalid_filenames.extend(batch.invalid_filenames);
+
+        for record in batch.files {
+            let FileRecord {
+                rel,
+                outcome,
+                ads,
+                latency_ms,
+            } = record;
+            match outcome {
+                // A stat failure never marks the path seen (matching the
+                // pre-parallel scanner): the deletion suppression alone keeps
+                // its stored row out of `deleted`.
+                Outcome::StatFailed => errored_prefixes.push(rel),
+                // A placeholder IS marked seen - it is present locally, just
+                // dehydrated - but without a collision check, again matching
+                // the pre-parallel scanner.
+                Outcome::Placeholder => {
+                    seen.insert(rel);
+                    skipped_cloud_only += 1;
                 }
-                tracing::warn!(target: TARGET, source_id = %source.id, %err, "walk error; suppressing deletes under this subtree");
-                continue;
-            }
-        };
-
-        // Symlink check BEFORE the is_file filter: a link to a file can read
-        // as a file on some platforms, and we must skip + count it either
-        // way (DESIGN s5.2.1 SymlinkPolicy::Skip).
-        if entry.file_type().is_some_and(|t| t.is_symlink()) {
-            skipped_symlinks += 1;
-            tracing::trace!(target: TARGET, source_id = %source.id, path = %entry.path().display(), "skipping symlink");
-            continue;
-        }
-        // Files only; directories and other non-files are not backed up.
-        if !entry.file_type().is_some_and(|t| t.is_file()) {
-            continue;
-        }
-
-        // Live progress tick. Counted here - BEFORE the include/exclude decision
-        // and before the (possibly slow) stat + deep-verify hash - so descending
-        // a large excluded tree still moves the counter. Awaiting the sink is
-        // also the walk's only yield point, which is what lets a joined consumer
-        // (the orchestrator's state transition + broadcast) run mid-scan instead
-        // of only after the whole walk finishes.
-        visited += 1;
-        if let Some(sink) = on_progress {
-            if visited - reported >= SCAN_PROGRESS_FILE_STRIDE
-                || last_tick.elapsed() >= SCAN_PROGRESS_MIN_INTERVAL
-            {
-                reported = visited;
-                last_tick = Instant::now();
-                sink(visited).await;
-                // Awaiting the sink is NOT by itself a yield: the orchestrator's
-                // sink resolves without ever returning Pending (an uncontended
-                // lock write plus a broadcast send), so the walk would still hold
-                // the runtime thread for the whole tree. Yield explicitly so the
-                // consumers of the event we just emitted actually get scheduled
-                // mid-scan rather than after it.
-                tokio::task::yield_now().await;
-            }
-        }
-
-        let abs = entry.path();
-        let rel = match abs.strip_prefix(root).ok().and_then(|p| {
-            // RelativePath::try_from enforces the NFC / no-`..` invariants.
-            RelativePath::try_from(p).ok()
-        }) {
-            Some(r) => r,
-            None => {
-                // Not representable as a RelativePath (e.g. an unpaired UTF-16
-                // surrogate that fails UTF-8 conversion). Record it so the
-                // orchestrator emits a local.invalid_filename warning (SPEC s24)
-                // rather than dropping the file silently; the scan continues.
-                let shown = abs.to_string_lossy().into_owned();
-                tracing::warn!(target: TARGET, source_id = %source.id, path = %shown, "local.invalid_filename: skipping path not representable as a relative path");
-                invalid_filenames.push(shown);
-                continue;
-            }
-        };
-
-        // Include/exclude decision (DESIGN s5.2): consult the same matcher the
-        // orphan split below uses, on the NFC `RelativePath` so both agree. We
-        // are past the is_file filter, so `is_dir = false`. An excluded file is
-        // simply not backed up - and, crucially, never lands in `seen`, so if a
-        // stored `file_state` row exists for it the orphan split classifies it
-        // as an excluded-orphan (no trash), not a deletion.
-        // TODO(perf): prune excluded directories via WalkBuilder::filter_entry
-        //   so we do not descend e.g. node_modules just to discard each file.
-        if !matcher.is_included(Path::new(rel.as_str()), false) {
-            tracing::trace!(target: TARGET, source_id = %source.id, path = %rel, "excluded by ignore rules");
-            continue;
-        }
-
-        // Telemetry (DESIGN s13): time this file's stat-through-change-detection
-        // processing. Only armed when a reservoir is threaded in AND capture is
-        // enabled, so a scan with no telemetry pays nothing (not even the
-        // `Instant::now`). Recorded at the end of the iteration for a
-        // fully-processed file; the cheap early-`continue` skips below (cloud-only
-        // placeholder, NFC collision) intentionally record nothing.
-        let file_timer = latency
-            .filter(|r| r.is_enabled())
-            .map(|_| std::time::Instant::now());
-
-        let meta = match entry.metadata() {
-            Ok(m) => m,
-            Err(err) => {
-                // A stat failure on a single file is a per-file error, not a
-                // subtree walk error; suppress this path from deletion (its
-                // row, if any, should not be trashed) and move on.
-                errored_prefixes.push(rel.clone());
-                tracing::warn!(target: TARGET, source_id = %source.id, path = %abs.display(), %err, "metadata read failed; skipping file");
-                continue;
-            }
-        };
-
-        // OneDrive Files-On-Demand policy (issue #4, DESIGN s5.2.1): a cloud-only
-        // placeholder has FILE_ATTRIBUTE_RECALL_ON_OPEN set; opening it to
-        // stat/hash would force a network hydration. Under the default
-        // `PlaceholderPolicy::Skip` we skip it, but FIRST mark it `seen` so the
-        // deletion sweep below does NOT treat its existing `file_state` row as
-        // "known but missing" and trash the Drive backup - a placeholder is still
-        // present locally, just dehydrated. Under `ForceDownload` we do NOT skip:
-        // the file falls through to the normal stat + change-detection path, and
-        // the subsequent read (deep-verify hash / upload) hydrates it on demand.
-        #[cfg(windows)]
-        {
-            use std::os::windows::fs::MetadataExt;
-            if should_skip_placeholder(meta.file_attributes(), source.placeholder_policy) {
-                seen.insert(rel.clone());
-                skipped_cloud_only += 1;
-                tracing::trace!(target: TARGET, source_id = %source.id, path = %rel, "skipping cloud-only (OneDrive Files-On-Demand) placeholder");
-                continue;
-            }
-        }
-
-        let size = meta.len();
-        let mtime_ns = mtime_ns(&meta);
-        // NFC collision detection (DESIGN s5.2.3, SPEC s24
-        // local.unicode_collision): `RelativePath::try_from` NFC-normalised
-        // `rel`, so two byte-distinct raw paths can collapse to one key.
-        // `HashSet::insert` returns false when the key was already present;
-        // keep the first file, record + drop the later collider rather than
-        // emitting a duplicate upload op for the same `file_state` key.
-        if !seen.insert(rel.clone()) {
-            tracing::warn!(target: TARGET, source_id = %source.id, path = %rel, "local.unicode_collision: distinct raw paths normalise to one NFC key; dropping later duplicate");
-            collisions.push(rel.clone());
-            continue;
-        }
-
-        // NTFS Alternate Data Stream detection (DESIGN s5.2.1, SPEC s24
-        // `local.ads_skipped`): this file is about to be backed up (main
-        // stream only), so if it carries any named data stream record the
-        // path. The orchestrator surfaces one warning per affected file; the
-        // named streams are NOT uploaded (a documented V1 limitation that
-        // must be visible, not silent). Windows-only; a no-op elsewhere.
-        #[cfg(windows)]
-        {
-            if has_alternate_data_streams(abs) {
-                tracing::warn!(target: TARGET, source_id = %source.id, path = %rel, "local.ads_skipped: file has NTFS alternate data stream(s); only the main stream is backed up");
-                ads_skipped.push(rel.clone());
-            }
-        }
-
-        let stored = known.get(&rel);
-        let stat_match =
-            matches!(stored, Some(row) if row.size == size && row.mtime_ns == mtime_ns);
-
-        if stat_match {
-            // A stat-matched file is unchanged on the fast path UNLESS its
-            // content must be verified. Two triggers re-hash it (DESIGN s5.2
-            // step 2): DeepVerify always re-hashes (bit-rot / mtime lies); and
-            // on a coarse-granularity filesystem the fallback re-hashes a
-            // stat-matched file whose ctime/birth post-dates the last scan or
-            // whose mtime is within one granularity window of it - a within-
-            // quantum in-place edit reports an unchanged mtime and would
-            // otherwise be missed. ctime/birth are read only when the FS is
-            // coarse, so a fine-FS fast scan pays nothing.
-            let coarse_suspect = is_coarse
-                && coarse_fs_needs_rehash(
-                    granularity_ns,
-                    mtime_ns,
-                    ctime_ns(&meta),
-                    birth_ns(&meta),
-                    last_scan_end_ns,
-                );
-            if mode == ScanMode::DeepVerify || coarse_suspect {
-                let stored_hash = stored.map(|r| r.hash_blake3);
-                match hash_file(abs) {
-                    Ok(hash) => {
-                        if stored_hash != Some(hash) {
-                            let reason = if mode == ScanMode::DeepVerify {
-                                "deep-verify"
-                            } else {
-                                "coarse-fs mtime-granularity fallback"
-                            };
-                            tracing::info!(target: TARGET, source_id = %source.id, path = %rel, reason, "hash mismatch; marking changed");
+                other => {
+                    // NFC collision detection (DESIGN s5.2.3, SPEC s24
+                    // local.unicode_collision): `RelativePath::try_from`
+                    // NFC-normalised `rel`, so two byte-distinct raw paths can
+                    // collapse to one key. `HashSet::insert` returns false when
+                    // the key was already present; keep the first file, record +
+                    // drop the later collider rather than emitting a duplicate
+                    // upload op for the same `file_state` key. Only this
+                    // consumer can make that call - a worker cannot know which
+                    // key another thread already claimed.
+                    if !seen.insert(rel.clone()) {
+                        tracing::warn!(target: TARGET, source_id = %source.id, path = %rel, "local.unicode_collision: distinct raw paths normalise to one NFC key; dropping later duplicate");
+                        collisions.push(rel);
+                        continue;
+                    }
+                    if ads {
+                        ads_skipped.push(rel.clone());
+                    }
+                    match other {
+                        Outcome::Changed { size, mtime_ns } => {
                             new_or_changed.push(LocalEntry {
                                 rel,
                                 size,
                                 mtime_ns,
                             });
                         }
+                        Outcome::VerifyFailed => errored_prefixes.push(rel),
+                        // Unchanged: nothing to emit.
+                        _ => {}
                     }
-                    Err(err) => {
-                        // Could not read to verify: don't claim changed (no
-                        // evidence) but suppress this path from deletion.
-                        errored_prefixes.push(rel.clone());
-                        tracing::warn!(target: TARGET, source_id = %source.id, path = %rel, %err, "content-verify read failed; skipping file");
+                    // Telemetry (DESIGN s13): the worker timed the file, the
+                    // reservoir lives here. `record_scan_ms` re-checks the
+                    // enable gate (a no-op if telemetry was disabled mid-scan).
+                    if let (Some(res), Some(ms)) = (latency, latency_ms) {
+                        res.record_scan_ms(ms);
                     }
                 }
             }
-            // Otherwise a fast-path stat-match: unchanged, nothing to emit.
-        } else {
-            // New (no row) or changed (stat differs).
-            new_or_changed.push(LocalEntry {
-                rel,
-                size,
-                mtime_ns,
-            });
         }
 
-        // Telemetry (DESIGN s13): record this file's per-file scan-processing
-        // latency. `latency` is `Some` iff a reservoir was armed above; the
-        // `record_scan_ms` call re-checks the enable gate (a no-op if telemetry
-        // was disabled mid-scan).
-        if let (Some(res), Some(started)) = (latency, file_timer) {
-            res.record_scan_ms(u64::try_from(started.elapsed().as_millis()).unwrap_or(u64::MAX));
+        // Live progress tick, on the same stride / interval throttle as before -
+        // plus one on the FIRST batch that carries anything, so the readout
+        // starts moving as soon as the walk produces something instead of
+        // waiting out a whole stride on a fast tree.
+        if let Some(sink) = on_progress {
+            if visited > 0
+                && (reported == 0
+                    || visited - reported >= SCAN_PROGRESS_FILE_STRIDE
+                    || last_tick.elapsed() >= SCAN_PROGRESS_MIN_INTERVAL)
+            {
+                reported = visited;
+                last_tick = Instant::now();
+                sink(visited).await;
+                // Awaiting the sink is NOT by itself a yield: the orchestrator's
+                // sink resolves without ever returning Pending (an uncontended
+                // lock write plus a broadcast send). Yield explicitly so the
+                // consumers of the event we just emitted are actually scheduled.
+                tokio::task::yield_now().await;
+            }
         }
     }
+
+    // Surface a matcher-build failure or a panicked walk thread rather than
+    // silently treating an aborted walk as "the tree is empty" - which the
+    // orphan split below would read as a mass deletion.
+    let matcher = walk_task
+        .await
+        .context("scan walk task failed")?
+        .context("building the source matcher for the scan")?;
 
     // Final progress tick: the walk is done, so report the true total even when
     // the last stride/interval boundary fell short of it. Always emitted (even
@@ -626,21 +944,33 @@ pub async fn scan_with_progress(
     // destructive action, so a transient permission error must hold it back.
     // Classifying an orphan is non-destructive (no op either way), so it is
     // safe even mid-error and is not gated.
-    let mut deleted: Vec<RelativePath> = Vec::new();
-    let mut excluded_orphans: Vec<RelativePath> = Vec::new();
-    for path in known.keys().filter(|p| !seen.contains(*p)) {
-        if !matcher.is_included(Path::new(path.as_str()), false) {
-            // (b) excluded by a (possibly new) ignore rule - not a deletion.
-            excluded_orphans.push(path.clone());
-            continue;
+    //
+    // Runs on a blocking thread like the walk: a source with 600k stored rows
+    // means 600k matcher queries here, which would otherwise seize the runtime
+    // thread the moment the walk finally released it.
+    let errored_prefix_count = errored_prefixes.len();
+    let split_matcher = Arc::clone(&matcher);
+    let split_known = Arc::clone(&known);
+    let (deleted, excluded_orphans) = tokio::task::spawn_blocking(move || {
+        let mut deleted: Vec<RelativePath> = Vec::new();
+        let mut excluded_orphans: Vec<RelativePath> = Vec::new();
+        for path in split_known.keys().filter(|p| !seen.contains(*p)) {
+            if !split_matcher.is_included(Path::new(path.as_str()), false) {
+                // (b) excluded by a (possibly new) ignore rule - not a deletion.
+                excluded_orphans.push(path.clone());
+                continue;
+            }
+            // (a) still included, so genuinely missing from disk -> a deletion,
+            // subject to the walk-error suppression.
+            if unattributed_error || is_under_any(path, &errored_prefixes) {
+                continue;
+            }
+            deleted.push(path.clone());
         }
-        // (a) still included, so genuinely missing from disk -> a deletion,
-        // subject to the walk-error suppression.
-        if unattributed_error || is_under_any(path, &errored_prefixes) {
-            continue;
-        }
-        deleted.push(path.clone());
-    }
+        (deleted, excluded_orphans)
+    })
+    .await
+    .context("scan orphan-split task failed")?;
 
     tracing::debug!(
         target: TARGET,
@@ -655,7 +985,7 @@ pub async fn scan_with_progress(
         collisions = collisions.len(),
         ads_skipped = ads_skipped.len(),
         invalid_filenames = invalid_filenames.len(),
-        errored_prefixes = errored_prefixes.len(),
+        errored_prefixes = errored_prefix_count,
         unattributed_error,
         granularity_ns,
         is_coarse,
@@ -1375,25 +1705,21 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn nested_negation_under_excluded_dir_not_false_deleted() {
-        // P1-1 (data-loss guard): a nested negation (`vendor/.gitignore:
-        // !keep.txt`) re-includes `vendor/keep.txt` even though a parent rule
-        // excludes `vendor/`. The flattened matcher classifies it INCLUDED, so
-        // if dir-pruning skipped `vendor/` the file would never be walked, land
-        // un-`seen`, and the orphan split would false-classify its stored
-        // file_state row as `deleted` - trashing a file that still exists.
-        // With the fix, build_walker disables pruning whenever the matcher has
-        // negations, so `vendor/` IS walked, `keep.txt` is seen, and the row is
-        // neither deleted nor an excluded_orphan.
+    async fn negation_above_an_excluded_dir_keeps_the_file_out_of_deleted() {
+        // P1-1 (data-loss guard): a `!`-rule that can reach INTO an excluded
+        // directory keeps that directory walked. Here the root `.gitignore`
+        // excludes `vendor/` and then re-includes `vendor/keep.txt`; the
+        // matcher classifies the file INCLUDED, so if the walk had pruned
+        // `vendor/` the file would land un-`seen` and the orphan split would
+        // false-classify its stored row as `deleted` - trashing a file that
+        // still exists. The per-directory reachability check keeps `vendor/`
+        // walked, so the row is neither deleted nor an excluded_orphan.
         let dir = tempfile::tempdir().unwrap();
         let root = dir.path();
-        write(&root.join(".gitignore"), b"vendor/\n");
-        // Nested negation re-including a file inside the excluded dir. A
-        // no-slash `!keep.txt` matches the path itself before the excluded
-        // parent is consulted (the exact P1-1 mechanism).
-        write(&root.join("vendor/.gitignore"), b"!keep.txt\n");
+        write(&root.join(".gitignore"), b"vendor/\n!vendor/keep.txt\n");
         let keep = root.join("vendor/keep.txt");
         write(&keep, b"x");
+        write(&root.join("vendor/drop.txt"), b"x");
         write(&root.join("top.txt"), b"x");
 
         let src = source_at(root);
@@ -1412,13 +1738,54 @@ mod tests {
         let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
         assert!(
             !res.deleted.contains(&rel("vendor/keep.txt")),
-            "a nested-negation re-included file under an excluded dir must NOT be deleted: {:?}",
+            "a re-included file under an excluded dir must NOT be deleted: {:?}",
             res.deleted
         );
         assert!(
             !res.excluded_orphans.contains(&rel("vendor/keep.txt")),
             "the re-included file is INCLUDED, so it is not an excluded_orphan either: {:?}",
             res.excluded_orphans
+        );
+    }
+
+    #[tokio::test]
+    async fn nested_negation_under_pruned_dir_is_orphan_not_deleted() {
+        // The other half of the P1-1 lockstep invariant. Nothing at or above
+        // `vendor/` carries a `!`-rule, so the matcher build prunes it and never
+        // reads `vendor/.gitignore` - exactly as git would not - and the walk
+        // prunes it too. The two agreeing is what makes this SAFE: the matcher
+        // classifies `vendor/keep.txt` EXCLUDED, so its stored `file_state` row
+        // is an excluded_orphan (the planner emits no trash op) and can never be
+        // read as a deletion, even though the file was never walked.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), b"vendor/\n");
+        write(&root.join("vendor/.gitignore"), b"!keep.txt\n");
+        let keep = root.join("vendor/keep.txt");
+        write(&keep, b"x");
+        write(&root.join("top.txt"), b"x");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let (size, mtime) = stat_of(&keep);
+        state.put(row(
+            src.id,
+            "vendor/keep.txt",
+            size,
+            mtime,
+            *blake3::hash(b"x").as_bytes(),
+        ));
+
+        let res = scan(&src, &state, ScanMode::FastPath).await.unwrap();
+        assert!(
+            res.deleted.is_empty(),
+            "a pruned directory must NEVER produce a deletion: {:?}",
+            res.deleted
+        );
+        assert_eq!(
+            res.excluded_orphans,
+            vec![rel("vendor/keep.txt")],
+            "the stored row is an excluded_orphan (no trash op): {res:?}"
         );
     }
 
