@@ -27,6 +27,7 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
 
 use bytes::Bytes;
@@ -545,6 +546,24 @@ pub trait Executor: Send + Sync {
     /// only `pending_ops`, not every file. Run once before the first
     /// normal cycle.
     async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()>;
+
+    /// Sets the manual-pause dispatch gate (DESIGN s5.7).
+    ///
+    /// `true` means "stop starting new ops": an `execute` that is CURRENTLY
+    /// running must stop dispatching from the plan at the next op boundary,
+    /// let the already-in-flight ops finish + durably commit, and return the
+    /// outcomes it produced so far. `false` re-opens the gate.
+    ///
+    /// The orchestrator's gate check only runs BETWEEN cycles, so without this
+    /// a pause raised mid-plan would not be observed until the whole plan
+    /// finished - on a large initial backup that is minutes-to-hours of
+    /// uploads after the user pressed pause. There is deliberately no default
+    /// body: an executor that silently ignored the pause would reintroduce
+    /// exactly that bug.
+    ///
+    /// Not a cancel and not persisted: an in-flight op is never torn mid-file,
+    /// and durable pause state lives in the orchestrator/state DB.
+    fn set_paused(&self, paused: bool);
 }
 
 /// Construction-time dependencies an [`Executor`] implementation wires
@@ -854,6 +873,12 @@ pub struct DefaultExecutor {
     /// `ensure_folder` per component instead of racing duplicate
     /// search+create calls (which manifest as duplicate folders on Drive).
     parent_walk: tokio::sync::Mutex<()>,
+    /// Cooperative "stop dispatching new ops" flag (DESIGN s5.7 manual pause).
+    /// Written by [`Executor::set_paused`], read by the `execute` dispatch loop
+    /// before it starts each op. It is a dispatch gate, not a cancel: ops
+    /// already in flight run to their durable commit, so a pause never tears a
+    /// file mid-upload.
+    paused: AtomicBool,
     #[cfg(test)]
     mid_upload_hook: Option<MidUploadHook>,
     #[cfg(test)]
@@ -936,6 +961,7 @@ impl DefaultExecutor {
             latency: None,
             parent_dirs: std::sync::Mutex::new(HashMap::new()),
             parent_walk: tokio::sync::Mutex::new(()),
+            paused: AtomicBool::new(false),
             #[cfg(test)]
             mid_upload_hook: None,
             #[cfg(test)]
@@ -3920,6 +3946,24 @@ impl Executor for DefaultExecutor {
         let mut next_op = ops.next();
 
         loop {
+            // Manual-pause dispatch gate (DESIGN s5.7). Checked EVERY iteration,
+            // not once before the loop: the user pauses mid-plan, and a plan is
+            // routinely thousands of ops long, so a pre-loop-only check is the
+            // same as no check at all. Dropping `next_op` stops dispatch here
+            // and falls through to the drain arm, so the ops already in flight
+            // still finish + durably commit (no torn file) and `execute`
+            // returns the partial outcome list. The remaining ops keep no
+            // `file_state` row, so the next unpaused scan re-plans them.
+            if next_op.is_some() && self.paused.load(Ordering::Relaxed) {
+                debug!(
+                    target: TARGET,
+                    source = %source.id,
+                    dispatched = outcomes.len() + in_flight.len(),
+                    planned = plan.ops.len(),
+                    "manual pause: halting op dispatch; draining in-flight uploads"
+                );
+                next_op = None;
+            }
             if next_op.is_none() && in_flight.is_empty() {
                 break;
             }
@@ -3960,6 +4004,13 @@ impl Executor for DefaultExecutor {
         }
 
         Ok(outcomes)
+    }
+
+    fn set_paused(&self, paused: bool) {
+        // `Relaxed` is sufficient: the flag guards nothing but its own read in
+        // the dispatch loop, and "one more op starts" on a racing write is
+        // already the accepted graceful-drain behaviour.
+        self.paused.store(paused, Ordering::Relaxed);
     }
 
     async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()> {
@@ -6259,6 +6310,109 @@ mod tests {
     /// streamed activity (returns an immediately-ready future).
     fn noop_outcome(_o: &OpOutcome) -> futures::future::BoxFuture<'static, ()> {
         Box::pin(async {})
+    }
+
+    // --- issue #147: the manual-pause dispatch gate -------------------------
+
+    /// Build a plan of `n` independent `HashThenUpload` ops over files named
+    /// `paused/f{i}.txt`, so a pause test has a long plan to be stopped
+    /// part-way through.
+    fn multi_upload_plan(h: &Harness, n: usize) -> Plan {
+        Plan {
+            ops: (0..n)
+                .map(|i| {
+                    let (relative_path, size) =
+                        h.write_file(&format!("paused/f{i}.txt"), format!("body {i}").as_bytes());
+                    Op::HashThenUpload {
+                        source_id: h.source.id,
+                        relative_path,
+                        size,
+                    }
+                })
+                .collect(),
+            collisions: vec![],
+        }
+    }
+
+    /// Issue #147 (the tray "Pause for 30m" that kept uploading): a pause
+    /// raised WHILE a plan is executing must stop the executor from dispatching
+    /// further ops. The op already in flight still finishes and commits (a
+    /// pause is a graceful drain, never a torn file), so exactly one of the 20
+    /// planned uploads lands.
+    ///
+    /// Deterministic without any sleeping: the pool is sized to 1 permit, so
+    /// exactly one op is ever in flight, and the pause is raised from the
+    /// per-op outcome sink - which the executor awaits inside the in-flight
+    /// future, before the dispatch loop's next iteration.
+    #[tokio::test]
+    async fn manual_pause_mid_plan_stops_dispatching_further_ops() {
+        let h = harness().await;
+        let plan = multi_upload_plan(&h, 20);
+        let exec = h
+            .executor()
+            .with_upload_pool(crate::adaptive::UploadPool::with_bounds(1, 1, 1));
+
+        let pause_on_first = |_o: &OpOutcome| -> futures::future::BoxFuture<'_, ()> {
+            exec.set_paused(true);
+            Box::pin(async {})
+        };
+        let outcomes = exec
+            .execute(&h.source, &plan, &noop_progress, &pause_on_first)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcomes.len(),
+            1,
+            "the in-flight op drains but the pause stops dispatch of the other 19: {outcomes:?}"
+        );
+        // The undispatched tail must be untouched on BOTH sides: nothing
+        // uploaded, and no `file_state` row - so the next unpaused scan replans
+        // every one of them (a pause loses no files).
+        for op in plan.ops.iter().skip(1) {
+            let Op::HashThenUpload { relative_path, .. } = op else {
+                unreachable!("multi_upload_plan builds HashThenUpload ops only");
+            };
+            assert!(
+                h.state
+                    .get_file_state(h.source.id, relative_path)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{relative_path} was never dispatched, so it must have no file_state row"
+            );
+        }
+    }
+
+    /// Issue #147: a pause that is already in force when `execute` is entered
+    /// dispatches NOTHING. This is the state the orchestrator leaves behind
+    /// after a paused cycle - a stale trigger must not sneak a plan through the
+    /// closed gate.
+    #[tokio::test]
+    async fn execute_under_an_active_pause_dispatches_zero_ops() {
+        let h = harness().await;
+        let plan = multi_upload_plan(&h, 5);
+        let exec = h.executor();
+        exec.set_paused(true);
+
+        let outcomes = exec
+            .execute(&h.source, &plan, &noop_progress, &noop_outcome)
+            .await
+            .unwrap();
+
+        assert!(
+            outcomes.is_empty(),
+            "an already-paused executor uploads nothing: {outcomes:?}"
+        );
+
+        // ...and clearing the pause re-opens the gate: the same plan then runs
+        // to completion, proving the flag is a gate and not a one-way kill.
+        exec.set_paused(false);
+        let outcomes = exec
+            .execute(&h.source, &plan, &noop_progress, &noop_outcome)
+            .await
+            .unwrap();
+        assert_eq!(outcomes.len(), plan.ops.len(), "resume re-opens the gate");
     }
 
     // --- V2 small-file bundling (issue #35) ---------------------------------
