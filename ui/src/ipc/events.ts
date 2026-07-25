@@ -9,6 +9,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AccountSyncStatus,
   ActivityEntry,
+  ExecProgress,
   GlobalSyncStatus,
   PauseState,
   RestoreJobStatus,
@@ -39,10 +40,19 @@ export function onPauseChanged(handler: (pause: PauseState | null) => void): Pro
   return listen<PauseState | null>("sync:pause_changed", (e) => handler(e.payload));
 }
 
-/** `sync:source_progress` payload: { sourceId, progress } (SPEC s11.7). */
+/** `sync:source_progress` payload: `{ account_id, source_id, progress }` (SPEC
+ * s11.7; mirrors src-tauri/src/assembly.rs `SourceProgressEvent`). snake_case on
+ * the wire like the rest of the M5 sync DTOs.
+ *
+ * One throttled execution-progress tick. The orchestrator enters `executing`
+ * with a ZEROED `ExecProgress` and never re-emits that state for the source, so
+ * these ticks are the ONLY carrier of the moving counters - the progress store
+ * folds them over the state's embedded snapshot to keep the top-of-app bar
+ * determinate. */
 export interface SourceProgressPayload {
-  sourceId: string;
-  progress: unknown;
+  account_id: string;
+  source_id: string;
+  progress: ExecProgress;
 }
 
 export function onSyncSourceProgress(

@@ -325,11 +325,17 @@ describe("progress store - subscribe + hydrate", () => {
     expect(store.active).toBe(false);
   });
 
-  it("is idempotent: a second subscribe does not register a second listener", async () => {
+  it("subscribes to BOTH sync channels: a second subscribe registers no more", async () => {
     const store = useProgressStore();
     await store.subscribe();
+    // Status alone leaves the bar indeterminate (the `executing` transition
+    // carries only zeros), so the progress channel is not optional.
+    expect(listenMock).toHaveBeenCalledTimes(2);
+    expect(handlers["sync:status_changed"]).toBeTypeOf("function");
+    expect(handlers["sync:source_progress"]).toBeTypeOf("function");
+
     await store.subscribe();
-    expect(listenMock).toHaveBeenCalledTimes(1);
+    expect(listenMock).toHaveBeenCalledTimes(2);
   });
 
   it("hydrates the map from get_sync_status (a run already underway at boot)", async () => {
@@ -356,11 +362,219 @@ describe("progress store - subscribe + hydrate", () => {
     expect(store.active).toBe(false);
   });
 
-  it("unsubscribe tears down the listener", async () => {
+  it("unsubscribe tears down every listener", async () => {
     const store = useProgressStore();
     await store.subscribe();
     store.unsubscribe();
+    expect(unlistenMock).toHaveBeenCalledTimes(2);
+    expect(handlers["sync:status_changed"]).toBeUndefined();
+    expect(handlers["sync:source_progress"]).toBeUndefined();
+  });
+
+  it("cleans up the first listener when the second registration fails", async () => {
+    const store = useProgressStore();
+    listenMock.mockImplementationOnce(
+      async (event: string, cb: (e: { payload: unknown }) => void) => {
+        handlers[event] = (payload: unknown) => cb({ payload });
+        return vi.fn(() => {
+          delete handlers[event];
+          unlistenMock();
+        });
+      }
+    );
+    listenMock.mockImplementationOnce(async () => {
+      throw new Error("listener registration failed");
+    });
+
+    await expect(store.subscribe()).rejects.toThrow("listener registration failed");
+    // The half-registered status listener must not leak: it is torn down, and a
+    // retry re-registers both from scratch.
     expect(unlistenMock).toHaveBeenCalledTimes(1);
     expect(handlers["sync:status_changed"]).toBeUndefined();
+
+    await store.subscribe();
+    expect(handlers["sync:status_changed"]).toBeTypeOf("function");
+    expect(handlers["sync:source_progress"]).toBeTypeOf("function");
+  });
+});
+
+// The fix for "the backing-up bar never leaves the indeterminate sweep": the
+// orchestrator transitions to `executing` ONCE with a zeroed ExecProgress and
+// then streams the moving counters as separate `sync:source_progress` ticks.
+// Folding those ticks in is the only way the percent is ever non-null.
+describe("progress store - source_progress ticks", () => {
+  const tick = (
+    accountId: string,
+    p: Partial<ExecProgress>,
+    sourceId = "src-1"
+  ): { account_id: string; source_id: string; progress: ExecProgress } => ({
+    account_id: accountId,
+    source_id: sourceId,
+    progress: {
+      files_done: 0,
+      files_total: 0,
+      bytes_done: 0,
+      bytes_total: 0,
+      trashes_done: 0,
+      trashes_total: 0,
+      errors: 0,
+      ...p,
+    },
+  });
+
+  it("turns the zeroed executing snapshot into a determinate percent", () => {
+    const store = useProgressStore();
+    // Exactly what the backend sends: the transition, carrying only zeros.
+    store.ingest(perAccount("a", executing({})));
+    expect(store.percent).toBeNull();
+
+    store.ingestProgress(tick("a", { bytes_done: 250, bytes_total: 1000 }));
+    expect(store.percent).toBeCloseTo(0.25, 5);
+
+    store.ingestProgress(tick("a", { bytes_done: 750, bytes_total: 1000 }));
+    expect(store.percent).toBeCloseTo(0.75, 5);
+  });
+
+  it("prefers the tick over the state's embedded snapshot", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", executing({ bytes_done: 0, bytes_total: 1000 })));
+    store.ingestProgress(
+      tick("a", { bytes_done: 400, bytes_total: 1000, files_done: 4, files_total: 10 })
+    );
+    expect(store.percent).toBeCloseTo(0.4, 5);
+    expect(store.filesDone).toBe(4);
+    expect(store.filesTotal).toBe(10);
+  });
+
+  // Edge case (a): a late tick must not resurrect a finished run.
+  it("ignores a tick for an account that is no longer executing", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", executing({})));
+    store.ingestProgress(tick("a", { bytes_done: 500, bytes_total: 1000 }));
+    expect(store.active).toBe(true);
+
+    store.ingest(perAccount("a", idle()));
+    expect(store.active).toBe(false);
+    expect(store.percent).toBeNull();
+
+    // The executor's final snapshot can trail the transition. It must not make
+    // the bar reappear, nor leave a percent behind.
+    store.ingestProgress(tick("a", { bytes_done: 1000, bytes_total: 1000 }));
+    expect(store.active).toBe(false);
+    expect(store.percent).toBeNull();
+    expect(store.filesDone).toBe(0);
+  });
+
+  it("ignores a tick for an account it has never seen a status for", () => {
+    const store = useProgressStore();
+    store.ingestProgress(tick("ghost", { bytes_done: 5, bytes_total: 10 }));
+    expect(store.active).toBe(false);
+    expect(store.percent).toBeNull();
+    expect(Object.keys(store.states)).toEqual([]);
+  });
+
+  // Edge case (b/c): a new run must not inherit the previous run's last tick.
+  it("drops the stale tick when the account re-enters executing for a new run", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", executing({})));
+    store.ingestProgress(tick("a", { bytes_done: 1000, bytes_total: 1000, files_done: 9 }));
+    expect(store.percent).toBe(1);
+
+    // Next source: another `executing` transition carrying ExecProgress::zero().
+    store.ingest(perAccount("a", executing({})));
+    expect(store.percent).toBeNull();
+    expect(store.filesDone).toBe(0);
+
+    // ...and the new run's own ticks drive it from the start.
+    store.ingestProgress(tick("a", { bytes_done: 10, bytes_total: 1000 }, "src-2"));
+    expect(store.percent).toBeCloseTo(0.01, 5);
+  });
+
+  it("drops the tick on ANY state change, not just a new executing", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", executing({})));
+    store.ingestProgress(tick("a", { bytes_done: 800, bytes_total: 1000 }));
+    store.ingest(perAccount("a", scanning(3)));
+    expect(store.phase).toBe("scanning");
+    expect(store.percent).toBeNull();
+
+    store.ingest(perAccount("a", executing({})));
+    expect(store.percent).toBeNull();
+  });
+
+  it("clears every tick when an aggregate payload replaces the map", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", executing({})));
+    store.ingestProgress(tick("a", { bytes_done: 900, bytes_total: 1000 }));
+    expect(store.percent).toBeCloseTo(0.9, 5);
+
+    // hydrate()'s shape: an aggregate re-states every account at once.
+    store.ingest(global(perAccount("a", executing({}))));
+    expect(store.percent).toBeNull();
+  });
+
+  // Edge case (c): multi-account aggregation must still SUM.
+  it("sums ticks across concurrently executing accounts", () => {
+    const store = useProgressStore();
+    store.ingest(global(perAccount("a", executing({})), perAccount("b", executing({}))));
+    store.ingestProgress(
+      tick("a", { bytes_done: 100, bytes_total: 400, files_done: 1, files_total: 2 })
+    );
+    store.ingestProgress(
+      tick("b", { bytes_done: 100, bytes_total: 100, files_done: 3, files_total: 3 })
+    );
+    // (100 + 100) / (400 + 100) = 0.4
+    expect(store.percent).toBeCloseTo(0.4, 5);
+    expect(store.filesDone).toBe(4);
+    expect(store.filesTotal).toBe(5);
+  });
+
+  it("mixes a ticked account with one still on its embedded snapshot", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", executing({})));
+    store.ingest(perAccount("b", executing({ bytes_done: 50, bytes_total: 100 })));
+    store.ingestProgress(tick("a", { bytes_done: 100, bytes_total: 300 }));
+    // (100 + 50) / (300 + 100) = 0.375
+    expect(store.percent).toBeCloseTo(0.375, 5);
+  });
+
+  it("keeps a mixed upload+delete plan honest across ticks", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", executing({})));
+    // Uploads finished, trash ops pending: bytes alone would read 100%.
+    store.ingestProgress(
+      tick("a", {
+        bytes_done: 1000,
+        bytes_total: 1000,
+        files_done: 2,
+        files_total: 2,
+        trashes_done: 0,
+        trashes_total: 2,
+      })
+    );
+    expect(store.percent).toBeCloseTo(0.5, 5);
+  });
+
+  it("updates from a live sync:source_progress event", async () => {
+    const store = useProgressStore();
+    await store.subscribe();
+
+    handlers["sync:status_changed"](perAccount("a", executing({})));
+    expect(store.percent).toBeNull();
+
+    handlers["sync:source_progress"](tick("a", { bytes_done: 3, bytes_total: 4 }));
+    expect(store.percent).toBeCloseTo(0.75, 5);
+  });
+
+  it("ignores a malformed tick payload rather than throwing", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", executing({ bytes_done: 1, bytes_total: 4 })));
+    store.ingestProgress({
+      account_id: "a",
+      source_id: "src-1",
+      progress: null as unknown as ExecProgress,
+    });
+    // The embedded snapshot still stands; nothing threw.
+    expect(store.percent).toBeCloseTo(0.25, 5);
   });
 });
