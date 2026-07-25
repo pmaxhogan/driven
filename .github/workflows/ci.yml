@@ -59,6 +59,11 @@ jobs:
         if: runner.os == 'Windows'
         shell: pwsh
         run: |
+          # Temporary probe: if real-time protection is already off on the hosted
+          # image, these exclusions are a no-op and the step is pure overhead.
+          Get-MpComputerStatus |
+            Select-Object RealTimeProtectionEnabled, AntivirusEnabled, AMRunningMode |
+            Format-List
           Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
           Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
           Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
