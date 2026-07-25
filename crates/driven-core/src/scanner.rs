@@ -318,6 +318,11 @@ struct WalkCtx {
 enum Outcome {
     /// A cloud-only (OneDrive Files-On-Demand) placeholder: marked seen so its
     /// stored row is not read as a deletion, then skipped before stat/hash.
+    ///
+    /// Only Windows carries the `FILE_ATTRIBUTE_RECALL_ON_OPEN` attribute, so
+    /// only the Windows branch of [`process_file`] ever produces this; the
+    /// consumer handles it unconditionally to keep one code path.
+    #[cfg_attr(not(windows), allow(dead_code))]
     Placeholder,
     /// `metadata()` failed: NOT marked seen, and deletions under it suppressed.
     StatFailed,
