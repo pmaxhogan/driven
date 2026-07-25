@@ -34,6 +34,23 @@
     "timed": "Backups paused - {minutes}m left",
     "resume": "Resume"
   },
+  "toast": {
+    "dismiss": "Dismiss notification",
+    "kind": {
+      "info": "Information",
+      "success": "Success",
+      "warning": "Warning",
+      "error": "Error"
+    },
+    "backup": {
+      "started": "Backup started",
+      "complete": "Backup complete",
+      "completeFiles": "Backup complete - {count} file uploaded | Backup complete - {count} files uploaded"
+    },
+    "rulesSaved": "Backup rules saved",
+    "settingsSaved": "Settings saved",
+    "diagnosticsSaved": "Diagnostic bundle saved to {path}"
+  },
   "common": {
     "next": "Next",
     "back": "Back",

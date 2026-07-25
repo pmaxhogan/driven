@@ -110,8 +110,10 @@ describe("App shell", () => {
     await mountAppAt("/activity");
     // Three updater events (available, download_progress, downloaded) + the
     // progress store's TWO sync events (status_changed for the phase,
-    // source_progress for the moving counters) + the pause event registered.
-    expect(listenMock).toHaveBeenCalledTimes(6);
+    // source_progress for the moving counters) + the pause event registered +
+    // the two ToastHost subscriptions (status_changed for "Backup started",
+    // activity:new for the backup_done row behind "Backup complete").
+    expect(listenMock).toHaveBeenCalledTimes(8);
     expect(invokeMock).toHaveBeenCalledWith("get_pending_update_info", undefined);
     expect(invokeMock).toHaveBeenCalledWith("get_sync_status", undefined);
     expect(invokeMock).toHaveBeenCalledWith("get_pause_state", undefined);

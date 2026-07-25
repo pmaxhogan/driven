@@ -7,6 +7,7 @@ import AccountList from "../components/AccountList.vue";
 import SourceTable from "../components/SourceTable.vue";
 import TelemetryPreviewModal from "../components/TelemetryPreviewModal.vue";
 import { useSettingsStore } from "../stores/settings";
+import { useToastsStore } from "../stores/toasts";
 import { getVssHelperStatus, validateCustomCa, validateProxy } from "../ipc/commands";
 import type { SettingsPatch, VssHelperStatus } from "../ipc/types";
 
@@ -23,6 +24,7 @@ const props = withDefaults(defineProps<{ tab?: "accounts" | "sources" | "rules" 
 const { t } = useI18n();
 const router = useRouter();
 const settings = useSettingsStore();
+const toasts = useToastsStore();
 
 const tabs = [
   { key: "accounts", route: "/accounts", label: "settings.tabs.accounts" },
@@ -249,6 +251,11 @@ function parseRequiredClamped(
 async function commitPatch(p: SettingsPatch): Promise<void> {
   try {
     await settings.patch(p);
+    // The Rules form has no Save button - every control commits on change, and
+    // until now did so completely silently. One toast per commit is the whole
+    // confirmation. Rapid toggling does not stack: the toast store folds an
+    // identical consecutive message back into the toast already showing.
+    toasts.push({ kind: "success", message: t("toast.settingsSaved") });
   } catch {
     // errorCode is set on the store and surfaced as the banner.
   }

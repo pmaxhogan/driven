@@ -5,6 +5,7 @@ import { useI18n } from "vue-i18n";
 
 import GlobalProgressBar from "./components/GlobalProgressBar.vue";
 import PausedBanner from "./components/PausedBanner.vue";
+import ToastHost from "./components/ToastHost.vue";
 import { usePauseStore } from "./stores/pause";
 import { useProgressStore } from "./stores/progress";
 import { useUpdaterStore } from "./stores/updater";
@@ -139,5 +140,6 @@ const NAV_LINK_ACTIVE = "text-teal-700 dark:text-teal-300 font-semibold";
     <main class="flex-1 p-6">
       <RouterView />
     </main>
+    <ToastHost />
   </div>
 </template>
