@@ -45,6 +45,10 @@ describe("activityEventLabel (R1-P2-3)", () => {
     // those are localized via the shared error labels.
     expect(label("drive.checksum_mismatch")).toBe("Verification failed");
     expect(label("local.file_locked")).toBe("File in use");
+    // The self-healing stale-drive_file_id skip: a warn row whose event type is
+    // this code, so the Activity table must have a label for it rather than
+    // showing the raw dotted string.
+    expect(label("drive.remote_file_missing")).toBe("Remote copy missing");
   });
 
   it("safely falls back to the raw code for an unknown event type", () => {

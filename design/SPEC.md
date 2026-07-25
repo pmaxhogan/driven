@@ -1769,6 +1769,7 @@ Stable codes (V1):
 | `drive.upload_size_limit`    | File exceeds Drive's per-file size limit      |
 | `drive.checksum_mismatch`    | Verification failed after upload              |
 | `drive.unreachable`          | Drive API down / unreachable / 5xx-circuit-open |
+| `drive.remote_file_missing`  | The backed-up copy a recorded `drive_file_id` points at is gone (definitive 404 on an update); the stale id is cleared and the file re-uploads on the next scan (warn, self-healing) |
 | `drive.resumable_session_invalid` | 4xx during resumable upload — caller must restart session |
 | `local.file_locked`          | Couldn't open even with `FILE_SHARE_DELETE` (V1: locked file; VSS path failed too — see `local.vss_unavailable`) |
 | `local.vss_unavailable`      | Driven needs elevation to use VSS but isn't elevated |
