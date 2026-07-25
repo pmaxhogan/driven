@@ -11,6 +11,7 @@ import type {
   ActivityEntry,
   ExclusionPreviewBatch,
   ExclusionPreviewDone,
+  ExclusionPreviewError,
   ExecProgress,
   GlobalSyncStatus,
   PauseState,
@@ -161,4 +162,13 @@ export function onExclusionPreviewDone(
   handler: (done: ExclusionPreviewDone) => void
 ): Promise<UnlistenFn> {
   return listen<ExclusionPreviewDone>("exclusion_preview:done", (e) => handler(e.payload));
+}
+
+/** `exclusion_preview:error` payload: a streaming preview that had already been
+ * handed a generation id failed to set itself up (see `ExclusionPreviewError`).
+ * Discarded, like a batch, when it is not the generation on screen. */
+export function onExclusionPreviewError(
+  handler: (error: ExclusionPreviewError) => void
+): Promise<UnlistenFn> {
+  return listen<ExclusionPreviewError>("exclusion_preview:error", (e) => handler(e.payload));
 }

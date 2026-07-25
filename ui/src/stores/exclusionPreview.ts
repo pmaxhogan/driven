@@ -1,11 +1,16 @@
 import { ref, shallowRef } from "vue";
 
 import * as ipc from "../ipc/commands";
-import { onExclusionPreviewBatch, onExclusionPreviewDone } from "../ipc/events";
+import {
+  onExclusionPreviewBatch,
+  onExclusionPreviewDone,
+  onExclusionPreviewError,
+} from "../ipc/events";
 import { toErrorCode } from "../ipc/errors";
 import type {
   ExclusionPreviewBatch,
   ExclusionPreviewDone,
+  ExclusionPreviewError,
   ExclusionPreviewRequest,
 } from "../ipc/types";
 
@@ -28,6 +33,14 @@ import type {
 //    flush per animation frame (the same pattern as the activity store's
 //    `pendingLive`), so a fast SSD walk streaming thousands of nodes a second
 //    still costs one reactive update per frame.
+//
+// A third thing makes it usable while EDITING rules: a new generation never
+// blanks the old one. `start` builds the incoming tree off to the side and swaps
+// it in whole on its first batch, so the panel goes from one result straight to
+// the next with no empty frame and no counts bouncing through zero. The backend
+// keeps the folder tree in memory across a rule edit, so that first batch
+// normally lands within a frame or two; `recomputing` covers the gap with a
+// dimmed "updating" state rather than a reset.
 //
 // It is a FACTORY, not a Pinia singleton: the add-source wizard and the inline
 // per-source editor can both be mounted, and each needs its own generation,
@@ -172,6 +185,10 @@ export function createExclusionPreview() {
   const treeVersion = ref(0);
   /** A walk is in flight (the "still scanning" indicator). */
   const scanning = ref(false);
+  /** A NEW generation is being computed while the PREVIOUS one is still on
+   * screen (see `start`). Drives a subtle "updating" affordance - never a
+   * reset. Clears the instant the new generation's first batch swaps in. */
+  const recomputing = ref(false);
   /** The last walk ran to completion (not cancelled): show "scan complete". */
   const complete = ref(false);
   const includedCount = ref(0);
@@ -187,11 +204,26 @@ export function createExclusionPreview() {
   const roots = shallowRef<PreviewTreeNode[]>([]);
 
   // --- non-reactive index --------------------------------------------------
-  const index = new Map<string, PreviewTreeNode>();
+  /** The tree being BUILT for the current generation. While a recompute is in
+   *  flight this is NOT what is on screen (see `displayedIndex`). */
+  let index = new Map<string, PreviewTreeNode>();
   let rootChildren: PreviewTreeNode[] = [];
+  /** The index matching what `roots` currently renders. Identical to `index`
+   *  except during a recompute, when the previous generation is still shown. */
+  let displayedIndex = index;
   /** Parents whose `children` gained an entry this flush and so need re-sorting
    *  (sorting once per flush instead of once per insert). */
   let dirtyParents = new Set<PreviewTreeNode | null>();
+  /** The previous generation's tree is on screen and the new one has not
+   * produced anything yet, so nothing may be published.
+   *
+   * This is the whole no-flash guarantee: a rule edit used to blank the tree and
+   * zero the counts the moment it started, then repopulate - so every keystroke
+   * flashed the panel empty and every number bounced through 0. Now the old
+   * result stays put (dimmed via `recomputing`) and is replaced ATOMICALLY by
+   * the new generation's first batch, which with the backend's folder-tree cache
+   * lands in milliseconds. */
+  let swapPending = false;
 
   // --- generation bookkeeping ----------------------------------------------
   /** The generation whose events we accept; null before the first id resolves. */
@@ -205,28 +237,43 @@ export function createExclusionPreview() {
    *  node cap, so this cannot grow without limit). */
   let preIdBatches: ExclusionPreviewBatch[] = [];
   let preIdDone: ExclusionPreviewDone[] = [];
+  let preIdErrors: ExclusionPreviewError[] = [];
 
   // --- coalesced flush -----------------------------------------------------
   const pending: ExclusionPreviewBatch[] = [];
   let pendingDone: ExclusionPreviewDone | null = null;
   let flushScheduled = false;
 
-  /** Reset the tree + totals for a new generation. */
-  function clearTree(): void {
-    index.clear();
+  /** Start building a new generation's tree.
+   *
+   * Deliberately does NOT touch what is rendered when a previous result is
+   * showing: the new tree is built off to the side and swapped in whole (see
+   * `swapPending`). Only a FIRST preview - nothing on screen to preserve -
+   * publishes its empty state, and there the zeroes are the truth rather than a
+   * flash.
+   */
+  function beginGeneration(): void {
+    index = new Map();
     rootChildren = [];
     dirtyParents = new Set();
     pending.length = 0;
     pendingDone = null;
     preIdBatches = [];
     preIdDone = [];
-    roots.value = [];
-    includedCount.value = 0;
-    excludedCount.value = 0;
-    includedBytes.value = 0;
-    truncated.value = false;
+    preIdErrors = [];
     complete.value = false;
-    treeVersion.value += 1;
+
+    swapPending = roots.value.length > 0;
+    recomputing.value = swapPending;
+    if (!swapPending) {
+      displayedIndex = index;
+      roots.value = [];
+      includedCount.value = 0;
+      excludedCount.value = 0;
+      includedBytes.value = 0;
+      truncated.value = false;
+      treeVersion.value += 1;
+    }
   }
 
   /** The container `path`'s children live in, creating any missing ancestor
@@ -282,14 +329,12 @@ export function createExclusionPreview() {
     flushScheduled = false;
     if (pending.length === 0 && pendingDone === null) return;
 
+    let latest: ExclusionPreviewBatch | null = null;
     for (const batch of pending.splice(0)) {
       for (const node of batch.nodes) {
         upsert(node.path, node.isDir, node.included, node.size);
       }
-      includedCount.value = batch.includedCount;
-      excludedCount.value = batch.excludedCount;
-      includedBytes.value = batch.includedBytes;
-      truncated.value = batch.truncated;
+      latest = batch;
     }
 
     for (const parent of dirtyParents) {
@@ -298,9 +343,36 @@ export function createExclusionPreview() {
     }
     dirtyParents = new Set();
 
-    if (pendingDone !== null) {
-      const done = pendingDone;
-      pendingDone = null;
+    const done = pendingDone;
+    pendingDone = null;
+
+    if (swapPending) {
+      // The new generation has something real to show: swap the whole tree and
+      // its totals over in this one update, so the panel goes straight from the
+      // old result to the new one with no empty frame in between. A `done` also
+      // swaps - it is the generation's final word, even if it found nothing -
+      // but a CANCELLED one does not: it means this generation was abandoned,
+      // and the tree on screen is still the best answer available.
+      if (latest === null && (done === null || done.cancelled)) {
+        if (done !== null) {
+          scanning.value = false;
+          recomputing.value = false;
+        }
+        return;
+      }
+      swapPending = false;
+      recomputing.value = false;
+      displayedIndex = index;
+    }
+
+    if (latest !== null) {
+      includedCount.value = latest.includedCount;
+      excludedCount.value = latest.excludedCount;
+      includedBytes.value = latest.includedBytes;
+      truncated.value = latest.truncated;
+    }
+
+    if (done !== null) {
       includedCount.value = done.includedCount;
       excludedCount.value = done.excludedCount;
       includedBytes.value = done.includedBytes;
@@ -345,27 +417,50 @@ export function createExclusionPreview() {
     scheduleFlush();
   }
 
+  /** Take an `exclusion_preview:error` from the event stream.
+   *
+   * The backend hands out the generation id before it can know the preview is
+   * viable (building the matcher reads the source's ignore-file cascade off
+   * disk), so a setup failure arrives here rather than as a rejected `start`.
+   * It is terminal for the generation: stop the spinner and show the code. The
+   * tree is left alone - the view renders the error in its place, and if the
+   * user fixes the rule the next generation swaps a real tree back in. */
+  function ingestError(error: ExclusionPreviewError): void {
+    if (currentId === null) {
+      preIdErrors.push(error);
+      return;
+    }
+    if (error.previewId !== currentId) return;
+    errorCode.value = error.code;
+    scanning.value = false;
+    recomputing.value = false;
+  }
+
   /** Replay the events that arrived before the generation id was known, keeping
    *  only the ones that belong to it. */
   function drainPreId(): void {
     const batches = preIdBatches;
     const dones = preIdDone;
+    const errors = preIdErrors;
     preIdBatches = [];
     preIdDone = [];
+    preIdErrors = [];
     for (const batch of batches) ingestBatch(batch);
     for (const done of dones) ingestDone(done);
+    for (const error of errors) ingestError(error);
   }
 
   /**
-   * Start a fresh preview for `req`, replacing whatever is on screen.
+   * Start a fresh preview for `req`, replacing whatever is on screen ONLY once
+   * the replacement exists (see `beginGeneration` / `swapPending`).
    *
-   * The backend cancels the walk this supersedes, so re-previewing on every rule
-   * edit cannot stack concurrent full-tree walks.
+   * The backend supersedes the pass this replaces, so re-previewing on every
+   * rule edit cannot stack concurrent full-tree walks.
    */
   async function start(req: ExclusionPreviewRequest): Promise<void> {
     const seq = ++startSeq;
     currentId = null;
-    clearTree();
+    beginGeneration();
     scanning.value = true;
     errorCode.value = null;
     let id: string;
@@ -377,6 +472,7 @@ export function createExclusionPreview() {
       if (seq === startSeq) {
         errorCode.value = toErrorCode(e);
         scanning.value = false;
+        recomputing.value = false;
       }
       return;
     }
@@ -397,6 +493,7 @@ export function createExclusionPreview() {
     const id = currentId;
     currentId = null;
     scanning.value = false;
+    recomputing.value = false;
     if (id === null) return;
     await ipc.previewExclusionsCancel(id).catch(() => undefined);
   }
@@ -407,6 +504,7 @@ export function createExclusionPreview() {
     const unlisteners = await Promise.all([
       onExclusionPreviewBatch(ingestBatch),
       onExclusionPreviewDone(ingestDone),
+      onExclusionPreviewError(ingestError),
     ]);
     return () => {
       for (const un of unlisteners) un();
@@ -419,6 +517,7 @@ export function createExclusionPreview() {
     // reactive state
     treeVersion,
     scanning,
+    recomputing,
     complete,
     includedCount,
     excludedCount,
@@ -434,7 +533,8 @@ export function createExclusionPreview() {
     flush,
     /** The live generation id, or null. Test/diagnostic seam. */
     currentPreviewId: () => currentId,
-    /** Look up a streamed node by path. Test/diagnostic seam. */
-    nodeAt: (path: string) => index.get(path),
+    /** Look up a node of the tree ON SCREEN by path - which during a recompute
+     *  is still the previous generation's. Test/diagnostic seam. */
+    nodeAt: (path: string) => displayedIndex.get(path),
   };
 }

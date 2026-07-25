@@ -879,16 +879,35 @@ pub async fn preview_exclusions(
 /// candidate globs, resolve the walk root from a backend-trusted selector, and
 /// build the SAME matcher the scanner uses.
 ///
-/// Factored out so the two commands can never drift apart on the
-/// security-relevant half: identical pattern validation (R4-P2-1), identical
-/// exactly-one-selector rule (R4-P2-1), identical dialog-token PEEK + SQLite
-/// lookup (R1-P1-2, SPEC s11.6.1), and identical [`validate_readable_dir`]
-/// canonicalisation. Returns the canonical root plus its matcher, ready for a
-/// (blocking) walk.
+/// A thin composition of [`resolve_preview_root`] and [`build_preview_matcher`];
+/// the streaming command calls the two halves SEPARATELY because only the first
+/// is fast (see [`resolve_preview_root`]).
 pub(crate) async fn resolve_preview_root_and_matcher(
     state: &State<'_, AppState>,
     req: &ExclusionPreviewRequest,
 ) -> CommandResult<(std::path::PathBuf, driven_core::exclude::SourceMatcher)> {
+    let canon = resolve_preview_root(state, req).await?;
+    let matcher = build_preview_matcher(&canon, req).map_err(CommandError::from)?;
+    Ok((canon, matcher))
+}
+
+/// Validate a preview request and resolve its walk root - the FAST, fallible
+/// half, and everything a caller must do before it can hand out a preview id.
+///
+/// Factored out so the two preview commands can never drift apart on the
+/// security-relevant part: identical pattern validation (R4-P2-1), identical
+/// exactly-one-selector rule (R4-P2-1), identical dialog-token PEEK + SQLite
+/// lookup (R1-P1-2, SPEC s11.6.1), and identical [`validate_readable_dir`]
+/// canonicalisation.
+///
+/// Everything here is bounded work - a glob parse, one indexed SQLite row or an
+/// in-memory token peek, one `canonicalize` + `read_dir` probe - so the
+/// streaming command can await it inline and still return its generation id
+/// promptly. The UNbounded work is [`build_preview_matcher`].
+pub(crate) async fn resolve_preview_root(
+    state: &State<'_, AppState>,
+    req: &ExclusionPreviewRequest,
+) -> CommandResult<std::path::PathBuf> {
     // R4-P2-1: validate the candidate include / exclude globs BEFORE walking,
     // so an invalid / oversized glob surfaces a stable s24 invalid-input error
     // (the same code add_source / update_source use) instead of a confusing
@@ -916,12 +935,28 @@ pub(crate) async fn resolve_preview_root_and_matcher(
             }
         };
 
-    let canon = validate_readable_dir(&root)?;
+    validate_readable_dir(&root)
+}
 
-    // A synthetic source carrying the candidate rules so the SAME matcher the
-    // scanner uses (defaults + optional gitignore tier + the candidate
-    // include/exclude globs) decides include/exclude - the preview matches the
-    // real backup classification exactly.
+/// Build the matcher a preview of `canon` under `req`'s candidate rules should
+/// classify with - the SLOW half, deliberately separated from
+/// [`resolve_preview_root`].
+///
+/// Slow because [`build_source_matcher`] collects the source's ignore-file
+/// cascade off disk (`.gitignore` / `.ignore` / `.git/info/exclude` and the
+/// global tiers); on a repo-of-repos that is seconds of I/O on its own. The
+/// streaming command therefore runs this INSIDE its blocking task, after the
+/// preview id is already back in the webview's hands, and reports a failure on
+/// `exclusion_preview:error` rather than as a rejected call.
+///
+/// The matcher is built from a synthetic source carrying the candidate rules, so
+/// the SAME matcher the scanner uses (defaults + optional gitignore tier + the
+/// candidate include/exclude globs) decides include/exclude - the preview
+/// matches the real backup classification exactly.
+pub(crate) fn build_preview_matcher(
+    canon: &std::path::Path,
+    req: &ExclusionPreviewRequest,
+) -> anyhow::Result<driven_core::exclude::SourceMatcher> {
     let synthetic = SourceRow {
         id: SourceId::new_v4(),
         account_id: AccountId::new_v4(),
@@ -947,9 +982,7 @@ pub(crate) async fn resolve_preview_root_and_matcher(
         created_at: 0,
     };
 
-    let matcher = build_source_matcher(&synthetic).map_err(CommandError::from)?;
-
-    Ok((canon, matcher))
+    build_source_matcher(&synthetic)
 }
 
 /// Walk `root` and classify every regular file as included vs excluded under

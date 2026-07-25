@@ -69,12 +69,16 @@ onUnmounted(() => {
   teardown = null;
 });
 
-/** (Re)start the walk with the CURRENT rules. Called on mount, and by the
- *  parent editor whenever a rule changes (textarea blur, gitignore toggle, or a
- *  "+"/"-" click). The backend cancels the walk this supersedes. */
+/** (Re)start the classification with the CURRENT rules. Called on mount, and by
+ * the parent editor whenever a rule changes (textarea blur, gitignore toggle, or
+ * a "+"/"-" click). The backend supersedes the pass this replaces.
+ *
+ * Expansion and paging state deliberately SURVIVE a restart. A rule edit
+ * re-classifies the same folder, so the folders the user opened to inspect are
+ * exactly the ones they still want open - collapsing the tree on every keystroke
+ * (which is what resetting these did) threw away their place in it. Paths are
+ * stable keys, so a path that stops being streamed simply never matches. */
 async function restart(): Promise<void> {
-  expanded.value = new Set();
-  shownLimit.value = new Map();
   await preview.start({
     sourceId: props.sourceId ?? undefined,
     localPathToken: props.localPathToken ?? undefined,
@@ -181,8 +185,15 @@ async function applyRule(node: PreviewTreeNode): Promise<void> {
 <template>
   <div class="space-y-2" data-testid="exclusion-preview">
     <!-- Running summary: counts + bytes stay EXACT even when the tree below is
-         truncated, and the scan state is spelled out in words. -->
-    <div class="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm">
+         truncated, and the scan state is spelled out in words.
+
+         While a rule edit is being re-classified the PREVIOUS numbers stay put,
+         dimmed - they are the last true answer, and blanking them to zero for a
+         frame read as "your rule excluded everything". -->
+    <div
+      class="flex flex-wrap items-center gap-x-3 gap-y-1 text-sm transition-opacity duration-150"
+      :class="preview.recomputing.value ? 'opacity-60' : ''"
+    >
       <span class="text-zinc-700 dark:text-zinc-300">
         {{
           t("settings.addSource.preview.included", {
@@ -205,7 +216,19 @@ async function applyRule(node: PreviewTreeNode): Promise<void> {
         }}
       </span>
       <span
-        v-if="preview.scanning.value"
+        v-if="preview.recomputing.value"
+        class="inline-flex items-center gap-1.5 text-xs text-zinc-500 dark:text-zinc-400"
+        data-testid="preview-recomputing"
+        role="status"
+      >
+        <span
+          class="size-1.5 animate-pulse rounded-full bg-zinc-400 dark:bg-zinc-500"
+          aria-hidden="true"
+        />
+        {{ t("settings.exclusionPreview.recomputing") }}
+      </span>
+      <span
+        v-else-if="preview.scanning.value"
         class="inline-flex items-center gap-1.5 text-xs text-teal-700 dark:text-teal-300"
         data-testid="preview-scanning"
         role="status"
@@ -232,7 +255,8 @@ async function applyRule(node: PreviewTreeNode): Promise<void> {
 
     <div
       v-else
-      class="max-h-64 overflow-auto rounded-md border border-zinc-200 bg-zinc-50/60 p-1 dark:border-zinc-700 dark:bg-zinc-950/40"
+      class="max-h-64 overflow-auto rounded-md border border-zinc-200 bg-zinc-50/60 p-1 transition-opacity duration-150 dark:border-zinc-700 dark:bg-zinc-950/40"
+      :class="preview.recomputing.value ? 'opacity-60' : ''"
     >
       <p
         v-if="rows.length === 0"

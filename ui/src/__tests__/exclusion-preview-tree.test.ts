@@ -17,6 +17,7 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 let batchHandler: ((payload: unknown) => void) | null = null;
 let doneHandler: ((payload: unknown) => void) | null = null;
+let errorHandler: ((payload: unknown) => void) | null = null;
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (event: string, cb: (e: { payload: unknown }) => void) => {
     if (event === "exclusion_preview:batch") {
@@ -24,6 +25,9 @@ vi.mock("@tauri-apps/api/event", () => ({
     }
     if (event === "exclusion_preview:done") {
       doneHandler = (payload: unknown) => cb({ payload });
+    }
+    if (event === "exclusion_preview:error") {
+      errorHandler = (payload: unknown) => cb({ payload });
     }
     return vi.fn();
   }),
@@ -39,10 +43,10 @@ function node(path: string, isDir: boolean, included: boolean, size = 0): Exclus
   return { path, isDir, included, size };
 }
 
-function batch(nodes: ExclusionPreviewNode[]): ExclusionPreviewBatch {
+function batch(nodes: ExclusionPreviewNode[], previewId = "gen-1"): ExclusionPreviewBatch {
   const files = nodes.filter((n) => !n.isDir);
   return {
-    previewId: "gen-1",
+    previewId,
     nodes,
     includedCount: files.filter((n) => n.included).length,
     excludedCount: files.filter((n) => !n.included).length,
@@ -71,12 +75,19 @@ async function mountWithNodes(nodes: ExclusionPreviewNode[]) {
   return wrapper;
 }
 
+/** Let the controller's rAF-fallback flush run, then settle Vue. */
+async function settle(): Promise<void> {
+  vi.advanceTimersByTime(20);
+  await flushPromises();
+}
+
 beforeEach(() => {
   vi.useFakeTimers();
   invokeMock.mockReset();
   invokeMock.mockResolvedValue("gen-1");
   batchHandler = null;
   doneHandler = null;
+  errorHandler = null;
 });
 
 describe("ExclusionPreviewTree", () => {
@@ -327,6 +338,77 @@ describe("ExclusionPreviewTree", () => {
     expect(invokeMock).toHaveBeenCalledWith("preview_exclusions_cancel", {
       previewId: "gen-1",
     });
+  });
+
+  // (e) a rule edit updates the tree in place - it never blanks it.
+  it("keeps the old rows and counts visible, dimmed, while a rule edit recomputes", async () => {
+    const wrapper = await mountWithNodes([
+      node("keep.txt", false, true, 1024),
+      node("skip.log", false, false, 8),
+    ]);
+    expect(wrapper.find('[data-testid="preview-recomputing"]').exists()).toBe(false);
+
+    invokeMock.mockResolvedValue("gen-2");
+    await wrapper.setProps({ excludePatterns: ["*.log"] });
+    await (wrapper.vm as unknown as { restart: () => Promise<void> }).restart();
+    await settle();
+
+    // The previous answer is still on screen and still readable - just marked
+    // as being refreshed. Blanking it here is the bug this replaces.
+    expect(wrapper.find('[data-testid="preview-row-keep.txt"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="preview-row-skip.log"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain(
+      i18n.global.t("settings.addSource.preview.included", { count: "1" })
+    );
+    expect(wrapper.text()).toContain("1 KB");
+    const recomputing = wrapper.get('[data-testid="preview-recomputing"]');
+    expect(recomputing.attributes("role")).toBe("status");
+    expect(recomputing.text()).toBe(i18n.global.t("settings.exclusionPreview.recomputing"));
+    // ...and only ONE state badge shows at a time.
+    expect(wrapper.find('[data-testid="preview-scanning"]').exists()).toBe(false);
+    expect(wrapper.get('[role="tree"]').element.closest(".opacity-60")).not.toBeNull();
+
+    // The new generation's first batch swaps everything over at once.
+    batchHandler!(batch([node("keep.txt", false, true, 1024)], "gen-2"));
+    await settle();
+    expect(wrapper.find('[data-testid="preview-recomputing"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="preview-scanning"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="preview-row-skip.log"]').exists()).toBe(false);
+    expect(wrapper.get('[role="tree"]').element.closest(".opacity-60")).toBeNull();
+  });
+
+  it("keeps the folders the user opened expanded across a rule edit", async () => {
+    // A rule edit re-classifies the SAME folder, so collapsing the tree throws
+    // away the user's place in it right when they are inspecting a subtree.
+    const wrapper = await mountWithNodes([
+      node("docs", true, true),
+      node("docs/inner.txt", false, true),
+    ]);
+    await wrapper.get('[data-testid="preview-row-docs"]').get("button").trigger("click");
+    expect(wrapper.find('[data-testid="preview-row-docs/inner.txt"]').exists()).toBe(true);
+
+    invokeMock.mockResolvedValue("gen-2");
+    await wrapper.setProps({ excludePatterns: ["*.txt"] });
+    await (wrapper.vm as unknown as { restart: () => Promise<void> }).restart();
+    batchHandler!(batch([node("docs", true, true), node("docs/inner.txt", false, false)], "gen-2"));
+    await settle();
+
+    expect(wrapper.get('[data-testid="preview-row-docs"]').attributes("aria-expanded")).toBe(
+      "true"
+    );
+    const inner = wrapper.get('[data-testid="preview-row-docs/inner.txt"]');
+    expect(inner.html()).toContain("line-through");
+  });
+
+  it("localizes a post-start error event the same way as a rejected start", async () => {
+    const wrapper = await mountWithNodes([node("a.txt", false, true)]);
+    errorHandler!({ previewId: "gen-1", code: "local.io_error", message: "unreadable" });
+    await settle();
+
+    const alert = wrapper.get('[role="alert"]');
+    expect(alert.text()).toBe(i18n.global.t("errors.local.io_error.long"));
+    expect(wrapper.find('[role="tree"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="preview-scanning"]').exists()).toBe(false);
   });
 
   it("localizes a start failure instead of leaving an empty tree unexplained", async () => {
