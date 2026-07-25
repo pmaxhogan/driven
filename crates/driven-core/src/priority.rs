@@ -39,6 +39,22 @@
 //! owns for their entire life (a dedicated walker/hasher worker), where there
 //! is no "afterwards" to restore to.
 //!
+//! # Where this is applied today, and what it does NOT cover yet
+//!
+//! One site: the executor's `build_bundle` blocking task (V2 small-file
+//! bundling), which reads every member off disk and gzips it. So the setting
+//! currently shapes **bundled small-file uploads only**.
+//!
+//! A large-file backup is not covered, and cannot be by a per-thread guard as
+//! things stand: the read/hash/encrypt/upload pipeline is a set of interleaved
+//! async stages, and the actual disk reads happen on `tokio::fs`'s internal
+//! blocking pool, which Driven does not own a handle to. The scanner's walk and
+//! deep-verify hashing are the other big consumers, and they run inline on the
+//! async task today. The win there arrives when the scanner moves to dedicated
+//! worker threads: those are Driven's own, live for the whole walk, and should
+//! call [`apply_to_current_thread`] at startup. This module exists in the shape
+//! it does so that adoption is a one-line change.
+//!
 //! # What each level maps to, per OS
 //!
 //! | | Windows | Linux | macOS |
