@@ -55,6 +55,11 @@ env:
   # compile-time-checked queries; CI has no live DB, so resolve against the
   # committed .sqlx/ cache (same as ci.yml).
   SQLX_OFFLINE: "true"
+  # No debuginfo in CI dev builds - MUST match ci.yml's value: both workflows
+  # share the per-OS "workspace" rust-cache key, and a differing debug level
+  # would fork every fingerprint and thrash that shared cache. (See ci.yml for
+  # the MSVC link-time rationale.)
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   chaos-hermetic:
@@ -70,6 +75,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      # Defender exclusion for the build dirs (see ci.yml rust-test for the
+      # rationale); ordered before the cache restore so the untar benefits.
+      - name: Exclude build dirs from Windows Defender
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux Tauri deps
         if: runner.os == 'Linux'
@@ -104,6 +118,15 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
+      # Defender exclusion for the build dirs (see ci.yml rust-test for the
+      # rationale); ordered before the cache restore so the untar benefits.
+      - name: Exclude build dirs from Windows Defender
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux Tauri deps
         if: runner.os == 'Linux'

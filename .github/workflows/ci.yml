@@ -21,6 +21,14 @@ env:
   # checked queries resolve against the committed `.sqlx/` cache instead.
   # Regenerated locally with `cargo sqlx prepare --workspace`.
   SQLX_OFFLINE: "true"
+  # CI-only: no debuginfo in the dev profile. PDB generation dominates MSVC
+  # link time (each `--all-targets` test binary links separately), and CI never
+  # attaches a debugger - panics still name the failing test via RUST_BACKTRACE.
+  # Set as an env override (not Cargo.toml) so LOCAL builds keep full debuginfo.
+  # chaos.yml sets the SAME value: both workflows share the per-OS "workspace"
+  # rust-cache key, and a differing debug level would fork every fingerprint and
+  # thrash that shared cache.
+  CARGO_PROFILE_DEV_DEBUG: "0"
 
 jobs:
   rust-fmt:
@@ -41,6 +49,19 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
+      # Defender's real-time scan inspects every file create; a cargo build
+      # writes tens of thousands under target/, and the rust-cache untar below
+      # tens of thousands more. Excluding the build dirs is the single biggest
+      # windows-latest win after debuginfo. Hosted runners run elevated, so
+      # Add-MpPreference just works; ordered BEFORE the cache restore so the
+      # untar benefits too.
+      - name: Exclude build dirs from Windows Defender
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
       - uses: dtolnay/rust-toolchain@stable
         with: { components: clippy }
       - name: Install Linux Tauri deps
@@ -64,7 +85,13 @@ jobs:
           save-if: ${{ github.ref == 'refs/heads/main' }}
       - name: cargo build (compile-only)
         run: cargo build --workspace --all-targets
+      # Clippy findings are lint-level and platform-independent in practice;
+      # running it on all three OSes tripled the cost of an entire extra check
+      # pass for zero unique signal, and windows-latest paid the most for it.
+      # The job NAME keeps the os suffix on every OS so the required status
+      # checks ("cargo test + clippy (<os>)") continue to match.
       - name: cargo clippy
+        if: matrix.os == 'ubuntu-latest'
         run: cargo clippy --workspace --all-targets -- -D warnings
       - name: cargo test
         run: cargo test --workspace
@@ -106,6 +133,15 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
+      # Same Defender exclusion as rust-test above: the debug tauri build writes
+      # the same tens of thousands of target/ files.
+      - name: Exclude build dirs from Windows Defender
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
+          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v6
         with: { version: 10 }
