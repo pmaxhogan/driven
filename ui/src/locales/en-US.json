@@ -20,6 +20,7 @@
   "progress": {
     "backingUp": "Backing up...",
     "backingUpPercent": "Backing up - {percent}%",
+    "backingUpPercentFiles": "Backing up - {percent}% ({done} of {total} files)",
     "starting": "Starting backup...",
     "scanning": "Scanning for changes...",
     "scanningCount": "Scanning for changes - {count} files",

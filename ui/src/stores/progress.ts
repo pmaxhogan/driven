@@ -3,7 +3,12 @@ import { computed, ref } from "vue";
 import type { UnlistenFn } from "@tauri-apps/api/event";
 
 import * as ipc from "../ipc/commands";
-import { onSyncStatusChanged, type SyncStatusChangedPayload } from "../ipc/events";
+import {
+  onSyncSourceProgress,
+  onSyncStatusChanged,
+  type SourceProgressPayload,
+  type SyncStatusChangedPayload,
+} from "../ipc/events";
 import type { ExecProgress, GlobalSyncStatus, OrchestratorState } from "../ipc/types";
 
 /**
@@ -18,6 +23,13 @@ import type { ExecProgress, GlobalSyncStatus, OrchestratorState } from "../ipc/t
  * determinate percent comes from the `executing` phase's byte/file totals; the
  * scan/plan/verify phases carry no reliable total, so the bar runs indeterminate
  * for them.
+ *
+ * The `executing` STATE is only ever emitted once per source, carrying a ZEROED
+ * `ExecProgress` - the moving counters arrive on the separate
+ * `sync:source_progress` channel. So the store subscribes to both and folds the
+ * latest per-account tick over the state's embedded snapshot; without the tick
+ * the "determinate" branch never has a non-zero total and the bar stays an
+ * indeterminate sweep for the whole upload.
  */
 
 /** OrchestratorState discriminants (SPEC s5) that mean a backup/sync run is
@@ -55,10 +67,10 @@ function numField(obj: Record<string, unknown>, key: string): number {
   return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
 
-/** Extract the ExecProgress carried by an `executing` state, or null otherwise. */
-function execProgressOf(state: OrchestratorState): ExecProgress | null {
-  if (stateTag(state) !== "executing") return null;
-  const p = state["progress"];
+/** Coerce an untyped wire `progress` object into an ExecProgress, or null when it
+ * is not an object at all. Shared by the `executing` state's embedded snapshot
+ * and the `sync:source_progress` ticks, so both go through one reader. */
+function readExecProgress(p: unknown): ExecProgress | null {
   if (p === null || typeof p !== "object") return null;
   const o = p as Record<string, unknown>;
   return {
@@ -70,6 +82,12 @@ function execProgressOf(state: OrchestratorState): ExecProgress | null {
     trashes_total: numField(o, "trashes_total"),
     errors: numField(o, "errors"),
   };
+}
+
+/** Extract the ExecProgress carried by an `executing` state, or null otherwise. */
+function execProgressOf(state: OrchestratorState): ExecProgress | null {
+  if (stateTag(state) !== "executing") return null;
+  return readExecProgress(state["progress"]);
 }
 
 /** Clamp a fraction into [0, 1] (and map NaN to 0). */
@@ -86,19 +104,55 @@ export const useProgressStore = defineStore("progress", () => {
   // `hydrate()` (via get_sync_status) always supplies the aggregate.
   const states = ref<Record<string, OrchestratorState>>({});
 
+  // Latest `sync:source_progress` tick per account. The orchestrator runs one
+  // source at a time per account and re-enters `executing` with a zeroed
+  // snapshot for each, so ONE latest tick per account is the whole picture -
+  // and a state change for that account always drops its tick (below), which is
+  // what stops a finished run's last tick from leaking into the next one.
+  const ticks = ref<Record<string, ExecProgress>>({});
+
   function isGlobal(payload: SyncStatusChangedPayload): payload is GlobalSyncStatus {
     return Array.isArray((payload as GlobalSyncStatus).accounts);
   }
 
-  /** Fold one status payload into the per-account map (handles both shapes). */
+  /** Fold one status payload into the per-account map (handles both shapes).
+   *
+   * Any state change for an account DROPS that account's pending progress tick,
+   * including a fresh `executing` transition (which carries `ExecProgress::zero()`
+   * and marks the head of a NEW source's execution). Without that, the previous
+   * run's final tick - typically 100% - would be folded into the new run and the
+   * bar would open full before falling back. */
   function ingest(payload: SyncStatusChangedPayload): void {
     if (isGlobal(payload)) {
       const next: Record<string, OrchestratorState> = {};
       for (const a of payload.accounts) next[a.account_id] = a.state;
       states.value = next;
+      // An aggregate snapshot re-states EVERY account, so every tick is stale.
+      ticks.value = {};
     } else {
       states.value = { ...states.value, [payload.account_id]: payload.state };
+      if (payload.account_id in ticks.value) {
+        const next = { ...ticks.value };
+        delete next[payload.account_id];
+        ticks.value = next;
+      }
     }
+  }
+
+  /** Fold one `sync:source_progress` tick into the per-account map.
+   *
+   * Gated on the account being CURRENTLY `executing`: a tick that arrives after
+   * the run left that state (the executor's final snapshot can trail the
+   * transition, and an account we have never seen a status for is not running at
+   * all) must not resurrect the bar or contribute to the percent. The `exec`
+   * aggregate re-checks the same condition at read time, so even a tick stored
+   * and then orphaned by an out-of-order status event is ignored. */
+  function ingestProgress(payload: SourceProgressPayload): void {
+    const state = states.value[payload.account_id];
+    if (!state || stateTag(state) !== "executing") return;
+    const progress = readExecProgress(payload.progress);
+    if (!progress) return;
+    ticks.value = { ...ticks.value, [payload.account_id]: progress };
   }
 
   /** True while ANY account's orchestrator is in a working state - i.e. a
@@ -148,7 +202,15 @@ export const useProgressStore = defineStore("progress", () => {
   const verified = computed<number>(() => sumOver("verifying", "sampled"));
 
   /** Aggregate execution progress across every account currently `executing`.
-   * Scan/plan/verify carry no reliable total, so they contribute nothing here. */
+   * Scan/plan/verify carry no reliable total, so they contribute nothing here.
+   *
+   * Per account the FRESHEST reading wins: the latest `sync:source_progress`
+   * tick when there is one, else the snapshot embedded in the `executing` state
+   * (which is always the zeroed one the transition carried). Iterating `states`
+   * rather than `ticks` is what keeps a stale tick out of the sum - an account
+   * that is no longer `executing` contributes nothing regardless of what tick it
+   * still holds. Multi-account runs still SUM, so two accounts uploading at once
+   * produce one combined percent. */
   const exec = computed(() => {
     let filesDone = 0;
     let filesTotal = 0;
@@ -156,8 +218,8 @@ export const useProgressStore = defineStore("progress", () => {
     let bytesTotal = 0;
     let trashesDone = 0;
     let trashesTotal = 0;
-    for (const s of Object.values(states.value)) {
-      const p = execProgressOf(s);
+    for (const [accountId, s] of Object.entries(states.value)) {
+      const p = stateTag(s) === "executing" ? (ticks.value[accountId] ?? execProgressOf(s)) : null;
       if (!p) continue;
       filesDone += p.files_done;
       filesTotal += p.files_total;
@@ -198,22 +260,30 @@ export const useProgressStore = defineStore("progress", () => {
   const filesTotal = computed<number>(() => exec.value.filesTotal);
 
   // --- event subscription (App.vue owns the app-lifetime registration) ------
-  let unlisten: UnlistenFn | null = null;
+  let unlisteners: UnlistenFn[] = [];
   let desiredSubscribed = false;
 
-  /** Subscribe to `sync:status_changed` (idempotent). */
+  /** Subscribe to `sync:status_changed` AND `sync:source_progress` (idempotent).
+   * Both are needed for a determinate bar: the first says WHICH phase each
+   * account is in, the second carries the moving counters. Registered together
+   * so App.vue keeps its single call. A partial failure tears down whatever did
+   * register and resets, so a later retry starts clean rather than leaking a
+   * half-wired subscription. */
   async function subscribe(): Promise<void> {
     if (desiredSubscribed) return;
     desiredSubscribed = true;
+    const registered: UnlistenFn[] = [];
     try {
-      const un = await onSyncStatusChanged((payload) => ingest(payload));
+      registered.push(await onSyncStatusChanged((payload) => ingest(payload)));
+      registered.push(await onSyncSourceProgress((payload) => ingestProgress(payload)));
       // unsubscribe() may have raced ahead while we awaited; honor it.
       if (!desiredSubscribed) {
-        un();
+        for (const un of registered) un();
         return;
       }
-      unlisten = un;
+      unlisteners = registered;
     } catch (e) {
+      for (const un of registered) un();
       // Reset so a later retry can re-subscribe; re-throw so the caller can log.
       desiredSubscribed = false;
       throw e;
@@ -232,17 +302,16 @@ export const useProgressStore = defineStore("progress", () => {
     }
   }
 
-  /** Stop the subscription. */
+  /** Stop every subscription. */
   function unsubscribe(): void {
     desiredSubscribed = false;
-    if (unlisten) {
-      unlisten();
-      unlisten = null;
-    }
+    for (const un of unlisteners) un();
+    unlisteners = [];
   }
 
   return {
     states,
+    ticks,
     active,
     phase,
     scanned,
@@ -253,6 +322,7 @@ export const useProgressStore = defineStore("progress", () => {
     filesTotal,
     exec,
     ingest,
+    ingestProgress,
     subscribe,
     hydrate,
     unsubscribe,

@@ -1134,11 +1134,35 @@ fn spawn_event_bridge(
                         );
                     }
                 }
+                BridgeAction::SourceProgress {
+                    source_id,
+                    progress,
+                } => {
+                    // The `Executing` state transition carries a ZEROED
+                    // ExecProgress and never fires again for that source, so the
+                    // moving counters only exist on these ticks. Forwarding them
+                    // is what makes the top-of-app bar determinate instead of an
+                    // indeterminate sweep for the whole upload. The account id
+                    // comes from this bridge (the core event carries only the
+                    // source) so the webview can attribute the tick.
+                    let payload = SourceProgressEvent {
+                        account_id: account_id.to_string(),
+                        source_id: source_id.to_string(),
+                        progress,
+                    };
+                    if let Err(err) = events::emit_sync_source_progress(&app, &payload) {
+                        tracing::debug!(
+                            target: TARGET,
+                            account_id = %account_id,
+                            %err,
+                            "emit sync:source_progress failed"
+                        );
+                    }
+                }
                 BridgeAction::Ignore => {
-                    // Progress / Power / Network events: not bridged to the
-                    // webview in M5 (the progress DTO lands with a later
-                    // milestone). The tray's coarse state is driven by
-                    // StateChanged above.
+                    // Power / Network events: not bridged to the webview - the
+                    // tray's coarse state is driven by StateChanged above and
+                    // the gate outcome surfaces as a `Paused` state anyway.
                 }
                 BridgeAction::Stop => {
                     tracing::debug!(
@@ -1173,7 +1197,14 @@ enum BridgeAction {
     /// `activity:lagged` so the webview reconciles from the durable
     /// `activity_log`. No durable row is lost.
     ActivityReconcile { skipped: u64 },
-    /// A non-bridged event (progress / power / network); do nothing.
+    /// Emit `sync:source_progress` with one execution-progress tick, so the
+    /// webview's progress bar moves during an upload (the `Executing` state
+    /// transition only ever carries `ExecProgress::zero()`).
+    SourceProgress {
+        source_id: driven_core::types::SourceId,
+        progress: driven_core::types::ExecProgress,
+    },
+    /// A non-bridged event (power / network); do nothing.
     Ignore,
     /// The broadcast closed (orchestrator dropped); end the bridge.
     Stop,
@@ -1192,6 +1223,13 @@ fn classify_bridge_event(
             BridgeAction::NeedsReauth { account_id }
         }
         Ok(OrchestratorEvent::ActivityWritten { entry }) => BridgeAction::ActivityNew { entry },
+        Ok(OrchestratorEvent::Progress {
+            source_id,
+            progress,
+        }) => BridgeAction::SourceProgress {
+            source_id,
+            progress,
+        },
         Ok(_) => BridgeAction::Ignore,
         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
             BridgeAction::ActivityReconcile { skipped }
@@ -1210,13 +1248,24 @@ struct AccountSyncStatusEvent {
     state: driven_core::types::OrchestratorState,
 }
 
+/// The per-tick `sync:source_progress` payload (SPEC s11.7
+/// `{ source_id, progress }`, plus the `account_id` the bridge knows and the
+/// core event does not). snake_case on the wire like the rest of the M5 sync
+/// DTOs and like `ExecProgress` itself, so the webview parses one convention.
+#[derive(serde::Serialize, Clone)]
+struct SourceProgressEvent {
+    account_id: String,
+    source_id: String,
+    progress: driven_core::types::ExecProgress,
+}
+
 #[cfg(test)]
 mod tests {
     use super::{classify_bridge_event, BridgeAction};
     use driven_core::orchestrator::OrchestratorConfig;
     use driven_core::state::sqlite::SqliteStateRepo;
     use driven_core::state::StateRepo;
-    use driven_core::types::{ActivityEntry, OrchestratorEvent};
+    use driven_core::types::{AccountId, ActivityEntry, ExecProgress, OrchestratorEvent, SourceId};
     use tokio::sync::broadcast::error::RecvError;
 
     /// M7-P1-1: a broadcast `Lagged` MUST classify as an `ActivityReconcile`
@@ -1260,6 +1309,73 @@ mod tests {
         }
     }
 
+    /// An execution-progress tick MUST classify as `SourceProgress` (carrying the
+    /// source + the moving counters unchanged) so the bridge emits
+    /// `sync:source_progress`. This is the fix for the bar staying indeterminate:
+    /// the `Executing` state transition carries only `ExecProgress::zero()`, so
+    /// dropping these ticks (the old `Ignore`) left the webview with nothing but
+    /// zeros and therefore no percent.
+    #[test]
+    fn progress_classifies_as_source_progress() {
+        let source_id = SourceId::new_v4();
+        let progress = ExecProgress {
+            files_done: 3,
+            files_total: 10,
+            bytes_done: 512,
+            bytes_total: 2048,
+            trashes_done: 1,
+            trashes_total: 2,
+            errors: 0,
+        };
+        match classify_bridge_event(Ok(OrchestratorEvent::Progress {
+            source_id,
+            progress,
+        })) {
+            BridgeAction::SourceProgress {
+                source_id: got_source,
+                progress: got,
+            } => {
+                assert_eq!(got_source, source_id);
+                assert_eq!(got, progress, "the tick must be forwarded unchanged");
+            }
+            other => panic!(
+                "Progress must bridge, got {:?}",
+                BridgeActionKind::of(&other)
+            ),
+        }
+    }
+
+    /// The `sync:source_progress` payload must serialize snake_case (matching
+    /// the M5 sync DTOs and `ExecProgress` itself) and carry the account id the
+    /// bridge adds, so the webview can attribute a tick to one orchestrator and
+    /// parse `progress` with the same reader it uses for the `executing` state.
+    #[test]
+    fn source_progress_payload_is_snake_case_with_account() {
+        let account_id = AccountId::new_v4();
+        let source_id = SourceId::new_v4();
+        let payload = super::SourceProgressEvent {
+            account_id: account_id.to_string(),
+            source_id: source_id.to_string(),
+            progress: ExecProgress {
+                files_done: 2,
+                files_total: 4,
+                bytes_done: 100,
+                bytes_total: 400,
+                trashes_done: 0,
+                trashes_total: 0,
+                errors: 0,
+            },
+        };
+        let json = serde_json::to_value(&payload).expect("serialize");
+        assert_eq!(
+            json["account_id"],
+            serde_json::json!(account_id.to_string())
+        );
+        assert_eq!(json["source_id"], serde_json::json!(source_id.to_string()));
+        assert_eq!(json["progress"]["files_done"], serde_json::json!(2));
+        assert_eq!(json["progress"]["bytes_total"], serde_json::json!(400));
+    }
+
     /// A closed broadcast classifies as `Stop` so the bridge ends (no orphaned
     /// task); a non-bridged event (`Power`) classifies as `Ignore`.
     #[test]
@@ -1284,6 +1400,7 @@ mod tests {
         NeedsReauth,
         ActivityNew,
         ActivityReconcile,
+        SourceProgress,
         Ignore,
         Stop,
     }
@@ -1294,6 +1411,7 @@ mod tests {
                 BridgeAction::NeedsReauth { .. } => Self::NeedsReauth,
                 BridgeAction::ActivityNew { .. } => Self::ActivityNew,
                 BridgeAction::ActivityReconcile { .. } => Self::ActivityReconcile,
+                BridgeAction::SourceProgress { .. } => Self::SourceProgress,
                 BridgeAction::Ignore => Self::Ignore,
                 BridgeAction::Stop => Self::Stop,
             }

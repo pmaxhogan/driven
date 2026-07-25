@@ -109,8 +109,9 @@ describe("App shell", () => {
   it("subscribes + hydrates the updater, progress and pause stores on boot", async () => {
     await mountAppAt("/activity");
     // Three updater events (available, download_progress, downloaded) + the
-    // sync-status event + the pause event registered.
-    expect(listenMock).toHaveBeenCalledTimes(5);
+    // progress store's TWO sync events (status_changed for the phase,
+    // source_progress for the moving counters) + the pause event registered.
+    expect(listenMock).toHaveBeenCalledTimes(6);
     expect(invokeMock).toHaveBeenCalledWith("get_pending_update_info", undefined);
     expect(invokeMock).toHaveBeenCalledWith("get_sync_status", undefined);
     expect(invokeMock).toHaveBeenCalledWith("get_pause_state", undefined);

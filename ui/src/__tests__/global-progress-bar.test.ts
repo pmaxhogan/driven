@@ -46,6 +46,24 @@ function executing(p: Partial<ExecProgress>): OrchestratorState {
 function perAccount(accountId: string, state: OrchestratorState) {
   return { account_id: accountId, state };
 }
+/** One `sync:source_progress` tick - the ONLY carrier of the moving counters
+ * (the `executing` transition itself carries `ExecProgress::zero()`). */
+function tick(accountId: string, p: Partial<ExecProgress>) {
+  return {
+    account_id: accountId,
+    source_id: "src-1",
+    progress: {
+      files_done: 0,
+      files_total: 0,
+      bytes_done: 0,
+      bytes_total: 0,
+      trashes_done: 0,
+      trashes_total: 0,
+      errors: 0,
+      ...p,
+    },
+  };
+}
 
 function mountBar() {
   const pinia = createPinia();
@@ -167,12 +185,48 @@ describe("GlobalProgressBar", () => {
       expect(wrapper.find(PHASE_LABEL).text()).toBe("Backing up - 50%");
     });
 
+    it("names the file counts once the live ticks carry a total", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", executing({})));
+      store.ingestProgress(tick("a", { bytes_done: 512, bytes_total: 1024 }));
+      await wrapper.vm.$nextTick();
+      // No file total yet (a delete-only plan uploads nothing): bare percent.
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Backing up - 50%");
+
+      store.ingestProgress(
+        tick("a", { bytes_done: 512, bytes_total: 1024, files_done: 1234, files_total: 3000 })
+      );
+      await wrapper.vm.$nextTick();
+      // Locale-grouped counts, so the run's scale is legible at a glance.
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Backing up - 50% (1,234 of 3,000 files)");
+      expect(wrapper.find(BAR).attributes("aria-label")).toBe(
+        "Backing up - 50% (1,234 of 3,000 files)"
+      );
+    });
+
     it("renders no readout at all while idle", async () => {
       const { store, wrapper } = mountBar();
       store.ingest(perAccount("a", idle()));
       await wrapper.vm.$nextTick();
       expect(wrapper.find(PHASE_LABEL).exists()).toBe(false);
     });
+  });
+
+  // The bug this fixes: in production the `executing` state ALWAYS arrives with
+  // a zeroed ExecProgress, so before the ticks were bridged the bar rendered the
+  // indeterminate sweep for the entire upload.
+  it("goes from indeterminate to determinate when the first live tick lands", async () => {
+    const { store, wrapper } = mountBar();
+    store.ingest(perAccount("a", executing({})));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(INDETERMINATE).exists()).toBe(true);
+    expect(wrapper.find(BAR).attributes("aria-valuenow")).toBeUndefined();
+
+    store.ingestProgress(tick("a", { bytes_done: 300, bytes_total: 1200 }));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(INDETERMINATE).exists()).toBe(false);
+    expect(wrapper.find(BAR).attributes("aria-valuenow")).toBe("25");
+    expect(wrapper.find(BAR).find("div").attributes("style")).toContain("width: 25%");
   });
 
   it("appears and disappears reactively as a run starts then finishes", async () => {

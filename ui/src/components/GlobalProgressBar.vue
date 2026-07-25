@@ -56,9 +56,18 @@ const label = computed<string>(() => {
     case "power_check":
       return t("progress.starting");
     default:
-      return widthPct.value !== null
-        ? t("progress.backingUpPercent", { percent: widthPct.value })
-        : t("progress.backingUp");
+      if (widthPct.value === null) return t("progress.backingUp");
+      // Once the executor's live ticks arrive the file totals are real, so name
+      // them: a bare percent gives no sense of scale, and "1,234 of 3,000 files"
+      // is what tells the user whether this run is minutes or hours. Falls back
+      // to the bare percent for a delete-only plan, which uploads no files.
+      return progress.filesTotal > 0
+        ? t("progress.backingUpPercentFiles", {
+            percent: widthPct.value,
+            done: count.format(progress.filesDone),
+            total: count.format(progress.filesTotal),
+          })
+        : t("progress.backingUpPercent", { percent: widthPct.value });
   }
 });
 </script>

@@ -14,12 +14,17 @@ use tauri::{AppHandle, Emitter};
 /// `sync:status_changed` - global sync status changed (payload:
 /// `GlobalSyncStatus`, SPEC s11.7).
 pub const EVENT_SYNC_STATUS_CHANGED: &str = "sync:status_changed";
-/// `sync:source_progress` - per-source progress (payload:
-/// `{ source_id, progress }`, SPEC s11.7).
+/// `sync:source_progress` - per-source execution progress (payload:
+/// `{ account_id, source_id, progress }`, SPEC s11.7).
 ///
-/// Reserved for M6: the per-source progress DTO + the bridge that emits it land
-/// with the M6 IPC layer (the M5 event bridge only forwards `StateChanged`).
-#[allow(dead_code)]
+/// The orchestrator transitions to `Executing { progress: ExecProgress::zero() }`
+/// exactly ONCE per source and then streams the moving counters as separate
+/// `OrchestratorEvent::Progress` ticks. Those ticks used to stop at the event
+/// bridge, so the webview only ever saw the zeroed snapshot embedded in the
+/// state and the top-of-app bar stayed indeterminate for the whole upload. The
+/// bridge now forwards every tick on this channel so the bar is determinate.
+/// The account id is added by the bridge (the core event carries only the
+/// source) so the webview can attribute the tick to the right orchestrator.
 pub const EVENT_SYNC_SOURCE_PROGRESS: &str = "sync:source_progress";
 /// `activity:new` - a new activity-log entry (payload: `ActivityEntry`,
 /// SPEC s11.7).
@@ -108,6 +113,20 @@ pub fn emit_sync_status_changed<P: Serialize + Clone>(
     status: &P,
 ) -> tauri::Result<()> {
     app.emit(EVENT_SYNC_STATUS_CHANGED, status)
+}
+
+/// Broadcast `sync:source_progress` with one execution-progress tick (SPEC
+/// s11.7).
+///
+/// Thin wrapper over [`Emitter::emit`], mirroring `emit_sync_status_changed`, so
+/// the event bridge cannot typo the channel. The payload is the bridge's
+/// `SourceProgressEvent` (`{ account_id, source_id, progress }`, snake_case like
+/// the rest of the M5 sync DTOs).
+pub fn emit_sync_source_progress<P: Serialize + Clone>(
+    app: &AppHandle,
+    progress: &P,
+) -> tauri::Result<()> {
+    app.emit(EVENT_SYNC_SOURCE_PROGRESS, progress)
 }
 
 /// Broadcast `activity:new` with the new activity entry (SPEC s11.7).
