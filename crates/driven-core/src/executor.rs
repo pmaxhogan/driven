@@ -1165,7 +1165,7 @@ impl DefaultExecutor {
     async fn open_effective(&self, live_path: &Path) -> EffectiveOpen {
         let Some(vss) = self.vss.as_ref() else {
             // No VSS configured: live open, lock => skip (historical path).
-            return match open_shared(live_path).await {
+            return match open_shared(live_path, self.priority.get()).await {
                 Ok(file) => EffectiveOpen::Opened {
                     read_path: live_path.to_path_buf(),
                     file,
@@ -1190,7 +1190,7 @@ impl DefaultExecutor {
         if mode == VssMode::Always {
             // Do not even attempt the live open in always mode; we route reads
             // through the snapshot. Probe lock state only to feed the decision.
-            attempt = match open_shared(live_path).await {
+            attempt = match open_shared(live_path, self.priority.get()).await {
                 Ok(file) => {
                     live_file = Some(file);
                     OpenAttempt::Ok
@@ -1202,7 +1202,7 @@ impl DefaultExecutor {
                 }
             };
         } else {
-            match open_shared(live_path).await {
+            match open_shared(live_path, self.priority.get()).await {
                 Ok(file) => {
                     // Live open worked; in auto/never this is the read path.
                     return EffectiveOpen::Opened {
@@ -1238,7 +1238,7 @@ impl DefaultExecutor {
                         file,
                     }
                 } else {
-                    match open_shared(live_path).await {
+                    match open_shared(live_path, self.priority.get()).await {
                         Ok(file) => EffectiveOpen::Opened {
                             read_path: live_path.to_path_buf(),
                             file,
@@ -1255,7 +1255,7 @@ impl DefaultExecutor {
                 // Open the frozen shadow-copy path. A second sharing violation
                 // here (extremely unusual - the snapshot is read-only) degrades
                 // to skip.
-                match open_shared(&snapshot_path).await {
+                match open_shared(&snapshot_path, self.priority.get()).await {
                     Ok(file) => {
                         tracing::info!(target: TARGET, live = %live_path.display(), snapshot = %snapshot_path.display(), "VSS: reading locked file from snapshot");
                         EffectiveOpen::Opened {
@@ -4623,7 +4623,7 @@ impl DefaultExecutor {
         // what proves the bytes we are about to re-read are the same ones the
         // crashed run was uploading.
         let full_path = join_source_path(&source.local_path, &op.relative_path);
-        let mut file = match open_shared(&full_path).await {
+        let mut file = match open_shared(&full_path, self.priority.get()).await {
             Ok(f) => f,
             // File gone/locked: cannot resume; let the caller requeue.
             Err(_) => return Ok(None),
@@ -4964,7 +4964,7 @@ impl DefaultExecutor {
     /// blake3), so it is comparable for both encrypted and plaintext
     /// sources.
     async fn rehash_local_plaintext(&self, full_path: &Path) -> Option<([u8; 32], u64, i64)> {
-        let mut file = open_shared(full_path).await.ok()?;
+        let mut file = open_shared(full_path, self.priority.get()).await.ok()?;
         let id = fstat_identity(&file).await.ok()?;
         // We only need the blake3-over-plaintext; pass crypto=None so the
         // body bytes are not built up unnecessarily - read_hash_encrypt still
@@ -6168,7 +6168,14 @@ enum EffectiveOpen {
 /// process can atomically replace it while we read the original bytes
 /// (SPEC s8 defence #2). On Unix the default open already allows the path
 /// to be unlinked/replaced under an open handle.
-async fn open_shared(path: &Path) -> Result<tokio::fs::File, OpenError> {
+async fn open_shared(
+    path: &Path,
+    // SPEC s22 `io_priority`: the level to hint on the returned handle. This is
+    // the ONE choke point every executor-side file read goes through (live
+    // opens, the VSS snapshot open, the resume identity check, the reconcile
+    // re-hash), so hinting here shapes all of them from a single site.
+    priority: crate::priority::WorkPriority,
+) -> Result<tokio::fs::File, OpenError> {
     #[cfg(windows)]
     {
         use std::os::windows::fs::OpenOptionsExt;
@@ -6177,12 +6184,28 @@ async fn open_shared(path: &Path) -> Result<tokio::fs::File, OpenError> {
         let mut opts = std::fs::OpenOptions::new();
         opts.read(true).share_mode(SHARE_MODE);
         match opts.open(path) {
-            Ok(std_file) => Ok(tokio::fs::File::from_std(std_file)),
+            Ok(std_file) => {
+                // Hint BEFORE the handle is wrapped for async use, while it is
+                // still a plain `std::fs::File`. The hint then rides on the
+                // handle for its whole life, so every read is shaped even
+                // though `tokio::fs` performs them on shared pool threads we
+                // cannot demote. Best-effort: a refusal just means normal-
+                // priority reads. The access mask is deliberately unchanged -
+                // a read-only handle is enough for this class, so the open's
+                // sharing/locking behaviour is byte-identical to before.
+                crate::priority::apply_to_file_handle(&std_file, priority);
+                Ok(tokio::fs::File::from_std(std_file))
+            }
             Err(e) => Err(classify_open_error(e)),
         }
     }
     #[cfg(not(windows))]
     {
+        // No per-descriptor I/O priority exists on Linux / macOS (both scope it
+        // to the thread), so the hint has nowhere to land and the reads run at
+        // normal priority. See `crate::priority` for why the thread-scoped
+        // levers cannot reach these reads either.
+        let _ = priority;
         match tokio::fs::File::open(path).await {
             Ok(f) => Ok(f),
             Err(e) => Err(classify_open_error(e)),
@@ -10180,7 +10203,7 @@ mod tests {
         // Sanity: a plain shared open must now fail with a lock.
         assert!(
             matches!(
-                super::open_shared(&live).await,
+                super::open_shared(&live, crate::priority::WorkPriority::Normal).await,
                 Err(super::OpenError::Locked)
             ),
             "test setup: file must be locked"
@@ -10238,7 +10261,7 @@ mod tests {
             .expect("open locked-pending.dat exclusively");
         assert!(
             matches!(
-                super::open_shared(&live).await,
+                super::open_shared(&live, crate::priority::WorkPriority::Normal).await,
                 Err(super::OpenError::Locked)
             ),
             "test setup: file must be locked"
