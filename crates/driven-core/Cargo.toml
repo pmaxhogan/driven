@@ -76,6 +76,13 @@ md5 = { workspace = true }
 tar = { workspace = true }
 flate2 = { workspace = true }
 
+# Below-normal CPU + I/O priority for backup threads (SPEC s22 `io_priority`,
+# `driven_core::priority`). Unix only: Linux needs the `ioprio_set` syscall
+# number and `setpriority`, macOS needs `setpriority` for the Darwin background
+# band. The Windows backend calls kernel32 directly, so no dependency there.
+[target.'cfg(unix)'.dependencies]
+libc = { workspace = true }
+
 [dev-dependencies]
 # `test-util` enables `#[tokio::test(start_paused = true)]` so the orchestrator
 # run-loop scheduled-tick test drives `tokio::time::interval` on virtual time

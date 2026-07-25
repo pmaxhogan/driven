@@ -543,6 +543,16 @@ async fn build_account(
         .map(|s| std::path::PathBuf::from(&s.local_path))
         .unwrap_or_else(|| std::path::PathBuf::from("."));
     let clock_for_adaptive = clock.clone();
+
+    // --- backup-work priority (SPEC s22 `io_priority`) -----------------------
+    // ONE cell, cloned into the executor (the reader, which demotes a thread
+    // before it starts a blocking section) and the orchestrator (the writer,
+    // which republishes it on every `reconfigure` so a settings save applies
+    // without a restart). Same shape as the pacer / upload pool / latency
+    // reservoir above. Seeded from the persisted setting so a cold start
+    // already honours it - `SyncOrchestrator::new` reads the same
+    // `config.io_priority` into its own copy below.
+    let priority = driven_core::priority::PriorityCell::new(config.io_priority);
     let pacer_for_adaptive = pacer.clone();
 
     // --- executor -----------------------------------------------------------
@@ -573,7 +583,9 @@ async fn build_account(
     .with_latency_reservoir(latency.clone())
     // DESIGN s11.4.7: the SAME pool the controller resizes (fixed here when the
     // kill-switch is off, honouring `default_concurrent_uploads` either way).
-    .with_upload_pool(upload_pool.clone());
+    .with_upload_pool(upload_pool.clone())
+    // SPEC s22: the SAME cell the orchestrator republishes on a settings change.
+    .with_priority_cell(priority.clone());
     if adaptive_enabled {
         // DESIGN s11.4.7: the SAME probe the controller drains.
         exec = exec.with_throughput_probe(throughput.clone());
@@ -607,6 +619,9 @@ async fn build_account(
     // Share the executor's pacer so the V2 metered throttle (DESIGN s17) can
     // lower / lift its bandwidth cap as the network goes on / off metered.
     orchestrator = orchestrator.with_pacer(pacer);
+    // SPEC s22 `io_priority`: the SAME cell the executor reads, so a settings
+    // save reaches the backup threads on the next piece of work.
+    orchestrator = orchestrator.with_priority_cell(priority);
     // DESIGN s13: the SAME reservoir the executor holds, so per-file scan latency
     // and upload-per-MB latency feed one app-global sampler.
     orchestrator = orchestrator.with_latency_reservoir(latency.clone());
@@ -1470,6 +1485,16 @@ mod tests {
         assert_eq!(cfg.bandwidth_cap_mbps, Some(7));
         assert!(!cfg.skip_on_battery);
         assert!(!cfg.skip_on_metered);
+        // SPEC s22 `io_priority`: the persisted string must arrive as a real
+        // `WorkPriority`, not stay inert. The code default is `Normal`, so a
+        // seeded `"low"` proves the setting - not the default - is what a cold
+        // start hands to the priority cell.
+        assert_eq!(
+            cfg.io_priority,
+            driven_core::priority::WorkPriority::Low,
+            "cold-start config must reflect the persisted io_priority"
+        );
+        assert_ne!(default_cfg.io_priority, cfg.io_priority);
 
         let _ = std::fs::remove_dir_all(dir);
     }

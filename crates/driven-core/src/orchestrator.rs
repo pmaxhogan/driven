@@ -58,6 +58,7 @@ use crate::executor::{Executor, OpOutcome};
 use crate::hooks::{CommandRunner, HookKind, NoopCommandRunner};
 use crate::network::{NetworkProbe, NetworkState, ServiceHealth, ServiceName};
 use crate::pacer::{Pacer, PacerCeilings};
+use crate::priority::{PriorityCell, WorkPriority};
 use crate::state::{ActivityLevel, NewActivity, SourceRow, StateRepo};
 use crate::time::Clock;
 use crate::types::{
@@ -209,6 +210,15 @@ pub struct OrchestratorConfig {
     /// kill-switch - the pool stays FIXED at
     /// [`default_concurrent_uploads`](Self::default_concurrent_uploads).
     pub adaptive_parallelism_enabled: bool,
+    /// How far below normal the threads doing backup work run (SPEC s22
+    /// `global.io_priority`), so Driven yields to whatever the user has in the
+    /// foreground.
+    ///
+    /// [`Orchestrator::reconfigure`] publishes this into the
+    /// [`PriorityCell`](crate::priority::PriorityCell) shared with the
+    /// executor, so a settings save applies to work that STARTS after it; work
+    /// already in flight keeps the level it began with.
+    pub io_priority: WorkPriority,
 }
 
 /// What Driven does on a metered network when
@@ -258,6 +268,11 @@ impl Default for OrchestratorConfig {
             metered_bandwidth_cap_mbps: None,
             default_concurrent_uploads: None,
             adaptive_parallelism_enabled: true,
+            // Normal, not the settings seed of `low`: the code default is what
+            // a test / the chaos harness / a settings-load failure gets, and
+            // "behave exactly as before" is the right fallback there. The
+            // persisted setting is what demotes a real install.
+            io_priority: WorkPriority::Normal,
         }
     }
 }
@@ -428,6 +443,17 @@ pub struct SyncOrchestrator {
     /// network goes on / off metered. `None` (the default / tests) disables the
     /// runtime throttle; the cap then stays at its construction value.
     pacer: Option<Arc<dyn Pacer>>,
+    /// The live backup-work priority (SPEC s22 `io_priority`), shared with the
+    /// executor by the app assembly the same way [`Self::pacer`] is.
+    ///
+    /// The orchestrator is the WRITER: it publishes
+    /// [`OrchestratorConfig::io_priority`] here at construction and on every
+    /// [`Orchestrator::reconfigure`], because it is the only component that
+    /// sees a settings change. The executor is the reader, consulting it when
+    /// it starts a piece of blocking work. When the assembly does not wire a
+    /// shared cell (tests, the chaos harness) this is a private cell nobody
+    /// reads, and the executor stays at [`WorkPriority::Normal`].
+    priority: PriorityCell,
     /// Per-orchestrator record-at-create ledger (P1-A). The recorder hook wired
     /// into the provider by [`Self::with_vss`] pushes each freshly-created
     /// shadow GUID here synchronously; `record_vss_orphans` drains it into the
@@ -487,6 +513,7 @@ impl SyncOrchestrator {
         let (trigger_tx, trigger_rx) = mpsc::channel(1);
         let (watcher_tx, watcher_rx) = mpsc::channel(WATCHER_CHANNEL_CAPACITY);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
+        let priority = PriorityCell::new(config.io_priority);
         Self {
             account_id,
             state,
@@ -508,6 +535,7 @@ impl SyncOrchestrator {
             vss: None,
             command_runner: Arc::new(NoopCommandRunner),
             pacer: None,
+            priority,
             vss_create_ledger: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             orphan_cleanup_done: Mutex::new(false),
             suspended: std::sync::atomic::AtomicBool::new(false),
@@ -530,6 +558,27 @@ impl SyncOrchestrator {
         controller: Arc<crate::adaptive::AdaptiveController>,
     ) -> Self {
         self.adaptive = Some(controller);
+        self
+    }
+
+    /// Share the backup-work priority cell (SPEC s22 `io_priority`) with the
+    /// executor.
+    ///
+    /// Pass the SAME [`PriorityCell`] given to
+    /// [`DefaultExecutor::with_priority_cell`](crate::executor::DefaultExecutor::with_priority_cell),
+    /// exactly like [`Self::with_pacer`]: this orchestrator is the only writer
+    /// (on construction and on every [`Orchestrator::reconfigure`]) and the
+    /// executor is the reader. Seeded immediately from the config this
+    /// orchestrator was built with, so the very first cycle already runs at the
+    /// user's configured level. Without this call the executor keeps its own
+    /// cell and every thread runs at [`WorkPriority::Normal`].
+    #[must_use]
+    pub fn with_priority_cell(mut self, priority: PriorityCell) -> Self {
+        // Carry over what `new` seeded from the config rather than reaching
+        // through the config lock - this builder runs inside the assembly's
+        // async fn, where a blocking lock acquisition would panic.
+        priority.set(self.priority.get());
+        self.priority = priority;
         self
     }
 
@@ -2443,6 +2492,12 @@ impl Orchestrator for SyncOrchestrator {
         if let Some(vss) = self.vss.as_ref() {
             vss.set_mode(config.vss_mode);
         }
+        // Publish the backup-work priority (SPEC s22 `io_priority`) into the
+        // cell the executor reads. Same reason as the VSS mode above: the
+        // setting would otherwise be frozen at whatever the orchestrator was
+        // built with. Work that has already started keeps its level; work that
+        // starts after this call picks the new one up.
+        self.priority.set(config.io_priority);
         *self.config.write().await = config;
     }
 
@@ -3453,6 +3508,66 @@ mod tests {
                 reason: PauseReason::Schedule
             },
             "inside the window the schedule gate must not pause"
+        );
+    }
+
+    /// SPEC s22 `io_priority`: the app assembly hands ONE
+    /// [`PriorityCell`] to the orchestrator and the executor, and the
+    /// orchestrator is the writer. Construction must seed the shared cell from
+    /// the config, and `reconfigure` must republish it - otherwise a settings
+    /// save would be inert until the app restarted (exactly the bug that made
+    /// `vss_mode` inert before P1-5).
+    #[tokio::test]
+    async fn priority_cell_is_seeded_at_build_and_republished_on_reconfigure() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let cell = PriorityCell::new(WorkPriority::Normal);
+        let (orch, _clock) = build(
+            account,
+            vec![source_in(account, dir.path())],
+            Arc::new(RecordingExecutor::default()),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig {
+                io_priority: WorkPriority::Low,
+                ..OrchestratorConfig::default()
+            },
+        );
+        // The executor's view of the cell before any settings edit.
+        let orch = orch.with_priority_cell(cell.clone());
+        assert_eq!(
+            cell.get(),
+            WorkPriority::Low,
+            "the first cycle must already run at the configured level, with no settings edit"
+        );
+
+        orch.reconfigure(OrchestratorConfig {
+            io_priority: WorkPriority::Idle,
+            ..OrchestratorConfig::default()
+        })
+        .await;
+        assert_eq!(
+            cell.get(),
+            WorkPriority::Idle,
+            "a settings save must reach the executor's cell"
+        );
+
+        orch.reconfigure(OrchestratorConfig::default()).await;
+        assert_eq!(
+            cell.get(),
+            WorkPriority::Normal,
+            "turning the setting back to normal must un-demote future work"
+        );
+    }
+
+    /// The default config must not demote anything: a test, the chaos harness,
+    /// or a settings-load failure has to behave exactly as it did before this
+    /// feature existed.
+    #[test]
+    fn default_config_runs_backup_work_at_normal_priority() {
+        assert_eq!(
+            OrchestratorConfig::default().io_priority,
+            WorkPriority::Normal
         );
     }
 

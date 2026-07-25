@@ -889,6 +889,14 @@ pub struct DefaultExecutor {
     /// `ensure_folder` per component instead of racing duplicate
     /// search+create calls (which manifest as duplicate folders on Drive).
     parent_walk: tokio::sync::Mutex<()>,
+    /// The live backup-work priority (SPEC s22 `io_priority`), written by the
+    /// orchestrator on every settings change when the app assembly wires the
+    /// SAME cell into both (via [`Self::with_priority_cell`]). Read at each
+    /// blocking-work site rather than captured once, so a settings save applies
+    /// without a restart. Defaults to a private cell holding
+    /// [`WorkPriority::Normal`], which is why every test and the chaos harness
+    /// run at normal priority unless they opt in.
+    priority: crate::priority::PriorityCell,
     /// Cooperative "stop dispatching new ops" flag (DESIGN s5.7 manual pause).
     /// Written by [`Executor::set_paused`], read by the `execute` dispatch loop
     /// before it starts each op. It is a dispatch gate, not a cancel: ops
@@ -975,6 +983,7 @@ impl DefaultExecutor {
             throughput: None,
             mem_gauge: None,
             latency: None,
+            priority: crate::priority::PriorityCell::default(),
             parent_dirs: std::sync::Mutex::new(HashMap::new()),
             parent_walk: tokio::sync::Mutex::new(()),
             paused: AtomicBool::new(false),
@@ -1018,6 +1027,22 @@ impl DefaultExecutor {
     #[must_use]
     pub fn with_throughput_probe(mut self, probe: Arc<crate::adaptive::ThroughputProbe>) -> Self {
         self.throughput = Some(probe);
+        self
+    }
+
+    /// Share the backup-work priority cell (SPEC s22 `io_priority`) with the
+    /// orchestrator.
+    ///
+    /// Pass the SAME [`PriorityCell`](crate::priority::PriorityCell) given to
+    /// [`SyncOrchestrator::with_priority_cell`](crate::orchestrator::SyncOrchestrator::with_priority_cell),
+    /// the same one-cell-into-two-consumers wiring as
+    /// [`Self::with_upload_pool`]: the orchestrator writes it when settings
+    /// change, this executor reads it when it starts blocking work. Every other
+    /// construction path keeps a private cell pinned at
+    /// [`WorkPriority`](crate::priority::WorkPriority)`::Normal`.
+    #[must_use]
+    pub fn with_priority_cell(mut self, priority: crate::priority::PriorityCell) -> Self {
+        self.priority = priority;
         self
     }
 
@@ -1667,7 +1692,15 @@ impl DefaultExecutor {
                 )
             })
             .collect();
-        let built = match tokio::task::spawn_blocking(move || {
+        // SPEC s22 `io_priority`: this closure reads every member off disk and
+        // gzips it, so it is the executor's one genuinely blocking, genuinely
+        // heavy section - and being a `spawn_blocking` closure with no `.await`
+        // inside, it is somewhere a per-thread priority guard is actually SOUND
+        // (see `crate::priority` for why that distinction is load-bearing). The
+        // level is read HERE, per bundle, so a settings change applies to the
+        // next bundle without a restart.
+        let priority = self.priority.get();
+        let built = match crate::priority::spawn_blocking(priority, move || {
             crate::bundle::build_bundle(&inputs, crate::planner::BUNDLE_MAX_BYTES_CEILING)
         })
         .await

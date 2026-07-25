@@ -120,6 +120,11 @@ clap = { version = "4", features = ["derive", "env"] }
 # reproducible cross-platform build; matches the app's no-native-deps posture).
 tar = "0.4"
 flate2 = { version = "1", default-features = false, features = ["rust_backend"] }
+# Raw POSIX calls the std library does not expose: `ioprio_set` / `setpriority`
+# for the below-normal backup-thread priority (`driven_core::priority`), and the
+# chaos harness's fault injection. Pulled per-crate under a `cfg(unix)` target
+# section - the Windows backends call kernel32 directly.
+libc = "0.2"
 
 [profile.dev]
 opt-level = 1
