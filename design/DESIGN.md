@@ -1614,11 +1614,18 @@ the release and the GH Actions build pipeline takes over.
   attaches the hint to the FILE HANDLE instead (`IoPriorityHintLow` for `low`,
   `IoPriorityHintVeryLow` for `idle`), so every read is shaped regardless of
   which thread performs it, and nothing needs restoring because the handle
-  closes with the upload. Applied inside `executor::open_shared`, the single
-  choke point for every source-file read (live open, VSS snapshot open, resume
-  identity check, reconcile re-hash). A read-only handle carries sufficient
-  access, so the open's access mask - and therefore its sharing/locking
-  behaviour - is unchanged.
+  closes with the upload. Applied at both places the executor reads local file
+  bytes: `executor::open_shared` (the choke point for every individual-file read
+  - live open, VSS snapshot open, resume identity check, reconcile re-hash) and
+  `bundle::build_bundle`, which opens each member of a small-file bundle. A
+  read-only handle carries sufficient access, so the open's access mask - and
+  therefore its sharing/locking behaviour - is unchanged.
+  - The bundle path needs BOTH levers, which is what makes the split concrete.
+    Its thread guard covers the gzip CPU, but on Windows `low` maps to
+    `THREAD_PRIORITY_BELOW_NORMAL`, which is CPU-only - so without the handle
+    hint a `low` backup of many small files would still read at normal I/O
+    priority. At `idle` the thread's background mode already covers I/O, so the
+    hint is redundant there but harmless.
   - Linux and macOS have no per-descriptor equivalent (both scope I/O priority
     to the thread), so upload read I/O is unshaped there. Closing that gap means
     owning the reader thread outright, a streaming-pipeline restructure that

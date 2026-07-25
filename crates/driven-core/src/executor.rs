@@ -1806,9 +1806,15 @@ impl DefaultExecutor {
         // (see `crate::priority` for why that distinction is load-bearing). The
         // level is read HERE, per bundle, so a settings change applies to the
         // next bundle without a restart.
+        //
+        // The SAME level also goes INTO `build_bundle`, which hints each
+        // member's file handle. Both levers are needed here: the thread guard
+        // covers the gzip CPU (and, at `idle` on Windows, I/O too via background
+        // mode), while the handle hint is what lowers READ priority at `low`,
+        // where the Windows thread guard is CPU-only.
         let priority = self.priority.get();
         let built = match crate::priority::spawn_blocking(priority, move || {
-            crate::bundle::build_bundle(&inputs, crate::planner::BUNDLE_MAX_BYTES_CEILING)
+            crate::bundle::build_bundle(&inputs, crate::planner::BUNDLE_MAX_BYTES_CEILING, priority)
         })
         .await
         {

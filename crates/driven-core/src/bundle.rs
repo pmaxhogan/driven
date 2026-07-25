@@ -129,9 +129,17 @@ fn mtime_ns(meta: &std::fs::Metadata) -> i64 {
 /// could not be read, or its `(size, mtime)` changed between the two stats or
 /// disagreed with the bytes read, so only a coherent snapshot is ever packed. The
 /// gzip layer is written with a zeroed mtime for reproducibility.
+///
+/// `priority` (SPEC s22 `io_priority`) is hinted onto each member's file handle
+/// as it is opened, so these reads are serviced below normal instead of
+/// competing with whatever the user has in the foreground. It is purely a
+/// scheduling hint: it changes nothing about which members are packed, what
+/// bytes they contain, or which are skipped. See
+/// [`crate::priority::apply_to_file_handle`] for the per-OS reality.
 pub fn build_bundle(
     inputs: &[(RelativePath, PathBuf, u64)],
     max_total_bytes: u64,
+    priority: crate::priority::WorkPriority,
 ) -> Result<BuildOutput> {
     use flate2::{Compression, GzBuilder};
 
@@ -167,7 +175,7 @@ pub fn build_bundle(
             continue;
         }
 
-        let bytes = match std::fs::read(path) {
+        let bytes = match read_member(path, pre.len(), priority) {
             Ok(b) => b,
             Err(_) => {
                 skipped.push(rel.clone());
@@ -225,6 +233,33 @@ pub fn build_bundle(
     })
 }
 
+/// Read one bundle member's bytes with the SPEC s22 `io_priority` hint attached
+/// to its handle.
+///
+/// This is `std::fs::read` split open so there is a handle to hint: that call
+/// opens and reads in one step and never exposes the `File`, and the hint has to
+/// land on the handle BEFORE the reads it is meant to shape. Behaviour is
+/// otherwise identical - same default share mode (`File::open` is what
+/// `std::fs::read` uses internally, so the open's sharing/locking semantics are
+/// unchanged), and the same "size the buffer from the stat we already took"
+/// allocation, using the caller's `pre` stat rather than re-statting.
+///
+/// `expected_size` is only a capacity hint. It is deliberately NOT trusted as a
+/// read bound: the caller's post-read coherency stat is what decides whether the
+/// bytes are a usable snapshot, and short-circuiting here would hide a
+/// grew-mid-read member from that check.
+fn read_member(
+    path: &std::path::Path,
+    expected_size: u64,
+    priority: crate::priority::WorkPriority,
+) -> std::io::Result<Vec<u8>> {
+    let mut file = std::fs::File::open(path)?;
+    crate::priority::apply_to_file_handle(&file, priority);
+    let mut bytes = Vec::with_capacity(usize::try_from(expected_size).unwrap_or(0));
+    file.read_to_end(&mut bytes)?;
+    Ok(bytes)
+}
+
 /// Extract one member's plaintext bytes from a decompressed-in-memory `.tar.gz`
 /// bundle by its [`member_entry_name`]. Returns `Ok(None)` if no such entry
 /// exists. `max_decompressed` bounds the TOTAL bytes read from the gzip stream (a
@@ -275,6 +310,7 @@ pub fn extract_member(
 #[cfg(test)]
 mod tests {
     use super::*;
+    use crate::priority::WorkPriority;
 
     fn rel(s: &str) -> RelativePath {
         RelativePath::try_from(s.to_string()).expect("valid relative path")
@@ -295,6 +331,58 @@ mod tests {
     /// any fixture's total).
     const TEST_MAX_TOTAL: u64 = 8 * 1024 * 1024;
 
+    /// SPEC s22 `io_priority` is a SCHEDULING hint and nothing more: the archive
+    /// bytes, the packed members, and the skip list must be identical at every
+    /// level. Byte-equality is a meaningful assertion here because the gzip
+    /// layer is written with a zeroed mtime for reproducibility, so two builds
+    /// over the same inputs are bit-identical.
+    #[test]
+    fn priority_does_not_change_the_archive_or_the_members() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let mut inputs = Vec::new();
+        for i in 0..6u8 {
+            let name = format!("f{i}.txt");
+            let body = format!("member {i} bytes {i}{i}{i}").into_bytes();
+            std::fs::write(dir.path().join(&name), &body).expect("write");
+            inputs.push((rel(&name), dir.path().join(&name), body.len() as u64));
+        }
+        // A member that will be skipped, so the skip path is compared too.
+        inputs.push((rel("gone.txt"), dir.path().join("gone.txt"), 10));
+
+        let baseline = build_bundle(&inputs, TEST_MAX_TOTAL, WorkPriority::Normal).expect("build");
+        assert_eq!(baseline.members.len(), 6);
+        assert_eq!(baseline.skipped, vec![rel("gone.txt")]);
+
+        for level in [WorkPriority::Low, WorkPriority::Idle] {
+            let out = build_bundle(&inputs, TEST_MAX_TOTAL, level).expect("build");
+            assert_eq!(out.tar_gz, baseline.tar_gz, "{level:?} changed the archive");
+            assert_eq!(out.members, baseline.members, "{level:?} changed members");
+            assert_eq!(out.skipped, baseline.skipped, "{level:?} changed skips");
+        }
+    }
+
+    /// `read_member` replaced a `std::fs::read` call, so it has to reproduce that
+    /// call's behaviour exactly: all the bytes on success, and an error (never a
+    /// truncated read) for a missing file. The `expected_size` argument is a
+    /// capacity hint only - passing a wrong one must not truncate or pad, because
+    /// the caller's coherency stat is what decides whether the bytes are usable.
+    #[test]
+    fn read_member_matches_fs_read_and_ignores_a_wrong_size_hint() {
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("payload.bin");
+        let body = b"the exact bytes that must come back".to_vec();
+        std::fs::write(&path, &body).expect("write");
+
+        for hint in [0, body.len() as u64, 1024] {
+            let got = read_member(&path, hint, WorkPriority::Idle).expect("read");
+            assert_eq!(got, body, "size hint {hint} must not change the bytes");
+        }
+        assert!(
+            read_member(&dir.path().join("missing.bin"), 0, WorkPriority::Low).is_err(),
+            "a missing file must error, exactly as std::fs::read does"
+        );
+    }
+
     #[test]
     fn build_then_extract_roundtrips_each_member() {
         let dir = tempfile::tempdir().expect("tempdir");
@@ -308,7 +396,7 @@ mod tests {
             contents.push((rel(&name), body));
         }
 
-        let out = build_bundle(&inputs, TEST_MAX_TOTAL).expect("build");
+        let out = build_bundle(&inputs, TEST_MAX_TOTAL, WorkPriority::Normal).expect("build");
         assert_eq!(out.members.len(), 12);
         assert!(out.skipped.is_empty());
 
@@ -342,7 +430,7 @@ mod tests {
             dir.path().join("big.bin"),
             body.len() as u64,
         )];
-        let out = build_bundle(&inputs, TEST_MAX_TOTAL).expect("build");
+        let out = build_bundle(&inputs, TEST_MAX_TOTAL, WorkPriority::Normal).expect("build");
         // A cap below the member size must fail rather than return truncated bytes.
         let res = extract_member(&out.tar_gz, &member_entry_name(&rel("big.bin")), 1024);
         assert!(res.is_err(), "expected decompressed-cap error");
@@ -356,7 +444,7 @@ mod tests {
             (rel("present.txt"), dir.path().join("present.txt"), 2),
             (rel("gone.txt"), dir.path().join("gone.txt"), 2),
         ];
-        let out = build_bundle(&inputs, TEST_MAX_TOTAL).expect("build");
+        let out = build_bundle(&inputs, TEST_MAX_TOTAL, WorkPriority::Normal).expect("build");
         assert_eq!(out.members.len(), 1);
         assert_eq!(out.skipped, vec![rel("gone.txt")]);
     }
@@ -380,7 +468,7 @@ mod tests {
             ),
         ];
 
-        let out = build_bundle(&inputs, TEST_MAX_TOTAL).expect("build");
+        let out = build_bundle(&inputs, TEST_MAX_TOTAL, WorkPriority::Normal).expect("build");
 
         assert_eq!(
             out.skipped,
@@ -412,7 +500,7 @@ mod tests {
 
         // 2500-byte cap: the first two (1000 + 1000) pack; the third (would reach
         // 3000) is skipped.
-        let out = build_bundle(&inputs, 2500).expect("build");
+        let out = build_bundle(&inputs, 2500, WorkPriority::Normal).expect("build");
         assert_eq!(out.members.len(), 2, "two members fit under the ceiling");
         assert_eq!(out.skipped.len(), 1, "the overflowing member is skipped");
     }

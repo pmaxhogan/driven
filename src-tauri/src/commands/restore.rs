@@ -3516,6 +3516,7 @@ mod tests {
         let built = driven_core::bundle::build_bundle(
             &inputs,
             driven_core::planner::BUNDLE_MAX_BYTES_CEILING,
+            driven_core::priority::WorkPriority::Normal,
         )
         .unwrap();
         // Plaintext source stores the archive as-is; an encrypted source stores the
