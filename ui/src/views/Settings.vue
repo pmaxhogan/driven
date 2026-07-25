@@ -6,17 +6,23 @@ import { useI18n } from "vue-i18n";
 import AccountList from "../components/AccountList.vue";
 import SourceTable from "../components/SourceTable.vue";
 import TelemetryPreviewModal from "../components/TelemetryPreviewModal.vue";
+// About is a Settings SUBTAB now, so this view embeds it. It still lives under
+// views/ (and is still reached at /about) because that path is its route entry
+// point - the router just resolves /about to THIS view with `tab: "about"`.
+import About from "./About.vue";
 import { useSettingsStore } from "../stores/settings";
 import { getVssHelperStatus, validateCustomCa, validateProxy } from "../ipc/commands";
 import type { SettingsPatch, VssHelperStatus } from "../ipc/types";
 
-// Settings view (SPEC s25 /accounts, /sources, /rules; DESIGN s8.2). One view
-// hosts the three routed tabs; the active tab comes from the route (router
+// Settings view (SPEC s25 /accounts, /sources, /rules, /about; DESIGN s8.2). One
+// view hosts the four routed tabs; the active tab comes from the route (router
 // passes `tab` as a prop). The Accounts + Sources tabs render their components;
 // the Rules tab is the global-rules form (SPEC s22 `global` + Windows `vss_mode`)
-// editing the settings store. About is its own route (/about -> About.vue) per
-// the s25 route map, so it is not a tab here.
-const props = withDefaults(defineProps<{ tab?: "accounts" | "sources" | "rules" }>(), {
+// editing the settings store; the About tab embeds the About surface (version,
+// update channel, release notes, diagnostics). About used to be a top-nav item
+// of its own - it is a configuration surface, so it belongs in this sub-bar, and
+// /about now resolves here rather than to a standalone view.
+const props = withDefaults(defineProps<{ tab?: "accounts" | "sources" | "rules" | "about" }>(), {
   tab: "accounts",
 });
 
@@ -28,6 +34,7 @@ const tabs = [
   { key: "accounts", route: "/accounts", label: "settings.tabs.accounts" },
   { key: "sources", route: "/sources", label: "settings.tabs.sources" },
   { key: "rules", route: "/rules", label: "settings.tabs.rules" },
+  { key: "about", route: "/about", label: "settings.tabs.about" },
 ] as const;
 
 const active = computed(() => props.tab);
@@ -534,6 +541,7 @@ const showTelemetryPreview = ref(false);
 
     <AccountList v-if="active === 'accounts'" />
     <SourceTable v-else-if="active === 'sources'" />
+    <About v-else-if="active === 'about'" />
     <div v-else class="space-y-4">
       <h2 class="text-lg font-medium">
         {{ t("settings.rules.title") }}

@@ -14,8 +14,7 @@
     "accounts": "Accounts",
     "sources": "Sources",
     "rules": "Rules",
-    "restore": "Restore",
-    "about": "About"
+    "restore": "Restore"
   },
   "progress": {
     "backingUp": "Backing up...",

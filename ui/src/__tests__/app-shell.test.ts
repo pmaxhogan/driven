@@ -78,12 +78,37 @@ async function mountAppAt(path: string) {
 }
 
 describe("App shell", () => {
-  it("renders the top nav with the app wordmark and all four primary surfaces", async () => {
+  it("renders the top nav with the app wordmark and all three primary surfaces", async () => {
     const wrapper = await mountAppAt("/activity");
     expect(wrapper.find("nav").exists()).toBe(true);
     const links = wrapper.findAll("nav a");
-    // Wordmark + Activity | Settings | Restore | About.
-    expect(links.length).toBe(5);
+    // Wordmark + Activity | Restore | Settings. About is no longer a top-nav
+    // surface - it is a subtab inside Settings.
+    expect(links.length).toBe(4);
+    expect(links.map((l) => l.attributes("href"))).toEqual([
+      "/activity",
+      "/activity",
+      "/restore",
+      "/settings",
+    ]);
+  });
+
+  it("orders Restore before Settings in the nav", async () => {
+    const wrapper = await mountAppAt("/activity");
+    const hrefs = wrapper.findAll("nav a").map((l) => l.attributes("href"));
+    expect(hrefs.indexOf("/restore")).toBeLessThan(hrefs.indexOf("/settings"));
+  });
+
+  it("offers no top-nav About link (it moved into Settings)", async () => {
+    const wrapper = await mountAppAt("/activity");
+    expect(wrapper.find('nav a[href="/about"]').exists()).toBe(false);
+  });
+
+  // /about still resolves - it renders the Settings view's About tab - so the
+  // Settings nav item must stay lit there, exactly as it does for /accounts.
+  it("keeps Settings active on /about, which now renders the About subtab", async () => {
+    const wrapper = await mountAppAt("/about");
+    expect(wrapper.find('a[href="/settings"]').attributes("aria-current")).toBe("page");
   });
 
   it("marks the Activity link active (and no other) when on /activity", async () => {

@@ -121,6 +121,29 @@ describe("GlobalProgressBar", () => {
     expect(wrapper.find(INDETERMINATE).exists()).toBe(true);
   });
 
+  // The scan phase must never LOOK like a finished bar. The sweep segment is a
+  // partial-width element carrying no inline width, so nothing about it can
+  // render as a full determinate fill; the determinate branch (the only thing
+  // that sets an inline width) is absent entirely.
+  //
+  // Only the template half of that guarantee is unit-testable: the scoped
+  // `prefers-reduced-motion` fallback is plain CSS, which jsdom does not apply.
+  // Keeping the width in a Tailwind class on the element (rather than something
+  // the media query stretches to 100%) is what makes the partial width hold in
+  // BOTH motion modes.
+  it("renders the scan sweep as a partial-width segment with no inline width", async () => {
+    const { store, wrapper } = mountBar();
+    store.ingest(perAccount("a", scanning(120)));
+    await wrapper.vm.$nextTick();
+
+    const sweep = wrapper.find('[data-testid="global-progress-indeterminate"]');
+    expect(sweep.exists()).toBe(true);
+    expect(sweep.classes()).toContain("w-2/5");
+    expect(sweep.attributes("style")).toBeUndefined();
+    // No determinate fill alongside it (that branch is the one with a width).
+    expect(wrapper.find(BAR).findAll("div[style]").length).toBe(0);
+  });
+
   // The "Run now looks dead during the scan" fix: the bar carries a visible
   // phase readout, and the scan phase streams a live file count into it. Before
   // this, every pre-upload phase rendered the same bare "Backing up..." on a

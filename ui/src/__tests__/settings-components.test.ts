@@ -1798,3 +1798,64 @@ describe("Settings Rules tab", () => {
     expect(wrapper.find('[data-testid="telemetry-preview-modal"]').exists()).toBe(false);
   });
 });
+
+// About moved out of the top nav and into the Settings sub-bar as a fourth tab.
+// /about still resolves (the router points it at THIS view with `tab: "about"`),
+// so these cover the new branch: the tab is offered, it is the active one on
+// that route, and it renders the real About surface rather than the Rules form.
+describe("Settings About tab", () => {
+  function aboutTab(wrapper: ReturnType<typeof mount>) {
+    return wrapper
+      .findAll("nav button")
+      .find((b) => b.text() === i18n.global.t("settings.tabs.about"));
+  }
+
+  it("offers About as a subtab alongside Accounts / Sources / Rules", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, { props: { tab: "accounts" }, global: globalMountOptions });
+    await flushPromises();
+
+    const labels = wrapper.findAll("nav button").map((b) => b.text());
+    expect(labels).toEqual([
+      i18n.global.t("settings.tabs.accounts"),
+      i18n.global.t("settings.tabs.sources"),
+      i18n.global.t("settings.tabs.rules"),
+      i18n.global.t("settings.tabs.about"),
+    ]);
+  });
+
+  it("navigates to /about when the About subtab is clicked", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, { props: { tab: "accounts" }, global: globalMountOptions });
+    await flushPromises();
+
+    await aboutTab(wrapper)!.trigger("click");
+    expect(pushMock).toHaveBeenCalledWith("/about");
+  });
+
+  it("renders the About surface (not the Rules form) with the tab marked active", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_update_channel") return Promise.resolve("stable");
+      if (cmd === "list_releases") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, { props: { tab: "about" }, global: globalMountOptions });
+    await flushPromises();
+
+    expect(aboutTab(wrapper)!.classes()).toContain("border-teal-600");
+    // The About surface's own controls are present...
+    expect(wrapper.find('[data-testid="channel-select"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="check-updates"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain(i18n.global.t("about.updatesTitle"));
+    // ...and the Rules form is not rendered in its place.
+    expect(wrapper.find('[data-testid="rules-form"]').exists()).toBe(false);
+  });
+});

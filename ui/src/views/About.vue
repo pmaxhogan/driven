@@ -11,7 +11,10 @@ import TelemetryPreviewModal from "../components/TelemetryPreviewModal.vue";
 import { isMacOS } from "../platform";
 import type { ReleaseDto } from "../ipc/types";
 
-// About view (SPEC s11.6, s15, s25 /about; DESIGN s8.2 About tab). Shows the app
+// About surface (SPEC s11.6, s15, s25 /about; DESIGN s8.2 About tab). Rendered
+// as the About TAB inside Settings.vue: /about resolves to Settings with
+// `tab: "about"`, which embeds this. Its headings are therefore section-level
+// (h2 + h3) under the Settings h1, not a page title of their own. Shows the app
 // version, the update channel selector (stable / dev), Check-for-updates, an
 // in-app "update available" banner with Install + download progress + View
 // changelog, the paginated release-notes viewer (list_releases) with a per-entry
@@ -144,9 +147,9 @@ function viewReleaseChangelog(release: ReleaseDto): void {
 
 <template>
   <section class="max-w-2xl space-y-6">
-    <h1 class="text-2xl font-semibold">
+    <h2 class="text-lg font-medium">
       {{ t("about.title") }}
-    </h1>
+    </h2>
 
     <!-- Update-available banner (listens to updater:available via the store). An
          available update is actionable, not a success state, so it uses the teal
@@ -234,9 +237,9 @@ function viewReleaseChangelog(release: ReleaseDto): void {
 
     <!-- Updates: channel + check action + status -->
     <div class="space-y-3" :class="cardCls">
-      <h2 class="text-lg font-medium">
+      <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
         {{ t("about.updatesTitle") }}
-      </h2>
+      </h3>
       <label class="block max-w-xs space-y-1 text-sm">
         <span class="text-zinc-600 dark:text-zinc-400">{{ t("about.channelLabel") }}</span>
         <select
@@ -287,9 +290,9 @@ function viewReleaseChangelog(release: ReleaseDto): void {
 
     <!-- Privacy: telemetry opt-out + display language -->
     <div class="space-y-3" :class="cardCls">
-      <h2 class="text-lg font-medium">
+      <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
         {{ t("about.privacyTitle") }}
-      </h2>
+      </h3>
       <label class="flex items-center gap-2 text-sm">
         <input
           type="checkbox"
@@ -315,9 +318,9 @@ function viewReleaseChangelog(release: ReleaseDto): void {
 
     <!-- Diagnostics: export bundle -->
     <div class="space-y-2" :class="cardCls">
-      <h2 class="text-lg font-medium">
+      <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
         {{ t("about.diagnosticsTitle") }}
-      </h2>
+      </h3>
       <button type="button" :class="secondaryBtn" :disabled="exporting" @click="exportDiagnostics">
         {{ t("about.exportDiagnosticsButton") }}
       </button>
@@ -335,9 +338,9 @@ function viewReleaseChangelog(release: ReleaseDto): void {
 
     <!-- Release notes -->
     <div class="space-y-3" :class="cardCls">
-      <h2 class="text-lg font-medium">
+      <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
         {{ t("about.releaseNotesTitle") }}
-      </h2>
+      </h3>
       <p
         v-if="updater.releasesLoading && updater.releases.length === 0"
         class="text-sm text-zinc-500"

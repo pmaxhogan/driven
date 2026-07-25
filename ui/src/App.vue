@@ -15,11 +15,11 @@ import { useUpdaterStore } from "./stores/updater";
 // menu + deep links navigate the same router.
 //
 // UI-CORE IA fix: the top nav is the SHELL-level information architecture and
-// lists only the four primary surfaces - Activity | Settings | Restore | About.
-// Accounts / Sources / Rules are NOT top-nav items: they are subtabs INSIDE the
-// Settings page (the only place they live), so the "Settings" item lights up for
-// any of /settings, /accounts, /sources, /rules. Teal is the shell accent (brand
-// wordmark + active/hover link states).
+// lists only the three primary surfaces - Activity | Restore | Settings.
+// Accounts / Sources / Rules / About are NOT top-nav items: they are subtabs
+// INSIDE the Settings page (the only place they live), so the "Settings" item
+// lights up for any of /settings, /accounts, /sources, /rules, /about. Teal is
+// the shell accent (brand wordmark + active/hover link states).
 const { t } = useI18n();
 const route = useRoute();
 
@@ -85,18 +85,19 @@ onMounted(async () => {
 });
 
 // The top-nav surfaces. `match` is the set of route paths for which the item is
-// the ACTIVE one; Settings owns its three subtab routes so it stays lit while the
+// the ACTIVE one; Settings owns its four subtab routes so it stays lit while the
 // user is on any of them. A path is active when it equals a match path or is
 // nested under it (so /restore/:sourceId keeps Restore active).
+// Restore sits before Settings: it is a primary user-facing surface, whereas
+// Settings is the configuration drawer and reads last in the row.
 const navLinks = [
   { to: "/activity", label: "nav.activity", match: ["/activity"] },
+  { to: "/restore", label: "nav.restore", match: ["/restore"] },
   {
     to: "/settings",
     label: "nav.settings",
-    match: ["/settings", "/accounts", "/sources", "/rules"],
+    match: ["/settings", "/accounts", "/sources", "/rules", "/about"],
   },
-  { to: "/restore", label: "nav.restore", match: ["/restore"] },
-  { to: "/about", label: "nav.about", match: ["/about"] },
 ] as const;
 
 function isActive(matches: readonly string[]): boolean {
