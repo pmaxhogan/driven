@@ -443,18 +443,43 @@ mod tests {
         }
     }
 
+    /// Resolves a path discovered by the walk below and returns it only if it
+    /// really is inside `base`.
+    ///
+    /// The walk takes its paths from the filesystem rather than from the spec,
+    /// so a symlink or a `..` component could otherwise lead it outside the
+    /// fixture root. Re-checking containment against the canonical base is the
+    /// standard guard, and it keeps the helper honest about what it will read.
+    fn inside(base: &Path, candidate: &Path) -> PathBuf {
+        let base = base.canonicalize().expect("fixture root must exist");
+        let full = candidate.canonicalize().expect("walked path must exist");
+        assert!(
+            full.starts_with(&base),
+            "{} escaped the fixture root {}",
+            full.display(),
+            base.display()
+        );
+        full
+    }
+
+    /// Every file under `root`, as `(tree-relative slash path, contents)`,
+    /// sorted. Walking (rather than reading the paths the spec predicts) is
+    /// deliberate: it is the only way these tests can catch a stray EXTRA file,
+    /// which is exactly what a stale or half-rebuilt fixture looks like.
     fn read_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
         let mut out = Vec::new();
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             for entry in fs::read_dir(&dir).unwrap() {
                 let entry = entry.unwrap();
-                let path = entry.path();
-                if path.is_dir() {
-                    stack.push(path);
+                // Ask the directory entry, not the path: one fewer stat, and no
+                // filesystem lookup driven by a reconstructed path.
+                if entry.file_type().unwrap().is_dir() {
+                    stack.push(inside(root, &entry.path()));
                 } else {
+                    let path = inside(root, &entry.path());
                     let rel = path
-                        .strip_prefix(root)
+                        .strip_prefix(root.canonicalize().unwrap())
                         .unwrap()
                         .to_string_lossy()
                         .replace('\\', "/");
