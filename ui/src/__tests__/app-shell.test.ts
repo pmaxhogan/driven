@@ -31,6 +31,8 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import App from "../App.vue";
+import GlobalProgressBar from "../components/GlobalProgressBar.vue";
+import PausedBanner from "../components/PausedBanner.vue";
 import { i18n } from "../i18n";
 import { createAppRouter } from "../router";
 
@@ -129,6 +131,38 @@ describe("App shell", () => {
     const wrapper = await mountAppAt("/restore/some-source");
     const restoreLink = wrapper.find('a[href="/restore"]');
     expect(restoreLink.attributes("aria-current")).toBe("page");
+  });
+
+  // The shell chrome must not be scrollable out of the way: on a long view (a
+  // 10k-row Activity list) the running-backup progress bar used to disappear off
+  // the top. Progress bar + paused banner + nav are one sticky block, so all
+  // three pin together and the document stays the scroll container (which
+  // `useVirtualList` depends on - it windows off window scroll).
+  it("pins the progress bar, paused banner and nav in one sticky header", async () => {
+    const wrapper = await mountAppAt("/activity");
+    const header = wrapper.get('[data-testid="app-header"]');
+
+    expect(header.classes()).toContain("sticky");
+    expect(header.classes()).toContain("top-0");
+    // Above page content and Restore's `sticky bottom-0 z-10` bar, below modals.
+    expect(header.classes()).toContain("z-30");
+    // All three pieces of chrome live INSIDE it (so none can scroll away alone).
+    expect(header.findComponent(GlobalProgressBar).exists()).toBe(true);
+    expect(header.findComponent(PausedBanner).exists()).toBe(true);
+    expect(header.find("nav").exists()).toBe(true);
+  });
+
+  // Sticky, not fixed, and no inner scroll container: the header keeps its space
+  // in normal flow, so the shell needs no compensating top padding and there is
+  // exactly one scrollbar (the document's).
+  it("leaves the document as the only scroll container", async () => {
+    const wrapper = await mountAppAt("/activity");
+    const root = wrapper.get('[data-testid="app-header"]').element.parentElement!;
+
+    expect(root.className).not.toContain("overflow");
+    const main = wrapper.get("main");
+    expect(main.classes()).not.toContain("overflow-y-auto");
+    expect(main.classes().some((c) => c.startsWith("pt-"))).toBe(false);
   });
 
   it("subscribes + hydrates the updater, progress and pause stores on boot", async () => {
