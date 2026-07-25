@@ -524,6 +524,14 @@ pub(crate) struct Faults {
     pub(crate) response_delay_nanos: AtomicU64,
     /// Latched once tripped (auth.invalid_grant is "stay-broken").
     pub(crate) invalid_grant_latched: std::sync::atomic::AtomicBool,
+    /// When true, every `update()` (and every resumable session opened with
+    /// [`ResumableKind::Update`]) fails with a REAL-SHAPED Drive 404 - the
+    /// classified error a `GoogleDriveStore` produces when the recorded
+    /// `drive_file_id` no longer exists (the user deleted or purged the object
+    /// out-of-band). Creates are unaffected, so a self-healing executor can
+    /// re-upload the same path on the next cycle. Latches for the lifetime of
+    /// the store; set by [`fault_injection::with_update_not_found`].
+    pub(crate) update_not_found: std::sync::atomic::AtomicBool,
     /// Dest-folder states are latched on construction by the builder.
     pub(crate) dest_folder_missing: std::sync::atomic::AtomicBool,
     pub(crate) dest_folder_readonly: std::sync::atomic::AtomicBool,
@@ -569,6 +577,7 @@ impl Default for Faults {
             daily_quota_latched: AtomicBool::new(false),
             response_delay_nanos: AtomicU64::new(0),
             invalid_grant_latched: AtomicBool::new(false),
+            update_not_found: AtomicBool::new(false),
             dest_folder_missing: AtomicBool::new(false),
             dest_folder_readonly: AtomicBool::new(false),
             trashed_visible_in_find: AtomicBool::new(false),
@@ -840,6 +849,25 @@ enum RequestKind {
     WriteTarget,
 }
 
+/// The error a real `GoogleDriveStore` produces when a request names a Drive
+/// object that no longer exists: a CLASSIFIED [`crate::google::DriveError`]
+/// built from a genuine Drive 404 body.
+///
+/// Built through [`crate::google::DriveError::from_response`] (not a plain
+/// `anyhow::anyhow!` string) precisely so the fake reproduces the real shape
+/// end-to-end: the executor's typed downcast classifies it
+/// [`crate::remote_store::DriveErrorClassification::Other`] AND
+/// [`crate::google::error_is_not_found`] finds `drive HTTP 404` in the source
+/// chain. A stringly fake message would satisfy neither.
+fn remote_file_missing_error(file_id: &str) -> anyhow::Error {
+    let body = format!(r#"{{"error":{{"code":404,"message":"File not found: {file_id}."}}}}"#);
+    anyhow::Error::new(crate::google::DriveError::from_response(
+        404,
+        body.as_bytes(),
+        None,
+    ))
+}
+
 /// Atomically decrement `counter` if it is non-zero and not `u64::MAX`.
 /// Returns `true` iff the decrement crossed from 1 to 0 (the "trip"
 /// edge). `u64::MAX` means "never trip" and is left alone.
@@ -1022,6 +1050,9 @@ impl RemoteStore for InMemoryRemoteStore {
         app_properties_patch: HashMap<String, String>,
     ) -> anyhow::Result<RemoteEntry> {
         self.check_request_faults(RequestKind::WriteTarget).await?;
+        if self.faults.update_not_found.load(Ordering::Acquire) {
+            return Err(remote_file_missing_error(file_id));
+        }
         let body = collect_body(body, self.oracle_on()).await?;
 
         let new_len = body.len();
@@ -1076,6 +1107,12 @@ impl RemoteStore for InMemoryRemoteStore {
                 guard.ensure_folder_parent(parent_id)?;
             }
             ResumableKind::Update { file_id } => {
+                // The update-target-missing fault applies here too: the real
+                // Drive validates the file id when the session is opened, so a
+                // gone object 404s before a single byte is pushed.
+                if self.faults.update_not_found.load(Ordering::Acquire) {
+                    return Err(remote_file_missing_error(file_id));
+                }
                 guard.ensure_object(file_id)?;
             }
         }

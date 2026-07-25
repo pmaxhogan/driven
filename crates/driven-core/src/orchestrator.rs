@@ -4981,6 +4981,47 @@ mod tests {
         );
     }
 
+    /// A self-healed stale `drive_file_id` must read truthfully in the activity
+    /// log: a WARN row keyed `drive.remote_file_missing` naming the file - NOT
+    /// an Error row, and NOT the `drive.unreachable` the 404 used to be reported
+    /// as. It must also NOT count as a failed op, since holding the source's
+    /// scan timestamps back would punish every other file for a condition the
+    /// executor already fixed.
+    #[test]
+    fn a_healed_missing_remote_copy_is_a_warn_row_and_not_a_failure() {
+        let src_id = crate::types::SourceId::new_v4();
+        let outcome = OpOutcome::Skipped {
+            relative_path: RelativePath::try_from("docs/report.pdf".to_string()).unwrap(),
+            reason: crate::executor::SkipReason::RemoteFileMissing,
+        };
+
+        let row = SyncOrchestrator::outcome_activity_row(src_id, 1_700_000_000_000, &outcome);
+        assert_eq!(
+            row.level,
+            ActivityLevel::Warn,
+            "a handled self-heal is a warning, not an error"
+        );
+        assert_eq!(row.event_type, "drive.remote_file_missing");
+        assert_eq!(row.message.as_deref(), Some("docs/report.pdf"));
+        assert_eq!(row.source_id, Some(src_id));
+
+        // Not a failed op: the cycle's timestamp-advance gate and the closing
+        // progress snapshot both leave it out.
+        assert!(!matches!(outcome, OpOutcome::Failed { .. }));
+        assert_eq!(
+            exec_progress_from(
+                &crate::types::PlanSummary {
+                    uploads: 1,
+                    ..Default::default()
+                },
+                std::slice::from_ref(&outcome),
+            )
+            .errors,
+            0,
+            "a healed missing remote copy must not be counted as a cycle error"
+        );
+    }
+
     #[tokio::test]
     async fn per_op_activity_survives_a_mid_plan_stop() {
         // R2-P2-1: activity is streamed PER OP (persisted immediately after each

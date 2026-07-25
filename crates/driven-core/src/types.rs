@@ -1027,6 +1027,15 @@ pub enum ErrorCode {
     /// `drive.unreachable` - Drive API down, unreachable, or 5xx
     /// circuit-open.
     DriveUnreachable,
+    /// `drive.remote_file_missing` - the backed-up copy this file's recorded
+    /// `drive_file_id` points at no longer exists on Drive (the user deleted
+    /// and purged it out-of-band), so the planned UPDATE returned a definitive
+    /// 404. NOT an error the user must act on: the executor clears the stale id
+    /// and the next scan re-uploads the file as a fresh create, so this is a
+    /// warn-level, self-healing outcome rather than a failure. Distinct from
+    /// [`Self::DriveUnreachable`], which a 404 used to be reported as - and
+    /// which is retried forever against an id that can never come back.
+    DriveRemoteFileMissing,
     /// `drive.resumable_session_invalid` - 4xx during resumable upload;
     /// caller must restart the session.
     DriveResumableSessionInvalid,
@@ -1148,6 +1157,7 @@ impl ErrorCode {
             ErrorCode::DriveUploadSizeLimit => "drive.upload_size_limit",
             ErrorCode::DriveChecksumMismatch => "drive.checksum_mismatch",
             ErrorCode::DriveUnreachable => "drive.unreachable",
+            ErrorCode::DriveRemoteFileMissing => "drive.remote_file_missing",
             ErrorCode::DriveResumableSessionInvalid => "drive.resumable_session_invalid",
             ErrorCode::DriveDestFolderMissing => "drive.dest_folder_missing",
             ErrorCode::DriveDestFolderPermissionDenied => "drive.dest_folder_permission_denied",
@@ -1202,6 +1212,7 @@ impl ErrorCode {
             "drive.upload_size_limit" => ErrorCode::DriveUploadSizeLimit,
             "drive.checksum_mismatch" => ErrorCode::DriveChecksumMismatch,
             "drive.unreachable" => ErrorCode::DriveUnreachable,
+            "drive.remote_file_missing" => ErrorCode::DriveRemoteFileMissing,
             "drive.resumable_session_invalid" => ErrorCode::DriveResumableSessionInvalid,
             "drive.dest_folder_missing" => ErrorCode::DriveDestFolderMissing,
             "drive.dest_folder_permission_denied" => ErrorCode::DriveDestFolderPermissionDenied,
@@ -1372,6 +1383,35 @@ mod tests {
     fn relative_path_from_path_round_trips() {
         let rp: RelativePath = std::path::Path::new("a/b.txt").try_into().unwrap();
         assert_eq!(rp.as_str(), "a/b.txt");
+    }
+
+    // --- ErrorCode (SPEC s24 stable codes) ----------------------------------
+
+    /// `drive.remote_file_missing` (the self-healing stale-`drive_file_id`
+    /// outcome) must round-trip BOTH ways: `code()` is the persisted
+    /// `activity_log.event_type` and the UI's i18n key, and `from_code()` is
+    /// how a stored row is read back. A mapping added in only one direction
+    /// would silently degrade an existing row to "unknown code".
+    #[test]
+    fn drive_remote_file_missing_round_trips() {
+        assert_eq!(
+            ErrorCode::DriveRemoteFileMissing.code(),
+            "drive.remote_file_missing"
+        );
+        assert_eq!(
+            ErrorCode::from_code("drive.remote_file_missing"),
+            Some(ErrorCode::DriveRemoteFileMissing)
+        );
+        // ...and it is its OWN code, not folded into drive.unreachable (the
+        // bug this code exists to fix reported a definitive 404 as unreachable).
+        assert_ne!(
+            ErrorCode::DriveRemoteFileMissing.code(),
+            ErrorCode::DriveUnreachable.code()
+        );
+        assert_eq!(
+            ErrorCode::DriveRemoteFileMissing.to_string(),
+            "drive.remote_file_missing"
+        );
     }
 
     // --- ScheduleConfig (V2 schedule windows) -------------------------------

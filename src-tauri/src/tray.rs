@@ -527,6 +527,10 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         | ErrorCode::DriveResumableSessionInvalid
         | ErrorCode::DriveDestFolderMissing
         | ErrorCode::DriveDestFolderPermissionDenied
+        // A missing remote copy is a self-healed, per-file warning (the next
+        // scan re-uploads it), and it says nothing about reachability - Drive
+        // answered, the object was simply gone. Non-network either way.
+        | ErrorCode::DriveRemoteFileMissing
         // Local filesystem / VSS errors -> red error. (The transient
         // vss_helper_pending skip is not an error condition, but it is not a
         // network one either, so it classifies here as non-network.)

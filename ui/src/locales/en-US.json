@@ -572,6 +572,10 @@
         "short": "Drive unavailable",
         "long": "Google Drive is unreachable right now. Driven will keep retrying."
       },
+      "remote_file_missing": {
+        "short": "Remote copy missing",
+        "long": "The backed-up copy of this file was missing on Drive; it will be re-uploaded automatically on the next scan."
+      },
       "resumable_session_invalid": {
         "short": "Upload interrupted",
         "long": "A resumable upload session expired. Driven will restart the upload."

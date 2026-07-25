@@ -22,8 +22,8 @@
 //! - Transient faults (rate-limit, 5xx, network-drop) reset to "never
 //!   trip" once they fire; the next request after the trip succeeds.
 //! - "Stay-broken" faults (auth.invalid_grant, dest-folder missing /
-//!   readonly, trashed-visible-in-find) latch on first trigger and
-//!   remain set for the lifetime of the store.
+//!   readonly, update-target-not-found, trashed-visible-in-find) latch on
+//!   first trigger and remain set for the lifetime of the store.
 //! - `md5_mismatch_after` latches **on the affected entry**: when it
 //!   trips during a write, the entry's wrong md5 is stamped onto the
 //!   entry so every subsequent read of that entry (metadata,
@@ -172,6 +172,24 @@ impl InMemoryRemoteStore {
         self.faults
             .dest_folder_missing
             .store(true, Ordering::Release);
+        self
+    }
+
+    /// Latches "the object an UPDATE targets is gone": every `update()` and
+    /// every resumable session opened as [`crate::remote_store::ResumableKind::Update`]
+    /// fails with a real-shaped classified Drive 404, modelling a
+    /// `drive_file_id` whose object the user deleted (and purged) out-of-band.
+    ///
+    /// CREATES keep working, which is the point: the executor must clear the
+    /// stale id and re-upload the same path as a fresh create on the next
+    /// cycle (`drive.remote_file_missing`) instead of retrying a doomed update
+    /// forever. Read-only calls are unaffected.
+    ///
+    /// Latches for the lifetime of the store (a deleted Drive object does not
+    /// come back), so a test that wants the re-upload to succeed simply lets
+    /// the next cycle take the create path.
+    pub fn with_update_not_found(self) -> Self {
+        self.faults.update_not_found.store(true, Ordering::Release);
         self
     }
 

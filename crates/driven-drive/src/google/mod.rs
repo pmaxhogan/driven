@@ -240,7 +240,7 @@ impl std::error::Error for DriveError {
     fn source(&self) -> Option<&(dyn std::error::Error + 'static)> {
         match self {
             // The `anyhow::Error` source is surfaced as the error chain so the
-            // `is_not_found` helper (and any caller) can walk to the
+            // `error_is_not_found` helper (and any caller) can walk to the
             // `drive HTTP <status>` cause. `anyhow::Error` impls
             // `AsRef<dyn Error + Send + Sync>`; coerce off the auto traits to
             // the `source()` return type.
@@ -1494,7 +1494,7 @@ impl RemoteStore for GoogleDriveStore {
             Ok(_) => Ok(()),
             Err(e) => {
                 // 404 -> already gone, treated as success (SPEC s3 `trash`).
-                if is_not_found(&e) {
+                if error_is_not_found(&e) {
                     Ok(())
                 } else {
                     Err(e)
@@ -1522,7 +1522,7 @@ impl RemoteStore for GoogleDriveStore {
         match result {
             Ok(_) => Ok(()),
             Err(e) => {
-                if is_not_found(&e) {
+                if error_is_not_found(&e) {
                     Ok(())
                 } else {
                     Err(e)
@@ -1758,8 +1758,26 @@ pub(crate) fn parse_retry_after(resp: &reqwest::Response) -> Option<u64> {
         .map(|secs| secs.saturating_mul(1000))
 }
 
-/// Whether an error is a Drive 404 (used to make `trash` idempotent).
-fn is_not_found(err: &anyhow::Error) -> bool {
+/// Whether `err` is a DEFINITIVE Drive "not found" (HTTP 404): the object the
+/// request named does not exist (deleted out-of-band, purged from the trash, or
+/// never ours).
+///
+/// The generic [`DriveErrorClassification`] of a 404 is
+/// [`DriveErrorClassification::Other`], which renders as
+/// `drive.unreachable: unclassified Drive error` - indistinguishable from any
+/// other unclassified failure. Callers that must react to a MISSING object
+/// specifically (the executor self-healing a stale `drive_file_id`, `trash`
+/// treating a 404 as an idempotent no-op) use this instead of re-deriving the
+/// classification: [`DriveError::from_response`] embeds the literal
+/// `drive HTTP 404` in the source chain, and [`DriveError`]'s
+/// `Error::source` exposes that chain, so walking it is the one reliable
+/// signal available across both the typed and stringly paths.
+///
+/// Deliberately narrow: only a real 404 matches. A 403 / 5xx / transport
+/// failure returns `false`, so a transient fault is never mistaken for a
+/// permanently-gone object.
+#[must_use]
+pub fn error_is_not_found(err: &anyhow::Error) -> bool {
     // `DriveError::from_response` embeds `drive HTTP 404` in the source chain.
     err.chain()
         .any(|c| c.to_string().contains("drive HTTP 404"))
@@ -1963,6 +1981,59 @@ pub(crate) fn clone_kind(kind: &ResumableKind) -> ResumableKind {
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A 404 arriving as a CLASSIFIED Drive error (the shape every real
+    /// `GoogleDriveStore` call produces) must be detected by
+    /// [`error_is_not_found`], even though its classification is the generic
+    /// [`DriveErrorClassification::Other`] whose `Display` says
+    /// `drive.unreachable`. Callers (the executor's stale-`drive_file_id`
+    /// self-heal, `trash`'s idempotent no-op) depend on this distinction.
+    #[test]
+    fn error_is_not_found_detects_a_classified_404() {
+        let err = anyhow::Error::new(DriveError::from_response(
+            404,
+            br#"{"error":{"code":404,"message":"File not found: abc123."}}"#,
+            None,
+        ));
+        assert!(
+            error_is_not_found(&err),
+            "a classified Drive 404 must read as not-found, got: {err:?}"
+        );
+        // The generic classification stays `Other` (this helper is the decision
+        // point, not the classification) - guard against a future rework
+        // silently changing that assumption.
+        assert_eq!(
+            classification_of(&err),
+            Some(DriveErrorClassification::Other),
+            "a 404 classifies as Other; only `error_is_not_found` distinguishes it"
+        );
+    }
+
+    /// Nothing else may masquerade as not-found: a transient 5xx, a 403, a
+    /// plain `anyhow` message, and a wrapped error whose chain has no
+    /// `drive HTTP 404` all return `false`, so a temporary fault is never
+    /// mistaken for a permanently-gone object.
+    #[test]
+    fn error_is_not_found_rejects_non_404_errors() {
+        let five_xx = anyhow::Error::new(DriveError::from_response(503, b"unavailable", None));
+        assert!(
+            !error_is_not_found(&five_xx),
+            "a transient 5xx must NOT read as not-found"
+        );
+        let forbidden = anyhow::Error::new(DriveError::from_response(403, b"forbidden", None));
+        assert!(
+            !error_is_not_found(&forbidden),
+            "a 403 must NOT read as not-found"
+        );
+        assert!(
+            !error_is_not_found(&anyhow::anyhow!("drive: something else went wrong")),
+            "an untyped Drive error must NOT read as not-found"
+        );
+        assert!(
+            !error_is_not_found(&anyhow::anyhow!("boom").context("while updating")),
+            "a plain wrapped error must NOT read as not-found"
+        );
+    }
 
     #[test]
     fn google_store_new_builds_a_stream_client_with_the_ca() {

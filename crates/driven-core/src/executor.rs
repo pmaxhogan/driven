@@ -360,8 +360,11 @@ impl PendingOpPayload {
 /// later scan rather than marking it `synced` (SPEC s8 file-changed
 /// defences, DESIGN s5.3).
 ///
-/// A skip is not an error: the bytes are simply not coherent to commit
-/// this pass. Each maps to a `local.*` [`ErrorCode`] for the activity log.
+/// A skip is not an error: the op did not complete, but nothing is wrong that
+/// the user must act on and the next scan retries it. Each maps to a stable
+/// [`ErrorCode`] for the activity log - a `local.*` one for the file-coherence
+/// cases, plus the one Drive-side reason
+/// ([`SkipReason::RemoteFileMissing`], `drive.remote_file_missing`).
 #[derive(Debug, Clone, Copy, PartialEq, Eq, Hash, Serialize, Deserialize)]
 #[serde(rename_all = "snake_case")]
 pub enum SkipReason {
@@ -393,6 +396,18 @@ pub enum SkipReason {
     /// skipped TRANSIENTLY this cycle and retried next cycle (once the broker is
     /// up) - NOT reported as a permanent lock (`local.vss_helper_pending`).
     VssHelperPending,
+    /// The UPDATE this op planned targeted a recorded `drive_file_id` whose
+    /// Drive object is GONE (a definitive 404 - the backed-up copy was deleted
+    /// and purged out-of-band), so the update could never have succeeded
+    /// (`drive.remote_file_missing`).
+    ///
+    /// The one Drive-side skip reason. It belongs with the skips rather than the
+    /// failures because the executor SELF-HEALS the condition before returning
+    /// it: the stale id is cleared and the pending op dropped, so the next scan
+    /// re-plans the file as a fresh CREATE and re-uploads it. Reporting it as a
+    /// failure would be wrong twice over - it is neither a user-actionable error
+    /// nor a reason to hold this source's scan timestamps back.
+    RemoteFileMissing,
 }
 
 impl SkipReason {
@@ -407,6 +422,7 @@ impl SkipReason {
             SkipReason::Locked => ErrorCode::LocalFileLocked,
             SkipReason::VssUnavailable => ErrorCode::LocalVssUnavailable,
             SkipReason::VssHelperPending => ErrorCode::LocalVssHelperPending,
+            SkipReason::RemoteFileMissing => ErrorCode::DriveRemoteFileMissing,
         }
     }
 }
@@ -1488,6 +1504,49 @@ impl DefaultExecutor {
                     code,
                 })
             }
+            Err(UploadError::RemoteFileMissing) => {
+                // SELF-HEAL a stale `drive_file_id` on the LIVE path, mirroring
+                // what reconcile already does when its `metadata()` read 404s
+                // (R3-P1-2). The recorded object is permanently gone, so:
+                //
+                // 1. NULL the id on the `file_state` row. The row itself stays
+                //    (only the pointer was wrong), so nothing about the file's
+                //    history is lost - but with no id the next execution of this
+                //    path takes the CREATE branch and re-uploads the bytes.
+                // 2. Drop the pending op exactly like the `Failed` arm above: no
+                //    object was created (the update never reached Drive), so
+                //    there is no orphan for reconcile to adopt and nothing to
+                //    recover - keeping the op would just re-run the same doomed
+                //    update.
+                // 3. Report a WARN-level skip, not an error. This is deliberate
+                //    for the cycle's timestamp-advance logic (`any_failed` in
+                //    the orchestrator): a `Failed` outcome holds
+                //    `last_full_scan_at` back to force a retry, but there is
+                //    nothing to retry - the condition is already handled, and
+                //    the file is re-planned by the next scan because the update
+                //    was only planned in the first place after its
+                //    `(size, mtime)` diverged from the row we just left in
+                //    place. Blocking the advance would also punish every OTHER
+                //    source-level timestamp for one healed file.
+                //
+                // Only updates reach here (`update_target_is_missing` requires
+                // an existing id), so a 404 on a create still means "destination
+                // folder missing" and keeps its own handling.
+                self.state
+                    .clear_file_state_drive_file_id(source.id, relative_path)
+                    .await?;
+                self.state.delete_pending_op(op_id).await?;
+                warn!(
+                    target: TARGET,
+                    source = %source.id,
+                    path = %relative_path,
+                    "the backed-up copy was missing on Drive; cleared the stale drive_file_id - the next scan re-uploads this file as a new object"
+                );
+                Ok(OpOutcome::Skipped {
+                    relative_path: relative_path.clone(),
+                    reason: SkipReason::RemoteFileMissing,
+                })
+            }
             Err(UploadError::ChecksumMismatch { stranded_file_id }) => {
                 // Issue #36: for a VERSIONED change the mismatching object is the
                 // NEW create orphan; `effective_existing_id` is None so it is
@@ -1780,6 +1839,18 @@ impl DefaultExecutor {
                 Ok(OpOutcome::Skipped {
                     relative_path: representative,
                     reason,
+                })
+            }
+            Err(UploadError::RemoteFileMissing) => {
+                // Unreachable by construction: a bundle is ALWAYS a create
+                // (`upload_bytes` is called with `existing_file_id: None`), and
+                // `update_target_is_missing` requires an existing id. Handled
+                // defensively rather than with a panic - nothing landed, so drop
+                // the op and let the next scan re-bundle the members.
+                self.state.delete_pending_op(op_id).await?;
+                Ok(OpOutcome::Skipped {
+                    relative_path: representative,
+                    reason: SkipReason::RemoteFileMissing,
                 })
             }
             Err(UploadError::Fatal(e)) => Err(e),
@@ -2522,6 +2593,17 @@ impl DefaultExecutor {
         result.map_err(|e| {
             let class = classify_drive_error(&e);
             self.pacer.note_response(class.response_class());
+            // The UPDATE's target object is gone from Drive (404): no retry and
+            // no `drive.unreachable` failure - hand it to the caller's self-heal
+            // so the stale id is cleared and the next scan re-creates the file.
+            if update_target_is_missing(existing_file_id, &e) {
+                warn!(
+                    target: TARGET,
+                    name = %target.name,
+                    "streamed update target is gone on Drive (404); clearing the stale drive_file_id so the next scan re-uploads: {e}"
+                );
+                return UploadError::RemoteFileMissing;
+            }
             // C5-P1-3: a post-upload checksum mismatch on the simple-band
             // (4-5 MiB CREATE/UPDATE + VSS large reads forced through simple
             // upload) must route through the SAME durable 3-consecutive-mismatch
@@ -2575,7 +2657,21 @@ impl DefaultExecutor {
         let session = self
             .open_resumable_session(target, existing_file_id, mime, total, op_id, payload)
             .await
-            .map_err(UploadError::Fatal)?;
+            .map_err(|e| {
+                // A 404 opening an UPDATE session means the target object is
+                // gone. `Fatal` here would abort the WHOLE cycle for a
+                // condition that is per-file and self-healable, so route it to
+                // the caller's self-heal instead.
+                if update_target_is_missing(existing_file_id, &e) {
+                    warn!(
+                        target: TARGET,
+                        name = %target.name,
+                        "resumable update session target is gone on Drive (404); clearing the stale drive_file_id so the next scan re-uploads: {e}"
+                    );
+                    return UploadError::RemoteFileMissing;
+                }
+                UploadError::Fatal(e)
+            })?;
 
         let mut acc: Vec<u8> = Vec::with_capacity(WIRE_CHUNK);
         let mut offset: u64 = 0;
@@ -2850,6 +2946,22 @@ impl DefaultExecutor {
                             });
                         }
                     }
+                }
+                Err(e) if update_target_is_missing(existing_file_id, &e) => {
+                    // The object this UPDATE targets is gone from Drive (404).
+                    // Retrying (or failing as `drive.unreachable` and keeping
+                    // the id) can never succeed - hand it to the caller's
+                    // self-heal, which clears the id so the next scan re-creates
+                    // the file. Covers both the simple multipart update and the
+                    // resumable one (whose session-open 404s the same way).
+                    warn!(
+                        target: TARGET,
+                        name = %target.name,
+                        file_id = %existing_file_id.unwrap_or_default(),
+                        "update target is gone on Drive (404); clearing the stale drive_file_id so the next scan re-uploads: {e}"
+                    );
+                    self.pacer.note_response(ResponseClass::OtherError);
+                    return Err(UploadError::RemoteFileMissing);
                 }
                 Err(e) => match self.classify_retry(
                     &e,
@@ -5542,7 +5654,40 @@ enum UploadError {
     /// raised for creates (`existing_file_id.is_none()`); updates are
     /// idempotent and retry inline.
     DeferToReconcile(ErrorCode),
+    /// The UPDATE targeted a `drive_file_id` whose Drive object is definitively
+    /// GONE (a 404 from the update itself, from the metadata read the real store
+    /// does first, or from opening a resumable UPDATE session).
+    ///
+    /// Carried distinctly from [`UploadError::Failed`] so `hash_then_upload` can
+    /// SELF-HEAL: clear the stale id, drop the op, and report the warn-level
+    /// `drive.remote_file_missing` skip so the next scan re-uploads the file as
+    /// a fresh create. Without it the op failed as `drive.unreachable`, KEPT the
+    /// dead id, and every later cycle re-planned the same doomed update forever.
+    ///
+    /// Only ever raised when an existing `drive_file_id` was targeted; a 404 on
+    /// a CREATE is a destination-folder condition and keeps its existing
+    /// `map_parent_write_error` handling.
+    RemoteFileMissing,
     Fatal(anyhow::Error),
+}
+
+/// Does `e` prove that the object this op's UPDATE targeted is GONE from Drive?
+///
+/// Two conditions, both required:
+/// - the op targeted an EXISTING `drive_file_id` (an update, not a create - a
+///   404 on a create means the destination FOLDER is missing, which
+///   `map_parent_write_error` already promotes to
+///   [`DriveError::DestFolderMissing`]);
+/// - the error carries a definitive Drive 404 in its chain
+///   ([`driven_drive::google::error_is_not_found`]).
+///
+/// The generic classification of a 404 stays
+/// [`DriveErrorClassification::Other`] -> [`DriveError::Other`] ->
+/// `drive.unreachable`; deliberately so (reworking the taxonomy is out of
+/// scope). THIS is the decision point that separates "Drive is having a bad
+/// day, retry" from "that object can never be updated again".
+fn update_target_is_missing(existing_file_id: Option<&str>, e: &anyhow::Error) -> bool {
+    existing_file_id.is_some() && driven_drive::google::error_is_not_found(e)
 }
 
 impl UploadError {
@@ -7407,6 +7552,290 @@ mod tests {
             .unwrap();
         assert_eq!(children.len(), 1);
         assert_eq!(children[0].size, Some(size2));
+    }
+
+    // --- a stale drive_file_id self-heals on the LIVE update path -----------
+
+    /// Seed a `file_state` row for `rel` that claims `drive_file_id` and looks
+    /// synced, so the next execution takes the UPDATE branch (the executor
+    /// decides create-vs-update from this row, not from the plan). The recorded
+    /// `(size, mtime_ns)` deliberately do NOT match the live file - exactly the
+    /// shape a real change-detected update has, and what makes the next scan
+    /// re-plan the file after a self-heal.
+    async fn seed_synced_row(h: &Harness, rel: &RelativePath, drive_file_id: &str) {
+        h.state
+            .upsert_file_state(&FileStateRow {
+                source_id: h.source.id,
+                relative_path: rel.clone(),
+                size: 1,
+                mtime_ns: 1,
+                hash_blake3: *blake3::hash(b"stale").as_bytes(),
+                drive_file_id: Some(drive_file_id.to_string()),
+                drive_md5: None,
+                encrypted_remote_path: None,
+                status: FileStateStatus::Synced,
+                last_uploaded_at: Some(h.clock.now_ms()),
+                last_verified_at: None,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The live-path counterpart of `reconcile_metadata_not_found_clears_stale_id_and_drops_op`
+    /// (R3-P1-2): a planned UPDATE whose recorded `drive_file_id` no longer
+    /// exists on Drive (the user deleted + purged the backed-up copy) must
+    /// SELF-HEAL instead of failing forever.
+    ///
+    /// Before this fix the 404 classified as `DriveErrorClassification::Other`
+    /// -> `drive.unreachable`, the op FAILED, and the dead id was KEPT - so
+    /// every later cycle re-planned the same doomed update (observed in a user
+    /// diagnostics bundle as four files erroring identically, every cycle,
+    /// while neighbouring uploads succeeded).
+    #[tokio::test]
+    async fn update_against_a_missing_drive_object_heals_and_re_uploads_next_cycle() {
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_update_not_found()).await;
+        let (rel, size) = h.write_file("gone.txt", b"local bytes that changed");
+        seed_synced_row(&h, &rel, "id-of-an-object-the-user-deleted").await;
+
+        let exec = h.executor();
+        let outcomes = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .expect("a missing remote object must not abort the cycle");
+
+        // The outcome is a WARN-level skip carrying the dedicated code - NOT an
+        // error, and NOT `drive.unreachable`.
+        assert_eq!(
+            outcomes,
+            vec![OpOutcome::Skipped {
+                relative_path: rel.clone(),
+                reason: SkipReason::RemoteFileMissing,
+            }],
+            "a definitive 404 on an update must surface as the self-healing skip"
+        );
+        assert_eq!(
+            SkipReason::RemoteFileMissing.error_code(),
+            ErrorCode::DriveRemoteFileMissing
+        );
+
+        // The stale id is CLEARED (the row itself survives) ...
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("the file_state row must survive; only the dead id is cleared");
+        assert!(
+            row.drive_file_id.is_none(),
+            "the stale drive_file_id must be cleared so the next scan re-creates the object"
+        );
+        // ... and the doomed op is gone, so nothing re-runs it.
+        assert!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the dead update op must be dropped, not retried forever"
+        );
+
+        // The NEXT cycle re-plans the same file as a CREATE and succeeds - the
+        // whole point of the self-heal. `with_update_not_found` still breaks
+        // updates, so a green result here proves the create branch was taken.
+        let outcomes = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes,
+            vec![OpOutcome::Done {
+                relative_path: rel.clone(),
+                kind: DoneKind::Upload,
+                bytes: Some(size),
+            }],
+            "the next cycle must re-upload the file as a fresh create"
+        );
+        let healed = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        let new_id = healed
+            .drive_file_id
+            .expect("the re-upload must record a fresh drive_file_id");
+        assert_ne!(
+            new_id, "id-of-an-object-the-user-deleted",
+            "the row must point at the NEW object"
+        );
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "exactly one object, no duplicate");
+        assert_eq!(children[0].id, new_id);
+        assert_eq!(children[0].size, Some(size));
+    }
+
+    /// The self-heal is gated on a DEFINITIVE 404, not on "the update failed".
+    /// Any other definitive update failure keeps the pre-fix behaviour: the op
+    /// FAILS with `drive.unreachable` and the recorded `drive_file_id` is KEPT
+    /// (clearing it would force a duplicate re-upload of a file whose object may
+    /// be perfectly alive).
+    ///
+    /// Driven by the fake's own not-found message ("fake: no object with file_id
+    /// ..."), which is deliberately NOT 404-shaped - it stands in for any
+    /// unclassified Drive failure on an update.
+    #[tokio::test]
+    async fn non_404_update_failure_still_fails_as_unreachable_and_keeps_the_id() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("kept.txt", b"local bytes that changed");
+        seed_synced_row(&h, &rel, "an-id-the-fake-does-not-know").await;
+
+        let outcomes = h
+            .executor()
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcomes,
+            vec![OpOutcome::Failed {
+                relative_path: rel.clone(),
+                code: ErrorCode::DriveUnreachable,
+            }],
+            "an unclassified update failure must still fail as drive.unreachable"
+        );
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.drive_file_id.as_deref(),
+            Some("an-id-the-fake-does-not-know"),
+            "a non-404 failure must NOT clear the drive_file_id"
+        );
+    }
+
+    /// A TRANSIENT 5xx on an update is untouched by the self-heal: it is still
+    /// retried inline and still lands on the SAME object. A transient fault must
+    /// never be mistaken for "the remote copy is gone" - that would re-upload a
+    /// live file as a duplicate on every wobble.
+    ///
+    /// Fault budget: `with_5xx_after(1)` lets the setup `create` (request 1)
+    /// through and trips on request 2 - the executor's update of a root-level
+    /// file, which issues no `ensure_folder` first.
+    #[tokio::test]
+    async fn transient_5xx_on_an_update_retries_and_keeps_the_same_object() {
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_5xx_after(1)).await;
+        let (rel, size) = h.write_file("wobble.txt", b"local bytes that changed");
+        let existing = h
+            .remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "wobble.txt",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from_static(b"old bytes")),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+        seed_synced_row(&h, &rel, &existing.id).await;
+
+        let outcomes = h
+            .executor()
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcomes,
+            vec![OpOutcome::Done {
+                relative_path: rel.clone(),
+                kind: DoneKind::Upload,
+                bytes: Some(size),
+            }],
+            "a single transient 5xx on an update must be retried, not healed"
+        );
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            row.drive_file_id.as_deref(),
+            Some(existing.id.as_str()),
+            "the update must have landed on the SAME object"
+        );
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "no duplicate object was created");
+        assert_eq!(children[0].size, Some(size));
+    }
+
+    /// Unit-level guard on the decision point itself: only an UPDATE (an
+    /// existing id) hitting a definitive 404 self-heals. A create's 404 belongs
+    /// to `map_parent_write_error` (destination folder missing) and must not be
+    /// stolen; a 5xx / untyped failure stays a plain failure.
+    #[test]
+    fn update_target_is_missing_only_fires_for_a_404_against_an_existing_id() {
+        use driven_drive::google::DriveError as DriveStoreError;
+        use driven_drive::remote_store::DriveErrorClassification;
+
+        // The exact shape `DriveError::from_response(404, ..)` builds: an
+        // `Other`-classified error whose SOURCE chain carries the HTTP status.
+        let not_found = anyhow::Error::new(DriveStoreError::Classified {
+            kind: DriveErrorClassification::Other,
+            source: anyhow::anyhow!("drive HTTP 404: File not found: x."),
+        });
+        let transient = anyhow::Error::new(DriveStoreError::Classified {
+            kind: DriveErrorClassification::Transient5xx,
+            source: anyhow::anyhow!("drive HTTP 503: backend error"),
+        });
+
+        assert!(super::update_target_is_missing(Some("file-id"), &not_found));
+        assert!(
+            !super::update_target_is_missing(None, &not_found),
+            "a 404 on a CREATE is a dest-folder condition, not a missing remote copy"
+        );
+        assert!(
+            !super::update_target_is_missing(Some("file-id"), &transient),
+            "a transient 5xx must never read as a missing remote copy"
+        );
+        assert!(
+            !super::update_target_is_missing(
+                Some("file-id"),
+                &anyhow::anyhow!("fake: no object with file_id file-id")
+            ),
+            "only a real Drive 404 counts; an unclassified failure keeps failing"
+        );
     }
 
     // --- issue #36: versioning (trash-as-version-store) ---------------------

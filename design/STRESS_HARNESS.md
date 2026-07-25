@@ -420,6 +420,7 @@ impl InMemoryRemoteStore {
     pub fn with_md5_mismatch_after(self, n: u64) -> Self;
     pub fn with_dest_folder_missing(self) -> Self;
     pub fn with_dest_folder_readonly(self) -> Self;
+    pub fn with_update_not_found(self) -> Self;
     pub fn with_fileid_recycle(self) -> Self;
 }
 ```
