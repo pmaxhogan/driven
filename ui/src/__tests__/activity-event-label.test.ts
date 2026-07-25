@@ -35,6 +35,9 @@ describe("activityEventLabel (R1-P2-3)", () => {
     // backend-emitted types with no curated label.
     expect(label("hook.pre")).toBe("Pre-backup hook");
     expect(label("hook.post")).toBe("Post-backup hook");
+    // The run-completion row the orchestrator writes when a cycle's ops all
+    // succeeded (the feed used to trail off after the last per-file row).
+    expect(label("backup_done")).toBe("Backup complete");
   });
 
   it("falls back to errors.<code>.short for error/skip code event types", () => {
