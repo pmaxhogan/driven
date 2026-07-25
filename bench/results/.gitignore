@@ -1,0 +1,8 @@
+# Benchmark reports are generated artefacts of a local run, and a run happens
+# every time someone types `just bench` - so they are ignored by default rather
+# than swept into an unrelated commit.
+#
+# To keep one deliberately as a durable record to compare against later:
+#   git add -f bench/results/<timestamp>.md bench/results/<timestamp>.json
+*.md
+*.json
