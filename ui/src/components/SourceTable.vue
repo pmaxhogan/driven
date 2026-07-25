@@ -8,7 +8,11 @@ import RecoveryPhraseReveal from "./RecoveryPhraseReveal.vue";
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
 import { useAccountsStore } from "../stores/accounts";
-import { appendPatternLine } from "../stores/exclusionPreview";
+import {
+  appendPatternLine,
+  splitPatterns,
+  unconstrainedIncludePatterns,
+} from "../stores/exclusionPreview";
 import { useSourcesStore } from "../stores/sources";
 import type { SourceDto } from "../ipc/types";
 
@@ -101,12 +105,10 @@ onMounted(async () => {
   await Promise.all([sources.refresh(), accounts.refresh()]);
 });
 
-function splitPatterns(text: string): string[] {
-  return text
-    .split(/[\n,]/)
-    .map((p) => p.trim())
-    .filter((p) => p.length > 0);
-}
+// The include rules in the open editor that stop the scanner from pruning
+// excluded folders, recomputed AS THE USER TYPES (the preview walk itself only
+// re-runs on blur, but the guidance should not wait for it).
+const unconstrainedIncludes = computed(() => unconstrainedIncludePatterns(editIncludeText.value));
 
 function openWizard(): void {
   void wizard.value?.start();
@@ -534,6 +536,26 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
               @blur="refreshEditPreview"
             />
           </label>
+          <!-- An include rule the scanner cannot bound to a fixed depth forces
+               it into every excluded folder, so the walk stops being prunable. -->
+          <div
+            v-if="unconstrainedIncludes.length > 0"
+            class="rounded-lg border border-amber-400 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200"
+            data-testid="include-pattern-warning"
+            role="status"
+          >
+            <p class="font-medium">
+              {{ t("settings.addSource.includeWarning.title") }}
+            </p>
+            <ul class="mt-1 list-disc space-y-0.5 pl-5 font-mono break-all">
+              <li v-for="pattern in unconstrainedIncludes" :key="pattern">
+                {{ pattern }}
+              </li>
+            </ul>
+            <p class="mt-2">
+              {{ t("settings.addSource.includeWarning.hint") }}
+            </p>
+          </div>
           <label class="block space-y-1 text-sm">
             <span class="text-zinc-600 dark:text-zinc-400">{{
               t("settings.addSource.excludePatternsLabel")

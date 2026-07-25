@@ -35,6 +35,8 @@ import {
   anchoredPatternForPath,
   appendPatternLine,
   createExclusionPreview,
+  isUnconstrainedIncludePattern,
+  unconstrainedIncludePatterns,
   type ExclusionPreviewController,
 } from "../stores/exclusionPreview";
 import type { ExclusionPreviewBatch, ExclusionPreviewNode } from "../ipc/types";
@@ -125,6 +127,67 @@ describe("appendPatternLine", () => {
     expect(appendPatternLine("*.log\n/a.txt", "/a.txt")).toBe("*.log\n/a.txt");
     // The editors split on commas too, so a comma-listed duplicate also counts.
     expect(appendPatternLine("*.log,/a.txt", "/a.txt")).toBe("*.log,/a.txt");
+  });
+});
+
+describe("isUnconstrainedIncludePattern", () => {
+  // The scanner may only PRUNE an excluded directory when no include pattern
+  // could match beneath it, which needs a root-anchored pattern of bounded
+  // depth. Anything relative, or spanning levels with a double-star, forces the
+  // walk into every excluded folder - those are the ones the editors warn about.
+  const vectors: Array<[string, boolean]> = [
+    // Unconstrained: no leading slash, so it matches at any depth.
+    [".env", true],
+    ["*/.env", true],
+    ["blah/.env", true],
+    ["**/.env", true],
+    // Unconstrained: anchored, but a double-star spans any number of levels.
+    ["/*/x/**/.env", true],
+    ["/**", true],
+    ["/a/**/b", true],
+    // Constrained: anchored AND depth-bounded.
+    ["/x/.env", false],
+    ["/*/.env", false],
+    ["/a/*/b/.env", false],
+    ["/.env", false],
+    ["/node_modules/", false],
+    // Blank lines are not patterns at all.
+    ["", false],
+    ["   ", false],
+  ];
+
+  it.each(vectors)("treats %j as unconstrained=%s", (pattern, expected) => {
+    expect(isUnconstrainedIncludePattern(pattern)).toBe(expected);
+  });
+
+  it("judges a pattern by its trimmed form", () => {
+    // The editors trim each line before sending it, so surrounding whitespace
+    // must not change the verdict either way.
+    expect(isUnconstrainedIncludePattern("  /x/.env  ")).toBe(false);
+    expect(isUnconstrainedIncludePattern("  .env  ")).toBe(true);
+  });
+});
+
+describe("unconstrainedIncludePatterns", () => {
+  it("reports only the offending patterns, in the order they were typed", () => {
+    expect(unconstrainedIncludePatterns("/x/.env\n.env\n/a/*/b/.env\n/*/x/**/.env")).toEqual([
+      ".env",
+      "/*/x/**/.env",
+    ]);
+  });
+
+  it("splits on commas as well as newlines, the way both editors do", () => {
+    expect(unconstrainedIncludePatterns("/x/.env,blah/.env,/*/.env")).toEqual(["blah/.env"]);
+  });
+
+  it("ignores blank lines and surrounding whitespace", () => {
+    expect(unconstrainedIncludePatterns("\n  \n  /x/.env  \n\n,, \t\n")).toEqual([]);
+    expect(unconstrainedIncludePatterns("  */.env  \n\n")).toEqual(["*/.env"]);
+  });
+
+  it("is empty for empty input and for an all-anchored list", () => {
+    expect(unconstrainedIncludePatterns("")).toEqual([]);
+    expect(unconstrainedIncludePatterns("/x/.env\n/*/.env\n/a/*/b/.env")).toEqual([]);
   });
 });
 
