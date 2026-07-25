@@ -863,13 +863,19 @@ pub async fn scan_with_progress(
                     // NFC collision detection (DESIGN s5.2.3, SPEC s24
                     // local.unicode_collision): `RelativePath::try_from`
                     // NFC-normalised `rel`, so two byte-distinct raw paths can
-                    // collapse to one key. `HashSet::insert` returns false when
-                    // the key was already present; keep the first file, record +
-                    // drop the later collider rather than emitting a duplicate
-                    // upload op for the same `file_state` key. Only this
-                    // consumer can make that call - a worker cannot know which
-                    // key another thread already claimed.
-                    if !seen.insert(rel.clone()) {
+                    // collapse to one key. Keep the first file, record + drop
+                    // the later collider rather than emitting a duplicate upload
+                    // op for the same `file_state` key. Only this consumer can
+                    // make that call - a worker cannot know which key another
+                    // thread already claimed.
+                    //
+                    // Probed with `contains` rather than `insert` so the path can
+                    // be MOVED into whichever collection claims it below. The
+                    // overwhelmingly common outcome on an incremental scan is
+                    // `Unchanged`, which owns `rel` outright - hashing twice is
+                    // cheaper than cloning a path per file across a 600k-file
+                    // source.
+                    if seen.contains(&rel) {
                         tracing::warn!(target: TARGET, source_id = %source.id, path = %rel, "local.unicode_collision: distinct raw paths normalise to one NFC key; dropping later duplicate");
                         collisions.push(rel);
                         continue;
@@ -879,15 +885,22 @@ pub async fn scan_with_progress(
                     }
                     match other {
                         Outcome::Changed { size, mtime_ns } => {
+                            seen.insert(rel.clone());
                             new_or_changed.push(LocalEntry {
                                 rel,
                                 size,
                                 mtime_ns,
                             });
                         }
-                        Outcome::VerifyFailed => errored_prefixes.push(rel),
-                        // Unchanged: nothing to emit.
-                        _ => {}
+                        Outcome::VerifyFailed => {
+                            seen.insert(rel.clone());
+                            errored_prefixes.push(rel);
+                        }
+                        // Unchanged: nothing to emit, so the path is consumed by
+                        // the `seen` set alone.
+                        _ => {
+                            seen.insert(rel);
+                        }
                     }
                     // Telemetry (DESIGN s13): the worker timed the file, the
                     // reservoir lives here. `record_scan_ms` re-checks the
