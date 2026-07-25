@@ -842,6 +842,18 @@ pub struct DefaultExecutor {
     /// normalized per MiB via [`crate::telemetry::per_mb_ms`]; the reservoir's
     /// own enable gate makes the record a no-op when telemetry is off.
     latency: Option<Arc<crate::telemetry::LatencyReservoir>>,
+    /// Per-run cache of ensured parent-folder ids, keyed by
+    /// `(source_id, plaintext cumulative dir path)`. Avoids re-walking the
+    /// `ensure_folder` chain (a search + maybe-create API call per component)
+    /// for every file of a large tree. Invalidated per-path via
+    /// `invalidate_parent_dirs` when an upload against a resolved target
+    /// fails (stale id after a remote folder deletion).
+    parent_dirs: std::sync::Mutex<HashMap<(String, String), String>>,
+    /// Single-flight lock for `parent_dirs` cache misses so a burst of
+    /// parallel uploads into one brand-new directory issues one
+    /// `ensure_folder` per component instead of racing duplicate
+    /// search+create calls (which manifest as duplicate folders on Drive).
+    parent_walk: tokio::sync::Mutex<()>,
     #[cfg(test)]
     mid_upload_hook: Option<MidUploadHook>,
     #[cfg(test)]
@@ -922,6 +934,8 @@ impl DefaultExecutor {
             throughput: None,
             mem_gauge: None,
             latency: None,
+            parent_dirs: std::sync::Mutex::new(HashMap::new()),
+            parent_walk: tokio::sync::Mutex::new(()),
             #[cfg(test)]
             mid_upload_hook: None,
             #[cfg(test)]
@@ -1836,10 +1850,10 @@ impl DefaultExecutor {
         // unchanged.
         let size = pre.size;
 
-        // --- P1-5: resolve the remote target (encrypted path when the source
-        // is encrypted; flat plaintext name otherwise). This ensure_folders
-        // the encrypted parent directory components up front so the upload
-        // lands under the ciphertext path, not a leaked plaintext name.
+        // --- P1-5: resolve the remote target. This ensure_folders the parent
+        // directory components up front (plaintext names for a plaintext
+        // source; ciphertext components for an encrypted one, so the upload
+        // lands under the ciphertext path, not a leaked plaintext name).
         let target = self
             .resolve_remote_target(source, relative_path, app_props, crypto.as_deref())
             .await
@@ -1873,7 +1887,7 @@ impl DefaultExecutor {
         // md5 over the exact sent bytes (SPEC s8). The streaming arm returns
         // the entry directly (it cannot return a buffered body); the inline
         // arm buffers then uploads.
-        let UploadProduct { blake3, entry } = if size >= PIPELINE_THRESHOLD {
+        let product = if size >= PIPELINE_THRESHOLD {
             self.stream_upload(
                 source,
                 relative_path,
@@ -1889,7 +1903,7 @@ impl DefaultExecutor {
                 crypto.clone(),
                 recorded,
             )
-            .await?
+            .await
         } else {
             self.inline_upload(
                 source,
@@ -1906,7 +1920,18 @@ impl DefaultExecutor {
                 allow_resumable,
                 crypto.as_deref(),
             )
-            .await?
+            .await
+        };
+        let UploadProduct { blake3, entry } = match product {
+            Ok(p) => p,
+            Err(e) => {
+                // The resolved target may have gone stale under us (parent
+                // folder trashed/deleted remotely after being cached). Drop
+                // the cached chain so the retry re-ensures from the source
+                // root; a spurious invalidation just costs one re-walk.
+                self.invalidate_parent_dirs(source, relative_path);
+                return Err(e);
+            }
         };
 
         // --- P1-1: post-UPLOAD identity re-check (SPEC s8) -----------------
@@ -2733,7 +2758,7 @@ impl DefaultExecutor {
     /// the simple multipart path below [`RESUMABLE_THRESHOLD`] and the
     /// resumable protocol at or above it. Uploads to `target` (the resolved
     /// parent folder + name; the encrypted ciphertext path for an encrypted
-    /// source, the flat plaintext name otherwise - P1-5).
+    /// source, the plaintext folder chain + name otherwise - P1-5).
     #[allow(clippy::too_many_arguments)]
     async fn upload_bytes(
         &self,
@@ -3091,10 +3116,11 @@ impl DefaultExecutor {
     /// `source`, carrying the canonical `app_props` (built by the caller with
     /// the op_uuid).
     ///
-    /// - **Plaintext source**: the file lands flat under the source's
-    ///   `drive_folder_id` with its plaintext final component as the name
-    ///   (the pre-existing M3 behaviour; nested plaintext folders are not in
-    ///   scope here).
+    /// - **Plaintext source**: every parent directory component is
+    ///   `ensure_folder`ed on Drive with its plaintext name, so the object
+    ///   lands under a folder tree mirroring the local layout (pre-2.1.1 the
+    ///   file landed FLAT under `drive_folder_id` - the M3 carve-out that
+    ///   dumped whole trees into the destination root).
     /// - **Encrypted source** (DESIGN s7): every path component is encrypted
     ///   independently via [`SourceCryptoSuite::encrypt_filename`], chaining
     ///   each child under its parent's ciphertext as AEAD AAD. The encrypted
@@ -3109,13 +3135,16 @@ impl DefaultExecutor {
         relative_path: &RelativePath,
         app_props: HashMap<String, String>,
         // M5 per-source crypto (resolved FAIL-CLOSED by the caller): `Some` =>
-        // encrypt the path components; `None` => flat plaintext name.
+        // encrypt the path components; `None` => plaintext component names.
         crypto: Option<&dyn SourceCryptoSuite>,
     ) -> anyhow::Result<RemoteTarget> {
         let Some(crypto) = crypto else {
-            // Plaintext: flat under the source root with the plaintext name.
+            // Plaintext: ensure the plaintext parent folder chain and land the
+            // leaf under the deepest folder, mirroring the local tree.
+            let ResolvedParents { parent_id, .. } =
+                self.ensure_parents(source, relative_path, None).await?;
             return Ok(RemoteTarget {
-                parent_id: source.drive_folder_id.clone(),
+                parent_id,
                 name: filename_of(relative_path),
                 app_props,
                 encrypted_remote_path: None,
@@ -3124,13 +3153,13 @@ impl DefaultExecutor {
 
         // Encrypted: ensure_folder the encrypted parent chain, then encrypt
         // the leaf under the deepest folder's ciphertext AAD.
-        let EncryptedParents {
+        let ResolvedParents {
             parent_id,
             parent_aad,
-            mut encrypted_components,
+            components: mut encrypted_components,
             leaf,
         } = self
-            .ensure_encrypted_parents(source, relative_path, crypto)
+            .ensure_parents(source, relative_path, Some(crypto))
             .await?;
 
         let enc_leaf = crypto
@@ -3148,11 +3177,11 @@ impl DefaultExecutor {
 
     /// Re-derive (read path) the Drive folder id the orphan of
     /// `relative_path` would live directly under, for the reconcile create
-    /// path (P1-5 / Cluster-A no-duplicate). For a plaintext source this is
-    /// the source root; for an encrypted source it is the deepest encrypted
-    /// parent folder, re-derived via the same idempotent `ensure_folder`
-    /// chain `resolve_remote_target` used on the original upload (so the
-    /// `find_by_op_uuid` search hits the right parent, not the root).
+    /// path (P1-5 / Cluster-A no-duplicate). The deepest parent folder
+    /// (plaintext or ciphertext names per the source's crypto), re-derived
+    /// via the same idempotent `ensure_folder` chain `resolve_remote_target`
+    /// used on the original upload (so the `find_by_op_uuid` search hits the
+    /// right parent, not the root).
     async fn reconcile_parent_id(
         &self,
         source: &SourceRow,
@@ -3160,15 +3189,9 @@ impl DefaultExecutor {
         // M5 per-source crypto (resolved FAIL-CLOSED by the caller).
         crypto: Option<&dyn SourceCryptoSuite>,
     ) -> anyhow::Result<String> {
-        match crypto {
-            None => Ok(source.drive_folder_id.clone()),
-            Some(crypto) => {
-                let EncryptedParents { parent_id, .. } = self
-                    .ensure_encrypted_parents(source, relative_path, crypto)
-                    .await?;
-                Ok(parent_id)
-            }
-        }
+        let ResolvedParents { parent_id, .. } =
+            self.ensure_parents(source, relative_path, crypto).await?;
+        Ok(parent_id)
     }
 
     /// P2-6: re-derive the `encrypted_remote_path` for `relative_path` during
@@ -3189,13 +3212,13 @@ impl DefaultExecutor {
         let Some(crypto) = crypto else {
             return Ok(None);
         };
-        let EncryptedParents {
+        let ResolvedParents {
             parent_aad,
-            mut encrypted_components,
+            components: mut encrypted_components,
             leaf,
             ..
         } = self
-            .ensure_encrypted_parents(source, relative_path, crypto)
+            .ensure_parents(source, relative_path, Some(crypto))
             .await?;
         let enc_leaf = crypto
             .encrypt_filename(&leaf, &parent_aad)
@@ -3204,18 +3227,31 @@ impl DefaultExecutor {
         Ok(Some(encrypted_components.join("/")))
     }
 
-    /// Walk the directory components of `relative_path`, encrypting each
-    /// under its parent's ciphertext AAD and `ensure_folder`ing it on Drive
-    /// (idempotent), returning the deepest folder id, the AAD to bind the
-    /// leaf under, the encrypted directory components, and the plaintext
-    /// leaf. Shared by `resolve_remote_target` (upload) and
-    /// `reconcile_parent_id` (recovery).
-    async fn ensure_encrypted_parents(
+    /// Walk the directory components of `relative_path` and `ensure_folder`
+    /// each on Drive (idempotent), returning the deepest folder id, the AAD
+    /// to bind the leaf under (encrypted sources), the stored directory
+    /// components, and the plaintext leaf. Component names are the plaintext
+    /// directory names for a plaintext source, or each component encrypted
+    /// under its parent's ciphertext AAD (DESIGN s7.1) for an encrypted one -
+    /// `encrypt_filename` is deterministic (SIV-style), so re-derivation is
+    /// stable. Shared by `resolve_remote_target` (upload) and
+    /// `reconcile_parent_id` / `reconcile_encrypted_remote_path` (recovery).
+    ///
+    /// Folder ids resolve through `parent_dirs`, a per-source cache keyed by
+    /// the PLAINTEXT cumulative dir path (safe for encrypted sources because
+    /// filename encryption is deterministic). Cache misses take the
+    /// `parent_walk` single-flight lock so a burst of parallel uploads into
+    /// one brand-new directory issues ONE `ensure_folder` per component
+    /// instead of racing duplicate search+create calls. A cached id that has
+    /// gone stale (folder trashed/deleted remotely mid-run) surfaces as an
+    /// upload/create failure; `invalidate_parent_dirs` drops the chain so the
+    /// retry re-ensures from the root.
+    async fn ensure_parents(
         &self,
         source: &SourceRow,
         relative_path: &RelativePath,
-        crypto: &dyn SourceCryptoSuite,
-    ) -> anyhow::Result<EncryptedParents> {
+        crypto: Option<&dyn SourceCryptoSuite>,
+    ) -> anyhow::Result<ResolvedParents> {
         let components: Vec<&str> = relative_path
             .as_str()
             .split('/')
@@ -3228,32 +3264,95 @@ impl DefaultExecutor {
             .ok_or_else(|| anyhow::anyhow!("relative_path has no components: {relative_path}"))?;
 
         let mut parent_id = source.drive_folder_id.clone();
-        // The parent ciphertext name bound in as AEAD AAD (empty at the root,
-        // DESIGN s7.1). Tracks the deepest folder's ciphertext name.
+        // The parent stored-name bytes bound in as AEAD AAD for an encrypted
+        // source (empty at the root, DESIGN s7.1); tracked but unused for a
+        // plaintext source.
         let mut parent_aad: Vec<u8> = Vec::new();
-        let mut encrypted_components: Vec<String> = Vec::with_capacity(components.len());
+        let mut stored_components: Vec<String> = Vec::with_capacity(components.len());
+        // Cumulative PLAINTEXT dir path - the cache key within this source.
+        let mut dir_path = String::new();
 
         for dir in dirs {
-            let enc_name = crypto
-                .encrypt_filename(dir, &parent_aad)
-                .map_err(|e| anyhow::anyhow!("filename encrypt failed for a directory: {e}"))?;
-            self.pacer.permit_request().await;
-            let folder = self
-                .remote
-                .ensure_folder(&parent_id, &enc_name, &source.drive_context())
-                .await?;
-            self.pacer.note_response(ResponseClass::Ok);
-            parent_id = folder.id;
-            parent_aad = enc_name.as_bytes().to_vec();
-            encrypted_components.push(enc_name);
+            let stored_name = match crypto {
+                Some(crypto) => crypto
+                    .encrypt_filename(dir, &parent_aad)
+                    .map_err(|e| anyhow::anyhow!("filename encrypt failed for a directory: {e}"))?,
+                None => (*dir).to_string(),
+            };
+            if !dir_path.is_empty() {
+                dir_path.push('/');
+            }
+            dir_path.push_str(dir);
+
+            let cache_key = (source.id.to_string(), dir_path.clone());
+            let cached = self.parent_dirs.lock().unwrap().get(&cache_key).cloned();
+            let folder_id = match cached {
+                Some(id) => id,
+                None => {
+                    // Single-flight the miss so concurrent uploads into a new
+                    // directory don't race duplicate ensure_folder calls.
+                    let _flight = self.parent_walk.lock().await;
+                    let recheck = self.parent_dirs.lock().unwrap().get(&cache_key).cloned();
+                    match recheck {
+                        Some(id) => id,
+                        None => {
+                            self.pacer.permit_request().await;
+                            let folder = self
+                                .remote
+                                .ensure_folder(&parent_id, &stored_name, &source.drive_context())
+                                .await?;
+                            self.pacer.note_response(ResponseClass::Ok);
+                            self.parent_dirs
+                                .lock()
+                                .unwrap()
+                                .insert(cache_key, folder.id.clone());
+                            folder.id
+                        }
+                    }
+                }
+            };
+
+            parent_id = folder_id;
+            parent_aad = stored_name.as_bytes().to_vec();
+            stored_components.push(stored_name);
         }
 
-        Ok(EncryptedParents {
+        Ok(ResolvedParents {
             parent_id,
             parent_aad,
-            encrypted_components,
+            components: stored_components,
             leaf: leaf.to_string(),
         })
+    }
+
+    /// Drop every cached parent-folder id along `relative_path`'s directory
+    /// chain for `source`, so the next `ensure_parents` walk re-derives the
+    /// chain from the source root. Called when an upload/create against a
+    /// resolved target fails - the dominant stale-cache cause is a parent
+    /// folder trashed or deleted remotely mid-run, and re-ensuring is cheap
+    /// relative to the failed upload's retry.
+    fn invalidate_parent_dirs(&self, source: &SourceRow, relative_path: &RelativePath) {
+        let mut dir_path = String::new();
+        let mut keys: Vec<(String, String)> = Vec::new();
+        let components: Vec<&str> = relative_path
+            .as_str()
+            .split('/')
+            .filter(|c| !c.is_empty())
+            .collect();
+        let Some((_leaf, dirs)) = components.split_last() else {
+            return;
+        };
+        for dir in dirs {
+            if !dir_path.is_empty() {
+                dir_path.push('/');
+            }
+            dir_path.push_str(dir);
+            keys.push((source.id.to_string(), dir_path.clone()));
+        }
+        let mut cache = self.parent_dirs.lock().unwrap();
+        for key in keys {
+            cache.remove(&key);
+        }
     }
 
     /// Build the canonical `appProperties` for an object Driven owns
@@ -4859,13 +4958,14 @@ struct UploadProduct {
     entry: RemoteEntry,
 }
 
-/// The result of `ensure_encrypted_parents`: the deepest encrypted parent
-/// folder, the AAD to bind the leaf under, the encrypted dir components, and
-/// the plaintext leaf component.
-struct EncryptedParents {
+/// The result of `ensure_parents`: the deepest parent folder, the AAD to
+/// bind the leaf under (encrypted sources; empty for plaintext), the stored
+/// dir components (plaintext or ciphertext names), and the plaintext leaf
+/// component.
+struct ResolvedParents {
     parent_id: String,
     parent_aad: Vec<u8>,
-    encrypted_components: Vec<String>,
+    components: Vec<String>,
     leaf: String,
 }
 
@@ -6275,6 +6375,252 @@ mod tests {
                 .expect("member present in archive");
             assert_eq!(&extracted, body, "extracted member equals the original");
         }
+    }
+
+    /// The flat-dump bug (2.1.0): a plaintext nested file must land under a
+    /// folder chain mirroring its relative path, not flat in the source root.
+    #[tokio::test]
+    async fn plaintext_nested_create_builds_folder_chain() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("a/b/c.txt", b"nested-body");
+        let exec = h.executor();
+        let out = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out[0], OpOutcome::Done { .. }),
+            "expected Uploaded, got {:?}",
+            out[0]
+        );
+
+        // Root holds exactly the folder "a" (no flat file).
+        let root = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(root.len(), 1, "root has exactly one child, got {root:?}");
+        assert_eq!(root[0].name, "a");
+        assert!(root[0].size.is_none(), "\"a\" is a folder");
+
+        // a -> b -> c.txt.
+        let a = h
+            .remote
+            .list_folder(&root[0].id, &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(a.len(), 1);
+        assert_eq!(a[0].name, "b");
+        let b = h
+            .remote
+            .list_folder(&a[0].id, &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(b.len(), 1);
+        assert_eq!(b[0].name, "c.txt");
+        assert_eq!(b[0].size, Some(size));
+
+        // The committed row points at the nested object.
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("file_state row");
+        assert_eq!(row.drive_file_id.as_deref(), Some(b[0].id.as_str()));
+        // Plaintext sources never store an encrypted_remote_path.
+        assert!(row.encrypted_remote_path.is_none());
+    }
+
+    /// Sibling files in one directory reuse the SAME ensured folders - one
+    /// "a" and one "a/b" total, never duplicates (the parent-dir cache +
+    /// ensure_folder idempotency).
+    #[tokio::test]
+    async fn plaintext_siblings_share_one_folder_chain() {
+        let h = harness().await;
+        let (rel1, size1) = h.write_file("a/b/c.txt", b"first-body");
+        let (rel2, size2) = h.write_file("a/b/d.txt", b"second-body!");
+        let exec = h.executor();
+        let plan = Plan {
+            ops: vec![
+                Op::HashThenUpload {
+                    source_id: h.source.id,
+                    relative_path: rel1.clone(),
+                    size: size1,
+                },
+                Op::HashThenUpload {
+                    source_id: h.source.id,
+                    relative_path: rel2.clone(),
+                    size: size2,
+                },
+            ],
+            collisions: vec![],
+        };
+        let out = exec
+            .execute(&h.source, &plan, &noop_progress, &noop_outcome)
+            .await
+            .unwrap();
+        assert!(out.iter().all(|o| matches!(o, OpOutcome::Done { .. })));
+
+        let root = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(root.len(), 1, "one \"a\" folder, got {root:?}");
+        let a = h
+            .remote
+            .list_folder(&root[0].id, &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(a.len(), 1, "one \"b\" folder, got {a:?}");
+        let mut names: Vec<String> = h
+            .remote
+            .list_folder(&a[0].id, &DriveContext::MyDrive)
+            .await
+            .unwrap()
+            .into_iter()
+            .map(|e| e.name)
+            .collect();
+        names.sort();
+        assert_eq!(names, vec!["c.txt".to_string(), "d.txt".to_string()]);
+    }
+
+    /// `reconcile_parent_id` re-derives the SAME deepest folder the upload
+    /// used for a plaintext nested path (so orphan adoption searches the
+    /// right parent, not the root).
+    #[tokio::test]
+    async fn plaintext_reconcile_parent_id_matches_upload_parent() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("x/y/z.bin", b"reconcile-me");
+        let exec = h.executor();
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel, size),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+
+        let reparent = exec
+            .reconcile_parent_id(&h.source, &rel, None)
+            .await
+            .unwrap();
+        // Resolve x/y by walking the fake store.
+        let root = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        let x = &root[0];
+        let y = &h
+            .remote
+            .list_folder(&x.id, &DriveContext::MyDrive)
+            .await
+            .unwrap()[0];
+        assert_eq!(reparent, y.id, "reconcile parent = the ensured y folder");
+        assert_ne!(reparent, h.source.drive_folder_id, "not the root");
+    }
+
+    /// A cached parent-folder id that went stale (folder deleted remotely
+    /// mid-run) fails the NEXT upload once, and the failure invalidates the
+    /// cached chain so the retry re-ensures the folders from the root and
+    /// succeeds - the cache never wedges a path permanently.
+    #[tokio::test]
+    async fn stale_cached_parent_recovers_after_remote_delete() {
+        let h = harness().await;
+        let (rel1, size1) = h.write_file("p/q/first.txt", b"seed the cache");
+        let exec = h.executor();
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel1, size1),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+
+        // Delete the deepest ensured folder ("q") remotely; the executor's
+        // cache still holds its id. (Delete the LEAF folder because the
+        // fake's delete_permanent does not cascade - deleting "p" would leave
+        // "q" alive and the create would still succeed.)
+        let root = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        let q_id = h
+            .remote
+            .list_folder(&root[0].id, &DriveContext::MyDrive)
+            .await
+            .unwrap()[0]
+            .id
+            .clone();
+        h.remote.delete_permanent(&q_id).await.unwrap();
+
+        // Next upload into p/q hits the stale cached parent and fails this
+        // cycle (any error class is fine - the point is invalidation).
+        let (rel2, size2) = h.write_file("p/q/second.txt", b"post-delete body");
+        let out = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel2, size2),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            !matches!(out[0], OpOutcome::Done { .. }),
+            "stale parent must fail the first attempt, got {:?}",
+            out[0]
+        );
+
+        // Retry with the SAME executor instance: the invalidated cache
+        // re-ensures p/q and the upload lands nested.
+        let out = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel2, size2),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out[0], OpOutcome::Done { .. }),
+            "retry after invalidation must succeed, got {:?}",
+            out[0]
+        );
+        let root = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        let live: Vec<_> = root.iter().filter(|e| !e.trashed).collect();
+        assert_eq!(live.len(), 1, "one recreated p, got {live:?}");
+        let p = &live[0];
+        let q = &h
+            .remote
+            .list_folder(&p.id, &DriveContext::MyDrive)
+            .await
+            .unwrap()[0];
+        let files = h
+            .remote
+            .list_folder(&q.id, &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert!(
+            files.iter().any(|e| e.name == "second.txt"),
+            "second.txt recreated under p/q, got {files:?}"
+        );
     }
 
     /// Issue #35 (findings 1+4): a member that GREW on disk between the scan

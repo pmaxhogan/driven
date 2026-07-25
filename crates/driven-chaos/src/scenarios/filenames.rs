@@ -135,15 +135,14 @@ impl Fixture {
         self.handle.orchestrator.run_cycle(TickSource::Manual).await
     }
 
-    /// Live (non-trashed) objects under the source's destination folder.
+    /// Live (non-trashed) file objects anywhere under the source's
+    /// destination folder. Recursive: plaintext sources mirror their local
+    /// directory tree on Drive (2.1.1), so a nested leaf (e.g. the deep-path
+    /// scenario's) lives under ensured folders, not the root.
     async fn live_objects(&self) -> anyhow::Result<Vec<driven_drive::remote_store::RemoteEntry>> {
         Ok(self
             .remote
-            .list_folder(
-                &self.folder_id,
-                &driven_drive::remote_store::DriveContext::MyDrive,
-            )
-            .await?
+            .descendant_files_with_trashed(&self.folder_id)
             .into_iter()
             .filter(|e| !e.trashed)
             .collect())
@@ -851,7 +850,8 @@ impl Scenario for NamePath4096Bytes {
 
         fx.run_one_cycle().await?;
 
-        // The plaintext executor uploads the leaf flat under the source root.
+        // The plaintext executor mirrors the directory chain on Drive (2.1.1)
+        // and lands the leaf under the deepest ensured folder.
         let objects = fx.live_objects().await?;
         let synced = fx.file_states_with_status(FileStateStatus::Synced).await?;
         anyhow::ensure!(

@@ -200,7 +200,9 @@ pub async fn assert_invariants(
     // leaves the remote in a LATCHED fault state (e.g. auth.invalid_grant, which
     // the fake applies to read calls too) can still have its terminal-state
     // invariants verified instead of the sweep itself erroring on the fault.
-    let all: Vec<_> = remote.list_folder_with_trashed(folder_id);
+    // Recursive: plaintext sources mirror their local directory tree on Drive
+    // (2.1.1), so nested objects live under ensured folders, not the root.
+    let all: Vec<_> = remote.descendant_files_with_trashed(folder_id);
     let live: Vec<_> = all.iter().filter(|e| !e.trashed).cloned().collect();
     let live_object_count = live.len() as u64;
 
