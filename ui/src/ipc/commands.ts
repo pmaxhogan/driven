@@ -21,6 +21,7 @@ import type {
   FileSearchHitDto,
   FileVersionDto,
   GlobalSyncStatus,
+  PauseState,
   OAuthAuthUrl,
   OAuthStatus,
   PageRequestDto,
@@ -186,6 +187,12 @@ export function resumeSync(): Promise<void> {
 
 export function getSyncStatus(): Promise<GlobalSyncStatus> {
   return invoke("get_sync_status");
+}
+
+/** The active manual pause, or null when sync is not manually paused. An
+ * already-elapsed timed pause reads as null, never as a stale countdown. */
+export function getPauseState(): Promise<PauseState | null> {
+  return invoke("get_pause_state");
 }
 
 // --- Settings & misc (SPEC s11.6) ---

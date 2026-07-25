@@ -10,6 +10,7 @@ import type {
   AccountSyncStatus,
   ActivityEntry,
   GlobalSyncStatus,
+  PauseState,
   RestoreJobStatus,
   UpdateInfo,
 } from "./types";
@@ -28,6 +29,14 @@ export function onSyncStatusChanged(
   handler: (status: SyncStatusChangedPayload) => void
 ): Promise<UnlistenFn> {
   return listen<SyncStatusChangedPayload>("sync:status_changed", (e) => handler(e.payload));
+}
+
+/** `sync:pause_changed` payload: the active `PauseState`, or null once sync is
+ * no longer manually paused. Emitted on pause, on resume, when a timed pause
+ * auto-expires, and once at boot when a persisted pause is re-applied - so the
+ * paused banner appears and disappears with no refresh. */
+export function onPauseChanged(handler: (pause: PauseState | null) => void): Promise<UnlistenFn> {
+  return listen<PauseState | null>("sync:pause_changed", (e) => handler(e.payload));
 }
 
 /** `sync:source_progress` payload: { sourceId, progress } (SPEC s11.7). */

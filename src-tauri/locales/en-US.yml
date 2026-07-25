@@ -22,6 +22,7 @@ tray:
   pause: "Pause sync"
   resume: "Resume sync"
   pause_30m: "Pause for 30 minutes"
+  pause_indefinite: "Pause until I resume"
   activity: "Activity"
   settings: "Settings"
   restore: "Restore"

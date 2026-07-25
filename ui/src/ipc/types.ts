@@ -488,6 +488,12 @@ export interface GlobalSyncStatus {
   accounts: AccountSyncStatus[];
 }
 
+/** The active manual pause (mirrors the Rust `PauseState` in
+ * src-tauri/src/commands/sync.rs). Internally tagged on a snake_case `kind`
+ * field and - like the other M5 sync DTOs above - snake_case on the wire.
+ * `null` rather than a variant means sync is not manually paused. */
+export type PauseState = { kind: "timed"; until_ms: number } | { kind: "indefinite" };
+
 // --- Restore (SPEC s11.5; DESIGN s8.4) - mirrors src-tauri restore DTOs ---
 
 /** One node in the Restore browser tree (mirrors src-tauri RemoteEntryDto):

@@ -49,6 +49,7 @@ function backend(): void {
     if (cmd === "list_accounts") return Promise.resolve([ACCOUNT]);
     if (cmd === "get_pending_update_info") return Promise.resolve(null);
     if (cmd === "get_sync_status") return Promise.resolve({ accounts: [] });
+    if (cmd === "get_pause_state") return Promise.resolve(null);
     return Promise.resolve(undefined);
   });
 }
@@ -105,13 +106,14 @@ describe("App shell", () => {
     expect(restoreLink.attributes("aria-current")).toBe("page");
   });
 
-  it("subscribes + hydrates the updater and progress stores on boot", async () => {
+  it("subscribes + hydrates the updater, progress and pause stores on boot", async () => {
     await mountAppAt("/activity");
-    // Three updater events (available, download_progress, downloaded) + one
-    // sync-status event registered.
-    expect(listenMock).toHaveBeenCalledTimes(4);
+    // Three updater events (available, download_progress, downloaded) + the
+    // sync-status event + the pause event registered.
+    expect(listenMock).toHaveBeenCalledTimes(5);
     expect(invokeMock).toHaveBeenCalledWith("get_pending_update_info", undefined);
     expect(invokeMock).toHaveBeenCalledWith("get_sync_status", undefined);
+    expect(invokeMock).toHaveBeenCalledWith("get_pause_state", undefined);
   });
 
   it("never throws when a subscribe registration fails - hydration still runs", async () => {
