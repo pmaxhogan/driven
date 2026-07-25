@@ -16,11 +16,11 @@ import { useUpdaterStore } from "./stores/updater";
 // menu + deep links navigate the same router.
 //
 // UI-CORE IA fix: the top nav is the SHELL-level information architecture and
-// lists only the four primary surfaces - Activity | Settings | Restore | About.
-// Accounts / Sources / Rules are NOT top-nav items: they are subtabs INSIDE the
-// Settings page (the only place they live), so the "Settings" item lights up for
-// any of /settings, /accounts, /sources, /rules. Teal is the shell accent (brand
-// wordmark + active/hover link states).
+// lists only the three primary surfaces - Activity | Restore | Settings.
+// Accounts / Sources / Rules / About are NOT top-nav items: they are subtabs
+// INSIDE the Settings page (the only place they live), so the "Settings" item
+// lights up for any of /settings, /accounts, /sources, /rules, /about. Teal is
+// the shell accent (brand wordmark + active/hover link states).
 const { t } = useI18n();
 const route = useRoute();
 
@@ -86,18 +86,19 @@ onMounted(async () => {
 });
 
 // The top-nav surfaces. `match` is the set of route paths for which the item is
-// the ACTIVE one; Settings owns its three subtab routes so it stays lit while the
+// the ACTIVE one; Settings owns its four subtab routes so it stays lit while the
 // user is on any of them. A path is active when it equals a match path or is
 // nested under it (so /restore/:sourceId keeps Restore active).
+// Restore sits before Settings: it is a primary user-facing surface, whereas
+// Settings is the configuration drawer and reads last in the row.
 const navLinks = [
   { to: "/activity", label: "nav.activity", match: ["/activity"] },
+  { to: "/restore", label: "nav.restore", match: ["/restore"] },
   {
     to: "/settings",
     label: "nav.settings",
-    match: ["/settings", "/accounts", "/sources", "/rules"],
+    match: ["/settings", "/accounts", "/sources", "/rules", "/about"],
   },
-  { to: "/restore", label: "nav.restore", match: ["/restore"] },
-  { to: "/about", label: "nav.about", match: ["/about"] },
 ] as const;
 
 function isActive(matches: readonly string[]): boolean {
@@ -115,28 +116,45 @@ const NAV_LINK_ACTIVE = "text-teal-700 dark:text-teal-300 font-semibold";
 
 <template>
   <div class="min-h-screen flex flex-col">
-    <GlobalProgressBar />
-    <PausedBanner />
-    <nav
-      class="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-zinc-200 bg-white px-6 py-3 text-sm dark:border-zinc-800 dark:bg-zinc-900"
-      :aria-label="t('nav.primary')"
-    >
-      <RouterLink
-        to="/activity"
-        class="mr-2 text-base font-bold tracking-tight text-teal-700 transition-colors hover:text-teal-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-teal-300 dark:hover:text-teal-200"
+    <!-- The shell chrome - progress bar, paused banner, nav - is ONE sticky
+         block pinned to the top of the viewport, so none of it can be scrolled
+         out of the way on a long view (a 10k-row Activity list used to hide the
+         running-backup bar entirely). Sticky rather than fixed: a sticky element
+         keeps its space in normal flow, so nothing needs a compensating top
+         padding and the layout is byte-identical to before at scroll 0.
+         Deliberately NOT the other option (making <main> the scroll container):
+         `useVirtualList` windows the Restore browser off WINDOW scroll +
+         `window.innerHeight`, so moving the scroll into an inner element would
+         stop its scroll events firing and freeze the list on its first window.
+         z-30 clears page content and Restore's `sticky bottom-0 z-10` action
+         bar while staying under the z-50 modal overlays. The explicit surface
+         color matters: PausedBanner's dark-mode fill is semi-transparent
+         (`bg-amber-950/40`), so it needs an opaque backdrop of its own or
+         scrolled content would show through it. -->
+    <header class="sticky top-0 z-30 bg-zinc-50 dark:bg-zinc-950" data-testid="app-header">
+      <GlobalProgressBar />
+      <PausedBanner />
+      <nav
+        class="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-zinc-200 bg-white px-6 py-3 text-sm dark:border-zinc-800 dark:bg-zinc-900"
+        :aria-label="t('nav.primary')"
       >
-        {{ t("app.name") }}
-      </RouterLink>
-      <RouterLink
-        v-for="link in navLinks"
-        :key="link.to"
-        :to="link.to"
-        :class="[NAV_LINK_BASE, isActive(link.match) ? NAV_LINK_ACTIVE : NAV_LINK_INACTIVE]"
-        :aria-current="isActive(link.match) ? 'page' : undefined"
-      >
-        {{ t(link.label) }}
-      </RouterLink>
-    </nav>
+        <RouterLink
+          to="/activity"
+          class="mr-2 text-base font-bold tracking-tight text-teal-700 transition-colors hover:text-teal-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-teal-300 dark:hover:text-teal-200"
+        >
+          {{ t("app.name") }}
+        </RouterLink>
+        <RouterLink
+          v-for="link in navLinks"
+          :key="link.to"
+          :to="link.to"
+          :class="[NAV_LINK_BASE, isActive(link.match) ? NAV_LINK_ACTIVE : NAV_LINK_INACTIVE]"
+          :aria-current="isActive(link.match) ? 'page' : undefined"
+        >
+          {{ t(link.label) }}
+        </RouterLink>
+      </nav>
+    </header>
     <main class="flex-1 p-6">
       <RouterView />
     </main>

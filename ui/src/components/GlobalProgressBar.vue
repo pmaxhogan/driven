@@ -91,10 +91,13 @@ const label = computed<string>(() => {
           :style="{ width: `${widthPct}%` }"
         ></div>
         <!-- Indeterminate: a teal sliver sweeping across while a run is active but
-             has no measurable total yet (scan / plan / verify). -->
+             has no measurable total yet (scan / plan / verify). It is always a
+             PARTIAL width so it can never be mistaken for a finished bar, and
+             rounded so it reads as a travelling pill rather than a fill edge. -->
         <div
           v-else
-          class="global-progress__indeterminate absolute inset-y-0 left-0 w-2/5 bg-teal-600 dark:bg-teal-400"
+          class="global-progress__indeterminate absolute inset-y-0 left-0 w-2/5 rounded-full bg-teal-600 dark:bg-teal-400"
+          data-testid="global-progress-indeterminate"
         ></div>
       </div>
       <!-- Phase readout. `aria-live="polite"` so a screen reader hears the phase
@@ -113,8 +116,14 @@ const label = computed<string>(() => {
 </template>
 
 <style scoped>
+/* Transform-only sweep so the compositor can run it off the main thread - a
+   scan that is hammering the disk must never make the one thing telling the
+   user "we are working" stutter. The segment is 40% of the track and the
+   keyframes are in percentages OF THAT segment, so it enters from fully
+   off-track on the left and exits fully off-track on the right. */
 .global-progress__indeterminate {
-  animation: driven-progress-indeterminate 1.3s ease-in-out infinite;
+  animation: driven-progress-indeterminate 1.2s ease-in-out infinite;
+  will-change: transform;
 }
 
 @keyframes driven-progress-indeterminate {
@@ -123,6 +132,17 @@ const label = computed<string>(() => {
   }
   100% {
     transform: translateX(350%);
+  }
+}
+
+/* Reduced-motion fallback (below) - a slow, gentle fade in place. */
+@keyframes driven-progress-pulse {
+  0%,
+  100% {
+    opacity: 1;
+  }
+  50% {
+    opacity: 0.45;
   }
 }
 
@@ -136,13 +156,19 @@ const label = computed<string>(() => {
   opacity: 0;
 }
 
-/* Respect reduced-motion: drop the sweep animation and show a steady partial
-   bar so the indeterminate state is still visibly "working". */
+/* Respect reduced-motion: drop the travelling sweep for a gentle fade in place.
+   The segment MUST stay partial-width here. The previous fallback stretched it
+   to `width: 100%`, which rendered a solid full-width teal line - visually
+   indistinguishable from a completed determinate fill. That is what a scan
+   looked like for anyone with OS animations turned off (Windows' "Show
+   animations in Windows" maps to prefers-reduced-motion: reduce), so the bar
+   read as "finished" for the entire scan. A partial bar can never be mistaken
+   for 100%, and the opacity pulse still says "working" without moving anything
+   across the screen. */
 @media (prefers-reduced-motion: reduce) {
   .global-progress__indeterminate {
-    animation: none;
-    width: 100%;
-    opacity: 0.6;
+    animation: driven-progress-pulse 2.4s ease-in-out infinite;
+    will-change: opacity;
   }
 }
 </style>

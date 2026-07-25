@@ -31,6 +31,8 @@ vi.mock("@tauri-apps/api/event", () => ({
 }));
 
 import App from "../App.vue";
+import GlobalProgressBar from "../components/GlobalProgressBar.vue";
+import PausedBanner from "../components/PausedBanner.vue";
 import { i18n } from "../i18n";
 import { createAppRouter } from "../router";
 
@@ -78,12 +80,37 @@ async function mountAppAt(path: string) {
 }
 
 describe("App shell", () => {
-  it("renders the top nav with the app wordmark and all four primary surfaces", async () => {
+  it("renders the top nav with the app wordmark and all three primary surfaces", async () => {
     const wrapper = await mountAppAt("/activity");
     expect(wrapper.find("nav").exists()).toBe(true);
     const links = wrapper.findAll("nav a");
-    // Wordmark + Activity | Settings | Restore | About.
-    expect(links.length).toBe(5);
+    // Wordmark + Activity | Restore | Settings. About is no longer a top-nav
+    // surface - it is a subtab inside Settings.
+    expect(links.length).toBe(4);
+    expect(links.map((l) => l.attributes("href"))).toEqual([
+      "/activity",
+      "/activity",
+      "/restore",
+      "/settings",
+    ]);
+  });
+
+  it("orders Restore before Settings in the nav", async () => {
+    const wrapper = await mountAppAt("/activity");
+    const hrefs = wrapper.findAll("nav a").map((l) => l.attributes("href"));
+    expect(hrefs.indexOf("/restore")).toBeLessThan(hrefs.indexOf("/settings"));
+  });
+
+  it("offers no top-nav About link (it moved into Settings)", async () => {
+    const wrapper = await mountAppAt("/activity");
+    expect(wrapper.find('nav a[href="/about"]').exists()).toBe(false);
+  });
+
+  // /about still resolves - it renders the Settings view's About tab - so the
+  // Settings nav item must stay lit there, exactly as it does for /accounts.
+  it("keeps Settings active on /about, which now renders the About subtab", async () => {
+    const wrapper = await mountAppAt("/about");
+    expect(wrapper.find('a[href="/settings"]').attributes("aria-current")).toBe("page");
   });
 
   it("marks the Activity link active (and no other) when on /activity", async () => {
@@ -104,6 +131,38 @@ describe("App shell", () => {
     const wrapper = await mountAppAt("/restore/some-source");
     const restoreLink = wrapper.find('a[href="/restore"]');
     expect(restoreLink.attributes("aria-current")).toBe("page");
+  });
+
+  // The shell chrome must not be scrollable out of the way: on a long view (a
+  // 10k-row Activity list) the running-backup progress bar used to disappear off
+  // the top. Progress bar + paused banner + nav are one sticky block, so all
+  // three pin together and the document stays the scroll container (which
+  // `useVirtualList` depends on - it windows off window scroll).
+  it("pins the progress bar, paused banner and nav in one sticky header", async () => {
+    const wrapper = await mountAppAt("/activity");
+    const header = wrapper.get('[data-testid="app-header"]');
+
+    expect(header.classes()).toContain("sticky");
+    expect(header.classes()).toContain("top-0");
+    // Above page content and Restore's `sticky bottom-0 z-10` bar, below modals.
+    expect(header.classes()).toContain("z-30");
+    // All three pieces of chrome live INSIDE it (so none can scroll away alone).
+    expect(header.findComponent(GlobalProgressBar).exists()).toBe(true);
+    expect(header.findComponent(PausedBanner).exists()).toBe(true);
+    expect(header.find("nav").exists()).toBe(true);
+  });
+
+  // Sticky, not fixed, and no inner scroll container: the header keeps its space
+  // in normal flow, so the shell needs no compensating top padding and there is
+  // exactly one scrollbar (the document's).
+  it("leaves the document as the only scroll container", async () => {
+    const wrapper = await mountAppAt("/activity");
+    const root = wrapper.get('[data-testid="app-header"]').element.parentElement!;
+
+    expect(root.className).not.toContain("overflow");
+    const main = wrapper.get("main");
+    expect(main.classes()).not.toContain("overflow-y-auto");
+    expect(main.classes().some((c) => c.startsWith("pt-"))).toBe(false);
   });
 
   it("subscribes + hydrates the updater, progress and pause stores on boot", async () => {
