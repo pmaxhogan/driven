@@ -2160,14 +2160,20 @@ impl StateRepo for SqliteStateRepo {
         // selects nothing - the `BETWEEN`/`>= AND <=` predicate is simply empty,
         // so the aggregate is all-zero (no panic, no double-count).
 
-        // upload_done count + byte sum in the window.
+        // Upload count + byte sum in the window. "Upload row" is BOTH
+        // `upload_done` (one file per row, `file_count` NULL) and the V2
+        // bundling `bundle_upload` (one row, `file_count` member files, the
+        // packed object's bytes) - the same definition `activity_summary` and
+        // the throughput series use, so telemetry cannot under-report a source
+        // whose small files get bundled. `COALESCE(file_count, 1)` maps a plain
+        // upload row to exactly one file and a bundle row to all of its members.
         let uploads = sqlx::query!(
             r#"
             SELECT
-                COUNT(*)                  AS "files!: i64",
-                COALESCE(SUM(bytes), 0)   AS "bytes!: i64"
+                COALESCE(SUM(COALESCE(file_count, 1)), 0) AS "files!: i64",
+                COALESCE(SUM(bytes), 0)                   AS "bytes!: i64"
             FROM activity_log
-            WHERE ts >= ?1 AND ts <= ?2 AND event_type = 'upload_done'
+            WHERE ts >= ?1 AND ts <= ?2 AND event_type IN ('upload_done', 'bundle_upload')
             "#,
             since_ms,
             now_ms,
@@ -6148,7 +6154,8 @@ mod tests {
 
     #[tokio::test]
     async fn telemetry_events_since_aggregates_uploads_errors_and_deep_verify() {
-        // M9b (SPEC s16): the telemetry aggregate counts upload_done rows + bytes,
+        // M9b (SPEC s16): the telemetry aggregate counts upload rows (upload_done
+        // one file each, bundle_upload all its member files) + bytes,
         // groups error-level rows by error code, counts update_applied rows, and
         // counts `deep_verify_done` activity ROWS in the window (R3-P2-1). It NEVER
         // selects a path/name. Rows older than `since` are excluded; rows AFTER
@@ -6200,11 +6207,25 @@ mod tests {
             .await
             .unwrap();
         }
+        // V2 bundling: an in-window `bundle_upload` row is ONE row that uploaded
+        // `file_count` member files as a single packed object - it must count as
+        // all 5 files + its bytes (the dashboard's upload-row definition), not be
+        // invisible to telemetry. Pre-window and future bundle rows are excluded
+        // by the same window bounds as plain uploads.
+        write_bundle_upload(&repo, src.id, 1350, 5, 40).await;
+        write_bundle_upload(&repo, src.id, 700, 9, 999).await; // pre-window -> excluded
+        write_bundle_upload(&repo, src.id, 9200, 9, 999).await; // after now -> excluded
 
         let agg = repo.telemetry_events_since(since, now).await.unwrap();
 
-        assert_eq!(agg.files_uploaded, 2, "two in-window upload_done rows");
-        assert_eq!(agg.bytes_uploaded, 300, "100 + 200 bytes in-window");
+        assert_eq!(
+            agg.files_uploaded, 7,
+            "two in-window upload_done rows (file_count NULL -> 1 each) plus the 5 members of the in-window bundle_upload"
+        );
+        assert_eq!(
+            agg.bytes_uploaded, 340,
+            "100 + 200 upload_done bytes + 40 bundle_upload bytes in-window"
+        );
         assert_eq!(
             agg.errors_by_class,
             vec![
