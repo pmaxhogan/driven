@@ -34,6 +34,15 @@ const WORKING_STATES: ReadonlySet<string> = new Set([
   "verifying",
 ]);
 
+/** The phase the bar reports, in the order it wins when several accounts are
+ * working at once. Executing is the most informative (it has a real percent), so
+ * it outranks the pre-flight phases; `power_check` is the least. Mirrors the
+ * WORKING_STATES set - anything not listed here is not an active run. */
+const PHASE_PRECEDENCE = ["executing", "verifying", "planning", "scanning", "power_check"] as const;
+
+/** One of PHASE_PRECEDENCE, or null when no run is active. */
+export type SyncPhase = (typeof PHASE_PRECEDENCE)[number] | null;
+
 /** Read the snake_case `state` discriminant of an OrchestratorState. */
 function stateTag(state: OrchestratorState): string {
   const tag = state["state"];
@@ -97,6 +106,46 @@ export const useProgressStore = defineStore("progress", () => {
   const active = computed<boolean>(() =>
     Object.values(states.value).some((s) => WORKING_STATES.has(stateTag(s)))
   );
+
+  /** The phase to report while a run is active (highest-precedence working
+   * state across accounts), or null when idle. Drives the bar's phase label, so
+   * the scan/plan phases are no longer indistinguishable from a stalled app. */
+  const phase = computed<SyncPhase>(() => {
+    const tags = new Set(Object.values(states.value).map(stateTag));
+    return PHASE_PRECEDENCE.find((p) => tags.has(p)) ?? null;
+  });
+
+  /** Sum a numeric field over every account whose state carries the given tag. */
+  function sumOver(tag: string, key: string): number {
+    let total = 0;
+    for (const s of Object.values(states.value)) {
+      if (stateTag(s) !== tag) continue;
+      total += numField(s as Record<string, unknown>, key);
+    }
+    return total;
+  }
+
+  /** Files the scanner has visited so far, summed across scanning accounts. The
+   * backend streams this on every throttled scan tick, so it climbs live during
+   * the walk instead of sitting at the 0 the single pre-scan transition used to
+   * leave it at. */
+  const scanned = computed<number>(() => sumOver("scanning", "scanned"));
+
+  /** Upload ops the planner produced, summed across accounts in `planning`. */
+  const plannedFiles = computed<number>(() => {
+    let total = 0;
+    for (const s of Object.values(states.value)) {
+      if (stateTag(s) !== "planning") continue;
+      const plan = s["plan"];
+      if (plan === null || typeof plan !== "object") continue;
+      const p = plan as Record<string, unknown>;
+      total += numField(p, "uploads") + numField(p, "trashes");
+    }
+    return total;
+  });
+
+  /** Files sampled so far, summed across accounts in `verifying`. */
+  const verified = computed<number>(() => sumOver("verifying", "sampled"));
 
   /** Aggregate execution progress across every account currently `executing`.
    * Scan/plan/verify carry no reliable total, so they contribute nothing here. */
@@ -195,6 +244,10 @@ export const useProgressStore = defineStore("progress", () => {
   return {
     states,
     active,
+    phase,
+    scanned,
+    plannedFiles,
+    verified,
     percent,
     filesDone,
     filesTotal,

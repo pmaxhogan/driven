@@ -46,7 +46,7 @@ use std::collections::HashSet;
 use std::fs::Metadata;
 use std::io::Read;
 use std::path::{Path, PathBuf};
-use std::time::UNIX_EPOCH;
+use std::time::{Duration, Instant, UNIX_EPOCH};
 
 use anyhow::Context;
 
@@ -208,6 +208,49 @@ pub async fn scan_with_latency(
     mode: ScanMode,
     latency: Option<&crate::telemetry::LatencyReservoir>,
 ) -> anyhow::Result<ScanResult> {
+    scan_with_progress(source, state, mode, latency, None).await
+}
+
+/// The live scan-progress sink the scanner AWAITS as the walk advances, so a
+/// caller can stream "scanning... N files" to the UI while the walk is still
+/// running (issue: "Run now" looked dead for ~10s because the whole scan phase
+/// emitted nothing).
+///
+/// Mirrors the executor's [`OutcomeSink`](crate::executor::OutcomeSink): a boxed
+/// future so the sink may do async work (the orchestrator awaits a state
+/// transition + broadcast), with the borrow tied to the call so the closure can
+/// capture `&self` without a `'static` bound. Each tick is followed by an
+/// explicit `yield_now`, which is what hands the otherwise fully synchronous
+/// walk back to the runtime so the tick's consumers run mid-scan.
+///
+/// The argument is the running count of regular files the walk has VISITED -
+/// counted before the include/exclude decision, so a long descent through an
+/// excluded tree (`node_modules`) still shows movement rather than a frozen
+/// counter.
+pub type ScanProgressSink<'a> =
+    dyn Fn(u64) -> futures::future::BoxFuture<'a, ()> + Send + Sync + 'a;
+
+/// Files visited between two [`ScanProgressSink`] ticks. Paired with
+/// [`SCAN_PROGRESS_MIN_INTERVAL`] so a fast walk ticks on the file stride and a
+/// slow one (deep-verify re-hashing multi-GB files) still ticks on the clock.
+const SCAN_PROGRESS_FILE_STRIDE: u64 = 512;
+
+/// Minimum wall-clock gap between two [`ScanProgressSink`] ticks. Keeps a
+/// million-file walk to a few ticks per second instead of one per file, so the
+/// orchestrator's bounded event broadcast cannot be flooded by scan progress.
+const SCAN_PROGRESS_MIN_INTERVAL: Duration = Duration::from_millis(200);
+
+/// [`scan_with_latency`] plus an optional [`ScanProgressSink`] the walk ticks as
+/// it advances (throttled to [`SCAN_PROGRESS_FILE_STRIDE`] files /
+/// [`SCAN_PROGRESS_MIN_INTERVAL`], with a final tick carrying the total once the
+/// walk ends). Passing `None` is exactly the old behaviour at zero cost.
+pub async fn scan_with_progress(
+    source: &SourceRow,
+    state: &dyn StateRepo,
+    mode: ScanMode,
+    latency: Option<&crate::telemetry::LatencyReservoir>,
+    on_progress: Option<&ScanProgressSink<'_>>,
+) -> anyhow::Result<ScanResult> {
     let known = state
         .load_source_file_state(source.id)
         .await
@@ -327,6 +370,13 @@ pub async fn scan_with_latency(
     // is visible rather than silent.
     let mut invalid_filenames: Vec<String> = Vec::new();
 
+    // Live scan-progress state (see [`ScanProgressSink`]). `visited` counts every
+    // regular file the walk yields; `reported` / `last_tick` throttle the sink so
+    // a huge tree ticks a few times a second, not once per file.
+    let mut visited: u64 = 0;
+    let mut reported: u64 = 0;
+    let mut last_tick = Instant::now();
+
     for result in walker {
         let entry = match result {
             Ok(e) => e,
@@ -358,6 +408,30 @@ pub async fn scan_with_latency(
         // Files only; directories and other non-files are not backed up.
         if !entry.file_type().is_some_and(|t| t.is_file()) {
             continue;
+        }
+
+        // Live progress tick. Counted here - BEFORE the include/exclude decision
+        // and before the (possibly slow) stat + deep-verify hash - so descending
+        // a large excluded tree still moves the counter. Awaiting the sink is
+        // also the walk's only yield point, which is what lets a joined consumer
+        // (the orchestrator's state transition + broadcast) run mid-scan instead
+        // of only after the whole walk finishes.
+        visited += 1;
+        if let Some(sink) = on_progress {
+            if visited - reported >= SCAN_PROGRESS_FILE_STRIDE
+                || last_tick.elapsed() >= SCAN_PROGRESS_MIN_INTERVAL
+            {
+                reported = visited;
+                last_tick = Instant::now();
+                sink(visited).await;
+                // Awaiting the sink is NOT by itself a yield: the orchestrator's
+                // sink resolves without ever returning Pending (an uncontended
+                // lock write plus a broadcast send), so the walk would still hold
+                // the runtime thread for the whole tree. Yield explicitly so the
+                // consumers of the event we just emitted actually get scheduled
+                // mid-scan rather than after it.
+                tokio::task::yield_now().await;
+            }
         }
 
         let abs = entry.path();
@@ -528,6 +602,18 @@ pub async fn scan_with_latency(
         }
     }
 
+    // Final progress tick: the walk is done, so report the true total even when
+    // the last stride/interval boundary fell short of it. Always emitted (even
+    // for a zero-file source) so a consumer can render a settled count rather
+    // than a stale partial one.
+    if let Some(sink) = on_progress {
+        sink(visited).await;
+        // Same reason as the in-walk ticks: hand control back so the settled
+        // count reaches its consumers BEFORE the plan/execute phases start
+        // emitting their own (far noisier) events.
+        tokio::task::yield_now().await;
+    }
+
     // Split the known-but-not-seen paths into genuine deletions vs
     // excluded-orphans (DESIGN s5.5). A `file_state` key the walk did not
     // yield is either (a) genuinely gone from disk -> `deleted` (planner
@@ -560,6 +646,7 @@ pub async fn scan_with_latency(
         target: TARGET,
         source_id = %source.id,
         ?mode,
+        visited,
         new_or_changed = new_or_changed.len(),
         deleted = deleted.len(),
         excluded_orphans = excluded_orphans.len(),
@@ -1914,6 +2001,104 @@ mod tests {
         assert!(
             res.probed_granularity_ns.is_some(),
             "the probe runs on the scan after the first"
+        );
+    }
+
+    /// The live scan-progress sink (the "Run now looks dead" fix): the walk must
+    /// tick it AS it goes, and the last tick must carry the true total.
+    #[tokio::test]
+    async fn scan_ticks_the_progress_sink_and_reports_the_final_total() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        // More than one stride so the in-walk throttle fires at least once
+        // before the final tick.
+        let files = (SCAN_PROGRESS_FILE_STRIDE + 7) as usize;
+        for i in 0..files {
+            write(&root.join(format!("sub{}/f{}.txt", i % 4, i)), b"x");
+        }
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let ticks: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let sink = |visited: u64| -> futures::future::BoxFuture<'_, ()> {
+            ticks.lock().unwrap().push(visited);
+            Box::pin(async {})
+        };
+
+        let res = scan_with_progress(&src, &state, ScanMode::FastPath, None, Some(&sink))
+            .await
+            .unwrap();
+        assert_eq!(res.new_or_changed.len(), files, "every file is new");
+
+        let ticks = ticks.lock().unwrap().clone();
+        assert!(
+            ticks.len() >= 2,
+            "expected an in-walk tick plus the final one, got {ticks:?}"
+        );
+        assert_eq!(
+            *ticks.last().unwrap(),
+            files as u64,
+            "the final tick carries the true visited total"
+        );
+        assert!(
+            ticks.windows(2).all(|w| w[0] <= w[1]),
+            "the visited count is monotonic: {ticks:?}"
+        );
+        assert!(
+            ticks[..ticks.len() - 1].iter().any(|&t| t < files as u64),
+            "at least one tick lands BEFORE the walk finishes: {ticks:?}"
+        );
+    }
+
+    /// A source with no files still settles the readout: exactly one tick, zero.
+    #[tokio::test]
+    async fn scan_ticks_zero_on_an_empty_source() {
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_at(dir.path());
+        let state = FakeState::default();
+        let ticks: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let sink = |visited: u64| -> futures::future::BoxFuture<'_, ()> {
+            ticks.lock().unwrap().push(visited);
+            Box::pin(async {})
+        };
+
+        scan_with_progress(&src, &state, ScanMode::FastPath, None, Some(&sink))
+            .await
+            .unwrap();
+        assert_eq!(*ticks.lock().unwrap(), vec![0]);
+    }
+
+    /// Excluded files still move the counter - otherwise descending a big
+    /// `node_modules` looks identical to a hung scan.
+    #[tokio::test]
+    async fn scan_progress_counts_excluded_files_too() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("keep.txt"), b"x");
+        write(&root.join("skip/a.txt"), b"x");
+        write(&root.join("skip/b.txt"), b"x");
+
+        let mut src = source_at(root);
+        src.exclude_patterns = vec!["skip/**".to_string()];
+        let state = FakeState::default();
+        let ticks: Mutex<Vec<u64>> = Mutex::new(Vec::new());
+        let sink = |visited: u64| -> futures::future::BoxFuture<'_, ()> {
+            ticks.lock().unwrap().push(visited);
+            Box::pin(async {})
+        };
+
+        let res = scan_with_progress(&src, &state, ScanMode::FastPath, None, Some(&sink))
+            .await
+            .unwrap();
+        assert_eq!(
+            res.new_or_changed.len(),
+            1,
+            "only the included file uploads"
+        );
+        assert_eq!(
+            *ticks.lock().unwrap().last().unwrap(),
+            3,
+            "all three visited files count toward scan progress"
         );
     }
 }

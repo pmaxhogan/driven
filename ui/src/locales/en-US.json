@@ -19,7 +19,14 @@
   },
   "progress": {
     "backingUp": "Backing up...",
-    "backingUpPercent": "Backing up - {percent}%"
+    "backingUpPercent": "Backing up - {percent}%",
+    "starting": "Starting backup...",
+    "scanning": "Scanning for changes...",
+    "scanningCount": "Scanning for changes - {count} files",
+    "planning": "Preparing changes...",
+    "planningCount": "Preparing {count} changes",
+    "verifying": "Verifying backup...",
+    "verifyingCount": "Verifying backup - {count} files"
   },
   "common": {
     "next": "Next",
@@ -376,6 +383,7 @@
     "events": {
       "upload_done": "Uploaded",
       "trash_done": "Removed",
+      "scan_started": "Scan started",
       "scan_done": "Scan complete",
       "deep_verify_done": "Deep verify complete",
       "update_applied": "App updated",

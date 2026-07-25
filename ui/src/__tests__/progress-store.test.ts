@@ -39,11 +39,14 @@ function idle(): OrchestratorState {
 function scanning(scanned = 0): OrchestratorState {
   return { state: "scanning", source_id: "src-1", scanned };
 }
-function planning(): OrchestratorState {
-  return { state: "planning", plan: {} };
+function planning(uploads = 0, trashes = 0): OrchestratorState {
+  return { state: "planning", plan: { uploads, trashes, bytes: 0 } };
 }
-function verifying(): OrchestratorState {
-  return { state: "verifying", sampled: 0, mismatches: 0 };
+function verifying(sampled = 0): OrchestratorState {
+  return { state: "verifying", sampled, mismatches: 0 };
+}
+function powerCheck(): OrchestratorState {
+  return { state: "power_check" };
 }
 function backoff(): OrchestratorState {
   return { state: "backoff", until: 0 };
@@ -218,6 +221,77 @@ describe("progress store - determinate percent", () => {
     );
     expect(store.active).toBe(true);
     expect(store.percent).toBeCloseTo(0.25, 5);
+  });
+});
+
+// Phase + per-phase counters (the "Run now looks dead during the scan" fix).
+// The store used to collapse every working state into a single boolean, so the
+// UI could not tell scanning from executing or say how far the scan had got.
+describe("progress store - phase + phase counters", () => {
+  it("reports no phase while idle", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", idle()));
+    expect(store.phase).toBeNull();
+    expect(store.scanned).toBe(0);
+  });
+
+  it("reports the scanning phase and the live scanned count", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", scanning(12401)));
+    expect(store.phase).toBe("scanning");
+    expect(store.scanned).toBe(12401);
+  });
+
+  it("sums the scanned count across concurrently scanning accounts", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", scanning(100)));
+    store.ingest(perAccount("b", scanning(250)));
+    expect(store.scanned).toBe(350);
+  });
+
+  it("counts planned uploads plus trashes as the planning total", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", planning(1200, 34)));
+    expect(store.phase).toBe("planning");
+    expect(store.plannedFiles).toBe(1234);
+  });
+
+  it("reports the verifying phase and its sampled count", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", verifying(42)));
+    expect(store.phase).toBe("verifying");
+    expect(store.verified).toBe(42);
+  });
+
+  it("reports the pre-flight power check as its own phase", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", powerCheck()));
+    expect(store.phase).toBe("power_check");
+  });
+
+  it("prefers executing over the pre-upload phases when accounts differ", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", scanning(500)));
+    store.ingest(perAccount("b", planning(10)));
+    store.ingest(perAccount("c", executing({ bytes_done: 1, bytes_total: 2 })));
+    expect(store.phase).toBe("executing");
+    // The scan counter is still readable; it just is not what the bar reports.
+    expect(store.scanned).toBe(500);
+  });
+
+  it("ignores a malformed plan payload rather than throwing", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", { state: "planning", plan: null }));
+    expect(store.phase).toBe("planning");
+    expect(store.plannedFiles).toBe(0);
+  });
+
+  it("reports no phase for non-working states (paused / backoff / error)", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", paused()));
+    store.ingest(perAccount("b", backoff()));
+    store.ingest(perAccount("c", errored()));
+    expect(store.phase).toBeNull();
   });
 });
 

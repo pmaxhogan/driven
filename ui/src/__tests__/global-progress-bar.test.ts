@@ -15,8 +15,17 @@ import type { ExecProgress, OrchestratorState } from "../ipc/types";
 // sweep, no aria-valuenow) during scan/plan/verify. These mount the real
 // component and drive it through the store so every render branch is covered.
 
-function scanning(): OrchestratorState {
-  return { state: "scanning", source_id: "src-1", scanned: 0 };
+function scanning(scanned = 0): OrchestratorState {
+  return { state: "scanning", source_id: "src-1", scanned };
+}
+function planning(uploads: number, trashes = 0): OrchestratorState {
+  return { state: "planning", plan: { uploads, trashes, bytes: 0 } };
+}
+function verifying(sampled: number): OrchestratorState {
+  return { state: "verifying", sampled, mismatches: 0 };
+}
+function powerCheck(): OrchestratorState {
+  return { state: "power_check" };
 }
 function idle(): OrchestratorState {
   return { state: "idle", last_run_at: null };
@@ -48,6 +57,7 @@ function mountBar() {
 
 const BAR = '[role="progressbar"]';
 const INDETERMINATE = ".global-progress__indeterminate";
+const PHASE_LABEL = '[data-testid="global-progress-label"]';
 
 describe("GlobalProgressBar", () => {
   it("renders nothing while idle (no run active)", async () => {
@@ -90,8 +100,79 @@ describe("GlobalProgressBar", () => {
     const bar = wrapper.find(BAR);
     expect(bar.exists()).toBe(true);
     expect(bar.attributes("aria-valuenow")).toBeUndefined();
-    expect(bar.attributes("aria-label")).toBe("Backing up...");
     expect(wrapper.find(INDETERMINATE).exists()).toBe(true);
+  });
+
+  // The "Run now looks dead during the scan" fix: the bar carries a visible
+  // phase readout, and the scan phase streams a live file count into it. Before
+  // this, every pre-upload phase rendered the same bare "Backing up..." on a
+  // 4px sliver, so the ~10s scan of a large tree was indistinguishable from a
+  // hung app.
+  describe("phase readout", () => {
+    it("names the scan phase and hides the count until the first tick lands", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", scanning(0)));
+      await wrapper.vm.$nextTick();
+
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Scanning for changes...");
+      expect(wrapper.find(BAR).attributes("aria-label")).toBe("Scanning for changes...");
+    });
+
+    it("streams the live scanned file count into the readout", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", scanning(512)));
+      await wrapper.vm.$nextTick();
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Scanning for changes - 512 files");
+
+      // A later scan tick updates the same readout in place (locale-grouped).
+      store.ingest(perAccount("a", scanning(12401)));
+      await wrapper.vm.$nextTick();
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Scanning for changes - 12,401 files");
+    });
+
+    it("names the planning phase with the planned change count", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", planning(1200, 34)));
+      await wrapper.vm.$nextTick();
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Preparing 1,234 changes");
+    });
+
+    it("names the verifying phase with the sampled file count", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", verifying(42)));
+      await wrapper.vm.$nextTick();
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Verifying backup - 42 files");
+    });
+
+    it("names the pre-flight power check", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", powerCheck()));
+      await wrapper.vm.$nextTick();
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Starting backup...");
+    });
+
+    it("shows the upload percent once execution starts", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", executing({ bytes_done: 1, bytes_total: 4 })));
+      await wrapper.vm.$nextTick();
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Backing up - 25%");
+    });
+
+    it("reports the executing account while another is still scanning", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", scanning(900)));
+      store.ingest(perAccount("b", executing({ bytes_done: 1, bytes_total: 2 })));
+      await wrapper.vm.$nextTick();
+      // Executing outranks scanning: it is the phase with a real percent.
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Backing up - 50%");
+    });
+
+    it("renders no readout at all while idle", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", idle()));
+      await wrapper.vm.$nextTick();
+      expect(wrapper.find(PHASE_LABEL).exists()).toBe(false);
+    });
   });
 
   it("appears and disappears reactively as a run starts then finishes", async () => {
