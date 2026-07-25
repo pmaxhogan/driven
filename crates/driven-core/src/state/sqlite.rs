@@ -2067,6 +2067,57 @@ impl StateRepo for SqliteStateRepo {
         })
     }
 
+    async fn activity_throughput_series(
+        &self,
+        window_start_ms: UnixMs,
+        bucket_ms: u64,
+        bucket_count: u32,
+    ) -> Result<Vec<u64>> {
+        // The bucketed sibling of `activity_summary`'s scalar throughput window,
+        // backing the dashboard's last-5-minutes sparkline. Deliberately the
+        // SAME `event_type = 'upload_done'` filter, so the sparkline and the
+        // headline rate stay two views of one number rather than two competing
+        // definitions of it.
+        //
+        // GROUP BY integer division bucketises without a date function, and the
+        // caller supplies every boundary (from a single `now`) so the query is
+        // deterministic + unit-testable. Only non-empty buckets come back; the
+        // zero-fill below turns them into a dense, index-is-elapsed-time series.
+        if bucket_count == 0 || bucket_ms == 0 {
+            return Ok(Vec::new());
+        }
+        let bucket_ms_i64 = i64::try_from(bucket_ms).unwrap_or(i64::MAX);
+        let rows = sqlx::query!(
+            r#"
+            SELECT
+                ((ts - ?1) / ?2)           AS "bucket!: i64",
+                COALESCE(SUM(bytes), 0)    AS "bytes!: i64"
+            FROM activity_log
+            WHERE ts >= ?1 AND event_type = 'upload_done'
+            GROUP BY ((ts - ?1) / ?2)
+            ORDER BY ((ts - ?1) / ?2) ASC
+            "#,
+            window_start_ms,
+            bucket_ms_i64,
+        )
+        .fetch_all(&self.pool)
+        .await?;
+
+        let mut series = vec![0u64; bucket_count as usize];
+        let last = series.len() - 1;
+        for r in rows {
+            // A row can land in the CURRENT (still-filling) bucket or, if the
+            // clock moved between the caller's `now` and this query, just past
+            // the end. Fold anything at or past the end into the newest bucket
+            // rather than dropping the freshest bytes. A negative bucket is
+            // impossible under the `ts >= window_start` filter, but clamp
+            // defensively rather than risk an index panic.
+            let idx = usize::try_from(r.bucket).unwrap_or(0).min(last);
+            series[idx] = series[idx].saturating_add(r.bytes.max(0) as u64);
+        }
+        Ok(series)
+    }
+
     async fn telemetry_events_since(
         &self,
         since_ms: UnixMs,
@@ -5720,6 +5771,135 @@ mod tests {
                 },
             ]
         );
+    }
+
+    /// Writes one `upload_done` row (the only event type the byte aggregates
+    /// count) at `ts` carrying `bytes`.
+    async fn write_upload(repo: &SqliteStateRepo, src: SourceId, ts: i64, bytes: u64) {
+        repo.write_activity(NewActivity {
+            ts,
+            source_id: Some(src),
+            level: ActivityLevel::Info,
+            event_type: "upload_done".into(),
+            file_count: Some(1),
+            bytes: Some(bytes),
+            message: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    #[tokio::test]
+    async fn throughput_series_buckets_bytes_by_elapsed_time() {
+        // The dashboard sparkline's data source: a DENSE series where the index
+        // IS elapsed time, so an idle stretch renders as a real gap rather than
+        // collapsing the chart's time axis.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let window_start = 10_000_i64;
+        let bucket_ms = 1_000_u64;
+
+        // bucket 0 (two rows, summed), bucket 2, bucket 4. Buckets 1 and 3 idle.
+        write_upload(&repo, src.id, 10_100, 30).await;
+        write_upload(&repo, src.id, 10_900, 70).await;
+        write_upload(&repo, src.id, 12_500, 55).await;
+        write_upload(&repo, src.id, 14_000, 11).await;
+
+        let series = repo
+            .activity_throughput_series(window_start, bucket_ms, 5)
+            .await
+            .unwrap();
+        assert_eq!(series, vec![100, 0, 55, 0, 11]);
+    }
+
+    #[tokio::test]
+    async fn throughput_series_is_dense_and_zeroed_when_nothing_uploaded() {
+        // The empty state the tile must render gracefully: a full-length series
+        // of zeros, never a short vector the UI has to pad itself.
+        let (repo, _dir) = temp_repo().await;
+        let series = repo
+            .activity_throughput_series(0, 10_000, 30)
+            .await
+            .unwrap();
+        assert_eq!(series.len(), 30);
+        assert!(series.iter().all(|&b| b == 0));
+    }
+
+    #[tokio::test]
+    async fn throughput_series_counts_only_upload_rows() {
+        // Same filter as the scalar throughput window: a byte-carrying row of
+        // any other event type must not inflate the sparkline, or the chart and
+        // the headline rate would tell different stories.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        write_upload(&repo, src.id, 1_500, 40).await;
+        repo.write_activity(NewActivity {
+            ts: 1_600,
+            source_id: Some(src.id),
+            level: ActivityLevel::Info,
+            event_type: "scan_done".into(),
+            file_count: Some(9),
+            bytes: Some(1_000_000),
+            message: None,
+        })
+        .await
+        .unwrap();
+
+        let series = repo
+            .activity_throughput_series(1_000, 1_000, 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            series,
+            vec![40, 0],
+            "only the upload_done bytes are counted"
+        );
+    }
+
+    #[tokio::test]
+    async fn throughput_series_folds_rows_past_the_window_into_the_last_bucket() {
+        // A row can land past the caller's computed window end (an upload that
+        // commits between `now` and the query). Fold it into the newest bucket
+        // rather than dropping the freshest bytes or panicking on the index.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        write_upload(&repo, src.id, 5_500, 10).await;
+        // Two buckets requested (5000..7000), but this row is at bucket 4.
+        write_upload(&repo, src.id, 9_100, 25).await;
+
+        let series = repo
+            .activity_throughput_series(5_000, 1_000, 2)
+            .await
+            .unwrap();
+        assert_eq!(series, vec![10, 25]);
+    }
+
+    #[tokio::test]
+    async fn throughput_series_with_no_buckets_is_empty() {
+        // Degenerate inputs return an empty series instead of dividing by zero.
+        let (repo, _dir) = temp_repo().await;
+        assert!(repo
+            .activity_throughput_series(0, 1_000, 0)
+            .await
+            .unwrap()
+            .is_empty());
+        assert!(repo
+            .activity_throughput_series(0, 0, 10)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     #[tokio::test]

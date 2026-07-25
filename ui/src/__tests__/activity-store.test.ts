@@ -56,6 +56,8 @@ import {
   ACTIVITY_PAGE_SIZE,
   ACTIVITY_RENDER_WINDOW,
   LIVE_TAIL_CAP,
+  SPARKLINE_BUCKET_MS,
+  SPARKLINE_WINDOW_MS,
 } from "../stores/activity";
 import type { ActivityEntry } from "../ipc/types";
 
@@ -617,6 +619,95 @@ describe("activity store: backend facets + summary (M7-P2-4, P2-5)", () => {
       liveHandler?.(makeEntry({ id: 1, ts: 1, eventType: "drive.checksum_mismatch", bytes: null }));
       await vi.advanceTimersByTimeAsync(2000);
       expect(invokeMock.mock.calls.filter((c) => c[0] === "activity_summary").length).toBe(0);
+      void store;
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+});
+
+describe("activity store: throughput sparkline series", () => {
+  it("loads the rolling series with the window + bucket the tile draws", async () => {
+    const series = [0, 1024, 2048, 0];
+    invokeMock.mockResolvedValueOnce(series);
+    const store = useActivityStore();
+    await store.loadThroughputSeries();
+
+    expect(invokeMock).toHaveBeenCalledWith("activity_throughput_series", {
+      windowMs: SPARKLINE_WINDOW_MS,
+      bucketMs: SPARKLINE_BUCKET_MS,
+    });
+    expect(store.throughputSeries).toEqual(series);
+  });
+
+  it("degrades to an empty series (the tile's zero state) when the query fails", async () => {
+    const store = useActivityStore();
+    invokeMock.mockResolvedValueOnce([1, 2, 3]);
+    await store.loadThroughputSeries();
+    expect(store.throughputSeries).toEqual([1, 2, 3]);
+
+    // A later failure must clear the stale shape rather than leave a chart that
+    // silently stopped updating.
+    invokeMock.mockRejectedValueOnce(new Error("backend gone"));
+    await store.loadThroughputSeries();
+    expect(store.throughputSeries).toEqual([]);
+  });
+
+  it("normalizes a malformed response instead of handing the chart NaN", async () => {
+    const store = useActivityStore();
+
+    // An unregistered / version-skewed command resolves undefined: the chart
+    // must get the empty series, not `undefined` (which crashes the render).
+    invokeMock.mockResolvedValueOnce(undefined);
+    await store.loadThroughputSeries();
+    expect(store.throughputSeries).toEqual([]);
+
+    // A ragged array keeps its LENGTH - the index IS elapsed time, so dropping
+    // entries would shift the whole series through time - with bad cells zeroed.
+    invokeMock.mockResolvedValueOnce([1024, null, "big", NaN, -5, 2048]);
+    await store.loadThroughputSeries();
+    expect(store.throughputSeries).toEqual([1024, 0, 0, 0, 0, 2048]);
+  });
+
+  it("refreshes with the summary on the same debounced upload burst", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = useActivityStore();
+      await store.subscribeLive();
+      invokeMock.mockImplementation((cmd: string) =>
+        cmd === "activity_throughput_series" ? Promise.resolve([4, 5]) : Promise.resolve(undefined)
+      );
+
+      for (let i = 1; i <= 4; i++) {
+        liveHandler?.(makeEntry({ id: i, ts: i, eventType: "upload_done", bytes: 256 }));
+      }
+      const seriesCalls = () =>
+        invokeMock.mock.calls.filter((c) => c[0] === "activity_throughput_series").length;
+      expect(seriesCalls()).toBe(0);
+
+      await vi.advanceTimersByTimeAsync(1000);
+      await Promise.resolve();
+      // ONE refresh for the whole burst - the chart rides the same debounce as
+      // the headline number, so they cannot disagree by a debounce interval.
+      expect(seriesCalls()).toBe(1);
+      expect(store.throughputSeries).toEqual([4, 5]);
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("does not refresh the series on a live event carrying no bytes", async () => {
+    vi.useFakeTimers();
+    try {
+      const store = useActivityStore();
+      await store.subscribeLive();
+      invokeMock.mockResolvedValue(undefined);
+
+      liveHandler?.(makeEntry({ id: 1, ts: 1, eventType: "scan_started", bytes: null }));
+      await vi.advanceTimersByTimeAsync(2000);
+      expect(
+        invokeMock.mock.calls.filter((c) => c[0] === "activity_throughput_series").length
+      ).toBe(0);
       void store;
     } finally {
       vi.useRealTimers();

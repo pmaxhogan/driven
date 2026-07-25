@@ -4,8 +4,15 @@ import { useI18n } from "vue-i18n";
 
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
+import ThroughputStatTile from "../components/ThroughputStatTile.vue";
 import { activityEventLabel } from "../stores/activityEventLabel";
-import { ACTIVITY_PAGE_SIZE, ACTIVITY_RENDER_WINDOW, useActivityStore } from "../stores/activity";
+import {
+  ACTIVITY_PAGE_SIZE,
+  ACTIVITY_RENDER_WINDOW,
+  SPARKLINE_BUCKET_MS,
+  useActivityStore,
+} from "../stores/activity";
+import { formatBytes as formatByteCount } from "../stores/formatBytes";
 import { useSourcesStore } from "../stores/sources";
 import type { ActivityEntry, ActivityLevel, FileStateStatus } from "../ipc/types";
 
@@ -55,17 +62,11 @@ const dateTimeFormatter = computed(
 const numberFormatter = computed(() => new Intl.NumberFormat(locale.value));
 
 // M7-P2-5 (DESIGN s8.3 header aggregates). Locale-aware byte + rate formatting
-// via Intl.NumberFormat (DESIGN s8.7: never a hand-rolled English formatter).
-const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"] as const;
-
+// (DESIGN s8.7: never a hand-rolled English formatter). The formatter itself now
+// lives in `stores/formatBytes` so the throughput tile's tooltip renders byte
+// values identically to these header tiles.
 function formatBytes(bytes: number): string {
-  if (bytes <= 0) return `${numberFormatter.value.format(0)} ${BYTE_UNITS[0]}`;
-  const exponent = Math.min(Math.floor(Math.log(bytes) / Math.log(1024)), BYTE_UNITS.length - 1);
-  const value = bytes / Math.pow(1024, exponent);
-  const fmt = new Intl.NumberFormat(locale.value, {
-    maximumFractionDigits: exponent === 0 ? 0 : 1,
-  });
-  return `${fmt.format(value)} ${BYTE_UNITS[exponent]}`;
+  return formatByteCount(bytes, locale.value);
 }
 
 // Header aggregate view model (M7-P2-5). Null until the summary loads.
@@ -75,11 +76,13 @@ const bytesToday = computed(() =>
 const bytesWeek = computed(() =>
   activity.summary ? formatBytes(activity.summary.bytesWeek) : null
 );
-const throughput = computed(() => {
+// The headline rate for the throughput tile, in bytes/sec. Null until the
+// summary loads (the tile renders its own unknown state for that); the tile owns
+// the formatting so its sparkline tooltip and its big number agree.
+const throughputPerSecond = computed<number | null>(() => {
   const s = activity.summary;
   if (!s || s.throughputWindowMs <= 0) return null;
-  const perSec = s.throughputWindowBytes / (s.throughputWindowMs / 1000);
-  return formatBytes(perSec);
+  return s.throughputWindowBytes / (s.throughputWindowMs / 1000);
 });
 const statusCounts = computed(() => activity.summary?.fileStatusCounts ?? []);
 
@@ -227,6 +230,7 @@ onMounted(async () => {
     activity.loadInitial(),
     activity.loadEventTypeOptions(),
     activity.loadSummary(),
+    activity.loadThroughputSeries(),
   ]);
 });
 
@@ -291,14 +295,11 @@ onUnmounted(() => {
             {{ bytesWeek }}
           </dd>
         </div>
-        <div :class="STAT_TILE">
-          <dt class="text-xs text-zinc-500 dark:text-zinc-400">
-            {{ t("activity.summary.throughput") }}
-          </dt>
-          <dd class="mt-1 text-lg font-semibold">
-            {{ t("activity.summary.perSecond", { rate: throughput }) }}
-          </dd>
-        </div>
+        <ThroughputStatTile
+          :series="activity.throughputSeries"
+          :bucket-ms="SPARKLINE_BUCKET_MS"
+          :rate-per-second="throughputPerSecond"
+        />
         <div :class="STAT_TILE">
           <dt class="text-xs text-zinc-500 dark:text-zinc-400">
             {{ t("activity.summary.byStatus") }}

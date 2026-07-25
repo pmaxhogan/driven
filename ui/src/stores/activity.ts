@@ -36,6 +36,16 @@ export const ACTIVITY_RENDER_WINDOW = 200;
  * window seconds for a current bytes/sec rate. */
 export const THROUGHPUT_WINDOW_MS = 60_000;
 
+/** The rolling window the throughput tile's sparkline covers (5 minutes). Wider
+ * than `THROUGHPUT_WINDOW_MS` on purpose: the headline number answers "how fast
+ * right now", the chart behind it answers "and what has it been doing", which
+ * needs enough history to show a shape. */
+export const SPARKLINE_WINDOW_MS = 300_000;
+
+/** Bucket width for that series: 5 minutes / 10s = 30 points. Enough to read a
+ * trend at tile size without drawing more marks than the tile has pixels. */
+export const SPARKLINE_BUCKET_MS = 10_000;
+
 /** R1-P2-1: a byte-carrying live event refreshes the DESIGN s8.3 header
  * aggregates, debounced by this many ms so an upload burst fires ONE reload
  * (its trailing edge) rather than one query per row. */
@@ -112,6 +122,12 @@ export const useActivityStore = defineStore("activity", () => {
   const eventTypeOptions = ref<string[]>([]);
   // M7-P2-5: the header aggregate summary (null until first load).
   const summary = ref<ActivitySummaryDto | null>(null);
+
+  // Bytes per `SPARKLINE_BUCKET_MS` bucket over the last `SPARKLINE_WINDOW_MS`,
+  // oldest first, for the throughput tile's sparkline. Empty until the first
+  // load AND whenever the query fails - the tile renders its zero state either
+  // way, so an empty array is always a safe value here.
+  const throughputSeries = ref<number[]>([]);
 
   // Membership index by row id so dedup is O(1) across both lists. A plain Set
   // (NOT reactive) so the per-event dedup bookkeeping never triggers a render.
@@ -572,6 +588,20 @@ export const useActivityStore = defineStore("activity", () => {
     }
   }
 
+  /** Load the throughput tile's rolling sparkline series (bytes per bucket,
+   * oldest first). Kept OUT of `loadSummary` so a failure of one never blanks
+   * the other; an empty series is the tile's documented zero state, so a failure
+   * degrades to "no chart" rather than to a wrong chart. */
+  async function loadThroughputSeries(): Promise<void> {
+    try {
+      throughputSeries.value = toByteSeries(
+        await ipc.activityThroughputSeries(SPARKLINE_WINDOW_MS, SPARKLINE_BUCKET_MS)
+      );
+    } catch {
+      throughputSeries.value = [];
+    }
+  }
+
   // --- R1-P2-1: debounced header-aggregate refresh on live byte events ------
   // A burst of uploads must not fire one `loadSummary()` per row. Coalesce them
   // into a single trailing refresh `SUMMARY_REFRESH_DEBOUNCE_MS` after the last
@@ -583,6 +613,10 @@ export const useActivityStore = defineStore("activity", () => {
     summaryRefreshTimer = setTimeout(() => {
       summaryRefreshTimer = null;
       void loadSummary();
+      // The sparkline rides the same debounce: it is the same window of the same
+      // rows, so refreshing them together keeps the chart and the headline rate
+      // from ever disagreeing by a debounce interval.
+      void loadThroughputSeries();
     }, SUMMARY_REFRESH_DEBOUNCE_MS);
   }
 
@@ -650,6 +684,7 @@ export const useActivityStore = defineStore("activity", () => {
     errorCode,
     eventTypeOptions,
     summary,
+    throughputSeries,
     isEmpty,
     loadInitial,
     loadMore,
@@ -659,6 +694,7 @@ export const useActivityStore = defineStore("activity", () => {
     reconcileFromHistory,
     loadEventTypeOptions,
     loadSummary,
+    loadThroughputSeries,
     subscribeLive,
     unsubscribeLive,
   };
@@ -677,4 +713,18 @@ function sameFilter(a: ActivityFilterDto, b: ActivityFilterDto): boolean {
   const aSet = new Set(aTypes);
   for (const t of bTypes) if (!aSet.has(t)) return false;
   return true;
+}
+
+/** Normalize an `activity_throughput_series` response into a plotted series.
+ *
+ * The IPC boundary is untyped at runtime: a version-skewed backend, a command
+ * that is not registered, or a transport hiccup can hand back `undefined` or a
+ * ragged array. Feeding that straight to the chart turns a missing number into a
+ * `NaN` coordinate and a broken path (or, for a non-array, a render crash), so
+ * anything that is not a finite non-negative number is dropped to 0 and a
+ * non-array becomes the empty series - which is the tile's documented zero
+ * state. */
+function toByteSeries(raw: unknown): number[] {
+  if (!Array.isArray(raw)) return [];
+  return raw.map((v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0));
 }

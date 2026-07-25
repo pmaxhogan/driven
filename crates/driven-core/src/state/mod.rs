@@ -1529,6 +1529,30 @@ pub trait StateRepo: Send + Sync {
         Ok(ActivitySummary::default())
     }
 
+    /// The recent upload-throughput SERIES: `bucket_count` consecutive
+    /// `bucket_ms`-wide byte sums starting at `window_start_ms`, oldest first
+    /// (DESIGN s8.3 header aggregates; backs the Activity dashboard's
+    /// last-5-minutes throughput sparkline).
+    ///
+    /// Same source and same row filter as the scalar window in
+    /// [`StateRepo::activity_summary`] - `upload_done` rows only - so the
+    /// sparkline and the headline rate can never tell different stories. A
+    /// bucket with no uploads comes back as `0` rather than being omitted, so
+    /// the returned vector is always exactly `bucket_count` long and its index
+    /// IS elapsed time.
+    ///
+    /// Default impl returns an empty series; the SQLite repo overrides it with
+    /// the real bucketed aggregate SQL.
+    async fn activity_throughput_series(
+        &self,
+        window_start_ms: UnixMs,
+        bucket_ms: u64,
+        bucket_count: u32,
+    ) -> Result<Vec<u64>> {
+        let _ = (window_start_ms, bucket_ms, bucket_count);
+        Ok(Vec::new())
+    }
+
     /// M9b (SPEC s16): the anonymous-telemetry aggregate, computed from the durable
     /// `activity_log` + `backup_sources` over the HALF-OPEN-ish window
     /// `[since_ms, now_ms]` (both bounds passed by the caller). The telemetry client
