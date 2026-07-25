@@ -850,9 +850,29 @@ pub struct ActivitySummaryDto {
     pub file_status_counts: Vec<FileStatusCountDto>,
     /// Bytes observed in the recent throughput window.
     pub throughput_window_bytes: u64,
+    /// FILES observed in that same window (a `bundle_upload` row counts every
+    /// member file it packed), so the files tile's headline and the throughput
+    /// tile's headline describe one window.
+    pub throughput_window_files: u64,
     /// Length of the throughput window in milliseconds (so the UI derives a
     /// bytes/sec rate).
     pub throughput_window_ms: u64,
+}
+
+/// The bucketed recent-upload series behind the Activity dashboard sparklines
+/// (DESIGN s8.3). Two parallel, dense, oldest-first arrays over the SAME
+/// buckets: bytes uploaded and files uploaded. Mirrors
+/// [`driven_core::state::ActivityThroughputSeries`] over the camelCase wire.
+///
+/// They travel together (one command, one query) so the throughput tile and the
+/// files tile plot the same buckets by construction.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ActivityThroughputSeriesDto {
+    /// Bytes uploaded per bucket, oldest first.
+    pub bytes: Vec<u64>,
+    /// Files uploaded per bucket, oldest first.
+    pub files: Vec<u64>,
 }
 
 // -----------------------------------------------------------------------------

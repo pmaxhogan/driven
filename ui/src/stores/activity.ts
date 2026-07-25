@@ -129,6 +129,13 @@ export const useActivityStore = defineStore("activity", () => {
   // way, so an empty array is always a safe value here.
   const throughputSeries = ref<number[]>([]);
 
+  // FILES uploaded per bucket over that same window and the same buckets, for
+  // the files-uploaded tile's sparkline. Loaded by the same call as
+  // `throughputSeries` (the backend returns both from one query), so the two
+  // tiles can never plot different windows - and, for the same reason, both are
+  // cleared together when the query fails.
+  const filesSeries = ref<number[]>([]);
+
   // Membership index by row id so dedup is O(1) across both lists. A plain Set
   // (NOT reactive) so the per-event dedup bookkeeping never triggers a render.
   const seenIds = new Set<number>();
@@ -556,7 +563,14 @@ export const useActivityStore = defineStore("activity", () => {
    * so the dropdown offers types from history, not just loaded rows. */
   async function loadEventTypeOptions(): Promise<void> {
     try {
-      eventTypeOptions.value = await ipc.distinctActivityEventTypes();
+      // Same untyped-IPC guard as the series below: an unregistered / skewed
+      // command RESOLVES with `undefined` rather than rejecting, and assigning
+      // that here would crash the view's `eventTypeOptions.length` read on the
+      // next render instead of degrading to "no facets".
+      const types = await ipc.distinctActivityEventTypes();
+      eventTypeOptions.value = Array.isArray(types)
+        ? types.filter((t): t is string => typeof t === "string")
+        : [];
     } catch {
       // Non-fatal: fall back to an empty option list (the dropdown still shows
       // "all event types"). A page-load error already surfaces the real failure.
@@ -588,17 +602,19 @@ export const useActivityStore = defineStore("activity", () => {
     }
   }
 
-  /** Load the throughput tile's rolling sparkline series (bytes per bucket,
-   * oldest first). Kept OUT of `loadSummary` so a failure of one never blanks
-   * the other; an empty series is the tile's documented zero state, so a failure
-   * degrades to "no chart" rather than to a wrong chart. */
+  /** Load the sparkline series behind BOTH header tiles (bytes per bucket and
+   * files per bucket, oldest first, over the same buckets). Kept OUT of
+   * `loadSummary` so a failure of one never blanks the other; an empty series is
+   * the tiles' documented zero state, so a failure degrades to "no chart" rather
+   * than to a wrong chart. */
   async function loadThroughputSeries(): Promise<void> {
     try {
-      throughputSeries.value = toByteSeries(
-        await ipc.activityThroughputSeries(SPARKLINE_WINDOW_MS, SPARKLINE_BUCKET_MS)
-      );
+      const dto = await ipc.activityThroughputSeries(SPARKLINE_WINDOW_MS, SPARKLINE_BUCKET_MS);
+      throughputSeries.value = toCountSeries(dto?.bytes);
+      filesSeries.value = toCountSeries(dto?.files);
     } catch {
       throughputSeries.value = [];
+      filesSeries.value = [];
     }
   }
 
@@ -613,9 +629,9 @@ export const useActivityStore = defineStore("activity", () => {
     summaryRefreshTimer = setTimeout(() => {
       summaryRefreshTimer = null;
       void loadSummary();
-      // The sparkline rides the same debounce: it is the same window of the same
-      // rows, so refreshing them together keeps the chart and the headline rate
-      // from ever disagreeing by a debounce interval.
+      // Both sparklines ride the same debounce: they are the same window of the
+      // same rows, so refreshing them together keeps the charts and the headline
+      // numbers from ever disagreeing by a debounce interval.
       void loadThroughputSeries();
     }, SUMMARY_REFRESH_DEBOUNCE_MS);
   }
@@ -685,6 +701,7 @@ export const useActivityStore = defineStore("activity", () => {
     eventTypeOptions,
     summary,
     throughputSeries,
+    filesSeries,
     isEmpty,
     loadInitial,
     loadMore,
@@ -715,16 +732,18 @@ function sameFilter(a: ActivityFilterDto, b: ActivityFilterDto): boolean {
   return true;
 }
 
-/** Normalize an `activity_throughput_series` response into a plotted series.
+/** Normalize one array of an `activity_throughput_series` response (its bytes or
+ * its files) into a plotted series.
  *
  * The IPC boundary is untyped at runtime: a version-skewed backend, a command
  * that is not registered, or a transport hiccup can hand back `undefined` or a
  * ragged array. Feeding that straight to the chart turns a missing number into a
  * `NaN` coordinate and a broken path (or, for a non-array, a render crash), so
  * anything that is not a finite non-negative number is dropped to 0 and a
- * non-array becomes the empty series - which is the tile's documented zero
- * state. */
-function toByteSeries(raw: unknown): number[] {
+ * non-array (including the whole response arriving as the pre-2.3 bare array,
+ * where `.bytes` / `.files` are `undefined`) becomes the empty series - which is
+ * the tiles' documented zero state. */
+function toCountSeries(raw: unknown): number[] {
   if (!Array.isArray(raw)) return [];
   return raw.map((v) => (typeof v === "number" && Number.isFinite(v) && v > 0 ? v : 0));
 }

@@ -444,14 +444,26 @@ export interface FileStatusCountDto {
 
 /** The Activity dashboard header aggregates (M7-P2-5; mirrors src-tauri
  * ActivitySummaryDto / DESIGN s8.3): bytes uploaded today / this week, file
- * count by status, and the current throughput window (bytes + window length, so
- * the UI derives a bytes/sec rate). */
+ * count by status, and the current throughput window (bytes + files + window
+ * length, so the UI derives a bytes/sec rate and a files headline over the SAME
+ * window). */
 export interface ActivitySummaryDto {
   bytesToday: number;
   bytesWeek: number;
   fileStatusCounts: FileStatusCountDto[];
   throughputWindowBytes: number;
+  throughputWindowFiles: number;
   throughputWindowMs: number;
+}
+
+/** The bucketed recent-upload series behind the Activity sparklines (mirrors
+ * src-tauri ActivityThroughputSeriesDto): two dense, oldest-first arrays over
+ * the SAME buckets - bytes uploaded and files uploaded. One command returns
+ * both, so the throughput tile and the files tile always plot the same
+ * buckets. */
+export interface ActivityThroughputSeriesDto {
+  bytes: number[];
+  files: number[];
 }
 
 // --- Sync (SPEC s11.3) - mirrors src-tauri/src/commands/sync.rs ---

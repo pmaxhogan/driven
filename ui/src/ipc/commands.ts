@@ -11,6 +11,7 @@ import type {
   ActivityFilterDto,
   ActivityPageDto,
   ActivitySummaryDto,
+  ActivityThroughputSeriesDto,
   AddAccountWizardSessionId,
   AddSourceRequest,
   AddSourceResult,
@@ -346,12 +347,17 @@ export function activitySummary(
   });
 }
 
-/** Recent upload throughput as a DENSE series of `bucketMs`-wide byte sums,
- * oldest first, covering `now - windowMs .. now`. Backs the throughput tile's
- * sparkline. Shares `activity_summary`'s window semantics (upload rows only), so
- * the chart and the headline rate stay two views of one number; the backend
- * derives the bucket count from the window, so length and span cannot disagree. */
-export function activityThroughputSeries(windowMs: number, bucketMs: number): Promise<number[]> {
+/** Recent uploads as two DENSE, oldest-first series over the same `bucketMs`-wide
+ * buckets covering `now - windowMs .. now`: bytes uploaded and files uploaded.
+ * Backs the throughput tile's and the files tile's sparklines. Shares
+ * `activity_summary`'s window semantics (upload rows only), so each chart and
+ * its headline stay two views of one number; the backend derives the bucket
+ * count from the window, so length and span cannot disagree, and returns both
+ * series from one query so the two tiles cannot plot different buckets. */
+export function activityThroughputSeries(
+  windowMs: number,
+  bucketMs: number
+): Promise<ActivityThroughputSeriesDto> {
   return invoke("activity_throughput_series", { windowMs, bucketMs });
 }
 

@@ -417,6 +417,9 @@
       "perSecond": "{rate}/s",
       "noThroughput": "No recent uploads",
       "sparklineLabel": "Upload throughput over the last {minutes} minutes, peaking at {peak} per second",
+      "filesUploaded": "Files uploaded",
+      "filesValue": "{count} file | {count} files",
+      "filesSparklineLabel": "Files uploaded over the last {minutes} minutes, peaking at {peak} in a single {seconds}-second interval",
       "byStatus": "Files by status",
       "noFiles": "No files tracked yet"
     },

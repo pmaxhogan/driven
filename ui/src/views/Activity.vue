@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
+import FilesUploadedStatTile from "../components/FilesUploadedStatTile.vue";
 import ThroughputStatTile from "../components/ThroughputStatTile.vue";
 import { activityEventLabel } from "../stores/activityEventLabel";
 import {
@@ -37,6 +38,18 @@ const SELECT_INPUT =
   "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-hidden focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
 const SECONDARY_BTN =
   "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
+
+// Skeleton class for one pulsing placeholder bar. `motion-safe:` so a user who
+// asked for reduced motion gets a static grey bar instead of a pulse (the
+// `<style>` block below silences the load-in animation for the same reason).
+const SKELETON_BAR = "rounded bg-zinc-200 motion-safe:animate-pulse dark:bg-zinc-800";
+
+// False until the FIRST load of this view has settled (successfully or not).
+// Switching to the Activity tab used to paint an empty header, an empty filter
+// bar and a "Showing 0 of 0" line, then swap each one out as its query landed -
+// a visible flash of wrong content. Instead the view holds a skeleton of its own
+// shape until everything has arrived, then fades the real content in once.
+const firstLoadDone = ref(false);
 
 // Filter form state (bound to the controls; applied via the store on change).
 const filterSourceId = ref<string>("");
@@ -84,6 +97,13 @@ const throughputPerSecond = computed<number | null>(() => {
   if (!s || s.throughputWindowMs <= 0) return null;
   return s.throughputWindowBytes / (s.throughputWindowMs / 1000);
 });
+// The files tile's headline: files uploaded over the SAME window the throughput
+// headline covers (the backend counts them in the same query), so the two tiles
+// are one window read two ways rather than two windows that drift apart. Null
+// until the summary loads; the tile renders its own unknown state for that.
+const filesUploaded = computed<number | null>(
+  () => activity.summary?.throughputWindowFiles ?? null
+);
 const statusCounts = computed(() => activity.summary?.fileStatusCounts ?? []);
 
 function statusLabel(status: FileStateStatus): string {
@@ -225,13 +245,20 @@ onMounted(async () => {
   // The subscription also reconciles from the durable log on `activity:lagged`
   // (M7-P1-1), so a broadcast-lag burst loses no rows.
   await activity.subscribeLive();
-  await Promise.all([
-    sources.refresh(),
-    activity.loadInitial(),
-    activity.loadEventTypeOptions(),
-    activity.loadSummary(),
-    activity.loadThroughputSeries(),
-  ]);
+  try {
+    await Promise.all([
+      sources.refresh(),
+      activity.loadInitial(),
+      activity.loadEventTypeOptions(),
+      activity.loadSummary(),
+      activity.loadThroughputSeries(),
+    ]);
+  } finally {
+    // `finally`, not the happy path: a rejected load must still retire the
+    // skeleton, or a failure would leave the view pulsing forever instead of
+    // showing its error / empty state.
+    firstLoadDone.value = true;
+  }
 });
 
 onUnmounted(() => {
@@ -240,7 +267,7 @@ onUnmounted(() => {
 </script>
 
 <template>
-  <section class="space-y-4">
+  <section class="space-y-4" :aria-busy="!firstLoadDone">
     <header class="space-y-3">
       <div class="flex items-start justify-between gap-3">
         <div class="space-y-1">
@@ -273,10 +300,26 @@ onUnmounted(() => {
         {{ t("activity.exportedTo", { path: exportedPath }) }}
       </p>
 
+      <!-- First-load placeholder for the aggregate tiles: the same grid at the
+           same size, so the real tiles land where the skeleton stood instead of
+           shifting the page. Hidden from assistive tech - the section's
+           `aria-busy` already says a load is in flight. -->
+      <div
+        v-if="!firstLoadDone"
+        class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5"
+        data-testid="activity-summary-skeleton"
+        aria-hidden="true"
+      >
+        <div v-for="n in 5" :key="n" :class="STAT_TILE">
+          <div class="h-3 w-20" :class="SKELETON_BAR"></div>
+          <div class="mt-2 h-5 w-16" :class="SKELETON_BAR"></div>
+        </div>
+      </div>
+
       <!-- M7-P2-5 (DESIGN s8.3): header aggregate stats. -->
       <dl
-        v-if="activity.summary"
-        class="grid grid-cols-2 gap-3 sm:grid-cols-4"
+        v-else-if="activity.summary"
+        class="activity-load-in grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5"
         data-testid="activity-summary"
       >
         <div :class="STAT_TILE">
@@ -300,6 +343,11 @@ onUnmounted(() => {
           :bucket-ms="SPARKLINE_BUCKET_MS"
           :rate-per-second="throughputPerSecond"
         />
+        <FilesUploadedStatTile
+          :series="activity.filesSeries"
+          :bucket-ms="SPARKLINE_BUCKET_MS"
+          :files-uploaded="filesUploaded"
+        />
         <div :class="STAT_TILE">
           <dt class="text-xs text-zinc-500 dark:text-zinc-400">
             {{ t("activity.summary.byStatus") }}
@@ -321,7 +369,23 @@ onUnmounted(() => {
       </dl>
     </header>
 
-    <div :class="CARD" data-testid="activity-filters">
+    <!-- Placeholder for the filter bar. Its dropdowns are populated by their own
+         queries, so rendering the real controls straight away would show every
+         one of them in its "nothing to filter by yet" state and then swap the
+         options in - the same flash the tiles had. -->
+    <div
+      v-if="!firstLoadDone"
+      :class="CARD"
+      data-testid="activity-filters-skeleton"
+      aria-hidden="true"
+    >
+      <div class="h-4 w-16" :class="SKELETON_BAR"></div>
+      <div class="mt-3 flex flex-wrap items-end gap-3">
+        <div v-for="n in 3" :key="n" class="h-9 w-40" :class="SKELETON_BAR"></div>
+      </div>
+    </div>
+
+    <div v-else :class="[CARD, 'activity-load-in']" data-testid="activity-filters">
       <h2 class="mb-3 text-sm font-semibold text-zinc-700 dark:text-zinc-300">
         {{ t("activity.filters.title") }}
       </h2>
@@ -409,101 +473,149 @@ onUnmounted(() => {
       </div>
     </div>
 
-    <p
-      v-if="activity.errorCode"
-      class="text-sm text-red-600 dark:text-red-400"
-      data-testid="activity-error"
-    >
-      {{ t(`errors.${activity.errorCode}.long`) }}
-    </p>
+    <!-- Placeholder for the count line + the event table, so the first page of
+         rows fades in where the skeleton stood rather than pushing the layout
+         down as it arrives. -->
+    <template v-if="!firstLoadDone">
+      <div class="h-4 w-48" :class="SKELETON_BAR" aria-hidden="true"></div>
+      <div :class="CARD" data-testid="activity-table-skeleton" aria-hidden="true">
+        <div class="space-y-3">
+          <div v-for="n in 6" :key="n" class="h-4" :class="SKELETON_BAR"></div>
+        </div>
+      </div>
+    </template>
 
-    <p
-      v-if="!activity.errorCode"
-      class="text-sm text-zinc-500 dark:text-zinc-400"
-      data-testid="activity-count"
-    >
-      {{
-        t("activity.countSummary", {
-          shown: numberFormatter.format(shownCount),
-          total: numberFormatter.format(activity.total),
-        })
-      }}
-    </p>
-
-    <p
-      v-if="activity.isEmpty"
-      class="rounded-lg border border-dashed border-zinc-300 p-8 text-center text-sm text-zinc-500 dark:border-zinc-700"
-      data-testid="activity-empty"
-    >
-      {{ t("activity.empty") }}
-    </p>
-
-    <div v-else-if="activity.entries.length > 0" class="overflow-x-auto" :class="CARD">
-      <table class="w-full text-left text-sm" data-testid="activity-table">
-        <thead class="text-xs text-zinc-500 dark:text-zinc-400">
-          <tr>
-            <th class="py-1 pr-3 font-medium">
-              {{ t("activity.column.time") }}
-            </th>
-            <th class="py-1 pr-3 font-medium">
-              {{ t("activity.column.level") }}
-            </th>
-            <th class="py-1 pr-3 font-medium">
-              {{ t("activity.column.event") }}
-            </th>
-            <th class="py-1 pr-3 font-medium">
-              {{ t("activity.column.source") }}
-            </th>
-            <th class="py-1 font-medium">
-              {{ t("activity.column.details") }}
-            </th>
-          </tr>
-        </thead>
-        <tbody class="divide-y divide-zinc-200 dark:divide-zinc-800">
-          <tr v-for="entry in visibleEntries" :key="entry.id" data-testid="activity-row">
-            <td class="whitespace-nowrap py-2 pr-3 align-top">
-              {{ formatTime(entry) }}
-            </td>
-            <td class="py-2 pr-3 align-top font-medium" :class="levelClass(entry.level)">
-              {{ levelLabel(entry.level) }}
-            </td>
-            <td class="break-all py-2 pr-3 align-top" :title="entry.eventType">
-              {{ eventLabel(entry.eventType) }}
-            </td>
-            <td class="break-all py-2 pr-3 align-top">
-              {{ sourceLabel(entry) }}
-            </td>
-            <td class="break-all py-2 align-top text-zinc-600 dark:text-zinc-300">
-              <span v-if="entry.message">{{ entry.message }}</span>
-              <span v-else-if="entry.fileCount != null" class="text-zinc-500 dark:text-zinc-400">
-                {{
-                  t("activity.files", {
-                    count: numberFormatter.format(entry.fileCount),
-                  })
-                }}
-              </span>
-            </td>
-          </tr>
-        </tbody>
-      </table>
-    </div>
-
-    <div v-if="canLoadMore" class="flex justify-center">
-      <button
-        type="button"
-        :class="SECONDARY_BTN"
-        :disabled="activity.loading"
-        data-testid="activity-load-more"
-        @click="loadMoreRows"
+    <template v-else>
+      <p
+        v-if="activity.errorCode"
+        class="activity-load-in text-sm text-red-600 dark:text-red-400"
+        data-testid="activity-error"
       >
-        {{ activity.loading ? t("activity.loadingMore") : t("activity.loadMore") }}
-      </button>
-    </div>
-    <p
-      v-else-if="activity.entries.length > 0"
-      class="text-center text-xs text-zinc-400 dark:text-zinc-500"
-    >
-      {{ t("activity.allLoaded") }}
-    </p>
+        {{ t(`errors.${activity.errorCode}.long`) }}
+      </p>
+
+      <p
+        v-if="!activity.errorCode"
+        class="activity-load-in text-sm text-zinc-500 dark:text-zinc-400"
+        data-testid="activity-count"
+      >
+        {{
+          t("activity.countSummary", {
+            shown: numberFormatter.format(shownCount),
+            total: numberFormatter.format(activity.total),
+          })
+        }}
+      </p>
+
+      <p
+        v-if="activity.isEmpty"
+        class="activity-load-in rounded-lg border border-dashed border-zinc-300 p-8 text-center text-sm text-zinc-500 dark:border-zinc-700"
+        data-testid="activity-empty"
+      >
+        {{ t("activity.empty") }}
+      </p>
+
+      <div
+        v-else-if="activity.entries.length > 0"
+        class="activity-load-in overflow-x-auto"
+        :class="CARD"
+      >
+        <table class="w-full text-left text-sm" data-testid="activity-table">
+          <thead class="text-xs text-zinc-500 dark:text-zinc-400">
+            <tr>
+              <th class="py-1 pr-3 font-medium">
+                {{ t("activity.column.time") }}
+              </th>
+              <th class="py-1 pr-3 font-medium">
+                {{ t("activity.column.level") }}
+              </th>
+              <th class="py-1 pr-3 font-medium">
+                {{ t("activity.column.event") }}
+              </th>
+              <th class="py-1 pr-3 font-medium">
+                {{ t("activity.column.source") }}
+              </th>
+              <th class="py-1 font-medium">
+                {{ t("activity.column.details") }}
+              </th>
+            </tr>
+          </thead>
+          <tbody class="divide-y divide-zinc-200 dark:divide-zinc-800">
+            <tr v-for="entry in visibleEntries" :key="entry.id" data-testid="activity-row">
+              <td class="whitespace-nowrap py-2 pr-3 align-top">
+                {{ formatTime(entry) }}
+              </td>
+              <td class="py-2 pr-3 align-top font-medium" :class="levelClass(entry.level)">
+                {{ levelLabel(entry.level) }}
+              </td>
+              <td class="break-all py-2 pr-3 align-top" :title="entry.eventType">
+                {{ eventLabel(entry.eventType) }}
+              </td>
+              <td class="break-all py-2 pr-3 align-top">
+                {{ sourceLabel(entry) }}
+              </td>
+              <td class="break-all py-2 align-top text-zinc-600 dark:text-zinc-300">
+                <span v-if="entry.message">{{ entry.message }}</span>
+                <span v-else-if="entry.fileCount != null" class="text-zinc-500 dark:text-zinc-400">
+                  {{
+                    t("activity.files", {
+                      count: numberFormatter.format(entry.fileCount),
+                    })
+                  }}
+                </span>
+              </td>
+            </tr>
+          </tbody>
+        </table>
+      </div>
+
+      <div v-if="canLoadMore" class="flex justify-center">
+        <button
+          type="button"
+          :class="SECONDARY_BTN"
+          :disabled="activity.loading"
+          data-testid="activity-load-more"
+          @click="loadMoreRows"
+        >
+          {{ activity.loading ? t("activity.loadingMore") : t("activity.loadMore") }}
+        </button>
+      </div>
+      <p
+        v-else-if="activity.entries.length > 0"
+        class="text-center text-xs text-zinc-400 dark:text-zinc-500"
+      >
+        {{ t("activity.allLoaded") }}
+      </p>
+    </template>
   </section>
 </template>
+
+<style scoped>
+/* The load-in: once the first queries have all landed, the real content fades
+   and rises a few pixels into the space the skeleton held. A one-shot CSS
+   animation rather than a <Transition>, because the elements are ENTERING a
+   fragment that was never in the DOM - there is nothing to transition FROM -
+   and a plain keyframe cannot get stuck mid-flight. */
+.activity-load-in {
+  animation: activity-load-in 220ms ease-out both;
+}
+
+@keyframes activity-load-in {
+  from {
+    opacity: 0;
+    transform: translateY(4px);
+  }
+  to {
+    opacity: 1;
+    transform: none;
+  }
+}
+
+/* Respect reduced-motion: the content still arrives, it just arrives instantly
+   and in place. `motion-safe:` handles the skeleton's pulse the same way. */
+@media (prefers-reduced-motion: reduce) {
+  .activity-load-in {
+    animation: none;
+  }
+}
+</style>

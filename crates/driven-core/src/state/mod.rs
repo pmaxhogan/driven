@@ -495,9 +495,34 @@ pub struct ActivitySummary {
     /// `activity_log.bytes` at or after `window_start`), used with the window
     /// length to render a current bytes/sec rate in the UI.
     pub throughput_window_bytes: u64,
+    /// FILES observed in that same throughput window - the sibling headline of
+    /// `throughput_window_bytes`, so the dashboard can answer "how many files"
+    /// and "how many bytes" over one window rather than two.
+    ///
+    /// A plain upload row is one file (`activity_log.file_count` is NULL there);
+    /// a `bundle_upload` row carries the number of member files it packed, so it
+    /// counts as all of them (`COALESCE(file_count, 1)`).
+    pub throughput_window_files: u64,
     /// Length of the throughput window in milliseconds (so the UI computes the
     /// rate as `throughput_window_bytes / (throughput_window_ms / 1000)`).
     pub throughput_window_ms: u64,
+}
+
+/// The bucketed recent-upload series behind the Activity dashboard sparklines
+/// (DESIGN s8.3): two parallel, dense, oldest-first vectors over the SAME
+/// buckets - bytes uploaded and files uploaded.
+///
+/// Both are exactly `bucket_count` long and share an index, so bucket `i` of
+/// [`Self::bytes`] and bucket `i` of [`Self::files`] describe the same slice of
+/// time. They are returned together (one query) precisely so the two tiles can
+/// never plot two different windows.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct ActivityThroughputSeries {
+    /// Bytes uploaded per bucket, oldest first.
+    pub bytes: Vec<u64>,
+    /// Files uploaded per bucket, oldest first (a `bundle_upload` bucket counts
+    /// every member file it packed, not the single row).
+    pub files: Vec<u64>,
 }
 
 /// M9b (SPEC s16): the anonymous-telemetry 24h aggregate, computed entirely from
@@ -1508,8 +1533,8 @@ pub trait StateRepo: Send + Sync {
     /// - `day_start_ms` / `week_start_ms`: inclusive lower bounds for the
     ///   today / this-week byte sums.
     /// - `throughput_window_start_ms`: inclusive lower bound for the recent
-    ///   throughput byte sum; `throughput_window_ms` is its length (carried
-    ///   straight through so the UI computes bytes/sec).
+    ///   throughput byte AND file sums; `throughput_window_ms` is its length
+    ///   (carried straight through so the UI computes bytes/sec).
     ///
     /// Default impl returns a zeroed summary; the SQLite repo overrides it with
     /// the real aggregate SQL.
@@ -1529,16 +1554,19 @@ pub trait StateRepo: Send + Sync {
         Ok(ActivitySummary::default())
     }
 
-    /// The recent upload-throughput SERIES: `bucket_count` consecutive
-    /// `bucket_ms`-wide byte sums starting at `window_start_ms`, oldest first
-    /// (DESIGN s8.3 header aggregates; backs the Activity dashboard's
-    /// last-5-minutes throughput sparkline).
+    /// The recent upload SERIES: `bucket_count` consecutive `bucket_ms`-wide
+    /// buckets starting at `window_start_ms`, oldest first, each carrying the
+    /// bytes AND the files uploaded in it (DESIGN s8.3 header aggregates; backs
+    /// the Activity dashboard's last-5-minutes sparklines).
     ///
     /// Same source and same row filter as the scalar window in
-    /// [`StateRepo::activity_summary`] - `upload_done` rows only - so the
-    /// sparkline and the headline rate can never tell different stories. A
-    /// bucket with no uploads comes back as `0` rather than being omitted, so
-    /// the returned vector is always exactly `bucket_count` long and its index
+    /// [`StateRepo::activity_summary`] - upload rows only (`upload_done` plus
+    /// the V2 bundling `bundle_upload`) - so a sparkline and its headline can
+    /// never tell different stories. Bytes and files come from ONE query over
+    /// one bucketisation, so the two tiles cannot drift apart either.
+    ///
+    /// A bucket with no uploads comes back as `0` rather than being omitted, so
+    /// each returned vector is always exactly `bucket_count` long and its index
     /// IS elapsed time.
     ///
     /// Default impl returns an empty series; the SQLite repo overrides it with
@@ -1548,9 +1576,9 @@ pub trait StateRepo: Send + Sync {
         window_start_ms: UnixMs,
         bucket_ms: u64,
         bucket_count: u32,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<ActivityThroughputSeries> {
         let _ = (window_start_ms, bucket_ms, bucket_count);
-        Ok(Vec::new())
+        Ok(ActivityThroughputSeries::default())
     }
 
     /// M9b (SPEC s16): the anonymous-telemetry aggregate, computed from the durable

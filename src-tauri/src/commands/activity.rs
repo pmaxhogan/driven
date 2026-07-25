@@ -24,7 +24,8 @@ use driven_core::types::{ActivityEntry, ErrorCode, FileStateStatus, SourceId};
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    ActivityFilterDto, ActivityPageDto, ActivitySummaryDto, FileStatusCountDto, PageRequestDto,
+    ActivityFilterDto, ActivityPageDto, ActivitySummaryDto, ActivityThroughputSeriesDto,
+    FileStatusCountDto, PageRequestDto,
 };
 use crate::commands::{CommandError, CommandResult};
 
@@ -258,6 +259,7 @@ pub async fn activity_summary(
         bytes_week: summary.bytes_week,
         file_status_counts,
         throughput_window_bytes: summary.throughput_window_bytes,
+        throughput_window_files: summary.throughput_window_files,
         throughput_window_ms: summary.throughput_window_ms,
     })
 }
@@ -271,20 +273,23 @@ const MIN_THROUGHPUT_BUCKET_MS: u64 = 1_000;
 /// Upper bound on the number of buckets one series request may return.
 const MAX_THROUGHPUT_BUCKETS: u64 = 240;
 
-/// `activity_throughput_series(window_ms, bucket_ms)` - the recent upload
-/// throughput as a dense series of `bucket_ms`-wide byte sums, oldest first.
+/// `activity_throughput_series(window_ms, bucket_ms)` - the recent uploads as
+/// two dense, oldest-first series over the same `bucket_ms`-wide buckets: bytes
+/// uploaded and files uploaded.
 ///
-/// Backs the Activity dashboard's last-5-minutes throughput sparkline. Shares
-/// `activity_summary`'s window semantics (`now - window_ms`, `upload_done` rows
-/// only), so the sparkline and the headline rate are two views of one number.
-/// The bucket count is derived here rather than taken from the caller, so the
-/// series length and the window can never disagree.
+/// Backs the Activity dashboard's last-5-minutes sparklines (the throughput tile
+/// and the files-uploaded tile). Shares `activity_summary`'s window semantics
+/// (`now - window_ms`, upload rows only), so each sparkline and its headline are
+/// two views of one number. Both series come from ONE query, so the two tiles
+/// cannot plot different buckets. The bucket count is derived here rather than
+/// taken from the caller, so the series length and the window can never
+/// disagree.
 #[tauri::command]
 pub async fn activity_throughput_series(
     state: State<'_, AppState>,
     window_ms: u64,
     bucket_ms: u64,
-) -> CommandResult<Vec<u64>> {
+) -> CommandResult<ActivityThroughputSeriesDto> {
     if !(1..=MAX_THROUGHPUT_WINDOW_MS).contains(&window_ms) {
         return Err(CommandError::with_code(
             ErrorCode::InvalidInput,
@@ -325,12 +330,15 @@ pub async fn activity_throughput_series(
 
     tracing::debug!(
         target: TARGET,
-        buckets = series.len(),
+        buckets = series.bytes.len(),
         window_ms,
         bucket_ms,
         "activity_throughput_series served"
     );
-    Ok(series)
+    Ok(ActivityThroughputSeriesDto {
+        bytes: series.bytes,
+        files: series.files,
+    })
 }
 
 /// Map a [`FileStateStatus`] to its stable wire string (matching the SPEC s2
