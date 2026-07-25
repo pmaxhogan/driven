@@ -86,17 +86,18 @@ impl RunReport {
                 }
             ));
             out.push_str(
-                "| Tool | Phase | Wall s | MiB/s | files/s | Files | Bytes | API calls | CPU s | Peak RSS | Conc | Notes |\n",
+                "| Tool | Phase | Wall s | Scan s | MiB/s | files/s | Files | Bytes | API calls | CPU s | Peak RSS | Conc | Notes |\n",
             );
             out.push_str(
-                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
+                "| --- | --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: | --- |\n",
             );
             for r in &scenario.results {
                 out.push_str(&format!(
-                    "| {} | {} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
+                    "| {} | {} | {:.1} | {} | {} | {} | {} | {} | {} | {} | {} | {} | {} |\n",
                     r.tool,
                     r.phase,
                     r.wall_secs,
+                    opt_f(r.scan_secs, 1),
                     // Two places: on the tiny-files shape the byte rate is a
                     // small fraction of a MiB/s and one place rounds it to 0.0.
                     opt_f(r.mib_per_sec(), 2),
@@ -126,7 +127,12 @@ impl RunReport {
              database and hashes file content, which costs it time on the cold phase and buys it \
              precision on the incremental phase; rclone compares size and modification time and \
              keeps no database. `API calls` is instrumented inside Driven's Drive client and has \
-             no rclone equivalent, so a blank cell there means \"not measurable\", not zero.\n",
+             no rclone equivalent, so a blank cell there means \"not measurable\", not zero.\n\n\
+             `Scan s` is the time Driven spent walking and hashing before the first upload \
+             started, so `Wall s - Scan s` is the upload half. That split is what says WHERE a \
+             slow run went: a large scan share means the local walk is the constraint, a small \
+             one means Drive round-trips are. rclone interleaves listing with transferring and \
+             exposes no such boundary, so its cell is blank.\n",
         );
         out
     }
@@ -219,6 +225,7 @@ mod tests {
             bytes_transferred: Some(10 * 1_048_576),
             api_calls: (tool == Tool::Driven).then_some(120),
             concurrency: Some(8),
+            scan_secs: (tool == Tool::Driven).then_some(3.0),
             ok,
             detail: None,
         }
@@ -260,6 +267,30 @@ mod tests {
         // rclone has no request counter; the API column must be a dash so the
         // table never claims it made zero requests.
         assert!(row.contains(" - |"), "expected a dash cell in: {row}");
+    }
+
+    #[test]
+    fn the_scan_column_shows_drivens_split_and_stays_blank_for_rclone() {
+        let md = report(vec![result(Tool::Driven, true), result(Tool::Rclone, true)]).to_markdown();
+        assert!(md.contains("| Scan s |"), "the table must carry the column");
+        let driven = md
+            .lines()
+            .find(|l| l.starts_with("| driven |"))
+            .expect("driven row");
+        assert!(
+            driven.contains("| 3.0 |"),
+            "driven must report its scan time, got: {driven}"
+        );
+        let rclone = md
+            .lines()
+            .find(|l| l.starts_with("| rclone |"))
+            .expect("rclone row");
+        // rclone interleaves listing with transferring; the cell must be a dash,
+        // never a zero that would read as "no scan needed".
+        assert!(
+            !rclone.contains("| 0.0 |"),
+            "rclone must not claim a zero scan, got: {rclone}"
+        );
     }
 
     #[test]

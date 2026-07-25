@@ -1,0 +1,53 @@
+{
+  "started_at": "2026-07-25T23:17:54Z",
+  "scale": "smoke",
+  "seed": 1,
+  "host": "windows/x86_64",
+  "cpus": 20,
+  "driven_version": "2.3.0",
+  "rclone_version": null,
+  "tools": [
+    "driven"
+  ],
+  "scenarios": [
+    {
+      "spec": {
+        "shape": "huge",
+        "files": 2,
+        "huge_file_bytes": 8388608,
+        "depth": 0,
+        "seed": 1
+      },
+      "results": [
+        {
+          "tool": "driven",
+          "phase": "cold",
+          "wall_secs": 2.7920272,
+          "cpu_secs": 0.265625,
+          "peak_rss_bytes": 50872320,
+          "files_transferred": 2,
+          "bytes_transferred": 16777216,
+          "api_calls": 6,
+          "concurrency": 16,
+          "scan_secs": 0.006,
+          "ok": true,
+          "detail": null
+        },
+        {
+          "tool": "driven",
+          "phase": "incremental",
+          "wall_secs": 2.2996396,
+          "cpu_secs": 0.1875,
+          "peak_rss_bytes": 37617664,
+          "files_transferred": 1,
+          "bytes_transferred": 8388608,
+          "api_calls": 4,
+          "concurrency": 16,
+          "scan_secs": 0.505,
+          "ok": true,
+          "detail": null
+        }
+      ]
+    }
+  ]
+}

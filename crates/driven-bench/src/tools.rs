@@ -89,6 +89,12 @@ pub struct PhaseResult {
     /// Upload concurrency the tool ran at, for the report to show alongside the
     /// timings.
     pub concurrency: Option<u64>,
+    /// Seconds spent walking and hashing before any upload began, when the tool
+    /// can report it. Only Driven can: it is the number that says whether a slow
+    /// run was bound by the local scan or by Drive round-trips. rclone
+    /// interleaves listing with transferring and exposes no such boundary, so
+    /// this stays `None` for it rather than being invented.
+    pub scan_secs: Option<f64>,
     /// Whether the child exited zero.
     pub ok: bool,
     /// A short human-facing note - the failure reason when `ok` is false.
@@ -128,6 +134,7 @@ fn failed(tool: Tool, phase: Phase, wall: Duration, detail: String) -> PhaseResu
         bytes_transferred: None,
         api_calls: None,
         concurrency: None,
+        scan_secs: None,
         ok: false,
         detail: Some(detail),
     }
@@ -209,6 +216,7 @@ pub fn run_driven(
         bytes_transferred: Some(bytes),
         api_calls: Some(agent.api.total),
         concurrency: Some(driven_core::adaptive::default_pool_size() as u64),
+        scan_secs: agent.scan_ms.map(|ms| ms as f64 / 1000.0),
         ok: agent.errors == 0,
         detail: (agent.errors > 0).then(|| format!("{} executor error(s)", agent.errors)),
     })
@@ -315,6 +323,9 @@ pub fn run_rclone(
         // rclone exposes no request counter.
         api_calls: None,
         concurrency: Some(transfers),
+        // rclone interleaves listing and transferring; there is no scan phase
+        // to report, so the column stays empty instead of guessing.
+        scan_secs: None,
         ok: errors == 0,
         detail: (errors > 0).then(|| format!("{errors} rclone error(s)")),
     })
@@ -426,6 +437,7 @@ mod tests {
             bytes_transferred: Some(0),
             api_calls: None,
             concurrency: None,
+            scan_secs: None,
             ok: true,
             detail: None,
         };
