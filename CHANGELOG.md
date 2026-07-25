@@ -5,6 +5,22 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.3.0](https://github.com/pmaxhogan/driven/compare/v2.2.0...v2.3.0) (2026-07-25)
+
+
+### Features
+
+* **core:** record a backup_done activity row when a run completes ([#160](https://github.com/pmaxhogan/driven/issues/160)) ([90cde5c](https://github.com/pmaxhogan/driven/commit/90cde5c4971aa5caadb50f19278ecdae1ebeade4))
+* **ui:** files-uploaded stat card with sparkline and smoother Activity load-in ([#157](https://github.com/pmaxhogan/driven/issues/157)) ([2d85c99](https://github.com/pmaxhogan/driven/commit/2d85c9922a55ecc2fa05feff9f9f24f3ff85a520))
+* **ui:** live streaming folder-tree preview for the exclusion editor ([#158](https://github.com/pmaxhogan/driven/issues/158)) ([47ebe14](https://github.com/pmaxhogan/driven/commit/47ebe141e1f73372442e812c0645e7d9d1cafc7b))
+
+
+### Bug Fixes
+
+* **telemetry:** count bundled uploads in the anonymous aggregate ([#159](https://github.com/pmaxhogan/driven/issues/159)) ([11af7ea](https://github.com/pmaxhogan/driven/commit/11af7ea802632817a2d45ed825dc1d824b8b9e9e))
+* **ui:** label bundle_upload and hook activity event types ([#154](https://github.com/pmaxhogan/driven/issues/154)) ([2998c76](https://github.com/pmaxhogan/driven/commit/2998c761fb1b3e0910e958bd878db6e05cc8db89))
+* **ui:** make the backing-up bar a true determinate progress bar ([#155](https://github.com/pmaxhogan/driven/issues/155)) ([eed80a6](https://github.com/pmaxhogan/driven/commit/eed80a6396496afa035c190a50b80c11a6c5018d))
+
 ## [2.2.0](https://github.com/pmaxhogan/driven/compare/v2.1.0...v2.2.0) (2026-07-25)
 
 
