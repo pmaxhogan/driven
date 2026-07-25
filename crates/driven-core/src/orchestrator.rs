@@ -2134,6 +2134,14 @@ impl Orchestrator for SyncOrchestrator {
         // A `tokio::time::Instant` so re-arming the `select!` never resets it.
         let mut resume_deadline: Option<tokio::time::Instant> = None;
         let mut shutdown_rx = self.shutdown_rx.clone();
+        // Manual-pause changes (DESIGN s5.7). Without this arm NOTHING wakes the
+        // loop when the user RESUMES: the pause flag would be clear but the next
+        // cycle would still wait for a scheduled tick - `scan_interval_secs`,
+        // 600 s as shipped - so "Resume" would sit doing nothing visible for up
+        // to ten minutes. Waking on the change just re-evaluates the gates,
+        // which is a resume when the pause cleared and a no-op `Paused`
+        // transition (zero remote calls) when it was just set.
+        let mut pause_rx = self.pause_tx.subscribe();
 
         // The scheduled interval reads the config at spawn time. A reconfigure
         // takes effect on the next `run()`; within a run the cadence is fixed
@@ -2282,6 +2290,24 @@ impl Orchestrator for SyncOrchestrator {
                         tracing::warn!(target: TARGET, account_id = %self.account_id, %err, "post-wake resume cycle failed; continuing");
                     }
                     None
+                },
+
+                // Manual pause set or cleared (DESIGN s5.7). The RESUME direction
+                // is the load-bearing one: it must start work now rather than at
+                // the next scheduled tick. Both directions run a cycle whose gate
+                // check is the single source of truth - paused re-derives
+                // `Paused{Manual}` and issues zero remote calls, resumed proceeds.
+                // A closed channel (sender gone with the orchestrator) leaves the
+                // arm inert; the scheduled fallback keeps the loop alive.
+                res = pause_rx.changed() => {
+                    match res {
+                        Ok(()) => {
+                            let paused = *pause_rx.borrow();
+                            tracing::debug!(target: TARGET, account_id = %self.account_id, paused, "manual-pause signal changed; re-evaluating gates");
+                            Some(TickSource::Manual)
+                        }
+                        Err(_) => None,
+                    }
                 },
 
                 res = shutdown_rx.changed() => {
@@ -5219,6 +5245,55 @@ mod tests {
             2,
             "a mid-cycle burst coalesces to exactly one follow-up"
         );
+    }
+
+    /// Clearing the manual pause must WAKE the run loop and run a cycle now, not
+    /// leave the user waiting for the next scheduled tick.
+    ///
+    /// The pause signal was a watch cell nothing selected on, so "Resume" (tray
+    /// or the paused banner's button) cleared the flag and then sat there until
+    /// the scheduled interval elapsed - 600 s in the shipped default. Invisible
+    /// while the pause did not actually stop uploads; user-facing once it did.
+    /// The hour-long interval here is the point: if the resume did not wake the
+    /// loop, NOTHING could run a cycle inside the timeout, so this fails loudly
+    /// rather than passing on the scheduled fallback.
+    #[tokio::test]
+    async fn run_loop_wakes_and_runs_a_cycle_when_the_manual_pause_clears() {
+        let exec = Arc::new(RecordingExecutor::default());
+        let cfg = OrchestratorConfig {
+            scan_interval_secs: 3_600,
+            ..OrchestratorConfig::default()
+        };
+        let power = Arc::new(FakePowerSource::new(power_on_ac()));
+        let (orch, _dir) = build_arc(exec.clone(), power, cfg);
+
+        // Start out manually paused, then spawn the loop.
+        orch.set_paused(true).await;
+        let handle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run().await })
+        };
+
+        // Resume, resending until a cycle is observed: the loop subscribes to
+        // the pause signal INSIDE `run()`, so a `set_paused` that landed before
+        // that subscription is already marked seen and would not fire the arm.
+        // Each resend re-notifies (watch `send_replace` always does, even for an
+        // equal value), which makes this race-free rather than timing-dependent.
+        let ran = tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            loop {
+                orch.set_paused(false).await;
+                if exec.executes.load(Ordering::SeqCst) > 0 {
+                    break true;
+                }
+                tokio::time::sleep(std::time::Duration::from_millis(20)).await;
+            }
+        })
+        .await
+        .expect("clearing the manual pause must wake the loop and run a cycle, NOT wait an hour for the scheduled tick");
+        assert!(ran, "the resumed loop ran a cycle");
+
+        orch.shutdown();
+        let _ = tokio::time::timeout(std::time::Duration::from_secs(30), handle).await;
     }
 
     #[tokio::test]
