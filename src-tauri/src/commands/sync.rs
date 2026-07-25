@@ -418,16 +418,17 @@ mod tests {
         assert_eq!(PauseState::Indefinite.remaining(0), None);
     }
 
-    async fn temp_repo(tag: &str) -> driven_core::state::sqlite::SqliteStateRepo {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("driven-pause-{tag}-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        driven_core::state::sqlite::SqliteStateRepo::open(&dir.join("state.db"))
+    /// A throwaway repo on a RAII temp dir; keep the returned `TempDir` alive
+    /// for the repo's lifetime (drop deletes the directory).
+    async fn temp_repo() -> (
+        tempfile::TempDir,
+        driven_core::state::sqlite::SqliteStateRepo,
+    ) {
+        let dir = tempfile::tempdir().unwrap();
+        let repo = driven_core::state::sqlite::SqliteStateRepo::open(&dir.path().join("state.db"))
             .await
-            .expect("open repo")
+            .expect("open repo");
+        (dir, repo)
     }
 
     /// DESIGN s5.7: the manual pause must survive a restart. Round-trip both
@@ -435,7 +436,7 @@ mod tests {
     /// resume does not leave a stale record a later boot would re-apply).
     #[tokio::test]
     async fn pause_state_round_trips_through_the_settings_table_and_clears() {
-        let repo = temp_repo("roundtrip").await;
+        let (_dir, repo) = temp_repo().await;
         assert_eq!(
             read_pause_state(&repo).await,
             None,
@@ -464,7 +465,7 @@ mod tests {
     /// backups running, which the user can always re-pause with one click.
     #[tokio::test]
     async fn an_unparseable_pause_record_reads_as_not_paused() {
-        let repo = temp_repo("corrupt").await;
+        let (_dir, repo) = temp_repo().await;
         repo.set_setting(PAUSE_STATE_KEY, &serde_json::json!({ "kind": "sideways" }))
             .await
             .unwrap();
