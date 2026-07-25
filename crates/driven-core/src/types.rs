@@ -152,7 +152,7 @@ impl TryFrom<String> for RelativePath {
     type Error = RelativePathError;
 
     fn try_from(value: String) -> Result<Self, Self::Error> {
-        use unicode_normalization::UnicodeNormalization;
+        use unicode_normalization::{is_nfc_quick, IsNormalized, UnicodeNormalization};
 
         // Reject Windows-absolute / drive-relative / UNC / device paths on
         // the RAW input, BEFORE backslash normalization. Otherwise
@@ -204,6 +204,18 @@ impl TryFrom<String> for RelativePath {
         // local.unicode_collision depends on this canonical form. The
         // validity checks above run on the pre-normalized string because
         // NFC never introduces `/`, `..`, NUL, or a leading separator.
+        //
+        // Fast path: this runs once per file on every scan, and the
+        // overwhelming majority of real paths are already NFC (every ASCII one
+        // trivially is). ASCII is checked first because it is a cheap byte scan
+        // and settles almost all paths; `is_nfc_quick` then catches the
+        // already-normalized non-ASCII ones. Only a genuinely denormalized path
+        // pays for the normalizing pass and the second allocation. `Yes` means
+        // definitely NFC - `Maybe` and `No` both fall through to normalize, so
+        // the canonical form is unchanged.
+        if s.is_ascii() || matches!(is_nfc_quick(s.chars()), IsNormalized::Yes) {
+            return Ok(Self(s));
+        }
         let s: String = s.nfc().collect();
         Ok(Self(s))
     }
@@ -1383,6 +1395,50 @@ mod tests {
     fn relative_path_from_path_round_trips() {
         let rp: RelativePath = std::path::Path::new("a/b.txt").try_into().unwrap();
         assert_eq!(rp.as_str(), "a/b.txt");
+    }
+
+    #[test]
+    fn relative_path_nfc_fast_path_preserves_the_canonical_form() {
+        // The `is_ascii()` / `is_nfc_quick` short-circuit is a pure speed
+        // optimisation (it runs once per file per scan). It must produce exactly
+        // what the unconditional `nfc()` pass produced, or two spellings of one
+        // logical path would stop collapsing to a single `file_state` key and the
+        // SPEC s24 `local.unicode_collision` dedup would silently break.
+        use unicode_normalization::UnicodeNormalization;
+
+        let cases = [
+            // ASCII - takes the byte-scan fast path.
+            "a/b.txt",
+            "plain/nested/name-1_2.rs",
+            // Already-NFC non-ASCII - takes the is_nfc_quick fast path.
+            "caf\u{00e9}.txt",
+            "\u{00fc}ber/gr\u{00fc}n.md",
+            "\u{65e5}\u{672c}\u{8a9e}/\u{30d5}\u{30a1}\u{30a4}\u{30eb}.txt",
+            // DECOMPOSED (NFD) - must NOT take the fast path; normalizes.
+            "cafe\u{0301}.txt",
+            "u\u{0308}ber/gru\u{0308}n.md",
+            // Mixed: an ASCII directory with a decomposed leaf.
+            "docs/cafe\u{0301}.txt",
+        ];
+
+        for raw in cases {
+            let got = RelativePath::try_from(raw.to_string()).expect("valid path");
+            let expected: String = raw.nfc().collect();
+            assert_eq!(
+                got.as_str(),
+                expected,
+                "fast path changed the canonical form of {raw:?}"
+            );
+        }
+
+        // The invariant that actually matters: the precomposed and decomposed
+        // spellings of the same name still land on ONE key.
+        let precomposed = RelativePath::try_from("caf\u{00e9}.txt".to_string()).unwrap();
+        let decomposed = RelativePath::try_from("cafe\u{0301}.txt".to_string()).unwrap();
+        assert_eq!(
+            precomposed, decomposed,
+            "NFC and NFD spellings must still collapse to one file_state key"
+        );
     }
 
     // --- ErrorCode (SPEC s24 stable codes) ----------------------------------
