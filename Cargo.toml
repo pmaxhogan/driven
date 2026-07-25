@@ -13,6 +13,7 @@ members = [
     "crates/driven-cli",
     "crates/driven-test-fixtures",
     "crates/driven-chaos",
+    "crates/driven-bench",
     "src-tauri",
 ]
 # M9b (SPEC s16): the telemetry Cloudflare Worker has its own (TypeScript/wrangler)

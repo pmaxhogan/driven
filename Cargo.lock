@@ -1570,6 +1570,31 @@ dependencies = [
 ]
 
 [[package]]
+name = "driven-bench"
+version = "2.3.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "clap",
+ "driven-core",
+ "driven-diskstat",
+ "driven-drive",
+ "driven-power",
+ "driven-test-fixtures",
+ "futures",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
+ "uuid",
+ "windows 0.62.2",
+]
+
+[[package]]
 name = "driven-chaos"
 version = "2.3.0"
 dependencies = [

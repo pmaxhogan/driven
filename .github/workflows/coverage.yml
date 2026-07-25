@@ -12,10 +12,13 @@ name: Coverage
 # there is no baseline, so the gate is informational (fail-open) for that one
 # run, then enforces from the next PR onward.
 #
-# Scope: the library crates (`--exclude src-tauri --exclude driven-chaos`).
-# src-tauri is a thin IPC layer over driven-core; driven-chaos is the stress
-# harness. Both are excluded from the measured/report set (their tests are not
-# run for coverage), but `--workspace --exclude` still auto-includes any NEW
+# Scope: the library crates (`--exclude src-tauri --exclude driven-chaos
+# --exclude driven-bench`). src-tauri is a thin IPC layer over driven-core;
+# driven-chaos is the stress harness; driven-bench is the benchmark harness,
+# which mostly spawns child processes and talks to a real Google account and so
+# is largely unreachable without credentials. All three are excluded from the
+# measured/report set (their tests are not run for coverage), but
+# `--workspace --exclude` still auto-includes any NEW
 # crate in the gate, which a hand-maintained `-p` list would silently miss. The
 # Vue/TS app (`ui/`) is measured in full. (telemetry-worker is its own toolchain
 # and is out of scope for this gate.)
@@ -88,6 +91,7 @@ jobs:
       - name: Rust coverage (library crates)
         run: |
           cargo llvm-cov --workspace --exclude src-tauri --exclude driven-chaos \
+            --exclude driven-bench \
             --summary-only --json --output-path coverage-rust.json
           RUST_PCT=$(jq '.data[0].totals.lines.percent' coverage-rust.json)
           echo "HEAD_RUST=$RUST_PCT" >> "$GITHUB_ENV"

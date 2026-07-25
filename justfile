@@ -62,6 +62,26 @@ chaos-soak args="--duration 30m":
     $env:DRIVEN_CHAOS_SOAK="1"; cargo run -p driven-chaos -- run-all --hermetic
     cargo run -p driven-chaos -- fuzz {{args}}
 
+# --- benchmark suite (bench/README.md) ---
+
+# Compare Driven's real engine against rclone on a live Drive account. Uploads
+# REAL bytes and takes real time - see bench/README.md for scales and costs.
+# `just bench smoke` proves the pipeline in a few minutes; the default `small`
+# scale uploads ~610 MiB per tool. Needs rclone on PATH and the DRIVEN_E2E_*
+# credentials (the gitignored .env.test at the repo root is loaded for you).
+bench scale="small" args="":
+    cargo run --release -p driven-bench -- run --scale {{scale}} {{args}}
+
+# Materialise a benchmark fixture without uploading anything, e.g.
+# `just bench-fixture tiny-deep small`.
+bench-fixture shape scale="small":
+    cargo run --release -p driven-bench -- fixture build --shape {{shape}} --scale {{scale}}
+
+# Delete every cached benchmark fixture under target/bench-fixtures/ (the `full`
+# scale leaves ~10 GB behind).
+bench-fixture-clean:
+    cargo run -p driven-bench -- fixture clean
+
 lint:
     cargo fmt --all -- --check
     cargo clippy --workspace --all-targets -- -D warnings
@@ -84,7 +104,7 @@ deny:
 # (.github/workflows/coverage.yml). Needs `cargo install cargo-llvm-cov`. For
 # the exact parsed percentages CI compares against main, run ./scripts/coverage.sh.
 coverage:
-    cargo llvm-cov --workspace --exclude src-tauri --exclude driven-chaos --summary-only
+    cargo llvm-cov --workspace --exclude src-tauri --exclude driven-chaos --exclude driven-bench --summary-only
     pnpm --dir ui run test:coverage
 
 # --- sqlx dev helpers (need `cargo install sqlx-cli`) ---

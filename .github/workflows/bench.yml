@@ -1,0 +1,131 @@
+name: Bench
+
+# Real-world benchmark suite: Driven's engine vs rclone (bench/README.md).
+#
+# COST POLICY: this workflow uploads REAL bytes to a REAL Google account and
+# takes minutes to hours. It therefore NEVER runs on `pull_request` and NEVER on
+# a plain push - only:
+#
+#   workflow_dispatch - on demand, with a chosen scale and tool list.
+#   v* tag pushes     - at the SMOKE scale only, as a release-time check that
+#                       the suite still works and nothing has fallen off a
+#                       cliff. Same gating shape as chaos.yml's real-drive job.
+#
+# Like `chaos-real-drive`, the job degrades to a clean SKIP (never red) when the
+# credentials are absent, so a fork or a rotated-away secret does not fail a
+# release. Every job is time-boxed so a hung upload cannot burn hours of runner
+# budget.
+
+on:
+  workflow_dispatch:
+    inputs:
+      scale:
+        description: "Fixture scale"
+        type: choice
+        default: smoke
+        options: [smoke, small, medium, full]
+      tools:
+        description: "Comma-separated tools to measure"
+        type: string
+        default: "driven,rclone"
+  push:
+    tags: ["v*"]
+
+concurrency:
+  # One benchmark at a time: two concurrent runs would contend for the same
+  # uplink and produce numbers that mean nothing. Never cancel a running one -
+  # a cancelled run leaves its uploaded folder behind.
+  group: ${{ github.workflow }}
+  cancel-in-progress: false
+
+permissions:
+  contents: read
+
+env:
+  CARGO_TERM_COLOR: always
+  RUST_BACKTRACE: 1
+  # The harness boots the headless core, whose state layer uses sqlx
+  # compile-time-checked queries; CI has no live DB (same as ci.yml).
+  SQLX_OFFLINE: "true"
+  CARGO_PROFILE_DEV_DEBUG: "0"
+
+jobs:
+  bench:
+    name: benchmark (${{ inputs.scale || 'smoke' }})
+    runs-on: ubuntu-latest
+    # A `full` run is meant to take hours; everything else finishes long before
+    # this. The cap exists so a hung upload cannot run until the 6h default.
+    timeout-minutes: 180
+    env:
+      DRIVEN_E2E_REFRESH_TOKEN: ${{ secrets.DRIVEN_E2E_REFRESH_TOKEN }}
+      DRIVEN_E2E_DEST_FOLDER_ID: ${{ secrets.DRIVEN_E2E_DEST_FOLDER_ID }}
+      DRIVEN_OAUTH_CLIENT_ID: ${{ secrets.DRIVEN_OAUTH_CLIENT_ID }}
+      DRIVEN_OAUTH_CLIENT_SECRET: ${{ secrets.DRIVEN_OAUTH_CLIENT_SECRET }}
+      # A tag push has no inputs; the release-time check is deliberately small.
+      BENCH_SCALE: ${{ inputs.scale || 'smoke' }}
+      BENCH_TOOLS: ${{ inputs.tools || 'driven,rclone' }}
+    steps:
+      - uses: actions/checkout@v7
+
+      - name: Check for credentials
+        id: creds
+        # Absent secrets are a clean skip, not a failure: forks and rotated
+        # secrets must not turn a release tag red.
+        run: |
+          if [ -n "$DRIVEN_E2E_REFRESH_TOKEN" ] && [ -n "$DRIVEN_E2E_DEST_FOLDER_ID" ] \
+             && [ -n "$DRIVEN_OAUTH_CLIENT_SECRET" ]; then
+            echo "present=true" >> "$GITHUB_OUTPUT"
+          else
+            echo "present=false" >> "$GITHUB_OUTPUT"
+            echo "Bench credentials are not available; skipping the benchmark run."
+          fi
+
+      - uses: dtolnay/rust-toolchain@stable
+        if: steps.creds.outputs.present == 'true'
+
+      - name: Install build deps
+        if: steps.creds.outputs.present == 'true'
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y libssl-dev
+
+      - name: Install rclone
+        if: steps.creds.outputs.present == 'true'
+        run: |
+          sudo apt-get install -y rclone
+          rclone version
+
+      - uses: Swatinem/rust-cache@v2
+        if: steps.creds.outputs.present == 'true'
+        with:
+          # Builds a subset of the workspace, so it restores the same per-OS
+          # cache ci.yml warms. This workflow never runs on main, so it is
+          # purely restore-only.
+          shared-key: "workspace"
+          save-if: false
+
+      - name: Run the benchmark
+        if: steps.creds.outputs.present == 'true'
+        run: |
+          # The upload cap is deliberate; the larger scales opt out of it
+          # explicitly rather than the harness silently ignoring it.
+          full=""
+          case "$BENCH_SCALE" in
+            medium|full) full="--full" ;;
+          esac
+          cargo run --release -p driven-bench -- run \
+            --scale "$BENCH_SCALE" \
+            --tools "$BENCH_TOOLS" \
+            $full
+
+      - name: Publish the report to the run summary
+        # `always()` so a failed benchmark still shows its table - the numbers
+        # are the point, and a partial run is usually the interesting one.
+        if: always() && steps.creds.outputs.present == 'true'
+        run: |
+          latest=$(ls -1t bench/results/*.md 2>/dev/null | head -n 1 || true)
+          if [ -n "$latest" ]; then
+            cat "$latest" >> "$GITHUB_STEP_SUMMARY"
+          else
+            echo "No benchmark report was produced." >> "$GITHUB_STEP_SUMMARY"
+          fi
