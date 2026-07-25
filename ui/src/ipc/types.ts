@@ -213,6 +213,21 @@ export interface ExclusionPreviewDone {
   cancelled: boolean;
 }
 
+/** The `exclusion_preview:error` payload: this generation could not be set up.
+ *
+ * `previewExclusionsStart` returns its id BEFORE the backend builds the matcher
+ * (collecting a big source's ignore-file cascade is itself seconds of disk I/O,
+ * and holding the id back left the editor unable to tell "starting" from
+ * "hung"), so a failure in that phase arrives as an event rather than as a
+ * rejected call. `code` is the same stable SPEC s24 code the rejection would
+ * have carried, i.e. the i18n key to render. */
+export interface ExclusionPreviewError {
+  previewId: string;
+  code: string;
+  /** Backend English fallback; never rendered - the view localizes `code`. */
+  message: string;
+}
+
 // --- Settings & misc (SPEC s11.6, s22) ---
 
 export interface ScheduleSettings {

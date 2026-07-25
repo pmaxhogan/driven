@@ -438,6 +438,29 @@ pub struct ExclusionPreviewDone {
     pub cancelled: bool,
 }
 
+/// A streaming exclusion preview failed AFTER it was started
+/// (`exclusion_preview:error`).
+///
+/// `preview_exclusions_start` returns its generation id before the matcher is
+/// built, because collecting a big source's ignore-file cascade is itself
+/// seconds of disk I/O and holding the id back left the editor unable to tell
+/// "starting" from "hung". A failure in that phase therefore cannot be a
+/// rejected call any more - it arrives here instead, carrying the same stable
+/// SPEC s24 `code` the rejection would have used, so the editor renders the
+/// identical localized message.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExclusionPreviewError {
+    /// The generation that failed (see [`ExclusionPreviewBatch::preview_id`]).
+    /// A superseded generation's error is discarded like its batches.
+    pub preview_id: String,
+    /// The stable dotted SPEC s24 error code, which is also the i18n key.
+    pub code: String,
+    /// The backend's English fallback text. Diagnostics only - the webview
+    /// renders `code`, never this.
+    pub message: String,
+}
+
 // -----------------------------------------------------------------------------
 // Dialog tokens (SPEC s11.6.1 - C1)
 // -----------------------------------------------------------------------------

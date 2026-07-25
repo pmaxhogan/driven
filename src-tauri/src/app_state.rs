@@ -312,6 +312,16 @@ pub struct AppState {
     /// task deregisters itself when it ends, outliving the command that spawned
     /// it.
     exclusion_previews: Arc<crate::commands::exclusion_stream::PreviewRegistry>,
+    /// The exclusion editor's in-memory folder-tree cache
+    /// ([`crate::commands::preview_cache`]). Walking the source folder and
+    /// classifying it under the candidate rules are separate jobs, and only the
+    /// second one changes when a glob is edited - so the first pass over a root
+    /// records what it found here and every later pass re-classifies from
+    /// memory, turning a minutes-long re-walk per keystroke into milliseconds.
+    /// Editor-scoped: dropped when the previewed root changes and freed when the
+    /// editor closes. Behind an `Arc` for the same reason as the registry above
+    /// (the blocking pass outlives the command that spawned it).
+    preview_tree_cache: Arc<crate::commands::preview_cache::PreviewTreeCache>,
     /// M9b (SPEC s16): the anonymous-telemetry runtime - the periodic ping task
     /// handle + shutdown signal, so the app-quit drain joins it with NO orphan
     /// (mirrors the M9a updater bookkeeping). The ping itself is best-effort and
@@ -552,6 +562,7 @@ impl AppState {
             restore_jobs: std::sync::Mutex::new(HashMap::new()),
             updater: UpdaterRuntime::default(),
             exclusion_previews: Arc::default(),
+            preview_tree_cache: Arc::default(),
             telemetry: TelemetryRuntime::default(),
             recovery_acks: std::sync::Mutex::new(HashMap::new()),
             vss_helper: std::sync::Mutex::new(None),
@@ -1124,6 +1135,14 @@ impl AppState {
     /// started it has returned.
     pub fn exclusion_previews(&self) -> Arc<crate::commands::exclusion_stream::PreviewRegistry> {
         Arc::clone(&self.exclusion_previews)
+    }
+
+    /// The exclusion editor's folder-tree cache (see the
+    /// [`Self::preview_tree_cache`] field docs). Returns an owned `Arc` so the
+    /// spawned blocking pass can keep filling it after the command that started
+    /// it has returned.
+    pub fn preview_tree_cache(&self) -> Arc<crate::commands::preview_cache::PreviewTreeCache> {
+        Arc::clone(&self.preview_tree_cache)
     }
 
     /// Lock the dialog-token map, recovering a poisoned lock.

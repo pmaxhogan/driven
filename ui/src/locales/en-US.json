@@ -222,6 +222,7 @@
     "exclusionPreview": {
       "treeLabel": "Scanned folder preview",
       "scanning": "Still scanning...",
+      "recomputing": "Updating...",
       "complete": "Scan complete",
       "empty": "Nothing found in this folder.",
       "truncated": "The tree stops here, but the counts above keep going and stay exact.",

@@ -16,6 +16,7 @@ pub mod exclusion_stream;
 /// `unhandledrejection` output here so it is re-emitted through `tracing` and
 /// lands in the rolling log file + the SPEC s18 diagnostic bundle.
 pub mod frontend_log;
+pub mod preview_cache;
 pub mod restore;
 pub mod settings;
 pub mod sources;

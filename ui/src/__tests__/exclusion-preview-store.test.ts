@@ -2,11 +2,12 @@ import { describe, it, expect, vi, beforeEach } from "vitest";
 
 // Streaming exclusion-preview controller tests (SPEC s11.2; DESIGN s8.5 step 3).
 // The seams are `@tauri-apps/api/core`'s `invoke` (the start / cancel commands)
-// and `@tauri-apps/api/event`'s `listen` (the batch / done stream). Mocking both
-// lets us drive the controller against a fake backend and fire batches by hand,
-// asserting: batches fold into a tree with parents before children, a superseded
-// generation's events are discarded, the totals track the stream (and stay exact
-// past a truncation), and the "+"/"-" globs match the Rust matcher's form.
+// and `@tauri-apps/api/event`'s `listen` (the batch / done / error stream).
+// Mocking both lets us drive the controller against a fake backend and fire
+// events by hand, asserting: batches fold into a tree with parents before
+// children, a superseded generation's events are discarded, the totals track the
+// stream (and stay exact past a truncation), a recompute never blanks what is on
+// screen, and the "+"/"-" globs match the Rust matcher's form.
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -15,8 +16,10 @@ vi.mock("@tauri-apps/api/core", () => ({
 
 let batchHandler: ((payload: unknown) => void) | null = null;
 let doneHandler: ((payload: unknown) => void) | null = null;
+let errorHandler: ((payload: unknown) => void) | null = null;
 const unlistenBatch = vi.fn();
 const unlistenDone = vi.fn();
+const unlistenError = vi.fn();
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (event: string, cb: (e: { payload: unknown }) => void) => {
     if (event === "exclusion_preview:batch") {
@@ -26,6 +29,10 @@ vi.mock("@tauri-apps/api/event", () => ({
     if (event === "exclusion_preview:done") {
       doneHandler = (payload: unknown) => cb({ payload });
       return unlistenDone;
+    }
+    if (event === "exclusion_preview:error") {
+      errorHandler = (payload: unknown) => cb({ payload });
+      return unlistenError;
     }
     return vi.fn();
   }),
@@ -76,12 +83,25 @@ async function started(id = "gen-1"): Promise<ExclusionPreviewController> {
   return preview;
 }
 
+/** Re-start `preview` under new rules, resolving to generation `id`. */
+async function restart(preview: ExclusionPreviewController, id: string): Promise<void> {
+  invokeMock.mockResolvedValue(id);
+  await preview.start({
+    sourceId: "src-1",
+    respectGitignore: false,
+    includePatterns: [],
+    excludePatterns: ["*.txt"],
+  });
+}
+
 beforeEach(() => {
   invokeMock.mockReset();
   batchHandler = null;
   doneHandler = null;
+  errorHandler = null;
   unlistenBatch.mockReset();
   unlistenDone.mockReset();
+  unlistenError.mockReset();
 });
 
 describe("anchoredPatternForPath", () => {
@@ -369,28 +389,201 @@ describe("createExclusionPreview", () => {
     expect(preview.complete.value).toBe(false);
   });
 
-  it("clears the tree when a new preview starts", async () => {
+  it("keeps the previous result on screen until the new generation replaces it", async () => {
+    // The reset-flash this fixes: a rule edit used to blank the tree and zero
+    // the counts the instant it started, so every keystroke flashed the panel
+    // empty before repopulating it.
     const preview = await started();
     batchHandler!(batch("gen-1", [node("old.txt", false, true, 9)]));
     preview.flush();
-    expect(preview.roots.value).toHaveLength(1);
+    expect(preview.roots.value.map((n) => n.path)).toEqual(["old.txt"]);
 
-    invokeMock.mockResolvedValue("gen-2");
-    await preview.start({
-      sourceId: "src-1",
-      respectGitignore: false,
-      includePatterns: [],
-      excludePatterns: ["*.txt"],
-    });
-    expect(preview.roots.value).toHaveLength(0);
-    expect(preview.includedCount.value).toBe(0);
-    expect(preview.includedBytes.value).toBe(0);
+    await restart(preview, "gen-2");
     expect(preview.currentPreviewId()).toBe("gen-2");
+    expect(preview.roots.value.map((n) => n.path)).toEqual([
+      "old.txt",
+      // the previous answer is still the best one available
+    ]);
+    expect(preview.includedCount.value).toBe(1);
+    expect(preview.includedBytes.value).toBe(9);
+    expect(preview.recomputing.value).toBe(true);
+    expect(preview.scanning.value).toBe(true);
 
-    // And the OLD generation's still-in-flight events cannot come back.
+    // The OLD generation's still-in-flight events must not fold into the new
+    // tree even while the old tree is what is being rendered.
+    batchHandler!(batch("gen-1", [node("sneaky.txt", false, true, 1)]));
+    preview.flush();
+    expect(preview.roots.value.map((n) => n.path)).toEqual(["old.txt"]);
+
+    // The new generation's FIRST batch swaps the whole thing over at once.
+    batchHandler!(batch("gen-2", [node("new.txt", false, true, 4)]));
+    preview.flush();
+    expect(preview.roots.value.map((n) => n.path)).toEqual(["new.txt"]);
+    expect(preview.nodeAt("old.txt")).toBeUndefined();
+    expect(preview.includedCount.value).toBe(1);
+    expect(preview.includedBytes.value).toBe(4);
+    expect(preview.recomputing.value).toBe(false);
+  });
+
+  it("never lets the totals dip through zero on the way to the new ones", async () => {
+    // The user watches these numbers to judge a rule. Bouncing them through 0
+    // reads as "your pattern just excluded everything" - so every observed
+    // value must be either the old answer or the new one, never a blank.
+    const preview = await started();
+    batchHandler!(
+      batch("gen-1", [node("a.txt", false, true, 100)], {
+        includedCount: 40,
+        excludedCount: 2,
+        includedBytes: 4000,
+      })
+    );
+    preview.flush();
+
+    const seen: number[] = [];
+    const record = (): void => {
+      seen.push(preview.includedCount.value);
+    };
+
+    record();
+    await restart(preview, "gen-2");
+    record();
+    preview.flush();
+    record();
+    batchHandler!(
+      batch("gen-2", [node("a.txt", false, true, 100)], {
+        includedCount: 31,
+        excludedCount: 11,
+        includedBytes: 3100,
+      })
+    );
+    preview.flush();
+    record();
+
+    expect(seen).toEqual([40, 40, 40, 31]);
+    expect(preview.excludedCount.value).toBe(11);
+    expect(preview.includedBytes.value).toBe(3100);
+  });
+
+  it("swaps on the new generation's done even when it found nothing", async () => {
+    // A `done` is the generation's final word. If the folder really is empty
+    // under the new rules, holding the old tree forever would be a lie.
+    const preview = await started();
     batchHandler!(batch("gen-1", [node("old.txt", false, true, 9)]));
     preview.flush();
+
+    await restart(preview, "gen-2");
+    doneHandler!({
+      previewId: "gen-2",
+      includedCount: 0,
+      excludedCount: 0,
+      includedBytes: 0,
+      truncated: false,
+      cancelled: false,
+    });
+    preview.flush();
+
     expect(preview.roots.value).toHaveLength(0);
+    expect(preview.includedCount.value).toBe(0);
+    expect(preview.recomputing.value).toBe(false);
+    expect(preview.complete.value).toBe(true);
+  });
+
+  it("does not swap to an empty tree for a generation that was abandoned", async () => {
+    // A cancelled generation produced nothing and never will. Blanking the
+    // panel on its behalf would flash exactly what this avoids.
+    const preview = await started();
+    batchHandler!(batch("gen-1", [node("old.txt", false, true, 9)]));
+    preview.flush();
+
+    await restart(preview, "gen-2");
+    doneHandler!({
+      previewId: "gen-2",
+      includedCount: 0,
+      excludedCount: 0,
+      includedBytes: 0,
+      truncated: false,
+      cancelled: true,
+    });
+    preview.flush();
+
+    expect(preview.roots.value.map((n) => n.path)).toEqual(["old.txt"]);
+    expect(preview.includedCount.value).toBe(1);
+    expect(preview.scanning.value).toBe(false);
+    expect(preview.recomputing.value).toBe(false);
+    expect(preview.complete.value).toBe(false);
+  });
+
+  it("publishes the first preview's content as soon as its first batch lands", async () => {
+    // Nothing to preserve on a first open, so there is no swap to wait for -
+    // rows must render on batch 1 rather than at the end of the walk.
+    const preview = await started();
+    expect(preview.recomputing.value).toBe(false);
+    expect(preview.scanning.value).toBe(true);
+    expect(preview.roots.value).toHaveLength(0);
+
+    batchHandler!(batch("gen-1", [node("first.txt", false, true, 3)]));
+    preview.flush();
+    expect(preview.roots.value.map((n) => n.path)).toEqual(["first.txt"]);
+    expect(preview.includedCount.value).toBe(1);
+    expect(preview.scanning.value).toBe(true);
+  });
+
+  it("surfaces a post-start error event as a stable code and stops the spinner", async () => {
+    // The backend hands out the generation id before it knows the preview is
+    // viable (building the matcher reads ignore files off disk), so a setup
+    // failure arrives as an event rather than as a rejected start.
+    const preview = await started();
+    errorHandler!({
+      previewId: "gen-1",
+      code: "local.io_error",
+      message: "adding exclude `[`: unclosed class",
+    });
+    expect(preview.errorCode.value).toBe("local.io_error");
+    expect(preview.scanning.value).toBe(false);
+    expect(preview.recomputing.value).toBe(false);
+  });
+
+  it("ignores an error event from a superseded generation", async () => {
+    const preview = await started();
+    errorHandler!({ previewId: "gen-STALE", code: "internal.bug", message: "boom" });
+    expect(preview.errorCode.value).toBeNull();
+    expect(preview.scanning.value).toBe(true);
+  });
+
+  it("replays a pre-id error event once the generation id resolves", async () => {
+    const preview = createExclusionPreview();
+    await preview.subscribe();
+    let resolveStart: (id: string) => void = () => undefined;
+    invokeMock.mockImplementation(
+      () =>
+        new Promise<string>((res) => {
+          resolveStart = res;
+        })
+    );
+    const starting = preview.start({
+      sourceId: "src-1",
+      respectGitignore: true,
+      includePatterns: [],
+      excludePatterns: [],
+    });
+
+    errorHandler!({ previewId: "gen-1", code: "local.io_error", message: "nope" });
+    errorHandler!({ previewId: "gen-OTHER", code: "internal.bug", message: "not mine" });
+    resolveStart("gen-1");
+    await starting;
+
+    expect(preview.errorCode.value).toBe("local.io_error");
+    expect(preview.scanning.value).toBe(false);
+  });
+
+  it("clears a previous error when the next generation starts", async () => {
+    const preview = await started();
+    errorHandler!({ previewId: "gen-1", code: "local.io_error", message: "nope" });
+    expect(preview.errorCode.value).toBe("local.io_error");
+
+    await restart(preview, "gen-2");
+    expect(preview.errorCode.value).toBeNull();
+    expect(preview.scanning.value).toBe(true);
   });
 
   it("abandons and cancels a start that a newer one overtook", async () => {
@@ -451,6 +644,7 @@ describe("createExclusionPreview", () => {
     teardown();
     expect(unlistenBatch).toHaveBeenCalled();
     expect(unlistenDone).toHaveBeenCalled();
+    expect(unlistenError).toHaveBeenCalled();
     expect(invokeMock).toHaveBeenCalledWith("preview_exclusions_cancel", {
       previewId: "gen-1",
     });

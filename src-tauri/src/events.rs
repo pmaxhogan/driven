@@ -109,6 +109,15 @@ pub const EVENT_EXCLUSION_PREVIEW_BATCH: &str = "exclusion_preview:batch";
 /// tree was truncated at the node cap) plus a `cancelled` flag, so the editor
 /// can show "scan complete" only for a walk that really finished.
 pub const EVENT_EXCLUSION_PREVIEW_DONE: &str = "exclusion_preview:done";
+/// `exclusion_preview:error` - a streaming exclusion preview failed after it
+/// started (payload: `ExclusionPreviewError`).
+///
+/// `preview_exclusions_start` hands back its generation id BEFORE building the
+/// matcher, so the editor can render as soon as the first nodes arrive instead
+/// of waiting out an ignore-file collection it cannot see. The failure path of
+/// that phase therefore cannot be a rejected call - it lands here, carrying the
+/// same stable SPEC s24 code, so the editor shows the identical message.
+pub const EVENT_EXCLUSION_PREVIEW_ERROR: &str = "exclusion_preview:error";
 
 /// Broadcast one `exclusion_preview:batch` slice of a streaming exclusion
 /// preview.
@@ -126,6 +135,15 @@ pub fn emit_exclusion_preview_done<P: Serialize + Clone>(
     done: &P,
 ) -> tauri::Result<()> {
     app.emit(EVENT_EXCLUSION_PREVIEW_DONE, done)
+}
+
+/// Broadcast `exclusion_preview:error` - the preview with this generation id
+/// could not be set up (its matcher failed to build).
+pub fn emit_exclusion_preview_error<P: Serialize + Clone>(
+    app: &AppHandle,
+    error: &P,
+) -> tauri::Result<()> {
+    app.emit(EVENT_EXCLUSION_PREVIEW_ERROR, error)
 }
 
 /// Broadcast `sync:pause_changed` with the active pause, or `null` when sync is
