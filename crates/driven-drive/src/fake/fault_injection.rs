@@ -193,6 +193,29 @@ impl InMemoryRemoteStore {
         self
     }
 
+    /// Latches "the source-object enumeration cannot be completed": every
+    /// [`crate::remote_store::RemoteStore::list_source_object_ids`] call fails.
+    /// Every OTHER call - uploads, reads, trashes - keeps working.
+    ///
+    /// Targets that ONE call on purpose. It models the failure the
+    /// remote-existence audit must survive without writing anything: the
+    /// enumeration is the only input that tells the audit which objects are
+    /// still alive, so a test needs the setup uploads to land normally and then
+    /// exactly that request to fail. A blanket read fault would break the
+    /// setup too and prove nothing.
+    ///
+    /// The audit infers "gone" from ABSENCE, so this is the fault that would
+    /// otherwise re-upload an entire source - the reason
+    /// `list_source_object_ids` returns `Err` rather than a partial set.
+    ///
+    /// Latches for the lifetime of the store.
+    pub fn with_source_listing_broken(self) -> Self {
+        self.faults
+            .source_listing_broken
+            .store(true, Ordering::Release);
+        self
+    }
+
     /// Latches the destination-folder-readonly state. Every subsequent
     /// write-target request returns `drive.dest_folder_permission_denied`
     /// (SPEC s24). Read-only calls keep working - mirrors the user

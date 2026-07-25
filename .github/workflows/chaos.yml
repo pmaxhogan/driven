@@ -75,15 +75,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      # Defender exclusion for the build dirs (see ci.yml rust-test for the
-      # rationale); ordered before the cache restore so the untar benefits.
-      - name: Exclude build dirs from Windows Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
+      # No Defender exclusion step - real-time protection is already off on the
+      # windows-latest image, see the note in ci.yml rust-test.
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux Tauri deps
         if: runner.os == 'Linux'
@@ -118,15 +111,8 @@ jobs:
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v7
-      # Defender exclusion for the build dirs (see ci.yml rust-test for the
-      # rationale); ordered before the cache restore so the untar benefits.
-      - name: Exclude build dirs from Windows Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
+      # No Defender exclusion step - real-time protection is already off on the
+      # windows-latest image, see the note in ci.yml rust-test.
       - uses: dtolnay/rust-toolchain@stable
       - name: Install Linux Tauri deps
         if: runner.os == 'Linux'

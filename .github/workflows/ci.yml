@@ -49,19 +49,13 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
-      # Defender's real-time scan inspects every file create; a cargo build
-      # writes tens of thousands under target/, and the rust-cache untar below
-      # tens of thousands more. Excluding the build dirs is the single biggest
-      # windows-latest win after debuginfo. Hosted runners run elevated, so
-      # Add-MpPreference just works; ordered BEFORE the cache restore so the
-      # untar benefits too.
-      - name: Exclude build dirs from Windows Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
+      # NOTE: do not add `Add-MpPreference` build-dir exclusions here. #161 did,
+      # on the theory that Defender's real-time scan was taxing the target/ writes
+      # and the rust-cache untar. It isn't: `Get-MpComputerStatus` on the
+      # windows-latest image reports RealTimeProtectionEnabled=False (measured on
+      # PR #175 - AntivirusEnabled=True, but the on-access scanner is off), so the
+      # exclusions were a no-op that cost ~8.5s per windows job. The real #161 win
+      # came from CARGO_PROFILE_DEV_DEBUG=0 and dropping clippy off windows/macos.
       - uses: dtolnay/rust-toolchain@stable
         with: { components: clippy }
       - name: Install Linux Tauri deps
@@ -133,15 +127,7 @@ jobs:
         os: [ubuntu-latest, macos-latest, windows-latest]
     steps:
       - uses: actions/checkout@v7
-      # Same Defender exclusion as rust-test above: the debug tauri build writes
-      # the same tens of thousands of target/ files.
-      - name: Exclude build dirs from Windows Defender
-        if: runner.os == 'Windows'
-        shell: pwsh
-        run: |
-          Add-MpPreference -ExclusionPath "$env:GITHUB_WORKSPACE"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.cargo"
-          Add-MpPreference -ExclusionPath "$env:USERPROFILE\.rustup"
+      # No Defender exclusion step - see the note in rust-test above.
       - uses: dtolnay/rust-toolchain@stable
       - uses: pnpm/action-setup@v6
         with: { version: 10 }

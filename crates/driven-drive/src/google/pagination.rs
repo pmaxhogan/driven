@@ -23,6 +23,15 @@ use crate::remote_store::{DriveContext, RemoteEntry};
 pub const FILE_FIELDS: &str =
     "id,name,parents,size,md5Checksum,mimeType,modifiedTime,trashed,appProperties";
 
+/// The MINIMAL `fields=` projection: just the object id.
+///
+/// [`list_ids_all`] uses this for the remote-existence audit, which enumerates
+/// every object one source owns purely to learn WHICH ids are still alive. The
+/// full [`FILE_FIELDS`] projection would pull nine fields per row and throw
+/// eight of them away - on a source with hundreds of thousands of objects that
+/// is megabytes of wire and JSON parsing for data nothing reads.
+pub const ID_ONLY_FIELDS: &str = "id";
+
 /// The `files.list` response page shape.
 #[derive(Debug, Deserialize)]
 struct ListResponse {
@@ -64,6 +73,96 @@ pub async fn list_all(
     Ok(out)
 }
 
+/// Runs the full `files.list` pagination loop for `q`, collecting ONLY the
+/// object ids into a set (the id-only counterpart of [`list_all`]).
+///
+/// Backs [`crate::remote_store::RemoteStore::list_source_object_ids`], the
+/// remote-existence audit's enumeration primitive. Requests
+/// [`ID_ONLY_FIELDS`] instead of the full [`FILE_FIELDS`] projection, because
+/// the audit only needs to know which ids are still alive.
+///
+/// COMPLETENESS IS THE CONTRACT. The audit treats "recorded id absent from
+/// this set" as proof the object is gone and heals the row, so a listing that
+/// stopped early would read as a mass deletion and re-upload the whole source.
+/// Any page error therefore propagates as `Err` and the caller MUST abort
+/// without writing anything - a returned set is always the COMPLETE live-id
+/// set, never a partial one.
+pub async fn list_ids_all(
+    http: &reqwest::Client,
+    access_token: &str,
+    q: &str,
+    drive_context: &DriveContext,
+) -> anyhow::Result<HashSet<String>> {
+    let mut out: HashSet<String> = HashSet::new();
+    let mut page_token: Option<String> = None;
+    loop {
+        let (ids, next) =
+            list_ids_page(http, access_token, q, page_token.as_deref(), drive_context).await?;
+        out.extend(ids);
+        match next {
+            Some(tok) if !tok.is_empty() => page_token = Some(tok),
+            _ => break,
+        }
+    }
+    Ok(out)
+}
+
+/// One page of the [`list_ids_all`] loop: the ids on this page plus the
+/// `nextPageToken` (or `None` when this was the last page).
+async fn list_ids_page(
+    http: &reqwest::Client,
+    access_token: &str,
+    q: &str,
+    page_token: Option<&str>,
+    drive_context: &DriveContext,
+) -> anyhow::Result<(Vec<String>, Option<String>)> {
+    let query = list_query_params_with_fields(q, page_token, drive_context, ID_ONLY_FIELDS);
+
+    let resp = http
+        .get(format!("{}/files", super::DRIVE_API_BASE))
+        .query(&query)
+        .bearer_auth(access_token)
+        .send()
+        .await
+        .map_err(DriveError::from_transport)?;
+
+    let status = resp.status().as_u16();
+    let retry_after = super::parse_retry_after(&resp);
+    let body = resp.bytes().await.map_err(DriveError::from_transport)?;
+    if !(200..300).contains(&status) {
+        return Err(anyhow::Error::new(DriveError::from_response(
+            status,
+            &body,
+            retry_after,
+        )));
+    }
+
+    let parsed: IdListResponse = serde_json::from_slice(&body)
+        .map_err(|e| anyhow::anyhow!("drive: failed to parse files.list id page: {e}"))?;
+    Ok((
+        parsed.files.into_iter().map(|f| f.id).collect(),
+        parsed.next_page_token,
+    ))
+}
+
+/// The id-only `files.list` response page. A dedicated shape rather than
+/// [`ListResponse`]: under [`ID_ONLY_FIELDS`] every other [`DriveFile`] field
+/// is absent from the wire, so decoding through the full type would depend on
+/// each of its fields staying `#[serde(default)]` forever.
+#[derive(Debug, Deserialize)]
+struct IdListResponse {
+    #[serde(default)]
+    files: Vec<IdOnlyFile>,
+    #[serde(rename = "nextPageToken", default)]
+    next_page_token: Option<String>,
+}
+
+/// One row of an [`ID_ONLY_FIELDS`] listing.
+#[derive(Debug, Deserialize)]
+struct IdOnlyFile {
+    id: String,
+}
+
 /// Builds the `files.list` query parameters for one page (issue #7 Shared
 /// Drives). Split out as a PURE function so the exact wire params - and how
 /// they differ between My Drive and a Shared Drive - are unit-testable without
@@ -83,9 +182,23 @@ pub fn list_query_params(
     page_token: Option<&str>,
     drive_context: &DriveContext,
 ) -> Vec<(&'static str, String)> {
+    list_query_params_with_fields(q, page_token, drive_context, FILE_FIELDS)
+}
+
+/// [`list_query_params`] with an explicit per-file field projection, so a
+/// caller that needs only some of a file's fields does not pay for the full
+/// [`FILE_FIELDS`] shape ([`list_ids_all`] passes [`ID_ONLY_FIELDS`]).
+/// Everything else about the request - corpus scoping, `pageSize`, `spaces`,
+/// `supportsAllDrives`, the page token - is identical.
+pub fn list_query_params_with_fields(
+    q: &str,
+    page_token: Option<&str>,
+    drive_context: &DriveContext,
+    file_fields: &str,
+) -> Vec<(&'static str, String)> {
     // Field selection for a LIST nests the file projection under `files(..)`
     // and adds the page-token field.
-    let fields = format!("nextPageToken,files({FILE_FIELDS})");
+    let fields = format!("nextPageToken,files({file_fields})");
     let mut query: Vec<(&'static str, String)> = vec![
         ("q", q.to_string()),
         ("fields", fields),
@@ -204,6 +317,71 @@ mod tests {
         // corpora=user must NOT be present alongside corpora=drive.
         assert_eq!(param(&query, "corpora"), Some("drive"));
         assert_eq!(param(&query, "pageToken"), Some("tok42"));
+    }
+
+    /// The audit's enumeration asks for ONLY the id. The projection must be
+    /// exactly `nextPageToken,files(id)` - not the nine-field `FILE_FIELDS`
+    /// shape - while every other request parameter stays identical to a normal
+    /// listing (the audit is a plain `files.list`, just a leaner one).
+    #[test]
+    fn id_only_params_request_just_the_id_and_keep_everything_else() {
+        let q = "appProperties has { key='driven.source_id' and value='s1' } and trashed = false";
+        let full = list_query_params(q, None, &DriveContext::MyDrive);
+        let ids = list_query_params_with_fields(q, None, &DriveContext::MyDrive, ID_ONLY_FIELDS);
+
+        assert_eq!(param(&ids, "fields"), Some("nextPageToken,files(id)"));
+        assert_ne!(
+            param(&ids, "fields"),
+            param(&full, "fields"),
+            "the id-only projection must not silently inherit FILE_FIELDS"
+        );
+        // Everything that is NOT the projection is unchanged.
+        for key in ["q", "pageSize", "spaces", "supportsAllDrives", "corpora"] {
+            assert_eq!(
+                param(&ids, key),
+                param(&full, key),
+                "{key} must match the full-projection listing"
+            );
+        }
+    }
+
+    /// A Shared Drive audit listing keeps the `corpora=drive` + `driveId` +
+    /// `includeItemsFromAllDrives` combination - the only one that returns
+    /// objects living inside a Shared Drive. Without it the audit would see an
+    /// EMPTY live set for every Shared-Drive source and declare every recorded
+    /// id dead.
+    #[test]
+    fn id_only_params_still_scope_to_a_shared_drive() {
+        let ctx = DriveContext::SharedDrive {
+            drive_id: "0ADriveIdXYZ".to_string(),
+        };
+        let query = list_query_params_with_fields("q", Some("tok9"), &ctx, ID_ONLY_FIELDS);
+        assert_eq!(param(&query, "corpora"), Some("drive"));
+        assert_eq!(param(&query, "driveId"), Some("0ADriveIdXYZ"));
+        assert_eq!(param(&query, "includeItemsFromAllDrives"), Some("true"));
+        assert_eq!(param(&query, "pageToken"), Some("tok9"));
+        assert_eq!(param(&query, "fields"), Some("nextPageToken,files(id)"));
+    }
+
+    /// An id-only page decodes from a body carrying ONLY `id` per file - the
+    /// shape `fields=nextPageToken,files(id)` actually returns. Decoding it
+    /// through the full `DriveFile` type would couple the audit to every one
+    /// of that struct's fields staying optional.
+    #[test]
+    fn id_list_response_parses_id_only_rows() {
+        let page = br#"{"nextPageToken":"tok7","files":[{"id":"a"},{"id":"b"}]}"#;
+        let r: IdListResponse = serde_json::from_slice(page).unwrap();
+        assert_eq!(r.next_page_token.as_deref(), Some("tok7"));
+        assert_eq!(
+            r.files.iter().map(|f| f.id.as_str()).collect::<Vec<_>>(),
+            vec!["a", "b"]
+        );
+
+        // Last page: no token, and an empty `files` array is legal.
+        let last = br#"{"files":[]}"#;
+        let r: IdListResponse = serde_json::from_slice(last).unwrap();
+        assert!(r.next_page_token.is_none());
+        assert!(r.files.is_empty());
     }
 
     #[test]

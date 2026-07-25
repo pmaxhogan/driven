@@ -77,7 +77,7 @@ use std::time::{Duration, Instant};
 
 use tauri::{AppHandle, State};
 
-use driven_core::exclude::SourceMatcher;
+use driven_core::exclude::{DirDecision, SourceMatcher};
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
@@ -280,13 +280,19 @@ impl Default for StreamConfig {
 }
 
 /// A directory waiting to be classified, in BFS order.
-///
-/// Only the root-relative path today. When the per-directory decision cursor
-/// lands it rides along here too, so descending re-uses the parent's cascade
-/// state instead of re-deriving it from the root for every entry.
 struct QueuedDir {
     /// Path relative to the source root; empty for the root itself.
     rel: PathBuf,
+    /// The resolved ignore-cascade cursor for this directory.
+    ///
+    /// Because the BFS already visits a directory before its children, the
+    /// parent's state is always in hand, so every entry is classified in
+    /// O(scopes) instead of `is_included`'s O(depth x scopes) - no lookup
+    /// structure and no re-walking of parent components per entry. On a source
+    /// with a deep nested `.gitignore` cascade that is the bulk of the preview's
+    /// CPU, and it is the half of the cost the folder-tree cache does NOT
+    /// remove: replaying a cached directory still has to classify it.
+    decision: DirDecision,
 }
 
 /// Read one directory off disk into the cache's entry form, applying the walk
@@ -376,9 +382,16 @@ pub fn stream_classify_tree(
     // BFS: a directory is emitted while scanning its PARENT and only descended
     // when it comes off the front of the queue, so every node's parent has
     // already been streamed by the time the node itself is.
+    //
+    // Each queue entry also carries its directory's resolved [`DirDecision`]
+    // cursor, so an entry is classified against the parent's already-resolved
+    // cascade rather than re-deriving it from the root (see [`QueuedDir`]). The
+    // cursor is only a faster spelling of `is_included`: it returns the same
+    // verdict, and hands back to the slow path if ever mis-threaded.
     let mut queue: VecDeque<QueuedDir> = VecDeque::new();
     queue.push_back(QueuedDir {
         rel: PathBuf::new(),
+        decision: matcher.root_decision(),
     });
 
     let cancelled = 'walk: loop {
@@ -409,8 +422,17 @@ pub fn stream_classify_tree(
             let rel = dir.rel.join(&entry.name);
             let is_dir = entry.is_dir;
 
-            let included = matcher.is_included(&rel, is_dir);
+            // A directory's verdict and the cursor to walk into it come from one
+            // call, since both need the same per-scope match work.
+            let (included, child_state) = if is_dir {
+                let (inc, child) = matcher.descend(&dir.decision, &rel);
+                (inc, Some(child))
+            } else {
+                (matcher.is_included_at(&dir.decision, &rel, false), None)
+            };
             let size = entry.size;
+            // Materialise the wire form now: the queue below takes ownership of
+            // `rel`.
             let rel_str = rel.to_string_lossy().replace('\\', "/");
 
             if is_dir {
@@ -418,7 +440,9 @@ pub fn stream_classify_tree(
                 // i.e. no `!`-rule anywhere could re-include something beneath
                 // THIS directory (the scanner's own per-directory rule).
                 if included || matcher.negations_could_match_under(&rel) {
-                    queue.push_back(QueuedDir { rel });
+                    if let Some(decision) = child_state {
+                        queue.push_back(QueuedDir { rel, decision });
+                    }
                 }
             } else if included {
                 included_count += 1;
@@ -775,6 +799,83 @@ mod tests {
         assert!(
             nodes.iter().filter(|n| n.is_dir).all(|n| n.size == 0),
             "a directory carries no size"
+        );
+    }
+
+    #[test]
+    fn every_streamed_verdict_equals_the_matchers_own_answer() {
+        // The lockstep guarantee for the DirDecision cursor: the preview now
+        // classifies each entry from its parent directory's cached state instead
+        // of calling `is_included` per path. That is only ever a faster spelling,
+        // so EVERY streamed node must carry exactly the verdict `is_included`
+        // would have given - checked here against a tree with a real nested
+        // cascade (root rules, a deeper .gitignore overriding them, a directory
+        // holding its own rules, an excluded subtree, and source-level
+        // include/exclude overrides), which is where a per-scope inheritance bug
+        // would show up.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        write(&root.join(".gitignore"), "*.log\nbuild/\n/anchored.txt\n");
+        write(&root.join("anchored.txt"), "x");
+        write(&root.join("sub/anchored.txt"), "x");
+        write(&root.join("top.log"), "x");
+        write(&root.join("keep.txt"), "x");
+        write(&root.join("build/out/app.js"), "x");
+
+        // A deeper .gitignore that re-includes what the root rule dropped.
+        write(&root.join("a/.gitignore"), "!special.log\n*.dat\n");
+        write(&root.join("a/special.log"), "x");
+        write(&root.join("a/other.log"), "x");
+        write(&root.join("a/thing.dat"), "x");
+        write(&root.join("a/deep/special.log"), "x");
+        write(&root.join("a/deep/plain.txt"), "x");
+
+        // Source-level overrides on top of the whole cascade.
+        write(&root.join("stale.bak"), "x");
+        write(&root.join("secret/.env"), "x");
+        let source = source_at(root, &["/secret/.env"], &["*.bak"]);
+
+        let matcher = build_source_matcher(&source).expect("matcher");
+
+        // Checked on BOTH paths a pass can take: walked off disk, and replayed
+        // from the folder-tree cache. The cursor is threaded identically either
+        // way, so a bug that only showed up on the replay would otherwise reach
+        // every rule edit after the first.
+        let cache = PreviewTreeCache::default();
+        cache.begin(root);
+        for pass in ["walked", "cached"] {
+            let (batches, done) = run_with_cache(root, &source, &StreamConfig::default(), &cache);
+            let nodes = all_nodes(&batches);
+
+            assert!(
+                nodes.len() >= 15,
+                "the fixture must actually stream a real tree, got {} nodes on the {pass} pass",
+                nodes.len()
+            );
+            for node in &nodes {
+                let expected = matcher.is_included(Path::new(&node.path), node.is_dir);
+                assert_eq!(
+                    node.included, expected,
+                    "{pass} verdict for {} (is_dir={}) disagreed with the matcher",
+                    node.path, node.is_dir
+                );
+            }
+
+            // The counts must line up with the per-node verdicts too, so a cursor
+            // bug cannot hide inside the totals.
+            let included_files = nodes.iter().filter(|n| !n.is_dir && n.included).count() as u64;
+            let excluded_files = nodes.iter().filter(|n| !n.is_dir && !n.included).count() as u64;
+            assert_eq!(done.included_count, included_files, "{pass}");
+            assert_eq!(done.excluded_count, excluded_files, "{pass}");
+            assert!(
+                !done.truncated,
+                "the fixture is well under the node cap ({pass})"
+            );
+        }
+        assert!(
+            cache.entry_count() > 0,
+            "the first pass really did populate the cache the second replayed"
         );
     }
 

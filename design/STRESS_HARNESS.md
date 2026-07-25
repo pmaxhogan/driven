@@ -421,6 +421,7 @@ impl InMemoryRemoteStore {
     pub fn with_dest_folder_missing(self) -> Self;
     pub fn with_dest_folder_readonly(self) -> Self;
     pub fn with_update_not_found(self) -> Self;
+    pub fn with_source_listing_broken(self) -> Self;
     pub fn with_fileid_recycle(self) -> Self;
 }
 ```

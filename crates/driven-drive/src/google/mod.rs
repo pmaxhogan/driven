@@ -125,6 +125,18 @@ pub(crate) const FOLDER_MARKER_KEY: &str = "driven.folder_marker";
 /// `app_properties` key carrying the crash-safe create-op UUID (DESIGN s5.6).
 pub(crate) const CLIENT_OP_UUID_KEY: &str = "driven.client_op_uuid";
 
+/// `app_properties` key carrying the id of the source an object belongs to
+/// (SPEC s3 preamble). Stamped by the executor on every object it creates -
+/// per-file objects and `.tar.gz` bundles alike - and queried back by
+/// [`RemoteStore::list_source_object_ids`] to enumerate a source's live
+/// footprint.
+///
+/// Deliberately PUBLIC and shared: `driven-core`'s executor re-exports this
+/// same constant for the stamp rather than declaring its own copy. If the two
+/// ever drifted the audit query would match NOTHING, read every recorded id as
+/// dead, and re-upload the entire source - so they must be one definition.
+pub const SOURCE_ID_KEY: &str = "driven.source_id";
+
 /// Files at or above this go through the resumable upload protocol; below
 /// uses a simple multipart upload (DESIGN s5.4 `RESUMABLE_THRESHOLD = 5 MiB`).
 pub(crate) const RESUMABLE_THRESHOLD: u64 = 5 * 1024 * 1024;
@@ -1608,6 +1620,35 @@ impl RemoteStore for GoogleDriveStore {
         // Most-recent by modifiedTime.
         matches.sort_by_key(|e| std::cmp::Reverse(e.modified_time));
         Ok(Some(matches.remove(0)))
+    }
+
+    async fn list_source_object_ids(
+        &self,
+        source_id: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<HashSet<String>> {
+        // Every object Driven creates for a source carries
+        // `appProperties["driven.source_id"]`, so this ONE query enumerates the
+        // source's whole live footprint (per-file objects and `.tar.gz`
+        // bundles). Folders are excluded for free - `ensure_folder` stamps only
+        // `driven.folder_marker`, never the source id.
+        //
+        // `trashed = false` matters: a trashed object cannot be updated and its
+        // bytes are on a deletion clock, so the audit must count it as gone.
+        let q = format!(
+            "appProperties has {{ key='{}' and value='{}' }} and trashed = false",
+            escape_drive_query(SOURCE_ID_KEY),
+            escape_drive_query(source_id),
+        );
+        // Retried as a WHOLE (like `list_query`): `files.list` is idempotent, so
+        // a transient 5xx / 429 mid-pagination restarts the loop rather than
+        // returning a short set. Once retries are exhausted the error
+        // propagates and the caller abandons the audit without writing.
+        retry::with_retry(|| async {
+            let token = self.bearer().await?;
+            pagination::list_ids_all(&self.http, &token, &q, drive_context).await
+        })
+        .await
     }
 
     async fn about(&self) -> anyhow::Result<AboutInfo> {

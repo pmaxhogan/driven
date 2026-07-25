@@ -44,7 +44,7 @@ use driven_core::types::{
 use driven_crypto::key::SourceKey;
 use driven_crypto::{ContentDecryptor, DrivenCryptoSuite, SourceCryptoSuite, HEADER_LEN};
 
-use driven_drive::fake::{InMemoryRemoteStore, CLIENT_OP_UUID_KEY};
+use driven_drive::fake::{InMemoryRemoteStore, CLIENT_OP_UUID_KEY, SOURCE_ID_KEY};
 use driven_drive::remote_store::{DriveContext, RemoteStore, UploadBody};
 
 use driven_power::{PowerSource, PowerState};
@@ -1039,10 +1039,22 @@ async fn reconcile_requeue_reuploads_changed_bytes_on_next_cycle() {
     let old_bytes = b"OLD uploaded bytes".to_vec();
     let new_bytes = b"NEW locally-edited bytes - different length".to_vec();
 
+    // The source is built FIRST so the orphan below can be stamped with its id,
+    // exactly as the executor would have stamped it.
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+
     // The orphan landed on Drive with the OLD bytes + its client_op_uuid.
     let op_uuid = uuid::Uuid::new_v4().to_string();
     let mut app = std::collections::HashMap::new();
     app.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.clone());
+    // The orphan stands in for an object the EXECUTOR created, and the executor
+    // stamps the owning source on everything it creates (it has done so since
+    // v0.1.0). Omitting it made this fixture unfaithful in a way that now
+    // matters: the remote-existence audit enumerates a source's live objects by
+    // exactly this key, so an UNSTAMPED object reads as deleted - and the
+    // adopted orphan would be re-uploaded as a duplicate.
+    app.insert(SOURCE_ID_KEY.to_string(), src.id.to_string());
     let created = remote
         .create(
             &folder,
@@ -1057,8 +1069,6 @@ async fn reconcile_requeue_reuploads_changed_bytes_on_next_cycle() {
     // But locally the file now holds the NEW bytes (edited after the upload,
     // before the lost commit).
     write_file(src_dir.path(), "drift.bin", &new_bytes);
-    let src = source_in(account, src_dir.path(), &folder);
-    state.upsert_source(&src).await.unwrap();
     let rel = RelativePath::try_from("drift.bin".to_string()).unwrap();
 
     let clock = Arc::new(FakeClock::new());
