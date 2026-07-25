@@ -127,6 +127,24 @@ export function previewExclusions(req: ExclusionPreviewRequest): Promise<Exclusi
   return invoke("preview_exclusions", { req });
 }
 
+/** Begin a STREAMING exclusion preview and resolve to its generation id.
+ *
+ * Validates the request exactly like `previewExclusions` (so an invalid glob or
+ * a missing root selector still rejects immediately), then walks the tree in the
+ * background, reporting through `exclusion_preview:batch` / `:done` events
+ * tagged with the returned id. Starting a preview cancels any walk still
+ * running, so the caller only needs `previewExclusionsCancel` when nothing
+ * replaces it (the editor closing). */
+export function previewExclusionsStart(req: ExclusionPreviewRequest): Promise<string> {
+  return invoke("preview_exclusions_start", { req });
+}
+
+/** Stop the streaming preview with this generation id. Cancelling an unknown or
+ *  already-finished generation is a deliberate no-op. */
+export function previewExclusionsCancel(previewId: string): Promise<void> {
+  return invoke("preview_exclusions_cancel", { previewId });
+}
+
 /** Issue #36: the per-source point-in-time versioning config (absent -> OFF). */
 export function getSourceVersioning(sourceId: string): Promise<VersioningConfig> {
   return invoke("get_source_versioning", { sourceId });

@@ -11,6 +11,7 @@ pub mod accounts;
 pub mod activity;
 pub mod dialogs;
 pub mod dtos;
+pub mod exclusion_stream;
 pub mod restore;
 pub mod settings;
 pub mod sources;

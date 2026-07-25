@@ -93,6 +93,41 @@ pub const EVENT_RESTORE_PROGRESS: &str = "restore:progress";
 /// appears and disappears without the user refreshing.
 pub const EVENT_PAUSE_CHANGED: &str = "sync:pause_changed";
 
+/// `exclusion_preview:batch` - a slice of the streaming exclusion preview's
+/// walk (payload: `ExclusionPreviewBatch`).
+///
+/// The exclusion editor's live folder tree: the walk emits one of these every
+/// few hundred nodes (or every ~100ms on a slow tree), each carrying the newly
+/// discovered nodes plus the running included/excluded totals. Every batch is
+/// tagged with the `preview_id` `preview_exclusions_start` returned so the
+/// webview can discard a superseded walk's in-flight events.
+pub const EVENT_EXCLUSION_PREVIEW_BATCH: &str = "exclusion_preview:batch";
+/// `exclusion_preview:done` - the streaming exclusion preview finished or was
+/// cancelled (payload: `ExclusionPreviewDone`).
+///
+/// Carries the EXACT final totals (which stay accurate even when the streamed
+/// tree was truncated at the node cap) plus a `cancelled` flag, so the editor
+/// can show "scan complete" only for a walk that really finished.
+pub const EVENT_EXCLUSION_PREVIEW_DONE: &str = "exclusion_preview:done";
+
+/// Broadcast one `exclusion_preview:batch` slice of a streaming exclusion
+/// preview.
+pub fn emit_exclusion_preview_batch<P: Serialize + Clone>(
+    app: &AppHandle,
+    batch: &P,
+) -> tauri::Result<()> {
+    app.emit(EVENT_EXCLUSION_PREVIEW_BATCH, batch)
+}
+
+/// Broadcast the terminal `exclusion_preview:done` totals of a streaming
+/// exclusion preview.
+pub fn emit_exclusion_preview_done<P: Serialize + Clone>(
+    app: &AppHandle,
+    done: &P,
+) -> tauri::Result<()> {
+    app.emit(EVENT_EXCLUSION_PREVIEW_DONE, done)
+}
+
 /// Broadcast `sync:pause_changed` with the active pause, or `null` when sync is
 /// no longer manually paused (SPEC s11.7).
 pub fn emit_pause_changed(

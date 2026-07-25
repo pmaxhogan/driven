@@ -858,6 +858,37 @@ pub async fn preview_exclusions(
     state: State<'_, AppState>,
     req: ExclusionPreviewRequest,
 ) -> CommandResult<ExclusionPreview> {
+    let (canon, matcher) = resolve_preview_root_and_matcher(&state, &req).await?;
+
+    // Run the (blocking) walk + classification off the async runtime.
+    let preview = tokio::task::spawn_blocking(move || classify_tree(&canon, &matcher))
+        .await
+        .map_err(|e| {
+            CommandError::with_code(
+                ErrorCode::InternalBug,
+                format!("exclusion preview task failed: {e}"),
+            )
+        })??;
+
+    Ok(preview)
+}
+
+/// The shared front half of BOTH exclusion previews - the one-shot
+/// [`preview_exclusions`] and the streaming
+/// [`crate::commands::exclusion_stream::preview_exclusions_start`]: validate the
+/// candidate globs, resolve the walk root from a backend-trusted selector, and
+/// build the SAME matcher the scanner uses.
+///
+/// Factored out so the two commands can never drift apart on the
+/// security-relevant half: identical pattern validation (R4-P2-1), identical
+/// exactly-one-selector rule (R4-P2-1), identical dialog-token PEEK + SQLite
+/// lookup (R1-P1-2, SPEC s11.6.1), and identical [`validate_readable_dir`]
+/// canonicalisation. Returns the canonical root plus its matcher, ready for a
+/// (blocking) walk.
+pub(crate) async fn resolve_preview_root_and_matcher(
+    state: &State<'_, AppState>,
+    req: &ExclusionPreviewRequest,
+) -> CommandResult<(std::path::PathBuf, driven_core::exclude::SourceMatcher)> {
     // R4-P2-1: validate the candidate include / exclude globs BEFORE walking,
     // so an invalid / oversized glob surfaces a stable s24 invalid-input error
     // (the same code add_source / update_source use) instead of a confusing
@@ -918,18 +949,7 @@ pub async fn preview_exclusions(
 
     let matcher = build_source_matcher(&synthetic).map_err(CommandError::from)?;
 
-    // Run the (blocking) walk + classification off the async runtime.
-    let canon_walk = canon.clone();
-    let preview = tokio::task::spawn_blocking(move || classify_tree(&canon_walk, &matcher))
-        .await
-        .map_err(|e| {
-            CommandError::with_code(
-                ErrorCode::InternalBug,
-                format!("exclusion preview task failed: {e}"),
-            )
-        })??;
-
-    Ok(preview)
+    Ok((canon, matcher))
 }
 
 /// Walk `root` and classify every regular file as included vs excluded under

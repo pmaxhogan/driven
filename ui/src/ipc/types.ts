@@ -176,6 +176,43 @@ export interface ExclusionPreview {
   truncated: boolean;
 }
 
+/** One entry of the STREAMING exclusion preview, as the walk discovers it.
+ *  `path` is source-root-relative and forward-slashed on every platform. */
+export interface ExclusionPreviewNode {
+  path: string;
+  isDir: boolean;
+  /** The matcher's verdict - the same one the real backup will apply. */
+  included: boolean;
+  /** File size in bytes; always 0 for a directory. */
+  size: number;
+}
+
+/** One `exclusion_preview:batch` payload: newly discovered nodes plus the
+ *  running totals (which stay exact even after the node stream truncates). */
+export interface ExclusionPreviewBatch {
+  /** The generation this batch belongs to; a batch for any OTHER generation
+   *  must be discarded so a superseded walk cannot pollute the live tree. */
+  previewId: string;
+  nodes: ExclusionPreviewNode[];
+  includedCount: number;
+  excludedCount: number;
+  includedBytes: number;
+  /** `true` once the streamed TREE hit the node cap; the counts stay exact. */
+  truncated: boolean;
+}
+
+/** The terminal `exclusion_preview:done` payload: the exact final totals. */
+export interface ExclusionPreviewDone {
+  previewId: string;
+  includedCount: number;
+  excludedCount: number;
+  includedBytes: number;
+  truncated: boolean;
+  /** `true` when the walk was stopped early (superseded, or the editor closed),
+   *  so the totals are a partial snapshot and the scan is NOT complete. */
+  cancelled: boolean;
+}
+
 // --- Settings & misc (SPEC s11.6, s22) ---
 
 export interface ScheduleSettings {

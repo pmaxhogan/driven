@@ -3,19 +3,21 @@ import { computed, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
 import AddSourceWizard from "./AddSourceWizard.vue";
+import ExclusionPreviewTree from "./ExclusionPreviewTree.vue";
 import RecoveryPhraseReveal from "./RecoveryPhraseReveal.vue";
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
 import { useAccountsStore } from "../stores/accounts";
+import { appendPatternLine } from "../stores/exclusionPreview";
 import { useSourcesStore } from "../stores/sources";
-import type { ExclusionPreview, SourceDto } from "../ipc/types";
+import type { SourceDto } from "../ipc/types";
 
 // Sources settings tab body (SPEC s11.2; DESIGN s8.2). A table of sources with
 // the per-row affordances the design calls for: enabled toggle, local path,
 // Drive destination, account, encryption on/off, "Edit exclusions" (inline
 // editor with a live preview), "Run now" (sync_now), and "Remove" (with an
 // "also delete from Drive" opt-in). "Add source" opens the AddSourceWizard.
-const { t, locale } = useI18n();
+const { t } = useI18n();
 const sources = useSourcesStore();
 const accounts = useAccountsStore();
 
@@ -46,8 +48,24 @@ const editExcludeText = ref("");
 // Issue #4: when true, back up OneDrive / cloud-only placeholder files
 // (PlaceholderPolicy "force_download") instead of skipping them (the default).
 const editBackupCloudOnly = ref(false);
-const editPreview = ref<ExclusionPreview | null>(null);
-const editPreviewLoading = ref(false);
+// The live streaming folder-tree preview inside the open editor. It owns the
+// walk (start / cancel / batched events); this component only tells it when the
+// rules changed.
+//
+// The editor panel sits inside the per-source `v-for`, and Vue registers a
+// template ref declared in a `v-for` SCOPE as an ARRAY (even though the `v-if`
+// means at most one editor is ever mounted). So the ref is typed - and unwrapped
+// below - as either shape; reading `.restart` off the raw ref would silently be
+// `undefined` and every rule edit would stop re-classifying.
+type PreviewTreeRef = InstanceType<typeof ExclusionPreviewTree>;
+const editPreviewTree = ref<PreviewTreeRef | PreviewTreeRef[] | null>(null);
+
+/** The single mounted preview tree, whichever shape Vue stored the ref in. */
+function currentPreviewTree(): PreviewTreeRef | null {
+  const found = editPreviewTree.value;
+  if (Array.isArray(found)) return found[0] ?? null;
+  return found;
+}
 const savingEdit = ref(false);
 
 // Inline remove-confirmation state.
@@ -70,8 +88,6 @@ const revealAcking = ref(false);
 // String(e), which renders a Tauri structured error as `[object Object]` and can
 // leak backend English). The template localizes it via t(`errors.${code}.long`).
 const revealErrorCode = ref<string | null>(null);
-
-const numberFormatter = computed(() => new Intl.NumberFormat(locale.value));
 
 const accountEmailById = computed<Record<string, string>>(() => {
   const map: Record<string, string> = {};
@@ -118,29 +134,31 @@ function beginEditExclusions(source: SourceDto): void {
   editIncludeText.value = source.includePatterns.join("\n");
   editExcludeText.value = source.excludePatterns.join("\n");
   editBackupCloudOnly.value = source.placeholderPolicy === "force_download";
-  editPreview.value = null;
-  void loadEditPreview(source);
+  // The tree starts its first streaming walk when it mounts with the panel.
 }
 
 function cancelEdit(): void {
+  // Unmounting the tree cancels the walk it has in flight, so closing the editor
+  // over a huge source does not leave a scan burning CPU.
   editingId.value = null;
-  editPreview.value = null;
 }
 
-async function loadEditPreview(source: SourceDto): Promise<void> {
-  editPreviewLoading.value = true;
-  try {
-    // R1-P1-2 (SPEC s11.6.1): preview an EXISTING source by its id - the backend
-    // resolves the local path from SQLite, never from a webview-supplied string.
-    editPreview.value = await ipc.previewExclusions({
-      sourceId: source.id,
-      respectGitignore: editRespectGitignore.value,
-      includePatterns: splitPatterns(editIncludeText.value),
-      excludePatterns: splitPatterns(editExcludeText.value),
-    });
-  } finally {
-    editPreviewLoading.value = false;
-  }
+/** Re-run the live preview under the current rules (a textarea blur, the
+ *  gitignore toggle, or a "+"/"-" click in the tree itself). */
+function refreshEditPreview(): void {
+  void currentPreviewTree()?.restart();
+}
+
+/** A "+" in the tree: re-include that path. The glob is appended as a new line
+ * to the include patterns (skipping an exact duplicate); the tree re-classifies
+ * and Save persists the patterns as edited. */
+function onAppendInclude(pattern: string): void {
+  editIncludeText.value = appendPatternLine(editIncludeText.value, pattern);
+}
+
+/** A "-" in the tree: exclude that path. */
+function onAppendExclude(pattern: string): void {
+  editExcludeText.value = appendPatternLine(editExcludeText.value, pattern);
 }
 
 async function saveEdit(source: SourceDto): Promise<void> {
@@ -153,7 +171,6 @@ async function saveEdit(source: SourceDto): Promise<void> {
       placeholderPolicy: editBackupCloudOnly.value ? "force_download" : "skip",
     });
     editingId.value = null;
-    editPreview.value = null;
   } finally {
     savingEdit.value = false;
   }
@@ -501,7 +518,7 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
               v-model="editRespectGitignore"
               type="checkbox"
               class="accent-teal-600"
-              @change="loadEditPreview(source)"
+              @change="refreshEditPreview"
             />
             {{ t("settings.addSource.respectGitignoreLabel") }}
           </label>
@@ -514,7 +531,7 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
               rows="2"
               class="w-full"
               :class="inputCls"
-              @blur="loadEditPreview(source)"
+              @blur="refreshEditPreview"
             />
           </label>
           <label class="block space-y-1 text-sm">
@@ -526,7 +543,7 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
               rows="2"
               class="w-full"
               :class="inputCls"
-              @blur="loadEditPreview(source)"
+              @blur="refreshEditPreview"
             />
           </label>
           <label class="flex items-start gap-2 text-sm">
@@ -543,22 +560,18 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
               </span>
             </span>
           </label>
-          <p v-if="editPreviewLoading" class="text-sm text-zinc-500">
-            {{ t("common.loading") }}
-          </p>
-          <p v-else-if="editPreview" class="text-sm">
-            {{
-              t("settings.addSource.preview.included", {
-                count: numberFormatter.format(editPreview.includedCount),
-              })
-            }}
-            -
-            {{
-              t("settings.addSource.preview.excluded", {
-                count: numberFormatter.format(editPreview.excludedCount),
-              })
-            }}
-          </p>
+          <!-- The live streaming tree: rows appear as the walk finds them, every
+               folder starts collapsed, and each row's "+"/"-" appends the
+               matching glob above and re-classifies. -->
+          <ExclusionPreviewTree
+            ref="editPreviewTree"
+            :source-id="source.id"
+            :respect-gitignore="editRespectGitignore"
+            :include-patterns="splitPatterns(editIncludeText)"
+            :exclude-patterns="splitPatterns(editExcludeText)"
+            @append-include="onAppendInclude"
+            @append-exclude="onAppendExclude"
+          />
           <div class="flex gap-2">
             <button
               type="button"
