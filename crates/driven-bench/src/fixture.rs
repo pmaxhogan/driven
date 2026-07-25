@@ -443,52 +443,46 @@ mod tests {
         }
     }
 
-    /// Resolves a path discovered by the walk below and returns it only if it
-    /// really is inside `base`.
+    /// The files `spec` says must exist under `root`, as
+    /// `(tree-relative slash path, contents)`, sorted.
     ///
-    /// The walk takes its paths from the filesystem rather than from the spec,
-    /// so a symlink or a `..` component could otherwise lead it outside the
-    /// fixture root. Re-checking containment against the canonical base is the
-    /// standard guard, and it keeps the helper honest about what it will read.
-    fn inside(base: &Path, candidate: &Path) -> PathBuf {
-        let base = base.canonicalize().expect("fixture root must exist");
-        let full = candidate.canonicalize().expect("walked path must exist");
-        assert!(
-            full.starts_with(&base),
-            "{} escaped the fixture root {}",
-            full.display(),
-            base.display()
-        );
-        full
+    /// Reads by the path the spec PREDICTS rather than by walking the tree.
+    /// That is the stronger assertion: the fixture's entire contract is that
+    /// its layout is a pure function of the spec, so a helper that discovered
+    /// paths from disk would happily pass even if `file_path` and the writer
+    /// had drifted together. A missing file fails loudly here. Use
+    /// [`count_files`] alongside it to catch a stray EXTRA file.
+    fn read_expected(root: &Path, spec: &FixtureSpec) -> Vec<(String, Vec<u8>)> {
+        let mut out: Vec<(String, Vec<u8>)> = (0..spec.files)
+            .map(|index| {
+                let rel = spec.file_path(index);
+                let bytes = fs::read(root.join(&rel))
+                    .unwrap_or_else(|e| panic!("fixture file {} missing: {e}", rel.display()));
+                (rel.to_string_lossy().replace('\\', "/"), bytes)
+            })
+            .collect();
+        out.sort();
+        out
     }
 
-    /// Every file under `root`, as `(tree-relative slash path, contents)`,
-    /// sorted. Walking (rather than reading the paths the spec predicts) is
-    /// deliberate: it is the only way these tests can catch a stray EXTRA file,
-    /// which is exactly what a stale or half-rebuilt fixture looks like.
-    fn read_tree(root: &Path) -> Vec<(String, Vec<u8>)> {
-        let mut out = Vec::new();
+    /// How many files exist under `root`, so a test can catch a leftover file
+    /// from an earlier spec that [`read_expected`] would never look at.
+    fn count_files(root: &Path) -> usize {
+        let mut count = 0;
         let mut stack = vec![root.to_path_buf()];
         while let Some(dir) = stack.pop() {
             for entry in fs::read_dir(&dir).unwrap() {
                 let entry = entry.unwrap();
-                // Ask the directory entry, not the path: one fewer stat, and no
-                // filesystem lookup driven by a reconstructed path.
+                // Ask the directory entry rather than re-statting its path: one
+                // fewer syscall, and nothing to get wrong about the path itself.
                 if entry.file_type().unwrap().is_dir() {
-                    stack.push(inside(root, &entry.path()));
+                    stack.push(entry.path());
                 } else {
-                    let path = inside(root, &entry.path());
-                    let rel = path
-                        .strip_prefix(root.canonicalize().unwrap())
-                        .unwrap()
-                        .to_string_lossy()
-                        .replace('\\', "/");
-                    out.push((rel, fs::read(&path).unwrap()));
+                    count += 1;
                 }
             }
         }
-        out.sort();
-        out
+        count
     }
 
     #[test]
@@ -498,18 +492,25 @@ mod tests {
         let spec = tiny_spec();
         let fa = Fixture::build(a.path(), &spec).unwrap();
         let fb = Fixture::build(b.path(), &spec).unwrap();
-        assert_eq!(read_tree(&fa.tree()), read_tree(&fb.tree()));
+        assert_eq!(
+            read_expected(&fa.tree(), &spec),
+            read_expected(&fb.tree(), &spec)
+        );
     }
 
     #[test]
     fn different_seeds_produce_different_content() {
         let a = tempdir();
         let b = tempdir();
-        let fa = Fixture::build(a.path(), &tiny_spec()).unwrap();
-        let mut other = tiny_spec();
+        let spec = tiny_spec();
+        let fa = Fixture::build(a.path(), &spec).unwrap();
+        let mut other = spec.clone();
         other.seed = 8;
         let fb = Fixture::build(b.path(), &other).unwrap();
-        assert_ne!(read_tree(&fa.tree()), read_tree(&fb.tree()));
+        assert_ne!(
+            read_expected(&fa.tree(), &spec),
+            read_expected(&fb.tree(), &other)
+        );
     }
 
     #[test]
@@ -517,8 +518,13 @@ mod tests {
         let dir = tempdir();
         let spec = tiny_spec();
         let f = Fixture::build(dir.path(), &spec).unwrap();
-        let files = read_tree(&f.tree());
+        let files = read_expected(&f.tree(), &spec);
         assert_eq!(files.len(), spec.files);
+        assert_eq!(
+            count_files(&f.tree()),
+            spec.files,
+            "the tree must hold exactly the spec's files and nothing else"
+        );
         for (rel, _) in &files {
             // depth directory components plus the file name.
             assert_eq!(
@@ -535,7 +541,7 @@ mod tests {
         let dir = tempdir();
         let spec = tiny_spec();
         let f = Fixture::build(dir.path(), &spec).unwrap();
-        let on_disk: u64 = read_tree(&f.tree())
+        let on_disk: u64 = read_expected(&f.tree(), &spec)
             .iter()
             .map(|(_, b)| b.len() as u64)
             .sum();
@@ -553,8 +559,9 @@ mod tests {
             seed: 1,
         };
         let f = Fixture::build(dir.path(), &spec).unwrap();
-        let files = read_tree(&f.tree());
+        let files = read_expected(&f.tree(), &spec);
         assert_eq!(files.len(), 3);
+        assert_eq!(count_files(&f.tree()), 3);
         for (rel, bytes) in files {
             assert!(!rel.contains('/'), "huge shape must be flat, got {rel}");
             assert_eq!(bytes.len(), 4096);
@@ -566,14 +573,14 @@ mod tests {
         let dir = tempdir();
         let spec = tiny_spec();
         let mut f = Fixture::build(dir.path(), &spec).unwrap();
-        let before = read_tree(&f.tree());
+        let before = read_expected(&f.tree(), &spec);
 
         let touched = f.mutate(0.1).unwrap();
         assert_eq!(touched.len(), 4, "10% of 40 files");
-        let after = read_tree(&f.tree());
+        let after = read_expected(&f.tree(), &spec);
         assert_eq!(
-            after.len(),
-            before.len(),
+            count_files(&f.tree()),
+            spec.files,
             "mutate must not add or remove files"
         );
         let changed = before
@@ -584,7 +591,11 @@ mod tests {
         assert_eq!(changed, touched.len());
 
         f.restore().unwrap();
-        assert_eq!(read_tree(&f.tree()), before, "restore must be exact");
+        assert_eq!(
+            read_expected(&f.tree(), &spec),
+            before,
+            "restore must be exact"
+        );
     }
 
     #[test]
@@ -601,25 +612,30 @@ mod tests {
         let dir = tempdir();
         let spec = tiny_spec();
         let mut f = Fixture::build(dir.path(), &spec).unwrap();
-        let pristine = read_tree(&f.tree());
+        let pristine = read_expected(&f.tree(), &spec);
         f.mutate(0.1).unwrap();
-        assert_ne!(read_tree(&f.tree()), pristine);
+        assert_ne!(read_expected(&f.tree(), &spec), pristine);
         drop(f);
 
         // A fresh build over the same cache must hand back a pristine tree.
         let reused = Fixture::build(dir.path(), &spec).unwrap();
-        assert_eq!(read_tree(&reused.tree()), pristine);
+        assert_eq!(read_expected(&reused.tree(), &spec), pristine);
     }
 
     #[test]
     fn a_changed_spec_rebuilds_rather_than_reusing() {
         let dir = tempdir();
-        let f = Fixture::build(dir.path(), &tiny_spec()).unwrap();
-        assert_eq!(read_tree(&f.tree()).len(), 40);
-        let mut bigger = tiny_spec();
-        bigger.files = 12;
-        let f2 = Fixture::build(dir.path(), &bigger).unwrap();
-        assert_eq!(read_tree(&f2.tree()).len(), 12);
+        let spec = tiny_spec();
+        let f = Fixture::build(dir.path(), &spec).unwrap();
+        assert_eq!(count_files(&f.tree()), spec.files);
+
+        let mut smaller = spec.clone();
+        smaller.files = 12;
+        let f2 = Fixture::build(dir.path(), &smaller).unwrap();
+        // Exactly 12 - the 28 files the previous spec wrote must be GONE, not
+        // left behind to be uploaded as part of the next benchmark.
+        assert_eq!(count_files(&f2.tree()), 12);
+        assert_eq!(read_expected(&f2.tree(), &smaller).len(), 12);
     }
 
     #[test]
