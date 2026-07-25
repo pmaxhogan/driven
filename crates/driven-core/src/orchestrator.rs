@@ -1565,12 +1565,17 @@ impl SyncOrchestrator {
                 scanned_total.store(scanned, std::sync::atomic::Ordering::Relaxed);
                 Box::pin(self.transition(OrchestratorState::Scanning { source_id, scanned }))
             };
-            crate::scanner::scan_with_progress(
+            crate::scanner::scan_with_priority(
                 source,
                 self.state.as_ref(),
                 mode,
                 self.latency.as_deref(),
                 Some(&on_scan_progress),
+                // Live SPEC s22 io_priority: the walk's coordinator + worker
+                // threads demote themselves so scan stat/hash I/O yields to
+                // foreground apps (the same cell the executor's bundle path
+                // reads).
+                self.priority.get(),
             )
             .await?
         };
