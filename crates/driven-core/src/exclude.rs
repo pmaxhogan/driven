@@ -579,6 +579,91 @@ pub struct SourceMatcher {
     has_negations: bool,
 }
 
+/// One scope's RESOLVED verdict for a path - the three-way outcome of
+/// [`Gitignore::matched_path_or_any_parents`] flattened so it can be cached.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum ScopeVerdict {
+    /// No rule in this scope matched the path or any of its parents.
+    None,
+    /// The last matching rule excluded it.
+    Ignore,
+    /// The last matching rule was a `!`-re-include.
+    Whitelist,
+}
+
+impl ScopeVerdict {
+    fn from_match<T>(m: &ignore::Match<T>) -> Self {
+        if m.is_ignore() {
+            ScopeVerdict::Ignore
+        } else if m.is_whitelist() {
+            ScopeVerdict::Whitelist
+        } else {
+            ScopeVerdict::None
+        }
+    }
+
+    /// This verdict if the scope matched the path itself, else the verdict it
+    /// INHERITS from the parent directory. This is the per-scope parent fallback
+    /// that makes the cursor equivalent to `matched_path_or_any_parents`.
+    fn or(self, inherited: ScopeVerdict) -> Self {
+        match self {
+            ScopeVerdict::None => inherited,
+            decided => decided,
+        }
+    }
+
+    /// Fold into a running LAST-MATCH-WINS accumulator across scopes: a decided
+    /// verdict replaces the running one, `None` leaves it alone.
+    fn or_keep(self, running: ScopeVerdict) -> Self {
+        match self {
+            ScopeVerdict::None => running,
+            decided => decided,
+        }
+    }
+}
+
+/// The resolved include/exclude state of ONE directory: every applicable scope's
+/// verdict at that directory, in ascending precedence order.
+///
+/// This is the cursor a recursive walk carries down by reference so each entry
+/// costs O(scopes) instead of [`SourceMatcher::is_included`]'s O(depth x scopes).
+/// It works because, per scope,
+///
+/// ```text
+/// matched_path_or_any_parents(p, is_dir)
+///     == matched(p, is_dir)  orelse  matched_path_or_any_parents(parent(p), true)
+/// ```
+///
+/// (verified against `ignore`'s `gitignore.rs`), so a child resolves with ONE
+/// non-parent-walking `matched` call per scope plus the parent's cached verdict.
+///
+/// The load-bearing subtlety: each scope's own parent fallback must be applied
+/// BEFORE the last-match-wins fold across scopes. Folding first and inheriting a
+/// single combined verdict is WRONG - a high-precedence scope matching an
+/// ancestor must still beat a low-precedence scope matching the child itself.
+///
+/// Obtain the root state from [`SourceMatcher::root_decision`], then
+/// [`SourceMatcher::descend`] into each subdirectory and
+/// [`SourceMatcher::is_included_at`] for the entries inside it. The struct
+/// records which directory it describes, so handing a mismatched cursor to
+/// either method falls back to the authoritative slow path instead of answering
+/// wrongly.
+#[derive(Debug, Clone)]
+pub struct DirDecision {
+    /// The ABSOLUTE directory this state describes.
+    dir: PathBuf,
+    /// `(scope index, that scope's resolved verdict at `dir`)`, ascending by
+    /// index - which is ascending precedence (see [`SourceMatcher::scopes`]).
+    states: Vec<(u32, ScopeVerdict)>,
+}
+
+impl DirDecision {
+    /// Whether this state describes the parent directory of `abs`.
+    fn describes_parent_of(&self, abs: &Path) -> bool {
+        abs.parent() == Some(self.dir.as_path())
+    }
+}
+
 impl SourceMatcher {
     /// Whether any rule can re-include an otherwise-excluded path (see the
     /// [`SourceMatcher::has_negations`] field docs).
@@ -650,6 +735,136 @@ impl SourceMatcher {
         applicable
             .into_iter()
             .any(|idx| scope_negations_reach(&self.scopes[idx as usize], &abs))
+    }
+
+    /// The decision state at the SOURCE ROOT - the seed a recursive walk carries
+    /// down (see [`DirDecision`]).
+    pub fn root_decision(&self) -> DirDecision {
+        self.decision_for_dir(Path::new(""))
+    }
+
+    /// The decision state for an ARBITRARY directory, computed from scratch.
+    ///
+    /// Walk-independent and O(depth x scopes) - the general form. A walk should
+    /// use [`SourceMatcher::descend`] instead, which derives a child's state from
+    /// its parent's in O(scopes). This is also the fallback [`is_included_at`]
+    /// and [`descend`] take when a caller hands them a `parent` that does not
+    /// actually describe the queried path's parent directory.
+    ///
+    /// [`is_included_at`]: SourceMatcher::is_included_at
+    /// [`descend`]: SourceMatcher::descend
+    pub fn decision_for_dir(&self, rel_dir: &Path) -> DirDecision {
+        let abs = self.root.join(rel_dir);
+        let mut applicable = Vec::new();
+        self.applicable_scopes(&abs, &mut applicable);
+        let states = applicable
+            .into_iter()
+            .map(|idx| {
+                let m = self.scopes[idx as usize]
+                    .matcher
+                    .matched_path_or_any_parents(&abs, true);
+                (idx, ScopeVerdict::from_match(&m))
+            })
+            .collect();
+        DirDecision { dir: abs, states }
+    }
+
+    /// Whether the entry `rel` - which MUST live directly inside the directory
+    /// `parent` describes - is included, resolved from `parent` in O(scopes)
+    /// instead of the O(depth x scopes) of [`SourceMatcher::is_included`].
+    ///
+    /// Returns exactly what `is_included(rel, is_dir)` returns. If `parent` does
+    /// not describe `rel`'s actual parent directory the call silently falls back
+    /// to the authoritative slow path, so a mis-threaded cursor costs speed and
+    /// never correctness.
+    pub fn is_included_at(&self, parent: &DirDecision, rel: &Path, is_dir: bool) -> bool {
+        let abs = self.root.join(rel);
+        if !parent.describes_parent_of(&abs) {
+            return self.is_included(rel, is_dir);
+        }
+        // Scopes rooted AT `abs` itself also apply to it (the ancestor sweep in
+        // `applicable_scopes` includes `abs`), so they must be folded in here too
+        // - otherwise a directory holding its own `.gitignore` would be judged
+        // without that file's rules.
+        let mut last = ScopeVerdict::None;
+        let mut extra = self.by_dir.get(&abs).map(|v| v.as_slice()).unwrap_or(&[]);
+        for &(idx, inherited) in &parent.states {
+            // Merge in any scope rooted at `abs` whose precedence falls before
+            // this inherited one, keeping ascending-index (precedence) order.
+            while let Some((&next, rest)) = extra.split_first() {
+                if next >= idx {
+                    break;
+                }
+                last = self.fold_new_scope(next, &abs, is_dir, last);
+                extra = rest;
+            }
+            let own = self.scopes[idx as usize].matcher.matched(&abs, is_dir);
+            let resolved = ScopeVerdict::from_match(&own).or(inherited);
+            last = resolved.or_keep(last);
+        }
+        for &idx in extra {
+            last = self.fold_new_scope(idx, &abs, is_dir, last);
+        }
+        last != ScopeVerdict::Ignore
+    }
+
+    /// Descend into the subdirectory `rel_dir` of the directory `parent`
+    /// describes: returns whether that directory is itself included, plus the
+    /// [`DirDecision`] to carry into it.
+    ///
+    /// Both answers share the same per-scope match work, so a walk should call
+    /// this once per directory rather than pairing `is_included_at` with a
+    /// separate state build. Falls back to the from-scratch path when `parent`
+    /// does not describe `rel_dir`'s parent (see
+    /// [`SourceMatcher::decision_for_dir`]).
+    pub fn descend(&self, parent: &DirDecision, rel_dir: &Path) -> (bool, DirDecision) {
+        let abs = self.root.join(rel_dir);
+        if !parent.describes_parent_of(&abs) {
+            return (
+                self.is_included(rel_dir, true),
+                self.decision_for_dir(rel_dir),
+            );
+        }
+        let mut states: Vec<(u32, ScopeVerdict)> = Vec::with_capacity(parent.states.len() + 1);
+        for &(idx, inherited) in &parent.states {
+            let own = self.scopes[idx as usize].matcher.matched(&abs, true);
+            states.push((idx, ScopeVerdict::from_match(&own).or(inherited)));
+        }
+        // Scopes rooted at this directory (a `.gitignore` living here) join the
+        // cascade now. Seed each with the REAL `matched_path_or_any_parents`
+        // verdict for the directory itself rather than assuming `None`, so the
+        // cursor reproduces `is_included` exactly even for whatever the `ignore`
+        // crate returns when a path equals its own scope root.
+        if let Some(idxs) = self.by_dir.get(&abs) {
+            for &idx in idxs {
+                let m = self.scopes[idx as usize]
+                    .matcher
+                    .matched_path_or_any_parents(&abs, true);
+                states.push((idx, ScopeVerdict::from_match(&m)));
+            }
+            // `scopes` is stored in ascending precedence, so sorting by index
+            // restores precedence order after the merge.
+            states.sort_unstable_by_key(|(idx, _)| *idx);
+        }
+        let included = states
+            .iter()
+            .fold(ScopeVerdict::None, |acc, (_, v)| v.or_keep(acc))
+            != ScopeVerdict::Ignore;
+        (included, DirDecision { dir: abs, states })
+    }
+
+    /// Fold a scope rooted exactly at the queried path into a running verdict.
+    fn fold_new_scope(
+        &self,
+        idx: u32,
+        abs: &Path,
+        is_dir: bool,
+        running: ScopeVerdict,
+    ) -> ScopeVerdict {
+        let m = self.scopes[idx as usize]
+            .matcher
+            .matched_path_or_any_parents(abs, is_dir);
+        ScopeVerdict::from_match(&m).or_keep(running)
     }
 
     /// Collect - in ascending precedence order - the indices of the scopes that
@@ -2665,5 +2880,369 @@ mod tests {
             "an UNescaped `alt{{a,b}}.txt` would read `{{a,b}}` as an alternation \
              and also exclude alta.txt"
         );
+    }
+
+    // --- DirDecision cursor (per-directory decision cache) ------------------
+
+    /// BFS the real tree under `root` with the cursor, asserting at EVERY entry
+    /// (files and directories alike) that the cursor's verdict is identical to
+    /// [`SourceMatcher::is_included`] - the authority. Returns how many entries
+    /// were compared so a test can prove it did not pass vacuously.
+    ///
+    /// This mirrors exactly how `stream_classify_tree` drives the cursor: state
+    /// rides on the queue entry, so a child is always resolved from its true
+    /// parent.
+    fn assert_cursor_matches_walk(root: &Path, matcher: &SourceMatcher) -> usize {
+        let mut compared = 0usize;
+        let mut queue: std::collections::VecDeque<(PathBuf, DirDecision)> =
+            std::collections::VecDeque::new();
+        queue.push_back((root.to_path_buf(), matcher.root_decision()));
+
+        while let Some((dir, state)) = queue.pop_front() {
+            let entries = match fs::read_dir(&dir) {
+                Ok(e) => e,
+                Err(_) => continue,
+            };
+            for entry in entries.flatten() {
+                let path = entry.path();
+                let Ok(ft) = entry.file_type() else { continue };
+                let rel = path.strip_prefix(root).expect("under root");
+                let is_dir = ft.is_dir();
+
+                let expected = matcher.is_included(rel, is_dir);
+                if is_dir {
+                    let (got, child) = matcher.descend(&state, rel);
+                    assert_eq!(
+                        got,
+                        expected,
+                        "cursor disagreed on DIR {}: cursor={got} is_included={expected}",
+                        rel.display()
+                    );
+                    // `is_included_at` must agree with `descend` on the same dir.
+                    assert_eq!(
+                        matcher.is_included_at(&state, rel, true),
+                        expected,
+                        "is_included_at disagreed on DIR {}",
+                        rel.display()
+                    );
+                    queue.push_back((path, child));
+                } else {
+                    let got = matcher.is_included_at(&state, rel, false);
+                    assert_eq!(
+                        got,
+                        expected,
+                        "cursor disagreed on FILE {}: cursor={got} is_included={expected}",
+                        rel.display()
+                    );
+                }
+                compared += 1;
+            }
+        }
+        compared
+    }
+
+    #[test]
+    fn cursor_matches_is_included_across_the_full_semantics_matrix() {
+        // One tree exercising every gitignore shape the matcher supports, walked
+        // with the cursor and compared against `is_included` at every entry:
+        // anchored vs unanchored, dir-only rules, `**`, character classes, the
+        // nested cascade with a deeper file overriding a shallower one, a nested
+        // negation under an excluded parent (the P1-1 permissive re-include), a
+        // directory that carries its OWN .gitignore, and `.ignore` +
+        // .git/info/exclude tiers.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+
+        write(
+            &root.join(".gitignore"),
+            "*.log\nbuild/\n/anchored.txt\n**/deep/*.tmpx\nclass[0-9].dat\n",
+        );
+        write(&root.join(".ignore"), "hidden.dat\n");
+        write(&root.join(".git/info/exclude"), "private.bin\n");
+
+        write(&root.join("anchored.txt"), "x");
+        write(&root.join("sub/anchored.txt"), "x");
+        write(&root.join("top.log"), "x");
+        write(&root.join("keep.txt"), "x");
+        write(&root.join("hidden.dat"), "x");
+        write(&root.join("private.bin"), "x");
+        write(&root.join("class3.dat"), "x");
+        write(&root.join("classX.dat"), "x");
+        write(&root.join("build/out/app.js"), "x");
+        write(&root.join("a/deep/x.tmpx"), "x");
+        write(&root.join("a/deep/keep.txt"), "x");
+
+        // A nested .gitignore that re-includes under an excluded parent, plus a
+        // deeper file overriding a shallower rule.
+        write(&root.join("vendor/.gitignore"), "!keep.log\n*.dat\n");
+        write(&root.join("vendor/keep.log"), "x");
+        write(&root.join("vendor/drop.log"), "x");
+        write(&root.join("vendor/thing.dat"), "x");
+        write(&root.join("vendor/nested/keep.log"), "x");
+
+        // A directory carrying its own .gitignore, one level down.
+        write(&root.join("pkg/sub/.gitignore"), "/local.txt\n");
+        write(&root.join("pkg/sub/local.txt"), "x");
+        write(&root.join("pkg/sub/deeper/local.txt"), "x");
+        write(&root.join("pkg/keep.md"), "x");
+
+        let src = source_at(root, true, &[".env"], &["*.bak", "/forced/"]);
+        write(&root.join(".env"), "x");
+        write(&root.join("stale.bak"), "x");
+        write(&root.join("forced/inside.txt"), "x");
+
+        let matcher = build_source_matcher(&src).expect("matcher");
+        let compared = assert_cursor_matches_walk(root, &matcher);
+        assert!(
+            compared >= 25,
+            "the fixture must actually exercise the cursor, compared only {compared}"
+        );
+    }
+
+    #[test]
+    fn cursor_applies_each_scopes_parent_fallback_before_combining() {
+        // THE precedence trap, and the reason a naive per-directory cache is
+        // wrong. Two scopes disagree at different depths:
+        //   - the .gitignore cascade (LOWER precedence) whitelists the FILE
+        //     itself (`!keep.txt`);
+        //   - the source's own exclude_patterns (HIGHEST precedence) exclude the
+        //     PARENT DIRECTORY (`/vendor/`).
+        // `is_included` consults each scope with matched_path_or_any_parents, so
+        // the high-precedence scope's match on the ancestor wins and the file is
+        // EXCLUDED.
+        //
+        // A cache that folded scopes into ONE verdict per directory and then let
+        // a child's own match override it would answer INCLUDED here: it would
+        // see only "parent excluded" plus "child whitelisted by some scope". The
+        // cursor keeps every scope's verdict separate and applies each scope's
+        // own parent fallback BEFORE the cross-scope fold, so it agrees with
+        // `is_included`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "!keep.txt\n");
+        write(&root.join("vendor/keep.txt"), "x");
+        write(&root.join("vendor/other.txt"), "x");
+        write(&root.join("keep.txt"), "x");
+
+        let src = source_at(root, true, &[], &["/vendor/"]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+
+        // The authority says excluded - the high-precedence dir rule wins.
+        assert!(
+            !matcher.is_included(Path::new("vendor/keep.txt"), false),
+            "a higher-precedence rule matching the PARENT must beat a \
+             lower-precedence whitelist matching the child"
+        );
+        // ...and the cursor must reproduce that exactly.
+        let (vendor_inc, vendor_state) =
+            matcher.descend(&matcher.root_decision(), Path::new("vendor"));
+        assert!(!vendor_inc, "vendor/ itself is excluded");
+        assert!(
+            !matcher.is_included_at(&vendor_state, Path::new("vendor/keep.txt"), false),
+            "the cursor must NOT let the lower-precedence !keep.txt re-include it"
+        );
+        // The root-level keep.txt is genuinely whitelisted (nothing excludes it).
+        assert!(matcher.is_included(Path::new("keep.txt"), false));
+        assert!(matcher.is_included_at(&matcher.root_decision(), Path::new("keep.txt"), false));
+
+        assert_cursor_matches_walk(root, &matcher);
+    }
+
+    #[test]
+    fn cursor_reproduces_a_reinclude_that_reaches_into_an_excluded_dir() {
+        // The re-include that survives the pruned collection: the negation lives
+        // in a scope ABOVE the excluded directory (here the source's own
+        // include_patterns, which are always loaded), so it IS in the cascade,
+        // pruning is disabled, and the file comes back even though its parent
+        // directory is excluded - the P1-1 permissive re-include.
+        //
+        // Contrast `a_negation_nested_inside_a_pruned_dir_is_not_collected`: a
+        // negation living INSIDE a prunable excluded dir is never collected, so
+        // it cannot re-include. The cursor must reproduce BOTH outcomes, since
+        // it is only ever a faster spelling of `is_included`.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("vendor/keep.txt"), "x");
+        write(&root.join("vendor/drop.txt"), "x");
+        write(&root.join("top.txt"), "x");
+
+        let src = source_at(root, true, &["/vendor/keep.txt"], &["/vendor/"]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(
+            matcher.is_included(Path::new("vendor/keep.txt"), false),
+            "an include_pattern re-includes through an excluded parent dir"
+        );
+
+        let (vendor_inc, vendor_state) =
+            matcher.descend(&matcher.root_decision(), Path::new("vendor"));
+        assert!(!vendor_inc, "the directory itself stays excluded");
+        assert!(
+            matcher.is_included_at(&vendor_state, Path::new("vendor/keep.txt"), false),
+            "the re-include must survive through the cursor too"
+        );
+        assert!(!matcher.is_included_at(&vendor_state, Path::new("vendor/drop.txt"), false));
+
+        assert_cursor_matches_walk(root, &matcher);
+    }
+
+    #[test]
+    fn cursor_agrees_when_a_nested_negation_is_never_collected() {
+        // The other half: `vendor/.gitignore: !keep.txt` inside a prunable
+        // excluded `vendor/` is NOT collected (git's own rule, and what keeps the
+        // walk and the matcher in lockstep), so the file stays EXCLUDED. The
+        // cursor must agree - it must not resurrect a rule the cascade never
+        // loaded.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "vendor/\n");
+        write(&root.join("vendor/.gitignore"), "!keep.txt\n");
+        write(&root.join("vendor/keep.txt"), "x");
+        write(&root.join("top.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        assert!(!matcher.is_included(Path::new("vendor/keep.txt"), false));
+
+        let (vendor_inc, vendor_state) =
+            matcher.descend(&matcher.root_decision(), Path::new("vendor"));
+        assert!(!vendor_inc);
+        assert!(
+            !matcher.is_included_at(&vendor_state, Path::new("vendor/keep.txt"), false),
+            "the cursor must not re-include via an uncollected nested negation"
+        );
+
+        assert_cursor_matches_walk(root, &matcher);
+    }
+
+    #[test]
+    fn cursor_folds_in_a_scope_rooted_at_the_queried_directory() {
+        // A directory that holds its OWN .gitignore: those rules are in scope for
+        // the directory itself (the ancestor sweep includes the path), so both
+        // `descend` and `is_included_at` must merge that scope in at the right
+        // precedence rather than only from the next level down.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("pkg/.gitignore"), "*.gen\n!important.gen\n");
+        write(&root.join("pkg/a.gen"), "x");
+        write(&root.join("pkg/important.gen"), "x");
+        write(&root.join("pkg/plain.txt"), "x");
+        write(&root.join("pkg/nested/b.gen"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+
+        let (_, pkg_state) = matcher.descend(&matcher.root_decision(), Path::new("pkg"));
+        assert!(!matcher.is_included_at(&pkg_state, Path::new("pkg/a.gen"), false));
+        assert!(matcher.is_included_at(&pkg_state, Path::new("pkg/important.gen"), false));
+        assert!(matcher.is_included_at(&pkg_state, Path::new("pkg/plain.txt"), false));
+
+        let (_, nested_state) = matcher.descend(&pkg_state, Path::new("pkg/nested"));
+        assert!(
+            !matcher.is_included_at(&nested_state, Path::new("pkg/nested/b.gen"), false),
+            "the pkg-level rule reaches one level deeper too"
+        );
+
+        assert_cursor_matches_walk(root, &matcher);
+    }
+
+    #[test]
+    fn a_mismatched_cursor_falls_back_instead_of_answering_wrongly() {
+        // The API's safety net: handing a cursor for the WRONG directory must
+        // never produce a wrong verdict. Both entry points detect it and fall
+        // back to the authoritative from-scratch path.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "*.log\n");
+        write(&root.join("a/keep.txt"), "x");
+        write(&root.join("a/drop.log"), "x");
+        write(&root.join("b/keep.txt"), "x");
+        write(&root.join("b/deep/keep.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+
+        // A cursor for `a/`, used to judge paths under `b/` and the root.
+        let (_, a_state) = matcher.descend(&matcher.root_decision(), Path::new("a"));
+        for (rel, is_dir) in [
+            ("b/keep.txt", false),
+            ("b/deep/keep.txt", false),
+            ("b/deep", true),
+            ("a/keep.txt", false),
+        ] {
+            let p = Path::new(rel);
+            assert_eq!(
+                matcher.is_included_at(&a_state, p, is_dir),
+                matcher.is_included(p, is_dir),
+                "mismatched cursor must fall back for {rel}"
+            );
+        }
+
+        // `descend` with a mismatched parent must still produce a USABLE state.
+        let (inc, deep_state) = matcher.descend(&a_state, Path::new("b/deep"));
+        assert_eq!(inc, matcher.is_included(Path::new("b/deep"), true));
+        assert_eq!(
+            matcher.is_included_at(&deep_state, Path::new("b/deep/keep.txt"), false),
+            matcher.is_included(Path::new("b/deep/keep.txt"), false),
+            "the recovered state must be correct for its own children"
+        );
+    }
+
+    #[test]
+    fn decision_for_dir_matches_a_descend_chain() {
+        // The from-scratch builder and the incremental one must agree, since the
+        // fallback path silently swaps one for the other.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "*.log\nbuild/\n");
+        write(&root.join("a/.gitignore"), "!special.log\n");
+        write(&root.join("a/b/.gitignore"), "*.dat\n");
+        write(&root.join("a/b/c/x.dat"), "x");
+        write(&root.join("a/b/c/special.log"), "x");
+        write(&root.join("a/b/c/plain.txt"), "x");
+
+        let src = source_at(root, true, &[], &[]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+
+        // Walk down incrementally...
+        let mut state = matcher.root_decision();
+        for rel in ["a", "a/b", "a/b/c"] {
+            state = matcher.descend(&state, Path::new(rel)).1;
+        }
+        // ...versus building the same directory's state from scratch.
+        let scratch = matcher.decision_for_dir(Path::new("a/b/c"));
+
+        for name in ["a/b/c/x.dat", "a/b/c/special.log", "a/b/c/plain.txt"] {
+            let p = Path::new(name);
+            let expected = matcher.is_included(p, false);
+            assert_eq!(
+                matcher.is_included_at(&state, p, false),
+                expected,
+                "descend chain wrong for {name}"
+            );
+            assert_eq!(
+                matcher.is_included_at(&scratch, p, false),
+                expected,
+                "decision_for_dir wrong for {name}"
+            );
+        }
+    }
+
+    #[test]
+    fn cursor_matches_when_gitignore_is_disabled_and_only_overrides_apply() {
+        // respect_gitignore=false leaves only the defaults + override scopes, so
+        // the cursor runs with a minimal cascade - the common case for a plain
+        // documents folder.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "ignored.txt\n");
+        write(&root.join("ignored.txt"), "x");
+        write(&root.join("notes/a.txt"), "x");
+        write(&root.join("notes/b.log"), "x");
+        write(&root.join("Thumbs.db"), "x");
+
+        let src = source_at(root, false, &[], &["*.log"]);
+        let matcher = build_source_matcher(&src).expect("matcher");
+        let compared = assert_cursor_matches_walk(root, &matcher);
+        assert!(compared >= 5, "compared only {compared}");
     }
 }
