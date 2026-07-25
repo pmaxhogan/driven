@@ -1,0 +1,58 @@
+[package]
+name = "driven-bench"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven real-world benchmark harness; see bench/README.md"
+publish = false
+
+[[bin]]
+name = "driven-bench"
+path = "src/main.rs"
+
+[dependencies]
+# The harness drives the REAL engine (the same scan -> plan -> execute pipeline
+# the desktop app runs), so it boots driven-core directly against a live
+# `GoogleDriveStore` - exactly the assembly `src-tauri/src/assembly.rs` performs,
+# minus the GUI/VSS/crypto/hook layers. It does NOT depend on src-tauri.
+driven-core = { path = "../driven-core" }
+driven-drive = { path = "../driven-drive" }
+driven-power = { path = "../driven-power" }
+# The adaptive upload-parallelism controller's per-OS disk-busy reader, so the
+# benchmarked engine behaves like a production build (adaptive is default-ON).
+driven-diskstat = { path = "../driven-diskstat" }
+# Deterministic on-AC power for the run (a laptop on battery would otherwise
+# have the orchestrator's power gate decide the result).
+driven-test-fixtures = { path = "../driven-test-fixtures" }
+
+anyhow.workspace = true
+async-trait.workspace = true
+clap.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true
+uuid.workspace = true
+bytes.workspace = true
+futures.workspace = true
+# Per-scenario state databases and rclone configs live in a throwaway directory
+# that is removed when the run ends.
+tempfile = "3"
+
+# Per-child CPU time + peak working set, so `driven` and `rclone` are measured
+# by the SAME OS accounting rather than one in-process and one out.
+[target.'cfg(windows)'.dependencies]
+windows = { version = "0.62", features = [
+    "Win32_Foundation",
+    "Win32_System_Threading",
+    "Win32_System_ProcessStatus",
+] }
+
+[target.'cfg(unix)'.dependencies]
+libc.workspace = true
+
+[dev-dependencies]
+tempfile = "3"
