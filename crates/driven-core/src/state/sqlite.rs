@@ -34,10 +34,10 @@ use uuid::Uuid;
 
 use super::{
     AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
-    BundleRef, BundleRow, DiscardPendingOutcome, FileSearchHit, FileStateRow, FileStatusCount,
-    FileVersionRow, ImmediateTreeChildren, NewActivity, NewFileVersion, NewPendingOp, PageRequest,
-    PendingOpRow, PendingRecoveryAck, PlaceholderPolicy, RestoreFileRow, SourceRow, StateRepo,
-    TelemetryAggregate,
+    ActivityThroughputSeries, BundleRef, BundleRow, DiscardPendingOutcome, FileSearchHit,
+    FileStateRow, FileStatusCount, FileVersionRow, ImmediateTreeChildren, NewActivity,
+    NewFileVersion, NewPendingOp, PageRequest, PendingOpRow, PendingRecoveryAck, PlaceholderPolicy,
+    RestoreFileRow, SourceRow, StateRepo, TelemetryAggregate,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -2015,20 +2015,34 @@ impl StateRepo for SqliteStateRepo {
         // per-sum CASE ran, undercounting throughput at week boundaries. Gate
         // by `MIN(day, week, throughput)` so every CASE owns its own window.
         //
-        // M7-R3-P2 (recheck-3): the byte aggregates count ONLY `upload_done`
-        // rows. "Uploaded today / this week" + the throughput rate are upload
-        // metrics; any other byte-carrying event type (a future scan/dry-run/
-        // error row that happens to set `bytes`) must NOT inflate them. The
-        // outer `WHERE event_type = 'upload_done'` constrains every CASE sum to
-        // upload rows; the `file_state.status` GROUP BY is unaffected.
+        // M7-R3-P2 (recheck-3): the byte aggregates count ONLY upload rows.
+        // "Uploaded today / this week" + the throughput rate are upload metrics;
+        // any other byte-carrying event type (a future scan/dry-run/error row
+        // that happens to set `bytes`) must NOT inflate them. The outer
+        // `WHERE event_type IN (...)` constrains every CASE sum to upload rows;
+        // the `file_state.status` GROUP BY is unaffected.
+        //
+        // "Upload row" is BOTH `upload_done` (one file per row) and the V2
+        // bundling `bundle_upload` (one row, `file_count` member files, the
+        // packed object's bytes). A bundle really did upload those bytes, so
+        // excluding it - as this query did before - silently under-reported
+        // every aggregate for a source whose small files get bundled.
+        //
+        // The file counts use `COALESCE(file_count, 1)`: `upload_done` leaves
+        // `file_count` NULL and means exactly one file, while a `bundle_upload`
+        // row carries its member count and means all of them.
         let byte_sums = sqlx::query!(
             r#"
             SELECT
                 COALESCE(SUM(CASE WHEN ts >= ?1 THEN bytes ELSE 0 END), 0) AS "today!: i64",
                 COALESCE(SUM(CASE WHEN ts >= ?2 THEN bytes ELSE 0 END), 0) AS "week!: i64",
-                COALESCE(SUM(CASE WHEN ts >= ?3 THEN bytes ELSE 0 END), 0) AS "window!: i64"
+                COALESCE(SUM(CASE WHEN ts >= ?3 THEN bytes ELSE 0 END), 0) AS "window!: i64",
+                COALESCE(
+                    SUM(CASE WHEN ts >= ?3 THEN COALESCE(file_count, 1) ELSE 0 END),
+                    0
+                ) AS "window_files!: i64"
             FROM activity_log
-            WHERE ts >= MIN(?1, ?2, ?3) AND event_type = 'upload_done'
+            WHERE ts >= MIN(?1, ?2, ?3) AND event_type IN ('upload_done', 'bundle_upload')
             "#,
             day_start_ms,
             week_start_ms,
@@ -2063,6 +2077,7 @@ impl StateRepo for SqliteStateRepo {
             bytes_week: byte_sums.week.max(0) as u64,
             file_status_counts,
             throughput_window_bytes: byte_sums.window.max(0) as u64,
+            throughput_window_files: byte_sums.window_files.max(0) as u64,
             throughput_window_ms,
         })
     }
@@ -2072,28 +2087,36 @@ impl StateRepo for SqliteStateRepo {
         window_start_ms: UnixMs,
         bucket_ms: u64,
         bucket_count: u32,
-    ) -> Result<Vec<u64>> {
+    ) -> Result<ActivityThroughputSeries> {
         // The bucketed sibling of `activity_summary`'s scalar throughput window,
-        // backing the dashboard's last-5-minutes sparkline. Deliberately the
-        // SAME `event_type = 'upload_done'` filter, so the sparkline and the
-        // headline rate stay two views of one number rather than two competing
-        // definitions of it.
+        // backing the dashboard's last-5-minutes sparklines. Deliberately the
+        // SAME upload-row filter as that scalar window (`upload_done` plus the
+        // V2 bundling `bundle_upload`), so a sparkline and its headline stay two
+        // views of one number rather than two competing definitions of it.
+        //
+        // Bytes and files are aggregated in ONE query over ONE bucketisation:
+        // the two tiles plot the same buckets by construction, so they cannot
+        // drift apart the way two separate queries eventually would. Files use
+        // `COALESCE(file_count, 1)` because an `upload_done` row leaves
+        // `file_count` NULL and means one file, while a `bundle_upload` row
+        // carries the number of member files it packed.
         //
         // GROUP BY integer division bucketises without a date function, and the
         // caller supplies every boundary (from a single `now`) so the query is
         // deterministic + unit-testable. Only non-empty buckets come back; the
-        // zero-fill below turns them into a dense, index-is-elapsed-time series.
+        // zero-fill below turns them into dense, index-is-elapsed-time series.
         if bucket_count == 0 || bucket_ms == 0 {
-            return Ok(Vec::new());
+            return Ok(ActivityThroughputSeries::default());
         }
         let bucket_ms_i64 = i64::try_from(bucket_ms).unwrap_or(i64::MAX);
         let rows = sqlx::query!(
             r#"
             SELECT
-                ((ts - ?1) / ?2)           AS "bucket!: i64",
-                COALESCE(SUM(bytes), 0)    AS "bytes!: i64"
+                ((ts - ?1) / ?2)                       AS "bucket!: i64",
+                COALESCE(SUM(bytes), 0)                AS "bytes!: i64",
+                COALESCE(SUM(COALESCE(file_count, 1)), 0) AS "files!: i64"
             FROM activity_log
-            WHERE ts >= ?1 AND event_type = 'upload_done'
+            WHERE ts >= ?1 AND event_type IN ('upload_done', 'bundle_upload')
             GROUP BY ((ts - ?1) / ?2)
             ORDER BY ((ts - ?1) / ?2) ASC
             "#,
@@ -2103,8 +2126,9 @@ impl StateRepo for SqliteStateRepo {
         .fetch_all(&self.pool)
         .await?;
 
-        let mut series = vec![0u64; bucket_count as usize];
-        let last = series.len() - 1;
+        let mut bytes = vec![0u64; bucket_count as usize];
+        let mut files = vec![0u64; bucket_count as usize];
+        let last = bytes.len() - 1;
         for r in rows {
             // A row can land in the CURRENT (still-filling) bucket or, if the
             // clock moved between the caller's `now` and this query, just past
@@ -2113,9 +2137,10 @@ impl StateRepo for SqliteStateRepo {
             // impossible under the `ts >= window_start` filter, but clamp
             // defensively rather than risk an index panic.
             let idx = usize::try_from(r.bucket).unwrap_or(0).min(last);
-            series[idx] = series[idx].saturating_add(r.bytes.max(0) as u64);
+            bytes[idx] = bytes[idx].saturating_add(r.bytes.max(0) as u64);
+            files[idx] = files[idx].saturating_add(r.files.max(0) as u64);
         }
-        Ok(series)
+        Ok(ActivityThroughputSeries { bytes, files })
     }
 
     async fn telemetry_events_since(
@@ -5755,6 +5780,8 @@ mod tests {
         assert_eq!(summary.bytes_week, 60);
         // throughput window = rows with ts >= 1500: 30.
         assert_eq!(summary.throughput_window_bytes, 30);
+        // ...carrying one file (each row above is a single-file upload).
+        assert_eq!(summary.throughput_window_files, 1);
         assert_eq!(summary.throughput_window_ms, window_ms);
 
         // status counts: Pending=1, Synced=2 (sorted ascending by status text).
@@ -5773,8 +5800,8 @@ mod tests {
         );
     }
 
-    /// Writes one `upload_done` row (the only event type the byte aggregates
-    /// count) at `ts` carrying `bytes`.
+    /// Writes one `upload_done` row (a single-file upload, one of the two event
+    /// types the byte aggregates count) at `ts` carrying `bytes`.
     async fn write_upload(repo: &SqliteStateRepo, src: SourceId, ts: i64, bytes: u64) {
         repo.write_activity(NewActivity {
             ts,
@@ -5782,6 +5809,50 @@ mod tests {
             level: ActivityLevel::Info,
             event_type: "upload_done".into(),
             file_count: Some(1),
+            bytes: Some(bytes),
+            message: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Writes one `upload_done` row with a NULL `file_count` - the shape the
+    /// orchestrator actually writes for a plain upload (see
+    /// `outcome_activity_row`), which the file aggregates must read as one file.
+    async fn write_upload_without_file_count(
+        repo: &SqliteStateRepo,
+        src: SourceId,
+        ts: i64,
+        bytes: u64,
+    ) {
+        repo.write_activity(NewActivity {
+            ts,
+            source_id: Some(src),
+            level: ActivityLevel::Info,
+            event_type: "upload_done".into(),
+            file_count: None,
+            bytes: Some(bytes),
+            message: None,
+        })
+        .await
+        .unwrap();
+    }
+
+    /// Writes one V2-bundling `bundle_upload` row: ONE row that uploaded `files`
+    /// member files as a single `bytes`-sized object.
+    async fn write_bundle_upload(
+        repo: &SqliteStateRepo,
+        src: SourceId,
+        ts: i64,
+        files: u64,
+        bytes: u64,
+    ) {
+        repo.write_activity(NewActivity {
+            ts,
+            source_id: Some(src),
+            level: ActivityLevel::Info,
+            event_type: "bundle_upload".into(),
+            file_count: Some(files),
             bytes: Some(bytes),
             message: None,
         })
@@ -5813,27 +5884,66 @@ mod tests {
             .activity_throughput_series(window_start, bucket_ms, 5)
             .await
             .unwrap();
-        assert_eq!(series, vec![100, 0, 55, 0, 11]);
+        assert_eq!(series.bytes, vec![100, 0, 55, 0, 11]);
+        // The files series shares those buckets: bucket 0 held two uploads.
+        assert_eq!(series.files, vec![2, 0, 1, 0, 1]);
     }
 
     #[tokio::test]
     async fn throughput_series_is_dense_and_zeroed_when_nothing_uploaded() {
-        // The empty state the tile must render gracefully: a full-length series
+        // The empty state the tiles must render gracefully: full-length series
         // of zeros, never a short vector the UI has to pad itself.
         let (repo, _dir) = temp_repo().await;
         let series = repo
             .activity_throughput_series(0, 10_000, 30)
             .await
             .unwrap();
-        assert_eq!(series.len(), 30);
-        assert!(series.iter().all(|&b| b == 0));
+        assert_eq!(series.bytes.len(), 30);
+        assert_eq!(series.files.len(), 30);
+        assert!(series.bytes.iter().all(|&b| b == 0));
+        assert!(series.files.iter().all(|&f| f == 0));
+    }
+
+    #[tokio::test]
+    async fn throughput_series_counts_a_bundle_row_as_all_its_member_files() {
+        // V2 bundling (issue #35) uploads N small files as ONE object, logged as
+        // ONE `bundle_upload` row carrying `file_count = N`. The files series
+        // must count all N - counting the row as a single file would make a
+        // bundling source look idle - while the bytes series counts the packed
+        // object once.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        // Bucket 0: a plain upload written the way the orchestrator writes it
+        // (NULL file_count = exactly one file). Bucket 1: a bundle of 7 files.
+        write_upload_without_file_count(&repo, src.id, 1_100, 40).await;
+        write_bundle_upload(&repo, src.id, 2_100, 7, 900).await;
+
+        let series = repo
+            .activity_throughput_series(1_000, 1_000, 3)
+            .await
+            .unwrap();
+        assert_eq!(
+            series.files,
+            vec![1, 7, 0],
+            "a NULL file_count is one file; a bundle is all its members"
+        );
+        assert_eq!(
+            series.bytes,
+            vec![40, 900, 0],
+            "the bundle's bytes are the packed object, counted once"
+        );
     }
 
     #[tokio::test]
     async fn throughput_series_counts_only_upload_rows() {
-        // Same filter as the scalar throughput window: a byte-carrying row of
-        // any other event type must not inflate the sparkline, or the chart and
-        // the headline rate would tell different stories.
+        // Same filter as the scalar throughput window: a byte-carrying row of a
+        // NON-upload event type must not inflate either sparkline, or a chart
+        // and its headline would tell different stories. A `scan_done` row
+        // carries both bytes and a file count, so it exercises both series.
         let (repo, _dir) = temp_repo().await;
         let acct = sample_account();
         repo.upsert_account(&acct).await.unwrap();
@@ -5858,9 +5968,14 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(
-            series,
+            series.bytes,
             vec![40, 0],
-            "only the upload_done bytes are counted"
+            "only the upload bytes are counted"
+        );
+        assert_eq!(
+            series.files,
+            vec![1, 0],
+            "the scan row's 9 files are not uploads"
         );
     }
 
@@ -5883,23 +5998,21 @@ mod tests {
             .activity_throughput_series(5_000, 1_000, 2)
             .await
             .unwrap();
-        assert_eq!(series, vec![10, 25]);
+        assert_eq!(series.bytes, vec![10, 25]);
+        // The fold applies to BOTH series, so they stay index-aligned.
+        assert_eq!(series.files, vec![1, 1]);
     }
 
     #[tokio::test]
     async fn throughput_series_with_no_buckets_is_empty() {
-        // Degenerate inputs return an empty series instead of dividing by zero.
+        // Degenerate inputs return empty series instead of dividing by zero.
         let (repo, _dir) = temp_repo().await;
-        assert!(repo
-            .activity_throughput_series(0, 1_000, 0)
-            .await
-            .unwrap()
-            .is_empty());
-        assert!(repo
-            .activity_throughput_series(0, 0, 10)
-            .await
-            .unwrap()
-            .is_empty());
+        let no_buckets = repo.activity_throughput_series(0, 1_000, 0).await.unwrap();
+        assert!(no_buckets.bytes.is_empty());
+        assert!(no_buckets.files.is_empty());
+        let no_width = repo.activity_throughput_series(0, 0, 10).await.unwrap();
+        assert!(no_width.bytes.is_empty());
+        assert!(no_width.files.is_empty());
     }
 
     #[tokio::test]
@@ -5959,12 +6072,18 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn activity_summary_byte_sums_count_only_upload_done_rows() {
+    async fn activity_summary_byte_sums_count_only_upload_rows() {
         // M7-R3-P2 (recheck-3): the "Uploaded today / this week" + throughput
-        // byte aggregates MUST count only `upload_done` rows. A byte-carrying
-        // row of any OTHER event type (here a synthetic scan/dry-run row) must
-        // not inflate them. Before the fix the sums included every row's
-        // `bytes`, so such a row would over-report uploads.
+        // byte aggregates MUST count only UPLOAD rows. A byte-carrying row of
+        // any OTHER event type (here a synthetic scan/dry-run row) must not
+        // inflate them. Before the fix the sums included every row's `bytes`,
+        // so such a row would over-report uploads.
+        //
+        // "Upload row" spans both `upload_done` and the V2-bundling
+        // `bundle_upload`: a bundle genuinely uploaded those bytes and those
+        // member files, so it belongs in the aggregates (it used to be dropped
+        // by an `event_type = 'upload_done'` filter, silently under-reporting
+        // every source whose small files get bundled).
         let (repo, _dir) = temp_repo().await;
         let acct = sample_account();
         repo.upsert_account(&acct).await.unwrap();
@@ -6002,19 +6121,28 @@ mod tests {
         })
         .await
         .unwrap();
+        // A bundle of 3 files inside all three windows: 60 more bytes and 3
+        // more files, all of which the aggregates MUST see.
+        write_bundle_upload(&repo, src.id, 1950, 3, 60).await;
 
         let summary = repo
             .activity_summary(day_start, week_start, window_start, window_ms)
             .await
             .unwrap();
 
-        // Every byte aggregate sees ONLY the upload_done row's 40 bytes; the
-        // 1_000_000-byte scan_done row is excluded.
-        assert_eq!(summary.bytes_today, 40, "today counts only upload_done");
-        assert_eq!(summary.bytes_week, 40, "week counts only upload_done");
+        // Every byte aggregate sees the upload_done row's 40 bytes plus the
+        // bundle's 60; the 1_000_000-byte scan_done row is excluded.
+        assert_eq!(summary.bytes_today, 100, "today counts only upload rows");
+        assert_eq!(summary.bytes_week, 100, "week counts only upload rows");
         assert_eq!(
-            summary.throughput_window_bytes, 40,
-            "throughput counts only upload_done"
+            summary.throughput_window_bytes, 100,
+            "throughput counts only upload rows"
+        );
+        // Files: 1 from the single upload + 3 bundle members. The scan row's
+        // file_count is not an upload and must not appear.
+        assert_eq!(
+            summary.throughput_window_files, 4,
+            "the bundle contributes all of its member files"
         );
     }
 

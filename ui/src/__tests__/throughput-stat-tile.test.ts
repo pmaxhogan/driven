@@ -10,10 +10,14 @@ import ThroughputStatTile from "../components/ThroughputStatTile.vue";
 // state, the unknown-rate state, and the hover readout - is drivable without a
 // backend. The geometry assertions pin the y-scale: a sparkline whose peak
 // silently stops scaling is a chart that lies.
+//
+// The chart itself now lives in the shared SparklineStatTile, so these mount the
+// wrapper and assert THROUGH it - which is the point: they pin the behaviour a
+// user sees, and would catch the shared tile being wired up wrong.
 
 const SVG = '[data-testid="throughput-sparkline"]';
 const TILE = '[data-testid="throughput-tile"]';
-const RATE = '[data-testid="throughput-rate"]';
+const RATE = '[data-testid="throughput-value"]';
 const HOVER = '[data-testid="throughput-hover"]';
 const UNKNOWN = '[data-testid="throughput-unknown"]';
 

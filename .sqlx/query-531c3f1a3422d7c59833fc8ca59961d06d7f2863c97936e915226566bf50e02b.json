@@ -1,0 +1,35 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            SELECT\n                ((ts - ?1) / ?2)                       AS \"bucket!: i64\",\n                COALESCE(SUM(bytes), 0)                AS \"bytes!: i64\",\n                COALESCE(SUM(COALESCE(file_count, 1)), 0) AS \"files!: i64\"\n            FROM activity_log\n            WHERE ts >= ?1 AND event_type IN ('upload_done', 'bundle_upload')\n            GROUP BY ((ts - ?1) / ?2)\n            ORDER BY ((ts - ?1) / ?2) ASC\n            ",
+  "describe": {
+    "columns": [
+      {
+        "name": "bucket!: i64",
+        "ordinal": 0,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "bytes!: i64",
+        "ordinal": 1,
+        "type_info": "Integer",
+        "origin": "Expression"
+      },
+      {
+        "name": "files!: i64",
+        "ordinal": 2,
+        "type_info": "Integer",
+        "origin": "Expression"
+      }
+    ],
+    "parameters": {
+      "Right": 2
+    },
+    "nullable": [
+      true,
+      false,
+      false
+    ]
+  },
+  "hash": "531c3f1a3422d7c59833fc8ca59961d06d7f2863c97936e915226566bf50e02b"
+}

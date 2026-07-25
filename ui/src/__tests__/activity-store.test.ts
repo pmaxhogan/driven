@@ -627,9 +627,10 @@ describe("activity store: backend facets + summary (M7-P2-4, P2-5)", () => {
 });
 
 describe("activity store: throughput sparkline series", () => {
-  it("loads the rolling series with the window + bucket the tile draws", async () => {
-    const series = [0, 1024, 2048, 0];
-    invokeMock.mockResolvedValueOnce(series);
+  it("loads both rolling series with the window + bucket the tiles draw", async () => {
+    const bytes = [0, 1024, 2048, 0];
+    const files = [0, 1, 3, 0];
+    invokeMock.mockResolvedValueOnce({ bytes, files });
     const store = useActivityStore();
     await store.loadThroughputSeries();
 
@@ -637,36 +638,53 @@ describe("activity store: throughput sparkline series", () => {
       windowMs: SPARKLINE_WINDOW_MS,
       bucketMs: SPARKLINE_BUCKET_MS,
     });
-    expect(store.throughputSeries).toEqual(series);
+    expect(store.throughputSeries).toEqual(bytes);
+    expect(store.filesSeries).toEqual(files);
   });
 
-  it("degrades to an empty series (the tile's zero state) when the query fails", async () => {
+  it("degrades to empty series (the tiles' zero state) when the query fails", async () => {
     const store = useActivityStore();
-    invokeMock.mockResolvedValueOnce([1, 2, 3]);
+    invokeMock.mockResolvedValueOnce({ bytes: [1, 2, 3], files: [1, 1, 2] });
     await store.loadThroughputSeries();
     expect(store.throughputSeries).toEqual([1, 2, 3]);
+    expect(store.filesSeries).toEqual([1, 1, 2]);
 
     // A later failure must clear the stale shape rather than leave a chart that
-    // silently stopped updating.
+    // silently stopped updating - and it must clear BOTH, so the two tiles never
+    // disagree about whether there is data.
     invokeMock.mockRejectedValueOnce(new Error("backend gone"));
     await store.loadThroughputSeries();
     expect(store.throughputSeries).toEqual([]);
+    expect(store.filesSeries).toEqual([]);
   });
 
-  it("normalizes a malformed response instead of handing the chart NaN", async () => {
+  it("normalizes a malformed response instead of handing the charts NaN", async () => {
     const store = useActivityStore();
 
-    // An unregistered / version-skewed command resolves undefined: the chart
+    // An unregistered / version-skewed command resolves undefined: the charts
     // must get the empty series, not `undefined` (which crashes the render).
     invokeMock.mockResolvedValueOnce(undefined);
     await store.loadThroughputSeries();
     expect(store.throughputSeries).toEqual([]);
+    expect(store.filesSeries).toEqual([]);
+
+    // A pre-2.3 backend answers with a BARE byte array instead of the
+    // {bytes, files} object. Neither field is there, so both charts fall back to
+    // their zero state rather than plotting array indices as data.
+    invokeMock.mockResolvedValueOnce([1024, 2048]);
+    await store.loadThroughputSeries();
+    expect(store.throughputSeries).toEqual([]);
+    expect(store.filesSeries).toEqual([]);
 
     // A ragged array keeps its LENGTH - the index IS elapsed time, so dropping
     // entries would shift the whole series through time - with bad cells zeroed.
-    invokeMock.mockResolvedValueOnce([1024, null, "big", NaN, -5, 2048]);
+    invokeMock.mockResolvedValueOnce({
+      bytes: [1024, null, "big", NaN, -5, 2048],
+      files: [1, undefined, -2, 4],
+    });
     await store.loadThroughputSeries();
     expect(store.throughputSeries).toEqual([1024, 0, 0, 0, 0, 2048]);
+    expect(store.filesSeries).toEqual([1, 0, 0, 4]);
   });
 
   it("refreshes with the summary on the same debounced upload burst", async () => {
@@ -675,7 +693,9 @@ describe("activity store: throughput sparkline series", () => {
       const store = useActivityStore();
       await store.subscribeLive();
       invokeMock.mockImplementation((cmd: string) =>
-        cmd === "activity_throughput_series" ? Promise.resolve([4, 5]) : Promise.resolve(undefined)
+        cmd === "activity_throughput_series"
+          ? Promise.resolve({ bytes: [4, 5], files: [1, 2] })
+          : Promise.resolve(undefined)
       );
 
       for (let i = 1; i <= 4; i++) {
@@ -687,10 +707,11 @@ describe("activity store: throughput sparkline series", () => {
 
       await vi.advanceTimersByTimeAsync(1000);
       await Promise.resolve();
-      // ONE refresh for the whole burst - the chart rides the same debounce as
-      // the headline number, so they cannot disagree by a debounce interval.
+      // ONE refresh for the whole burst - the charts ride the same debounce as
+      // the headline numbers, so they cannot disagree by a debounce interval.
       expect(seriesCalls()).toBe(1);
       expect(store.throughputSeries).toEqual([4, 5]);
+      expect(store.filesSeries).toEqual([1, 2]);
     } finally {
       vi.useRealTimers();
     }
