@@ -410,6 +410,8 @@
       "bytesWeek": "Uploaded this week",
       "throughput": "Current throughput",
       "perSecond": "{rate}/s",
+      "noThroughput": "No recent uploads",
+      "sparklineLabel": "Upload throughput over the last {minutes} minutes, peaking at {peak} per second",
       "byStatus": "Files by status",
       "noFiles": "No files tracked yet"
     },

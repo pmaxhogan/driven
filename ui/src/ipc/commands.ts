@@ -339,6 +339,15 @@ export function activitySummary(
   });
 }
 
+/** Recent upload throughput as a DENSE series of `bucketMs`-wide byte sums,
+ * oldest first, covering `now - windowMs .. now`. Backs the throughput tile's
+ * sparkline. Shares `activity_summary`'s window semantics (upload rows only), so
+ * the chart and the headline rate stay two views of one number; the backend
+ * derives the bucket count from the window, so length and span cannot disagree. */
+export function activityThroughputSeries(windowMs: number, bucketMs: number): Promise<number[]> {
+  return invoke("activity_throughput_series", { windowMs, bucketMs });
+}
+
 // --- Restore (SPEC s11.5; DESIGN s8.4) ---
 
 /** List the immediate children (sub-folders + files) of `prefix` in the backed-up

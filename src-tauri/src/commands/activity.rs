@@ -262,6 +262,77 @@ pub async fn activity_summary(
     })
 }
 
+/// Bucket bounds for `activity_throughput_series` (SPEC s11.6.1): a bucket must
+/// be at least a second (finer is meaningless against ms timestamps and only
+/// grows the payload) and the series is capped at 240 points - well past the 30
+/// the dashboard sparkline draws, and small enough that a hostile/buggy caller
+/// cannot ask for a million-element vector.
+const MIN_THROUGHPUT_BUCKET_MS: u64 = 1_000;
+/// Upper bound on the number of buckets one series request may return.
+const MAX_THROUGHPUT_BUCKETS: u64 = 240;
+
+/// `activity_throughput_series(window_ms, bucket_ms)` - the recent upload
+/// throughput as a dense series of `bucket_ms`-wide byte sums, oldest first.
+///
+/// Backs the Activity dashboard's last-5-minutes throughput sparkline. Shares
+/// `activity_summary`'s window semantics (`now - window_ms`, `upload_done` rows
+/// only), so the sparkline and the headline rate are two views of one number.
+/// The bucket count is derived here rather than taken from the caller, so the
+/// series length and the window can never disagree.
+#[tauri::command]
+pub async fn activity_throughput_series(
+    state: State<'_, AppState>,
+    window_ms: u64,
+    bucket_ms: u64,
+) -> CommandResult<Vec<u64>> {
+    if !(1..=MAX_THROUGHPUT_WINDOW_MS).contains(&window_ms) {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            format!(
+                "activity_throughput_series window_ms must be 1..={MAX_THROUGHPUT_WINDOW_MS}, got {window_ms}"
+            ),
+        ));
+    }
+    if bucket_ms < MIN_THROUGHPUT_BUCKET_MS || bucket_ms > window_ms {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            format!(
+                "activity_throughput_series bucket_ms must be {MIN_THROUGHPUT_BUCKET_MS}..={window_ms}, got {bucket_ms}"
+            ),
+        ));
+    }
+    // Ceiling division: a window that is not a whole number of buckets still
+    // covers its whole span (the trailing partial bucket is a real, if short,
+    // slice of time), rather than silently dropping the remainder.
+    let bucket_count = window_ms.div_ceil(bucket_ms);
+    if bucket_count > MAX_THROUGHPUT_BUCKETS {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            format!(
+                "activity_throughput_series would return {bucket_count} buckets; max is {MAX_THROUGHPUT_BUCKETS}"
+            ),
+        ));
+    }
+
+    let now = SystemClock.now_ms();
+    // Clamp at 0 so a skewed / tiny `now` cannot produce a negative lower bound.
+    let window_start = now.saturating_sub(window_ms as i64).max(0);
+    let series = state
+        .state()
+        .activity_throughput_series(window_start, bucket_ms, bucket_count as u32)
+        .await
+        .map_err(CommandError::from)?;
+
+    tracing::debug!(
+        target: TARGET,
+        buckets = series.len(),
+        window_ms,
+        bucket_ms,
+        "activity_throughput_series served"
+    );
+    Ok(series)
+}
+
 /// Map a [`FileStateStatus`] to its stable wire string (matching the SPEC s2
 /// `file_state.status` TEXT values + the SQLite serialiser). An explicit match
 /// (not serde) so the wire contract is visible + the i18n key base is stable.
