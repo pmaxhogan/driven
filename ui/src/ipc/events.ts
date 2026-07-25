@@ -9,6 +9,8 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AccountSyncStatus,
   ActivityEntry,
+  ExclusionPreviewBatch,
+  ExclusionPreviewDone,
   ExecProgress,
   GlobalSyncStatus,
   PauseState,
@@ -141,4 +143,22 @@ export function onRestoreProgress(
   handler: (status: RestoreJobStatus) => void
 ): Promise<UnlistenFn> {
   return listen<RestoreJobStatus>("restore:progress", (e) => handler(e.payload));
+}
+
+/** `exclusion_preview:batch` payload: a slice of the streaming exclusion
+ * preview's walk - the nodes discovered since the last batch plus the running
+ * totals. The exclusion editor's tree subscribes to this and DISCARDS any batch
+ * whose `previewId` is not the generation it is currently showing. */
+export function onExclusionPreviewBatch(
+  handler: (batch: ExclusionPreviewBatch) => void
+): Promise<UnlistenFn> {
+  return listen<ExclusionPreviewBatch>("exclusion_preview:batch", (e) => handler(e.payload));
+}
+
+/** `exclusion_preview:done` payload: the exact final totals of a streaming
+ * exclusion preview, plus whether it was cancelled rather than completed. */
+export function onExclusionPreviewDone(
+  handler: (done: ExclusionPreviewDone) => void
+): Promise<UnlistenFn> {
+  return listen<ExclusionPreviewDone>("exclusion_preview:done", (e) => handler(e.payload));
 }

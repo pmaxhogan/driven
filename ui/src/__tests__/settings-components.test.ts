@@ -16,8 +16,17 @@ const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: unknown) => invokeMock(cmd, args),
 }));
+// The exclusion preview's live tree is event-driven, so the `listen` seam has to
+// hand back the handlers a test can fire batches through. Every other event just
+// resolves to an inert unlisten as before.
+let previewBatchHandler: ((payload: unknown) => void) | null = null;
 vi.mock("@tauri-apps/api/event", () => ({
-  listen: vi.fn().mockResolvedValue(() => undefined),
+  listen: vi.fn(async (event: string, cb: (e: { payload: unknown }) => void) => {
+    if (event === "exclusion_preview:batch") {
+      previewBatchHandler = (payload: unknown) => cb({ payload });
+    }
+    return () => undefined;
+  }),
 }));
 const openDialogMock = vi.fn();
 vi.mock("@tauri-apps/plugin-dialog", () => ({
@@ -107,6 +116,7 @@ const globalMountOptions = { plugins: [i18n] };
 
 beforeEach(() => {
   setActivePinia(createPinia());
+  previewBatchHandler = null;
   invokeMock.mockReset();
   invokeMock.mockResolvedValue(undefined);
   openDialogMock.mockReset();
@@ -394,19 +404,51 @@ describe("SourceTable", () => {
     });
   });
 
+  it("re-runs the streaming preview when a rule changes in the open editor", async () => {
+    // The editor's panel lives inside the per-source v-for, so the tree's
+    // template ref is registered in a v-for scope; a blur must still reach the
+    // component's restart(). This is the whole point of the live preview - a
+    // rule edit has to re-classify without closing and reopening the editor.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources") return Promise.resolve([makeSource()]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+    await wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.sources.editExclusionsButton"))!
+      .trigger("click");
+    await flushPromises();
+
+    const editor = wrapper.get('[data-testid="exclusion-editor"]');
+    const startsAfterOpen = invokeMock.mock.calls.filter(
+      (c) => c[0] === "preview_exclusions_start"
+    ).length;
+    const excludeArea = editor.findAll("textarea")[1];
+    await excludeArea.setValue("*.log");
+    await excludeArea.trigger("blur");
+    await flushPromises();
+
+    const startsAfterBlur = invokeMock.mock.calls.filter(
+      (c) => c[0] === "preview_exclusions_start"
+    ).length;
+    expect(startsAfterBlur).toBe(startsAfterOpen + 1);
+    expect(invokeMock).toHaveBeenLastCalledWith(
+      "preview_exclusions_start",
+      expect.objectContaining({
+        req: expect.objectContaining({ sourceId: "src-1", excludePatterns: ["*.log"] }),
+      })
+    );
+  });
+
   it("Edit exclusions opens the inline editor and saves a patch", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources") return Promise.resolve([makeSource()]);
       if (cmd === "list_accounts") return Promise.resolve([]);
-      if (cmd === "preview_exclusions")
-        return Promise.resolve({
-          includedCount: 3,
-          excludedCount: 1,
-          includedBytes: 1024,
-          includedSample: ["a", "b", "c"],
-          excludedSample: ["d"],
-          truncated: false,
-        });
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
       if (cmd === "update_source") return Promise.resolve(makeSource());
       return Promise.resolve(undefined);
     });
@@ -419,10 +461,12 @@ describe("SourceTable", () => {
     await flushPromises();
     const editor = wrapper.get('[data-testid="exclusion-editor"]');
     expect(invokeMock).toHaveBeenCalledWith(
-      "preview_exclusions",
+      "preview_exclusions_start",
       // R1-P1-2: an EXISTING source is previewed by its id (the backend resolves
       // the local path from SQLite), NEVER a raw webview path. The wrapper nests
-      // the request under `req` (matching the Rust signature).
+      // the request under `req` (matching the Rust signature). The editor now
+      // opens the STREAMING preview, which validates identically and then feeds
+      // the live folder tree.
       expect.objectContaining({
         req: expect.objectContaining({ sourceId: "src-1" }),
       })
@@ -454,15 +498,7 @@ describe("SourceTable", () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources") return Promise.resolve([makeSource()]);
       if (cmd === "list_accounts") return Promise.resolve([]);
-      if (cmd === "preview_exclusions")
-        return Promise.resolve({
-          includedCount: 1,
-          excludedCount: 0,
-          includedBytes: 1,
-          includedSample: ["a"],
-          excludedSample: [],
-          truncated: false,
-        });
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
       if (cmd === "update_source")
         return Promise.resolve(makeSource({ placeholderPolicy: "force_download" }));
       return Promise.resolve(undefined);
@@ -498,15 +534,7 @@ describe("SourceTable", () => {
       if (cmd === "list_sources")
         return Promise.resolve([makeSource({ placeholderPolicy: "force_download" })]);
       if (cmd === "list_accounts") return Promise.resolve([]);
-      if (cmd === "preview_exclusions")
-        return Promise.resolve({
-          includedCount: 1,
-          excludedCount: 0,
-          includedBytes: 1,
-          includedSample: ["a"],
-          excludedSample: [],
-          truncated: false,
-        });
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
       return Promise.resolve(undefined);
     });
     const wrapper = mount(SourceTable, { global: globalMountOptions });
@@ -542,15 +570,7 @@ describe("AddSourceWizard", () => {
           currentFolderPath: "",
           folders: [{ id: "f-docs", name: "Docs" }],
         });
-      if (cmd === "preview_exclusions")
-        return Promise.resolve({
-          includedCount: 10,
-          excludedCount: 2,
-          includedBytes: 2048,
-          includedSample: ["x"],
-          excludedSample: ["y"],
-          truncated: false,
-        });
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
       if (cmd === "pick_folder_dialog")
         return Promise.resolve({ path: "/home/u/docs", token: "tok-folder" });
       if (cmd === "add_source")
@@ -618,6 +638,115 @@ describe("AddSourceWizard", () => {
     expect(wrapper.emitted("created")).toBeTruthy();
   });
 
+  it("a tree row's +/- appends the matching glob to the patterns and re-previews", async () => {
+    // The end-to-end wiring of spec point (d): the wizard's exclusions step
+    // renders the live tree, a row's action button emits the anchored glob, the
+    // wizard appends it as a NEW LINE to the right textarea, and the walk
+    // re-runs so the tree reflects the new rule. The globs asserted here are the
+    // exact forms the Rust exclude tests verify against the real matcher.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_accounts")
+        return Promise.resolve([
+          {
+            id: "acc-1",
+            email: "user@example.com",
+            displayName: null,
+            state: "ok",
+            encryptionEnabled: false,
+            createdAt: 0,
+            lastSyncedAt: null,
+          },
+        ]);
+      if (cmd === "pick_drive_folder")
+        return Promise.resolve({ currentFolderId: "root", currentFolderPath: "", folders: [] });
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
+      if (cmd === "pick_folder_dialog")
+        return Promise.resolve({ path: "/home/u/docs", token: "tok-folder" });
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(AddSourceWizard, { global: globalMountOptions });
+    await (wrapper.vm as unknown as { start: () => Promise<void> }).start();
+    await flushPromises();
+    await wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.addSource.chooseLocalButton"))!
+      .trigger("click");
+    await flushPromises();
+    const clickNext = async () => {
+      await wrapper
+        .findAll("button")
+        .find((b) => b.text() === i18n.global.t("common.next"))!
+        .trigger("click");
+      await flushPromises();
+    };
+    await clickNext(); // -> Drive
+    await clickNext(); // -> Exclusions
+
+    // R1-P1-2: a NEW candidate folder is previewed by its dialog TOKEN.
+    expect(invokeMock).toHaveBeenCalledWith(
+      "preview_exclusions_start",
+      expect.objectContaining({
+        req: expect.objectContaining({ localPathToken: "tok-folder" }),
+      })
+    );
+
+    // Stream a tiny tree: an included file, an included folder, and an excluded
+    // file (which the backend surfaces even though it will not be backed up).
+    // A click re-runs the walk, which CLEARS the tree (every verdict is now
+    // stale under the new rule) - so each step re-streams, exactly as the real
+    // backend would.
+    const streamTree = async () => {
+      previewBatchHandler!({
+        previewId: "gen-1",
+        nodes: [
+          { path: "keep.txt", isDir: false, included: true, size: 4 },
+          { path: "build", isDir: true, included: true, size: 0 },
+          { path: "secret.env", isDir: false, included: false, size: 2 },
+        ],
+        includedCount: 1,
+        excludedCount: 1,
+        includedBytes: 4,
+        truncated: false,
+      });
+      await new Promise((r) => setTimeout(r, 25));
+      await flushPromises();
+    };
+    await streamTree();
+
+    const textareas = () => wrapper.findAll("textarea");
+    // "-" on an INCLUDED file -> an anchored exclude glob.
+    await wrapper.get('[data-testid="preview-action-keep.txt"]').trigger("click");
+    await flushPromises();
+    expect((textareas()[1].element as HTMLTextAreaElement).value).toBe("/keep.txt");
+    await streamTree();
+
+    // "-" on an INCLUDED folder -> the trailing-slash (whole subtree) form,
+    // appended on its own line under the first rule.
+    await wrapper.get('[data-testid="preview-action-build"]').trigger("click");
+    await flushPromises();
+    expect((textareas()[1].element as HTMLTextAreaElement).value).toBe(
+      ["/keep.txt", "/build/"].join("\n")
+    );
+    await streamTree();
+
+    // "+" on an EXCLUDED file -> the INCLUDE textarea, not the exclude one.
+    await wrapper.get('[data-testid="preview-action-secret.env"]').trigger("click");
+    await flushPromises();
+    expect((textareas()[0].element as HTMLTextAreaElement).value).toBe("/secret.env");
+
+    // Each click re-ran the walk with the rules as they then stood.
+    expect(invokeMock).toHaveBeenLastCalledWith(
+      "preview_exclusions_start",
+      expect.objectContaining({
+        req: expect.objectContaining({
+          includePatterns: ["/secret.env"],
+          excludePatterns: ["/keep.txt", "/build/"],
+        }),
+      })
+    );
+  });
+
   it("issue #4: checking the cloud-only toggle sends placeholderPolicy force_download; default is skip", async () => {
     let addArgs: unknown = null;
     invokeMock.mockImplementation((cmd: string, args?: unknown) => {
@@ -639,15 +768,7 @@ describe("AddSourceWizard", () => {
           currentFolderPath: "",
           folders: [{ id: "f-docs", name: "Docs" }],
         });
-      if (cmd === "preview_exclusions")
-        return Promise.resolve({
-          includedCount: 1,
-          excludedCount: 0,
-          includedBytes: 1,
-          includedSample: ["x"],
-          excludedSample: [],
-          truncated: false,
-        });
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
       if (cmd === "pick_folder_dialog")
         return Promise.resolve({ path: "/home/u/docs", token: "tok-folder" });
       if (cmd === "add_source") {
@@ -732,15 +853,7 @@ describe("AddSourceWizard", () => {
           currentFolderPath: "", // backend always blank
           folders: [{ id: "f-docs", name: "Docs" }],
         });
-      if (cmd === "preview_exclusions")
-        return Promise.resolve({
-          includedCount: 1,
-          excludedCount: 0,
-          includedBytes: 1,
-          includedSample: ["a"],
-          excludedSample: [],
-          truncated: false,
-        });
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
       if (cmd === "add_source")
         return Promise.resolve({
           source: makeSource({ driveFolderPath: "Docs" }),

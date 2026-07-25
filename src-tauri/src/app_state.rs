@@ -303,6 +303,15 @@ pub struct AppState {
     /// app-quit drain joins it with NO orphan (mirrors the M5 no-orphan
     /// bookkeeping).
     updater: UpdaterRuntime,
+    /// The ONE in-flight streaming exclusion preview
+    /// ([`crate::commands::exclusion_stream`]). The exclusion editor re-previews
+    /// on every rule edit, so without a single-slot registry a user tweaking
+    /// globs over a large folder would stack N concurrent full-tree walks;
+    /// starting a preview cancels the one it supersedes, and the editor cancels
+    /// the last one when it closes. Behind an `Arc` because the blocking walk
+    /// task deregisters itself when it ends, outliving the command that spawned
+    /// it.
+    exclusion_previews: Arc<crate::commands::exclusion_stream::PreviewRegistry>,
     /// M9b (SPEC s16): the anonymous-telemetry runtime - the periodic ping task
     /// handle + shutdown signal, so the app-quit drain joins it with NO orphan
     /// (mirrors the M9a updater bookkeeping). The ping itself is best-effort and
@@ -542,6 +551,7 @@ impl AppState {
             fake_remote_stores,
             restore_jobs: std::sync::Mutex::new(HashMap::new()),
             updater: UpdaterRuntime::default(),
+            exclusion_previews: Arc::default(),
             telemetry: TelemetryRuntime::default(),
             recovery_acks: std::sync::Mutex::new(HashMap::new()),
             vss_helper: std::sync::Mutex::new(None),
@@ -1106,6 +1116,14 @@ impl AppState {
             return None;
         }
         Some(binding.path.clone())
+    }
+
+    /// The streaming-exclusion-preview registry (see the
+    /// [`Self::exclusion_previews`] field docs). Returns an owned `Arc` so the
+    /// spawned blocking walk can deregister itself after the command that
+    /// started it has returned.
+    pub fn exclusion_previews(&self) -> Arc<crate::commands::exclusion_stream::PreviewRegistry> {
+        Arc::clone(&self.exclusion_previews)
     }
 
     /// Lock the dialog-token map, recovering a poisoned lock.

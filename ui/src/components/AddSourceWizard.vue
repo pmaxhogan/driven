@@ -3,21 +3,25 @@ import { computed, ref } from "vue";
 import { useI18n } from "vue-i18n";
 
 import DriveFolderPicker from "./DriveFolderPicker.vue";
+import ExclusionPreviewTree from "./ExclusionPreviewTree.vue";
 import RecoveryPhraseReveal from "./RecoveryPhraseReveal.vue";
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
 import { useAccountsStore } from "../stores/accounts";
+import { appendPatternLine } from "../stores/exclusionPreview";
 import { useSourcesStore } from "../stores/sources";
-import type { ExclusionPreview, SourceDto } from "../ipc/types";
+import type { SourceDto } from "../ipc/types";
 
 // Add-source wizard (SPEC s11.2; DESIGN s8.5 step 3 / s8.2 add-source wizard).
 // Five steps: pick a LOCAL folder (tauri-plugin-dialog, dialog-derived path
 // only - the webview is never trusted to supply an arbitrary local path), pick
 // a DRIVE destination (pick_drive_folder paginated tree under the chosen
-// account), preview EXCLUSIONS (preview_exclusions: first ~50 included vs
-// excluded), opt into ENCRYPTION, then CONFIRM (add_source). The modal is closed
-// by default; the parent SourceTable opens it via the exposed `start()`.
-const { t, locale } = useI18n();
+// account), preview EXCLUSIONS (ExclusionPreviewTree: a live folder tree that
+// streams in as the walk runs, with a per-row "+"/"-" that appends the matching
+// glob to the patterns below), opt into ENCRYPTION, then CONFIRM (add_source).
+// The modal is closed by default; the parent SourceTable opens it via the
+// exposed `start()`.
+const { t } = useI18n();
 const accounts = useAccountsStore();
 const sources = useSourcesStore();
 
@@ -85,8 +89,10 @@ const pendingRecoveryAck = ref(false);
 // Drive destination (id + human path) is owned by the shared DriveFolderPicker
 // via v-model; this component only stages the chosen values for add_source.
 
-const preview = ref<ExclusionPreview | null>(null);
-const previewLoading = ref(false);
+// The live streaming folder-tree preview on the exclusions step. It owns the
+// walk (start / cancel / batched events); this component only tells it when the
+// rules changed.
+const previewTree = ref<InstanceType<typeof ExclusionPreviewTree> | null>(null);
 const submitting = ref(false);
 // The wizard's general error as a stable SPEC s24 CODE (not a raw String(e),
 // which renders a Tauri structured `{ code, message }` error as the literal
@@ -103,28 +109,11 @@ const excludePatterns = computed(() => splitPatterns(excludePatternsText.value))
 const canLeaveLocal = computed(() => accountId.value !== null && localPathToken.value !== null);
 const canLeaveDrive = computed(() => driveFolderId.value !== null);
 
-const numberFormatter = computed(() => new Intl.NumberFormat(locale.value));
-
 function splitPatterns(text: string): string[] {
   return text
     .split(/[\n,]/)
     .map((p) => p.trim())
     .filter((p) => p.length > 0);
-}
-
-function formatBytes(bytes: number): string {
-  const units = ["B", "KB", "MB", "GB", "TB"];
-  let value = bytes;
-  let unit = 0;
-  while (value >= 1024 && unit < units.length - 1) {
-    value /= 1024;
-    unit += 1;
-  }
-  const rounded =
-    unit === 0
-      ? value.toString()
-      : value.toLocaleString(locale.value, { maximumFractionDigits: 1 });
-  return `${rounded} ${units[unit]}`;
 }
 
 async function start(): Promise<void> {
@@ -155,7 +144,6 @@ function reset(): void {
   recoveryPhrase.value = [];
   createdSource.value = null;
   pendingRecoveryAck.value = false;
-  preview.value = null;
   errorCode.value = null;
   revealErrorCode.value = null;
   submitting.value = false;
@@ -183,34 +171,32 @@ function onDrivePickerError(e: unknown): void {
   errorCode.value = toErrorCode(e);
 }
 
-async function loadPreview(): Promise<void> {
-  // R1-P1-2: preview by the backend-minted dialog TOKEN (not a raw path). The
-  // token is peeked non-consumingly, so add_source still gets its single use.
-  if (localPathToken.value === null) return;
-  previewLoading.value = true;
-  errorCode.value = null;
-  try {
-    preview.value = await ipc.previewExclusions({
-      localPathToken: localPathToken.value,
-      respectGitignore: respectGitignore.value,
-      includePatterns: includePatterns.value,
-      excludePatterns: excludePatterns.value,
-    });
-  } catch (e) {
-    errorCode.value = toErrorCode(e);
-  } finally {
-    previewLoading.value = false;
-  }
+/** Re-run the live preview under the current rules. The tree mounts (and starts
+ * its first walk) when the exclusions step becomes active, so this only fires
+ * for a rule CHANGE: a textarea blur, the gitignore toggle, or a "+"/"-" click
+ * in the tree itself. */
+function refreshPreview(): void {
+  void previewTree.value?.restart();
 }
 
-async function next(): Promise<void> {
+/** A "+" in the tree: re-include that path. The glob is appended as a new line
+ * to the include patterns (skipping an exact duplicate) and the tree
+ * re-classifies. */
+function onAppendInclude(pattern: string): void {
+  includePatternsText.value = appendPatternLine(includePatternsText.value, pattern);
+}
+
+/** A "-" in the tree: exclude that path. */
+function onAppendExclude(pattern: string): void {
+  excludePatternsText.value = appendPatternLine(excludePatternsText.value, pattern);
+}
+
+function next(): void {
   if (stepIndex.value >= STEPS.length - 1) return;
   stepIndex.value += 1;
-  // Lazily load each step's data as it becomes active. The Drive step
-  // self-loads its root listing when the shared DriveFolderPicker mounts.
-  if (step.value === "exclusions") {
-    await loadPreview();
-  }
+  // Each step lazily loads its own data as it becomes active: the Drive step
+  // when the shared DriveFolderPicker mounts, the exclusions step when
+  // ExclusionPreviewTree mounts and starts its first streaming walk.
 }
 
 function back(): void {
@@ -400,7 +386,7 @@ defineExpose({ start });
             v-model="respectGitignore"
             type="checkbox"
             class="accent-teal-600"
-            @change="loadPreview"
+            @change="refreshPreview"
           />
           {{ t("settings.addSource.respectGitignoreLabel") }}
         </label>
@@ -413,7 +399,7 @@ defineExpose({ start });
             rows="2"
             class="w-full"
             :class="inputCls"
-            @blur="loadPreview"
+            @blur="refreshPreview"
           />
         </label>
         <label class="block space-y-1 text-sm">
@@ -425,7 +411,7 @@ defineExpose({ start });
             rows="2"
             class="w-full"
             :class="inputCls"
-            @blur="loadPreview"
+            @blur="refreshPreview"
           />
         </label>
 
@@ -444,46 +430,18 @@ defineExpose({ start });
           </span>
         </label>
 
-        <p v-if="previewLoading" class="text-sm text-zinc-500">
-          {{ t("common.loading") }}
-        </p>
-        <div v-else-if="preview" class="space-y-2 text-sm" data-testid="exclusion-preview">
-          <p>
-            {{
-              t("settings.addSource.preview.included", {
-                count: numberFormatter.format(preview.includedCount),
-              })
-            }}
-            -
-            {{
-              t("settings.addSource.preview.includedBytes", {
-                size: formatBytes(preview.includedBytes),
-              })
-            }}
-          </p>
-          <p>
-            {{
-              t("settings.addSource.preview.excluded", {
-                count: numberFormatter.format(preview.excludedCount),
-              })
-            }}
-          </p>
-          <div class="grid grid-cols-2 gap-3">
-            <ul class="max-h-40 overflow-auto text-xs text-zinc-600 dark:text-zinc-400">
-              <li v-for="(path, i) in preview.includedSample" :key="`inc-${i}`" class="break-all">
-                {{ path }}
-              </li>
-            </ul>
-            <ul class="max-h-40 overflow-auto text-xs text-zinc-400 line-through">
-              <li v-for="(path, i) in preview.excludedSample" :key="`exc-${i}`" class="break-all">
-                {{ path }}
-              </li>
-            </ul>
-          </div>
-          <p v-if="preview.truncated" class="text-xs text-zinc-500">
-            {{ t("settings.addSource.preview.truncated") }}
-          </p>
-        </div>
+        <!-- The live streaming tree: rows appear as the walk finds them, every
+             folder starts collapsed, and each row's "+"/"-" appends the matching
+             glob above and re-classifies. -->
+        <ExclusionPreviewTree
+          ref="previewTree"
+          :local-path-token="localPathToken"
+          :respect-gitignore="respectGitignore"
+          :include-patterns="includePatterns"
+          :exclude-patterns="excludePatterns"
+          @append-include="onAppendInclude"
+          @append-exclude="onAppendExclude"
+        />
       </div>
 
       <!-- Step 4: encryption opt-in (phrase is revealed AFTER confirm, B3) -->

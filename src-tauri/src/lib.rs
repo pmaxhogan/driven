@@ -604,6 +604,13 @@ pub fn run() {
             commands::sources::remove_source,
             commands::sources::pick_drive_folder,
             commands::sources::preview_exclusions,
+            // The STREAMING exclusion preview behind the editor's live folder
+            // tree: start returns a generation id and the walk reports through
+            // `exclusion_preview:batch` / `:done`; cancel stops a walk the editor
+            // has navigated away from. The one-shot `preview_exclusions` above
+            // stays for callers that only want the final counts.
+            commands::exclusion_stream::preview_exclusions_start,
+            commands::exclusion_stream::preview_exclusions_cancel,
             // Issue #36: per-source point-in-time versioning config.
             commands::sources::get_source_versioning,
             commands::sources::set_source_versioning,

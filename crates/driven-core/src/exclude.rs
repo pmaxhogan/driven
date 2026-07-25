@@ -379,6 +379,70 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
     })
 }
 
+/// The glob a UI affordance emits to target EXACTLY ONE path in a source, and
+/// nothing else (the exclusion editor's per-row "+" / "-" buttons).
+///
+/// `rel` is the path RELATIVE to the source root, forward-slashed (the form the
+/// exclusion preview streams). The returned glob is ROOT-ANCHORED - it starts
+/// with `/`, which [`GitignoreBuilder::add_line`] reads as "match only at the
+/// root of this scope" - so `/docs/notes.txt` hits that one file and never a
+/// same-named `sub/docs/notes.txt`. A directory gets a trailing `/`
+/// (`/docs/build/`), which sets the `ignore` crate's `is_only_dir` flag: the
+/// directory itself matches, and every path beneath it matches through
+/// [`Gitignore::matched_path_or_any_parents`], which retries each parent as a
+/// directory. That is the SAME call [`SourceMatcher::is_included`] makes, so the
+/// glob flips the whole subtree exactly as the walk would see it.
+///
+/// The string is written for BOTH sides: stored verbatim in `exclude_patterns`
+/// it force-excludes the path, and stored in `include_patterns` (where
+/// [`build_source_matcher`] prepends the `!`) it re-includes it. Because the
+/// source's own override scope is added LAST and the include rules go in after
+/// the exclude rules, a generated pattern always beats the gitignore cascade and
+/// the defaults.
+///
+/// Every glob metacharacter in a path component is backslash-escaped so a
+/// literal `[`, `{` or `*` in a filename cannot widen the match, and a single
+/// trailing space is escaped (`add_line` trims trailing whitespace unless the
+/// line ends with `\ `).
+///
+/// Returns `None` when the path CANNOT be expressed as one glob line: an empty
+/// path, one holding a newline or carriage return (the UI stores patterns one
+/// per line, so it would split into two broken rules), or one ending in
+/// non-space whitespace such as a tab (`add_line` trims it and only a trailing
+/// SPACE can be protected). The caller withholds the affordance rather than
+/// emitting a rule that would silently match the wrong thing.
+pub fn anchored_pattern_for_path(rel: &str, is_dir: bool) -> Option<String> {
+    if rel.is_empty() || rel.contains('\n') || rel.contains('\r') {
+        return None;
+    }
+    // Only a trailing SPACE survives `add_line`'s trim (via the `\ ` escape);
+    // any other trailing whitespace would be silently stripped, leaving a glob
+    // that misses the very path it was generated for.
+    if rel.ends_with(|c: char| c.is_whitespace() && c != ' ') {
+        return None;
+    }
+
+    let mut out = String::with_capacity(rel.len() + 4);
+    out.push('/');
+    for ch in rel.chars() {
+        // The metacharacters `GlobBuilder` (with `backslash_escape(true)`)
+        // treats as syntax; a backslash itself must be escaped so a Windows-ish
+        // name cannot start an escape sequence of its own.
+        if matches!(ch, '\\' | '*' | '?' | '[' | ']' | '{' | '}') {
+            out.push('\\');
+        }
+        out.push(ch);
+    }
+    if is_dir {
+        out.push('/');
+    } else if out.ends_with(' ') {
+        // `add_line` trims trailing whitespace unless the line ends with `\ `.
+        out.pop();
+        out.push_str("\\ ");
+    }
+    Some(out)
+}
+
 /// Max TOTAL number of include + exclude patterns a single source may carry
 /// (R3-P2-1, DESIGN 18.8: "per-source max 256 patterns total"). A backup
 /// source's rule list is small in practice; an unbounded list from a compromised
@@ -1243,6 +1307,222 @@ mod tests {
         assert!(
             matcher.is_included(Path::new("other/c.tmpx"), false),
             "but never a sibling tree"
+        );
+    }
+
+    /// The exact glob strings [`anchored_pattern_for_path`] produces, shared with
+    /// the webview's `patternForPath` (ui/src/stores/exclusionPreview.ts) - the
+    /// exclusion editor's "+" / "-" buttons build the pattern in TypeScript, so
+    /// the two implementations MUST agree character for character or a click
+    /// would append a rule this matcher reads differently. The same table is
+    /// asserted by the vitest `exclusion-preview-store` suite; change both sides
+    /// together.
+    const PATTERN_VECTORS: &[(&str, bool, Option<&str>)] = &[
+        ("notes.txt", false, Some("/notes.txt")),
+        ("docs/notes.txt", false, Some("/docs/notes.txt")),
+        ("docs", true, Some("/docs/")),
+        ("a/b/c", true, Some("/a/b/c/")),
+        // Glob metacharacters in a real filename are escaped, never syntax.
+        ("odd[1].txt", false, Some("/odd\\[1\\].txt")),
+        ("alt{a,b}.txt", false, Some("/alt\\{a,b\\}.txt")),
+        ("star*.txt", false, Some("/star\\*.txt")),
+        ("q?.txt", false, Some("/q\\?.txt")),
+        ("back\\slash.txt", false, Some("/back\\\\slash.txt")),
+        // A leading `!` / `#` is inert because the glob is `/`-anchored.
+        ("!bang.txt", false, Some("/!bang.txt")),
+        ("#hash.txt", false, Some("/#hash.txt")),
+        // Spaces are ordinary; only a TRAILING one needs the `\ ` guard against
+        // `GitignoreBuilder::add_line`'s trailing-whitespace trim.
+        ("My Documents/a.txt", false, Some("/My Documents/a.txt")),
+        ("trailing .txt", false, Some("/trailing .txt")),
+        ("trails ", false, Some("/trails\\ ")),
+        // Inexpressible as a single glob line - the UI withholds the button.
+        ("", false, None),
+        ("two\nlines.txt", false, None),
+        ("carriage\rreturn.txt", false, None),
+        ("tabbed\t", false, None),
+    ];
+
+    #[test]
+    fn anchored_pattern_vectors_are_stable() {
+        for &(rel, is_dir, expected) in PATTERN_VECTORS {
+            assert_eq!(
+                anchored_pattern_for_path(rel, is_dir).as_deref(),
+                expected,
+                "pattern for {rel:?} (is_dir={is_dir})"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_exclude_pattern_flips_only_its_own_path() {
+        // The "-" button on an INCLUDED row: the generated glob goes into
+        // `exclude_patterns` verbatim and must exclude exactly that path - not a
+        // same-named file in a sibling directory, not a sibling in the same
+        // directory, and not a prefix-sharing neighbour.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("docs/notes.txt"), "x");
+        write(&root.join("docs/notes.txt.bak"), "x");
+        write(&root.join("docs/other.txt"), "x");
+        write(&root.join("sub/docs/notes.txt"), "x");
+
+        let pattern = anchored_pattern_for_path("docs/notes.txt", false).expect("expressible");
+        assert_eq!(pattern, "/docs/notes.txt");
+        // The generated glob must survive the same validator the IPC layer runs
+        // before persisting it.
+        validate_patterns(&[], std::slice::from_ref(&pattern)).expect("generated glob validates");
+
+        let before = build_source_matcher(&source_at(root, false, &[], &[])).expect("matcher");
+        assert!(before.is_included(Path::new("docs/notes.txt"), false));
+
+        let after =
+            build_source_matcher(&source_at(root, false, &[], &["/docs/notes.txt"])).expect("m");
+        assert!(
+            !after.is_included(Path::new("docs/notes.txt"), false),
+            "the clicked path flips to excluded"
+        );
+        for sibling in ["docs/notes.txt.bak", "docs/other.txt", "sub/docs/notes.txt"] {
+            assert!(
+                after.is_included(Path::new(sibling), false),
+                "{sibling} must be untouched by the anchored glob"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_dir_exclude_pattern_covers_the_subtree_only() {
+        // The "-" button on an INCLUDED folder row: the trailing-slash glob
+        // excludes the folder AND everything under it (via the matcher's
+        // parent retry), and nothing outside it.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("build/out/app.js"), "x");
+        write(&root.join("build.txt"), "x");
+        write(&root.join("builder/keep.js"), "x");
+
+        let pattern = anchored_pattern_for_path("build", true).expect("expressible");
+        assert_eq!(pattern, "/build/");
+        validate_patterns(&[], std::slice::from_ref(&pattern)).expect("generated glob validates");
+
+        let after = build_source_matcher(&source_at(root, false, &[], &[&pattern])).expect("m");
+        assert!(
+            !after.is_included(Path::new("build"), true),
+            "folder itself"
+        );
+        assert!(
+            !after.is_included(Path::new("build/out/app.js"), false),
+            "a file deep inside the folder"
+        );
+        assert!(
+            !after.is_included(Path::new("build/out"), true),
+            "a nested folder inside it"
+        );
+        assert!(
+            after.is_included(Path::new("build.txt"), false),
+            "a prefix-sharing FILE is untouched"
+        );
+        assert!(
+            after.is_included(Path::new("builder/keep.js"), false),
+            "a prefix-sharing FOLDER is untouched"
+        );
+    }
+
+    #[test]
+    fn generated_include_pattern_reincludes_only_its_own_path() {
+        // The "+" button on an EXCLUDED row: the generated glob goes into
+        // `include_patterns` (where `build_source_matcher` prepends the `!`) and
+        // must re-include exactly that path, even when a broader rule - here a
+        // `.gitignore` AND an exclude glob - put it out.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join(".gitignore"), "*.log\n");
+        write(&root.join("logs/keep.log"), "x");
+        write(&root.join("logs/drop.log"), "x");
+        write(&root.join("other/keep.log"), "x");
+
+        let pattern = anchored_pattern_for_path("logs/keep.log", false).expect("expressible");
+        assert_eq!(pattern, "/logs/keep.log");
+        validate_patterns(std::slice::from_ref(&pattern), &[]).expect("generated glob validates");
+
+        let before = build_source_matcher(&source_at(root, true, &[], &[])).expect("matcher");
+        assert!(!before.is_included(Path::new("logs/keep.log"), false));
+
+        let after =
+            build_source_matcher(&source_at(root, true, &[&pattern], &["*.log"])).expect("m");
+        assert!(
+            after.is_included(Path::new("logs/keep.log"), false),
+            "the clicked path flips to included, beating BOTH gitignore and the exclude glob"
+        );
+        for sibling in ["logs/drop.log", "other/keep.log"] {
+            assert!(
+                !after.is_included(Path::new(sibling), false),
+                "{sibling} must stay excluded"
+            );
+        }
+    }
+
+    #[test]
+    fn generated_dir_include_pattern_reincludes_the_subtree_only() {
+        // The "+" button on an EXCLUDED folder row: `!/vendor/keep/` re-includes
+        // the folder and its contents (the permissive re-include this module
+        // documents), while its excluded siblings stay out.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("vendor/keep/lib.js"), "x");
+        write(&root.join("vendor/drop/lib.js"), "x");
+
+        let pattern = anchored_pattern_for_path("vendor/keep", true).expect("expressible");
+        assert_eq!(pattern, "/vendor/keep/");
+
+        let after =
+            build_source_matcher(&source_at(root, false, &[&pattern], &["/vendor/"])).expect("m");
+        assert!(after.is_included(Path::new("vendor/keep"), true));
+        assert!(
+            after.is_included(Path::new("vendor/keep/lib.js"), false),
+            "a file under the re-included folder comes back too"
+        );
+        assert!(!after.is_included(Path::new("vendor/drop"), true));
+        assert!(!after.is_included(Path::new("vendor/drop/lib.js"), false));
+        assert!(
+            after.has_negations(),
+            "an include pattern must disable directory pruning so the walk can \
+             actually reach the re-included subtree"
+        );
+    }
+
+    #[test]
+    fn generated_pattern_escapes_metacharacters_against_the_real_matcher() {
+        // A filename holding glob syntax must be matched LITERALLY: the escaped
+        // glob hits the odd name and leaves the name the unescaped glob would
+        // have swallowed alone. (`*` / `?` are illegal in Windows filenames, so
+        // the on-disk fixtures use the class / alternation characters that are
+        // legal everywhere.)
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("odd[1].txt"), "x");
+        write(&root.join("odd1.txt"), "x");
+        write(&root.join("alt{a,b}.txt"), "x");
+        write(&root.join("alta.txt"), "x");
+
+        let bracket = anchored_pattern_for_path("odd[1].txt", false).expect("expressible");
+        let brace = anchored_pattern_for_path("alt{a,b}.txt", false).expect("expressible");
+        validate_patterns(&[], &[bracket.clone(), brace.clone()])
+            .expect("generated globs validate");
+
+        let after = build_source_matcher(&source_at(root, false, &[], &[&bracket, &brace]))
+            .expect("matcher");
+        assert!(!after.is_included(Path::new("odd[1].txt"), false));
+        assert!(
+            after.is_included(Path::new("odd1.txt"), false),
+            "an UNescaped `odd[1].txt` would read `[1]` as a character class and \
+             also exclude odd1.txt"
+        );
+        assert!(!after.is_included(Path::new("alt{a,b}.txt"), false));
+        assert!(
+            after.is_included(Path::new("alta.txt"), false),
+            "an UNescaped `alt{{a,b}}.txt` would read `{{a,b}}` as an alternation \
+             and also exclude alta.txt"
         );
     }
 }

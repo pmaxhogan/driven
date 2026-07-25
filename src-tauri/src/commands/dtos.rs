@@ -366,6 +366,78 @@ pub struct ExclusionPreview {
     pub truncated: bool,
 }
 
+/// One entry the STREAMING exclusion preview (`preview_exclusions_start`) sends
+/// to the webview as the walk discovers it.
+///
+/// Deliberately tiny: a huge source streams hundreds of thousands of these, so
+/// every field earns its bytes. `path` is source-root-relative and
+/// forward-slashed on every platform (the webview splits it on `/` to build the
+/// tree, and it is the exact string the "+" / "-" buttons feed to
+/// `anchoredPatternForPath`).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExclusionPreviewNode {
+    /// Source-root-relative path, forward-slashed (e.g. `docs/notes.txt`).
+    pub path: String,
+    /// `true` for a directory, `false` for a regular file.
+    pub is_dir: bool,
+    /// The matcher's verdict for THIS entry - the same
+    /// `SourceMatcher::is_included` call the scanner makes, so the preview and
+    /// the real backup never disagree.
+    pub included: bool,
+    /// File size in bytes; always 0 for a directory.
+    pub size: u64,
+}
+
+/// One streamed batch of the exclusion preview (`exclusion_preview:batch`).
+///
+/// Carries the newly discovered nodes PLUS the running totals, so the webview
+/// renders live counts without summing the tree itself (which would go wrong
+/// once the node stream truncates - the counts keep climbing past the cap).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExclusionPreviewBatch {
+    /// The generation this batch belongs to (the id `preview_exclusions_start`
+    /// returned). The webview DISCARDS any batch whose id is not the preview it
+    /// is currently showing, so a superseded walk's in-flight events can never
+    /// pollute the new tree.
+    pub preview_id: String,
+    /// The nodes discovered since the previous batch. Empty once the node cap is
+    /// reached (the counts below keep updating).
+    pub nodes: Vec<ExclusionPreviewNode>,
+    /// Files classified INCLUDED so far (exact, never truncated).
+    pub included_count: u64,
+    /// Files classified EXCLUDED so far (exact, never truncated).
+    pub excluded_count: u64,
+    /// Total bytes of the included files so far (exact, never truncated).
+    pub included_bytes: u64,
+    /// `true` once the streamed node cap was hit: the TREE stops growing but the
+    /// counts above stay live and exact.
+    pub truncated: bool,
+}
+
+/// The terminal event of a streaming exclusion preview
+/// (`exclusion_preview:done`): the final, exact totals.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ExclusionPreviewDone {
+    /// The generation these totals belong to (see
+    /// [`ExclusionPreviewBatch::preview_id`]).
+    pub preview_id: String,
+    /// Final count of files that would be backed up under these rules.
+    pub included_count: u64,
+    /// Final count of files that would be excluded under these rules.
+    pub excluded_count: u64,
+    /// Final total bytes of the included files.
+    pub included_bytes: u64,
+    /// `true` if the streamed TREE was capped (the counts are still exact).
+    pub truncated: bool,
+    /// `true` when the walk stopped early because it was cancelled (superseded
+    /// by a newer preview, or the editor closed). The totals are then a partial
+    /// snapshot and the webview shows no "scan complete" state.
+    pub cancelled: bool,
+}
+
 // -----------------------------------------------------------------------------
 // Dialog tokens (SPEC s11.6.1 - C1)
 // -----------------------------------------------------------------------------

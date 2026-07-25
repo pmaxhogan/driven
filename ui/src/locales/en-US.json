@@ -196,9 +196,22 @@
       "preview": {
         "included": "{count} files included",
         "excluded": "{count} files excluded",
-        "includedBytes": "{size} to back up",
-        "truncated": "Showing a sample; more files match."
+        "includedBytes": "{size} to back up"
       }
+    },
+    "exclusionPreview": {
+      "treeLabel": "Scanned folder preview",
+      "scanning": "Still scanning...",
+      "complete": "Scan complete",
+      "empty": "Nothing found in this folder.",
+      "truncated": "The tree stops here, but the counts above keep going and stay exact.",
+      "includedLabel": "Included",
+      "excludedLabel": "Excluded",
+      "includeAction": "Include {path}",
+      "excludeAction": "Exclude {path}",
+      "expandAction": "Expand {name}",
+      "collapseAction": "Collapse {name}",
+      "showMore": "Show {count} more"
     },
     "rules": {
       "title": "Global rules",
