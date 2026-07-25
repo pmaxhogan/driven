@@ -381,7 +381,11 @@ impl WalkVisitor {
         // A closed channel means the consumer is already gone - the scan future
         // was dropped mid-walk. Nobody is left to tell, so stop walking rather
         // than burn a disk's worth of I/O on results nothing will read.
-        if self.tx.blocking_send(std::mem::take(&mut self.batch)).is_err() {
+        if self
+            .tx
+            .blocking_send(std::mem::take(&mut self.batch))
+            .is_err()
+        {
             self.consumer_gone = true;
         }
     }
