@@ -647,3 +647,16 @@ export interface RestoreJobStatus {
   cancelled: boolean;
   files: RestoreFileProgress[];
 }
+
+/** Severity of a captured webview log entry (mirrors the `level` string the
+ * src-tauri `FrontendLogEntry` maps onto a `tracing` level). */
+export type FrontendLogLevel = "error" | "warn" | "info" | "debug";
+
+/** One captured webview console entry shipped to `report_frontend_logs`
+ * (mirrors src-tauri `FrontendLogEntry`). `ts` is `Date.now()` at capture time;
+ * `text` is the formatted console arguments, already truncated by the sender. */
+export interface FrontendLogEntryDto {
+  level: FrontendLogLevel;
+  ts: number;
+  text: string;
+}

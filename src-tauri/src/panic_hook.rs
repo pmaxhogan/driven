@@ -1,9 +1,10 @@
 //! Panic hook installing a crash-dump writer (SPEC s17).
 //!
 //! Installs a `std::panic` hook that writes the panic message + a forced
-//! backtrace to `<config_dir>/driven/logs/crash-<timestamp>.txt`, then chains
-//! the previous hook so the default abort/print behaviour is preserved. The
-//! crash files surface in the diagnostic bundle (SPEC s18).
+//! backtrace to `crash-<timestamp>.txt` inside [`crate::logging::log_dir`],
+//! then chains the previous hook so the default abort/print behaviour is
+//! preserved. The crash files land beside the rolling `driven.*.log` files and
+//! surface in the diagnostic bundle (SPEC s18).
 //!
 //! Redaction note (SPEC s17 + s18): the crash file is written verbatim
 //! (panic message + backtrace) so a developer reading the file on the user's
@@ -16,7 +17,7 @@
 //! settings) beyond what the panic already carries, to keep incidental
 //! sensitive data out of the dump.
 
-use std::path::PathBuf;
+use crate::logging::log_dir;
 
 /// Install the crash-dump panic hook (SPEC s17). Called once from `run()`
 /// before the Tauri runtime starts so a panic anywhere - including during
@@ -62,55 +63,6 @@ fn write_crash_dump(info: &std::panic::PanicHookInfo<'_>) {
         ts = now_iso8601(),
     );
     let _ = std::fs::write(&path, body);
-}
-
-/// `<config_dir>/driven/logs`, matching Tauri's `app_config_dir()`
-/// (`config_dir() + identifier`) for identifier `app.driven`, so crash dumps
-/// land next to the tracing logs the diagnostic bundle collects (SPEC s18).
-///
-/// Resolved from platform env conventions rather than the Tauri path resolver
-/// because the hook is installed before the app handle exists (and must keep
-/// working for panics that happen during startup, before `.setup()`).
-/// `None` if the home / config dir cannot be determined.
-fn log_dir() -> Option<PathBuf> {
-    config_dir().map(|c| c.join("app.driven").join("logs"))
-}
-
-/// Platform config dir, equivalent to `dirs::config_dir()` (which Tauri's
-/// `app_config_dir()` builds on), hand-resolved so the panic hook carries no
-/// extra dependency and no app-handle requirement.
-///
-/// - Windows: `%APPDATA%` (Roaming AppData).
-/// - macOS:   `$HOME/Library/Application Support`.
-/// - other:   `$XDG_CONFIG_HOME`, else `$HOME/.config`.
-fn config_dir() -> Option<PathBuf> {
-    #[cfg(target_os = "windows")]
-    {
-        non_empty_env("APPDATA").map(PathBuf::from)
-    }
-    #[cfg(target_os = "macos")]
-    {
-        non_empty_env("HOME").map(|h| PathBuf::from(h).join("Library").join("Application Support"))
-    }
-    #[cfg(not(any(target_os = "windows", target_os = "macos")))]
-    {
-        if let Some(xdg) = non_empty_env("XDG_CONFIG_HOME") {
-            // XDG spec: relative paths are invalid and must be ignored.
-            let p = PathBuf::from(xdg);
-            if p.is_absolute() {
-                return Some(p);
-            }
-        }
-        non_empty_env("HOME").map(|h| PathBuf::from(h).join(".config"))
-    }
-}
-
-/// Read an env var, treating an absent OR empty value as "unset".
-fn non_empty_env(key: &str) -> Option<String> {
-    match std::env::var(key) {
-        Ok(v) if !v.is_empty() => Some(v),
-        _ => None,
-    }
 }
 
 /// Seconds since the Unix epoch, formatted as a filename-safe sortable

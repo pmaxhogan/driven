@@ -1159,8 +1159,8 @@ pub async fn reconcile_autostart_on_boot(app: &AppHandle, state: &dyn StateRepo)
 
 /// Apply a `tracing` max-level change at runtime (SPEC s22 `global.log_level`).
 ///
-/// The process installs a plain `tracing_subscriber::fmt` subscriber at boot
-/// (lib.rs) with no runtime-reloadable filter handle, so this cannot mutate the
+/// The process installs its layered subscriber once at boot (`logging::init`)
+/// with no runtime-reloadable filter handle, so this cannot mutate the
 /// LIVE subscriber's level in-process; what it CAN do honestly is export the
 /// chosen level to `RUST_LOG` so it is the effective level on the next launch and
 /// for any subsystem that reads the env. The persisted `global.log_level` is the
@@ -1418,9 +1418,19 @@ async fn build_diagnostic_zip(app: &AppHandle, state: &dyn StateRepo) -> Command
     let activity_csv = build_activity_csv(state, &redactor).await;
     zip.add_file("activity_last_30d.csv", activity_csv.as_bytes());
 
-    // logs/ + crashes/ (SPEC s18): the recent tracing output + crash dumps from
-    // <config_dir>/driven/logs/, each passed through the redaction pipeline.
-    add_logs_and_crashes(app, &mut zip, &redactor);
+    // logs/ + crashes/ (SPEC s18): the rolling tracing output + crash dumps from
+    // `logging::log_dir()`, each passed through the redaction pipeline.
+    //
+    // The file layer behind those logs is a `tracing-appender` NON-BLOCKING
+    // writer: a `tracing::` call hands the formatted line to a worker thread
+    // rather than writing it inline. Lines emitted moments ago - notably the
+    // frontend console entries the UI flushes via `report_frontend_logs` right
+    // before invoking this command - may still be in that worker's queue. Yield
+    // briefly so the worker drains them onto disk; without it the freshest and
+    // most relevant lines are exactly the ones missing from the bundle. Bounded
+    // and tiny next to writing the ZIP itself.
+    tokio::time::sleep(std::time::Duration::from_millis(150)).await;
+    add_logs_and_crashes(&mut zip, &redactor);
 
     // redaction-policy.txt (SPEC s18): tell the recipient the bundle's threat
     // model + exactly what was redacted.
@@ -1549,21 +1559,25 @@ fn csv_field(s: &str) -> String {
     }
 }
 
-/// SPEC s18: add `logs/` (recent tracing output) + `crashes/` (crash dumps) from
-/// `<config_dir>/driven/logs/`, each passed through the redaction pipeline.
+/// SPEC s18: add `logs/` (the rolling `driven.*.log` tracing output) +
+/// `crashes/` (crash dumps) from [`crate::logging::log_dir`], each passed
+/// through the redaction pipeline.
+///
+/// The directory comes from the shared `logging::log_dir()` rather than being
+/// re-derived here. This function used to resolve
+/// `app_config_dir()/driven/logs` while the panic hook wrote to
+/// `app_config_dir()/logs` - so the bundle read a directory that never existed
+/// and silently shipped with no `logs/` and no `crashes/`, even when crash
+/// dumps were sitting on disk.
 ///
 /// Best-effort: a missing log dir / unreadable file is logged + skipped (a
 /// partial bundle is still useful). `crash-*.txt` files go under `crashes/`;
-/// every other file goes under `logs/`. The cumulative log bytes are bounded by
-/// [`MAX_LOG_BYTES`], newest-first.
-fn add_logs_and_crashes(app: &AppHandle, zip: &mut ZipWriter, redactor: &Redactor) {
-    use tauri::Manager;
-    let log_dir = match app.path().app_config_dir() {
-        Ok(dir) => dir.join("driven").join("logs"),
-        Err(e) => {
-            tracing::debug!(target: TARGET, error = %e, "diagnostic bundle: cannot resolve log dir; omitting logs/");
-            return;
-        }
+/// every other file (i.e. the rolling logs) goes under `logs/`. The cumulative
+/// log bytes are bounded by [`MAX_LOG_BYTES`], newest-first.
+fn add_logs_and_crashes(zip: &mut ZipWriter, redactor: &Redactor) {
+    let Some(log_dir) = crate::logging::log_dir() else {
+        tracing::debug!(target: TARGET, "diagnostic bundle: cannot resolve log dir; omitting logs/");
+        return;
     };
     let entries = match std::fs::read_dir(&log_dir) {
         Ok(e) => e,
@@ -2192,7 +2206,10 @@ What this bundle contains:
 - schema.txt   : state-DB schema version (PRAGMA user_version) + table counts.
 - activity_last_30d.csv : the last 30 days of the activity log, with the
   free-text message + source id passed through the redaction pipeline below.
-- logs/        : recent tracing output, passed through the redaction pipeline.
+- logs/        : recent tracing output (driven.<date>.log), passed through the
+  redaction pipeline. These files interleave backend lines with the app
+  window's own console output, which is captured under the target
+  driven::frontend and redacted identically.
 - crashes/     : crash dumps (crash-*.txt), passed through the redaction pipeline.
 - redaction-policy.txt : this file.
 
