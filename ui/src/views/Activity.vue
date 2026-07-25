@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
+import { flushFrontendLogs } from "../frontendLog";
 import FilesUploadedStatTile from "../components/FilesUploadedStatTile.vue";
 import ThroughputStatTile from "../components/ThroughputStatTile.vue";
 import { activityEventLabel } from "../stores/activityEventLabel";
@@ -230,6 +231,10 @@ async function exportBundle(): Promise<void> {
   }
   exporting.value = true;
   try {
+    // Push the buffered webview console entries to the backend BEFORE it
+    // collects logs/, so the UI-side lines leading up to this export are in the
+    // bundle rather than still sitting in the ring. Never throws.
+    await flushFrontendLogs();
     exportedPath.value = await ipc.exportDiagnosticBundle(token);
   } catch (e) {
     // M7-P2-6: normalize to the stable SPEC s24 code and localize via t().

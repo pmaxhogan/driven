@@ -4,6 +4,7 @@ import { useI18n } from "vue-i18n";
 import { getVersion } from "@tauri-apps/api/app";
 
 import * as ipc from "../ipc/commands";
+import { flushFrontendLogs } from "../frontendLog";
 import { useSettingsStore } from "../stores/settings";
 import { useUpdaterStore } from "../stores/updater";
 import ChangelogModal from "../components/ChangelogModal.vue";
@@ -129,6 +130,10 @@ async function exportDiagnostics(): Promise<void> {
   }
   exporting.value = true;
   try {
+    // Push the buffered webview console entries to the backend BEFORE it
+    // collects logs/, so the UI-side lines leading up to this export are in the
+    // bundle rather than still sitting in the ring. Never throws.
+    await flushFrontendLogs();
     exportedPath.value = await ipc.exportDiagnosticBundle(token);
   } catch (e) {
     exportError.value = String(e);

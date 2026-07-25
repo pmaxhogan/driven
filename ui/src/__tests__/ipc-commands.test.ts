@@ -63,4 +63,10 @@ describe("typed IPC command wrappers", () => {
       clientSecret: "csecret",
     });
   });
+
+  it("reportFrontendLogs forwards the batch under `entries`", async () => {
+    const entries = [{ level: "warn" as const, ts: 1_750_000_000_000, text: "fetch failed" }];
+    await ipc.reportFrontendLogs(entries);
+    expect(invokeMock).toHaveBeenCalledWith("report_frontend_logs", { entries });
+  });
 });

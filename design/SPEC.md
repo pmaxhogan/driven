@@ -1412,8 +1412,12 @@ containing:
   Drive file_ids replaced by stable per-bundle hashes** (`fileid_<hash>`,
   `path_<hash>`). The mapping is NOT included in the bundle.
 - `logs/` — last 50 MB of tracing output from
-  `<config_dir>/driven/logs/`, **after being passed through a redaction
-  pipeline**:
+  `<config_dir>/app.driven/logs/` (the daily-rolling `driven.<date>.log`
+  files; `app.driven` is the bundle identifier, so this is Tauri's
+  `app_config_dir()` + `logs`). These files also carry the app window's
+  own console output, captured by `report_frontend_logs` under the
+  `driven::frontend` target and interleaved with the backend lines.
+  Everything is **passed through a redaction pipeline**:
   - OAuth tokens (anything matching the access / refresh token regex)
     replaced with `<token-redacted>`.
   - Local paths replaced with `<path:<hash>>`.

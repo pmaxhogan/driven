@@ -34,6 +34,10 @@ mod crypto_provider_impl;
 mod events;
 mod hook_runner;
 mod i18n;
+// The layered tracing subscriber (stdout + rolling file) and the ONE resolution
+// of `<config_dir>/app.driven/logs`, shared with the panic hook (SPEC s17) and
+// the diagnostic-bundle collector (SPEC s18).
+mod logging;
 mod migrations;
 mod panic_hook;
 // M9b (SPEC s16): anonymous usage telemetry - the install_id + enabled pref, the
@@ -344,7 +348,11 @@ async fn drain_restore_handle(mut handle: tokio::task::JoinHandle<()>) {
 
 #[cfg_attr(mobile, tauri::mobile_entry_point)]
 pub fn run() {
-    tracing_subscriber::fmt::init();
+    // Stdout AND a daily-rolling file in `<config_dir>/app.driven/logs`. The
+    // previous `tracing_subscriber::fmt::init()` was stdout-only, so an
+    // installed build (no attached console) discarded every log line and the
+    // SPEC s18 diagnostic bundle shipped with an empty `logs/`.
+    logging::init();
     // i18n must initialise before any tray/notification string is built;
     // keep this ahead of the builder (and ahead of the panic hook, which only
     // emits ASCII).
@@ -629,6 +637,10 @@ pub fn run() {
             commands::settings::export_diagnostic_bundle,
             commands::settings::check_for_updates,
             commands::settings::list_releases,
+            // Webview console capture: batches of frontend `console.*` /
+            // uncaught-error entries, re-emitted into the rolling log file so
+            // the diagnostic bundle carries the UI side of a failure too.
+            commands::frontend_log::report_frontend_logs,
             // Issue #34: validate a candidate corporate root-CA PEM before save.
             commands::settings::validate_custom_ca,
             commands::settings::validate_proxy,

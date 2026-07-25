@@ -21,6 +21,7 @@ import type {
   ExclusionPreviewRequest,
   FileSearchHitDto,
   FileVersionDto,
+  FrontendLogEntryDto,
   GlobalSyncStatus,
   PauseState,
   OAuthAuthUrl,
@@ -231,6 +232,15 @@ export function getVssHelperStatus(): Promise<VssHelperStatus> {
 
 export function exportDiagnosticBundle(token: string): Promise<string> {
   return invoke("export_diagnostic_bundle", { token });
+}
+
+/** Ship a batch of captured webview console entries to the backend, which
+ * re-emits them through `tracing` so they land in the rolling log file and the
+ * diagnostic bundle alongside the backend's own lines. Called only by
+ * `src/frontendLog.ts`; the backend caps a batch at 200 entries and each
+ * `text` at 2000 characters. */
+export function reportFrontendLogs(entries: FrontendLogEntryDto[]): Promise<void> {
+  return invoke("report_frontend_logs", { entries });
 }
 
 export function checkForUpdates(): Promise<UpdateInfo | null> {
