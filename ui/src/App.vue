@@ -4,6 +4,8 @@ import { useRoute } from "vue-router";
 import { useI18n } from "vue-i18n";
 
 import GlobalProgressBar from "./components/GlobalProgressBar.vue";
+import PausedBanner from "./components/PausedBanner.vue";
+import { usePauseStore } from "./stores/pause";
 import { useProgressStore } from "./stores/progress";
 import { useUpdaterStore } from "./stores/updater";
 
@@ -37,6 +39,12 @@ const updater = useUpdaterStore();
 // before the active view mounted.
 const progress = useProgressStore();
 
+// Manual-pause banner: own the `sync:pause_changed` subscription at the app root
+// too, so the yellow "Backups paused" bar shows on ANY route - including for a
+// pause set from the tray while the window was closed, or restored from a
+// previous run at boot.
+const pause = usePauseStore();
+
 // R4-P2-1: subscribe() can reject on a partial listener-registration failure (it
 // now cleans up + resets state so a later retry can re-subscribe). A failed
 // subscribe must NOT skip pending-update hydration: the backend's startup check
@@ -62,6 +70,17 @@ onMounted(async () => {
     console.error("progress subscribe failed at app boot", e);
   } finally {
     await progress.hydrate();
+  }
+  // Same pattern for the paused banner: subscribe first so no live pause event
+  // is missed, then hydrate the current pause so one already in force at boot
+  // shows immediately. A subscribe failure must not skip hydration
+  // (get_pause_state is an independent path), so hydrate in `finally`.
+  try {
+    await pause.subscribe();
+  } catch (e) {
+    console.error("pause subscribe failed at app boot", e);
+  } finally {
+    await pause.hydrate();
   }
 });
 
@@ -96,6 +115,7 @@ const NAV_LINK_ACTIVE = "text-teal-700 dark:text-teal-300 font-semibold";
 <template>
   <div class="min-h-screen flex flex-col">
     <GlobalProgressBar />
+    <PausedBanner />
     <nav
       class="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-zinc-200 bg-white px-6 py-3 text-sm dark:border-zinc-800 dark:bg-zinc-900"
       :aria-label="t('nav.primary')"

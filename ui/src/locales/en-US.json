@@ -28,6 +28,11 @@
     "verifying": "Verifying backup...",
     "verifyingCount": "Verifying backup - {count} files"
   },
+  "pauseBanner": {
+    "indefinite": "Backups paused indefinitely",
+    "timed": "Backups paused - {minutes}m left",
+    "resume": "Resume"
+  },
   "common": {
     "next": "Next",
     "back": "Back",

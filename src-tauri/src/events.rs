@@ -80,6 +80,22 @@ pub const EVENT_UPDATER_DOWNLOADED: &str = "updater:downloaded";
 /// same snapshot is recorded on `AppState` so `get_restore_job` can serve a late
 /// subscriber.
 pub const EVENT_RESTORE_PROGRESS: &str = "restore:progress";
+/// `sync:pause_changed` - the manual pause was set, cleared, or auto-expired
+/// (payload: `PauseState | null`, SPEC s11.7).
+///
+/// Emitted by the pause/resume commands, by a timed pause's auto-resume timer,
+/// and once at boot when a persisted pause is re-applied - so the paused banner
+/// appears and disappears without the user refreshing.
+pub const EVENT_PAUSE_CHANGED: &str = "sync:pause_changed";
+
+/// Broadcast `sync:pause_changed` with the active pause, or `null` when sync is
+/// no longer manually paused (SPEC s11.7).
+pub fn emit_pause_changed(
+    app: &AppHandle,
+    pause: Option<crate::commands::sync::PauseState>,
+) -> tauri::Result<()> {
+    app.emit(EVENT_PAUSE_CHANGED, pause)
+}
 
 /// Broadcast `sync:status_changed` with the global status payload (SPEC s11.7).
 ///

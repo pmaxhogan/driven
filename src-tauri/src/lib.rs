@@ -486,6 +486,13 @@ pub fn run() {
                     )
                     .await;
                 }
+                // DESIGN s5.7: re-apply a manual pause the user set in a
+                // previous run. Without this a restart silently resumed
+                // backups the user had explicitly paused. Runs after `manage`
+                // (it reads the pause record through AppState) and after the
+                // tray exists so the re-applied pause is reflected there.
+                // Best-effort: never aborts boot.
+                commands::sync::restore_persisted_pause(&handle).await;
                 // M9a (SPEC s15.2): start the periodic update-check task (an
                 // immediate check on startup, then every 6h). Spawned here -
                 // INSIDE the Tauri async runtime's `block_on` so `tokio::spawn`
@@ -578,6 +585,7 @@ pub fn run() {
             commands::sync::sync_now,
             commands::sync::pause_sync,
             commands::sync::resume_sync,
+            commands::sync::get_pause_state,
             commands::sync::get_sync_status,
             // SPEC s11.1 accounts (M6).
             commands::accounts::list_accounts,

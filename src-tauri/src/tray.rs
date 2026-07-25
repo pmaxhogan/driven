@@ -78,6 +78,7 @@ const CONFIG_TRAY_ID: &str = "main";
 mod menu_id {
     pub const SYNC_NOW: &str = "sync_now";
     pub const PAUSE_30M: &str = "pause_30m";
+    pub const PAUSE_INDEFINITE: &str = "pause_indefinite";
     pub const RESUME: &str = "resume";
     pub const SETTINGS: &str = "settings";
     pub const ACTIVITY: &str = "activity";
@@ -810,6 +811,7 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
     MenuBuilder::new(app)
         .item(&item(menu_id::SYNC_NOW, "tray.sync_now")?)
         .item(&item(menu_id::PAUSE_30M, "tray.pause_30m")?)
+        .item(&item(menu_id::PAUSE_INDEFINITE, "tray.pause_indefinite")?)
         .item(&item(menu_id::RESUME, "tray.resume")?)
         .separator()
         .item(&item(menu_id::SETTINGS, "tray.settings")?)
@@ -837,11 +839,20 @@ fn on_menu_event(app: &AppHandle, id: &str) {
             };
             crate::commands::sync::pause_sync(app.clone(), state, Some(30 * 60)).await
         }),
+        // `None` = pause until the user resumes (no auto-resume timer). The
+        // paused banner's Resume button and the tray's "Resume sync" both clear
+        // it; nothing else does.
+        menu_id::PAUSE_INDEFINITE => spawn_command(app, |app| async move {
+            let Some(state) = app.try_state::<crate::app_state::AppState>() else {
+                return missing_state_err();
+            };
+            crate::commands::sync::pause_sync(app.clone(), state, None).await
+        }),
         menu_id::RESUME => spawn_command(app, |app| async move {
             let Some(state) = app.try_state::<crate::app_state::AppState>() else {
                 return missing_state_err();
             };
-            crate::commands::sync::resume_sync(state).await
+            crate::commands::sync::resume_sync(app.clone(), state).await
         }),
         menu_id::SETTINGS | menu_id::ACTIVITY | menu_id::RESTORE => {
             // Route selection (Settings/Activity/Restore) is an M6 frontend
@@ -1692,6 +1703,7 @@ mod tests {
         let cases = [
             ("tray.sync_now", "Sync now"),
             ("tray.pause_30m", "Pause for 30 minutes"),
+            ("tray.pause_indefinite", "Pause until I resume"),
             ("tray.resume", "Resume sync"),
             ("tray.settings", "Settings"),
             ("tray.activity", "Activity"),
@@ -1732,6 +1744,7 @@ mod tests {
             "app.name",
             "tray.sync_now",
             "tray.pause_30m",
+            "tray.pause_indefinite",
             "tray.resume",
             "tray.settings",
             "tray.activity",
