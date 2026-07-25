@@ -427,6 +427,7 @@
       "scan_done": "Scan complete",
       "backup_done": "Backup complete",
       "deep_verify_done": "Deep verify complete",
+      "remote_audit_done": "Missing backups re-queued",
       "update_applied": "App updated",
       "paused": "Paused",
       "error": "Error",

@@ -38,6 +38,10 @@ describe("activityEventLabel (R1-P2-3)", () => {
     // The run-completion row the orchestrator writes when a cycle's ops all
     // succeeded (the feed used to trail off after the last per-file row).
     expect(label("backup_done")).toBe("Backup complete");
+    // The remote-existence audit's summary row. Its `file_count` carries how
+    // many files were re-queued, so the label must read as an OUTCOME rather
+    // than as "an audit ran" - the row is written only when damage was found.
+    expect(label("remote_audit_done")).toBe("Missing backups re-queued");
   });
 
   it("falls back to errors.<code>.short for error/skip code event types", () => {

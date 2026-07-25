@@ -19,7 +19,7 @@
 //! contract-test suite verifies both honour the duplicate-name-allowed,
 //! 256-KiB-non-final-chunk, and `find_by_op_uuid` semantics.
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 
 use async_trait::async_trait;
 use bytes::Bytes;
@@ -395,6 +395,40 @@ pub trait RemoteStore: Send + Sync {
         op_uuid: &str,
         drive_context: &DriveContext,
     ) -> anyhow::Result<Option<RemoteEntry>>;
+
+    /// Enumerates the ids of every LIVE object Driven owns for one source -
+    /// the remote-existence audit's primitive.
+    ///
+    /// Every object the store creates for a source is stamped with
+    /// `appProperties["driven.source_id"] = <source_id>` (per-file objects and
+    /// `.tar.gz` bundles alike; folders carry only `driven.folder_marker` and
+    /// are deliberately NOT included). So one paged query for that key returns
+    /// the complete set of ids the source still has on Drive, in
+    /// `ceil(N / pageSize)` requests rather than one `metadata()` GET per
+    /// recorded file. `drive_context` scopes the search exactly as
+    /// [`Self::list_folder`] does.
+    ///
+    /// Trashed objects are EXCLUDED: an object in the trash can no longer be
+    /// updated and its bytes are on a deletion clock, so for the audit's
+    /// purposes it is already gone and the file should be re-uploaded.
+    ///
+    /// # Completeness contract
+    ///
+    /// The caller computes `dead = recorded - live` and heals every id in
+    /// `dead`, so a SILENTLY TRUNCATED result would read as a mass deletion
+    /// and churn the entire source. Implementations MUST therefore return
+    /// either the COMPLETE live-id set or `Err` - never a partial set. A
+    /// failure on any page (rate limit, 5xx, expired token) must propagate,
+    /// and the caller aborts the audit having written nothing.
+    ///
+    /// There is deliberately no default body. A wrapper store that forgot to
+    /// delegate would answer "no live objects", which is not a safe
+    /// degradation - it is the truncation failure above, arriving silently.
+    async fn list_source_object_ids(
+        &self,
+        source_id: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<HashSet<String>>;
 
     /// Returns quota / about info for the authenticated account. Cheap
     /// enough to call for the "x of y used" UI display.

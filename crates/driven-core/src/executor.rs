@@ -25,7 +25,7 @@
 //! executor is exercisable against `InMemoryRemoteStore` + a real
 //! `SqliteStateRepo` with no live Drive (DESIGN s14).
 
-use std::collections::HashMap;
+use std::collections::{HashMap, HashSet};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
@@ -117,7 +117,14 @@ const CLIENT_OP_UUID_KEY: &str = "driven.client_op_uuid";
 
 /// `appProperties` key carrying the source id of the object Driven owns
 /// (SPEC s3 preamble canonical identity).
-const SOURCE_ID_KEY: &str = "driven.source_id";
+///
+/// RE-EXPORTED from `driven-drive`, not re-declared: the store's
+/// [`RemoteStore::list_source_object_ids`] queries Drive for this exact key to
+/// enumerate a source's live objects, so the key the executor STAMPS and the
+/// key the audit SEARCHES must be one definition. Two copies that drifted
+/// would make the audit match nothing, judge every recorded id dead, and
+/// re-upload the whole source.
+use driven_drive::google::SOURCE_ID_KEY;
 
 /// `appProperties` key carrying the relative-path hash (SPEC s3 preamble).
 const RELATIVE_PATH_HASH_KEY: &str = "driven.relative_path_hash";
@@ -563,6 +570,37 @@ pub trait Executor: Send + Sync {
     /// normal cycle.
     async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()>;
 
+    /// Runs the REMOTE-EXISTENCE AUDIT for `source`: proactively detect
+    /// `file_state` rows and `bundles` rows whose Drive object no longer
+    /// exists, and re-queue them for re-upload.
+    ///
+    /// # Why this exists
+    ///
+    /// The self-heal in [`SkipReason::RemoteFileMissing`] only fires when an
+    /// UPDATE is actually attempted - i.e. when the local file CHANGES. A user
+    /// who deletes Driven's backup folders on Drive and empties the trash
+    /// leaves every recorded `drive_file_id` dangling; the files that later
+    /// change heal themselves, but the files that NEVER change would stay
+    /// silently un-backed-up forever, with no error shown and restore
+    /// impossible. This pass is what closes that gap: it compares the ids
+    /// Driven has recorded against the ids Drive still has, with no dependence
+    /// on local activity.
+    ///
+    /// (This is not hypothetical - the incident that motivated it left 4,526
+    /// rows pointing at hard-deleted objects.)
+    ///
+    /// # Contract
+    ///
+    /// - Cheap: a handful of paged list requests, not one GET per file.
+    /// - ALL-OR-NOTHING: if the remote enumeration cannot be completed, the
+    ///   pass writes NOTHING and returns an empty report. A partial listing
+    ///   would read as a mass deletion and re-upload the entire source.
+    /// - Idempotent: a second run over already-healed state finds nothing.
+    /// - Never fatal: a Drive-side failure returns `Err` for the caller to log,
+    ///   and the audit is retried on a later cycle. It must not abort a backup.
+    async fn audit_remote_existence(&self, source: &SourceRow)
+        -> anyhow::Result<RemoteAuditReport>;
+
     /// Sets the manual-pause dispatch gate (DESIGN s5.7).
     ///
     /// `true` means "stop starting new ops": an `execute` that is CURRENTLY
@@ -580,6 +618,59 @@ pub trait Executor: Send + Sync {
     /// Not a cancel and not persisted: an in-flight op is never torn mid-file,
     /// and durable pause state lives in the orchestrator/state DB.
     fn set_paused(&self, paused: bool);
+}
+
+/// How many per-file `drive.remote_file_missing` WARN rows one audit may write
+/// before it stops enumerating them individually.
+///
+/// The motivating incident would have produced 4,526 rows in a single pass -
+/// enough to bury every other row in the Activity feed and to make the log
+/// itself the problem. Past the cap the audit stops writing per-file rows; the
+/// summary row still carries the FULL healed count, so nothing is hidden, only
+/// the per-file enumeration is bounded.
+pub const REMOTE_AUDIT_WARN_ROW_CAP: usize = 20;
+
+/// What one [`Executor::audit_remote_existence`] pass found and healed.
+///
+/// An all-zero report (the [`Default`]) means one of two things, and the caller
+/// treats them identically because both are "nothing to report": every recorded
+/// object is still alive (the normal, silent-green case), or the audit was
+/// skipped because the remote enumeration failed.
+#[derive(Debug, Clone, Default, PartialEq, Eq)]
+pub struct RemoteAuditReport {
+    /// `file_state` rows whose standalone Drive object was gone. Each had its
+    /// `drive_file_id` cleared and its mtime sentineled, so the next scan
+    /// re-uploads it as a fresh create.
+    pub healed_files: u64,
+    /// Bundles whose `.tar.gz` Drive object was gone. Each had its `bundles`
+    /// row dropped (cascading its membership rows).
+    pub healed_bundles: u64,
+    /// Member files re-queued as a consequence of `healed_bundles`. Counted
+    /// separately from [`Self::healed_files`] because one dead bundle object
+    /// can strand hundreds of members.
+    pub healed_bundle_members: u64,
+    /// Up to [`REMOTE_AUDIT_WARN_ROW_CAP`] of the affected paths, for the
+    /// per-file WARN rows. A sample, never the whole set - see the cap's docs.
+    pub sample_paths: Vec<RelativePath>,
+}
+
+impl RemoteAuditReport {
+    /// Total FILES this pass re-queued: dead standalone objects plus the
+    /// members stranded by dead bundle objects. The number the summary
+    /// activity row reports, and the one that answers "how many files stopped
+    /// being backed up".
+    #[must_use]
+    pub fn healed_paths(&self) -> u64 {
+        self.healed_files.saturating_add(self.healed_bundle_members)
+    }
+
+    /// Whether this pass found any damage at all. A clean audit writes NO
+    /// activity rows - a backup tool that logs "nothing was wrong" every cycle
+    /// trains users to ignore the log.
+    #[must_use]
+    pub fn found_anything(&self) -> bool {
+        self.healed_paths() > 0 || self.healed_bundles > 0
+    }
 }
 
 /// Construction-time dependencies an [`Executor`] implementation wires
@@ -779,6 +870,22 @@ impl RemoteStore for BreakerReportingStore {
 
     async fn metadata(&self, file_id: &str) -> anyhow::Result<RemoteEntry> {
         self.report(self.inner.metadata(file_id).await)
+    }
+
+    async fn list_source_object_ids(
+        &self,
+        source_id: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<HashSet<String>> {
+        // Delegated with the normal breaker accounting. Delegation (rather than
+        // an empty default) is load-bearing: "no live objects" is not a safe
+        // answer for this call - the audit would read every recorded id as dead
+        // and re-upload the whole source.
+        self.report(
+            self.inner
+                .list_source_object_ids(source_id, drive_context)
+                .await,
+        )
     }
 
     async fn download(&self, file_id: &str) -> anyhow::Result<DownloadStream> {
@@ -3384,7 +3491,76 @@ impl DefaultExecutor {
     /// gone stale (folder trashed/deleted remotely mid-run) surfaces as an
     /// upload/create failure; `invalidate_parent_dirs` drops the chain so the
     /// retry re-ensures from the root.
+    ///
+    /// # Stale-cache recovery
+    ///
+    /// A cached folder id can be DEAD - the user deleted the folder on Drive
+    /// after we walked it. Two shapes, only one of which the caller could
+    /// handle:
+    ///
+    /// - Every component of the chain is cached. The walk issues no request at
+    ///   all and returns a dead parent id; the failure surfaces on the upload,
+    ///   where `upload_and_commit` already calls `invalidate_parent_dirs`.
+    /// - An INTERMEDIATE component is cached but a deeper one is not - a new
+    ///   subdirectory under a deleted-but-cached parent. Then the walk itself
+    ///   calls `ensure_folder(dead_parent, ..)`, which 404s. That error used to
+    ///   propagate out of `resolve_remote_target` as `UploadError::Fatal`,
+    ///   ABORTING the entire cycle for the source, and - because the caller's
+    ///   invalidation runs only AFTER the target resolves - the dead entry
+    ///   stayed cached for the rest of the process, failing every later file
+    ///   under that chain the same way. A permanent wedge until restart.
+    ///
+    /// So a failed walk drops this path's cached chain and retries ONCE, from
+    /// the source root. `ensure_folder` is search-or-create and idempotent, so
+    /// the retry re-creates exactly the missing components and costs one extra
+    /// walk in the worst case.
+    ///
+    /// The retry is gated on the invalidation having actually REMOVED
+    /// something, which keeps two behaviours intact:
+    /// - A walk that was not cache-driven (nothing to be stale) fails as
+    ///   before, with no wasted second attempt.
+    /// - The SOURCE ROOT never enters this cache - only subdirectories do - so
+    ///   a deleted destination root removes nothing, is never re-created, and
+    ///   keeps its deliberate `dest_folder_missing` mass-delete guard. Only the
+    ///   subfolder chain self-heals.
     async fn ensure_parents(
+        &self,
+        source: &SourceRow,
+        relative_path: &RelativePath,
+        crypto: Option<&dyn SourceCryptoSuite>,
+    ) -> anyhow::Result<ResolvedParents> {
+        match self
+            .ensure_parents_once(source, relative_path, crypto)
+            .await
+        {
+            Ok(resolved) => Ok(resolved),
+            Err(first) => {
+                if self.invalidate_parent_dirs(source, relative_path) == 0 {
+                    // No cached chain was involved, so a stale cache cannot be
+                    // the cause and a retry would just repeat the same request.
+                    return Err(first);
+                }
+                warn!(
+                    target: TARGET,
+                    source = %source.id,
+                    path = %relative_path,
+                    "resolving the destination folder chain failed; dropped its cached ids and re-ensuring from the source root once: {first}"
+                );
+                self.ensure_parents_once(source, relative_path, crypto)
+                    .await
+                    // Report the RETRY's error: it is the one made against
+                    // freshly-resolved ids, so it reflects Drive's actual state
+                    // rather than a stale-cache artefact.
+                    .map_err(|retry| {
+                        retry.context("destination folder chain could not be re-created")
+                    })
+            }
+        }
+    }
+
+    /// One `ensure_parents` walk, with no stale-cache retry. See
+    /// [`Self::ensure_parents`], which wraps this.
+    async fn ensure_parents_once(
         &self,
         source: &SourceRow,
         relative_path: &RelativePath,
@@ -3469,7 +3645,13 @@ impl DefaultExecutor {
     /// resolved target fails - the dominant stale-cache cause is a parent
     /// folder trashed or deleted remotely mid-run, and re-ensuring is cheap
     /// relative to the failed upload's retry.
-    fn invalidate_parent_dirs(&self, source: &SourceRow, relative_path: &RelativePath) {
+    ///
+    /// Returns how many entries were actually removed. `0` means no cached
+    /// chain was involved, which is what [`Self::ensure_parents`] uses to tell
+    /// "a stale cache could explain this failure" from "it could not" - and,
+    /// because the SOURCE ROOT is never cached here, is also what keeps a
+    /// deleted destination root on its unchanged fail-fast path.
+    fn invalidate_parent_dirs(&self, source: &SourceRow, relative_path: &RelativePath) -> usize {
         let mut dir_path = String::new();
         let mut keys: Vec<(String, String)> = Vec::new();
         let components: Vec<&str> = relative_path
@@ -3478,7 +3660,7 @@ impl DefaultExecutor {
             .filter(|c| !c.is_empty())
             .collect();
         let Some((_leaf, dirs)) = components.split_last() else {
-            return;
+            return 0;
         };
         for dir in dirs {
             if !dir_path.is_empty() {
@@ -3488,9 +3670,9 @@ impl DefaultExecutor {
             keys.push((source.id.to_string(), dir_path.clone()));
         }
         let mut cache = self.parent_dirs.lock().unwrap();
-        for key in keys {
-            cache.remove(&key);
-        }
+        keys.into_iter()
+            .filter(|key| cache.remove(key).is_some())
+            .count()
     }
 
     /// Build the canonical `appProperties` for an object Driven owns
@@ -4123,6 +4305,135 @@ impl Executor for DefaultExecutor {
         // the dispatch loop, and "one more op starts" on a racing write is
         // already the accepted graceful-drain behaviour.
         self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    async fn audit_remote_existence(
+        &self,
+        source: &SourceRow,
+    ) -> anyhow::Result<RemoteAuditReport> {
+        // --- 1. The RECORDED set: what state thinks exists on Drive ---------
+        // Read BEFORE the remote listing. Reading it after would widen the race
+        // with a concurrent upload: an object created between the listing and
+        // this read would be recorded-but-not-listed and judged dead. In this
+        // order the worst case is the harmless inverse - an object listed but
+        // not yet recorded, which the diff simply ignores.
+        let recorded_files = self.state.list_file_state_drive_ids(source.id).await?;
+        let recorded_bundles = self.state.list_bundles_for_source(source.id).await?;
+        if recorded_files.is_empty() && recorded_bundles.is_empty() {
+            // Nothing has been uploaded yet: no remote call needed at all.
+            return Ok(RemoteAuditReport::default());
+        }
+
+        // --- 2. The LIVE set: what Drive actually still has -----------------
+        // One paged query over `appProperties driven.source_id`, not one GET
+        // per recorded file. Paced like every other remote call so a big
+        // enumeration cannot outrun the account's request budget.
+        self.pacer.permit_request().await;
+        let live = match self
+            .remote
+            .list_source_object_ids(&source.id.to_string(), &source.drive_context())
+            .await
+        {
+            Ok(live) => {
+                self.pacer.note_response(ResponseClass::Ok);
+                live
+            }
+            Err(e) => {
+                // ABORT WITH ZERO WRITES. This is the safety property the whole
+                // design turns on: the audit infers "gone" from ABSENCE, so an
+                // enumeration that failed - or, worse, succeeded partially -
+                // would name live objects as dead and re-upload the entire
+                // source. Retrying next cycle costs nothing; acting on a
+                // truncated listing costs the user their bandwidth and quota.
+                let class = classify_drive_error(&e);
+                self.pacer.note_response(class.response_class());
+                return Err(e.context(
+                    "remote-existence audit: could not enumerate the source's live Drive objects",
+                ));
+            }
+        };
+
+        // --- 3. The DIFF: recorded minus live -------------------------------
+        let mut report = RemoteAuditReport::default();
+
+        for (relative_path, drive_file_id) in recorded_files {
+            if live.contains(&drive_file_id) {
+                continue;
+            }
+            // The recorded object is gone. Same remediation the live update
+            // path applies on a definitive 404 (`SkipReason::RemoteFileMissing`),
+            // just reached proactively instead of waiting for the file to
+            // change: clear the dead pointer and force the next scan to
+            // re-emit the path, which re-uploads it as a fresh create.
+            self.state
+                .requeue_file_state_for_reupload(
+                    source.id,
+                    &relative_path,
+                    REQUEUE_FORCE_RESCAN_MTIME_NS,
+                )
+                .await?;
+            warn!(
+                target: TARGET,
+                source = %source.id,
+                path = %relative_path,
+                file_id = %drive_file_id,
+                "remote-existence audit: the backed-up copy is gone from Drive; re-queued the file for a fresh upload"
+            );
+            report.healed_files = report.healed_files.saturating_add(1);
+            if report.sample_paths.len() < REMOTE_AUDIT_WARN_ROW_CAP {
+                report.sample_paths.push(relative_path);
+            }
+        }
+
+        for (bundle_id, drive_file_id) in recorded_bundles {
+            if live.contains(&drive_file_id) {
+                continue;
+            }
+            // The `.tar.gz` holding these members' bytes is gone, so EVERY
+            // member is unbacked - the members' own rows look fine (a bundled
+            // member legitimately has no `drive_file_id`), which is exactly why
+            // only a bundle-level check can find this.
+            let members = self
+                .state
+                .heal_dead_bundle(&bundle_id, REQUEUE_FORCE_RESCAN_MTIME_NS)
+                .await?;
+            warn!(
+                target: TARGET,
+                source = %source.id,
+                bundle_id = %bundle_id,
+                file_id = %drive_file_id,
+                members = members.len(),
+                "remote-existence audit: a bundle object is gone from Drive; re-queued its members for individual upload"
+            );
+            report.healed_bundles = report.healed_bundles.saturating_add(1);
+            report.healed_bundle_members = report
+                .healed_bundle_members
+                .saturating_add(members.len() as u64);
+            for path in members {
+                if report.sample_paths.len() >= REMOTE_AUDIT_WARN_ROW_CAP {
+                    break;
+                }
+                report.sample_paths.push(path);
+            }
+        }
+
+        if report.found_anything() {
+            warn!(
+                target: TARGET,
+                source = %source.id,
+                healed_files = report.healed_files,
+                healed_bundles = report.healed_bundles,
+                healed_bundle_members = report.healed_bundle_members,
+                "remote-existence audit found objects missing from Drive; the next scan re-uploads them"
+            );
+        } else {
+            debug!(
+                target: TARGET,
+                source = %source.id,
+                "remote-existence audit: every recorded Drive object is still live"
+            );
+        }
+        Ok(report)
     }
 
     async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()> {
@@ -6234,7 +6545,7 @@ mod tests {
     use tempfile::TempDir;
 
     use crate::state::SqliteStateRepo;
-    use crate::types::{AccountId, AccountState};
+    use crate::types::{AccountId, AccountState, ScanMode};
 
     // --- P1-E: out-of-space classification (STRESS_HARNESS s3.1) ------------
 
@@ -7301,6 +7612,15 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl RemoteStore for BundleTrashFailsStore {
+        async fn list_source_object_ids(
+            &self,
+            source_id: &str,
+            drive_context: &DriveContext,
+        ) -> anyhow::Result<HashSet<String>> {
+            self.inner
+                .list_source_object_ids(source_id, drive_context)
+                .await
+        }
         async fn ensure_folder(
             &self,
             parent_id: &str,
@@ -7835,6 +8155,831 @@ mod tests {
                 &anyhow::anyhow!("fake: no object with file_id file-id")
             ),
             "only a real Drive 404 counts; an unclassified failure keeps failing"
+        );
+    }
+
+    // --- the remote-existence audit -----------------------------------------
+    //
+    // The gap #168 left open: its self-heal only fires when an UPDATE is
+    // actually attempted, i.e. when the local file CHANGES. A file that never
+    // changes after its Drive object was deleted would stay silently
+    // un-backed-up forever. These tests drive the proactive pass that closes
+    // it, end to end against the real SQLite repo + the fake store.
+
+    /// Upload `rel` normally and return the Drive object id the row now
+    /// records - the "healthy backup" starting state every audit test damages.
+    async fn upload_and_record(h: &Harness, rel: &RelativePath, size: u64) -> String {
+        let out = h
+            .executor()
+            .execute(
+                &h.source,
+                &h.upload_plan(rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .expect("the initial upload must succeed");
+        assert!(
+            matches!(out.as_slice(), [OpOutcome::Done { .. }]),
+            "setup upload did not land: {out:?}"
+        );
+        h.state
+            .get_file_state(h.source.id, rel)
+            .await
+            .unwrap()
+            .expect("an uploaded file has a row")
+            .drive_file_id
+            .expect("an uploaded file records its object id")
+    }
+
+    /// Run a FastPath scan of the harness source against the real repo and
+    /// return the relative paths the scanner considers new-or-changed.
+    ///
+    /// The audit's whole remediation is "make the next scan re-emit this path",
+    /// so asserting on the row's columns alone would be testing the mechanism
+    /// instead of the outcome. This runs the actual scanner.
+    async fn scan_changed_paths(h: &Harness) -> Vec<String> {
+        crate::scanner::scan(&h.source, h.state.as_ref(), ScanMode::FastPath)
+            .await
+            .unwrap()
+            .new_or_changed
+            .into_iter()
+            .map(|e| e.rel.as_str().to_string())
+            .collect()
+    }
+
+    /// THE INCIDENT, in miniature: a file is backed up, the user deletes the
+    /// Drive object out-of-band, and the local file never changes again.
+    ///
+    /// Without the audit that file is un-backed-up forever with no error shown
+    /// (the #168 self-heal needs an UPDATE to fire, and an unchanging file
+    /// never plans one). The audit must find it from the id diff alone, re-queue
+    /// it, and the very next scan must re-upload it.
+    #[tokio::test]
+    async fn audit_heals_a_file_whose_drive_object_was_deleted() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("never-touched-again.txt", b"important bytes");
+        let original_id = upload_and_record(&h, &rel, size).await;
+
+        // Nothing to do while the object is alive: the scan agrees the file is
+        // synced, so absent the deletion this file would never be looked at
+        // again. That is precisely the trap.
+        assert!(
+            scan_changed_paths(&h).await.is_empty(),
+            "a freshly-synced, unchanged file must not be re-emitted"
+        );
+
+        // The user deletes the backup on Drive and empties the trash.
+        h.remote.delete_permanent(&original_id).await.unwrap();
+
+        let report = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .expect("a successful listing must produce a report");
+        assert_eq!(report.healed_files, 1);
+        assert_eq!(report.healed_bundles, 0);
+        assert_eq!(report.healed_paths(), 1);
+        assert!(report.found_anything());
+        assert_eq!(
+            report
+                .sample_paths
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            vec![rel.as_str()],
+            "the affected path must be reported for the per-file warn row"
+        );
+
+        // The row survives (only its remote pointer was wrong) but no longer
+        // claims a live object, and carries the sentinel that guarantees the
+        // next scan re-emits it.
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("the row must survive; only the dead pointer is cleared");
+        assert!(row.drive_file_id.is_none(), "the dead id must be cleared");
+        assert!(
+            row.drive_md5.is_none(),
+            "the md5 described bytes that no longer exist"
+        );
+        assert_eq!(row.mtime_ns, REQUEUE_FORCE_RESCAN_MTIME_NS);
+
+        // The outcome that actually matters: the next scan re-emits the path,
+        // and executing it re-uploads the file as a NEW object.
+        assert_eq!(
+            scan_changed_paths(&h).await,
+            vec![rel.as_str().to_string()],
+            "the healed file must be re-emitted by the very next scan"
+        );
+        let out = h
+            .executor()
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out.as_slice(), [OpOutcome::Done { .. }]),
+            "the re-queued file must upload cleanly: {out:?}"
+        );
+        let healed = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        let new_id = healed.drive_file_id.expect("re-uploaded object id");
+        assert_ne!(new_id, original_id, "the row must point at the NEW object");
+        let children = h
+            .remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(children.len(), 1, "exactly one object, no duplicate");
+        assert_eq!(children[0].id, new_id);
+
+        // Idempotent: a second audit over the healed state finds nothing.
+        let second = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .unwrap();
+        assert!(
+            !second.found_anything(),
+            "a re-run over healed state must find nothing: {second:?}"
+        );
+    }
+
+    /// A LIVE object must never be touched. The audit's verdict comes from
+    /// absence, so a false positive here would re-upload a perfectly good file
+    /// - and, at source scale, the entire backup.
+    #[tokio::test]
+    async fn audit_leaves_live_objects_alone() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("alive.txt", b"still on drive");
+        let id = upload_and_record(&h, &rel, size).await;
+        let before = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let report = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .unwrap();
+        assert_eq!(report, RemoteAuditReport::default());
+        assert!(
+            !report.found_anything(),
+            "a healthy source must produce a silent, empty report"
+        );
+
+        let after = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.drive_file_id.as_deref(), Some(id.as_str()));
+        assert_eq!(after.mtime_ns, before.mtime_ns, "mtime must be untouched");
+        assert_eq!(after.drive_md5, before.drive_md5);
+        assert!(
+            scan_changed_paths(&h).await.is_empty(),
+            "an untouched live file must not be re-emitted"
+        );
+    }
+
+    /// A TRASHED object counts as gone. It can no longer be updated and its
+    /// bytes are on a deletion clock, so leaving the row pointing at it would
+    /// be the same silent non-backup as a hard delete - just slower.
+    #[tokio::test]
+    async fn audit_treats_a_trashed_object_as_missing() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("trashed.txt", b"soft deleted");
+        let id = upload_and_record(&h, &rel, size).await;
+        h.remote.trash(&id).await.unwrap();
+
+        let report = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .unwrap();
+        assert_eq!(report.healed_files, 1, "a trashed object is not a backup");
+        assert!(h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap()
+            .drive_file_id
+            .is_none());
+    }
+
+    /// THE SAFETY PROPERTY. When the remote enumeration fails, the audit must
+    /// write NOTHING.
+    ///
+    /// It infers "gone" from ABSENCE, so a failed - or worse, silently
+    /// truncated - listing would name live objects as dead and re-upload the
+    /// whole source. Retrying next cycle is free; acting on a bad listing costs
+    /// the user their bandwidth and their Drive quota.
+    #[tokio::test]
+    async fn audit_writes_nothing_when_the_listing_fails() {
+        // `with_5xx_after(n)` trips on a later request, so let the setup upload
+        // through and break the audit's listing.
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_source_listing_broken()).await;
+        let (rel, size) = h.write_file("must-not-churn.txt", b"live bytes");
+        let id = upload_and_record(&h, &rel, size).await;
+        let before = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let err = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .expect_err("a failed enumeration must surface as an error, not an empty live set");
+        assert!(
+            format!("{err:#}").contains("enumerate"),
+            "the error must name the enumeration it could not complete: {err:#}"
+        );
+
+        // Not one column moved, and the file is still considered synced.
+        let after = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.drive_file_id.as_deref(),
+            Some(id.as_str()),
+            "a failed listing must never clear a live object's id"
+        );
+        assert_eq!(after.mtime_ns, before.mtime_ns);
+        assert!(
+            scan_changed_paths(&h).await.is_empty(),
+            "a failed audit must not re-queue a single file"
+        );
+    }
+
+    /// The per-file warn rows are capped, but the COUNT is not. The motivating
+    /// incident would have produced 4,526 rows; enumerating them all would bury
+    /// every other row in the Activity feed. The summary count must still
+    /// report the true scale, so nothing is hidden - only the enumeration is
+    /// bounded.
+    #[tokio::test]
+    async fn audit_caps_the_per_file_sample_but_not_the_healed_count() {
+        let h = harness().await;
+        let dead = REMOTE_AUDIT_WARN_ROW_CAP + 5;
+        for i in 0..dead {
+            let (rel, size) = h.write_file(&format!("f{i}.txt"), format!("body {i}").as_bytes());
+            let id = upload_and_record(&h, &rel, size).await;
+            h.remote.delete_permanent(&id).await.unwrap();
+        }
+
+        let report = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.healed_files, dead as u64,
+            "every dead file must be healed and counted, cap or no cap"
+        );
+        assert_eq!(
+            report.sample_paths.len(),
+            REMOTE_AUDIT_WARN_ROW_CAP,
+            "the per-file sample must stop at the cap"
+        );
+        // All of them - not just the sampled ones - are actually re-queued.
+        assert_eq!(scan_changed_paths(&h).await.len(), dead);
+    }
+
+    /// A BUNDLE object's death is invisible to a per-file check: each member's
+    /// `file_state` row looks perfectly healthy, because a bundled member
+    /// legitimately carries `drive_file_id = NULL`. Only a bundle-level check
+    /// finds it - and one dead `.tar.gz` can strand hundreds of files at once.
+    #[tokio::test]
+    async fn audit_heals_a_bundle_whose_drive_object_was_deleted() {
+        let h = harness().await;
+        let mut members: Vec<(RelativePath, u64)> = Vec::new();
+        for i in 0..4 {
+            let (rel, size) = h.write_file(
+                &format!("logs/f{i}.log"),
+                format!("member {i} bytes").as_bytes(),
+            );
+            members.push((rel, size));
+        }
+        let out = h
+            .executor()
+            .execute(
+                &h.source,
+                &bundle_plan(h.source.id, &members),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out.as_slice(), [OpOutcome::BundleDone { files: 4, .. }]),
+            "setup bundle did not land: {out:?}"
+        );
+        let bundle_object = h
+            .state
+            .get_bundle_ref_for_member(h.source.id, &members[0].0)
+            .await
+            .unwrap()
+            .expect("membership resolves")
+            .drive_file_id;
+
+        // Every member is "synced" and nothing re-emits: the bundle is doing
+        // its job.
+        assert!(scan_changed_paths(&h).await.is_empty());
+
+        // The user deletes the bundle object.
+        h.remote.delete_permanent(&bundle_object).await.unwrap();
+
+        let report = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .unwrap();
+        assert_eq!(report.healed_bundles, 1);
+        assert_eq!(
+            report.healed_bundle_members, 4,
+            "one dead bundle object strands ALL of its members"
+        );
+        assert_eq!(
+            report.healed_files, 0,
+            "the members had no standalone objects of their own to heal"
+        );
+        assert_eq!(report.healed_paths(), 4);
+
+        // The bundle row and its memberships are gone, so nothing still claims
+        // these files live inside an archive that no longer exists.
+        for (rel, _) in &members {
+            assert!(
+                h.state
+                    .get_bundle_ref_for_member(h.source.id, rel)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "membership in a dead bundle must not survive"
+            );
+            let row = h
+                .state
+                .get_file_state(h.source.id, rel)
+                .await
+                .unwrap()
+                .expect("the member row survives");
+            assert!(row.drive_file_id.is_none());
+            assert_eq!(row.mtime_ns, REQUEUE_FORCE_RESCAN_MTIME_NS);
+        }
+
+        // Every member is re-emitted and re-uploads - as INDIVIDUAL objects,
+        // the same standalone promotion a bundled member gets whenever it
+        // changes (the planner only bundles genuinely-new files, and these
+        // still have rows).
+        let mut changed = scan_changed_paths(&h).await;
+        changed.sort();
+        let mut expected: Vec<String> = members
+            .iter()
+            .map(|(r, _)| r.as_str().to_string())
+            .collect();
+        expected.sort();
+        assert_eq!(
+            changed, expected,
+            "every stranded member must be re-emitted"
+        );
+
+        for (rel, size) in &members {
+            let out = h
+                .executor()
+                .execute(
+                    &h.source,
+                    &h.upload_plan(rel, *size),
+                    &noop_progress,
+                    &noop_outcome,
+                )
+                .await
+                .unwrap();
+            assert!(
+                matches!(out.as_slice(), [OpOutcome::Done { .. }]),
+                "a stranded member must re-upload: {out:?}"
+            );
+            assert!(h
+                .state
+                .get_file_state(h.source.id, rel)
+                .await
+                .unwrap()
+                .unwrap()
+                .drive_file_id
+                .is_some());
+        }
+
+        // And the audit is quiet again.
+        assert!(!h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .unwrap()
+            .found_anything());
+    }
+
+    /// A LIVE bundle is left completely alone - its row, its memberships, and
+    /// its members' mtimes. Re-queueing a healthy bundle would unpack it into N
+    /// individual uploads for nothing.
+    #[tokio::test]
+    async fn audit_leaves_a_live_bundle_alone() {
+        let h = harness().await;
+        let mut members: Vec<(RelativePath, u64)> = Vec::new();
+        for i in 0..3 {
+            let (rel, size) =
+                h.write_file(&format!("cold/f{i}.log"), format!("cold {i}").as_bytes());
+            members.push((rel, size));
+        }
+        h.executor()
+            .execute(
+                &h.source,
+                &bundle_plan(h.source.id, &members),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+
+        let report = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .unwrap();
+        assert_eq!(report, RemoteAuditReport::default());
+        for (rel, _) in &members {
+            assert!(
+                h.state
+                    .get_bundle_ref_for_member(h.source.id, rel)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "a live bundle keeps its memberships"
+            );
+        }
+        assert!(scan_changed_paths(&h).await.is_empty());
+    }
+
+    /// A source that has never uploaded anything makes NO remote call at all -
+    /// there is nothing recorded to audit. Cheap by construction, so the pass
+    /// can run on every deep verify without thought.
+    #[tokio::test]
+    async fn audit_of_an_empty_source_issues_no_remote_call() {
+        // A store whose listing would ERROR: reaching it at all fails the test.
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_source_listing_broken()).await;
+        let report = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .expect("an empty source must not touch the remote");
+        assert_eq!(report, RemoteAuditReport::default());
+    }
+
+    /// Objects belonging to ANOTHER source must not count as live for this one.
+    /// The enumeration is keyed on `driven.source_id`, and a query that ignored
+    /// it would mask a genuinely dead id behind a neighbour's healthy object.
+    #[tokio::test]
+    async fn audit_enumeration_is_scoped_to_the_source() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("mine.txt", b"mine");
+        let id = upload_and_record(&h, &rel, size).await;
+
+        // A second source sharing the same Drive folder, with a live object.
+        let other = SourceRow {
+            id: SourceId::new_v4(),
+            ..h.source.clone()
+        };
+        h.state.upsert_source(&other).await.unwrap();
+        let (other_rel, other_size) = h.write_file("theirs.txt", b"theirs");
+        h.executor()
+            .execute(
+                &other,
+                &Plan {
+                    ops: vec![Op::HashThenUpload {
+                        source_id: other.id,
+                        relative_path: other_rel.clone(),
+                        size: other_size,
+                    }],
+                    collisions: vec![],
+                },
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+
+        // Killing OUR object must be detected even though the sibling's object
+        // is still sitting in the same folder.
+        h.remote.delete_permanent(&id).await.unwrap();
+        let report = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .unwrap();
+        assert_eq!(report.healed_files, 1);
+        assert_eq!(
+            report
+                .sample_paths
+                .iter()
+                .map(|p| p.as_str())
+                .collect::<Vec<_>>(),
+            vec![rel.as_str()]
+        );
+
+        // ...and the sibling source is untouched by our audit.
+        let their_report = h.executor().audit_remote_existence(&other).await.unwrap();
+        assert_eq!(their_report, RemoteAuditReport::default());
+        assert!(h
+            .state
+            .get_file_state(other.id, &other_rel)
+            .await
+            .unwrap()
+            .unwrap()
+            .drive_file_id
+            .is_some());
+    }
+
+    // --- ancestor (parent folder) deletion recovery -------------------------
+    //
+    // The incident deleted FOLDERS, not individual files, so every child died
+    // with its folder. These tests pin what happens to the folder chain
+    // itself - in particular with a WARM `parent_dirs` cache, where the
+    // executor holds folder ids that Drive no longer has.
+
+    /// Resolve the Drive id of a direct child folder of the source root.
+    async fn child_folder_id(h: &Harness, name: &str) -> String {
+        h.remote
+            .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
+            .await
+            .unwrap()
+            .into_iter()
+            .find(|e| e.name == name && e.mime_type.contains("folder"))
+            .unwrap_or_else(|| panic!("no child folder named {name}"))
+            .id
+    }
+
+    /// THE FULL ANCESTOR-DELETION PATH, cold cache (a fresh process): a whole
+    /// `sub/dir/` chain and the object inside it are deleted on Drive, and the
+    /// local file never changes.
+    ///
+    /// This is the two halves of this PR meeting: the AUDIT notices the dead
+    /// object (nothing else would - the file is untouched), and the re-upload
+    /// then needs the folder chain re-created under it. Both must happen, and
+    /// the source must not wedge on `dest_folder_missing`.
+    #[tokio::test]
+    async fn a_deleted_parent_chain_recovers_with_a_cold_folder_cache() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("sub/dir/report.txt", b"v1");
+        upload_and_record(&h, &rel, size).await;
+        let sub_id = child_folder_id(&h, "sub").await;
+
+        // The user deletes `sub` in the Drive web UI: the folder, `sub/dir`,
+        // and the object inside all go together.
+        let removed = h.remote.delete_folder_tree(&sub_id);
+        assert!(removed.len() >= 3, "the delete must cascade: {removed:?}");
+
+        // A FRESH executor models the post-restart cold cache.
+        let report = h
+            .executor()
+            .audit_remote_existence(&h.source)
+            .await
+            .unwrap();
+        assert_eq!(
+            report.healed_files, 1,
+            "the audit must notice the dead object"
+        );
+        assert_eq!(
+            scan_changed_paths(&h).await,
+            vec![rel.as_str().to_string()],
+            "the healed file is re-emitted despite never changing locally"
+        );
+
+        let out = h
+            .executor()
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .expect("a deleted parent chain must not abort the cycle");
+        assert!(
+            matches!(out.as_slice(), [OpOutcome::Done { .. }]),
+            "the file must re-upload under a re-created chain: {out:?}"
+        );
+        let files = h
+            .remote
+            .descendant_files_with_trashed(h.source.drive_folder_id.as_str());
+        assert_eq!(files.len(), 1, "exactly one object: {files:?}");
+        assert_eq!(files[0].name, "report.txt");
+    }
+
+    /// The same recovery with a WARM cache where EVERY component of the chain
+    /// is cached: the executor instance that walked `sub` and `sub/dir` is
+    /// still alive and still holds their now-dead ids.
+    ///
+    /// This case is structurally different from the new-subdirectory one and
+    /// recovers by a different route. Because both components are cached, the
+    /// walk issues NO request and cannot notice anything is wrong - it hands
+    /// back a dead parent, and the failure surfaces on the create. That is the
+    /// path `upload_and_commit`'s existing `invalidate_parent_dirs` already
+    /// owns: the op FAILS (which holds the source's scan timestamps, so it
+    /// stays due), the poisoned chain is dropped, and the NEXT cycle re-creates
+    /// the chain and lands the file.
+    ///
+    /// So the contract here is two cycles, not one - and, critically, no
+    /// `Err` from `execute`: a per-op failure, never an aborted cycle.
+    #[tokio::test]
+    async fn a_deleted_parent_chain_recovers_with_a_warm_folder_cache() {
+        let h = harness().await;
+        let exec = h.executor();
+        let (rel, size) = h.write_file("sub/dir/report.txt", b"v1");
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel, size),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+        let sub_id = child_folder_id(&h, "sub").await;
+        h.remote.delete_folder_tree(&sub_id);
+
+        // SAME executor throughout: the cache still holds the dead folder ids.
+        assert_eq!(
+            exec.audit_remote_existence(&h.source)
+                .await
+                .unwrap()
+                .healed_files,
+            1
+        );
+
+        // Cycle 1: a per-op failure, NOT an aborted cycle. The source is not
+        // wedged - it is simply left due.
+        let out = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .expect("a warm dead-chain cache must never abort the whole cycle");
+        assert!(
+            matches!(out.as_slice(), [OpOutcome::Failed { .. }]),
+            "expected a single failed op while the cache was poisoned: {out:?}"
+        );
+
+        // Cycle 2: the invalidated chain is re-ensured and the file lands.
+        let out = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(
+            matches!(out.as_slice(), [OpOutcome::Done { .. }]),
+            "the next cycle must re-create the chain and upload: {out:?}"
+        );
+        let files = h
+            .remote
+            .descendant_files_with_trashed(h.source.drive_folder_id.as_str());
+        assert_eq!(
+            files.len(),
+            1,
+            "exactly one object, no duplicate: {files:?}"
+        );
+        assert_eq!(files[0].name, "report.txt");
+        assert_ne!(
+            child_folder_id(&h, "sub").await,
+            sub_id,
+            "the chain was re-created, not resurrected"
+        );
+    }
+
+    /// WARM cache, NEW subdirectory - the case that actually broke.
+    ///
+    /// `sub` is cached (and dead) but `sub/newdir` was never walked, so
+    /// `ensure_parents` DOES call `ensure_folder(dead_sub, "newdir")`. That
+    /// 404 comes out of `resolve_remote_target`, which maps to
+    /// `UploadError::Fatal` - aborting the ENTIRE `execute` for the source -
+    /// and, because `invalidate_parent_dirs` only runs after the target has
+    /// been resolved, the dead `sub` stayed cached for the rest of the process.
+    /// Every later file under `sub/` failed the same way: a permanent wedge
+    /// until restart.
+    ///
+    /// The chain must instead be re-ensured from the source root and the
+    /// upload must succeed in the SAME cycle.
+    #[tokio::test]
+    async fn a_new_subdirectory_under_a_cached_dead_parent_recovers_without_wedging() {
+        let h = harness().await;
+        let exec = h.executor();
+
+        // Walk `sub/dir` once so BOTH components land in `parent_dirs`.
+        let (seed, seed_size) = h.write_file("sub/dir/seed.txt", b"seed");
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&seed, seed_size),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+        let sub_id = child_folder_id(&h, "sub").await;
+        h.remote.delete_folder_tree(&sub_id);
+
+        // A brand-new file in a directory the cache has NEVER seen, under the
+        // cached-and-now-dead `sub`.
+        let (fresh, fresh_size) = h.write_file("sub/newdir/fresh.txt", b"brand new bytes");
+        let out = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&fresh, fresh_size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .expect("a stale cached parent must not abort the whole cycle");
+        assert!(
+            matches!(out.as_slice(), [OpOutcome::Done { .. }]),
+            "the new file must upload under a re-created chain in the SAME cycle: {out:?}"
+        );
+
+        // It really landed, under a re-created `sub/newdir`.
+        let new_sub = child_folder_id(&h, "sub").await;
+        assert_ne!(new_sub, sub_id, "the dead `sub` must have been re-created");
+        let files = h
+            .remote
+            .descendant_files_with_trashed(h.source.drive_folder_id.as_str());
+        assert_eq!(files.len(), 1, "exactly one object: {files:?}");
+        assert_eq!(files[0].name, "fresh.txt");
+
+        // And the SAME executor keeps working for further files under `sub/` -
+        // the poisoned cache entry must not have survived.
+        let (second, second_size) = h.write_file("sub/newdir/second.txt", b"more bytes");
+        let out = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&second, second_size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .expect("the source must not be wedged for the rest of the process");
+        assert!(
+            matches!(out.as_slice(), [OpOutcome::Done { .. }]),
+            "a later file under the same chain must also upload: {out:?}"
+        );
+    }
+
+    /// The SOURCE ROOT itself being gone stays FATAL. That is a deliberate
+    /// mass-delete guard: re-creating a destination the user deleted would
+    /// silently re-upload their entire backup into a folder they did not
+    /// choose. Only the SUBFOLDER chain self-heals - re-ensuring a subfolder
+    /// under a root the user still has is safe and expected.
+    #[tokio::test]
+    async fn a_missing_source_root_still_fails_rather_than_being_re_created() {
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_dest_folder_missing()).await;
+        let (rel, size) = h.write_file("sub/dir/report.txt", b"bytes");
+
+        let out = h
+            .executor()
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await;
+
+        // Either a hard error or a dest-folder failure outcome is acceptable -
+        // what must NOT happen is a silent success that re-created the root.
+        let succeeded = matches!(out.as_deref(), Ok([OpOutcome::Done { .. }]));
+        assert!(
+            !succeeded,
+            "a missing destination root must never be silently re-created: {out:?}"
         );
     }
 
@@ -10718,6 +11863,19 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl RemoteStore for MismatchStore {
+        async fn list_source_object_ids(
+            &self,
+            _source_id: &str,
+            _drive_context: &DriveContext,
+        ) -> anyhow::Result<HashSet<String>> {
+            // This double models only the checksum-mismatch upload path and has
+            // no object index to enumerate. It must ERROR rather than return an
+            // empty set: "no live objects" is the answer that would make an
+            // audit judge every recorded id dead.
+            Err(anyhow::anyhow!(
+                "MismatchStore does not model object enumeration"
+            ))
+        }
         async fn create(
             &self,
             _parent_id: &str,
@@ -10827,6 +11985,13 @@ mod tests {
     }
     #[async_trait::async_trait]
     impl RemoteStore for TrashFailStore {
+        async fn list_source_object_ids(
+            &self,
+            source_id: &str,
+            dc: &DriveContext,
+        ) -> anyhow::Result<HashSet<String>> {
+            self.inner.list_source_object_ids(source_id, dc).await
+        }
         async fn ensure_folder(
             &self,
             p: &str,
@@ -11795,6 +12960,17 @@ mod tests {
 
         #[async_trait::async_trait]
         impl RemoteStore for ToggleStore {
+            async fn list_source_object_ids(
+                &self,
+                _source_id: &str,
+                _drive_context: &DriveContext,
+            ) -> anyhow::Result<HashSet<String>> {
+                // No object index to enumerate; error rather than answer "no
+                // live objects" (see `MismatchStore` for why that matters).
+                Err(anyhow::anyhow!(
+                    "ToggleStore does not model object enumeration"
+                ))
+            }
             async fn create(
                 &self,
                 _parent_id: &str,

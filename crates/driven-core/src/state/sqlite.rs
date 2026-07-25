@@ -1576,6 +1576,106 @@ impl StateRepo for SqliteStateRepo {
         Ok(())
     }
 
+    async fn list_file_state_drive_ids(
+        &self,
+        source: SourceId,
+    ) -> Result<Vec<(RelativePath, String)>> {
+        let source_str = source.to_string();
+        // Runtime `sqlx::query` (NOT the compile-checked `query!` macro) so this
+        // additive method needs NO `.sqlx` cache regeneration - the same reason
+        // `clear_file_state_drive_file_id` uses it.
+        let rows: Vec<(String, String)> = sqlx::query_as(
+            "SELECT relative_path, drive_file_id FROM file_state \
+             WHERE source_id = ?1 AND drive_file_id IS NOT NULL",
+        )
+        .bind(source_str.as_str())
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (path, drive_file_id) in rows {
+            out.push((relative_path_from_string(path)?, drive_file_id));
+        }
+        Ok(out)
+    }
+
+    async fn list_bundles_for_source(&self, source: SourceId) -> Result<Vec<(String, String)>> {
+        let source_str = source.to_string();
+        let rows: Vec<(String, String)> =
+            sqlx::query_as("SELECT id, drive_file_id FROM bundles WHERE source_id = ?1")
+                .bind(source_str.as_str())
+                .fetch_all(&self.pool)
+                .await?;
+        Ok(rows)
+    }
+
+    async fn requeue_file_state_for_reupload(
+        &self,
+        source: SourceId,
+        path: &RelativePath,
+        force_rescan_mtime_ns: i64,
+    ) -> Result<()> {
+        let source_str = source.to_string();
+        let path_str = path.as_str().to_string();
+        // A targeted three-column UPDATE: it cannot clobber a column a
+        // concurrent edit may have changed, and a missing row updates 0 rows
+        // (idempotent no-op).
+        sqlx::query(
+            "UPDATE file_state SET drive_file_id = NULL, drive_md5 = NULL, mtime_ns = ?3 \
+             WHERE source_id = ?1 AND relative_path = ?2",
+        )
+        .bind(source_str.as_str())
+        .bind(path_str.as_str())
+        .bind(force_rescan_mtime_ns)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn heal_dead_bundle(
+        &self,
+        bundle_id: &str,
+        force_rescan_mtime_ns: i64,
+    ) -> Result<Vec<RelativePath>> {
+        let mut tx = self.pool.begin().await?;
+
+        // Read the members FIRST: the `DELETE FROM bundles` below cascades
+        // `bundle_members` away via its `bundle_id` FK, after which this list
+        // cannot be recovered.
+        let members: Vec<(String, String)> = sqlx::query_as(
+            "SELECT source_id, relative_path FROM bundle_members WHERE bundle_id = ?1",
+        )
+        .bind(bundle_id)
+        .fetch_all(&mut *tx)
+        .await?;
+
+        let mut paths = Vec::with_capacity(members.len());
+        for (source_id, relative_path) in &members {
+            // Members carry `drive_file_id = NULL` already (their bytes lived
+            // in the bundle), so the sentinel mtime is what forces the rescan.
+            // The NULLs are still written so the statement is identical to
+            // `requeue_file_state_for_reupload` and stays correct if a member
+            // ever does hold an id.
+            sqlx::query(
+                "UPDATE file_state SET drive_file_id = NULL, drive_md5 = NULL, mtime_ns = ?3 \
+                 WHERE source_id = ?1 AND relative_path = ?2",
+            )
+            .bind(source_id.as_str())
+            .bind(relative_path.as_str())
+            .bind(force_rescan_mtime_ns)
+            .execute(&mut *tx)
+            .await?;
+            paths.push(relative_path_from_string(relative_path.clone())?);
+        }
+
+        sqlx::query("DELETE FROM bundles WHERE id = ?1")
+            .bind(bundle_id)
+            .execute(&mut *tx)
+            .await?;
+
+        tx.commit().await?;
+        Ok(paths)
+    }
+
     async fn bump_checksum_mismatch_count(
         &self,
         source: SourceId,
