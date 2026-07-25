@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n            SELECT\n                COUNT(*)                  AS \"files!: i64\",\n                COALESCE(SUM(bytes), 0)   AS \"bytes!: i64\"\n            FROM activity_log\n            WHERE ts >= ?1 AND ts <= ?2 AND event_type = 'upload_done'\n            ",
+  "query": "\n            SELECT\n                COALESCE(SUM(COALESCE(file_count, 1)), 0) AS \"files!: i64\",\n                COALESCE(SUM(bytes), 0)                   AS \"bytes!: i64\"\n            FROM activity_log\n            WHERE ts >= ?1 AND ts <= ?2 AND event_type IN ('upload_done', 'bundle_upload')\n            ",
   "describe": {
     "columns": [
       {
@@ -24,5 +24,5 @@
       false
     ]
   },
-  "hash": "1b3fbf854838e44eae49971f6e6d72fe90a5118e85787b04bc4fd4bb1de93554"
+  "hash": "950fb746fe882bae0e3bd30c9d686c89e818232cbe861b55b54439a95523420d"
 }
