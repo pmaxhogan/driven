@@ -18,6 +18,13 @@ import { formatBytes } from "../stores/formatBytes";
 //   from the mark behind the text, not from tinting the text.
 // - Marks are thin: a 2px line with `non-scaling-stroke` so the non-uniform
 //   viewBox scale cannot fatten it, over a low-opacity fill.
+// - The hue is teal-600 (#0d9488) in BOTH modes, which is the step that clears
+//   the palette validator's lightness band and its >= 3:1 contrast check against
+//   the light AND dark chart surfaces. The app's usual dark accent (teal-400)
+//   fails the dark lightness band, and teal-500 only warns on light contrast, so
+//   the line is deliberately one step off the shell's accent. The area keeps a
+//   low-opacity wash - it is the recessive half of the mark, and the line is
+//   what carries the reading.
 // - The plot has a hover layer (crosshair + tooltip): a chart the user can point
 //   at is the default, not an upgrade.
 //
@@ -171,7 +178,7 @@ function clearHover(): void {
       :aria-label="chartSummary"
       data-testid="throughput-sparkline"
     >
-      <path :d="areaPath" class="fill-teal-500/15 dark:fill-teal-400/15" />
+      <path :d="areaPath" class="fill-teal-600/15 dark:fill-teal-500/20" />
       <path
         :d="linePath"
         fill="none"
@@ -179,7 +186,7 @@ function clearHover(): void {
         stroke-linejoin="round"
         stroke-linecap="round"
         vector-effect="non-scaling-stroke"
-        class="stroke-teal-500/70 dark:stroke-teal-400/70"
+        class="stroke-teal-600"
       />
     </svg>
 
@@ -187,12 +194,12 @@ function clearHover(): void {
          is stretched non-uniformly, which would squash a circle into an ellipse. -->
     <template v-if="hoverIndex !== null && !isEmpty">
       <div
-        class="pointer-events-none absolute inset-y-0 w-px bg-teal-500/40 dark:bg-teal-400/40"
+        class="pointer-events-none absolute inset-y-0 w-px bg-teal-600/40"
         :style="{ left: `${hoverLeftPct}%` }"
         aria-hidden="true"
       ></div>
       <div
-        class="pointer-events-none absolute h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-teal-600 ring-2 ring-white dark:bg-teal-400 dark:ring-zinc-900"
+        class="pointer-events-none absolute h-2 w-2 -translate-x-1/2 -translate-y-1/2 rounded-full bg-teal-600 ring-2 ring-white dark:ring-zinc-900"
         :style="{ left: `${hoverLeftPct}%`, top: `${hoverTopPct}%` }"
         aria-hidden="true"
       ></div>
