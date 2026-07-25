@@ -1631,6 +1631,7 @@ dependencies = [
  "futures",
  "hex",
  "ignore",
+ "libc",
  "md-5 0.10.6",
  "notify",
  "rayon",

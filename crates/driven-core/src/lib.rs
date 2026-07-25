@@ -29,6 +29,7 @@ pub mod network;
 pub mod orchestrator;
 pub mod pacer;
 pub mod planner;
+pub mod priority;
 pub mod scanner;
 pub mod state;
 pub mod telemetry;

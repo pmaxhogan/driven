@@ -32,6 +32,7 @@ use serde::Deserialize;
 use tauri::{AppHandle, State};
 
 use driven_core::orchestrator::{MeteredMode, OrchestratorConfig};
+use driven_core::priority::WorkPriority;
 use driven_core::state::StateRepo;
 use driven_core::types::ErrorCode;
 
@@ -1249,6 +1250,7 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
         metered_bandwidth_cap_mbps: global.metered_bandwidth_cap_mbps,
         default_concurrent_uploads: global.default_concurrent_uploads,
         adaptive_parallelism_enabled: global.adaptive_parallelism_enabled,
+        io_priority: WorkPriority::from_setting(&global.io_priority),
     })
 }
 

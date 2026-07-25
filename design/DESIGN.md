@@ -1583,12 +1583,28 @@ the release and the GH Actions build pipeline takes over.
   sha256 on modern CPUs.
 - **mmap big files** (> 4 MB) for hashing to avoid double-buffering.
   Fall back to streaming read if mmap fails (network mounts).
-- **Lowered I/O priority** during scans:
-  - Windows: `SetThreadInformation(... ThreadPowerThrottling ...)` +
-    `SetPriorityClass(BELOW_NORMAL_PRIORITY_CLASS)`.
-  - macOS: `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD,
-    IOPOL_THROTTLE)`.
-  - Linux: `ioprio_set(IOPRIO_CLASS_IDLE)`.
+- **Lowered CPU + I/O priority** for backup work, driven by the SPEC s22
+  `global.io_priority` setting (`normal` | `low` | `idle`) and implemented in
+  `driven_core::priority`. Everything is **per-thread** and **best-effort**: a
+  refused call is logged at `debug` and the work runs at normal priority - it
+  never fails a backup. Note this is deliberately NOT `SetPriorityClass`, which
+  is process-wide and would drag the UI/IPC threads down with it.
+  - Windows: `low` = `SetThreadPriority(THREAD_PRIORITY_BELOW_NORMAL)` (CPU
+    only - the only documented per-thread I/O hint is background mode, which
+    also floors CPU and memory); `idle` = `THREAD_MODE_BACKGROUND_BEGIN`
+    (CPU + I/O + memory).
+  - macOS: `setiopolicy_np(IOPOL_TYPE_DISK, IOPOL_SCOPE_THREAD, ...)` with
+    `IOPOL_UTILITY` for `low` and `IOPOL_THROTTLE` for `idle`, plus
+    `setpriority(PRIO_DARWIN_THREAD, 0, PRIO_DARWIN_BG)` for `idle`.
+  - Linux: `ioprio_set` - best-effort class priority 6 for `low`,
+    `IOPRIO_CLASS_IDLE` for `idle`. The nice value is deliberately NOT changed
+    inside a scoped guard: raising it is irreversible without `CAP_SYS_NICE`,
+    so a pooled thread would stay deniced forever. Only threads Driven owns end
+    to end (`priority::apply_to_current_thread`) take the nice bump.
+  - A scoped `PriorityGuard` restores the thread on drop and is `!Send`, so
+    holding one across an `.await` - which would demote a pooled thread and
+    leak the demotion - is a compile error rather than a runtime mystery. That
+    confines the apply sites to `spawn_blocking` closures.
 - **Bounded channels** between scanner → planner → uploader so a fast
   scanner doesn't OOM the queue.
 - **Streaming hash + upload.** No "hash first, upload second" two-pass.
