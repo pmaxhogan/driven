@@ -5,6 +5,35 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.4.0](https://github.com/pmaxhogan/driven/compare/v2.3.0...v2.4.0) (2026-07-26)
+
+
+### Features
+
+* **cli:** add dump-client-creds to print an account's stored BYO OAuth client ([#166](https://github.com/pmaxhogan/driven/issues/166)) ([4b6070b](https://github.com/pmaxhogan/driven/commit/4b6070b7470b95efec113fb4b2bc55e2f423db03))
+* **core:** parallel scan with negation-aware directory pruning ([#169](https://github.com/pmaxhogan/driven/issues/169)) ([3792e47](https://github.com/pmaxhogan/driven/commit/3792e47cd803626994c5ec6bb292121c92e6ecfe))
+* **core:** remote-existence audit heals files whose Drive objects vanished ([#171](https://github.com/pmaxhogan/driven/issues/171)) ([5cb8e3a](https://github.com/pmaxhogan/driven/commit/5cb8e3affd2ec1a5d60f79a65cd97298f70bf9f2))
+* **core:** run the scan walk at the configured io_priority ([#173](https://github.com/pmaxhogan/driven/issues/173)) ([8f39961](https://github.com/pmaxhogan/driven/commit/8f399617c64f9038367e740659fa4ad8bb2e5354))
+* **core:** shape bundle-build file reads with the io_priority setting ([#179](https://github.com/pmaxhogan/driven/issues/179)) ([af8f048](https://github.com/pmaxhogan/driven/commit/af8f0480bd00a2c6fa4169fdb10b1630e498cf0d))
+* **core:** shape upload I/O with the io_priority setting ([#176](https://github.com/pmaxhogan/driven/issues/176)) ([badd9c9](https://github.com/pmaxhogan/driven/commit/badd9c9680920e2200b73f19a5e988af8e9dedf1))
+* **core:** wire the ioPriority setting to real OS thread priorities ([#170](https://github.com/pmaxhogan/driven/issues/170)) ([51bb1f3](https://github.com/pmaxhogan/driven/commit/51bb1f345d4da98b07df8dc0c96d4de68afa494b))
+* persist rolling backend logs and capture frontend console into diagnostics ([#167](https://github.com/pmaxhogan/driven/issues/167)) ([292e221](https://github.com/pmaxhogan/driven/commit/292e2210966eb2038d79c6fd3be00fce43ddcc2f))
+* real-world benchmark suite comparing driven with rclone ([#178](https://github.com/pmaxhogan/driven/issues/178)) ([85f6d6a](https://github.com/pmaxhogan/driven/commit/85f6d6a7413b5e8c3b5b32cbd0ea6e23c4eac19e))
+* **ui:** instant exclusion-preview re-evaluation from an in-memory tree ([#177](https://github.com/pmaxhogan/driven/issues/177)) ([8f49570](https://github.com/pmaxhogan/driven/commit/8f4957000c54a89f635a7163eecb417b107fcf12))
+* **ui:** sticky shell chrome, indeterminate scan progress and navigation cleanup ([#163](https://github.com/pmaxhogan/driven/issues/163)) ([4896336](https://github.com/pmaxhogan/driven/commit/4896336b8796eede4a5655f0de752061caa6f7b1))
+* **ui:** transient in-app toast notifications ([#164](https://github.com/pmaxhogan/driven/issues/164)) ([0104a8e](https://github.com/pmaxhogan/driven/commit/0104a8e896d47a375d8f75e1bc7058de82ea1ac5))
+* **ui:** warn when include patterns defeat directory pruning ([#162](https://github.com/pmaxhogan/driven/issues/162)) ([6d3b4b2](https://github.com/pmaxhogan/driven/commit/6d3b4b2a4f265754b3f76d2358e6039123d62d63))
+
+
+### Bug Fixes
+
+* **core:** self-heal a stale drive_file_id when an update hits a definitive 404 ([#168](https://github.com/pmaxhogan/driven/issues/168)) ([8b983b3](https://github.com/pmaxhogan/driven/commit/8b983b35e5d53304eaeee82b52c32eaae011680f))
+
+
+### Performance Improvements
+
+* **core:** per-directory decision cursor for the exclusion preview + NFC fast path ([#172](https://github.com/pmaxhogan/driven/issues/172)) ([a587fed](https://github.com/pmaxhogan/driven/commit/a587fed8fad9ff9e19e6429f9641ea41754b7c1e))
+
 ## [2.3.0](https://github.com/pmaxhogan/driven/compare/v2.2.0...v2.3.0) (2026-07-25)
 
 
