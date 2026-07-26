@@ -21,12 +21,13 @@ guide to creating that credential in the Google Cloud Console:
 ## How Driven compares
 
 Driven is a native desktop app that pairs end-to-end encryption with one-way
-backup to a cloud you already own, plus laptop-friendly touches (gitignore-aware
-excludes, battery and metered-network awareness) that CLI backup tools and
-consumer sync clients skip. Where it is thinner today (more backends,
-block-level dedup) is marked honestly below.
+backup to a cloud you already own, plus laptop-friendly touches - gitignore-aware
+excludes, battery and metered-network awareness, and backup work that runs below
+normal CPU and disk priority so it does not fight whatever you are actually using
+the machine for - that CLI backup tools and consumer sync clients skip. Where it
+is thinner today (more backends, block-level dedup) is marked honestly below.
 
-Legend: :white_check_mark: yes &nbsp; :large_orange_diamond: partial (see note) &nbsp; :x: no
+Legend: :white_check_mark: yes &nbsp; :large_orange_diamond: partial (see note) &nbsp; :x: no &nbsp; :grey_question: not documented
 
 | Capability | Driven | rclone | Drive for desktop | Duplicati | restic | Backblaze |
 | --- | :---: | :---: | :---: | :---: | :---: | :---: |
@@ -43,12 +44,18 @@ Legend: :white_check_mark: yes &nbsp; :large_orange_diamond: partial (see note) 
 | Block-level deduplication | :x:⁶ | :x: | :x: | :white_check_mark: | :white_check_mark: | :x: |
 | Locked / open-file backup (Windows VSS) | :white_check_mark: | :x: | :large_orange_diamond:¹² | :white_check_mark: | :white_check_mark: | :white_check_mark: |
 | Periodic integrity re-verification | :white_check_mark: | :large_orange_diamond:¹³ | :x: | :white_check_mark: | :large_orange_diamond:¹³ | :large_orange_diamond:¹³ |
-| Automatic battery / metered-network / sleep awareness | :white_check_mark: | :x: | :x: | :x: | :x: | :x:¹⁴ |
-| Per-source include/exclude incl. .gitignore | :white_check_mark: | :large_orange_diamond:¹⁵ | :x: | :large_orange_diamond:¹⁵ | :large_orange_diamond:¹⁵ | :large_orange_diamond:¹⁵ |
-| Native desktop GUI app | :white_check_mark: | :x:¹⁶ | :white_check_mark: | :large_orange_diamond:¹⁷ | :x:¹⁶ | :white_check_mark: |
-| In-app file search + selective restore | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :large_orange_diamond:¹⁸ | :white_check_mark: |
+| Re-uploads backup copies deleted at the destination | :white_check_mark:¹⁴ | :white_check_mark:¹⁵ | :x:¹⁶ | :large_orange_diamond:¹⁷ | :large_orange_diamond:¹⁷ | :grey_question:¹⁸ |
+| Parallel, multi-threaded local scan | :white_check_mark:¹⁹ | :white_check_mark:²⁰ | :grey_question:²¹ | :x:²² | :large_orange_diamond:²³ | :grey_question:²¹ |
+| OS-level CPU / disk I/O priority for backup work | :white_check_mark:²⁴ | :x:²⁵ | :x:²⁵ | :x:²⁵ | :x:²⁵ | :x:²⁵ |
+| Automatic battery / metered-network / sleep awareness | :white_check_mark: | :x: | :x: | :x: | :x: | :x:²⁶ |
+| Per-source include/exclude incl. .gitignore | :white_check_mark: | :large_orange_diamond:²⁷ | :x:²⁷ | :large_orange_diamond:²⁷ | :large_orange_diamond:²⁷ | :large_orange_diamond:²⁷ |
+| Live preview of which files a rule keeps or drops | :white_check_mark:²⁸ | :large_orange_diamond:²⁹ | :x: | :white_check_mark:³⁰ | :large_orange_diamond:²⁹ | :x: |
+| Native desktop GUI app | :white_check_mark: | :x:³¹ | :white_check_mark: | :large_orange_diamond:³² | :x:³¹ | :white_check_mark: |
+| In-app file search + selective restore | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :large_orange_diamond:³³ | :white_check_mark: |
+| Rolling local logs plus a one-click diagnostics bundle | :white_check_mark:³⁴ | :large_orange_diamond:³⁵ | :white_check_mark: | :large_orange_diamond:³⁶ | :x:³⁷ | :white_check_mark: |
 | Open source (permissive license) | :white_check_mark: | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
-| Cross-platform desktop (Windows, macOS, Linux) | :white_check_mark: | :white_check_mark: | :x:¹⁹ | :white_check_mark: | :white_check_mark: | :x:¹⁹ |
+| Cross-platform desktop (Windows, macOS, Linux) | :white_check_mark: | :white_check_mark: | :x:³⁸ | :white_check_mark: | :white_check_mark: | :x:³⁸ |
+| Reproducible end-to-end benchmark suite in the repo | :white_check_mark:³⁹ | :x:⁴⁰ | :x:⁴⁰ | :x:⁴⁰ | :x:⁴⁰ | :x:⁴⁰ |
 
 Notes:
 
@@ -65,14 +72,37 @@ Notes:
 - ¹¹ Backblaze restores from within a retention window (30 days by default, extendable).
 - ¹² Drive for desktop continuously syncs open files but does not take an application-consistent VSS snapshot.
 - ¹³ rclone (`check` / `cryptcheck`) and restic (`check`) verify on demand rather than on an automatic schedule; Backblaze runs periodic server-side checks only.
-- ¹⁴ Several tools offer manual bandwidth limits or schedules; only Driven automatically defers on battery, metered, or offline networks and resumes on wake.
-- ¹⁵ rclone, Duplicati, restic, and Backblaze support custom include/exclude filter rules but not `.gitignore` semantics.
-- ¹⁶ rclone and restic are command-line tools; their GUIs are separate third-party projects (for example RcloneView, Backrest).
-- ¹⁷ Duplicati runs as a background service with a local web UI plus a tray helper, not a native desktop app.
-- ¹⁸ restic search and selective restore are driven from the CLI (or a mounted snapshot), not an in-app browser.
-- ¹⁹ Windows and macOS only; Linux needs third-party tools.
+- ¹⁴ Driven keeps a local state database, so an unchanged file is not normally re-checked against the cloud at all. A separate audit pass therefore runs at startup and on every deep-verify cycle: it enumerates what the account still holds for each source and re-queues anything whose remote object is gone. It infers "missing" only from an enumeration it completed, so a failed listing heals nothing rather than re-uploading a whole source.
+- ¹⁵ rclone keeps no state, so `copy` / `sync` re-list the destination on every run and a file deleted there is simply transferred again. Self-correcting by construction, at the cost of a full remote listing every run.
+- ¹⁶ Worse than absent: Drive for desktop mirrors deletions in both directions, so a file deleted in Drive is deleted locally too.
+- ¹⁷ Both detect destination damage (`list-broken-files`, `check`), but recovery is operator-driven. Duplicati's `repair` regenerates index files, while missing data volumes need `--rebuild-missing-dblock-files` or get amputated by `purge-broken-files`; restic's `repair` commands drop references to lost data, and healing means re-running `backup` against a source that still has it.
+- ¹⁸ Backblaze does not document whether its client detects and re-uploads files whose server-side copies were lost.
+- ¹⁹ Driven's walk runs on `available_parallelism()` worker threads (clamped to 2..=8) off the async runtime, and prunes excluded directories that no negation rule can reach into rather than descending them.
+- ²⁰ rclone walks at `--checkers` concurrency (8 by default) and transfers at `--transfers` (4 by default).
+- ²¹ Neither Google nor Backblaze documents its client's scan concurrency. Backblaze's thread setting governs upload connections, not the local walk.
+- ²² Duplicati's file enumeration is a single serial pass; the hashing, compression, and upload stages downstream of it are concurrent.
+- ²³ restic reads files concurrently at `--read-concurrency`, which defaults to 2.
+- ²⁴ Driven's `io_priority` setting (`low` by default) maps to real per-platform OS calls: below-normal thread priority plus per-handle I/O priority hints on Windows, `ioprio_set` on Linux, `setiopolicy_np` on macOS. It shapes the scan walk, upload reads, and bundle builds. It is best-effort by design, so a refused call means that work runs at normal priority rather than failing.
+- ²⁵ None of the five sets an OS priority itself. rclone and restic document running them under `nice` / `ionice` yourself; Duplicati still accepts `--thread-priority` but marks it deprecated ("has no effect, use the operating system controls to set the process priority"); Drive for desktop and Backblaze offer bandwidth throttles (and Backblaze an upload-thread count), which cap network rate rather than CPU or disk priority.
+- ²⁶ Several tools offer manual bandwidth limits or schedules; only Driven automatically defers on battery, metered, or offline networks and resumes on wake.
+- ²⁷ rclone, Duplicati, restic, and Backblaze support custom include/exclude filter rules but not `.gitignore` semantics. Drive for desktop has no pattern rules at all, only a choice of which folders to sync.
+- ²⁸ Driven re-classifies the folder tree from an in-memory cache as you type, so a rule edit updates the tree and its counts without re-reading the disk. On a 63k-entry tree a re-classification takes 536 ms against 868 ms for a fresh walk of the same (already OS-cached) tree, and issues no `read_dir` calls at all, so unlike a walk its cost does not scale with disk speed.
+- ²⁹ rclone and restic answer the question with `--dry-run`, which re-walks the source on every attempt.
+- ³⁰ Duplicati 2.3.0.4 (July 2026) added server-evaluated inclusion state to its new UI's tree; it marks the nodes you expand rather than summarising the whole source.
+- ³¹ rclone and restic are command-line tools; their GUIs are separate third-party projects (for example RcloneView, Backrest).
+- ³² Duplicati runs as a background service with a local web UI plus a tray helper, not a native desktop app.
+- ³³ restic search and selective restore are driven from the CLI (or a mounted snapshot), not an in-app browser.
+- ³⁴ Driven writes daily rolling logs (pruned at 14 days / 25 MB) that interleave backend tracing with the webview's own console output, and the in-app diagnostics export bundles them.
+- ³⁵ rclone logs to a file only when you pass `--log-file` (rotation via `--log-file-max-size` and friends), and has no bundle export; its bug template asks you to attach a log you produced by hand.
+- ³⁶ Duplicati's "Create bug report" export is a genuine one-click bundle (system info plus an obfuscated copy of the local database), and its web UI has a live log view; file logging is opt-in via `--log-file`, defaults to warnings only, and does not rotate.
+- ³⁷ restic has no log-file option at all - output goes to stdout, and the only file logging is an unrotated `DEBUG_LOG` env var that its contributing guide asks you to redact yourself.
+- ³⁸ Windows and macOS only; Linux needs third-party tools.
+- ³⁹ `bench/` runs Driven's real engine and rclone over identical seeded fixtures against a live Drive account, reporting wall time, throughput, API calls, CPU time, and peak memory for a cold and an incremental pass. See [`bench/README.md`](bench/README.md) for scales, costs, and what is and is not apples-to-apples.
+- ⁴⁰ The others publish unit-test microbenchmarks, internal tuning harnesses (Duplicati's unreleased AutoTune), or vendor marketing numbers, rather than a runnable end-to-end suite. Backblaze does publish a quarterly benchmark, but of B2 object storage rather than the backup client.
 
-Feature sets verified 2026-07; check each project's current docs before relying on a cell.
+Competitor rows were verified in July 2026 against rclone 1.74.4, restic 0.19.1,
+Duplicati 2.3.0.4, Backblaze Personal Backup 10.0.2, and Drive for desktop 128.0.
+These move: check each project's current docs before relying on a cell.
 
 ## Features
 
@@ -80,15 +110,25 @@ Feature sets verified 2026-07; check each project's current docs before relying 
   sync surprises).
 - Optional per-source client-side encryption (XChaCha20-Poly1305 for contents
   and file names; a BIP39 recovery phrase guards the master key).
-- Scanner that honors `.gitignore`, built-in and custom exclude rules, and a
-  configurable symlink policy.
+- Parallel, multi-threaded scanner that honors `.gitignore`, built-in and custom
+  exclude rules, and a configurable symlink policy, and that skips excluded
+  directories instead of descending them.
+- Live exclusion preview that re-classifies the folder tree as you edit a rule,
+  from an in-memory tree rather than a fresh walk of the disk.
 - Concurrent, paced executor with retries and resumable uploads.
+- Configurable OS priority (`low` by default) for the scan, upload reads, and
+  bundle builds, so backups yield CPU and disk to whatever is in the foreground.
 - Battery and network awareness: backups defer on battery and on metered or
   offline networks, then resume automatically.
+- Remote-existence audit that re-queues files whose Drive copies were deleted
+  outside Driven, so a destination-side deletion cannot leave a file silently
+  un-backed-up.
 - Windows Volume Shadow Copy support so locked files (Outlook PSTs, running DB
   files, VM disks) still back up.
 - In-app restore browser with full-text file-name search and streaming decrypt.
 - Activity dashboard with a live tail and filterable history.
+- Rolling local log files covering both the backend and the webview console,
+  collected into a one-click diagnostics bundle.
 - In-app auto-update with signed update manifests and a stable / dev channel
   selector.
 - Anonymous, opt-out telemetry (coarse counts only; never file names, paths, or
@@ -206,7 +246,12 @@ just test    # cargo test --workspace + vitest
 just lint    # cargo fmt --check + clippy + eslint
 just bundle  # cargo tauri build
 just deny    # cargo deny check
+just bench   # benchmark the real engine against rclone (needs live credentials)
 ```
+
+`just bench` uploads to a real Drive account and costs real bandwidth; read
+[`bench/README.md`](bench/README.md) for the prerequisites, scales, and safety
+rails before running it.
 
 ## Run via Docker
 
