@@ -29,7 +29,7 @@ tracing.workspace = true
 boa_engine = "0.20"
 url.workspace = true
 # >=0.16.3 fixes RUSTSEC-2026-0002 (IterMut soundness); we only use get/put.
-lru = "0.16"
+lru = "0.18"
 
 [dev-dependencies]
 # The async `resolve_proxy` / `validate_pac_source` tests run on a minimal
