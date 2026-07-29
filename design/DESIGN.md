@@ -1398,6 +1398,59 @@ Always-present icon. States:
 | Red                   | Error state requires attention (auth needed, decrypt failure, disk full)    |
 
 The yellow-with-`!` state covers all of §5.8's network failure modes.
+
+**macOS carve-out - the colours above are Windows/Linux only.** macOS
+menu-bar extras are expected to be *template* images: alpha-only art the
+OS tints itself (black on a light menu bar, white on a dark or selected
+one). A colour-bearing icon there does not read as themed, it reads as
+broken - it is the one coloured blob among the system's monochrome
+extras. So on macOS the tray renders a template mark and **state is
+carried by the badge SHAPE alone**: spinner = syncing, pause bars =
+paused, `!` = network attention, `X` = error, plain mark = idle. That is
+the same shape vocabulary as the table above, minus the colour; the
+glyphs were always designed to be readable without colour (colour-blind
+users, tiny trays), which is what makes dropping it safe here. macOS
+therefore has no yellow or red tray icon - every other mention of a
+"yellow"/"red" tray icon in this document (§5.8.1, §5.10.2) means the
+shape-equivalent state there. This is deliberate and matches SPEC
+§1579's `iconAsTemplate` for macOS; do **not** "fix" the macOS path back
+to a colour icon.
+
+#### 8.1.1 macOS Dock icon on `cargo tauri dev` (known, dev-only, WONTFIX)
+
+**A `cargo tauri dev` run shows the generic green "exec" icon instead of
+the Driven mark. This is a dev-run cosmetic artifact, not a defect in the
+shipped product** - do not spend time "fixing" it in the app, and do not
+treat a report of it against a dev build as a release bug.
+
+Why: `cargo tauri dev` launches the bare `driven-app` Mach-O with no
+`.app` wrapper, so LaunchServices has no icon to associate with the
+process. A packaged build is unaffected - `icons/icon.icns` is listed in
+`bundle.icon` in `tauri.conf.json` and ends up in `Contents/Resources`,
+so `Driven.app` has always had the correct Dock icon.
+
+Investigated 2026-07 and deliberately NOT fixed in code. The findings,
+so nobody re-derives them:
+
+- **Tauri already does the only available runtime fix.** `tauri-codegen`
+  embeds the icns whenever `target == MacOS && dev` (confirmed: the icns
+  bytes are present verbatim in the built dev binary), and `tauri`
+  calls `-[NSApplication setApplicationIconImage:]` at `RunEvent::Ready`.
+  Re-applying it later is a re-run of a mechanism already executing.
+- **`setApplicationIconImage:` cannot fix the surface people usually
+  notice.** Third-party status bars, window switchers, and anything else
+  reading `NSRunningApplication.icon()` get the **static LaunchServices
+  file-type icon**, which that call does not affect. Confirmed with a
+  control experiment: a bundle-less process that successfully sets its
+  own icon still reports the generic one through that API.
+- **So the only real fix for an unbundled run is to run a bundled
+  `.app`** (e.g. `cargo tauri build` and launch the bundle), not any
+  runtime API call.
+
+If the generic icon is ever reported against a RELEASE build, that is a
+different bug with different evidence (a broken/missing icns in the
+bundle) - chase it then, and do not assume it is this.
+
 The tooltip shows the specific condition ("Connected, no Internet",
 "Captive portal — click to sign in", "Google Drive is unavailable", etc.)
 and the tray menu surfaces the matching action ("Open captive portal",
