@@ -1902,10 +1902,16 @@ mod tests {
     fn validate_source_metadata_enforces_printable_nonempty_bounded() {
         // R4-P2-3: the renderer-supplied source metadata is validated before it
         // lands in SQLite. A valid set passes.
-        validate_source_metadata("My Docs", "drive-folder-id", "Backups/Docs", BackendKind::GoogleDrive)
-            .expect("a clean metadata set is accepted");
+        validate_source_metadata(
+            "My Docs",
+            "drive-folder-id",
+            "Backups/Docs",
+            BackendKind::GoogleDrive,
+        )
+        .expect("a clean metadata set is accepted");
         // An empty Drive folder PATH is allowed (My Drive root).
-        validate_source_metadata("My Docs", "root", "", BackendKind::GoogleDrive).expect("empty path = My Drive root");
+        validate_source_metadata("My Docs", "root", "", BackendKind::GoogleDrive)
+            .expect("empty path = My Drive root");
 
         // Empty / whitespace display name -> rejected.
         assert_eq!(
@@ -1953,9 +1959,14 @@ mod tests {
         );
         // Control char in the Drive folder path -> rejected.
         assert_eq!(
-            validate_source_metadata("ok", "fid", "Backups/\u{0000}/Docs", BackendKind::GoogleDrive)
-                .expect_err("control char in drive folder path")
-                .code,
+            validate_source_metadata(
+                "ok",
+                "fid",
+                "Backups/\u{0000}/Docs",
+                BackendKind::GoogleDrive
+            )
+            .expect_err("control char in drive folder path")
+            .code,
             ErrorCode::InvalidInput
         );
     }
