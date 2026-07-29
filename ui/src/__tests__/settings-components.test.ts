@@ -107,6 +107,9 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     updater: { channel: "stable", checkIntervalSecs: 21600 },
     ui: { trayLeftClickOpens: "activity", locale: "en-US", colorMode: "system" },
     windows: { vssMode: "auto", vssHelper: false },
+    // null off macOS - the default fixture stands in for a non-mac host, so the
+    // APFS block is absent unless a test opts in with `makeSettings({ macos })`.
+    macos: null,
     bundleSmallFiles: false,
     ...over,
   };
@@ -1803,6 +1806,205 @@ describe("Settings Rules tab", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  // --- macOS APFS-snapshot locked-file backup (DESIGN s5.3.2) ---
+  //
+  // The mac twin of the VSS helper block above. `settings.macos` is non-null ONLY
+  // on macOS, and that nullability IS the platform check - no userAgent sniffing.
+
+  function apfsStatus(over: Record<string, unknown> = {}): Record<string, unknown> {
+    return {
+      supported: true,
+      helperEnabled: false,
+      helperAlive: false,
+      helperLaunchable: true,
+      launchPending: false,
+      launchDeclined: false,
+      lockedFileBackupDegraded: false,
+      ...over,
+    };
+  }
+
+  it("DESIGN s5.3.2: renders the APFS snapshot toggle on macOS and toggling it patches macos.apfsSnapshot", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(makeSettings({ macos: { apfsSnapshot: false } }));
+      if (cmd === "get_vss_helper_status") return Promise.resolve(undefined);
+      if (cmd === "get_apfs_helper_status") return Promise.resolve(apfsStatus());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("get_apfs_helper_status", undefined);
+    expect(wrapper.find('[data-testid="apfs-snapshot-setting"]').exists()).toBe(true);
+    // The TCC caveat is always shown next to the toggle: a snapshot cannot read
+    // around a macOS privacy denial, so that case still needs Full Disk Access.
+    const tccNote = wrapper.get('[data-testid="apfs-snapshot-tcc-note"]');
+    expect(tccNote.text()).toContain("Full Disk Access");
+
+    const toggle = wrapper.get('[data-testid="apfs-snapshot-toggle"]');
+    // Reflects the stored setting (default off).
+    expect((toggle.element as HTMLInputElement).checked).toBe(false);
+    await toggle.setValue(true);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { macos: { apfsSnapshot: true } },
+    });
+  });
+
+  it("DESIGN s5.3.2: hides the APFS snapshot toggle when macos is null (off macOS)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      // The default fixture has `macos: null` - i.e. a non-mac host.
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_apfs_helper_status")
+        return Promise.resolve(apfsStatus({ supported: false, helperLaunchable: false }));
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="apfs-snapshot-setting"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="apfs-snapshot-toggle"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="apfs-snapshot-tcc-note"]').exists()).toBe(false);
+  });
+
+  it("DESIGN s5.3.2: enabling the APFS snapshot shows the waiting-for-approval hint, then resolves on poll", async () => {
+    vi.useFakeTimers();
+    try {
+      let statusCall = 0;
+      invokeMock.mockImplementation((cmd: string, args: unknown) => {
+        if (cmd === "get_settings")
+          return Promise.resolve(makeSettings({ macos: { apfsSnapshot: false } }));
+        if (cmd === "get_apfs_helper_status") {
+          statusCall += 1;
+          // On tab load: idle. After enabling: pending (the admin prompt is up).
+          // Still pending on the first poll (so the poll re-arms itself), then
+          // declined on the second (the user dismissed the prompt).
+          if (statusCall === 1) return Promise.resolve(apfsStatus());
+          if (statusCall <= 3)
+            return Promise.resolve(apfsStatus({ helperEnabled: true, launchPending: true }));
+          return Promise.resolve(
+            apfsStatus({
+              helperEnabled: true,
+              helperLaunchable: false,
+              launchDeclined: true,
+              lockedFileBackupDegraded: true,
+            })
+          );
+        }
+        if (cmd === "update_settings") {
+          const patch = (args as { patch: Record<string, unknown> }).patch;
+          return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+        }
+        return Promise.resolve(undefined);
+      });
+      const wrapper = mount(Settings, {
+        props: { tab: "rules" },
+        global: globalMountOptions,
+      });
+      await flushPromises();
+
+      const toggle = wrapper.get('[data-testid="apfs-snapshot-toggle"]');
+      await toggle.setValue(true);
+      await flushPromises();
+
+      // The eager enable committed and the pending hint is shown.
+      expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+        patch: { macos: { apfsSnapshot: true } },
+      });
+      expect(wrapper.find('[data-testid="apfs-helper-pending"]').exists()).toBe(true);
+
+      // First poll tick: still pending, so the poll re-arms itself.
+      await vi.advanceTimersByTimeAsync(1600);
+      await flushPromises();
+      expect(wrapper.find('[data-testid="apfs-helper-pending"]').exists()).toBe(true);
+
+      // Second tick: the launch resolves to declined -> declined hint shown.
+      await vi.advanceTimersByTimeAsync(1600);
+      await flushPromises();
+      expect(wrapper.find('[data-testid="apfs-helper-pending"]').exists()).toBe(false);
+      expect(wrapper.find('[data-testid="apfs-helper-declined"]').exists()).toBe(true);
+
+      // Unmounting with a spent poll handle still in hand clears it, so no timer
+      // is orphaned when the user navigates away mid-launch.
+      wrapper.unmount();
+      await vi.advanceTimersByTimeAsync(5000);
+      await flushPromises();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("DESIGN s5.3.2: an unavailable APFS status on tab load hides both hints", async () => {
+    // IPC unavailable (e.g. a browser dev shell): the Rules tab must still render
+    // with no hints rather than surface an error.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(makeSettings({ macos: { apfsSnapshot: true } }));
+      if (cmd === "get_apfs_helper_status") return Promise.reject(new Error("status unavailable"));
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="apfs-snapshot-toggle"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="apfs-helper-pending"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="apfs-helper-declined"]').exists()).toBe(false);
+  });
+
+  it("DESIGN s5.3.2: toggling the APFS snapshot survives a failing status re-fetch", async () => {
+    // The setApfsSnapshot handler re-fetches get_apfs_helper_status after
+    // committing; a rejection there must be swallowed (no unhandled rejection, no
+    // crash) - the commit still lands and no hint is shown.
+    let statusCalls = 0;
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(makeSettings({ macos: { apfsSnapshot: false } }));
+      if (cmd === "get_apfs_helper_status") {
+        statusCalls += 1;
+        // First call (on tab activation) resolves; the post-toggle re-fetch rejects.
+        return statusCalls === 1
+          ? Promise.resolve(apfsStatus())
+          : Promise.reject(new Error("status unavailable"));
+      }
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const toggle = wrapper.get('[data-testid="apfs-snapshot-toggle"]');
+    await toggle.setValue(true);
+    await flushPromises();
+
+    // The commit still happened despite the failing status re-fetch.
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { macos: { apfsSnapshot: true } },
+    });
+    // Status went null on the rejection, so neither hint is rendered.
+    expect(wrapper.find('[data-testid="apfs-helper-pending"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="apfs-helper-declined"]').exists()).toBe(false);
   });
 
   it("reflects telemetry default ON and toggling it calls set_telemetry_enabled (SPEC s16 R2-P1-1)", async () => {

@@ -354,6 +354,13 @@ pub struct AppState {
     /// `get_vss_helper_status` can report truthful liveness. Behind a sync `Mutex`
     /// (set once at boot, read for status/shutdown - never held across an await).
     vss_helper: std::sync::Mutex<Option<Arc<crate::vss_helper::VssHelperManager>>>,
+    /// DESIGN s5.3.2: the macOS sibling of [`Self::vss_helper`] - the app-side
+    /// APFS snapshot broker lifecycle owner, or `None` when it is not in play
+    /// (off macOS, or the bundled sidecar could not be located). Built ONCE by
+    /// `assembly::build_and_spawn` and installed here so (a) the quit sweep can
+    /// shut the broker down (no root process outlives the app) and (b)
+    /// `get_apfs_helper_status` can report truthful liveness.
+    apfs_helper: std::sync::Mutex<Option<Arc<crate::apfs_helper::ApfsHelperManager>>>,
 }
 
 /// M9c D4: one pending recovery-phrase ack - the owning account (so the ack can
@@ -566,6 +573,7 @@ impl AppState {
             telemetry: TelemetryRuntime::default(),
             recovery_acks: std::sync::Mutex::new(HashMap::new()),
             vss_helper: std::sync::Mutex::new(None),
+            apfs_helper: std::sync::Mutex::new(None),
         }
     }
 
@@ -595,6 +603,36 @@ impl AppState {
     /// process outlives the app session. Mirrors the M9a/M9b task drains.
     pub fn shutdown_vss_helper(&self) {
         if let Some(manager) = self.vss_helper_manager() {
+            manager.shutdown();
+        }
+    }
+
+    // --- DESIGN s5.3.2: macOS APFS snapshot broker --------------------------
+
+    /// Install the APFS broker lifecycle manager built by
+    /// `assembly::build_and_spawn` (macOS only). Called once at boot before
+    /// `.manage(..)`; a subsequent call replaces it.
+    pub fn set_apfs_helper_manager(&self, manager: Arc<crate::apfs_helper::ApfsHelperManager>) {
+        *self.apfs_helper.lock().unwrap_or_else(|e| e.into_inner()) = Some(manager);
+    }
+
+    /// The installed APFS broker manager, if one is in play. `None` off macOS.
+    /// Returns a cloned `Arc` so `get_apfs_helper_status` can read liveness
+    /// without holding the lock.
+    #[must_use]
+    pub fn apfs_helper_manager(&self) -> Option<Arc<crate::apfs_helper::ApfsHelperManager>> {
+        self.apfs_helper
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Shut the APFS broker down at app quit (best-effort; a no-op when no
+    /// manager is in play), so no root process - and no mounted snapshot -
+    /// outlives the app session. The broker also self-terminates when the app
+    /// pid it was launched with exits, so this is belt-and-braces.
+    pub fn shutdown_apfs_helper(&self) {
+        if let Some(manager) = self.apfs_helper_manager() {
             manager.shutdown();
         }
     }

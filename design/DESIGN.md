@@ -696,6 +696,108 @@ start with it. A path that does not lie under the mount is mapped as
 so an exotic mount layout degrades to skip rather than reading the wrong
 file.
 
+**App wiring (the setting, the provider, the sidecar).** Three pieces, each
+the macOS mirror of its s5.3.1 Windows twin:
+
+1. **The opt-in setting** is `macos.apfs_snapshot` (SPEC s22), default
+   `false` - additive and `#[serde(default)]`, so a settings DB written
+   before this feature loads unchanged. It is macOS-only in the same way
+   `windows` is Windows-only: `get_settings` returns the `macos` group as
+   `None` off macOS, and that nullability IS the UI's platform check (no
+   userAgent sniff).
+2. **Provider selection** happens at the one existing site,
+   `assembly::build_vss`, which now has three arms (Windows VSS, macOS
+   APFS, Linux `None`). The macOS arm builds an `ApfsBrokeredProvider` over
+   a single app-owned `ApfsHelperManager`, and the SAME `Arc` is the
+   launcher for every account's provider - so there is ONE broker, ONE
+   socket, and ONE administrator prompt per session, matching the Windows
+   one-UAC-prompt model. The manager is built at boot REGARDLESS of the
+   setting, so toggling it on takes effect without an app restart; a
+   disabled manager reports `Disabled` and every provider behaves exactly
+   like the historical skip.
+3. **The toggle drives the provider's `VssMode`** (on -> `Auto`, off ->
+   `Never`), so a change is applied between cycles by the existing
+   `reconfigure` -> `VssProvider::set_mode` path rather than needing an
+   orchestrator rebuild. The manager gate and the mode are belt-and-braces:
+   either alone would disable the fallback.
+
+**Packaging.** `driven-apfs-helper` ships as a Tauri `externalBin` sidecar
+on both darwin targets, built in CI and staged into `src-tauri/binaries/`
+with a target-triple suffix, merged at bundle time via
+`--config src-tauri/tauri.apfs-helper.conf.json`. This is the same
+split-config trick s5.3.1 uses for the Windows helper, and for the same
+reason: each OS's bundle references only its own sidecar, and the
+cargo-only CI gates (which never pass `--config`) stay free of both. Tauri
+installs an externalBin into `Driven.app/Contents/MacOS/`, the same
+directory as the app binary, so the sidecar resolves via
+`current_exe().parent()` exactly as on Windows.
+
+**The socket path must fit in `sockaddr_un`.** Darwin's `sun_path` is 104
+bytes, and macOS points `TMPDIR` at a per-user
+`/var/folders/<xx>/<~20 chars>/T/`. Building the session socket under
+`std::env::temp_dir()` therefore yields a ~110-byte path and
+`UnixListener::bind` fails with "path must be shorter than SUN_LEN" - on
+EVERY Mac, before the broker serves a single request. The runtime directory
+is consequently `/tmp/driven-apfs-<uid>` (created `0700`), which brings the
+full socket path to ~70 bytes. `/tmp` is world-writable but sticky and the
+per-uid subdirectory is `0700`, so another user can neither read the socket
+nor replace the directory; if they pre-create it, it is owned by them and the
+broker's own "socket parent must be owned by the peer uid with mode 0700"
+check refuses to serve, so the failure is closed rather than silent.
+
+**Install layout weakens one check but does not disable the feature.** The
+broker's co-installation check ("the caller's executable sits next to mine")
+is only strong if the peer user cannot WRITE to the helper's directory.
+Measured on macOS 26.6, essentially no drag-installed bundle satisfies that:
+every app installed by dragging out of a `.dmg` - including into
+`/Applications`, not merely `~/Applications` - has `Contents/MacOS` owned by
+the installing USER (verified across AltTab, Audacity, Chrome, Claude,
+Discord, Docker, GIMP), whereas pkg- and App-Store-installed apps (Cloudflare
+WARP, GarageBand) are `root:wheel`. Driven ships a `.dmg`, so this is the
+normal case, not the exotic one.
+
+The check is therefore **advisory** rather than fatal: the broker serves, and
+writes a `DEGRADED:` line to its root-owned audit log naming the directory and
+the uid. The reasoning is that the attacker it guards against is ALREADY the
+same uid - `getpeereid` is not bypassable by planting a binary - so defeating
+co-installation buys them a read-only, `nosuid`, `nodev`,
+ownership-preserving mount of an allow-listed volume at a broker-chosen
+mountpoint. That is a point-in-time copy of files that uid could already read,
+with TCC still applying to their own process. Trading locked-file backup away
+for every drag-install user would not have been a good exchange. The
+load-bearing checks are the peer uid, the volume allow-list, the snapshot-name
+validation and the mount options; this one is defence in depth.
+
+A `.pkg`-style install that lands the bundle root-owned restores the check to
+full strength and silences the `DEGRADED:` line, and remains the better
+end state - but it is an improvement, not a prerequisite.
+
+**`Ready` means the socket answered, not that a process was spawned.**
+`osascript` exits 0 as soon as the consent prompt resolves and the shell
+backgrounds the broker, so the launcher's own `Ready` reflects the SPAWN
+alone. If the broker then dies immediately - a failed pre-flight check, a bad
+sidecar, a socket path that will not bind - the user gets an administrator
+prompt followed by a healthy-looking status while nothing ever mounts. That
+silent shape is precisely what the `sun_path` overflow above produced, and it
+is the difference between a bug found in minutes and one found never. The app
+manager therefore probes the socket before passing `Ready` upward: a
+connect-and-drop liveness check (existence is not enough - a dead broker
+leaves its socket file behind, and connecting to that fails `ECONNREFUSED`).
+An unbacked `Ready` reports `Pending` - a transient skip, retried next cycle -
+for a 15s grace window covering the bind, and then `Disabled`, which makes
+`helper_launchable` false and surfaces as degraded in the UI rather than as an
+eternal `Pending` nobody can diagnose. Probing stops at the first success, so
+a healthy session pays a couple of connects, not one per status poll.
+
+**Not a TCC bypass.** Worth restating because it is the single most likely
+misreading of this whole section: an APFS snapshot lets Driven read a file
+that is BUSY. It does nothing whatsoever for a file TCC has denied. The
+mount preserves the original's ownership and the mounted tree is itself
+subject to TCC, and the historical `-o noowners` trick was CVE-2020-9771 -
+patched, and now an EDR-flagged signature we deliberately do not emit. A
+`local.permission_denied` file needs Full Disk Access; no snapshot setting
+substitutes for it.
+
 ### 5.4 Upload pipeline
 
 Per-account:
