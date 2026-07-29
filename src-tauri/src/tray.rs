@@ -30,10 +30,41 @@
 //! badge colours are the same per-state palette used elsewhere, so the icon
 //! conveys the live state at a glance while staying on-brand.
 //!
-//! `set_icon_as_template(false)` is forced on the live tray so macOS does not
-//! recolour these colour-bearing icons to monochrome (which would erase the
-//! teal + the badge colours); the committed `tauri.conf.json` keeps
-//! `iconAsTemplate: true` only for the static boot icon.
+//! ## macOS renders a TEMPLATE image instead (issue: colour icon in menu bar)
+//!
+//! macOS menu-bar extras are expected to be TEMPLATE images: alpha-only art the
+//! OS tints itself (black on a light bar, white on a dark or selected one). A
+//! colour-bearing icon there does not read as "themed", it reads as broken - it
+//! is the odd one out among the system's monochrome extras.
+//!
+//! So on macOS the live tray renders from [`TEMPLATE_PNG`] (`icons/tray.svg`
+//! rasterised to `icons/tray-template.png`: black glyph on transparency) via
+//! [`TrayIcon::template_rgba_frame`], and [`set_template_mode`] turns template
+//! mode ON. Windows and Linux keep the colour-bearing brand mark with template
+//! mode OFF, exactly as before.
+//!
+//! The critical constraint is that AppKit DISCARDS a template's RGB and keys
+//! only on ALPHA. Handing it the opaque `icons/64x64.png` would paint a solid
+//! black square. Everything the template path draws is therefore drawn in
+//! alpha: the badge's contrast band is a punched-out transparent ring rather
+//! than a white ring, and each state's glyph is punched OUT of the badge disc as
+//! holes rather than painted white on top. The holes are cut using the SAME
+//! glyph painters as the colour path (rendered to a scratch buffer, then
+//! inverted into alpha), so the two platforms cannot drift apart in shape.
+//!
+//! Consequence, and a deliberate divergence from DESIGN s8.1's colour table:
+//! **on macOS the state is carried by SHAPE only** - there is no yellow or red.
+//! That is sound because the badge glyphs were already designed to be readable
+//! without colour (see above), and it is what SPEC s1579's `iconAsTemplate` for
+//! macOS asks for. The template badge is drawn LARGER than the colour one
+//! ([`BADGE_R_TEMPLATE`] vs [`BADGE_R_COLOUR`]) so the punched holes survive
+//! being scaled down to a 22pt menu bar. Do NOT "fix" this back to a colour
+//! icon on macOS.
+//!
+//! `tauri.conf.json`'s `trayIcon` block governs only the static boot icon -
+//! [`build`] removes that tray ([`CONFIG_TRAY_ID`]) and replaces it with the
+//! generated `"driven-main"` one, so its `iconAsTemplate` never reaches the
+//! live icon.
 //!
 //! ## Animated Syncing (real, not faked)
 //!
@@ -224,8 +255,69 @@ impl TrayIcon {
     fn brand_rgba_frame(self, base: &BrandImage, frame: u32) -> Vec<u8> {
         let mut rgba = base.rgba.clone();
         if let Some(color) = self.badge_color() {
-            draw_badge(&mut rgba, base.width, base.height, color);
-            self.draw_glyph(&mut rgba, base.width, base.height, frame);
+            let geom = badge_geometry(base.width, base.height);
+            draw_badge(&mut rgba, base.width, base.height, &geom, color);
+            self.draw_glyph(&mut rgba, base.width, base.height, &geom, frame);
+        }
+        rgba
+    }
+
+    /// The macOS TEMPLATE RGBA for this state at animation `frame`.
+    ///
+    /// A macOS template image carries NO colour: AppKit throws the RGB away and
+    /// tints every pixel by its ALPHA (black on a light menu bar, white on a
+    /// dark or selected one). So this path paints in alpha, not in colour:
+    ///
+    /// 1. start from the alpha-shaped brand glyph ([`TEMPLATE_PNG`]);
+    /// 2. punch the contrast band around the badge fully transparent, so the
+    ///    badge reads as a separate mark instead of fusing with the glyph;
+    /// 3. fill the badge disc opaque;
+    /// 4. punch this state's glyph OUT of that disc as holes.
+    ///
+    /// Step 4 reuses the very same painters as the colour path, so the two
+    /// platforms can never drift apart in shape: the glyph is rendered into a
+    /// scratch buffer and its brightness is INVERTED into alpha (bright glyph
+    /// pixel -> fully transparent hole). That also preserves the spinner's
+    /// comet-tail fade - and therefore keeps consecutive frames distinct.
+    #[cfg(target_os = "macos")]
+    fn template_rgba_frame(self, base: &BrandImage, frame: u32) -> Vec<u8> {
+        let (w, h) = (base.width, base.height);
+        let mut rgba = base.rgba.clone();
+        // A template's RGB is discarded by AppKit; normalise it to black so the
+        // buffer is also sane if it is ever inspected or rendered untinted.
+        for px in rgba.chunks_exact_mut(4) {
+            px[0] = 0;
+            px[1] = 0;
+            px[2] = 0;
+        }
+        if self.badge_color().is_none() {
+            return rgba;
+        }
+
+        let geom = badge_geometry_with(w, h, BADGE_R_TEMPLATE);
+        let r_ring = geom.r_fill + ring_width(w, h);
+        for y in 0..h as i32 {
+            for x in 0..w as i32 {
+                let dx = x as f32 + 0.5 - geom.cx;
+                let dy = y as f32 + 0.5 - geom.cy;
+                let dist = (dx * dx + dy * dy).sqrt();
+                let idx = ((y as u32 * w + x as u32) as usize) * 4;
+                if dist <= geom.r_fill {
+                    rgba[idx + 3] = 0xff;
+                } else if dist <= r_ring {
+                    rgba[idx + 3] = 0x00;
+                }
+            }
+        }
+
+        // Render the state glyph into a scratch buffer with the SHARED painters,
+        // then invert its brightness into holes in the disc above.
+        let mut scratch = vec![0u8; (w * h * 4) as usize];
+        self.draw_glyph(&mut scratch, w, h, &geom, frame);
+        for (dst, src) in rgba.chunks_exact_mut(4).zip(scratch.chunks_exact(4)) {
+            if src[3] != 0 {
+                dst[3] = 0xff - src[0];
+            }
         }
         rgba
     }
@@ -235,13 +327,13 @@ impl TrayIcon {
     /// the state by SHAPE so the icon is readable without relying on colour:
     /// a spinner (syncing), pause bars (paused), an `!` (network attention), and
     /// an `X` (error).
-    fn draw_glyph(self, rgba: &mut [u8], width: u32, height: u32, frame: u32) {
+    fn draw_glyph(self, rgba: &mut [u8], width: u32, height: u32, geom: &BadgeGeom, frame: u32) {
         match self {
             TrayIcon::Idle => {}
-            TrayIcon::Syncing => draw_spinner_glyph(rgba, width, height, frame),
-            TrayIcon::Paused => draw_pause_glyph(rgba, width, height),
-            TrayIcon::NetworkAttention => draw_bang_glyph(rgba, width, height),
-            TrayIcon::Error => draw_cross_glyph(rgba, width, height),
+            TrayIcon::Syncing => draw_spinner_glyph(rgba, width, height, geom, frame),
+            TrayIcon::Paused => draw_pause_glyph(rgba, width, height, geom),
+            TrayIcon::NetworkAttention => draw_bang_glyph(rgba, width, height, geom),
+            TrayIcon::Error => draw_cross_glyph(rgba, width, height, geom),
         }
     }
 
@@ -257,6 +349,17 @@ impl TrayIcon {
     /// [`TrayIcon::rgba_buffer`] colour tile (which has no animation). The
     /// syncing animation calls this each tick with an advancing `frame`.
     fn image_frame(self, frame: u32) -> Image<'static> {
+        // macOS: hand the menu bar an alpha-shaped TEMPLATE so the OS can tint it
+        // for light/dark/selected, matching every other menu-bar extra. State is
+        // carried by the badge SHAPE, since a template has no colour to spend.
+        #[cfg(target_os = "macos")]
+        if let Some(base) = template_base() {
+            return Image::new_owned(
+                self.template_rgba_frame(base, frame),
+                base.width,
+                base.height,
+            );
+        }
         match brand_base() {
             Some(base) => {
                 Image::new_owned(self.brand_rgba_frame(base, frame), base.width, base.height)
@@ -270,6 +373,17 @@ impl TrayIcon {
 /// the base for every tray icon. 64x64 is a crisp source the OS scales down to
 /// the platform tray size; rendered from `icons/icon.svg` (see `icons/64x64.png`).
 const BRAND_PNG: &[u8] = include_bytes!("../icons/64x64.png");
+
+/// The compiled-in macOS TEMPLATE mark: the same road-to-cloud glyph as
+/// [`BRAND_PNG`], but as solid black on TRANSPARENCY (rendered from
+/// `icons/tray.svg`) rather than white on an opaque teal square.
+///
+/// This asset exists because macOS template images are alpha-only. Feeding
+/// [`BRAND_PNG`] to `set_icon_as_template(true)` would render a solid black
+/// SQUARE - its alpha is opaque edge to edge, so AppKit would tint the whole
+/// tile and the glyph would vanish. Only an alpha-shaped source works.
+#[cfg(target_os = "macos")]
+const TEMPLATE_PNG: &[u8] = include_bytes!("../icons/tray-template.png");
 
 /// A decoded RGBA image (row-major, top-to-bottom) plus its dimensions.
 struct BrandImage {
@@ -313,15 +427,34 @@ struct BadgeGeom {
     r_fill: f32,
 }
 
-/// Compute the shared badge geometry (see [`BadgeGeom`]). The disc is sized as a
-/// fraction of the smaller dimension so it scales with the source resolution.
-fn badge_geometry(width: u32, height: u32) -> BadgeGeom {
+/// Badge disc radius as a fraction of the icon's smaller dimension, for the
+/// COLOUR path (Windows/Linux). The glyph is drawn in white on a saturated disc,
+/// so colour does most of the work and the disc can stay compact.
+const BADGE_R_COLOUR: f32 = 0.24;
+
+/// Badge disc radius fraction for the macOS TEMPLATE path. Deliberately larger
+/// than [`BADGE_R_COLOUR`]: a template badge has no colour to distinguish it, so
+/// the state must read from the punched-out glyph SHAPE alone. At a 22pt menu
+/// bar the compact colour-path disc would shrink the glyph holes to ~2px and the
+/// states would smear together, so the template disc (and every hole in it) is
+/// scaled up to stay legible.
+#[cfg(target_os = "macos")]
+const BADGE_R_TEMPLATE: f32 = 0.32;
+
+/// Compute the shared badge geometry (see [`BadgeGeom`]) with the disc radius as
+/// `r_frac` of the smaller dimension, so it scales with the source resolution.
+fn badge_geometry_with(width: u32, height: u32, r_frac: f32) -> BadgeGeom {
     let min = width.min(height) as f32;
     BadgeGeom {
         cx: width as f32 * 0.72,
         cy: height as f32 * 0.72,
-        r_fill: min * 0.24,
+        r_fill: min * r_frac,
     }
+}
+
+/// The COLOUR-path badge geometry (Windows/Linux).
+fn badge_geometry(width: u32, height: u32) -> BadgeGeom {
+    badge_geometry_with(width, height, BADGE_R_COLOUR)
 }
 
 /// Paint a single opaque pixel at (`x`, `y`) to grayscale `intensity` (white at
@@ -370,16 +503,80 @@ fn fill_rect(rgba: &mut [u8], width: u32, height: u32, cx: f32, cy: f32, hw: f32
     }
 }
 
+/// The decoded macOS template mark, decoded exactly once and cached.
+///
+/// `None` (logged once) if decoding ever fails; callers then fall back to the
+/// COLOUR path with template mode off, which is merely off-style rather than
+/// invisible. See [`renders_as_template`].
+#[cfg(target_os = "macos")]
+fn template_base() -> Option<&'static BrandImage> {
+    static BASE: OnceLock<Option<BrandImage>> = OnceLock::new();
+    BASE.get_or_init(|| match Image::from_bytes(TEMPLATE_PNG) {
+        Ok(img) => Some(BrandImage {
+            rgba: img.rgba().to_vec(),
+            width: img.width(),
+            height: img.height(),
+        }),
+        Err(err) => {
+            tracing::error!(
+                target: TARGET,
+                "decode tray template PNG failed; falling back to the colour mark: {err}"
+            );
+            None
+        }
+    })
+    .as_ref()
+}
+
+/// Whether the live tray icon should be handed to macOS as a TEMPLATE image.
+///
+/// True only on macOS, and only when the alpha-shaped [`TEMPLATE_PNG`] actually
+/// decoded - the fallback colour mark is opaque, and declaring THAT a template
+/// would paint a solid black square in the menu bar. Every `set_icon` call site
+/// pairs with `set_icon_as_template(renders_as_template())` so the flag can
+/// never disagree with the pixels that were just handed over.
+fn renders_as_template() -> bool {
+    #[cfg(target_os = "macos")]
+    {
+        template_base().is_some()
+    }
+    #[cfg(not(target_os = "macos"))]
+    {
+        false
+    }
+}
+
+/// Tell the OS whether the icon just handed to `tray` is a template image.
+///
+/// Best-effort: a failure here is cosmetic, so it is logged and swallowed
+/// (HARD RULE: no panics in the tray path). Call this after EVERY `set_icon` -
+/// including inside the spinner animation task - so the flag and the pixels
+/// stay in lockstep.
+fn set_template_mode(tray: &tauri::tray::TrayIcon<tauri::Wry>) {
+    let want = renders_as_template();
+    if let Err(err) = tray.set_icon_as_template(want) {
+        tracing::debug!(target: TARGET, "set_icon_as_template({want}) failed: {err}");
+    }
+}
+
+/// Width of the contrast band drawn just outside the badge disc. On the colour
+/// path it is painted white; on the macOS template path it is punched fully
+/// TRANSPARENT (a template has no second ink, so the only way to separate the
+/// black badge from the black brand mark behind it is a hole).
+fn ring_width(width: u32, height: u32) -> f32 {
+    let min = width.min(height) as f32;
+    (min * 0.06).max(1.0)
+}
+
 /// Draw a filled status-badge disc (with a white contrast ring) into the
 /// bottom-right corner of an RGBA buffer, in place. Marks the brand tray icon
 /// with the live state's colour while keeping the mark recognisable; the white
 /// ring keeps it visible against both the teal background and the white cloud.
-fn draw_badge(rgba: &mut [u8], width: u32, height: u32, color: [u8; 3]) {
+fn draw_badge(rgba: &mut [u8], width: u32, height: u32, geom: &BadgeGeom, color: [u8; 3]) {
     let w = width as i32;
     let h = height as i32;
-    let min = w.min(h) as f32;
-    let BadgeGeom { cx, cy, r_fill } = badge_geometry(width, height);
-    let r_ring = r_fill + (min * 0.06).max(1.0);
+    let &BadgeGeom { cx, cy, r_fill } = geom;
+    let r_ring = r_fill + ring_width(width, height);
     for y in 0..h {
         for x in 0..w {
             let dx = x as f32 + 0.5 - cx;
@@ -406,8 +603,8 @@ fn draw_badge(rgba: &mut [u8], width: u32, height: u32, color: [u8; 3]) {
 /// fading behind it. Advancing `frame` rotates the bright head one dot per tick,
 /// so consecutive frames render distinct buffers (a real spinning motion) and
 /// frame `f == f + SYNC_FRAMES` (full circle). White-on-blue.
-fn draw_spinner_glyph(rgba: &mut [u8], width: u32, height: u32, frame: u32) {
-    let BadgeGeom { cx, cy, r_fill } = badge_geometry(width, height);
+fn draw_spinner_glyph(rgba: &mut [u8], width: u32, height: u32, geom: &BadgeGeom, frame: u32) {
+    let &BadgeGeom { cx, cy, r_fill } = geom;
     let orbit = r_fill * 0.55;
     let dot_r = (r_fill * 0.20).max(1.0);
     let head = frame % SYNC_DOTS;
@@ -427,8 +624,8 @@ fn draw_spinner_glyph(rgba: &mut [u8], width: u32, height: u32, frame: u32) {
 
 /// Draw the PAUSED glyph: two vertical white bars (the universal pause symbol)
 /// centred in the badge disc.
-fn draw_pause_glyph(rgba: &mut [u8], width: u32, height: u32) {
-    let BadgeGeom { cx, cy, r_fill } = badge_geometry(width, height);
+fn draw_pause_glyph(rgba: &mut [u8], width: u32, height: u32, geom: &BadgeGeom) {
+    let &BadgeGeom { cx, cy, r_fill } = geom;
     let bar_hw = (r_fill * 0.16).max(1.0);
     let bar_hh = r_fill * 0.5;
     let offset = r_fill * 0.4;
@@ -439,8 +636,8 @@ fn draw_pause_glyph(rgba: &mut [u8], width: u32, height: u32) {
 /// Draw the NETWORK-ATTENTION glyph: a white exclamation mark (`!`) - a vertical
 /// stem above a dot - centred in the badge disc (the DESIGN s8.1
 /// "yellow-with-`!`" reachability mark, now drawn for real).
-fn draw_bang_glyph(rgba: &mut [u8], width: u32, height: u32) {
-    let BadgeGeom { cx, cy, r_fill } = badge_geometry(width, height);
+fn draw_bang_glyph(rgba: &mut [u8], width: u32, height: u32, geom: &BadgeGeom) {
+    let &BadgeGeom { cx, cy, r_fill } = geom;
     let stem_hw = (r_fill * 0.13).max(1.0);
     // Stem: from near the top of the disc to just above centre.
     let stem_top = cy - r_fill * 0.55;
@@ -455,8 +652,8 @@ fn draw_bang_glyph(rgba: &mut [u8], width: u32, height: u32) {
 
 /// Draw the ERROR glyph: a white `X` (two diagonal strokes) centred in the badge
 /// disc - reads as "attention / failure" without relying on the red colour.
-fn draw_cross_glyph(rgba: &mut [u8], width: u32, height: u32) {
-    let BadgeGeom { cx, cy, r_fill } = badge_geometry(width, height);
+fn draw_cross_glyph(rgba: &mut [u8], width: u32, height: u32, geom: &BadgeGeom) {
+    let &BadgeGeom { cx, cy, r_fill } = geom;
     let reach = r_fill * 0.5;
     let thick = (r_fill * 0.18).max(1.0);
     let x0 = (cx - reach).floor() as i32;
@@ -775,12 +972,10 @@ pub fn build(app: &AppHandle) -> tauri::Result<()> {
         })
         .build(app)?;
 
-    // Our generated icons are colour-bearing; the config sets the boot icon as
-    // a template (macOS recolours templates monochrome, which would erase the
-    // yellow/red distinction), so force template OFF on the live tray.
-    if let Err(err) = tray.set_icon_as_template(false) {
-        tracing::debug!(target: TARGET, "set_icon_as_template(false) failed: {err}");
-    }
+    // Match the flag to the pixels we just handed over: the macOS path renders
+    // an alpha-shaped template, every other platform a colour-bearing mark that
+    // must NOT be flattened to monochrome.
+    set_template_mode(&tray);
 
     Ok(())
 }
@@ -1012,8 +1207,8 @@ fn start_sync_animation(app: &AppHandle) {
                     tracing::debug!(target: TARGET, "set sync animation frame failed: {err}");
                 }
                 // Colour-bearing frames must never be recoloured to a macOS template.
-                if let Err(err) = tray.set_icon_as_template(false) {
-                    tracing::trace!(target: TARGET, "set_icon_as_template(false) during animation failed: {err}");
+                if let Err(err) = tray.set_icon_as_template(renders_as_template()) {
+                    tracing::trace!(target: TARGET, "set_icon_as_template during animation failed: {err}");
                 }
             }
             // Advance to the next spinner frame, wrapping each full rotation.
@@ -1090,10 +1285,7 @@ pub fn apply_state(app: &AppHandle, account_id: AccountId, state: OrchestratorSt
                 if let Err(err) = tray.set_icon(Some(icon.image())) {
                     tracing::warn!(target: TARGET, "set tray icon failed: {err}");
                 }
-                // Generated tiles are colour-bearing; never let the OS recolour them.
-                if let Err(err) = tray.set_icon_as_template(false) {
-                    tracing::debug!(target: TARGET, "set_icon_as_template(false) failed: {err}");
-                }
+                set_template_mode(&tray);
             }
             if let Err(err) = tray.set_tooltip(Some(tooltip_for(&aggregate))) {
                 tracing::warn!(target: TARGET, "set tray tooltip failed: {err}");
@@ -1326,9 +1518,7 @@ pub fn apply_suspending(app: &AppHandle) {
     if let Err(err) = tray.set_icon(Some(TrayIcon::Paused.image())) {
         tracing::warn!(target: TARGET, "set suspending icon failed: {err}");
     }
-    if let Err(err) = tray.set_icon_as_template(false) {
-        tracing::debug!(target: TARGET, "set_icon_as_template(false) failed: {err}");
-    }
+    set_template_mode(&tray);
     if let Err(err) = tray.set_tooltip(Some(rust_i18n::t!("tray.tooltip.suspending").into_owned()))
     {
         tracing::warn!(target: TARGET, "set suspending tooltip failed: {err}");
