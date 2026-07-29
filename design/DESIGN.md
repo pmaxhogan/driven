@@ -498,11 +498,22 @@ read around some of it and the stress harness pins that outcome.
 Aligning the two platforms is a separate decision.
 
 Scope note: this classification covers files the scanner could *stat*
-but the executor could not *open*. An unreadable **directory** fails
-earlier, inside the walk, where DESIGN s5.2 step 3 already applies -
-the walker error is recorded and deletions under that subtree are
-suppressed for the cycle, so nothing is trashed just because a folder
-became unreadable.
+but the executor could not *open* through `open_shared`. Two neighbouring
+paths are unchanged and reach the user differently:
+
+- An unreadable **directory** fails earlier, inside the walk, where
+  DESIGN s5.2 step 3 already applies - the walker error is recorded and
+  deletions under that subtree are suppressed for the cycle, so nothing
+  is trashed just because a folder became unreadable. This (not the
+  per-file case) is the shape a TCC-blocked `~/Library/Mail` usually
+  takes.
+- A **bundle member** (s5.x small-file bundling) is read by
+  `bundle::read_member`, not `open_shared`. An unreadable member is
+  dropped into `BuildOutput::skipped` and stays pending for the next
+  cycle with no per-file code at all - so a tiny denied file inside a
+  bundle candidate is retried silently rather than reported. Pre-existing
+  and unchanged here; routing bundle-member reads through the same
+  classification is follow-up work.
 
 #### 5.3.1 Least-privilege VSS helper (V1.x, issue #25)
 

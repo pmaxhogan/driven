@@ -986,6 +986,23 @@ mod tests {
             "shared invariants must hold: {:?}",
             outcome.notes
         );
+        // Turning the mode-000 outcome from a FAILURE into a SKIP re-queues the
+        // op instead of erroring it, so assert the s6.3 sweep explicitly: a
+        // permanently-denied file must not leave a due `pending_ops` row behind
+        // cycle after cycle. (The CI chaos jobs are Windows-only, so this row's
+        // impl is never exercised there - this assertion is the only place the
+        // invariant is checked for it.)
+        let invariants = outcome.invariants.expect("invariants computed");
+        assert!(
+            invariants.no_pending_leak,
+            "a denied file must not leak a due pending_ops row: {:?}",
+            outcome.notes
+        );
+        assert!(
+            invariants.no_data_loss && invariants.no_duplicate_op_uuid,
+            "s6.3 invariants must hold: {:?}",
+            outcome.notes
+        );
     }
 
     /// On a Unix host the setuid row uploads both files as plain content with
