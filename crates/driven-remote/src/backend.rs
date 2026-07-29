@@ -49,12 +49,20 @@ pub enum BackendKind {
     /// B2, Wasabi, Ceph RGW, ...), authorized by a directly-entered access key
     /// pair rather than an OAuth consent flow.
     S3,
+    /// A plain directory on this machine: a USB drive, an external SSD, a NAS
+    /// mount, or any local folder. Needs no credential at all - the user
+    /// already has write access to the folder they chose.
+    LocalFolder,
 }
 
 impl BackendKind {
     /// Every kind this build knows, in the order the destination picker shows
     /// them. The first entry is the default selection.
-    pub const ALL: &'static [BackendKind] = &[BackendKind::GoogleDrive, BackendKind::S3];
+    pub const ALL: &'static [BackendKind] = &[
+        BackendKind::GoogleDrive,
+        BackendKind::S3,
+        BackendKind::LocalFolder,
+    ];
 
     /// The stable stored/wire identifier. This string is written to
     /// `accounts.backend_kind` and crosses the Tauri IPC boundary, so it is
@@ -63,6 +71,7 @@ impl BackendKind {
         match self {
             BackendKind::GoogleDrive => "google_drive",
             BackendKind::S3 => "s3",
+            BackendKind::LocalFolder => "local_folder",
         }
     }
 
@@ -79,6 +88,9 @@ impl BackendKind {
             // S3 credentials are an access key pair the user pastes in; there
             // is no consent flow to run.
             BackendKind::S3 => false,
+            // A folder the user can already write to needs no credential, so
+            // there is nothing to consent to and nothing in the keychain.
+            BackendKind::LocalFolder => false,
         }
     }
 
@@ -90,6 +102,11 @@ impl BackendKind {
             // S3 "folders" are key prefixes, which the picker can browse the
             // same way it browses Drive folders.
             BackendKind::S3 => true,
+            // The destination folder is chosen with the OS folder dialog at
+            // setup time, and everything below it is Driven's; browsing the
+            // remote tree afterwards would only offer the user a way to nest
+            // one backup inside another.
+            BackendKind::LocalFolder => false,
         }
     }
 

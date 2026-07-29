@@ -7,6 +7,7 @@ members = [
     "crates/driven-drive",
     "crates/driven-s3",
     "crates/driven-rclone",
+    "crates/driven-localfs",
     "crates/driven-crypto",
     "crates/driven-power",
     "crates/driven-diskstat",

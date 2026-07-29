@@ -7,10 +7,12 @@ import BackendPicker from "../components/BackendPicker.vue";
 import CredentialsWalkthrough from "../components/CredentialsWalkthrough.vue";
 import S3CredentialsForm from "../components/S3CredentialsForm.vue";
 import DriveFolderPicker from "../components/DriveFolderPicker.vue";
+import LocalFolderForm from "../components/LocalFolderForm.vue";
 import RecoveryPhraseReveal from "../components/RecoveryPhraseReveal.vue";
 import { pickFolderDialog } from "../ipc/commands";
 import { useSetupStore, WIZARD_STEPS } from "../stores/setup";
-import type { CreateS3AccountRequest } from "../ipc/types";
+import type { CreateLocalFolderAccountRequest, CreateS3AccountRequest } from "../ipc/types";
+import { LOCAL_FOLDER_BACKEND_ID } from "../ipc/types";
 
 // Setup wizard (SPEC s25 /setup; DESIGN s8.5 5-step wizard). Drives the whole
 // first-run flow as a stepper:
@@ -76,6 +78,14 @@ const errorLong = computed<string | null>(() =>
   setup.errorCode ? t(`errors.${setup.errorCode}.long`) : null
 );
 
+/** Step 2's heading, which names the destination being connected. */
+const credentialsStepTitle = computed<string>(() => {
+  if (setup.backendUsesOauth) return t("wizard.step2.title");
+  return setup.backendId === LOCAL_FOLDER_BACKEND_ID
+    ? t("localFolderSetup.title")
+    : t("s3Setup.title");
+});
+
 // --- Per-step "can advance" gating -------------------------------------------
 
 const canAdvance = computed(() => {
@@ -110,6 +120,14 @@ async function chooseLocalFolder(): Promise<void> {
     setup.localPathToken = picked.token;
     if (!setup.sourceDisplayName) {
       setup.sourceDisplayName = baseName(picked.path);
+    }
+    // A destination with no browsable tree (a local folder) still needs a
+    // non-empty destination folder id on the source row, so derive it from the
+    // source's own name - the same choice a Drive user would have made by hand,
+    // and shown read-only below so it is never a surprise.
+    if (!setup.backendSupportsFolderPicker) {
+      setup.driveFolderId = setup.destinationFolderIdFor(picked.path);
+      setup.driveFolderPath = `${setup.localFolderRoot ?? ""}/${setup.driveFolderId}`;
     }
   } catch {
     // A cancel (or dialog error) surfaces as a rejected command; leave the path
@@ -147,6 +165,18 @@ function onCredentialsComplete(): void {
  */
 async function onS3Submit(req: CreateS3AccountRequest): Promise<void> {
   const ok = await setup.createS3Account(req);
+  if (ok && setup.step === "credentials") setup.next();
+}
+
+/**
+ * The local-folder branch's "sign in": one call that validates the folder,
+ * proves it is writable, stamps its destination marker and writes the account.
+ * Only on success does the wizard advance - a folder that cannot be written to
+ * leaves the user on the form with the specific reason, exactly as a failed
+ * OAuth consent does.
+ */
+async function onLocalFolderSubmit(req: CreateLocalFolderAccountRequest): Promise<void> {
+  const ok = await setup.createLocalFolderAccount(req);
   if (ok && setup.step === "credentials") setup.next();
 }
 
@@ -261,12 +291,22 @@ function baseName(p: string): string {
 
     <!-- Step 2: credentials. Which form depends on the destination chosen on
          step 1: Google Drive runs the BYO-OAuth consent flow; an S3-compatible
-         destination takes an access key pair directly. -->
+         destination takes an access key pair directly; a local or removable
+         folder just needs the folder, and has no credential at all. The
+         non-OAuth destinations are told apart by id rather than by a second
+         boolean, because "which form" is a per-backend question, not a
+         two-valued one. -->
     <div v-else-if="setup.step === 'credentials'" :class="CARD" class="space-y-3">
       <h2 class="text-lg font-medium text-zinc-900 dark:text-zinc-100">
-        {{ setup.backendUsesOauth ? t("wizard.step2.title") : t("s3Setup.title") }}
+        {{ credentialsStepTitle }}
       </h2>
       <CredentialsWalkthrough v-if="setup.backendUsesOauth" @complete="onCredentialsComplete" />
+      <LocalFolderForm
+        v-else-if="setup.backendId === LOCAL_FOLDER_BACKEND_ID"
+        :busy="setup.busy"
+        :error-message="errorLong"
+        @submit="onLocalFolderSubmit"
+      />
       <template v-else>
         <S3CredentialsForm :busy="setup.busy" :error-message="errorLong" @submit="onS3Submit" />
         <p class="text-xs text-amber-700 dark:text-amber-400">
@@ -289,6 +329,7 @@ function baseName(p: string): string {
           type="button"
           :class="SECONDARY_BTN"
           :disabled="pickingFolder"
+          data-testid="wizard-choose-folder"
           @click="chooseLocalFolder"
         >
           {{ t("wizard.step3.chooseFolderButton") }}
@@ -303,12 +344,26 @@ function baseName(p: string): string {
           t("wizard.step3.driveDestinationLabel")
         }}</span>
         <DriveFolderPicker
+          v-if="setup.backendSupportsFolderPicker"
           v-model:folder-id="setup.driveFolderId"
           v-model:folder-path="setup.driveFolderPath"
           v-model:drive-id="setup.driveId"
           :account-id="setup.accountId"
           @error="onDrivePickerError"
         />
+        <!-- A destination with no browsable tree (a local or removable folder):
+             the root was already chosen on step 2, so the only thing left to
+             show is WHERE inside it this source will land. Read-only, but
+             visible, so the resolved path is never a surprise. -->
+        <p
+          v-else
+          class="break-all text-sm text-zinc-600 dark:text-zinc-400"
+          data-testid="local-destination-path"
+        >
+          {{
+            setup.driveFolderPath || setup.localFolderRoot || t("wizard.step3.chooseFolderFirst")
+          }}
+        </p>
       </div>
     </div>
 

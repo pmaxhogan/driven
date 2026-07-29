@@ -48,8 +48,8 @@ use driven_remote::remote_store::{DriveContext, RemoteStore};
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    AccountDto, AddAccountWizardSessionId, BackendDto, CreateS3AccountRequest, OAuthAuthUrl,
-    OAuthStatus, ReauthSession, SessionId,
+    AccountDto, AddAccountWizardSessionId, BackendDto, CreateLocalFolderAccountRequest,
+    CreateS3AccountRequest, OAuthAuthUrl, OAuthStatus, ReauthSession, SessionId,
 };
 use crate::commands::{CommandError, CommandResult};
 use crate::events::EVENT_OAUTH_COMPLETE;
@@ -1198,6 +1198,130 @@ pub async fn create_s3_account(
     Ok(account_row_to_dto(&row))
 }
 
+/// Validate + normalize the destination folder path a webview supplied for
+/// `create_local_folder_account`.
+///
+/// Extracted from the command so it is reachable by tests: a `#[tauri::command]`
+/// needs a live `AppHandle` and `State`, which a unit test has no way to build,
+/// and this is exactly the part worth pinning. The store re-validates
+/// everything anyway ([`driven_localfs::LocalFsConfig::normalized`]); this is the
+/// IPC boundary saying no early with a message the user can act on.
+///
+/// A RELATIVE path is rejected rather than resolved: it would resolve against
+/// whatever the app's working directory happened to be at the time, which is not
+/// a property a backup destination may have.
+fn validate_local_folder_root(raw: &str) -> CommandResult<String> {
+    let root = raw.trim().to_string();
+    reject_control_chars(&root, "destination folder")?;
+    if root.is_empty() {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "choose a destination folder",
+        ));
+    }
+    if !std::path::Path::new(&root).is_absolute() {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "the destination folder must be an absolute path",
+        ));
+    }
+    Ok(root)
+}
+
+/// `create_local_folder_account(req)` - create an account backed by a plain
+/// folder: a USB drive, an external SSD, a NAS mount, or any directory on this
+/// machine.
+///
+/// The local-folder counterpart of the OAuth wizard's
+/// `begin -> submit -> signin -> finish` sequence, collapsed into one call
+/// because there is nothing to authenticate: the user already has write access
+/// to the folder they picked, so this backend has NO credential and touches the
+/// OS keychain not at all.
+///
+/// The destination is PROVED usable before the account row is written - the
+/// folder must exist, be a directory, and accept a real write - because an
+/// account that cannot reach its destination is worse than no account: it sits
+/// in the sources list looking configured while every backup cycle fails.
+/// Preparing the destination also stamps (or ADOPTS) its identity marker, which
+/// is what later lets the store tell "the drive is unplugged" apart from "an
+/// empty mount point on the boot disk"; adopting means re-adding a drive that
+/// already holds a Driven backup keeps every object on it.
+#[tauri::command]
+pub async fn create_local_folder_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: CreateLocalFolderAccountRequest,
+) -> CommandResult<AccountDto> {
+    let root = validate_local_folder_root(&req.root)?;
+    let root_path = std::path::PathBuf::from(&root);
+
+    let now = SystemClock.now_ms();
+    // Blocking filesystem work (a real write + fsync of the marker), kept off the
+    // async runtime's worker threads - a NAS mount can take seconds to answer.
+    let prepared = {
+        let root_path = root_path.clone();
+        tokio::task::spawn_blocking(move || driven_backend::prepare_local_folder(&root_path, now))
+            .await
+            .map_err(|e| {
+                CommandError::with_code(
+                    ErrorCode::InternalBug,
+                    format!("preparing the destination folder panicked: {e}"),
+                )
+            })?
+    };
+    let config_json =
+        prepared.map_err(|e| CommandError::with_code(ErrorCode::InvalidInput, e.to_string()))?;
+
+    let account_id = AccountId::new_v4();
+    let label = req
+        .display_name
+        .clone()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| {
+            // A local destination has no account identity to fetch; the folder
+            // IS the account's human label, and `email` is the field the UI
+            // renders.
+            root_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.clone())
+        });
+    let row = AccountRow {
+        id: account_id,
+        email: label,
+        display_name: req.display_name.clone().filter(|d| !d.trim().is_empty()),
+        state: AccountState::Ok,
+        encryption_master_key_id: None,
+        created_at: now,
+        last_synced_at: None,
+        backend_kind: BackendKind::LocalFolder,
+        backend_config_json: Some(config_json),
+    };
+
+    // There is no keychain entry to roll back: a failed row write leaves only the
+    // destination marker on the folder, which the next attempt ADOPTS rather than
+    // duplicating.
+    state
+        .state()
+        .upsert_account(&row)
+        .await
+        .map_err(CommandError::from)?;
+    tracing::info!(target: TARGET, account_id = %account_id, "local-folder account persisted");
+
+    // A2: hot-spawn so the wizard's initial sync finds a live handle.
+    match crate::assembly::spawn_account(&app, &state, account_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(target: TARGET, account_id = %account_id, "local-folder account persisted but orchestrator not spawned");
+        }
+        Err(err) => {
+            tracing::error!(target: TARGET, account_id = %account_id, %err, "hot-spawn after create_local_folder_account failed; orchestrator will start on next launch");
+        }
+    }
+
+    Ok(account_row_to_dto(&row))
+}
+
 /// `reauth_account(account_id)` - re-run consent for an account whose refresh
 /// token was revoked (SPEC s11.1; the `account:needs_reauth` banner CTA).
 ///
@@ -1477,7 +1601,99 @@ mod tests {
         }
     }
 
+    /// An absolute destination path for the platform under test.
+    ///
+    /// Deliberately platform-AWARE rather than `#[cfg(unix)]`-gated: a
+    /// local-folder destination is genuinely cross-platform, a Windows user
+    /// really will pick `D:\Backups`, and gating the test would have left the
+    /// Windows behaviour of the only validator on that path unasserted.
+    #[cfg(windows)]
+    const ABSOLUTE_ROOT: &str = r"D:\Backups";
+    #[cfg(not(windows))]
+    const ABSOLUTE_ROOT: &str = "/Volumes/Backup";
+
+    /// Paths that are RELATIVE on the platform under test and must be refused -
+    /// a relative destination would resolve against whatever the app's working
+    /// directory happened to be at the time.
+    #[cfg(windows)]
+    const RELATIVE_ROOTS: &[&str] = &[
+        "backups",
+        "../backups",
+        "./x",
+        // Windows-specific relative shapes that LOOK rooted but are not:
+        // `\Backups` is relative to the CURRENT DRIVE, and `D:Backups` is
+        // relative to the current directory ON D:. Both would move with the
+        // process's cwd.
+        r"\Backups",
+        r"D:Backups",
+        // Not an absolute path on Windows at all.
+        "/Volumes/Backup",
+    ];
+    #[cfg(not(windows))]
+    const RELATIVE_ROOTS: &[&str] = &[
+        "backups",
+        "../backups",
+        "./x",
+        // On unix a colon and a backslash are ordinary filename characters, so
+        // this is just a weirdly-named relative path - and must still be refused.
+        r"D:\Backups",
+    ];
+
+    #[test]
+    fn local_folder_root_must_be_an_absolute_control_free_path() {
+        // Accepted, with surrounding whitespace trimmed.
+        assert_eq!(
+            validate_local_folder_root(&format!("  {ABSOLUTE_ROOT}  ")).unwrap(),
+            ABSOLUTE_ROOT
+        );
+
+        for bad in ["", "   "] {
+            let err =
+                validate_local_folder_root(bad).expect_err("an empty destination must be refused");
+            assert_eq!(err.code, ErrorCode::InvalidInput, "{bad:?}");
+        }
+        for bad in RELATIVE_ROOTS {
+            let err = validate_local_folder_root(bad)
+                .expect_err("a relative destination must be refused");
+            assert_eq!(err.code, ErrorCode::InvalidInput, "{bad:?}");
+        }
+        // A control character would corrupt the stored config blob and any log
+        // line carrying the path.
+        for bad in ["\n", "\t", "\r", "\u{0}"] {
+            let path = format!("{ABSOLUTE_ROOT}{bad}sub");
+            assert!(
+                validate_local_folder_root(&path).is_err(),
+                "a {bad:?} in the path must be refused"
+            );
+        }
+    }
+
+    /// A UNC share (`\\server\share`) is how a Windows user names a NAS - one of
+    /// the destinations this backend exists for - so it must be ACCEPTED, not
+    /// swept up by the relative-path refusal.
+    ///
+    /// Only the BACKSLASH forms are asserted. Rust's Windows path parser detects
+    /// a UNC prefix by the literal `\\`, so a forward-slash `//server/share`
+    /// parses with no prefix and `is_absolute()` is false - Driven would refuse
+    /// it. That is a limitation of what the validator can PROVE rather than a
+    /// claim about Windows, and it is not a real input: the destination folder
+    /// always arrives from the backend-owned native dialog (SPEC s11.6.1 / C1),
+    /// which returns backslashes.
+    #[cfg(windows)]
+    #[test]
+    fn a_unc_share_is_a_valid_windows_destination() {
+        assert_eq!(
+            validate_local_folder_root(r"  \\server\share\Backups  ").unwrap(),
+            r"\\server\share\Backups"
+        );
+        assert_eq!(
+            validate_local_folder_root(r"\\server\share").unwrap(),
+            r"\\server\share"
+        );
+    }
+
     #[tokio::test]
+
     async fn persist_new_account_row_failure_rolls_back_all_keychain_entries() {
         // R2-P2-2: a forced ROW-insert failure must leave NO orphaned keychain
         // creds (both the refresh token and the BYO client creds are rolled back),
