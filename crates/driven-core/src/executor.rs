@@ -389,8 +389,22 @@ pub enum SkipReason {
     ReplacedDuringUpload,
     /// The file is locked and could not be opened even with
     /// `FILE_SHARE_DELETE` (and the VSS fallback failed too)
-    /// (`local.file_locked`).
+    /// (`local.file_locked`). On Unix the same reason covers an `EBUSY` /
+    /// `ETXTBSY` / `EAGAIN` open.
     Locked,
+    /// The OS refused to open the file on PERMISSION grounds - Unix `EACCES`
+    /// (mode bits / an ACL / a parent directory without `+x`) or `EPERM`, which
+    /// is what macOS's TCC privacy layer returns for a protected path such as
+    /// `~/Library/Mail` until the user grants Driven Full Disk Access
+    /// (`local.permission_denied`).
+    ///
+    /// A skip rather than a failure: nothing is broken, the file is simply out
+    /// of reach this cycle, and the moment the user grants access the next scan
+    /// backs it up with no further action. Distinct from [`Self::Locked`] (no
+    /// one is holding the file, so waiting will never help) and from a
+    /// `local.io_error` failure (the disk is fine), so the UI can offer the
+    /// grant-access remedy instead of "another program has it open".
+    Denied,
     /// The file is locked and VSS could not help because it is UNAVAILABLE -
     /// the process is not elevated (or off Windows / `vss_mode = never`), so a
     /// shadow copy was never attempted. Distinct from [`SkipReason::Locked`]
@@ -427,6 +441,7 @@ impl SkipReason {
             }
             SkipReason::ChangedDuringUpload => ErrorCode::LocalFileChangedDuringUpload,
             SkipReason::Locked => ErrorCode::LocalFileLocked,
+            SkipReason::Denied => ErrorCode::LocalPermissionDenied,
             SkipReason::VssUnavailable => ErrorCode::LocalVssUnavailable,
             SkipReason::VssHelperPending => ErrorCode::LocalVssHelperPending,
             SkipReason::RemoteFileMissing => ErrorCode::DriveRemoteFileMissing,
@@ -1265,6 +1280,14 @@ impl DefaultExecutor {
     ///   snapshot.
     /// - VSS unavailable (not elevated / `never` / off Windows / snapshot
     ///   failed): a locked file is skipped, exactly as before.
+    /// - Permission DENIED (Unix `EACCES`/`EPERM`, incl. a macOS TCC-protected
+    ///   path): skipped immediately as `local.permission_denied`, WITHOUT
+    ///   consulting the snapshot provider. This is deliberate and is the seam a
+    ///   future macOS APFS-snapshot fallback must respect: a snapshot preserves
+    ///   mode bits and is itself TCC-gated, so it can read around a LOCK but
+    ///   never around a denial. Sending denials into the provider would only
+    ///   buy per-file snapshot cost plus a misleading "would back up if
+    ///   elevated" banner.
     ///
     /// Returns the opened handle paired with the path it was opened from (the
     /// live path or the snapshot-mapped path), so the caller threads ONE path
@@ -1278,6 +1301,7 @@ impl DefaultExecutor {
                     file,
                 },
                 Err(OpenError::Locked) => EffectiveOpen::Skip(SkipReason::Locked),
+                Err(OpenError::Denied) => EffectiveOpen::Skip(SkipReason::Denied),
                 Err(OpenError::Io(e)) => {
                     warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
                     EffectiveOpen::Failed(local_io_error_code(&e))
@@ -1303,6 +1327,10 @@ impl DefaultExecutor {
                     OpenAttempt::Ok
                 }
                 Err(OpenError::Locked) => OpenAttempt::Locked,
+                // A denial short-circuits BEFORE the provider is consulted: no
+                // snapshot (VSS today, APFS later) can read around a permission
+                // the running user does not hold.
+                Err(OpenError::Denied) => return EffectiveOpen::Skip(SkipReason::Denied),
                 Err(OpenError::Io(e)) => {
                     warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
                     return EffectiveOpen::Failed(local_io_error_code(&e));
@@ -1318,6 +1346,8 @@ impl DefaultExecutor {
                     };
                 }
                 Err(OpenError::Locked) => attempt = OpenAttempt::Locked,
+                // See above: a denial never reaches the snapshot provider.
+                Err(OpenError::Denied) => return EffectiveOpen::Skip(SkipReason::Denied),
                 Err(OpenError::Io(e)) => {
                     warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
                     return EffectiveOpen::Failed(local_io_error_code(&e));
@@ -1351,6 +1381,7 @@ impl DefaultExecutor {
                             file,
                         },
                         Err(OpenError::Locked) => EffectiveOpen::Skip(SkipReason::Locked),
+                        Err(OpenError::Denied) => EffectiveOpen::Skip(SkipReason::Denied),
                         Err(OpenError::Io(e)) => {
                             warn!(target: TARGET, path = %live_path.display(), error = %e, "open failed");
                             EffectiveOpen::Failed(local_io_error_code(&e))
@@ -1371,6 +1402,10 @@ impl DefaultExecutor {
                         }
                     }
                     Err(OpenError::Locked) => EffectiveOpen::Skip(SkipReason::Locked),
+                    // A denial ON THE SNAPSHOT copy is a permission problem
+                    // just the same (the snapshot carries the original's mode
+                    // bits), so report it as such rather than as a lock.
+                    Err(OpenError::Denied) => EffectiveOpen::Skip(SkipReason::Denied),
                     Err(OpenError::Io(e)) => {
                         warn!(target: TARGET, path = %snapshot_path.display(), error = %e, "VSS: snapshot open failed; degrading to skip");
                         EffectiveOpen::Skip(SkipReason::Locked)
@@ -1378,22 +1413,7 @@ impl DefaultExecutor {
                 }
             }
             FallbackDecision::SkipLocked => {
-                // P2-6 / recheck2 (SPEC s24): distinguish "locked, VSS COULD help
-                // but is not available" from "locked, VSS disabled or tried+failed".
-                // `vss.available()` (here `elevated`) is false for ALL of:
-                // un-elevated, off-Windows, AND `vss_mode = never`. Only the first
-                // two ("VSS would help if Driven ran elevated") warrant
-                // `local.vss_unavailable`; `never` is a user choice, so a locked
-                // file under `never` is a plain `local.file_locked` (NOT a
-                // misleading "needs elevation"). A genuine snapshot/map failure
-                // despite availability is also `local.file_locked`.
-                let reason =
-                    if attempt == OpenAttempt::Locked && mode != VssMode::Never && !elevated {
-                        SkipReason::VssUnavailable
-                    } else {
-                        SkipReason::Locked
-                    };
-                EffectiveOpen::Skip(reason)
+                EffectiveOpen::Skip(skip_locked_reason(attempt, mode, elevated))
             }
             FallbackDecision::SkipRetryLater => {
                 // DESIGN s5.3.1: the least-privilege helper broker is launching /
@@ -6453,13 +6473,24 @@ fn filetime_to_unix_ns(filetime_100ns: u64) -> i64 {
 
 /// Error opening the source file for read.
 enum OpenError {
-    /// Sharing violation / lock (Windows) -> `local.file_locked` skip. P2-F:
-    /// constructed ONLY on Windows (a sharing/lock-violation raw OS error); off
-    /// Windows there is no such lock concept, so the variant is never built
-    /// there - but the match arms that handle it are shared cross-platform, so
-    /// the variant stays and the off-Windows dead-code lint is suppressed.
-    #[cfg_attr(not(windows), allow(dead_code))]
+    /// The file exists and we are allowed to read it, but something else is
+    /// holding it in a way that blocks the open RIGHT NOW -> `local.file_locked`
+    /// skip. Windows: `ERROR_SHARING_VIOLATION` / `ERROR_LOCK_VIOLATION`.
+    /// Unix: `EBUSY` / `ETXTBSY` / `EAGAIN`|`EWOULDBLOCK` (a mandatory-locked or
+    /// busy file). Transient by nature: the next cycle retries and usually wins.
     Locked,
+    /// The OS refused the open on PERMISSION grounds -> `local.permission_denied`
+    /// skip. Unix only (`EACCES` / `EPERM`, the latter being what macOS returns
+    /// for a TCC-protected path such as `~/Library/Mail` even for an otherwise
+    /// all-powerful user). Nothing is holding the file and no snapshot can read
+    /// around it - only a permission / Full-Disk-Access change helps - so it is
+    /// deliberately NOT folded into [`Self::Locked`].
+    ///
+    /// Windows never constructs this (an ACL denial stays `local.io_error`
+    /// there, per `classify_open_error`), so the variant is dead code on that
+    /// target while the match arms handling it stay cross-platform.
+    #[cfg_attr(windows, allow(dead_code))]
+    Denied,
     /// Any other IO error.
     Io(std::io::Error),
 }
@@ -6530,13 +6561,53 @@ async fn open_shared(
     }
 }
 
-/// Classify an open error (P2-F): ONLY a Windows sharing/lock violation is a
-/// "locked file" (the VSS / `local.file_locked` path). An ACL / access-denied
-/// failure is NOT a lock - it is a permission problem the user must fix - so it
-/// maps to a plain IO error (`local.io_error`), never `local.vss_unavailable`.
-/// We inspect the raw OS error, not just [`std::io::ErrorKind`], because both a
-/// sharing violation and an access-denial surface as `PermissionDenied` on
-/// Windows, yet only the former is a lock VSS can read around.
+/// Which [`SkipReason`] a [`FallbackDecision::SkipLocked`] outcome surfaces.
+///
+/// P2-6 / recheck2 (SPEC s24): distinguish "locked, VSS COULD help but is not
+/// available" from "locked, VSS disabled or tried+failed". `vss.available()`
+/// (here `elevated`) is false for ALL of: un-elevated, off-Windows, AND
+/// `vss_mode = never`. Only "VSS would help if Driven ran elevated" warrants
+/// `local.vss_unavailable`; `never` is a user choice, so a locked file under
+/// `never` is a plain `local.file_locked` (NOT a misleading "needs elevation").
+/// A genuine snapshot/map failure despite availability is also
+/// `local.file_locked`.
+///
+/// ...and the whole distinction is WINDOWS-ONLY. Now that a Unix `EBUSY` /
+/// `ETXTBSY` / `EAGAIN` open also produces [`OpenAttempt::Locked`], an un-gated
+/// `!elevated` test would tell a macOS user their busy file "needs Volume Shadow
+/// Copy, which requires running Driven elevated" - advice that names a Windows
+/// service and cannot be acted on anywhere else. There is no VSS off Windows, so
+/// a lock there is simply `local.file_locked`. `cfg!` (not `#[cfg]`) keeps BOTH
+/// arms compiling on every target.
+fn skip_locked_reason(attempt: OpenAttempt, mode: VssMode, elevated: bool) -> SkipReason {
+    if cfg!(windows) && attempt == OpenAttempt::Locked && mode != VssMode::Never && !elevated {
+        SkipReason::VssUnavailable
+    } else {
+        SkipReason::Locked
+    }
+}
+
+/// Classify an open error (P2-F) into the three outcomes the caller
+/// distinguishes: a transient LOCK (skip + report, VSS may read around it), a
+/// permission DENIAL (skip + report, nothing but a permission change helps), or
+/// a genuine IO fault (fail the op).
+///
+/// We inspect the RAW OS error, never just [`std::io::ErrorKind`]:
+/// - On Windows a sharing violation and an ACL denial BOTH surface as
+///   `PermissionDenied`, yet only the former is a lock VSS can read around.
+/// - On Unix `EACCES` and `EPERM` both surface as `PermissionDenied` while
+///   `EBUSY`/`ETXTBSY` map to kinds (`ResourceBusy`/`ExecutableFileBusy`) whose
+///   stability we would rather not depend on.
+///
+/// A synthetic [`std::io::Error`] with no errno therefore still classifies as
+/// plain IO - which is what the tests below (and a caller constructing an error
+/// out of an `ErrorKind`) expect.
+///
+/// Platform asymmetry, deliberate: on Windows `ERROR_ACCESS_DENIED` (5) stays
+/// `local.io_error`. The Windows ACL story is the pre-existing, harness-pinned
+/// behaviour (`chaos` `acl-deny-read`) and elevation/VSS genuinely can read
+/// around some of it, so widening it is a separate decision from the macOS/Unix
+/// gap this function closes.
 fn classify_open_error(e: std::io::Error) -> OpenError {
     // ERROR_SHARING_VIOLATION (32) / ERROR_LOCK_VIOLATION (33): the file is
     // open exclusively by another process - the genuine "locked" case VSS
@@ -6545,11 +6616,36 @@ fn classify_open_error(e: std::io::Error) -> OpenError {
     if matches!(e.raw_os_error(), Some(32) | Some(33)) {
         return OpenError::Locked;
     }
-    // Everything else - including ERROR_ACCESS_DENIED (5) / an ACL denial that
-    // surfaces as `PermissionDenied` - is a plain IO error. Routing an ACL
-    // failure through the locked-file/VSS path would mislead the user with
-    // `local.vss_unavailable` ("would back up if elevated") when elevation
-    // would not help, and conflicts with the stress harness's expectations.
+    #[cfg(unix)]
+    {
+        match e.raw_os_error() {
+            // EACCES: ordinary mode-bit / ACL denial (`chmod 000`, a parent
+            // directory without `+x`, a root-owned file).
+            // EPERM: what macOS's TCC layer returns for a privacy-protected
+            // path (`~/Library/Mail`, `~/Library/Messages`, Photos, ...) until
+            // the user grants Driven Full Disk Access - the exact case this
+            // arm exists for, since the errno alone reads as "operation not
+            // permitted" with nothing wrong with the file itself.
+            Some(libc::EACCES) | Some(libc::EPERM) => return OpenError::Denied,
+            // EBUSY: the file is held in a way that blocks the open (a mounted
+            // image, a device node in use).
+            // ETXTBSY: an executable currently being run.
+            // EAGAIN == EWOULDBLOCK on every supported Unix: a mandatory /
+            // `O_NONBLOCK`-contended open that would have to wait. All three
+            // are the Unix analogue of a Windows sharing violation: transient,
+            // nobody's fault, retry next cycle.
+            Some(libc::EBUSY) | Some(libc::ETXTBSY) | Some(libc::EAGAIN) => {
+                return OpenError::Locked
+            }
+            _ => {}
+        }
+    }
+    // Everything else - including Windows ERROR_ACCESS_DENIED (5) / an ACL
+    // denial that surfaces as `PermissionDenied` - is a plain IO error.
+    // Routing a Windows ACL failure through the locked-file/VSS path would
+    // mislead the user with `local.vss_unavailable` ("would back up if
+    // elevated") when elevation would not help, and conflicts with the stress
+    // harness's expectations.
     OpenError::Io(e)
 }
 
@@ -11217,6 +11313,176 @@ mod tests {
         }
     }
 
+    /// Unix errno classification (macOS locked/denied parity). The three
+    /// classes must be told apart by RAW ERRNO, never by `ErrorKind`:
+    /// `EACCES`/`EPERM` are a permission DENIAL (skip + "grant access"),
+    /// `EBUSY`/`ETXTBSY`/`EAGAIN` are a LOCK (skip + retry), and everything
+    /// else is a plain IO failure.
+    ///
+    /// `EPERM` is the load-bearing one on macOS: a TCC-protected path
+    /// (`~/Library/Mail`, `~/Library/Messages`, Photos) returns "Operation not
+    /// permitted" even for a user whose mode bits say they may read it, and
+    /// before this classification that surfaced as a generic `local.io_error`
+    /// ("Driven hit a disk error") with no hint that Full Disk Access is the
+    /// remedy.
+    #[cfg(unix)]
+    #[test]
+    fn classify_open_error_unix_splits_denied_locked_and_io() {
+        use std::io::{Error, ErrorKind};
+
+        for errno in [libc::EACCES, libc::EPERM] {
+            assert!(
+                matches!(
+                    super::classify_open_error(Error::from_raw_os_error(errno)),
+                    super::OpenError::Denied
+                ),
+                "errno {errno} must classify as Denied (permission), not Io"
+            );
+        }
+
+        for errno in [libc::EBUSY, libc::ETXTBSY, libc::EAGAIN] {
+            assert!(
+                matches!(
+                    super::classify_open_error(Error::from_raw_os_error(errno)),
+                    super::OpenError::Locked
+                ),
+                "errno {errno} must classify as Locked (busy), not Io"
+            );
+        }
+
+        // EWOULDBLOCK is an alias of EAGAIN on every supported Unix; assert the
+        // identity so a future target where they diverge fails here loudly
+        // rather than silently dropping one of them into `Io`.
+        assert_eq!(
+            libc::EWOULDBLOCK,
+            libc::EAGAIN,
+            "EWOULDBLOCK is assumed to alias EAGAIN"
+        );
+
+        // Genuine IO faults stay failures - a denial must not swallow them.
+        for errno in [libc::EIO, libc::ENOENT, libc::ENOTDIR] {
+            assert!(
+                matches!(
+                    super::classify_open_error(Error::from_raw_os_error(errno)),
+                    super::OpenError::Io(_)
+                ),
+                "errno {errno} must stay a plain IO error"
+            );
+        }
+
+        // A SYNTHETIC error with no errno keeps its historical classification
+        // (plain IO): we classify on the raw OS error, so an `ErrorKind`-only
+        // value carries no evidence of a denial.
+        assert!(
+            matches!(
+                super::classify_open_error(Error::new(ErrorKind::PermissionDenied, "synthetic")),
+                super::OpenError::Io(_)
+            ),
+            "an errno-less PermissionDenied carries no evidence; stays Io"
+        );
+    }
+
+    /// A REAL `chmod 000` file on this host must classify as `Denied` through
+    /// the actual `open()` syscall - not just through a synthesised errno.
+    /// Skipped (loudly) when running as root, which bypasses mode bits.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn real_mode_000_file_opens_as_denied() {
+        // SAFETY: `geteuid` is a pure read of the calling process's identity;
+        // it takes no arguments, touches no memory, and cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "SKIP real_mode_000_file_opens_as_denied: running as root, which bypasses \
+                 mode bits (a chmod-000 file opens fine). Run as a normal user."
+            );
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        let dir = tempfile::tempdir().unwrap();
+        let path = dir.path().join("secret.bin");
+        std::fs::write(&path, b"unreadable bytes").unwrap();
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+        let got = super::open_shared(&path, crate::priority::WorkPriority::Normal).await;
+        assert!(
+            matches!(got, Err(super::OpenError::Denied)),
+            "a real chmod-000 open must classify as Denied"
+        );
+
+        // Restore so the tempdir can be cleaned up on every platform.
+        std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+    }
+
+    /// The denial must reach the caller as a SKIP carrying the distinct
+    /// `local.permission_denied` code - the whole point of the variant, since a
+    /// sibling Full-Disk-Access onboarding flow keys off that code to offer the
+    /// grant-access remedy.
+    #[test]
+    fn denied_skip_maps_to_local_permission_denied() {
+        assert_eq!(
+            SkipReason::Denied.error_code(),
+            ErrorCode::LocalPermissionDenied
+        );
+        assert_eq!(
+            ErrorCode::LocalPermissionDenied.code(),
+            "local.permission_denied"
+        );
+        assert_eq!(
+            ErrorCode::from_code("local.permission_denied"),
+            Some(ErrorCode::LocalPermissionDenied),
+            "the stored activity_log event_type must read back to the variant"
+        );
+        // ...and it is nobody else's code.
+        for other in [
+            SkipReason::Locked,
+            SkipReason::VssUnavailable,
+            SkipReason::VssHelperPending,
+        ] {
+            assert_ne!(
+                other.error_code(),
+                ErrorCode::LocalPermissionDenied,
+                "{other:?} must not collapse into the denial code"
+            );
+        }
+    }
+
+    /// A LOCK off Windows must NOT be reported as `local.vss_unavailable`.
+    /// Volume Shadow Copy is a Windows service, and `available()` is false for
+    /// every non-Windows provider - so before the platform gate a macOS `EBUSY`
+    /// open would have told the user to "run Driven elevated to use Volume
+    /// Shadow Copy", advice that does not exist on their OS.
+    #[test]
+    fn locked_skip_reason_never_claims_vss_off_windows() {
+        use driven_vss::{OpenAttempt, VssMode};
+
+        for mode in [VssMode::Auto, VssMode::Always] {
+            let reason = super::skip_locked_reason(OpenAttempt::Locked, mode, false);
+            #[cfg(windows)]
+            assert_eq!(
+                reason,
+                SkipReason::VssUnavailable,
+                "on Windows an un-elevated lock still means 'VSS would help'"
+            );
+            #[cfg(not(windows))]
+            assert_eq!(
+                reason,
+                SkipReason::Locked,
+                "off Windows a lock is local.file_locked, never local.vss_unavailable"
+            );
+        }
+        // `never` is a user choice on every platform: plain file_locked.
+        assert_eq!(
+            super::skip_locked_reason(OpenAttempt::Locked, VssMode::Never, false),
+            SkipReason::Locked
+        );
+        // An AVAILABLE provider that still could not snapshot: file_locked.
+        assert_eq!(
+            super::skip_locked_reason(OpenAttempt::Locked, VssMode::Auto, true),
+            SkipReason::Locked
+        );
+    }
+
     /// V-D / C-P2-1: `classify_drive_error` must use the TYPED downcast for the
     /// real store so `Transient5xx` (retry) and `Other` (fatal) are
     /// distinguished even though both render the `drive.unreachable` Display
@@ -11309,6 +11575,75 @@ mod tests {
             .unwrap()
             .expect("file_state row");
         assert_eq!(row.status, FileStateStatus::Synced);
+    }
+
+    /// End-to-end through `execute`: a `chmod 000` file is SKIPPED with
+    /// `local.permission_denied` (not FAILED with `local.io_error`), leaves no
+    /// `Synced` row, and - with an UNAVAILABLE VSS provider configured - is
+    /// still reported as a denial rather than as `local.vss_unavailable`.
+    /// That last assertion pins the provider BYPASS: a snapshot cannot read
+    /// around a permission the user does not hold, so denials must never be
+    /// dressed up as "would back up if Driven ran elevated".
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn denied_file_is_skipped_not_failed() {
+        // SAFETY: `geteuid` reads the calling process's identity; no args, no
+        // memory access, cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "SKIP denied_file_is_skipped_not_failed: running as root, which bypasses \
+                 mode bits. Run as a normal user."
+            );
+            return;
+        }
+        use std::os::unix::fs::PermissionsExt;
+
+        for with_vss in [false, true] {
+            let h = harness().await;
+            let (rel, size) = h.write_file("secret.bin", b"unreadable bytes");
+            let path = h.tmp_src.path().join("secret.bin");
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+            let exec = if with_vss {
+                let vss: Arc<dyn driven_vss::VssProvider> =
+                    Arc::new(driven_vss::FakeVssProvider::unavailable());
+                h.executor_with_vss(vss)
+            } else {
+                h.executor()
+            };
+            let out = exec
+                .execute(
+                    &h.source,
+                    &h.upload_plan(&rel, size),
+                    &noop_progress,
+                    &noop_outcome,
+                )
+                .await
+                .unwrap();
+
+            match &out[0] {
+                OpOutcome::Skipped { reason, .. } => assert_eq!(
+                    *reason,
+                    SkipReason::Denied,
+                    "with_vss={with_vss}: a permission denial is its own skip reason"
+                ),
+                other => panic!("with_vss={with_vss}: expected a skip, got {other:?}"),
+            }
+            assert_eq!(
+                out[0].relative_path().as_str(),
+                "secret.bin",
+                "the skip must name the file the user has to grant access to"
+            );
+
+            // Nothing uploaded, and no row claims to be backed up.
+            let row = h.state.get_file_state(h.source.id, &rel).await.unwrap();
+            assert!(
+                row.is_none() || row.unwrap().status != FileStateStatus::Synced,
+                "with_vss={with_vss}: an unreadable file must never commit Synced"
+            );
+
+            std::fs::set_permissions(&path, std::fs::Permissions::from_mode(0o644)).unwrap();
+        }
     }
 
     /// REAL VSS locked-file integration test (ROADMAP M3.5 acceptance).

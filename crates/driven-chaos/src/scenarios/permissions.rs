@@ -7,8 +7,13 @@
 //! file and uploads the rest of the source.
 //!
 //! `posix-mode-000` (Unix): a `chmod 000` file the process can stat but
-//! not open. Same outcome - `local.io_error` for that file, the rest of
-//! the source completes.
+//! not open. Driven classifies the `EACCES` as a permission denial and takes
+//! the graceful SKIP path: a WARN `local.permission_denied` row for that file
+//! (NOT an `local.io_error` failure - the disk is fine, the user simply may not
+//! read it), and the rest of the source completes. The same classification
+//! covers macOS TCC denials (`EPERM` on `~/Library/Mail` and friends until Full
+//! Disk Access is granted), which is the case this row stands in for on a
+//! developer's Mac.
 //!
 //! `windows-acl-deny-enumerate` (Windows + NTFS + admin): an NTFS ACL
 //! denies LIST DIRECTORY on a subfolder. The scanner's walker yields an
@@ -127,24 +132,45 @@ fn live_object_count(remote: &InMemoryRemoteStore, folder_id: &str) -> usize {
 }
 
 /// Whether the activity log carries at least one row whose `event_type`
-/// equals `code`'s stable string AND whose level is `Error`.
-async fn saw_error_code(
+/// equals `code`'s stable string AND whose level is at least `min_level`.
+async fn saw_code_at_least(
     state: &dyn StateRepo,
     source_id: SourceId,
     code: ErrorCode,
+    min_level: ActivityLevel,
 ) -> anyhow::Result<bool> {
     let page = state
         .query_activity(
             ActivityFilter {
                 source_id: Some(source_id),
                 event_types: vec![code.code().to_string()],
-                min_level: Some(ActivityLevel::Error),
+                min_level: Some(min_level),
                 ..ActivityFilter::default()
             },
             PageRequest::first(10_000),
         )
         .await?;
     Ok(!page.rows.is_empty())
+}
+
+/// Whether the activity log carries at least one ERROR-level row for `code`
+/// (the hard-failure rows: a failed op, not a skip).
+async fn saw_error_code(
+    state: &dyn StateRepo,
+    source_id: SourceId,
+    code: ErrorCode,
+) -> anyhow::Result<bool> {
+    saw_code_at_least(state, source_id, code, ActivityLevel::Error).await
+}
+
+/// Whether the activity log carries at least one WARN-or-worse row for `code`
+/// (the graceful SKIP rows - a skip is a warning, not an error).
+async fn saw_skip_code(
+    state: &dyn StateRepo,
+    source_id: SourceId,
+    code: ErrorCode,
+) -> anyhow::Result<bool> {
+    saw_code_at_least(state, source_id, code, ActivityLevel::Warn).await
 }
 
 /// The cross-scenario s6.3 invariant subset the permissions rows assert
@@ -243,8 +269,9 @@ fn icacls_run(path: &Path, extra: &[&str]) -> anyhow::Result<()> {
 // ===========================================================================
 
 /// A `chmod 000` file inside an otherwise-normal source: stat-able but not
-/// open-able. Driven surfaces `local.io_error` for that file and uploads
-/// the rest of the source (STRESS_HARNESS s3.3).
+/// open-able. Driven surfaces `local.permission_denied` for that file (a
+/// graceful skip, warn level) and uploads the rest of the source
+/// (STRESS_HARNESS s3.3).
 struct PosixMode000 {
     fixture: Mutex<FixtureState>,
 }
@@ -264,7 +291,7 @@ impl Scenario for PosixMode000 {
     }
 
     fn description(&self) -> &'static str {
-        "Unix chmod-000 file: local.io_error for that file, rest of the source uploads"
+        "Unix chmod-000 file: local.permission_denied skip for that file, rest of the source uploads"
     }
 
     fn requires(&self) -> CapabilityRequirements {
@@ -324,6 +351,17 @@ impl Scenario for PosixMode000 {
         let live = live_object_count(&remote, &folder);
         notes.push(format!("{live} of 4 files uploaded (1 locked)"));
 
+        // The denial is a SKIP, so its activity row is WARN-level (a skip is
+        // not an error the user must fix a disk over - they just have to grant
+        // access). Querying at Error level would find nothing.
+        let saw_denied = saw_skip_code(
+            handle.state.as_ref(),
+            source_id,
+            ErrorCode::LocalPermissionDenied,
+        )
+        .await?;
+        // ...and it must NOT be misreported as a disk fault, the pre-parity
+        // behaviour this row used to pin.
         let saw_io_error =
             saw_error_code(handle.state.as_ref(), source_id, ErrorCode::LocalIoError).await?;
 
@@ -334,14 +372,23 @@ impl Scenario for PosixMode000 {
         // On a non-Unix host the scenario is SKIPPED by the capability gate
         // and run_assertions never executes, so the `cfg(unix)` outcome below
         // is the only path that runs in practice. We assert it directly: the
-        // io_error must surface and exactly the 3 readable files upload.
-        let error_codes_seen = if saw_io_error {
-            vec![ErrorCode::LocalIoError]
+        // denial must surface and exactly the 3 readable files upload.
+        let error_codes_seen = if saw_denied {
+            vec![ErrorCode::LocalPermissionDenied]
         } else {
             vec![]
         };
-        if !saw_io_error {
-            notes.push("expected local.io_error for the mode-000 file but none was logged".into());
+        if !saw_denied {
+            notes.push(
+                "expected local.permission_denied for the mode-000 file but none was logged".into(),
+            );
+        }
+        if saw_io_error {
+            notes.push(
+                "the mode-000 file was reported as local.io_error; a permission denial is not \
+                 a disk fault"
+                    .into(),
+            );
         }
         if live != 3 {
             notes.push(format!("expected 3 uploaded readable files, got {live}"));
@@ -352,7 +399,8 @@ impl Scenario for PosixMode000 {
             final_drive_object_count: live as u64,
             final_hash_matches_local: inv_report.data_loss_paths.is_empty()
                 && live == 3
-                && saw_io_error,
+                && saw_denied
+                && !saw_io_error,
             invariants: Some(inv_report.to_invariant_outcome(true)),
             notes,
         })
@@ -370,8 +418,13 @@ impl Scenario for PosixMode000 {
     }
 
     fn expected_outcome(&self) -> ExpectedOutcome {
+        // `GracefulFailureWith` is the harness's "surfaces exactly this stable
+        // code, does not crash, reaches the documented post-state" verdict. The
+        // outcome here is a graceful SKIP rather than a failure; there is no
+        // separate `GracefulSkipWith` variant, and the check it performs (this
+        // code appears in `error_codes_seen`) is exactly right either way.
         ExpectedOutcome::GracefulFailureWith {
-            code: ErrorCode::LocalIoError,
+            code: ErrorCode::LocalPermissionDenied,
         }
     }
 }
@@ -849,12 +902,20 @@ mod tests {
     }
 
     /// The two Unix rows surface the documented outcome: mode-000 expects a
-    /// graceful `local.io_error`; setuid is a documented limitation.
+    /// graceful `local.permission_denied` skip (the Windows ACL row keeps its
+    /// pre-existing `local.io_error` failure); setuid is a documented
+    /// limitation.
     #[test]
     fn expected_outcomes_match_the_spec() {
         for s in scenarios() {
             match s.name() {
-                "posix-mode-000" | "windows-acl-deny-read-file" => assert!(matches!(
+                "posix-mode-000" => assert!(matches!(
+                    s.expected_outcome(),
+                    ExpectedOutcome::GracefulFailureWith {
+                        code: ErrorCode::LocalPermissionDenied
+                    }
+                )),
+                "windows-acl-deny-read-file" => assert!(matches!(
                     s.expected_outcome(),
                     ExpectedOutcome::GracefulFailureWith {
                         code: ErrorCode::LocalIoError
@@ -870,12 +931,24 @@ mod tests {
     }
 
     /// On a Unix host the mode-000 row runs end-to-end against the in-memory
-    /// fake: the locked file surfaces `local.io_error`, the other three
-    /// upload, and the shared invariants hold. (On Windows this row is
+    /// fake: the unreadable file surfaces `local.permission_denied`, the other
+    /// three upload, and the shared invariants hold. (On Windows this row is
     /// capability-SKIPPED, so the test only drives the impl where it applies.)
+    ///
+    /// Skipped as ROOT, which bypasses mode bits entirely - a `chmod 000` file
+    /// opens fine for uid 0, so the fixture would not be a denial at all.
     #[cfg(unix)]
     #[tokio::test]
-    async fn posix_mode_000_uploads_rest_and_logs_io_error() {
+    async fn posix_mode_000_uploads_rest_and_logs_permission_denied() {
+        // SAFETY: `geteuid` reads the calling process's identity - no
+        // arguments, no memory access, cannot fail.
+        if unsafe { libc::geteuid() } == 0 {
+            eprintln!(
+                "SKIP posix_mode_000_uploads_rest_and_logs_permission_denied: running as root, \
+                 which bypasses mode bits. Run as a normal user."
+            );
+            return;
+        }
         let scenario = PosixMode000::new();
         let mut ctx = ScenarioContext::default();
         scenario.setup(&mut ctx).await.expect("setup");
@@ -897,8 +970,15 @@ mod tests {
             outcome.notes
         );
         assert!(
-            outcome.error_codes_seen.contains(&ErrorCode::LocalIoError),
-            "the mode-000 file must surface local.io_error: {:?}",
+            outcome
+                .error_codes_seen
+                .contains(&ErrorCode::LocalPermissionDenied),
+            "the mode-000 file must surface local.permission_denied: {:?}",
+            outcome.notes
+        );
+        assert!(
+            !outcome.error_codes_seen.contains(&ErrorCode::LocalIoError),
+            "a permission denial must not be reported as a disk error: {:?}",
             outcome.notes
         );
         assert!(

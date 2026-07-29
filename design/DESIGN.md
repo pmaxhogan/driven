@@ -417,8 +417,9 @@ Driven reads files like this:
 - **Windows:** `OpenOptionsExt::share_mode(FILE_SHARE_READ | FILE_SHARE_WRITE
   | FILE_SHARE_DELETE)` so Word / Excel / Photoshop can still write to,
   rename, or delete the file while we read.
-- **macOS / Linux:** standard `std::fs::File::open` — POSIX advisory locks
-  don't block reads in practice.
+- **macOS / Linux:** standard `std::fs::File::open` - POSIX advisory locks
+  don't block reads in practice, and an unlink/replace under an open handle
+  is already allowed.
 - **Hard-locked file** (Outlook PSTs, BitLocker images, OS swap files,
   hypervisor disk images): if `open()` returns `ERROR_SHARING_VIOLATION`,
   Driven falls through to **VSS (Volume Shadow Copy Service)** on
@@ -444,6 +445,64 @@ Driven reads files like this:
   client's model. On macOS, file coordination + APFS clones could help
   in narrow cases (V2+ research). On Linux, btrfs/ZFS snapshots would
   require ops the user must already have set up; we don't try.
+  `driven-vss` compiles to a stub off Windows whose every entry point
+  returns `VssError::Unavailable`, so `fallback_decision` routes an
+  unopenable file straight to a skip and no snapshot is ever attempted.
+  A future macOS APFS-snapshot fallback plugs in at exactly one place -
+  `VssProvider::map_for_volume` returning `SnapshotOutcome::Mapped(path)`
+  instead of `Unavailable` (`crates/driven-vss/src/provider.rs`, the
+  `#[cfg(not(windows))] fn map_for_volume`); the executor's snapshot
+  consult, the frozen-read-path threading, and the end-of-cycle release
+  already handle a mapped path unchanged.
+
+##### Unopenable files on macOS / Linux
+
+An `open()` that fails is classified by **raw errno**, not by
+`io::ErrorKind` (`EACCES` and `EPERM` are indistinguishable as a kind),
+into three outcomes:
+
+| errno | Outcome | Code |
+|-------|---------|------|
+| `EBUSY`, `ETXTBSY`, `EAGAIN`/`EWOULDBLOCK` | skip + retry next cycle | `local.file_locked` |
+| `EACCES`, `EPERM` | skip + report, retry next cycle | `local.permission_denied` |
+| anything else | fail the op | `local.io_error` (or `local.disk_full`) |
+
+Both skip classes take the same graceful path a Windows sharing
+violation takes: the file is re-queued rather than marked synced, the
+rest of the source backs up normally, one warn-level activity row names
+the file, and the cycle's error count is unaffected. Neither is a
+failure.
+
+The split matters because the remedies are opposite. A **lock** is
+transient and nobody's fault - waiting is the fix. A **denial** is
+permanent until the user acts, and on macOS it is usually not a mode-bit
+problem at all: TCC (the privacy layer) returns `EPERM` -
+"Operation not permitted" - for `~/Library/Mail`, `~/Library/Messages`,
+Photos, and similar paths no matter what the mode bits say, until the
+user grants Driven **Full Disk Access** in System Settings. Reporting
+that as `local.io_error` ("Driven hit a disk error") sent users to check
+their disk for a problem that does not exist; `local.permission_denied`
+is a distinct SPEC s24 code precisely so the UI can offer the
+grant-access remedy instead.
+
+A denial deliberately does **not** consult the snapshot provider: a
+snapshot preserves the original's mode bits and is itself TCC-gated, so
+it can read around a lock but never around a denial. `local.vss_unavailable`
+("would back up if Driven ran elevated") is likewise Windows-only - it
+names a Windows service, so a lock off Windows reports `local.file_locked`
+and never asks a Mac user to elevate.
+
+Windows keeps its pre-existing behaviour for `ERROR_ACCESS_DENIED`: an
+ACL denial there stays `local.io_error`, since elevation genuinely can
+read around some of it and the stress harness pins that outcome.
+Aligning the two platforms is a separate decision.
+
+Scope note: this classification covers files the scanner could *stat*
+but the executor could not *open*. An unreadable **directory** fails
+earlier, inside the walk, where DESIGN s5.2 step 3 already applies -
+the walker error is recorded and deletions under that subtree are
+suppressed for the cycle, so nothing is trashed just because a folder
+became unreadable.
 
 #### 5.3.1 Least-privilege VSS helper (V1.x, issue #25)
 
