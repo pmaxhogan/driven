@@ -82,6 +82,38 @@ pub struct ApfsHelperManager {
     /// [`HelperLauncher::launch_status`] on a locked file, and the enable-toggle
     /// [`Self::launch_now`] - and cleared whenever the launcher is replaced.
     launch_attempted: AtomicBool,
+    /// Set once the broker's socket has actually answered, after which the
+    /// liveness probe in [`Self::confirm_ready`] is skipped for the session.
+    broker_confirmed: AtomicBool,
+    /// When the launcher FIRST claimed `Ready` without a live socket behind it,
+    /// so the grace window in [`Self::confirm_ready`] can expire.
+    ready_since: Mutex<Option<std::time::Instant>>,
+}
+
+/// How long a launcher-reported `Ready` may go unbacked by a live socket before
+/// the broker is declared dead. Generous: it only has to cover the gap between
+/// `osascript` returning and the broker binding its socket, and erring long
+/// costs a few extra transient skips while erring short would call a healthy
+/// broker dead.
+const BROKER_READY_GRACE: std::time::Duration = std::time::Duration::from_secs(15);
+
+/// Whether a unix-domain socket at `path` has a LISTENER behind it right now.
+///
+/// Existence alone is not enough: a broker that died leaves its socket file on
+/// disk, and connecting to that stale file fails with `ECONNREFUSED`. The
+/// connection is dropped immediately without speaking the protocol - this is a
+/// liveness probe, not a handshake, and [`crate::apfs_helper`] never treats it
+/// as authentication (the client's own root-peer check does that).
+#[cfg(unix)]
+fn socket_is_live(path: &Path) -> bool {
+    std::os::unix::net::UnixStream::connect(path).is_ok()
+}
+
+/// Off unix there are no unix-domain sockets, and the launcher can never report
+/// `Ready` there anyway (the osascript stub always fails).
+#[cfg(not(unix))]
+fn socket_is_live(_path: &Path) -> bool {
+    false
 }
 
 impl ApfsHelperManager {
@@ -119,6 +151,8 @@ impl ApfsHelperManager {
             enabled: AtomicBool::new(enabled),
             launcher: Mutex::new(launcher),
             launch_attempted: AtomicBool::new(false),
+            broker_confirmed: AtomicBool::new(false),
+            ready_since: Mutex::new(None),
         }
     }
 
@@ -169,6 +203,10 @@ impl ApfsHelperManager {
         // A fresh launcher has not been triggered, so status reads must go back
         // to answering "not yet tried" WITHOUT touching it.
         self.launch_attempted.store(false, Ordering::SeqCst);
+        // The next launch gets a fresh broker, so re-prove its liveness rather
+        // than trusting a previous session's confirmation.
+        self.broker_confirmed.store(false, Ordering::SeqCst);
+        *self.ready_since.lock().unwrap_or_else(|p| p.into_inner()) = None;
     }
 
     /// The launcher's status, but ONLY once a launch has genuinely been
@@ -180,7 +218,48 @@ impl ApfsHelperManager {
         if !self.is_enabled() || !self.launch_attempted.load(Ordering::SeqCst) {
             return None;
         }
-        Some(self.current_launcher().launch_status())
+        Some(self.confirm_ready(self.current_launcher().launch_status()))
+    }
+
+    /// Downgrade a launcher-reported `Ready` that no live broker backs.
+    ///
+    /// `osascript` exits 0 as soon as the consent prompt resolves and the shell
+    /// BACKGROUNDS the broker (`... &`), so the launcher records `Ready` from
+    /// the spawn alone. If the broker then dies immediately - a refused
+    /// pre-flight check, a bad sidecar, a socket path that will not bind - the
+    /// user sees an administrator prompt followed by a healthy status while
+    /// nothing ever mounts. That silent shape is exactly what the `sun_path`
+    /// overflow produced, so `Ready` is only reported once the socket actually
+    /// answers.
+    ///
+    /// Timing matters: the broker needs a moment to bind after the spawn, so a
+    /// not-yet-live socket is `Pending` (a transient skip, retried next cycle)
+    /// until [`BROKER_READY_GRACE`] elapses, and only then `Disabled` - which
+    /// makes `helper_launchable` false and surfaces as "degraded" in the UI
+    /// rather than as an eternal `Pending` nobody can diagnose.
+    ///
+    /// Probing stops permanently at the first success, so a healthy session
+    /// costs at most a few connects rather than one per status poll.
+    fn confirm_ready(&self, status: HelperLaunchStatus) -> HelperLaunchStatus {
+        if status != HelperLaunchStatus::Ready || self.broker_confirmed.load(Ordering::SeqCst) {
+            return status;
+        }
+        if socket_is_live(&self.socket) {
+            self.broker_confirmed.store(true, Ordering::SeqCst);
+            return HelperLaunchStatus::Ready;
+        }
+        let mut first = self.ready_since.lock().unwrap_or_else(|p| p.into_inner());
+        let started = *first.get_or_insert_with(std::time::Instant::now);
+        if started.elapsed() < BROKER_READY_GRACE {
+            HelperLaunchStatus::Pending
+        } else {
+            tracing::warn!(
+                socket = %self.socket.display(),
+                "apfs broker reported launched but its socket never came up; \
+                 locked-file backup is unavailable this session"
+            );
+            HelperLaunchStatus::Disabled
+        }
     }
 
     /// Apply a change to the `macos.apfs_snapshot` setting (called from the
@@ -422,6 +501,84 @@ mod tests {
     /// on every Mac, not just unusual ones. Confirmed against the real broker
     /// binary on macOS 26.6. Nothing else in the suite binds a socket, so only
     /// a length assertion catches it.
+    /// The liveness probe must distinguish a LIVE listener from a stale socket
+    /// FILE. A broker that died leaves its socket on disk, so an
+    /// existence-only check would keep reporting a healthy helper forever -
+    /// which is the exact silent shape this probe exists to prevent.
+    #[cfg(unix)]
+    #[test]
+    fn socket_probe_sees_a_live_listener_and_rejects_a_stale_file() {
+        // `tempfile` rather than a hand-rolled `temp_dir().join(...)`: CodeQL
+        // flags the latter as `rust/path-injection` (the process id is a
+        // user-influenced value reaching a filesystem sink), and TempDir also
+        // cleans up on panic, which the manual remove at the end did not.
+        let dir = tempfile::tempdir().expect("probe tempdir");
+        let sock = dir.path().join("probe.sock");
+
+        // Nothing there at all.
+        assert!(!socket_is_live(&sock), "absent socket is not live");
+
+        // A real listener answers.
+        let listener = std::os::unix::net::UnixListener::bind(&sock).expect("bind probe socket");
+        assert!(socket_is_live(&sock), "a bound listener must probe live");
+
+        // Dropping the listener leaves the FILE behind but nothing listening -
+        // connect must now fail (ECONNREFUSED), not succeed on file existence.
+        drop(listener);
+        assert!(sock.exists(), "the stale socket file is still on disk");
+        assert!(
+            !socket_is_live(&sock),
+            "a stale socket file must NOT probe live"
+        );
+        // `dir` drops here, removing the socket with it.
+    }
+
+    #[test]
+    fn a_ready_launcher_without_a_live_socket_is_not_reported_ready() {
+        // The manager's socket path is never bound in this test, so a launcher
+        // claiming Ready is exactly the "osascript spawned it, then it died"
+        // case. It must degrade to Pending inside the grace window rather than
+        // telling the UI locked-file backup is healthy.
+        let m = manager_with_real_exe(true);
+        assert_eq!(
+            m.confirm_ready(HelperLaunchStatus::Ready),
+            HelperLaunchStatus::Pending,
+            "an unbacked Ready degrades to Pending while the broker may still be binding"
+        );
+        // Non-Ready statuses pass through untouched.
+        assert_eq!(
+            m.confirm_ready(HelperLaunchStatus::Declined),
+            HelperLaunchStatus::Declined
+        );
+        assert_eq!(
+            m.confirm_ready(HelperLaunchStatus::Disabled),
+            HelperLaunchStatus::Disabled
+        );
+    }
+
+    #[test]
+    fn an_unbacked_ready_becomes_disabled_once_the_grace_window_expires() {
+        let m = manager_with_real_exe(true);
+        // Backdate the first-Ready stamp past the grace window.
+        *m.ready_since.lock().expect("ready_since") = Some(
+            std::time::Instant::now()
+                .checked_sub(BROKER_READY_GRACE + std::time::Duration::from_secs(5))
+                .expect("backdate"),
+        );
+        assert_eq!(
+            m.confirm_ready(HelperLaunchStatus::Ready),
+            HelperLaunchStatus::Disabled,
+            "a broker whose socket never came up must end DISABLED (degraded + \
+             diagnosable), not Pending forever"
+        );
+        // Disabled is what `helper_launchable` maps to false, which is what the
+        // UI renders as degraded. That end-to-end mapping is not asserted here
+        // on purpose: reaching it requires `launch_attempted`, and setting that
+        // would make the accessors call the real launcher, whose NotAttempted
+        // transition spawns an actual osascript consent prompt. See
+        // `reading_status_never_triggers_a_consent_prompt` for that guard.
+    }
+
     #[test]
     fn socket_path_fits_in_sockaddr_un() {
         // Darwin's sun_path is 104 bytes including the NUL terminator.

@@ -99,7 +99,7 @@ Notes:
 - ³⁸ Windows and macOS only; Linux needs third-party tools.
 - ³⁹ `bench/` runs Driven's real engine and rclone over identical seeded fixtures against a live Drive account, reporting wall time, throughput, API calls, CPU time, and peak memory for a cold and an incremental pass. See [`bench/README.md`](bench/README.md) for scales, costs, and what is and is not apples-to-apples.
 - ⁴⁰ The others publish unit-test microbenchmarks, internal tuning harnesses (Duplicati's unreleased AutoTune), or vendor marketing numbers, rather than a runnable end-to-end suite. Backblaze does publish a quarterly benchmark, but of B2 object storage rather than the backup client.
-- ⁴¹ Driven's checkmark is scoped to Windows, where a VSS snapshot lets a locked file (Outlook PST, running DB, VM disk) back up while it is held open. Neither macOS nor Linux backs a file up through a lock today - on macOS and Linux, a file Driven cannot open is instead classified precisely as a transient lock (`local.file_locked`) versus a macOS Full Disk Access denial (`local.permission_denied`) and skipped with a clear reason in the activity log, rather than misreported as a disk error. A macOS APFS-snapshot bypass equivalent to Windows VSS exists as a broker crate but is not yet wired into the backup path, so it does not do anything for a user yet; there is no Linux equivalent planned. See `design/DESIGN.md` §5.3 and §5.3.2.
+- ⁴¹ Driven's checkmark is scoped to Windows, where a VSS snapshot lets a locked file (Outlook PST, running DB, VM disk) back up while it is held open. macOS has an equivalent behind an opt-in setting (Settings > Rules): a small privileged helper mounts a read-only APFS local snapshot so a *busy* file can be read: it is off by default, and it does nothing for a Full Disk Access denial. On both macOS and Linux, a file Driven cannot open is in any case classified precisely as a transient lock (`local.file_locked`) versus a macOS Full Disk Access denial (`local.permission_denied`) and skipped with a clear reason in the activity log, rather than misreported as a disk error. Linux has no snapshot equivalent and none is planned. See `design/DESIGN.md` §5.3 and §5.3.2.
 
 Competitor rows were verified in July 2026 against rclone 1.74.4, restic 0.19.1,
 Duplicati 2.3.0.4, Backblaze Personal Backup 10.0.2, and Drive for desktop 128.0.
@@ -128,8 +128,9 @@ These move: check each project's current docs before relying on a cell.
   files, VM disks) still back up. On macOS and Linux, a file Driven cannot open
   is classified precisely - a transient lock versus a macOS Full Disk Access
   denial - and skipped with a clear reason rather than reported as a generic
-  disk error; an APFS-snapshot bypass equivalent to Windows VSS is in
-  development for macOS but not yet available.
+  disk error. macOS can also back up a *busy* file through an opt-in APFS
+  snapshot (Settings > Rules), which does not help with a Full Disk Access
+  denial; there is no Linux equivalent.
 - In-app restore browser with full-text file-name search and streaming decrypt.
 - Activity dashboard with a live tail and filterable history.
 - Rolling local log files covering both the backend and the webview console,
@@ -208,14 +209,46 @@ is planned for a future release. Until then, grant it manually if you want
 those folders backed up; everything else backs up normally without it.
 
 **A locked-file snapshot is not a substitute for Full Disk Access, and Driven
-never tries to make it one.** Driven's locked-file handling (Windows VSS
-today; a macOS APFS-snapshot equivalent is in development, see the table
-above) exists to read around a file that is transiently *busy* - open in
+never tries to make it one.** Driven's locked-file handling (Windows VSS,
+and the opt-in macOS APFS snapshot described below) exists to read around a file that is transiently *busy* - open in
 another program. It does not and cannot read around a TCC *denial*, because a
 snapshot preserves the original file's permissions and is itself subject to
 the same TCC check. The historical `-o noowners` mount trick that could bypass
 this (CVE-2020-9771) is long patched and is now a signature EDR products flag
 as suspicious; Driven does not use it and never will.
+
+#### macOS locked-file backup (APFS snapshot, opt-in)
+
+Two different things stop a file being backed up on macOS, and they have
+different fixes:
+
+| Situation | Reported as | Fix |
+|-----------|-------------|-----|
+| The file is held open / busy - a live database, a VM disk, a mail store | `local.file_locked` | Turn on **Back up locked files using an APFS snapshot** in Settings > Rules |
+| macOS privacy protection denies the read | `local.permission_denied` | Grant Full Disk Access (above). Nothing else works. |
+
+The APFS snapshot option is **off by default**. Turning it on asks for your
+administrator password once per session, and from then on Driven reads busy
+files out of a read-only APFS local snapshot mounted by a small privileged
+helper - the app itself stays un-elevated, and the helper only ever mounts and
+unmounts. It works without Time Machine being set up.
+
+> **Note on drag-installed copies.** One of the helper's defence-in-depth
+> checks is weaker when Driven is installed the usual way. The helper confirms
+> that whatever is talking to it sits next to it in the same folder - which only
+> proves much if you could not write to that folder yourself. Dragging an app
+> out of a `.dmg` makes **you** the owner of everything inside it (this is true
+> even when you drag it into `/Applications`; only `.pkg` and App Store installs
+> land root-owned), so on a normal Driven install that check is advisory and the
+> helper records a `DEGRADED` line in its own log instead of enforcing it.
+>
+> Locked-file backup still works, and the checks that carry the real weight are
+> unaffected: the helper only talks to your own user account, only mounts
+> volumes Driven listed at launch, and only ever makes read-only mounts that
+> preserve the original file ownership. Someone who defeated the folder check
+> would already have to be running as you, and would gain a read-only copy of
+> files they could already read. Installing from a `.pkg` would restore the
+> check to full strength; it is an improvement, not a prerequisite.
 
 #### macOS auto-updater caveat
 

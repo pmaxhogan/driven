@@ -745,21 +745,49 @@ nor replace the directory; if they pre-create it, it is owned by them and the
 broker's own "socket parent must be owned by the peer uid with mode 0700"
 check refuses to serve, so the failure is closed rather than silent.
 
-**Install layout decides whether the feature works at all.** The broker
-refuses to serve when the helper's own directory is writable by the client
-uid, because the peer check ("the caller's executable sits next to mine") is
-meaningless if the caller can drop a binary there. Measured on macOS 26.6:
-every app drag-installed from a DMG - including into `/Applications`, not
-merely `~/Applications` - has `Contents/MacOS` owned by the installing USER
-(verified across AltTab, Audacity, Chrome, Claude, Discord, Docker, GIMP),
-whereas pkg- and App-Store-installed apps (Cloudflare WARP, GarageBand) are
-`root:wheel`. Driven currently ships a `.dmg` whose documented install is a
-drag to `/Applications`, so on a stock install the broker exits at startup
-and locked-file backup never engages. Shipping this feature in a usable state
-therefore requires a `.pkg` (or a post-install `chown root:wheel` step) that
-lands the bundle root-owned. This is a deliberate security property of the
-broker, not a bug to work around: the alternative is a co-installation check
-that looks like authentication and is not.
+**Install layout weakens one check but does not disable the feature.** The
+broker's co-installation check ("the caller's executable sits next to mine")
+is only strong if the peer user cannot WRITE to the helper's directory.
+Measured on macOS 26.6, essentially no drag-installed bundle satisfies that:
+every app installed by dragging out of a `.dmg` - including into
+`/Applications`, not merely `~/Applications` - has `Contents/MacOS` owned by
+the installing USER (verified across AltTab, Audacity, Chrome, Claude,
+Discord, Docker, GIMP), whereas pkg- and App-Store-installed apps (Cloudflare
+WARP, GarageBand) are `root:wheel`. Driven ships a `.dmg`, so this is the
+normal case, not the exotic one.
+
+The check is therefore **advisory** rather than fatal: the broker serves, and
+writes a `DEGRADED:` line to its root-owned audit log naming the directory and
+the uid. The reasoning is that the attacker it guards against is ALREADY the
+same uid - `getpeereid` is not bypassable by planting a binary - so defeating
+co-installation buys them a read-only, `nosuid`, `nodev`,
+ownership-preserving mount of an allow-listed volume at a broker-chosen
+mountpoint. That is a point-in-time copy of files that uid could already read,
+with TCC still applying to their own process. Trading locked-file backup away
+for every drag-install user would not have been a good exchange. The
+load-bearing checks are the peer uid, the volume allow-list, the snapshot-name
+validation and the mount options; this one is defence in depth.
+
+A `.pkg`-style install that lands the bundle root-owned restores the check to
+full strength and silences the `DEGRADED:` line, and remains the better
+end state - but it is an improvement, not a prerequisite.
+
+**`Ready` means the socket answered, not that a process was spawned.**
+`osascript` exits 0 as soon as the consent prompt resolves and the shell
+backgrounds the broker, so the launcher's own `Ready` reflects the SPAWN
+alone. If the broker then dies immediately - a failed pre-flight check, a bad
+sidecar, a socket path that will not bind - the user gets an administrator
+prompt followed by a healthy-looking status while nothing ever mounts. That
+silent shape is precisely what the `sun_path` overflow above produced, and it
+is the difference between a bug found in minutes and one found never. The app
+manager therefore probes the socket before passing `Ready` upward: a
+connect-and-drop liveness check (existence is not enough - a dead broker
+leaves its socket file behind, and connecting to that fails `ECONNREFUSED`).
+An unbacked `Ready` reports `Pending` - a transient skip, retried next cycle -
+for a 15s grace window covering the bind, and then `Disabled`, which makes
+`helper_launchable` false and surfaces as degraded in the UI rather than as an
+eternal `Pending` nobody can diagnose. Probing stops at the first success, so
+a healthy session pays a couple of connects, not one per status poll.
 
 **Not a TCC bypass.** Worth restating because it is the single most likely
 misreading of this whole section: an APFS snapshot lets Driven read a file
