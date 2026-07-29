@@ -95,6 +95,12 @@ driven-drive = { path = "../crates/driven-drive" }
 # restore path all build their store through it so they can never disagree
 # about which backend an account targets.
 driven-backend = { path = "../crates/driven-backend" }
+# The S3 destination's config + credential types, which the setup command
+# validates before persisting anything.
+driven-s3 = { path = "../crates/driven-s3" }
+# The backend-neutral RemoteStore trait, for the create-time reachability
+# probe that proves a destination works before an account row exists.
+driven-remote = { path = "../crates/driven-remote" }
 driven-crypto = { path = "../crates/driven-crypto" }
 driven-power = { path = "../crates/driven-power" }
 # Adaptive upload parallelism (DESIGN s11.4.7): the real per-OS disk-busy reader

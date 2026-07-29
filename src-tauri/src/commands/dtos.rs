@@ -93,6 +93,36 @@ pub struct BackendDto {
     pub is_default: bool,
 }
 
+/// The user-supplied settings for a new S3-compatible destination
+/// (`create_s3_account`).
+///
+/// `access_key_id` / `secret_access_key` are IN-FLIGHT ONLY: the command writes
+/// them straight to the OS keychain and persists only the rest. They must never
+/// be echoed back to the webview, logged, or stored in SQLite - which is why
+/// there is no `S3ConfigDto` reading them back out.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateS3AccountRequest {
+    /// Optional human label for the account; defaults to `bucket/prefix`.
+    pub display_name: Option<String>,
+    /// Service endpoint including scheme, e.g.
+    /// `https://<account>.r2.cloudflarestorage.com`.
+    pub endpoint: String,
+    /// Bucket name.
+    pub bucket: String,
+    /// SigV4 signing region; defaults to `us-east-1` when omitted or blank.
+    pub region: Option<String>,
+    /// Path-style addressing (`host/bucket/key`). Defaults to `true`, which is
+    /// what MinIO and Cloudflare R2's account endpoint require.
+    pub path_style: Option<bool>,
+    /// Optional key prefix confining Driven to a subtree of the bucket.
+    pub prefix: Option<String>,
+    /// S3 access key id.
+    pub access_key_id: String,
+    /// S3 secret access key. Keychain-bound; never persisted anywhere else.
+    pub secret_access_key: String,
+}
+
 /// The opaque session id returned by `begin_add_account_wizard` and threaded
 /// through the OAuth steps (SPEC s11.1 `AddAccountWizardSessionId`).
 ///

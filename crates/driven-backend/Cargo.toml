@@ -13,6 +13,8 @@ publish = false
 driven-remote = { path = "../driven-remote" }
 # The Google Drive backend (the historical default destination).
 driven-drive = { path = "../driven-drive" }
+# The S3-compatible backend (AWS S3, R2, MinIO, B2, ...).
+driven-s3 = { path = "../driven-s3" }
 # Corporate custom-CA + proxy config, threaded into every client the factory
 # builds (issue #34).
 driven-tls = { path = "../driven-tls" }

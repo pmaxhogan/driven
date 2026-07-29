@@ -45,12 +45,16 @@ pub enum BackendKind {
     /// pre-migration account decodes to.
     #[default]
     GoogleDrive,
+    /// Any S3-compatible object store (AWS S3, Cloudflare R2, MinIO, Backblaze
+    /// B2, Wasabi, Ceph RGW, ...), authorized by a directly-entered access key
+    /// pair rather than an OAuth consent flow.
+    S3,
 }
 
 impl BackendKind {
     /// Every kind this build knows, in the order the destination picker shows
     /// them. The first entry is the default selection.
-    pub const ALL: &'static [BackendKind] = &[BackendKind::GoogleDrive];
+    pub const ALL: &'static [BackendKind] = &[BackendKind::GoogleDrive, BackendKind::S3];
 
     /// The stable stored/wire identifier. This string is written to
     /// `accounts.backend_kind` and crosses the Tauri IPC boundary, so it is
@@ -58,6 +62,7 @@ impl BackendKind {
     pub const fn id(self) -> &'static str {
         match self {
             BackendKind::GoogleDrive => "google_drive",
+            BackendKind::S3 => "s3",
         }
     }
 
@@ -71,6 +76,9 @@ impl BackendKind {
     pub const fn uses_oauth(self) -> bool {
         match self {
             BackendKind::GoogleDrive => true,
+            // S3 credentials are an access key pair the user pastes in; there
+            // is no consent flow to run.
+            BackendKind::S3 => false,
         }
     }
 
@@ -79,6 +87,9 @@ impl BackendKind {
     pub const fn supports_folder_picker(self) -> bool {
         match self {
             BackendKind::GoogleDrive => true,
+            // S3 "folders" are key prefixes, which the picker can browse the
+            // same way it browses Drive folders.
+            BackendKind::S3 => true,
         }
     }
 
@@ -114,6 +125,7 @@ impl BackendKind {
     pub fn to_stored(self) -> Option<&'static str> {
         match self {
             BackendKind::GoogleDrive => None,
+            other => Some(other.id()),
         }
     }
 }

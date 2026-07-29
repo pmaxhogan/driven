@@ -44,11 +44,12 @@ use driven_crypto::Keystore;
 
 use driven_drive::google::oauth::{run_pkce_loopback_flow, OAuthProgress, Tokens};
 use driven_drive::google::token_store::KeyringTokenStore;
+use driven_remote::remote_store::{DriveContext, RemoteStore};
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    AccountDto, AddAccountWizardSessionId, BackendDto, OAuthAuthUrl, OAuthStatus, ReauthSession,
-    SessionId,
+    AccountDto, AddAccountWizardSessionId, BackendDto, CreateS3AccountRequest, OAuthAuthUrl,
+    OAuthStatus, ReauthSession, SessionId,
 };
 use crate::commands::{CommandError, CommandResult};
 use crate::events::EVENT_OAUTH_COMPLETE;
@@ -1040,6 +1041,22 @@ pub async fn remove_account(
     {
         tracing::warn!(target: TARGET, account_id = %account_id, error = %e, "failed to delete BYO client creds from keychain on account removal");
     }
+    // Wipe any NON-Drive backend secret the account owns (idempotent). The purge
+    // is a `match` on the kind inside the factory, so a new backend cannot be
+    // added without deciding what removing an account of that kind deletes -
+    // a forgotten arm would strand a live credential in the user's keychain.
+    // Purged for EVERY kind, not just the row's own, because the row is already
+    // gone by this point and a mis-recorded kind must not leave a secret behind.
+    for kind in driven_core::state::BackendKind::ALL.iter().copied() {
+        let spec = driven_backend::AccountBackend {
+            account_id: account_id.to_string(),
+            kind,
+            config_json: None,
+        };
+        if let Err(e) = driven_backend::purge_account_secrets(&spec) {
+            tracing::warn!(target: TARGET, account_id = %account_id, %kind, error = %e, "failed to delete a backend secret from the keychain on account removal");
+        }
+    }
     // Wipe the account master key (encryption opt-out / removal; idempotent).
     match Keystore::open(&account_id.to_string()) {
         Ok(ks) => {
@@ -1054,6 +1071,131 @@ pub async fn remove_account(
 
     tracing::info!(target: TARGET, account_id = %account_id, "account removed");
     Ok(())
+}
+
+/// `create_s3_account(req)` - create an account backed by an S3-compatible
+/// destination.
+///
+/// The S3 counterpart of the OAuth wizard's
+/// `begin -> submit -> signin -> finish` sequence, collapsed into one call
+/// because there is no consent round trip: the user supplies an access key pair
+/// directly. As with the OAuth path, the SECRET is written to the OS keychain
+/// and only the non-secret config (endpoint, bucket, region, addressing style,
+/// prefix) reaches SQLite.
+///
+/// The credentials are VERIFIED against the live service before the account row
+/// is written - a listing of the destination root must succeed. An account that
+/// cannot reach its bucket is worse than no account: it would sit in the sources
+/// list looking configured while every backup cycle failed.
+///
+/// Ordering mirrors `finish_add_account`: keychain first, then the row, with the
+/// keychain entry rolled back if the row write fails, so a failure leaves no
+/// orphaned secret and no half-account.
+#[tauri::command]
+pub async fn create_s3_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: CreateS3AccountRequest,
+) -> CommandResult<AccountDto> {
+    reject_control_chars(&req.access_key_id, "S3 access key id")?;
+    reject_control_chars(&req.secret_access_key, "S3 secret access key")?;
+
+    let config = driven_s3::S3Config {
+        endpoint: req.endpoint.clone(),
+        bucket: req.bucket.clone(),
+        region: req.region.clone().unwrap_or_default(),
+        path_style: req.path_style.unwrap_or(true),
+        prefix: req.prefix.clone(),
+    }
+    .normalized()
+    .map_err(|e| CommandError::with_code(ErrorCode::InvalidInput, e.to_string()))?;
+    let creds = driven_s3::S3Credentials {
+        access_key_id: req.access_key_id.clone(),
+        secret_access_key: req.secret_access_key.clone(),
+    };
+
+    // Issue #34: honour the corporate CA + proxy for the verification probe too,
+    // so a deployment behind a TLS-inspecting proxy can complete setup.
+    let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
+        .await
+        .unwrap_or_default();
+    let proxy = crate::commands::settings::load_proxy_config(state.state().as_ref())
+        .await
+        .unwrap_or_default();
+
+    // Prove the destination is reachable and the key pair works BEFORE anything
+    // is persisted.
+    let probe = driven_s3::S3Store::new(&config, &creds, &ca, &proxy).map_err(|e| {
+        CommandError::with_code(ErrorCode::InvalidInput, format!("invalid S3 settings: {e}"))
+    })?;
+    let root = probe.root_id().to_string();
+    probe
+        .list_folder(&root, &DriveContext::MyDrive)
+        .await
+        .map_err(|e| {
+            // The store already classified this (bad key -> auth.invalid_grant,
+            // missing bucket -> drive.dest_folder_missing, ...); reuse that
+            // verdict rather than flattening every failure to one code.
+            CommandError::from(e)
+        })?;
+
+    let account_id = AccountId::new_v4();
+    let config_json = driven_backend::store_s3_credentials(&account_id.to_string(), config, &creds)
+        .map_err(|e| {
+            CommandError::with_code(
+                ErrorCode::CryptoKeyMissing,
+                format!("failed to persist the S3 credentials in the keychain: {e}"),
+            )
+        })?;
+
+    let label = req
+        .display_name
+        .clone()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| format!("{}/{}", req.bucket, req.prefix.clone().unwrap_or_default()));
+    let row = AccountRow {
+        id: account_id,
+        // S3 has no account identity to fetch; the bucket IS the account's
+        // human label, and `email` is the field the UI renders.
+        email: label.clone(),
+        display_name: req.display_name.clone().filter(|d| !d.trim().is_empty()),
+        state: AccountState::Ok,
+        encryption_master_key_id: None,
+        created_at: SystemClock.now_ms(),
+        last_synced_at: None,
+        backend_kind: BackendKind::S3,
+        backend_config_json: Some(config_json),
+    };
+
+    if let Err(e) = state.state().upsert_account(&row).await {
+        // Roll the keychain entry back so a failed create leaves no orphaned
+        // secret behind (the same discipline `persist_new_account` applies to
+        // the OAuth path).
+        let spec = driven_backend::AccountBackend {
+            account_id: account_id.to_string(),
+            kind: BackendKind::S3,
+            config_json: None,
+        };
+        if let Err(purge) = driven_backend::purge_account_secrets(&spec) {
+            tracing::warn!(target: TARGET, account_id = %account_id, error = %purge, "rollback of the S3 keychain entry failed");
+        }
+        return Err(CommandError::from(e));
+    }
+
+    tracing::info!(target: TARGET, account_id = %account_id, "S3 account persisted");
+
+    // A2: hot-spawn so the wizard's initial sync finds a live handle.
+    match crate::assembly::spawn_account(&app, &state, account_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(target: TARGET, account_id = %account_id, "S3 account persisted but orchestrator not spawned");
+        }
+        Err(err) => {
+            tracing::error!(target: TARGET, account_id = %account_id, %err, "hot-spawn after create_s3_account failed; orchestrator will start on next launch");
+        }
+    }
+
+    Ok(account_row_to_dto(&row))
 }
 
 /// `reauth_account(account_id)` - re-run consent for an account whose refresh

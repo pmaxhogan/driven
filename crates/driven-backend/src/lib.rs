@@ -35,6 +35,7 @@ use driven_drive::google::token_store::{
 use driven_drive::google::GoogleDriveStore;
 use driven_remote::remote_store::RemoteStore;
 use driven_remote::BackendKind;
+use driven_s3::{S3Config, S3CredentialStore, S3Credentials, S3Store};
 use driven_tls::{CustomCaConfig, ProxyConfig};
 
 /// Tracing target for the backend factory.
@@ -144,6 +145,10 @@ pub fn descriptors() -> Vec<BackendDescriptor> {
 pub fn picker_root_id(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::GoogleDrive => "root",
+        // An S3 "folder" is a key prefix; the destination root is the bucket
+        // root (or the configured prefix, which the store applies itself), so
+        // the empty prefix is the right starting point.
+        BackendKind::S3 => "",
     }
 }
 
@@ -161,6 +166,67 @@ pub fn build_store(
 ) -> anyhow::Result<StoreOutcome> {
     match account.kind {
         BackendKind::GoogleDrive => build_google_drive(&account.account_id, ctx),
+        BackendKind::S3 => build_s3(account, ctx),
+    }
+}
+
+/// The S3 arm: persisted non-secret config + keychain access key pair ->
+/// `S3Store`.
+fn build_s3(account: &AccountBackend, ctx: BackendContext<'_>) -> anyhow::Result<StoreOutcome> {
+    let json = account.config_json.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("s3.config_invalid: the account has no stored S3 backend configuration")
+    })?;
+    let config = S3Config::from_json(json)?;
+    let Some(creds) = S3CredentialStore::new(account.account_id.clone()).load()? else {
+        tracing::warn!(
+            target: TARGET,
+            account_id = %account.account_id,
+            "no stored S3 credentials; account needs reauth (NOT falling back to a fake store)"
+        );
+        return Ok(StoreOutcome::NeedsReauth);
+    };
+    let store = S3Store::new(&config, &creds, ctx.ca, ctx.proxy)?;
+    tracing::info!(
+        target: TARGET,
+        account_id = %account.account_id,
+        // Endpoint and bucket are NOT secrets and are what an operator needs to
+        // debug a misconfigured destination. The key pair is never logged.
+        bucket = %config.bucket,
+        endpoint = %config.endpoint,
+        "built real S3Store (keyring access key)"
+    );
+    Ok(StoreOutcome::Store(Arc::new(store)))
+}
+
+/// Persist an account's S3 destination: validate + normalize the non-secret
+/// config into the blob for `accounts.backend_config_json`, and put the access
+/// key pair in the OS keychain.
+///
+/// Returns the config JSON for the caller to store on the account row. The
+/// credentials are NOT returned and never reach the caller's storage.
+pub fn store_s3_credentials(
+    account_id: &str,
+    config: S3Config,
+    creds: &S3Credentials,
+) -> anyhow::Result<String> {
+    let config = config.normalized()?;
+    S3CredentialStore::new(account_id.to_string()).store(creds)?;
+    config.to_json()
+}
+
+/// Remove every keychain secret an account's backend owns.
+///
+/// Called on account removal. Idempotent per backend, and deliberately a
+/// `match` on the kind so a new backend cannot be added without deciding what
+/// its removal purges - a forgotten arm would leave a live credential in the
+/// user's keychain after they deleted the account.
+pub fn purge_account_secrets(account: &AccountBackend) -> anyhow::Result<()> {
+    match account.kind {
+        // The Drive refresh token + BYO client creds are purged by the accounts
+        // command layer's own secret seam (which predates this factory and is
+        // covered by its tests); nothing extra to do here.
+        BackendKind::GoogleDrive => Ok(()),
+        BackendKind::S3 => S3CredentialStore::new(account.account_id.clone()).delete(),
     }
 }
 
@@ -344,6 +410,87 @@ mod tests {
     #[test]
     fn picker_root_is_the_drive_root_alias() {
         assert_eq!(picker_root_id(BackendKind::GoogleDrive), "root");
+        assert_eq!(picker_root_id(BackendKind::S3), "");
+    }
+
+    #[test]
+    fn an_s3_account_without_config_is_an_error_not_a_needs_reauth() {
+        // A missing CONFIG is a bug (the account row was written wrong); a
+        // missing CREDENTIAL is a reauth. Conflating them would send the user
+        // round the credential prompt forever on a malformed row.
+        let account = AccountBackend {
+            account_id: "acct-s3".to_string(),
+            kind: BackendKind::S3,
+            config_json: None,
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        // `StoreOutcome` holds a `dyn RemoteStore`, which has no `Debug`, so
+        // unwrap the Result by hand rather than via `expect_err`.
+        let err = match build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            },
+        ) {
+            Ok(_) => panic!("a missing S3 config must be an error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("s3.config_invalid"), "{err}");
+    }
+
+    #[test]
+    fn an_invalid_s3_config_blob_is_rejected_before_any_keychain_read() {
+        let account = AccountBackend {
+            account_id: "acct-s3".to_string(),
+            kind: BackendKind::S3,
+            config_json: Some(r#"{"endpoint":"not a url","bucket":"b"}"#.to_string()),
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        assert!(build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_persisted_s3_config_blob_carries_no_credential_material() {
+        // The blob is what lands in SQLite and the diagnostic bundle.
+        let config = S3Config {
+            endpoint: "https://example.com/".to_string(),
+            bucket: "bkt".to_string(),
+            region: String::new(),
+            path_style: true,
+            prefix: Some("/backups/".to_string()),
+        };
+        let blob = config.normalized().expect("valid").to_json().expect("json");
+        assert!(!blob.to_lowercase().contains("secret"));
+        assert!(!blob.contains("AKIA"));
+        assert!(blob.contains("backups/"));
+    }
+
+    #[test]
+    fn store_s3_credentials_validates_before_touching_the_keychain() {
+        // A bad config must not leave a stored credential behind for an account
+        // that could never work.
+        let creds = S3Credentials {
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "super-secret".to_string(),
+        };
+        let bad = S3Config {
+            endpoint: String::new(),
+            bucket: "bkt".to_string(),
+            region: String::new(),
+            path_style: true,
+            prefix: None,
+        };
+        assert!(store_s3_credentials("acct-never-created", bad, &creds).is_err());
     }
 
     fn ctx<'a>(ca: &'a CustomCaConfig, proxy: &'a ProxyConfig) -> BackendContext<'a> {
