@@ -336,6 +336,111 @@ ROADMAP M3.7).
 | `pause-mid-resumable-7d`          | Same as above but `FakeClock.advance(7 days)`. Driven persists session age, discards sessions older than 6 days.            | Stored session discarded; upload restarted from byte 0; no `drive.resumable_session_invalid` leaks past the executor.                              | fake     |
 | `kill-9-mid-pipeline`             | `kill_orchestrator()` mid 16-file pipeline; reboot handle.                                                                  | Reconciliation pass (DESIGN §5.6) `find_by_op_uuid` adopts or trashes orphans; final state has no duplicates; `state.reconcile_orphan` logged.    | fake     |
 
+### 3.9 Backend-specific destination hazards
+
+Sections 3.1-3.8 all drive ONE destination: Google Drive, through
+`InMemoryRemoteStore`. Driven now has more than one backend
+(`driven-drive`, `driven-s3`, and the local-folder backend), and the
+s6.3 invariants claim to be **backend-independent**. This section is
+where that claim is tested rather than asserted: every row below ends
+in the same `assert_invariants` sweep the Drive rows use, reached
+through the backend-neutral `InvariantSurface` seam (s6.3).
+
+Implemented in `crates/driven-chaos/src/scenarios/backends.rs`. Every
+row is registered in BOTH `registry()` and `fault_injection_registry()`,
+so the `chaos-fake-drive` job - the one that names itself after fault
+injection - actually runs them.
+
+#### Why these faults are injected on the WIRE
+
+The S3 failure modes that lose data rather than merely erroring live
+BELOW the `RemoteStore` trait, in the HTTP layer. A fault injected at
+the trait seam arrives already classified and so proves nothing about
+the code that does the classifying. So these rows drive the REAL
+`driven_s3::S3Store` - real SigV4 signing, real `reqwest` round trips,
+real XML parsing, real `classify_s3_response` - against the in-process
+`FaultyS3Server` (s5.1), and inject faults as bytes on a socket.
+
+| Scenario                                  | Setup                                                                                                | Expected outcome                                                                                                       | Requires |
+|-------------------------------------------|------------------------------------------------------------------------------------------------------|------------------------------------------------------------------------------------------------------------------------|----------|
+| `s3-multipart-interrupted-between-parts`  | Connection dropped mid-`UploadPart`, with one part already committed.                                | Recovers to exactly ONE object whose bytes equal the local file. No gap where the lost part was, no duplicate.          | user     |
+| `s3-multipart-interrupted-before-complete`| Connection dropped carrying `CompleteMultipartUpload`; every part is on the server.                  | NOTHING published and NOTHING recorded `synced` until a completion actually succeeds; then exactly one byte-exact object. | user     |
+| `s3-complete-200-with-error-document`     | `CompleteMultipartUpload` answers HTTP **200** with an `<Error>` body and publishes nothing.          | The status is not trusted: no object, no `synced` row. Recovery afterwards yields exactly one byte-exact object.        | user     |
+| `s3-slow-down-throttling`                 | A burst of `503 SlowDown` **longer than the finite 5xx retry budget** (`MAX_TRANSIENT_RETRIES = 6`). | The upload still completes - throttling retries indefinitely under the pacer. A shorter burst would not discriminate.   | user     |
+| `s3-request-timeout-retryable-400`        | `400 RequestTimeout` mid-transfer.                                                                   | Retried despite the 4xx status; the file is not abandoned.                                                             | user     |
+| `s3-kill-mid-upload-then-reboot`          | Upload cut, orchestrator dropped with no graceful shutdown, fresh handle over the same DB and bucket. | No orphaned object with no `file_state` row, no duplicate, nothing falsely `synced`.                                   | user     |
+| `s3-destination-full-mid-upload`          | Byte budget exhausted with parts ALREADY uploaded (`QuotaExceeded`).                                  | `drive.quota_exhausted`; nothing partial published; freeing space lets the backup finish.                               | user     |
+| `localfs-crash-between-temp-write-and-rename` | Two phases: a commit whose `rename` genuinely cannot land, then the abandoned temp file (holding the file's FULL bytes) a killed process leaves. | Nothing readable at the target path, no sidecar, nothing `synced`; the orphan is invisible to `list_folder` AND to the remote-existence audit; the stale one is swept, a FRESH one survives. | user |
+| `destination-vanished-across-backends`    | Destination vanishes mid-cycle on ALL THREE backends from ONE body: a marker holding a different destination id (local folder), `NoSuchBucket` (S3), a latched flag (Drive). | `drive.dest_folder_missing`, nothing written after the destination went away, nothing already synced lost.  | user     |
+
+#### The local-folder rows
+
+The local-folder backend needs no protocol server: its destination IS a
+directory, so `crates/driven-chaos/src/localfs_fixture.rs` constructs
+each post-crash state byte-for-byte as the failure produces it, rather
+than modelling it. Its three hazards:
+
+- **Destination vanished mid-cycle** (the removable-media case, and the
+  reason `.driven-destination.json` exists - an unmounted NAS mount
+  point is an ordinary empty directory, so an existence check alone
+  would write a whole backup onto the boot disk underneath the mount,
+  where it disappears on the next remount while `file_state` still calls
+  every file synced). Covered as the third arm of
+  `destination-vanished-across-backends`. The injected fault is the
+  NASTIER of the two the marker catches: not a missing marker, but one
+  carrying a different destination id - a different stick at the same
+  mount point, where the path exists, is a directory, is writable, and
+  even looks like a Driven destination.
+- **A crash between the temp-file write and the atomic rename**, covered
+  by `localfs-crash-between-temp-write-and-rename`. Reached WITHOUT a
+  fault seam in production code: phase 1 puts an object-shaped directory
+  at the target path so the store really writes and `F_FULLFSYNC`es its
+  temp file and the real `fsx::commit_rename` really fails; phase 2
+  plants the temp file a killed process leaves. The row asserts on the
+  DATA file's absence, never on a sidecar's presence: the backend
+  commits data first and sidecar second on purpose, so a crash between
+  them is benign by design and a row that asserted the opposite ordering
+  would encode a bug as the expected behaviour.
+- **Out of space (`ENOSPC`)** maps onto `DriveError::StorageQuota` - the
+  local-folder errno table sends `ENOSPC`/`EDQUOT` there - the same
+  variant S3's `QuotaExceeded` produces, so the end-to-end behaviour
+  (account pauses, nothing partial published, recovery once space is
+  freed) is covered mid-multipart by `s3-destination-full-mid-upload`.
+
+  What is NOT covered is the localfs errno path itself end to end,
+  because a real `ENOSPC` needs a real constrained VOLUME: unprivileged
+  on macOS (`hdiutil`), root-only on Linux (`losetup`), admin-only on
+  Windows (`New-VHD`). `disk-full-target` sets the precedent -
+  capability-gated behind `DRIVEN_CHAOS_ALLOW_DISK_MOUNT` - and a row
+  gated the same way would SKIP in the Windows-only PR gate, the one job
+  that blocks a merge. The errno table is unit-tested in
+  `driven-localfs`; what a chaos row adds beyond it is the orchestrator
+  behaviour, which the S3 row proves. Recorded as a deliberate gap
+  rather than a scenario that is always SKIPPED.
+
+#### Every row must PROVE its fault fired, and must DISCRIMINATE
+
+Two disciplines apply to every row in this section, both learned the
+hard way:
+
+- **Proof the fault fired.** The S3 server keeps per-fault firing
+  counters and each row asserts on the one it armed; the local-folder
+  rows assert an error was surfaced, and make their orphan-filtering
+  claims against a destination that already holds a REAL object (on an
+  empty destination "the audit returned nothing" is trivially true). A
+  green run that never reached its fault is not a passing test - it is
+  the `append-only-log` flake in a new costume.
+- **Proof the row discriminates.** Each high-value row was re-run with
+  the production defence it guards deliberately disabled, and must go
+  RED. `s3-complete-200-with-error-document` needed all THREE of
+  `driven-s3`'s independent defences removed before it failed (the body
+  scan, the composed-ETag check, and the post-completion `HEAD`), which
+  is worth knowing on its own. `s3-slow-down-throttling` FAILED this
+  test as first written - one injected `SlowDown` passes whether or not
+  the S3 code is special-cased, because a transient 5xx is also retried
+  - and now injects a burst longer than the finite 5xx retry budget,
+  which is the only shape that separates the two.
+
 ---
 
 ## 4. Continuous-mutation harness (the "mutator")
@@ -430,6 +535,132 @@ Each scenario in §3.7 binds one or more. The fake's underlying
 counter machinery is shared across builders so combinations behave
 predictably (e.g. "5xx after request 50, then OK").
 
+One RUNTIME counterpart exists alongside the construction-time
+builders: `latch_dest_folder_missing(&self)`, in the same shape as the
+already-present `arm_session_invalidated_after`. "The destination
+vanished" is a mid-run event, and asserting that nothing already backed
+up is lost needs a healthy first cycle to establish a synced baseline
+before the fault arrives - which a construction-time-only surface
+cannot express without rebuilding the store and discarding the very
+objects the assertion is about.
+
+### 5.1 S3-side fault injection (the in-process S3 server)
+
+The S3 backend's interesting failures live **below** the `RemoteStore`
+trait, so they cannot be injected the way §5 injects Drive's. A fault
+introduced at the trait seam arrives already classified, which proves
+nothing about the code that does the classifying - and
+`classify_s3_response` is exactly the code that decides whether a
+throttled backup keeps retrying or strands the file.
+
+`crates/driven-chaos/src/s3_server.rs` therefore runs a
+`FaultyS3Server`: an in-process, loopback-bound HTTP/1.1 server speaking
+the S3 subset `driven-s3` uses, with faults injected as bytes on the
+socket. The §3.9 rows drive the REAL `driven_s3::S3Store` against it -
+real SigV4 presigning, real `reqwest` round trips, real XML parsing,
+real classification.
+
+**Why in-process rather than MinIO behind a proxy.** `driven-s3`'s own
+integration suite already covers real MinIO and real Cloudflare R2. The
+chaos jobs are a different question: per §7 they run **Windows-only** on
+every PR, and `minio` is installed only on the Linux legs of `ci.yml` /
+`coverage.yml`. A MinIO-gated chaos row would SKIP in the one job that
+blocks a merge. An in-process server needs no external binary, no port
+coordination beyond `:0`, and behaves identically on all three
+platforms.
+
+**No SigV4 validation, deliberately.** `S3Store` signs every request as
+a presigned URL, so the credential rides in the query string and the
+server never has to verify it. Validating signatures would test
+`rusty-s3` rather than Driven.
+
+The arming surface (runtime rather than construction-time, because an S3
+row usually needs a clean first cycle and the fault only for the
+second):
+
+```rust
+impl FaultyS3Server {
+    // Throttling and transient failures with S3's own status quirks.
+    pub fn arm_slow_down_after(&self, n: u64);          // 503 SlowDown, single shot
+    pub fn arm_slow_down_burst(&self, n: u64);          // 503 SlowDown x n
+    pub fn arm_request_timeout_after(&self, n: u64);    // retryable 400
+    pub fn arm_internal_error_after(&self, n: u64);     // 500 InternalError
+
+    // Destination-level, latching.
+    pub fn arm_bucket_missing(&self);                   // 404 NoSuchBucket
+    pub fn arm_access_disabled(&self);                  // 403 AllAccessDisabled
+    pub fn arm_quota_bytes(&self, n: u64);              // QuotaExceeded past a budget
+
+    // Multipart, the transport-level cuts with no trait representation.
+    pub fn arm_drop_part_after(&self, n: u64);          // connection dies mid-UploadPart
+    pub fn arm_drop_complete(&self, n: u64);            // dies at CompleteMultipartUpload
+    pub fn arm_complete_error_document(&self, n: u64);  // HTTP 200 + <Error> body
+    pub fn arm_no_such_upload_at_complete(&self);       // 404 NoSuchUpload
+
+    // Race-window widening, and a reset.
+    pub fn arm_response_delay(&self, delay: Duration);
+    pub fn clear_faults(&self);
+}
+```
+
+**Every row must prove its fault fired.** The server keeps per-fault
+firing counters (`RequestCounts::slow_down_fired`,
+`complete_error_documents_sent`, `quota_refusals`, ...) and each row
+asserts on the one it armed. This is the §7 discipline applied to fault
+injection: a green run that never reached its fault is not a passing
+test, it is a test that did nothing - the exact shape of the
+`append-only-log` flake.
+
+**A burst is sometimes required for the row to discriminate.** One
+`503 SlowDown` proves nothing, because a transient 5xx is also retried:
+the row passes whether or not the S3 code is special-cased. Only a burst
+LONGER than the executor's finite 5xx budget (`MAX_TRANSIENT_RETRIES`)
+separates the two - rate limiting retries indefinitely and completes, a
+transient 5xx gives up and strands the file.
+
+**Real S3 semantics the server keeps**, because a fault row is only
+meaningful if the non-faulted path behaves like S3: `Content-MD5` is
+verified and a mismatch answered with `400 BadDigest`; a single-`PUT`
+ETag is the content md5 while a multipart ETag is
+`md5(concat(part md5s))-N`; `CompleteMultipartUpload` assembles ONLY the
+parts the request body names and discards any other part held for that
+upload id (the property the crash-resume path relies on);
+`ListObjectsV2` honours `max-keys` and emits `NextContinuationToken`; a
+`DeleteObject` of a missing key answers 204 while a `HEAD` of one
+answers 404.
+
+### 5.2 Local-folder fault construction (no seam needed)
+
+The local-folder backend's destination IS a directory, so the harness
+needs no protocol server and no fault seam in production code: it
+constructs the post-crash on-disk state byte-for-byte and reads the
+ground truth back with `std::fs`.
+`crates/driven-chaos/src/localfs_fixture.rs` provides:
+
+```rust
+impl LocalFsFixture {
+    pub fn swap_marker_identity(&self);                     // a different volume, same path
+    pub fn block_target_path(&self, encoded: &str);          // the commit's rename cannot land
+    pub fn plant_orphan_temp_file(&self, bytes: &[u8], age: Duration);
+}
+```
+
+`block_target_path` is the interesting one: putting an object-shaped
+DIRECTORY at the target path means the store really writes and
+`F_FULLFSYNC`es its temp file and the real `fsx::commit_rename` really
+fails, so the row reaches the instant between the sync and the rename
+without any production code knowing it is under test.
+
+`LocalFsOracle` is the fault-free listing, and it must reproduce the
+backend's own notion of what is NOT an object - `.driven-meta/`,
+`.driven-destination.json`, `.driven-tmp-*`, and the macOS AppleDouble
+`._*` shadows the OS writes on exFAT/FAT32. It therefore delegates to the
+backend's own `layout::is_control_entry` rather than re-deriving the
+list, so the two cannot drift. (Counting a `.driven-tmp-*` file as an
+object is precisely the bug the crash row hunts, and `._*` files never
+appear on a tempdir - which is exactly why an oracle that forgot them
+would look correct in CI and lie on real hardware.)
+
 ---
 
 ## 6. Reporting
@@ -509,6 +740,36 @@ yet fail one of these.
 - **No `pending_ops` leak.** Post-run, `pending_ops` is either empty
   or only contains rows whose `scheduled_for` is in the future (a
   legitimate backoff).
+
+These invariants are **backend-independent**, and that is enforced
+structurally rather than by convention. `assert_invariants` is generic
+over one narrow trait, `InvariantSurface`, which every backend
+implements:
+
+```rust
+#[async_trait]
+pub trait InvariantSurface: Send + Sync {
+    async fn invariant_listing(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>>;
+    async fn retained_content(&self, id: &str) -> Option<ObjectContent>;
+}
+```
+
+Two properties of that seam are load-bearing:
+
+- **It is fault-free.** A scenario that ends with a LATCHED fault
+  (`auth.invalid_grant`, `NoSuchBucket`) would make the sweep's own read
+  fail, and the harness would report "could not verify" as though it
+  were "verified nothing wrong". Every implementation reads the
+  destination's ground truth directly, bypassing the fault layer.
+- **It is not `RemoteStore`.** On S3, `list_folder` returns keys, sizes
+  and ETags but NO user metadata, so a duplicate-`client_op_uuid` check
+  written against it would be silently vacuous on that backend - always
+  green, never looking. It is also non-recursive on both backends.
+
+There is therefore exactly ONE implementation of each invariant, shared
+by every backend. A second, forked copy of "no duplicate
+`client_op_uuid`" per backend is precisely the drift this section exists
+to prevent.
 - **No `unwrap` / panic in logs.** `tracing` captures must not
   contain `'thread .* panicked'`, `internal.bug`, or
   `Result::unwrap()` failures.

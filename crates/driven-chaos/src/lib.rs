@@ -13,6 +13,12 @@
 //! [`registry`] - the scenario registry the dispatch iterates (s2.2)
 //! [`reporting`] - per-scenario [`reporting::Verdict`] + run report (s6)
 //! [`mutator`] - the FS / Drive mutation command enums (s4)
+//! [`s3_server`] - an in-process, fault-injecting S3 server (s5.1), so the S3
+//! backend's wire-level quirks can be injected against the REAL
+//! `driven_s3::S3Store`
+//! [`localfs_fixture`] - a local-folder destination fixture + its fault-free
+//! oracle (s5.2), so the removable-media and crash-mid-commit states can be
+//! built on disk exactly as the failure leaves them
 //! [`scenarios`] - the s3 catalogue, one submodule per category
 //!
 //! The Phase-1 interface fixes these types and trait signatures; the
@@ -22,9 +28,11 @@
 pub mod capabilities;
 pub mod dispatch;
 pub mod handle;
+pub mod localfs_fixture;
 pub mod mutator;
 pub mod registry;
 pub mod reporting;
 pub mod runner;
+pub mod s3_server;
 pub mod scenario;
 pub mod scenarios;

@@ -22,7 +22,11 @@
 //! `fuzz` / `mutator` CLI driver functions (s2.2)
 //! `reporting` -> s6.3 cross-scenario-invariant scenarios + the shared
 //! `assert_invariants` post-condition check
+//! `backends` -> s3.9 backend-specific destination hazards (the S3 wire quirks
+//! and the removable-media / out-of-space shapes), all routed through the same
+//! `assert_invariants` sweep via the backend-neutral `InvariantSurface` seam
 
+pub mod backends;
 pub mod concurrency;
 pub mod drive_side;
 pub mod file_size;

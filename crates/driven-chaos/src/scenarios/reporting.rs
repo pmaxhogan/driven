@@ -69,6 +69,108 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
 }
 
 // ===========================================================================
+// The backend-neutral seam the s6.3 sweep reads through
+// ===========================================================================
+
+/// The fault-free view of a destination that [`assert_invariants`] needs.
+///
+/// ## Why this exists
+///
+/// The s6.3 invariants are supposed to be BACKEND-INDEPENDENT - that is the
+/// whole claim they make. Until the S3 rows landed, `assert_invariants` took a
+/// `&InMemoryRemoteStore` and called two INHERENT methods on it
+/// (`descendant_files_with_trashed`, `object_content`), so the claim was
+/// structurally welded to the fake: a second backend could only be covered by a
+/// second, forked copy of the checker - and two copies of "no duplicate
+/// `client_op_uuid`" is exactly the drift s6.3 exists to prevent.
+///
+/// This trait is the narrowest seam that unwelds it. Every backend supplies the
+/// same two facts and the invariant logic stays in ONE place.
+///
+/// ## Why it is not just `RemoteStore`
+///
+/// Two reasons, both load-bearing:
+///
+/// 1. **It must be fault-free.** A scenario that ends with a LATCHED fault
+///    (`auth.invalid_grant`, `NoSuchBucket`) would make the sweep's own read
+///    fail, and the harness would report "could not verify" as though it were
+///    "verified nothing wrong". Every implementation therefore reads the
+///    destination's ground truth directly, bypassing the fault layer.
+/// 2. **`RemoteStore::list_folder` is not enough.** On S3 it returns keys,
+///    sizes and ETags but NO user metadata - `app_properties` is unreachable
+///    through it - so a duplicate-`client_op_uuid` check written against it
+///    would be silently vacuous on the S3 backend: always green, never
+///    looking. It is also non-recursive on both backends.
+#[async_trait]
+pub trait InvariantSurface: Send + Sync {
+    /// Every object at or below `folder_id`, INCLUDING trashed ones, read from
+    /// the destination's ground truth with no fault injection applied.
+    ///
+    /// Trashed objects are included deliberately: "two objects created for one
+    /// op, then one trashed" is still evidence of a duplicate-create bug, so
+    /// filtering them out before counting would hide it.
+    async fn invariant_listing(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>>;
+
+    /// The content of one object, for the blake3 byte-integrity check.
+    /// `None` when the id is unknown or the object is a folder;
+    /// [`ObjectContent::Oracle`] when the backend deliberately retains a
+    /// digest instead of the bytes (the 10-50 GB rows).
+    async fn retained_content(&self, id: &str) -> Option<ObjectContent>;
+}
+
+#[async_trait]
+impl InvariantSurface for InMemoryRemoteStore {
+    async fn invariant_listing(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+        // The FAULT-FREE accessor (a direct in-memory read), NOT the faulted
+        // `list_folder` trait method - see the trait docs.
+        Ok(self.descendant_files_with_trashed(folder_id))
+    }
+
+    async fn retained_content(&self, id: &str) -> Option<ObjectContent> {
+        InMemoryRemoteStore::object_content(self, id)
+    }
+}
+
+#[async_trait]
+impl InvariantSurface for crate::s3_server::FaultyS3Server {
+    async fn invariant_listing(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+        Ok(self.oracle_entries(folder_id))
+    }
+
+    async fn retained_content(&self, id: &str) -> Option<ObjectContent> {
+        // The fake bucket retains literal bytes for every object (the s3.9 rows
+        // are megabyte-scale, not the 10-50 GB oracle rows), so the blake3
+        // content check runs for real on this backend too.
+        self.object_bytes(id).map(ObjectContent::Literal)
+    }
+}
+
+#[async_trait]
+impl InvariantSurface for crate::localfs_fixture::LocalFsOracle {
+    async fn invariant_listing(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+        Ok(self.entries(folder_id))
+    }
+
+    async fn retained_content(&self, id: &str) -> Option<ObjectContent> {
+        self.object_bytes(id).map(ObjectContent::Literal)
+    }
+}
+
+/// Delegating impl so a scenario holding an `Arc<...>` (most of them do, since
+/// the handle needs an `Arc<dyn RemoteStore>` too) can pass it straight to
+/// [`assert_invariants`] with no call-site change.
+#[async_trait]
+impl<T: InvariantSurface + ?Sized> InvariantSurface for std::sync::Arc<T> {
+    async fn invariant_listing(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+        (**self).invariant_listing(folder_id).await
+    }
+
+    async fn retained_content(&self, id: &str) -> Option<ObjectContent> {
+        (**self).retained_content(id).await
+    }
+}
+
+// ===========================================================================
 // Shared s6.3 invariant checker
 // ===========================================================================
 
@@ -180,29 +282,31 @@ fn is_deferred_create_reconcile(op: &driven_core::state::PendingOpRow) -> bool {
 /// `pub` so sibling categories run the exact same logic (s6.3 requires the
 /// invariants be computed uniformly across every scenario).
 ///
-/// Takes the [`InMemoryRemoteStore`] by reference (the scenarios construct
-/// it and keep a typed handle - the `RemoteStore` trait object cannot be
-/// downcast). The credential-gated real-Drive scenarios run a Drive-backed
-/// variant the run-all driver supplies. Returns `Err` only on a genuine
-/// state-layer fault (which is itself an invariant failure: the harness
-/// could not verify, so it must not report green).
-pub async fn assert_invariants(
+/// Takes the destination through the backend-neutral [`InvariantSurface`] seam
+/// (the scenarios construct a concrete store and keep a typed handle - the
+/// `RemoteStore` trait object cannot be downcast). The fake, the S3 backend and
+/// any future backend all route through THIS function; there is no per-backend
+/// copy of the checks. Returns `Err` only on a genuine state-layer fault (which
+/// is itself an invariant failure: the harness could not verify, so it must not
+/// report green).
+pub async fn assert_invariants<R: InvariantSurface + ?Sized>(
     handle: &DrivenHandle,
-    remote: &InMemoryRemoteStore,
+    remote: &R,
     source_id: SourceId,
     folder_id: &str,
 ) -> anyhow::Result<InvariantReport> {
     // Live remote objects + a map from client_op_uuid -> count of live
     // objects carrying it (the duplicate-detection key, s6.3).
     //
-    // Use the FAULT-FREE `list_folder_with_trashed` accessor (a direct in-memory
-    // read, NOT the faulted `list_folder` trait method) so a scenario that
-    // leaves the remote in a LATCHED fault state (e.g. auth.invalid_grant, which
-    // the fake applies to read calls too) can still have its terminal-state
-    // invariants verified instead of the sweep itself erroring on the fault.
-    // Recursive: plaintext sources mirror their local directory tree on Drive
-    // (2.1.1), so nested objects live under ensured folders, not the root.
-    let all: Vec<_> = remote.descendant_files_with_trashed(folder_id);
+    // Read through the FAULT-FREE `InvariantSurface` seam (a direct read of the
+    // destination's ground truth, NOT the faulted `list_folder` trait method) so
+    // a scenario that leaves the remote in a LATCHED fault state (e.g.
+    // auth.invalid_grant / NoSuchBucket, which apply to read calls too) can
+    // still have its terminal-state invariants verified instead of the sweep
+    // itself erroring on the fault. Recursive: plaintext sources mirror their
+    // local directory tree on the destination (2.1.1), so nested objects live
+    // under ensured folders, not the root.
+    let all: Vec<_> = remote.invariant_listing(folder_id).await?;
     let live: Vec<_> = all.iter().filter(|e| !e.trashed).cloned().collect();
     let live_object_count = live.len() as u64;
 
@@ -275,7 +379,7 @@ pub async fn assert_invariants(
         // plaintext `hash_blake3`. Only for an unencrypted source (ciphertext
         // hashes differ from the plaintext hash) and a retained-bytes object.
         if !encryption_enabled {
-            if let Some(ObjectContent::Literal(bytes)) = remote.object_content(id) {
+            if let Some(ObjectContent::Literal(bytes)) = remote.retained_content(id).await {
                 if *blake3::hash(&bytes).as_bytes() != row.hash_blake3 {
                     data_loss_paths.push(format!("{rel}: blake3 content mismatch"));
                     continue;

@@ -17,6 +17,24 @@ path = "src/main.rs"
 # thick-core / thin-shell split); it does NOT depend on src-tauri.
 driven-core = { path = "../driven-core" }
 driven-drive = { path = "../driven-drive" }
+# The S3 backend under test. The s3.9 rows drive the REAL `S3Store` (real
+# signing, real reqwest round trips, real `classify_s3_response`) against the
+# in-process fault-injecting server in `s3_server.rs` - injecting an
+# already-classified error at the trait seam would prove nothing about the wire
+# quirks (503 SlowDown, RequestTimeout-as-400, a 200 carrying an error
+# document) that only exist below it.
+driven-s3 = { path = "../driven-s3" }
+# The local-folder backend under test. Unlike the HTTP backends its destination
+# IS a directory, so the s3.9 local-folder rows construct post-crash on-disk
+# states (an abandoned temp file, a rename that cannot land, a marker belonging
+# to a different volume) byte-for-byte rather than modelling them.
+driven-localfs = { path = "../driven-localfs" }
+# `S3Store::new` takes the shared custom-CA + proxy config (issue #34); the
+# harness passes the "none / system" pair.
+driven-tls = { path = "../driven-tls" }
+# The backend-neutral `RemoteStore` trait + `DriveError` taxonomy the s3.9 rows
+# assert against directly.
+driven-remote = { path = "../driven-remote" }
 driven-crypto = { path = "../driven-crypto" }
 driven-power = { path = "../driven-power" }
 driven-test-fixtures = { path = "../driven-test-fixtures" }
@@ -26,6 +44,10 @@ driven-vss = { path = "../driven-vss" }
 
 anyhow.workspace = true
 async-trait.workspace = true
+# Upload bodies at the `RemoteStore` seam are `Bytes`; the s3.9 rows that assert
+# the trait contract directly (rather than only through the orchestrator) need
+# them.
+bytes.workspace = true
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true
