@@ -20,6 +20,13 @@ export type BackendKindId = string;
  * before the destination picker reports. */
 export const DEFAULT_BACKEND_ID: BackendKindId = "google_drive";
 
+/** The local / removable-folder destination (`BackendKind::LocalFolder::id`).
+ *
+ * Named here rather than inlined because the wizard's credentials step has to
+ * tell the two NON-OAuth destinations apart to pick a form, and "which form"
+ * is a per-backend question that no boolean on `BackendDto` answers. */
+export const LOCAL_FOLDER_BACKEND_ID: BackendKindId = "local_folder";
+
 export interface AccountDto {
   id: string;
   email: string;
@@ -45,6 +52,16 @@ export interface CreateS3AccountRequest {
   prefix?: string | null;
   accessKeyId: string;
   secretAccessKey: string;
+}
+
+/** The settings for a new local / removable-folder destination
+ * (`createLocalFolderAccount`).
+ *
+ * There is deliberately no credential field: a folder the user already has write
+ * access to needs none, so this backend never touches the OS keychain. */
+export interface CreateLocalFolderAccountRequest {
+  displayName?: string | null;
+  root: string;
 }
 
 /** One selectable backup destination, as reported by `listBackends()`. Mirrors
