@@ -360,6 +360,22 @@ fn uuid_from_str(s: &str) -> Result<Uuid> {
     Uuid::parse_str(s).map_err(|e| anyhow!("invalid uuid {s:?}: {e}"))
 }
 
+/// Narrow a report counter for storage in SQLite's signed `INTEGER`.
+///
+/// Saturating rather than `as`: a `u64` past `i64::MAX` is unreachable for a
+/// per-run count, but a wrapping cast would store a NEGATIVE count and make
+/// the persisted report actively misleading, whereas a saturated one is merely
+/// capped.
+fn count_to_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// Widen a stored counter back. A negative value can only come from a
+/// hand-edited DB; read it as `0` rather than wrapping to a colossal count.
+fn i64_to_count(v: i64) -> u64 {
+    u64::try_from(v).unwrap_or(0)
+}
+
 /// Decode a raw `file_versions` row (issue #36) into a [`FileVersionRow`]. Shared
 /// by the four SELECTs (list / resolve / over-cap / untrashed) so the BLOB +
 /// uuid + path decoding lives in one place.
@@ -1692,6 +1708,225 @@ impl StateRepo for SqliteStateRepo {
 
         tx.commit().await?;
         Ok(paths)
+    }
+
+    // --- integrity scrub (migration 0013) -----------------------------------
+    //
+    // Every statement below uses runtime `sqlx::query` / `sqlx::query_as` (NOT
+    // the compile-checked `query!` macro) so these additive methods need NO
+    // `.sqlx` cache regeneration - the same choice, for the same reason, as
+    // `requeue_file_state_for_reupload` above.
+
+    async fn list_scrub_file_page(
+        &self,
+        source: SourceId,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::scrub::ScrubCandidate>> {
+        let source_str = source.to_string();
+        // `?2` is the exclusive lower bound. `COALESCE(?2, '')` would be wrong
+        // for a path that sorts before the empty string (impossible today, but
+        // the explicit `?2 IS NULL` disjunction does not depend on that), so
+        // the bound is tested for NULL instead. The `(source_id,
+        // relative_path)` PRIMARY KEY is the covering index for both the range
+        // and the ORDER BY, so this is a bounded index scan, never a sort.
+        let rows: Vec<(String, String, i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT relative_path, drive_file_id, size, drive_md5 FROM file_state \
+             WHERE source_id = ?1 AND drive_file_id IS NOT NULL \
+               AND (?2 IS NULL OR relative_path > ?2) \
+             ORDER BY relative_path LIMIT ?3",
+        )
+        .bind(source_str.as_str())
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (path, drive_file_id, size, md5) in rows {
+            out.push(crate::scrub::ScrubCandidate {
+                target: crate::scrub::ScrubTarget::File {
+                    path: relative_path_from_string(path)?,
+                },
+                drive_file_id,
+                // A negative size cannot occur (the column is written from a
+                // `u64`), but a hand-edited DB must not panic the scrub.
+                size: u64::try_from(size).unwrap_or(0),
+                md5: md5_from_bytes(md5)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn list_scrub_bundle_page(
+        &self,
+        source: SourceId,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::scrub::ScrubCandidate>> {
+        let source_str = source.to_string();
+        let rows: Vec<(String, String, i64, Option<Vec<u8>>)> = sqlx::query_as(
+            "SELECT id, drive_file_id, size, drive_md5 FROM bundles \
+             WHERE source_id = ?1 AND (?2 IS NULL OR id > ?2) \
+             ORDER BY id LIMIT ?3",
+        )
+        .bind(source_str.as_str())
+        .bind(after)
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for (bundle_id, drive_file_id, size, md5) in rows {
+            out.push(crate::scrub::ScrubCandidate {
+                target: crate::scrub::ScrubTarget::Bundle { bundle_id },
+                drive_file_id,
+                size: u64::try_from(size).unwrap_or(0),
+                md5: md5_from_bytes(md5)?,
+            });
+        }
+        Ok(out)
+    }
+
+    async fn scrub_cursor(&self, source: SourceId) -> Result<Option<crate::scrub::ScrubCursor>> {
+        let source_str = source.to_string();
+        let row: Option<(Option<String>, Option<String>, Option<i64>)> = sqlx::query_as(
+            "SELECT file_cursor, bundle_cursor, last_scrub_at FROM scrub_state \
+             WHERE source_id = ?1",
+        )
+        .bind(source_str.as_str())
+        .fetch_optional(&self.pool)
+        .await?;
+        Ok(row.map(
+            |(file_cursor, bundle_cursor, last_scrub_at)| crate::scrub::ScrubCursor {
+                file_cursor,
+                bundle_cursor,
+                last_scrub_at,
+            },
+        ))
+    }
+
+    async fn set_scrub_cursor(
+        &self,
+        source: SourceId,
+        cursor: &crate::scrub::ScrubCursor,
+    ) -> Result<()> {
+        let source_str = source.to_string();
+        sqlx::query(
+            "INSERT INTO scrub_state (source_id, file_cursor, bundle_cursor, last_scrub_at) \
+             VALUES (?1, ?2, ?3, ?4) \
+             ON CONFLICT(source_id) DO UPDATE SET \
+               file_cursor = excluded.file_cursor, \
+               bundle_cursor = excluded.bundle_cursor, \
+               last_scrub_at = excluded.last_scrub_at",
+        )
+        .bind(source_str.as_str())
+        .bind(cursor.file_cursor.as_deref())
+        .bind(cursor.bundle_cursor.as_deref())
+        .bind(cursor.last_scrub_at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_scrub_run(&self, run: &crate::state::NewScrubRun) -> Result<i64> {
+        let source_str = run.source_id.to_string();
+        let r = &run.report;
+        // Insert + prune in ONE transaction so a crash between them cannot
+        // leave the history unbounded, and so a concurrent reader never sees
+        // the table momentarily over cap.
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO scrub_runs ( \
+               source_id, started_at, finished_at, checked, ok, missing, size_mismatch, \
+               hash_mismatch, unverifiable, healed, healed_bundle_members, unrecoverable, \
+               deep_checked, deep_failed, wrapped, outcome) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13, ?14, ?15, ?16)",
+        )
+        .bind(source_str.as_str())
+        .bind(run.started_at)
+        .bind(run.finished_at)
+        .bind(count_to_i64(r.checked))
+        .bind(count_to_i64(r.ok))
+        .bind(count_to_i64(r.missing))
+        .bind(count_to_i64(r.size_mismatch))
+        .bind(count_to_i64(r.hash_mismatch))
+        .bind(count_to_i64(r.unverifiable))
+        .bind(count_to_i64(r.healed))
+        .bind(count_to_i64(r.healed_bundle_members))
+        .bind(count_to_i64(r.unrecoverable))
+        .bind(count_to_i64(r.deep_checked))
+        .bind(count_to_i64(r.deep_failed))
+        .bind(i64::from(r.wrapped))
+        .bind(r.outcome.label())
+        .execute(&mut *tx)
+        .await?;
+        let (id,): (i64,) = sqlx::query_as("SELECT last_insert_rowid()")
+            .fetch_one(&mut *tx)
+            .await?;
+        // Keep only the newest CAP rows for THIS source. Scoped per source so a
+        // busy source can never evict a quiet source's whole history.
+        sqlx::query(
+            "DELETE FROM scrub_runs WHERE source_id = ?1 AND id NOT IN ( \
+               SELECT id FROM scrub_runs WHERE source_id = ?1 \
+               ORDER BY started_at DESC, id DESC LIMIT ?2)",
+        )
+        .bind(source_str.as_str())
+        .bind(i64::from(crate::state::SCRUB_RUN_HISTORY_CAP))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn list_scrub_runs(
+        &self,
+        source: Option<SourceId>,
+        limit: u32,
+    ) -> Result<Vec<crate::state::ScrubRunRow>> {
+        use sqlx::Row as _;
+        let source_str = source.map(|s| s.to_string());
+        // Columns are read POSITIONALLY off `SqliteRow` rather than decoded
+        // into a tuple: sqlx only implements `FromRow` for tuples up to 16
+        // elements and this row has 17.
+        let rows = sqlx::query(
+            "SELECT id, source_id, started_at, finished_at, checked, ok, missing, \
+               size_mismatch, hash_mismatch, unverifiable, healed, healed_bundle_members, \
+               unrecoverable, deep_checked, deep_failed, wrapped, outcome \
+             FROM scrub_runs \
+             WHERE (?1 IS NULL OR source_id = ?1) \
+             ORDER BY started_at DESC, id DESC LIMIT ?2",
+        )
+        .bind(source_str.as_deref())
+        .bind(i64::from(limit))
+        .fetch_all(&self.pool)
+        .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            let source_id: String = r.try_get("source_id")?;
+            let outcome: String = r.try_get("outcome")?;
+            let wrapped: i64 = r.try_get("wrapped")?;
+            out.push(crate::state::ScrubRunRow {
+                id: r.try_get("id")?,
+                source_id: uuid_from_str(&source_id)?.into(),
+                started_at: r.try_get("started_at")?,
+                finished_at: r.try_get("finished_at")?,
+                report: crate::scrub::ScrubReport {
+                    checked: i64_to_count(r.try_get("checked")?),
+                    ok: i64_to_count(r.try_get("ok")?),
+                    missing: i64_to_count(r.try_get("missing")?),
+                    size_mismatch: i64_to_count(r.try_get("size_mismatch")?),
+                    hash_mismatch: i64_to_count(r.try_get("hash_mismatch")?),
+                    unverifiable: i64_to_count(r.try_get("unverifiable")?),
+                    healed: i64_to_count(r.try_get("healed")?),
+                    healed_bundle_members: i64_to_count(r.try_get("healed_bundle_members")?),
+                    unrecoverable: i64_to_count(r.try_get("unrecoverable")?),
+                    deep_checked: i64_to_count(r.try_get("deep_checked")?),
+                    deep_failed: i64_to_count(r.try_get("deep_failed")?),
+                    wrapped: wrapped != 0,
+                    outcome: crate::scrub::ScrubOutcome::from_label(&outcome),
+                },
+            });
+        }
+        Ok(out)
     }
 
     async fn bump_checksum_mismatch_count(
