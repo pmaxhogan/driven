@@ -168,7 +168,8 @@ fn top_level_help_lists_every_subcommand() {
             .and(predicate::str::contains("sync"))
             .and(predicate::str::contains("status"))
             .and(predicate::str::contains("history"))
-            .and(predicate::str::contains("verify")),
+            .and(predicate::str::contains("verify"))
+            .and(predicate::str::contains("rclone")),
     );
 }
 
@@ -214,6 +215,7 @@ fn every_subcommand_help_parses() {
         "status",
         "history",
         "verify",
+        "rclone",
     ] {
         cli()
             .args([sub, "--help"])
@@ -461,4 +463,297 @@ fn verify_corrupt_db_exits_nonzero() {
         .code(1)
         .stdout(predicate::str::contains("need attention"))
         .stderr(predicate::str::contains("problem state"));
+}
+
+// ---------------------------------------------------------------------------
+// `rclone list` / `rclone import` - the migration path.
+//
+// The mapping itself is unit-tested exhaustively in `driven-rclone`; these
+// prove the SHIPPED binary end to end: argument parsing, reading a real file
+// off disk, the exit codes, and - most importantly - that a credential in the
+// config does not reach stdout or stderr unless the user explicitly asks.
+// ---------------------------------------------------------------------------
+
+/// A realistic `rclone.conf` covering both importable types, an unsupported
+/// wrapper, and rclone's native B2 backend. Every credential in it is a
+/// recognisable marker so the leak assertions below are exact.
+const RCLONE_CONF: &str = r#"# my rclone config
+
+[r2]
+type = s3
+provider = Cloudflare
+access_key_id = 0123456789abcdef
+secret_access_key = SUPERSECRETR2KEY
+endpoint = https://acct123.r2.cloudflarestorage.com
+region = auto
+acl = private
+
+[aws]
+type = s3
+provider = AWS
+access_key_id = AKIAIOSFODNN7EXAMPLE
+secret_access_key = SUPERSECRETAWSKEY
+region = eu-west-2
+
+[gdrive]
+type = drive
+scope = drive
+root_folder_id = 1AbCdEfGhIjKlMnOpQrSt
+team_drive = 0ABCdefGHI
+token = {"access_token":"ya29.SECRETACCESS","refresh_token":"1//0eSECRETREFRESH"}
+
+[secretstore]
+type = crypt
+remote = r2:mybucket/enc
+password = 7DDMx0sPIbhRhqSXHkNwPQ
+
+[archive]
+type = b2
+account = 001abc
+key = K001xyz
+"#;
+
+/// Every credential-shaped string in [`RCLONE_CONF`]. None may appear in output
+/// unless `--reveal-secrets` was passed (and the OAuth token never may).
+const SECRETS: &[&str] = &[
+    "SUPERSECRETR2KEY",
+    "SUPERSECRETAWSKEY",
+    "1//0eSECRETREFRESH",
+    "ya29.SECRETACCESS",
+    "7DDMx0sPIbhRhqSXHkNwPQ",
+];
+
+fn write_conf(dir: &Path, body: &str) -> std::path::PathBuf {
+    let path = dir.join("rclone.conf");
+    std::fs::write(&path, body).unwrap();
+    path
+}
+
+/// Assert that no marker credential appears anywhere in a command's output.
+fn assert_no_secrets(output: &std::process::Output, context: &str) {
+    let stdout = String::from_utf8_lossy(&output.stdout);
+    let stderr = String::from_utf8_lossy(&output.stderr);
+    for secret in SECRETS {
+        assert!(
+            !stdout.contains(secret),
+            "{context}: stdout leaked {secret}:\n{stdout}"
+        );
+        assert!(
+            !stderr.contains(secret),
+            "{context}: stderr leaked {secret}:\n{stderr}"
+        );
+    }
+}
+
+#[test]
+fn rclone_list_classifies_every_remote() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_conf(dir.path(), RCLONE_CONF);
+    let out = cli()
+        .args(["rclone", "list", "--config", conf.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("r2"))
+        .stdout(predicate::str::contains("gdrive"))
+        .stdout(predicate::str::contains("Google Drive"))
+        .stdout(predicate::str::contains("3 of 5 remote(s)"))
+        .get_output()
+        .clone();
+    assert_no_secrets(&out, "rclone list");
+}
+
+#[test]
+fn rclone_import_redacts_the_secret_by_default() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_conf(dir.path(), RCLONE_CONF);
+    let out = cli()
+        .args([
+            "rclone",
+            "import",
+            "r2",
+            "--config",
+            conf.to_str().unwrap(),
+            "--bucket",
+            "backups",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains(
+            "https://acct123.r2.cloudflarestorage.com",
+        ))
+        .stdout(predicate::str::contains("0123456789abcdef"))
+        .stdout(predicate::str::contains("<redacted>"))
+        .stdout(predicate::str::contains("\"bucket\":\"backups\""))
+        .get_output()
+        .clone();
+    assert_no_secrets(&out, "rclone import (default)");
+}
+
+#[test]
+fn rclone_import_prints_the_secret_only_when_asked() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_conf(dir.path(), RCLONE_CONF);
+    cli()
+        .args([
+            "rclone",
+            "import",
+            "r2",
+            "--config",
+            conf.to_str().unwrap(),
+            "--reveal-secrets",
+        ])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("SUPERSECRETR2KEY"));
+}
+
+#[test]
+fn rclone_import_never_prints_the_drive_oauth_token_even_with_reveal_secrets() {
+    // The token cannot authorize Driven, so printing it would be pure exposure.
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_conf(dir.path(), RCLONE_CONF);
+    for extra in [Vec::new(), vec!["--reveal-secrets"]] {
+        let mut args = vec![
+            "rclone",
+            "import",
+            "gdrive",
+            "--config",
+            conf.to_str().unwrap(),
+        ];
+        args.extend(extra.iter().copied());
+        let out = cli()
+            .args(&args)
+            .assert()
+            .success()
+            .stdout(predicate::str::contains("1AbCdEfGhIjKlMnOpQrSt"))
+            .stdout(predicate::str::contains("RFC 6749"))
+            .get_output()
+            .clone();
+        let stdout = String::from_utf8_lossy(&out.stdout);
+        assert!(
+            !stdout.contains("1//0eSECRETREFRESH") && !stdout.contains("ya29.SECRETACCESS"),
+            "the OAuth token leaked (args {args:?}):\n{stdout}"
+        );
+    }
+}
+
+#[test]
+fn rclone_import_json_derives_the_aws_endpoint_and_stays_redacted() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_conf(dir.path(), RCLONE_CONF);
+    let out = cli()
+        .args([
+            "rclone",
+            "import",
+            "aws",
+            "--config",
+            conf.to_str().unwrap(),
+            "--bucket",
+            "b",
+            "--json",
+        ])
+        .assert()
+        .success()
+        .get_output()
+        .clone();
+    let stdout = String::from_utf8_lossy(&out.stdout);
+    assert!(stdout.contains("\"backend\": \"s3\""), "{stdout}");
+    assert!(stdout.contains("\"importable\": true"), "{stdout}");
+    assert!(
+        stdout.contains("\"endpoint\": \"https://s3.eu-west-2.amazonaws.com\""),
+        "the AWS regional endpoint must be derived from the region:\n{stdout}"
+    );
+    assert!(
+        stdout.contains("\"pathStyle\": false"),
+        "AWS is virtual-host style:\n{stdout}"
+    );
+    assert_no_secrets(&out, "rclone import --json");
+}
+
+#[test]
+fn rclone_import_of_an_unknown_remote_lists_the_names_it_does_have() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_conf(dir.path(), RCLONE_CONF);
+    let out = cli()
+        .args([
+            "rclone",
+            "import",
+            "nope",
+            "--config",
+            conf.to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("no remote named"))
+        .stderr(predicate::str::contains("r2"))
+        .get_output()
+        .clone();
+    assert_no_secrets(&out, "rclone import (unknown remote)");
+}
+
+#[test]
+fn rclone_refuses_a_whole_file_encrypted_config_without_asking_for_a_password() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_conf(
+        dir.path(),
+        "# Encrypted rclone configuration File\n\nRCLONE_ENCRYPT_V0:\nc2VjcmV0Ym9keQ\n",
+    );
+    cli()
+        .args(["rclone", "list", "--config", conf.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("rclone config show"))
+        // The ciphertext body must not be echoed back at the user.
+        .stderr(predicate::str::contains("c2VjcmV0Ym9keQ").not());
+}
+
+#[test]
+fn rclone_reports_a_missing_config_file_with_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let missing = dir.path().join("nope.conf");
+    cli()
+        .args(["rclone", "list", "--config", missing.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("nope.conf"));
+}
+
+#[test]
+fn rclone_reports_a_malformed_config_by_line_number_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_conf(
+        dir.path(),
+        "[a]\ntype = s3\nsecret_access_key = SUPERSECRETR2KEY\nthis line is broken\n",
+    );
+    let out = cli()
+        .args(["rclone", "list", "--config", conf.to_str().unwrap()])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("line 4"))
+        .get_output()
+        .clone();
+    assert_no_secrets(&out, "rclone list (malformed)");
+}
+
+#[test]
+fn rclone_list_of_an_empty_config_succeeds_and_says_so() {
+    let dir = tempfile::tempdir().unwrap();
+    let conf = write_conf(dir.path(), "# nothing configured yet\n");
+    cli()
+        .args(["rclone", "list", "--config", conf.to_str().unwrap()])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("No remotes found"));
+}
+
+#[test]
+fn rclone_subcommands_require_their_arguments() {
+    cli().args(["rclone"]).assert().failure();
+    cli().args(["rclone", "import"]).assert().failure();
+    cli()
+        .args(["rclone", "--help"])
+        .assert()
+        .success()
+        .stdout(predicate::str::contains("list"))
+        .stdout(predicate::str::contains("import"));
 }

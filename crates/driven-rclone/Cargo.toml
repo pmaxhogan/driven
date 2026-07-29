@@ -1,0 +1,30 @@
+[package]
+name = "driven-rclone"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Reads an existing rclone.conf and translates its remotes into Driven destination settings"
+publish = false
+
+[dependencies]
+# `BackendKind` - the destination taxonomy an imported remote maps onto.
+driven-remote = { path = "../driven-remote" }
+# `S3Config` - the exact non-secret shape an imported `type = s3` remote
+# produces, so the importer can never emit a blob the backend would reject.
+driven-s3 = { path = "../driven-s3" }
+anyhow.workspace = true
+thiserror.workspace = true
+# The `--json` rendering only. Nothing in this crate derives Serialize - the
+# JSON shape is built field by field in `render.rs` so a new struct field can
+# never silently start being emitted (which, on a type that holds credentials,
+# is exactly the accident to design out).
+serde_json.workspace = true
+# NOTE: no cipher dependency. `rclone obscure` only ever applies to options
+# rclone marks `IsPassword: true`, and NEITHER importable remote type has one -
+# see the `obscured values` section of `lib.rs`. Adding AES to reveal a value
+# that cannot appear would be dead code guarding a hazard we do not have.
+
+[dev-dependencies]
+tempfile = "3"
