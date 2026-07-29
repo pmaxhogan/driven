@@ -1,0 +1,33 @@
+-- Pluggable backup-destination backends: record WHICH destination an account
+-- backs up to, and that destination's non-secret configuration.
+--
+-- Driven shipped with exactly one destination (Google Drive), so the choice was
+-- implicit in the code: every store-construction site built a
+-- `GoogleDriveStore`. These two columns make it explicit and per-account so a
+-- second backend is a config value rather than a fork of the assembly path.
+--
+-- Additive, backward compatible: two nullable TEXT columns.
+--
+--   backend_kind        NULL (every pre-migration row) decodes to
+--                       `BackendKind::GoogleDrive`. The historical default is
+--                       deliberately stored as NULL rather than the literal
+--                       'google_drive', so a row this build writes is
+--                       byte-identical to a pre-migration one and a downgrade
+--                       to an older Driven keeps working for Drive accounts.
+--                       An UNRECOGNISED value is a load-time ERROR, never a
+--                       silent fallback to Drive - a config written by a newer
+--                       build naming a backend this one does not know must fail
+--                       loudly rather than point the account's uploads at the
+--                       wrong destination.
+--
+--   backend_config_json The destination's NON-SECRET settings as a JSON blob
+--                       (endpoint, bucket, region, addressing style, prefix for
+--                       an object-store backend). NULL for Google Drive, which
+--                       needs none. CREDENTIALS ARE NEVER STORED HERE - every
+--                       backend's secret lives in the OS keychain keyed by the
+--                       account id, exactly as the Drive refresh token does.
+--
+-- Data-format note (v1.0.0 stored-format stability): additive ADD COLUMN only,
+-- no existing column touched, no data migration.
+ALTER TABLE accounts ADD COLUMN backend_kind TEXT;
+ALTER TABLE accounts ADD COLUMN backend_config_json TEXT;

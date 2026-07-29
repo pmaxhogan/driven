@@ -5,10 +5,14 @@ edition.workspace = true
 rust-version.workspace = true
 license.workspace = true
 repository.workspace = true
-description = "Driven RemoteStore trait + Google Drive impl + InMemoryRemoteStore fake"
+description = "Driven Google Drive RemoteStore impl + InMemoryRemoteStore fake"
 publish = false
 
 [dependencies]
+# The `RemoteStore` trait, the SPEC s24 error taxonomy, the retry middleware
+# and the `driven.*` appProperties vocabulary. All re-exported from their
+# historical `driven_drive::{remote_store, google::*}` paths.
+driven-remote = { path = "../driven-remote" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true

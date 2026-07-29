@@ -91,6 +91,10 @@ os_info = { version = "3", default-features = false }
 
 driven-core = { path = "../crates/driven-core" }
 driven-drive = { path = "../crates/driven-drive" }
+# The backup-destination factory: assembly, the destination picker and the
+# restore path all build their store through it so they can never disagree
+# about which backend an account targets.
+driven-backend = { path = "../crates/driven-backend" }
 driven-crypto = { path = "../crates/driven-crypto" }
 driven-power = { path = "../crates/driven-power" }
 # Adaptive upload parallelism (DESIGN s11.4.7): the real per-OS disk-busy reader

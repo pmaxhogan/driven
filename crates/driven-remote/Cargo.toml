@@ -1,0 +1,29 @@
+[package]
+name = "driven-remote"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven's backend-neutral RemoteStore trait, error taxonomy, retry middleware and appProperties vocabulary"
+publish = false
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+# The error taxonomy classifies `reqwest::Error` transport failures, and the
+# retry middleware is shared by every HTTP-speaking backend. No client is built
+# here - this crate stays transport-policy only.
+reqwest.workspace = true
+
+[dev-dependencies]
+# The retry-backoff unit tests use `#[tokio::test(start_paused = true)]` to
+# fast-forward the exponential backoff sleeps, which requires tokio's
+# `test-util` feature.
+tokio = { workspace = true, features = ["test-util"] }

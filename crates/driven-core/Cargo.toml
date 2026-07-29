@@ -45,6 +45,11 @@ sqlx = { version = "0.9", default-features = false, features = [
 # here is acyclic. The executor holds the RemoteStore + SourceCryptoSuite
 # seams; the orchestrator holds the PowerSource seam (SPEC s5).
 driven-drive = { path = "../driven-drive" }
+# The backend-neutral RemoteStore contract, error taxonomy and `BackendKind`
+# taxonomy. Named DIRECTLY (rather than only through driven-drive's re-export)
+# because `AccountRow.backend_kind` is destination-agnostic state: driven-core
+# must not imply "the destination is Google Drive" anywhere.
+driven-remote = { path = "../driven-remote" }
 driven-crypto = { path = "../driven-crypto" }
 driven-power = { path = "../driven-power" }
 # Per-OS disk-busy reader for the adaptive upload-parallelism controller

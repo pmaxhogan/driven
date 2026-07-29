@@ -1,7 +1,17 @@
-//! Exponential-backoff + error-classification middleware for Drive requests
-//! (SPEC s9, s24; DESIGN s5.4 / s5.8.3; ROADMAP M4).
+//! Exponential-backoff + error-classification middleware for remote-store
+//! requests (SPEC s9, s24; DESIGN s5.4 / s5.8.3; ROADMAP M4).
 //!
-//! Every Drive request flows through [`with_retry`], which classifies the
+//! [`with_retry`], [`transient_backoff`] and [`classify_transport_error`] are
+//! backend-neutral - the policy (which classes retry, how long, how often) is
+//! identical for every destination. [`classify_response`] maps an HTTP status +
+//! body and understands Google's `{"error":{"errors":[{"reason":..}]}}`
+//! envelope; a backend with a different error document (the S3 XML
+//! `<Error><Code>` shape, say) classifies its own body first and hands the
+//! verdict to [`crate::error::DriveError::from_classified_response`]. The
+//! status-only rules ([`classify_response`]'s 429 / 5xx / 401 arms) are
+//! protocol-independent and stay useful as a fallback.
+//!
+//! Every request flows through [`with_retry`], which classifies the
 //! response into a [`DriveErrorClassification`] and retries the transient
 //! classes (429 with `Retry-After`, 5xx, network) with exponential backoff,
 //! while surfacing the fatal classes (auth / quota / dest-folder) straight
@@ -218,11 +228,11 @@ fn full_jitter(d: Duration) -> Duration {
 // forcing every caller into a bespoke result type.
 
 /// Reads the [`DriveErrorClassification`] off an error if it carries one (a
-/// [`crate::google::DriveError`]). Returns `None` for an un-classified error
+/// [`crate::error::DriveError`]). Returns `None` for an un-classified error
 /// (which the loop then treats as fatal - we never retry a verdict we cannot
 /// read, to avoid hammering on a genuine bug).
 fn classification_in(err: &anyhow::Error) -> Option<DriveErrorClassification> {
-    crate::google::classification_of(err)
+    crate::error::classification_of(err)
 }
 
 /// Runs `make_request` with exponential-backoff retry for the transient
@@ -231,7 +241,7 @@ fn classification_in(err: &anyhow::Error) -> Option<DriveErrorClassification> {
 ///
 /// Generic over the request factory + its `Output` so it wraps any Drive call
 /// (metadata GET, multipart create, resumable chunk push, ...). The error the
-/// factory returns must be a [`crate::google::DriveError`] (so its class is
+/// factory returns must be a [`crate::error::DriveError`] (so its class is
 /// readable); a non-classified error is treated as fatal and returned as-is.
 ///
 /// Rate-limit failures retry indefinitely (DESIGN s5.4); 5xx / network
@@ -286,7 +296,7 @@ mod tests {
     use std::sync::atomic::{AtomicU32, Ordering};
     use std::sync::Arc;
 
-    use crate::google::DriveError;
+    use crate::error::DriveError;
 
     #[test]
     fn classify_429_is_rate_limited_with_retry_after() {

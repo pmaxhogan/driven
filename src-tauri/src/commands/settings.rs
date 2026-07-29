@@ -3584,6 +3584,8 @@ mod tests {
         let (repo, dir) = seeded_repo().await;
         let account_id = AccountId::new_v4();
         repo.upsert_account(&AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id: account_id,
             email: "u@example.com".to_string(),
             display_name: None,

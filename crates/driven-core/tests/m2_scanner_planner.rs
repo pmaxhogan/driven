@@ -73,6 +73,8 @@ async fn temp_repo() -> (SqliteStateRepo, TempDir) {
 /// An `accounts` row the seeded source can FK to.
 fn account() -> AccountRow {
     AccountRow {
+        backend_kind: driven_core::state::BackendKind::GoogleDrive,
+        backend_config_json: None,
         id: AccountId::new_v4(),
         email: "m2@example.com".into(),
         display_name: Some("M2".into()),

@@ -10,6 +10,16 @@
 /** `accounts.state` serialized form. */
 export type AccountState = "ok" | "needs_reauth" | "disabled";
 
+/** A `BackendKind::id` - which backup destination an account targets. Open
+ * (`string`) rather than a closed union because the set is defined by the Rust
+ * factory and surfaced at runtime via `listBackends()`; the UI renders whatever
+ * the binary reports rather than a hard-coded list that could drift. */
+export type BackendKindId = string;
+
+/** The historical default destination, and the value every account created
+ * before the destination picker reports. */
+export const DEFAULT_BACKEND_ID: BackendKindId = "google_drive";
+
 export interface AccountDto {
   id: string;
   email: string;
@@ -18,6 +28,17 @@ export interface AccountDto {
   encryptionEnabled: boolean;
   createdAt: number;
   lastSyncedAt: number | null;
+  backendKind: BackendKindId;
+}
+
+/** One selectable backup destination, as reported by `listBackends()`. Mirrors
+ * the Rust `BackendDto`, which is derived from `driven_backend::descriptors()` -
+ * so the picker can only ever offer destinations this build can construct. */
+export interface BackendDto {
+  id: BackendKindId;
+  usesOauth: boolean;
+  supportsFolderPicker: boolean;
+  isDefault: boolean;
 }
 
 /** Opaque add-account wizard session id (transparent string newtype). */

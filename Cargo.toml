@@ -2,6 +2,8 @@
 resolver = "2"
 members = [
     "crates/driven-core",
+    "crates/driven-remote",
+    "crates/driven-backend",
     "crates/driven-drive",
     "crates/driven-crypto",
     "crates/driven-power",

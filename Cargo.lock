@@ -1535,6 +1535,7 @@ dependencies = [
  "blake3",
  "bytes",
  "crc32fast",
+ "driven-backend",
  "driven-core",
  "driven-crypto",
  "driven-diskstat",
@@ -1573,6 +1574,17 @@ dependencies = [
  "tracing-subscriber",
  "uuid",
  "windows-sys 0.61.2",
+]
+
+[[package]]
+name = "driven-backend"
+version = "2.4.0"
+dependencies = [
+ "anyhow",
+ "driven-drive",
+ "driven-remote",
+ "driven-tls",
+ "tracing",
 ]
 
 [[package]]
@@ -1656,6 +1668,7 @@ dependencies = [
  "driven-diskstat",
  "driven-drive",
  "driven-power",
+ "driven-remote",
  "driven-test-fixtures",
  "driven-vss",
  "flate2",
@@ -1713,6 +1726,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "driven-remote",
  "driven-tls",
  "futures",
  "hex",
@@ -1764,6 +1778,21 @@ dependencies = [
  "tracing",
  "windows 0.62.2",
  "zbus",
+]
+
+[[package]]
+name = "driven-remote"
+version = "2.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "futures",
+ "reqwest 0.12.28",
+ "serde",
+ "serde_json",
+ "tokio",
+ "tracing",
 ]
 
 [[package]]

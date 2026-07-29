@@ -37,8 +37,6 @@ use driven_core::time::{Clock, SystemClock};
 use driven_core::types::{AccountId, AccountState, OrchestratorEvent};
 use driven_core::watcher::{NotifyWatcher, SourceWatcher};
 
-use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
-use driven_drive::google::GoogleDriveStore;
 use driven_drive::remote_store::RemoteStore;
 
 use driven_net::ReqwestBackend;
@@ -65,15 +63,11 @@ const TARGET: &str = "driven::app::assembly";
 /// a real `GoogleDriveStore`. Mirrors the assembly contract in the task spec.
 pub const ENV_USE_FAKE_REMOTE: &str = "DRIVEN_USE_FAKE_REMOTE";
 
-/// R2-P2-1 (BYO-only, SPEC s11.1 / DESIGN s6.1): the OAuth client id env
-/// override. Driven is BYO-ONLY - there is NO baked-in default client. This env
-/// var exists ONLY as a TEST injection seam (real-Drive e2e); a production
-/// account refreshes against its PERSISTED BYO client creds.
-const ENV_OAUTH_CLIENT_ID: &str = "DRIVEN_OAUTH_CLIENT_ID";
-
-/// R2-P2-1: the OAuth client secret env override (test injection seam only). An
-/// installed-app PKCE client has no real secret, so this defaults to empty.
-const ENV_OAUTH_CLIENT_SECRET: &str = "DRIVEN_OAUTH_CLIENT_SECRET";
+// R2-P2-1 (BYO-only, SPEC s11.1 / DESIGN s6.1): the OAuth client id/secret env
+// overrides moved to `driven_backend::{ENV_OAUTH_CLIENT_ID,
+// ENV_OAUTH_CLIENT_SECRET}` alongside the resolver that reads them. Driven is
+// BYO-ONLY - there is NO baked-in default client; those vars exist ONLY as a
+// TEST injection seam (real-Drive e2e).
 
 /// Build every account's orchestrator over the real seams and spawn its run
 /// loop, returning the [`AppState`] for `.manage(..)` (SPEC s5).
@@ -702,12 +696,13 @@ async fn build_account(
     ))))
 }
 
-/// Construct the [`RemoteStore`] for one account.
+/// Construct the [`RemoteStore`] for one account's CONFIGURED destination.
 ///
 /// - `DRIVEN_USE_FAKE_REMOTE=1`: the in-memory fake (dev / e2e ONLY).
-/// - Real mode with a valid stored refresh token: a real `GoogleDriveStore`
-///   (the `driven-cli` `build_store` pattern).
-/// - Real mode with NO stored refresh token: [`RemoteOutcome::NeedsReauth`].
+/// - Real mode: delegate to the `driven-backend` factory, which dispatches on
+///   the account's `BackendKind` and reads that backend's secret from the OS
+///   keychain. Adding a destination adds an arm THERE, not here.
+/// - Real mode with NO stored credential: [`RemoteOutcome::NeedsReauth`].
 ///
 /// C5-P1-1 (silent-data-loss guard): in REAL mode a missing/invalid token does
 /// NOT fall back to the in-memory fake. Doing so would let the orchestrator mark
@@ -734,46 +729,45 @@ fn build_remote(
         return Ok(RemoteOutcome::Store(Arc::new(store)));
     }
 
-    // The keychain token store is keyed by account id (the same key the auth
-    // flow stores under). Wrap it in an Arc so a refresh-token ROTATION is
-    // persisted back to the keychain (codex C-P2-4 / V-A3).
-    let token_store = Arc::new(KeyringTokenStore::new(account.id.to_string()));
-    let refresh_token = match token_store.load_refresh_token() {
-        Ok(Some(token)) => token,
-        Ok(None) => {
-            // C5-P1-1: NO fake fallback in real mode. The account needs
-            // re-consent; the caller persists needs_reauth + emits the banner
-            // and does NOT spawn the orchestrator (no fake-id silent data loss).
+    match driven_backend::build_store(
+        &account_backend(account),
+        driven_backend::BackendContext { ca, proxy },
+    )? {
+        driven_backend::StoreOutcome::Store(store) => {
+            tracing::info!(
+                target: TARGET,
+                account_id = %account.id,
+                backend = %account.backend_kind,
+                "remote: real store for the account's configured backend"
+            );
+            Ok(RemoteOutcome::Store(store))
+        }
+        // C5-P1-1: NO fake fallback in real mode. The account needs re-consent;
+        // the caller persists needs_reauth + emits the banner and does NOT spawn
+        // the orchestrator (no fake-id silent data loss).
+        driven_backend::StoreOutcome::NeedsReauth => {
             tracing::warn!(
                 target: TARGET,
                 account_id = %account.id,
-                "remote: no stored refresh token in real mode; needs reauth (NOT falling back to fake)"
+                backend = %account.backend_kind,
+                "remote: no stored credential in real mode; needs reauth (NOT falling back to fake)"
             );
-            return Ok(RemoteOutcome::NeedsReauth);
+            Ok(RemoteOutcome::NeedsReauth)
         }
-        Err(err) => return Err(err),
-    };
+    }
+}
 
-    // A1: prefer the account's persisted BYO client creds (the client that
-    // minted this refresh token); fall back to env / public default only when
-    // the account stored none (a default-client account). A refresh token is
-    // bound to the client that minted it, so using the wrong client fails.
-    let (client_id, client_secret) = resolve_account_oauth_creds(account.id);
-    let token_source = RefreshingTokenSource::from_stored_refresh_token(
-        refresh_token,
-        client_id,
-        client_secret,
-        ca,
-        proxy,
-    )?
-    .with_store(token_store);
-    let store = GoogleDriveStore::with_default_clients(token_source, ca, proxy)?;
-    tracing::info!(
-        target: TARGET,
-        account_id = %account.id,
-        "remote: real GoogleDriveStore (keyring refresh token)"
-    );
-    Ok(RemoteOutcome::Store(Arc::new(store)))
+/// The `driven-backend` factory input for one persisted account row.
+///
+/// Shared by assembly, the destination picker and the restore path so all three
+/// resolve the SAME destination for an account - which is the whole point of
+/// having one factory instead of three copies of the construction chain.
+pub(crate) fn account_backend(account: &AccountRow) -> driven_backend::AccountBackend {
+    driven_backend::AccountBackend {
+        account_id: account.id.to_string(),
+        kind: account.backend_kind,
+        config_json: account.backend_config_json.clone(),
+    }
 }
 
 /// Emit the `account:needs_reauth` webview banner + raise the OS notification
@@ -794,45 +788,11 @@ fn emit_needs_reauth(app: &AppHandle, account: &AccountRow) {
     tray::notify_needs_reauth(app, &account.email);
 }
 
-/// R2-P2-1 (BYO-only): resolve the OAuth client creds from the ENV override only
-/// (a TEST injection seam). There is NO baked-in production default client, so
-/// this returns whatever the env carries (an empty client id when unset). A
-/// production account always reaches [`resolve_account_oauth_creds`] with its
-/// PERSISTED BYO creds; this env-only path is the fallback for the e2e seam, and
-/// an empty client id surfaces a clear `invalid_client` rather than silently
-/// using a Driven-owned client.
-fn resolve_oauth_creds() -> (String, String) {
-    let client_id = std::env::var(ENV_OAUTH_CLIENT_ID).unwrap_or_default();
-    let client_secret = std::env::var(ENV_OAUTH_CLIENT_SECRET).unwrap_or_default();
-    (client_id, client_secret)
-}
-
-/// A1: resolve the OAuth client creds for `account_id`, preferring its PERSISTED
-/// BYO client creds (loaded from the keychain) over the env / public default.
-///
-/// The refresh token in the keychain was minted by a specific OAuth client; a
-/// refresh against a different client fails (`invalid_client`). So an account
-/// that brought its own client MUST refresh against that same client across
-/// restarts. Shared with `commands::sources` (the Drive-folder picker builds the
-/// same one-off store). NEVER logs the secret.
-pub fn resolve_account_oauth_creds(account_id: AccountId) -> (String, String) {
-    use driven_drive::google::token_store::ClientCredsStore;
-    match ClientCredsStore::new(account_id.to_string()).load() {
-        Ok(Some(creds)) if !creds.client_id.trim().is_empty() => {
-            (creds.client_id, creds.client_secret)
-        }
-        Ok(_) => resolve_oauth_creds(),
-        Err(err) => {
-            tracing::warn!(
-                target: TARGET,
-                account_id = %account_id,
-                %err,
-                "failed to load account BYO client creds from keychain; using env/default client"
-            );
-            resolve_oauth_creds()
-        }
-    }
-}
+// A1: resolving an account's OAuth client creds (its PERSISTED BYO client creds
+// from the keychain, falling back to the env seam) moved to
+// `driven_backend::resolve_account_oauth_creds` - the factory needs it to build
+// the Drive store, and a second copy here would be the same
+// two-definitions-that-drift trap the appProperties keys warn about.
 
 /// Build the Windows VSS snapshot provider (ROADMAP M3.5; DESIGN s5.3.1), or
 /// `None` off Windows. The returned `Arc` is threaded into BOTH the executor
@@ -1545,6 +1505,8 @@ mod tests {
         // path spawned orchestrators, THIS source would resume encrypted backups.
         let account_id = AccountId::new_v4();
         repo.upsert_account(&AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id: account_id,
             email: "quiesce@example.com".to_string(),
             display_name: None,

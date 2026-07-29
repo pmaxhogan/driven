@@ -30,6 +30,7 @@ function makeAccount(over: Partial<AccountDto> = {}): AccountDto {
     encryptionEnabled: false,
     createdAt: 0,
     lastSyncedAt: null,
+    backendKind: "google_drive",
     ...over,
   };
 }

@@ -136,6 +136,8 @@ pub async fn run(args: AgentArgs) -> Result<()> {
             let id = AccountId::new_v4();
             state
                 .upsert_account(&AccountRow {
+                    backend_kind: driven_core::state::BackendKind::GoogleDrive,
+                    backend_config_json: None,
                     id,
                     email: "bench@driven.invalid".into(),
                     display_name: Some("driven-bench".into()),

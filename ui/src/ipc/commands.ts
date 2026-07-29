@@ -15,6 +15,8 @@ import type {
   AddAccountWizardSessionId,
   AddSourceRequest,
   AddSourceResult,
+  BackendDto,
+  BackendKindId,
   CustomCaValidation,
   DriveFolderListing,
   ExclusionPreview,
@@ -51,8 +53,18 @@ export function listAccounts(): Promise<AccountDto[]> {
   return invoke("list_accounts");
 }
 
-export function beginAddAccountWizard(): Promise<AddAccountWizardSessionId> {
-  return invoke("begin_add_account_wizard");
+/** The backup destinations THIS BUILD can construct, in picker order. */
+export function listBackends(): Promise<BackendDto[]> {
+  return invoke("list_backends");
+}
+
+/** Open an add-account wizard session for `backend` (a `BackendKindId` from
+ * `listBackends()`). Omitting it means the default destination, Google Drive;
+ * the backend REJECTS an id it does not implement rather than silently
+ * defaulting, so the user can never end up backing up somewhere they did not
+ * choose. */
+export function beginAddAccountWizard(backend?: BackendKindId): Promise<AddAccountWizardSessionId> {
+  return invoke("begin_add_account_wizard", { backend: backend ?? null });
 }
 
 export function submitOauthCredentials(

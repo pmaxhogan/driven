@@ -36,7 +36,7 @@ use std::sync::{Mutex, OnceLock};
 use tauri::{AppHandle, Emitter, State};
 use tokio::sync::mpsc;
 
-use driven_core::state::AccountRow;
+use driven_core::state::{AccountRow, BackendKind};
 use driven_core::time::{Clock, SystemClock};
 use driven_core::types::{AccountId, AccountState, ErrorCode};
 
@@ -47,7 +47,8 @@ use driven_drive::google::token_store::KeyringTokenStore;
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    AccountDto, AddAccountWizardSessionId, OAuthAuthUrl, OAuthStatus, ReauthSession, SessionId,
+    AccountDto, AddAccountWizardSessionId, BackendDto, OAuthAuthUrl, OAuthStatus, ReauthSession,
+    SessionId,
 };
 use crate::commands::{CommandError, CommandResult};
 use crate::events::EVENT_OAUTH_COMPLETE;
@@ -83,6 +84,11 @@ struct WizardSession {
     tokens: Option<Tokens>,
     /// For a reauth flow: the existing account being re-consented.
     account_id: Option<AccountId>,
+    /// The backup destination this wizard is configuring. Chosen on the
+    /// destination step, carried through the OAuth steps, and persisted onto the
+    /// `accounts` row by `finish_add_account`. A reauth session inherits the
+    /// existing account's kind (re-consent never changes a destination).
+    backend: BackendKind,
     /// `true` once `start_oauth_signin` has launched the flow, so a second call
     /// is a no-op rather than a duplicate loopback bind.
     started: bool,
@@ -97,7 +103,7 @@ struct WizardSession {
 }
 
 impl WizardSession {
-    fn new(account_id: Option<AccountId>) -> Self {
+    fn new(account_id: Option<AccountId>, backend: BackendKind) -> Self {
         let now = SystemClock.now_ms();
         Self {
             client_id: None,
@@ -105,6 +111,7 @@ impl WizardSession {
             status: OAuthStatus::AwaitingCallback,
             tokens: None,
             account_id,
+            backend,
             started: false,
             created_at: now,
             updated_at: now,
@@ -260,7 +267,28 @@ fn account_row_to_dto(row: &AccountRow) -> AccountDto {
         encryption_enabled: row.encryption_master_key_id.is_some(),
         created_at: row.created_at,
         last_synced_at: row.last_synced_at,
+        backend_kind: row.backend_kind.id().to_string(),
     }
+}
+
+/// `list_backends()` - the backup destinations THIS BUILD can construct, in
+/// picker order, for the setup wizard's destination step.
+///
+/// Sourced from the `driven-backend` factory's descriptor list rather than a
+/// hand-maintained UI constant, so the webview can never offer a destination the
+/// binary cannot actually build.
+#[tauri::command]
+pub async fn list_backends(_state: State<'_, AppState>) -> CommandResult<Vec<BackendDto>> {
+    let default = BackendKind::default();
+    Ok(driven_backend::descriptors()
+        .into_iter()
+        .map(|d| BackendDto {
+            id: d.id.to_string(),
+            uses_oauth: d.uses_oauth,
+            supports_folder_picker: d.supports_folder_picker,
+            is_default: d.kind == default,
+        })
+        .collect())
 }
 
 /// The serialized form of [`AccountState`] (matches `#[serde(rename_all =
@@ -273,18 +301,44 @@ fn account_state_str(state: AccountState) -> &'static str {
     }
 }
 
-/// `begin_add_account_wizard()` - open a new add-account session (SPEC s11.1).
+/// `begin_add_account_wizard(backend)` - open a new add-account session
+/// (SPEC s11.1).
+///
+/// `backend` is a `BackendKind::id` from `list_backends()`; `None` (and a
+/// pre-destination-picker webview) means the default, Google Drive. An
+/// unrecognised id is rejected here rather than silently defaulting - a webview
+/// asking for a destination this build cannot construct is a bug, and quietly
+/// giving it Drive would point the user's backups somewhere they did not choose.
+/// The chosen kind rides the session through the OAuth steps and is persisted
+/// onto the `accounts` row by `finish_add_account`.
 #[tauri::command]
 pub async fn begin_add_account_wizard(
     _state: State<'_, AppState>,
+    backend: Option<String>,
 ) -> CommandResult<AddAccountWizardSessionId> {
+    let kind = parse_backend_id(backend.as_deref())?;
     // R4-P2-4: reap any abandoned / stale-terminal sessions before opening a new
     // one, so the process-global map cannot accumulate them across a long run.
     prune_stale_sessions();
     let id = uuid::Uuid::new_v4().to_string();
-    lock_sessions().insert(id.clone(), WizardSession::new(None));
-    tracing::info!(target: TARGET, session = %id, "add-account wizard session opened");
+    lock_sessions().insert(id.clone(), WizardSession::new(None, kind));
+    tracing::info!(
+        target: TARGET,
+        session = %id,
+        backend = %kind,
+        "add-account wizard session opened"
+    );
     Ok(AddAccountWizardSessionId(id))
+}
+
+/// Parse a webview-supplied `BackendKind::id`. `None` / empty is the default
+/// destination (Google Drive); anything unrecognised is a caller error.
+fn parse_backend_id(id: Option<&str>) -> CommandResult<BackendKind> {
+    match id.map(str::trim).filter(|s| !s.is_empty()) {
+        None => Ok(BackendKind::default()),
+        Some(id) => BackendKind::from_id(id)
+            .map_err(|e| CommandError::with_code(ErrorCode::InvalidInput, e.to_string())),
+    }
 }
 
 /// `submit_oauth_credentials(session, client_id, client_secret)` - record the
@@ -545,14 +599,15 @@ pub async fn finish_add_account(
     // and keychain creds are durably persisted (success path); a failure leaves
     // the session intact so the user can retry `finish_add_account` without
     // re-running the whole OAuth flow.
-    let (tokens, reauth_account, creds) = {
+    let (tokens, reauth_account, creds, backend) = {
         let mut sessions = lock_sessions();
         let s = sessions
             .get_mut(&session.0)
             .ok_or_else(unknown_session_err)?;
         let creds = resolve_creds(s)?;
+        let backend = s.backend;
         match (&s.status, s.tokens.clone()) {
-            (OAuthStatus::Complete, Some(tokens)) => (tokens, s.account_id, creds),
+            (OAuthStatus::Complete, Some(tokens)) => (tokens, s.account_id, creds, backend),
             (OAuthStatus::Failed { code }, _) => {
                 let ec = ErrorCode::from_code(code).unwrap_or(ErrorCode::AuthConsentRequired);
                 return Err(CommandError::with_code(
@@ -656,6 +711,13 @@ pub async fn finish_add_account(
         });
 
         let row = AccountRow {
+            // The destination the user picked on the wizard's first step. Drive
+            // (the default) stores NULL, so a Drive account row is unchanged
+            // from a pre-`0013` one.
+            backend_kind: backend,
+            // No backend needs non-secret config yet; a backend that does fills
+            // this in from its own config step. Secrets NEVER land here.
+            backend_config_json: None,
             id: account_id,
             email,
             display_name: user_label.or(google_name),
@@ -1010,19 +1072,24 @@ pub async fn reauth_account(
     state: State<'_, AppState>,
     account_id: AccountId,
 ) -> CommandResult<ReauthSession> {
-    // The account must exist (read by id from the strongly-consistent state DB).
-    let exists = state
+    // The account must exist. Read the whole row (not just the state) because a
+    // reauth session INHERITS the account's configured destination - re-consent
+    // never moves an account to a different backend.
+    let rows = state
         .state()
-        .account_state(account_id)
+        .list_accounts()
         .await
-        .map_err(CommandError::from)?
-        .is_some();
-    if !exists {
-        return Err(CommandError::with_code(
-            ErrorCode::InternalBug,
-            format!("unknown account id: {account_id}"),
-        ));
-    }
+        .map_err(CommandError::from)?;
+    let backend = rows
+        .iter()
+        .find(|r| r.id == account_id)
+        .map(|r| r.backend_kind)
+        .ok_or_else(|| {
+            CommandError::with_code(
+                ErrorCode::InternalBug,
+                format!("unknown account id: {account_id}"),
+            )
+        })?;
 
     // R4-P2-4: reap abandoned / stale-terminal sessions before opening this one.
     prune_stale_sessions();
@@ -1032,7 +1099,7 @@ pub async fn reauth_account(
     // token is minted by - and bound to - that client. Seed the session with
     // the stored creds when present.
     let session_id = uuid::Uuid::new_v4().to_string();
-    let mut session = WizardSession::new(Some(account_id));
+    let mut session = WizardSession::new(Some(account_id), backend);
     if let Some((client_id, client_secret)) = load_account_client_creds(account_id) {
         session.client_id = Some(client_id);
         session.client_secret = Some(client_secret);
@@ -1105,6 +1172,8 @@ mod tests {
     fn account_row_to_dto_maps_fields_and_hides_key_handle() {
         let id = AccountId::new_v4();
         let row = AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id,
             email: "label".to_string(),
             display_name: Some("My Drive".to_string()),
@@ -1141,20 +1210,20 @@ mod tests {
         {
             let mut sessions = lock_sessions();
             // Fresh non-terminal: kept.
-            let mut fresh = WizardSession::new(None);
+            let mut fresh = WizardSession::new(None, BackendKind::GoogleDrive);
             fresh.updated_at = now;
             sessions.insert(fresh_id.clone(), fresh);
             // Abandoned non-terminal, idle past the TTL: reaped.
-            let mut stale = WizardSession::new(None);
+            let mut stale = WizardSession::new(None, BackendKind::GoogleDrive);
             stale.updated_at = now - SESSION_TTL_MS - 1;
             sessions.insert(stale_abandoned_id.clone(), stale);
             // Terminal but recent (within grace): kept.
-            let mut recent_terminal = WizardSession::new(None);
+            let mut recent_terminal = WizardSession::new(None, BackendKind::GoogleDrive);
             recent_terminal.status = OAuthStatus::Complete;
             recent_terminal.updated_at = now - 1;
             sessions.insert(recent_terminal_id.clone(), recent_terminal);
             // Terminal past the grace: reaped.
-            let mut stale_terminal = WizardSession::new(None);
+            let mut stale_terminal = WizardSession::new(None, BackendKind::GoogleDrive);
             stale_terminal.status = OAuthStatus::Failed {
                 code: "auth.consent_required".to_string(),
             };
@@ -1254,6 +1323,8 @@ mod tests {
 
     fn fresh_row(id: AccountId) -> AccountRow {
         AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id,
             email: "u@example.com".to_string(),
             display_name: None,
@@ -1306,7 +1377,7 @@ mod tests {
         // failed finish the session still carries its Complete status + tokens and
         // the user can retry without re-running OAuth. Model that invariant on a
         // session directly: a clone must NOT empty the session's tokens.
-        let mut s = WizardSession::new(None);
+        let mut s = WizardSession::new(None, BackendKind::GoogleDrive);
         s.status = OAuthStatus::Complete;
         s.tokens = Some(Tokens {
             access_token: "at".to_string(),
@@ -1360,7 +1431,7 @@ mod tests {
         // env override so the no-creds path is deterministic.
         std::env::remove_var(ENV_OAUTH_CLIENT_ID);
         std::env::remove_var(ENV_OAUTH_CLIENT_SECRET);
-        let mut s = WizardSession::new(None);
+        let mut s = WizardSession::new(None, BackendKind::GoogleDrive);
         let err = resolve_creds(&s).expect_err("no creds must be rejected");
         assert_eq!(err.code, ErrorCode::AuthConsentRequired);
         // BYO submitted -> resolves to exactly those creds.
@@ -1410,5 +1481,39 @@ mod tests {
             .expect("a clean printable client secret is accepted");
         // An empty secret (valid for a PKCE installed-app client) is accepted.
         reject_control_chars("", "OAuth client secret").expect("an empty secret is accepted");
+    }
+
+    #[test]
+    fn parse_backend_id_defaults_to_drive_and_rejects_unknown() {
+        // A webview that predates the destination picker sends nothing; that is
+        // the historical default, Google Drive.
+        assert_eq!(
+            parse_backend_id(None).expect("none"),
+            BackendKind::default()
+        );
+        assert_eq!(
+            parse_backend_id(Some("")).expect("empty"),
+            BackendKind::default()
+        );
+        assert_eq!(
+            parse_backend_id(Some("  ")).expect("blank"),
+            BackendKind::default()
+        );
+        // Every id the factory advertises round-trips.
+        for d in driven_backend::descriptors() {
+            assert_eq!(parse_backend_id(Some(d.id)).expect("descriptor id"), d.kind);
+        }
+        // An unknown destination is REJECTED, not silently downgraded to Drive -
+        // quietly backing up to a destination the user did not choose is the
+        // failure this guard exists to prevent.
+        let err = parse_backend_id(Some("dropbox")).expect_err("unknown backend rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+    }
+
+    #[test]
+    fn account_dto_reports_the_row_backend_kind() {
+        let mut row = fresh_row(AccountId::new_v4());
+        row.backend_kind = BackendKind::GoogleDrive;
+        assert_eq!(account_row_to_dto(&row).backend_kind, "google_drive");
     }
 }

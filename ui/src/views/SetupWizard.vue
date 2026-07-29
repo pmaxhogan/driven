@@ -3,6 +3,7 @@ import { computed, onBeforeUnmount, onMounted, ref } from "vue";
 import { useI18n } from "vue-i18n";
 import { useRouter } from "vue-router";
 
+import BackendPicker from "../components/BackendPicker.vue";
 import CredentialsWalkthrough from "../components/CredentialsWalkthrough.vue";
 import DriveFolderPicker from "../components/DriveFolderPicker.vue";
 import RecoveryPhraseReveal from "../components/RecoveryPhraseReveal.vue";
@@ -49,17 +50,14 @@ const SECONDARY_BTN =
 const CARD =
   "rounded-lg border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900";
 
-// Begin the wizard session up front so the credentials step has a session id
-// (SPEC s11.1 begin_add_account_wizard). Idempotent: only begins once.
+// Load the destinations this build can construct so the welcome step's picker
+// has options. The wizard SESSION is deliberately NOT begun here: the session is
+// stamped with the chosen destination server-side, so it must not open until the
+// user has left the picker. `connectAccount` begins one on demand if the
+// credentials step is somehow reached without it, so nothing can dead-end.
 onMounted(async () => {
   setup.reset();
-  try {
-    await setup.begin();
-  } catch {
-    // begin failure surfaces via the credentials step the first time the user
-    // tries to sign in (connectAccount re-begins if no session); no hard stop
-    // here so the welcome step still renders.
-  }
+  await setup.loadBackends();
 });
 
 // R4-P2-4: if the wizard is left while an OAuth session is still open (the user
@@ -140,6 +138,16 @@ function onCredentialsComplete(): void {
 
 async function onNext(): Promise<void> {
   if (!canAdvance.value) return;
+  if (setup.step === "welcome") {
+    // Open the server-side wizard session NOW, stamped with the destination the
+    // user just chose. A failure is not a hard stop - the credentials step's
+    // `connectAccount` re-begins and surfaces the error there.
+    try {
+      await setup.begin();
+    } catch {
+      // Deliberately swallowed; see above.
+    }
+  }
   if (setup.step === "encryption") {
     // Create the first source with its encryption flag, then advance to confirm.
     try {
@@ -221,14 +229,20 @@ function baseName(p: string): string {
       </div>
     </header>
 
-    <!-- Step 1: Welcome -->
-    <div v-if="setup.step === 'welcome'" :class="CARD" class="space-y-2">
+    <!-- Step 1: Welcome + backup-destination choice -->
+    <div v-if="setup.step === 'welcome'" :class="CARD" class="space-y-4">
       <h2 class="text-lg font-medium text-zinc-900 dark:text-zinc-100">
         {{ t("wizard.step1.title") }}
       </h2>
       <p class="text-zinc-600 dark:text-zinc-400">
         {{ t("wizard.step1.body") }}
       </p>
+      <BackendPicker
+        v-model:selected="setup.backendId"
+        :backends="setup.backends"
+        :loading="setup.busy"
+        @load="setup.loadBackends()"
+      />
     </div>
 
     <!-- Step 2: BYO credentials + sign-in -->

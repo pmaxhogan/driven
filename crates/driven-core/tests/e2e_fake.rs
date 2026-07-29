@@ -158,6 +158,8 @@ async fn seed_account(state: &SqliteStateRepo) -> AccountId {
     let id = AccountId::new_v4();
     state
         .upsert_account(&AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id,
             email: "e2e@example.com".into(),
             display_name: None,
