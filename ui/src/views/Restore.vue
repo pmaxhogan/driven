@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, onMounted, onUnmounted, ref, watch } from "vue";
+import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from "vue";
 import { useI18n } from "vue-i18n";
 
 import { useVirtualList } from "../composables/useVirtualList";
@@ -80,10 +80,11 @@ const overallPercent = computed(() => {
 // lines up exactly, and only the visible window (+ overscan) is mounted. The
 // same ROW_HEIGHT drives both the composable and the per-row style binding.
 const ROW_HEIGHT = 40;
-const { containerRef: listRef, range: virtualRange } = useVirtualList(
-  () => restore.rows.length,
-  ROW_HEIGHT
-);
+// `useTemplateRef` (Vue 3.5+) is the typed way to reach the `ref="listRef"` <ul>
+// below: the element ref is owned here and handed to the composable, which only
+// reads it to measure the list's position.
+const listRef = useTemplateRef<HTMLElement>("listRef");
+const { range: virtualRange } = useVirtualList(listRef, () => restore.rows.length, ROW_HEIGHT);
 // The mounted slice of `restore.rows`. Slicing preserves each row's identity and
 // keyOf keying (the key is derived from the row, not its position).
 const visibleRows = computed(() =>
