@@ -1138,10 +1138,29 @@ token = {\"access_token\":\"ya29.x\",\"refresh_token\":\"1//0eX\",\"expiry\":\"2
             ("HOME", "/home/u"),
         ]))
         .unwrap_err();
-        assert!(msg.contains("/explicit/my.conf"), "{msg}");
+
+        // The expected paths are BUILT the same way the code builds them
+        // (`PathBuf::join` + `Display`) rather than written as literals with
+        // forward slashes. `join` emits the platform separator, so on Windows
+        // the message reads `/home/u\.config\rclone\rclone.conf` and a
+        // hardcoded `/`-joined literal would not be a substring of it - the
+        // assertion would fail on logic that is entirely correct. Config
+        // discovery is a genuinely cross-platform path (Windows users have
+        // rclone configs too), so this is fixed rather than cfg'd away.
+        let home = PathBuf::from("/home/u");
+        for want in [
+            PathBuf::from("/explicit/my.conf"),
+            home.join(".config").join("rclone").join("rclone.conf"),
+            home.join(".rclone.conf"),
+        ] {
+            let rendered = want.display().to_string();
+            assert!(
+                msg.contains(&rendered),
+                "the message must name {rendered}: {msg}"
+            );
+        }
+        // These carry no path separators, so they are safe as literals.
         assert!(msg.contains("$RCLONE_CONFIG"), "{msg}");
-        assert!(msg.contains("/home/u/.config/rclone/rclone.conf"), "{msg}");
-        assert!(msg.contains("/home/u/.rclone.conf"), "{msg}");
         assert!(msg.contains("rclone config file"), "{msg}");
         assert!(msg.contains("--config"), "{msg}");
 

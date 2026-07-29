@@ -410,10 +410,17 @@ mod tests {
         // Hiding the value is only helpful if the user is told how to get it;
         // otherwise everyone reaches for --reveal-secrets and the default is
         // decorative.
+        // `config_path` is an already-rendered String that the renderer echoes
+        // verbatim - no `PathBuf::join`, so no platform separator is introduced
+        // and this literal round-trips identically on Windows. (Contrast
+        // `config_file::tests::locate_config_...`, which compares against paths
+        // the code BUILDS with `join` and so must build its expectations the
+        // same way.) Bound to a variable so the assertion cannot drift from it.
+        let config_path = "/home/u/.config/rclone/rclone.conf";
         let out = render_detail(
             &one(R2),
             &RenderOptions {
-                config_path: Some("/home/u/.config/rclone/rclone.conf".into()),
+                config_path: Some(config_path.into()),
                 ..Default::default()
             },
         );
@@ -421,7 +428,7 @@ mod tests {
             out.contains("secret_access_key` line of the [r2] section"),
             "{out}"
         );
-        assert!(out.contains("/home/u/.config/rclone/rclone.conf"), "{out}");
+        assert!(out.contains(config_path), "{out}");
         assert!(out.contains("--reveal-secrets"), "{out}");
         assert!(!out.contains("TOPSECRETVALUE"), "{out}");
 
