@@ -139,6 +139,9 @@ These move: check each project's current docs before relying on a cell.
   selector.
 - Anonymous, opt-out telemetry (coarse counts only; never file names, paths, or
   content).
+- Guided Full Disk Access onboarding for macOS: when macOS privacy protection
+  blocks a file, Driven says so and offers a one-click jump to the right
+  System Settings pane instead of leaving you to find it.
 
 <!--
 DRAFT - do not uncomment until the corresponding PR merges. Flip each bullet
@@ -147,9 +150,6 @@ on individually as its PR lands, then delete this comment wrapper.
   unmerged - depends on the pluggable-backend seam / `driven-remote` crate,
   #200, also unmerged.)
 - Local / removable-drive backup destination. (unmerged - same seam as above.)
-- Guided Full Disk Access onboarding for macOS, so Driven walks you through
-  granting access to Mail / Messages / Photos instead of requiring a manual
-  System Settings visit. (#205, unmerged.)
 - Scheduled integrity scrub that periodically re-verifies already-backed-up
   files against the destination. (unmerged.)
 - Restore drill: a one-click "prove the backup actually restores" check.
@@ -204,9 +204,32 @@ Disk Access. A file in that state fails to open with a permission error, not a
 "file is busy" error, and Driven reports it in the activity log rather than
 silently skipping it or silently backing it up.
 
-There is currently no in-app guided flow for granting Full Disk Access - that
-is planned for a future release. Until then, grant it manually if you want
-those folders backed up; everything else backs up normally without it.
+Driven notices this and offers the fix. The first time a backup is refused,
+a banner appears with a button that opens the Full Disk Access pane directly.
+You can dismiss it; everything else backs up normally without the grant.
+
+To grant it:
+
+1. Click **Open Full Disk Access settings** in Driven's banner, or from a
+   terminal:
+
+   ```sh
+   open 'x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles'
+   ```
+
+2. Add Driven with the `+` button (or drag `Driven.app` in) and switch it on.
+3. Quit and reopen Driven. A grant only applies to a newly launched process,
+   so the running app keeps skipping until you restart it.
+
+**The grant can stop working after an update, because Driven is unsigned.**
+macOS ties Full Disk Access to the binary's code signature (its cdhash), not
+to its name or path. Driven's builds are not signed with a Developer ID, so
+every update is a different program as far as the privacy system is concerned.
+After installing one, the grant may quietly stop applying and the skips come
+back - even though Driven is still listed under Full Disk Access with its
+switch on. The fix is to remove the stale Driven entry from that list, add the
+new app, and relaunch. This is a consequence of the missing code signature
+rather than a bug, and it goes away once macOS code signing lands.
 
 **A locked-file snapshot is not a substitute for Full Disk Access, and Driven
 never tries to make it one.** Driven's locked-file handling (Windows VSS,

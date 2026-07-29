@@ -171,8 +171,9 @@ describe("App shell", () => {
     // progress store's TWO sync events (status_changed for the phase,
     // source_progress for the moving counters) + the pause event registered +
     // the two ToastHost subscriptions (status_changed for "Backup started",
-    // activity:new for the backup_done row behind "Backup complete").
-    expect(listenMock).toHaveBeenCalledTimes(8);
+    // activity:new for the backup_done row behind "Backup complete") + the
+    // FdaBanner's own activity:new subscription (the macOS TCC denial row).
+    expect(listenMock).toHaveBeenCalledTimes(9);
     expect(invokeMock).toHaveBeenCalledWith("get_pending_update_info", undefined);
     expect(invokeMock).toHaveBeenCalledWith("get_sync_status", undefined);
     expect(invokeMock).toHaveBeenCalledWith("get_pause_state", undefined);
