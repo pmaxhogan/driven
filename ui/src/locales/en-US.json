@@ -78,8 +78,25 @@
       "google_drive": {
         "name": "Google Drive",
         "description": "Back up to your Google Drive or a shared drive, using your own OAuth client."
+      },
+      "local_folder": {
+        "name": "Local or removable folder",
+        "description": "Back up to a USB drive, an external disk, a NAS share, or any folder on this computer. No account and no network."
       }
     }
+  },
+  "localFolderSetup": {
+    "title": "Choose your backup folder",
+    "body": "Driven copies your files straight into a folder you own - a USB drive, an external disk, a NAS share, or anywhere on this computer. There is no account to connect and nothing goes over the network.",
+    "folderLabel": "Backup folder",
+    "chooseButton": "Choose folder...",
+    "folderHint": "Pick the drive or folder Driven should back up into. Driven writes a small marker file there so it can tell your drive apart from an empty folder if it is ever disconnected.",
+    "displayNameLabel": "Name for this destination (optional)",
+    "displayNameHint": "How this destination appears in Driven. Defaults to the folder's name.",
+    "trashWarning": "This destination has no trash: when Driven removes a backed-up file it is deleted permanently.",
+    "removableWarning": "If the drive is disconnected, Driven pauses this account and tells you to reconnect it - it will never quietly back up to the empty folder left behind.",
+    "connectButton": "Use this folder",
+    "connecting": "Checking the folder..."
   },
   "drivePicker": {
     "rootName": "My Drive",
@@ -130,6 +147,7 @@
       "title": "Pick your first backup source",
       "body": "Choose a local folder to back up and the Google Drive destination it syncs to.",
       "chooseFolderButton": "Choose folder...",
+      "chooseFolderFirst": "Choose a folder to back up first.",
       "driveDestinationLabel": "Drive destination"
     },
     "step4": {

@@ -1582,9 +1582,11 @@ version = "2.4.0"
 dependencies = [
  "anyhow",
  "driven-drive",
+ "driven-localfs",
  "driven-remote",
  "driven-tls",
  "keyring-core",
+ "tempfile",
  "tracing",
 ]
 
@@ -1742,6 +1744,29 @@ dependencies = [
  "tokio",
  "tracing",
  "url",
+ "uuid",
+]
+
+[[package]]
+name = "driven-localfs"
+version = "2.4.0"
+dependencies = [
+ "anyhow",
+ "async-trait",
+ "bytes",
+ "driven-remote",
+ "futures",
+ "hex",
+ "libc",
+ "md-5 0.11.0",
+ "parking_lot",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tokio",
+ "tracing",
+ "tracing-subscriber",
  "uuid",
 ]
 

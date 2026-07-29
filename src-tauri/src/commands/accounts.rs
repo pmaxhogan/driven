@@ -47,8 +47,8 @@ use driven_drive::google::token_store::KeyringTokenStore;
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    AccountDto, AddAccountWizardSessionId, BackendDto, OAuthAuthUrl, OAuthStatus, ReauthSession,
-    SessionId,
+    AccountDto, AddAccountWizardSessionId, BackendDto, CreateLocalFolderAccountRequest,
+    OAuthAuthUrl, OAuthStatus, ReauthSession, SessionId,
 };
 use crate::commands::{CommandError, CommandResult};
 use crate::events::EVENT_OAUTH_COMPLETE;
@@ -1054,6 +1054,113 @@ pub async fn remove_account(
 
     tracing::info!(target: TARGET, account_id = %account_id, "account removed");
     Ok(())
+}
+
+/// `create_local_folder_account(req)` - create an account backed by a plain
+/// folder: a USB drive, an external SSD, a NAS mount, or any directory on this
+/// machine.
+///
+/// The local-folder counterpart of the OAuth wizard's
+/// `begin -> submit -> signin -> finish` sequence, collapsed into one call
+/// because there is nothing to authenticate: the user already has write access
+/// to the folder they picked, so this backend has NO credential and touches the
+/// OS keychain not at all.
+///
+/// The destination is PROVED usable before the account row is written - the
+/// folder must exist, be a directory, and accept a real write - because an
+/// account that cannot reach its destination is worse than no account: it sits
+/// in the sources list looking configured while every backup cycle fails.
+/// Preparing the destination also stamps (or ADOPTS) its identity marker, which
+/// is what later lets the store tell "the drive is unplugged" apart from "an
+/// empty mount point on the boot disk"; adopting means re-adding a drive that
+/// already holds a Driven backup keeps every object on it.
+#[tauri::command]
+pub async fn create_local_folder_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: CreateLocalFolderAccountRequest,
+) -> CommandResult<AccountDto> {
+    let root = req.root.trim().to_string();
+    reject_control_chars(&root, "destination folder")?;
+    if root.is_empty() {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "choose a destination folder",
+        ));
+    }
+    let root_path = std::path::PathBuf::from(&root);
+    if !root_path.is_absolute() {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "the destination folder must be an absolute path",
+        ));
+    }
+
+    let now = SystemClock.now_ms();
+    // Blocking filesystem work (a real write + fsync of the marker), kept off the
+    // async runtime's worker threads - a NAS mount can take seconds to answer.
+    let prepared = {
+        let root_path = root_path.clone();
+        tokio::task::spawn_blocking(move || driven_backend::prepare_local_folder(&root_path, now))
+            .await
+            .map_err(|e| {
+                CommandError::with_code(
+                    ErrorCode::InternalBug,
+                    format!("preparing the destination folder panicked: {e}"),
+                )
+            })?
+    };
+    let config_json =
+        prepared.map_err(|e| CommandError::with_code(ErrorCode::InvalidInput, e.to_string()))?;
+
+    let account_id = AccountId::new_v4();
+    let label = req
+        .display_name
+        .clone()
+        .filter(|d| !d.trim().is_empty())
+        .unwrap_or_else(|| {
+            // A local destination has no account identity to fetch; the folder
+            // IS the account's human label, and `email` is the field the UI
+            // renders.
+            root_path
+                .file_name()
+                .map(|n| n.to_string_lossy().into_owned())
+                .unwrap_or_else(|| root.clone())
+        });
+    let row = AccountRow {
+        id: account_id,
+        email: label,
+        display_name: req.display_name.clone().filter(|d| !d.trim().is_empty()),
+        state: AccountState::Ok,
+        encryption_master_key_id: None,
+        created_at: now,
+        last_synced_at: None,
+        backend_kind: BackendKind::LocalFolder,
+        backend_config_json: Some(config_json),
+    };
+
+    // There is no keychain entry to roll back: a failed row write leaves only the
+    // destination marker on the folder, which the next attempt ADOPTS rather than
+    // duplicating.
+    state
+        .state()
+        .upsert_account(&row)
+        .await
+        .map_err(CommandError::from)?;
+    tracing::info!(target: TARGET, account_id = %account_id, "local-folder account persisted");
+
+    // A2: hot-spawn so the wizard's initial sync finds a live handle.
+    match crate::assembly::spawn_account(&app, &state, account_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(target: TARGET, account_id = %account_id, "local-folder account persisted but orchestrator not spawned");
+        }
+        Err(err) => {
+            tracing::error!(target: TARGET, account_id = %account_id, %err, "hot-spawn after create_local_folder_account failed; orchestrator will start on next launch");
+        }
+    }
+
+    Ok(account_row_to_dto(&row))
 }
 
 /// `reauth_account(account_id)` - re-run consent for an account whose refresh

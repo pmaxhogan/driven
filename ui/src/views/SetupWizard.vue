@@ -6,9 +6,11 @@ import { useRouter } from "vue-router";
 import BackendPicker from "../components/BackendPicker.vue";
 import CredentialsWalkthrough from "../components/CredentialsWalkthrough.vue";
 import DriveFolderPicker from "../components/DriveFolderPicker.vue";
+import LocalFolderForm from "../components/LocalFolderForm.vue";
 import RecoveryPhraseReveal from "../components/RecoveryPhraseReveal.vue";
 import { pickFolderDialog } from "../ipc/commands";
 import { useSetupStore, WIZARD_STEPS } from "../stores/setup";
+import type { CreateLocalFolderAccountRequest } from "../ipc/types";
 
 // Setup wizard (SPEC s25 /setup; DESIGN s8.5 5-step wizard). Drives the whole
 // first-run flow as a stepper:
@@ -109,6 +111,14 @@ async function chooseLocalFolder(): Promise<void> {
     if (!setup.sourceDisplayName) {
       setup.sourceDisplayName = baseName(picked.path);
     }
+    // A destination with no browsable tree (a local folder) still needs a
+    // non-empty destination folder id on the source row, so derive it from the
+    // source's own name - the same choice a Drive user would have made by hand,
+    // and shown read-only below so it is never a surprise.
+    if (!setup.backendSupportsFolderPicker) {
+      setup.driveFolderId = setup.destinationFolderIdFor(picked.path);
+      setup.driveFolderPath = `${setup.localFolderRoot ?? ""}/${setup.driveFolderId}`;
+    }
   } catch {
     // A cancel (or dialog error) surfaces as a rejected command; leave the path
     // unset so the step's "Next" stays disabled. No hard error shown for a
@@ -134,6 +144,18 @@ function onDrivePickerError(e: unknown): void {
 function onCredentialsComplete(): void {
   // Sign-in resolved; move to the source step.
   if (setup.step === "credentials") setup.next();
+}
+
+/**
+ * The local-folder branch's "sign in": one call that validates the folder,
+ * proves it is writable, stamps its destination marker and writes the account.
+ * Only on success does the wizard advance - a folder that cannot be written to
+ * leaves the user on the form with the specific reason, exactly as a failed
+ * OAuth consent does.
+ */
+async function onLocalFolderSubmit(req: CreateLocalFolderAccountRequest): Promise<void> {
+  const ok = await setup.createLocalFolderAccount(req);
+  if (ok && setup.step === "credentials") setup.next();
 }
 
 async function onNext(): Promise<void> {
@@ -245,12 +267,20 @@ function baseName(p: string): string {
       />
     </div>
 
-    <!-- Step 2: BYO credentials + sign-in -->
+    <!-- Step 2: credentials. Which form depends on the destination chosen on
+         step 1: Google Drive runs the BYO-OAuth consent flow; a local or
+         removable folder just needs the folder, and has no credential at all. -->
     <div v-else-if="setup.step === 'credentials'" :class="CARD" class="space-y-3">
       <h2 class="text-lg font-medium text-zinc-900 dark:text-zinc-100">
-        {{ t("wizard.step2.title") }}
+        {{ setup.backendUsesOauth ? t("wizard.step2.title") : t("localFolderSetup.title") }}
       </h2>
-      <CredentialsWalkthrough @complete="onCredentialsComplete" />
+      <CredentialsWalkthrough v-if="setup.backendUsesOauth" @complete="onCredentialsComplete" />
+      <LocalFolderForm
+        v-else
+        :busy="setup.busy"
+        :error-message="errorLong"
+        @submit="onLocalFolderSubmit"
+      />
     </div>
 
     <!-- Step 3: First backup source -->
@@ -281,12 +311,24 @@ function baseName(p: string): string {
           t("wizard.step3.driveDestinationLabel")
         }}</span>
         <DriveFolderPicker
+          v-if="setup.backendSupportsFolderPicker"
           v-model:folder-id="setup.driveFolderId"
           v-model:folder-path="setup.driveFolderPath"
           v-model:drive-id="setup.driveId"
           :account-id="setup.accountId"
           @error="onDrivePickerError"
         />
+        <!-- A destination with no browsable tree (a local or removable folder):
+             the root was already chosen on step 2, so the only thing left to
+             show is WHERE inside it this source will land. Read-only, but
+             visible, so the resolved path is never a surprise. -->
+        <p
+          v-else
+          class="break-all text-sm text-zinc-600 dark:text-zinc-400"
+          data-testid="local-destination-path"
+        >
+          {{ setup.driveFolderPath || setup.localFolderRoot || t("wizard.step3.chooseFolderFirst") }}
+        </p>
       </div>
     </div>
 

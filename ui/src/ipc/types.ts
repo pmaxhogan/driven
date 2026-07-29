@@ -31,6 +31,16 @@ export interface AccountDto {
   backendKind: BackendKindId;
 }
 
+/** The settings for a new local / removable-folder destination
+ * (`createLocalFolderAccount`).
+ *
+ * There is deliberately no credential field: a folder the user already has write
+ * access to needs none, so this backend never touches the OS keychain. */
+export interface CreateLocalFolderAccountRequest {
+  displayName?: string | null;
+  root: string;
+}
+
 /** One selectable backup destination, as reported by `listBackends()`. Mirrors
  * the Rust `BackendDto`, which is derived from `driven_backend::descriptors()` -
  * so the picker can only ever offer destinations this build can construct. */

@@ -10,6 +10,7 @@ import type {
   AddSourceRequest,
   BackendDto,
   BackendKindId,
+  CreateLocalFolderAccountRequest,
   OAuthStatus,
   SessionId,
 } from "../ipc/types";
@@ -49,6 +50,10 @@ export const useSetupStore = defineStore("setup", () => {
   // it always did.
   const backends = ref<BackendDto[]>([]);
   const backendId = ref<BackendKindId>(DEFAULT_BACKEND_ID);
+  // The destination ROOT of a local-folder account, kept for display on the
+  // source step (which shows the resolved `<root>/<sub-folder>` the backup will
+  // land in). Not sent anywhere - the account row already holds it.
+  const localFolderRoot = ref<string | null>(null);
 
   // Cross-step staged inputs. Kept here (not component-local) so navigating
   // back/forward preserves what the user already entered.
@@ -137,6 +142,15 @@ export const useSetupStore = defineStore("setup", () => {
    * so the wizard never briefly hides the credentials step it is about to need. */
   const backendUsesOauth = computed(() => selectedBackend.value?.usesOauth ?? true);
 
+  /** Whether the selected destination has a browsable remote tree for the source
+   * step's destination picker. Defaults to `true` (the Drive behaviour) until the
+   * descriptors load. A local folder does NOT: the destination root was already
+   * chosen with the OS folder dialog, and browsing below it would only offer the
+   * user a way to nest one backup inside another. */
+  const backendSupportsFolderPicker = computed(
+    () => selectedBackend.value?.supportsFolderPicker ?? true
+  );
+
   /** Load the destinations this build can construct. Idempotent and safe to call
    * on every wizard entry. On failure the list stays empty and the wizard runs
    * with the Google Drive default rather than dead-ending. */
@@ -166,6 +180,59 @@ export const useSetupStore = defineStore("setup", () => {
 
   async function begin(): Promise<void> {
     session.value = await ipc.beginAddAccountWizard(backendId.value);
+  }
+
+  /**
+   * Create a local-folder-backed account from the destination step's form (the
+   * non-OAuth branch). One call: the backend validates the folder, PROVES it is
+   * writable, stamps its destination marker, writes the account row and
+   * hot-spawns its orchestrator - so on success the wizard is in exactly the
+   * state the OAuth path reaches after `finish`.
+   */
+  async function createLocalFolderAccount(
+    req: CreateLocalFolderAccountRequest
+  ): Promise<boolean> {
+    busy.value = true;
+    errorCode.value = null;
+    try {
+      const account = await ipc.createLocalFolderAccount(req);
+      accountId.value = account.id;
+      accountEmail.value = account.email;
+      localFolderRoot.value = req.root;
+      // The source step gates on a resolved destination; a local folder has no
+      // consent round trip, so mark the sign-in resolved here.
+      oauthStatus.value = { kind: "complete" };
+      return true;
+    } catch (e) {
+      errorCode.value = toErrorCode(e);
+      return false;
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  /**
+   * The destination sub-folder id to back a local source up into, derived from
+   * the source folder's own name.
+   *
+   * A destination with no browsable tree still needs a non-empty `driveFolderId`
+   * on the source row (`add_source` requires one, and rejects whitespace in it -
+   * it was written for Drive's opaque ids). Rather than invent an opaque handle,
+   * this mirrors what a Drive user would have picked by hand: a folder named
+   * after the source, so `~/Documents` lands in `<destination>/Documents/` and
+   * the backup stays browsable and hand-restorable, which is most of the point
+   * of backing up to a folder you own.
+   *
+   * Whitespace collapses to `-` to satisfy the id validator. Two sources whose
+   * names collapse to one id would share a destination sub-tree - exactly what
+   * happens on Drive when a user picks the same destination folder twice, and
+   * visible on the source step, which shows the resolved destination path.
+   */
+  function destinationFolderIdFor(localPathValue: string): string {
+    const parts = localPathValue.split(/[\\/]/).filter(Boolean);
+    const base = parts.length > 0 ? parts[parts.length - 1] : localPathValue;
+    const slug = base.replace(/\s+/g, "-");
+    return slug.length > 0 ? `${slug}/` : "backup/";
   }
 
   async function submitCredentials(clientId: string, clientSecret: string): Promise<void> {
@@ -414,6 +481,7 @@ export const useSetupStore = defineStore("setup", () => {
     // The destination list is a property of the BUILD, not of a wizard run, so
     // it survives a reset; only the user's choice is reverted to the default.
     backendId.value = backends.value.find((b) => b.isDefault)?.id ?? DEFAULT_BACKEND_ID;
+    localFolderRoot.value = null;
     accountId.value = null;
     accountEmail.value = null;
     localPath.value = null;
@@ -465,9 +533,13 @@ export const useSetupStore = defineStore("setup", () => {
     backends,
     backendId,
     selectedBackend,
+    localFolderRoot,
     backendUsesOauth,
+    backendSupportsFolderPicker,
     loadBackends,
     selectBackend,
+    createLocalFolderAccount,
+    destinationFolderIdFor,
     accountId,
     accountEmail,
     localPath,

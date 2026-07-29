@@ -17,6 +17,7 @@ import type {
   AddSourceResult,
   BackendDto,
   BackendKindId,
+  CreateLocalFolderAccountRequest,
   CustomCaValidation,
   DriveFolderListing,
   ExclusionPreview,
@@ -65,6 +66,19 @@ export function listBackends(): Promise<BackendDto[]> {
  * choose. */
 export function beginAddAccountWizard(backend?: BackendKindId): Promise<AddAccountWizardSessionId> {
   return invoke("begin_add_account_wizard", { backend: backend ?? null });
+}
+
+/** Create an account backed by a plain folder (a USB drive, a NAS mount, any
+ * local directory).
+ *
+ * The local-folder counterpart of the whole OAuth begin/submit/signin/finish
+ * sequence: there is no credential and no consent round trip, so one call
+ * validates the folder, PROVES it is writable, stamps its destination marker
+ * and writes the account row. */
+export function createLocalFolderAccount(
+  req: CreateLocalFolderAccountRequest
+): Promise<AccountDto> {
+  return invoke("create_local_folder_account", { req });
 }
 
 export function submitOauthCredentials(

@@ -93,6 +93,22 @@ pub struct BackendDto {
     pub is_default: bool,
 }
 
+/// The user-supplied settings for a new local / removable-folder destination
+/// (`create_local_folder_account`).
+///
+/// There is deliberately no credential field: this backend has none. The whole
+/// configuration is a folder path the user already has write access to, which is
+/// why it is safe to persist in `accounts.backend_config_json` in the clear.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateLocalFolderAccountRequest {
+    /// Optional human label for the account; defaults to the folder's own name.
+    pub display_name: Option<String>,
+    /// Absolute path of the destination folder: a mounted USB drive, a NAS
+    /// share, or any local directory.
+    pub root: String,
+}
+
 /// The opaque session id returned by `begin_add_account_wizard` and threaded
 /// through the OAuth steps (SPEC s11.1 `AddAccountWizardSessionId`).
 ///

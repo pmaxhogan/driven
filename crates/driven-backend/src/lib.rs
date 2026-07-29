@@ -33,6 +33,7 @@ use driven_drive::google::token_store::{
     ClientCredsStore, KeyringTokenStore, RefreshingTokenSource,
 };
 use driven_drive::google::GoogleDriveStore;
+use driven_localfs::{LocalFsConfig, LocalFsStore};
 use driven_remote::remote_store::RemoteStore;
 use driven_remote::BackendKind;
 use driven_tls::{CustomCaConfig, ProxyConfig};
@@ -144,6 +145,11 @@ pub fn descriptors() -> Vec<BackendDescriptor> {
 pub fn picker_root_id(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::GoogleDrive => "root",
+        // A local destination's ids are paths RELATIVE to the configured root,
+        // so the root is the empty path. (`supports_folder_picker` is false for
+        // it, so nothing browses this today - but the factory must still have an
+        // answer, and a wrong one would be worse than none.)
+        BackendKind::LocalFolder => "",
     }
 }
 
@@ -161,7 +167,59 @@ pub fn build_store(
 ) -> anyhow::Result<StoreOutcome> {
     match account.kind {
         BackendKind::GoogleDrive => build_google_drive(&account.account_id, ctx),
+        BackendKind::LocalFolder => build_local_folder(account),
     }
+}
+
+/// The local-folder arm: the persisted non-secret config is the whole
+/// configuration.
+///
+/// There is no credential and therefore no [`StoreOutcome::NeedsReauth`] path -
+/// a folder the user picked is either reachable or it is not, and THAT is
+/// decided per operation by the store's destination-marker check, not here. A
+/// removable drive is routinely unplugged, and refusing to build the store would
+/// leave the account unable to start until the user happened to have the stick
+/// plugged in.
+fn build_local_folder(account: &AccountBackend) -> anyhow::Result<StoreOutcome> {
+    let json = account.config_json.as_deref().ok_or_else(|| {
+        anyhow::anyhow!(
+            "localfs.config_invalid: the account has no stored local-folder backend configuration"
+        )
+    })?;
+    let config = LocalFsConfig::from_json(json)?;
+    let store = LocalFsStore::new(&config)?;
+    tracing::info!(
+        target: TARGET,
+        account_id = %account.account_id,
+        // The folder path is not a secret and is what an operator needs to debug
+        // a destination that stopped being reachable.
+        root = %config.root,
+        "built real LocalFsStore"
+    );
+    Ok(StoreOutcome::Store(Arc::new(store)))
+}
+
+/// Prepare a directory to be a local-folder destination and render the blob for
+/// `accounts.backend_config_json`.
+///
+/// Validates that the path is a writable directory (by actually writing), then
+/// stamps or ADOPTS its destination-identity marker - adopting so that
+/// re-adding a drive which already holds a Driven backup keeps every object on
+/// it. Returns the config JSON for the caller to store on the account row.
+pub fn prepare_local_folder(root: &std::path::Path, now_ms: i64) -> anyhow::Result<String> {
+    let (destination_id, outcome) = driven_localfs::prepare_destination(root, now_ms)?;
+    tracing::info!(
+        target: TARGET,
+        root = %root.display(),
+        ?outcome,
+        "prepared a local-folder destination"
+    );
+    LocalFsConfig {
+        root: root.to_string_lossy().into_owned(),
+        destination_id,
+    }
+    .normalized()?
+    .to_json()
 }
 
 /// The Google Drive arm: keychain refresh token -> refreshing token source ->
@@ -344,6 +402,101 @@ mod tests {
     #[test]
     fn picker_root_is_the_drive_root_alias() {
         assert_eq!(picker_root_id(BackendKind::GoogleDrive), "root");
+        assert_eq!(picker_root_id(BackendKind::LocalFolder), "");
+    }
+
+    #[test]
+    fn a_local_folder_account_without_config_is_an_error_not_a_needs_reauth() {
+        // A missing CONFIG is a bug (the account row was written wrong). There
+        // is no credential for this backend, so it can never be a reauth, and
+        // conflating the two would send the user round a prompt that cannot fix
+        // anything.
+        let account = AccountBackend {
+            account_id: "acct-local".to_string(),
+            kind: BackendKind::LocalFolder,
+            config_json: None,
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        // `StoreOutcome` holds a `dyn RemoteStore`, which has no `Debug`, so
+        // unwrap the Result by hand rather than via `expect_err`.
+        let err = match build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            },
+        ) {
+            Ok(_) => panic!("a missing local-folder config must be an error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("localfs.config_invalid"), "{err}");
+    }
+
+    #[test]
+    fn a_relative_local_folder_config_is_rejected() {
+        // A relative destination would resolve against whatever the app's
+        // working directory happened to be, which is not a property a backup
+        // destination may have.
+        let account = AccountBackend {
+            account_id: "acct-local".to_string(),
+            kind: BackendKind::LocalFolder,
+            config_json: Some(r#"{"root":"backups","destinationId":"d"}"#.to_string()),
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        assert!(build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn preparing_a_local_folder_stamps_a_marker_and_yields_a_credential_free_blob() {
+        let dir = tempfile::tempdir().unwrap();
+        let blob = prepare_local_folder(dir.path(), 1_700_000_000_000).expect("prepare");
+        assert!(blob.contains("destinationId"), "{blob}");
+        assert!(dir.path().join(".driven-destination.json").exists());
+        // The blob lands in SQLite and the diagnostic bundle; it must carry no
+        // credential material (this backend has none, and it must stay that
+        // way).
+        for forbidden in ["secret", "accesskey", "password", "token"] {
+            assert!(!blob.to_lowercase().contains(forbidden), "{blob}");
+        }
+
+        // Re-preparing the same folder ADOPTS its identity rather than
+        // re-stamping it - a new id would orphan every object already there.
+        let again = prepare_local_folder(dir.path(), 1_700_000_001_000).expect("prepare again");
+        assert_eq!(again, blob);
+    }
+
+    #[test]
+    fn a_prepared_local_folder_builds_a_real_store() {
+        let dir = tempfile::tempdir().unwrap();
+        let config_json = prepare_local_folder(dir.path(), 0).expect("prepare");
+        let account = AccountBackend {
+            account_id: "acct-local".to_string(),
+            kind: BackendKind::LocalFolder,
+            config_json: Some(config_json),
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        let outcome = build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            },
+        )
+        .expect("build");
+        assert!(
+            outcome.store().is_some(),
+            "a local folder has no credential, so it can never need reauth"
+        );
     }
 
     fn ctx<'a>(ca: &'a CustomCaConfig, proxy: &'a ProxyConfig) -> BackendContext<'a> {

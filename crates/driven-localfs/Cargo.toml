@@ -1,0 +1,52 @@
+[package]
+name = "driven-localfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven local / removable-folder RemoteStore backend (USB drives, NAS mounts, fast restore drills)"
+publish = false
+
+[dependencies]
+# The RemoteStore trait, the SPEC s24 error taxonomy and the driven.*
+# appProperties vocabulary.
+driven-remote = { path = "../driven-remote" }
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+uuid.workspace = true
+hex.workspace = true
+# An await-free Mutex over the per-directory name-claim table. The lock is only
+# ever held for a short synchronous map edit, never across an await.
+parking_lot.workspace = true
+# Content digests. The executor verifies every upload against `RemoteEntry.md5`,
+# which is an md5 over the exact bytes sent (SPEC s8), so this backend must speak
+# the same digest - it does NOT get to invent one.
+md-5 = "0.11"
+
+[target.'cfg(unix)'.dependencies]
+# `F_FULLFSYNC` (macOS) and `statvfs` (volume capacity for `about()`). A plain
+# `fsync(2)` on macOS returns before the DRIVE has flushed its own write cache,
+# which is exactly the failure mode that matters on a removable stick yanked a
+# moment after a backup "finished".
+libc.workspace = true
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+futures.workspace = true
+# The round-trip tests build their destination tree in a throwaway directory
+# when no real volume is pointed at them.
+tempfile = "3"
+md-5 = "0.11"
+driven-remote = { path = "../driven-remote" }
+anyhow.workspace = true
+bytes.workspace = true
+# Surfaces the store's own warn-level diagnostics in test output.
+tracing-subscriber.workspace = true

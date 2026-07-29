@@ -45,12 +45,16 @@ pub enum BackendKind {
     /// pre-migration account decodes to.
     #[default]
     GoogleDrive,
+    /// A plain directory on this machine: a USB drive, an external SSD, a NAS
+    /// mount, or any local folder. Needs no credential at all - the user
+    /// already has write access to the folder they chose.
+    LocalFolder,
 }
 
 impl BackendKind {
     /// Every kind this build knows, in the order the destination picker shows
     /// them. The first entry is the default selection.
-    pub const ALL: &'static [BackendKind] = &[BackendKind::GoogleDrive];
+    pub const ALL: &'static [BackendKind] = &[BackendKind::GoogleDrive, BackendKind::LocalFolder];
 
     /// The stable stored/wire identifier. This string is written to
     /// `accounts.backend_kind` and crosses the Tauri IPC boundary, so it is
@@ -58,6 +62,7 @@ impl BackendKind {
     pub const fn id(self) -> &'static str {
         match self {
             BackendKind::GoogleDrive => "google_drive",
+            BackendKind::LocalFolder => "local_folder",
         }
     }
 
@@ -71,6 +76,9 @@ impl BackendKind {
     pub const fn uses_oauth(self) -> bool {
         match self {
             BackendKind::GoogleDrive => true,
+            // A folder the user can already write to needs no credential, so
+            // there is nothing to consent to and nothing in the keychain.
+            BackendKind::LocalFolder => false,
         }
     }
 
@@ -79,6 +87,11 @@ impl BackendKind {
     pub const fn supports_folder_picker(self) -> bool {
         match self {
             BackendKind::GoogleDrive => true,
+            // The destination folder is chosen with the OS folder dialog at
+            // setup time, and everything below it is Driven's; browsing the
+            // remote tree afterwards would only offer the user a way to nest
+            // one backup inside another.
+            BackendKind::LocalFolder => false,
         }
     }
 
@@ -114,6 +127,7 @@ impl BackendKind {
     pub fn to_stored(self) -> Option<&'static str> {
         match self {
             BackendKind::GoogleDrive => None,
+            other => Some(other.id()),
         }
     }
 }
