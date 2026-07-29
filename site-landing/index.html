@@ -129,6 +129,18 @@
             </p>
           </li>
         </ul>
+        <!--
+        DRAFT feature cards - do not uncomment until the corresponding PR
+        merges. Add each as a <li class="feature"> once shipped, then delete
+        this comment wrapper.
+        - S3-compatible backup destination (#207, unmerged; depends on #200's
+          pluggable-backend seam / driven-remote crate, also unmerged).
+        - Local / removable-drive backup destination (unmerged).
+        - Guided macOS Full Disk Access onboarding (#205, unmerged).
+        - Scheduled integrity scrub (unmerged).
+        - Restore drill (unmerged).
+        - rclone config importer (unmerged).
+        -->
       </div>
     </section>
 
@@ -155,11 +167,14 @@
           </li>
         </ul>
         <p class="section-note">
-          V1 binaries are not yet code-signed with a paid OS certificate, so the
+          Binaries are not yet code-signed with a paid OS certificate, so the
           OS may warn you on first run. On Windows click "More info" then "Run
           anyway"; on macOS right-click the app and choose "Open". The in-app
           auto-updater works on Windows and Linux; on macOS, re-download the latest
-          <code>.dmg</code> to update until Developer ID signing lands.
+          <code>.dmg</code> to update until Developer ID signing lands. The
+          macOS-specific work in this release was verified on real Apple
+          Silicon hardware; that is a separate thing from code signing, which
+          is still pending.
         </p>
         <div class="cta-row">
           <a class="btn btn-primary" href="https://github.com/pmaxhogan/driven/releases">

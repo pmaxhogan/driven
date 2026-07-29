@@ -42,7 +42,7 @@ Legend: :white_check_mark: yes &nbsp; :large_orange_diamond: partial (see note) 
 | Recovery phrase for the encryption key | :white_check_mark: | :x:⁹ | :x: | :x:⁹ | :x:⁹ | :x:⁹ |
 | Point-in-time restore (an earlier version by date) | :white_check_mark: | :x: | :large_orange_diamond:¹⁰ | :white_check_mark: | :white_check_mark: | :white_check_mark:¹¹ |
 | Block-level deduplication | :x:⁶ | :x: | :x: | :white_check_mark: | :white_check_mark: | :x: |
-| Locked / open-file backup (Windows VSS) | :white_check_mark: | :x: | :large_orange_diamond:¹² | :white_check_mark: | :white_check_mark: | :white_check_mark: |
+| Locked / open-file backup (Windows VSS)⁴¹ | :white_check_mark: | :x: | :large_orange_diamond:¹² | :white_check_mark: | :white_check_mark: | :white_check_mark: |
 | Periodic integrity re-verification | :white_check_mark: | :large_orange_diamond:¹³ | :x: | :white_check_mark: | :large_orange_diamond:¹³ | :large_orange_diamond:¹³ |
 | Re-uploads backup copies deleted at the destination | :white_check_mark:¹⁴ | :white_check_mark:¹⁵ | :x:¹⁶ | :large_orange_diamond:¹⁷ | :large_orange_diamond:¹⁷ | :grey_question:¹⁸ |
 | Parallel, multi-threaded local scan | :white_check_mark:¹⁹ | :white_check_mark:²⁰ | :grey_question:²¹ | :x:²² | :large_orange_diamond:²³ | :grey_question:²¹ |
@@ -99,6 +99,7 @@ Notes:
 - ³⁸ Windows and macOS only; Linux needs third-party tools.
 - ³⁹ `bench/` runs Driven's real engine and rclone over identical seeded fixtures against a live Drive account, reporting wall time, throughput, API calls, CPU time, and peak memory for a cold and an incremental pass. See [`bench/README.md`](bench/README.md) for scales, costs, and what is and is not apples-to-apples.
 - ⁴⁰ The others publish unit-test microbenchmarks, internal tuning harnesses (Duplicati's unreleased AutoTune), or vendor marketing numbers, rather than a runnable end-to-end suite. Backblaze does publish a quarterly benchmark, but of B2 object storage rather than the backup client.
+- ⁴¹ Driven's checkmark is scoped to Windows, where a VSS snapshot lets a locked file (Outlook PST, running DB, VM disk) back up while it is held open. Neither macOS nor Linux backs a file up through a lock today - on macOS and Linux, a file Driven cannot open is instead classified precisely as a transient lock (`local.file_locked`) versus a macOS Full Disk Access denial (`local.permission_denied`) and skipped with a clear reason in the activity log, rather than misreported as a disk error. A macOS APFS-snapshot bypass equivalent to Windows VSS exists as a broker crate but is not yet wired into the backup path, so it does not do anything for a user yet; there is no Linux equivalent planned. See `design/DESIGN.md` §5.3 and §5.3.2.
 
 Competitor rows were verified in July 2026 against rclone 1.74.4, restic 0.19.1,
 Duplicati 2.3.0.4, Backblaze Personal Backup 10.0.2, and Drive for desktop 128.0.
@@ -124,7 +125,11 @@ These move: check each project's current docs before relying on a cell.
   outside Driven, so a destination-side deletion cannot leave a file silently
   un-backed-up.
 - Windows Volume Shadow Copy support so locked files (Outlook PSTs, running DB
-  files, VM disks) still back up.
+  files, VM disks) still back up. On macOS and Linux, a file Driven cannot open
+  is classified precisely - a transient lock versus a macOS Full Disk Access
+  denial - and skipped with a clear reason rather than reported as a generic
+  disk error; an APFS-snapshot bypass equivalent to Windows VSS is in
+  development for macOS but not yet available.
 - In-app restore browser with full-text file-name search and streaming decrypt.
 - Activity dashboard with a live tail and filterable history.
 - Rolling local log files covering both the backend and the webview console,
@@ -133,6 +138,24 @@ These move: check each project's current docs before relying on a cell.
   selector.
 - Anonymous, opt-out telemetry (coarse counts only; never file names, paths, or
   content).
+
+<!--
+DRAFT - do not uncomment until the corresponding PR merges. Flip each bullet
+on individually as its PR lands, then delete this comment wrapper.
+- S3-compatible backup destination, in addition to Google Drive. (#207,
+  unmerged - depends on the pluggable-backend seam / `driven-remote` crate,
+  #200, also unmerged.)
+- Local / removable-drive backup destination. (unmerged - same seam as above.)
+- Guided Full Disk Access onboarding for macOS, so Driven walks you through
+  granting access to Mail / Messages / Photos instead of requiring a manual
+  System Settings visit. (#205, unmerged.)
+- Scheduled integrity scrub that periodically re-verifies already-backed-up
+  files against the destination. (unmerged.)
+- Restore drill: a one-click "prove the backup actually restores" check.
+  (unmerged.)
+- rclone config importer: point Driven at an existing rclone config to
+  pre-fill setup. (unmerged.)
+-->
 
 ## Install
 
@@ -169,11 +192,40 @@ macOS will refuse to open an unsigned app on a double-click. Either:
   xattr -dr com.apple.quarantine "/Applications/Driven.app"
   ```
 
-#### macOS auto-updater caveat (V1)
+#### macOS Full Disk Access (separate from Gatekeeper)
 
-Because the macOS build is not signed with a Developer ID in V1, the in-app
+Opening the app (above) and reading protected data are two different macOS
+permissions, and one does not grant the other. macOS's privacy layer (TCC)
+blocks access to `~/Library/Mail`, `~/Library/Messages`, Photos, and similar
+locations no matter what the file's permission bits say, until you grant
+Driven **Full Disk Access** in System Settings > Privacy & Security > Full
+Disk Access. A file in that state fails to open with a permission error, not a
+"file is busy" error, and Driven reports it in the activity log rather than
+silently skipping it or silently backing it up.
+
+There is currently no in-app guided flow for granting Full Disk Access - that
+is planned for a future release. Until then, grant it manually if you want
+those folders backed up; everything else backs up normally without it.
+
+**A locked-file snapshot is not a substitute for Full Disk Access, and Driven
+never tries to make it one.** Driven's locked-file handling (Windows VSS
+today; a macOS APFS-snapshot equivalent is in development, see the table
+above) exists to read around a file that is transiently *busy* - open in
+another program. It does not and cannot read around a TCC *denial*, because a
+snapshot preserves the original file's permissions and is itself subject to
+the same TCC check. The historical `-o noowners` mount trick that could bypass
+this (CVE-2020-9771) is long patched and is now a signature EDR products flag
+as suspicious; Driven does not use it and never will.
+
+#### macOS auto-updater caveat
+
+Because the macOS build is not signed with a Developer ID, the in-app
 auto-updater is NOT reliable on macOS: the OS may block the silently-staged
-update from launching. This is a known V1 limitation. On macOS, update Driven by
+update from launching. This is a known limitation - unrelated to hardware
+access (the macOS-specific work in this release, including the locked-file
+classification and the tray icon, was verified on real Apple Silicon
+hardware) and purely about the unresolved cost/process of Developer ID
+enrollment. On macOS, update Driven by
 re-downloading the latest `.dmg` from the Releases page and reinstalling, rather
 than relying on the in-app updater. On Windows and Linux the in-app updater works
 normally. Code signing on macOS is tracked for a future release, after which the
