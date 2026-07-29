@@ -22,6 +22,7 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
     all.extend(scenarios::ntfs::scenarios());
     all.extend(scenarios::mutation::scenarios());
     all.extend(scenarios::drive_side::scenarios());
+    all.extend(scenarios::backends::scenarios());
     all.extend(scenarios::concurrency::scenarios());
     // s4 continuous-mutation soak / fuzz scenarios and s6.3 cross-scenario
     // invariant scenarios are registered alongside the s3 catalogue so
@@ -41,6 +42,13 @@ pub fn registry() -> Vec<Box<dyn Scenario>> {
 pub fn fault_injection_registry() -> Vec<Box<dyn Scenario>> {
     let mut all: Vec<Box<dyn Scenario>> = Vec::new();
     all.extend(scenarios::drive_side::scenarios());
+    // s3.9 backend hazards belong in the dedicated fault-injection gate too:
+    // they ARE fault injection, just one layer lower (on the wire, against the
+    // real `driven_s3::S3Store`) than the s3.7 rows against
+    // `InMemoryRemoteStore`. Omitting them here would leave the S3 wire quirks
+    // out of the faster-feedback job that names itself after this exact
+    // concern.
+    all.extend(scenarios::backends::scenarios());
     all.extend(scenarios::mutator::scenarios());
     all
 }

@@ -853,6 +853,25 @@ impl InMemoryRemoteStore {
         }
     }
 
+    /// Latch the destination-folder-missing fault on a store that is ALREADY
+    /// serving traffic.
+    ///
+    /// Counterpart to the construction-time builder
+    /// [`InMemoryRemoteStore::with_dest_folder_missing`], in the same shape as
+    /// [`InMemoryRemoteStore::arm_session_invalidated_after`]: the builder
+    /// arms a store before it is used, this arms one mid-run.
+    ///
+    /// Needed because "the destination vanished" is a MID-RUN event. Asserting
+    /// that nothing already backed up is lost requires a healthy first cycle to
+    /// establish a synced baseline, and only then the fault - which a
+    /// construction-time-only surface cannot express without rebuilding the
+    /// store and throwing away the very objects the assertion is about.
+    pub fn latch_dest_folder_missing(&self) {
+        self.faults
+            .dest_folder_missing
+            .store(true, std::sync::atomic::Ordering::Release);
+    }
+
     // ---------------------------------------------------------------
     // Internal helpers.
     // ---------------------------------------------------------------
