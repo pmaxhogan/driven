@@ -109,8 +109,9 @@ not a hidden failure.
 
 `cargo test --workspace` must never touch your real login keychain, and it
 does not. Any test that can reach a keychain entry - Driven stores the account
-master key under `dev.maxhogan.driven` and the Google secrets under
-`driven.google.refresh_token` / `driven.google.client_creds` - starts with:
+master key under `dev.maxhogan.driven`, the Google secrets under
+`driven.google.refresh_token` / `driven.google.client_creds`, and S3 key pairs
+under `driven.s3.credentials` - starts with:
 
 ```rust
 let Some(_guard) = driven_test_fixtures::keychain::isolated() else {
@@ -124,7 +125,8 @@ allowed to store anything, and returns `None` (so the test skips honestly) if it
 cannot. Add that line to any new test that reaches the keychain, and add
 `driven-test-fixtures` to your crate's `[dev-dependencies]` if it is not there
 yet. Every crate that owns a keychain call site - `driven-crypto`,
-`driven-drive`, `driven-backend`, `src-tauri` - already has the wiring and a
+`driven-drive`, `driven-s3`, `driven-backend`, `src-tauri` - already has the
+wiring and a
 `the_test_suite_is_isolated_from_the_os_keychain` guard test, so if the
 mechanism ever breaks (a `keyring` upgrade, say) those fail loudly instead of
 the suite quietly starting to write for real.

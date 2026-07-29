@@ -32,3 +32,5 @@ tracing.workspace = true
 # headless CI box's absent one. Dev-only: production always uses the real
 # per-OS store.
 driven-test-fixtures = { path = "../driven-test-fixtures" }
+# The local-folder tests need a throwaway destination directory.
+tempfile = "3"

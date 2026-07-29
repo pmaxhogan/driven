@@ -141,22 +141,27 @@ honour them; deviating requires re-asking the user.
     update.** Distribution friction is not the only price of shipping
     unsigned on macOS. The bundle is only ad-hoc (linker) signed, so
     it has no stable designated requirement and its cdhash changes
-    every build - and macOS pins both keychain ACLs and TCC privacy
-    grants to exactly that identity. So each update is a new app as
-    far as the OS is concerned: the user is re-prompted for access to
-    Driven's three keychain services (`dev.maxhogan.driven`,
-    `driven.google.refresh_token`, `driven.google.client_creds`) and a
-    granted Full Disk Access can silently stop taking effect until it
-    is removed and re-added. Denying the keychain prompt is safe by
-    construction - the per-source crypto resolver fails closed
-    (`Unavailable` -> `crypto.key_missing`, §7.1) rather than
-    uploading plaintext - but it does stall encrypted sources until
-    the user re-authorizes. A Developer ID signature is the only fix;
-    an entitlement cannot substitute for one. The same mechanism bites
-    development: because every `cargo test` rebuild is a new identity,
-    a test that reaches the real keychain re-prompts on every rebuild,
-    which is why the suite is keychain-isolated (see CONTRIBUTING and
-    `driven_test_fixtures::keychain`).
+    every build - and macOS pins permission grants to exactly that
+    identity, so each update is a new program as far as the OS is
+    concerned. §5.3.3 covers the TCC / Full Disk Access half of this
+    (and the banner copy that warns about it). **Keychain ACLs behave
+    the same way**, which is the half nothing else documents: an
+    "Always Allow" recorded against one build does not carry to the
+    next, so every update re-prompts for each keychain service Driven
+    uses - `dev.maxhogan.driven`, `driven.google.refresh_token`,
+    `driven.google.client_creds`, `driven.s3.credentials`. Apple
+    states the rule plainly: the dialog reappears when the system
+    software or the app was updated, or the app was modified.
+    Denying the prompt is safe by construction - the per-source crypto
+    resolver fails closed (`Unavailable` -> `crypto.key_missing`,
+    §7.1) rather than uploading plaintext - but it does stall
+    encrypted sources until the user re-authorizes. A Developer ID
+    signature is the only fix; an entitlement cannot substitute for
+    one. The same mechanism bites development: because every `cargo
+    test` rebuild is a new identity, a test that reaches the real
+    keychain re-prompts on EVERY rebuild and blocks the run on a modal
+    dialog, which is why the suite is keychain-isolated (see
+    CONTRIBUTING and `driven_test_fixtures::keychain`).
 - **Update channels:** **stable + dev.** Stable = tagged releases on `main`.
   Dev = GATED dev builds (NOT every main commit): `dev-channel.yml` builds only on
   a manual `workflow_dispatch` OR when the head commit message contains the
@@ -872,6 +877,11 @@ while being denied. This is a recurring, confusing support case rather than
 a hypothetical, so the banner states it in one line and the README explains
 the remove-and-re-add fix in full. It resolves itself when macOS code
 signing lands.
+
+The same identity binding governs **keychain** ACLs, so the same update also
+re-prompts for every secret Driven stores. That half has no banner (the OS
+dialog is itself the prompt, and answering it once per update is the whole
+fix); see §3.6 and the README's macOS caveats.
 
 ### 5.4 Upload pipeline
 
