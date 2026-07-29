@@ -113,14 +113,19 @@ pub fn isolated() -> Option<KeychainGuard> {
 /// a crate can make in a guard test: `assert!(driven_test_fixtures::keychain::
 /// is_isolated())` fails loudly if the mechanism ever stops working for that
 /// crate's test binary.
+///
+/// Deliberately does NOT take the [`lock`]: that lock serializes access to the
+/// process-global *entries*, which this never touches, and taking it would make
+/// a guard test stall behind whichever test currently holds a
+/// [`KeychainGuard`]. [`install`] is idempotent and internally synchronized.
 #[must_use]
 pub fn is_isolated() -> bool {
-    let _guard = lock().lock().unwrap_or_else(|e| e.into_inner());
     install()
 }
 
 /// Installs + proves the mock exactly once per process; later calls return the
-/// cached verdict. Callers must hold [`lock`].
+/// cached verdict. Internally synchronized (`OnceLock`), so it is safe to call
+/// with or without [`lock`] held.
 fn install() -> bool {
     static ACTIVE: OnceLock<bool> = OnceLock::new();
     *ACTIVE.get_or_init(install_once)
