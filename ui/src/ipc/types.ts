@@ -377,12 +377,36 @@ export interface VssHelperStatus {
   lockedFileBackupDegraded: boolean;
 }
 
+export interface MacosSettings {
+  apfsSnapshot: boolean;
+}
+
+/** Status of least-privilege locked-file backup on macOS (DESIGN s5.3.2). */
+export interface ApfsHelperStatus {
+  supported: boolean;
+  helperEnabled: boolean;
+  /** The privileged helper is running this session (lazy - it only launches on
+   * the first locked file, so usually false at Settings-open). */
+  helperAlive: boolean;
+  /** The helper can be brought up on demand (installed, no prior launch
+   * failure), so locked-file backup is available even before the launch. */
+  helperLaunchable: boolean;
+  /** A launch is in progress - awaiting administrator approval; the Rules tab
+   * shows a "waiting for approval" hint until it resolves. */
+  launchPending: boolean;
+  /** The user declined the administrator prompt this session (memoised). */
+  launchDeclined: boolean;
+  lockedFileBackupDegraded: boolean;
+}
+
 export interface SettingsDto {
   global: GlobalSettings;
   telemetry: TelemetrySettings;
   updater: UpdaterSettings;
   ui: UiSettings;
   windows: WindowsSettings | null;
+  /** null off macOS (the backend gates it on `cfg!(target_os = "macos")`). */
+  macos: MacosSettings | null;
   /** V2 small-file bundling on/off (issue #35). A standalone advanced toggle. */
   bundleSmallFiles: boolean;
 }
@@ -441,12 +465,17 @@ export interface WindowsSettingsPatch {
   vssHelper?: boolean;
 }
 
+export interface MacosSettingsPatch {
+  apfsSnapshot?: boolean;
+}
+
 export interface SettingsPatch {
   global?: GlobalSettingsPatch;
   telemetry?: TelemetrySettingsPatch;
   updater?: UpdaterSettingsPatch;
   ui?: UiSettingsPatch;
   windows?: WindowsSettingsPatch;
+  macos?: MacosSettingsPatch;
   /** Toggle V2 small-file bundling (issue #35). Absent = leave unchanged. */
   bundleSmallFiles?: boolean;
 }

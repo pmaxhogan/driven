@@ -554,6 +554,8 @@ pub struct SettingsDto {
     pub ui: UiSettings,
     /// SPEC s22 `windows` settings group; `None` on non-Windows hosts.
     pub windows: Option<WindowsSettings>,
+    /// SPEC s22 `macos` settings group; `None` on non-macOS hosts.
+    pub macos: Option<MacosSettings>,
     /// V2 small-file bundling on/off (issue #35 item d). A standalone advanced
     /// toggle, NOT part of any SPEC s22 group blob: it is backed by the
     /// `bundle_small_files` settings KV key the core planner reads directly, so
@@ -689,6 +691,56 @@ pub struct WindowsSettings {
     pub vss_helper: bool,
 }
 
+/// SPEC s22 `macos` settings (macOS-only).
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacosSettings {
+    /// Back up locked (BUSY) files by reading them out of an APFS local snapshot
+    /// mounted by the least-privilege root broker (DESIGN s5.3.2), so the main
+    /// app stays un-elevated. `false` (default) keeps the historical behaviour
+    /// (a locked file is skipped and retried next cycle).
+    ///
+    /// Scope: this helps BUSY/locked files only. It does NOT read around a TCC
+    /// (privacy) denial - a snapshot mount preserves the original's ownership
+    /// and is itself TCC-gated - so a `local.permission_denied` file still needs
+    /// Full Disk Access.
+    #[serde(default)]
+    pub apfs_snapshot: bool,
+}
+
+/// Status of macOS locked-file backup (DESIGN s5.3.2), surfaced to the Settings
+/// hints. All fields are `false` off macOS. Mirrors [`VssHelperStatus`].
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ApfsHelperStatus {
+    /// APFS snapshot locked-file backup is a macOS-only capability.
+    pub supported: bool,
+    /// The user has opted in (`macos.apfs_snapshot`).
+    pub helper_enabled: bool,
+    /// The root broker has been LAUNCHED this session. Lazy: the broker only
+    /// launches on the first locked file, so this is usually `false` at
+    /// Settings-open time even when the setting is on.
+    #[serde(default)]
+    pub helper_alive: bool,
+    /// The broker can be brought up ON DEMAND - the bundled sidecar is present
+    /// and a prior launch did not fail or get declined.
+    #[serde(default)]
+    pub helper_launchable: bool,
+    /// A launch is in progress - awaiting administrator approval. The UI shows a
+    /// "waiting for approval" hint while this is `true`.
+    #[serde(default)]
+    pub launch_pending: bool,
+    /// The user declined (or dismissed) the administrator prompt this session.
+    /// Memoised - no further prompt until the app restarts or the toggle is
+    /// switched off then on.
+    #[serde(default)]
+    pub launch_declined: bool,
+    /// Locked-file backup is currently DEGRADED: files held open are being
+    /// skipped because no APFS snapshot can be taken (the setting is off, or the
+    /// broker was declined / cannot launch).
+    pub locked_file_backup_degraded: bool,
+}
+
 /// Status of least-privilege locked-file backup (DESIGN s5.3.1), surfaced to the
 /// Settings banner. All fields are `false` off Windows.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
@@ -745,6 +797,8 @@ pub struct SettingsPatch {
     pub ui: Option<UiSettingsPatch>,
     /// Partial `windows` group (Windows-only).
     pub windows: Option<WindowsSettingsPatch>,
+    /// Partial `macos` group (macOS-only).
+    pub macos: Option<MacosSettingsPatch>,
     /// Toggle V2 small-file bundling (issue #35 item d). `None` = leave
     /// unchanged; `Some(v)` writes the `bundle_small_files` settings KV key the
     /// core reads. See [`SettingsDto::bundle_small_files`].
@@ -849,6 +903,14 @@ pub struct WindowsSettingsPatch {
     pub vss_mode: Option<String>,
     /// See [`WindowsSettings::vss_helper`].
     pub vss_helper: Option<bool>,
+}
+
+/// Partial SPEC s22 `macos` settings.
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MacosSettingsPatch {
+    /// See [`MacosSettings::apfs_snapshot`].
+    pub apfs_snapshot: Option<bool>,
 }
 
 /// Issue #34: the result of validating a candidate custom-root-CA PEM file for

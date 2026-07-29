@@ -49,6 +49,12 @@ use driven_power::RealPowerSource;
 #[cfg(windows)]
 use driven_vss_helper::{BrokeredVssProvider, HelperLauncher};
 
+// DESIGN s5.3.2: likewise the APFS provider + its launcher trait are only
+// referenced in the macOS `build_vss` arm.
+#[cfg(target_os = "macos")]
+use driven_apfs::{ApfsBrokeredProvider, HelperLauncher as ApfsHelperLauncher};
+
+use crate::apfs_helper::ApfsHelperManager;
 use crate::app_state::{
     fake_remote_store_in, AccountHandle, AccountTasks, AppState, FakeRemoteStores, RemoteMode,
 };
@@ -99,12 +105,19 @@ pub async fn build_and_spawn(
     let helper_enabled = crate::commands::settings::load_vss_helper_enabled(state.as_ref()).await;
     let vss_helper = build_vss_helper_manager(&all_sources, helper_enabled);
 
+    // DESIGN s5.3.2: the macOS mirror - build the APFS snapshot broker manager
+    // ONCE so every account's ApfsBrokeredProvider shares one broker / socket /
+    // administrator prompt. `None` off macOS.
+    let apfs_enabled = crate::commands::settings::load_apfs_snapshot_enabled(state.as_ref()).await;
+    let apfs_helper = build_apfs_helper_manager(&all_sources, apfs_enabled);
+
     tracing::info!(
         target: TARGET,
         accounts = accounts.len(),
         sources = all_sources.len(),
         fake_remote = use_fake,
         vss_helper = vss_helper.is_some(),
+        apfs_helper = apfs_helper.is_some(),
         "assembling per-account orchestrators"
     );
 
@@ -168,6 +181,7 @@ pub async fn build_and_spawn(
             use_fake,
             &fake_remote_stores,
             vss_helper.as_ref(),
+            apfs_helper.as_ref(),
             &latency,
         )
         .await
@@ -215,6 +229,11 @@ pub async fn build_and_spawn(
     // and `get_vss_helper_status` can report truthful liveness.
     if let Some(manager) = vss_helper {
         app_state.set_vss_helper_manager(manager);
+    }
+    // DESIGN s5.3.2: same for the APFS broker, so the quit sweep can shut it down
+    // and `get_apfs_helper_status` can report truthful liveness.
+    if let Some(manager) = apfs_helper {
+        app_state.set_apfs_helper_manager(manager);
     }
     Ok(app_state)
 }
@@ -325,6 +344,9 @@ pub async fn spawn_account(
     // Issue #25: reuse the SAME broker manager the running AppState owns, so a
     // hot-added account's BrokeredVssProvider shares the one launch / pipe.
     let vss_helper = app_state.vss_helper_manager();
+    // DESIGN s5.3.2: likewise reuse the SAME APFS broker manager, so a hot-added
+    // account's ApfsBrokeredProvider shares the one broker / socket / prompt.
+    let apfs_helper = app_state.apfs_helper_manager();
 
     // DESIGN s13: a hot-added account records into the SAME app-global latency
     // reservoir the running AppState + ping task already share.
@@ -338,6 +360,7 @@ pub async fn spawn_account(
         use_fake,
         &fake_remote_stores,
         vss_helper.as_ref(),
+        apfs_helper.as_ref(),
         &latency,
     )
     .await?
@@ -405,6 +428,7 @@ async fn build_account(
     use_fake: bool,
     fake_remote_stores: &FakeRemoteStores,
     vss_helper: Option<&Arc<VssHelperManager>>,
+    apfs_helper: Option<&Arc<ApfsHelperManager>>,
     latency: &Arc<driven_core::telemetry::LatencyReservoir>,
 ) -> anyhow::Result<BuildOutcome> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
@@ -504,7 +528,7 @@ async fn build_account(
     // --- VSS provider (Windows): SAME Arc into executor + orchestrator --------
     // Brokered through the least-privilege helper when `vss_helper` is present
     // (un-elevated + setting on); in-process RealVssProvider otherwise (issue #25).
-    let vss = build_vss(&config, vss_helper);
+    let vss = build_vss(&config, vss_helper, apfs_helper);
 
     // --- crypto: per-source keystore resolver (FAIL CLOSED - GA blocker) -----
     // B2: keep the CONCRETE Arc so the AccountHandle can expose it for live
@@ -794,9 +818,10 @@ fn emit_needs_reauth(app: &AppHandle, account: &AccountRow) {
 // the Drive store, and a second copy here would be the same
 // two-definitions-that-drift trap the appProperties keys warn about.
 
-/// Build the Windows VSS snapshot provider (ROADMAP M3.5; DESIGN s5.3.1), or
-/// `None` off Windows. The returned `Arc` is threaded into BOTH the executor
-/// (snapshot reads) and the orchestrator (per-cycle release + orphan cleanup).
+/// Build the platform snapshot provider - Windows VSS (ROADMAP M3.5; DESIGN
+/// s5.3.1) or macOS APFS (DESIGN s5.3.2) - or `None` on Linux. The returned
+/// `Arc` is threaded into BOTH the executor (snapshot reads) and the
+/// orchestrator (per-cycle release + orphan cleanup).
 ///
 /// Two Windows shapes (issue #25):
 /// - `vss_helper` present (the app is UN-elevated): a [`BrokeredVssProvider`]
@@ -811,6 +836,7 @@ fn emit_needs_reauth(app: &AppHandle, account: &AccountRow) {
 fn build_vss(
     config: &OrchestratorConfig,
     vss_helper: Option<&Arc<VssHelperManager>>,
+    _apfs_helper: Option<&Arc<ApfsHelperManager>>,
 ) -> Option<Arc<dyn driven_vss::VssProvider>> {
     match vss_helper {
         Some(manager) => {
@@ -828,11 +854,35 @@ fn build_vss(
     }
 }
 
-/// Off Windows there is no VSS; the executor's locked-file path skips as before.
-#[cfg(not(windows))]
+/// On macOS the snapshot provider is the APFS broker (DESIGN s5.3.2). The SAME
+/// [`ApfsHelperManager`] `Arc` is the launcher for every account's provider, so
+/// there is ONE broker, ONE socket, and ONE administrator prompt per session -
+/// the macOS mirror of the Windows one-UAC-prompt model.
+///
+/// `None` when the manager could not be built (the sidecar path is
+/// unresolvable), which leaves the executor's locked-file path skipping exactly
+/// as it did before this feature existed.
+#[cfg(target_os = "macos")]
+fn build_vss(
+    config: &OrchestratorConfig,
+    _vss_helper: Option<&Arc<VssHelperManager>>,
+    apfs_helper: Option<&Arc<ApfsHelperManager>>,
+) -> Option<Arc<dyn driven_vss::VssProvider>> {
+    let manager = apfs_helper?;
+    let launcher: Arc<dyn ApfsHelperLauncher> = manager.clone();
+    Some(Arc::new(ApfsBrokeredProvider::new(
+        launcher,
+        config.vss_mode,
+    )))
+}
+
+/// Off Windows and macOS there is no snapshot provider; the executor's
+/// locked-file path skips as before.
+#[cfg(not(any(windows, target_os = "macos")))]
 fn build_vss(
     _config: &OrchestratorConfig,
     _vss_helper: Option<&Arc<VssHelperManager>>,
+    _apfs_helper: Option<&Arc<ApfsHelperManager>>,
 ) -> Option<Arc<dyn driven_vss::VssProvider>> {
     None
 }
@@ -897,6 +947,62 @@ fn build_vss_helper_manager(
     _all_sources: &[SourceRow],
     _helper_enabled: bool,
 ) -> Option<Arc<VssHelperManager>> {
+    None
+}
+
+/// Build the app-side APFS snapshot broker manager (DESIGN s5.3.2), or `None`
+/// when it cannot be in play. Built ONCE at boot and shared into every account's
+/// [`ApfsBrokeredProvider`], so there is a SINGLE broker / socket / administrator
+/// prompt across all accounts - the macOS mirror of the Windows model.
+///
+/// Built REGARDLESS of the `macos.apfs_snapshot` setting so the user can flip it
+/// on at runtime and have the already-wired providers use the broker without an
+/// app restart. The `enabled` flag gates behaviour: a disabled manager never
+/// launches and reports itself unavailable, so the providers behave exactly like
+/// the historical skip until the user opts in. Boot is LAZY (no password prompt
+/// at silent startup); the eager prompt only fires on the enable-toggle.
+///
+/// `None` when the current-exe path cannot be resolved (so the bundled sidecar
+/// cannot be located) or the socket directory cannot be created. The broker's
+/// allow-list of mountable volumes is the union of the configured source roots
+/// at boot - a source ADDED mid-session is covered on the next app restart, the
+/// same trust-model constraint the Windows broker has.
+#[cfg(target_os = "macos")]
+fn build_apfs_helper_manager(
+    all_sources: &[SourceRow],
+    helper_enabled: bool,
+) -> Option<Arc<ApfsHelperManager>> {
+    let helper_exe = ApfsHelperManager::bundled_helper_exe()?;
+    let runtime_dir = ApfsHelperManager::runtime_dir()?;
+    // Union of the configured source roots (dedup), fixed as the broker's
+    // mountable allow-list at launch.
+    let mut roots: Vec<std::path::PathBuf> = Vec::new();
+    for s in all_sources {
+        let p = std::path::PathBuf::from(&s.local_path);
+        if !roots.contains(&p) {
+            roots.push(p);
+        }
+    }
+    tracing::info!(
+        target: TARGET,
+        roots = roots.len(),
+        enabled = helper_enabled,
+        "DESIGN s5.3.2: APFS snapshot broker manager built; boot is lazy - the broker launches on the first locked file when enabled, or immediately when the user toggles it on"
+    );
+    Some(Arc::new(ApfsHelperManager::new(
+        helper_exe,
+        &runtime_dir,
+        roots,
+        helper_enabled,
+    )))
+}
+
+/// Off macOS the APFS broker does not exist.
+#[cfg(not(target_os = "macos"))]
+fn build_apfs_helper_manager(
+    _all_sources: &[SourceRow],
+    _helper_enabled: bool,
+) -> Option<Arc<ApfsHelperManager>> {
     None
 }
 

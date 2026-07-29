@@ -7,9 +7,11 @@ Cargo.lock.bak
 /src-tauri/target
 /src-tauri/gen
 /src-tauri/WixTools
-# Issue #25: the VSS helper sidecar is BUILT in CI (release.yml / dev-channel.yml)
-# and copied here with a target-triple suffix just before `tauri build`; never a
-# committed source artifact.
+# Issue #25: the privileged helper sidecars - the VSS helper on Windows
+# (DESIGN s5.3.1) and the APFS mount broker on macOS (DESIGN s5.3.2) - are
+# BUILT in CI (release.yml / dev-channel.yml) and copied here with a
+# target-triple suffix just before `tauri build`; never committed source
+# artifacts.
 /src-tauri/binaries
 
 # Node

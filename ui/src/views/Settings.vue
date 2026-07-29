@@ -12,8 +12,13 @@ import TelemetryPreviewModal from "../components/TelemetryPreviewModal.vue";
 import About from "./About.vue";
 import { useSettingsStore } from "../stores/settings";
 import { useToastsStore } from "../stores/toasts";
-import { getVssHelperStatus, validateCustomCa, validateProxy } from "../ipc/commands";
-import type { SettingsPatch, VssHelperStatus } from "../ipc/types";
+import {
+  getApfsHelperStatus,
+  getVssHelperStatus,
+  validateCustomCa,
+  validateProxy,
+} from "../ipc/commands";
+import type { ApfsHelperStatus, SettingsPatch, VssHelperStatus } from "../ipc/types";
 
 // Settings view (SPEC s25 /accounts, /sources, /rules, /about; DESIGN s8.2). One
 // view hosts the four routed tabs; the active tab comes from the route (router
@@ -85,6 +90,49 @@ function pollVssStatusWhilePending(attemptsLeft: number): void {
   }, 1500);
 }
 onUnmounted(clearVssPoll);
+
+// macOS locked-file backup status (DESIGN s5.3.2). The APFS-snapshot path is the
+// mac twin of the Windows VSS helper above: a small privileged helper mounts a
+// read-only local snapshot so held-open files can be read. Kept as its own set of
+// refs/functions rather than generalised over the VSS ones - the two platforms'
+// statuses are independent and only one of them is ever non-null.
+const apfsStatus = ref<ApfsHelperStatus | null>(null);
+// While the helper is being installed/launched, show a "waiting for approval"
+// hint; once the user declines the administrator prompt, show a "declined" hint.
+const showApfsPending = computed(() => apfsStatus.value?.launchPending ?? false);
+const showApfsDeclined = computed(() => apfsStatus.value?.launchDeclined ?? false);
+
+// Poll timer used to watch a pending launch resolve (pending -> ready/declined).
+// Bounded + cleared on unmount so no timer is orphaned.
+let apfsPollTimer: ReturnType<typeof setTimeout> | null = null;
+function clearApfsPoll(): void {
+  if (apfsPollTimer !== null) {
+    clearTimeout(apfsPollTimer);
+    apfsPollTimer = null;
+  }
+}
+async function refreshApfsStatus(): Promise<void> {
+  try {
+    apfsStatus.value = await getApfsHelperStatus();
+  } catch {
+    apfsStatus.value = null;
+  }
+}
+// After the eager enable, the privileged launch resolves asynchronously; re-fetch
+// the status a few times so the Rules tab reflects pending -> ready/declined
+// without a manual refresh.
+function pollApfsStatusWhilePending(attemptsLeft: number): void {
+  clearApfsPoll();
+  if (attemptsLeft <= 0) return;
+  apfsPollTimer = setTimeout(() => {
+    void refreshApfsStatus().then(() => {
+      if (apfsStatus.value?.launchPending) {
+        pollApfsStatusWhilePending(attemptsLeft - 1);
+      }
+    });
+  }, 1500);
+}
+onUnmounted(clearApfsPoll);
 
 // Shared design-system class strings (DRIVEN UI design system). Native controls
 // MUST carry explicit light/dark surface + text colors so they stay readable on a
@@ -159,6 +207,12 @@ watch(
           // No status (e.g. IPC unavailable in a browser dev shell): hide the
           // banner rather than surface an error on the Rules tab.
           vssStatus.value = null;
+        });
+      void getApfsHelperStatus()
+        .then((s) => (apfsStatus.value = s))
+        .catch(() => {
+          // Same fallback as the VSS status above: no status = no hints.
+          apfsStatus.value = null;
         });
     }
   },
@@ -499,6 +553,23 @@ async function setVssHelper(event: Event): Promise<void> {
     pollVssStatusWhilePending(60);
   } else {
     clearVssPoll();
+  }
+}
+
+// DESIGN s5.3.2: toggle APFS-snapshot backup of locked files on macOS. Enabling
+// it fires the ATTENDED administrator prompt right away (the user is here to
+// approve it); the launch resolves asynchronously, so we re-fetch the status and
+// poll while it is pending to show waiting -> ready / declined without a manual
+// refresh.
+async function setApfsSnapshot(event: Event): Promise<void> {
+  const checked = (event.target as HTMLInputElement).checked;
+  await commitPatch({ macos: { apfsSnapshot: checked } });
+  await refreshApfsStatus();
+  if (checked && apfsStatus.value?.launchPending) {
+    // Watch the pending launch resolve (bounded; cleared on unmount).
+    pollApfsStatusWhilePending(60);
+  } else {
+    clearApfsPoll();
   }
 }
 
@@ -897,6 +968,50 @@ const showTelemetryPreview = ref(false);
             class="text-xs text-amber-700 dark:text-amber-300"
           >
             {{ t("settings.rules.vssHelperDeclined") }}
+          </p>
+
+          <!-- macOS twin of the VSS helper above (DESIGN s5.3.2). `macos` is
+               non-null only on macOS, so exactly one of the two blocks renders. -->
+          <label
+            v-if="settings.settings.macos"
+            class="block space-y-1"
+            data-testid="apfs-snapshot-setting"
+          >
+            <span class="flex items-center gap-2">
+              <input
+                type="checkbox"
+                class="accent-teal-600"
+                data-testid="apfs-snapshot-toggle"
+                :checked="settings.settings.macos.apfsSnapshot"
+                @change="setApfsSnapshot"
+              />
+              {{ t("settings.rules.apfsSnapshotLabel") }}
+            </span>
+            <p class="text-xs text-zinc-500 dark:text-zinc-400">
+              {{ t("settings.rules.apfsSnapshotNote") }}
+            </p>
+            <p
+              data-testid="apfs-snapshot-tcc-note"
+              class="text-xs text-zinc-500 dark:text-zinc-400"
+            >
+              {{ t("settings.rules.apfsSnapshotTccNote") }}
+            </p>
+          </label>
+
+          <!-- Attended-administrator launch feedback (DESIGN s5.3.2). -->
+          <p
+            v-if="showApfsPending"
+            data-testid="apfs-helper-pending"
+            class="text-xs text-teal-700 dark:text-teal-300"
+          >
+            {{ t("settings.rules.apfsHelperPending") }}
+          </p>
+          <p
+            v-else-if="showApfsDeclined"
+            data-testid="apfs-helper-declined"
+            class="text-xs text-amber-700 dark:text-amber-300"
+          >
+            {{ t("settings.rules.apfsHelperDeclined") }}
           </p>
         </section>
 

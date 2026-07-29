@@ -16,6 +16,10 @@
 // The `locales` path is relative to `CARGO_MANIFEST_DIR` (src-tauri/).
 rust_i18n::i18n!("locales", fallback = "en-US");
 
+// DESIGN s5.3.2: app-side owner of the macOS APFS snapshot broker (the macOS
+// sibling of `vss_helper`). Compiled on every target so its gate tests run in
+// the 3-OS CI matrix; only the socket/mount calls inside are macOS-gated.
+mod apfs_helper;
 mod app_state;
 mod assembly;
 // `pub` so the integration tests (`tests/ipc_path_validation.rs`, SPEC s11.6.1)
@@ -316,6 +320,11 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
     // backup is mid-stream on the pipe. Sync (a quick pipe Shutdown), so it runs
     // on this thread rather than the async runtime.
     state.shutdown_vss_helper();
+
+    // DESIGN s5.3.2: the macOS mirror - shut the APFS snapshot broker down so no
+    // root process, and no mounted snapshot, outlives the app session. Same
+    // ordering rationale as the VSS sweep above.
+    state.shutdown_apfs_helper();
 }
 
 /// R2-P2-2: drive ONE cancelled restore task to a true stop with a bounded budget.
@@ -635,6 +644,7 @@ pub fn run() {
             // SPEC s11.6 settings & misc (M6).
             commands::settings::get_settings,
             commands::settings::get_vss_helper_status,
+            commands::settings::get_apfs_helper_status,
             commands::settings::update_settings,
             commands::settings::export_diagnostic_bundle,
             commands::settings::check_for_updates,

@@ -15,6 +15,7 @@ import type {
   AddAccountWizardSessionId,
   AddSourceRequest,
   AddSourceResult,
+  ApfsHelperStatus,
   BackendDto,
   BackendKindId,
   CreateS3AccountRequest,
@@ -251,6 +252,11 @@ export function updateSettings(patch: SettingsPatch): Promise<SettingsDto> {
 /** Least-privilege locked-file backup status for the Settings banner (DESIGN s5.3.1). */
 export function getVssHelperStatus(): Promise<VssHelperStatus> {
   return invoke("get_vss_helper_status");
+}
+
+/** macOS locked-file backup status for the Settings hints (DESIGN s5.3.2). */
+export function getApfsHelperStatus(): Promise<ApfsHelperStatus> {
+  return invoke("get_apfs_helper_status");
 }
 
 export function exportDiagnosticBundle(token: string): Promise<string> {

@@ -1689,6 +1689,22 @@ Stored as JSON values in the `settings` KV table.
                                          //   false: no helper; VSS needs the whole app launched as Administrator
 }
 
+// key: "macos" (macOS-only; absent on Windows/Linux)
+{
+  "apfs_snapshot": false                 // false (default) | true
+                                         //   true:  back up locked (BUSY) files by reading them out of an APFS local
+                                         //          snapshot mounted by the least-privilege root broker
+                                         //          (DESIGN s5.3.2); launches driven-apfs-helper via one
+                                         //          administrator prompt per session, and the main app stays
+                                         //          un-elevated. Maps to VssMode::Auto for the provider.
+                                         //   false: no snapshot; a locked file is skipped and retried next cycle
+                                         //          (the historical behaviour). Maps to VssMode::Never.
+                                         // NOTE: this covers BUSY/locked files ONLY. It does NOT read around a TCC
+                                         // (privacy) denial - a snapshot mount preserves the original's ownership
+                                         // and is itself TCC-gated - so a `local.permission_denied` file still
+                                         // needs Full Disk Access. There is no snapshot-based workaround.
+}
+
 // key: "ui"
 {
   "tray_left_click_opens": "activity",

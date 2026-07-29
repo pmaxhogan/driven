@@ -696,6 +696,51 @@ start with it. A path that does not lie under the mount is mapped as
 so an exotic mount layout degrades to skip rather than reading the wrong
 file.
 
+**App wiring (the setting, the provider, the sidecar).** Three pieces, each
+the macOS mirror of its s5.3.1 Windows twin:
+
+1. **The opt-in setting** is `macos.apfs_snapshot` (SPEC s22), default
+   `false` - additive and `#[serde(default)]`, so a settings DB written
+   before this feature loads unchanged. It is macOS-only in the same way
+   `windows` is Windows-only: `get_settings` returns the `macos` group as
+   `None` off macOS, and that nullability IS the UI's platform check (no
+   userAgent sniff).
+2. **Provider selection** happens at the one existing site,
+   `assembly::build_vss`, which now has three arms (Windows VSS, macOS
+   APFS, Linux `None`). The macOS arm builds an `ApfsBrokeredProvider` over
+   a single app-owned `ApfsHelperManager`, and the SAME `Arc` is the
+   launcher for every account's provider - so there is ONE broker, ONE
+   socket, and ONE administrator prompt per session, matching the Windows
+   one-UAC-prompt model. The manager is built at boot REGARDLESS of the
+   setting, so toggling it on takes effect without an app restart; a
+   disabled manager reports `Disabled` and every provider behaves exactly
+   like the historical skip.
+3. **The toggle drives the provider's `VssMode`** (on -> `Auto`, off ->
+   `Never`), so a change is applied between cycles by the existing
+   `reconfigure` -> `VssProvider::set_mode` path rather than needing an
+   orchestrator rebuild. The manager gate and the mode are belt-and-braces:
+   either alone would disable the fallback.
+
+**Packaging.** `driven-apfs-helper` ships as a Tauri `externalBin` sidecar
+on both darwin targets, built in CI and staged into `src-tauri/binaries/`
+with a target-triple suffix, merged at bundle time via
+`--config src-tauri/tauri.apfs-helper.conf.json`. This is the same
+split-config trick s5.3.1 uses for the Windows helper, and for the same
+reason: each OS's bundle references only its own sidecar, and the
+cargo-only CI gates (which never pass `--config`) stay free of both. Tauri
+installs an externalBin into `Driven.app/Contents/MacOS/`, the same
+directory as the app binary, so the sidecar resolves via
+`current_exe().parent()` exactly as on Windows.
+
+**Not a TCC bypass.** Worth restating because it is the single most likely
+misreading of this whole section: an APFS snapshot lets Driven read a file
+that is BUSY. It does nothing whatsoever for a file TCC has denied. The
+mount preserves the original's ownership and the mounted tree is itself
+subject to TCC, and the historical `-o noowners` trick was CVE-2020-9771 -
+patched, and now an EDR-flagged signature we deliberately do not emit. A
+`local.permission_denied` file needs Full Disk Access; no snapshot setting
+substitutes for it.
+
 ### 5.4 Upload pipeline
 
 Per-account:

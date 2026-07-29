@@ -34,13 +34,23 @@ jobs:
     strategy:
       fail-fast: false
       matrix:
-        # Issue #25: `helperConfig` merges the Windows-only externalBin (the VSS
-        # helper sidecar) at bundle time via `--config` - so the mac/linux bundles
-        # never reference (and never require) the Windows-only sidecar, and the
-        # cargo-only CI gates (which do not pass --config) stay free of it.
+        # Issue #25: `helperConfig` merges the per-OS externalBin helper sidecar
+        # at bundle time via `--config` - the Windows VSS helper (DESIGN s5.3.1)
+        # on Windows, and the macOS APFS mount broker (DESIGN s5.3.2) on both
+        # darwin targets. Each OS's bundle therefore references ONLY its own
+        # sidecar (linux has none, so it stays empty), and the cargo-only CI
+        # gates (which do not pass --config) stay free of every sidecar.
         include:
-          - { os: macos-latest, target: aarch64-apple-darwin, helperConfig: "" }
-          - { os: macos-latest, target: x86_64-apple-darwin, helperConfig: "" }
+          - {
+              os: macos-latest,
+              target: aarch64-apple-darwin,
+              helperConfig: "--config src-tauri/tauri.apfs-helper.conf.json",
+            }
+          - {
+              os: macos-latest,
+              target: x86_64-apple-darwin,
+              helperConfig: "--config src-tauri/tauri.apfs-helper.conf.json",
+            }
           - { os: ubuntu-22.04, target: x86_64-unknown-linux-gnu, helperConfig: "" }
           - {
               os: windows-latest,
@@ -131,6 +141,24 @@ jobs:
              "src-tauri/binaries/driven-vss-helper-${{ matrix.target }}.exe"
           echo "staged sidecar:"; ls -la src-tauri/binaries
 
+      # DESIGN s5.3.2: build the least-privilege APFS snapshot mount broker
+      # binary and stage it as a Tauri externalBin sidecar (target-triple suffix)
+      # so `tauri build --config tauri.apfs-helper.conf.json` bundles it next to
+      # the app on macOS. `tauri build` does NOT build the helper bin itself (it
+      # is not a dependency of the app binary), so it must be prebuilt here.
+      # macOS only - the sidecar ships only in the darwin bundles.
+      - name: Build APFS helper sidecar (macOS)
+        if: runner.os == 'macOS'
+        shell: bash
+        run: |
+          set -euo pipefail
+          cargo build --release --target ${{ matrix.target }} \
+            -p driven-apfs --bin driven-apfs-helper
+          mkdir -p src-tauri/binaries
+          cp "target/${{ matrix.target }}/release/driven-apfs-helper" \
+             "src-tauri/binaries/driven-apfs-helper-${{ matrix.target }}"
+          echo "staged sidecar:"; ls -la src-tauri/binaries
+
       - name: Build + sign + release (tauri-action)
         uses: tauri-apps/tauri-action@v1
         env:
@@ -180,7 +208,9 @@ jobs:
           # `--bundles nsis` here. See design/CODEX_NOTES.md "## M10 dev-build fix".
           #
           # Issue #25: `helperConfig` is `--config src-tauri/tauri.helper.conf.json`
-          # on Windows (merges the externalBin VSS-helper sidecar), empty elsewhere.
+          # on Windows (merges the externalBin VSS-helper sidecar) and
+          # `--config src-tauri/tauri.apfs-helper.conf.json` on darwin (merges the
+          # externalBin APFS-helper sidecar); empty on linux.
           args: --target ${{ matrix.target }} ${{ matrix.helperConfig }}
 
   publish-updater-manifest:

@@ -132,6 +132,14 @@ driven-vss = { path = "../crates/driven-vss" }
 # argv + `HelperLauncher`) compiles on every target; the pipe/VSS/`runas` bits
 # are Windows-gated inside the crate.
 driven-vss-helper = { path = "../crates/driven-vss-helper" }
+# DESIGN s5.3.2: the macOS sibling of the VSS helper. The app-side lifecycle
+# manager (`apfs_helper.rs`) launches the root mount broker on demand via one
+# osascript consent prompt and hands each account an `ApfsBrokeredProvider` that
+# reads locked files out of an APFS local snapshot, so the main app stays
+# un-elevated. OS-independent surface (provider + launch argv + `HelperLauncher`)
+# compiles on every target; the socket/mount/osascript bits are macOS-gated
+# inside the crate.
+driven-apfs = { path = "../crates/driven-apfs" }
 
 # R2-P1-1 (SPEC s11.6.1): handle-based restore confinement on Unix. The restore
 # sink opens a verified no-follow parent-directory fd and does BOTH the temp
@@ -142,6 +150,10 @@ driven-vss-helper = { path = "../crates/driven-vss-helper" }
 # build/clippy stays green without rustix on Windows.
 [target.'cfg(unix)'.dependencies]
 rustix = { version = "1.1.4", features = ["fs"] }
+# DESIGN s5.3.2: `getuid` for the APFS broker's peer-uid allow-list (the broker
+# refuses any socket peer that is not the launching user). Already in the tree
+# via driven-apfs, so this adds no new build.
+libc = "0.2"
 
 # R1-P2-2 / R2-P1-1 (SPEC s11.6.1 step 5): atomic restore-over-existing + handle-
 # based confinement on Windows. The restore sink opens a verified no-follow parent

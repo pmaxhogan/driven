@@ -40,8 +40,9 @@ use driven_vss::VssMode;
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    CustomCaValidation, GlobalSettings, ReleaseDto, ScheduleSettings, SettingsDto, SettingsPatch,
-    TelemetrySettings, UiSettings, UpdateInfo, UpdaterSettings, VssHelperStatus, WindowsSettings,
+    ApfsHelperStatus, CustomCaValidation, GlobalSettings, MacosSettings, ReleaseDto,
+    ScheduleSettings, SettingsDto, SettingsPatch, TelemetrySettings, UiSettings, UpdateInfo,
+    UpdaterSettings, VssHelperStatus, WindowsSettings,
 };
 use crate::commands::{
     atomic_write, validate_writable_dest, CommandError, CommandResult, DialogToken,
@@ -57,6 +58,8 @@ const KEY_UPDATER: &str = "updater";
 const KEY_UI: &str = "ui";
 /// Windows-only KV group (SPEC s22): absent on macOS / Linux.
 const KEY_WINDOWS: &str = "windows";
+/// macOS-only KV group (SPEC s22): absent on Windows / Linux.
+const KEY_MACOS: &str = "macos";
 
 /// The GitHub `owner/repo` slug whose releases drive the About tab + the update
 /// check (workspace `repository` = `https://github.com/pmaxhogan/driven`).
@@ -169,6 +172,79 @@ fn compute_vss_helper_status(
     }
 }
 
+// ---------------------------------------------------------------------------
+// get_apfs_helper_status (DESIGN s5.3.2)
+// ---------------------------------------------------------------------------
+
+/// Report whether macOS locked-file backup is available or degraded, for the
+/// Settings hints. Truthful on every platform: off macOS the APFS snapshot
+/// fallback is unsupported (never degraded).
+#[tauri::command]
+pub async fn get_apfs_helper_status(state: State<'_, AppState>) -> CommandResult<ApfsHelperStatus> {
+    let helper_enabled = load_apfs_snapshot_enabled(state.state().as_ref()).await;
+    // Consult the app-side broker manager for TRUTHFUL state, exactly as the
+    // Windows status command does.
+    let (helper_alive, helper_launchable, launch_pending, launch_declined) =
+        match state.apfs_helper_manager() {
+            Some(manager) => (
+                manager.helper_alive(),
+                manager.helper_launchable(),
+                manager.launch_pending(),
+                manager.launch_declined(),
+            ),
+            None => (false, false, false, false),
+        };
+    Ok(compute_apfs_helper_status(
+        cfg!(target_os = "macos"),
+        helper_enabled,
+        helper_alive,
+        helper_launchable,
+        launch_pending,
+        launch_declined,
+    ))
+}
+
+/// Read the `macos.apfs_snapshot` setting (SPEC s22): whether the user opted
+/// into APFS-snapshot locked-file backup. `false` off macOS, or on any
+/// read/parse error (best-effort, like the cold-start config load). Shared by
+/// the boot assembly (which decides the provider's mode) and the status command.
+pub async fn load_apfs_snapshot_enabled(state: &dyn StateRepo) -> bool {
+    if !cfg!(target_os = "macos") {
+        return false;
+    }
+    load_group::<storage::Macos>(state, KEY_MACOS)
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.apfs_snapshot)
+        .unwrap_or(false)
+}
+
+/// Pure status derivation (unit-tested on every platform). Locked-file backup is
+/// degraded only where the APFS fallback is supported (macOS) and no snapshot
+/// can be taken: the broker is neither already up (`helper_alive`) nor launchable
+/// on demand (`helper_launchable`). A launchable broker is NOT degraded - it
+/// comes up on the first locked file.
+fn compute_apfs_helper_status(
+    supported: bool,
+    helper_enabled: bool,
+    helper_alive: bool,
+    helper_launchable: bool,
+    launch_pending: bool,
+    launch_declined: bool,
+) -> ApfsHelperStatus {
+    let locked_file_backup_degraded = supported && !(helper_alive || helper_launchable);
+    ApfsHelperStatus {
+        supported,
+        helper_enabled,
+        helper_alive,
+        helper_launchable,
+        launch_pending,
+        launch_declined,
+        locked_file_backup_degraded,
+    }
+}
+
 /// Read every SPEC s22 KV group into a [`SettingsDto`] (shared by `get_settings`
 /// and by `update_settings`'s read-back). A malformed stored value surfaces a
 /// typed `state.db_corrupt` error rather than a panic.
@@ -204,6 +280,20 @@ async fn load_settings_dto(state: &dyn StateRepo) -> CommandResult<SettingsDto> 
         None
     };
 
+    // The `macos` group is macOS-only (SPEC s22): present on macOS (defaulting
+    // to off if unseeded), `None` elsewhere so the DTO honestly reflects the
+    // platform. This nullability IS the UI's platform check for the toggle.
+    let macos = if cfg!(target_os = "macos") {
+        Some(
+            load_group::<storage::Macos>(state, KEY_MACOS)
+                .await?
+                .map(Into::into)
+                .unwrap_or_else(default_macos),
+        )
+    } else {
+        None
+    };
+
     // V2 small-file bundling toggle (issue #35 item d): a standalone advanced
     // setting backed by the `bundle_small_files` KV key the core planner reads
     // directly (NOT a group blob field). Absent/malformed reads as `false`.
@@ -220,6 +310,7 @@ async fn load_settings_dto(state: &dyn StateRepo) -> CommandResult<SettingsDto> 
         updater,
         ui,
         windows,
+        macos,
         bundle_small_files,
     })
 }
@@ -283,6 +374,10 @@ pub async fn update_settings(
     // actually changed), applied after persistence to (dis)arm + eagerly launch
     // the least-privilege helper broker.
     let mut vss_helper_target: Option<bool> = None;
+    // DESIGN s5.3.2: the `macos.apfs_snapshot` toggle transition (Some(new) iff
+    // it actually changed), applied after persistence to (dis)arm + eagerly
+    // launch the APFS snapshot broker.
+    let mut apfs_snapshot_target: Option<bool> = None;
 
     // --- global group -------------------------------------------------------
     if let Some(g) = patch.global {
@@ -572,6 +667,34 @@ pub async fn update_settings(
         store_group(repo, KEY_WINDOWS, &storage::Windows::from(cur)).await?;
     }
 
+    // --- macos group (macOS-only) -------------------------------------------
+    if let Some(m) = patch.macos {
+        // Persist on every host so a settings DB synced between machines keeps
+        // the value; the field only has a runtime effect on macOS.
+        let mut cur: MacosSettings = load_group::<storage::Macos>(repo, KEY_MACOS)
+            .await?
+            .map(Into::into)
+            .unwrap_or_else(default_macos);
+        if let Some(v) = m.apfs_snapshot {
+            // DESIGN s5.3.2: on a real change, (dis)arm the shared broker manager
+            // AFTER persistence. Enabling fires the ATTENDED administrator prompt
+            // (the user is at the Settings screen to approve the one prompt);
+            // disabling shuts the broker down.
+            if v != cur.apfs_snapshot {
+                apfs_snapshot_target = Some(v);
+                // Unlike the Windows helper, the toggle ALSO drives the
+                // provider's VssMode (enabled -> Auto, off -> Never), so the
+                // orchestrator must be reconfigured for the change to take
+                // effect on the next cycle without a restart.
+                if cfg!(target_os = "macos") {
+                    orchestrator_affecting = true;
+                }
+            }
+            cur.apfs_snapshot = v;
+        }
+        store_group(repo, KEY_MACOS, &storage::Macos::from(cur)).await?;
+    }
+
     // --- bundling toggle (issue #35 item d) ---------------------------------
     // A standalone advanced setting, not a group blob: write the
     // `bundle_small_files` KV key the core planner reads directly. The change
@@ -622,6 +745,22 @@ pub async fn update_settings(
                 // Eager, non-blocking: the launch runs on a background thread so
                 // this IPC returns at once; the UI polls get_vss_helper_status to
                 // show pending -> ready/declined.
+                manager.launch_now();
+            }
+        }
+    }
+
+    // DESIGN s5.3.2: (dis)arm + eagerly launch the APFS snapshot broker on a
+    // `macos.apfs_snapshot` change. Enabling fires the attended administrator
+    // prompt NOW (the user is present); disabling shuts the broker down.
+    // Best-effort: no manager (off macOS) is a no-op.
+    if let Some(enabled) = apfs_snapshot_target {
+        if let Some(manager) = state.apfs_helper_manager() {
+            manager.set_enabled(enabled);
+            if enabled {
+                // Eager, non-blocking: the osascript consent runs on a background
+                // thread so this IPC returns at once; the UI polls
+                // get_apfs_helper_status to show pending -> ready/declined.
                 manager.launch_now();
             }
         }
@@ -765,8 +904,8 @@ mod storage {
     use serde::{Deserialize, Serialize};
 
     use crate::commands::dtos::{
-        GlobalSettings, ScheduleSettings, TelemetrySettings, UiSettings, UpdaterSettings,
-        WindowsSettings,
+        GlobalSettings, MacosSettings, ScheduleSettings, TelemetrySettings, UiSettings,
+        UpdaterSettings, WindowsSettings,
     };
 
     /// `snake_case` on-disk form of the V2 schedule window (DESIGN s17).
@@ -1046,6 +1185,32 @@ mod storage {
             }
         }
     }
+
+    /// `snake_case` on-disk form of the SPEC s22 `macos` group (macOS-only).
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct Macos {
+        // Absent in DBs written before the APFS snapshot fallback landed
+        // (DESIGN s5.3.2); default to `false` so an older row deserialises and
+        // the feature stays opt-in.
+        #[serde(default)]
+        pub apfs_snapshot: bool,
+    }
+
+    impl From<Macos> for MacosSettings {
+        fn from(s: Macos) -> Self {
+            MacosSettings {
+                apfs_snapshot: s.apfs_snapshot,
+            }
+        }
+    }
+
+    impl From<MacosSettings> for Macos {
+        fn from(d: MacosSettings) -> Self {
+            Macos {
+                apfs_snapshot: d.apfs_snapshot,
+            }
+        }
+    }
 }
 
 /// Register or unregister the app for OS autostart (SPEC s13) via the autostart
@@ -1220,11 +1385,23 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
         .map(Into::into)
         .unwrap_or_else(default_global);
 
+    // Windows takes the explicit three-way `windows.vss_mode` policy. macOS has
+    // no such policy setting: the single `macos.apfs_snapshot` opt-in IS the
+    // mode, so it maps to Auto (snapshot a locked file) or Never (skip it, the
+    // historical behaviour). Routing it through the mode - rather than the
+    // launcher gate alone - is what makes `reconfigure` apply a toggle between
+    // cycles via `VssProvider::set_mode`, with no app restart.
     let vss_mode = if cfg!(windows) {
         load_group::<storage::Windows>(state, KEY_WINDOWS)
             .await?
             .map(|w| VssMode::from_str_lenient(&w.vss_mode))
             .unwrap_or_default()
+    } else if cfg!(target_os = "macos") {
+        if load_apfs_snapshot_enabled(state).await {
+            VssMode::Auto
+        } else {
+            VssMode::Never
+        }
     } else {
         VssMode::default()
     };
@@ -2124,6 +2301,8 @@ struct RedactedSettings {
     ui: UiSettings,
     #[serde(skip_serializing_if = "Option::is_none")]
     windows: Option<WindowsSettings>,
+    #[serde(skip_serializing_if = "Option::is_none")]
+    macos: Option<MacosSettings>,
 }
 
 /// Telemetry settings with the stable `install_id` replaced by a per-bundle
@@ -2155,6 +2334,7 @@ fn redact_settings(s: &SettingsDto) -> RedactedSettings {
         updater: s.updater.clone(),
         ui: s.ui.clone(),
         windows: s.windows.clone(),
+        macos: s.macos.clone(),
     }
 }
 
@@ -2630,6 +2810,14 @@ fn default_windows() -> WindowsSettings {
     }
 }
 
+/// SPEC s22 `macos` defaults: the APFS snapshot fallback is OPT-IN, so an
+/// unseeded group reads as off and nothing prompts for administrator access.
+fn default_macos() -> MacosSettings {
+    MacosSettings {
+        apfs_snapshot: false,
+    }
+}
+
 // ---------------------------------------------------------------------------
 // Minimal STORED-method ZIP writer (no compression).
 // ---------------------------------------------------------------------------
@@ -2987,6 +3175,122 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn macos_apfs_snapshot_setting_round_trips() {
+        let (repo, dir) = seeded_repo().await;
+        // The group is unseeded on a fresh DB, so it reads as the opt-OUT default.
+        let mut cur: MacosSettings = load_group::<storage::Macos>(&repo, KEY_MACOS)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap_or_else(default_macos);
+        assert!(!cur.apfs_snapshot, "default is off (opt-in feature)");
+        cur.apfs_snapshot = true;
+        store_group(&repo, KEY_MACOS, &storage::Macos::from(cur))
+            .await
+            .unwrap();
+
+        let back: MacosSettings = load_group::<storage::Macos>(&repo, KEY_MACOS)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap();
+        assert!(back.apfs_snapshot, "apfs_snapshot persisted");
+
+        // The boot-assembly reader reflects the persisted flag on macOS; off
+        // macOS the APFS fallback is unsupported so it is always false
+        // regardless of the stored value (a settings DB synced from a Mac).
+        let enabled = load_apfs_snapshot_enabled(&repo).await;
+        assert_eq!(enabled, cfg!(target_os = "macos"));
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn macos_group_absent_from_an_older_db_reads_as_off() {
+        let (repo, dir) = seeded_repo().await;
+        // Backward compatibility: a settings blob written before this feature
+        // existed has no `apfs_snapshot` key at all. `#[serde(default)]` must
+        // deserialise it rather than erroring the whole settings load.
+        store_group(&repo, KEY_MACOS, &serde_json::json!({}))
+            .await
+            .unwrap();
+        let back: MacosSettings = load_group::<storage::Macos>(&repo, KEY_MACOS)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap();
+        assert!(!back.apfs_snapshot, "a missing key defaults to off");
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn apfs_snapshot_toggle_drives_the_orchestrator_vss_mode_on_macos() {
+        let (repo, dir) = seeded_repo().await;
+        // Off (the default) -> Never, so the provider skips a locked file exactly
+        // as it did before the feature existed.
+        let cfg_off = load_orchestrator_config(&repo).await.unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(
+                cfg_off.vss_mode,
+                VssMode::Never,
+                "opt-out means no snapshot"
+            );
+        }
+
+        store_group(
+            &repo,
+            KEY_MACOS,
+            &storage::Macos::from(MacosSettings {
+                apfs_snapshot: true,
+            }),
+        )
+        .await
+        .unwrap();
+
+        // On -> Auto. This is what `reconfigure` hands to `VssProvider::set_mode`,
+        // so the toggle takes effect on the next cycle with no app restart.
+        let cfg_on = load_orchestrator_config(&repo).await.unwrap();
+        if cfg!(target_os = "macos") {
+            assert_eq!(cfg_on.vss_mode, VssMode::Auto);
+        } else {
+            // Off macOS the macos group must never influence the mode.
+            assert_eq!(cfg_on.vss_mode, cfg_off.vss_mode);
+        }
+        cleanup(dir);
+    }
+
+    #[test]
+    fn apfs_status_is_never_degraded_off_macos() {
+        let s = compute_apfs_helper_status(false, false, false, false, false, false);
+        assert!(!s.supported);
+        assert!(
+            !s.locked_file_backup_degraded,
+            "an unsupported platform is not degraded"
+        );
+    }
+
+    #[test]
+    fn apfs_status_degrades_only_when_no_snapshot_is_possible() {
+        // Supported, but the broker is neither up nor launchable -> degraded.
+        let degraded = compute_apfs_helper_status(true, false, false, false, false, false);
+        assert!(degraded.locked_file_backup_degraded);
+
+        // Launchable on demand is NOT degraded: the broker comes up on the first
+        // locked file, so nothing is being skipped for lack of a snapshot.
+        let launchable = compute_apfs_helper_status(true, true, false, true, false, false);
+        assert!(!launchable.locked_file_backup_degraded);
+
+        // Already up is likewise not degraded.
+        let alive = compute_apfs_helper_status(true, true, true, false, false, false);
+        assert!(!alive.locked_file_backup_degraded);
+
+        // A declined prompt leaves it neither alive nor launchable -> degraded,
+        // and the declined flag is carried through for the UI hint.
+        let declined = compute_apfs_helper_status(true, true, false, false, false, true);
+        assert!(declined.launch_declined);
+        assert!(declined.locked_file_backup_degraded);
+    }
+
+    #[tokio::test]
     async fn load_orchestrator_config_reflects_global_gates() {
         let (repo, dir) = seeded_repo().await;
         // Flip the battery gate + scan cadence in the global group.
@@ -3109,6 +3413,7 @@ mod tests {
             updater: default_updater(),
             ui: default_ui(),
             windows: None,
+            macos: None,
             bundle_small_files: false,
         };
         let red = redact_settings(&dto);
