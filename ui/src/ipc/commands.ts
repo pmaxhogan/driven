@@ -423,10 +423,7 @@ export function activityThroughputSeries(
  * every source interleaved by time. Every field is a COUNT - the shape carries
  * no paths or remote ids - so this can never surface an encrypted source's
  * filenames. */
-export function listScrubRuns(
-  sourceId?: string,
-  limit?: number
-): Promise<ScrubRun[]> {
+export function listScrubRuns(sourceId?: string, limit?: number): Promise<ScrubRun[]> {
   return invoke("list_scrub_runs", { sourceId, limit });
 }
 
