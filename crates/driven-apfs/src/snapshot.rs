@@ -15,6 +15,9 @@
 //! create and mount, or files gone mid-read) as an expected race that degrades
 //! to skip-the-locked-file - never as a hard failure.
 
+// Only the macOS half of this module shells out; on other targets just the
+// pure parsing/validation compiles, so the import is gated with it.
+#[cfg(target_os = "macos")]
 use std::process::Command;
 
 /// The prefix + suffix every APFS local Time Machine snapshot name carries.
@@ -200,12 +203,6 @@ pub fn list_local_snapshots(volume_mount: &str) -> Result<Vec<String>, SnapshotE
         &out.stdout,
     )))
 }
-
-// Keep the unused-import lint quiet on non-macOS targets, where only the pure
-// parsing/validation half of this module compiles.
-#[cfg(not(target_os = "macos"))]
-#[allow(unused_imports)]
-use Command as _;
 
 #[cfg(test)]
 mod tests {

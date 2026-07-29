@@ -12,12 +12,17 @@
 //!
 //! Off macOS every operation reports unavailable, exactly like the VSS stub.
 
+// Off macOS the provider is an always-unavailable shell, so these are only
+// reachable from the macOS paths or from the cross-OS tests.
+#[cfg(any(target_os = "macos", test))]
 use std::path::PathBuf;
 use std::sync::{Arc, Mutex};
 
 use driven_vss::{RecordedSnapshot, SnapshotOutcome, SnapshotRecorder, VssMode, VssProvider};
 
-use crate::launch::{HelperLaunchStatus, HelperLauncher};
+#[cfg(any(target_os = "macos", test))]
+use crate::launch::HelperLaunchStatus;
+use crate::launch::HelperLauncher;
 
 /// Per-cycle state (all torn down by `end_cycle`).
 #[derive(Default)]
@@ -29,7 +34,9 @@ struct CycleState {
     /// so a placeholder 0 would date every snapshot to 1970 and mark it
     /// instantly sweepable.
     snapshot_created_ms: i64,
-    /// Volume mount point -> broker mountpoint for that snapshot.
+    /// Volume mount point -> broker mountpoint for that snapshot. Only the
+    /// macOS path mounts anything, so off macOS this would be dead weight.
+    #[cfg(target_os = "macos")]
     mounts: std::collections::HashMap<PathBuf, PathBuf>,
     /// The connected broker client (kept for the cycle once established).
     #[cfg(target_os = "macos")]

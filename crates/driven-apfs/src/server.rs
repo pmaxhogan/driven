@@ -36,7 +36,6 @@
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
-use crate::protocol::Control;
 use crate::snapshot::is_valid_snapshot_name;
 
 /// Prefix for the broker's root-owned mountpoint directories, swept for stale
@@ -55,7 +54,8 @@ pub struct MountRequest {
     pub snapshot_name: String,
 }
 
-/// Boundary validation for a [`Control::MountSnapshot`] request. The volume
+/// Boundary validation for a [`crate::protocol::Control::MountSnapshot`]
+/// request. The volume
 /// must EXACTLY match an allow-listed entry (no prefix/containment games -
 /// the allow-list is short and app-fixed, so exact string paths are the
 /// least-surprise contract) and the snapshot name must be a strict
@@ -153,7 +153,7 @@ mod macos {
 
     use super::*;
     use crate::launch::HelperArgs;
-    use crate::protocol::{read_control, write_control, PROTOCOL_VERSION};
+    use crate::protocol::{read_control, write_control, Control, PROTOCOL_VERSION};
 
     /// Everything one session's server shares across connections.
     struct ServerShared {
