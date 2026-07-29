@@ -6495,24 +6495,19 @@ async fn open_shared(
 ) -> Result<tokio::fs::File, OpenError> {
     #[cfg(windows)]
     {
-        use std::os::windows::fs::OpenOptionsExt;
-        // FILE_SHARE_READ | FILE_SHARE_WRITE | FILE_SHARE_DELETE.
-        const SHARE_MODE: u32 = 0x0000_0001 | 0x0000_0002 | 0x0000_0004;
-        let mut opts = std::fs::OpenOptions::new();
-        opts.read(true).share_mode(SHARE_MODE);
-        match opts.open(path) {
-            Ok(std_file) => {
-                // Hint BEFORE the handle is wrapped for async use, while it is
-                // still a plain `std::fs::File`. The hint then rides on the
-                // handle for its whole life, so every read is shaped even
-                // though `tokio::fs` performs them on shared pool threads we
-                // cannot demote. Best-effort: a refusal just means normal-
-                // priority reads. The access mask is deliberately unchanged -
-                // a read-only handle is enough for this class, so the open's
-                // sharing/locking behaviour is byte-identical to before.
-                crate::priority::apply_to_file_handle(&std_file, priority);
-                Ok(tokio::fs::File::from_std(std_file))
-            }
+        // The share mode + the SPEC s22 priority hint both live in
+        // `crate::platform_open`, the ONE place Driven opens a local file for
+        // reading (DESIGN s5.3), so the scanner's deep-verify hash opens with
+        // exactly the same sharing this path does. The hint is applied there
+        // while the file is still a plain `std::fs::File` - before it is
+        // wrapped for async use - so it rides on the handle for its whole life
+        // and shapes every read even though `tokio::fs` performs them on
+        // shared pool threads we cannot demote. Best-effort: a refusal just
+        // means normal-priority reads. The access mask is deliberately
+        // read-only, so the open's sharing/locking behaviour is byte-identical
+        // to before this was factored out.
+        match crate::platform_open::open_read_shared(path, priority) {
+            Ok(std_file) => Ok(tokio::fs::File::from_std(std_file)),
             Err(e) => Err(classify_open_error(e)),
         }
     }

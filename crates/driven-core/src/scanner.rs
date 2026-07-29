@@ -638,7 +638,7 @@ fn process_file(ctx: &WalkCtx, entry: &DirEntry, rel: RelativePath) -> FileRecor
             );
         if ctx.mode == ScanMode::DeepVerify || coarse_suspect {
             let stored_hash = stored.map(|r| r.hash_blake3);
-            match hash_file(abs) {
+            match hash_file(abs, ctx.priority) {
                 Ok(hash) if stored_hash != Some(hash) => {
                     let reason = if ctx.mode == ScanMode::DeepVerify {
                         "deep-verify"
@@ -1291,9 +1291,23 @@ fn error_path(err: &ignore::Error) -> Option<&Path> {
 
 /// BLAKE3 hash of a file's bytes, read in bounded chunks (DESIGN s3.3
 /// deep-verify). Streams so memory stays bounded regardless of file size.
-fn hash_file(path: &Path) -> anyhow::Result<[u8; 32]> {
-    // TODO(M3): use FILE_SHARE_DELETE platform-open helper per DESIGN s5.3 (executor open path)
-    let mut file = std::fs::File::open(path)
+fn hash_file(path: &Path, priority: WorkPriority) -> anyhow::Result<[u8; 32]> {
+    // DESIGN s5.3: open through the shared platform helper, NOT a bare
+    // `File::open`, so this read gets the same two guarantees the executor's
+    // read path has:
+    //
+    // - The explicit `FILE_SHARE_READ | WRITE | DELETE` share mode, stated by
+    //   Driven rather than inherited from a std default, so a deep-verify -
+    //   which holds the handle for as long as it takes to stream the whole
+    //   file - provably never blocks the user's own editor from saving over,
+    //   renaming, or deleting the file.
+    // - The SPEC s22 `io_priority` hint on the HANDLE. This is the part that
+    //   was actually missing: on Windows `WorkPriority::Low` demotes only CPU
+    //   priority at the thread level, so a deep-verify's hash reads ran at
+    //   NORMAL I/O priority no matter what `io_priority` was set to, while the
+    //   executor's uploads honoured it. `Idle` was already covered (background
+    //   mode floors thread I/O priority too), so this closes the `low` gap.
+    let mut file = crate::platform_open::open_read_shared(path, priority)
         .with_context(|| format!("opening {} for deep-verify", path.display()))?;
     let mut hasher = blake3::Hasher::new();
     let mut buf = vec![0u8; 64 * 1024];
