@@ -128,10 +128,15 @@ honour them; deviating requires re-asking the user.
   documented bypass instructions.
   - **Windows:** Microsoft Trusted Signing (~$10/mo) is the likely
     future upgrade when distribution warrants it.
-  - **macOS:** the maintainer has no Apple hardware. macOS bundles
-    ship unsigned and the in-app auto-updater is **not expected to
-    work cleanly on macOS in V1** — macOS users do a manual reinstall
-    per release. No fix planned until Apple hardware is available.
+  - **macOS:** Apple hardware is now available and used for real
+    hardware verification of macOS-specific work (see §5.3.2, §8.1),
+    so macOS is a hardware-tested platform, not merely a compile
+    target. Code signing itself is a separate, still-open blocker -
+    it needs a paid Apple Developer ID enrollment, which hardware
+    access alone does not solve. macOS bundles still ship unsigned and
+    the in-app auto-updater is **not expected to work cleanly on
+    macOS** as a result - macOS users do a manual reinstall per
+    release. No fix planned until Developer ID signing lands.
 - **Update channels:** **stable + dev.** Stable = tagged releases on `main`.
   Dev = GATED dev builds (NOT every main commit): `dev-channel.yml` builds only on
   a manual `workflow_dispatch` OR when the head commit message contains the
@@ -2177,14 +2182,19 @@ V1 does **not** sign the installers themselves — only the updater payload
 (required by Tauri's verifier). Users see SmartScreen / Gatekeeper warnings
 on first install; the README has a 1-paragraph "how to bypass" section.
 
-**macOS posture (V1):** the maintainer has no Apple hardware, so
-macOS bundles ship unsigned and the in-app updater is **not expected
-to work cleanly** on macOS in V1 (Gatekeeper + quarantine make
-unsigned bundle swaps unreliable). macOS users do a manual reinstall
-per release — the in-app updater UI surfaces "macOS: download the new
-DMG from <releases URL>" rather than offering an install button.
-Documented as a known V1 caveat; no fix planned until Apple hardware
-is available.
+**macOS posture:** Apple hardware is now available and macOS-specific
+work (locked/permission-denied file classification §5.3, the APFS
+snapshot broker §5.3.2, the template tray icon §8.1) is verified on
+real Apple Silicon hardware rather than compiled blind. What hardware
+access does NOT solve is code signing: that needs a paid Apple
+Developer ID enrollment, a separate and still-open blocker. So macOS
+bundles still ship unsigned and the in-app updater is **not expected
+to work cleanly** on macOS (Gatekeeper + quarantine make unsigned
+bundle swaps unreliable). macOS users do a manual reinstall per
+release - the in-app updater UI surfaces "macOS: download the new DMG
+from <releases URL>" rather than offering an install button.
+Documented as a known caveat; no fix planned until Developer ID
+signing lands.
 
 **Windows posture (V1+):** unsigned for V1. When V1 distribution
 warrants it, **Microsoft Trusted Signing via Azure (~$10/mo)** is the

@@ -15,6 +15,14 @@
 > - `STRESS_HARNESS.md` — chaos / fuzz / soak test catalogue (M3.7)
 > - `IMPLEMENTATION.md` (this file) — orchestration plan
 
+> **Status note (added post-GA):** M0-M10 are all long complete - the repo
+> shipped v1.0.0 and is past v2.4.0. This file is kept as a historical
+> record of the original bootstrap orchestration plan, not a live task list.
+> The real-Drive OAuth preflight in §1.2 below already happened; for the
+> current state of e2e credentials and what the CI real-Drive gate actually
+> does today, see `design/E2E_REAL.md` instead of inferring it from this
+> section.
+
 ---
 
 ## 0. Operating principle

@@ -517,20 +517,24 @@ yet fail one of these.
 
 ## 7. CI integration
 
-Three jobs plus a weekly soak. All defined in `.github/workflows/`.
+Four jobs, all in `.github/workflows/chaos.yml`; the weekly soak is
+NOT one of them (see below).
 
 | Job                  | Trigger                              | Runtime  | What runs                                                                                                                                            | Gates merge? |
 |----------------------|--------------------------------------|----------|------------------------------------------------------------------------------------------------------------------------------------------------------|--------------|
-| `chaos-hermetic`     | Every PR                              | ~5 min   | Every scenario whose `requires()` doesn't include `cap:real_drive_creds` AND doesn't require Admin (so it runs on standard GH runners).             | Yes          |
-| `chaos-fake-drive`   | Every PR                              | ~10 min  | Adds the fault-injection scenarios (§3.7 / §5) against `InMemoryRemoteStore`.                                                                       | Yes          |
-| `chaos-real-drive`   | Nightly + before each `v*` tag        | ~30 min  | The subset of §3.7 marked `optional cap:real_drive_creds` runs against real Drive using the maintainer's E2E refresh token + a throwaway folder.     | Tag-blocking |
-| `chaos-soak`         | Weekly cron on a beefy runner         | 6 h      | `driven-chaos fuzz --duration 6h --seed $(date +%s)` against `InMemoryRemoteStore`. Failures open a GitHub issue with the seed + mutation log.       | No (informational) |
+| `chaos-hermetic`     | Every PR/push (Windows-only; 3-OS on a `v*` tag) | ~5 min   | Every scenario whose `requires()` doesn't include `cap:real_drive_creds` AND doesn't require Admin (so it runs on standard GH runners).             | Yes          |
+| `chaos-fake-drive`   | Every PR/push (Windows-only; 3-OS on a `v*` tag) | ~10 min  | Adds the fault-injection scenarios (§3.7 / §5) against `InMemoryRemoteStore`.                                                                       | Yes          |
+| `chaos-real-drive`   | `v*` tag pushes only (no nightly schedule) | ~30 min  | The subset of §3.7 marked `optional cap:real_drive_creds` runs against real Drive using the maintainer's E2E refresh token + a throwaway folder. Skips cleanly (never fails) if the secrets are absent. | Tag-blocking |
+| `chaos-soak`         | NOT run in CI - local/on-demand `just chaos-soak` | 6 h      | `driven-chaos fuzz --duration 6h --seed $(date +%s)` against `InMemoryRemoteStore`. A bounded `fuzz-smoke` row still runs per-PR as part of `chaos-hermetic`. | N/A (local task) |
 
-**Gating on M4.** The `chaos-real-drive` job depends on
-`GoogleDriveStore` (M4) and the `DRIVEN_E2E_REFRESH_TOKEN` secret. It
-is configured at M3.7 but the job stays `if: false`-skipped until M4
-lands, at which point the gate flips. Stated explicitly so M3.7 isn't
-self-contradictory.
+**M4 gate: flipped.** The `chaos-real-drive` job depends on
+`GoogleDriveStore` (M4) and the `DRIVEN_E2E_REFRESH_TOKEN` /
+`DRIVEN_E2E_DEST_FOLDER_ID` / `DRIVEN_OAUTH_CLIENT_SECRET` secrets. It
+was configured at M3.7 as `if: false`-skipped pending M4; M4 landed
+long ago and the job now runs for real
+(`if: startsWith(github.ref, 'refs/tags/')`), degrading to a clean
+skip rather than a failure if a secret is missing. Kept here as a
+historical note so M3.7 isn't self-contradictory.
 
 **Admin / NTFS coverage.** GH's standard `windows-latest` runner does
 not run elevated by default. The harness scenarios needing Admin

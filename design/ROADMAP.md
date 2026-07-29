@@ -7,6 +7,14 @@
 > pass before claiming completion. If the agent can't make them pass, it
 > stops and surfaces the blocker rather than papering over it.
 
+> **Status note (added post-GA):** M0-M10 are all long complete - the repo
+> shipped v1.0.0 and is past v2.4.0. This file is kept as a historical build
+> log; only the "Beyond V1 (V1.1+)" section below still reflects live,
+> unshipped work. A handful of M3.7 CI-gating notes below describe a
+> pre-M4 state ("skipped until M4 lands") that no longer applies - fixed
+> in place rather than deleted, so the milestone text stays internally
+> consistent.
+
 ---
 
 ## Sequencing rationale
@@ -270,8 +278,11 @@ the number jump is deliberate.
 > Read `design/STRESS_HARNESS.md` cover-to-cover before starting -
 > the scenario catalogue is the spec. This milestone implements the
 > harness binary and the hermetic + fake-drive CI jobs. The
-> real-Drive job is wired but skipped until M4 lands and
-> `DRIVEN_E2E_REFRESH_TOKEN` is available.
+> real-Drive job needs `GoogleDriveStore` (M4) and
+> `DRIVEN_E2E_REFRESH_TOKEN`; both have long since landed, and the
+> job now runs on `v*` tag pushes (see `.github/workflows/chaos.yml`)
+> - historical note, kept because M3.7 predates M4 in this doc's
+> ordering.
 
 ### Tasks
 - New workspace crate `crates/driven-chaos/` per SPEC §1 layout and
@@ -304,15 +315,19 @@ the number jump is deliberate.
 - Cross-cutting invariant checks per STRESS_HARNESS.md §6.3 run on
   every scenario as post-conditions.
 - CI jobs per STRESS_HARNESS.md §7:
-  - `.github/workflows/chaos-hermetic.yml` - every PR, ~5 min, runs
-    every scenario whose `requires()` doesn't need
-    `cap:real_drive_creds` or Admin.
-  - `.github/workflows/chaos-fake-drive.yml` - every PR, ~10 min,
-    adds the fault-injection scenarios.
-  - `.github/workflows/chaos-real-drive.yml` - nightly + before
-    `v*` tags, gated `if: false` until M4 flips the gate.
-  - `.github/workflows/chaos-soak.yml` - weekly cron, 6 h fuzz,
-    opens a GitHub issue with the seed on failure.
+  - `chaos-hermetic` - every PR, ~5 min, runs every scenario whose
+    `requires()` doesn't need `cap:real_drive_creds` or Admin.
+  - `chaos-fake-drive` - every PR, ~10 min, adds the fault-injection
+    scenarios.
+  - `chaos-real-drive` - `v*` tag pushes only (not nightly - see
+    the cost policy comment in `.github/workflows/chaos.yml`), was
+    `if: false`-gated until M4 landed; the gate is now
+    `if: startsWith(github.ref, 'refs/tags/')` and the job skips
+    cleanly (never fails) if the real-Drive secrets are absent.
+  - `chaos-soak` - NOT a CI cron; a local/on-demand `just chaos-soak`
+    task (6 h fuzz). Only a bounded `fuzz-smoke` row runs per-PR.
+  - (All four jobs live in one `.github/workflows/chaos.yml`, not
+    separate per-job workflow files as originally sketched here.)
 - Add `justfile` recipes:
   ```
   chaos:
@@ -339,8 +354,9 @@ the number jump is deliberate.
   Linux) show as SKIPPED, not FAIL, and the SKIPPED count appears on
   the PR check.
 - `chaos-fake-drive` CI job passes on Linux + macOS + Windows.
-- `chaos-real-drive` workflow file exists and is parseable, but the
-  job is `if: false`-gated. (M4 flips the gate.)
+- `chaos-real-drive` job now runs for real on `v*` tag pushes (M4
+  flipped the gate long ago); it degrades to a clean skip rather than
+  a failure when the real-Drive secrets are absent.
 - A deliberately-broken commit (e.g. removing the `fstat` post-check
   from `executor.rs` per SPEC §8) causes the `truncate-and-rewrite`
   and `replace-via-atomic-rename` scenarios to FAIL with a clear
@@ -597,8 +613,18 @@ opt-in (dev channel). Each new version surfaces release notes in-app.
 
 Tracked as separate roadmap items, no fixed sequence yet:
 
-- **macOS Volume Shadow Copy equivalent** (FSSnapshot via APFS clones)
-  for the small subset of macOS files held with exclusive locks.
+- **macOS Volume Shadow Copy equivalent** (APFS local snapshots via an
+  unprivileged `tmutil localsnapshot` plus a root mount broker) for
+  the small subset of macOS files held with exclusive locks - IN
+  PROGRESS. The `driven-apfs` broker crate and its DESIGN §5.3.2
+  writeup landed, and macOS/Linux open failures are now classified
+  precisely into locked-vs-permission-denied and skipped-and-reported
+  (DESIGN §5.3, `local.file_locked` / `local.permission_denied`). Not
+  yet done: the broker is not wired into `driven-vss`'s
+  `map_for_volume` seam, so no macOS file is actually backed up
+  through a lock yet - every locked file still skips. Full Disk Access
+  onboarding UI for TCC-denied files (a separate problem from locked
+  files - see DESIGN §5.3.2) is also still unmerged.
 - **Schedule windows** (time-of-day rules) in the UI.
 - **Pre/post backup shell hooks.**
 - **rclone-crypt-format compatibility** (opt-in second format).
@@ -614,8 +640,15 @@ Tracked as separate roadmap items, no fixed sequence yet:
   escape Drive's per-file API overhead. Opt-in (Settings "Advanced" toggle, off
   by default); coldness + density gated; a reconcile pass GCs emptied bundles.
   See DESIGN.md §17 for the shipped thresholds and rationale.
-- **Backends beyond Google Drive** — OneDrive (Graph API), Backblaze B2,
-  generic S3.
+- **Backends beyond Google Drive** - IN PROGRESS, unmerged as of this
+  docs pass: a pluggable backend seam plus a new `driven-remote` crate,
+  an S3-compatible backend, and a local/removable-folder backend. Not
+  yet available to users. OneDrive (Graph API) and Backblaze B2 remain
+  unstarted.
+- **Scheduled integrity scrub** and a **restore-drill** feature - IN
+  PROGRESS, unmerged as of this docs pass.
+- **rclone config importer** - IN PROGRESS, unmerged as of this docs
+  pass; would read an existing rclone config to pre-fill Driven setup.
 - **Web admin / status page** for users who want to monitor multiple
   machines.
 - **mobile companion app** (Tauri mobile) for read-only restore.
