@@ -100,6 +100,14 @@ const MUTATE_EVERY: Duration = Duration::from_millis(4);
 /// jitter, short enough that the scenario stays fast.
 const SLOW_REMOTE: Duration = Duration::from_millis(120);
 
+/// Remote per-request delay used by the `append-only-log` soak to hold the
+/// FIRST upload's hash -> upload -> post-upload-`fstat` window open past the
+/// mutator's [`MUTATE_EVERY`] cadence, so the issue #144 create-during-upload
+/// path is exercised on EVERY run rather than occasionally by luck. Deliberately
+/// under `MUTATE_EVERY` so at least one append lands inside the window while the
+/// soak still runs its 24 cycles in a fraction of a second.
+const CREATE_RACE_DELAY: Duration = Duration::from_millis(3);
+
 // ---------------------------------------------------------------------------
 // Shared per-scenario harness
 // ---------------------------------------------------------------------------
@@ -959,7 +967,38 @@ impl Scenario for AppendOnlyLog {
     }
 
     async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
-        let h = SoakHarness::boot(Arc::new(InMemoryRemoteStore::new())).await?;
+        // The property this row actually gates is the issue #144 create-orphan
+        // race: the FIRST upload of `app.log` is a plain CREATE (no
+        // `drive_file_id` yet), and an append that lands between the hash and
+        // the SPEC s8 post-upload `fstat` makes the executor settle it as a
+        // changed-after-upload. Before #146 that stranded a LIVE object with no
+        // `file_state` row, so the next scan planned a SECOND create and the
+        // post-reconcile "exactly 1 object" assertion below found 2+.
+        //
+        // Left to incidental timing that window opens only occasionally, which
+        // is exactly why this row was a ~5-10% flake instead of a gate (it
+        // failed when the race happened to fire more than once, and passed -
+        // testing nothing - when it never fired at all). An instant in-memory
+        // remote makes the hash->upload->recheck window shorter than the 4 ms
+        // mutation cadence on a fast host, so most runs never reach the code
+        // under test.
+        //
+        // So widen the window deliberately, the same way the `mid-upload-*`
+        // rows do: a per-request remote delay slightly under `MUTATE_EVERY`
+        // guarantees at least one append lands inside the create's upload
+        // window on every run. Measured on an M4 Mac, 4-6 way parallel:
+        //
+        //   - with the #146 settle commit REVERTED: 0/20 pass at this delay
+        //     (2-14 duplicate objects each) vs 194/200 pass with no delay -
+        //     i.e. the delay converts a 3% flake into a 100% catch.
+        //   - with #146 in place: 260/260 pass at 3-10 ms, 690/690 with no
+        //     delay.
+        //
+        // The delay costs ~150 ms of wall clock per run.
+        let h = SoakHarness::boot(Arc::new(
+            InMemoryRemoteStore::new().with_slow_responses(CREATE_RACE_DELAY),
+        ))
+        .await?;
         write_file(&h.src_root, "app.log", b"start\n")?;
 
         let target = h.src_root.join("app.log");
@@ -977,17 +1016,24 @@ impl Scenario for AppendOnlyLog {
         mutator.stop_and_join();
         drain_to_steady_state(&h).await?;
 
-        // #69: under load the first upload (a CREATE, no drive_file_id yet) can
-        // race a concurrent append and land as a changed-after-upload. By DESIGN
-        // s5.6 that leaves BOTH (a) an orphan remote object and (b) a surviving
-        // create op, reclaimed only by the adopt-by-op-uuid reconcile pass - which
-        // is startup-gated (`reconcile_once` runs once per process). So mid-session
-        // a duplicate object + an overdue create op can persist until the next
-        // restart, which is accepted behaviour. Simulate that restart here: run
-        // the reconcile pass, then drain - exactly what the next launch does - so
-        // the strict invariants below assert the engine's REAL post-restart
-        // contract (one object, no data loss, no overdue op) and still fail loudly
-        // if a restart does NOT converge.
+        // #69/#144: under load the first upload (a CREATE, no drive_file_id yet)
+        // races the concurrent append and lands as a changed-after-upload. Since
+        // #146 the executor settles that in place - it durably commits a
+        // force-rescan `file_state` row pointing at the just-created object and
+        // drops the op in one transaction - so the next scan UPDATEs that same
+        // object and NO duplicate is ever created mid-session. Before #146 it
+        // instead stranded a live orphan with no row, and the only thing that
+        // adopted it was the startup-gated reconcile pass (`reconcile_once` runs
+        // once per process), so a mid-session scan re-created the path.
+        //
+        // The reconcile + drain below therefore no longer papers over a routine
+        // duplicate; it stands in for the app RESTART that still backstops the
+        // arms #146 deliberately left to reconcile (a crash between the upload
+        // and the settle commit, a versioned create, an ambiguous
+        // `DeferToReconcile`). Running it here means the strict invariants that
+        // follow assert the engine's REAL post-restart contract (one object, no
+        // data loss, no overdue op) and fail loudly if a restart does NOT
+        // converge.
         {
             let clock = Arc::new(FakeClock::new());
             let pacer: Arc<dyn driven_core::pacer::Pacer> = Arc::new(NoopPacer);
