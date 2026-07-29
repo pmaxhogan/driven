@@ -34,8 +34,24 @@ use driven_apfs::{HelperLaunchStatus, HelperLauncher, OsascriptLauncher};
 /// Windows `current_exe().parent()` resolution works here unchanged.
 const HELPER_EXE_NAME: &str = "driven-apfs-helper";
 
-/// Directory (created `0700`) holding this session's broker socket.
-const RUNTIME_DIR_NAME: &str = "driven-apfs";
+/// Parent of the per-user directory (created `0700`) holding this session's
+/// broker socket.
+///
+/// Deliberately `/tmp` and NOT [`std::env::temp_dir`]. A unix-domain socket path
+/// must fit in `sockaddr_un.sun_path`, which is 104 bytes on Darwin, and macOS
+/// points `TMPDIR` at a per-user `/var/folders/<xx>/<20-odd chars>/T/` path. That
+/// leaves a real socket path of ~110 bytes, so `UnixListener::bind` fails with
+/// "path must be shorter than SUN_LEN" and the broker exits before it ever
+/// serves - on EVERY Mac, not just unusual ones. Measured on macOS 26.6:
+/// `$TMPDIR/driven-apfs/driven-apfs-<32 hex>.sock` = 110 bytes; the `/tmp` form
+/// below = 70. See `socket_path_fits_in_sockaddr_un` for the regression guard.
+///
+/// `/tmp` is world-writable but sticky, and the per-uid subdirectory is created
+/// `0700`, so another user can neither read the socket nor replace the
+/// directory. If they pre-create it, it is owned by THEM, and the broker's own
+/// "socket parent must be owned by the peer uid with mode 0700" check refuses to
+/// serve - the failure is closed, not silent.
+const RUNTIME_DIR_PARENT: &str = "/tmp";
 
 /// The app-side owner of the macOS APFS snapshot broker (DESIGN s5.3.2).
 pub struct ApfsHelperManager {
@@ -54,6 +70,18 @@ pub struct ApfsHelperManager {
     /// a memoised decline or transient failure ("an enable-toggle constructs a
     /// fresh launcher and retries").
     launcher: Mutex<Arc<OsascriptLauncher>>,
+    /// Whether anything has DELIBERATELY triggered a launch on the current
+    /// launcher.
+    ///
+    /// Load-bearing: [`OsascriptLauncher::launch_status`] is NOT a pure read -
+    /// its `NotAttempted -> InFlight` transition is exactly what spawns the
+    /// consent prompt. So the status accessors below must not call it before a
+    /// real trigger, or merely opening the Settings tab (which polls
+    /// `get_apfs_helper_status`) would pop an administrator prompt the user
+    /// never asked for. Set by the two genuine trigger paths - the provider's
+    /// [`HelperLauncher::launch_status`] on a locked file, and the enable-toggle
+    /// [`Self::launch_now`] - and cleared whenever the launcher is replaced.
+    launch_attempted: AtomicBool,
 }
 
 impl ApfsHelperManager {
@@ -90,6 +118,7 @@ impl ApfsHelperManager {
             args,
             enabled: AtomicBool::new(enabled),
             launcher: Mutex::new(launcher),
+            launch_attempted: AtomicBool::new(false),
         }
     }
 
@@ -108,7 +137,8 @@ impl ApfsHelperManager {
     /// cannot be created.
     #[must_use]
     pub fn runtime_dir() -> Option<PathBuf> {
-        let dir = std::env::temp_dir().join(RUNTIME_DIR_NAME);
+        // Per-uid so two users on one Mac never share a directory.
+        let dir = Path::new(RUNTIME_DIR_PARENT).join(format!("driven-apfs-{}", current_uid()));
         std::fs::create_dir_all(&dir).ok()?;
         #[cfg(unix)]
         {
@@ -128,7 +158,7 @@ impl ApfsHelperManager {
     }
 
     /// Replace the launch state machine with a fresh one, clearing any memoised
-    /// decline / transient failure so the next status read re-prompts.
+    /// decline / transient failure so the next genuine trigger re-prompts.
     fn reset_launcher(&self) {
         let fresh = Arc::new(OsascriptLauncher::new(
             self.helper_exe.clone(),
@@ -136,6 +166,21 @@ impl ApfsHelperManager {
             self.args.clone(),
         ));
         *self.launcher.lock().unwrap_or_else(|p| p.into_inner()) = fresh;
+        // A fresh launcher has not been triggered, so status reads must go back
+        // to answering "not yet tried" WITHOUT touching it.
+        self.launch_attempted.store(false, Ordering::SeqCst);
+    }
+
+    /// The launcher's status, but ONLY once a launch has genuinely been
+    /// triggered. `None` means "not yet tried" and is what every status
+    /// accessor must report before a trigger, because merely asking the
+    /// launcher would start the consent prompt (see
+    /// [`Self::launch_attempted`]). Also `None` when the setting is off.
+    fn observed_status(&self) -> Option<HelperLaunchStatus> {
+        if !self.is_enabled() || !self.launch_attempted.load(Ordering::SeqCst) {
+            return None;
+        }
+        Some(self.current_launcher().launch_status())
     }
 
     /// Apply a change to the `macos.apfs_snapshot` setting (called from the
@@ -159,6 +204,7 @@ impl ApfsHelperManager {
         if !self.is_enabled() {
             return;
         }
+        self.launch_attempted.store(true, Ordering::SeqCst);
         let _ = self.current_launcher().launch_status();
     }
 
@@ -167,33 +213,38 @@ impl ApfsHelperManager {
     /// STATUS: the broker is up and serving this session.
     #[must_use]
     pub fn helper_alive(&self) -> bool {
-        self.is_enabled() && self.current_launcher().launch_status() == HelperLaunchStatus::Ready
+        self.observed_status() == Some(HelperLaunchStatus::Ready)
     }
 
     /// STATUS: a consent prompt is in flight - the UI shows a "waiting for
     /// approval" hint.
     #[must_use]
     pub fn launch_pending(&self) -> bool {
-        self.is_enabled() && self.current_launcher().launch_status() == HelperLaunchStatus::Pending
+        self.observed_status() == Some(HelperLaunchStatus::Pending)
     }
 
     /// STATUS: the user declined the admin prompt this session (memoised).
     #[must_use]
     pub fn launch_declined(&self) -> bool {
-        self.is_enabled() && self.current_launcher().launch_status() == HelperLaunchStatus::Declined
+        self.observed_status() == Some(HelperLaunchStatus::Declined)
     }
 
     /// STATUS: locked-file backup can (still) happen - the setting is on, the
-    /// sidecar exists, and the broker is up / coming up / not yet tried.
+    /// sidecar exists, and the broker is up / coming up / not yet tried. Only
+    /// a declined or failed launch makes it false, which is what drives the
+    /// "degraded" state. Matches the Windows twin, which likewise counts
+    /// not-yet-attempted as launchable.
     #[must_use]
     pub fn helper_launchable(&self) -> bool {
         if !self.is_enabled() || !self.helper_exe.exists() {
             return false;
         }
-        matches!(
-            self.current_launcher().launch_status(),
-            HelperLaunchStatus::Ready | HelperLaunchStatus::Pending
-        )
+        match self.observed_status() {
+            // Not yet tried: the broker comes up on the first locked file.
+            None => true,
+            Some(HelperLaunchStatus::Ready | HelperLaunchStatus::Pending) => true,
+            Some(HelperLaunchStatus::Declined | HelperLaunchStatus::Disabled) => false,
+        }
     }
 
     /// Shut the broker down (unmount everything, delete the snapshot, exit) at
@@ -219,6 +270,10 @@ impl HelperLauncher for ApfsHelperManager {
         if !self.is_enabled() {
             return HelperLaunchStatus::Disabled;
         }
+        // This IS the lazy-launch trigger (the provider calls it on the first
+        // locked file), so record that the launcher has been engaged - after
+        // this the status accessors may read it without causing a prompt.
+        self.launch_attempted.store(true, Ordering::SeqCst);
         self.current_launcher().launch_status()
     }
 
@@ -304,6 +359,51 @@ mod tests {
         assert!(!m.is_available());
     }
 
+    /// A manager whose sidecar path EXISTS, so `helper_launchable` gets past its
+    /// `helper_exe.exists()` guard and the status logic is actually exercised.
+    fn manager_with_real_exe(enabled: bool) -> ApfsHelperManager {
+        let dir = std::env::temp_dir();
+        ApfsHelperManager::new(
+            std::env::current_exe().expect("current exe"),
+            &dir,
+            vec![PathBuf::from("/Users")],
+            enabled,
+        )
+    }
+
+    #[test]
+    fn reading_status_never_triggers_a_consent_prompt() {
+        // REGRESSION: `OsascriptLauncher::launch_status` is not a pure read - its
+        // NotAttempted -> InFlight transition is what spawns the administrator
+        // prompt. The status accessors are polled every time the Settings Rules
+        // tab opens, so if any of them delegated blindly, merely opening Settings
+        // would ask the user for their password.
+        let m = manager_with_real_exe(true);
+        for _ in 0..3 {
+            assert!(!m.helper_alive());
+            assert!(
+                !m.launch_pending(),
+                "a status read must never put the launcher in flight"
+            );
+            assert!(!m.launch_declined());
+            // Not yet tried is LAUNCHABLE (the broker comes up on the first
+            // locked file), so the UI must not call this degraded.
+            assert!(
+                m.helper_launchable(),
+                "not-yet-attempted must count as launchable, matching Windows"
+            );
+        }
+    }
+
+    #[test]
+    fn a_disabled_manager_is_never_launchable_even_with_a_real_sidecar() {
+        let m = manager_with_real_exe(false);
+        assert!(!m.helper_launchable());
+        assert!(!m.helper_alive());
+        assert!(!m.launch_pending());
+        assert!(!m.launch_declined());
+    }
+
     #[test]
     fn launch_args_carry_socket_allow_list_uid_and_pid() {
         let m = manager(true);
@@ -313,6 +413,40 @@ mod tests {
         assert_eq!(parsed.allowed_volumes, vec![PathBuf::from("/Users")]);
         assert_eq!(parsed.app_pid, std::process::id());
         assert_eq!(parsed.peer_uid, current_uid());
+    }
+
+    /// The bug this guards against cost the whole feature: with
+    /// `std::env::temp_dir()` the real socket path was 110 bytes against
+    /// Darwin's 104-byte `sockaddr_un.sun_path`, so the broker died with
+    /// "path must be shorter than SUN_LEN" before serving a single request -
+    /// on every Mac, not just unusual ones. Confirmed against the real broker
+    /// binary on macOS 26.6. Nothing else in the suite binds a socket, so only
+    /// a length assertion catches it.
+    #[test]
+    fn socket_path_fits_in_sockaddr_un() {
+        // Darwin's sun_path is 104 bytes including the NUL terminator.
+        const SUN_PATH_LEN: usize = 104;
+        let dir = ApfsHelperManager::runtime_dir().expect("runtime dir");
+        let sock = driven_apfs::launch::generate_socket_path(&dir);
+        let len = sock.as_os_str().as_encoded_bytes().len();
+        assert!(
+            len < SUN_PATH_LEN,
+            "socket path must fit in sockaddr_un: {len} bytes >= {SUN_PATH_LEN} for {}",
+            sock.display()
+        );
+    }
+
+    #[test]
+    fn runtime_dir_avoids_the_long_per_user_tmpdir() {
+        // Regression: macOS points TMPDIR at /var/folders/<xx>/<~20 chars>/T/,
+        // which alone eats most of the sockaddr_un budget. The runtime dir must
+        // not live under it.
+        let dir = ApfsHelperManager::runtime_dir().expect("runtime dir");
+        assert!(
+            !dir.starts_with("/var/folders"),
+            "runtime dir must avoid the long per-user TMPDIR: {}",
+            dir.display()
+        );
     }
 
     #[test]

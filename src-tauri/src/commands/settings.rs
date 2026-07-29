@@ -3447,6 +3447,7 @@ mod tests {
             updater: default_updater(),
             ui: default_ui(),
             windows: None,
+            macos: None,
             bundle_small_files: false,
         };
         let red = redact_settings(&dto);

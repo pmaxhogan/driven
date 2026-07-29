@@ -732,6 +732,35 @@ installs an externalBin into `Driven.app/Contents/MacOS/`, the same
 directory as the app binary, so the sidecar resolves via
 `current_exe().parent()` exactly as on Windows.
 
+**The socket path must fit in `sockaddr_un`.** Darwin's `sun_path` is 104
+bytes, and macOS points `TMPDIR` at a per-user
+`/var/folders/<xx>/<~20 chars>/T/`. Building the session socket under
+`std::env::temp_dir()` therefore yields a ~110-byte path and
+`UnixListener::bind` fails with "path must be shorter than SUN_LEN" - on
+EVERY Mac, before the broker serves a single request. The runtime directory
+is consequently `/tmp/driven-apfs-<uid>` (created `0700`), which brings the
+full socket path to ~70 bytes. `/tmp` is world-writable but sticky and the
+per-uid subdirectory is `0700`, so another user can neither read the socket
+nor replace the directory; if they pre-create it, it is owned by them and the
+broker's own "socket parent must be owned by the peer uid with mode 0700"
+check refuses to serve, so the failure is closed rather than silent.
+
+**Install layout decides whether the feature works at all.** The broker
+refuses to serve when the helper's own directory is writable by the client
+uid, because the peer check ("the caller's executable sits next to mine") is
+meaningless if the caller can drop a binary there. Measured on macOS 26.6:
+every app drag-installed from a DMG - including into `/Applications`, not
+merely `~/Applications` - has `Contents/MacOS` owned by the installing USER
+(verified across AltTab, Audacity, Chrome, Claude, Discord, Docker, GIMP),
+whereas pkg- and App-Store-installed apps (Cloudflare WARP, GarageBand) are
+`root:wheel`. Driven currently ships a `.dmg` whose documented install is a
+drag to `/Applications`, so on a stock install the broker exits at startup
+and locked-file backup never engages. Shipping this feature in a usable state
+therefore requires a `.pkg` (or a post-install `chown root:wheel` step) that
+lands the bundle root-owned. This is a deliberate security property of the
+broker, not a bug to work around: the alternative is a co-installation check
+that looks like authentication and is not.
+
 **Not a TCC bypass.** Worth restating because it is the single most likely
 misreading of this whole section: an APFS snapshot lets Driven read a file
 that is BUSY. It does nothing whatsoever for a file TCC has denied. The
