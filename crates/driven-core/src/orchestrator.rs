@@ -494,6 +494,14 @@ pub struct SyncOrchestrator {
     /// once per throughput window, resize the SAME [`UploadPool`](crate::adaptive::UploadPool)
     /// the executor acquires from. Set via [`Self::with_adaptive_controller`].
     adaptive: Option<Arc<crate::adaptive::AdaptiveController>>,
+    /// Restore-drill probe (`driven_core::drill`), or `None` when the app has
+    /// not wired one (every test, the CLI, the chaos harness). When `None` a
+    /// drill is never dispatched - which is the correct degradation, because
+    /// the probe IS the drill: without a real restore path there is nothing to
+    /// exercise, and reporting a drill that restored nothing as a pass would be
+    /// exactly the lie this feature exists to prevent. Set via
+    /// [`Self::with_restore_probe`].
+    restore_probe: Option<Arc<dyn crate::drill::RestoreProbe>>,
 }
 
 impl SyncOrchestrator {
@@ -549,6 +557,7 @@ impl SyncOrchestrator {
             suspended: std::sync::atomic::AtomicBool::new(false),
             latency: None,
             adaptive: None,
+            restore_probe: None,
         }
     }
 
@@ -566,6 +575,23 @@ impl SyncOrchestrator {
         controller: Arc<crate::adaptive::AdaptiveController>,
     ) -> Self {
         self.adaptive = Some(controller);
+        self
+    }
+
+    /// Wire the RESTORE-DRILL probe (`driven_core::drill`).
+    ///
+    /// The probe performs the actual sample restore through the app's real
+    /// restore path (destination confinement, stream decryption, bundle
+    /// extraction, plaintext-hash verification) into a temp directory. It lives
+    /// in the app shell because that path does; this crate owns only the
+    /// schedule, the sampling, and the report.
+    ///
+    /// Without it, drills never run. That is deliberate: a "drill" with no
+    /// restore path would verify nothing while producing a report, and a report
+    /// nobody can distinguish from a real pass is worse than no report.
+    #[must_use]
+    pub fn with_restore_probe(mut self, probe: Arc<dyn crate::drill::RestoreProbe>) -> Self {
+        self.restore_probe = Some(probe);
         self
     }
 
@@ -1367,6 +1393,188 @@ impl SyncOrchestrator {
         }
     }
 
+    /// Runs a RESTORE DRILL for `source` when it is due: restore a small,
+    /// deterministically-sampled set of backed-up files through the REAL
+    /// restore path, verify them, and persist the report.
+    ///
+    /// # Why the read side needs its own check
+    ///
+    /// Every other check verifies the backup from the WRITE side - post-upload
+    /// md5, the deep-verify re-hash, the remote-existence audit, the integrity
+    /// scrub. None of them ever runs the reverse pipeline (download,
+    /// stream-decrypt, extract a bundle member, verify the plaintext hash), so
+    /// a break anywhere in it surfaces exactly once: the day the user needs
+    /// their data.
+    ///
+    /// # Why it never fails the cycle
+    ///
+    /// Same rule as the audit and the scrub. A drill FAILURE is reported
+    /// loudly - it is the point of the feature - but it is reported through the
+    /// durable activity log and the persisted report, not by aborting a backup
+    /// that is otherwise perfectly able to run. Refusing to back up new work
+    /// because an OLD file would not restore would turn one problem into two.
+    async fn drill_if_due(&self, source: &SourceRow) {
+        let Some(probe) = self.restore_probe.clone() else {
+            return;
+        };
+        let cfg = crate::drill::load_drill_config(self.state.as_ref()).await;
+        if !cfg.enabled {
+            return;
+        }
+        let last = match self.state.drill_cursor(source.id).await {
+            Ok(c) => c.and_then(|c| c.last_drill_at),
+            Err(err) => {
+                tracing::warn!(
+                    target: TARGET,
+                    source_id = %source.id,
+                    %err,
+                    "could not read the restore-drill cursor; skipping the drill this cycle"
+                );
+                return;
+            }
+        };
+        let now = self.clock.now_ms();
+        if !crate::drill::drill_due(last, now, cfg.interval_ms()) {
+            return;
+        }
+
+        let started_at = now;
+        let report = self.run_drill(source, &cfg, probe.as_ref()).await;
+        let finished_at = self.clock.now_ms();
+
+        // Stamp the source regardless of the OUTCOME. A drill that failed still
+        // RAN: leaving it un-stamped would re-drill every 10-minute cycle
+        // against a backup that is already known to be broken, spending the
+        // user's bandwidth to re-learn the same fact. The failure is durable in
+        // the activity log and the report; the schedule does not need to shout.
+        if let Err(err) = self.state.set_drill_cursor(source.id, finished_at).await {
+            tracing::warn!(
+                target: TARGET,
+                source_id = %source.id,
+                %err,
+                "failed to stamp the restore-drill schedule"
+            );
+        }
+        if let Err(err) = self
+            .state
+            .insert_drill_run(&crate::state::NewDrillRun {
+                source_id: source.id,
+                started_at,
+                finished_at,
+                report: report.clone(),
+            })
+            .await
+        {
+            tracing::warn!(
+                target: TARGET,
+                source_id = %source.id,
+                %err,
+                "failed to persist the restore-drill report"
+            );
+        }
+
+        // SILENT GREEN on a pass, like every other periodic check here.
+        if !report.found_anything() {
+            tracing::debug!(
+                target: TARGET,
+                source_id = %source.id,
+                verified = report.verified,
+                skipped = report.skipped,
+                "restore drill passed"
+            );
+            return;
+        }
+
+        // A failed drill is the SAME class of event as any other backup
+        // failure, and is surfaced the same way: a durable ERROR-level
+        // `activity_log` row carrying a stable SPEC s24 code, which the Activity
+        // dashboard renders and the tray's error classification already
+        // understands. `file_count` carries the number of files that would not
+        // come back.
+        //
+        // `message` is `None` - the report is counts-and-codes only, so this row
+        // can never carry an encrypted source's filename.
+        tracing::error!(
+            target: TARGET,
+            source_id = %source.id,
+            sampled = report.sampled,
+            failed = report.failed,
+            "restore drill FAILED: sampled files could not be restored from the backup"
+        );
+        self.record_activity(NewActivity {
+            ts: finished_at,
+            source_id: Some(source.id),
+            level: ActivityLevel::Error,
+            event_type: crate::types::ErrorCode::RestoreDrillFailed.to_string(),
+            file_count: Some(report.failed),
+            bytes: None,
+            message: None,
+        })
+        .await;
+    }
+
+    /// Sample and restore, returning the finished report. Split out of
+    /// [`Self::drill_if_due`] so the scheduling/reporting half stays readable
+    /// and this half is a straight loop.
+    async fn run_drill(
+        &self,
+        source: &SourceRow,
+        cfg: &crate::drill::DrillConfig,
+        probe: &dyn crate::drill::RestoreProbe,
+    ) -> crate::drill::DrillReport {
+        let mut report = crate::drill::DrillReport::default();
+
+        let total = match self
+            .state
+            .count_restorable_files(source.id, crate::drill::DRILL_MAX_FILE_BYTES)
+            .await
+        {
+            Ok(n) => n,
+            Err(err) => {
+                tracing::warn!(
+                    target: TARGET,
+                    source_id = %source.id,
+                    %err,
+                    "could not count restorable files; the drill reports inconclusive"
+                );
+                report.finish();
+                return report;
+            }
+        };
+
+        // Seeded on the source plus the run's start time, so a given run's
+        // sample is reproducible from its report while successive runs move on
+        // to different files (a sampler that kept re-testing the same three
+        // would "pass" forever while the rest of the backup rotted).
+        let seed = format!("{}|{}", source.id, self.clock.now_ms());
+        for offset in crate::drill::sample_offsets(&seed, total, cfg.sample_size) {
+            let candidate = match self
+                .state
+                .nth_restorable_file(source.id, crate::drill::DRILL_MAX_FILE_BYTES, offset)
+                .await
+            {
+                Ok(Some(c)) => c,
+                // A concurrent deletion between the count and the lookup is
+                // benign - the file is legitimately gone, not un-restorable.
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        source_id = %source.id,
+                        %err,
+                        "could not resolve a drill candidate; skipping it"
+                    );
+                    continue;
+                }
+            };
+            let attempt = probe.restore_and_verify(&candidate).await;
+            report.record(&attempt);
+        }
+
+        report.finish();
+        report
+    }
+
     /// Writes a durable `activity_log` ERROR row per NFC collision the planner
     /// dropped (SPEC s24 `local.unicode_collision`, the M2-deferred item in
     /// design/CODEX_NOTES.md).
@@ -1711,6 +1919,12 @@ impl SyncOrchestrator {
         // force-rescan sentinel) before the scan below, so the heal completes
         // in ONE cycle exactly like the audit's.
         self.scrub_if_due(source).await;
+
+        // Restore drill, on its own (much slower) cadence. Runs AFTER the scrub
+        // so a drill never samples a file the scrub is about to re-queue as
+        // missing - which would report a known, already-being-fixed gap as a
+        // restore failure and raise a user alert for it.
+        self.drill_if_due(source).await;
 
         let user_initiated = tick == TickSource::Manual;
         if user_initiated {
@@ -3088,6 +3302,13 @@ mod tests {
         scrub_cursors: StdMutex<HashMap<SourceId, crate::scrub::ScrubCursor>>,
         /// Every persisted scrub run, newest LAST (insertion order).
         scrub_runs: StdMutex<Vec<crate::state::NewScrubRun>>,
+        /// Per-source drill stamps, for the drill-cadence tests.
+        drill_cursors: StdMutex<HashMap<SourceId, UnixMs>>,
+        /// Every persisted drill run, newest LAST.
+        drill_runs: StdMutex<Vec<crate::state::NewDrillRun>>,
+        /// The restorable population this fake reports, as `(path, size)` pairs
+        /// in `relative_path` order - the drill's sampling universe.
+        restorable: StdMutex<Vec<(String, u64)>>,
     }
 
     impl FakeState {
@@ -3101,12 +3322,32 @@ mod tests {
                 settings: StdMutex::new(HashMap::new()),
                 scrub_cursors: StdMutex::new(HashMap::new()),
                 scrub_runs: StdMutex::new(Vec::new()),
+                drill_cursors: StdMutex::new(HashMap::new()),
+                drill_runs: StdMutex::new(Vec::new()),
+                restorable: StdMutex::new(Vec::new()),
             }
         }
 
         /// Snapshot the persisted scrub runs, oldest-first.
         fn scrub_runs_snapshot(&self) -> Vec<crate::state::NewScrubRun> {
             self.scrub_runs.lock().unwrap().clone()
+        }
+
+        /// Snapshot the persisted drill runs, oldest-first.
+        ///
+        /// `allow(dead_code)`: scaffolding for the not-yet-written drill
+        /// scheduling tests, same as `FakeRestoreProbe`.
+        #[allow(dead_code)]
+        fn drill_runs_snapshot(&self) -> Vec<crate::state::NewDrillRun> {
+            self.drill_runs.lock().unwrap().clone()
+        }
+
+        /// Populate the restorable set the drill samples from.
+        #[allow(dead_code)]
+        fn with_restorable(self, files: &[(&str, u64)]) -> Self {
+            *self.restorable.lock().unwrap() =
+                files.iter().map(|(p, s)| ((*p).to_string(), *s)).collect();
+            self
         }
 
         /// Snapshot the recorded `mark_account_state` calls (V-F test).
@@ -3127,6 +3368,86 @@ mod tests {
 
     #[async_trait]
     impl StateRepo for FakeState {
+        async fn count_restorable_files(
+            &self,
+            _source: SourceId,
+            max_size: u64,
+        ) -> anyhow::Result<u64> {
+            Ok(self
+                .restorable
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, s)| *s <= max_size)
+                .count() as u64)
+        }
+
+        async fn nth_restorable_file(
+            &self,
+            source: SourceId,
+            max_size: u64,
+            offset: u64,
+        ) -> anyhow::Result<Option<crate::drill::DrillCandidate>> {
+            Ok(self
+                .restorable
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, s)| *s <= max_size)
+                .nth(offset as usize)
+                .map(|(p, s)| crate::drill::DrillCandidate {
+                    source_id: source,
+                    path: RelativePath::try_from(p.clone()).unwrap(),
+                    size: *s,
+                }))
+        }
+
+        async fn drill_cursor(
+            &self,
+            source: SourceId,
+        ) -> anyhow::Result<Option<crate::drill::DrillCursor>> {
+            Ok(self.drill_cursors.lock().unwrap().get(&source).map(|at| {
+                crate::drill::DrillCursor {
+                    last_drill_at: Some(*at),
+                }
+            }))
+        }
+
+        async fn set_drill_cursor(&self, source: SourceId, at: UnixMs) -> anyhow::Result<()> {
+            self.drill_cursors.lock().unwrap().insert(source, at);
+            Ok(())
+        }
+
+        async fn insert_drill_run(&self, run: &crate::state::NewDrillRun) -> anyhow::Result<i64> {
+            let mut runs = self.drill_runs.lock().unwrap();
+            runs.push(run.clone());
+            Ok(runs.len() as i64)
+        }
+
+        async fn list_drill_runs(
+            &self,
+            source: Option<SourceId>,
+            limit: u32,
+        ) -> anyhow::Result<Vec<crate::state::DrillRunRow>> {
+            Ok(self
+                .drill_runs
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .filter(|r| source.is_none_or(|s| r.source_id == s))
+                .take(limit as usize)
+                .enumerate()
+                .map(|(i, r)| crate::state::DrillRunRow {
+                    id: i as i64,
+                    source_id: r.source_id,
+                    started_at: r.started_at,
+                    finished_at: r.finished_at,
+                    report: r.report.clone(),
+                })
+                .collect())
+        }
+
         async fn scrub_cursor(
             &self,
             source: SourceId,
@@ -3588,6 +3909,63 @@ mod tests {
             OrchestratorConfig::default(),
         );
         (orch, state, clock)
+    }
+
+    /// Records every candidate handed to it and returns a scripted outcome.
+    ///
+    /// The scripted outcomes are consumed in order and the LAST one repeats, so
+    /// a test can say "the first restore fails, the rest verify" without
+    /// counting calls.
+    ///
+    /// `allow(dead_code)`: this is scaffolding for the drill SCHEDULING tests,
+    /// which are not written yet (see the PR description). It is committed
+    /// alongside the engine so the next person starts from a working double
+    /// rather than re-deriving one; delete the attribute as the tests land.
+    #[derive(Default)]
+    #[allow(dead_code)]
+    struct FakeRestoreProbe {
+        seen: StdMutex<Vec<String>>,
+        script: StdMutex<Vec<crate::drill::DrillAttempt>>,
+    }
+
+    #[allow(dead_code)]
+    impl FakeRestoreProbe {
+        fn new(script: Vec<crate::drill::DrillAttempt>) -> Arc<Self> {
+            Arc::new(FakeRestoreProbe {
+                seen: StdMutex::new(Vec::new()),
+                script: StdMutex::new(script),
+            })
+        }
+
+        fn always(attempt: crate::drill::DrillAttempt) -> Arc<Self> {
+            Self::new(vec![attempt])
+        }
+
+        fn seen_paths(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::drill::RestoreProbe for FakeRestoreProbe {
+        async fn restore_and_verify(
+            &self,
+            candidate: &crate::drill::DrillCandidate,
+        ) -> crate::drill::DrillAttempt {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(candidate.path.as_str().to_string());
+            let mut script = self.script.lock().unwrap();
+            if script.len() > 1 {
+                script.remove(0)
+            } else {
+                script
+                    .first()
+                    .cloned()
+                    .unwrap_or(crate::drill::DrillAttempt::Verified)
+            }
+        }
     }
 
     /// One recorded hook invocation: the command and its env vars.

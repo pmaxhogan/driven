@@ -373,6 +373,47 @@ fn i64_to_count(v: i64) -> u64 {
     u64::try_from(v).unwrap_or(0)
 }
 
+/// Narrow a `u64` byte size / offset for a SQLite bind, saturating rather than
+/// wrapping (a wrapped negative bound would silently invert the comparison).
+fn size_to_i64(v: u64) -> i64 {
+    i64::try_from(v).unwrap_or(i64::MAX)
+}
+
+/// The RESTORABLE predicate, as a macro expanding to a string LITERAL so both
+/// queries below can `concat!` it.
+///
+/// One definition, deliberately: the count and the nth-row lookup must describe
+/// the SAME population or an offset drawn from the count would address a
+/// different row (or none), and a drill would silently sample the wrong files.
+/// A macro rather than a `const` because `concat!` only composes literals.
+///
+/// Mirrors the restore browser's own `is_restorable`: a SYNCED row that either
+/// owns a standalone remote object OR is a bundle member (whose bytes live
+/// inside a `.tar.gz`, so its own `drive_file_id` is NULL by the migration-0007
+/// invariant). Keeping the definitions identical means a drill can only ever
+/// pick a file the user could pick by hand.
+macro_rules! restorable_predicate {
+    () => {
+        "f.source_id = ?1 AND f.status = 'synced' AND f.size <= ?2 \
+         AND (f.drive_file_id IS NOT NULL \
+              OR EXISTS (SELECT 1 FROM bundle_members m \
+                         WHERE m.source_id = f.source_id AND m.relative_path = f.relative_path))"
+    };
+}
+
+/// `SELECT COUNT(*)` over the restorable population.
+const RESTORABLE_COUNT_SQL: &str = concat!(
+    "SELECT COUNT(*) FROM file_state f WHERE ",
+    restorable_predicate!()
+);
+
+/// One restorable row at a given offset, in the SAME order the count implies.
+const RESTORABLE_NTH_SQL: &str = concat!(
+    "SELECT f.relative_path, f.size FROM file_state f WHERE ",
+    restorable_predicate!(),
+    " ORDER BY f.relative_path LIMIT 1 OFFSET ?3"
+);
+
 /// Decode a raw `file_versions` row (issue #36) into a [`FileVersionRow`]. Shared
 /// by the four SELECTs (list / resolve / over-cap / untrashed) so the BLOB +
 /// uuid + path decoding lives in one place.
@@ -1905,6 +1946,157 @@ impl StateRepo for SqliteStateRepo {
                     deep_failed: i64_to_count(r.try_get("deep_failed")?),
                     wrapped: wrapped != 0,
                     outcome: crate::scrub::ScrubOutcome::from_label(&outcome),
+                },
+            });
+        }
+        Ok(out)
+    }
+
+    // --- restore drills (migration 0014) ------------------------------------
+    //
+    // Runtime `sqlx::query` throughout, so these additive methods need no
+    // `.sqlx` cache regeneration.
+
+    async fn count_restorable_files(&self, source: SourceId, max_size: u64) -> Result<u64> {
+        let source_str = source.to_string();
+        // "Restorable" mirrors the restore browser's own rule: a SYNCED row that
+        // either owns a standalone object OR is a bundle member (whose bytes
+        // live inside a `.tar.gz`, so its own `drive_file_id` is NULL by the
+        // migration-0007 invariant). Keeping the two definitions identical means
+        // a drill can only ever pick a file the user could pick by hand.
+        let (n,): (i64,) = sqlx::query_as(RESTORABLE_COUNT_SQL)
+            .bind(source_str.as_str())
+            .bind(size_to_i64(max_size))
+            .fetch_one(&self.pool)
+            .await?;
+        Ok(i64_to_count(n))
+    }
+
+    async fn nth_restorable_file(
+        &self,
+        source: SourceId,
+        max_size: u64,
+        offset: u64,
+    ) -> Result<Option<crate::drill::DrillCandidate>> {
+        let source_str = source.to_string();
+        let row: Option<(String, i64)> = sqlx::query_as(RESTORABLE_NTH_SQL)
+            .bind(source_str.as_str())
+            .bind(size_to_i64(max_size))
+            .bind(size_to_i64(offset))
+            .fetch_optional(&self.pool)
+            .await?;
+        match row {
+            None => Ok(None),
+            Some((path, size)) => Ok(Some(crate::drill::DrillCandidate {
+                source_id: source,
+                path: relative_path_from_string(path)?,
+                size: u64::try_from(size).unwrap_or(0),
+            })),
+        }
+    }
+
+    async fn drill_cursor(&self, source: SourceId) -> Result<Option<crate::drill::DrillCursor>> {
+        let source_str = source.to_string();
+        let row: Option<(Option<i64>,)> =
+            sqlx::query_as("SELECT last_drill_at FROM drill_state WHERE source_id = ?1")
+                .bind(source_str.as_str())
+                .fetch_optional(&self.pool)
+                .await?;
+        Ok(row.map(|(last_drill_at,)| crate::drill::DrillCursor { last_drill_at }))
+    }
+
+    async fn set_drill_cursor(&self, source: SourceId, at: UnixMs) -> Result<()> {
+        let source_str = source.to_string();
+        sqlx::query(
+            "INSERT INTO drill_state (source_id, last_drill_at) VALUES (?1, ?2) \
+             ON CONFLICT(source_id) DO UPDATE SET last_drill_at = excluded.last_drill_at",
+        )
+        .bind(source_str.as_str())
+        .bind(at)
+        .execute(&self.pool)
+        .await?;
+        Ok(())
+    }
+
+    async fn insert_drill_run(&self, run: &crate::state::NewDrillRun) -> Result<i64> {
+        let source_str = run.source_id.to_string();
+        let r = &run.report;
+        // The failure breakdown is a JSON array of [code, count] pairs rather
+        // than its own table: it is at most a handful of entries, is only ever
+        // read back whole with its run, and the codes are a closed vocabulary,
+        // so a child table would buy nothing but a join.
+        let codes = serde_json::to_string(&r.failure_codes)?;
+        let mut tx = self.pool.begin().await?;
+        sqlx::query(
+            "INSERT INTO drill_runs ( \
+               source_id, started_at, finished_at, sampled, verified, skipped, failed, \
+               failure_codes, outcome) \
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)",
+        )
+        .bind(source_str.as_str())
+        .bind(run.started_at)
+        .bind(run.finished_at)
+        .bind(count_to_i64(r.sampled))
+        .bind(count_to_i64(r.verified))
+        .bind(count_to_i64(r.skipped))
+        .bind(count_to_i64(r.failed))
+        .bind(codes.as_str())
+        .bind(r.outcome.label())
+        .execute(&mut *tx)
+        .await?;
+        let (id,): (i64,) = sqlx::query_as("SELECT last_insert_rowid()")
+            .fetch_one(&mut *tx)
+            .await?;
+        sqlx::query(
+            "DELETE FROM drill_runs WHERE source_id = ?1 AND id NOT IN ( \
+               SELECT id FROM drill_runs WHERE source_id = ?1 \
+               ORDER BY started_at DESC, id DESC LIMIT ?2)",
+        )
+        .bind(source_str.as_str())
+        .bind(i64::from(crate::state::DRILL_RUN_HISTORY_CAP))
+        .execute(&mut *tx)
+        .await?;
+        tx.commit().await?;
+        Ok(id)
+    }
+
+    async fn list_drill_runs(
+        &self,
+        source: Option<SourceId>,
+        limit: u32,
+    ) -> Result<Vec<crate::state::DrillRunRow>> {
+        let source_str = source.map(|s| s.to_string());
+        #[allow(clippy::type_complexity)]
+        let rows: Vec<(i64, String, i64, i64, i64, i64, i64, i64, String, String)> =
+            sqlx::query_as(
+                "SELECT id, source_id, started_at, finished_at, sampled, verified, skipped, \
+                   failed, failure_codes, outcome \
+                 FROM drill_runs \
+                 WHERE (?1 IS NULL OR source_id = ?1) \
+                 ORDER BY started_at DESC, id DESC LIMIT ?2",
+            )
+            .bind(source_str.as_deref())
+            .bind(i64::from(limit))
+            .fetch_all(&self.pool)
+            .await?;
+        let mut out = Vec::with_capacity(rows.len());
+        for r in rows {
+            // A malformed blob can only come from a hand-edited DB; read it as
+            // "no breakdown" rather than failing the whole listing, so one bad
+            // row cannot hide every good one.
+            let failure_codes: Vec<(String, u64)> = serde_json::from_str(&r.8).unwrap_or_default();
+            out.push(crate::state::DrillRunRow {
+                id: r.0,
+                source_id: uuid_from_str(&r.1)?.into(),
+                started_at: r.2,
+                finished_at: r.3,
+                report: crate::drill::DrillReport {
+                    sampled: i64_to_count(r.4),
+                    verified: i64_to_count(r.5),
+                    skipped: i64_to_count(r.6),
+                    failed: i64_to_count(r.7),
+                    failure_codes,
+                    outcome: crate::drill::DrillOutcome::from_label(&r.9),
                 },
             });
         }
@@ -4216,6 +4408,230 @@ mod tests {
                 .unwrap(),
             Some(serde_json::json!(true))
         );
+    }
+
+    // --- migration 0014: restore drills --------------------------------------
+
+    /// Seed an account + source with `n` SYNCED, uploaded files of `size` bytes.
+    async fn seed_for_drill(n: usize, size: u64) -> (SqliteStateRepo, TempDir, SourceId) {
+        let (repo, dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        for i in 0..n {
+            let mut row = sample_file(src.id, &format!("f{i:02}.txt"), i as u8);
+            row.status = FileStateStatus::Synced;
+            row.drive_file_id = Some(format!("drive-{i:02}"));
+            row.size = size;
+            repo.upsert_file_state(&row).await.unwrap();
+        }
+        (repo, dir, src.id)
+    }
+
+    #[tokio::test]
+    async fn restorable_counting_and_nth_lookup_agree_on_the_same_population() {
+        // The load-bearing invariant: an offset drawn from the COUNT must
+        // address a row in the SAME population the nth lookup walks, or a drill
+        // silently samples the wrong file (or none).
+        let (repo, _dir, src) = seed_for_drill(5, 1_000).await;
+        let cap = 64 * 1024 * 1024;
+
+        assert_eq!(repo.count_restorable_files(src, cap).await.unwrap(), 5);
+        for (offset, expected) in [(0u64, "f00.txt"), (2, "f02.txt"), (4, "f04.txt")] {
+            let c = repo
+                .nth_restorable_file(src, cap, offset)
+                .await
+                .unwrap()
+                .expect("an offset inside the count must resolve");
+            assert_eq!(c.path.as_str(), expected);
+            assert_eq!(c.source_id, src);
+            assert_eq!(c.size, 1_000);
+        }
+        assert!(
+            repo.nth_restorable_file(src, cap, 5)
+                .await
+                .unwrap()
+                .is_none(),
+            "an offset past the end is a benign None, not an error"
+        );
+    }
+
+    /// Only files a USER could restore are drillable - otherwise a drill would
+    /// "fail" on a file the restore browser would not even offer.
+    #[tokio::test]
+    async fn non_synced_and_never_uploaded_rows_are_not_drillable() {
+        let (repo, _dir, src) = seed_for_drill(2, 100).await;
+        let cap = 64 * 1024 * 1024;
+
+        // Never uploaded (no standalone object, no bundle).
+        let mut never = sample_file(src, "z-never.txt", 9);
+        never.status = FileStateStatus::Synced;
+        never.drive_file_id = None;
+        repo.upsert_file_state(&never).await.unwrap();
+
+        // Uploaded but not synced (pending / corrupt).
+        for (name, status) in [
+            ("z-pending.txt", FileStateStatus::Pending),
+            ("z-corrupt.txt", FileStateStatus::Corrupt),
+        ] {
+            let mut row = sample_file(src, name, 8);
+            row.status = status;
+            row.drive_file_id = Some("drive-x".into());
+            repo.upsert_file_state(&row).await.unwrap();
+        }
+
+        assert_eq!(
+            repo.count_restorable_files(src, cap).await.unwrap(),
+            2,
+            "only the two synced, uploaded rows are drillable"
+        );
+    }
+
+    /// A bundled member has `drive_file_id IS NULL` but IS restorable (its bytes
+    /// live inside the bundle object), so it must be drillable - excluding it
+    /// would leave the whole bundle restore path untested.
+    #[tokio::test]
+    async fn bundled_members_are_drillable() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        let op_id = enqueue_bundle_op(&repo, src.id, "logs/a.log").await;
+        let members = vec![synced_member(src.id, "logs/a.log", 1)];
+        let bundle = BundleRow {
+            id: "bundle-1".into(),
+            source_id: src.id,
+            drive_file_id: "drive-bundle-1".into(),
+            drive_md5: Some([9u8; 16]),
+            size: 4096,
+            member_count: 1,
+            created_at: 1,
+        };
+        repo.commit_bundle_result(op_id, &bundle, &members)
+            .await
+            .unwrap();
+
+        let cap = 64 * 1024 * 1024;
+        assert_eq!(repo.count_restorable_files(src.id, cap).await.unwrap(), 1);
+        let c = repo
+            .nth_restorable_file(src.id, cap, 0)
+            .await
+            .unwrap()
+            .expect("the bundled member is drillable");
+        assert_eq!(c.path.as_str(), "logs/a.log");
+    }
+
+    /// The size cap is applied in the QUERY, not after sampling - filtering
+    /// afterwards would silently shrink a 3-file drill to 0 on a source of
+    /// large files.
+    #[tokio::test]
+    async fn the_size_cap_shrinks_the_population_rather_than_the_sample() {
+        let (repo, _dir, src) = seed_for_drill(3, 10_000).await;
+        assert_eq!(repo.count_restorable_files(src, 10_000).await.unwrap(), 3);
+        assert_eq!(repo.count_restorable_files(src, 9_999).await.unwrap(), 0);
+        assert!(repo
+            .nth_restorable_file(src, 9_999, 0)
+            .await
+            .unwrap()
+            .is_none());
+    }
+
+    #[tokio::test]
+    async fn the_drill_cursor_round_trips_and_upserts() {
+        let (repo, _dir, src) = seed_for_drill(1, 10).await;
+        assert!(repo.drill_cursor(src).await.unwrap().is_none());
+        repo.set_drill_cursor(src, 1_700_000_000_000).await.unwrap();
+        assert_eq!(
+            repo.drill_cursor(src).await.unwrap().unwrap().last_drill_at,
+            Some(1_700_000_000_000)
+        );
+        repo.set_drill_cursor(src, 1_700_000_600_000).await.unwrap();
+        assert_eq!(
+            repo.drill_cursor(src).await.unwrap().unwrap().last_drill_at,
+            Some(1_700_000_600_000)
+        );
+    }
+
+    #[tokio::test]
+    async fn drill_runs_round_trip_including_the_failure_code_breakdown() {
+        let (repo, _dir, src) = seed_for_drill(1, 10).await;
+        let mut report = crate::drill::DrillReport::default();
+        report.record(&crate::drill::DrillAttempt::Verified);
+        report.record(&crate::drill::DrillAttempt::Skipped {
+            code: crate::types::ErrorCode::CryptoKeyMissing,
+        });
+        report.record(&crate::drill::DrillAttempt::Failed {
+            code: crate::types::ErrorCode::DriveUnreachable,
+        });
+        report.record(&crate::drill::DrillAttempt::Failed {
+            code: crate::types::ErrorCode::DriveUnreachable,
+        });
+        report.finish();
+
+        repo.insert_drill_run(&crate::state::NewDrillRun {
+            source_id: src,
+            started_at: 100,
+            finished_at: 200,
+            report: report.clone(),
+        })
+        .await
+        .unwrap();
+
+        let rows = repo.list_drill_runs(Some(src), 10).await.unwrap();
+        assert_eq!(rows.len(), 1);
+        assert_eq!(rows[0].started_at, 100);
+        assert_eq!(rows[0].finished_at, 200);
+        assert_eq!(
+            rows[0].report, report,
+            "counts, the code breakdown, and the outcome all survive the round trip"
+        );
+        assert_eq!(
+            rows[0].report.failure_codes,
+            vec![("drive.unreachable".to_string(), 2)]
+        );
+    }
+
+    #[tokio::test]
+    async fn drill_run_history_is_capped_per_source_keeping_the_newest() {
+        let (repo, _dir, src) = seed_for_drill(1, 10).await;
+        let cap = i64::from(crate::state::DRILL_RUN_HISTORY_CAP);
+        for i in 0..(cap + 5) {
+            repo.insert_drill_run(&crate::state::NewDrillRun {
+                source_id: src,
+                started_at: i,
+                finished_at: i,
+                report: crate::drill::DrillReport::default(),
+            })
+            .await
+            .unwrap();
+        }
+        assert_eq!(repo.table_row_count("drill_runs").await.unwrap(), cap);
+        assert_eq!(
+            repo.list_drill_runs(Some(src), 1).await.unwrap()[0].started_at,
+            cap + 4
+        );
+    }
+
+    #[tokio::test]
+    async fn the_drill_tables_are_known_to_the_diagnostic_bundle() {
+        let (repo, _dir) = temp_repo().await;
+        for t in ["drill_state", "drill_runs"] {
+            assert!(crate::state::KNOWN_STATE_TABLES.contains(&t));
+            assert_eq!(repo.table_row_count(t).await.unwrap(), 0);
+        }
+    }
+
+    #[tokio::test]
+    async fn the_migration_seeds_the_shipped_drill_defaults() {
+        let (repo, _dir) = temp_repo().await;
+        let cfg = crate::drill::load_drill_config(&repo).await;
+        assert_eq!(cfg, crate::drill::DrillConfig::default());
+        assert!(cfg.enabled);
+        assert_eq!(cfg.interval_secs, 2_592_000);
+        assert_eq!(cfg.sample_size, 3);
     }
 
     // --- issue #36: versioning (file_versions + config) ---------------------

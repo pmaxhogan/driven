@@ -558,6 +558,12 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         // A point-in-time restore rejected for want of a covering version is a
         // user-input condition, not a network reachability problem.
         | ErrorCode::RestoreNoVersionAsOf
+        // A failed restore drill means a file the user believes is backed up
+        // would not come back. Emphatically NOT a reachability condition - it
+        // must render as the red error state, never the yellow "we'll retry
+        // when the network is better" bang, because nothing about waiting fixes
+        // it.
+        | ErrorCode::RestoreDrillFailed
         | ErrorCode::HarnessTimeout
         | ErrorCode::InternalBug
         // Invalid input crossing the IPC boundary is a user/renderer error,

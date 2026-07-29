@@ -643,6 +643,13 @@ async fn build_account(
         ));
         orchestrator = orchestrator.with_adaptive_controller(controller);
     }
+    // Scheduled restore drills (`driven_core::drill`): the probe runs a sampled
+    // file through the app's REAL restore path into a temp dir. Wired here
+    // because this is the only place that has both the orchestrator and an app
+    // handle; without it the orchestrator never dispatches a drill, which is the
+    // correct degradation for the CLI / chaos harness (no restore path to test).
+    orchestrator =
+        orchestrator.with_restore_probe(crate::drill_probe::AppRestoreProbe::new(app.clone()));
     let orchestrator = Arc::new(orchestrator);
 
     // R-P1-1: one shutdown signal both bridges select! on, so quit can stop the

@@ -23,6 +23,7 @@ mod assembly;
 // `DialogToken`) against the real implementation.
 pub mod commands;
 mod crypto_provider_impl;
+mod drill_probe;
 // NOTE: the "run elevated" module was removed pre-V1 (2026-06-25). It implemented
 // WHOLE-APP elevation (a /RL HIGHEST Task Scheduler logon task + a UAC restart),
 // which is not the least-privilege model we want. The intended V1.x design is a
