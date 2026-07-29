@@ -30,8 +30,11 @@
 //!   the un-elevated app read only what it could already read).
 //!
 //! The pure decision pieces (mount registry reuse, allow-list matching,
-//! request validation) are unit-tested cross-OS; the socket/mount syscalls
-//! are macOS-gated.
+//! request validation) are unit-tested on unix; the socket/mount syscalls are
+//! macOS-gated. The tests are unix-gated rather than fully cross-OS because
+//! the volume allow-list is expressed in POSIX absolute paths, which
+//! `Path::is_absolute` rejects on Windows - the snapshot-name/date validation
+//! and the protocol framing ARE portable and run everywhere.
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
@@ -636,7 +639,11 @@ mod macos {
 #[cfg(target_os = "macos")]
 pub use macos::run;
 
-#[cfg(test)]
+// Unix-gated for the same reason as `paths::tests`: the allow-list cases use
+// POSIX absolute volume mounts, which `Path::is_absolute` rejects on Windows.
+// The genuinely portable checks (snapshot name/date validation, the protocol
+// framing) live in `snapshot`/`protocol` and DO run on every target.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 

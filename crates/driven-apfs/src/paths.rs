@@ -15,8 +15,9 @@
 //!   be the same file (dev+ino) before trusting it, so an exotic mount layout
 //!   degrades to skip rather than reading the wrong file.
 //!
-//! The candidate DECISION is pure and unit-tested cross-OS; only the
-//! statfs/stat verification is macOS-gated.
+//! The candidate DECISION is pure and unit-tested on unix (POSIX absolute
+//! paths are not absolute on Windows, so the mapping it pins is inexpressible
+//! there); only the statfs/stat verification is macOS-gated.
 
 use std::path::{Path, PathBuf};
 
@@ -142,7 +143,11 @@ pub fn snapshot_path_for(live: &Path, volume_mount: &Path, mountpoint: &Path) ->
     Some(mapped)
 }
 
-#[cfg(test)]
+// These exercise POSIX path semantics with absolute paths like
+// `/System/Volumes/Data`. On Windows `Path::is_absolute` is false for those
+// (it wants a drive letter or UNC), so the mapping logic they pin cannot be
+// expressed there - running them on Windows tests nothing and fails loudly.
+#[cfg(all(test, unix))]
 mod tests {
     use super::*;
 
