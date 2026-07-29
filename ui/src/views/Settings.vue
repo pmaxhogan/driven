@@ -165,6 +165,12 @@ const meteredModes = ["pause", "throttle"] as const;
 const meteredMode = ref("pause");
 const meteredCapText = ref("");
 
+// Scheduled integrity-scrub local mirrors. The cadence is stored in SECONDS but
+// entered in HOURS (a weekly default reads as `168`, not `604800`).
+const scrubIntervalHoursText = ref("");
+const scrubSliceText = ref("");
+const scrubDeepSampleText = ref("");
+
 // Issue #34: custom corporate root CA path + inline validation feedback.
 const customCaPath = ref("");
 const caFeedback = ref<{ ok: boolean; message: string } | null>(null);
@@ -245,6 +251,12 @@ watch(
     meteredMode.value = s.global.meteredMode ?? "pause";
     meteredCapText.value =
       s.global.meteredBandwidthCapMbps === null ? "" : String(s.global.meteredBandwidthCapMbps);
+    // Scrub: seconds -> hours for display. A settings snapshot written by an
+    // older build may not carry the group at all, so fall back to the shipped
+    // defaults rather than rendering NaN.
+    scrubIntervalHoursText.value = String(Math.round((s.scrub?.intervalSecs ?? 604_800) / 3600));
+    scrubSliceText.value = String(s.scrub?.sliceSize ?? 500);
+    scrubDeepSampleText.value = String(s.scrub?.deepSample ?? 0);
     customCaPath.value = s.global.customRootCaPath ?? "";
     // NOTE: do NOT reset `caFeedback` here - `commitCustomCa` updates the store,
     // which re-runs this loader, and clearing it would wipe the just-shown
@@ -269,6 +281,12 @@ const RANGES = {
   scanIntervalSecs: [30, 604_800],
   deepVerifyIntervalSecs: [3_600, 31_536_000],
   hookTimeoutSecs: [1, 86_400],
+  // The scrub cadence is entered in HOURS but stored in seconds, so this range
+  // is the backend's SCRUB_INTERVAL_MIN..MAX (1 hour .. 1 year) expressed in
+  // hours - keep the two in step.
+  scrubIntervalHours: [1, 8_760],
+  scrubSliceSize: [10, 10_000],
+  scrubDeepSample: [0, 100],
 } as const;
 
 function clampToRange(value: number, [min, max]: readonly [number, number]): number {
@@ -345,6 +363,44 @@ async function setSkipOnMetered(event: Event): Promise<void> {
 async function setBundleSmallFiles(event: Event): Promise<void> {
   const checked = (event.target as HTMLInputElement).checked;
   await commitPatch({ bundleSmallFiles: checked });
+}
+
+// Scheduled integrity scrub. The cadence is stored in SECONDS but shown in
+// HOURS: a weekly default is `604800`, which is unreadable as a number in a box,
+// while `168` is a duration a person can reason about.
+async function setScrubEnabled(event: Event): Promise<void> {
+  const checked = (event.target as HTMLInputElement).checked;
+  await commitPatch({ scrub: { enabled: checked } });
+}
+
+async function commitScrubInterval(): Promise<void> {
+  const hours = parseRequiredClamped(
+    scrubIntervalHoursText.value,
+    RANGES.scrubIntervalHours,
+    Math.round((settings.settings?.scrub?.intervalSecs ?? 604_800) / 3600)
+  );
+  scrubIntervalHoursText.value = String(hours);
+  await commitPatch({ scrub: { intervalSecs: hours * 3600 } });
+}
+
+async function commitScrubSlice(): Promise<void> {
+  const value = parseRequiredClamped(
+    scrubSliceText.value,
+    RANGES.scrubSliceSize,
+    settings.settings?.scrub?.sliceSize ?? 500
+  );
+  scrubSliceText.value = String(value);
+  await commitPatch({ scrub: { sliceSize: value } });
+}
+
+async function commitScrubDeepSample(): Promise<void> {
+  const value = parseRequiredClamped(
+    scrubDeepSampleText.value,
+    RANGES.scrubDeepSample,
+    settings.settings?.scrub?.deepSample ?? 0
+  );
+  scrubDeepSampleText.value = String(value);
+  await commitPatch({ scrub: { deepSample: value } });
 }
 
 async function setMeteredMode(event: Event): Promise<void> {
@@ -1032,6 +1088,74 @@ const showTelemetryPreview = ref(false);
           </label>
           <p class="text-xs text-zinc-500 dark:text-zinc-400">
             {{ t("settings.rules.bundleSmallFilesNote") }}
+          </p>
+        </section>
+
+        <!-- Scheduled integrity scrub -->
+        <section class="space-y-2" :class="cardCls" data-testid="scrub-setting">
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("scrub.settings.heading") }}
+          </h3>
+          <p class="text-xs text-zinc-500 dark:text-zinc-400">
+            {{ t("scrub.settings.description") }}
+          </p>
+          <label class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              class="accent-teal-600"
+              data-testid="scrub-enabled-toggle"
+              :checked="settings.settings?.scrub?.enabled ?? true"
+              @change="setScrubEnabled"
+            />
+            {{ t("scrub.settings.enabledLabel") }}
+          </label>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("scrub.settings.intervalLabel")
+            }}</span>
+            <input
+              v-model="scrubIntervalHoursText"
+              type="number"
+              min="1"
+              max="8760"
+              data-testid="scrub-interval"
+              class="w-full"
+              :class="inputCls"
+              @change="commitScrubInterval"
+            />
+          </label>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("scrub.settings.sliceLabel")
+            }}</span>
+            <input
+              v-model="scrubSliceText"
+              type="number"
+              min="10"
+              max="10000"
+              data-testid="scrub-slice"
+              class="w-full"
+              :class="inputCls"
+              @change="commitScrubSlice"
+            />
+          </label>
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("scrub.settings.deepSampleLabel")
+            }}</span>
+            <input
+              v-model="scrubDeepSampleText"
+              type="number"
+              min="0"
+              max="100"
+              data-testid="scrub-deep-sample"
+              class="w-full"
+              :class="inputCls"
+              @change="commitScrubDeepSample"
+            />
+          </label>
+          <p class="text-xs text-zinc-500 dark:text-zinc-400">
+            {{ t("scrub.settings.deepSampleHelp") }}
           </p>
         </section>
 

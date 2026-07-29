@@ -79,6 +79,10 @@ enum Command {
     /// Read an existing `rclone.conf` and show what each remote maps to in
     /// Driven (read-only; it creates no account and writes no secret).
     Rclone(rclone::RcloneArgs),
+    /// Show the integrity-scrub configuration and recent scrub reports from
+    /// the local state database. With `--fail-on-drift`, exits non-zero when
+    /// the latest run of any source found drift it could not repair.
+    Scrub(inspect::ScrubArgs),
 }
 
 /// Arguments for `driven-cli auth`.
@@ -169,6 +173,7 @@ async fn main() -> anyhow::Result<()> {
             rclone::RcloneCommand::List(a) => rclone::run_list(a).await,
             rclone::RcloneCommand::Import(a) => rclone::run_import(a).await,
         },
+        Command::Scrub(args) => inspect::run_scrub(args).await,
     }
 }
 

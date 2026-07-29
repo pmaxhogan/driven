@@ -96,6 +96,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     windows: { vssMode: "auto", vssHelper: false },
     macos: null,
     bundleSmallFiles: false,
+    scrub: { enabled: true, intervalSecs: 604800, sliceSize: 500, deepSample: 0 },
     ...over,
   };
 }

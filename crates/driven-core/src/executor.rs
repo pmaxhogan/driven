@@ -616,6 +616,47 @@ pub trait Executor: Send + Sync {
     async fn audit_remote_existence(&self, source: &SourceRow)
         -> anyhow::Result<RemoteAuditReport>;
 
+    /// Runs ONE SLICE of the scheduled INTEGRITY SCRUB for `source`: verify
+    /// that a bounded, rolling window of recorded objects still matches what
+    /// the remote reports about them, repair what is repairable, and return
+    /// the counts-only report.
+    ///
+    /// # Why this exists, given the audit already runs
+    ///
+    /// [`Self::audit_remote_existence`] answers "does the object still exist?"
+    /// - a set-membership question it can settle for the WHOLE source in a
+    /// handful of paged list calls. It cannot answer "do the object's bytes
+    /// still match what we recorded?", because the whole-source listing
+    /// carries only ids. That second question needs the per-object metadata
+    /// (`size` + `md5Checksum`), which is one GET per object - so it is asked
+    /// about a bounded SLICE per run, resumed from a persisted cursor, and it
+    /// catches the failure the audit structurally cannot: an object that is
+    /// still there but no longer holds the bytes Driven uploaded.
+    ///
+    /// # Contract
+    ///
+    /// - **Bounded**: at most `cfg.slice_size` metadata GETs per population
+    ///   (files, bundles), plus one whole-source listing, plus at most
+    ///   `cfg.deep_sample` downloads. Every remote call goes through the pacer.
+    /// - **ALL-OR-NOTHING on existence**: if the live-object enumeration
+    ///   cannot be completed the run writes NOTHING, advances NO cursor, and
+    ///   reports [`crate::scrub::ScrubOutcome::Incomplete`]. A partial listing
+    ///   would read as a mass deletion - the same trap, and the same rule, as
+    ///   the audit.
+    /// - **Repairs only what is safely repairable**: a MISSING object is
+    ///   re-queued exactly as the audit re-queues it. A size/hash mismatch is
+    ///   COUNTED and surfaced but never "repaired", because the only repair
+    ///   primitive NULLs `drive_file_id`, which would orphan the still-live
+    ///   remote object and silently burn the user's quota forever.
+    /// - **Never fatal**: a remote failure is reported, never propagated as a
+    ///   cycle abort. "We could not check" is not "the backup is broken".
+    /// - **Idempotent**: re-running over already-healed state finds nothing.
+    async fn scrub_slice(
+        &self,
+        source: &SourceRow,
+        cfg: &crate::scrub::ScrubConfig,
+    ) -> anyhow::Result<crate::scrub::ScrubReport>;
+
     /// Sets the manual-pause dispatch gate (DESIGN s5.7).
     ///
     /// `true` means "stop starting new ops": an `execute` that is CURRENTLY
@@ -4495,6 +4536,247 @@ impl Executor for DefaultExecutor {
         Ok(report)
     }
 
+    async fn scrub_slice(
+        &self,
+        source: &SourceRow,
+        cfg: &crate::scrub::ScrubConfig,
+    ) -> anyhow::Result<crate::scrub::ScrubReport> {
+        use crate::scrub::{
+            advance_cursor, classify, deterministic_sample, Drift, ScrubCursor, ScrubOutcome,
+            ScrubReport,
+        };
+
+        let mut report = ScrubReport::default();
+        let now = self.clock.now_ms();
+        let cursor = self
+            .state
+            .scrub_cursor(source.id)
+            .await?
+            .unwrap_or_default();
+
+        // --- 1. The RECORDED slice: one bounded keyset page per population --
+        // Read BEFORE the remote listing, for the same reason the audit does:
+        // reading it after would widen the race with a concurrent upload, and
+        // an object created between listing and read would be
+        // recorded-but-not-listed and judged dead. In this order the worst
+        // case is the harmless inverse.
+        let files = self
+            .state
+            .list_scrub_file_page(source.id, cursor.file_cursor.as_deref(), cfg.slice_size)
+            .await?;
+        let bundles = self
+            .state
+            .list_scrub_bundle_page(source.id, cursor.bundle_cursor.as_deref(), cfg.slice_size)
+            .await?;
+
+        let (next_file_cursor, files_wrapped) = advance_cursor(
+            files.last().map(crate::scrub::ScrubCandidate::cursor_key),
+            files.len(),
+            cfg.slice_size,
+            cursor.file_cursor.is_some(),
+        );
+        let (next_bundle_cursor, bundles_wrapped) = advance_cursor(
+            bundles.last().map(crate::scrub::ScrubCandidate::cursor_key),
+            bundles.len(),
+            cfg.slice_size,
+            cursor.bundle_cursor.is_some(),
+        );
+        report.wrapped = files_wrapped || bundles_wrapped;
+
+        if files.is_empty() && bundles.is_empty() {
+            // Nothing uploaded yet, or both cursors sat exactly at the end of
+            // their populations. Either way there is no remote call to make -
+            // just wrap both cursors so the next run starts a fresh lap, and
+            // stamp the run so the source is not permanently due.
+            self.state
+                .set_scrub_cursor(
+                    source.id,
+                    &ScrubCursor {
+                        file_cursor: None,
+                        bundle_cursor: None,
+                        last_scrub_at: Some(now),
+                    },
+                )
+                .await?;
+            report.finish();
+            return Ok(report);
+        }
+
+        // --- 2. The LIVE set: the existence oracle ---------------------------
+        // The SAME whole-source enumeration the remote-existence audit infers
+        // deletion from. Using one oracle for both passes is what stops them
+        // disagreeing about a single object (a scrub that healed something the
+        // audit considers live would oscillate: heal, re-upload, audit clean,
+        // heal again).
+        self.pacer.permit_request().await;
+        let live = match self
+            .remote
+            .list_source_object_ids(&source.id.to_string(), &source.drive_context())
+            .await
+        {
+            Ok(live) => {
+                self.pacer.note_response(ResponseClass::Ok);
+                live
+            }
+            Err(e) => {
+                // ABORT WITH ZERO WRITES and NO CURSOR ADVANCE. The scrub
+                // infers "gone" from ABSENCE, so a failed - or worse, partial -
+                // enumeration would name live objects as dead. Unlike the
+                // audit this returns Ok: an `incomplete` run is still a fact
+                // worth persisting, because "we could not check" must be
+                // distinguishable from "we checked and it was fine".
+                let class = classify_drive_error(&e);
+                self.pacer.note_response(class.response_class());
+                warn!(
+                    target: TARGET,
+                    source_id = %source.id,
+                    err = %e,
+                    "integrity scrub could not enumerate the source's live Drive objects; nothing was checked or changed"
+                );
+                report.outcome = ScrubOutcome::Incomplete;
+                report.wrapped = false;
+                return Ok(report);
+            }
+        };
+
+        // --- 3. Per-object verification -------------------------------------
+        // `Ok` candidates that carry a recorded md5 are the deep-check pool -
+        // collected as we go so the sample is drawn from objects that already
+        // passed the cheap check (a deep check of an object we know is broken
+        // teaches nothing).
+        let mut deep_pool: Vec<&crate::scrub::ScrubCandidate> = Vec::new();
+        for candidate in files.iter().chain(bundles.iter()) {
+            let is_live = live.contains(&candidate.drive_file_id);
+            // Only ask for metadata when the object is live: a GET against a
+            // hard-deleted id is a guaranteed failure, and the live set has
+            // already answered the existence question.
+            let observed = if is_live {
+                self.pacer.permit_request().await;
+                match self.remote.metadata(&candidate.drive_file_id).await {
+                    Ok(entry) => {
+                        self.pacer.note_response(ResponseClass::Ok);
+                        Some(entry)
+                    }
+                    Err(e) => {
+                        let class = classify_drive_error(&e);
+                        self.pacer.note_response(class.response_class());
+                        debug!(
+                            target: TARGET,
+                            source_id = %source.id,
+                            err = %e,
+                            "integrity scrub could not read one object's metadata; counted as unverifiable"
+                        );
+                        None
+                    }
+                }
+            } else {
+                None
+            };
+
+            let drift = classify(candidate, is_live, observed.as_ref());
+            report.record(drift);
+
+            match drift {
+                Drift::Ok
+                    if candidate.md5.is_some()
+                        && candidate.size <= crate::scrub::SCRUB_DEEP_MAX_OBJECT_BYTES =>
+                {
+                    deep_pool.push(candidate);
+                }
+                Drift::Missing => self.repair_missing(source, candidate, &mut report).await,
+                _ => {}
+            }
+        }
+
+        // Every size/hash mismatch is drift the scrub deliberately does NOT
+        // repair (see the trait docs): the only repair primitive NULLs
+        // `drive_file_id`, which is right for a gone object and wrong for a
+        // live one - it would orphan the remote object. So they are counted as
+        // needing a human instead.
+        report.unrecoverable = report
+            .unrecoverable
+            .saturating_add(report.size_mismatch)
+            .saturating_add(report.hash_mismatch);
+
+        // --- 4. Deep sample --------------------------------------------------
+        if cfg.deep_sample > 0 && !deep_pool.is_empty() {
+            let n = (cfg.deep_sample as usize).min(crate::scrub::SCRUB_DEEP_SAMPLE_HARD_CAP);
+            // Seeded on the source plus the slice's starting cursors, so the
+            // SAME slice always deep-checks the SAME objects and a reported
+            // failure is reproducible by re-running the scrub.
+            let seed = format!(
+                "{}|{}|{}",
+                source.id,
+                cursor.file_cursor.as_deref().unwrap_or(""),
+                cursor.bundle_cursor.as_deref().unwrap_or("")
+            );
+            let keys: Vec<&str> = deep_pool.iter().map(|c| c.cursor_key()).collect();
+            for idx in deterministic_sample(&seed, &keys, n) {
+                let candidate = deep_pool[idx];
+                match self.deep_check(candidate).await {
+                    Ok(true) => report.deep_checked = report.deep_checked.saturating_add(1),
+                    Ok(false) => {
+                        report.deep_checked = report.deep_checked.saturating_add(1);
+                        report.deep_failed = report.deep_failed.saturating_add(1);
+                        report.unrecoverable = report.unrecoverable.saturating_add(1);
+                        warn!(
+                            target: TARGET,
+                            source_id = %source.id,
+                            "integrity scrub deep check: a downloaded object did not re-hash to its recorded md5"
+                        );
+                    }
+                    Err(e) => {
+                        // A download that failed proves nothing; it is not a
+                        // deep check that happened, so it is not counted at all.
+                        debug!(
+                            target: TARGET,
+                            source_id = %source.id,
+                            err = %e,
+                            "integrity scrub deep check could not download an object; skipped"
+                        );
+                    }
+                }
+            }
+        }
+
+        // --- 5. Advance the rolling cursors ---------------------------------
+        // Only reached when the enumeration succeeded, so the slice really was
+        // checked and skipping past it next run loses nothing.
+        self.state
+            .set_scrub_cursor(
+                source.id,
+                &ScrubCursor {
+                    file_cursor: next_file_cursor,
+                    bundle_cursor: next_bundle_cursor,
+                    last_scrub_at: Some(now),
+                },
+            )
+            .await?;
+
+        report.finish();
+        if report.found_anything() {
+            warn!(
+                target: TARGET,
+                source_id = %source.id,
+                checked = report.checked,
+                missing = report.missing,
+                size_mismatch = report.size_mismatch,
+                hash_mismatch = report.hash_mismatch,
+                healed = report.healed,
+                unrecoverable = report.unrecoverable,
+                "integrity scrub found drift between the recorded state and the remote"
+            );
+        } else {
+            debug!(
+                target: TARGET,
+                source_id = %source.id,
+                checked = report.checked,
+                "integrity scrub slice: every checked object matches the recorded state"
+            );
+        }
+        Ok(report)
+    }
+
     async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()> {
         let pending = self.state.get_pending_ops_for_source(source.id).await?;
 
@@ -4896,6 +5178,129 @@ impl Executor for DefaultExecutor {
 }
 
 impl DefaultExecutor {
+    /// Repairs one MISSING scrub candidate, updating `report`'s counters.
+    ///
+    /// Byte-for-byte the SAME remediation
+    /// [`Executor::audit_remote_existence`] applies - a standalone file is
+    /// re-queued with the force-rescan sentinel, a bundle is healed (members
+    /// re-queued, bundle row dropped, membership rows cascaded). Deliberately
+    /// not a new repair path: an object the scrub found gone and an object the
+    /// audit found gone are the same condition, so they must recover
+    /// identically or the two passes would produce different end states for
+    /// the same damage.
+    ///
+    /// A repair that itself fails is counted as UNRECOVERABLE rather than
+    /// propagated: one un-repairable row must not abort the rest of the slice,
+    /// and the un-advanced state means the next run tries again anyway.
+    async fn repair_missing(
+        &self,
+        source: &SourceRow,
+        candidate: &crate::scrub::ScrubCandidate,
+        report: &mut crate::scrub::ScrubReport,
+    ) {
+        match &candidate.target {
+            crate::scrub::ScrubTarget::File { path } => {
+                match self
+                    .state
+                    .requeue_file_state_for_reupload(source.id, path, REQUEUE_FORCE_RESCAN_MTIME_NS)
+                    .await
+                {
+                    Ok(()) => report.healed = report.healed.saturating_add(1),
+                    Err(err) => {
+                        report.unrecoverable = report.unrecoverable.saturating_add(1);
+                        warn!(
+                            target: TARGET,
+                            source_id = %source.id,
+                            %err,
+                            "integrity scrub could not re-queue a file whose remote object is gone"
+                        );
+                    }
+                }
+            }
+            crate::scrub::ScrubTarget::Bundle { bundle_id } => {
+                match self
+                    .state
+                    .heal_dead_bundle(bundle_id, REQUEUE_FORCE_RESCAN_MTIME_NS)
+                    .await
+                {
+                    Ok(members) => {
+                        report.healed = report.healed.saturating_add(1);
+                        report.healed_bundle_members = report
+                            .healed_bundle_members
+                            .saturating_add(members.len() as u64);
+                    }
+                    Err(err) => {
+                        report.unrecoverable = report.unrecoverable.saturating_add(1);
+                        warn!(
+                            target: TARGET,
+                            source_id = %source.id,
+                            %err,
+                            "integrity scrub could not heal a bundle whose remote object is gone"
+                        );
+                    }
+                }
+            }
+        }
+    }
+
+    /// Downloads one object and re-hashes the bytes the remote actually
+    /// returns, comparing against the recorded md5.
+    ///
+    /// `Ok(true)` = the bytes match; `Ok(false)` = they do not (real
+    /// corruption); `Err` = the download failed, which proves NOTHING and is
+    /// therefore not counted as a deep check at all.
+    ///
+    /// This is the check that does not trust the provider: the metadata
+    /// comparison believes Drive's own `md5Checksum`, so it cannot detect a
+    /// backend whose checksum is right while its bytes are not. Streamed
+    /// through a fixed buffer so memory stays bounded no matter how large the
+    /// object is, and NO plaintext is involved - the bytes hashed are exactly
+    /// the stored (ciphertext, for an encrypted source) bytes, so the deep
+    /// check needs no key and can never touch a decrypted filename or body.
+    async fn deep_check(&self, candidate: &crate::scrub::ScrubCandidate) -> anyhow::Result<bool> {
+        use md5::Digest as _;
+        use tokio::io::AsyncReadExt as _;
+
+        let Some(recorded) = candidate.md5 else {
+            // The caller only pools candidates that carry one; belt and braces.
+            return Err(anyhow::anyhow!("deep check needs a recorded md5"));
+        };
+
+        self.pacer.permit_request().await;
+        let mut reader = match self.remote.download(&candidate.drive_file_id).await {
+            Ok(stream) => {
+                self.pacer.note_response(ResponseClass::Ok);
+                stream.0
+            }
+            Err(e) => {
+                let class = classify_drive_error(&e);
+                self.pacer.note_response(class.response_class());
+                return Err(e);
+            }
+        };
+
+        let mut hasher = md5::Md5::new();
+        let mut buf = vec![0u8; 256 * 1024];
+        let mut total: u64 = 0;
+        loop {
+            let n = reader.read(&mut buf).await?;
+            if n == 0 {
+                break;
+            }
+            total = total.saturating_add(n as u64);
+            // A remote that streams more bytes than the object claims to hold
+            // is itself a fault; stop rather than hashing unbounded input.
+            if total > crate::scrub::SCRUB_DEEP_MAX_OBJECT_BYTES {
+                return Err(anyhow::anyhow!(
+                    "deep check aborted: object exceeded the deep-check size cap mid-stream"
+                ));
+            }
+            hasher.update(&buf[..n]);
+        }
+        let got: [u8; 16] = hasher.finalize().into();
+        Ok(got == recorded)
+    }
+
     /// P1-2 / P1-3: resume a persisted resumable session after a restart.
     /// Discards the session (returns `None`) when it is older than
     /// [`SESSION_MAX_AGE_MS`], the local file changed, or Drive
@@ -8311,6 +8716,415 @@ mod tests {
             ),
             "only a real Drive 404 counts; an unclassified failure keeps failing"
         );
+    }
+
+    // --- the scheduled integrity scrub --------------------------------------
+    //
+    // The gap the remote-existence audit leaves open: it settles EXISTENCE from
+    // a whole-source id listing, which cannot say anything about an object that
+    // still exists but no longer holds the bytes Driven uploaded. These rows
+    // drive the scrub end to end against the real SQLite repo + the fake store.
+
+    /// A scrub config with a slice big enough to cover the whole harness
+    /// source in one run, and no deep sampling (the shipped default).
+    fn scrub_cfg(slice: u32, deep: u32) -> crate::scrub::ScrubConfig {
+        crate::scrub::ScrubConfig {
+            enabled: true,
+            interval_secs: 604_800,
+            slice_size: slice,
+            deep_sample: deep,
+        }
+    }
+
+    /// Replace an object's bytes THROUGH THE TRAIT, so the fake recomputes its
+    /// published md5 and size - i.e. a genuine remote-side change, not a
+    /// pinned-checksum rot.
+    async fn overwrite_remote_object(h: &Harness, file_id: &str, bytes: &'static [u8]) {
+        h.remote
+            .update(
+                file_id,
+                UploadBody::Bytes(bytes::Bytes::from_static(bytes)),
+                HashMap::new(),
+            )
+            .await
+            .expect("the out-of-band overwrite must land");
+    }
+
+    /// The happy path: a freshly-synced source scrubs clean and writes nothing.
+    #[tokio::test]
+    async fn scrub_reports_a_clean_slice_when_every_recorded_object_matches() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("healthy.txt", b"good bytes");
+        upload_and_record(&h, &rel, size).await;
+
+        let report = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 0))
+            .await
+            .expect("a scrub over a healthy source must succeed");
+
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.ok, 1);
+        assert_eq!(report.drift_total(), 0);
+        assert_eq!(report.healed, 0);
+        assert_eq!(report.unrecoverable, 0);
+        assert_eq!(report.outcome, crate::scrub::ScrubOutcome::Clean);
+        assert!(
+            !report.found_anything(),
+            "a clean scrub must stay silent-green"
+        );
+        assert!(
+            report.wrapped,
+            "a slice larger than the population completes a lap"
+        );
+        // Nothing was touched: the file is still synced and the scan agrees.
+        assert!(scan_changed_paths(&h).await.is_empty());
+    }
+
+    /// MISSING drift: the object is gone, so the scrub applies exactly the same
+    /// remediation the audit applies, and the next scan re-uploads the file.
+    #[tokio::test]
+    async fn scrub_heals_a_file_whose_remote_object_was_deleted() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("deleted-on-drive.txt", b"important bytes");
+        let id = upload_and_record(&h, &rel, size).await;
+        assert!(scan_changed_paths(&h).await.is_empty());
+
+        h.remote.delete_permanent(&id).await.unwrap();
+
+        let report = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 0))
+            .await
+            .unwrap();
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.missing, 1);
+        assert_eq!(report.healed, 1);
+        assert_eq!(
+            report.unrecoverable, 0,
+            "a missing object IS repairable, so it must not be reported as needing a human"
+        );
+        assert_eq!(report.outcome, crate::scrub::ScrubOutcome::Drift);
+
+        // The same end state the audit produces: the row survives, its dead
+        // pointer is cleared, and the sentinel guarantees re-emission.
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("the row survives; only the dead pointer is cleared");
+        assert!(row.drive_file_id.is_none());
+        assert!(row.drive_md5.is_none());
+        assert_eq!(row.mtime_ns, REQUEUE_FORCE_RESCAN_MTIME_NS);
+        assert_eq!(
+            scan_changed_paths(&h).await,
+            vec![rel.as_str().to_string()],
+            "the healed file must be re-emitted by the very next scan"
+        );
+    }
+
+    /// HASH drift: the object still exists at the right length but its bytes
+    /// were replaced out-of-band.
+    ///
+    /// The load-bearing half of this test is the NEGATIVE assertion. The only
+    /// repair primitive available NULLs `drive_file_id`; applying it here would
+    /// orphan a live Drive object with nothing referencing it, silently burning
+    /// the user's quota forever. So this drift is counted and surfaced, never
+    /// "repaired".
+    #[tokio::test]
+    async fn scrub_reports_a_hash_mismatch_and_leaves_the_live_object_alone() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("rewritten.txt", b"original!!");
+        let id = upload_and_record(&h, &rel, size).await;
+        let before = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+
+        // Same LENGTH, different content, so only the checksum can catch it.
+        overwrite_remote_object(&h, &id, b"tampered!!").await;
+
+        let report = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 0))
+            .await
+            .unwrap();
+        assert_eq!(report.checked, 1);
+        assert_eq!(report.hash_mismatch, 1);
+        assert_eq!(report.size_mismatch, 0);
+        assert_eq!(report.healed, 0, "a live object must never be orphaned");
+        assert_eq!(
+            report.unrecoverable, 1,
+            "unrepairable drift is what tells the user a human is needed"
+        );
+        assert_eq!(report.outcome, crate::scrub::ScrubOutcome::Drift);
+
+        let after = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(
+            after.drive_file_id, before.drive_file_id,
+            "the pointer to the still-live object must survive"
+        );
+        assert_eq!(after.mtime_ns, before.mtime_ns);
+    }
+
+    /// SIZE drift: a truncated / extended object is caught by the cheaper
+    /// comparison, before the checksum is even consulted.
+    #[tokio::test]
+    async fn scrub_reports_a_size_mismatch() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("truncated.txt", b"the full original contents");
+        let id = upload_and_record(&h, &rel, size).await;
+
+        overwrite_remote_object(&h, &id, b"short").await;
+
+        let report = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 0))
+            .await
+            .unwrap();
+        assert_eq!(report.size_mismatch, 1);
+        assert_eq!(report.hash_mismatch, 0);
+        assert_eq!(report.healed, 0);
+        assert_eq!(report.unrecoverable, 1);
+        // The row is untouched: same reasoning as the hash-mismatch case.
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.drive_file_id.as_deref(), Some(id.as_str()));
+    }
+
+    /// THE SAFETY PROPERTY, inherited from the audit: when the live-object
+    /// enumeration fails the scrub must write nothing, heal nothing, and - just
+    /// as importantly - advance NO cursor, so the un-checked slice is checked
+    /// next time rather than silently skipped.
+    #[tokio::test]
+    async fn scrub_writes_nothing_and_advances_no_cursor_when_the_listing_fails() {
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_source_listing_broken()).await;
+        let (rel, size) = h.write_file("must-not-churn.txt", b"live bytes");
+        upload_and_record(&h, &rel, size).await;
+        let before = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+
+        let report = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 0))
+            .await
+            .expect("a failed enumeration is reported, not propagated as a cycle abort");
+        assert_eq!(report.outcome, crate::scrub::ScrubOutcome::Incomplete);
+        assert_eq!(report.checked, 0);
+        assert_eq!(report.healed, 0);
+        assert!(
+            !report.wrapped,
+            "an aborted run completed no lap, so it must not claim one"
+        );
+
+        let after = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(after.drive_file_id, before.drive_file_id);
+        assert_eq!(after.mtime_ns, before.mtime_ns);
+        assert!(
+            h.state.scrub_cursor(h.source.id).await.unwrap().is_none(),
+            "an aborted run must leave the cursor exactly where it was"
+        );
+    }
+
+    /// The rolling slice: with `slice_size = 1`, successive runs walk the
+    /// source one object at a time, in `relative_path` order, and wrap at the
+    /// end so the sweep repeats forever rather than stalling past the last key.
+    #[tokio::test]
+    async fn scrub_rolls_through_a_source_one_slice_at_a_time() {
+        let h = harness().await;
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            let (rel, size) = h.write_file(name, b"bytes");
+            upload_and_record(&h, &rel, size).await;
+        }
+
+        let cfg = scrub_cfg(1, 0);
+        // Three runs cover the three files, one per run, none wrapping.
+        for expected_cursor in ["a.txt", "b.txt", "c.txt"] {
+            let report = h.executor().scrub_slice(&h.source, &cfg).await.unwrap();
+            assert_eq!(report.checked, 1, "a slice of 1 checks exactly one object");
+            assert_eq!(report.ok, 1);
+            assert!(!report.wrapped);
+            let cursor = h
+                .state
+                .scrub_cursor(h.source.id)
+                .await
+                .unwrap()
+                .expect("a completed run persists its cursor");
+            assert_eq!(cursor.file_cursor.as_deref(), Some(expected_cursor));
+            assert!(cursor.last_scrub_at.is_some());
+        }
+
+        // The fourth run finds nothing past `c.txt`, so it wraps.
+        let wrap = h.executor().scrub_slice(&h.source, &cfg).await.unwrap();
+        assert_eq!(wrap.checked, 0);
+        assert!(wrap.wrapped, "running off the end starts a fresh lap");
+        assert_eq!(
+            h.state
+                .scrub_cursor(h.source.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .file_cursor,
+            None
+        );
+
+        // And the lap really does restart from the beginning.
+        h.executor().scrub_slice(&h.source, &cfg).await.unwrap();
+        assert_eq!(
+            h.state
+                .scrub_cursor(h.source.id)
+                .await
+                .unwrap()
+                .unwrap()
+                .file_cursor
+                .as_deref(),
+            Some("a.txt")
+        );
+    }
+
+    /// DEEP mode, the failure it exists for: the provider still publishes the
+    /// checksum Driven recorded, but the bytes it serves are not those bytes.
+    ///
+    /// The metadata comparison passes (size matches, md5 matches) - which is
+    /// the point. Only downloading the object and re-hashing what actually
+    /// comes back reveals the rot.
+    #[tokio::test]
+    async fn scrub_deep_sample_catches_bytes_that_no_longer_match_the_published_checksum() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("silently-rotted.txt", b"original!!");
+        let id = upload_and_record(&h, &rel, size).await;
+
+        assert!(
+            h.remote.rot_object_bytes(&id, b"tampered!!".to_vec()),
+            "the rot hook must find the object"
+        );
+
+        // Metadata-only mode is blind to this, by construction.
+        let shallow = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 0))
+            .await
+            .unwrap();
+        assert_eq!(shallow.ok, 1);
+        assert_eq!(shallow.drift_total(), 0);
+        assert_eq!(shallow.deep_checked, 0);
+
+        // Deep mode is not. (The cursor wrapped above, so this run re-reads the
+        // same slice.)
+        let deep = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 1))
+            .await
+            .unwrap();
+        assert_eq!(deep.ok, 1, "the metadata still looks fine");
+        assert_eq!(deep.deep_checked, 1);
+        assert_eq!(deep.deep_failed, 1);
+        assert_eq!(
+            deep.unrecoverable, 1,
+            "rotted bytes need a human: re-queuing would orphan the live object"
+        );
+        assert!(deep.found_anything());
+        assert_eq!(deep.outcome, crate::scrub::ScrubOutcome::Drift);
+    }
+
+    /// DEEP mode over healthy bytes must be silent - otherwise the mode is
+    /// unusable (a check that cries wolf is a check nobody enables).
+    #[tokio::test]
+    async fn scrub_deep_sample_passes_on_healthy_bytes() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("healthy.txt", b"good bytes");
+        upload_and_record(&h, &rel, size).await;
+
+        let report = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 5))
+            .await
+            .unwrap();
+        assert_eq!(report.deep_checked, 1, "the pool caps at the slice size");
+        assert_eq!(report.deep_failed, 0);
+        assert_eq!(report.unrecoverable, 0);
+        assert!(!report.found_anything());
+    }
+
+    /// A source that has never uploaded anything must issue NO remote call and
+    /// still stamp itself, so it is not permanently "due".
+    #[tokio::test]
+    async fn scrub_of_an_empty_source_makes_no_remote_call_and_still_stamps() {
+        // A broken listing proves the point: if the scrub called it, this would
+        // come back Incomplete.
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_source_listing_broken()).await;
+
+        let report = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 0))
+            .await
+            .unwrap();
+        assert_eq!(report.checked, 0);
+        assert_eq!(report.outcome, crate::scrub::ScrubOutcome::Clean);
+        assert!(
+            !report.wrapped,
+            "a source with nothing to check completed no lap"
+        );
+        assert!(
+            h.state
+                .scrub_cursor(h.source.id)
+                .await
+                .unwrap()
+                .expect("an empty source still stamps")
+                .last_scrub_at
+                .is_some(),
+            "without the stamp the source would be due on every single cycle"
+        );
+    }
+
+    /// The scrub must be idempotent: a second run over already-healed state
+    /// finds nothing left to do.
+    #[tokio::test]
+    async fn scrub_is_idempotent_over_already_healed_state() {
+        let h = harness().await;
+        let (rel, size) = h.write_file("gone.txt", b"bytes");
+        let id = upload_and_record(&h, &rel, size).await;
+        h.remote.delete_permanent(&id).await.unwrap();
+
+        let first = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 0))
+            .await
+            .unwrap();
+        assert_eq!(first.healed, 1);
+
+        // The row now has no `drive_file_id`, so it is not a scrub candidate at
+        // all - there is no standalone object left to check.
+        let second = h
+            .executor()
+            .scrub_slice(&h.source, &scrub_cfg(500, 0))
+            .await
+            .unwrap();
+        assert_eq!(second.checked, 0);
+        assert_eq!(second.healed, 0);
+        assert!(!second.found_anything());
+        let _ = rel;
     }
 
     // --- the remote-existence audit -----------------------------------------

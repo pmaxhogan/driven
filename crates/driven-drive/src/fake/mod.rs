@@ -699,6 +699,51 @@ impl InMemoryRemoteStore {
         out
     }
 
+    /// Test hook modelling SILENT REMOTE BIT-ROT: replace one object's stored
+    /// bytes while PINNING the md5 that every metadata / list read keeps
+    /// publishing to the value the object had before.
+    ///
+    /// Returns `false` when there is no such object (or it is a folder).
+    ///
+    /// This is the one damage mode that a metadata-only integrity check
+    /// structurally cannot see, and it is exactly what the scrub's DEEP mode
+    /// exists for: the provider still reports the checksum Driven recorded, so
+    /// `size` matches and `md5Checksum` matches, and only downloading the
+    /// object and re-hashing the bytes it actually returns reveals that the
+    /// content is not what was uploaded. Modelling it needs a hook because it
+    /// cannot be built from the trait methods - `update` recomputes the md5
+    /// (so the metadata check would catch it and the deep check would never be
+    /// reached), and [`fault_injection::with_md5_mismatch_after`] does the
+    /// INVERSE (bad published md5 over good bytes).
+    ///
+    /// Inherent rather than a `RemoteStore` method for the same reason as
+    /// [`Self::delete_folder_tree`]: this is something that happens TO Drive,
+    /// never something Driven performs.
+    pub fn rot_object_bytes(&self, file_id: &str, bytes: Vec<u8>) -> bool {
+        let mut guard = self.inner.lock();
+        let Some(entry) = guard.objects.get_mut(file_id) else {
+            return false;
+        };
+        if entry.is_folder() {
+            return false;
+        }
+        // Pin the PRE-ROT md5 (unless a fault already latched one, which we
+        // must not clobber) so every read path keeps reporting the checksum the
+        // object used to have.
+        if entry.corrupted_md5.is_none() {
+            entry.corrupted_md5 = entry.md5();
+        }
+        let old_len = entry.bytes.len() as u64;
+        let new_len = bytes.len() as u64;
+        entry.bytes = bytes;
+        if new_len >= old_len {
+            guard.bytes_stored = guard.bytes_stored.saturating_add(new_len - old_len);
+        } else {
+            guard.bytes_stored = guard.bytes_stored.saturating_sub(old_len - new_len);
+        }
+        true
+    }
+
     /// Test hook modelling a USER deleting a folder in the Drive web UI and
     /// emptying the trash: `folder_id` and EVERY descendant (files, bundles,
     /// nested folders) are removed outright.

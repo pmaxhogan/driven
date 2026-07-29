@@ -6,6 +6,7 @@ import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
 import { flushFrontendLogs } from "../frontendLog";
 import FilesUploadedStatTile from "../components/FilesUploadedStatTile.vue";
+import ScrubHistoryPanel from "../components/ScrubHistoryPanel.vue";
 import ThroughputStatTile from "../components/ThroughputStatTile.vue";
 import { activityEventLabel } from "../stores/activityEventLabel";
 import {
@@ -379,6 +380,12 @@ onUnmounted(() => {
         </div>
       </dl>
     </header>
+
+    <!-- Integrity-scrub history. A slow scheduled job, so this is a status
+         surface rather than part of the live feed; it loads its own data on
+         mount and shows counts only (never paths). Rendered after the header
+         stats so a drift warning sits above the fold. -->
+    <ScrubHistoryPanel />
 
     <!-- Placeholder for the filter bar. Its dropdowns are populated by their own
          queries, so rendering the real controls straight away would show every

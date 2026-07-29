@@ -39,6 +39,7 @@ import type {
   RestoreItem,
   RestoreJobId,
   RestoreJobStatus,
+  ScrubRun,
   SessionId,
   SettingsDto,
   SettingsPatch,
@@ -430,6 +431,14 @@ export function activityThroughputSeries(
   bucketMs: number
 ): Promise<ActivityThroughputSeriesDto> {
   return invoke("activity_throughput_series", { windowMs, bucketMs });
+}
+
+/** The persisted integrity-scrub reports, newest first. Omit `sourceId` for
+ * every source interleaved by time. Every field is a COUNT - the shape carries
+ * no paths or remote ids - so this can never surface an encrypted source's
+ * filenames. */
+export function listScrubRuns(sourceId?: string, limit?: number): Promise<ScrubRun[]> {
+  return invoke("list_scrub_runs", { sourceId, limit });
 }
 
 // --- Restore (SPEC s11.5; DESIGN s8.4) ---

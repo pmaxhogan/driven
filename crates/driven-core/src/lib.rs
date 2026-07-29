@@ -34,6 +34,7 @@ pub mod planner;
 mod platform_open;
 pub mod priority;
 pub mod scanner;
+pub mod scrub;
 pub mod state;
 pub mod telemetry;
 pub mod time;

@@ -1194,6 +1194,179 @@ impl SyncOrchestrator {
         .await;
     }
 
+    /// Runs one slice of the scheduled INTEGRITY SCRUB for `source` when it is
+    /// due, persists the run's report, and surfaces any drift.
+    ///
+    /// # When it runs
+    ///
+    /// On its own cadence (`scrub_interval_secs`, default weekly - the same
+    /// clock the deep-verify re-hash runs on, because the scrub is the remote
+    /// half of the same question), evaluated per source against
+    /// `scrub_state.last_scrub_at`. A never-scrubbed source is due
+    /// immediately. Unlike the remote-existence audit there is no
+    /// once-per-process trigger: the audit's whole-source listing is cheap
+    /// enough to justify running at startup, while the scrub's per-object
+    /// metadata GETs are not.
+    ///
+    /// # Why it never fails the cycle
+    ///
+    /// Identical rule to
+    /// [`Self::audit_remote_existence_if_due`]: a scrub error means "we could
+    /// not check", not "the backup is broken". The executor already declines
+    /// to advance the cursor on an aborted run, so the recorded state is
+    /// exactly as it was and the next cycle retries. Propagating would abort a
+    /// backup that is otherwise perfectly able to run.
+    async fn scrub_if_due(&self, source: &SourceRow) {
+        let cfg = crate::scrub::load_scrub_config(self.state.as_ref()).await;
+        if !cfg.enabled {
+            return;
+        }
+        let cursor = match self.state.scrub_cursor(source.id).await {
+            Ok(c) => c,
+            Err(err) => {
+                tracing::warn!(
+                    target: TARGET,
+                    source_id = %source.id,
+                    %err,
+                    "could not read the scrub cursor; skipping the scrub this cycle"
+                );
+                return;
+            }
+        };
+        let last = cursor.and_then(|c| c.last_scrub_at);
+        if !crate::scrub::scrub_due(last, self.clock.now_ms(), cfg.interval_ms()) {
+            return;
+        }
+
+        // The tray already has a state for "checking what we believe against
+        // what is true" - reuse it rather than adding a variant that every
+        // tray/UI mapping would have to learn.
+        self.transition(OrchestratorState::Verifying {
+            sampled: 0,
+            mismatches: 0,
+        })
+        .await;
+
+        let started_at = self.clock.now_ms();
+        let report = match self.executor.scrub_slice(source, &cfg).await {
+            Ok(report) => report,
+            Err(err) => {
+                tracing::warn!(
+                    target: TARGET,
+                    source_id = %source.id,
+                    %err,
+                    "integrity scrub could not run this cycle; retrying next cycle (nothing was changed)"
+                );
+                return;
+            }
+        };
+        let finished_at = self.clock.now_ms();
+
+        self.transition(OrchestratorState::Verifying {
+            sampled: report.checked,
+            mismatches: report.drift_total(),
+        })
+        .await;
+
+        self.persist_scrub_run(source, started_at, finished_at, &report)
+            .await;
+
+        // SILENT GREEN, exactly like the remote-existence audit: a clean scrub
+        // - the overwhelmingly common case - writes NO activity row. The
+        // durable `scrub_runs` row is the record of "we checked"; the activity
+        // feed is for things the user should act on, and burying it under a
+        // weekly "checked, all fine" trains people to ignore it.
+        if !report.found_anything() {
+            return;
+        }
+
+        // One WARN row carrying the drift COUNT. Deliberately no per-object
+        // rows and no `message`: a scrub report is counts-only by design (see
+        // `driven_core::scrub`), so it can never carry an encrypted source's
+        // filename into the activity log, the diagnostic bundle, or the UI.
+        self.record_activity(NewActivity {
+            ts: finished_at,
+            source_id: Some(source.id),
+            level: ActivityLevel::Warn,
+            event_type: "scrub_drift_found".to_string(),
+            file_count: Some(report.drift_total()),
+            bytes: None,
+            message: None,
+        })
+        .await;
+        // The summary row reports how much was checked, so the drift count
+        // above is readable as a proportion rather than a bare number.
+        self.record_activity(NewActivity {
+            ts: finished_at,
+            source_id: Some(source.id),
+            level: ActivityLevel::Info,
+            event_type: "scrub_done".to_string(),
+            file_count: Some(report.checked),
+            bytes: None,
+            message: None,
+        })
+        .await;
+    }
+
+    /// Persists one scrub run's report into `scrub_runs`.
+    ///
+    /// An INCOMPLETE run (the live-object enumeration failed) is persisted ONLY
+    /// when the previous run was not also incomplete. Without that dedupe a
+    /// multi-day Drive outage would write one row per cycle (hundreds per day)
+    /// and evict every real result from the capped per-source history, so the
+    /// feature would destroy exactly the record it exists to keep. One row per
+    /// outage still makes "we could not check" visible, which is the point of
+    /// having the outcome at all.
+    ///
+    /// A persistence failure is logged and dropped: the scrub's repairs are
+    /// already durable in `file_state`, and losing the report row must never
+    /// fail a backup cycle.
+    async fn persist_scrub_run(
+        &self,
+        source: &SourceRow,
+        started_at: crate::types::UnixMs,
+        finished_at: crate::types::UnixMs,
+        report: &crate::scrub::ScrubReport,
+    ) {
+        if report.outcome == crate::scrub::ScrubOutcome::Incomplete {
+            match self.state.list_scrub_runs(Some(source.id), 1).await {
+                Ok(prev)
+                    if prev.first().is_some_and(|r| {
+                        r.report.outcome == crate::scrub::ScrubOutcome::Incomplete
+                    }) =>
+                {
+                    return;
+                }
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::debug!(
+                        target: TARGET,
+                        source_id = %source.id,
+                        %err,
+                        "could not read the previous scrub run; recording this incomplete run anyway"
+                    );
+                }
+            }
+        }
+        if let Err(err) = self
+            .state
+            .insert_scrub_run(&crate::state::NewScrubRun {
+                source_id: source.id,
+                started_at,
+                finished_at,
+                report: report.clone(),
+            })
+            .await
+        {
+            tracing::warn!(
+                target: TARGET,
+                source_id = %source.id,
+                %err,
+                "failed to persist the integrity scrub report"
+            );
+        }
+    }
+
     /// Writes a durable `activity_log` ERROR row per NFC collision the planner
     /// dropped (SPEC s24 `local.unicode_collision`, the M2-deferred item in
     /// design/CODEX_NOTES.md).
@@ -1531,6 +1704,13 @@ impl SyncOrchestrator {
         // After the scan they would sit unrepaired until the next cycle.
         self.audit_remote_existence_if_due(source, deep_verify)
             .await;
+
+        // Integrity scrub, on its own cadence and immediately after the audit:
+        // both compare recorded state against the remote, and running the
+        // scrub here means a MISSING object it finds is re-queued (with the
+        // force-rescan sentinel) before the scan below, so the heal completes
+        // in ONE cycle exactly like the audit's.
+        self.scrub_if_due(source).await;
 
         let user_initiated = tick == TickSource::Manual;
         if user_initiated {
@@ -2703,10 +2883,38 @@ mod tests {
         /// decrements this WITHOUT recording the source - drives the "a failed
         /// audit is retried next cycle rather than skipped until restart" test.
         audit_failures_remaining: AtomicU64,
+        /// Sources passed to `scrub_slice`, in call order, so the scheduling
+        /// tests can assert the cadence gate fires exactly when it should.
+        scrubbed_sources: StdMutex<Vec<SourceId>>,
+        /// The report every `scrub_slice` call returns. `None` (the default)
+        /// yields a clean report, which must produce NO activity rows.
+        scrub_report: StdMutex<Option<crate::scrub::ScrubReport>>,
+        /// When `> 0`, the next `scrub_slice` call returns `Err` and decrements
+        /// this WITHOUT recording the source - drives the "a failed scrub never
+        /// fails the cycle" test.
+        scrub_failures_remaining: AtomicU64,
     }
 
     #[async_trait]
     impl Executor for RecordingExecutor {
+        async fn scrub_slice(
+            &self,
+            source: &SourceRow,
+            _cfg: &crate::scrub::ScrubConfig,
+        ) -> anyhow::Result<crate::scrub::ScrubReport> {
+            if self.scrub_failures_remaining.load(Ordering::SeqCst) > 0 {
+                self.scrub_failures_remaining.fetch_sub(1, Ordering::SeqCst);
+                return Err(anyhow::anyhow!("transient scrub error"));
+            }
+            self.scrubbed_sources.lock().unwrap().push(source.id);
+            Ok(self
+                .scrub_report
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default())
+        }
+
         async fn audit_remote_existence(
             &self,
             source: &SourceRow,
@@ -2875,6 +3083,11 @@ mod tests {
         account_state: StdMutex<Vec<(AccountId, AccountState)>>,
         /// In-memory settings k/v (used by the M3.5 VSS orphan-registry tests).
         settings: StdMutex<HashMap<String, serde_json::Value>>,
+        /// Per-source scrub cursors, so the scrub-cadence tests can drive the
+        /// due predicate through a repo that actually remembers the stamp.
+        scrub_cursors: StdMutex<HashMap<SourceId, crate::scrub::ScrubCursor>>,
+        /// Every persisted scrub run, newest LAST (insertion order).
+        scrub_runs: StdMutex<Vec<crate::state::NewScrubRun>>,
     }
 
     impl FakeState {
@@ -2886,7 +3099,14 @@ mod tests {
                 account_synced: StdMutex::new(Vec::new()),
                 account_state: StdMutex::new(Vec::new()),
                 settings: StdMutex::new(HashMap::new()),
+                scrub_cursors: StdMutex::new(HashMap::new()),
+                scrub_runs: StdMutex::new(Vec::new()),
             }
+        }
+
+        /// Snapshot the persisted scrub runs, oldest-first.
+        fn scrub_runs_snapshot(&self) -> Vec<crate::state::NewScrubRun> {
+            self.scrub_runs.lock().unwrap().clone()
         }
 
         /// Snapshot the recorded `mark_account_state` calls (V-F test).
@@ -2907,6 +3127,55 @@ mod tests {
 
     #[async_trait]
     impl StateRepo for FakeState {
+        async fn scrub_cursor(
+            &self,
+            source: SourceId,
+        ) -> anyhow::Result<Option<crate::scrub::ScrubCursor>> {
+            Ok(self.scrub_cursors.lock().unwrap().get(&source).cloned())
+        }
+
+        async fn set_scrub_cursor(
+            &self,
+            source: SourceId,
+            cursor: &crate::scrub::ScrubCursor,
+        ) -> anyhow::Result<()> {
+            self.scrub_cursors
+                .lock()
+                .unwrap()
+                .insert(source, cursor.clone());
+            Ok(())
+        }
+
+        async fn insert_scrub_run(&self, run: &crate::state::NewScrubRun) -> anyhow::Result<i64> {
+            let mut runs = self.scrub_runs.lock().unwrap();
+            runs.push(run.clone());
+            Ok(runs.len() as i64)
+        }
+
+        async fn list_scrub_runs(
+            &self,
+            source: Option<SourceId>,
+            limit: u32,
+        ) -> anyhow::Result<Vec<crate::state::ScrubRunRow>> {
+            Ok(self
+                .scrub_runs
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .filter(|r| source.is_none_or(|s| r.source_id == s))
+                .take(limit as usize)
+                .enumerate()
+                .map(|(i, r)| crate::state::ScrubRunRow {
+                    id: i as i64,
+                    source_id: r.source_id,
+                    started_at: r.started_at,
+                    finished_at: r.finished_at,
+                    report: r.report.clone(),
+                })
+                .collect())
+        }
+
         async fn list_enabled_sources_for(
             &self,
             account: AccountId,
@@ -4560,6 +4829,258 @@ mod tests {
         );
     }
 
+    // --- integrity scrub scheduling -----------------------------------------
+
+    /// A report with `n` units of unrepaired drift, for the reporting tests.
+    fn drifting_scrub_report(missing: u64, hash_mismatch: u64) -> crate::scrub::ScrubReport {
+        let mut r = crate::scrub::ScrubReport {
+            checked: missing + hash_mismatch + 10,
+            ok: 10,
+            missing,
+            hash_mismatch,
+            healed: missing,
+            unrecoverable: hash_mismatch,
+            ..Default::default()
+        };
+        r.finish();
+        r
+    }
+
+    /// The cadence gate: a never-scrubbed source is due immediately, and once
+    /// stamped it stays quiet until the interval elapses.
+    ///
+    /// This is the property that makes the feature affordable: without it every
+    /// 10-minute cycle would issue a slice's worth of per-object metadata GETs.
+    #[tokio::test]
+    async fn the_scrub_runs_on_the_first_cycle_then_waits_out_its_interval() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, state, clock) = build_with_state(account, vec![src], exec.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.scrubbed_sources.lock().unwrap().as_slice(),
+            &[src_id],
+            "a never-scrubbed source is due immediately"
+        );
+        // The executor fake does not stamp the cursor (the real one does), so
+        // stamp it here to model a completed run.
+        state
+            .set_scrub_cursor(
+                src_id,
+                &crate::scrub::ScrubCursor {
+                    file_cursor: None,
+                    bundle_cursor: None,
+                    last_scrub_at: Some(clock.now_ms()),
+                },
+            )
+            .await
+            .unwrap();
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.scrubbed_sources.lock().unwrap().len(),
+            1,
+            "a just-scrubbed source must not be scrubbed again on the next cycle"
+        );
+
+        // Push past the weekly interval: due again.
+        clock.advance(std::time::Duration::from_secs(604_800 + 1));
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.scrubbed_sources.lock().unwrap().as_slice(),
+            &[src_id, src_id],
+            "once the interval elapses the source is due again"
+        );
+    }
+
+    /// The kill-switch. `scrub_enabled = false` must stop the dispatch dead -
+    /// not merely stop the reporting - so an operator who does not want the
+    /// extra requests pays for none of them.
+    #[tokio::test]
+    async fn a_disabled_scrub_never_dispatches() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, state, _clock) = build_with_state(account, vec![src], exec.clone());
+        state
+            .set_setting(
+                crate::scrub::SETTING_SCRUB_ENABLED,
+                &serde_json::json!(false),
+            )
+            .await
+            .unwrap();
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert!(
+            exec.scrubbed_sources.lock().unwrap().is_empty(),
+            "the kill-switch must prevent the dispatch entirely"
+        );
+        assert!(
+            exec.executes.load(Ordering::SeqCst) > 0,
+            "disabling the scrub must not disable the backup"
+        );
+    }
+
+    /// A scrub error means "we could not check", not "the backup is broken" -
+    /// the same rule the remote-existence audit follows. The cycle must run to
+    /// completion and the next cycle must retry.
+    #[tokio::test]
+    async fn a_failed_scrub_does_not_fail_the_cycle_and_is_retried() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        exec.scrub_failures_remaining.store(1, Ordering::SeqCst);
+        let (orch, state, _clock) = build_with_state(account, vec![src], exec.clone());
+
+        orch.run_cycle(TickSource::Scheduled)
+            .await
+            .expect("a scrub failure must not fail the cycle");
+        assert!(exec.scrubbed_sources.lock().unwrap().is_empty());
+        assert!(
+            exec.executes.load(Ordering::SeqCst) > 0,
+            "the backup itself must still have run"
+        );
+        assert!(
+            state.scrub_runs_snapshot().is_empty(),
+            "a scrub that could not run at all persists no report"
+        );
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            exec.scrubbed_sources.lock().unwrap().as_slice(),
+            &[src_id],
+            "the next cycle retries the scrub"
+        );
+    }
+
+    /// SILENT GREEN, and the durable record. A clean scrub writes NO activity
+    /// row (a weekly "checked, all fine" would bury the rows that matter) but
+    /// DOES persist its report, because "we checked and it was fine" is exactly
+    /// what the history panel exists to show.
+    #[tokio::test]
+    async fn a_clean_scrub_persists_its_report_but_writes_no_activity() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let mut clean = crate::scrub::ScrubReport {
+            checked: 500,
+            ok: 500,
+            ..Default::default()
+        };
+        clean.finish();
+        *exec.scrub_report.lock().unwrap() = Some(clean);
+        let (orch, state, _clock) = build_with_state(account, vec![src], exec.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        let events: Vec<String> = state
+            .activity_rows()
+            .into_iter()
+            .map(|r| r.event_type)
+            .collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e == "scrub_done" || e == "scrub_drift_found"),
+            "a clean scrub must be silent in the activity feed, got: {events:?}"
+        );
+        let runs = state.scrub_runs_snapshot();
+        assert_eq!(runs.len(), 1, "the report itself is always persisted");
+        assert_eq!(runs[0].report.checked, 500);
+        assert_eq!(runs[0].report.outcome, crate::scrub::ScrubOutcome::Clean);
+    }
+
+    /// What the user sees when the scrub finds damage: one WARN row carrying
+    /// the drift count and one INFO summary carrying how much was checked, so
+    /// the drift reads as a proportion rather than a bare number.
+    ///
+    /// Neither row carries a `message`. That is load-bearing, not incidental: a
+    /// scrub report is counts-only by design, so it can never carry an
+    /// encrypted source's filename into the activity feed, the diagnostic
+    /// bundle, or the UI.
+    #[tokio::test]
+    async fn a_scrub_that_found_drift_reports_a_warn_and_a_summary_with_no_paths() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        *exec.scrub_report.lock().unwrap() = Some(drifting_scrub_report(3, 2));
+        let (orch, state, _clock) = build_with_state(account, vec![src], exec.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        let rows = state.activity_rows();
+
+        let warn = rows
+            .iter()
+            .find(|r| r.event_type == "scrub_drift_found")
+            .expect("drift must raise a WARN row");
+        assert_eq!(warn.level, ActivityLevel::Warn);
+        assert_eq!(warn.file_count, Some(5), "3 missing + 2 hash mismatches");
+        assert_eq!(warn.source_id, Some(src_id));
+        assert!(warn.message.is_none(), "a scrub report is counts-only");
+
+        let summary = rows
+            .iter()
+            .find(|r| r.event_type == "scrub_done")
+            .expect("drift must also raise the summary row");
+        assert_eq!(summary.level, ActivityLevel::Info);
+        assert_eq!(summary.file_count, Some(15));
+        assert!(summary.message.is_none());
+
+        assert_eq!(state.scrub_runs_snapshot().len(), 1);
+    }
+
+    /// A multi-day outage must not evict the real history.
+    ///
+    /// Every cycle during an outage produces an `incomplete` run. Persisting
+    /// each one would write hundreds of rows a day and push every real result
+    /// out of the capped per-source history - the feature would destroy exactly
+    /// the record it exists to keep. One row per outage still makes "we could
+    /// not check" visible.
+    #[tokio::test]
+    async fn consecutive_incomplete_scrubs_persist_only_the_first() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        *exec.scrub_report.lock().unwrap() = Some(crate::scrub::ScrubReport {
+            outcome: crate::scrub::ScrubOutcome::Incomplete,
+            ..Default::default()
+        });
+        let (orch, state, _clock) = build_with_state(account, vec![src], exec.clone());
+
+        for _ in 0..4 {
+            orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        }
+        assert_eq!(
+            state.scrub_runs_snapshot().len(),
+            1,
+            "an ongoing outage records one row, not one per cycle"
+        );
+
+        // Once the outage clears, a real result is recorded again.
+        let mut clean = crate::scrub::ScrubReport {
+            checked: 7,
+            ok: 7,
+            ..Default::default()
+        };
+        clean.finish();
+        *exec.scrub_report.lock().unwrap() = Some(clean);
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        let runs = state.scrub_runs_snapshot();
+        assert_eq!(runs.len(), 2);
+        assert_eq!(runs[1].report.outcome, crate::scrub::ScrubOutcome::Clean);
+    }
+
     /// SILENT GREEN. A clean audit - the overwhelmingly common case - writes no
     /// activity row at all. A backup tool that logged "checked, nothing wrong"
     /// on every cycle would train users to ignore the feed that carries the
@@ -5665,6 +6186,17 @@ mod tests {
 
         async fn reconcile(&self, _source: &SourceRow) -> anyhow::Result<()> {
             Ok(())
+        }
+
+        async fn scrub_slice(
+            &self,
+            _source: &SourceRow,
+            _cfg: &crate::scrub::ScrubConfig,
+        ) -> anyhow::Result<crate::scrub::ScrubReport> {
+            // Same reasoning as the clean audit below: this double exists to
+            // block inside `execute`, so the scrub must stay out of the way of
+            // the pause/shutdown timing it tests.
+            Ok(crate::scrub::ScrubReport::default())
         }
 
         async fn audit_remote_existence(
