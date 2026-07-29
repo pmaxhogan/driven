@@ -8,6 +8,7 @@ members = [
     "crates/driven-diskstat",
     "crates/driven-vss",
     "crates/driven-vss-helper",
+    "crates/driven-apfs",
     "crates/driven-net",
     "crates/driven-tls",
     "crates/driven-cli",

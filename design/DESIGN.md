@@ -441,19 +441,17 @@ Driven reads files like this:
     Scheduler entry that runs Driven elevated on login." Without
     elevation we degrade gracefully: skip locked files exactly as we
     do today and surface the count in the activity log.
-- **macOS / Linux** have no equivalent of VSS that fits a backup
-  client's model. On macOS, file coordination + APFS clones could help
-  in narrow cases (V2+ research). On Linux, btrfs/ZFS snapshots would
-  require ops the user must already have set up; we don't try.
-  `driven-vss` compiles to a stub off Windows whose every entry point
-  returns `VssError::Unavailable`, so `fallback_decision` routes an
-  unopenable file straight to a skip and no snapshot is ever attempted.
-  A future macOS APFS-snapshot fallback plugs in at exactly one place -
-  `VssProvider::map_for_volume` returning `SnapshotOutcome::Mapped(path)`
-  instead of `Unavailable` (`crates/driven-vss/src/provider.rs`, the
-  `#[cfg(not(windows))] fn map_for_volume`); the executor's snapshot
-  consult, the frozen-read-path threading, and the end-of-cycle release
-  already handle a mapped path unchanged.
+- **macOS** gets a VSS-equivalent via APFS local snapshots - see §5.3.2.
+  It plugs in at exactly one seam: a `VssProvider` whose
+  `map_for_volume` returns `SnapshotOutcome::Mapped(path)` instead of
+  `Unavailable`, so the executor's snapshot consult, the frozen-read-path
+  threading, and the end-of-cycle release all work unchanged.
+  **Linux** has no equivalent that fits a backup client's model: btrfs/ZFS
+  snapshots would require ops the user must already have set up; we don't
+  try. Where no provider applies, `driven-vss` compiles to a stub whose
+  every entry point returns `VssError::Unavailable`, so
+  `fallback_decision` routes an unopenable file straight to a skip and no
+  snapshot is ever attempted.
 
 ##### Unopenable files on macOS / Linux
 
@@ -606,6 +604,92 @@ shows a one-time banner offering to enable locked-file backup (which
 triggers the elevated helper launch). The `windows.vss_helper` boolean
 setting gates whether the brokered helper path is used at all (default
 off: the historical launch-elevated-manually behaviour is preserved).
+
+#### 5.3.2 macOS APFS snapshot broker
+
+The macOS sibling of §5.3.1, plugging into the SAME `VssProvider` seam
+(`driven-apfs`'s `ApfsBrokeredProvider`), so `fallback_decision` and the
+executor's open path are unchanged. Verified on macOS 26 hardware.
+
+**Platform facts that shape the design** (each verified, not assumed):
+
+- **Snapshot creation needs NO privilege.** `tmutil localsnapshot` proxies
+  over XPC to Apple's `backupd`, which holds the private
+  `com.apple.private.vfs.snapshot` entitlement. Driven can never call
+  `fs_snapshot_create(2)` itself: the public
+  `com.apple.developer.vfs.snapshot` entitlement is DTS-request-gated and
+  unavailable to an unsigned tool, and root does not substitute for it. So
+  `tmutil` is the design, not a workaround. It needs no configured Time
+  Machine destination (measured: ~165 ms to create).
+- **Only the MOUNT needs root.** `mount_apfs -s` requires root; that plus
+  unmount and `tmutil deletelocalsnapshots` is the broker's entire
+  privileged surface.
+- **No byte streaming.** Mounts preserve ownership, so the un-elevated app
+  reads the user's own files directly from the mountpoint. (The Windows
+  helper must stream bytes because `\\?\GLOBALROOT` devices are unreadable
+  un-elevated.) This makes the macOS broker's attack surface strictly
+  smaller than the Windows one.
+- **Snapshots do NOT bypass TCC.** The `-o noowners` bypass
+  (CVE-2020-9771) is patched and is now an EDR-fingerprinted signature;
+  Driven never passes it. A TCC-protected path is still `EPERM` through a
+  snapshot mount without Full Disk Access, so snapshots serve BUSY/locked
+  files only - TCC denials are an FDA-onboarding concern, a separate
+  problem with a separate fix.
+- **Auto-thinning is expected.** macOS purges local snapshots under disk
+  pressure, so a snapshot vanishing between create and mount is a normal
+  race that degrades to skip-the-locked-file, never a hard failure.
+
+**Process model.** An on-demand root broker (`driven-apfs-helper`),
+launched via `osascript ... with administrator privileges` - the one
+consent path available to an UNSIGNED app (`SMJobBless`/`SMAppService`
+both require signing). One admin prompt per app session, mirroring the
+Windows one-UAC-prompt model, with the same `Ready`/`Pending`/`Declined`/
+`Disabled` contract: a launch in flight yields `SkipRetryLater`, never a
+false "locked" report, and a decline is memoised for the session.
+
+**IPC surface.** A unix-domain socket at an app-chosen unguessable path
+inside the user's `0700` runtime dir. Framing is `[len: u32 BE][JSON]` -
+control-only, no data frames, because no bytes ever cross. The vocabulary:
+`Hello`/`HelloOk`, `MountSnapshot` -> `MountOk { mountpoint }`,
+`UnmountAll`, `DeleteSnapshot`, `Shutdown`.
+
+**Client authentication (broker trusts nobody).** `getpeereid` must match
+the `--peer-uid` fixed at launch, and the peer pid's executable
+(`LOCAL_PEERPID` + `proc_pidpath`) must live in the broker's own
+directory. The broker also refuses to serve if its socket's parent dir is
+not `0700` and owned by that uid. Pid-reuse TOCTOU is the same documented
+residual as §5.3.1, and code-signature verification is the same documented
+hardening follow-up.
+
+**Server authentication (app trusts nobody either).** The client checks
+`getpeereid` on the connected stream and refuses to speak unless the peer
+is uid 0 - a same-uid squatter that replaces the socket cannot present
+root. This is the TOCTOU-free unix analogue of the Windows
+verify-the-server-exe check.
+
+**Input validation on the boundary.** Snapshot names must match
+`com.apple.TimeMachine.<YYYY-MM-DD-HHMMSS>.local` exactly and dates the
+bare stamp (so nothing can be smuggled into a `tmutil` argv); volumes must
+EXACTLY equal an entry in the `--allowed-volume` list the app fixed at
+launch (a path *under* an allowed volume is rejected). Mountpoints are
+broker-chosen under a root-owned per-session directory - never
+client-supplied. Mounts are always `rdonly,nosuid,nodev`.
+
+**Lifecycle.** The CYCLE owns the snapshot, exactly as on Windows: one
+`tmutil localsnapshot` on first need (it covers every volume at once), one
+broker mount per volume, per-file mapping under the mountpoint, then
+`end_cycle` unmounts everything and deletes the snapshot. Ledger entries
+are namespaced `apfs:<date>` so Windows-GUID orphan cleanup never confuses
+the two. Crash cleanup: the broker sweeps stale mount roots at startup and
+a watcher thread unmounts + exits when the app pid disappears, with APFS
+auto-thinning as the final backstop.
+
+**Path mapping is firmlink-aware.** On a volume group, `statfs("/Users/me/f")`
+reports `f_mntonname = /System/Volumes/Data` even though the path does not
+start with it. A path that does not lie under the mount is mapped as
+`<mount><path>` and then VERIFIED to be the same file (dev+ino) before use,
+so an exotic mount layout degrades to skip rather than reading the wrong
+file.
 
 ### 5.4 Upload pipeline
 

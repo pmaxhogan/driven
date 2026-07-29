@@ -1526,6 +1526,20 @@ dependencies = [
 ]
 
 [[package]]
+name = "driven-apfs"
+version = "2.4.0"
+dependencies = [
+ "driven-vss",
+ "libc",
+ "serde",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
+ "tracing",
+ "uuid",
+]
+
+[[package]]
 name = "driven-app"
 version = "2.4.0"
 dependencies = [
