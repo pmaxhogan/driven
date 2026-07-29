@@ -285,6 +285,47 @@ pub struct BundleRef {
     pub drive_file_id: String,
 }
 
+/// How many `scrub_runs` rows are retained PER SOURCE.
+///
+/// On the default weekly cadence 200 rows is a bit under four years of
+/// history, which is far more than any UI surfaces and still bounded. The
+/// table is pruned inside [`StateRepo::insert_scrub_run`] because - unlike
+/// `activity_log` - there is no user-facing "clear history" affordance to hang
+/// a prune off, so an unpruned table would simply grow forever.
+pub const SCRUB_RUN_HISTORY_CAP: u32 = 200;
+
+/// A row to insert into `scrub_runs` (migration 0013): one completed integrity
+/// scrub run's persisted report.
+///
+/// COUNTS ONLY - there is deliberately no path, Drive id, or object name here,
+/// so rendering a scrub report can never leak an encrypted-source filename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewScrubRun {
+    /// FK to `backup_sources.id`.
+    pub source_id: SourceId,
+    /// Unix epoch ms the run began.
+    pub started_at: UnixMs,
+    /// Unix epoch ms the run ended.
+    pub finished_at: UnixMs,
+    /// The run's counts.
+    pub report: crate::scrub::ScrubReport,
+}
+
+/// One persisted `scrub_runs` row, as read back for the UI + CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrubRunRow {
+    /// Auto-increment row id.
+    pub id: i64,
+    /// Which source this run scrubbed.
+    pub source_id: SourceId,
+    /// Unix epoch ms the run began.
+    pub started_at: UnixMs,
+    /// Unix epoch ms the run ended.
+    pub finished_at: UnixMs,
+    /// The run's counts.
+    pub report: crate::scrub::ScrubReport,
+}
+
 /// Op-type discriminant stored in `pending_ops.op_type` (SPEC s2).
 ///
 /// Held as a plain string rather than the [`crate::types::Op`] enum to
@@ -750,6 +791,9 @@ pub const KNOWN_STATE_TABLES: &[&str] = &[
     // V2 small-file bundling (issue #35, migration 0007_bundles).
     "bundles",
     "bundle_members",
+    // Scheduled integrity scrub (migration 0013_integrity_scrub).
+    "scrub_state",
+    "scrub_runs",
 ];
 
 /// Storage contract for the SQLite-backed state at
@@ -1609,6 +1653,105 @@ pub trait StateRepo: Send + Sync {
     async fn delete_bundle(&self, bundle_id: &str) -> Result<()> {
         let _ = bundle_id;
         Ok(())
+    }
+
+    // --- integrity scrub (migration 0013) -----------------------------------
+
+    /// One keyset PAGE of standalone file objects to scrub, ordered by
+    /// `relative_path`, starting strictly AFTER `after`.
+    ///
+    /// The page is drawn in SQL (`WHERE relative_path > ?2 ORDER BY
+    /// relative_path LIMIT ?3`), not by loading the source and windowing in
+    /// Rust: the whole point of the rolling slice is that a source with
+    /// hundreds of thousands of rows never materialises them all, and a Rust-
+    /// side window would defeat that while still paying the full read.
+    ///
+    /// Rows with a NULL `drive_file_id` are EXCLUDED for the same reason
+    /// [`Self::list_file_state_drive_ids`] excludes them: a bundled member and
+    /// a never-uploaded row both have no standalone object to check, and
+    /// reading their absence from Drive as damage would re-upload them every
+    /// pass. A bundled member's bytes are checked through its BUNDLE instead
+    /// ([`Self::list_scrub_bundle_page`]).
+    ///
+    /// The default returns an empty page, which reads as "this repo records no
+    /// standalone objects" and makes the scrub a no-op - the SAFE degradation
+    /// for a fake that models no `file_state`, mirroring
+    /// [`Self::list_file_state_drive_ids`].
+    async fn list_scrub_file_page(
+        &self,
+        source: SourceId,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::scrub::ScrubCandidate>> {
+        let _ = (source, after, limit);
+        Ok(Vec::new())
+    }
+
+    /// One keyset PAGE of bundle objects to scrub, ordered by `bundles.id`,
+    /// starting strictly AFTER `after`.
+    ///
+    /// The bundle half of the scrub's recorded set. Distinct from
+    /// [`Self::list_bundles_for_source`], which returns every bundle at once
+    /// for the existence audit: the scrub needs `size` + `drive_md5` too, and
+    /// needs them a bounded page at a time. Default empty, like every other
+    /// bundle accessor.
+    async fn list_scrub_bundle_page(
+        &self,
+        source: SourceId,
+        after: Option<&str>,
+        limit: u32,
+    ) -> Result<Vec<crate::scrub::ScrubCandidate>> {
+        let _ = (source, after, limit);
+        Ok(Vec::new())
+    }
+
+    /// Where the rolling scrub stopped for `source`, or `None` before its
+    /// first run. Default `None` (never scrubbed), which makes the source
+    /// permanently due in a fake - harmless, since a fake with no candidate
+    /// pages has nothing to scrub.
+    async fn scrub_cursor(&self, source: SourceId) -> Result<Option<crate::scrub::ScrubCursor>> {
+        let _ = source;
+        Ok(None)
+    }
+
+    /// Persists where the rolling scrub stopped for `source`.
+    ///
+    /// Called ONLY after a run that completed its enumeration: an aborted run
+    /// must leave the cursor untouched so the next run re-checks the same
+    /// slice rather than skipping it. Default no-op (a fake persists nothing).
+    async fn set_scrub_cursor(
+        &self,
+        source: SourceId,
+        cursor: &crate::scrub::ScrubCursor,
+    ) -> Result<()> {
+        let _ = (source, cursor);
+        Ok(())
+    }
+
+    /// Appends one `scrub_runs` row and prunes that source's history down to
+    /// the newest [`SCRUB_RUN_HISTORY_CAP`] rows. Returns the new row id.
+    ///
+    /// Self-pruning because the table would otherwise grow forever on a weekly
+    /// cadence, and there is no user-facing "clear scrub history" affordance to
+    /// hang a prune off (unlike `activity_log`, which has one). Default returns
+    /// `0` (a fake persists nothing).
+    async fn insert_scrub_run(&self, run: &NewScrubRun) -> Result<i64> {
+        let _ = run;
+        Ok(0)
+    }
+
+    /// The newest scrub runs across all sources, newest-first.
+    ///
+    /// `source` narrows to one source; `None` returns every source's runs
+    /// interleaved by time, which is what the UI history panel shows. Default
+    /// empty.
+    async fn list_scrub_runs(
+        &self,
+        source: Option<SourceId>,
+        limit: u32,
+    ) -> Result<Vec<ScrubRunRow>> {
+        let _ = (source, limit);
+        Ok(Vec::new())
     }
 
     // --- activity_log -------------------------------------------------------

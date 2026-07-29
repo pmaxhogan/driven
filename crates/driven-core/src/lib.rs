@@ -31,6 +31,7 @@ pub mod pacer;
 pub mod planner;
 pub mod priority;
 pub mod scanner;
+pub mod scrub;
 pub mod state;
 pub mod telemetry;
 pub mod time;
