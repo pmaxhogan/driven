@@ -58,13 +58,36 @@ const expanded = ref(new Set<string>());
 const shownLimit = ref(new Map<string, number>());
 
 let teardown: (() => void) | null = null;
+/** Subscription INTENT, re-checked after `subscribe()` resolves.
+ *
+ * `subscribe()` is async (three `listen()` round-trips), so a component that
+ * unmounts while it is in flight would run `onUnmounted` with `teardown` still
+ * null and tear down nothing - stranding all three listeners for the life of
+ * the process. Those listeners are registered globally BY EVENT NAME, so the
+ * orphan keeps receiving every later preview's `exclusion_preview:batch`, and
+ * its controller (whose generation id never resolved) parks each one forever.
+ * The editor opens and closes on `v-if`, so losing that race is a normal
+ * interaction, not a pathological one.
+ *
+ * Same shape as `activity.ts`'s `desiredSubscribed`: flip the intent first,
+ * then have the resolving side honour it. */
+let subscribeWanted = false;
 
 onMounted(async () => {
-  teardown = await preview.subscribe();
+  subscribeWanted = true;
+  const stop = await preview.subscribe();
+  if (!subscribeWanted) {
+    // Unmounted while subscribing: tear the listeners down now, and do NOT
+    // start a walk nobody is rendering.
+    stop();
+    return;
+  }
+  teardown = stop;
   await restart();
 });
 
 onUnmounted(() => {
+  subscribeWanted = false;
   teardown?.();
   teardown = null;
 });

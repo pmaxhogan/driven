@@ -44,6 +44,7 @@ import {
   createExclusionPreview,
   isUnconstrainedIncludePattern,
   unconstrainedIncludePatterns,
+  PRE_ID_PARK_CAP,
   type ExclusionPreviewController,
 } from "../stores/exclusionPreview";
 import type { ExclusionPreviewBatch, ExclusionPreviewNode } from "../ipc/types";
@@ -102,6 +103,65 @@ beforeEach(() => {
   unlistenBatch.mockReset();
   unlistenDone.mockReset();
   unlistenError.mockReset();
+});
+
+describe("pre-generation-id park", () => {
+  // A controller whose `start` never resolves a generation id leaves `currentId`
+  // null FOREVER, while its `listen()` registrations - which are global by event
+  // name - keep receiving every later preview's batches. Nothing drains the park
+  // in that state, so the park is the one place in this controller where events
+  // can pile up unboundedly. This pins the bound.
+  it("caps the park so a controller that never resolves an id cannot grow without bound", async () => {
+    const preview = createExclusionPreview();
+    await preview.subscribe();
+    // The start command REJECTS, so no generation id is ever adopted.
+    invokeMock.mockRejectedValue(new Error("start failed"));
+    await preview.start({
+      sourceId: "src-1",
+      respectGitignore: true,
+      includePatterns: [],
+      excludePatterns: [],
+    });
+    expect(preview.currentPreviewId()).toBeNull();
+
+    // Four caps' worth of traffic from OTHER previews still arrives, because the
+    // listeners are registered by event name rather than per generation.
+    const fired = PRE_ID_PARK_CAP * 4;
+    for (let i = 0; i < fired; i += 1) {
+      batchHandler!(batch(`gen-${i}`, [node(`f${i}.txt`, false, true, 1)]));
+    }
+
+    expect(preview.preIdParkedCount()).toBe(PRE_ID_PARK_CAP);
+    expect(preview.preIdParkedCount()).toBeLessThan(fired);
+  });
+
+  it("still parks and replays everything that arrives before a real id lands", async () => {
+    const preview = createExclusionPreview();
+    await preview.subscribe();
+    let resolveStart: (id: string) => void = () => {};
+    invokeMock.mockReturnValue(
+      new Promise<string>((resolve) => {
+        resolveStart = resolve;
+      })
+    );
+    const starting = preview.start({
+      sourceId: "src-1",
+      respectGitignore: true,
+      includePatterns: [],
+      excludePatterns: [],
+    });
+    // The walk streams before `preview_exclusions_start` resolves.
+    batchHandler!(batch("gen-1", [node("dir", true, true), node("dir/a.txt", false, true, 7)]));
+    expect(preview.preIdParkedCount()).toBe(1);
+
+    resolveStart("gen-1");
+    await starting;
+    preview.flush();
+
+    expect(preview.preIdParkedCount()).toBe(0);
+    expect(preview.nodeAt("dir/a.txt")?.included).toBe(true);
+    expect(preview.includedCount.value).toBe(1);
+  });
 });
 
 describe("anchoredPatternForPath", () => {

@@ -171,6 +171,31 @@ const scheduleFrame: (cb: () => void) => void =
         setTimeout(cb, 16);
       };
 
+/** Park at most this many pre-generation-id events of each kind (see the
+ * `preIdBatches` declaration for why the park needs a cap at all).
+ *
+ * The backend caps one generation at `NODE_STREAM_CAP` (50,000) nodes in
+ * `BATCH_MAX_NODES` (400) sized batches, so 125 FULL batches - and only the
+ * ones arriving before `previewExclusionsStart` resolves are ever parked. That
+ * window is a single IPC round trip: since #177 the command hands back its
+ * generation id immediately and does the slow matcher build in the spawned
+ * task, so at the `BATCH_MAX_INTERVAL` (100ms) partial-flush cadence only a
+ * batch or two can land inside it. 256 is 2x the full-batch ceiling and orders
+ * above the realistic park, while still pinning an unresolvable controller's
+ * retention to a constant.
+ *
+ * Over the cap the NEWEST event is dropped rather than the oldest: the backend
+ * streams breadth-first, so the oldest batches carry the ancestors every later
+ * row hangs off, and truncating the tail is exactly the already-handled
+ * `truncated` case. */
+export const PRE_ID_PARK_CAP = 256;
+
+/** Park `event` in `park` unless it is already at [`PRE_ID_PARK_CAP`]. */
+function parkPreId<T>(park: T[], event: T): void {
+  if (park.length >= PRE_ID_PARK_CAP) return;
+  park.push(event);
+}
+
 export type ExclusionPreviewController = ReturnType<typeof createExclusionPreview>;
 
 /**
@@ -233,8 +258,16 @@ export function createExclusionPreview() {
   let startSeq = 0;
   /** The walk begins before `preview_exclusions_start` resolves, so its first
    *  batches can legitimately arrive BEFORE we know the generation id. They are
-   *  parked here and replayed once the id lands (bounded by the backend's own
-   *  node cap, so this cannot grow without limit). */
+   *  parked here and replayed once the id lands.
+   *
+   *  The park is capped at [`PRE_ID_PARK_CAP`]. The backend's own node cap
+   *  bounds ONE generation's stream, which is all a controller that goes on to
+   *  resolve an id can ever park - but a controller whose id never resolves
+   *  (a rejected `previewExclusionsStart`, or a controller orphaned by an
+   *  unmount that raced `subscribe`) leaves `currentId` null forever while its
+   *  globally-registered listeners keep receiving EVERY later preview's
+   *  batches. Nothing drains the park in that state, so without a cap it grows
+   *  for the life of the process. The cap makes that retention constant. */
   let preIdBatches: ExclusionPreviewBatch[] = [];
   let preIdDone: ExclusionPreviewDone[] = [];
   let preIdErrors: ExclusionPreviewError[] = [];
@@ -398,7 +431,7 @@ export function createExclusionPreview() {
   /** Take a batch from the event stream (or from the pre-id park). */
   function ingestBatch(batch: ExclusionPreviewBatch): void {
     if (currentId === null) {
-      preIdBatches.push(batch);
+      parkPreId(preIdBatches, batch);
       return;
     }
     // A superseded walk's in-flight events must never touch the live tree.
@@ -409,7 +442,7 @@ export function createExclusionPreview() {
 
   function ingestDone(done: ExclusionPreviewDone): void {
     if (currentId === null) {
-      preIdDone.push(done);
+      parkPreId(preIdDone, done);
       return;
     }
     if (done.previewId !== currentId) return;
@@ -427,7 +460,7 @@ export function createExclusionPreview() {
    * user fixes the rule the next generation swaps a real tree back in. */
   function ingestError(error: ExclusionPreviewError): void {
     if (currentId === null) {
-      preIdErrors.push(error);
+      parkPreId(preIdErrors, error);
       return;
     }
     if (error.previewId !== currentId) return;
@@ -536,5 +569,9 @@ export function createExclusionPreview() {
     /** Look up a node of the tree ON SCREEN by path - which during a recompute
      *  is still the previous generation's. Test/diagnostic seam. */
     nodeAt: (path: string) => displayedIndex.get(path),
+    /** Events parked awaiting a generation id, capped at `PRE_ID_PARK_CAP`.
+     *  Test/diagnostic seam: this is the retention of a controller whose id
+     *  never resolves, so it is a memory bound, not a queue length. */
+    preIdParkedCount: (): number => preIdBatches.length + preIdDone.length + preIdErrors.length,
   };
 }
