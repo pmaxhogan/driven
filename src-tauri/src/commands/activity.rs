@@ -184,6 +184,41 @@ pub async fn distinct_activity_event_types(
     Ok(types)
 }
 
+/// Max scrub-run page the webview may request. The history panel shows a
+/// handful of recent runs; a larger request is a caller bug, and the per-source
+/// history is capped at `SCRUB_RUN_HISTORY_CAP` rows anyway (SPEC s11.6.1
+/// bound).
+const MAX_SCRUB_RUN_LIMIT: u32 = 200;
+
+/// `list_scrub_runs(source_id, limit)` - the persisted integrity-scrub reports,
+/// newest-first (`driven_core::scrub`).
+///
+/// `source_id` narrows to one source; omit it for every source interleaved by
+/// time, which is what the history panel shows. Every returned field is a
+/// COUNT - the DTO carries no path, Drive id, or object name - so this command
+/// cannot leak an encrypted source's filenames to the webview.
+#[tauri::command]
+pub async fn list_scrub_runs(
+    state: State<'_, AppState>,
+    source_id: Option<String>,
+    limit: Option<u32>,
+) -> CommandResult<Vec<crate::commands::dtos::ScrubRunDto>> {
+    let source = match source_id.as_deref() {
+        None => None,
+        Some(s) => Some(driven_core::types::SourceId(s.parse().map_err(|_| {
+            CommandError::with_code(ErrorCode::InvalidInput, "source_id must be a uuid")
+        })?)),
+    };
+    let limit = limit.unwrap_or(25).clamp(1, MAX_SCRUB_RUN_LIMIT);
+    let rows = state
+        .state()
+        .list_scrub_runs(source, limit)
+        .await
+        .map_err(CommandError::from)?;
+    tracing::debug!(target: TARGET, count = rows.len(), "list_scrub_runs");
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 /// `activity_summary(day_start_ms, week_start_ms, throughput_window_ms)` - the
 /// Activity dashboard header aggregates (M7-P2-5; DESIGN s8.3): bytes uploaded
 /// today / this week, file count by status, and the current throughput window.

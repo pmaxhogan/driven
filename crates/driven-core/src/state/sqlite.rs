@@ -4017,6 +4017,230 @@ mod tests {
         }
     }
 
+    // --- migration 0013: integrity scrub -------------------------------------
+
+    /// Seed an account + source with `n` SYNCED, uploaded files named
+    /// `f00.txt..`, each recording a distinct `drive_file_id` and md5.
+    async fn seed_for_scrub(n: usize) -> (SqliteStateRepo, TempDir, SourceId) {
+        let (repo, dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+        for i in 0..n {
+            let mut row = sample_file(src.id, &format!("f{i:02}.txt"), i as u8);
+            row.status = FileStateStatus::Synced;
+            row.drive_file_id = Some(format!("drive-{i:02}"));
+            row.drive_md5 = Some([i as u8; 16]);
+            repo.upsert_file_state(&row).await.unwrap();
+        }
+        (repo, dir, src.id)
+    }
+
+    #[tokio::test]
+    async fn scrub_file_page_is_a_keyset_window_in_relative_path_order() {
+        let (repo, _dir, src) = seed_for_scrub(5).await;
+
+        let first = repo.list_scrub_file_page(src, None, 2).await.unwrap();
+        assert_eq!(
+            first
+                .iter()
+                .map(crate::scrub::ScrubCandidate::cursor_key)
+                .collect::<Vec<_>>(),
+            vec!["f00.txt", "f01.txt"]
+        );
+        assert_eq!(first[0].drive_file_id, "drive-00");
+        assert_eq!(first[0].size, 1024);
+        assert_eq!(first[0].md5, Some([0u8; 16]));
+
+        let second = repo
+            .list_scrub_file_page(src, Some("f01.txt"), 2)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(crate::scrub::ScrubCandidate::cursor_key)
+                .collect::<Vec<_>>(),
+            vec!["f02.txt", "f03.txt"],
+            "the cursor is an EXCLUSIVE lower bound, so pages never overlap"
+        );
+
+        let tail = repo
+            .list_scrub_file_page(src, Some("f04.txt"), 2)
+            .await
+            .unwrap();
+        assert!(tail.is_empty(), "past the last key the page is empty");
+    }
+
+    /// A bundled member has `drive_file_id IS NULL` by the migration-0007
+    /// invariant; treating its absence from Drive as damage would re-upload it
+    /// every single pass. Its bytes are checked through its BUNDLE instead.
+    #[tokio::test]
+    async fn scrub_file_page_excludes_rows_with_no_standalone_object() {
+        let (repo, _dir, src) = seed_for_scrub(2).await;
+        let mut bundled = sample_file(src, "f99.txt", 0x99);
+        bundled.status = FileStateStatus::Synced;
+        bundled.drive_file_id = None;
+        repo.upsert_file_state(&bundled).await.unwrap();
+
+        let page = repo.list_scrub_file_page(src, None, 100).await.unwrap();
+        assert_eq!(
+            page.iter()
+                .map(crate::scrub::ScrubCandidate::cursor_key)
+                .collect::<Vec<_>>(),
+            vec!["f00.txt", "f01.txt"],
+            "a row with no standalone object is not a scrub candidate"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_scrub_cursor_round_trips_and_upserts() {
+        let (repo, _dir, src) = seed_for_scrub(1).await;
+        assert!(repo.scrub_cursor(src).await.unwrap().is_none());
+
+        let first = crate::scrub::ScrubCursor {
+            file_cursor: Some("f00.txt".into()),
+            bundle_cursor: None,
+            last_scrub_at: Some(1_700_000_000_000),
+        };
+        repo.set_scrub_cursor(src, &first).await.unwrap();
+        assert_eq!(repo.scrub_cursor(src).await.unwrap(), Some(first));
+
+        let wrapped = crate::scrub::ScrubCursor {
+            file_cursor: None,
+            bundle_cursor: Some("bundle-9".into()),
+            last_scrub_at: Some(1_700_000_600_000),
+        };
+        repo.set_scrub_cursor(src, &wrapped).await.unwrap();
+        assert_eq!(
+            repo.scrub_cursor(src).await.unwrap(),
+            Some(wrapped),
+            "a second write upserts rather than erroring or duplicating"
+        );
+    }
+
+    #[tokio::test]
+    async fn scrub_runs_round_trip_newest_first_and_can_be_narrowed_to_one_source() {
+        let (repo, _dir, src) = seed_for_scrub(1).await;
+        let other = sample_source(
+            repo.list_sources().await.unwrap()[0].account_id,
+        );
+        repo.upsert_source(&other).await.unwrap();
+
+        let mut report = crate::scrub::ScrubReport {
+            checked: 12,
+            ok: 9,
+            missing: 1,
+            size_mismatch: 1,
+            hash_mismatch: 1,
+            unverifiable: 0,
+            healed: 1,
+            healed_bundle_members: 4,
+            unrecoverable: 2,
+            deep_checked: 3,
+            deep_failed: 1,
+            wrapped: true,
+            ..Default::default()
+        };
+        report.finish();
+        repo.insert_scrub_run(&crate::state::NewScrubRun {
+            source_id: src,
+            started_at: 1_000,
+            finished_at: 2_000,
+            report: report.clone(),
+        })
+        .await
+        .unwrap();
+        repo.insert_scrub_run(&crate::state::NewScrubRun {
+            source_id: other.id,
+            started_at: 3_000,
+            finished_at: 4_000,
+            report: crate::scrub::ScrubReport::default(),
+        })
+        .await
+        .unwrap();
+
+        let all = repo.list_scrub_runs(None, 10).await.unwrap();
+        assert_eq!(all.len(), 2);
+        assert_eq!(all[0].started_at, 3_000, "newest first");
+
+        let mine = repo.list_scrub_runs(Some(src), 10).await.unwrap();
+        assert_eq!(mine.len(), 1);
+        assert_eq!(mine[0].source_id, src);
+        assert_eq!(mine[0].finished_at, 2_000);
+        assert_eq!(
+            mine[0].report, report,
+            "every counter, the wrapped flag, and the outcome survive the round trip"
+        );
+    }
+
+    /// The history is self-pruning: on a weekly cadence nothing else would ever
+    /// bound this table, and there is no user-facing "clear scrub history"
+    /// affordance to hang a prune off.
+    #[tokio::test]
+    async fn scrub_run_history_is_capped_per_source_keeping_the_newest() {
+        let (repo, _dir, src) = seed_for_scrub(1).await;
+        let cap = i64::from(crate::state::SCRUB_RUN_HISTORY_CAP);
+        for i in 0..(cap + 5) {
+            repo.insert_scrub_run(&crate::state::NewScrubRun {
+                source_id: src,
+                started_at: i,
+                finished_at: i,
+                report: crate::scrub::ScrubReport {
+                    checked: u64::try_from(i).unwrap(),
+                    ..Default::default()
+                },
+            })
+            .await
+            .unwrap();
+        }
+
+        assert_eq!(
+            repo.table_row_count("scrub_runs").await.unwrap(),
+            cap,
+            "the table stays bounded"
+        );
+        let rows = repo.list_scrub_runs(Some(src), 1).await.unwrap();
+        assert_eq!(
+            rows[0].started_at,
+            cap + 4,
+            "the newest run survives the prune"
+        );
+    }
+
+    /// The scrub tables must be countable by the diagnostic bundle, which is
+    /// what `KNOWN_STATE_TABLES` gates.
+    #[tokio::test]
+    async fn the_scrub_tables_are_known_to_the_diagnostic_bundle() {
+        let (repo, _dir) = temp_repo().await;
+        for t in ["scrub_state", "scrub_runs"] {
+            assert!(
+                crate::state::KNOWN_STATE_TABLES.contains(&t),
+                "{t} must be in KNOWN_STATE_TABLES"
+            );
+            assert_eq!(repo.table_row_count(t).await.unwrap(), 0);
+        }
+    }
+
+    /// The four scrub settings are seeded by the migration, so a fresh install's
+    /// on-disk shape matches what `load_scrub_config` expects - and the shipped
+    /// posture is "gently on, metadata only".
+    #[tokio::test]
+    async fn the_migration_seeds_the_shipped_scrub_defaults() {
+        let (repo, _dir) = temp_repo().await;
+        let cfg = crate::scrub::load_scrub_config(&repo).await;
+        assert_eq!(cfg, crate::scrub::ScrubConfig::default());
+        assert!(cfg.enabled);
+        assert_eq!(cfg.deep_sample, 0);
+        assert_eq!(
+            repo.get_setting(crate::scrub::SETTING_SCRUB_ENABLED)
+                .await
+                .unwrap(),
+            Some(serde_json::json!(true))
+        );
+    }
+
     // --- issue #36: versioning (file_versions + config) ---------------------
 
     /// Seed an account + a source with one SYNCED file already uploaded under
@@ -4437,6 +4661,63 @@ mod tests {
         })
         .await
         .unwrap()
+    }
+
+    /// The bundle half of the scrub's recorded set: a bundle is a scrub
+    /// candidate keyed on its `bundles.id`, carrying the size + md5 of the
+    /// `.tar.gz` object. Its MEMBERS are not candidates - they have no
+    /// standalone object - which is what keeps the two populations disjoint.
+    #[tokio::test]
+    async fn scrub_bundle_page_is_a_keyset_window_over_bundle_objects() {
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        let src = sample_source(acct.id);
+        repo.upsert_source(&src).await.unwrap();
+
+        for (i, bid) in ["bundle-a", "bundle-b"].iter().enumerate() {
+            let op_id = enqueue_bundle_op(&repo, src.id, &format!("logs/{i}/x.log")).await;
+            let members = vec![synced_member(src.id, &format!("logs/{i}/x.log"), i as u8)];
+            let bundle = BundleRow {
+                id: (*bid).to_string(),
+                source_id: src.id,
+                drive_file_id: format!("drive-{bid}"),
+                drive_md5: Some([i as u8; 16]),
+                size: 4096 + i as u64,
+                member_count: 1,
+                created_at: 1,
+            };
+            repo.commit_bundle_result(op_id, &bundle, &members)
+                .await
+                .unwrap();
+        }
+
+        let first = repo.list_scrub_bundle_page(src.id, None, 1).await.unwrap();
+        assert_eq!(first.len(), 1);
+        assert_eq!(first[0].cursor_key(), "bundle-a");
+        assert_eq!(first[0].drive_file_id, "drive-bundle-a");
+        assert_eq!(first[0].size, 4096);
+        assert_eq!(first[0].md5, Some([0u8; 16]));
+
+        let second = repo
+            .list_scrub_bundle_page(src.id, Some("bundle-a"), 10)
+            .await
+            .unwrap();
+        assert_eq!(
+            second
+                .iter()
+                .map(crate::scrub::ScrubCandidate::cursor_key)
+                .collect::<Vec<_>>(),
+            vec!["bundle-b"]
+        );
+
+        assert!(
+            repo.list_scrub_file_page(src.id, None, 100)
+                .await
+                .unwrap()
+                .is_empty(),
+            "bundle members must not also appear as standalone-file candidates"
+        );
     }
 
     /// `commit_bundle_result` transactionally writes the bundle row + member
