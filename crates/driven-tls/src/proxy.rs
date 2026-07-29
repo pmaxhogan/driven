@@ -1327,6 +1327,58 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn validating_an_unsaved_source_does_not_disturb_the_live_one() {
+        // `validate_pac_source` is reachable from the `validate_proxy` IPC
+        // command - the UI's "test this PAC file" button - for a source the user
+        // has NOT saved. Publishing on validate must therefore never perturb the
+        // engine the configured source is using. This is the invariant the keyed
+        // (rather than single-slot) cache exists to guarantee.
+        let ca = crate::CustomCaConfig::none();
+        let dir = tempfile::tempdir().expect("tempdir");
+
+        let live_path = dir.path().join("live.pac");
+        let live = live_path.to_string_lossy().to_string();
+        std::fs::write(
+            &live_path,
+            "function FindProxyForURL(u,h){ return \"PROXY live:1\"; }",
+        )
+        .expect("write live");
+        let cfg = resolve_proxy("pac", Some(&live), &ca).await.expect("live");
+        assert_eq!(
+            cfg.pac_engine()
+                .expect("pac")
+                .evaluate_str("https://z.example/"),
+            Some("http://live:1".to_string())
+        );
+
+        // The user types a DIFFERENT source into the settings field and hits
+        // validate, without saving.
+        let probe_path = dir.path().join("probe.pac");
+        let probe = probe_path.to_string_lossy().to_string();
+        std::fs::write(
+            &probe_path,
+            "function FindProxyForURL(u,h){ return \"PROXY probe:2\"; }",
+        )
+        .expect("write probe");
+        validate_pac_source(&probe, &ca)
+            .await
+            .expect("the probe source validates");
+
+        // The configured source still routes by its own script.
+        let after = resolve_proxy("pac", Some(&live), &ca)
+            .await
+            .expect("live still resolves");
+        assert_eq!(
+            after
+                .pac_engine()
+                .expect("pac")
+                .evaluate_str("https://z.example/"),
+            Some("http://live:1".to_string()),
+            "validating an unsaved source must not change the live routing"
+        );
+    }
+
+    #[tokio::test]
     async fn a_stale_cache_entry_is_refetched() {
         // The TTL path: an entry older than PAC_ENGINE_TTL must not be served.
         // The entry is aged by writing `fetched_at` directly rather than by
