@@ -24,16 +24,11 @@ anyhow.workspace = true
 tracing.workspace = true
 
 [dev-dependencies]
-# `keyring` 4.x is a thin wrapper over `keyring-core`, whose `mock` module is an
-# IN-MEMORY credential store installable as the process default. That makes the
-# keychain-backed paths (the factory's Drive arm, the BYO client-creds
-# resolution) coverable by real tests instead of being untestable on a headless
-# CI box with no OS keychain - the constraint `driven-drive`'s `token_store`
-# module documents and had to work around. Dev-only: production always uses the
-# real per-OS store.
-keyring-core = "1"
-# The facade production uses. The test helper needs it to burn keyring 4.x's
-# one-shot platform-store latch before the in-memory mock can stick.
-keyring.workspace = true
-# The local-folder tests need a throwaway destination directory.
-tempfile = "3"
+# `driven_test_fixtures::keychain::isolated()` installs (and PROVES) an
+# in-memory credential store as the process default, so the keychain-backed
+# paths here - the factory's Drive arm, the BYO client-creds resolution - are
+# covered by real tests that never reach an OS keychain: neither the
+# developer's login keychain (which on macOS re-prompts on every rebuild) nor a
+# headless CI box's absent one. Dev-only: production always uses the real
+# per-OS store.
+driven-test-fixtures = { path = "../driven-test-fixtures" }

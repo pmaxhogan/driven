@@ -137,6 +137,26 @@ honour them; deviating requires re-asking the user.
     the in-app auto-updater is **not expected to work cleanly on
     macOS** as a result - macOS users do a manual reinstall per
     release. No fix planned until Developer ID signing lands.
+  - **macOS, second cost: permission grants do not survive an
+    update.** Distribution friction is not the only price of shipping
+    unsigned on macOS. The bundle is only ad-hoc (linker) signed, so
+    it has no stable designated requirement and its cdhash changes
+    every build - and macOS pins both keychain ACLs and TCC privacy
+    grants to exactly that identity. So each update is a new app as
+    far as the OS is concerned: the user is re-prompted for access to
+    Driven's three keychain services (`dev.maxhogan.driven`,
+    `driven.google.refresh_token`, `driven.google.client_creds`) and a
+    granted Full Disk Access can silently stop taking effect until it
+    is removed and re-added. Denying the keychain prompt is safe by
+    construction - the per-source crypto resolver fails closed
+    (`Unavailable` -> `crypto.key_missing`, §7.1) rather than
+    uploading plaintext - but it does stall encrypted sources until
+    the user re-authorizes. A Developer ID signature is the only fix;
+    an entitlement cannot substitute for one. The same mechanism bites
+    development: because every `cargo test` rebuild is a new identity,
+    a test that reaches the real keychain re-prompts on every rebuild,
+    which is why the suite is keychain-isolated (see CONTRIBUTING and
+    `driven_test_fixtures::keychain`).
 - **Update channels:** **stable + dev.** Stable = tagged releases on `main`.
   Dev = GATED dev builds (NOT every main commit): `dev-channel.yml` builds only on
   a manual `workflow_dispatch` OR when the head commit message contains the

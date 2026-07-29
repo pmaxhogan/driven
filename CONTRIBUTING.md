@@ -105,6 +105,51 @@ example real-Google-Drive end-to-end tests with no credentials, or VSS /
 elevation tests without admin). A clean run is all-pass plus those honest skips,
 not a hidden failure.
 
+### The test suite is isolated from your OS keychain
+
+`cargo test --workspace` must never touch your real login keychain, and it
+does not. Any test that can reach a keychain entry - Driven stores the account
+master key under `dev.maxhogan.driven` and the Google secrets under
+`driven.google.refresh_token` / `driven.google.client_creds` - starts with:
+
+```rust
+let Some(_guard) = driven_test_fixtures::keychain::isolated() else {
+    return; // could not isolate; skip rather than write to a real keychain
+};
+```
+
+`isolated()` installs `keyring-core`'s in-memory mock as the process-global
+default credential store, proves it is the effective store before the test is
+allowed to store anything, and returns `None` (so the test skips honestly) if it
+cannot. Add that line to any new test that reaches the keychain, and add
+`driven-test-fixtures` to your crate's `[dev-dependencies]` if it is not there
+yet. Every crate that owns a keychain call site - `driven-crypto`,
+`driven-drive`, `driven-backend`, `src-tauri` - already has the wiring and a
+`the_test_suite_is_isolated_from_the_os_keychain` guard test, so if the
+mechanism ever breaks (a `keyring` upgrade, say) those fail loudly instead of
+the suite quietly starting to write for real.
+
+**Why this matters more on macOS.** macOS ties a keychain ACL to the identity
+of the binary that was granted access, and every `cargo test` rebuild produces a
+binary with a new identity. So a single test that reaches the real keychain
+raises a modal "allow ... to access ..." prompt on *every* rebuild - clicking
+"Always Allow" does not help, because the next build is a different app - and
+the run blocks on the dialog until you answer it. (The same mechanism means
+released builds re-prompt users on every update; see the macOS notes in the
+README.) Ordering is load-bearing here: `keyring` 4.x's `Entry::new` installs
+the platform-native store on its *first* call and overwrites whatever default is
+already set, so installing the mock without first burning that latch is silently
+undone. `crates/driven-test-fixtures/src/keychain.rs` documents the sequence -
+use the helper rather than re-deriving it.
+
+If you ran the suite before this isolation landed, you may have leftover
+test-only items in your login keychain. Remove them with:
+
+```sh
+security delete-generic-password -s "driven.google.refresh_token" -a "acct-with-token"
+security delete-generic-password -s "driven.google.client_creds" -a "acct-byo"
+```
+
 ## Coverage gate
 
 The `coverage` workflow (`.github/workflows/coverage.yml`) measures line

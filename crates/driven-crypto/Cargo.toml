@@ -42,3 +42,13 @@ md5 = { workspace = true }
 # directly via `RngCore`/`TryRngCore`, so the two `rand_core` major versions
 # never need to match.
 rand = "0.10"
+
+[dev-dependencies]
+# `driven_test_fixtures::keychain::isolated()` binds keyring to an in-memory
+# mock store, so the [`Keystore`] round-trip tests exercise the real API
+# without touching a developer's login keychain (which on macOS re-prompts on
+# every rebuild) or needing one at all on headless CI. The dependency edge is a
+# cycle - driven-test-fixtures depends on driven-core, which depends on this
+# crate - which cargo permits precisely because it is dev-only and so cannot
+# appear in a shipped build.
+driven-test-fixtures = { path = "../driven-test-fixtures" }
