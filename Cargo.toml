@@ -110,7 +110,7 @@ keyring = "4"
 # (SPEC s4).
 url = "2"
 # M4 base64url for PKCE / token plumbing and any binary-in-JSON Drive fields.
-base64 = "0.22"
+base64 = "0.23"
 # M4 CLI surface (ROADMAP M4 acceptance: `cargo run --bin driven-cli auth`).
 # `derive` for the `#[derive(Parser)]` command tree.
 clap = { version = "4", features = ["derive", "env"] }
