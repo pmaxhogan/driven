@@ -22,7 +22,11 @@ export const useAccountsStore = defineStore("accounts", () => {
     loading.value = true;
     error.value = null;
     try {
-      accounts.value = await ipc.listAccounts();
+      // Defensive coercion: anything other than an array (an older backend, a
+      // stubbed command) would break every consumer that iterates or `.find`s
+      // this list, several of which now do so to resolve an account's backend.
+      const list = await ipc.listAccounts();
+      accounts.value = Array.isArray(list) ? list : [];
     } catch (e) {
       error.value = String(e);
     } finally {

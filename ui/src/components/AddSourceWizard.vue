@@ -14,6 +14,7 @@ import {
   unconstrainedIncludePatterns,
 } from "../stores/exclusionPreview";
 import { useSourcesStore } from "../stores/sources";
+import { isWindows } from "../platform";
 import type { BackendDto, SourceDto } from "../ipc/types";
 
 // Add-source wizard (SPEC s11.2; DESIGN s8.5 step 3 / s8.2 add-source wizard).
@@ -40,6 +41,11 @@ const inputCls =
   "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-hidden focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
 
 const emit = defineEmits<{ created: [source: SourceDto] }>();
+
+// The OneDrive / cloud-only placeholder policy only DOES anything on Windows, so
+// it is not offered elsewhere. Evaluated once: the host OS cannot change while
+// the app is running.
+const showPlaceholderPolicy = isWindows();
 
 // B3: a post-confirm "reveal" step is appended when an encrypted add returned a
 // recovery phrase; the user must acknowledge it before the wizard closes.
@@ -448,6 +454,7 @@ defineExpose({ start });
           v-model:folder-path="driveFolderPath"
           v-model:drive-id="driveId"
           :account-id="accountId"
+          :backend-kind="selectedAccount?.backendKind"
           @error="onDrivePickerError"
         />
       </div>
@@ -508,7 +515,12 @@ defineExpose({ start });
           />
         </label>
 
-        <label class="flex items-start gap-2 text-sm">
+        <!-- Windows-only: OneDrive / cloud-only placeholder files exist only on
+             Windows. Hiding it elsewhere does NOT change what the new source
+             gets - `backupCloudOnly` stays false, which sends "skip", the same
+             value a Windows user gets by leaving the box unticked and the same
+             value the Rust `#[serde(default)]` would apply. -->
+        <label v-if="showPlaceholderPolicy" class="flex items-start gap-2 text-sm">
           <input
             v-model="backupCloudOnly"
             type="checkbox"

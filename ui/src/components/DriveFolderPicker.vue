@@ -1,11 +1,11 @@
 <script setup lang="ts">
-import { ref, watch } from "vue";
+import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 
 import * as ipc from "../ipc/commands";
 import type { DriveFolderEntry } from "../ipc/types";
 
-// Shared Drive destination picker (SPEC s11.2; DESIGN s8.5 step 3). Used by BOTH
+// Shared destination picker (SPEC s11.2; DESIGN s8.5 step 3). Used by BOTH
 // the first-run setup wizard AND the Settings "Add source" wizard, so the two
 // flows can never drift again. They DID drift: the setup wizard had a degenerate
 // single-shot button that silently targeted My Drive root, showed no confirmation
@@ -30,10 +30,20 @@ import type { DriveFolderEntry } from "../ipc/types";
 // wizard maps to a stable SPEC s24 code (errors.${code}.long); AddSourceWizard
 // shows String(e). i18n: every visible string is a seeded key.
 
-const { t } = useI18n();
+const { t, te } = useI18n();
 
-const props = defineProps<{ accountId: string | null }>();
+const props = defineProps<{ accountId: string | null; backendKind?: string }>();
 const emit = defineEmits<{ (e: "error", err: unknown): void }>();
+
+/** What the destination ROOT is called at this backend. The picker is shared by
+ * every browsable destination, so a hard-coded "My Drive" was simply wrong for an
+ * S3 account looking at its bucket root. Falls back to a neutral label for a
+ * backend with no seeded name, so a destination added on the Rust side never
+ * renders as a Drive-ism or as a blank crumb. */
+const rootName = computed(() => {
+  const key = `drivePicker.root.${props.backendKind}`;
+  return props.backendKind !== undefined && te(key) ? t(key) : t("drivePicker.rootName");
+});
 
 const folderId = defineModel<string | null>("folderId", { default: null });
 const folderPath = defineModel<string>("folderPath", { default: "" });
@@ -122,7 +132,7 @@ watch(
           class="rounded-sm px-1 py-0.5 text-zinc-600 transition-colors hover:text-teal-700 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-1 focus-visible:outline-teal-500 dark:text-zinc-400 dark:hover:text-teal-300"
           @click="goToCrumb(i)"
         >
-          {{ i === 0 ? t("drivePicker.rootName") : crumb.path.split("/").pop() }}
+          {{ i === 0 ? rootName : crumb.path.split("/").pop() }}
         </button>
       </template>
     </nav>
@@ -160,7 +170,7 @@ watch(
     </template>
 
     <p class="text-sm text-zinc-700 dark:text-zinc-200" data-testid="drive-destination">
-      {{ t("drivePicker.destinationLabel") }}: {{ folderPath || t("drivePicker.rootName") }}
+      {{ t("drivePicker.destinationLabel") }}: {{ folderPath || rootName }}
     </p>
   </div>
 </template>

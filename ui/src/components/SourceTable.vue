@@ -15,6 +15,7 @@ import {
 } from "../stores/exclusionPreview";
 import { useSourcesStore } from "../stores/sources";
 import { useToastsStore } from "../stores/toasts";
+import { isWindows } from "../platform";
 import type { SourceDto } from "../ipc/types";
 
 // Sources settings tab body (SPEC s11.2; DESIGN s8.2). A table of sources with
@@ -22,7 +23,7 @@ import type { SourceDto } from "../ipc/types";
 // Drive destination, account, encryption on/off, "Edit exclusions" (inline
 // editor with a live preview), "Run now" (sync_now), and "Remove" (with an
 // "also delete from Drive" opt-in). "Add source" opens the AddSourceWizard.
-const { t } = useI18n();
+const { t, te } = useI18n();
 const sources = useSourcesStore();
 const accounts = useAccountsStore();
 const toasts = useToastsStore();
@@ -43,6 +44,11 @@ const inputCls =
   "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-hidden focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
 const cardCls =
   "rounded-lg border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900";
+
+// The OneDrive / cloud-only placeholder policy only DOES anything on Windows
+// (its own caption said so), so it is not offered on other platforms. Evaluated
+// once at setup: the host OS cannot change while the app is running.
+const showPlaceholderPolicy = isWindows();
 
 const wizard = ref<InstanceType<typeof AddSourceWizard> | null>(null);
 
@@ -102,6 +108,26 @@ const accountEmailById = computed<Record<string, string>>(() => {
   }
   return map;
 });
+
+/**
+ * What happens to superseded versions AT THIS SOURCE'S DESTINATION.
+ *
+ * This genuinely differs per backend rather than being a wording choice, so a
+ * single sentence could only ever be wrong somewhere: Drive keeps a superseded
+ * object in its trash (recoverable for ~30 days), while an S3 or local-folder
+ * destination has no trash and the re-upload lands on the SAME deterministic key,
+ * overwriting the previous copy. The versioning panel used to state Drive's
+ * behaviour unconditionally, directly contradicting the S3 setup screen's own
+ * "S3 has no trash" warning inside the same app.
+ *
+ * Unseeded / unknown backends fall back to the neutral `default`, because
+ * `BackendKind::ALL` is Rust-owned and gains entries ahead of the locale file.
+ */
+function retentionNote(accountId: string): string {
+  const kind = accounts.accounts.find((a) => a.id === accountId)?.backendKind;
+  const key = `versionRetention.${kind}`;
+  return kind !== undefined && te(key) ? t(key) : t("versionRetention.default");
+}
 
 onMounted(async () => {
   await Promise.all([sources.refresh(), accounts.refresh()]);
@@ -462,6 +488,11 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
           <p class="text-sm text-zinc-600 dark:text-zinc-400">
             {{ t("settings.sources.versioning.intro") }}
           </p>
+          <!-- What the DESTINATION does with superseded versions - a per-backend
+               fact, not a wording choice. See retentionNote(). -->
+          <p class="text-sm text-zinc-600 dark:text-zinc-400" data-testid="versioning-retention">
+            {{ retentionNote(source.accountId) }}
+          </p>
           <p v-if="versioningLoading" class="text-sm text-zinc-500">
             {{ t("common.loading") }}
           </p>
@@ -573,7 +604,12 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
               @blur="refreshEditPreview"
             />
           </label>
-          <label class="flex items-start gap-2 text-sm">
+          <!-- Windows-only: this policy governs OneDrive / cloud-only placeholder
+               files, which exist only on Windows. Hiding it elsewhere does NOT
+               change what a source gets: the toggle is SEEDED from the source's
+               stored policy and written back unchanged, so a value a Windows user
+               set survives an edit made on another platform. -->
+          <label v-if="showPlaceholderPolicy" class="flex items-start gap-2 text-sm">
             <input
               v-model="editBackupCloudOnly"
               type="checkbox"

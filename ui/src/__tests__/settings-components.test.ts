@@ -118,6 +118,18 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
 
 const globalMountOptions = { plugins: [i18n] };
 
+/** Pretend the webview is running on `ua`'s platform for the mounts that follow.
+ *
+ * The OneDrive / cloud-only placeholder policy is now hidden off Windows (it does
+ * nothing there), and the components read the platform at SETUP time - so the
+ * Windows-behaviour tests below have to say they are on Windows. jsdom's default
+ * user-agent is neither Windows nor macOS. */
+function setPlatformUserAgent(ua: string): void {
+  Object.defineProperty(window.navigator, "userAgent", { value: ua, configurable: true });
+}
+const WINDOWS_UA = "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36";
+const MACOS_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) AppleWebKit/605.1.15";
+
 beforeEach(() => {
   setActivePinia(createPinia());
   previewBatchHandler = null;
@@ -202,6 +214,56 @@ describe("SourceTable", () => {
     });
     // The panel closes after a successful save.
     expect(wrapper.find('[data-testid="versioning-editor"]').exists()).toBe(false);
+  });
+
+  it("states the version-retention behaviour of THIS source's destination", async () => {
+    // The versioning panel used to assert Drive's behaviour ("kept in Drive's
+    // trash, purged after ~30 days") for every source, which flatly contradicted
+    // the S3 setup screen's own "S3 has no trash" warning in the same app. It is
+    // not a wording problem: Drive really does keep a superseded object in its
+    // trash, and S3 really does overwrite the previous copy. So the note is
+    // resolved from the owning ACCOUNT's backend.
+    const openPanelFor = async (backendKind: string) => {
+      invokeMock.mockImplementation((cmd: string) => {
+        if (cmd === "list_sources") return Promise.resolve([makeSource({ accountId: "acc-1" })]);
+        if (cmd === "list_accounts")
+          return Promise.resolve([
+            {
+              id: "acc-1",
+              email: "dest",
+              displayName: null,
+              state: "ok",
+              encryptionEnabled: false,
+              createdAt: 0,
+              lastSyncedAt: null,
+              backendKind,
+            },
+          ]);
+        if (cmd === "get_source_versioning")
+          return Promise.resolve({ enabled: false, countCap: 10, maxBytes: 0 });
+        return Promise.resolve(undefined);
+      });
+      const wrapper = mount(SourceTable, { global: globalMountOptions });
+      await flushPromises();
+      await wrapper.get('[data-testid="versioning-button"]').trigger("click");
+      await flushPromises();
+      return wrapper.get('[data-testid="versioning-retention"]').text();
+    };
+
+    // Drive: the trash caveat is CORRECT and must be kept.
+    expect(await openPanelFor("google_drive")).toBe(i18n.global.t("versionRetention.google_drive"));
+
+    // S3: no trash, and the previous copy is overwritten - so it must NOT be told
+    // about a trash it does not have.
+    const s3Note = await openPanelFor("s3");
+    expect(s3Note).toBe(i18n.global.t("versionRetention.s3"));
+    expect(s3Note).not.toContain("trash");
+
+    // An unknown backend (BackendKind::ALL is Rust-owned and can gain entries
+    // ahead of the locale file) falls back to the neutral line, never to Drive's.
+    const unknownNote = await openPanelFor("some_future_backend");
+    expect(unknownNote).toBe(i18n.global.t("versionRetention.default"));
+    expect(unknownNote).not.toContain("trash");
   });
 
   it("shows an error instead of stale inputs when versioning config load fails (issue #36)", async () => {
@@ -536,7 +598,9 @@ describe("SourceTable", () => {
   it("issue #4: toggling the cloud-only backup checkbox patches placeholderPolicy", async () => {
     // The edit-exclusions panel exposes the OneDrive / cloud-only placeholder
     // toggle. It reflects the source's current policy ("skip" here) and, when the
-    // user turns it on, the saved patch carries "force_download".
+    // user turns it on, the saved patch carries "force_download". Windows-only:
+    // the control is not offered on platforms where the policy does nothing.
+    setPlatformUserAgent(WINDOWS_UA);
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources") return Promise.resolve([makeSource()]);
       if (cmd === "list_accounts") return Promise.resolve([]);
@@ -571,7 +635,47 @@ describe("SourceTable", () => {
     });
   });
 
+  it("hides the Windows-only cloud-only control off Windows, preserving the stored policy", async () => {
+    // The control's own caption said it "applies to OneDrive / cloud-only
+    // placeholder files on Windows (harmless elsewhere)" - so on macOS it was a
+    // setting that admitted it did nothing. Hiding it must NOT silently rewrite
+    // the source's policy: a force_download source edited on macOS keeps
+    // force_download, because the value is seeded from the row and written back.
+    setPlatformUserAgent(MACOS_UA);
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources")
+        return Promise.resolve([makeSource({ placeholderPolicy: "force_download" })]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
+      if (cmd === "update_source")
+        return Promise.resolve(makeSource({ placeholderPolicy: "force_download" }));
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+    await wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.sources.editExclusionsButton"))!
+      .trigger("click");
+    await flushPromises();
+
+    const editor = wrapper.get('[data-testid="exclusion-editor"]');
+    expect(editor.find('[data-testid="placeholder-policy-toggle"]').exists()).toBe(false);
+
+    // Saving keeps the Windows-set policy rather than downgrading it to "skip".
+    await editor
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("common.save"))!
+      .trigger("click");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_source", {
+      sourceId: "src-1",
+      patch: expect.objectContaining({ placeholderPolicy: "force_download" }),
+    });
+  });
+
   it("issue #4: the edit toggle reflects an already-force_download source", async () => {
+    setPlatformUserAgent(WINDOWS_UA);
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_sources")
         return Promise.resolve([makeSource({ placeholderPolicy: "force_download" })]);
@@ -845,6 +949,7 @@ describe("AddSourceWizard", () => {
   });
 
   it("issue #4: checking the cloud-only toggle sends placeholderPolicy force_download; default is skip", async () => {
+    setPlatformUserAgent(WINDOWS_UA);
     let addArgs: unknown = null;
     invokeMock.mockImplementation((cmd: string, args?: unknown) => {
       if (cmd === "list_accounts")
@@ -915,6 +1020,74 @@ describe("AddSourceWizard", () => {
     expect(addArgs).toMatchObject({
       req: { placeholderPolicy: "force_download" },
     });
+  });
+
+  it("hides the cloud-only toggle off Windows and still sends the default policy", async () => {
+    // Hiding a control must not send an absent / undefined field: the add still
+    // carries "skip", the same value a Windows user gets by leaving it unticked,
+    // so a macOS-created source behaves identically on the same account.
+    setPlatformUserAgent(MACOS_UA);
+    let addArgs: unknown = null;
+    invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "list_accounts")
+        return Promise.resolve([
+          {
+            id: "acc-1",
+            email: "user@example.com",
+            displayName: null,
+            state: "ok",
+            encryptionEnabled: false,
+            createdAt: 0,
+            lastSyncedAt: null,
+            backendKind: "google_drive",
+          },
+        ]);
+      if (cmd === "pick_drive_folder")
+        return Promise.resolve({ currentFolderId: "root", currentFolderPath: "", folders: [] });
+      if (cmd === "preview_exclusions_start") return Promise.resolve("gen-1");
+      if (cmd === "pick_folder_dialog")
+        return Promise.resolve({ path: "/home/u/docs", token: "tok-folder" });
+      if (cmd === "add_source") {
+        addArgs = args;
+        return Promise.resolve({
+          source: makeSource({ id: "src-new" }),
+          recoveryPhrase: null,
+          pendingRecoveryAck: false,
+        });
+      }
+      if (cmd === "list_sources") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(AddSourceWizard, { global: globalMountOptions });
+    await (wrapper.vm as unknown as { start: () => Promise<void> }).start();
+    await flushPromises();
+    await wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.addSource.chooseLocalButton"))!
+      .trigger("click");
+    await flushPromises();
+    const clickNext = async () => {
+      await wrapper
+        .findAll("button")
+        .find((b) => b.text() === i18n.global.t("common.next"))!
+        .trigger("click");
+      await flushPromises();
+    };
+    await clickNext(); // -> destination
+    await clickNext(); // -> exclusions
+
+    expect(wrapper.find('[data-testid="placeholder-policy-toggle"]').exists()).toBe(false);
+
+    await clickNext(); // -> encryption
+    await clickNext(); // -> confirm
+    await wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("common.finish"))!
+      .trigger("click");
+    await flushPromises();
+
+    expect(addArgs).toMatchObject({ req: { placeholderPolicy: "skip" } });
   });
 
   it("does not accept a typed local path - only the dialog result", async () => {

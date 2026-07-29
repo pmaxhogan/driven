@@ -158,10 +158,21 @@
     "connecting": "Checking the folder..."
   },
   "drivePicker": {
-    "rootName": "My Drive",
+    "rootName": "Top level",
+    "root": {
+      "google_drive": "My Drive",
+      "s3": "Bucket root",
+      "local_folder": "Destination root"
+    },
     "destinationLabel": "Backing up to",
     "empty": "No subfolders here - this folder is the destination.",
     "sharedDriveBadge": "Shared drive"
+  },
+  "versionRetention": {
+    "default": "How long an older version stays recoverable depends on your destination.",
+    "google_drive": "Older versions are kept in Drive's trash, which Drive may purge after about 30 days.",
+    "s3": "This destination keeps no older versions of its own: a changed file overwrites the previous copy, so in practice only the most recent backup can be restored. Turn on bucket versioning at your provider if you need older copies.",
+    "local_folder": "This destination keeps no older versions: a changed file overwrites the previous copy, so in practice only the most recent backup can be restored."
   },
   "wizard": {
     "title": "Set up Driven",
@@ -207,7 +218,7 @@
       "body": "Choose a local folder to back up and the destination it syncs to.",
       "chooseFolderButton": "Choose folder...",
       "chooseFolderFirst": "Choose a folder to back up first.",
-      "driveDestinationLabel": "Drive destination"
+      "driveDestinationLabel": "Destination folder"
     },
     "step4": {
       "title": "Encryption",
@@ -233,11 +244,11 @@
       "title": "Connected accounts",
       "empty": "No accounts connected yet.",
       "emptyTitle": "No accounts connected yet",
-      "emptyHint": "Connect a Google account to start backing up your folders.",
+      "emptyHint": "Connect a backup destination to start backing up your folders.",
       "addButton": "Add account",
       "removeButton": "Remove",
       "reauthButton": "Reconnect",
-      "deleteRemoteLabel": "Also delete backed-up files from Drive",
+      "deleteRemoteLabel": "Also delete the backed-up files from the destination",
       "lastSynced": "Last synced {when}",
       "neverSynced": "Never synced",
       "state": {
@@ -256,23 +267,23 @@
         "name": "Name",
         "enabled": "Enabled",
         "localPath": "Local path",
-        "driveDestination": "Drive destination",
+        "driveDestination": "Destination",
         "account": "Account",
         "encryption": "Encryption",
         "actions": "Actions"
       },
       "editExclusionsButton": "Edit exclusions",
       "placeholderPolicyLabel": "Back up OneDrive cloud-only files",
-      "placeholderPolicyCaption": "Applies to OneDrive / cloud-only placeholder files on Windows (harmless elsewhere). When on, Driven downloads and backs up files that are stored only in the cloud.",
+      "placeholderPolicyCaption": "Applies to OneDrive and other cloud-only placeholder files. When on, Driven downloads and backs up files that are stored only in the cloud.",
       "runNowButton": "Run now",
       "versioningButton": "Versioning",
       "versioning": {
-        "intro": "Keep previous versions so you can restore this source's files as they were on an earlier date. Older versions are kept in Drive's trash (which Drive may purge after ~30 days).",
+        "intro": "Keep previous versions so you can restore this source's files as they were on an earlier date.",
         "enabledLabel": "Keep previous versions of changed files",
         "capLabel": "Versions to keep per file"
       },
       "removeButton": "Remove",
-      "deleteRemoteLabel": "Also delete backed-up files from Drive",
+      "deleteRemoteLabel": "Also delete the backed-up files from the destination",
       "pendingRecoveryAckBadge": "Awaiting recovery phrase",
       "pendingRecoveryAckTooltip": "Reveal and save this source's recovery phrase before it can be enabled.",
       "revealAckButton": "Reveal and save recovery phrase",
@@ -285,13 +296,12 @@
       "noAccounts": "No accounts yet - connect one first.",
       "step": {
         "localFolder": "Local folder",
-        "driveFolder": "Drive folder",
+        "driveFolder": "Destination folder",
         "exclusions": "Exclusions",
         "encryption": "Encryption",
         "confirm": "Confirm"
       },
       "chooseLocalButton": "Choose local folder...",
-      "chooseDriveButton": "Choose Drive folder...",
       "respectGitignoreLabel": "Respect .gitignore files",
       "includePatternsLabel": "Include patterns",
       "excludePatternsLabel": "Exclude patterns",
@@ -300,7 +310,7 @@
         "hint": "Patterns without a leading / (or containing **) force the scanner to search inside every excluded folder such as node_modules. Anchor them to fixed depths instead, e.g. /*/.env, /path/to/.env, or /path/*/deploy/.env."
       },
       "placeholderPolicyLabel": "Back up OneDrive cloud-only files",
-      "placeholderPolicyCaption": "Applies to OneDrive / cloud-only placeholder files on Windows (harmless elsewhere). When on, Driven downloads and backs up files that are stored only in the cloud.",
+      "placeholderPolicyCaption": "Applies to OneDrive and other cloud-only placeholder files. When on, Driven downloads and backs up files that are stored only in the cloud.",
       "preview": {
         "included": "{count} files included",
         "excluded": "{count} files excluded",
@@ -333,7 +343,7 @@
         "privacy": "Privacy"
       },
       "bundleSmallFilesLabel": "Bundle small files in cold folders",
-      "bundleSmallFilesNote": "Packs many tiny, unchanged files from the same folder into a single compressed archive before uploading, cutting round-trips and Drive rate-limit pressure. Only old files in dense folders are bundled; new or recently-changed files still upload individually. Off by default.",
+      "bundleSmallFilesNote": "Packs many tiny, unchanged files from the same folder into a single compressed archive before uploading, cutting round-trips and rate-limit pressure at the destination. Only old files in dense folders are bundled; new or recently-changed files still upload individually. Off by default.",
       "autoStartOnLoginLabel": "Launch Driven when I sign in",
       "autoStartOnLoginNote": "Starts Driven in the background at login so backups keep running. Registers as a real startup app (Windows Task Manager, macOS Login Items, Linux autostart).",
       "skipOnBatteryLabel": "Pause backups while on battery",
@@ -604,8 +614,7 @@
     "asOf": {
       "label": "Restore as of",
       "clear": "Latest",
-      "active": "Restoring files as they were backed up on {date}.",
-      "ttlHint": "Older versions are kept in Drive's trash and may be purged after ~30 days."
+      "active": "Restoring files as they were backed up on {date}."
     },
     "start": "Restore selected",
     "cancel": "Cancel restore",
@@ -633,7 +642,7 @@
       },
       "invalid_grant": {
         "short": "Reconnect required",
-        "long": "Your Google sign-in expired or was revoked. Reconnect the account to continue backing up."
+        "long": "This account's credentials expired, were revoked, or no longer grant access. Reconnect the account to continue backing up."
       },
       "consent_required": {
         "short": "Sign-in needed",
@@ -651,7 +660,7 @@
       },
       "daily_quota_exhausted": {
         "short": "Daily limit reached",
-        "long": "Drive's daily request limit was reached. Driven will resume after the limit resets."
+        "long": "The destination's daily request limit was reached. Driven will resume after the limit resets."
       },
       "quota_exhausted": {
         "short": "Destination is full",
@@ -679,11 +688,11 @@
       },
       "dest_folder_missing": {
         "short": "Destination missing",
-        "long": "The Drive destination folder was deleted. Pick a new destination to resume backups."
+        "long": "The destination folder was deleted. Pick a new destination to resume backups."
       },
       "dest_folder_permission_denied": {
         "short": "No write access",
-        "long": "The Drive destination folder is no longer writable by this account. Check its sharing settings."
+        "long": "The destination folder is no longer writable by this account. Check its permissions."
       }
     },
     "local": {
@@ -801,7 +810,7 @@
       },
       "db_corrupt": {
         "short": "Database damaged",
-        "long": "Driven's database failed an integrity check. Rebuilding from your Drive backup is advised."
+        "long": "Driven's database failed an integrity check. Rebuilding from your backup is advised."
       },
       "reconcile_orphan": {
         "short": "Orphan cleaned up",
