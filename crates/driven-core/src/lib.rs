@@ -29,6 +29,9 @@ pub mod network;
 pub mod orchestrator;
 pub mod pacer;
 pub mod planner;
+/// The single read-open choke point (DESIGN s5.3). Crate-internal: callers
+/// outside `driven-core` never open a source file themselves.
+mod platform_open;
 pub mod priority;
 pub mod scanner;
 pub mod state;

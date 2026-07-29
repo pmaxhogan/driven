@@ -238,11 +238,13 @@ pub fn build_bundle(
 ///
 /// This is `std::fs::read` split open so there is a handle to hint: that call
 /// opens and reads in one step and never exposes the `File`, and the hint has to
-/// land on the handle BEFORE the reads it is meant to shape. Behaviour is
-/// otherwise identical - same default share mode (`File::open` is what
-/// `std::fs::read` uses internally, so the open's sharing/locking semantics are
-/// unchanged), and the same "size the buffer from the stat we already took"
-/// allocation, using the caller's `pre` stat rather than re-statting.
+/// land on the handle BEFORE the reads it is meant to shape. The open goes
+/// through [`crate::platform_open`], the single DESIGN s5.3 read-open choke
+/// point, so a bundled small file is opened with exactly the sharing (and the
+/// same `io_priority` hint) as a file uploaded on its own. Behaviour is
+/// otherwise identical to `std::fs::read`, including the same "size the buffer
+/// from the stat we already took" allocation, using the caller's `pre` stat
+/// rather than re-statting.
 ///
 /// `expected_size` is only a capacity hint. It is deliberately NOT trusted as a
 /// read bound: the caller's post-read coherency stat is what decides whether the
@@ -253,8 +255,7 @@ fn read_member(
     expected_size: u64,
     priority: crate::priority::WorkPriority,
 ) -> std::io::Result<Vec<u8>> {
-    let mut file = std::fs::File::open(path)?;
-    crate::priority::apply_to_file_handle(&file, priority);
+    let mut file = crate::platform_open::open_read_shared(path, priority)?;
     let mut bytes = Vec::with_capacity(usize::try_from(expected_size).unwrap_or(0));
     file.read_to_end(&mut bytes)?;
     Ok(bytes)
