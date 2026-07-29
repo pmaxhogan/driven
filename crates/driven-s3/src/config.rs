@@ -433,4 +433,114 @@ mod tests {
     fn decoding_a_malformed_record_is_an_error_not_a_silent_empty_secret() {
         assert!(decode_credentials("no-newline-here").is_err());
     }
+
+    /// Install `keyring-core`'s IN-MEMORY store as the process default so the
+    /// keychain round trip is covered by a real test with no OS keychain (which
+    /// headless CI does not have). The default store is process-global, so the
+    /// tests using it serialize on this lock.
+    fn keychain() -> std::sync::MutexGuard<'static, ()> {
+        use std::sync::{Mutex, OnceLock};
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        INSTALLED.get_or_init(|| {
+            let store = keyring_core::mock::Store::new().expect("in-memory keyring store");
+            keyring_core::set_default_store(store);
+        });
+        guard
+    }
+
+    #[test]
+    fn credentials_round_trip_through_the_keychain() {
+        let _g = keychain();
+        let store = S3CredentialStore::new("acct-s3-round-trip");
+        assert!(
+            store
+                .load()
+                .expect("an empty store is not an error")
+                .is_none(),
+            "an account with no stored key pair reads back as None, not an error"
+        );
+
+        let creds = S3Credentials {
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "sec/ret+with=padding".to_string(),
+        };
+        store.store(&creds).expect("store");
+        assert_eq!(store.load().expect("load"), Some(creds.clone()));
+
+        // Rotation replaces rather than appends.
+        let rotated = S3Credentials {
+            access_key_id: "AKIAROTATED".to_string(),
+            secret_access_key: "new-secret".to_string(),
+        };
+        store.store(&rotated).expect("rotate");
+        assert_eq!(store.load().expect("load after rotate"), Some(rotated));
+    }
+
+    #[test]
+    fn deleting_credentials_is_idempotent() {
+        // Account removal calls this unconditionally, including for accounts
+        // that never had an S3 key pair, so a missing entry must not error.
+        let _g = keychain();
+        let store = S3CredentialStore::new("acct-s3-delete");
+        store.delete().expect("deleting a missing entry is a no-op");
+
+        store
+            .store(&S3Credentials {
+                access_key_id: "id".to_string(),
+                secret_access_key: "secret".to_string(),
+            })
+            .expect("store");
+        store.delete().expect("delete");
+        assert!(store.load().expect("load after delete").is_none());
+        store.delete().expect("a second delete is still a no-op");
+    }
+
+    #[test]
+    fn credentials_are_scoped_per_account() {
+        // The keychain key is the account id, so two S3 accounts in one install
+        // must not read each other's key pair.
+        let _g = keychain();
+        let a = S3CredentialStore::new("acct-a");
+        let b = S3CredentialStore::new("acct-b");
+        a.store(&S3Credentials {
+            access_key_id: "a-id".to_string(),
+            secret_access_key: "a-secret".to_string(),
+        })
+        .expect("store a");
+        b.store(&S3Credentials {
+            access_key_id: "b-id".to_string(),
+            secret_access_key: "b-secret".to_string(),
+        })
+        .expect("store b");
+
+        assert_eq!(a.load().unwrap().unwrap().access_key_id, "a-id");
+        assert_eq!(b.load().unwrap().unwrap().access_key_id, "b-id");
+        a.delete().expect("delete a");
+        assert!(a.load().unwrap().is_none());
+        assert!(b.load().unwrap().is_some(), "deleting a must not touch b");
+    }
+
+    #[test]
+    fn storing_a_credential_with_control_characters_is_refused() {
+        // The keychain record is `id\nsecret`; a newline inside either field
+        // would decode to a DIFFERENT pair on read-back, silently swapping the
+        // account's credentials after a restart.
+        let _g = keychain();
+        let store = S3CredentialStore::new("acct-control-chars");
+        assert!(store
+            .store(&S3Credentials {
+                access_key_id: "id\nwith-newline".to_string(),
+                secret_access_key: "secret".to_string(),
+            })
+            .is_err());
+        assert!(
+            store.load().expect("load").is_none(),
+            "a refused store must leave nothing behind"
+        );
+    }
 }

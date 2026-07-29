@@ -1146,22 +1146,13 @@ impl RemoteStore for S3Store {
         }
 
         // Ask for the rewind (once) if this is a hydrated session that has not
-        // replayed yet.
+        // replayed yet, and refuse any offset that is not where we are.
         {
             let mut uploads = self.uploads.lock();
             let state = uploads
                 .get_mut(&upload_id)
                 .ok_or_else(|| anyhow::anyhow!("s3.session_invalid: upload state vanished"))?;
-            if !state.rewound {
-                state.rewound = true;
-                if offset != 0 {
-                    return Ok(ResumeProgress::InProgress { received: 0 });
-                }
-            }
-            if offset != state.consumed() {
-                // The caller is not where we are. Refuse rather than write the
-                // wrong bytes into the middle of a part.
-                let received = state.consumed();
+            if let Some(received) = seek_verdict(state, offset) {
                 return Ok(ResumeProgress::InProgress { received });
             }
         }
@@ -1395,15 +1386,13 @@ impl S3Store {
                 .get(upload_id)
                 .and_then(|s| s.existing.get(&number).cloned())
         };
-        if let Some((etag, existing_size)) = already {
-            if existing_size == size && parse_md5_hex(&etag) == Some(md5) {
-                tracing::debug!(
-                    target: crate::TARGET,
-                    number,
-                    "part already on the server with a matching digest; skipping the upload"
-                );
-                return Ok(PartRecord { number, md5, size });
-            }
+        if part_already_uploaded(already.as_ref(), &md5, size) {
+            tracing::debug!(
+                target: crate::TARGET,
+                number,
+                "part already on the server with a matching digest; skipping the upload"
+            );
+            return Ok(PartRecord { number, md5, size });
         }
         self.upload_part(key, upload_id, number, bytes).await
     }
@@ -1479,6 +1468,52 @@ impl S3Store {
                 Err(e)
             }
         }
+    }
+}
+
+/// Decide where the caller must be before its chunk can be accepted.
+///
+/// `Some(received)` tells the caller to seek to `received` and re-send from
+/// there; `None` means the chunk lines up with what this store has consumed and
+/// can be folded in.
+///
+/// Two rules, in order:
+///
+/// 1. **The one-shot rewind.** A state hydrated from a PERSISTED session has an
+///    empty buffer, but the caller's persisted offset counts bytes this store
+///    ACCEPTED - including any that were only buffered when the process died.
+///    Resuming there would drop those bytes out of the middle of the object, so
+///    the first chunk after hydration is answered with `0`: replay from the
+///    start. Bounded to once (`rewound`), so a caller that ignores the rewind
+///    cannot make this spin.
+/// 2. **No gaps, no overlaps.** Any other mismatch is answered with the true
+///    consumed offset rather than accepted, because writing a chunk at the wrong
+///    position would corrupt the assembled object silently.
+fn seek_verdict(state: &mut MultipartState, offset: u64) -> Option<u64> {
+    if !state.rewound {
+        state.rewound = true;
+        if offset != 0 {
+            return Some(0);
+        }
+    }
+    let consumed = state.consumed();
+    if offset != consumed {
+        return Some(consumed);
+    }
+    None
+}
+
+/// Whether a part re-derived during a replay is ALREADY on the server, and so
+/// can skip the upload.
+///
+/// Both the size AND the digest must match. The digest alone is not enough: S3
+/// part ETags are md5s, and accepting one without checking the size would let a
+/// truncated part masquerade as complete. This is also what turns the replay
+/// into a verification of the pre-crash parts rather than a blind trust of them.
+fn part_already_uploaded(existing: Option<&(String, u64)>, md5: &[u8; 16], size: u64) -> bool {
+    match existing {
+        Some((etag, existing_size)) => *existing_size == size && parse_md5_hex(etag) == Some(*md5),
+        None => false,
     }
 }
 
@@ -1677,6 +1712,91 @@ mod tests {
         assert!(take_flushable(&mut s, false).is_none());
         let (n, p) = take_flushable(&mut s, true).expect("one empty part");
         assert_eq!((n, p.len()), (1, 0));
+    }
+
+    #[test]
+    fn a_fresh_session_accepts_a_chunk_at_its_consumed_offset_and_refuses_gaps() {
+        let mut s = MultipartState::new();
+        // A session this process opened starts at 0 and needs no rewind.
+        assert_eq!(seek_verdict(&mut s, 0), None);
+        // Pretend a part flushed and 1 KiB is buffered.
+        s.buffer_start = PART_SIZE as u64;
+        s.buffer = vec![0u8; 1024];
+        let consumed = PART_SIZE as u64 + 1024;
+        assert_eq!(seek_verdict(&mut s, consumed), None);
+        // A GAP would leave a hole in the object; an OVERLAP would duplicate
+        // bytes. Both are answered with the true offset rather than accepted.
+        assert_eq!(seek_verdict(&mut s, consumed + 4096), Some(consumed));
+        assert_eq!(seek_verdict(&mut s, consumed - 512), Some(consumed));
+    }
+
+    #[test]
+    fn a_hydrated_session_rewinds_to_zero_exactly_once() {
+        // The persisted offset counts bytes the store ACCEPTED, including any
+        // that were still buffered when the process died. Resuming there would
+        // drop them out of the middle of the object, so the first chunk after a
+        // restart is answered with a rewind to 0.
+        let mut s = MultipartState::new();
+        s.rewound = false;
+        assert_eq!(
+            seek_verdict(&mut s, 40 * 1024 * 1024),
+            Some(0),
+            "a hydrated session must replay from the start"
+        );
+        // Bounded to once: after the rewind the normal offset rules apply, so a
+        // caller that ignored the rewind gets a definite answer instead of a
+        // loop.
+        assert_eq!(seek_verdict(&mut s, 40 * 1024 * 1024), Some(0));
+        assert_eq!(seek_verdict(&mut s, 0), None);
+    }
+
+    #[test]
+    fn a_hydrated_session_already_at_zero_needs_no_rewind() {
+        let mut s = MultipartState::new();
+        s.rewound = false;
+        assert_eq!(seek_verdict(&mut s, 0), None);
+    }
+
+    #[test]
+    fn a_replayed_part_skips_the_upload_only_on_an_exact_size_and_digest_match() {
+        let bytes = b"the part payload";
+        let md5 = md5_of(bytes);
+        let size = bytes.len() as u64;
+        let etag = hex::encode(md5);
+
+        assert!(part_already_uploaded(
+            Some(&(etag.clone(), size)),
+            &md5,
+            size
+        ));
+        // Quoted ETags (what a server actually returns) must match too.
+        assert!(part_already_uploaded(
+            Some(&(format!("\"{etag}\""), size)),
+            &md5,
+            size
+        ));
+
+        // A matching digest with a DIFFERENT size must not skip: accepting it
+        // would let a truncated part masquerade as complete.
+        assert!(!part_already_uploaded(
+            Some(&(etag.clone(), size + 1)),
+            &md5,
+            size
+        ));
+        // A different digest never skips.
+        assert!(!part_already_uploaded(
+            Some(&(hex::encode(md5_of(b"other")), size)),
+            &md5,
+            size
+        ));
+        // A part the previous run never uploaded is not on the server.
+        assert!(!part_already_uploaded(None, &md5, size));
+        // A garbage ETag is not a match.
+        assert!(!part_already_uploaded(
+            Some(&("not-a-digest".to_string(), size)),
+            &md5,
+            size
+        ));
     }
 
     #[test]

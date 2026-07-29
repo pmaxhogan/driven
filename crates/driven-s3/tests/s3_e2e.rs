@@ -184,10 +184,14 @@ async fn spawn_minio() -> Option<MinioServer> {
         _dir: dir,
     };
 
-    // Wait for readiness rather than sleeping a guessed interval.
+    // Wait for readiness rather than sleeping a guessed interval. The budget is
+    // generous (60s) because this also runs on a shared CI runner where a cold
+    // start competes with a parallel cargo build; a tight bound would turn a
+    // slow boot into a flaky failure, and the loop exits the moment MinIO is up
+    // so the generosity costs nothing on a fast machine.
     let health = format!("{endpoint}/minio/health/live");
     let client = reqwest::Client::new();
-    for _ in 0..100 {
+    for _ in 0..600 {
         if let Ok(resp) = client.get(&health).send().await {
             if resp.status().is_success() {
                 return Some(server);
@@ -195,7 +199,7 @@ async fn spawn_minio() -> Option<MinioServer> {
         }
         tokio::time::sleep(Duration::from_millis(100)).await;
     }
-    panic!("minio did not become healthy within 10s");
+    panic!("minio did not become healthy within 60s");
 }
 
 /// Create a bucket on a freshly spawned MinIO, using a signed request built the

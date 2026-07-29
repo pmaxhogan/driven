@@ -77,6 +77,21 @@ jobs:
           # saving it just burns the repo cache budget and evicts the reusable
           # main caches. PRs still RESTORE the main cache normally.
           save-if: ${{ github.ref == 'refs/heads/main' }}
+      # The S3 backend's integration suite (crates/driven-s3/tests/s3_e2e.rs)
+      # spawns a local MinIO and runs a real round trip against it: upload,
+      # multipart with the executor's exact chunking, download, listing, the
+      # remote-existence audit, delete. Without the binary the test gate-skips,
+      # which is honest but leaves the backend's whole I/O surface unexercised in
+      # CI. One ~100 MB download on ONE runner buys continuous verification of a
+      # backup destination, which is worth more than the seconds it costs.
+      # macOS/Windows still gate-skip: the suite is server-behaviour coverage,
+      # not platform coverage.
+      - name: Install MinIO (S3 backend integration tests)
+        if: matrix.os == 'ubuntu-latest'
+        run: |
+          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o /tmp/minio
+          sudo install -m 0755 /tmp/minio /usr/local/bin/minio
+          minio --version
       - name: cargo build (compile-only)
         run: cargo build --workspace --all-targets
       # Clippy findings are lint-level and platform-independent in practice;
