@@ -56,12 +56,54 @@ const SUPPORTED_MANUAL_SCHEMES: &[&str] = &["http", "https", "socks5", "socks5h"
 /// unique host until eviction).
 const PAC_CACHE_CAPACITY: usize = 256;
 
+/// Strip any `user:password@` userinfo from a URL, keeping the scheme and
+/// `host:port`.
+///
+/// Both a manual proxy URL and a PAC source URL can carry basic-auth
+/// credentials (`http://user:pass@wpad.corp/proxy.pac`), and both end up in
+/// runtime logs and in [`ProxyError`] messages. Driven's rolling logs are
+/// collected into the SPEC s18 diagnostic bundle, whose redactor scrubs by
+/// prefix/shape (OAuth tokens, emails, drive-file ids) and would NOT catch a
+/// proxy password - so anything URL-shaped must be redacted before it is
+/// written, not after.
+///
+/// Hand-rolled rather than routed through `url::Url` so a URL the parser
+/// rejects still gets scrubbed: a parse failure must never fall through to
+/// emitting the raw string. The authority is everything between `://` and the
+/// first `/`, `?` or `#`; the LAST `@` in it separates userinfo from the host
+/// (a password may itself contain an `@`).
+#[must_use]
+pub fn redact_userinfo(raw: &str) -> String {
+    let Some(sep) = raw.find("://") else {
+        // No scheme separator: not a URL we can split, so we cannot prove there
+        // is no credential in it. Redact wholesale rather than leak. (A bare
+        // filesystem path - the common PAC-from-disk case - has no `@` and so
+        // passes through untouched.)
+        return if raw.contains('@') {
+            "<redacted>".to_string()
+        } else {
+            raw.to_string()
+        };
+    };
+    let (scheme, rest) = raw.split_at(sep + 3);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => format!("{scheme}<redacted>@{}{tail}", &authority[at + 1..]),
+        None => raw.to_string(),
+    }
+}
+
 /// A failure resolving or applying the configured proxy. Every variant is
 /// fail-closed: the caller surfaces it, never proceeds unproxied.
+///
+/// Every URL / location in a `Display` message is passed through
+/// [`redact_userinfo`], because these messages are logged and surfaced to the
+/// settings UI. The struct fields keep the raw value for programmatic use.
 #[derive(Debug, thiserror::Error)]
 pub enum ProxyError {
     /// The manual proxy URL could not be parsed.
-    #[error("proxy URL `{url}` is not valid: {message}")]
+    #[error("proxy URL `{}` is not valid: {message}", redact_userinfo(.url))]
     InvalidUrl {
         /// The offending URL.
         url: String,
@@ -70,8 +112,9 @@ pub enum ProxyError {
     },
     /// The manual proxy URL used a scheme we do not support.
     #[error(
-        "proxy URL `{url}` uses unsupported scheme `{scheme}` \
-         (expected http, https, socks5, or socks5h)"
+        "proxy URL `{}` uses unsupported scheme `{scheme}` \
+         (expected http, https, socks5, or socks5h)",
+        redact_userinfo(.url)
     )]
     UnsupportedScheme {
         /// The offending URL.
@@ -88,7 +131,7 @@ pub enum ProxyError {
     /// The PAC file could not be read from a local path. (`location` is not
     /// named `source` because thiserror reserves that field name for a nested
     /// `std::error::Error` source.)
-    #[error("PAC file could not be read from `{location}`: {message}")]
+    #[error("PAC file could not be read from `{}`: {message}", redact_userinfo(.location))]
     PacRead {
         /// The path/URL we tried.
         location: String,
@@ -96,7 +139,7 @@ pub enum ProxyError {
         message: String,
     },
     /// The PAC file could not be fetched over HTTP(S).
-    #[error("PAC file could not be fetched from `{location}`: {message}")]
+    #[error("PAC file could not be fetched from `{}`: {message}", redact_userinfo(.location))]
     PacFetch {
         /// The URL we tried.
         location: String,
@@ -104,13 +147,13 @@ pub enum ProxyError {
         message: String,
     },
     /// The PAC file was read/fetched but was empty.
-    #[error("PAC file at `{location}` was empty")]
+    #[error("PAC file at `{}` was empty", redact_userinfo(.location))]
     PacEmpty {
         /// The source that was empty.
         location: String,
     },
     /// The PAC script did not compile or does not define `FindProxyForURL`.
-    #[error("PAC script from `{location}` is not usable: {message}")]
+    #[error("PAC script from `{}` is not usable: {message}", redact_userinfo(.location))]
     PacCompile {
         /// The source that failed.
         location: String,
@@ -436,7 +479,7 @@ async fn load_pac_engine(
             Some(last_good) => {
                 tracing::warn!(
                     target: TARGET,
-                    source = %source,
+                    source = %redact_userinfo(source),
                     %error,
                     retry_in_secs = PAC_REFRESH_RETRY.as_secs(),
                     "PAC refresh failed; continuing with the last known-good script \
@@ -532,6 +575,11 @@ fn file_url_to_path(source: &str) -> std::path::PathBuf {
 /// never stored, so the engine can live in a `reqwest::Proxy::custom` closure.
 pub struct PacEngine {
     script: Arc<str>,
+    /// The source this engine was compiled from, ALREADY passed through
+    /// [`redact_userinfo`]. This field exists only to be printed (runtime
+    /// warnings, `ProxyConfig`'s `Debug`), and a PAC URL can carry basic-auth
+    /// credentials, so the engine never retains the raw form. Refetching keys
+    /// off the caller's own source string, not this one.
     source: String,
     /// host -> chosen proxy URL (`None` = DIRECT). Bounds JS-engine invocations
     /// to at most once per unique host until eviction.
@@ -572,14 +620,16 @@ impl PacEngine {
         }
         Ok(Self {
             script: Arc::from(script.into_boxed_str()),
-            source,
+            // Store only the redacted form - see the field doc.
+            source: redact_userinfo(&source),
             cache: Mutex::new(LruCache::new(
                 std::num::NonZeroUsize::new(PAC_CACHE_CAPACITY).expect("capacity is non-zero"),
             )),
         })
     }
 
-    /// The source string this engine was compiled from (URL / path). For logs.
+    /// The source this engine was compiled from (URL / path), with any
+    /// `user:password@` userinfo redacted. For logs / display only.
     #[must_use]
     pub fn source(&self) -> &str {
         &self.source
@@ -1109,6 +1159,164 @@ mod tests {
     fn manual_url_is_redacted_in_debug() {
         let cfg = ProxyConfig::Manual("http://user:secret@proxy:8080".to_string());
         assert!(!format!("{cfg:?}").contains("secret"));
+    }
+
+    #[test]
+    fn redact_userinfo_handles_every_url_shape() {
+        // No credentials: untouched.
+        assert_eq!(
+            redact_userinfo("http://proxy.corp:8080"),
+            "http://proxy.corp:8080"
+        );
+        // A bare filesystem path (the PAC-from-disk case) passes through.
+        assert_eq!(
+            redact_userinfo("/etc/corp/proxy.pac"),
+            "/etc/corp/proxy.pac"
+        );
+        // socks5 with credentials.
+        assert_eq!(
+            redact_userinfo("socks5://u:p@127.0.0.1:1080"),
+            "socks5://<redacted>@127.0.0.1:1080"
+        );
+        // Username only, no password.
+        assert_eq!(
+            redact_userinfo("http://justuser@h:1"),
+            "http://<redacted>@h:1"
+        );
+        // A password containing '@' - the LAST '@' in the authority splits it.
+        assert_eq!(
+            redact_userinfo("http://u:p@ss@h:1"),
+            "http://<redacted>@h:1"
+        );
+        // A path/query must not be mistaken for the authority, and an '@' after
+        // the authority (in a path) is not userinfo.
+        assert_eq!(
+            redact_userinfo("http://u:p@wpad.corp/proxy.pac"),
+            "http://<redacted>@wpad.corp/proxy.pac"
+        );
+        assert_eq!(redact_userinfo("http://h:1/pa@th"), "http://h:1/pa@th");
+        // Unparseable garbage that still contains an '@' is redacted wholesale
+        // rather than passed through.
+        assert_eq!(redact_userinfo("u:p@h:1"), "<redacted>");
+        assert_eq!(redact_userinfo("not a url"), "not a url");
+    }
+
+    #[test]
+    fn pac_engine_never_retains_the_raw_source() {
+        // A PAC URL can carry basic-auth credentials. The engine keeps only the
+        // redacted form, because that string is printed by the runtime warning
+        // and by ProxyConfig's Debug - and Driven's logs are collected into the
+        // diagnostic bundle, whose redactor scrubs by token/email/path shape and
+        // would NOT catch a proxy password.
+        let engine = PacEngine::compile(
+            "function FindProxyForURL(u,h){ return \"DIRECT\"; }".to_string(),
+            "http://corpuser:hunter2@wpad.corp/proxy.pac".to_string(),
+        )
+        .expect("compiles");
+        assert!(
+            !engine.source().contains("hunter2"),
+            "the password must not be retained: {}",
+            engine.source()
+        );
+        assert!(
+            engine.source().contains("wpad.corp"),
+            "the host stays for diagnostics: {}",
+            engine.source()
+        );
+
+        // ProxyConfig's Debug prints that source - it must be clean too.
+        let cfg = ProxyConfig::Pac(Arc::new(engine));
+        let debug = format!("{cfg:?}");
+        assert!(
+            !debug.contains("hunter2"),
+            "ProxyConfig Debug must not carry the PAC password: {debug}"
+        );
+    }
+
+    #[test]
+    fn proxy_error_display_redacts_credentials() {
+        // ProxyError messages are logged AND surfaced to the settings UI, so
+        // every URL / location they embed must be redacted.
+        let cases: Vec<ProxyError> = vec![
+            ProxyError::InvalidUrl {
+                url: "http://u:hunter2@proxy:8080".to_string(),
+                message: "bad".to_string(),
+            },
+            ProxyError::UnsupportedScheme {
+                url: "ftp://u:hunter2@proxy:21".to_string(),
+                scheme: "ftp".to_string(),
+            },
+            ProxyError::PacRead {
+                location: "http://u:hunter2@wpad.corp/p.pac".to_string(),
+                message: "nope".to_string(),
+            },
+            ProxyError::PacFetch {
+                location: "http://u:hunter2@wpad.corp/p.pac".to_string(),
+                message: "nope".to_string(),
+            },
+            ProxyError::PacEmpty {
+                location: "http://u:hunter2@wpad.corp/p.pac".to_string(),
+            },
+            ProxyError::PacCompile {
+                location: "http://u:hunter2@wpad.corp/p.pac".to_string(),
+                message: "nope".to_string(),
+            },
+        ];
+        for case in cases {
+            let shown = case.to_string();
+            assert!(
+                !shown.contains("hunter2"),
+                "ProxyError Display must not carry credentials: {shown}"
+            );
+        }
+
+        // The raw value is still available programmatically - redaction is a
+        // property of the MESSAGE, not of the data.
+        let err = ProxyError::InvalidUrl {
+            url: "http://u:hunter2@proxy:8080".to_string(),
+            message: "bad".to_string(),
+        };
+        let ProxyError::InvalidUrl { url, .. } = &err else {
+            panic!("wrong variant");
+        };
+        assert!(url.contains("hunter2"), "the field itself is unredacted");
+    }
+
+    #[tokio::test]
+    async fn a_failing_pac_fetch_does_not_leak_credentials_in_its_message() {
+        // The `location` is redacted by the Display impl, but PacFetch's nested
+        // `message` is a transport error's own text, which may embed the URL it
+        // was given. Port 1 on loopback refuses instantly, so this exercises the
+        // real reqwest error path rather than a synthetic string.
+        let ca = crate::CustomCaConfig::none();
+        let err = validate_pac_source("http://corpuser:hunter2@127.0.0.1:1/p.pac", &ca)
+            .await
+            .expect_err("a refused connection must fail");
+        let shown = err.to_string();
+        assert!(
+            !shown.contains("hunter2"),
+            "no part of the error message may carry the proxy password: {shown}"
+        );
+
+        // Both halves of that message matter, so pin them separately.
+        let ProxyError::PacFetch { message, .. } = &err else {
+            panic!("expected a transport failure, got {err:?}");
+        };
+        // 1. Our own Display redacts the location:
+        //    "PAC file could not be fetched from `http://<redacted>@127.0.0.1:1/...`"
+        assert!(
+            shown.contains("<redacted>@127.0.0.1:1"),
+            "the location must be redacted by our Display impl: {shown}"
+        );
+        // 2. reqwest's nested text embeds the URL it was given, but strips the
+        //    userinfo itself ("error sending request for url
+        //    (http://127.0.0.1:1/p.pac)"). We rely on that, so assert it - a
+        //    future reqwest that stopped stripping would reintroduce the leak
+        //    through this field, and this is where we would find out.
+        assert!(
+            !message.contains("hunter2") && !message.contains("corpuser"),
+            "reqwest must not echo credentials in its error text: {message}"
+        );
     }
 
     #[tokio::test]
