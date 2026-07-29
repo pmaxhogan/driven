@@ -798,6 +798,61 @@ patched, and now an EDR-flagged signature we deliberately do not emit. A
 `local.permission_denied` file needs Full Disk Access; no snapshot setting
 substitutes for it.
 
+#### 5.3.3 Full Disk Access onboarding (macOS)
+
+The remedy s5.3.2 cannot provide. A `local.permission_denied` skip means TCC
+refused the read, and the ONLY fix is the user granting Driven Full Disk
+Access. So the UI has to ask, and has to ask well: the failure is silent
+from the user's point of view (the backup "succeeds", some files just never
+appear), and the error text alone does not tell them where to go.
+
+**Trigger.** A root-mounted banner subscribes to the `activity:new` stream
+and latches on the first row whose `event_type` is `local.permission_denied`.
+It is root-mounted (the `ToastHost` pattern) rather than living on a single
+view, so a denial during a background cycle is not missed just because the
+user happens to be on another tab. There is deliberately no per-cycle
+bookkeeping: a denial is PERMANENT until the user acts, unlike a lock, so
+"has this ever happened" is the right question and a sticky latch is the
+right shape. Gating on the `backup_done` row would have been wrong twice
+over - failed ops suppress it, and it is emitted per source, not per cycle.
+
+**Deduplication.** Because a denial is permanent, the same file produces one
+warn row EVERY cycle, forever - an unbounded stream. The banner therefore
+counts DISTINCT files, not rows, so a file denied across fifty cycles is
+reported once. This aggregation lives purely in the display layer; neither
+the executor's emission nor the activity store changes, so the raw rows stay
+available for diagnostics.
+
+**The deep link.** The banner's primary action opens the Full Disk Access
+pane directly via
+`x-apple.systempreferences:com.apple.preference.security?Privacy_AllFiles`.
+Two things make this work and both are load-bearing: the anchor is
+version-sensitive (a wrong or stale one silently lands the user on the
+generic Privacy & Security list, which is why it is verified against a
+control rather than assumed), and the custom scheme must be added to the
+opener plugin's capability scope - `opener:default` only permits
+`mailto:`/`tel:`/`http`/`https`, so without an explicit
+`opener:allow-open-url` scope entry the button would throw at runtime while
+every mocked test still passed.
+
+**Dismissal is per-session, on purpose.** The banner is dismissible, but the
+dismissal is in-memory and does not persist across restarts (matching the
+one existing dismissible-banner precedent, the updater's). That is the
+correct semantic here rather than a shortcut: the underlying condition is
+unresolved until FDA is granted, so permanently silencing it would hide a
+real, ongoing data-coverage gap. Once the grant is in place the denials stop
+and the banner stops appearing on its own.
+
+**The unsigned-binary caveat is part of the copy, not a footnote.** macOS
+binds a TCC grant to the binary's code signature (its cdhash), not its path.
+Driven's V1 builds are unsigned, so every update is a different program as
+far as TCC is concerned and a previously working grant can silently stop
+applying - the app still appears in the Full Disk Access list, switch on,
+while being denied. This is a recurring, confusing support case rather than
+a hypothetical, so the banner states it in one line and the README explains
+the remove-and-re-add fix in full. It resolves itself when macOS code
+signing lands.
+
 ### 5.4 Upload pipeline
 
 Per-account:

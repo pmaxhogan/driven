@@ -3,6 +3,7 @@ import { onMounted } from "vue";
 import { useRoute } from "vue-router";
 import { useI18n } from "vue-i18n";
 
+import FdaBanner from "./components/FdaBanner.vue";
 import GlobalProgressBar from "./components/GlobalProgressBar.vue";
 import PausedBanner from "./components/PausedBanner.vue";
 import ToastHost from "./components/ToastHost.vue";
@@ -134,6 +135,11 @@ const NAV_LINK_ACTIVE = "text-teal-700 dark:text-teal-300 font-semibold";
     <header class="sticky top-0 z-30 bg-zinc-50 dark:bg-zinc-950" data-testid="app-header">
       <GlobalProgressBar />
       <PausedBanner />
+      <!-- macOS TCC (DESIGN s5.3.2): shown only once a read has actually been
+           refused, so it costs nothing on Windows/Linux. Lives in the sticky
+           header - and therefore mounts for the app's whole lifetime - so it
+           cannot miss the `activity:new` denial it subscribes to. -->
+      <FdaBanner />
       <nav
         class="flex flex-wrap items-center gap-x-6 gap-y-2 border-b border-zinc-200 bg-white px-6 py-3 text-sm dark:border-zinc-800 dark:bg-zinc-900"
         :aria-label="t('nav.primary')"
