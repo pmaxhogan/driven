@@ -716,7 +716,7 @@ pub async fn update_settings(
         .map_err(CommandError::from)?;
     }
 
-    // --- integrity scrub (migration 0013) -----------------------------------
+    // --- integrity scrub (migration 0014) -----------------------------------
     // Standalone KV keys, not a group blob: `driven-core` re-reads them on each
     // run, so a change applies from the next cycle with no reconfigure. Every
     // numeric field is range-checked FIRST - the renderer is untrusted, and
@@ -3514,6 +3514,7 @@ mod tests {
             windows: None,
             macos: None,
             bundle_small_files: false,
+            scrub: driven_core::scrub::ScrubConfig::default().into(),
         };
         let red = redact_settings(&dto);
         let url = red.global.proxy_url.as_deref().expect("proxy url present");

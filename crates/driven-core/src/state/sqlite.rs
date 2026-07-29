@@ -1710,7 +1710,7 @@ impl StateRepo for SqliteStateRepo {
         Ok(paths)
     }
 
-    // --- integrity scrub (migration 0013) -----------------------------------
+    // --- integrity scrub (migration 0014) -----------------------------------
     //
     // Every statement below uses runtime `sqlx::query` / `sqlx::query_as` (NOT
     // the compile-checked `query!` macro) so these additive methods need NO
@@ -4017,7 +4017,7 @@ mod tests {
         }
     }
 
-    // --- migration 0013: integrity scrub -------------------------------------
+    // --- migration 0014: integrity scrub -------------------------------------
 
     /// Seed an account + source with `n` SYNCED, uploaded files named
     /// `f00.txt..`, each recording a distinct `drive_file_id` and md5.

@@ -308,7 +308,7 @@ pub struct BundleRef {
 /// a prune off, so an unpruned table would simply grow forever.
 pub const SCRUB_RUN_HISTORY_CAP: u32 = 200;
 
-/// A row to insert into `scrub_runs` (migration 0013): one completed integrity
+/// A row to insert into `scrub_runs` (migration 0014): one completed integrity
 /// scrub run's persisted report.
 ///
 /// COUNTS ONLY - there is deliberately no path, Drive id, or object name here,
@@ -805,7 +805,7 @@ pub const KNOWN_STATE_TABLES: &[&str] = &[
     // V2 small-file bundling (issue #35, migration 0007_bundles).
     "bundles",
     "bundle_members",
-    // Scheduled integrity scrub (migration 0013_integrity_scrub).
+    // Scheduled integrity scrub (migration 0014_integrity_scrub).
     "scrub_state",
     "scrub_runs",
 ];
@@ -1669,7 +1669,7 @@ pub trait StateRepo: Send + Sync {
         Ok(())
     }
 
-    // --- integrity scrub (migration 0013) -----------------------------------
+    // --- integrity scrub (migration 0014) -----------------------------------
 
     /// One keyset PAGE of standalone file objects to scrub, ordered by
     /// `relative_path`, starting strictly AFTER `after`.

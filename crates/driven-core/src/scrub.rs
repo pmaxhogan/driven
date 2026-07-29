@@ -50,7 +50,7 @@
 
 use crate::state::StateRepo;
 use crate::types::{RelativePath, UnixMs};
-use driven_drive::remote_store::RemoteEntry;
+use driven_remote::remote_store::RemoteEntry;
 
 /// Settings key: master on/off for the scrub (UI-surfaced).
 pub const SETTING_SCRUB_ENABLED: &str = "scrub_enabled";
@@ -343,7 +343,7 @@ impl Drift {
 ///
 /// `live` answers "is this object still in the source's live-object set?" -
 /// sourced from
-/// [`driven_drive::remote_store::RemoteStore::list_source_object_ids`], the
+/// [`driven_remote::remote_store::RemoteStore::list_source_object_ids`], the
 /// SAME all-or-nothing enumeration the remote-existence audit infers deletion
 /// from. Using the identical oracle is what keeps the two passes from
 /// disagreeing about one object (a scrub that healed what the audit considers
