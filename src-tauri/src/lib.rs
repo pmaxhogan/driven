@@ -666,6 +666,7 @@ pub fn run() {
             commands::activity::clear_activity_older_than,
             // M7-P2-4 / P2-5: filter facets + DESIGN s8.3 header aggregates.
             commands::activity::distinct_activity_event_types,
+            commands::activity::list_scrub_runs,
             commands::activity::activity_summary,
             commands::activity::activity_throughput_series,
             // SPEC s11.5 restore (M8).

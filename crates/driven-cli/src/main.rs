@@ -75,6 +75,10 @@ enum Command {
     /// Check the local state database for files in a corrupt / error state;
     /// exits non-zero when any are found.
     Verify(inspect::InspectArgs),
+    /// Show the integrity-scrub configuration and recent scrub reports from
+    /// the local state database. With `--fail-on-drift`, exits non-zero when
+    /// the latest run of any source found drift it could not repair.
+    Scrub(inspect::ScrubArgs),
 }
 
 /// Arguments for `driven-cli auth`.
@@ -161,6 +165,7 @@ async fn main() -> anyhow::Result<()> {
         Command::Status(args) => inspect::run_status(args).await,
         Command::History(args) => inspect::run_history(args).await,
         Command::Verify(args) => inspect::run_verify(args).await,
+        Command::Scrub(args) => inspect::run_scrub(args).await,
     }
 }
 

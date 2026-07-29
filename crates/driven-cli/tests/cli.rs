@@ -166,8 +166,139 @@ fn top_level_help_lists_every_subcommand() {
             .and(predicate::str::contains("sync"))
             .and(predicate::str::contains("status"))
             .and(predicate::str::contains("history"))
-            .and(predicate::str::contains("verify")),
+            .and(predicate::str::contains("verify"))
+            .and(predicate::str::contains("scrub")),
     );
+}
+
+/// Seed `path` with one source and `runs` recorded scrub reports.
+fn seed_scrub_runs(path: &Path, runs: &[driven_core::scrub::ScrubReport]) {
+    block_on(async {
+        let repo = SqliteStateRepo::open(path).await.unwrap();
+        let acc = AccountId::new_v4();
+        let src = SourceId::new_v4();
+        repo.upsert_account(&account(acc)).await.unwrap();
+        repo.upsert_source(&source(acc, src, "Docs")).await.unwrap();
+        for (i, report) in runs.iter().enumerate() {
+            repo.insert_scrub_run(&driven_core::state::NewScrubRun {
+                source_id: src,
+                started_at: i as i64 + 1,
+                finished_at: i as i64 + 2,
+                report: report.clone(),
+            })
+            .await
+            .unwrap();
+        }
+    });
+}
+
+#[test]
+fn scrub_on_a_fresh_database_reports_the_shipped_policy_and_no_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    seed_empty(&db);
+
+    cli()
+        .args(["scrub", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(
+            // The shipped posture: on, weekly, metadata-only.
+            predicate::str::contains("integrity scrub: enabled")
+                .and(predicate::str::contains("every 604800s"))
+                .and(predicate::str::contains("deep sample 0"))
+                .and(predicate::str::contains("No scrub has run yet.")),
+        );
+}
+
+#[test]
+fn scrub_renders_recorded_runs_newest_first_with_counts_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    let mut clean = driven_core::scrub::ScrubReport {
+        checked: 40,
+        ok: 40,
+        ..Default::default()
+    };
+    clean.finish();
+    let mut drifted = driven_core::scrub::ScrubReport {
+        checked: 40,
+        ok: 38,
+        missing: 1,
+        hash_mismatch: 1,
+        healed: 1,
+        unrecoverable: 1,
+        ..Default::default()
+    };
+    drifted.finish();
+    seed_scrub_runs(&db, &[clean, drifted]);
+
+    cli()
+        .args(["scrub", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("drift")
+                .and(predicate::str::contains("clean"))
+                .and(predicate::str::contains("checked 40"))
+                .and(predicate::str::contains("unrecoverable 1"))
+                .and(predicate::str::contains("Docs")),
+        );
+}
+
+/// `--fail-on-drift` makes the command usable as a monitoring check.
+#[test]
+fn scrub_fail_on_drift_exits_non_zero_only_when_the_latest_run_still_has_unrepaired_drift() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    let mut drifted = driven_core::scrub::ScrubReport {
+        checked: 5,
+        ok: 4,
+        hash_mismatch: 1,
+        unrecoverable: 1,
+        ..Default::default()
+    };
+    drifted.finish();
+    seed_scrub_runs(&db, &[drifted]);
+
+    cli()
+        .args(["scrub", "--fail-on-drift", "--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("could not be repaired"));
+
+    // A LATER clean run clears it: a source that drifted once and has been
+    // clean since is not a live problem, and flagging it forever would make the
+    // check useless as a monitor.
+    let dir2 = tempfile::tempdir().unwrap();
+    let db2 = dir2.path().join("state.db");
+    let mut clean = driven_core::scrub::ScrubReport {
+        checked: 5,
+        ok: 5,
+        ..Default::default()
+    };
+    clean.finish();
+    seed_scrub_runs(&db2, &[drifted_report(), clean]);
+    cli()
+        .args(["scrub", "--fail-on-drift", "--db"])
+        .arg(&db2)
+        .assert()
+        .success();
+}
+
+fn drifted_report() -> driven_core::scrub::ScrubReport {
+    let mut r = driven_core::scrub::ScrubReport {
+        checked: 5,
+        ok: 4,
+        hash_mismatch: 1,
+        unrecoverable: 1,
+        ..Default::default()
+    };
+    r.finish();
+    r
 }
 
 #[test]

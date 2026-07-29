@@ -214,6 +214,12 @@ async fn load_settings_dto(state: &dyn StateRepo) -> CommandResult<SettingsDto> 
         .and_then(|v| v.as_bool())
         .unwrap_or(false);
 
+    // Scheduled integrity scrub: four standalone KV keys the core re-reads per
+    // run. `load_scrub_config` fails closed to the shipped defaults and clamps
+    // an out-of-range stored value, so this can never surface a config the
+    // engine would not actually use.
+    let scrub = driven_core::scrub::load_scrub_config(state).await.into();
+
     Ok(SettingsDto {
         global,
         telemetry,
@@ -221,6 +227,7 @@ async fn load_settings_dto(state: &dyn StateRepo) -> CommandResult<SettingsDto> 
         ui,
         windows,
         bundle_small_files,
+        scrub,
     })
 }
 
@@ -584,6 +591,63 @@ pub async fn update_settings(
         )
         .await
         .map_err(CommandError::from)?;
+    }
+
+    // --- integrity scrub (migration 0013) -----------------------------------
+    // Standalone KV keys, not a group blob: `driven-core` re-reads them on each
+    // run, so a change applies from the next cycle with no reconfigure. Every
+    // numeric field is range-checked FIRST - the renderer is untrusted, and
+    // `load_scrub_config` would silently clamp a bad value, which would leave
+    // the UI showing something the engine is not doing.
+    if let Some(s) = patch.scrub {
+        if let Some(v) = s.interval_secs {
+            check_range(
+                "scrub.interval_secs",
+                v,
+                driven_core::scrub::SCRUB_INTERVAL_MIN,
+                driven_core::scrub::SCRUB_INTERVAL_MAX,
+            )?;
+        }
+        if let Some(v) = s.slice_size {
+            check_range(
+                "scrub.slice_size",
+                v,
+                driven_core::scrub::SCRUB_SLICE_MIN,
+                driven_core::scrub::SCRUB_SLICE_MAX,
+            )?;
+        }
+        if let Some(v) = s.deep_sample {
+            check_range(
+                "scrub.deep_sample",
+                v,
+                0,
+                driven_core::scrub::SCRUB_DEEP_SAMPLE_MAX,
+            )?;
+        }
+        // Written only after EVERY field validated, so a patch carrying one bad
+        // field cannot half-apply.
+        if let Some(v) = s.enabled {
+            repo.set_setting(
+                driven_core::scrub::SETTING_SCRUB_ENABLED,
+                &serde_json::Value::Bool(v),
+            )
+            .await
+            .map_err(CommandError::from)?;
+        }
+        for (key, value) in [
+            (
+                driven_core::scrub::SETTING_SCRUB_INTERVAL_SECS,
+                s.interval_secs,
+            ),
+            (driven_core::scrub::SETTING_SCRUB_SLICE_SIZE, s.slice_size),
+            (driven_core::scrub::SETTING_SCRUB_DEEP_SAMPLE, s.deep_sample),
+        ] {
+            if let Some(v) = value {
+                repo.set_setting(key, &serde_json::Value::from(v))
+                    .await
+                    .map_err(CommandError::from)?;
+            }
+        }
     }
 
     // --- side effects (after persistence) -----------------------------------
@@ -3091,6 +3155,7 @@ mod tests {
             ui: default_ui(),
             windows: None,
             bundle_small_files: false,
+            scrub: driven_core::scrub::ScrubConfig::default().into(),
         };
         let red = redact_settings(&dto);
         assert!(red.telemetry.install_id.starts_with("installid_"));
@@ -3409,6 +3474,79 @@ mod tests {
         validate_deep_verify_interval(604_800).expect("7-day default is valid");
         validate_deep_verify_interval(DEEP_VERIFY_MIN).expect("min bound is valid");
         validate_deep_verify_interval(DEEP_VERIFY_MAX).expect("max bound is valid");
+    }
+
+    /// The renderer is untrusted, so every scrub number is range-checked at the
+    /// IPC boundary rather than left to `load_scrub_config`'s clamp.
+    ///
+    /// Clamping alone would be worse than a rejection here: the write would
+    /// succeed, the UI would render the value it sent, and the engine would
+    /// quietly use a different one - the settings screen would be lying.
+    #[test]
+    fn scrub_settings_bounds_match_the_core_and_reject_out_of_range_input() {
+        use driven_core::scrub as s;
+
+        for (field, value, min, max) in [
+            ("scrub.interval_secs", 0, s::SCRUB_INTERVAL_MIN, s::SCRUB_INTERVAL_MAX),
+            (
+                "scrub.interval_secs",
+                s::SCRUB_INTERVAL_MIN - 1,
+                s::SCRUB_INTERVAL_MIN,
+                s::SCRUB_INTERVAL_MAX,
+            ),
+            (
+                "scrub.interval_secs",
+                s::SCRUB_INTERVAL_MAX + 1,
+                s::SCRUB_INTERVAL_MIN,
+                s::SCRUB_INTERVAL_MAX,
+            ),
+            ("scrub.slice_size", 0, s::SCRUB_SLICE_MIN, s::SCRUB_SLICE_MAX),
+            (
+                "scrub.slice_size",
+                s::SCRUB_SLICE_MAX + 1,
+                s::SCRUB_SLICE_MIN,
+                s::SCRUB_SLICE_MAX,
+            ),
+            (
+                "scrub.deep_sample",
+                s::SCRUB_DEEP_SAMPLE_MAX + 1,
+                0,
+                s::SCRUB_DEEP_SAMPLE_MAX,
+            ),
+        ] {
+            let err = check_range(field, value, min, max)
+                .expect_err(&format!("{field}={value} must be rejected"));
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidInput,
+                "{field}={value} must use the stable invalid-input code"
+            );
+        }
+
+        // The shipped defaults sit inside every bound - a fresh install must not
+        // be able to fail its own validator.
+        let d = s::ScrubConfig::default();
+        check_range(
+            "scrub.interval_secs",
+            d.interval_secs,
+            s::SCRUB_INTERVAL_MIN,
+            s::SCRUB_INTERVAL_MAX,
+        )
+        .expect("the shipped cadence is valid");
+        check_range(
+            "scrub.slice_size",
+            d.slice_size,
+            s::SCRUB_SLICE_MIN,
+            s::SCRUB_SLICE_MAX,
+        )
+        .expect("the shipped slice size is valid");
+        check_range(
+            "scrub.deep_sample",
+            d.deep_sample,
+            0,
+            s::SCRUB_DEEP_SAMPLE_MAX,
+        )
+        .expect("the shipped deep sample (0) is valid");
     }
 
     // R2-P1-4: whole-line / all-path-shape redaction tests (Windows shapes).

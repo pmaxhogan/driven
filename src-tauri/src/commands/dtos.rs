@@ -506,6 +506,110 @@ pub struct SettingsDto {
     /// it never rides a group round-trip. `false` (the frozen v1.0.0 behaviour)
     /// unless the user turns it on. The bundling thresholds stay backend-only KV.
     pub bundle_small_files: bool,
+    /// Scheduled integrity-scrub settings. Standalone KV keys, like
+    /// [`Self::bundle_small_files`], because `driven-core` re-reads them per run.
+    pub scrub: ScrubSettings,
+}
+
+/// Scheduled integrity-scrub settings (`driven_core::scrub`).
+///
+/// Backed by four standalone settings KV keys rather than a SPEC s22 group
+/// blob, for the same reason the bundling toggle is: the core reads them
+/// directly and re-reads them per run, so a change applies on the next cycle
+/// with no orchestrator reconfigure.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrubSettings {
+    /// Master on/off. Ships `true` - see the migration's rationale.
+    pub enabled: bool,
+    /// Seconds between runs for one source (default weekly).
+    pub interval_secs: u32,
+    /// How many objects of each population one run checks.
+    pub slice_size: u32,
+    /// How many of the slice's objects one run additionally DOWNLOADS and
+    /// re-hashes end to end. Ships `0` - the metadata comparison already
+    /// catches remote-side corruption, so spending bandwidth is opt-in.
+    pub deep_sample: u32,
+}
+
+impl From<driven_core::scrub::ScrubConfig> for ScrubSettings {
+    fn from(c: driven_core::scrub::ScrubConfig) -> Self {
+        ScrubSettings {
+            enabled: c.enabled,
+            interval_secs: c.interval_secs,
+            slice_size: c.slice_size,
+            deep_sample: c.deep_sample,
+        }
+    }
+}
+
+/// One persisted integrity-scrub run, as rendered by the UI history panel and
+/// `driven-cli scrub`.
+///
+/// COUNTS ONLY. There is deliberately no path, Drive id, or object name on this
+/// DTO - a scrub report can therefore never carry an encrypted source's
+/// filename across the IPC boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrubRunDto {
+    /// Row id.
+    pub id: i64,
+    /// Which source this run scrubbed.
+    pub source_id: String,
+    /// Unix epoch ms the run began.
+    pub started_at: i64,
+    /// Unix epoch ms the run ended.
+    pub finished_at: i64,
+    /// Objects checked this run.
+    pub checked: u64,
+    /// Objects that verified clean.
+    pub ok: u64,
+    /// Objects whose remote copy is gone.
+    pub missing: u64,
+    /// Objects whose stored byte length no longer matches.
+    pub size_mismatch: u64,
+    /// Objects whose stored checksum no longer matches.
+    pub hash_mismatch: u64,
+    /// Objects that could not be compared at all.
+    pub unverifiable: u64,
+    /// Objects re-queued for a fresh upload.
+    pub healed: u64,
+    /// Files re-queued because their bundle object was gone.
+    pub healed_bundle_members: u64,
+    /// Drift that could NOT be repaired automatically.
+    pub unrecoverable: u64,
+    /// Objects downloaded and re-hashed end to end.
+    pub deep_checked: u64,
+    /// Deep checks whose bytes did not match the recorded checksum.
+    pub deep_failed: u64,
+    /// Whether the rolling sweep completed a full lap this run.
+    pub wrapped: bool,
+    /// `clean` | `drift` | `incomplete`.
+    pub outcome: String,
+}
+
+impl From<driven_core::state::ScrubRunRow> for ScrubRunDto {
+    fn from(r: driven_core::state::ScrubRunRow) -> Self {
+        ScrubRunDto {
+            id: r.id,
+            source_id: r.source_id.to_string(),
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            checked: r.report.checked,
+            ok: r.report.ok,
+            missing: r.report.missing,
+            size_mismatch: r.report.size_mismatch,
+            hash_mismatch: r.report.hash_mismatch,
+            unverifiable: r.report.unverifiable,
+            healed: r.report.healed,
+            healed_bundle_members: r.report.healed_bundle_members,
+            unrecoverable: r.report.unrecoverable,
+            deep_checked: r.report.deep_checked,
+            deep_failed: r.report.deep_failed,
+            wrapped: r.report.wrapped,
+            outcome: r.report.outcome.label().to_string(),
+        }
+    }
 }
 
 /// SPEC s22 `global` settings.
@@ -695,6 +799,24 @@ pub struct SettingsPatch {
     /// unchanged; `Some(v)` writes the `bundle_small_files` settings KV key the
     /// core reads. See [`SettingsDto::bundle_small_files`].
     pub bundle_small_files: Option<bool>,
+    /// Partial integrity-scrub settings. Each field is independently optional
+    /// so the UI can commit one control at a time, matching how every other
+    /// settings control in this app commits on change.
+    pub scrub: Option<ScrubSettingsPatch>,
+}
+
+/// Partial integrity-scrub settings.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct ScrubSettingsPatch {
+    /// See [`ScrubSettings::enabled`].
+    pub enabled: Option<bool>,
+    /// See [`ScrubSettings::interval_secs`].
+    pub interval_secs: Option<u32>,
+    /// See [`ScrubSettings::slice_size`].
+    pub slice_size: Option<u32>,
+    /// See [`ScrubSettings::deep_sample`].
+    pub deep_sample: Option<u32>,
 }
 
 /// Partial SPEC s22 `global` settings.

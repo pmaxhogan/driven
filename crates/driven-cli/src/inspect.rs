@@ -34,6 +34,21 @@ pub struct InspectArgs {
     pub db: PathBuf,
 }
 
+/// Args for `driven-cli scrub`.
+#[derive(Debug, Args)]
+pub struct ScrubArgs {
+    /// Path to the Driven state database.
+    #[arg(long, default_value = "state.db")]
+    pub db: PathBuf,
+    /// Maximum number of scrub runs to show (newest first).
+    #[arg(long, default_value_t = 10)]
+    pub limit: u32,
+    /// Exit non-zero when the most recent run of any source found drift it
+    /// could not repair, so the command is usable as a monitoring check.
+    #[arg(long)]
+    pub fail_on_drift: bool,
+}
+
 /// Args for `driven-cli history`.
 #[derive(Debug, Args)]
 pub struct HistoryArgs {
@@ -202,6 +217,104 @@ pub async fn run_history(args: HistoryArgs) -> Result<()> {
             line.push_str(&format!("  (files: {n})"));
         }
         println!("{line}");
+    }
+    Ok(())
+}
+
+/// Everything `scrub` needs, gathered in one pass so the rendering is trivial
+/// and the query logic is unit-testable against a seeded temp DB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct ScrubOverview {
+    /// The configured scrub policy, as the engine would actually apply it
+    /// (clamped + defaulted by `load_scrub_config`).
+    pub config: driven_core::scrub::ScrubConfig,
+    /// Recent runs across every source, newest first.
+    pub runs: Vec<driven_core::state::ScrubRunRow>,
+    /// Display name per source id, so the report can name sources without the
+    /// caller re-querying. Sources deleted since a run was recorded are absent.
+    pub source_names: std::collections::HashMap<String, String>,
+}
+
+pub async fn gather_scrub(repo: &dyn StateRepo, limit: u32) -> Result<ScrubOverview> {
+    let config = driven_core::scrub::load_scrub_config(repo).await;
+    let runs = repo.list_scrub_runs(None, limit.max(1)).await?;
+    let source_names = repo
+        .list_sources()
+        .await?
+        .into_iter()
+        .map(|s| (s.id.to_string(), s.display_name))
+        .collect();
+    Ok(ScrubOverview {
+        config,
+        runs,
+        source_names,
+    })
+}
+
+pub async fn run_scrub(args: ScrubArgs) -> Result<()> {
+    let repo = open_existing(&args.db).await?;
+    let overview = gather_scrub(&repo, args.limit).await?;
+
+    let c = &overview.config;
+    println!(
+        "integrity scrub: {}  every {}s  slice {}  deep sample {}",
+        if c.enabled { "enabled" } else { "DISABLED" },
+        c.interval_secs,
+        c.slice_size,
+        c.deep_sample,
+    );
+
+    if overview.runs.is_empty() {
+        println!("No scrub has run yet.");
+        return Ok(());
+    }
+
+    // Counts only, never paths - the same rule the persisted report follows, so
+    // piping this into a log or a bug report cannot leak an encrypted source's
+    // filenames.
+    for r in &overview.runs {
+        let name = overview
+            .source_names
+            .get(&r.source_id.to_string())
+            .map_or("(deleted source)", String::as_str);
+        println!(
+            "{}  {:<10}  {}  checked {} (ok {}, missing {}, size {}, hash {}, unverifiable {})",
+            fmt_epoch_ms(Some(r.started_at)),
+            r.report.outcome.label(),
+            name,
+            r.report.checked,
+            r.report.ok,
+            r.report.missing,
+            r.report.size_mismatch,
+            r.report.hash_mismatch,
+            r.report.unverifiable,
+        );
+        if r.report.healed > 0 || r.report.unrecoverable > 0 || r.report.deep_checked > 0 {
+            println!(
+                "    healed {} (+{} bundle members), unrecoverable {}, deep checked {} (failed {})",
+                r.report.healed,
+                r.report.healed_bundle_members,
+                r.report.unrecoverable,
+                r.report.deep_checked,
+                r.report.deep_failed,
+            );
+        }
+    }
+
+    if args.fail_on_drift {
+        // "Most recent run PER SOURCE": a source that drifted a month ago and
+        // has been clean since is not a live problem, and reporting it as one
+        // would make the check useless as a monitor.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut unrecoverable = 0u64;
+        for r in &overview.runs {
+            if seen.insert(r.source_id.to_string()) {
+                unrecoverable = unrecoverable.saturating_add(r.report.unrecoverable);
+            }
+        }
+        if unrecoverable > 0 {
+            anyhow::bail!("{unrecoverable} object(s) drifted and could not be repaired");
+        }
     }
     Ok(())
 }
