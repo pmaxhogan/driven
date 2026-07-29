@@ -15,14 +15,50 @@ vars are set. This is an honest capability gate, not a faked-green skip.
 
 ## Gate variables
 
-| Variable                     | Required | Meaning                                                                 |
-|------------------------------|----------|-------------------------------------------------------------------------|
-| `DRIVEN_E2E_REFRESH_TOKEN`   | yes      | A Google OAuth refresh token with the `drive` scope for a test account. |
-| `DRIVEN_E2E_DEST_FOLDER_ID`  | yes      | The Drive folder id the tests upload under (each test makes a UUID child). |
-| `DRIVEN_OAUTH_CLIENT_SECRET` | yes      | The OAuth client secret used to refresh the token (no public default).  |
-| `DRIVEN_OAUTH_CLIENT_ID`     | no       | OAuth client id. Defaults to the public installed-app client id.        |
+| Variable                      | Required | Meaning                                                                 |
+|-------------------------------|----------|-------------------------------------------------------------------------|
+| `DRIVEN_E2E_REFRESH_TOKEN`    | yes      | A Google OAuth refresh token with the `drive` scope for a test account. |
+| `DRIVEN_E2E_DEST_FOLDER_ID`   | yes      | The Drive folder id the tests upload under (each test makes a UUID child). |
+| `DRIVEN_OAUTH_CLIENT_SECRET`  | yes      | The OAuth client secret used to refresh the token (no public default).  |
+| `DRIVEN_OAUTH_CLIENT_ID`      | no       | OAuth client id. Defaults to the public installed-app client id.        |
+| `DRIVEN_E2E_SHARED_DRIVE_ID`  | no       | A Google **Shared Drive** id (issue #7). Opens a SECOND, independent gate covering only the 5 `google_shared_drive_*` tests. |
 
 All three required vars must be non-empty; a missing one closes the gate.
+
+### The gate has two independent tiers
+
+This is the part that surprises people, so it is worth stating plainly: setting
+the three required vars above does **not** make all 13 tests do real Drive I/O.
+There are two separate gates, each with its own skip message.
+
+| Tier | Gated on | Tests | Skip message |
+|------|----------|-------|--------------|
+| Base | `DRIVEN_E2E_REFRESH_TOKEN` + `DRIVEN_E2E_DEST_FOLDER_ID` + `DRIVEN_OAUTH_CLIENT_SECRET` | the 8 non-Shared-Drive tests | `skipping real-Drive e2e (<test>): ...` |
+| Shared Drive | the base tier **plus** `DRIVEN_E2E_SHARED_DRIVE_ID` | the 5 `google_shared_drive_*` tests | `skipping Shared Drive e2e (<test>): ...` |
+
+So a fully credentialed run with no `DRIVEN_E2E_SHARED_DRIVE_ID` reports
+**13 passed** with 5 `skipping Shared Drive e2e` lines still present. That is the
+expected, healthy outcome - not a regression, and not a sign the creds are
+wrong. Only the disappearance of the *base* tier's `skipping real-Drive e2e`
+lines tells you the credentials took effect.
+
+The Shared Drive tests exist because a Shared Drive is a genuinely different
+Drive backend: its id doubles as its root folder id, and every listing must be
+scoped to that drive or the store list-empties and re-uploads (issue #7). Each
+one creates its UUID-named child folder directly under the Shared Drive root and
+drives the portable scenarios with a `SharedDrive` context instead of a My Drive
+one.
+
+**A consumer Google account cannot satisfy this tier.** Shared Drives are a
+Google Workspace feature; a plain `@gmail.com` account has none, so there is no
+id to put in the variable. `GET https://www.googleapis.com/drive/v3/drives`
+authenticated as such an account returns an empty `drives` list (a successful
+call, not a permission error) - which is exactly what the dedicated e2e account
+returns today. Running this tier against real Drive therefore requires a
+Workspace account; until one is wired up, the Shared Drive contract is covered
+only by the fake-store tests in `fake_contract.rs`. The CI `chaos-real-drive`
+job likewise sets no `DRIVEN_E2E_SHARED_DRIVE_ID`, so these 5 tests skip there
+too.
 
 Each test:
 1. Builds a `RefreshingTokenSource` from the refresh token (the first call
@@ -89,11 +125,23 @@ export DRIVEN_E2E_REFRESH_TOKEN="$(cargo run --bin driven-cli -- dump-refresh-to
 export DRIVEN_E2E_DEST_FOLDER_ID="<DRIVE_FOLDER_ID>"
 export DRIVEN_OAUTH_CLIENT_SECRET="<from client_secret.json>"
 # DRIVEN_OAUTH_CLIENT_ID defaults to the public installed-app id; override if needed.
+# DRIVEN_E2E_SHARED_DRIVE_ID is optional and needs a Workspace account; without
+# it the 5 google_shared_drive_* tests skip. See "The gate has two independent
+# tiers" above.
 
 cargo test -p driven-drive --test google_e2e -- --nocapture
 ```
 
-With the gate unset, the same command prints the skip lines and passes:
+A credentialed run without `DRIVEN_E2E_SHARED_DRIVE_ID` looks like this - 8
+tests doing real Drive I/O, 5 honestly skipping, all 13 green:
+
+```
+skipping Shared Drive e2e (google_shared_drive_round_trip): set DRIVEN_E2E_SHARED_DRIVE_ID to run
+...
+test result: ok. 13 passed; 0 failed; 0 ignored; 0 measured; 0 filtered out
+```
+
+With the gate unset, the same command prints the base skip lines and passes:
 
 ```sh
 cargo test -p driven-drive --test google_e2e
@@ -108,6 +156,8 @@ before the run, rather than exporting each time:
 DRIVEN_E2E_REFRESH_TOKEN=...
 DRIVEN_E2E_DEST_FOLDER_ID=...
 DRIVEN_OAUTH_CLIENT_SECRET=...
+# Optional, Workspace-only; omit to skip the 5 google_shared_drive_* tests.
+DRIVEN_E2E_SHARED_DRIVE_ID=...
 ```
 
 ```sh
