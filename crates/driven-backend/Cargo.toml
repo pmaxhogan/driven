@@ -30,3 +30,6 @@ tracing.workspace = true
 # module documents and had to work around. Dev-only: production always uses the
 # real per-OS store.
 keyring-core = "1"
+# The facade production uses. The test helper needs it to burn keyring 4.x's
+# one-shot platform-store latch before the in-memory mock can stick.
+keyring.workspace = true

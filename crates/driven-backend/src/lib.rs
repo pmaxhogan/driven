@@ -360,20 +360,59 @@ mod tests {
 
     /// Install `keyring-core`'s IN-MEMORY store as the process default, so the
     /// keychain-backed paths run for real without touching (or requiring) an OS
-    /// keychain. The default store is process-global, so every test that uses it
-    /// serializes on this lock and keys its entries by a unique account id.
-    fn keychain() -> std::sync::MutexGuard<'static, ()> {
+    /// keychain.
+    ///
+    /// Returns `None` when the mock could not be made the EFFECTIVE store, in
+    /// which case the caller MUST skip - the alternative is writing test
+    /// secrets into the developer's real login keychain, which on macOS also
+    /// blocks the run on a modal permission prompt.
+    ///
+    /// ## Ordering is load-bearing
+    ///
+    /// `keyring` 4.x's `Entry::new` installs the PLATFORM-NATIVE store on its
+    /// FIRST call, overwriting whatever default is already set (see
+    /// `keyring-4.1.5/src/v1.rs`, the `SET_CREDENTIAL_STORE` latch). Installing
+    /// the mock first is therefore silently undone by the first real `Entry`,
+    /// and every "mock" write lands in the OS keychain instead. So this burns
+    /// that latch first with a throwaway `Entry` (constructing one performs no
+    /// credential I/O), THEN installs the mock, and finally PROVES the mock is
+    /// in effect with a sentinel round trip before any test stores a secret.
+    fn keychain() -> Option<std::sync::MutexGuard<'static, ()>> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        static INSTALLED: OnceLock<()> = OnceLock::new();
+        static ACTIVE: OnceLock<bool> = OnceLock::new();
         let guard = LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        INSTALLED.get_or_init(|| {
-            let store = keyring_core::mock::Store::new().expect("in-memory keyring store");
-            keyring_core::set_default_store(store);
+        let active = *ACTIVE.get_or_init(|| {
+            // 1. Burn keyring's one-shot platform-store latch. Its error on a
+            //    headless box (no secret service) is expected and ignored.
+            let _ = keyring::Entry::new("driven.test.keyring-latch", "latch");
+            // 2. Now the mock sticks.
+            match keyring_core::mock::Store::new() {
+                Ok(store) => keyring_core::set_default_store(store),
+                Err(_) => return false,
+            }
+            // 3. Prove it, through the same `keyring` facade production uses.
+            let sentinel = match keyring::Entry::new("driven.test.sentinel", "probe") {
+                Ok(e) => e,
+                Err(_) => return false,
+            };
+            if sentinel.set_password("mock-is-active").is_err() {
+                return false;
+            }
+            let ok = sentinel.get_password().ok().as_deref() == Some("mock-is-active");
+            let _ = sentinel.delete_credential();
+            ok
         });
-        guard
+        if !active {
+            eprintln!(
+                "skipping the keychain test: the in-memory keyring store is not the effective \
+                 default, and this test will not write to a real OS keychain"
+            );
+            return None;
+        }
+        Some(guard)
     }
 
     /// Env vars are process-global too; `env_oauth_creds` reads them, so the
@@ -599,7 +638,7 @@ mod tests {
         // The end-to-end factory path over a real (in-memory) keychain: an
         // account whose refresh token was never stored - or was revoked and
         // deleted - must come back as NeedsReauth.
-        let _g = keychain();
+        let Some(_g) = keychain() else { return };
         let ca = CustomCaConfig::none();
         let proxy = ProxyConfig::system();
         let account = AccountBackend::google_drive("acct-no-token");
@@ -610,7 +649,7 @@ mod tests {
 
     #[test]
     fn build_store_returns_a_drive_store_once_a_refresh_token_is_stored() {
-        let _g = keychain();
+        let Some(_g) = keychain() else { return };
         let account_id = "acct-with-token";
         driven_drive::google::token_store::KeyringTokenStore::new(account_id.to_string())
             .store_refresh_token("a-refresh-token")
@@ -626,7 +665,7 @@ mod tests {
     #[test]
     fn account_creds_prefer_the_keychain_record_and_fall_back_to_the_env_seam() {
         use driven_drive::google::token_store::{ClientCreds, ClientCredsStore};
-        let _g = keychain();
+        let Some(_g) = keychain() else { return };
         set_env_client(Some("env-id"), Some("env-secret"));
 
         // No stored record: the env seam supplies the client.

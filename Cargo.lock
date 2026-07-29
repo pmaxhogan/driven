@@ -1632,6 +1632,7 @@ dependencies = [
  "driven-remote",
  "driven-s3",
  "driven-tls",
+ "keyring",
  "keyring-core",
  "tracing",
 ]

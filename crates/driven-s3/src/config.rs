@@ -436,26 +436,66 @@ mod tests {
 
     /// Install `keyring-core`'s IN-MEMORY store as the process default so the
     /// keychain round trip is covered by a real test with no OS keychain (which
-    /// headless CI does not have). The default store is process-global, so the
-    /// tests using it serialize on this lock.
-    fn keychain() -> std::sync::MutexGuard<'static, ()> {
+    /// headless CI does not have).
+    ///
+    /// Returns `None` when the mock could not be made the effective store, in
+    /// which case the caller MUST skip: the alternative is writing test secrets
+    /// into the developer's real login keychain, which on macOS also blocks the
+    /// run on a modal permission prompt.
+    ///
+    /// ## Ordering is load-bearing
+    ///
+    /// `keyring` 4.x's `Entry::new` installs the PLATFORM-NATIVE store on its
+    /// first call, overwriting whatever default is already set (see
+    /// `keyring-4.1.5/src/v1.rs`, the `SET_CREDENTIAL_STORE` latch). Setting the
+    /// mock first is therefore silently undone by the first real `Entry`, and
+    /// every "mock" write lands in the OS keychain. So this burns that latch
+    /// first with a throwaway `Entry` (constructing one performs no credential
+    /// I/O), THEN installs the mock, and finally PROVES the mock is in effect by
+    /// round-tripping a sentinel before any test is allowed to store a secret.
+    fn keychain() -> Option<std::sync::MutexGuard<'static, ()>> {
         use std::sync::{Mutex, OnceLock};
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        static INSTALLED: OnceLock<()> = OnceLock::new();
+        static ACTIVE: OnceLock<bool> = OnceLock::new();
         let guard = LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        INSTALLED.get_or_init(|| {
-            let store = keyring_core::mock::Store::new().expect("in-memory keyring store");
-            keyring_core::set_default_store(store);
+        let active = *ACTIVE.get_or_init(|| {
+            // 1. Burn keyring's one-shot platform-store latch. The error on a
+            //    headless box (no secret service) is expected and ignored.
+            let _ = keyring::Entry::new("driven.test.keyring-latch", "latch");
+            // 2. Now the mock sticks.
+            match keyring_core::mock::Store::new() {
+                Ok(store) => keyring_core::set_default_store(store),
+                Err(_) => return false,
+            }
+            // 3. Prove it. A sentinel round trip through the SAME `keyring`
+            //    façade production uses is the only evidence that matters.
+            let sentinel = match keyring::Entry::new("driven.test.sentinel", "probe") {
+                Ok(e) => e,
+                Err(_) => return false,
+            };
+            if sentinel.set_password("mock-is-active").is_err() {
+                return false;
+            }
+            let ok = sentinel.get_password().ok().as_deref() == Some("mock-is-active");
+            let _ = sentinel.delete_credential();
+            ok
         });
-        guard
+        if !active {
+            eprintln!(
+                "skipping the keychain test: the in-memory keyring store is not the effective \
+                 default, and this test will not write to a real OS keychain"
+            );
+            return None;
+        }
+        Some(guard)
     }
 
     #[test]
     fn credentials_round_trip_through_the_keychain() {
-        let _g = keychain();
+        let Some(_g) = keychain() else { return };
         let store = S3CredentialStore::new("acct-s3-round-trip");
         assert!(
             store
@@ -485,7 +525,7 @@ mod tests {
     fn deleting_credentials_is_idempotent() {
         // Account removal calls this unconditionally, including for accounts
         // that never had an S3 key pair, so a missing entry must not error.
-        let _g = keychain();
+        let Some(_g) = keychain() else { return };
         let store = S3CredentialStore::new("acct-s3-delete");
         store.delete().expect("deleting a missing entry is a no-op");
 
@@ -504,7 +544,7 @@ mod tests {
     fn credentials_are_scoped_per_account() {
         // The keychain key is the account id, so two S3 accounts in one install
         // must not read each other's key pair.
-        let _g = keychain();
+        let Some(_g) = keychain() else { return };
         let a = S3CredentialStore::new("acct-a");
         let b = S3CredentialStore::new("acct-b");
         a.store(&S3Credentials {
@@ -530,7 +570,7 @@ mod tests {
         // The keychain record is `id\nsecret`; a newline inside either field
         // would decode to a DIFFERENT pair on read-back, silently swapping the
         // account's credentials after a restart.
-        let _g = keychain();
+        let Some(_g) = keychain() else { return };
         let store = S3CredentialStore::new("acct-control-chars");
         assert!(store
             .store(&S3Credentials {
