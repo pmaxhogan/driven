@@ -1,0 +1,82 @@
+[package]
+name = "driven-s3"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven S3-compatible RemoteStore backend (AWS S3, Cloudflare R2, MinIO, Backblaze B2, ...)"
+publish = false
+
+[dependencies]
+# The RemoteStore trait, the SPEC s24 error taxonomy, the retry middleware and
+# the driven.* appProperties vocabulary.
+driven-remote = { path = "../driven-remote" }
+# Corporate custom-CA pinning + proxy config (issue #34), applied to every
+# client this crate builds - exactly as the Drive backend does.
+driven-tls = { path = "../driven-tls" }
+anyhow.workspace = true
+thiserror.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+tracing-subscriber.workspace = true
+futures.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
+reqwest.workspace = true
+# An await-free Mutex over the in-flight multipart-upload map. The lock is only
+# ever held for a short synchronous buffer edit, never across an await.
+parking_lot.workspace = true
+url.workspace = true
+hex.workspace = true
+base64.workspace = true
+# SPEC s4.1 pattern: the S3 secret access key lives in the OS keychain, never in
+# SQLite and never in a config file.
+keyring.workspace = true
+# Sans-io SigV4 request signing. Deliberately NOT the AWS SDK: this brings in
+# signing and XML parsing only, and leaves the HTTP client to us, so S3 traffic
+# rides the SAME reqwest/rustls stack (custom CA, proxy, timeouts, pooling) as
+# every other network call Driven makes. BSD-2-Clause, already on the
+# `cargo deny` allow-list.
+#
+# `default-features = false` + `rustcrypto` + `xml`: `rustcrypto` selects the
+# pure-Rust HMAC/SHA2 signer (no aws-lc-rs / C toolchain, matching the app's
+# no-native-deps posture); `xml` provides the ListObjectsV2 / multipart response
+# parsers. Dropping the `full` default also drops rusty-s3's own `md-5`, which
+# we do not use - Driven computes its digests with the workspace `md-5`.
+rusty-s3 = { version = "0.10", default-features = false, features = [
+    "rustcrypto",
+    "xml",
+] }
+# Content digests: the `Content-MD5` header S3 verifies server-side, and the
+# per-part digests the composed multipart ETag is checked against.
+md-5 = "0.11"
+
+[dev-dependencies]
+tokio = { workspace = true, features = ["test-util"] }
+futures.workspace = true
+# The integration tests drive a real server (local MinIO / Cloudflare R2) and
+# need a temp directory for the MinIO data root.
+tempfile = "3"
+# The e2e harness polls MinIO's health endpoint and issues the bucket-create
+# request directly, before any store exists.
+reqwest.workspace = true
+rusty-s3 = { version = "0.10", default-features = false, features = [
+    "rustcrypto",
+    "xml",
+] }
+md-5 = "0.11"
+driven-remote = { path = "../driven-remote" }
+driven-tls = { path = "../driven-tls" }
+anyhow.workspace = true
+bytes.workspace = true
+# Surfaces the store's own warn-level diagnostics in test output, so a failure
+# the trait can only report as an opaque SessionInvalid still shows the reason.
+tracing-subscriber.workspace = true
+# `keyring` 4.x wraps `keyring-core`, whose `mock` module is an IN-MEMORY
+# credential store installable as the process default. It lets the keychain
+# round trip in `S3CredentialStore` be covered by a real test rather than left
+# untestable on a headless CI box with no OS keychain. Dev-only.
+keyring-core = "1"

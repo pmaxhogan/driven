@@ -63,6 +63,19 @@ jobs:
           sudo apt-get install -y libwebkit2gtk-4.1-dev libxdo-dev libssl-dev \
             libayatana-appindicator3-dev librsvg2-dev libsoup-3.0-dev javascriptcoregtk-4.1
 
+      # The S3 backend's integration suite spawns a local MinIO and exercises the
+      # store's whole I/O surface (upload, multipart, download, listing, audit,
+      # delete). Without the binary that suite gate-skips and every one of those
+      # lines reads as uncovered - so this is what makes the destination's
+      # coverage number reflect code that is actually verified, rather than
+      # forcing the alternative of a hand-written fake S3 server that would drift
+      # from the real protocol. Mirrors the same step in ci.yml's rust-test job.
+      - name: Install MinIO (S3 backend integration tests)
+        run: |
+          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o /tmp/minio
+          sudo install -m 0755 /tmp/minio /usr/local/bin/minio
+          minio --version
+
       - uses: dtolnay/rust-toolchain@stable
         with: { components: llvm-tools-preview }
       - uses: taiki-e/install-action@v2

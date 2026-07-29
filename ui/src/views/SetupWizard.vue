@@ -5,10 +5,12 @@ import { useRouter } from "vue-router";
 
 import BackendPicker from "../components/BackendPicker.vue";
 import CredentialsWalkthrough from "../components/CredentialsWalkthrough.vue";
+import S3CredentialsForm from "../components/S3CredentialsForm.vue";
 import DriveFolderPicker from "../components/DriveFolderPicker.vue";
 import RecoveryPhraseReveal from "../components/RecoveryPhraseReveal.vue";
 import { pickFolderDialog } from "../ipc/commands";
 import { useSetupStore, WIZARD_STEPS } from "../stores/setup";
+import type { CreateS3AccountRequest } from "../ipc/types";
 
 // Setup wizard (SPEC s25 /setup; DESIGN s8.5 5-step wizard). Drives the whole
 // first-run flow as a stepper:
@@ -136,6 +138,18 @@ function onCredentialsComplete(): void {
   if (setup.step === "credentials") setup.next();
 }
 
+/**
+ * The S3 branch's "sign in": one call that validates the settings, proves the
+ * key pair reaches the bucket, stores the secret in the OS keychain and writes
+ * the account. Only on success does the wizard advance - a rejected credential
+ * leaves the user on the form with the specific reason, exactly as a failed
+ * OAuth consent does.
+ */
+async function onS3Submit(req: CreateS3AccountRequest): Promise<void> {
+  const ok = await setup.createS3Account(req);
+  if (ok && setup.step === "credentials") setup.next();
+}
+
 async function onNext(): Promise<void> {
   if (!canAdvance.value) return;
   if (setup.step === "welcome") {
@@ -245,12 +259,20 @@ function baseName(p: string): string {
       />
     </div>
 
-    <!-- Step 2: BYO credentials + sign-in -->
+    <!-- Step 2: credentials. Which form depends on the destination chosen on
+         step 1: Google Drive runs the BYO-OAuth consent flow; an S3-compatible
+         destination takes an access key pair directly. -->
     <div v-else-if="setup.step === 'credentials'" :class="CARD" class="space-y-3">
       <h2 class="text-lg font-medium text-zinc-900 dark:text-zinc-100">
-        {{ t("wizard.step2.title") }}
+        {{ setup.backendUsesOauth ? t("wizard.step2.title") : t("s3Setup.title") }}
       </h2>
-      <CredentialsWalkthrough @complete="onCredentialsComplete" />
+      <CredentialsWalkthrough v-if="setup.backendUsesOauth" @complete="onCredentialsComplete" />
+      <template v-else>
+        <S3CredentialsForm :busy="setup.busy" :error-message="errorLong" @submit="onS3Submit" />
+        <p class="text-xs text-amber-700 dark:text-amber-400">
+          {{ t("s3Setup.trashWarning") }}
+        </p>
+      </template>
     </div>
 
     <!-- Step 3: First backup source -->

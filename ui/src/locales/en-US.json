@@ -78,8 +78,35 @@
       "google_drive": {
         "name": "Google Drive",
         "description": "Back up to your Google Drive or a shared drive, using your own OAuth client."
+      },
+      "s3": {
+        "name": "S3-compatible storage",
+        "description": "Back up to Amazon S3, Cloudflare R2, MinIO, Backblaze B2 or any S3-compatible service, using an access key."
       }
     }
+  },
+  "s3Setup": {
+    "title": "Connect your S3-compatible storage",
+    "body": "Driven talks directly to your bucket with an access key you create. Nothing passes through anyone else's servers.",
+    "endpointLabel": "Endpoint",
+    "endpointPlaceholder": "https://example.r2.cloudflarestorage.com",
+    "endpointHint": "The service's S3 API address. For Amazon S3 use the regional endpoint; for Cloudflare R2 use your account's S3 endpoint.",
+    "bucketLabel": "Bucket",
+    "bucketPlaceholder": "my-backups",
+    "regionLabel": "Region",
+    "regionPlaceholder": "us-east-1",
+    "regionHint": "Leave blank unless your provider requires a specific region.",
+    "prefixLabel": "Folder inside the bucket (optional)",
+    "prefixPlaceholder": "driven/",
+    "prefixHint": "Confines Driven to one subtree, so it can share a bucket with your other data.",
+    "pathStyleLabel": "Use path-style addressing",
+    "pathStyleHint": "Required by MinIO and by Cloudflare R2's account endpoint. Turn it off only if your provider needs bucket-in-hostname URLs.",
+    "accessKeyLabel": "Access key ID",
+    "secretKeyLabel": "Secret access key",
+    "secretKeyHint": "Stored in your operating system's keychain, never in Driven's database.",
+    "connectButton": "Connect",
+    "connecting": "Checking your bucket...",
+    "trashWarning": "S3 has no trash: when Driven removes a backed-up file it is deleted permanently. Enable bucket versioning on your provider if you want to be able to recover deletions."
   },
   "drivePicker": {
     "rootName": "My Drive",

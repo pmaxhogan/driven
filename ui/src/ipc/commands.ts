@@ -17,6 +17,7 @@ import type {
   AddSourceResult,
   BackendDto,
   BackendKindId,
+  CreateS3AccountRequest,
   CustomCaValidation,
   DriveFolderListing,
   ExclusionPreview,
@@ -65,6 +66,16 @@ export function listBackends(): Promise<BackendDto[]> {
  * choose. */
 export function beginAddAccountWizard(backend?: BackendKindId): Promise<AddAccountWizardSessionId> {
   return invoke("begin_add_account_wizard", { backend: backend ?? null });
+}
+
+/** Create an account backed by an S3-compatible destination.
+ *
+ * The S3 counterpart of the whole OAuth begin/submit/signin/finish sequence:
+ * there is no consent round trip, so one call collects the settings, VERIFIES
+ * them against the live service, stores the secret in the OS keychain and
+ * writes the account row. */
+export function createS3Account(req: CreateS3AccountRequest): Promise<AccountDto> {
+  return invoke("create_s3_account", { req });
 }
 
 export function submitOauthCredentials(

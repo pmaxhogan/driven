@@ -31,6 +31,22 @@ export interface AccountDto {
   backendKind: BackendKindId;
 }
 
+/** The settings for a new S3-compatible destination (`createS3Account`).
+ *
+ * `accessKeyId` / `secretAccessKey` are IN-FLIGHT ONLY - the backend writes them
+ * to the OS keychain and persists only the rest. Nothing reads them back, which
+ * is why there is no corresponding "read the S3 config" DTO. */
+export interface CreateS3AccountRequest {
+  displayName?: string | null;
+  endpoint: string;
+  bucket: string;
+  region?: string | null;
+  pathStyle?: boolean | null;
+  prefix?: string | null;
+  accessKeyId: string;
+  secretAccessKey: string;
+}
+
 /** One selectable backup destination, as reported by `listBackends()`. Mirrors
  * the Rust `BackendDto`, which is derived from `driven_backend::descriptors()` -
  * so the picker can only ever offer destinations this build can construct. */

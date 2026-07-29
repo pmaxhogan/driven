@@ -35,6 +35,7 @@ use driven_drive::google::token_store::{
 use driven_drive::google::GoogleDriveStore;
 use driven_remote::remote_store::RemoteStore;
 use driven_remote::BackendKind;
+use driven_s3::{S3Config, S3CredentialStore, S3Credentials, S3Store};
 use driven_tls::{CustomCaConfig, ProxyConfig};
 
 /// Tracing target for the backend factory.
@@ -144,6 +145,10 @@ pub fn descriptors() -> Vec<BackendDescriptor> {
 pub fn picker_root_id(kind: BackendKind) -> &'static str {
     match kind {
         BackendKind::GoogleDrive => "root",
+        // An S3 "folder" is a key prefix; the destination root is the bucket
+        // root (or the configured prefix, which the store applies itself), so
+        // the empty prefix is the right starting point.
+        BackendKind::S3 => "",
     }
 }
 
@@ -161,6 +166,67 @@ pub fn build_store(
 ) -> anyhow::Result<StoreOutcome> {
     match account.kind {
         BackendKind::GoogleDrive => build_google_drive(&account.account_id, ctx),
+        BackendKind::S3 => build_s3(account, ctx),
+    }
+}
+
+/// The S3 arm: persisted non-secret config + keychain access key pair ->
+/// `S3Store`.
+fn build_s3(account: &AccountBackend, ctx: BackendContext<'_>) -> anyhow::Result<StoreOutcome> {
+    let json = account.config_json.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("s3.config_invalid: the account has no stored S3 backend configuration")
+    })?;
+    let config = S3Config::from_json(json)?;
+    let Some(creds) = S3CredentialStore::new(account.account_id.clone()).load()? else {
+        tracing::warn!(
+            target: TARGET,
+            account_id = %account.account_id,
+            "no stored S3 credentials; account needs reauth (NOT falling back to a fake store)"
+        );
+        return Ok(StoreOutcome::NeedsReauth);
+    };
+    let store = S3Store::new(&config, &creds, ctx.ca, ctx.proxy)?;
+    tracing::info!(
+        target: TARGET,
+        account_id = %account.account_id,
+        // Endpoint and bucket are NOT secrets and are what an operator needs to
+        // debug a misconfigured destination. The key pair is never logged.
+        bucket = %config.bucket,
+        endpoint = %config.endpoint,
+        "built real S3Store (keyring access key)"
+    );
+    Ok(StoreOutcome::Store(Arc::new(store)))
+}
+
+/// Persist an account's S3 destination: validate + normalize the non-secret
+/// config into the blob for `accounts.backend_config_json`, and put the access
+/// key pair in the OS keychain.
+///
+/// Returns the config JSON for the caller to store on the account row. The
+/// credentials are NOT returned and never reach the caller's storage.
+pub fn store_s3_credentials(
+    account_id: &str,
+    config: S3Config,
+    creds: &S3Credentials,
+) -> anyhow::Result<String> {
+    let config = config.normalized()?;
+    S3CredentialStore::new(account_id.to_string()).store(creds)?;
+    config.to_json()
+}
+
+/// Remove every keychain secret an account's backend owns.
+///
+/// Called on account removal. Idempotent per backend, and deliberately a
+/// `match` on the kind so a new backend cannot be added without deciding what
+/// its removal purges - a forgotten arm would leave a live credential in the
+/// user's keychain after they deleted the account.
+pub fn purge_account_secrets(account: &AccountBackend) -> anyhow::Result<()> {
+    match account.kind {
+        // The Drive refresh token + BYO client creds are purged by the accounts
+        // command layer's own secret seam (which predates this factory and is
+        // covered by its tests); nothing extra to do here.
+        BackendKind::GoogleDrive => Ok(()),
+        BackendKind::S3 => S3CredentialStore::new(account.account_id.clone()).delete(),
     }
 }
 
@@ -294,20 +360,59 @@ mod tests {
 
     /// Install `keyring-core`'s IN-MEMORY store as the process default, so the
     /// keychain-backed paths run for real without touching (or requiring) an OS
-    /// keychain. The default store is process-global, so every test that uses it
-    /// serializes on this lock and keys its entries by a unique account id.
-    fn keychain() -> std::sync::MutexGuard<'static, ()> {
+    /// keychain.
+    ///
+    /// Returns `None` when the mock could not be made the EFFECTIVE store, in
+    /// which case the caller MUST skip - the alternative is writing test
+    /// secrets into the developer's real login keychain, which on macOS also
+    /// blocks the run on a modal permission prompt.
+    ///
+    /// ## Ordering is load-bearing
+    ///
+    /// `keyring` 4.x's `Entry::new` installs the PLATFORM-NATIVE store on its
+    /// FIRST call, overwriting whatever default is already set (see
+    /// `keyring-4.1.5/src/v1.rs`, the `SET_CREDENTIAL_STORE` latch). Installing
+    /// the mock first is therefore silently undone by the first real `Entry`,
+    /// and every "mock" write lands in the OS keychain instead. So this burns
+    /// that latch first with a throwaway `Entry` (constructing one performs no
+    /// credential I/O), THEN installs the mock, and finally PROVES the mock is
+    /// in effect with a sentinel round trip before any test stores a secret.
+    fn keychain() -> Option<std::sync::MutexGuard<'static, ()>> {
         static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        static INSTALLED: OnceLock<()> = OnceLock::new();
+        static ACTIVE: OnceLock<bool> = OnceLock::new();
         let guard = LOCK
             .get_or_init(|| Mutex::new(()))
             .lock()
             .unwrap_or_else(|e| e.into_inner());
-        INSTALLED.get_or_init(|| {
-            let store = keyring_core::mock::Store::new().expect("in-memory keyring store");
-            keyring_core::set_default_store(store);
+        let active = *ACTIVE.get_or_init(|| {
+            // 1. Burn keyring's one-shot platform-store latch. Its error on a
+            //    headless box (no secret service) is expected and ignored.
+            let _ = keyring::Entry::new("driven.test.keyring-latch", "latch");
+            // 2. Now the mock sticks.
+            match keyring_core::mock::Store::new() {
+                Ok(store) => keyring_core::set_default_store(store),
+                Err(_) => return false,
+            }
+            // 3. Prove it, through the same `keyring` facade production uses.
+            let sentinel = match keyring::Entry::new("driven.test.sentinel", "probe") {
+                Ok(e) => e,
+                Err(_) => return false,
+            };
+            if sentinel.set_password("mock-is-active").is_err() {
+                return false;
+            }
+            let ok = sentinel.get_password().ok().as_deref() == Some("mock-is-active");
+            let _ = sentinel.delete_credential();
+            ok
         });
-        guard
+        if !active {
+            eprintln!(
+                "skipping the keychain test: the in-memory keyring store is not the effective \
+                 default, and this test will not write to a real OS keychain"
+            );
+            return None;
+        }
+        Some(guard)
     }
 
     /// Env vars are process-global too; `env_oauth_creds` reads them, so the
@@ -344,6 +449,87 @@ mod tests {
     #[test]
     fn picker_root_is_the_drive_root_alias() {
         assert_eq!(picker_root_id(BackendKind::GoogleDrive), "root");
+        assert_eq!(picker_root_id(BackendKind::S3), "");
+    }
+
+    #[test]
+    fn an_s3_account_without_config_is_an_error_not_a_needs_reauth() {
+        // A missing CONFIG is a bug (the account row was written wrong); a
+        // missing CREDENTIAL is a reauth. Conflating them would send the user
+        // round the credential prompt forever on a malformed row.
+        let account = AccountBackend {
+            account_id: "acct-s3".to_string(),
+            kind: BackendKind::S3,
+            config_json: None,
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        // `StoreOutcome` holds a `dyn RemoteStore`, which has no `Debug`, so
+        // unwrap the Result by hand rather than via `expect_err`.
+        let err = match build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            },
+        ) {
+            Ok(_) => panic!("a missing S3 config must be an error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("s3.config_invalid"), "{err}");
+    }
+
+    #[test]
+    fn an_invalid_s3_config_blob_is_rejected_before_any_keychain_read() {
+        let account = AccountBackend {
+            account_id: "acct-s3".to_string(),
+            kind: BackendKind::S3,
+            config_json: Some(r#"{"endpoint":"not a url","bucket":"b"}"#.to_string()),
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        assert!(build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn a_persisted_s3_config_blob_carries_no_credential_material() {
+        // The blob is what lands in SQLite and the diagnostic bundle.
+        let config = S3Config {
+            endpoint: "https://example.com/".to_string(),
+            bucket: "bkt".to_string(),
+            region: String::new(),
+            path_style: true,
+            prefix: Some("/backups/".to_string()),
+        };
+        let blob = config.normalized().expect("valid").to_json().expect("json");
+        assert!(!blob.to_lowercase().contains("secret"));
+        assert!(!blob.contains("AKIA"));
+        assert!(blob.contains("backups/"));
+    }
+
+    #[test]
+    fn store_s3_credentials_validates_before_touching_the_keychain() {
+        // A bad config must not leave a stored credential behind for an account
+        // that could never work.
+        let creds = S3Credentials {
+            access_key_id: "AKIAEXAMPLE".to_string(),
+            secret_access_key: "super-secret".to_string(),
+        };
+        let bad = S3Config {
+            endpoint: String::new(),
+            bucket: "bkt".to_string(),
+            region: String::new(),
+            path_style: true,
+            prefix: None,
+        };
+        assert!(store_s3_credentials("acct-never-created", bad, &creds).is_err());
     }
 
     fn ctx<'a>(ca: &'a CustomCaConfig, proxy: &'a ProxyConfig) -> BackendContext<'a> {
@@ -452,7 +638,7 @@ mod tests {
         // The end-to-end factory path over a real (in-memory) keychain: an
         // account whose refresh token was never stored - or was revoked and
         // deleted - must come back as NeedsReauth.
-        let _g = keychain();
+        let Some(_g) = keychain() else { return };
         let ca = CustomCaConfig::none();
         let proxy = ProxyConfig::system();
         let account = AccountBackend::google_drive("acct-no-token");
@@ -463,7 +649,7 @@ mod tests {
 
     #[test]
     fn build_store_returns_a_drive_store_once_a_refresh_token_is_stored() {
-        let _g = keychain();
+        let Some(_g) = keychain() else { return };
         let account_id = "acct-with-token";
         driven_drive::google::token_store::KeyringTokenStore::new(account_id.to_string())
             .store_refresh_token("a-refresh-token")
@@ -479,7 +665,7 @@ mod tests {
     #[test]
     fn account_creds_prefer_the_keychain_record_and_fall_back_to_the_env_seam() {
         use driven_drive::google::token_store::{ClientCreds, ClientCredsStore};
-        let _g = keychain();
+        let Some(_g) = keychain() else { return };
         set_env_client(Some("env-id"), Some("env-secret"));
 
         // No stored record: the env seam supplies the client.

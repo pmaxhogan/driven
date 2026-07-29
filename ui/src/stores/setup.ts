@@ -10,6 +10,7 @@ import type {
   AddSourceRequest,
   BackendDto,
   BackendKindId,
+  CreateS3AccountRequest,
   OAuthStatus,
   SessionId,
 } from "../ipc/types";
@@ -166,6 +167,32 @@ export const useSetupStore = defineStore("setup", () => {
 
   async function begin(): Promise<void> {
     session.value = await ipc.beginAddAccountWizard(backendId.value);
+  }
+
+  /**
+   * Create an S3-backed account from the credentials step's form (the non-OAuth
+   * branch). One call: the backend validates the settings, PROVES the key pair
+   * can reach the bucket, stores the secret in the OS keychain, writes the
+   * account row and hot-spawns its orchestrator - so on success the wizard is in
+   * exactly the state the OAuth path reaches after `finish`.
+   */
+  async function createS3Account(req: CreateS3AccountRequest): Promise<boolean> {
+    busy.value = true;
+    errorCode.value = null;
+    try {
+      const account = await ipc.createS3Account(req);
+      accountId.value = account.id;
+      accountEmail.value = account.email;
+      // The source step gates on a chosen destination; an S3 account has no
+      // consent round trip, so mark the sign-in resolved here.
+      oauthStatus.value = { kind: "complete" };
+      return true;
+    } catch (e) {
+      errorCode.value = toErrorCode(e);
+      return false;
+    } finally {
+      busy.value = false;
+    }
   }
 
   async function submitCredentials(clientId: string, clientSecret: string): Promise<void> {
@@ -468,6 +495,7 @@ export const useSetupStore = defineStore("setup", () => {
     backendUsesOauth,
     loadBackends,
     selectBackend,
+    createS3Account,
     accountId,
     accountEmail,
     localPath,
