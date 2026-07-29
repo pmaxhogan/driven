@@ -97,7 +97,12 @@ const canAdvance = computed(() => {
       // but also allow Next once signed in.
       return setup.signedIn;
     case "source":
-      return !!setup.localPathToken && !!setup.driveFolderId;
+      // `destinationSelected` (store-owned) rather than `!!setup.driveFolderId`:
+      // the empty string is a REAL destination (an S3 bucket root), and
+      // truthiness rejected it - which is what left Next permanently disabled for
+      // an S3 account. The predicate lives in the store so this view and
+      // `createFirstSource` cannot drift apart again.
+      return !!setup.localPathToken && setup.destinationSelected;
     case "encryption":
       return !setup.busy;
     case "confirm":
@@ -343,12 +348,17 @@ function baseName(p: string): string {
         <span class="block text-sm font-medium text-zinc-700 dark:text-zinc-200">{{
           t("wizard.step3.driveDestinationLabel")
         }}</span>
+        <!-- Only destinations that can enumerate a folder tree get a picker.
+             Drive browses folders and S3 browses key prefixes, so both do; a
+             local or removable folder does not - its root was already chosen when
+             the account was created, and there is nothing below it to choose. -->
         <DriveFolderPicker
           v-if="setup.backendSupportsFolderPicker"
           v-model:folder-id="setup.driveFolderId"
           v-model:folder-path="setup.driveFolderPath"
           v-model:drive-id="setup.driveId"
           :account-id="setup.accountId"
+          :backend-kind="setup.backendId"
           @error="onDrivePickerError"
         />
         <!-- A destination with no browsable tree (a local or removable folder):

@@ -143,13 +143,36 @@ export const useSetupStore = defineStore("setup", () => {
    * so the wizard never briefly hides the credentials step it is about to need. */
   const backendUsesOauth = computed(() => selectedBackend.value?.usesOauth ?? true);
 
-  /** Whether the selected destination has a browsable remote tree for the source
-   * step's destination picker. Defaults to `true` (the Drive behaviour) until the
-   * descriptors load. A local folder does NOT: the destination root was already
-   * chosen with the OS folder dialog, and browsing below it would only offer the
-   * user a way to nest one backup inside another. */
+  /** Whether the selected destination has a browsable remote tree, i.e. whether
+   * the source step should offer a destination picker at all. Defaults to `true`
+   * (the Drive behaviour) until the descriptors load, so the step never briefly
+   * hides the picker it is about to need.
+   *
+   * A local folder does NOT: its destination root was already chosen with the OS
+   * folder dialog, and browsing below it would only offer the user a way to nest
+   * one backup inside another.
+   *
+   * This - NOT `backendUsesOauth` - is the seam that decides whether a picker
+   * renders. Both are false for a local folder, which is why conflating them is
+   * tempting and wrong: S3 does not use OAuth but DOES browse (its "folders" are
+   * key prefixes), so gating the picker on OAuth would silently delete per-source
+   * prefix selection from the S3 destination. */
   const backendSupportsFolderPicker = computed(
     () => selectedBackend.value?.supportsFolderPicker ?? true
+  );
+
+  /** Whether the source step has a destination to save.
+   *
+   * The predicate is `!== null`, NEVER truthiness: the EMPTY STRING is a real,
+   * selectable destination id - it is the root of any backend whose root is the
+   * empty prefix (an S3 bucket root). `!!driveFolderId` treated that legitimate
+   * selection as "nothing picked", so an S3 account's Next button stayed disabled
+   * forever and first-run setup could not be completed at all.
+   *
+   * A destination with no browsable tree has nothing to pick on this step - its
+   * destination was fixed when the account was created - so it is satisfied. */
+  const destinationSelected = computed(
+    () => !backendSupportsFolderPicker.value || driveFolderId.value !== null
   );
 
   /** Load the destinations this build can construct. Idempotent and safe to call
@@ -389,7 +412,8 @@ export const useSetupStore = defineStore("setup", () => {
    * the Sources tab renders. The encryption flag rides along; the backend
    * returns the recovery phrase out-of-band on opt-in (surfaced in step 4 via
    * RecoveryPhraseReveal). Requires a chosen account + dialog-derived local
-   * path + a picked Drive destination.
+   * path + a destination that is valid for the account's backend
+   * (`destinationSelected`).
    */
   async function createFirstSource(): Promise<void> {
     // R1-P2-3: idempotent. The one-shot folder dialog token is CONSUMED by the
@@ -406,8 +430,11 @@ export const useSetupStore = defineStore("setup", () => {
       const acct = accountId.value;
       const local = localPath.value;
       const token = localPathToken.value;
-      const drive = driveFolderId.value;
-      if (!acct || !local || !token || !drive) {
+      // Truthiness is WRONG for the destination id: "" is the bucket root of an
+      // S3-shaped destination, a real selection. Gate on the shared
+      // `destinationSelected` predicate so this and the view's Next button can
+      // never disagree about what "picked a destination" means.
+      if (!acct || !local || !token || !destinationSelected.value) {
         throw new Error("source step is incomplete");
       }
       const req: AddSourceRequest = {
@@ -415,7 +442,9 @@ export const useSetupStore = defineStore("setup", () => {
         displayName: sourceDisplayName.value || driveFolderPath.value || local,
         localPathToken: token,
         localPath: local,
-        driveFolderId: drive,
+        // A destination with no browsable tree contributed no id; its root is the
+        // empty one, which is exactly what the backend accepts for it.
+        driveFolderId: driveFolderId.value ?? "",
         driveId: driveId.value,
         driveFolderPath: driveFolderPath.value,
         encryptionEnabled: encryptionEnabled.value,
@@ -564,6 +593,7 @@ export const useSetupStore = defineStore("setup", () => {
     localFolderRoot,
     backendUsesOauth,
     backendSupportsFolderPicker,
+    destinationSelected,
     loadBackends,
     selectBackend,
     createS3Account,

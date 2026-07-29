@@ -38,9 +38,9 @@ const SHARED_LISTING: DriveFolderListing = {
   folders: [{ id: "sub-1", name: "Sub", driveId: "0ATeamA", isSharedDrive: false }],
 };
 
-function mountPicker() {
+function mountPicker(backendKind?: string) {
   return mount(DriveFolderPicker, {
-    props: { accountId: ACCOUNT },
+    props: { accountId: ACCOUNT, backendKind },
     global: { plugins: [i18n] },
   });
 }
@@ -107,5 +107,67 @@ describe("DriveFolderPicker Shared Drive support (issue #7)", () => {
     const items = wrapper.findAll("li");
     expect(items).toHaveLength(1);
     expect(items[0].text()).toContain("Sub");
+  });
+});
+
+describe("DriveFolderPicker root label is per-destination", () => {
+  beforeEach(() => {
+    invokeMock.mockReset();
+    invokeMock.mockResolvedValue({
+      currentFolderId: "root",
+      driveId: null,
+      currentFolderPath: "",
+      folders: [],
+    });
+  });
+
+  /** The root breadcrumb button plus the "Backing up to" line, which both name
+   * the destination root. */
+  function rootLabels(wrapper: ReturnType<typeof mountPicker>): string[] {
+    return [
+      wrapper.findAll("nav button")[0].text(),
+      wrapper.get('[data-testid="drive-destination"]').text(),
+    ];
+  }
+
+  it("names Drive's root My Drive", async () => {
+    const wrapper = mountPicker("google_drive");
+    await flushPromises();
+    for (const label of rootLabels(wrapper)) {
+      expect(label).toContain(i18n.global.t("drivePicker.root.google_drive"));
+    }
+  });
+
+  it("names an S3 destination's root the bucket root, not My Drive", async () => {
+    // The picker is shared by every browsable destination, so a hard-coded
+    // "My Drive" was simply wrong for an S3 account sitting on its bucket root -
+    // which is exactly what the maintainer saw in the running app.
+    const wrapper = mountPicker("s3");
+    await flushPromises();
+    for (const label of rootLabels(wrapper)) {
+      expect(label).toContain(i18n.global.t("drivePicker.root.s3"));
+      expect(label).not.toContain("My Drive");
+    }
+  });
+
+  it("falls back to a neutral root label for an unseeded backend", async () => {
+    // `BackendKind::ALL` is Rust-owned and can gain a destination before the
+    // locale file does; that must render neutrally, never as a Drive-ism and
+    // never as a raw key.
+    const wrapper = mountPicker("some_future_backend");
+    await flushPromises();
+    for (const label of rootLabels(wrapper)) {
+      expect(label).toContain(i18n.global.t("drivePicker.rootName"));
+      expect(label).not.toContain("My Drive");
+      expect(label).not.toContain("drivePicker");
+    }
+  });
+
+  it("falls back to the neutral label when no backend kind is given at all", async () => {
+    const wrapper = mountPicker();
+    await flushPromises();
+    expect(wrapper.findAll("nav button")[0].text()).toContain(
+      i18n.global.t("drivePicker.rootName")
+    );
   });
 });

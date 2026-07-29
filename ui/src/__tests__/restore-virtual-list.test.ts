@@ -76,6 +76,21 @@ beforeEach(() => {
     switch (cmd) {
       case "list_sources":
         return Promise.resolve([source("s1", "Documents")]);
+      case "list_accounts":
+        // The view resolves each source's DESTINATION backend from the accounts
+        // list to state that destination's real version-retention behaviour.
+        return Promise.resolve([
+          {
+            id: "acct-1",
+            email: "user@example.com",
+            displayName: null,
+            state: "ok",
+            encryptionEnabled: false,
+            createdAt: 0,
+            lastSyncedAt: null,
+            backendKind: "s3",
+          },
+        ]);
       case "list_remote_tree":
         return Promise.resolve({ entries: bigFolder(FILE_COUNT), truncated: false });
       case "get_restore_job":
@@ -121,12 +136,15 @@ describe("Restore virtualization + sticky action bar (UI #47)", () => {
     // Default: latest (no point-in-time), so the active notice is hidden.
     expect(wrapper.find('[data-testid="restore-as-of-note"]').exists()).toBe(false);
 
-    // Setting a datetime activates point-in-time and shows the TTL notice.
+    // Setting a datetime activates point-in-time and shows the retention notice
+    // for THIS source's destination - an S3 account here, which keeps no older
+    // versions, so it must NOT be told about Drive's 30-day trash.
     await asOf.setValue("2026-01-02T03:04");
     await asOf.trigger("change");
     await flushPromises();
     const note = wrapper.get('[data-testid="restore-as-of-note"]');
-    expect(note.text()).toContain(i18n.global.t("restore.asOf.ttlHint"));
+    expect(note.text()).toContain(i18n.global.t("versionRetention.s3"));
+    expect(note.text()).not.toContain("trash");
 
     // Clearing returns to latest and hides the notice.
     await wrapper.get('[data-testid="restore-as-of-clear"]').trigger("click");

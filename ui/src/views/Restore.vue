@@ -3,6 +3,7 @@ import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from "vu
 import { useI18n } from "vue-i18n";
 
 import { useVirtualList } from "../composables/useVirtualList";
+import { useAccountsStore } from "../stores/accounts";
 import { useRestoreStore } from "../stores/restore";
 
 // Restore browser (SPEC s11.5; DESIGN s8.4). Browse the backed-up tree (lazy
@@ -14,8 +15,12 @@ import { useRestoreStore } from "../stores/restore";
 // plaintext path). Every user-facing string flows through t() (DESIGN s8.7).
 const props = defineProps<{ sourceId?: string }>();
 
-const { t, locale } = useI18n();
+const { t, te, locale } = useI18n();
 const restore = useRestoreStore();
+// Needed only to learn which BACKEND the browsed source backs up to, so the
+// point-in-time note can state that destination's real retention behaviour
+// instead of Drive's (see `retentionNote`).
+const accounts = useAccountsStore();
 
 // Design-system class strings (DRIVEN UI). Defined once so every control in this
 // view stays visually consistent with the rest of the app: teal accent for
@@ -53,6 +58,16 @@ function onClearAsOf(): void {
   asOfInput.value = "";
   restore.setAsOf(null);
 }
+
+/** The retention caveat for the BROWSED source's destination. Unknown / not-yet
+ * loaded resolves to the neutral `default` rather than asserting Drive's
+ * behaviour, which is what the old single hard-coded hint did. */
+const retentionNote = computed<string>(() => {
+  const source = restore.sources.find((s) => s.id === restore.sourceId);
+  const kind = accounts.accounts.find((a) => a.id === source?.accountId)?.backendKind;
+  const key = `versionRetention.${kind}`;
+  return kind !== undefined && te(key) ? t(key) : t("versionRetention.default");
+});
 
 // Locale-aware byte formatting (DESIGN s8.7: never a hand-rolled formatter).
 const BYTE_UNITS = ["B", "KB", "MB", "GB", "TB", "PB"] as const;
@@ -93,7 +108,10 @@ const visibleRows = computed(() =>
 
 onMounted(async () => {
   await restore.subscribeProgress();
-  await restore.loadSources();
+  // The accounts list is only needed to name each source's destination backend
+  // for the retention note; a failure there must never block browsing, so it is
+  // fired alongside (the store swallows its own error into `accounts.error`).
+  await Promise.all([restore.loadSources(), accounts.refresh()]);
   // A scoped route (/restore/:sourceId) browses that source directly.
   if (props.sourceId) {
     await restore.selectSource(props.sourceId);
@@ -412,15 +430,17 @@ async function onClearSearch(): Promise<void> {
       </button>
     </div>
 
-    <!-- Issue #36: active point-in-time notice + the ~30-day trash-retention
-         caveat (older versions live in Drive's trash, which Drive purges). -->
+    <!-- Issue #36: active point-in-time notice + this DESTINATION's retention
+         caveat. The caveat is per-backend because the behaviour is: Drive keeps a
+         superseded object in its trash for ~30 days, while an S3 or local-folder
+         destination overwrites the previous copy and keeps nothing. -->
     <p
       v-if="restore.asOf !== null"
       data-testid="restore-as-of-note"
       class="rounded-lg border border-teal-300 bg-teal-50 px-3 py-2 text-sm text-teal-800 dark:border-teal-800 dark:bg-teal-950 dark:text-teal-300"
     >
       {{ t("restore.asOf.active", { date: new Date(restore.asOf).toLocaleString(locale) }) }}
-      {{ t("restore.asOf.ttlHint") }}
+      {{ retentionNote }}
     </p>
 
     <!-- Live restore progress -->

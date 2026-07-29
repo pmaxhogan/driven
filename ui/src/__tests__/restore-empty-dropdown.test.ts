@@ -61,6 +61,9 @@ function installInvoke(sources: SourceDto[]): void {
   };
   invokeMock.mockImplementation((cmd: string) => {
     switch (cmd) {
+      case "list_accounts":
+        // Resolved for the destination-specific version-retention note.
+        return Promise.resolve([]);
       case "list_sources":
         return Promise.resolve(sources);
       case "list_remote_tree":
