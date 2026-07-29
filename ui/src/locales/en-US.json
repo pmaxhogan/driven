@@ -70,6 +70,17 @@
     "no": "No",
     "none": "None"
   },
+  "backendPicker": {
+    "legend": "Where should Driven back up to?",
+    "help": "Pick the storage service for this account. You can add more accounts later, each with its own destination.",
+    "empty": "No backup destinations are available in this build.",
+    "kind": {
+      "google_drive": {
+        "name": "Google Drive",
+        "description": "Back up to your Google Drive or a shared drive, using your own OAuth client."
+      }
+    }
+  },
   "drivePicker": {
     "rootName": "My Drive",
     "destinationLabel": "Backing up to",

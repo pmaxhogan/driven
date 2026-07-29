@@ -28,6 +28,11 @@ use crate::types::{
 pub mod sqlite;
 pub use sqlite::SqliteStateRepo;
 
+/// Which backup destination an account targets, re-exported beside the
+/// [`AccountRow`] that carries it so callers need no `driven-remote` import to
+/// name the field's type.
+pub use driven_remote::BackendKind;
+
 // -----------------------------------------------------------------------------
 // Row types - mirror SPEC s2 column shapes.
 // -----------------------------------------------------------------------------
@@ -50,6 +55,15 @@ pub struct AccountRow {
     pub created_at: UnixMs,
     /// `accounts.last_synced_at` (NULL until first successful sync).
     pub last_synced_at: Option<UnixMs>,
+    /// `accounts.backend_kind` - which backup destination this account targets
+    /// (migration `0013`). Every pre-migration row stores NULL and decodes to
+    /// [`BackendKind::GoogleDrive`], so existing accounts are unchanged.
+    pub backend_kind: BackendKind,
+    /// `accounts.backend_config_json` - the destination's NON-SECRET settings
+    /// as a JSON blob (migration `0013`). `None` for Google Drive, which needs
+    /// none. Credentials never live here: every backend's secret is in the OS
+    /// keychain keyed by the account id, exactly as the Drive refresh token is.
+    pub backend_config_json: Option<String>,
 }
 
 /// Per-source policy for OneDrive / cloud-only placeholder files (issue #4,

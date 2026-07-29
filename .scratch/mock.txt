@@ -1,0 +1,32 @@
+17-//! ## Testability note (keyring 4.1.2 / keyring-core 1.0.0)
+18-//!
+19-//! The workspace resolves `keyring = "4"` to 4.1.2, which is the
+20-//! `keyring-core` 1.0.0 re-architecture. The brief's
+21://! `set_default_credential_builder(mock)` recipe is the keyring 2.x/3.x API
+22://! and does NOT exist in 4.1.2; the 4.1.2 mock store lives in
+23://! `keyring_core::mock`, which is NOT a declared dependency of `driven-drive`
+24-//! (and `keyring` does not re-export it), and Cargo.toml is frozen for this
+25-//! phase. So the keychain ROUND-TRIP itself (keyring's own tested job) is not
+26-//! re-tested here; instead the keyring-result -> domain mapping that IS
+27-//! Driven's responsibility is extracted into pure free fns
+28-//! ([`map_load_result`], [`map_delete_result`]) and unit-tested in-process
+29-//! with constructed `keyring::Error` values - a real, non-skipped test that
+30-//! needs no OS keychain (and would otherwise be flaky on headless CI where no
+31-//! default store initialises). Production uses `keyring::Entry` exactly like
+32-//! `driven-crypto::keystore`.
+33-
+34-use std::sync::Arc;
+35-use std::time::Duration;
+36-
+37-use driven_tls::{CustomCaConfig, ProxyConfig};
+38-use keyring::Entry;
+39-use serde::Deserialize;
+40-use tokio::sync::Mutex;
+41-use tracing::warn;
+42-
+43-use super::oauth::Tokens;
+44-
+45-/// Tracing target for the token store / refresh path.
+46-const TARGET: &str = "driven::drive::token";
+47-
+48-/// keyring "service" namespace for Driven Google refresh tokens (SPEC s4.1).

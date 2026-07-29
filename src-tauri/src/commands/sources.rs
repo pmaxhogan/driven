@@ -24,14 +24,14 @@ use std::sync::Arc;
 use tauri::State;
 
 use driven_core::exclude::{build_source_matcher, validate_patterns};
-use driven_core::state::{AccountRow, PlaceholderPolicy, SourceRow, StateRepo, VersioningConfig};
+use driven_core::state::{
+    AccountRow, BackendKind, PlaceholderPolicy, SourceRow, StateRepo, VersioningConfig,
+};
 use driven_core::time::{Clock, SystemClock};
 use driven_core::types::{AccountId, ErrorCode, SourceId};
 
 use driven_crypto::{master_key_to_phrase, Keystore, MasterKey};
 
-use driven_drive::google::token_store::{KeyringTokenStore, RefreshingTokenSource};
-use driven_drive::google::GoogleDriveStore;
 use driven_drive::remote_store::{DriveContext, RemoteStore};
 use driven_drive::{CustomCaConfig, ProxyConfig};
 
@@ -728,8 +728,9 @@ pub async fn pick_drive_folder(
     start_folder_id: Option<String>,
     drive_id: Option<String>,
 ) -> CommandResult<DriveFolderListing> {
-    // The account must exist (so a stale webview id surfaces an error).
-    let _ = find_account(state.state().as_ref(), account_id).await?;
+    // The account must exist (so a stale webview id surfaces an error). Its row
+    // also carries the CONFIGURED destination the picker must browse.
+    let account = find_account(state.state().as_ref(), account_id).await?;
 
     // R1-P1-3: honour the run's remote mode. In FAKE mode (dev / e2e /
     // fake-remote wizard acceptance) we MUST NOT build a real Google store or
@@ -746,7 +747,7 @@ pub async fn pick_drive_folder(
     // Issue #34: resolve the proxy too (fail-closed - a configured-but-broken
     // proxy blocks the picker rather than connecting direct).
     let proxy = crate::commands::settings::load_proxy_config(state.state().as_ref()).await?;
-    let (store, default_folder_id) = select_picker_store(state.inner(), account_id, &ca, &proxy)?;
+    let (store, default_folder_id) = select_picker_store(state.inner(), &account, &ca, &proxy)?;
 
     // Issue #7: the drive context for this listing. `None`/"my-drive" is My
     // Drive; any other value is the Shared Drive being browsed. The webview
@@ -1527,37 +1528,38 @@ async fn reconfigure_account(state: &State<'_, AppState>, account_id: AccountId)
     tracing::debug!(target: TARGET, account_id = %account_id, "orchestrator reconfigured after source change");
 }
 
-/// Build a [`RemoteStore`] for `account_id` to DOWNLOAD from on restore (M8).
+/// Build a [`RemoteStore`] for `account` to DOWNLOAD from on restore (M8).
 ///
 /// The mode-aware store is exactly the one the picker / uploader use (via
 /// [`select_picker_store`]). In fake mode it is the account's SHARED
 /// [`InMemoryRemoteStore`] so restore reads the same objects the orchestrator
-/// uploaded; in real mode it is a live `GoogleDriveStore` from the account's
-/// keychain refresh token. Restore only needs the store handle (it downloads by
-/// the Drive file id carried in `file_state`), so the root id the picker also
-/// returns is dropped.
+/// uploaded; in real mode it is the `driven-backend` factory's store for the
+/// account's configured destination. Restore only needs the store handle (it
+/// downloads by the remote object id carried in `file_state`), so the root id
+/// the picker also returns is dropped.
 pub(crate) fn build_restore_store(
     state: &AppState,
-    account_id: AccountId,
+    account: &AccountRow,
     ca: &CustomCaConfig,
     proxy: &ProxyConfig,
 ) -> CommandResult<Arc<dyn RemoteStore>> {
-    select_picker_store(state, account_id, ca, proxy).map(|(store, _root)| store)
+    select_picker_store(state, account, ca, proxy).map(|(store, _root)| store)
 }
 
-/// R1-P1-3 / R2-P1-2: select the Drive-folder-picker store + its root id.
+/// R1-P1-3 / R2-P1-2: select the destination-picker store + its root id.
 ///
 /// - [`RemoteMode::Fake`] (dev / e2e / fake-remote wizard acceptance): return
 ///   the account's SHARED [`InMemoryRemoteStore`] from [`AppState`] (R2-P1-2),
 ///   NOT a throwaway instance - so a folder id this picker mints is visible to
 ///   the orchestrator's uploader, which holds the SAME shared store. NO real
-///   Google store is built and NO keychain creds are read - the fake-remote
-///   wizard completes end-to-end without real credentials.
-/// - [`RemoteMode::RealGoogleDrive`]: build the live [`GoogleDriveStore`] from
-///   the account's keychain refresh token and use Drive's `"root"` alias.
+///   store is built and NO keychain creds are read - the fake-remote wizard
+///   completes end-to-end without real credentials.
+/// - [`RemoteMode::RealGoogleDrive`]: build the account's CONFIGURED backend via
+///   the `driven-backend` factory and use that backend's picker root id (Drive's
+///   `"root"` alias).
 fn select_picker_store(
     state: &AppState,
-    account_id: AccountId,
+    account: &AccountRow,
     ca: &CustomCaConfig,
     proxy: &ProxyConfig,
 ) -> CommandResult<(Arc<dyn RemoteStore>, String)> {
@@ -1567,57 +1569,52 @@ fn select_picker_store(
             // into (the picker and the uploader must agree on folder ids). The
             // fake never builds an HTTP client, so `ca`/`proxy` are unused here.
             let _ = (ca, proxy);
-            let fake = state.fake_remote_store(account_id);
+            let fake = state.fake_remote_store(account.id);
             let root = fake.root_id().to_string();
             Ok((Arc::new(fake), root))
         }
         RemoteMode::RealGoogleDrive => Ok((
-            build_account_store(account_id, ca, proxy)?,
-            "root".to_string(),
+            build_account_store(
+                account.id,
+                account.backend_kind,
+                account.backend_config_json.clone(),
+                ca,
+                proxy,
+            )?,
+            driven_backend::picker_root_id(account.backend_kind).to_string(),
         )),
     }
 }
 
-/// Build a one-off real [`GoogleDriveStore`] for `account_id` from its keychain
-/// refresh token (the assembly `build_remote` pattern), for the Drive-folder
-/// picker. An account with no stored refresh token surfaces `auth.invalid_grant`
-/// (it needs re-consent before its Drive can be listed).
+/// Build a one-off real store for `account_id`'s CONFIGURED destination, for the
+/// folder picker and the restore path.
+///
+/// Delegates to the `driven-backend` factory, so the picker browses (and restore
+/// downloads from) exactly the destination the orchestrator uploads to - the
+/// three used to hand-roll the same construction chain independently. An account
+/// with no stored credential surfaces `auth.invalid_grant` (it needs re-consent
+/// before its destination can be listed).
 fn build_account_store(
     account_id: AccountId,
+    backend: BackendKind,
+    backend_config_json: Option<String>,
     ca: &CustomCaConfig,
     proxy: &ProxyConfig,
 ) -> CommandResult<Arc<dyn RemoteStore>> {
-    let token_store = Arc::new(KeyringTokenStore::new(account_id.to_string()));
-    let refresh_token = token_store
-        .load_refresh_token()
-        .map_err(|e| {
-            CommandError::with_code(
-                ErrorCode::CryptoKeyMissing,
-                format!("failed to read refresh token from keychain: {e}"),
-            )
-        })?
-        .ok_or_else(|| {
-            CommandError::with_code(
-                ErrorCode::AuthInvalidGrant,
-                "account has no stored credentials; re-authenticate before picking a Drive folder",
-            )
-        })?;
-
-    // A1: use the account's persisted BYO client creds (the client that minted
-    // this refresh token), falling back to env/default only if none stored.
-    let (client_id, client_secret) = crate::assembly::resolve_account_oauth_creds(account_id);
-    let token_source = RefreshingTokenSource::from_stored_refresh_token(
-        refresh_token,
-        client_id,
-        client_secret,
-        ca,
-        proxy,
-    )
-    .map_err(CommandError::from)?
-    .with_store(token_store);
-    let store = GoogleDriveStore::with_default_clients(token_source, ca, proxy)
+    let spec = driven_backend::AccountBackend {
+        account_id: account_id.to_string(),
+        kind: backend,
+        config_json: backend_config_json,
+    };
+    let outcome = driven_backend::build_store(&spec, driven_backend::BackendContext { ca, proxy })
         .map_err(CommandError::from)?;
-    Ok(Arc::new(store))
+    match outcome {
+        driven_backend::StoreOutcome::Store(store) => Ok(store),
+        driven_backend::StoreOutcome::NeedsReauth => Err(CommandError::with_code(
+            ErrorCode::AuthInvalidGrant,
+            "account has no stored credentials; re-authenticate before browsing its destination",
+        )),
+    }
 }
 
 #[cfg(test)]
@@ -1762,10 +1759,13 @@ mod tests {
     }
 
     /// A persisted source row rooted at `root` (an existing dir) for the overlap
-    /// tests. Inserts the owning account first so the FK is satisfied.
-    async fn persist_source_at(state: &dyn StateRepo, root: &Path) -> AccountId {
-        let account_id = AccountId::new_v4();
-        let account = AccountRow {
+    /// A Google Drive account row (the historical default destination) for the
+    /// store-selection tests, which need a row rather than a bare id now that
+    /// the destination is per-account.
+    fn drive_account(account_id: AccountId) -> AccountRow {
+        AccountRow {
+            backend_kind: BackendKind::GoogleDrive,
+            backend_config_json: None,
             id: account_id,
             email: "u@example.com".to_string(),
             display_name: None,
@@ -1773,7 +1773,13 @@ mod tests {
             encryption_master_key_id: None,
             created_at: 0,
             last_synced_at: None,
-        };
+        }
+    }
+
+    /// tests. Inserts the owning account first so the FK is satisfied.
+    async fn persist_source_at(state: &dyn StateRepo, root: &Path) -> AccountId {
+        let account_id = AccountId::new_v4();
+        let account = drive_account(account_id);
         state
             .upsert_account(&account)
             .await
@@ -2027,6 +2033,8 @@ mod tests {
         // Seed a pending first-encrypted source (disabled + durable pending-ack).
         let account_id = AccountId::new_v4();
         let account = AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id: account_id,
             email: "u@example.com".to_string(),
             display_name: None,
@@ -2102,6 +2110,8 @@ mod tests {
         // Account A with a pending first encrypted source (disabled + durable ack).
         let account_a = AccountId::new_v4();
         let account = AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id: account_a,
             email: "a@example.com".to_string(),
             display_name: None,
@@ -2147,6 +2157,8 @@ mod tests {
         // A DIFFERENT account with no pending ack is unaffected.
         let account_b = AccountId::new_v4();
         let account = AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id: account_b,
             email: "b@example.com".to_string(),
             display_name: None,
@@ -2204,6 +2216,8 @@ mod tests {
         // stamped master key).
         let account_id = AccountId::new_v4();
         let account = AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id: account_id,
             email: "u@example.com".to_string(),
             display_name: None,
@@ -2277,6 +2291,8 @@ mod tests {
         let (repo, dir) = temp_repo().await;
         let account_id = AccountId::new_v4();
         let account = AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id: account_id,
             email: "u@example.com".to_string(),
             display_name: None,
@@ -2339,7 +2355,7 @@ mod tests {
         let account_id = AccountId::new_v4();
         let (store, root) = select_picker_store(
             &app_state,
-            account_id,
+            &drive_account(account_id),
             &CustomCaConfig::none(),
             &ProxyConfig::system(),
         )
@@ -2372,7 +2388,7 @@ mod tests {
         // The picker resolves the account's fake store + root.
         let (picker_store, picker_root) = select_picker_store(
             &app_state,
-            account_id,
+            &drive_account(account_id),
             &CustomCaConfig::none(),
             &ProxyConfig::system(),
         )

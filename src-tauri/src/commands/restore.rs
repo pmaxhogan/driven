@@ -704,6 +704,13 @@ async fn build_restore_plans(
     // Issue #34: resolve the proxy once too (fail-closed - a broken proxy blocks
     // the restore rather than downloading direct).
     let proxy = crate::commands::settings::load_proxy_config(state.state().as_ref()).await?;
+    // Each account's row carries the CONFIGURED destination the restore store
+    // must be built against. Loaded once here rather than per-file.
+    let accounts = state
+        .state()
+        .list_accounts()
+        .await
+        .map_err(CommandError::from)?;
     for r in resolved {
         let source = sources
             .iter()
@@ -718,8 +725,16 @@ async fn build_restore_plans(
         let store = match store_cache.get(&account_id) {
             Some(s) => s.clone(),
             None => {
-                let s =
-                    crate::commands::sources::build_restore_store(state, account_id, &ca, &proxy)?;
+                let account = accounts
+                    .iter()
+                    .find(|a| a.id == account_id)
+                    .ok_or_else(|| {
+                        CommandError::with_code(
+                            ErrorCode::InternalBug,
+                            format!("account not found for restore: {account_id}"),
+                        )
+                    })?;
+                let s = crate::commands::sources::build_restore_store(state, account, &ca, &proxy)?;
                 store_cache.insert(account_id, s.clone());
                 s
             }
@@ -4374,6 +4389,8 @@ mod tests {
             .expect("open state repo");
         // Seed one account + one source so file_state rows have a valid FK.
         let account = driven_core::state::AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id: driven_core::types::AccountId::new_v4(),
             email: "alice@example.com".into(),
             display_name: Some("Alice".into()),

@@ -1,0 +1,30 @@
+[package]
+name = "driven-backend"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven backup-destination factory: builds the RemoteStore for an account's configured backend"
+publish = false
+
+[dependencies]
+# The trait + the `BackendKind` taxonomy the factory dispatches on.
+driven-remote = { path = "../driven-remote" }
+# The Google Drive backend (the historical default destination).
+driven-drive = { path = "../driven-drive" }
+# Corporate custom-CA + proxy config, threaded into every client the factory
+# builds (issue #34).
+driven-tls = { path = "../driven-tls" }
+anyhow.workspace = true
+tracing.workspace = true
+
+[dev-dependencies]
+# `keyring` 4.x is a thin wrapper over `keyring-core`, whose `mock` module is an
+# IN-MEMORY credential store installable as the process default. That makes the
+# keychain-backed paths (the factory's Drive arm, the BYO client-creds
+# resolution) coverable by real tests instead of being untestable on a headless
+# CI box with no OS keychain - the constraint `driven-drive`'s `token_store`
+# module documents and had to work around. Dev-only: production always uses the
+# real per-OS store.
+keyring-core = "1"

@@ -1,0 +1,12 @@
+{
+  "db_name": "SQLite",
+  "query": "\n            INSERT INTO accounts (\n                id, email, display_name, state,\n                encryption_master_key_id, created_at, last_synced_at,\n                backend_kind, backend_config_json\n            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)\n            ON CONFLICT(id) DO UPDATE SET\n                email                    = excluded.email,\n                display_name             = excluded.display_name,\n                state                    = excluded.state,\n                encryption_master_key_id = excluded.encryption_master_key_id,\n                created_at               = excluded.created_at,\n                last_synced_at           = excluded.last_synced_at,\n                backend_kind             = excluded.backend_kind,\n                backend_config_json      = excluded.backend_config_json\n            ",
+  "describe": {
+    "columns": [],
+    "parameters": {
+      "Right": 9
+    },
+    "nullable": []
+  },
+  "hash": "ce54983e255ef815a6fe256092a5383c8f86ed40008ee4f82487df03f2dd85a0"
+}

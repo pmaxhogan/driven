@@ -343,11 +343,21 @@ describe("SetupWizard walks all five steps (DESIGN s8.5)", () => {
     const { wrapper, router } = await mountWizard();
     const setup = useSetupStore();
 
-    // Step 1: welcome. begin() fired on mount.
+    // Step 1: welcome + backup-destination picker. Mount loads the destination
+    // descriptors; the wizard SESSION is not opened until the user leaves this
+    // step, because the session is stamped server-side with the destination they
+    // chose here.
     expect(setup.step).toBe("welcome");
-    expect(invokeMock).toHaveBeenCalledWith("begin_add_account_wizard", undefined);
+    expect(invokeMock).toHaveBeenCalledWith("list_backends", undefined);
+    expect(invokeMock).not.toHaveBeenCalledWith("begin_add_account_wizard", expect.anything());
     await wrapper.get("footer button:last-child").trigger("click");
+    await flushPromises();
     expect(setup.step).toBe("credentials");
+    // Leaving welcome opened the session carrying the chosen destination
+    // (Google Drive, the default).
+    expect(invokeMock).toHaveBeenCalledWith("begin_add_account_wizard", {
+      backend: "google_drive",
+    });
 
     // Step 2: credentials. Paste + sign in, then fire oauth:complete.
     const inputs = wrapper.findAll("input");

@@ -597,6 +597,7 @@ pub fn run() {
             commands::sync::get_sync_status,
             // SPEC s11.1 accounts (M6).
             commands::accounts::list_accounts,
+            commands::accounts::list_backends,
             commands::accounts::begin_add_account_wizard,
             commands::accounts::submit_oauth_credentials,
             commands::accounts::start_oauth_signin,

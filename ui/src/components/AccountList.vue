@@ -13,9 +13,17 @@ import { useAccountsStore } from "../stores/accounts";
 // (re-auth) affordances. A banner appears whenever any account needs re-auth;
 // it reacts live to the backend `account:needs_reauth` event as well as to the
 // state loaded from list_accounts.
-const { t, locale } = useI18n();
+const { t, te, locale } = useI18n();
 const accounts = useAccountsStore();
 const router = useRouter();
+
+/** Human label for a `BackendKindId`, falling back to the raw id so a
+ * destination added on the Rust side never renders blank if its strings are not
+ * seeded yet. */
+function backendName(id: string): string {
+  const key = `backendPicker.kind.${id}.name`;
+  return te(key) ? t(key) : id;
+}
 
 // Shared design-system class strings (DRIVEN UI design system). Teal is the
 // accent for primary affordances; red is reserved for destructive actions.
@@ -187,6 +195,12 @@ function formatLastSynced(ms: number | null): string {
             </p>
             <p class="text-xs text-zinc-500">
               {{ t(`settings.accounts.state.${account.state}`) }}
+            </p>
+            <!-- Which backup destination this account targets. Read-only: moving
+                 an existing account to a different destination would strand
+                 everything it has already uploaded, so it is not offered. -->
+            <p class="text-xs text-zinc-500" data-testid="account-backend">
+              {{ backendName(account.backendKind) }}
             </p>
             <p class="text-xs text-zinc-400">
               {{ formatLastSynced(account.lastSyncedAt) }}

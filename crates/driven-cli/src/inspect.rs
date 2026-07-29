@@ -288,6 +288,8 @@ mod tests {
 
     fn account(id: AccountId) -> AccountRow {
         AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
             id,
             email: "t@example.com".into(),
             display_name: None,

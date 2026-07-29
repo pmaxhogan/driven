@@ -67,6 +67,30 @@ pub struct AccountDto {
     pub created_at: i64,
     /// `accounts.last_synced_at` (unix ms), `None` until the first sync.
     pub last_synced_at: Option<i64>,
+    /// `accounts.backend_kind` - which backup destination this account targets
+    /// (the stable `BackendKind::id` string, e.g. `google_drive`). Every
+    /// pre-migration account reports `google_drive`.
+    pub backend_kind: String,
+}
+
+/// One selectable backup destination, surfaced to the setup wizard's
+/// destination picker by `list_backends()`.
+///
+/// Derived from `driven_backend::descriptors()`, so the UI's option list is the
+/// set of backends the BINARY can actually construct - it can never offer a
+/// destination this build does not implement.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct BackendDto {
+    /// The stable `BackendKind::id` string (`google_drive`). This is what the
+    /// webview passes back to `begin_add_account_wizard`.
+    pub id: String,
+    /// Whether the setup wizard should run the OAuth consent step for it.
+    pub uses_oauth: bool,
+    /// Whether the destination picker can browse a folder tree for it.
+    pub supports_folder_picker: bool,
+    /// Whether this is the picker's default selection (the first descriptor).
+    pub is_default: bool,
 }
 
 /// The opaque session id returned by `begin_add_account_wizard` and threaded

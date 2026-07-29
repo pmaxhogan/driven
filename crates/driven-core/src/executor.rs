@@ -6786,6 +6786,8 @@ mod tests {
         let account_id = AccountId::new_v4();
         state
             .upsert_account(&crate::state::AccountRow {
+                backend_kind: crate::state::BackendKind::GoogleDrive,
+                backend_config_json: None,
                 id: account_id,
                 email: "t@example.com".into(),
                 display_name: None,

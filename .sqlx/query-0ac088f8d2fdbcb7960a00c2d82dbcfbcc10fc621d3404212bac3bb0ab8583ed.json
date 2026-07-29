@@ -1,6 +1,6 @@
 {
   "db_name": "SQLite",
-  "query": "\n            SELECT\n                id                       AS \"id!: String\",\n                email                    AS \"email!: String\",\n                display_name             AS \"display_name: String\",\n                state                    AS \"state!: String\",\n                encryption_master_key_id AS \"encryption_master_key_id: String\",\n                created_at               AS \"created_at!: i64\",\n                last_synced_at           AS \"last_synced_at: i64\"\n            FROM accounts\n            ORDER BY created_at ASC, id ASC\n            ",
+  "query": "\n            SELECT\n                id                       AS \"id!: String\",\n                email                    AS \"email!: String\",\n                display_name             AS \"display_name: String\",\n                state                    AS \"state!: String\",\n                encryption_master_key_id AS \"encryption_master_key_id: String\",\n                created_at               AS \"created_at!: i64\",\n                last_synced_at           AS \"last_synced_at: i64\",\n                backend_kind             AS \"backend_kind: String\",\n                backend_config_json      AS \"backend_config_json: String\"\n            FROM accounts\n            ORDER BY created_at ASC, id ASC\n            ",
   "describe": {
     "columns": [
       {
@@ -79,6 +79,28 @@
             "name": "last_synced_at"
           }
         }
+      },
+      {
+        "name": "backend_kind: String",
+        "ordinal": 7,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "accounts",
+            "name": "backend_kind"
+          }
+        }
+      },
+      {
+        "name": "backend_config_json: String",
+        "ordinal": 8,
+        "type_info": "Text",
+        "origin": {
+          "Table": {
+            "table": "accounts",
+            "name": "backend_config_json"
+          }
+        }
       }
     ],
     "parameters": {
@@ -91,8 +113,10 @@
       false,
       true,
       false,
+      true,
+      true,
       true
     ]
   },
-  "hash": "e4bc8c71095316b4da1ad51a55a10812e1a878dc9d26c7887fdc31a81032772a"
+  "hash": "0ac088f8d2fdbcb7960a00c2d82dbcfbcc10fc621d3404212bac3bb0ab8583ed"
 }

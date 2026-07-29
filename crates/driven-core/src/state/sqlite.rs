@@ -37,10 +37,10 @@ use uuid::Uuid;
 
 use super::{
     AccountRow, ActivityFilter, ActivityLevel, ActivityPage, ActivityRow, ActivitySummary,
-    ActivityThroughputSeries, BundleRef, BundleRow, DiscardPendingOutcome, FileSearchHit,
-    FileStateRow, FileStatusCount, FileVersionRow, ImmediateTreeChildren, NewActivity,
-    NewFileVersion, NewPendingOp, PageRequest, PendingOpRow, PendingRecoveryAck, PlaceholderPolicy,
-    RestoreFileRow, SourceRow, StateRepo, TelemetryAggregate,
+    ActivityThroughputSeries, BackendKind, BundleRef, BundleRow, DiscardPendingOutcome,
+    FileSearchHit, FileStateRow, FileStatusCount, FileVersionRow, ImmediateTreeChildren,
+    NewActivity, NewFileVersion, NewPendingOp, PageRequest, PendingOpRow, PendingRecoveryAck,
+    PlaceholderPolicy, RestoreFileRow, SourceRow, StateRepo, TelemetryAggregate,
 };
 use crate::types::{
     AccountId, AccountState, ActivityId, FileStateStatus, PendingOpId, RelativePath, SourceId,
@@ -440,7 +440,9 @@ impl StateRepo for SqliteStateRepo {
                 state                    AS "state!: String",
                 encryption_master_key_id AS "encryption_master_key_id: String",
                 created_at               AS "created_at!: i64",
-                last_synced_at           AS "last_synced_at: i64"
+                last_synced_at           AS "last_synced_at: i64",
+                backend_kind             AS "backend_kind: String",
+                backend_config_json      AS "backend_config_json: String"
             FROM accounts
             ORDER BY created_at ASC, id ASC
             "#,
@@ -458,6 +460,11 @@ impl StateRepo for SqliteStateRepo {
                     encryption_master_key_id: r.encryption_master_key_id,
                     created_at: r.created_at,
                     last_synced_at: r.last_synced_at,
+                    // Migration 0013: NULL (every pre-migration row) decodes to
+                    // GoogleDrive. An unrecognised value is a LOUD error, never
+                    // a silent Drive fallback - see `BackendKind::from_stored`.
+                    backend_kind: BackendKind::from_stored(r.backend_kind.as_deref())?,
+                    backend_config_json: r.backend_config_json,
                 })
             })
             .collect()
@@ -466,19 +473,25 @@ impl StateRepo for SqliteStateRepo {
     async fn upsert_account(&self, row: &AccountRow) -> Result<()> {
         let id = row.id.to_string();
         let state = account_state_to_str(row.state);
+        // The historical default (Google Drive) writes NULL, so a row this
+        // build produces is byte-identical to a pre-0013 one.
+        let backend_kind = row.backend_kind.to_stored();
         sqlx::query!(
             r#"
             INSERT INTO accounts (
                 id, email, display_name, state,
-                encryption_master_key_id, created_at, last_synced_at
-            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7)
+                encryption_master_key_id, created_at, last_synced_at,
+                backend_kind, backend_config_json
+            ) VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9)
             ON CONFLICT(id) DO UPDATE SET
                 email                    = excluded.email,
                 display_name             = excluded.display_name,
                 state                    = excluded.state,
                 encryption_master_key_id = excluded.encryption_master_key_id,
                 created_at               = excluded.created_at,
-                last_synced_at           = excluded.last_synced_at
+                last_synced_at           = excluded.last_synced_at,
+                backend_kind             = excluded.backend_kind,
+                backend_config_json      = excluded.backend_config_json
             "#,
             id,
             row.email,
@@ -487,6 +500,8 @@ impl StateRepo for SqliteStateRepo {
             row.encryption_master_key_id,
             row.created_at,
             row.last_synced_at,
+            backend_kind,
+            row.backend_config_json,
         )
         .execute(&self.pool)
         .await?;
@@ -3714,6 +3729,8 @@ mod tests {
 
     fn sample_account() -> AccountRow {
         AccountRow {
+            backend_kind: BackendKind::GoogleDrive,
+            backend_config_json: None,
             id: AccountId::new_v4(),
             email: "alice@example.com".into(),
             display_name: Some("Alice".into()),
@@ -4440,6 +4457,79 @@ mod tests {
 
         repo.delete_account(acct.id).await.unwrap();
         assert!(repo.list_accounts().await.unwrap().is_empty());
+    }
+
+    #[tokio::test]
+    async fn google_drive_accounts_store_a_null_backend_kind() {
+        // Migration 0013 is a pure additive marker: the historical default is
+        // written as NULL, so a row this build writes is byte-identical to a
+        // pre-0013 one (an older Driven can still read it) and every legacy row
+        // reads back as GoogleDrive with no data migration.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        assert_eq!(acct.backend_kind, BackendKind::GoogleDrive);
+        repo.upsert_account(&acct).await.unwrap();
+
+        let stored: (Option<String>, Option<String>) =
+            sqlx::query_as("SELECT backend_kind, backend_config_json FROM accounts WHERE id = ?1")
+                .bind(acct.id.to_string())
+                .fetch_one(&repo.pool)
+                .await
+                .unwrap();
+        assert_eq!(
+            stored.0, None,
+            "a Google Drive account must store NULL, not the literal id"
+        );
+        assert_eq!(stored.1, None, "Google Drive carries no backend config");
+
+        assert_eq!(
+            repo.list_accounts().await.unwrap()[0].backend_kind,
+            BackendKind::GoogleDrive
+        );
+    }
+
+    #[tokio::test]
+    async fn a_legacy_null_backend_kind_reads_back_as_google_drive() {
+        // The exact shape of a row written before migration 0013: the column
+        // exists (the migration ran) but was never populated. It must decode to
+        // the historical default rather than erroring the whole account list.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        sqlx::query("UPDATE accounts SET backend_kind = NULL WHERE id = ?1")
+            .bind(acct.id.to_string())
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+
+        let listed = repo.list_accounts().await.unwrap();
+        assert_eq!(listed[0].backend_kind, BackendKind::GoogleDrive);
+        assert_eq!(&listed[0], &acct, "the row is otherwise unchanged");
+    }
+
+    #[tokio::test]
+    async fn an_unknown_backend_kind_fails_loudly_instead_of_defaulting_to_drive() {
+        // A row written by a NEWER Driven naming a destination this build cannot
+        // construct must surface an error. Silently reading it as Google Drive
+        // would point the account's uploads at a destination the user never
+        // chose - the worst possible failure for a backup tool.
+        let (repo, _dir) = temp_repo().await;
+        let acct = sample_account();
+        repo.upsert_account(&acct).await.unwrap();
+        sqlx::query("UPDATE accounts SET backend_kind = 'backend_from_the_future' WHERE id = ?1")
+            .bind(acct.id.to_string())
+            .execute(&repo.pool)
+            .await
+            .unwrap();
+
+        let err = repo
+            .list_accounts()
+            .await
+            .expect_err("an unknown backend kind must fail the load");
+        assert!(
+            err.to_string().contains("backend_from_the_future"),
+            "the error must name the offending value, got: {err}"
+        );
     }
 
     #[tokio::test]

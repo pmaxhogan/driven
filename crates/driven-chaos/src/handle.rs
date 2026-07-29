@@ -197,6 +197,8 @@ impl DrivenHandleBuilder {
                 let id = AccountId::new_v4();
                 state
                     .upsert_account(&AccountRow {
+                        backend_kind: driven_core::state::BackendKind::GoogleDrive,
+                        backend_config_json: None,
                         id,
                         email: "chaos@example.com".into(),
                         display_name: None,

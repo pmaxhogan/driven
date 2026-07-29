@@ -1,6 +1,5 @@
-//! `driven-drive` - the `RemoteStore` trait plus its implementations.
+//! `driven-drive` - the Google Drive backend plus the shared in-memory fake.
 //!
-//! - `remote_store` declares the trait every backend must satisfy.
 //! - `google::GoogleDriveStore` is the production Google Drive backend
 //!   (OAuth via PKCE loopback, resumable uploads, refresh-token storage
 //!   in the OS keychain).
@@ -10,10 +9,23 @@
 //! M1 phase 2B: the `fake` module is wired up. M4: the `google` module
 //! lands the production Google Drive backend (OAuth, resumable uploads,
 //! keychain-backed refresh-token storage).
+//!
+//! ## The trait now lives in `driven-remote`
+//!
+//! `RemoteStore`, its value types, the SPEC s24 `DriveError` taxonomy, the
+//! retry middleware and the `app_properties` key vocabulary moved to the
+//! backend-neutral `driven-remote` crate so a second destination can implement
+//! the contract without depending on Google's OAuth/keyring stack. Everything
+//! is re-exported from its historical path here - `driven_drive::remote_store`
+//! and `driven_drive::google::{DriveError, retry, SOURCE_ID_KEY, ..}` all still
+//! resolve - so no downstream `use` changed.
 
 pub mod fake;
 pub mod google;
-pub mod remote_store;
+
+/// The `RemoteStore` trait and its value types, re-exported from
+/// [`driven_remote`] at their historical `driven_drive::remote_store` path.
+pub use driven_remote as remote_store;
 
 // Issue #34: re-export the custom-root-CA config type so callers that already
 // depend on `driven-drive` (the CLI, the google_e2e integration test) can name

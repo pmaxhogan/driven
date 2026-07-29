@@ -46,6 +46,8 @@ fn block_on<F: std::future::Future>(fut: F) -> F::Output {
 
 fn account(id: AccountId) -> AccountRow {
     AccountRow {
+        backend_kind: driven_core::state::BackendKind::GoogleDrive,
+        backend_config_json: None,
         id,
         email: "t@example.com".into(),
         display_name: None,

@@ -434,3 +434,95 @@ pub trait RemoteStore: Send + Sync {
     /// enough to call for the "x of y used" UI display.
     async fn about(&self) -> anyhow::Result<AboutInfo>;
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn drive_context_decodes_every_stored_form_of_my_drive() {
+        // `SourceRow::drive_context` is the SINGLE decode point from the
+        // persisted `backup_sources.drive_id` column, so these three
+        // equivalences are what keep a pre-issue-#7 row (NULL), a row written by
+        // the picker at My Drive root ("my-drive"), and a defensively-blanked
+        // row all scoped to My Drive rather than to a Shared Drive that does not
+        // exist.
+        for stored in [None, Some(""), Some("   "), Some("my-drive")] {
+            let ctx = DriveContext::from_stored(stored);
+            assert_eq!(ctx, DriveContext::MyDrive, "stored {stored:?}");
+            assert_eq!(ctx.drive_id(), None);
+            assert!(!ctx.is_shared_drive());
+        }
+    }
+
+    #[test]
+    fn drive_context_decodes_a_shared_drive_id() {
+        let ctx = DriveContext::from_stored(Some("0ATeamDriveId"));
+        assert_eq!(
+            ctx,
+            DriveContext::SharedDrive {
+                drive_id: "0ATeamDriveId".to_string()
+            }
+        );
+        assert_eq!(ctx.drive_id(), Some("0ATeamDriveId"));
+        assert!(ctx.is_shared_drive());
+        // Surrounding whitespace must not become part of the id: it would be
+        // sent verbatim as the `driveId` query parameter and match nothing.
+        assert_eq!(
+            DriveContext::from_stored(Some("  0ATeamDriveId  ")).drive_id(),
+            Some("0ATeamDriveId")
+        );
+    }
+
+    #[test]
+    fn resumable_sessions_survive_a_serde_round_trip() {
+        // The session is persisted in `pending_ops.payload_json` and resumed
+        // after a process restart (DESIGN s5.4), so its serde encoding is a
+        // stored format: a field that failed to round-trip would silently
+        // orphan every in-flight large upload across an app restart.
+        let mut props = HashMap::new();
+        props.insert("driven.source_id".to_string(), "src-1".to_string());
+        for kind in [
+            ResumableKind::Create {
+                parent_id: "parent".to_string(),
+                name: "file.bin".to_string(),
+                app_properties: props,
+            },
+            ResumableKind::Update {
+                file_id: "file-1".to_string(),
+            },
+        ] {
+            let session = ResumableSession {
+                url: "https://upload.example/session/1".to_string(),
+                issued_at: 1_700_000_000_000,
+                size: 12_345,
+                kind,
+            };
+            let json = serde_json::to_string(&session).expect("serialize");
+            let back: ResumableSession = serde_json::from_str(&json).expect("deserialize");
+            assert_eq!(back.url, session.url);
+            assert_eq!(back.issued_at, session.issued_at);
+            assert_eq!(back.size, session.size);
+            match (&back.kind, &session.kind) {
+                (
+                    ResumableKind::Create {
+                        parent_id: a,
+                        name: b,
+                        app_properties: c,
+                    },
+                    ResumableKind::Create {
+                        parent_id: x,
+                        name: y,
+                        app_properties: z,
+                    },
+                ) => {
+                    assert_eq!((a, b, c), (x, y, z));
+                }
+                (ResumableKind::Update { file_id: a }, ResumableKind::Update { file_id: b }) => {
+                    assert_eq!(a, b);
+                }
+                _ => panic!("the resumable kind changed across the round trip"),
+            }
+        }
+    }
+}

@@ -8,9 +8,12 @@ import { useSourcesStore } from "./sources";
 import type {
   AddAccountWizardSessionId,
   AddSourceRequest,
+  BackendDto,
+  BackendKindId,
   OAuthStatus,
   SessionId,
 } from "../ipc/types";
+import { DEFAULT_BACKEND_ID } from "../ipc/types";
 
 // Setup-wizard store (DESIGN s8.5 5-step wizard; SPEC s11.1 OAuth flow). Holds
 // the wizard step cursor + the in-flight OAuth session/state + the staged
@@ -37,6 +40,15 @@ export const useSetupStore = defineStore("setup", () => {
   // automatic system-browser open is blocked - a failed auto-open is never a dead
   // end. Cleared by reset(); set each time connectAccount starts a sign-in.
   const authUrl = ref<string | null>(null);
+
+  // Destination (backend) selection. `backends` is whatever the RUST FACTORY
+  // reports it can construct - never a hard-coded UI list - so the picker can
+  // only offer destinations this build actually implements. `backendId` is the
+  // user's choice; it defaults to Google Drive so a wizard run that never
+  // reaches the picker (or a build with a single destination) behaves exactly as
+  // it always did.
+  const backends = ref<BackendDto[]>([]);
+  const backendId = ref<BackendKindId>(DEFAULT_BACKEND_ID);
 
   // Cross-step staged inputs. Kept here (not component-local) so navigating
   // back/forward preserves what the user already entered.
@@ -114,8 +126,46 @@ export const useSetupStore = defineStore("setup", () => {
     errorCode.value = null;
   }
 
+  /** The descriptor for the currently-selected destination, if it is one the
+   * backend advertised. `undefined` until `loadBackends` has resolved. */
+  const selectedBackend = computed<BackendDto | undefined>(() =>
+    backends.value.find((b) => b.id === backendId.value)
+  );
+
+  /** Whether the selected destination authenticates through the OAuth consent
+   * step. Defaults to `true` (the Drive behaviour) until the descriptors load,
+   * so the wizard never briefly hides the credentials step it is about to need. */
+  const backendUsesOauth = computed(() => selectedBackend.value?.usesOauth ?? true);
+
+  /** Load the destinations this build can construct. Idempotent and safe to call
+   * on every wizard entry. On failure the list stays empty and the wizard runs
+   * with the Google Drive default rather than dead-ending. */
+  async function loadBackends(): Promise<void> {
+    try {
+      // Defensive coercion: an older backend that does not implement
+      // `list_backends` resolves undefined rather than rejecting, and a
+      // non-array would break every consumer of `backends`. Either way the
+      // wizard falls through to the Google Drive default.
+      const list = await ipc.listBackends();
+      backends.value = Array.isArray(list) ? list : [];
+      // Keep the selection valid: if the current choice is not offered (a
+      // stale value, or a first load), fall back to the advertised default.
+      if (backends.value.length > 0 && !backends.value.some((b) => b.id === backendId.value)) {
+        backendId.value = backends.value.find((b) => b.isDefault)?.id ?? DEFAULT_BACKEND_ID;
+      }
+    } catch (e) {
+      errorCode.value = toErrorCode(e);
+    }
+  }
+
+  /** Choose the backup destination for this wizard run. Rejected server-side if
+   * the id is not one this build implements. */
+  function selectBackend(id: BackendKindId): void {
+    backendId.value = id;
+  }
+
   async function begin(): Promise<void> {
-    session.value = await ipc.beginAddAccountWizard();
+    session.value = await ipc.beginAddAccountWizard(backendId.value);
   }
 
   async function submitCredentials(clientId: string, clientSecret: string): Promise<void> {
@@ -361,6 +411,9 @@ export const useSetupStore = defineStore("setup", () => {
     session.value = null;
     oauthStatus.value = null;
     authUrl.value = null;
+    // The destination list is a property of the BUILD, not of a wizard run, so
+    // it survives a reset; only the user's choice is reverted to the default.
+    backendId.value = backends.value.find((b) => b.isDefault)?.id ?? DEFAULT_BACKEND_ID;
     accountId.value = null;
     accountEmail.value = null;
     localPath.value = null;
@@ -409,6 +462,12 @@ export const useSetupStore = defineStore("setup", () => {
     session,
     oauthStatus,
     authUrl,
+    backends,
+    backendId,
+    selectedBackend,
+    backendUsesOauth,
+    loadBackends,
+    selectBackend,
     accountId,
     accountEmail,
     localPath,
