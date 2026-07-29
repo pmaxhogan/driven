@@ -9,6 +9,15 @@
 //! frame kind: the broker never streams file bytes (the app reads the mounted
 //! snapshot directly with its own uid), so the vocabulary is control-only.
 //!
+//! # Deliberately absent: snapshot deletion
+//!
+//! An earlier revision had a `DeleteSnapshot` verb. It was REMOVED after
+//! measuring that `tmutil deletelocalsnapshots` succeeds unprivileged: keeping
+//! it would have meant carrying a client-supplied string into a root process's
+//! argv for no functional gain. Deletion is now a plain unprivileged call in
+//! [`crate::snapshot`]. Every verb the broker still accepts is one that
+//! genuinely requires root.
+//!
 //! The framing is pure `std::io::{Read, Write}` so both ends share the code
 //! and the round-trip is unit-tested cross-OS over an in-memory buffer.
 
@@ -68,15 +77,6 @@ pub enum Control {
     /// Client -> broker: unmount every snapshot mount this broker created
     /// (idempotent; used at end-of-cycle). Reply: [`Control::Ok`].
     UnmountAll,
-    /// Client -> broker: delete the APFS local snapshot with this `tmutil`
-    /// date stamp (e.g. `2026-07-29-154532`) - deterministic cleanup so a
-    /// released cycle does not wait on APFS auto-thinning. Reply:
-    /// [`Control::Ok`] (deleting an already-gone snapshot is a no-op success:
-    /// auto-thinning races are expected).
-    DeleteSnapshot {
-        /// The snapshot's `tmutil` date stamp (`YYYY-MM-DD-HHMMSS`).
-        snapshot_date: String,
-    },
     /// Client -> broker: unmount everything and exit the broker. Reply:
     /// [`Control::Ok`], after which the broker process terminates.
     Shutdown,
@@ -153,9 +153,6 @@ mod tests {
                 mountpoint: "/private/var/run/driven-apfs-1234/m0".into(),
             },
             Control::UnmountAll,
-            Control::DeleteSnapshot {
-                snapshot_date: "2026-07-29-154532".into(),
-            },
             Control::Shutdown,
             Control::Ok,
             Control::Error {

@@ -3,7 +3,10 @@
 //! Runs as root, serves the tiny [`crate::protocol::Control`] vocabulary over
 //! a unix-domain socket, and holds the ONLY privileged operations in the
 //! macOS snapshot design: `mount_apfs -s` (mount a named APFS local snapshot
-//! read-only), `umount`, and `tmutil deletelocalsnapshots`.
+//! read-only) and `umount`. Snapshot creation AND deletion are unprivileged
+//! and live in [`crate::snapshot`] - measurement showed `tmutil
+//! deletelocalsnapshots` needs no root, so that verb was removed from the
+//! broker rather than carrying a client string into a root argv for nothing.
 //!
 //! # Trust boundary (mirrors DESIGN s5.3.1)
 //!
@@ -34,7 +37,7 @@ use std::collections::HashMap;
 use std::path::{Path, PathBuf};
 
 use crate::protocol::Control;
-use crate::snapshot::{is_valid_snapshot_date, is_valid_snapshot_name};
+use crate::snapshot::is_valid_snapshot_name;
 
 /// Prefix for the broker's root-owned mountpoint directories, swept for stale
 /// leftovers at startup (nothing in the platform cleans up after a crash).
@@ -87,17 +90,6 @@ pub fn validate_mount_request(
     })
 }
 
-/// Boundary validation for a [`Control::DeleteSnapshot`] request.
-pub fn validate_delete_request(snapshot_date: &str) -> Result<(), (&'static str, String)> {
-    if !is_valid_snapshot_date(snapshot_date) {
-        return Err((
-            "invalid_request",
-            "snapshot date does not match the required shape".to_string(),
-        ));
-    }
-    Ok(())
-}
-
 /// The broker's in-memory registry of live mounts: one mount per
 /// (volume, snapshot) pair, reused across requests within the session -
 /// mirroring the Windows one-snapshot-per-volume-per-cycle contract.
@@ -123,6 +115,14 @@ impl MountRegistry {
         self.mounts
             .insert((volume.to_path_buf(), snapshot.to_string()), mp.clone());
         mp
+    }
+
+    /// Drop a recorded entry - used to roll back a reservation whose mount
+    /// failed, so a later request retries instead of short-circuiting onto an
+    /// unmounted path.
+    pub fn forget(&mut self, volume: &Path, snapshot: &str) {
+        self.mounts
+            .remove(&(volume.to_path_buf(), snapshot.to_string()));
     }
 
     /// Drain every recorded mountpoint (for unmount-all / shutdown).
@@ -162,6 +162,28 @@ mod macos {
         helper_dir: PathBuf,
         mount_root: PathBuf,
         registry: Mutex<MountRegistry>,
+        /// Root-owned append-only audit log (see [`audit`]).
+        audit_log: Mutex<Option<std::fs::File>>,
+    }
+
+    /// Append one line to the broker's root-owned audit log.
+    ///
+    /// A root process that leaves no trace is undebuggable in the field and,
+    /// worse, unauditable: the warning for a REJECTED connection - someone
+    /// probing the root broker - would otherwise go to a `tracing` subscriber
+    /// that does not exist, in a process whose stdio the launcher sent to
+    /// /dev/null. Mounts, unmounts and rejections all land here.
+    ///
+    /// Never logs backup file paths (house rule); only broker-owned
+    /// mountpoints, volumes, and rejection reasons.
+    fn audit(shared: &ServerShared, args: std::fmt::Arguments<'_>) {
+        use std::io::Write;
+        let mut guard = shared.audit_log.lock().expect("audit log lock");
+        if let Some(f) = guard.as_mut() {
+            // Best-effort: a full disk must never take the broker down.
+            let _ = writeln!(f, "[pid {}] {}", std::process::id(), args);
+            let _ = f.flush();
+        }
     }
 
     /// Run the broker. Refuses to run as non-root. Returns only on fatal
@@ -177,14 +199,37 @@ mod macos {
 
         sweep_stale_mount_roots();
 
-        // Root-owned per-session mount root: 0755 so the app user can
-        // traverse INTO the (ownership-preserving) mounted snapshots.
+        let helper_dir = std::env::current_exe()?
+            .parent()
+            .map(Path::to_path_buf)
+            .ok_or_else(|| io::Error::other("helper has no parent directory"))?;
+
+        // The peer check below trusts "the peer's executable sits next to
+        // mine". That is only meaningful if the peer user cannot WRITE to that
+        // directory - otherwise they simply drop a binary beside the helper and
+        // pass. For a bundle in ~/Applications or ~/Downloads that is exactly
+        // the case, so refuse to serve at all rather than offer a check that
+        // looks like security and is not.
+        if dir_is_writable_by(&helper_dir, args.peer_uid)? {
+            return Err(io::Error::new(
+                io::ErrorKind::PermissionDenied,
+                "refusing to serve: the helper's directory is writable by the client user, \
+                 so co-installation cannot authenticate a peer",
+            ));
+        }
+
+        // Root-owned per-session mount root: 0755 so the app user can traverse
+        // INTO the (ownership-preserving) mounted snapshots. chmod EXPLICITLY -
+        // create_dir_all honours the inherited umask, and `do shell script`
+        // does not guarantee one. At 0077 the app could not traverse and every
+        // locked file would skip with no distinguishing symptom.
         let mount_root = Path::new(MOUNT_ROOT_PARENT).join(format!(
             "{}{}",
             MOUNT_ROOT_PREFIX,
             std::process::id()
         ));
         std::fs::create_dir_all(&mount_root)?;
+        chown_chmod(&mount_root, 0, 0o755)?;
 
         // Bind the socket, then hand it to the app user (0600): only that
         // user and root can connect.
@@ -198,23 +243,34 @@ mod macos {
         let listener = UnixListener::bind(&args.socket)?;
         chown_chmod(&args.socket, args.peer_uid, 0o600)?;
 
-        let helper_dir = std::env::current_exe()?
-            .parent()
-            .map(Path::to_path_buf)
-            .ok_or_else(|| io::Error::other("helper has no parent directory"))?;
-
+        let audit_log = open_audit_log(&mount_root);
         let shared = Arc::new(ServerShared {
             allowed_volumes: args.allowed_volumes.clone(),
             peer_uid: args.peer_uid,
             helper_dir,
             mount_root,
             registry: Mutex::new(MountRegistry::default()),
+            audit_log: Mutex::new(audit_log),
         });
+        audit(
+            &shared,
+            format_args!(
+                "broker started for uid {} app pid {}",
+                args.peer_uid, args.app_pid
+            ),
+        );
 
         spawn_app_pid_watcher(args.app_pid, Arc::clone(&shared), args.socket.clone());
 
         for conn in listener.incoming() {
             let Ok(stream) = conn else { continue };
+            // Authenticate on the ACCEPTING thread, before spawning anything.
+            // Spawning first would let any same-uid process force unbounded
+            // thread creation inside a root process just by connecting.
+            if let Err(why) = authenticate_peer(&stream, &shared) {
+                audit(&shared, format_args!("rejected connection: {why}"));
+                continue;
+            }
             let shared = Arc::clone(&shared);
             std::thread::spawn(move || {
                 if let Err(e) = serve_connection(stream, &shared) {
@@ -223,6 +279,37 @@ mod macos {
             });
         }
         Ok(())
+    }
+
+    /// Open the root-owned (0600) append-only audit log for this session.
+    /// Best-effort: a broker that cannot open its log still serves.
+    fn open_audit_log(mount_root: &Path) -> Option<std::fs::File> {
+        let path = mount_root.join("broker.log");
+        let f = std::fs::OpenOptions::new()
+            .create(true)
+            .append(true)
+            .open(&path)
+            .ok()?;
+        let _ = chown_chmod(&path, 0, 0o600);
+        Some(f)
+    }
+
+    /// Whether `dir` (or, transitively, its writability) lets `uid` create
+    /// files in it: true when the user owns it, or when its group/other write
+    /// bits are set. Conservative - any stat failure reads as "writable" so an
+    /// unreadable layout fails CLOSED.
+    fn dir_is_writable_by(dir: &Path, uid: u32) -> io::Result<bool> {
+        use std::os::unix::fs::MetadataExt;
+        let md = match std::fs::metadata(dir) {
+            Ok(md) => md,
+            Err(_) => return Ok(true),
+        };
+        if md.uid() == uid {
+            return Ok(true);
+        }
+        // Group- or world-writable is enough for a same-uid attacker to plant
+        // a binary (group membership is not checked here - fail closed).
+        Ok(md.mode() & 0o022 != 0)
     }
 
     /// The socket's parent dir must be owned by the peer uid with mode 0700 -
@@ -312,12 +399,9 @@ mod macos {
         }
     }
 
+    /// Serve one ALREADY-AUTHENTICATED connection (`run` authenticates on the
+    /// accepting thread before this is spawned).
     fn serve_connection(stream: UnixStream, shared: &ServerShared) -> io::Result<()> {
-        if let Err(why) = authenticate_peer(&stream, shared) {
-            tracing::warn!(%why, "apfs broker rejected a connection");
-            // Do not answer unauthenticated peers at all.
-            return Ok(());
-        }
         let mut reader = stream.try_clone()?;
         let mut writer = stream;
 
@@ -359,14 +443,11 @@ mod macos {
                     unmount_all(shared);
                     write_control(&mut writer, &Control::Ok)?;
                 }
-                Control::DeleteSnapshot { snapshot_date } => {
-                    let reply = handle_delete(&snapshot_date);
-                    write_control(&mut writer, &reply)?;
-                }
                 Control::Shutdown => {
                     unmount_all(shared);
-                    let _ = std::fs::remove_dir(&shared.mount_root);
+                    audit(shared, format_args!("shutdown requested"));
                     write_control(&mut writer, &Control::Ok)?;
+                    cleanup_session(shared);
                     std::process::exit(0);
                 }
                 // Server-to-client vocabulary arriving at the server is a
@@ -398,6 +479,13 @@ mod macos {
                 }
             }
         };
+        // The registry lock is held across the whole mount, so a concurrent
+        // request for the same pair blocks and then sees the FINISHED state -
+        // either a real mount or nothing. Releasing it early would let a
+        // second caller receive MountOk for a path that is not mounted yet.
+        // mount_apfs is fast (a syscall-ish exec) and the executor's other
+        // workers are I/O-bound on unrelated files, so the contention is
+        // immaterial next to handing out a bogus mountpoint.
         let mut reg = shared.registry.lock().expect("mount registry lock");
         if let Some(mp) = reg.existing(&req.volume_mount, &req.snapshot_name) {
             return Control::MountOk {
@@ -405,13 +493,23 @@ mod macos {
             };
         }
         let mp = reg.record(&req.volume_mount, &req.snapshot_name, &shared.mount_root);
-        drop(reg);
+
+        // Every failure path below MUST roll the registry entry back. Leaving
+        // it recorded would make every later request for this pair
+        // short-circuit at `existing()` above and return MountOk for a
+        // directory nothing is mounted on - silently skipping every locked
+        // file on the volume until the broker restarts.
+        let fail = |reg: &mut MountRegistry, code: &str, message: String| -> Control {
+            reg.forget(&req.volume_mount, &req.snapshot_name);
+            let _ = std::fs::remove_dir(&mp);
+            Control::Error {
+                code: code.into(),
+                message,
+            }
+        };
 
         if let Err(e) = std::fs::create_dir_all(&mp) {
-            return Control::Error {
-                code: "io_error".into(),
-                message: format!("create mountpoint: {e}"),
-            };
+            return fail(&mut reg, "io_error", format!("create mountpoint: {e}"));
         }
         // Ownership-preserving read-only mount; NEVER `noowners` (see module
         // docs). nosuid/nodev harden the mounted tree.
@@ -424,51 +522,34 @@ mod macos {
             .arg(&mp)
             .output();
         match out {
-            Ok(o) if o.status.success() => Control::MountOk {
-                mountpoint: mp.to_string_lossy().into_owned(),
-            },
+            Ok(o) if o.status.success() => {
+                audit(shared, format_args!("mounted {}", mp.display()));
+                Control::MountOk {
+                    mountpoint: mp.to_string_lossy().into_owned(),
+                }
+            }
             Ok(o) => {
-                let _ = std::fs::remove_dir(&mp);
-                Control::Error {
-                    code: "mount_failed".into(),
-                    message: format!(
-                        "mount_apfs exited {}: {}",
-                        o.status,
-                        String::from_utf8_lossy(&o.stderr).trim()
-                    ),
-                }
+                let detail = format!(
+                    "mount_apfs exited {}: {}",
+                    o.status,
+                    String::from_utf8_lossy(&o.stderr).trim()
+                );
+                audit(shared, format_args!("mount failed: {detail}"));
+                fail(&mut reg, "mount_failed", detail)
             }
-            Err(e) => {
-                let _ = std::fs::remove_dir(&mp);
-                Control::Error {
-                    code: "io_error".into(),
-                    message: format!("mount_apfs spawn: {e}"),
-                }
-            }
+            Err(e) => fail(&mut reg, "io_error", format!("mount_apfs spawn: {e}")),
         }
     }
 
-    fn handle_delete(snapshot_date: &str) -> Control {
-        if let Err((code, message)) = validate_delete_request(snapshot_date) {
-            return Control::Error {
-                code: code.into(),
-                message,
-            };
+    /// Remove this session's mount root + socket at exit.
+    fn cleanup_session(shared: &ServerShared) {
+        // Drop the audit log handle before removing its directory.
+        {
+            let mut guard = shared.audit_log.lock().expect("audit log lock");
+            *guard = None;
         }
-        let out = Command::new("/usr/bin/tmutil")
-            .arg("deletelocalsnapshots")
-            .arg(snapshot_date)
-            .output();
-        match out {
-            // A snapshot already thinned away deletes as a failure exit -
-            // treat any "delete" outcome as idempotent success; the backstop
-            // (APFS auto-thinning) makes strictness pointless.
-            Ok(_) => Control::Ok,
-            Err(e) => Control::Error {
-                code: "io_error".into(),
-                message: format!("tmutil spawn: {e}"),
-            },
-        }
+        let _ = std::fs::remove_file(shared.mount_root.join("broker.log"));
+        let _ = std::fs::remove_dir(&shared.mount_root);
     }
 
     fn unmount_all(shared: &ServerShared) {
@@ -492,8 +573,13 @@ mod macos {
         let _ = std::fs::remove_dir(mp);
     }
 
-    /// Sweep mount roots stranded by a crashed prior session: unmount every
+    /// Sweep mount roots stranded by a CRASHED prior session: unmount every
     /// child mountpoint and remove the directories.
+    ///
+    /// The owning pid is encoded in the directory name and is checked for
+    /// liveness first: a second app instance, or a relaunch racing the old
+    /// broker's exit, must not rip mounts out from under an in-flight cycle
+    /// mid-read. Only roots whose owner is genuinely gone are swept.
     fn sweep_stale_mount_roots() {
         let Ok(entries) = std::fs::read_dir(MOUNT_ROOT_PARENT) else {
             return;
@@ -501,13 +587,27 @@ mod macos {
         for entry in entries.flatten() {
             let name = entry.file_name();
             let Some(name) = name.to_str() else { continue };
-            if !name.starts_with(MOUNT_ROOT_PREFIX) {
+            let Some(pid_str) = name.strip_prefix(MOUNT_ROOT_PREFIX) else {
+                continue;
+            };
+            // An unparseable suffix is not ours - leave it alone.
+            let Ok(pid) = pid_str.parse::<libc::pid_t>() else {
+                continue;
+            };
+            // SAFETY: signal 0 only tests for the process's existence.
+            let owner_alive = unsafe { libc::kill(pid, 0) } == 0;
+            if owner_alive && pid != std::process::id() as libc::pid_t {
                 continue;
             }
             let root = entry.path();
             if let Ok(children) = std::fs::read_dir(&root) {
                 for child in children.flatten() {
-                    unmount_one(&child.path());
+                    // Skip the audit log; only mountpoints are directories.
+                    if child.path().is_dir() {
+                        unmount_one(&child.path());
+                    } else {
+                        let _ = std::fs::remove_file(child.path());
+                    }
                 }
             }
             let _ = std::fs::remove_dir(&root);
@@ -523,7 +623,8 @@ mod macos {
             let alive = unsafe { libc::kill(app_pid as libc::pid_t, 0) } == 0;
             if !alive {
                 unmount_all(&shared);
-                let _ = std::fs::remove_dir(&shared.mount_root);
+                audit(&shared, format_args!("app pid {app_pid} gone; exiting"));
+                cleanup_session(&shared);
                 let _ = std::fs::remove_file(&socket);
                 std::process::exit(0);
             }
@@ -598,18 +699,30 @@ mod tests {
     }
 
     #[test]
-    fn delete_request_validates_the_date() {
-        assert!(validate_delete_request("2026-07-29-154532").is_ok());
-        assert_eq!(
-            validate_delete_request("2026-07-29").unwrap_err().0,
-            "invalid_request"
+    fn a_failed_mount_does_not_poison_the_registry() {
+        // The bug this pins: `record` reserves the entry BEFORE mounting, so a
+        // failure path that forgets to roll it back leaves every later request
+        // for the same pair short-circuiting onto a directory nothing is
+        // mounted on - silently skipping every locked file on that volume for
+        // the rest of the broker's life.
+        let mut reg = MountRegistry::default();
+        let root = Path::new("/private/var/run/driven-apfs-mounts-1");
+        let vol = Path::new("/System/Volumes/Data");
+        let snap = "com.apple.TimeMachine.2026-07-29-154532.local";
+
+        let mp = reg.record(vol, snap, root);
+        assert_eq!(reg.existing(vol, snap), Some(&mp));
+
+        reg.forget(vol, snap);
+        assert!(
+            reg.existing(vol, snap).is_none(),
+            "a rolled-back reservation must not be reused"
         );
-        assert_eq!(
-            validate_delete_request("2026-07-29-154532 --all")
-                .unwrap_err()
-                .0,
-            "invalid_request"
-        );
+
+        // A retry after the rollback gets a FRESH mountpoint and works.
+        let mp2 = reg.record(vol, snap, root);
+        assert_ne!(mp, mp2, "the retry must not reuse the failed mountpoint");
+        assert_eq!(reg.existing(vol, snap), Some(&mp2));
     }
 
     #[test]

@@ -110,14 +110,6 @@ impl HelperClient {
         self.expect_ok()
     }
 
-    /// Delete the local snapshot with this date stamp (deterministic cleanup).
-    pub fn delete_snapshot(&mut self, snapshot_date: &str) -> Result<(), ClientError> {
-        self.send(&Control::DeleteSnapshot {
-            snapshot_date: snapshot_date.to_string(),
-        })?;
-        self.expect_ok()
-    }
-
     /// Ask the broker to unmount everything and exit.
     pub fn shutdown(&mut self) -> Result<(), ClientError> {
         self.send(&Control::Shutdown)?;

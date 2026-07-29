@@ -90,12 +90,31 @@ pub fn same_file(a: &Path, b: &Path) -> bool {
 }
 
 /// Full live-path -> snapshot-path resolution for one file: compute the
-/// candidate, verify a firmlink candidate names the same file, and require
-/// the mapped path to EXIST inside the snapshot (the file predates the
-/// snapshot). `None` = mapping cannot be trusted; the caller degrades to
+/// candidate, verify a firmlink candidate names the same file, require the
+/// mapped path to EXIST inside the snapshot (the file predates the snapshot),
+/// and require it to be a REGULAR FILE that actually lives on the snapshot
+/// device. `None` = mapping cannot be trusted; the caller degrades to
 /// skip-the-locked-file.
+///
+/// # Why the device check is load-bearing
+///
+/// A symlink inside the snapshot resolves against the LIVE filesystem, not the
+/// snapshot: `stat -L` of an absolute-target link under a mounted snapshot
+/// returns the live device. So without this check, a symlinked path could hand
+/// the executor live bytes while every layer above believed it was reading a
+/// frozen copy - the exact wrong-file read this function exists to prevent.
+/// Relying on the scanner's `follow_links(false)` policy is not enough: that is
+/// an invisible cross-crate coupling, and it does not cover a symlinked
+/// ANCESTOR above the walk root (a source under `/tmp`, which is itself a link
+/// to `/private/tmp`, is the everyday example).
+///
+/// `symlink_metadata` (an lstat, which does NOT follow) is what makes the
+/// rejection sound: a symlink is identified as a symlink rather than silently
+/// resolved.
 #[cfg(target_os = "macos")]
 pub fn snapshot_path_for(live: &Path, volume_mount: &Path, mountpoint: &Path) -> Option<PathBuf> {
+    use std::os::unix::fs::MetadataExt;
+
     let rel = match map_candidate(live, volume_mount)? {
         MapCandidate::Direct(rel) => rel,
         MapCandidate::Firmlink(on_volume, rel) => {
@@ -106,11 +125,21 @@ pub fn snapshot_path_for(live: &Path, volume_mount: &Path, mountpoint: &Path) ->
         }
     };
     let mapped = snapshot_path(mountpoint, &rel);
-    if mapped.symlink_metadata().is_ok() {
-        Some(mapped)
-    } else {
-        None
+
+    // lstat: must exist, and must be a regular file. A symlink here would be
+    // followed by the later open and could escape the snapshot entirely.
+    let md = mapped.symlink_metadata().ok()?;
+    if !md.is_file() {
+        return None;
     }
+    // ... and it must live on the snapshot's own device. This also rejects the
+    // symlinked-ancestor case, where every component resolved through a link
+    // that pointed back at the live filesystem.
+    let snap_dev = mountpoint.symlink_metadata().ok()?.dev();
+    if md.dev() != snap_dev {
+        return None;
+    }
+    Some(mapped)
 }
 
 #[cfg(test)]

@@ -174,16 +174,19 @@ impl VssProvider for ApfsBrokeredProvider {
         #[cfg(target_os = "macos")]
         {
             let date_to_delete = cycle.snapshot_date.clone();
+            // Unmount FIRST (privileged, via the broker), then delete the
+            // snapshot ourselves - deletion needs no privilege, so it never
+            // goes near the root process.
             if let Some(client) = cycle.client.as_mut() {
                 if let Err(e) = client.unmount_all() {
                     tracing::warn!(error = %e, "broker unmount_all failed at end of cycle");
                 }
-                if let Some(date) = date_to_delete.as_deref() {
-                    if let Err(e) = client.delete_snapshot(date) {
-                        // Non-fatal: auto-thinning is the backstop, and the
-                        // ledger keeps the date for a later deterministic sweep.
-                        tracing::debug!(error = %e, "broker snapshot delete failed");
-                    }
+            }
+            if let Some(date) = date_to_delete.as_deref() {
+                if let Err(e) = crate::snapshot::delete_local_snapshot(date) {
+                    // Non-fatal: APFS auto-thinning is the backstop, and the
+                    // ledger keeps the date for a later deterministic sweep.
+                    tracing::debug!(error = %e, "snapshot delete failed");
                 }
             }
         }

@@ -90,7 +90,10 @@ fn helper_binary_refuses_to_run_unprivileged() {
         ])
         .output()
         .expect("spawn helper");
-    assert!(!out.status.success(), "helper must refuse to run as non-root");
+    assert!(
+        !out.status.success(),
+        "helper must refuse to run as non-root"
+    );
     let stderr = String::from_utf8_lossy(&out.stderr);
     assert!(
         stderr.contains("must run as root"),
@@ -107,8 +110,8 @@ fn helper_binary_refuses_to_run_unprivileged() {
 fn helper_binary_rejects_bad_arguments() {
     let exe = env!("CARGO_BIN_EXE_driven-apfs-helper");
     for args in [
-        vec!["--socket", "/tmp/x.sock"],           // no uid/pid
-        vec!["--bogus", "x"],                      // unknown flag
+        vec!["--socket", "/tmp/x.sock"],               // no uid/pid
+        vec!["--bogus", "x"],                          // unknown flag
         vec!["--socket", "/tmp/x.sock", "--peer-uid"], // dangling value
     ] {
         let out = std::process::Command::new(exe)
@@ -122,6 +125,50 @@ fn helper_binary_rejects_bad_arguments() {
             String::from_utf8_lossy(&out.stderr)
         );
     }
+}
+
+/// A symlink must never be handed back as a snapshot-mapped path.
+///
+/// This is the review finding that a symlink inside a mounted snapshot
+/// resolves against the LIVE filesystem, so returning one would let the
+/// executor read live bytes while believing it had a frozen copy. Verified
+/// here without needing a real snapshot: `snapshot_path_for` must reject a
+/// symlink on the shape of the check (lstat says "not a regular file"), and it
+/// must reject anything not on the mountpoint's device.
+#[test]
+fn a_symlink_is_never_returned_as_a_snapshot_path() {
+    use driven_apfs::paths::snapshot_path_for;
+
+    let dir = tempfile::tempdir().expect("tempdir");
+    let mountpoint = dir.path().join("mnt");
+    std::fs::create_dir(&mountpoint).expect("mkdir mnt");
+
+    // A real file OUTSIDE the "snapshot", and a symlink to it INSIDE.
+    let outside = dir.path().join("live-secret.txt");
+    std::fs::write(&outside, b"live bytes").expect("write");
+    let inside_link = mountpoint.join("Users");
+    std::os::unix::fs::symlink(&outside, &inside_link).expect("symlink");
+
+    // Map a live path whose mapped location IS the symlink.
+    let volume_mount = std::path::Path::new("/");
+    let live = std::path::Path::new("/Users");
+    assert_eq!(
+        snapshot_path_for(live, volume_mount, &mountpoint),
+        None,
+        "a symlink must be rejected, not returned as a frozen-copy path"
+    );
+
+    // A regular file at the mapped location is still accepted (the check must
+    // not be so strict that it rejects everything and silently disables the
+    // feature - that failure mode would look identical in production).
+    let plain_mp = dir.path().join("mnt2");
+    std::fs::create_dir(&plain_mp).expect("mkdir mnt2");
+    std::fs::write(plain_mp.join("etc"), b"frozen bytes").expect("write");
+    assert_eq!(
+        snapshot_path_for(std::path::Path::new("/etc"), volume_mount, &plain_mp),
+        Some(plain_mp.join("etc")),
+        "a regular file on the mountpoint's own device must still map"
+    );
 }
 
 /// A frame declaring a huge length must be rejected before allocation - the

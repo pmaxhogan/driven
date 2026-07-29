@@ -1,10 +1,12 @@
 //! Unprivileged `tmutil` snapshot operations and their (pure, cross-OS
 //! testable) output parsing + name/date validation.
 //!
-//! Creation and enumeration need NO privilege: `tmutil` proxies over XPC to
-//! Apple's entitled `backupd`. Only deletion (`tmutil deletelocalsnapshots`)
-//! needs root, so that lives broker-side (the [`crate::server`] handles
-//! [`crate::protocol::Control::DeleteSnapshot`]).
+//! Creation, enumeration AND deletion all need NO privilege: `tmutil` proxies
+//! over XPC to Apple's entitled `backupd`. Deletion was originally routed
+//! through the root broker on the assumption it needed root; measurement on
+//! macOS 26 showed `tmutil deletelocalsnapshots <date>` succeeding as an
+//! ordinary user (exit 0, snapshot gone), so it moved here and the broker lost
+//! a verb - one less client-controlled string reaching a root argv.
 //!
 //! # Auto-thinning is a feature, not a bug
 //!
@@ -38,10 +40,8 @@ pub enum SnapshotError {
 /// Validate a `tmutil` snapshot date stamp: exactly `YYYY-MM-DD-HHMMSS`
 /// (digits and dashes in fixed positions). This is the shape both
 /// `tmutil localsnapshot` prints and `tmutil deletelocalsnapshots` accepts,
-/// and the broker's boundary check for [`Control::DeleteSnapshot`] - so it is
-/// strict: anything else is rejected.
-///
-/// [`Control::DeleteSnapshot`]: crate::protocol::Control::DeleteSnapshot
+/// so it is strict: anything else is rejected before reaching a subprocess
+/// argv.
 pub fn is_valid_snapshot_date(date: &str) -> bool {
     let b = date.as_bytes();
     if b.len() != 17 {
@@ -147,6 +147,39 @@ pub fn create_local_snapshot() -> Result<String, SnapshotError> {
         )));
     }
     parse_localsnapshot_output(&String::from_utf8_lossy(&out.stdout))
+}
+
+/// Delete the APFS local snapshot with this `tmutil` date stamp
+/// (unprivileged - see the module docs).
+///
+/// The date is validated before it reaches the argv even though this is no
+/// longer a privileged call: it is still a subprocess argument, and the
+/// validation is free.
+///
+/// A snapshot that APFS already auto-thinned away exits non-zero; that is an
+/// expected race, so this reports success for it. Only a spawn failure or an
+/// invalid date is an error.
+#[cfg(target_os = "macos")]
+pub fn delete_local_snapshot(date: &str) -> Result<(), SnapshotError> {
+    if !is_valid_snapshot_date(date) {
+        return Err(SnapshotError::Parse(
+            "snapshot date does not match the required shape".to_string(),
+        ));
+    }
+    let out = Command::new("/usr/bin/tmutil")
+        .arg("deletelocalsnapshots")
+        .arg(date)
+        .output()
+        .map_err(|e| SnapshotError::Spawn(e.to_string()))?;
+    if !out.status.success() {
+        // Already gone (auto-thinned, or a prior delete won the race) reads as
+        // success; the caller only ever wants "it is not there any more".
+        tracing::debug!(
+            status = %out.status,
+            "tmutil deletelocalsnapshots exited non-zero; treating as already-deleted"
+        );
+    }
+    Ok(())
 }
 
 /// List the APFS local snapshot names for `volume_mount` (unprivileged).
