@@ -294,7 +294,7 @@ impl TrayIcon {
             return rgba;
         }
 
-        let geom = badge_geometry_with(w, h, BADGE_R_TEMPLATE);
+        let geom = template_badge_geometry(w, h);
         let r_ring = geom.r_fill + ring_width(w, h);
         for y in 0..h as i32 {
             for x in 0..w as i32 {
@@ -432,29 +432,46 @@ struct BadgeGeom {
 /// so colour does most of the work and the disc can stay compact.
 const BADGE_R_COLOUR: f32 = 0.24;
 
+/// Badge disc centre, as a fraction of each dimension, for the COLOUR path.
+const BADGE_C_COLOUR: f32 = 0.72;
+
 /// Badge disc radius fraction for the macOS TEMPLATE path. Deliberately larger
 /// than [`BADGE_R_COLOUR`]: a template badge has no colour to distinguish it, so
-/// the state must read from the punched-out glyph SHAPE alone. At a 22pt menu
-/// bar the compact colour-path disc would shrink the glyph holes to ~2px and the
-/// states would smear together, so the template disc (and every hole in it) is
-/// scaled up to stay legible.
+/// the state must read from the punched-out glyph SHAPE alone. Every glyph
+/// feature is sized as a fraction of `r_fill`, so widening the disc widens the
+/// holes with it - which is what keeps them from closing up when the icon is
+/// scaled down to a 22pt menu bar.
 #[cfg(target_os = "macos")]
-const BADGE_R_TEMPLATE: f32 = 0.32;
+const BADGE_R_TEMPLATE: f32 = 0.28;
 
-/// Compute the shared badge geometry (see [`BadgeGeom`]) with the disc radius as
-/// `r_frac` of the smaller dimension, so it scales with the source resolution.
-fn badge_geometry_with(width: u32, height: u32, r_frac: f32) -> BadgeGeom {
+/// Badge disc centre fraction for the macOS TEMPLATE path. Pulled IN from
+/// [`BADGE_C_COLOUR`] to keep the wider template disc (plus its transparent
+/// contrast band) inside the canvas: at 64px, `0.72` would put the disc edge at
+/// ~66px and the badge would be clipped flat against the right and bottom edges.
+#[cfg(target_os = "macos")]
+const BADGE_C_TEMPLATE: f32 = 0.66;
+
+/// Compute the shared badge geometry (see [`BadgeGeom`]): disc centred at
+/// `c_frac` of each dimension with radius `r_frac` of the smaller one, so it
+/// scales with the source resolution.
+fn badge_geometry_with(width: u32, height: u32, c_frac: f32, r_frac: f32) -> BadgeGeom {
     let min = width.min(height) as f32;
     BadgeGeom {
-        cx: width as f32 * 0.72,
-        cy: height as f32 * 0.72,
+        cx: width as f32 * c_frac,
+        cy: height as f32 * c_frac,
         r_fill: min * r_frac,
     }
 }
 
 /// The COLOUR-path badge geometry (Windows/Linux).
 fn badge_geometry(width: u32, height: u32) -> BadgeGeom {
-    badge_geometry_with(width, height, BADGE_R_COLOUR)
+    badge_geometry_with(width, height, BADGE_C_COLOUR, BADGE_R_COLOUR)
+}
+
+/// The macOS TEMPLATE-path badge geometry.
+#[cfg(target_os = "macos")]
+fn template_badge_geometry(width: u32, height: u32) -> BadgeGeom {
+    badge_geometry_with(width, height, BADGE_C_TEMPLATE, BADGE_R_TEMPLATE)
 }
 
 /// Paint a single opaque pixel at (`x`, `y`) to grayscale `intensity` (white at
@@ -2134,7 +2151,8 @@ mod tests {
             // Badge-only baseline (disc + ring, no glyph) vs the full glyphed icon.
             let mut badge_only = base.rgba.clone();
             let color = s.badge_color().expect("non-idle state has a badge colour");
-            draw_badge(&mut badge_only, base.width, base.height, color);
+            let geom = badge_geometry(base.width, base.height);
+            draw_badge(&mut badge_only, base.width, base.height, &geom, color);
             let with_glyph = s.brand_rgba_frame(base, 0);
             assert_ne!(
                 with_glyph, badge_only,
@@ -2236,6 +2254,7 @@ mod tests {
             &mut badge_only,
             base.width,
             base.height,
+            &badge_geometry(base.width, base.height),
             TrayIcon::Syncing
                 .badge_color()
                 .expect("syncing has a badge colour"),
@@ -2264,5 +2283,175 @@ mod tests {
             before.wrapping_add(1),
             "stop must retire (bump) the live generation so no further frame is written"
         );
+    }
+
+    // -------------------------------------------------------------------------
+    // macOS template icon (menu-bar theming)
+    // -------------------------------------------------------------------------
+    //
+    // The menu bar cannot be screenshotted from CI (nor from an agent session
+    // without TCC Screen Recording), so these assert on the ALPHA channel - the
+    // only channel macOS actually reads for a template image. They are written
+    // to catch the two ways this silently breaks: an opaque source (renders as a
+    // solid black square) and states whose holes collapse into each other
+    // (every state looks identical in the bar).
+    #[cfg(target_os = "macos")]
+    mod macos_template {
+        use super::*;
+
+        /// Alpha values of every pixel, in order.
+        fn alphas(rgba: &[u8]) -> Vec<u8> {
+            rgba.chunks_exact(4).map(|px| px[3]).collect()
+        }
+
+        const STATES: [TrayIcon; 4] = [
+            TrayIcon::Syncing,
+            TrayIcon::Paused,
+            TrayIcon::NetworkAttention,
+            TrayIcon::Error,
+        ];
+
+        /// THE guard against a solid black square: the template source must be
+        /// alpha-SHAPED (a real mix of transparent and opaque), not an opaque
+        /// tile. macOS discards its RGB, so opaque-everywhere = a black blob.
+        #[test]
+        fn template_source_is_alpha_shaped() {
+            let Some(base) = template_base() else {
+                panic!("template PNG (icons/tray-template.png) must decode");
+            };
+            let a = alphas(&base.rgba);
+            let clear = a.iter().filter(|&&v| v == 0).count();
+            let opaque = a.iter().filter(|&&v| v == 0xff).count();
+            assert!(
+                clear > a.len() / 4,
+                "template must be mostly transparent, else macOS paints a black \
+                 square ({clear}/{} clear)",
+                a.len()
+            );
+            assert!(
+                opaque > a.len() / 100,
+                "template must have real ink ({opaque}/{} opaque)",
+                a.len()
+            );
+        }
+
+        /// Idle is the plain mark: no badge is punched into it.
+        #[test]
+        fn template_idle_has_no_badge() {
+            let base = template_base().expect("template PNG must decode");
+            let idle = TrayIcon::Idle.template_rgba_frame(base, 0);
+            assert_eq!(
+                alphas(&idle),
+                alphas(&base.rgba),
+                "Idle must leave the template's alpha untouched"
+            );
+        }
+
+        /// Every non-idle state must differ from idle AND from each other - in
+        /// ALPHA, since that is all macOS renders. Comparing full RGBA would
+        /// pass even if the states were indistinguishable on screen.
+        #[test]
+        fn template_states_are_distinct_in_alpha() {
+            let base = template_base().expect("template PNG must decode");
+            let idle = alphas(&TrayIcon::Idle.template_rgba_frame(base, 0));
+
+            let mut seen: Vec<(TrayIcon, Vec<u8>)> = Vec::new();
+            for s in STATES {
+                let a = alphas(&s.template_rgba_frame(base, 0));
+                assert_eq!(a.len(), idle.len(), "{s:?} must keep the mark's size");
+                assert_ne!(a, idle, "{s:?} must punch a visible badge into the mark");
+                seen.push((s, a));
+            }
+            for i in 0..seen.len() {
+                for j in (i + 1)..seen.len() {
+                    assert_ne!(
+                        seen[i].1, seen[j].1,
+                        "{:?} and {:?} must be distinguishable by SHAPE alone - a \
+                         template has no colour to tell them apart",
+                        seen[i].0, seen[j].0
+                    );
+                }
+            }
+        }
+
+        /// The badge (and its transparent contrast band) must fit INSIDE the
+        /// canvas. Overflowing it clips the disc flat against the edge and the
+        /// badge stops reading as a badge - which a pixel-equality test would
+        /// happily accept.
+        #[test]
+        fn template_badge_fits_in_the_canvas() {
+            let base = template_base().expect("template PNG must decode");
+            let geom = template_badge_geometry(base.width, base.height);
+            let outer = geom.r_fill + ring_width(base.width, base.height);
+            assert!(
+                geom.cx + outer <= base.width as f32,
+                "badge overflows right edge: {} > {}",
+                geom.cx + outer,
+                base.width
+            );
+            assert!(
+                geom.cy + outer <= base.height as f32,
+                "badge overflows bottom edge: {} > {}",
+                geom.cy + outer,
+                base.height
+            );
+        }
+
+        /// The spinner still animates on the template path: the punched holes
+        /// rotate, so consecutive frames differ and the cycle repeats.
+        #[test]
+        fn template_syncing_frames_cycle() {
+            let base = template_base().expect("template PNG must decode");
+            let frames: Vec<Vec<u8>> = (0..SYNC_FRAMES)
+                .map(|f| alphas(&TrayIcon::Syncing.template_rgba_frame(base, f)))
+                .collect();
+            for f in 0..frames.len() {
+                let next = (f + 1) % frames.len();
+                assert_ne!(frames[f], frames[next], "template spinner must move");
+            }
+            assert_eq!(
+                frames[0],
+                alphas(&TrayIcon::Syncing.template_rgba_frame(base, SYNC_FRAMES)),
+                "template spinner must come full circle"
+            );
+        }
+
+        /// Static states ignore the animation frame on the template path too.
+        #[test]
+        fn template_static_states_ignore_the_frame() {
+            let base = template_base().expect("template PNG must decode");
+            for s in [
+                TrayIcon::Idle,
+                TrayIcon::Paused,
+                TrayIcon::NetworkAttention,
+                TrayIcon::Error,
+            ] {
+                assert_eq!(
+                    s.template_rgba_frame(base, 0),
+                    s.template_rgba_frame(base, 5),
+                    "{s:?} is static"
+                );
+            }
+        }
+
+        /// On macOS the live tray declares itself a template, and the icon it
+        /// hands over is the alpha-shaped one at the mark's dimensions. If these
+        /// two ever disagree the menu bar shows a black square.
+        #[test]
+        fn macos_renders_as_template() {
+            assert!(
+                renders_as_template(),
+                "macOS must hand the menu bar a template image"
+            );
+            let base = template_base().expect("template PNG must decode");
+            let img = TrayIcon::Paused.image();
+            assert_eq!(img.width(), base.width);
+            assert_eq!(img.height(), base.height);
+            assert_eq!(
+                img.rgba(),
+                TrayIcon::Paused.template_rgba_frame(base, 0),
+                "image() must return the TEMPLATE pixels on macOS"
+            );
+        }
     }
 }

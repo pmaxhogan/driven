@@ -31,6 +31,9 @@ mod crypto_provider_impl;
 // threat model. Tracked in design/CODEX_NOTES.md "VSS elevation - least-privilege
 // helper (post-V1)". Until then, locked-file VSS requires launching Driven as
 // administrator manually (the VssProvider degrade path handles the un-elevated case).
+// macOS only: the Dock icon for UNBUNDLED dev runs (`cargo tauri dev`), where
+// there is no `.app` for LaunchServices to take an icon from.
+mod dock_icon;
 mod events;
 mod hook_runner;
 mod i18n;
@@ -155,6 +158,10 @@ fn show_main_window(app: &tauri::AppHandle) {
         let _ = window.unminimize();
         let _ = window.show();
         let _ = window.set_focus();
+        // Surfacing the window is the point at which an unbundled dev run gets
+        // a Dock tile, so (re-)assert our icon here as well as at Ready - the
+        // single early attempt upstream makes is what leaves it generic.
+        dock_icon::apply("window shown");
     }
 }
 
@@ -703,6 +710,11 @@ pub fn run() {
     //     sync survives. (The window-close handler already hid the window, but
     //     this guards the path where the platform still raises ExitRequested.)
     app.run(|app_handle, event| {
+        // macOS, unbundled runs only: give the Dock the Driven icon instead of
+        // the generic "exec" tile. Idempotent, so re-applying is harmless.
+        if matches!(event, RunEvent::Ready) {
+            dock_icon::apply("ready");
+        }
         if let RunEvent::ExitRequested { code, api, .. } = &event {
             if code.is_none() {
                 tracing::debug!(target: "driven::app", "incidental exit (last window closed); staying alive in tray");

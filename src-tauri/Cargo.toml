@@ -142,6 +142,27 @@ rustix = { version = "1.1.4", features = ["fs"] }
 # so a concurrent parent swap cannot escape the root and an existing dest is
 # atomically replaced. Windows-only so the 3-OS CI build/clippy stays green on
 # Linux + macOS.
+# macOS Dock icon for UNBUNDLED dev runs (`cargo tauri dev`): the bare binary has
+# no `.app`, so LaunchServices gives it the generic "exec" tile and the only fix
+# is `-[NSApplication setApplicationIconImage:]` at runtime (see `src/dock_icon.rs`).
+#
+# These three crates are NOT new to the dependency graph - tauri 2.11.5 already
+# depends on all of them at exactly these versions on macOS, with a superset of
+# these features (NSApplication/NSImage, NSData). Declaring them directly pulls
+# in no extra crate and creates no duplicate version for `deny.toml` to flag.
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2 = "0.6.4"
+objc2-app-kit = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSApplication",
+    "NSImage",
+    "NSResponder",
+] }
+objc2-foundation = { version = "0.3.2", default-features = false, features = [
+    "std",
+    "NSData",
+] }
+
 [target.'cfg(windows)'.dependencies]
 windows-sys = { version = "0.61", features = [
     "Win32_Foundation",

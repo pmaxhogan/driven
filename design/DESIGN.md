@@ -1328,6 +1328,24 @@ Always-present icon. States:
 | Red                   | Error state requires attention (auth needed, decrypt failure, disk full)    |
 
 The yellow-with-`!` state covers all of §5.8's network failure modes.
+
+**macOS carve-out — the colours above are Windows/Linux only.** macOS
+menu-bar extras are expected to be *template* images: alpha-only art the
+OS tints itself (black on a light menu bar, white on a dark or selected
+one). A colour-bearing icon there does not read as themed, it reads as
+broken — it is the one coloured blob among the system's monochrome
+extras. So on macOS the tray renders a template mark and **state is
+carried by the badge SHAPE alone**: spinner = syncing, pause bars =
+paused, `!` = network attention, `X` = error, plain mark = idle. That is
+the same shape vocabulary as the table above, minus the colour; the
+glyphs were always designed to be readable without colour (colour-blind
+users, tiny trays), which is what makes dropping it safe here. macOS
+therefore has no yellow or red tray icon — every other mention of a
+"yellow"/"red" tray icon in this document (§5.8.1, §5.10.2) means the
+shape-equivalent state there. This is deliberate and matches SPEC
+§1579's `iconAsTemplate` for macOS; do **not** "fix" the macOS path back
+to a colour icon.
+
 The tooltip shows the specific condition ("Connected, no Internet",
 "Captive portal — click to sign in", "Google Drive is unavailable", etc.)
 and the tray menu surfaces the matching action ("Open captive portal",
