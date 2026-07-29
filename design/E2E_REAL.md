@@ -21,8 +21,23 @@ vars are set. This is an honest capability gate, not a faked-green skip.
 | `DRIVEN_E2E_DEST_FOLDER_ID`  | yes      | The Drive folder id the tests upload under (each test makes a UUID child). |
 | `DRIVEN_OAUTH_CLIENT_SECRET` | yes      | The OAuth client secret used to refresh the token (no public default).  |
 | `DRIVEN_OAUTH_CLIENT_ID`     | no       | OAuth client id. Defaults to the public installed-app client id.        |
+| `DRIVEN_E2E_SHARED_DRIVE_ID` | no       | A Shared Drive id. Gates the 5 `google_shared_drive_*` tests ONLY - see below. |
 
 All three required vars must be non-empty; a missing one closes the gate.
+
+### The gate has TWO independent tiers
+
+Setting the three required vars opens the BASE gate, which runs the 8
+plain-Drive tests. The 5 `google_shared_drive_*` tests sit behind a SECOND,
+separate gate on `DRIVEN_E2E_SHARED_DRIVE_ID` and print their own distinct
+`skipping Shared Drive e2e` line. So a fully-credentialed run still reports 5
+skips, and that is correct, not a misconfiguration.
+
+Note that a **consumer Google account cannot satisfy the second tier at all**:
+Shared Drives are a Google Workspace feature, so `GET /drive/v3/drives` on a
+plain `@gmail.com` test account returns an empty list. Real-Drive coverage of
+the Shared Drive contract needs a Workspace account; otherwise those five
+scenarios keep their fake-store coverage only.
 
 Each test:
 1. Builds a `RefreshingTokenSource` from the refresh token (the first call
