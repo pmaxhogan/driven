@@ -18,6 +18,10 @@ driven-drive = { path = "../driven-drive" }
 driven-net = { path = "../driven-net" }
 driven-crypto = { path = "../driven-crypto" }
 driven-power = { path = "../driven-power" }
+# `rclone list` / `rclone import`: parses an existing rclone.conf and renders
+# the Driven settings. All the logic (and its tests) live in the crate; the CLI
+# is a `println!` over it, which is why no `serde` dependency appears here.
+driven-rclone = { path = "../driven-rclone" }
 tokio.workspace = true
 anyhow.workspace = true
 tracing.workspace = true

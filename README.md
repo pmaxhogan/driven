@@ -253,6 +253,36 @@ walks you through:
 The wizard explains each step in-app. If you skip a step you can finish it later
 from Settings.
 
+## Migrating from rclone
+
+Already have an `rclone.conf`? `driven-cli` reads it and tells you exactly what
+to enter, rather than making you re-type every endpoint and key:
+
+```sh
+driven-cli rclone list                      # every remote, and what it maps to
+driven-cli rclone import r2 --bucket backups   # the settings for one remote
+```
+
+It finds the config in the same places rclone does (override with `--config`;
+`rclone config file` prints the one rclone is using). What transfers:
+
+- **`type = s3`** (AWS, Cloudflare R2, MinIO, Wasabi, Ceph, B2-over-S3, ...) -
+  endpoint, region and addressing style, plus the access key pair. The AWS
+  regional endpoint is derived from the region when rclone left it blank, and a
+  scheme-less endpoint gains `https://`. The one thing that cannot come from the
+  file is the **bucket**: rclone puts it in the path you type
+  (`remote:mybucket/dir`), not in the config, so pass `--bucket`.
+- **`type = drive`** - the destination folder id and Shared Drive id. The OAuth
+  token **cannot** transfer: a refresh token is redeemable only by the OAuth
+  client it was issued to (RFC 6749 s6), and rclone's grant was issued to
+  rclone's client. Sign in to Driven once and the grant is yours.
+
+The command is read-only - it creates no account and stores no secret. The
+secret access key prints as `<redacted>` unless you pass `--reveal-secrets`, and
+the Drive OAuth token is never printed at all. A password-encrypted
+`rclone.conf` is detected and refused with instructions (`rclone config show`)
+rather than prompting you for your rclone password.
+
 ## Update channels
 
 Driven has two update channels, selectable in Settings > About:

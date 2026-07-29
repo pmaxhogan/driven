@@ -28,6 +28,7 @@ use std::path::{Path, PathBuf};
 use clap::{Parser, Subcommand};
 
 mod inspect;
+mod rclone;
 
 use driven_drive::google::oauth::{run_pkce_loopback_flow, OAuthProgress};
 use driven_drive::google::token_store::{
@@ -75,6 +76,9 @@ enum Command {
     /// Check the local state database for files in a corrupt / error state;
     /// exits non-zero when any are found.
     Verify(inspect::InspectArgs),
+    /// Read an existing `rclone.conf` and show what each remote maps to in
+    /// Driven (read-only; it creates no account and writes no secret).
+    Rclone(rclone::RcloneArgs),
 }
 
 /// Arguments for `driven-cli auth`.
@@ -161,6 +165,10 @@ async fn main() -> anyhow::Result<()> {
         Command::Status(args) => inspect::run_status(args).await,
         Command::History(args) => inspect::run_history(args).await,
         Command::Verify(args) => inspect::run_verify(args).await,
+        Command::Rclone(args) => match args.command {
+            rclone::RcloneCommand::List(a) => rclone::run_list(a).await,
+            rclone::RcloneCommand::Import(a) => rclone::run_import(a).await,
+        },
     }
 }
 
@@ -333,7 +341,15 @@ async fn run_dump_refresh_token(args: DumpRefreshTokenArgs) -> anyhow::Result<()
 /// Mirrors [`run_dump_refresh_token`]: prints `client_id` then `client_secret`
 /// (one per line; the secret line is empty for a PKCE client) so a debugging
 /// session can refresh the account's token against the SAME client that minted
-/// it - a refresh against any other client fails with `invalid_client`.
+/// it - a refresh against any other client fails with `invalid_grant`.
+///
+/// `invalid_grant`, NOT `invalid_client`: the other client authenticates
+/// perfectly well, so the failure is not about the client's identity. RFC 6749
+/// s6 requires the authorization server to "ensure that the refresh token was
+/// issued to the authenticated client", and s5.2 puts a token that "was issued
+/// to another client" squarely under `invalid_grant`. Chasing an
+/// `invalid_client` that never appears is a wasted debugging session, which is
+/// the whole reason this subcommand exists.
 async fn run_dump_client_creds(args: DumpClientCredsArgs) -> anyhow::Result<()> {
     let store = ClientCredsStore::new(args.account.clone());
     match store.load()? {

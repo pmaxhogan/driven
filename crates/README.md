@@ -11,6 +11,8 @@ behind a trait, so `cargo test --workspace` runs with no real Drive, clock, or G
 - `driven-net` / `driven-tls` - network probes; shared custom-CA + proxy support
 - `driven-power` / `driven-diskstat` - per-OS power, metered, sleep-wake, disk-busy signals
 - `driven-vss` / `driven-vss-helper` - Windows shadow-copy reads and the elevated broker
+- `driven-rclone` - reads an existing `rclone.conf` and translates its remotes into
+  Driven destination settings (read-only; it writes nothing)
 - `driven-cli` - headless debugging CLI; `driven-chaos` - the stress harness
 - `driven-test-fixtures` - shared dev-dependency fakes (`tree!`, `FakeClock`, ...)
 

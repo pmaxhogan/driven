@@ -1699,6 +1699,7 @@ dependencies = [
  "driven-drive",
  "driven-net",
  "driven-power",
+ "driven-rclone",
  "predicates",
  "tempfile",
  "tokio",
@@ -1828,6 +1829,18 @@ dependencies = [
  "tracing",
  "windows 0.62.2",
  "zbus",
+]
+
+[[package]]
+name = "driven-rclone"
+version = "2.4.0"
+dependencies = [
+ "anyhow",
+ "driven-remote",
+ "driven-s3",
+ "serde_json",
+ "tempfile",
+ "thiserror 2.0.19",
 ]
 
 [[package]]
