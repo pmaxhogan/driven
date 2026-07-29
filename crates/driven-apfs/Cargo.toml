@@ -1,0 +1,53 @@
+[package]
+name = "driven-apfs"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+# Internal workspace crate (never published to crates.io).
+publish = false
+
+# macOS locked-file fallback via APFS local snapshots (DESIGN s5.3.2), the
+# macOS sibling of the Windows VSS helper (DESIGN s5.3.1). The main app stays
+# un-elevated; ONLY the snapshot MOUNT/UNMOUNT runs in a small root broker
+# (`driven-apfs-helper`) the app talks to over a secured unix-domain socket.
+# Snapshot CREATION needs no privilege at all (`tmutil localsnapshot` proxies
+# to Apple's entitled backupd over XPC - the fs_snapshot_* syscalls themselves
+# are gated on a private entitlement no third party can hold, signed or not),
+# and because mounts preserve ownership the un-elevated app reads the user's
+# files straight from the mounted snapshot - the broker never streams bytes,
+# which keeps its privileged surface to mount/unmount/delete only.
+#
+# The OS-independent surface (wire protocol + framing, tmutil output parsing,
+# snapshot-name/date validation, firmlink-aware path mapping DECISION logic,
+# launch argv construction, launcher state machine) compiles + unit-tests on
+# every target; the socket server/client, statfs volume resolution, and the
+# osascript elevation launch are `#[cfg(target_os = "macos")]` only.
+
+[lib]
+name = "driven_apfs"
+path = "src/lib.rs"
+
+# The root mount-broker binary. Small: parses `--socket`/`--allowed-volume`/
+# `--app-pid`/`--peer-uid`, refuses to run as non-root, sweeps stale mounts,
+# and runs the socket server loop.
+[[bin]]
+name = "driven-apfs-helper"
+path = "src/bin/driven-apfs-helper.rs"
+
+[dependencies]
+thiserror = { workspace = true }
+serde = { workspace = true }
+serde_json = { workspace = true }
+tracing = { workspace = true }
+uuid = { workspace = true }
+driven-vss = { path = "../driven-vss" }
+
+[target.'cfg(target_os = "macos")'.dependencies]
+libc = { workspace = true }
+
+[dev-dependencies]
+tempfile = "3"
