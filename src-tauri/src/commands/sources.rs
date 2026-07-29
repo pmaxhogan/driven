@@ -127,8 +127,10 @@ pub async fn add_source(
 ) -> CommandResult<AddSourceResult> {
     // The owning account must exist (a stale webview id surfaces an error). The
     // master-key state is re-read INSIDE the per-account lock below (R2-P1-1), so
-    // only the existence check matters here.
-    let _ = find_account(state.state().as_ref(), req.account_id).await?;
+    // only the existence check matters here. The row's `backend_kind` is also what
+    // tells `validate_source_metadata` which destination ids are legal for this
+    // account - notably whether the EMPTY id is this backend's root.
+    let account = find_account(state.state().as_ref(), req.account_id).await?;
 
     // C1 (SPEC s11.6.1): resolve the local path from the backend-minted dialog
     // token (single-use) - NOT the webview-supplied `local_path` string. Reject
@@ -168,6 +170,7 @@ pub async fn add_source(
         &req.display_name,
         &req.drive_folder_id,
         &req.drive_folder_path,
+        account.backend_kind,
     )?;
     // Issue #7: validate the optional Shared Drive id the same way as the folder
     // id (bounded, no control/whitespace) so a junk renderer value cannot bloat
@@ -1159,7 +1162,9 @@ const MAX_DRIVE_FOLDER_PATH_LEN: usize = 4096;
 /// `drive_folder_path` verbatim, so a buggy / hostile renderer could write a
 /// control-char-laden or unbounded string into `backup_sources`. This enforces:
 /// - `display_name`: non-empty (after trim), no control chars, length-capped.
-/// - `drive_folder_id`: non-empty, no control chars / whitespace, length-capped.
+/// - `drive_folder_id`: no control chars / whitespace, length-capped, and
+///   non-empty UNLESS the empty string IS the account backend's destination root
+///   (see below).
 /// - `drive_folder_path`: optional (empty = My Drive root), no control chars,
 ///   length-capped (it is a `/`-joined breadcrumb, NOT a local path - the local
 ///   path is validated separately via the dialog token).
@@ -1189,10 +1194,20 @@ fn validate_drive_id(drive_id: Option<&str>) -> CommandResult<()> {
     Ok(())
 }
 
+/// `backend` decides whether an EMPTY `drive_folder_id` is legal. It is legal iff
+/// the empty string is that backend's own destination root
+/// ([`driven_backend::picker_root_id`]): an S3 bucket root is the empty key
+/// prefix, so "back this source up at the top of the bucket" arrives here as `""`
+/// and is a perfectly valid choice. Google Drive's root is the concrete `"root"`
+/// alias, so an empty id there still means "the user picked nothing" and is still
+/// rejected. Hard-coding "non-empty" made an S3 account unable to create ANY
+/// bucket-root source - the wizard's Next stayed dead because the only value the
+/// picker could produce at the root was the one value the backend refused.
 fn validate_source_metadata(
     display_name: &str,
     drive_folder_id: &str,
     drive_folder_path: &str,
+    backend: BackendKind,
 ) -> CommandResult<()> {
     let invalid = |msg: &str| CommandError::with_code(ErrorCode::InvalidInput, msg.to_string());
 
@@ -1207,8 +1222,10 @@ fn validate_source_metadata(
         return Err(invalid("display name must not contain control characters"));
     }
 
-    if drive_folder_id.trim().is_empty() {
-        return Err(invalid("a Drive destination folder must be selected"));
+    // An empty id is only a "nothing selected" bug for a backend whose root is a
+    // concrete id. Where the root IS the empty string, it is the root selection.
+    if drive_folder_id.trim().is_empty() && !driven_backend::picker_root_id(backend).is_empty() {
+        return Err(invalid("a destination folder must be selected"));
     }
     if drive_folder_id.chars().count() > MAX_DRIVE_FOLDER_ID_LEN {
         return Err(invalid("Drive folder id is too long"));
@@ -1885,35 +1902,35 @@ mod tests {
     fn validate_source_metadata_enforces_printable_nonempty_bounded() {
         // R4-P2-3: the renderer-supplied source metadata is validated before it
         // lands in SQLite. A valid set passes.
-        validate_source_metadata("My Docs", "drive-folder-id", "Backups/Docs")
+        validate_source_metadata("My Docs", "drive-folder-id", "Backups/Docs", BackendKind::GoogleDrive)
             .expect("a clean metadata set is accepted");
         // An empty Drive folder PATH is allowed (My Drive root).
-        validate_source_metadata("My Docs", "root", "").expect("empty path = My Drive root");
+        validate_source_metadata("My Docs", "root", "", BackendKind::GoogleDrive).expect("empty path = My Drive root");
 
         // Empty / whitespace display name -> rejected.
         assert_eq!(
-            validate_source_metadata("   ", "fid", "")
+            validate_source_metadata("   ", "fid", "", BackendKind::GoogleDrive)
                 .expect_err("empty display name")
                 .code,
             ErrorCode::InvalidInput
         );
         // Control char in display name -> rejected.
         assert_eq!(
-            validate_source_metadata("bad\u{0007}name", "fid", "")
+            validate_source_metadata("bad\u{0007}name", "fid", "", BackendKind::GoogleDrive)
                 .expect_err("control char in display name")
                 .code,
             ErrorCode::InvalidInput
         );
         // Empty Drive folder id -> rejected.
         assert_eq!(
-            validate_source_metadata("ok", "  ", "")
+            validate_source_metadata("ok", "  ", "", BackendKind::GoogleDrive)
                 .expect_err("empty drive folder id")
                 .code,
             ErrorCode::InvalidInput
         );
         // Whitespace inside the Drive folder id -> rejected.
         assert_eq!(
-            validate_source_metadata("ok", "has space", "")
+            validate_source_metadata("ok", "has space", "", BackendKind::GoogleDrive)
                 .expect_err("whitespace in drive folder id")
                 .code,
             ErrorCode::InvalidInput
@@ -1921,7 +1938,7 @@ mod tests {
         // Over-long display name -> rejected.
         let long_name = "x".repeat(MAX_DISPLAY_NAME_LEN + 1);
         assert_eq!(
-            validate_source_metadata(&long_name, "fid", "")
+            validate_source_metadata(&long_name, "fid", "", BackendKind::GoogleDrive)
                 .expect_err("over-long display name")
                 .code,
             ErrorCode::InvalidInput
@@ -1929,15 +1946,54 @@ mod tests {
         // Over-long Drive folder path -> rejected.
         let long_path = "a/".repeat(MAX_DRIVE_FOLDER_PATH_LEN);
         assert_eq!(
-            validate_source_metadata("ok", "fid", &long_path)
+            validate_source_metadata("ok", "fid", &long_path, BackendKind::GoogleDrive)
                 .expect_err("over-long drive folder path")
                 .code,
             ErrorCode::InvalidInput
         );
         // Control char in the Drive folder path -> rejected.
         assert_eq!(
-            validate_source_metadata("ok", "fid", "Backups/\u{0000}/Docs")
+            validate_source_metadata("ok", "fid", "Backups/\u{0000}/Docs", BackendKind::GoogleDrive)
                 .expect_err("control char in drive folder path")
+                .code,
+            ErrorCode::InvalidInput
+        );
+    }
+
+    #[test]
+    fn empty_destination_id_is_valid_exactly_when_it_is_the_backends_root() {
+        // The release-blocking bug: `drive_folder_id` was required to be
+        // non-empty for EVERY backend, but an S3 bucket root IS the empty key
+        // prefix (`picker_root_id(S3) == ""`). So the one destination an S3
+        // account starts on could never be saved, and first-run setup dead-ended
+        // with a permanently disabled Next.
+        assert!(
+            driven_backend::picker_root_id(BackendKind::S3).is_empty(),
+            "this test's premise: the S3 destination root is the empty prefix"
+        );
+        validate_source_metadata("Docs", "", "", BackendKind::S3)
+            .expect("an S3 bucket-root destination is a valid selection");
+        // A non-empty S3 prefix (the user descended into one) stays valid.
+        validate_source_metadata("Docs", "backups", "backups", BackendKind::S3)
+            .expect("an S3 sub-prefix destination is valid");
+
+        // Google Drive's root is the concrete "root" alias, so empty there still
+        // means "nothing selected" and MUST still be rejected - the fix must not
+        // become a blanket hole in the Drive guard.
+        assert!(
+            !driven_backend::picker_root_id(BackendKind::GoogleDrive).is_empty(),
+            "this test's premise: the Drive destination root is a concrete id"
+        );
+        assert_eq!(
+            validate_source_metadata("Docs", "", "", BackendKind::GoogleDrive)
+                .expect_err("an empty Drive destination is still nothing-selected")
+                .code,
+            ErrorCode::InvalidInput
+        );
+        // Whitespace is never a destination, even where empty is allowed.
+        assert_eq!(
+            validate_source_metadata("Docs", "  ", "", BackendKind::S3)
+                .expect_err("whitespace is not the S3 bucket root")
                 .code,
             ErrorCode::InvalidInput
         );

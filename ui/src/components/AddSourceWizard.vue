@@ -1,5 +1,5 @@
 <script setup lang="ts">
-import { computed, ref } from "vue";
+import { computed, ref, watch } from "vue";
 import { useI18n } from "vue-i18n";
 
 import DriveFolderPicker from "./DriveFolderPicker.vue";
@@ -14,7 +14,7 @@ import {
   unconstrainedIncludePatterns,
 } from "../stores/exclusionPreview";
 import { useSourcesStore } from "../stores/sources";
-import type { SourceDto } from "../ipc/types";
+import type { BackendDto, SourceDto } from "../ipc/types";
 
 // Add-source wizard (SPEC s11.2; DESIGN s8.5 step 3 / s8.2 add-source wizard).
 // Five steps: pick a LOCAL folder (tauri-plugin-dialog, dialog-derived path
@@ -44,14 +44,50 @@ const emit = defineEmits<{ created: [source: SourceDto] }>();
 // B3: a post-confirm "reveal" step is appended when an encrypted add returned a
 // recovery phrase; the user must acknowledge it before the wizard closes.
 type Step = "localFolder" | "driveFolder" | "exclusions" | "encryption" | "confirm" | "reveal";
-const STEPS: Step[] = ["localFolder", "driveFolder", "exclusions", "encryption", "confirm"];
 
 const open = ref(false);
 const stepIndex = ref(0);
 // B3: the reveal step is shown out-of-band (after a successful encrypted add),
 // so it is tracked separately rather than as a normal STEPS index.
 const revealing = ref(false);
-const step = computed<Step>(() => (revealing.value ? "reveal" : STEPS[stepIndex.value]));
+
+// The destination descriptors this build can construct, loaded when the wizard
+// opens. They are what says whether the SELECTED ACCOUNT's destination can be
+// browsed - a capability `AccountDto` itself does not carry, which is precisely
+// why this wizard used to assume every account was Drive-shaped.
+const backends = ref<BackendDto[]>([]);
+
+/** The account the new source will belong to. */
+const selectedAccount = computed(() => accounts.accounts.find((a) => a.id === accountId.value));
+
+/** Whether that account's destination has a browsable folder tree. Defaults to
+ * `true` (the Drive behaviour) while the descriptors are still loading, so the
+ * step list never flickers shorter and then longer.
+ *
+ * Note this is a per-BACKEND capability, not "is it Google Drive": S3 browses key
+ * prefixes and so does get the step, while a local or removable folder has its
+ * destination fixed when the account is created and does not. */
+const destinationIsBrowsable = computed(() => {
+  const kind = selectedAccount.value?.backendKind;
+  if (kind === undefined) return true;
+  return backends.value.find((b) => b.id === kind)?.supportsFolderPicker ?? true;
+});
+
+/** The wizard's steps for the CURRENTLY-SELECTED account. A static list showed
+ * "Drive folder" to every account and walked non-Drive users into a step with
+ * nothing to pick in it; a destination with no browsable tree simply has no
+ * destination step. */
+const STEPS = computed<Step[]>(() => [
+  "localFolder",
+  ...(destinationIsBrowsable.value ? (["driveFolder"] as Step[]) : []),
+  "exclusions",
+  "encryption",
+  "confirm",
+]);
+
+const step = computed<Step>(() =>
+  revealing.value ? "reveal" : (STEPS.value[stepIndex.value] ?? "confirm")
+);
 
 // Form state.
 const accountId = ref<string | null>(null);
@@ -117,16 +153,48 @@ const unconstrainedIncludes = computed(() =>
 );
 
 const canLeaveLocal = computed(() => accountId.value !== null && localPathToken.value !== null);
+// `!== null`, never truthiness: "" is the destination id of a bucket root, a real
+// selection that a `!!` check would reject.
 const canLeaveDrive = computed(() => driveFolderId.value !== null);
+
+/** Whether a destination valid for this account's backend has been settled: one
+ * picked on the destination step, or the account's own fixed root when its
+ * destination cannot be browsed. */
+const destinationSettled = computed(() => !destinationIsBrowsable.value || canLeaveDrive.value);
 
 async function start(): Promise<void> {
   reset();
   open.value = true;
-  await accounts.refresh();
+  // Load the descriptors and the accounts together; the descriptors decide
+  // whether the destination step exists for whichever account is selected.
+  await Promise.all([accounts.refresh(), loadBackends()]);
   if (accounts.accounts.length > 0) {
     accountId.value = accounts.accounts[0].id;
   }
 }
+
+/** Load the destination descriptors. A failure leaves the list empty, which falls
+ * back to the Drive-shaped behaviour rather than dead-ending the wizard. */
+async function loadBackends(): Promise<void> {
+  try {
+    const list = await ipc.listBackends();
+    backends.value = Array.isArray(list) ? list : [];
+  } catch {
+    backends.value = [];
+  }
+}
+
+// Switching accounts mid-wizard invalidates any destination already picked - a
+// Drive folder id means nothing to an S3 account - so drop it and return to the
+// first step, whose step list is the one that just changed.
+watch(accountId, () => {
+  driveFolderId.value = null;
+  driveId.value = null;
+  driveFolderPath.value = "";
+  if (stepIndex.value > STEPS.value.length - 1) {
+    stepIndex.value = Math.max(0, STEPS.value.length - 1);
+  }
+});
 
 function reset(): void {
   stepIndex.value = 0;
@@ -195,7 +263,7 @@ function onAppendExclude(pattern: string): void {
 }
 
 function next(): void {
-  if (stepIndex.value >= STEPS.length - 1) return;
+  if (stepIndex.value >= STEPS.value.length - 1) return;
   stepIndex.value += 1;
   // Each step lazily loads its own data as it becomes active: the Drive step
   // when the shared DriveFolderPicker mounts, the exclusions step when
@@ -211,7 +279,7 @@ async function confirm(): Promise<void> {
     accountId.value === null ||
     localPath.value === null ||
     localPathToken.value === null ||
-    driveFolderId.value === null
+    !destinationSettled.value
   ) {
     return;
   }
@@ -224,7 +292,9 @@ async function confirm(): Promise<void> {
       displayName: displayName ?? localPath.value,
       localPathToken: localPathToken.value,
       localPath: localPath.value,
-      driveFolderId: driveFolderId.value,
+      // A destination that cannot be browsed contributed no id; its root is the
+      // empty one, which is what the backend accepts for such a destination.
+      driveFolderId: driveFolderId.value ?? "",
       driveId: driveId.value,
       driveFolderPath: driveFolderPath.value,
       encryptionEnabled: encryptionEnabled.value,
@@ -499,7 +569,13 @@ defineExpose({ start });
       <!-- Step 5: confirm -->
       <div v-else class="space-y-2 text-sm" data-testid="confirm-summary">
         <p>{{ t("settings.addSource.step.localFolder") }}: {{ localPath }}</p>
-        <p>{{ t("settings.addSource.step.driveFolder") }}: {{ driveFolderPath }}</p>
+        <!-- The destination: the folder picked on the destination step, or - when
+             this account's destination cannot be browsed - the account's own
+             fixed destination, so the summary is never a blank line. -->
+        <p data-testid="confirm-destination">
+          {{ t("settings.addSource.step.driveFolder") }}:
+          {{ destinationIsBrowsable ? driveFolderPath : (selectedAccount?.email ?? "") }}
+        </p>
         <p>
           {{ t("settings.sources.column.encryption") }}:
           {{ encryptionEnabled ? t("common.enabled") : t("common.disabled") }}
