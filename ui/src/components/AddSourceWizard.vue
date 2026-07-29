@@ -581,12 +581,13 @@ defineExpose({ start });
       <!-- Step 5: confirm -->
       <div v-else class="space-y-2 text-sm" data-testid="confirm-summary">
         <p>{{ t("settings.addSource.step.localFolder") }}: {{ localPath }}</p>
-        <!-- The destination: the folder picked on the destination step, or - when
-             this account's destination cannot be browsed - the account's own
-             fixed destination, so the summary is never a blank line. -->
+        <!-- The destination: the sub-folder picked on the destination step, else
+             the account's own destination - which covers BOTH a backend with no
+             browsable tree and a pick that landed on the ROOT (whose display path
+             is legitimately empty, e.g. a bucket root). Never a blank line. -->
         <p data-testid="confirm-destination">
           {{ t("settings.addSource.step.driveFolder") }}:
-          {{ destinationIsBrowsable ? driveFolderPath : (selectedAccount?.email ?? "") }}
+          {{ driveFolderPath || (selectedAccount?.email ?? "") }}
         </p>
         <p>
           {{ t("settings.sources.column.encryption") }}:
