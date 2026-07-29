@@ -1162,6 +1162,167 @@ describe("Settings Rules tab", () => {
     });
   });
 
+  /// Mount the Rules tab with a settings backend that echoes patches back, and
+  /// return the wrapper. Shared by the integrity-scrub control tests below.
+  async function mountRulesTab(over: Partial<SettingsDto> = {}) {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings(over));
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Partial<SettingsDto> }).patch;
+        return Promise.resolve({ ...makeSettings(over), ...patch });
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+    return wrapper;
+  }
+
+  it("integrity scrub: renders the shipped policy, on and metadata-only", async () => {
+    const wrapper = await mountRulesTab();
+
+    // Default ON - the scrub is the remote half of the weekly deep-verify, and
+    // an integrity check nobody enables detects nothing.
+    const toggle = wrapper.get('[data-testid="scrub-enabled-toggle"]');
+    expect((toggle.element as HTMLInputElement).checked).toBe(true);
+    // The cadence is stored in SECONDS but shown in HOURS: 604800s reads as
+    // "168", which a person can reason about, rather than as a wall of digits.
+    expect((wrapper.get('[data-testid="scrub-interval"]').element as HTMLInputElement).value).toBe(
+      "168"
+    );
+    expect((wrapper.get('[data-testid="scrub-slice"]').element as HTMLInputElement).value).toBe(
+      "500"
+    );
+    // Deep sampling ships OFF: the checksum comparison already catches
+    // remote-side corruption, so spending bandwidth is opt-in.
+    expect(
+      (wrapper.get('[data-testid="scrub-deep-sample"]').element as HTMLInputElement).value
+    ).toBe("0");
+  });
+
+  it("integrity scrub: the kill-switch patches the standalone scrub group", async () => {
+    const wrapper = await mountRulesTab();
+    await wrapper.get('[data-testid="scrub-enabled-toggle"]').setValue(false);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { scrub: { enabled: false } },
+    });
+  });
+
+  it("integrity scrub: the cadence is entered in hours and patched in seconds", async () => {
+    const wrapper = await mountRulesTab();
+    const input = wrapper.get('[data-testid="scrub-interval"]');
+    await input.setValue("24");
+    await input.trigger("change");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { scrub: { intervalSecs: 86_400 } },
+    });
+  });
+
+  it("integrity scrub: an out-of-range cadence is clamped in place, not sent", async () => {
+    // The backend validator would REJECT an out-of-range value and the whole
+    // Rules form would surface an error banner; clamping in the UI keeps the
+    // form usable and never sends a value the backend refuses.
+    const wrapper = await mountRulesTab();
+    const input = wrapper.get('[data-testid="scrub-interval"]');
+    await input.setValue("99999999");
+    await input.trigger("change");
+    await flushPromises();
+    // 8760 hours = 1 year, the backend's SCRUB_INTERVAL_MAX.
+    expect((input.element as HTMLInputElement).value).toBe("8760");
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { scrub: { intervalSecs: 8_760 * 3600 } },
+    });
+  });
+
+  it("integrity scrub: the slice size clamps to the backend bounds", async () => {
+    const wrapper = await mountRulesTab();
+    const input = wrapper.get('[data-testid="scrub-slice"]');
+
+    await input.setValue("1");
+    await input.trigger("change");
+    await flushPromises();
+    expect((input.element as HTMLInputElement).value).toBe("10");
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { scrub: { sliceSize: 10 } },
+    });
+
+    await input.setValue("999999");
+    await input.trigger("change");
+    await flushPromises();
+    expect((input.element as HTMLInputElement).value).toBe("10000");
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { scrub: { sliceSize: 10_000 } },
+    });
+  });
+
+  it("integrity scrub: the deep sample accepts zero and clamps its ceiling", async () => {
+    const wrapper = await mountRulesTab();
+    const input = wrapper.get('[data-testid="scrub-deep-sample"]');
+
+    // Zero is a LEGITIMATE value here (metadata-only), unlike the slice size -
+    // it must survive the clamp rather than being floored to 1.
+    await input.setValue("0");
+    await input.trigger("change");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { scrub: { deepSample: 0 } },
+    });
+
+    await input.setValue("5000");
+    await input.trigger("change");
+    await flushPromises();
+    expect((input.element as HTMLInputElement).value).toBe("100");
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { scrub: { deepSample: 100 } },
+    });
+  });
+
+  it("integrity scrub: an emptied field clamps to the minimum and never sends NaN", async () => {
+    // `<input type="number">` coerces an unparseable entry to "", so the
+    // handler sees an empty string rather than junk - `Number("")` is 0, which
+    // clamps to the floor. That is the SAME behaviour every other required
+    // numeric control in this form has (scan interval, hook timeout), and
+    // consistency across the form is worth more than a bespoke
+    // fall-back-to-persisted rule here.
+    //
+    // The property that actually matters, and what this test pins: a garbage
+    // entry can never put `NaN` on the wire, where it would serialize as `null`
+    // and fail the backend's range validator with an error banner over the
+    // whole form.
+    const wrapper = await mountRulesTab();
+    const input = wrapper.get('[data-testid="scrub-slice"]');
+    await input.setValue("not a number");
+    await input.trigger("change");
+    await flushPromises();
+    expect((input.element as HTMLInputElement).value).toBe("10");
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { scrub: { sliceSize: 10 } },
+    });
+  });
+
+  it("integrity scrub: hydrates a non-default persisted policy", async () => {
+    const wrapper = await mountRulesTab({
+      scrub: { enabled: false, intervalSecs: 86_400, sliceSize: 250, deepSample: 4 },
+    });
+    expect(
+      (wrapper.get('[data-testid="scrub-enabled-toggle"]').element as HTMLInputElement).checked
+    ).toBe(false);
+    expect((wrapper.get('[data-testid="scrub-interval"]').element as HTMLInputElement).value).toBe(
+      "24"
+    );
+    expect((wrapper.get('[data-testid="scrub-slice"]').element as HTMLInputElement).value).toBe(
+      "250"
+    );
+    expect(
+      (wrapper.get('[data-testid="scrub-deep-sample"]').element as HTMLInputElement).value
+    ).toBe("4");
+  });
+
   it("schedule window: enable, edit time, and toggle a day each patch the schedule", async () => {
     invokeMock.mockImplementation((cmd: string, args: unknown) => {
       if (cmd === "get_settings") return Promise.resolve(makeSettings());
