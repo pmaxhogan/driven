@@ -537,6 +537,9 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         | ErrorCode::LocalFileLocked
         | ErrorCode::LocalVssUnavailable
         | ErrorCode::LocalVssHelperPending
+        // A permission / Full-Disk-Access denial is a local consent problem,
+        // not a reachability one.
+        | ErrorCode::LocalPermissionDenied
         | ErrorCode::LocalFileChangedDuringUpload
         | ErrorCode::LocalFileReplacedDuringUpload
         | ErrorCode::LocalIoError

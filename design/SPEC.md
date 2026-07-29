@@ -1776,7 +1776,8 @@ Stable codes (V1):
 | `drive.remote_file_missing`  | The backed-up copy a recorded `drive_file_id` points at is gone (definitive 404 on an update); the stale id is cleared and the file re-uploads on the next scan (warn, self-healing) |
 | `drive.resumable_session_invalid` | 4xx during resumable upload — caller must restart session |
 | `local.file_locked`          | Couldn't open even with `FILE_SHARE_DELETE` (V1: locked file; VSS path failed too — see `local.vss_unavailable`) |
-| `local.vss_unavailable`      | Driven needs elevation to use VSS but isn't elevated |
+| `local.vss_unavailable`      | Driven needs elevation to use VSS but isn't elevated (Windows only) |
+| `local.permission_denied`    | The OS refused to open the file (Unix `EACCES`/`EPERM`, incl. a macOS TCC path such as `~/Library/Mail` before Full Disk Access is granted). A graceful skip: nothing is holding the file and no snapshot can read around it - only a permission grant helps |
 | `local.file_changed_during_upload` | Pre/post fstat showed file mutated mid-upload — re-queued |
 | `local.file_replaced_during_upload` | Atomic-replace detected by inode identity check — re-queued |
 | `local.io_error`             | Generic disk error                            |

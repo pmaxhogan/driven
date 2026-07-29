@@ -659,6 +659,75 @@ mod tests {
         let _ = p.available();
     }
 
+    /// The non-Windows stub must be a CLEAN no-op fallthrough, on a real
+    /// macOS/Linux host: every entry point answers "unavailable" without
+    /// panicking, allocating a snapshot, or returning a path a caller might
+    /// try to open - and the pure decision then routes a locked file to
+    /// `SkipLocked` (never `OpenSnapshot`) in every mode.
+    ///
+    /// This is the seam a future macOS APFS-snapshot fallback plugs into: it
+    /// replaces `map_for_volume`'s `Unavailable` with a `Mapped(...)` local
+    /// snapshot path, and everything downstream (executor `open_effective`,
+    /// `fallback_decision`, end-of-cycle release) already handles it.
+    #[cfg(not(windows))]
+    #[test]
+    fn stub_is_a_clean_no_op_off_windows() {
+        use crate::{OpenAttempt, VssError};
+
+        // The snapshot type itself refuses to construct, with the graceful
+        // degrade signal rather than a panic or a bogus handle.
+        assert!(matches!(
+            crate::VssSnapshot::create("C:"),
+            Err(VssError::Unavailable(_))
+        ));
+        assert!(matches!(
+            crate::VssSnapshot::delete_by_id("{some-guid}"),
+            Err(VssError::Unavailable(_))
+        ));
+
+        // The provider degrades in every mode and records nothing to release.
+        for mode in [VssMode::Auto, VssMode::Always, VssMode::Never] {
+            let p = RealVssProvider::new(mode);
+            assert!(!p.available(), "{mode:?}: there is no VSS off Windows");
+            assert_eq!(
+                p.map_for_volume(Path::new("/Users/someone/Library/Mail/x.emlx")),
+                SnapshotOutcome::Unavailable,
+                "{mode:?}: a POSIX path must degrade, not map"
+            );
+            assert!(
+                p.recorded_snapshots().is_empty(),
+                "{mode:?}: nothing to record when nothing is ever snapshotted"
+            );
+            // Idempotent + safe with no snapshots outstanding.
+            p.end_cycle();
+            p.end_cycle();
+
+            // ...and the pure decision therefore skips a locked file instead of
+            // trying to open a snapshot that does not exist.
+            assert_eq!(
+                crate::fallback_decision(
+                    OpenAttempt::Locked,
+                    mode,
+                    p.available(),
+                    SnapshotOutcome::Unavailable,
+                ),
+                crate::FallbackDecision::SkipLocked,
+                "{mode:?}: a locked file off Windows is a skip"
+            );
+            // A READABLE file is never held back by the missing snapshot.
+            assert_eq!(
+                crate::fallback_decision(
+                    OpenAttempt::Ok,
+                    mode,
+                    p.available(),
+                    SnapshotOutcome::Unavailable,
+                ),
+                crate::FallbackDecision::OpenLive,
+                "{mode:?}: an openable file still reads live"
+            );
+        }
+    }
+
     #[test]
     fn fake_provider_set_mode_never_reports_unavailable() {
         // P1-5: the fake mirrors the real provider so an orchestrator test can

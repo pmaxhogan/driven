@@ -604,6 +604,10 @@
         "short": "Starting helper",
         "long": "The least-privilege helper is starting to back up a locked file. Driven will retry it on the next cycle."
       },
+      "permission_denied": {
+        "short": "Permission needed",
+        "long": "Driven is not allowed to read this file. Grant it access to back the file up; until then Driven skips it and retries each time it runs."
+      },
       "file_changed_during_upload": {
         "short": "File changed",
         "long": "A file changed while it was being uploaded. Driven re-queued it for the next cycle."

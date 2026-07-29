@@ -1723,6 +1723,183 @@ async fn network_updater_down_does_not_block_sync() {
 }
 
 // ---------------------------------------------------------------------------
+// Row: permission-denied file skipped + reported, rest of the source syncs.
+// ---------------------------------------------------------------------------
+
+/// Unix/macOS locked-and-denied parity (DESIGN s5.3): an UNREADABLE file must
+/// take the graceful skip-and-report path, not the generic-failure path.
+///
+/// A `chmod 000` file is the portable stand-in for the macOS case that actually
+/// motivates this - a TCC-protected path such as `~/Library/Mail`, which returns
+/// `EPERM` ("Operation not permitted") no matter what the mode bits say until
+/// the user grants Driven Full Disk Access. Both errnos classify identically, so
+/// this row pins the whole behaviour without needing a TCC-protected fixture
+/// (which no unattended test can create: granting FDA is a manual System
+/// Settings action).
+///
+/// Asserts, end-to-end through the real scanner + planner + executor +
+/// orchestrator:
+/// 1. the readable files in the same source still back up;
+/// 2. the unreadable one surfaces a WARN `local.permission_denied` activity row;
+/// 3. it is NOT reported as `local.io_error` ("Driven hit a disk error"), and
+///    NOT as `local.file_locked` / `local.vss_unavailable` (nothing is holding
+///    it and no shadow copy exists on this OS);
+/// 4. the cycle completes (`Idle`) with `errors == 0` - a skip is not a failure;
+/// 5. a SECOND cycle repeats the skip rather than getting stuck or falsely
+///    marking the file synced.
+#[cfg(unix)]
+#[tokio::test]
+async fn permission_denied_file_is_skipped_and_reported() {
+    use driven_core::state::{ActivityFilter, ActivityLevel, PageRequest};
+    use std::os::unix::fs::PermissionsExt;
+
+    // SAFETY: `geteuid` reads the calling process's identity - no arguments,
+    // no memory access, cannot fail.
+    if unsafe { libc::geteuid() } == 0 {
+        eprintln!(
+            "SKIP permission_denied_file_is_skipped_and_reported: running as root, which \
+             bypasses mode bits (a chmod-000 file opens fine). Run as a normal user."
+        );
+        return;
+    }
+
+    let dir = tempfile::tempdir().unwrap();
+    let src_dir = tempfile::tempdir().unwrap();
+    let state = open_state(dir.path()).await;
+    let account = seed_account(&state).await;
+    let remote = Arc::new(InMemoryRemoteStore::new());
+    let folder = remote.root_id().to_string();
+
+    write_file(src_dir.path(), "readable.txt", b"this one uploads");
+    write_file(src_dir.path(), "secret.bin", b"the user cannot read this");
+    let denied = src_dir.path().join("secret.bin");
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o000)).unwrap();
+
+    let src = source_in(account, src_dir.path(), &folder);
+    state.upsert_source(&src).await.unwrap();
+    let source_id = src.id;
+
+    let orch = orchestrator(
+        account,
+        state.clone(),
+        remote.clone(),
+        Arc::new(FakePowerSource::new(power_on_ac())),
+        Arc::new(FakeNetProbe::online()),
+        Arc::new(FakeClock::new()),
+        OrchestratorConfig::default(),
+    );
+
+    let progress = run_cycle_capture_progress(&orch).await;
+
+    // (1) The readable file backed up; the unreadable one did not.
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        1,
+        "the readable file must still upload while the unreadable one is skipped"
+    );
+
+    // (4) A skip is not an error: the cycle reports zero errors and lands Idle.
+    assert_eq!(
+        progress.errors, 0,
+        "a permission denial is a skip, so it must not count as a cycle error"
+    );
+    assert!(matches!(orch.state().await, OrchestratorState::Idle { .. }));
+
+    // (2) The denial surfaced under its OWN code, at WARN.
+    let denied_rows = |min_level| {
+        let state = state.clone();
+        async move {
+            state
+                .query_activity(
+                    ActivityFilter {
+                        source_id: Some(source_id),
+                        event_types: vec!["local.permission_denied".to_string()],
+                        min_level,
+                        ..ActivityFilter::default()
+                    },
+                    PageRequest::first(100),
+                )
+                .await
+                .unwrap()
+                .rows
+        }
+    };
+    let warn_rows = denied_rows(Some(ActivityLevel::Warn)).await;
+    assert_eq!(
+        warn_rows.len(),
+        1,
+        "exactly one local.permission_denied row for the one unreadable file; got {warn_rows:?}"
+    );
+    assert!(
+        warn_rows[0]
+            .message
+            .as_deref()
+            .is_some_and(|m| m.contains("secret.bin")),
+        "the row must name the file the user has to grant access to; got {:?}",
+        warn_rows[0].message
+    );
+    assert!(
+        denied_rows(Some(ActivityLevel::Error)).await.is_empty(),
+        "a skip is a WARN, not an ERROR"
+    );
+
+    // (3) ...and under NO other code. Before this classification the same file
+    // produced `local.io_error`, which reads as a failing disk.
+    for wrong in [
+        "local.io_error",
+        "local.file_locked",
+        "local.vss_unavailable",
+    ] {
+        let page = state
+            .query_activity(
+                ActivityFilter {
+                    source_id: Some(source_id),
+                    event_types: vec![wrong.to_string()],
+                    ..ActivityFilter::default()
+                },
+                PageRequest::first(100),
+            )
+            .await
+            .unwrap();
+        assert!(
+            page.rows.is_empty(),
+            "an unreadable file must not be reported as {wrong}; got {:?}",
+            page.rows
+        );
+    }
+
+    // (5) A second cycle repeats the skip - the file is retried, never silently
+    // marked synced and never wedging the cycle. This also measures the cost of
+    // a PERMANENT denial: one identical warn row per cycle (a lock is transient,
+    // a denial is not), which is worth knowing before any UI aggregates them.
+    orch.run_cycle(TickSource::Manual).await.unwrap();
+    let after_two = denied_rows(Some(ActivityLevel::Warn)).await;
+    assert_eq!(
+        after_two.len(),
+        2,
+        "the denial re-reports each cycle (one row per cycle); got {after_two:?}"
+    );
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        1,
+        "the still-unreadable file must not appear on the remote"
+    );
+
+    // Restore so the tempdir teardown can remove the file.
+    std::fs::set_permissions(&denied, std::fs::Permissions::from_mode(0o644)).unwrap();
+
+    // Once readable, the very next cycle backs it up with no user action beyond
+    // the permission grant - the "grant Full Disk Access and it just works"
+    // contract the sibling onboarding flow is built on.
+    orch.run_cycle(TickSource::Manual).await.unwrap();
+    assert_eq!(
+        live_object_count(&remote, &folder).await,
+        2,
+        "granting access must let the next cycle back the file up"
+    );
+}
+
+// ---------------------------------------------------------------------------
 // Row (M3.5): VSS unavailable -> locked file skipped + reported, rest sync.
 // ---------------------------------------------------------------------------
 

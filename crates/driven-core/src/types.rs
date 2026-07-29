@@ -1069,6 +1069,18 @@ pub enum ErrorCode {
     /// permanent lock - distinct from [`Self::LocalFileLocked`] so the brief
     /// launch-in-progress window is not misreported as "file locked".
     LocalVssHelperPending,
+    /// `local.permission_denied` - the OS refused to OPEN the file for read
+    /// (Unix `EACCES` / `EPERM`). Distinct from [`Self::LocalFileLocked`]: no
+    /// other process holds the file, the running user simply is not allowed to
+    /// read it, so waiting or snapshotting cannot help - only a permission /
+    /// privacy-consent change can. On macOS this is the code a TCC-protected
+    /// path (`~/Library/Mail`, `~/Library/Messages`, Photos, ...) produces
+    /// until the user grants Driven Full Disk Access, which is why the UI needs
+    /// to tell it apart from "another program has the file locked". Also
+    /// distinct from [`Self::LocalIoError`]: it is a user-fixable consent
+    /// problem, not a failing disk, and it is reported as a graceful per-file
+    /// SKIP (warn, retried next cycle) rather than a hard failure.
+    LocalPermissionDenied,
     /// `local.file_changed_during_upload` - pre/post fstat showed file
     /// mutated mid-upload; re-queued.
     LocalFileChangedDuringUpload,
@@ -1176,6 +1188,7 @@ impl ErrorCode {
             ErrorCode::LocalFileLocked => "local.file_locked",
             ErrorCode::LocalVssUnavailable => "local.vss_unavailable",
             ErrorCode::LocalVssHelperPending => "local.vss_helper_pending",
+            ErrorCode::LocalPermissionDenied => "local.permission_denied",
             ErrorCode::LocalFileChangedDuringUpload => "local.file_changed_during_upload",
             ErrorCode::LocalFileReplacedDuringUpload => "local.file_replaced_during_upload",
             ErrorCode::LocalIoError => "local.io_error",
@@ -1231,6 +1244,7 @@ impl ErrorCode {
             "local.file_locked" => ErrorCode::LocalFileLocked,
             "local.vss_unavailable" => ErrorCode::LocalVssUnavailable,
             "local.vss_helper_pending" => ErrorCode::LocalVssHelperPending,
+            "local.permission_denied" => ErrorCode::LocalPermissionDenied,
             "local.file_changed_during_upload" => ErrorCode::LocalFileChangedDuringUpload,
             "local.file_replaced_during_upload" => ErrorCode::LocalFileReplacedDuringUpload,
             "local.io_error" => ErrorCode::LocalIoError,

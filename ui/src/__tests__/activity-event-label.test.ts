@@ -49,6 +49,9 @@ describe("activityEventLabel (R1-P2-3)", () => {
     // those are localized via the shared error labels.
     expect(label("drive.checksum_mismatch")).toBe("Verification failed");
     expect(label("local.file_locked")).toBe("File in use");
+    // A permission / Full-Disk-Access denial is its own skip code, and must NOT
+    // read as "File in use" (nothing is holding the file) or as a disk error.
+    expect(label("local.permission_denied")).toBe("Permission needed");
     // The self-healing stale-drive_file_id skip: a warn row whose event type is
     // this code, so the Activity table must have a label for it rather than
     // showing the raw dotted string.
