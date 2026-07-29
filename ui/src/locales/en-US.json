@@ -2,7 +2,7 @@
   "app": {
     "name": "Driven",
     "welcome": "Driven",
-    "tagline": "One-way local-folder backup to Google Drive.",
+    "tagline": "One-way local-folder backup to the cloud or a drive.",
     "boot": {
       "bootstrap": "Bootstrapping in progress."
     }
@@ -168,7 +168,7 @@
     "stepLabel": "Step {current} of {total}",
     "step1": {
       "title": "Welcome to Driven",
-      "body": "Driven backs up your local folders to Google Drive - one way, fast, with optional encryption, scheduling, and battery awareness."
+      "body": "Driven backs up your local folders - one way, fast, with optional encryption, scheduling, and battery awareness."
     },
     "step2": {
       "title": "Connect your Google account",
@@ -204,7 +204,7 @@
     },
     "step3": {
       "title": "Pick your first backup source",
-      "body": "Choose a local folder to back up and the Google Drive destination it syncs to.",
+      "body": "Choose a local folder to back up and the destination it syncs to.",
       "chooseFolderButton": "Choose folder...",
       "chooseFolderFirst": "Choose a folder to back up first.",
       "driveDestinationLabel": "Drive destination"
@@ -250,7 +250,7 @@
       "title": "Backup sources",
       "empty": "No backup sources yet.",
       "emptyTitle": "No backup sources yet",
-      "emptyHint": "Add a local folder to back it up to Google Drive.",
+      "emptyHint": "Add a local folder to start backing it up.",
       "addButton": "Add source",
       "column": {
         "name": "Name",
@@ -647,31 +647,31 @@
     "drive": {
       "rate_limited": {
         "short": "Slowing down",
-        "long": "Google Drive asked Driven to slow down. Driven is backing off and will retry automatically."
+        "long": "The destination asked Driven to slow down. Driven is backing off and will retry automatically."
       },
       "daily_quota_exhausted": {
         "short": "Daily limit reached",
         "long": "Drive's daily request limit was reached. Driven will resume after the limit resets."
       },
       "quota_exhausted": {
-        "short": "Drive is full",
-        "long": "Your Google Drive storage is full. Free up space or upgrade your plan to continue backing up."
+        "short": "Destination is full",
+        "long": "The destination is out of space. Free up space there (or upgrade the plan) to continue backing up."
       },
       "upload_size_limit": {
         "short": "File too large",
-        "long": "This file exceeds Google Drive's maximum file size and cannot be uploaded."
+        "long": "This file exceeds the destination's maximum file size and cannot be uploaded."
       },
       "checksum_mismatch": {
         "short": "Verification failed",
         "long": "The uploaded file did not match its checksum. Driven will re-upload it."
       },
       "unreachable": {
-        "short": "Drive unavailable",
-        "long": "Google Drive is unreachable right now. Driven will keep retrying."
+        "short": "Destination unavailable",
+        "long": "The destination is unreachable right now. Driven will keep retrying."
       },
       "remote_file_missing": {
         "short": "Remote copy missing",
-        "long": "The backed-up copy of this file was missing on Drive; it will be re-uploaded automatically on the next scan."
+        "long": "The backed-up copy of this file was missing at the destination; it will be re-uploaded automatically on the next scan."
       },
       "resumable_session_invalid": {
         "short": "Upload interrupted",
@@ -729,7 +729,7 @@
       },
       "invalid_filename": {
         "short": "Invalid name",
-        "long": "A file has a name Google Drive will not accept (a reserved name or trailing dot/space) and was skipped."
+        "long": "A file has a name the destination will not accept (a reserved name or trailing dot/space) and was skipped."
       },
       "ads_skipped": {
         "short": "Stream skipped",
