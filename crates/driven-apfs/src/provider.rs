@@ -24,6 +24,11 @@ use crate::launch::{HelperLaunchStatus, HelperLauncher};
 struct CycleState {
     /// The one snapshot this cycle created (its `tmutil` date stamp).
     snapshot_date: Option<String>,
+    /// When that snapshot was created, Unix epoch ms. MUST be the real time:
+    /// the orphan ledger prunes on age (`OrphanRegistry::orphans_older_than`),
+    /// so a placeholder 0 would date every snapshot to 1970 and mark it
+    /// instantly sweepable.
+    snapshot_created_ms: i64,
     /// Volume mount point -> broker mountpoint for that snapshot.
     mounts: std::collections::HashMap<PathBuf, PathBuf>,
     /// The connected broker client (kept for the cycle once established).
@@ -86,14 +91,15 @@ impl ApfsBrokeredProvider {
         if cycle.snapshot_date.is_none() {
             match snapshot::create_local_snapshot() {
                 Ok(date) => {
+                    let now_ms = std::time::SystemTime::now()
+                        .duration_since(std::time::UNIX_EPOCH)
+                        .map(|d| d.as_millis() as i64)
+                        .unwrap_or(0);
                     if let Some(rec) = self.recorder.lock().expect("recorder lock").as_ref() {
-                        let now_ms = std::time::SystemTime::now()
-                            .duration_since(std::time::UNIX_EPOCH)
-                            .map(|d| d.as_millis() as i64)
-                            .unwrap_or(0);
                         rec(&Self::ledger_id(&date), now_ms);
                     }
                     cycle.snapshot_date = Some(date);
+                    cycle.snapshot_created_ms = now_ms;
                 }
                 Err(e) => {
                     tracing::warn!(error = %e, "tmutil localsnapshot failed");
@@ -201,7 +207,7 @@ impl VssProvider for ApfsBrokeredProvider {
             .map(|date| {
                 vec![RecordedSnapshot {
                     snapshot_id: Self::ledger_id(date),
-                    created_at_ms: 0, // overwritten by the recorder-path entry
+                    created_at_ms: cycle.snapshot_created_ms,
                 }]
             })
             .unwrap_or_default()
