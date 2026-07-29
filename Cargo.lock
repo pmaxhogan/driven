@@ -1584,6 +1584,7 @@ dependencies = [
  "driven-drive",
  "driven-remote",
  "driven-tls",
+ "keyring-core",
  "tracing",
 ]
 

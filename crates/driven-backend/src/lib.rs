@@ -166,27 +166,56 @@ pub fn build_store(
 
 /// The Google Drive arm: keychain refresh token -> refreshing token source ->
 /// `GoogleDriveStore`.
+///
+/// This half performs the keychain READS; the decision it feeds them into lives
+/// in [`google_drive_outcome`] so that decision is unit-testable without an OS
+/// keychain (headless CI has none, and the driven-drive token-store module
+/// documents the same constraint).
 fn build_google_drive(account_id: &str, ctx: BackendContext<'_>) -> anyhow::Result<StoreOutcome> {
     // Wrapped in an `Arc` so a refresh-token ROTATION is persisted back to the
     // keychain (codex C-P2-4 / V-A3).
     let token_store = Arc::new(KeyringTokenStore::new(account_id.to_string()));
-    let refresh_token = match token_store.load_refresh_token()? {
-        Some(token) => token,
-        None => {
-            tracing::warn!(
-                target: TARGET,
-                %account_id,
-                "no stored refresh token; account needs reauth (NOT falling back to a fake store)"
-            );
-            return Ok(StoreOutcome::NeedsReauth);
-        }
-    };
-
+    let refresh_token = token_store.load_refresh_token()?;
     // A1: prefer the account's persisted BYO client creds (the client that
     // minted this refresh token); fall back to env only when the account stored
     // none. A refresh token is bound to the client that minted it, so using the
     // wrong client fails with `invalid_client`.
     let (client_id, client_secret) = resolve_account_oauth_creds(account_id);
+    google_drive_outcome(
+        account_id,
+        token_store,
+        refresh_token,
+        client_id,
+        client_secret,
+        ctx,
+    )
+}
+
+/// The DECISION half of the Drive arm: turn an already-resolved credential set
+/// into a [`StoreOutcome`].
+///
+/// Split from the keychain reads in [`build_google_drive`] so the C5-P1-1
+/// invariant - a missing refresh token yields
+/// [`StoreOutcome::NeedsReauth`] and NEVER a fake store - is covered by a real
+/// unit test. Assembling the store itself touches neither the keychain nor the
+/// network: it only builds `reqwest` clients, so a test can exercise the whole
+/// success path offline.
+fn google_drive_outcome(
+    account_id: &str,
+    token_store: Arc<KeyringTokenStore>,
+    refresh_token: Option<String>,
+    client_id: String,
+    client_secret: String,
+    ctx: BackendContext<'_>,
+) -> anyhow::Result<StoreOutcome> {
+    let Some(refresh_token) = refresh_token else {
+        tracing::warn!(
+            target: TARGET,
+            %account_id,
+            "no stored refresh token; account needs reauth (NOT falling back to a fake store)"
+        );
+        return Ok(StoreOutcome::NeedsReauth);
+    };
     let token_source = RefreshingTokenSource::from_stored_refresh_token(
         refresh_token,
         client_id,
@@ -218,6 +247,21 @@ fn env_oauth_creds() -> (String, String) {
     )
 }
 
+/// A1: the rule for choosing between an account's PERSISTED BYO client creds and
+/// the env seam.
+///
+/// Extracted from [`resolve_account_oauth_creds`] (which supplies `stored` from
+/// the keychain) so the rule itself is testable in-process. A stored record only
+/// wins when its client id is non-blank: a half-written record with an empty id
+/// would authenticate as no one, and falling through to the env seam surfaces a
+/// clear `invalid_client` instead.
+fn choose_oauth_creds(stored: Option<(String, String)>, env: (String, String)) -> (String, String) {
+    match stored {
+        Some((id, secret)) if !id.trim().is_empty() => (id, secret),
+        _ => env,
+    }
+}
+
 /// A1: resolve the OAuth client creds for `account_id`, preferring its PERSISTED
 /// BYO client creds (loaded from the keychain) over the env seam.
 ///
@@ -227,10 +271,10 @@ fn env_oauth_creds() -> (String, String) {
 /// restarts. NEVER logs the secret.
 pub fn resolve_account_oauth_creds(account_id: &str) -> (String, String) {
     match ClientCredsStore::new(account_id.to_string()).load() {
-        Ok(Some(creds)) if !creds.client_id.trim().is_empty() => {
-            (creds.client_id, creds.client_secret)
-        }
-        Ok(_) => env_oauth_creds(),
+        Ok(stored) => choose_oauth_creds(
+            stored.map(|c| (c.client_id, c.client_secret)),
+            env_oauth_creds(),
+        ),
         Err(err) => {
             tracing::warn!(
                 target: TARGET,
@@ -246,6 +290,38 @@ pub fn resolve_account_oauth_creds(account_id: &str) -> (String, String) {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use std::sync::{Mutex, OnceLock};
+
+    /// Install `keyring-core`'s IN-MEMORY store as the process default, so the
+    /// keychain-backed paths run for real without touching (or requiring) an OS
+    /// keychain. The default store is process-global, so every test that uses it
+    /// serializes on this lock and keys its entries by a unique account id.
+    fn keychain() -> std::sync::MutexGuard<'static, ()> {
+        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
+        static INSTALLED: OnceLock<()> = OnceLock::new();
+        let guard = LOCK
+            .get_or_init(|| Mutex::new(()))
+            .lock()
+            .unwrap_or_else(|e| e.into_inner());
+        INSTALLED.get_or_init(|| {
+            let store = keyring_core::mock::Store::new().expect("in-memory keyring store");
+            keyring_core::set_default_store(store);
+        });
+        guard
+    }
+
+    /// Env vars are process-global too; `env_oauth_creds` reads them, so the
+    /// tests that manipulate them share the keychain lock rather than racing.
+    fn set_env_client(id: Option<&str>, secret: Option<&str>) {
+        match id {
+            Some(v) => std::env::set_var(ENV_OAUTH_CLIENT_ID, v),
+            None => std::env::remove_var(ENV_OAUTH_CLIENT_ID),
+        }
+        match secret {
+            Some(v) => std::env::set_var(ENV_OAUTH_CLIENT_SECRET, v),
+            None => std::env::remove_var(ENV_OAUTH_CLIENT_SECRET),
+        }
+    }
 
     #[test]
     fn descriptors_cover_every_kind_in_picker_order() {
@@ -268,5 +344,176 @@ mod tests {
     #[test]
     fn picker_root_is_the_drive_root_alias() {
         assert_eq!(picker_root_id(BackendKind::GoogleDrive), "root");
+    }
+
+    fn ctx<'a>(ca: &'a CustomCaConfig, proxy: &'a ProxyConfig) -> BackendContext<'a> {
+        BackendContext { ca, proxy }
+    }
+
+    #[test]
+    fn a_missing_refresh_token_yields_needs_reauth_never_a_store() {
+        // C5-P1-1, the single most important rule in this crate: an account with
+        // no credential must NOT get some degraded store. Marking files `synced`
+        // against a store that cannot really hold them is silent data loss.
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        let outcome = google_drive_outcome(
+            "acct-1",
+            Arc::new(KeyringTokenStore::new("acct-1".to_string())),
+            None,
+            "client-id".to_string(),
+            "client-secret".to_string(),
+            ctx(&ca, &proxy),
+        )
+        .expect("a missing token is not an error, it is a reauth");
+        assert!(matches!(outcome, StoreOutcome::NeedsReauth));
+        assert!(
+            outcome.store().is_none(),
+            "NeedsReauth must not yield a store"
+        );
+    }
+
+    #[test]
+    fn a_stored_refresh_token_yields_a_live_store() {
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        let outcome = google_drive_outcome(
+            "acct-1",
+            Arc::new(KeyringTokenStore::new("acct-1".to_string())),
+            Some("refresh-token".to_string()),
+            "client-id".to_string(),
+            "client-secret".to_string(),
+            ctx(&ca, &proxy),
+        )
+        .expect("building the store must not need the network");
+        assert!(matches!(outcome, StoreOutcome::Store(_)));
+        assert!(outcome.store().is_some());
+    }
+
+    #[test]
+    fn a_broken_custom_ca_fails_closed_rather_than_building_a_store() {
+        // Issue #34 invariant: a configured-but-unreadable CA must NOT silently
+        // downgrade to the system trust store. Backup traffic would then bypass
+        // the trust boundary the user deliberately set.
+        let ca = CustomCaConfig::from_path(Some(std::path::PathBuf::from(
+            "/definitely/not/a/real/ca.pem",
+        )));
+        let proxy = ProxyConfig::system();
+        let err = google_drive_outcome(
+            "acct-1",
+            Arc::new(KeyringTokenStore::new("acct-1".to_string())),
+            Some("refresh-token".to_string()),
+            "client-id".to_string(),
+            "client-secret".to_string(),
+            ctx(&ca, &proxy),
+        );
+        assert!(err.is_err(), "an unusable custom CA must fail the build");
+    }
+
+    #[test]
+    fn stored_byo_creds_win_over_the_env_seam_unless_the_id_is_blank() {
+        let env = ("env-id".to_string(), "env-secret".to_string());
+
+        // A real stored record wins: the refresh token is bound to the client
+        // that minted it, so using the env client would fail every refresh.
+        assert_eq!(
+            choose_oauth_creds(
+                Some(("byo-id".to_string(), "byo-secret".to_string())),
+                env.clone()
+            ),
+            ("byo-id".to_string(), "byo-secret".to_string())
+        );
+
+        // No stored record at all: the env seam.
+        assert_eq!(choose_oauth_creds(None, env.clone()), env.clone());
+
+        // A half-written record with a blank id would authenticate as no one;
+        // falling through to the env seam surfaces a clear `invalid_client`
+        // instead of a confusing empty-credential failure.
+        for blank in ["", "   "] {
+            assert_eq!(
+                choose_oauth_creds(
+                    Some((blank.to_string(), "orphan-secret".to_string())),
+                    env.clone()
+                ),
+                env.clone(),
+                "a blank stored client id must not win"
+            );
+        }
+    }
+
+    #[test]
+    fn store_outcome_unwraps_to_the_store_it_holds() {
+        assert!(StoreOutcome::NeedsReauth.store().is_none());
+    }
+
+    #[test]
+    fn build_store_needs_reauth_for_a_drive_account_with_an_empty_keychain() {
+        // The end-to-end factory path over a real (in-memory) keychain: an
+        // account whose refresh token was never stored - or was revoked and
+        // deleted - must come back as NeedsReauth.
+        let _g = keychain();
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        let account = AccountBackend::google_drive("acct-no-token");
+        let outcome =
+            build_store(&account, ctx(&ca, &proxy)).expect("an empty keychain is not an error");
+        assert!(matches!(outcome, StoreOutcome::NeedsReauth));
+    }
+
+    #[test]
+    fn build_store_returns_a_drive_store_once_a_refresh_token_is_stored() {
+        let _g = keychain();
+        let account_id = "acct-with-token";
+        driven_drive::google::token_store::KeyringTokenStore::new(account_id.to_string())
+            .store_refresh_token("a-refresh-token")
+            .expect("store the token in the in-memory keychain");
+
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        let account = AccountBackend::google_drive(account_id);
+        let outcome = build_store(&account, ctx(&ca, &proxy)).expect("build the store");
+        assert!(matches!(outcome, StoreOutcome::Store(_)));
+    }
+
+    #[test]
+    fn account_creds_prefer_the_keychain_record_and_fall_back_to_the_env_seam() {
+        use driven_drive::google::token_store::{ClientCreds, ClientCredsStore};
+        let _g = keychain();
+        set_env_client(Some("env-id"), Some("env-secret"));
+
+        // No stored record: the env seam supplies the client.
+        assert_eq!(
+            resolve_account_oauth_creds("acct-env-only"),
+            ("env-id".to_string(), "env-secret".to_string())
+        );
+
+        // A stored BYO record wins - the refresh token is bound to the client
+        // that minted it, so the env client would fail every refresh.
+        let account_id = "acct-byo";
+        ClientCredsStore::new(account_id.to_string())
+            .store(&ClientCreds {
+                client_id: "byo-id".to_string(),
+                client_secret: "byo-secret".to_string(),
+            })
+            .expect("store the BYO creds");
+        assert_eq!(
+            resolve_account_oauth_creds(account_id),
+            ("byo-id".to_string(), "byo-secret".to_string())
+        );
+
+        // With the env seam UNSET and no stored record, the resolution is empty
+        // rather than some baked-in Driven-owned client: Driven is BYO-only, and
+        // an empty client id surfaces a clear `invalid_client`.
+        set_env_client(None, None);
+        assert_eq!(
+            resolve_account_oauth_creds("acct-nothing"),
+            (String::new(), String::new())
+        );
+        // The stored record still wins with the env cleared.
+        assert_eq!(
+            resolve_account_oauth_creds(account_id),
+            ("byo-id".to_string(), "byo-secret".to_string())
+        );
     }
 }
