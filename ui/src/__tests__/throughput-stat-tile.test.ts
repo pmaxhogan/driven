@@ -4,6 +4,7 @@ import { mount } from "@vue/test-utils";
 
 import { i18n } from "../i18n";
 import ThroughputStatTile from "../components/ThroughputStatTile.vue";
+import { pointerMoveAt } from "./pointer";
 
 // ThroughputStatTile tests. The tile is a pure render of its props (series +
 // bucket width + headline rate), so every branch - the plotted shape, the empty
@@ -136,7 +137,7 @@ describe("ThroughputStatTile", () => {
         bucketMs: 10_000,
         ratePerSecond: 204,
       });
-      await wrapper.find(TILE).trigger("pointermove", { clientX: 0 });
+      await pointerMoveAt(wrapper.find(TILE).element, 0);
 
       const hover = wrapper.find(HOVER);
       expect(hover.exists()).toBe(true);
@@ -150,14 +151,14 @@ describe("ThroughputStatTile", () => {
     it("snaps to the nearest bucket across the plot's width", async () => {
       const wrapper = mountTile({ series: [1024, 0, 20_480], bucketMs: 10_000 });
       // 200px wide, 3 buckets -> the right edge is the newest bucket.
-      await wrapper.find(TILE).trigger("pointermove", { clientX: 200 });
+      await pointerMoveAt(wrapper.find(TILE).element, 200);
       expect(wrapper.find(HOVER).text()).toContain("2 KB/s");
       expect(wrapper.find(HOVER).text()).toContain("now");
     });
 
     it("restores the headline rate when the pointer leaves", async () => {
       const wrapper = mountTile({ series: [1024, 2048], ratePerSecond: 512 });
-      await wrapper.find(TILE).trigger("pointermove", { clientX: 10 });
+      await pointerMoveAt(wrapper.find(TILE).element, 10);
       expect(wrapper.find(HOVER).exists()).toBe(true);
 
       await wrapper.find(TILE).trigger("pointerleave");
@@ -167,7 +168,7 @@ describe("ThroughputStatTile", () => {
 
     it("ignores hover on an empty plot (there is nothing to point at)", async () => {
       const wrapper = mountTile({ series: [0, 0, 0], ratePerSecond: 0 });
-      await wrapper.find(TILE).trigger("pointermove", { clientX: 100 });
+      await pointerMoveAt(wrapper.find(TILE).element, 100);
       expect(wrapper.find(HOVER).exists()).toBe(false);
       expect(wrapper.find(RATE).exists()).toBe(true);
     });
