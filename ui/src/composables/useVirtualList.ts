@@ -79,8 +79,6 @@ export function computeVirtualRange(
 
 /** What `useVirtualList` hands back to a component. */
 export interface UseVirtualList {
-  /** Bind to the list container element (the scrolled list's wrapper). */
-  containerRef: Ref<HTMLElement | null>;
   /** The reactive window to render (slice bounds + spacer paddings). */
   range: ComputedRef<VirtualRange>;
   /** Force a re-measure (e.g. after content above the list changes height). */
@@ -90,17 +88,20 @@ export interface UseVirtualList {
 /**
  * Window-scroll virtualization for a fixed-row-height list.
  *
+ * @param containerRef The list container element, as a template ref owned by the
+ *                     caller (`useTemplateRef("...")` bound to the list's
+ *                     wrapper). Only ever read, never written.
  * @param itemCount  A getter for the total row count (reactive source).
  * @param itemHeight The fixed per-row height in px (the list MUST render each row
  *                   at exactly this height for the spacer math to line up).
  * @param overscan   Extra rows rendered on each side of the window (default 6).
  */
 export function useVirtualList(
+  containerRef: Readonly<Ref<HTMLElement | null>>,
   itemCount: () => number,
   itemHeight: number,
   overscan = 6
 ): UseVirtualList {
-  const containerRef = ref<HTMLElement | null>(null);
   const listTop = ref(0);
   const viewportHeight = ref(typeof window !== "undefined" ? window.innerHeight : 0);
 
@@ -151,5 +152,5 @@ export function useVirtualList(
     if (frame !== 0) window.cancelAnimationFrame(frame);
   });
 
-  return { containerRef, range, measure };
+  return { range, measure };
 }
