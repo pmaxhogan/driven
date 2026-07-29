@@ -409,6 +409,62 @@ export interface SettingsDto {
   macos: MacosSettings | null;
   /** V2 small-file bundling on/off (issue #35). A standalone advanced toggle. */
   bundleSmallFiles: boolean;
+  /** Scheduled integrity scrub of remote objects. */
+  scrub: ScrubSettings;
+}
+
+/**
+ * Scheduled integrity-scrub policy. Backed by standalone settings KV keys the
+ * backup engine re-reads per run, so a change applies on the next cycle.
+ */
+export interface ScrubSettings {
+  /** Master on/off. Ships enabled. */
+  enabled: boolean;
+  /** Seconds between runs for one source (default weekly = 604800). */
+  intervalSecs: number;
+  /** How many objects of each population one run checks. */
+  sliceSize: number;
+  /**
+   * How many of the slice's objects one run additionally DOWNLOADS and
+   * re-hashes end to end. Ships 0 - the checksum comparison already catches
+   * remote-side corruption, so spending bandwidth is opt-in.
+   */
+  deepSample: number;
+}
+
+export interface ScrubSettingsPatch {
+  enabled?: boolean;
+  intervalSecs?: number;
+  sliceSize?: number;
+  deepSample?: number;
+}
+
+/**
+ * One persisted integrity-scrub run.
+ *
+ * COUNTS ONLY, deliberately: there is no path, remote id, or object name on
+ * this shape, so a scrub report can never carry an encrypted source's
+ * filenames into the UI.
+ */
+export interface ScrubRun {
+  id: number;
+  sourceId: string;
+  startedAt: number;
+  finishedAt: number;
+  checked: number;
+  ok: number;
+  missing: number;
+  sizeMismatch: number;
+  hashMismatch: number;
+  unverifiable: number;
+  healed: number;
+  healedBundleMembers: number;
+  unrecoverable: number;
+  deepChecked: number;
+  deepFailed: number;
+  wrapped: boolean;
+  /** `clean` | `drift` | `incomplete`. */
+  outcome: string;
 }
 
 export interface GlobalSettingsPatch {
@@ -478,6 +534,8 @@ export interface SettingsPatch {
   macos?: MacosSettingsPatch;
   /** Toggle V2 small-file bundling (issue #35). Absent = leave unchanged. */
   bundleSmallFiles?: boolean;
+  /** Partial integrity-scrub policy. Absent = leave unchanged. */
+  scrub?: ScrubSettingsPatch;
 }
 
 export interface UpdateInfo {

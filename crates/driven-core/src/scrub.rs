@@ -304,7 +304,10 @@ impl Drift {
     /// "could not tell").
     #[must_use]
     pub fn is_drift(self) -> bool {
-        matches!(self, Drift::Missing | Drift::SizeMismatch | Drift::HashMismatch)
+        matches!(
+            self,
+            Drift::Missing | Drift::SizeMismatch | Drift::HashMismatch
+        )
     }
 
     /// Whether the scrub can repair this itself by re-queuing the object for a
@@ -380,9 +383,16 @@ pub fn classify(candidate: &ScrubCandidate, live: bool, observed: Option<&Remote
 }
 
 /// Why a run ended.
-#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+///
+/// `Clean` is the [`Default`] so a freshly-built [`ScrubReport`] reads as "no
+/// problems found yet" rather than needing the caller to remember to set it;
+/// [`ScrubReport::finish`] recomputes it from the counters at the end of a run
+/// that completed, and an aborted run sets [`ScrubOutcome::Incomplete`]
+/// explicitly.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
 pub enum ScrubOutcome {
     /// Every object in the slice checked out.
+    #[default]
     Clean,
     /// At least one object drifted.
     Drift,
@@ -453,12 +463,6 @@ pub struct ScrubReport {
     pub wrapped: bool,
     /// Why the run ended.
     pub outcome: ScrubOutcome,
-}
-
-impl Default for ScrubOutcome {
-    fn default() -> Self {
-        ScrubOutcome::Clean
-    }
 }
 
 impl ScrubReport {
@@ -689,7 +693,11 @@ mod tests {
             Drift::HashMismatch,
             Drift::Unverifiable,
         ] {
-            assert!(!d.is_repairable(), "{} must not be auto-repaired", d.label());
+            assert!(
+                !d.is_repairable(),
+                "{} must not be auto-repaired",
+                d.label()
+            );
         }
     }
 
@@ -918,7 +926,10 @@ mod tests {
     #[test]
     fn the_shipped_defaults_are_a_gently_on_weekly_metadata_only_scrub() {
         let d = ScrubConfig::default();
-        assert!(d.enabled, "the scrub ships on - it is the remote half of the weekly deep-verify");
+        assert!(
+            d.enabled,
+            "the scrub ships on - it is the remote half of the weekly deep-verify"
+        );
         assert_eq!(d.interval_secs, 604_800);
         assert_eq!(d.slice_size, 500);
         assert_eq!(d.deep_sample, 0, "downloading objects is opt-in");

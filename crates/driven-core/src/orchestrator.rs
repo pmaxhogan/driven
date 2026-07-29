@@ -1312,8 +1312,8 @@ impl SyncOrchestrator {
     ///
     /// An INCOMPLETE run (the live-object enumeration failed) is persisted ONLY
     /// when the previous run was not also incomplete. Without that dedupe a
-    /// multi-day Drive outage would write one row per cycle - hundreds per day
-    /// - and evict every real result from the capped per-source history, so the
+    /// multi-day Drive outage would write one row per cycle (hundreds per day)
+    /// and evict every real result from the capped per-source history, so the
     /// feature would destroy exactly the record it exists to keep. One row per
     /// outage still makes "we could not check" visible, which is the point of
     /// having the outcome at all.
@@ -1331,11 +1331,9 @@ impl SyncOrchestrator {
         if report.outcome == crate::scrub::ScrubOutcome::Incomplete {
             match self.state.list_scrub_runs(Some(source.id), 1).await {
                 Ok(prev)
-                    if prev
-                        .first()
-                        .is_some_and(|r| {
-                            r.report.outcome == crate::scrub::ScrubOutcome::Incomplete
-                        }) =>
+                    if prev.first().is_some_and(|r| {
+                        r.report.outcome == crate::scrub::ScrubOutcome::Incomplete
+                    }) =>
                 {
                     return;
                 }
@@ -2909,7 +2907,12 @@ mod tests {
                 return Err(anyhow::anyhow!("transient scrub error"));
             }
             self.scrubbed_sources.lock().unwrap().push(source.id);
-            Ok(self.scrub_report.lock().unwrap().clone().unwrap_or_default())
+            Ok(self
+                .scrub_report
+                .lock()
+                .unwrap()
+                .clone()
+                .unwrap_or_default())
         }
 
         async fn audit_remote_existence(
@@ -4905,7 +4908,10 @@ mod tests {
         let exec = Arc::new(RecordingExecutor::default());
         let (orch, state, _clock) = build_with_state(account, vec![src], exec.clone());
         state
-            .set_setting(crate::scrub::SETTING_SCRUB_ENABLED, &serde_json::json!(false))
+            .set_setting(
+                crate::scrub::SETTING_SCRUB_ENABLED,
+                &serde_json::json!(false),
+            )
             .await
             .unwrap();
 

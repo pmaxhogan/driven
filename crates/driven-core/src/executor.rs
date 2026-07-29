@@ -4548,7 +4548,11 @@ impl Executor for DefaultExecutor {
 
         let mut report = ScrubReport::default();
         let now = self.clock.now_ms();
-        let cursor = self.state.scrub_cursor(source.id).await?.unwrap_or_default();
+        let cursor = self
+            .state
+            .scrub_cursor(source.id)
+            .await?
+            .unwrap_or_default();
 
         // --- 1. The RECORDED slice: one bounded keyset page per population --
         // Read BEFORE the remote listing, for the same reason the audit does:
@@ -5198,11 +5202,7 @@ impl DefaultExecutor {
             crate::scrub::ScrubTarget::File { path } => {
                 match self
                     .state
-                    .requeue_file_state_for_reupload(
-                        source.id,
-                        path,
-                        REQUEUE_FORCE_RESCAN_MTIME_NS,
-                    )
+                    .requeue_file_state_for_reupload(source.id, path, REQUEUE_FORCE_RESCAN_MTIME_NS)
                     .await
                 {
                     Ok(()) => report.healed = report.healed.saturating_add(1),

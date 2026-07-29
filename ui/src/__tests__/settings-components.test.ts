@@ -111,6 +111,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     // APFS block is absent unless a test opts in with `makeSettings({ macos })`.
     macos: null,
     bundleSmallFiles: false,
+    scrub: { enabled: true, intervalSecs: 604800, sliceSize: 500, deepSample: 0 },
     ...over,
   };
 }

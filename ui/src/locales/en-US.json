@@ -39,6 +39,32 @@
     "unsignedNote": "macOS ties this permission to the app's signature, and Driven is not signed yet, so the permission can stop working after an update. If files start being skipped again, remove Driven from the Full Disk Access list and add it back.",
     "openButton": "Open Full Disk Access settings"
   },
+  "scrub": {
+    "title": "Integrity scrub",
+    "refresh": "Refresh",
+    "explainer": "Periodically re-checks your backed-up files against what Driven recorded about them, and re-uploads anything whose backup went missing.",
+    "empty": "No scrub has run yet.",
+    "attention": "{count} backed-up file needs attention | {count} backed-up files need attention",
+    "checkedCount": "{count} checked",
+    "healedCount": "{count} re-queued",
+    "unrecoverableCount": "{count} need attention",
+    "deepCount": "{count} fully verified",
+    "outcome": {
+      "clean": "All good",
+      "repaired": "Repaired",
+      "needsAttention": "Needs attention",
+      "incomplete": "Could not check"
+    },
+    "settings": {
+      "heading": "Integrity scrub",
+      "description": "Re-checks backed-up files against what Driven recorded, on its own schedule.",
+      "enabledLabel": "Run a periodic integrity scrub",
+      "intervalLabel": "Check every (hours)",
+      "sliceLabel": "Files checked per run",
+      "deepSampleLabel": "Files fully re-downloaded per run",
+      "deepSampleHelp": "0 uses the storage provider's own checksum, which costs no bandwidth. A higher number downloads that many files to verify them end to end."
+    }
+  },
   "toast": {
     "dismiss": "Dismiss notification",
     "kind": {
@@ -478,6 +504,8 @@
       "backup_done": "Backup complete",
       "deep_verify_done": "Deep verify complete",
       "remote_audit_done": "Missing backups re-queued",
+      "scrub_done": "Integrity scrub complete",
+      "scrub_drift_found": "Integrity scrub found drift",
       "update_applied": "App updated",
       "paused": "Paused",
       "error": "Error",
