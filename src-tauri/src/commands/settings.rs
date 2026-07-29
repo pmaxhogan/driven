@@ -3487,7 +3487,12 @@ mod tests {
         use driven_core::scrub as s;
 
         for (field, value, min, max) in [
-            ("scrub.interval_secs", 0, s::SCRUB_INTERVAL_MIN, s::SCRUB_INTERVAL_MAX),
+            (
+                "scrub.interval_secs",
+                0,
+                s::SCRUB_INTERVAL_MIN,
+                s::SCRUB_INTERVAL_MAX,
+            ),
             (
                 "scrub.interval_secs",
                 s::SCRUB_INTERVAL_MIN - 1,
@@ -3500,7 +3505,12 @@ mod tests {
                 s::SCRUB_INTERVAL_MIN,
                 s::SCRUB_INTERVAL_MAX,
             ),
-            ("scrub.slice_size", 0, s::SCRUB_SLICE_MIN, s::SCRUB_SLICE_MAX),
+            (
+                "scrub.slice_size",
+                0,
+                s::SCRUB_SLICE_MIN,
+                s::SCRUB_SLICE_MAX,
+            ),
             (
                 "scrub.slice_size",
                 s::SCRUB_SLICE_MAX + 1,

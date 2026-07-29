@@ -4102,9 +4102,7 @@ mod tests {
     #[tokio::test]
     async fn scrub_runs_round_trip_newest_first_and_can_be_narrowed_to_one_source() {
         let (repo, _dir, src) = seed_for_scrub(1).await;
-        let other = sample_source(
-            repo.list_sources().await.unwrap()[0].account_id,
-        );
+        let other = sample_source(repo.list_sources().await.unwrap()[0].account_id);
         repo.upsert_source(&other).await.unwrap();
 
         let mut report = crate::scrub::ScrubReport {

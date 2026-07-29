@@ -108,6 +108,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     ui: { trayLeftClickOpens: "activity", locale: "en-US", colorMode: "system" },
     windows: { vssMode: "auto", vssHelper: false },
     bundleSmallFiles: false,
+    scrub: { enabled: true, intervalSecs: 604800, sliceSize: 500, deepSample: 0 },
     ...over,
   };
 }
