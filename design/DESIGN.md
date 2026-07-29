@@ -1346,6 +1346,41 @@ shape-equivalent state there. This is deliberate and matches SPEC
 §1579's `iconAsTemplate` for macOS; do **not** "fix" the macOS path back
 to a colour icon.
 
+#### 8.1.1 macOS Dock icon on `cargo tauri dev` (known, dev-only, WONTFIX)
+
+**A `cargo tauri dev` run shows the generic green "exec" icon instead of
+the Driven mark. This is a dev-run cosmetic artifact, not a defect in the
+shipped product** - do not spend time "fixing" it in the app, and do not
+treat a report of it against a dev build as a release bug.
+
+Why: `cargo tauri dev` launches the bare `driven-app` Mach-O with no
+`.app` wrapper, so LaunchServices has no icon to associate with the
+process. A packaged build is unaffected - `icons/icon.icns` is listed in
+`bundle.icon` in `tauri.conf.json` and ends up in `Contents/Resources`,
+so `Driven.app` has always had the correct Dock icon.
+
+Investigated 2026-07 and deliberately NOT fixed in code. The findings,
+so nobody re-derives them:
+
+- **Tauri already does the only available runtime fix.** `tauri-codegen`
+  embeds the icns whenever `target == MacOS && dev` (confirmed: the icns
+  bytes are present verbatim in the built dev binary), and `tauri`
+  calls `-[NSApplication setApplicationIconImage:]` at `RunEvent::Ready`.
+  Re-applying it later is a re-run of a mechanism already executing.
+- **`setApplicationIconImage:` cannot fix the surface people usually
+  notice.** Third-party status bars, window switchers, and anything else
+  reading `NSRunningApplication.icon()` get the **static LaunchServices
+  file-type icon**, which that call does not affect. Confirmed with a
+  control experiment: a bundle-less process that successfully sets its
+  own icon still reports the generic one through that API.
+- **So the only real fix for an unbundled run is to run a bundled
+  `.app`** (e.g. `cargo tauri build` and launch the bundle), not any
+  runtime API call.
+
+If the generic icon is ever reported against a RELEASE build, that is a
+different bug with different evidence (a broken/missing icns in the
+bundle) - chase it then, and do not assume it is this.
+
 The tooltip shows the specific condition ("Connected, no Internet",
 "Captive portal — click to sign in", "Google Drive is unavailable", etc.)
 and the tray menu surfaces the matching action ("Open captive portal",
