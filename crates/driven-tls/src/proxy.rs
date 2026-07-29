@@ -320,19 +320,36 @@ pub async fn validate_pac_source(
 /// fetch during a backup run.
 const PAC_ENGINE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
 
+/// How long to wait before retrying the source again after a REFRESH failed and
+/// we fell back to the last-good engine (see [`load_pac_engine`]). Without this
+/// backoff, a PAC-server outage would make every one of the ~9 client-build
+/// sites re-attempt a fetch (up to a 10s connect / 30s total timeout) instead of
+/// at most one attempt per minute.
+const PAC_REFRESH_RETRY: std::time::Duration = std::time::Duration::from_secs(60);
+
 /// How many distinct PAC sources to keep compiled. Only one proxy source is ever
 /// configured at a time, so this is effectively 1 in production; the extra slots
-/// keep a just-validated (not yet saved) source - and, in the test binary, the
-/// several PAC sources exercised in parallel - from evicting the live one.
+/// keep a just-validated (not yet saved) source from evicting the live one.
 const PAC_ENGINE_CACHE_SLOTS: usize = 8;
 
 /// A compiled PAC engine cached against the exact source string it came from, so
 /// the ~9 client-build load sites reuse ONE fetch + ONE warm decision cache
-/// instead of refetching per operation. `fetched_at` bounds that reuse to
-/// [`PAC_ENGINE_TTL`].
+/// instead of refetching per operation.
+///
+/// The bound is stored as an ABSOLUTE `expires_at` rather than a `fetched_at`
+/// age so every deadline is computed by ADDING to `Instant::now()`. Subtracting
+/// from an `Instant` can fail on a machine booted moments ago (a fresh CI VM),
+/// which would otherwise need a fallback branch here and in the tests.
 struct CachedPac {
     engine: Arc<PacEngine>,
-    fetched_at: std::time::Instant,
+    expires_at: std::time::Instant,
+}
+
+impl CachedPac {
+    /// A cache entry may be served until its deadline passes.
+    fn is_fresh(&self) -> bool {
+        std::time::Instant::now() < self.expires_at
+    }
 }
 
 /// Compiled PAC engines keyed by their source string (URL / path). Keyed rather
@@ -343,26 +360,51 @@ static PAC_CACHE: LazyLock<Mutex<LruCache<String, CachedPac>>> = LazyLock::new(|
     ))
 });
 
-/// Whether a cache entry of the given age may still be served. Split out as a
-/// pure predicate so the TTL policy is unit-testable without waiting 15 minutes.
-fn pac_entry_is_fresh(age: std::time::Duration) -> bool {
-    age < PAC_ENGINE_TTL
+/// Publish a freshly fetched+compiled engine so later resolves reuse it, valid
+/// for [`PAC_ENGINE_TTL`].
+fn store_pac_engine(source: &str, engine: &Arc<PacEngine>) {
+    put_pac_engine(source, engine, PAC_ENGINE_TTL);
 }
 
-/// Publish a freshly fetched+compiled engine so later resolves reuse it.
-fn store_pac_engine(source: &str, engine: &Arc<PacEngine>) {
+/// Insert `engine` for `source` with an explicit validity window.
+fn put_pac_engine(source: &str, engine: &Arc<PacEngine>, valid_for: std::time::Duration) {
     PAC_CACHE.lock().expect("PAC cache mutex poisoned").put(
         source.to_string(),
         CachedPac {
             engine: Arc::clone(engine),
-            fetched_at: std::time::Instant::now(),
+            expires_at: std::time::Instant::now() + valid_for,
         },
     );
 }
 
-/// Return the compiled engine for `source`, reusing the process cache when the
-/// source is unchanged AND the entry is still within [`PAC_ENGINE_TTL`];
-/// otherwise fetch + compile once and cache it.
+/// The cached engine for `source`, if one is present - fresh or not.
+fn cached_pac_engine(source: &str) -> Option<Arc<PacEngine>> {
+    PAC_CACHE
+        .lock()
+        .expect("PAC cache mutex poisoned")
+        .get(source)
+        .map(|c| Arc::clone(&c.engine))
+}
+
+/// Return the compiled engine for `source`, reusing the process cache while the
+/// entry is within [`PAC_ENGINE_TTL`]; otherwise fetch + compile once and cache
+/// it.
+///
+/// # Refresh failure serves the last-good engine
+///
+/// If the TTL has lapsed and the refresh FAILS (source unreachable, or the newly
+/// fetched script does not compile), we serve the last-good cached engine and
+/// log a warning rather than returning an error. Failing here would be an
+/// availability regression relative to the pre-TTL behaviour, where a compiled
+/// engine was pinned for the process lifetime and a PAC-server blip was
+/// invisible: every affected operation (update check, telemetry send, restore)
+/// would fail during any outage of the PAC source.
+///
+/// This does NOT weaken the fail-closed guarantee that matters. A stale PAC
+/// script still routes through a proxy - it never silently degrades to DIRECT.
+/// It is also what browsers do when a WPAD refresh fails. An error is still
+/// returned when there is no cached engine at all (the first resolve), so a
+/// misconfigured PAC source can never come up unproxied.
 async fn load_pac_engine(
     source: &str,
     ca: &crate::CustomCaConfig,
@@ -372,18 +414,43 @@ async fn load_pac_engine(
         .lock()
         .expect("PAC cache mutex poisoned")
         .get(source)
-        .filter(|c| pac_entry_is_fresh(c.fetched_at.elapsed()))
+        .filter(|c| c.is_fresh())
         .map(|c| Arc::clone(&c.engine))
     {
         return Ok(hit);
     }
 
-    let script = fetch_pac_script(source, ca).await?;
-    let engine = Arc::new(PacEngine::compile(script, source.to_string())?);
+    let refreshed = async {
+        let script = fetch_pac_script(source, ca).await?;
+        Ok::<_, ProxyError>(Arc::new(PacEngine::compile(script, source.to_string())?))
+    }
+    .await;
 
-    // Store (last writer wins if two sites raced a miss - harmless, idempotent).
-    store_pac_engine(source, &engine);
-    Ok(engine)
+    match refreshed {
+        Ok(engine) => {
+            // Store (last writer wins if two sites raced a miss - harmless).
+            store_pac_engine(source, &engine);
+            Ok(engine)
+        }
+        Err(error) => match cached_pac_engine(source) {
+            Some(last_good) => {
+                tracing::warn!(
+                    target: TARGET,
+                    source = %source,
+                    %error,
+                    retry_in_secs = PAC_REFRESH_RETRY.as_secs(),
+                    "PAC refresh failed; continuing with the last known-good script \
+                     (traffic stays proxied, it does not fall back to DIRECT)"
+                );
+                // Back off so an outage costs at most one fetch attempt per
+                // retry window rather than one per client build.
+                put_pac_engine(source, &last_good, PAC_REFRESH_RETRY);
+                Ok(last_good)
+            }
+            // Nothing cached: this is the first resolve, so fail closed.
+            None => Err(error),
+        },
+    }
 }
 
 /// Fetch (URL) or read (local path / `file://`) the raw PAC script text.
@@ -839,6 +906,30 @@ fn is_in_net(host: &str, pattern: &str, mask: &str) -> bool {
 mod tests {
     use super::*;
 
+    /// Serializes every test that depends on the state of the process-global
+    /// [`PAC_CACHE`]. Those tests assert on cache retention ("still cached
+    /// inside the TTL", "the last-good engine is served"), which other tests
+    /// inserting their own sources could perturb by evicting an entry from the
+    /// bounded LRU. Rather than leaving that as a latent flake that only shows
+    /// up on a loaded CI machine, such tests take this lock and start from an
+    /// empty cache.
+    /// A `tokio` mutex rather than a `std` one because the guard is held across
+    /// `await` points in these tests (`clippy::await_holding_lock` rejects a
+    /// `std::sync::MutexGuard` there). It also cannot be poisoned, so a panic in
+    /// one test does not cascade into the others.
+    static PAC_CACHE_TEST_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// Take the PAC-cache test lock and clear the cache. Hold the returned guard
+    /// for the duration of the test.
+    async fn pac_cache_guard() -> tokio::sync::MutexGuard<'static, ()> {
+        let guard = PAC_CACHE_TEST_LOCK.lock().await;
+        PAC_CACHE
+            .lock()
+            .unwrap_or_else(std::sync::PoisonError::into_inner)
+            .clear();
+        guard
+    }
+
     #[test]
     fn system_is_a_noop_and_builds() {
         let cfg = ProxyConfig::system();
@@ -1056,6 +1147,7 @@ mod tests {
 
     #[tokio::test]
     async fn resolve_pac_from_local_file() {
+        let _guard = pac_cache_guard().await;
         let script = "function FindProxyForURL(url, host){ return \"PROXY local:3128\"; }";
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("test.pac");
@@ -1092,6 +1184,7 @@ mod tests {
     async fn resolve_pac_over_http_fetches_compiles_and_evaluates() {
         // Covers the HTTP-fetch branch of `fetch_pac_script` + the process cache
         // in `load_pac_engine` with a one-shot local server (no external network).
+        let _guard = pac_cache_guard().await;
         use std::io::{Read, Write};
         let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind");
         let addr = listener.local_addr().expect("addr");
@@ -1240,21 +1333,33 @@ mod tests {
         assert!(format!("{pac:?}").contains("Pac"));
     }
 
+    /// A trivial compiled engine for cache-mechanics tests.
+    fn test_engine(directive: &str) -> Arc<PacEngine> {
+        Arc::new(
+            PacEngine::compile(
+                format!("function FindProxyForURL(u,h){{ return \"{directive}\"; }}"),
+                "test://engine".to_string(),
+            )
+            .expect("compiles"),
+        )
+    }
+
     #[test]
-    fn pac_entry_is_fresh_bounds_reuse_by_ttl() {
-        use std::time::Duration;
-        assert!(pac_entry_is_fresh(Duration::ZERO), "a new entry is fresh");
+    fn cached_entry_freshness_follows_its_deadline() {
+        let engine = test_engine("DIRECT");
+        let fresh = CachedPac {
+            engine: Arc::clone(&engine),
+            expires_at: std::time::Instant::now() + PAC_ENGINE_TTL,
+        };
+        assert!(fresh.is_fresh(), "an entry inside its window is fresh");
+
+        let expired = CachedPac {
+            engine,
+            expires_at: std::time::Instant::now(),
+        };
         assert!(
-            pac_entry_is_fresh(PAC_ENGINE_TTL - Duration::from_secs(1)),
-            "just inside the TTL is still fresh"
-        );
-        assert!(
-            !pac_entry_is_fresh(PAC_ENGINE_TTL),
-            "exactly at the TTL is stale (the bound is exclusive)"
-        );
-        assert!(
-            !pac_entry_is_fresh(PAC_ENGINE_TTL + Duration::from_secs(1)),
-            "past the TTL is stale"
+            !expired.is_fresh(),
+            "an entry at/past its deadline is stale (the bound is exclusive)"
         );
     }
 
@@ -1266,6 +1371,7 @@ mod tests {
         // and re-saving the SAME url/path validated the NEW script and then kept
         // routing by the OLD one until the app restarted - while the save path
         // logged "PAC proxy file validated on save".
+        let _guard = pac_cache_guard().await;
         let ca = crate::CustomCaConfig::none();
         let dir = tempfile::tempdir().expect("tempdir");
         // A path unique to this test so the keyed cache cannot collide with the
@@ -1333,6 +1439,7 @@ mod tests {
         // has NOT saved. Publishing on validate must therefore never perturb the
         // engine the configured source is using. This is the invariant the keyed
         // (rather than single-slot) cache exists to guarantee.
+        let _guard = pac_cache_guard().await;
         let ca = crate::CustomCaConfig::none();
         let dir = tempfile::tempdir().expect("tempdir");
 
@@ -1378,11 +1485,18 @@ mod tests {
         );
     }
 
+    /// Force the cached entry for `source` to be past its deadline, so the next
+    /// resolve takes the refresh path. Instant, deterministic, no sleeping.
+    fn expire_pac_entry(source: &str) {
+        let engine = cached_pac_engine(source).expect("entry present to expire");
+        // `Duration::ZERO` => `expires_at == now`, and freshness is exclusive.
+        put_pac_engine(source, &engine, std::time::Duration::ZERO);
+    }
+
     #[tokio::test]
     async fn a_stale_cache_entry_is_refetched() {
-        // The TTL path: an entry older than PAC_ENGINE_TTL must not be served.
-        // The entry is aged by writing `fetched_at` directly rather than by
-        // sleeping, so the test is instant and deterministic.
+        // The TTL path: an entry past its deadline must not be served.
+        let _guard = pac_cache_guard().await;
         let ca = crate::CustomCaConfig::none();
         let dir = tempfile::tempdir().expect("tempdir");
         let path = dir.path().join("ttl.pac");
@@ -1406,33 +1520,7 @@ mod tests {
             "function FindProxyForURL(u,h){ return \"PROXY second:2\"; }",
         )
         .expect("write v2");
-
-        // Age the cached entry past the TTL. `checked_sub` can return None on a
-        // machine booted moments ago (a fresh CI VM), in which case there is no
-        // representable stale instant and the TTL path cannot be exercised -
-        // rebuild the entry as already-expired via the same predicate instead of
-        // asserting nothing.
-        {
-            let mut cache = PAC_CACHE.lock().expect("PAC cache mutex poisoned");
-            let engine = Arc::clone(&cache.get(&source).expect("entry present").engine);
-            let aged = std::time::Instant::now()
-                .checked_sub(PAC_ENGINE_TTL * 2)
-                .unwrap_or_else(std::time::Instant::now);
-            if !pac_entry_is_fresh(aged.elapsed()) {
-                cache.put(
-                    source.clone(),
-                    CachedPac {
-                        engine,
-                        fetched_at: aged,
-                    },
-                );
-            } else {
-                // Uptime is shorter than the TTL: evict so the refetch below is
-                // still exercised (the freshness predicate itself is covered by
-                // `pac_entry_is_fresh_bounds_reuse_by_ttl`).
-                cache.pop(&source);
-            }
-        }
+        expire_pac_entry(&source);
 
         let refetched = resolve_proxy("pac", Some(&source), &ca)
             .await
@@ -1444,6 +1532,144 @@ mod tests {
                 .evaluate_str("https://y.example/"),
             Some("http://second:2".to_string()),
             "a stale entry must be refetched, picking up the edited script"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_refresh_serves_the_last_good_engine() {
+        // AVAILABILITY: once the TTL lapses, a PAC source that is unreachable
+        // must NOT fail the operation while a last-good compiled engine is still
+        // held. Pre-TTL, the engine was pinned for the process lifetime and a
+        // PAC-server blip was invisible; without this fallback the TTL would turn
+        // every such blip into a failed update check / telemetry send / restore.
+        //
+        // Fail-closed is preserved in the sense that matters: the stale script
+        // still routes through its proxy, it never degrades to DIRECT.
+        let _guard = pac_cache_guard().await;
+        let ca = crate::CustomCaConfig::none();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("outage.pac");
+        let source = path.to_string_lossy().to_string();
+
+        std::fs::write(
+            &path,
+            "function FindProxyForURL(u,h){ return \"PROXY lastgood:8080\"; }",
+        )
+        .expect("write pac");
+        resolve_proxy("pac", Some(&source), &ca)
+            .await
+            .expect("initial resolve");
+
+        // The source goes away (server outage / file removed) and the entry ages
+        // out.
+        std::fs::remove_file(&path).expect("remove pac");
+        expire_pac_entry(&source);
+
+        let served = resolve_proxy("pac", Some(&source), &ca)
+            .await
+            .expect("a failed refresh must NOT error while a last-good engine exists");
+        assert_eq!(
+            served
+                .pac_engine()
+                .expect("pac")
+                .evaluate_str("https://x.example/"),
+            Some("http://lastgood:8080".to_string()),
+            "the last known-good script must still route traffic through its proxy"
+        );
+
+        // The retry backoff re-armed the entry, so an outage costs at most one
+        // fetch attempt per window rather than one per client build.
+        assert!(
+            cached_pac_engine(&source).is_some(),
+            "the last-good engine stays cached for the retry window"
+        );
+
+        // Recovery: once the source is readable again and the entry lapses, the
+        // new script takes over.
+        std::fs::write(
+            &path,
+            "function FindProxyForURL(u,h){ return \"PROXY recovered:9090\"; }",
+        )
+        .expect("rewrite pac");
+        expire_pac_entry(&source);
+        let recovered = resolve_proxy("pac", Some(&source), &ca)
+            .await
+            .expect("recovered");
+        assert_eq!(
+            recovered
+                .pac_engine()
+                .expect("pac")
+                .evaluate_str("https://x.example/"),
+            Some("http://recovered:9090".to_string()),
+            "a recovered source must take over again"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_refresh_that_fetches_but_does_not_compile_also_falls_back() {
+        // The other half of "refresh failed": the source IS reachable but the
+        // administrator pushed a broken script. Same reasoning - keep routing by
+        // the last known-good script rather than failing every operation.
+        let _guard = pac_cache_guard().await;
+        let ca = crate::CustomCaConfig::none();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("broken.pac");
+        let source = path.to_string_lossy().to_string();
+
+        std::fs::write(
+            &path,
+            "function FindProxyForURL(u,h){ return \"PROXY good:1\"; }",
+        )
+        .expect("write good");
+        resolve_proxy("pac", Some(&source), &ca)
+            .await
+            .expect("initial resolve");
+
+        std::fs::write(&path, "this is not valid javascript (((").expect("write broken");
+        expire_pac_entry(&source);
+
+        let served = resolve_proxy("pac", Some(&source), &ca)
+            .await
+            .expect("a non-compiling refresh must fall back, not error");
+        assert_eq!(
+            served
+                .pac_engine()
+                .expect("pac")
+                .evaluate_str("https://x.example/"),
+            Some("http://good:1".to_string()),
+            "the last known-good script survives a broken redeploy"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_failed_first_fetch_with_no_cached_engine_still_fails_closed() {
+        // The other side of the fallback: with NOTHING cached, a broken PAC
+        // source must still be a hard error, so a misconfigured proxy can never
+        // come up silently unproxied.
+        let _guard = pac_cache_guard().await;
+        let ca = crate::CustomCaConfig::none();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let missing = dir.path().join("never-existed.pac");
+        let source = missing.to_string_lossy().to_string();
+
+        assert!(
+            matches!(
+                resolve_proxy("pac", Some(&source), &ca).await,
+                Err(ProxyError::PacRead { .. })
+            ),
+            "no cached engine => fail closed"
+        );
+
+        // A source that reads but does not compile is likewise a hard error on
+        // the first resolve.
+        let broken = dir.path().join("broken-first.pac");
+        std::fs::write(&broken, "not javascript (((").expect("write broken");
+        assert!(
+            matches!(
+                resolve_proxy("pac", Some(&broken.to_string_lossy()), &ca).await,
+                Err(ProxyError::PacCompile { .. })
+            ),
+            "no cached engine + uncompilable script => fail closed"
         );
     }
 
