@@ -207,19 +207,31 @@ mod macos {
             .map(Path::to_path_buf)
             .ok_or_else(|| io::Error::other("helper has no parent directory"))?;
 
-        // The peer check below trusts "the peer's executable sits next to
-        // mine". That is only meaningful if the peer user cannot WRITE to that
-        // directory - otherwise they simply drop a binary beside the helper and
-        // pass. For a bundle in ~/Applications or ~/Downloads that is exactly
-        // the case, so refuse to serve at all rather than offer a check that
-        // looks like security and is not.
-        if dir_is_writable_by(&helper_dir, args.peer_uid)? {
-            return Err(io::Error::new(
-                io::ErrorKind::PermissionDenied,
-                "refusing to serve: the helper's directory is writable by the client user, \
-                 so co-installation cannot authenticate a peer",
-            ));
-        }
+        // Is the co-installation peer check meaningful here? It is only
+        // strong if the peer user cannot WRITE to the helper's directory -
+        // otherwise they drop a binary beside the helper and pass it.
+        //
+        // This is DEGRADED, not fatal, and the reasoning matters enough to
+        // write down. Measured on macOS: EVERY drag-installed .dmg bundle has
+        // a user-owned `Contents/MacOS`, including bundles in /Applications
+        // (Chrome, Docker, Discord, GIMP all are); only pkg/App-Store
+        // installs land root-owned. Driven ships a .dmg, so refusing here
+        // would make locked-file backup inert for essentially every user -
+        // password prompt, then silent nothing.
+        //
+        // And what would an attacker who defeats it actually gain? They are
+        // already the same uid (the `getpeereid` check below is NOT
+        // bypassable this way). All they can then ask for is a read-only,
+        // nosuid, nodev, OWNERSHIP-PRESERVING mount of an allow-listed volume
+        // at a mountpoint the broker chooses - which exposes exactly the
+        // files that uid could already read, and does not bypass TCC for
+        // their process. The payoff is a point-in-time copy of their own
+        // data. That does not justify disabling the feature for everyone.
+        //
+        // The load-bearing checks are the peer uid, the volume allow-list,
+        // the snapshot-name validation, and the mount options. This one is
+        // defence in depth, so log it loudly and carry on.
+        let peer_could_plant = dir_is_writable_by(&helper_dir, args.peer_uid)?;
 
         // Root-owned per-session mount root: 0755 so the app user can traverse
         // INTO the (ownership-preserving) mounted snapshots. chmod EXPLICITLY -
@@ -255,6 +267,18 @@ mod macos {
             registry: Mutex::new(MountRegistry::default()),
             audit_log: Mutex::new(audit_log),
         });
+        if peer_could_plant {
+            audit(
+                &shared,
+                format_args!(
+                    "DEGRADED: helper directory {} is writable by uid {}, so the \
+                     co-installation peer check is advisory only; the peer-uid check, \
+                     volume allow-list and read-only ownership-preserving mounts still apply",
+                    shared.helper_dir.display(),
+                    args.peer_uid
+                ),
+            );
+        }
         audit(
             &shared,
             format_args!(
