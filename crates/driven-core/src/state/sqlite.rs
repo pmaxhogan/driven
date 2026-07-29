@@ -17,9 +17,12 @@
 //!   `INSERT OR REPLACE`) so the `ON DELETE CASCADE` chain on `accounts` /
 //!   `backup_sources` does not nuke dependent rows on a benign re-upsert,
 //!   and `file_state.rowid` stays stable for the external-content FTS index.
-//! - [`RelativePath`] currently has a `todo!()` `TryFrom` (M2 lands the real
-//!   validator); rows are deserialised via [`serde_json`] over the
-//!   `#[serde(transparent)] String` shape so reads do not panic before then.
+//! - [`RelativePath`] rows are deserialised via [`serde_json`] over the
+//!   `#[serde(transparent)] String` shape rather than through the validating
+//!   `TryFrom<String>`. A stored path was validated when it was first accepted,
+//!   so re-running the validator on every read would only cost CPU - and would
+//!   turn an infallible decode into a fallible one that could lock a user out of
+//!   their own history if the rules were ever tightened.
 
 use std::collections::HashMap;
 use std::path::Path;
@@ -3703,8 +3706,9 @@ mod tests {
     }
 
     fn rp(s: &str) -> RelativePath {
-        // Tests construct RelativePath via the serde-transparent string
-        // shape (TryFrom is `todo!()` until M2 lands the real validator).
+        // Same construction path the repo itself uses when decoding a row (the
+        // serde-transparent string shape), so a fixture path is built exactly
+        // like a stored one and the helper stays infallible.
         serde_json::from_value(Value::String(s.to_string())).expect("rp")
     }
 

@@ -121,7 +121,10 @@ i64_newtype! {
 
 /// A path relative to a backup source's `local_path`, in canonical form.
 ///
-/// Invariants the constructor must enforce (validation lands in M2):
+/// Invariants [`TryFrom<String>`] and [`TryFrom<&Path>`] enforce (the only
+/// validating constructors; note that the `#[serde(transparent)]` `Deserialize`
+/// impl deliberately does NOT re-validate, so a value read back out of SQLite is
+/// trusted to have been validated on the way in):
 /// - Uses forward slashes `/` as the separator, never backslashes.
 /// - Never starts with a leading `/`.
 /// - Never contains `..` segments.
@@ -756,9 +759,6 @@ pub enum PowerEvent {
 // -----------------------------------------------------------------------------
 
 /// One unit of work the planner emits for the executor (SPEC s7).
-///
-/// M1 phase 1 stub: only the variants used by the M1 contract surface are
-/// declared. The full variant set (resume, deep-verify, etc.) lands in M2.
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub enum Op {
     /// Hash a local file and upload it (creating or updating the remote

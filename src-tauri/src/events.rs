@@ -53,12 +53,9 @@ pub const EVENT_ACCOUNT_NEEDS_REAUTH: &str = "account:needs_reauth";
 /// `oauth:complete` - an in-flight add-account / reauth OAuth flow reached a
 /// terminal state (payload: `{ session_id, status }`, SPEC s11.7).
 ///
-/// M6: the wizard subscribes so it can advance past the OAuth step without
+/// The setup wizard subscribes so it can advance past the OAuth step without
 /// polling. Emitted by the accounts command layer once
-/// [`driven_drive::google::oauth::run_pkce_loopback_flow`] resolves; the
-/// emit helper lands with that implementer, so the constant is defined-but-
-/// uncalled in the M6 scaffold.
-#[allow(dead_code)]
+/// [`driven_drive::google::oauth::run_pkce_loopback_flow`] resolves.
 pub const EVENT_OAUTH_COMPLETE: &str = "oauth:complete";
 /// `updater:available` - a newer release is available (payload: `UpdateInfo`,
 /// SPEC s11.7).

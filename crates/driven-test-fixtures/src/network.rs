@@ -1,24 +1,23 @@
 //! [`FakeNetwork`] - test harness for the network-resilience subsystem
 //! (DESIGN s5.8).
 //!
-//! M3 lands the real network-resilience layer (probe topology, per-service
-//! circuit breakers, captive-portal detection, etc.). The fixture here is
-//! the shared piece M3's tests and any earlier orchestrator tests use to
-//! simulate every failure mode catalogued in DESIGN s5.8.1 without
-//! standing up a real reqwest stack.
+//! Stands in for the real network-resilience layer (probe topology,
+//! per-service circuit breakers, captive-portal detection) so a test can
+//! simulate every failure mode catalogued in DESIGN s5.8.1 without standing
+//! up a real reqwest stack.
 //!
 //! Usage shape:
 //!
 //! - A test mutates [`FakeNetwork::set_state`] to drive the simulated
 //!   network into one of the [`NetworkState`] variants.
-//! - The network-probe layer (M3) reads [`FakeNetwork::state`] from the
+//! - The network-probe layer reads [`FakeNetwork::state`] from the
 //!   orchestrator's [`PowerSource`](driven_power::PowerSource) /
 //!   network-probe wiring and translates the variant into the
 //!   appropriate probe response.
 //!
-//! Today the harness is intentionally state-bag-shaped; richer behaviour
+//! The harness is intentionally state-bag-shaped; richer behaviour
 //! (per-probe response shaping, latency injection, partial-success
-//! windows) lands alongside the M3 network layer that consumes it. Tests
+//! windows) is deliberately not built until a test needs it. Tests
 //! that need just "network up vs down" should reach for the
 //! [`PowerState::network_reachable`](driven_power::PowerState::network_reachable)
 //! flag on a [`FakePowerSource`](crate::power::FakePowerSource) instead.
