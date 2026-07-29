@@ -33,6 +33,12 @@
     "timed": "Backups paused - {minutes}m left",
     "resume": "Resume"
   },
+  "fdaBanner": {
+    "title": "macOS is blocking Driven from reading some files",
+    "body": "macOS privacy protection is stopping Driven from reading {count} file. Driven skips it and retries each run. To back it up, give Driven Full Disk Access. | macOS privacy protection is stopping Driven from reading {count} files. Driven skips them and retries each run. To back them up, give Driven Full Disk Access.",
+    "unsignedNote": "macOS ties this permission to the app's signature, and Driven is not signed yet, so the permission can stop working after an update. If files start being skipped again, remove Driven from the Full Disk Access list and add it back.",
+    "openButton": "Open Full Disk Access settings"
+  },
   "toast": {
     "dismiss": "Dismiss notification",
     "kind": {
