@@ -18,6 +18,12 @@ vi.mock("@tauri-apps/api/core", () => ({
 let batchHandler: ((payload: unknown) => void) | null = null;
 let doneHandler: ((payload: unknown) => void) | null = null;
 let errorHandler: ((payload: unknown) => void) | null = null;
+/** Every unlisten handed out by `listen()`, so a test can assert that NONE is
+ *  left registered after the component goes away. */
+const unlistenSpies: Array<ReturnType<typeof vi.fn>> = [];
+/** When set, `listen()` awaits this before resolving - which is what lets a test
+ *  unmount the component while `subscribe()` is still in flight. */
+let listenGate: Promise<void> | null = null;
 vi.mock("@tauri-apps/api/event", () => ({
   listen: vi.fn(async (event: string, cb: (e: { payload: unknown }) => void) => {
     if (event === "exclusion_preview:batch") {
@@ -29,7 +35,10 @@ vi.mock("@tauri-apps/api/event", () => ({
     if (event === "exclusion_preview:error") {
       errorHandler = (payload: unknown) => cb({ payload });
     }
-    return vi.fn();
+    if (listenGate) await listenGate;
+    const unlisten = vi.fn();
+    unlistenSpies.push(unlisten);
+    return unlisten;
   }),
 }));
 
@@ -88,6 +97,59 @@ beforeEach(() => {
   batchHandler = null;
   doneHandler = null;
   errorHandler = null;
+  unlistenSpies.length = 0;
+  listenGate = null;
+});
+
+describe("ExclusionPreviewTree teardown", () => {
+  it("tears down every listener when unmounted while subscribe is still in flight", async () => {
+    // The editor mounts under a `v-if` (SourceTable's inline editor,
+    // AddSourceWizard's exclusions step), so opening and immediately closing it
+    // is ordinary use. `subscribe()` is three async `listen()` round-trips; if
+    // the component unmounts inside that window, the resolved unlisteners must
+    // still be invoked. They cannot be recovered later: `listen` registers
+    // GLOBALLY BY EVENT NAME, so a stranded set keeps receiving every later
+    // preview's batches and parks them in a controller nobody can reach.
+    let openGate: () => void = () => {};
+    listenGate = new Promise<void>((resolve) => {
+      openGate = resolve;
+    });
+
+    const wrapper = mount(ExclusionPreviewTree, {
+      global: globalMountOptions,
+      props: {
+        sourceId: "src-1",
+        respectGitignore: true,
+        includePatterns: [],
+        excludePatterns: [],
+      },
+    });
+    // Nothing has resolved yet - this is the race window.
+    expect(unlistenSpies).toHaveLength(0);
+
+    wrapper.unmount();
+    openGate();
+    await flushPromises();
+
+    expect(unlistenSpies).toHaveLength(3);
+    for (const unlisten of unlistenSpies) {
+      expect(unlisten).toHaveBeenCalledTimes(1);
+    }
+    // ...and no walk is started for a tree that is no longer on screen.
+    expect(invokeMock).not.toHaveBeenCalledWith("preview_exclusions_start", expect.anything());
+  });
+
+  it("tears down every listener on an ordinary unmount", async () => {
+    const wrapper = await mountWithNodes([node("a.txt", false, true, 10)]);
+    expect(unlistenSpies).toHaveLength(3);
+
+    wrapper.unmount();
+    await flushPromises();
+
+    for (const unlisten of unlistenSpies) {
+      expect(unlisten).toHaveBeenCalledTimes(1);
+    }
+  });
 });
 
 describe("ExclusionPreviewTree", () => {
