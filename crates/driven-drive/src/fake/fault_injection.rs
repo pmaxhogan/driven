@@ -232,8 +232,9 @@ impl InMemoryRemoteStore {
     /// live ones, modelling the "I trashed a row but did not delete its
     /// `file_state` entry" reconciliation case (DESIGN s5.6). The fault
     /// is misnamed in early drafts as "fileid_recycle" - the behaviour
-    /// here is NOT actual Drive file_id recycling (that would need a
-    /// dedicated id-pool flag and lands in M3 design). The renamed
+    /// here is NOT actual Drive file_id recycling, which is a separate
+    /// fault with its own builder,
+    /// [`with_fileid_recycle`](Self::with_fileid_recycle). The renamed
     /// builder makes the intent obvious at call sites.
     pub fn with_trashed_visible_in_find_by_op_uuid(self) -> Self {
         self.faults
