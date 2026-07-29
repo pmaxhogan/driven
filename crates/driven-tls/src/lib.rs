@@ -36,8 +36,8 @@ use reqwest::{Certificate, ClientBuilder};
 pub mod proxy;
 
 pub use proxy::{
-    apply_proxy, resolve_proxy, validate_manual_url, validate_pac_source, PacEngine, ProxyConfig,
-    ProxyError, PROXY_MODES,
+    apply_proxy, redact_userinfo, resolve_proxy, validate_manual_url, validate_pac_source,
+    PacEngine, ProxyConfig, ProxyError, PROXY_MODES,
 };
 
 /// The resolved custom-root-CA setting: an optional path to a PEM file that may

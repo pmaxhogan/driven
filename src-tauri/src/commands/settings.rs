@@ -2161,28 +2161,13 @@ fn redact_settings(s: &SettingsDto) -> RedactedSettings {
 /// Strip any `user:password@` userinfo from a proxy URL, keeping the scheme and
 /// `host:port` (issue #34 follow-up; see [`redact_settings`]).
 ///
-/// Hand-rolled rather than routed through `url::Url` so a URL the parser rejects
-/// still gets scrubbed: a parse failure must never fall through to emitting the
-/// raw string. The authority is everything between `://` and the first `/`, `?`
-/// or `#`; the LAST `@` in it separates userinfo from the host (a password may
-/// itself contain an `@`).
+/// Delegates to [`driven_tls::redact_userinfo`], which is the single
+/// implementation shared with the proxy layer's own log / error redaction. It
+/// lived here first (the diagnostic-bundle fix) and moved down to `driven-tls`
+/// when the same scrub was needed for PAC source URLs in runtime logs - two
+/// copies of a redaction rule are two chances for one of them to drift.
 fn redact_proxy_userinfo(raw: &str) -> String {
-    let Some(sep) = raw.find("://") else {
-        // No scheme separator: not a URL we can split, so we cannot prove there
-        // is no credential in it. Redact wholesale rather than leak.
-        return if raw.contains('@') {
-            "<redacted>".to_string()
-        } else {
-            raw.to_string()
-        };
-    };
-    let (scheme, rest) = raw.split_at(sep + 3);
-    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
-    let (authority, tail) = rest.split_at(authority_end);
-    match authority.rfind('@') {
-        Some(at) => format!("{scheme}<redacted>@{}{tail}", &authority[at + 1..]),
-        None => raw.to_string(),
-    }
+    driven_tls::redact_userinfo(raw)
 }
 
 /// A short, stable, NON-reversible hex hash of `input` for the bundle's redacted
