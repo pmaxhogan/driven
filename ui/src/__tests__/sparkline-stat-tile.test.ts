@@ -4,6 +4,7 @@ import { mount } from "@vue/test-utils";
 
 import { i18n } from "../i18n";
 import SparklineStatTile from "../components/SparklineStatTile.vue";
+import { pointerMoveAt } from "./pointer";
 
 // SparklineStatTile tests. This is the shared chart both header tiles are built
 // from, so it is tested on its OWN contract - geometry, hover mapping, the empty
@@ -122,19 +123,19 @@ describe("SparklineStatTile", () => {
     const wrapper = mountTile({ series: [10, 0, 30], bucketMs: 10_000 });
 
     // 200px wide, 3 buckets -> the right edge is the newest bucket.
-    await wrapper.find(TILE).trigger("pointermove", { clientX: 200 });
+    await pointerMoveAt(wrapper.find(TILE).element, 200);
     expect(wrapper.find(HOVER).text()).toContain("30 units");
     expect(wrapper.find(HOVER).text()).toContain("now");
 
     // The far left is the oldest of 3 buckets: 2 x 10s ago.
-    await wrapper.find(TILE).trigger("pointermove", { clientX: 0 });
+    await pointerMoveAt(wrapper.find(TILE).element, 0);
     expect(wrapper.find(HOVER).text()).toContain("10 units");
     expect(wrapper.find(HOVER).text()).toContain("20 seconds ago");
   });
 
   it("restores the headline when the pointer leaves", async () => {
     const wrapper = mountTile({ series: [10, 20], headline: "42" });
-    await wrapper.find(TILE).trigger("pointermove", { clientX: 10 });
+    await pointerMoveAt(wrapper.find(TILE).element, 10);
     expect(wrapper.find(HOVER).exists()).toBe(true);
 
     await wrapper.find(TILE).trigger("pointerleave");
@@ -144,7 +145,7 @@ describe("SparklineStatTile", () => {
 
   it("ignores hover on an empty plot (there is nothing to point at)", async () => {
     const wrapper = mountTile({ series: [0, 0, 0] });
-    await wrapper.find(TILE).trigger("pointermove", { clientX: 100 });
+    await pointerMoveAt(wrapper.find(TILE).element, 100);
     expect(wrapper.find(HOVER).exists()).toBe(false);
     expect(wrapper.find(VALUE).exists()).toBe(true);
   });

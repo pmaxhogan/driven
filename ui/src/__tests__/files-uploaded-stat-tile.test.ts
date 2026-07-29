@@ -4,6 +4,7 @@ import { mount } from "@vue/test-utils";
 
 import { i18n } from "../i18n";
 import FilesUploadedStatTile from "../components/FilesUploadedStatTile.vue";
+import { pointerMoveAt } from "./pointer";
 
 // FilesUploadedStatTile tests. The tile is a pure render of its props (files per
 // bucket + bucket width + headline count), so every branch is drivable without a
@@ -120,7 +121,7 @@ describe("FilesUploadedStatTile", () => {
   it("reads a hovered bucket as a plain count, not a per-second rate", async () => {
     // 5 buckets of 10s; hovering the far left is the oldest (40s ago).
     const wrapper = mountTile({ series: [6, 0, 0, 0, 2], bucketMs: 10_000, filesUploaded: 8 });
-    await wrapper.find(TILE).trigger("pointermove", { clientX: 0 });
+    await pointerMoveAt(wrapper.find(TILE).element, 0);
 
     const hover = wrapper.find(HOVER);
     expect(hover.exists()).toBe(true);
