@@ -75,8 +75,10 @@ bytes.workspace = true
 # Surfaces the store's own warn-level diagnostics in test output, so a failure
 # the trait can only report as an opaque SessionInvalid still shows the reason.
 tracing-subscriber.workspace = true
-# `keyring` 4.x wraps `keyring-core`, whose `mock` module is an IN-MEMORY
-# credential store installable as the process default. It lets the keychain
-# round trip in `S3CredentialStore` be covered by a real test rather than left
-# untestable on a headless CI box with no OS keychain. Dev-only.
-keyring-core = "1"
+# `driven_test_fixtures::keychain::isolated()` installs (and PROVES) an
+# in-memory credential store as the process default, so the `S3CredentialStore`
+# round trip is covered by a real test that never reaches an OS keychain:
+# neither the developer's login keychain (which on macOS re-prompts on every
+# rebuild) nor a headless CI box's absent one. Dev-only: production always uses
+# the real per-OS store.
+driven-test-fixtures = { path = "../driven-test-fixtures" }

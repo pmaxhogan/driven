@@ -1,11 +1,12 @@
 //! Process-wide keychain isolation for tests.
 //!
-//! Driven stores three secrets in the OS keychain - the account master key
-//! (`dev.maxhogan.driven`, [`driven_crypto::Keystore`]), the Google refresh
-//! token (`driven.google.refresh_token`) and the per-account BYO OAuth client
-//! creds (`driven.google.client_creds`, both in
-//! [`driven_drive::google::token_store`]). A test that exercises any of those
-//! paths must NOT reach the developer's real login keychain: on macOS every
+//! Driven keeps every credential in the OS keychain: the account master key
+//! (`dev.maxhogan.driven`, `driven_crypto::Keystore`), the Google refresh token
+//! (`driven.google.refresh_token`), the per-account BYO OAuth client creds
+//! (`driven.google.client_creds`, both in
+//! [`driven_drive::google::token_store`]) and the S3 key pair
+//! (`driven.s3.credentials`). A test that exercises any of those paths must
+//! NOT reach the developer's real login keychain: on macOS every
 //! `cargo test` rebuild produces a binary with a new identity, so the OS treats
 //! each rebuild as a new app asking for access and raises a modal
 //! "allow ... to access ..." prompt - one per binary, forever, and the run

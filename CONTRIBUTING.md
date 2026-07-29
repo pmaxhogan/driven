@@ -147,8 +147,16 @@ test-only items in your login keychain. Remove them with:
 
 ```sh
 security delete-generic-password -s "driven.google.refresh_token" -a "acct-with-token"
-security delete-generic-password -s "driven.google.client_creds" -a "acct-byo"
+security delete-generic-password -s "driven.google.client_creds"  -a "acct-byo"
+security delete-generic-password -s "driven.s3.credentials"       -a "acct-s3-round-trip"
+security delete-generic-password -s "driven.s3.credentials"       -a "acct-a"
+security delete-generic-password -s "driven.s3.credentials"       -a "acct-b"
+security delete-generic-password -s "driven.s3.credentials"       -a "acct-s3-delete"
+security delete-generic-password -s "driven.s3.credentials"       -a "acct-control-chars"
 ```
+
+A `security: ... could not be found in the keychain` for any of these just means
+that one never leaked on your machine.
 
 ## Coverage gate
 
