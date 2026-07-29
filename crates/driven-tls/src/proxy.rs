@@ -285,8 +285,14 @@ pub async fn resolve_proxy(
 /// Validate a PAC source for the settings UI / save path: fetch/read + compile
 /// it (fail-closed), returning nothing on success. Async (may fetch). Uses the
 /// exact same path as [`resolve_proxy`], so "valid here" implies "resolves at
-/// build". Bypasses the process cache so a re-validate always re-checks the
-/// live source.
+/// build". Always re-reads the live source rather than serving the process
+/// cache, so a re-validate genuinely re-checks it.
+///
+/// On success the freshly compiled engine is PUBLISHED to the process cache.
+/// Without that, validation read the new script while every client kept the
+/// engine compiled from the old one: editing a PAC file and re-saving the same
+/// URL logged "PAC proxy file validated on save" and then routed traffic by the
+/// stale script until the app restarted.
 pub async fn validate_pac_source(
     source: &str,
     ca: &crate::CustomCaConfig,
@@ -296,35 +302,77 @@ pub async fn validate_pac_source(
         return Err(ProxyError::MissingPacSource);
     }
     let script = fetch_pac_script(source, ca).await?;
-    PacEngine::compile(script, source.to_string()).map(|_| ())
+    let engine = Arc::new(PacEngine::compile(script, source.to_string())?);
+    store_pac_engine(source, &engine);
+    Ok(())
 }
 
 // ---------------------------------------------------------------------------
 // PAC fetch + process-global compiled-engine cache
 // ---------------------------------------------------------------------------
 
+/// How long a compiled PAC engine stays usable before the next resolve refetches
+/// its source. A PAC file is administrator-managed and changes server-side
+/// without telling us, so an engine pinned for the whole process lifetime meant
+/// a corporate PAC change only took effect after an app restart. 15 minutes is
+/// the usual WPAD refresh ballpark: short enough that a routing change lands the
+/// same session, long enough that the ~9 client-build sites still share one
+/// fetch during a backup run.
+const PAC_ENGINE_TTL: std::time::Duration = std::time::Duration::from_secs(15 * 60);
+
+/// How many distinct PAC sources to keep compiled. Only one proxy source is ever
+/// configured at a time, so this is effectively 1 in production; the extra slots
+/// keep a just-validated (not yet saved) source - and, in the test binary, the
+/// several PAC sources exercised in parallel - from evicting the live one.
+const PAC_ENGINE_CACHE_SLOTS: usize = 8;
+
 /// A compiled PAC engine cached against the exact source string it came from, so
 /// the ~9 client-build load sites reuse ONE fetch + ONE warm decision cache
-/// instead of refetching per operation.
+/// instead of refetching per operation. `fetched_at` bounds that reuse to
+/// [`PAC_ENGINE_TTL`].
 struct CachedPac {
-    source: String,
     engine: Arc<PacEngine>,
+    fetched_at: std::time::Instant,
 }
 
-static PAC_CACHE: LazyLock<Mutex<Option<CachedPac>>> = LazyLock::new(|| Mutex::new(None));
+/// Compiled PAC engines keyed by their source string (URL / path). Keyed rather
+/// than a single slot so validating one source cannot evict the live one.
+static PAC_CACHE: LazyLock<Mutex<LruCache<String, CachedPac>>> = LazyLock::new(|| {
+    Mutex::new(LruCache::new(
+        std::num::NonZeroUsize::new(PAC_ENGINE_CACHE_SLOTS).expect("slot count is non-zero"),
+    ))
+});
+
+/// Whether a cache entry of the given age may still be served. Split out as a
+/// pure predicate so the TTL policy is unit-testable without waiting 15 minutes.
+fn pac_entry_is_fresh(age: std::time::Duration) -> bool {
+    age < PAC_ENGINE_TTL
+}
+
+/// Publish a freshly fetched+compiled engine so later resolves reuse it.
+fn store_pac_engine(source: &str, engine: &Arc<PacEngine>) {
+    PAC_CACHE.lock().expect("PAC cache mutex poisoned").put(
+        source.to_string(),
+        CachedPac {
+            engine: Arc::clone(engine),
+            fetched_at: std::time::Instant::now(),
+        },
+    );
+}
 
 /// Return the compiled engine for `source`, reusing the process cache when the
-/// source is unchanged; otherwise fetch + compile once and cache it.
+/// source is unchanged AND the entry is still within [`PAC_ENGINE_TTL`];
+/// otherwise fetch + compile once and cache it.
 async fn load_pac_engine(
     source: &str,
     ca: &crate::CustomCaConfig,
 ) -> Result<Arc<PacEngine>, ProxyError> {
-    // Fast path: cache hit. Drop the lock BEFORE any await.
+    // Fast path: a fresh cache hit. Drop the lock BEFORE any await.
     if let Some(hit) = PAC_CACHE
         .lock()
         .expect("PAC cache mutex poisoned")
-        .as_ref()
-        .filter(|c| c.source == source)
+        .get(source)
+        .filter(|c| pac_entry_is_fresh(c.fetched_at.elapsed()))
         .map(|c| Arc::clone(&c.engine))
     {
         return Ok(hit);
@@ -334,10 +382,7 @@ async fn load_pac_engine(
     let engine = Arc::new(PacEngine::compile(script, source.to_string())?);
 
     // Store (last writer wins if two sites raced a miss - harmless, idempotent).
-    *PAC_CACHE.lock().expect("PAC cache mutex poisoned") = Some(CachedPac {
-        source: source.to_string(),
-        engine: Arc::clone(&engine),
-    });
+    store_pac_engine(source, &engine);
     Ok(engine)
 }
 
@@ -1193,6 +1238,161 @@ mod tests {
         assert!(pac.pac_engine().is_some());
         assert!(pac.manual_url().is_none());
         assert!(format!("{pac:?}").contains("Pac"));
+    }
+
+    #[test]
+    fn pac_entry_is_fresh_bounds_reuse_by_ttl() {
+        use std::time::Duration;
+        assert!(pac_entry_is_fresh(Duration::ZERO), "a new entry is fresh");
+        assert!(
+            pac_entry_is_fresh(PAC_ENGINE_TTL - Duration::from_secs(1)),
+            "just inside the TTL is still fresh"
+        );
+        assert!(
+            !pac_entry_is_fresh(PAC_ENGINE_TTL),
+            "exactly at the TTL is stale (the bound is exclusive)"
+        );
+        assert!(
+            !pac_entry_is_fresh(PAC_ENGINE_TTL + Duration::from_secs(1)),
+            "past the TTL is stale"
+        );
+    }
+
+    #[tokio::test]
+    async fn revalidating_a_changed_pac_source_republishes_it() {
+        // THE BUG: `validate_pac_source` re-reads the live source, but
+        // `load_pac_engine` served a process-cached engine keyed only on the
+        // source string, with no TTL and no invalidation. So editing a PAC file
+        // and re-saving the SAME url/path validated the NEW script and then kept
+        // routing by the OLD one until the app restarted - while the save path
+        // logged "PAC proxy file validated on save".
+        let ca = crate::CustomCaConfig::none();
+        let dir = tempfile::tempdir().expect("tempdir");
+        // A path unique to this test so the keyed cache cannot collide with the
+        // other PAC tests running in parallel.
+        let path = dir.path().join("republish.pac");
+        let source = path.to_string_lossy().to_string();
+
+        std::fs::write(
+            &path,
+            "function FindProxyForURL(u,h){ return \"PROXY old:1\"; }",
+        )
+        .expect("write v1");
+        let cfg = resolve_proxy("pac", Some(&source), &ca).await.expect("v1");
+        assert_eq!(
+            cfg.pac_engine()
+                .expect("pac")
+                .evaluate_str("https://x.example/"),
+            Some("http://old:1".to_string())
+        );
+
+        // Edit the file in place, same source string.
+        std::fs::write(
+            &path,
+            "function FindProxyForURL(u,h){ return \"PROXY new:2\"; }",
+        )
+        .expect("write v2");
+
+        // Within the TTL and with no re-validate, the cached engine is reused -
+        // that reuse is the point of the cache, so assert it explicitly.
+        let cached = resolve_proxy("pac", Some(&source), &ca)
+            .await
+            .expect("cached");
+        assert_eq!(
+            cached
+                .pac_engine()
+                .expect("pac")
+                .evaluate_str("https://x.example/"),
+            Some("http://old:1".to_string()),
+            "inside the TTL the compiled engine is reused"
+        );
+
+        // What the settings-save path does. After it, the LIVE script must be in
+        // force - this assertion fails before the fix.
+        validate_pac_source(&source, &ca)
+            .await
+            .expect("the edited PAC still validates");
+
+        let after = resolve_proxy("pac", Some(&source), &ca)
+            .await
+            .expect("post-validate");
+        assert_eq!(
+            after
+                .pac_engine()
+                .expect("pac")
+                .evaluate_str("https://x.example/"),
+            Some("http://new:2".to_string()),
+            "after re-validating, the engine must be the one that was validated"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_stale_cache_entry_is_refetched() {
+        // The TTL path: an entry older than PAC_ENGINE_TTL must not be served.
+        // The entry is aged by writing `fetched_at` directly rather than by
+        // sleeping, so the test is instant and deterministic.
+        let ca = crate::CustomCaConfig::none();
+        let dir = tempfile::tempdir().expect("tempdir");
+        let path = dir.path().join("ttl.pac");
+        let source = path.to_string_lossy().to_string();
+
+        std::fs::write(
+            &path,
+            "function FindProxyForURL(u,h){ return \"PROXY first:1\"; }",
+        )
+        .expect("write v1");
+        let cfg = resolve_proxy("pac", Some(&source), &ca).await.expect("v1");
+        assert_eq!(
+            cfg.pac_engine()
+                .expect("pac")
+                .evaluate_str("https://y.example/"),
+            Some("http://first:1".to_string())
+        );
+
+        std::fs::write(
+            &path,
+            "function FindProxyForURL(u,h){ return \"PROXY second:2\"; }",
+        )
+        .expect("write v2");
+
+        // Age the cached entry past the TTL. `checked_sub` can return None on a
+        // machine booted moments ago (a fresh CI VM), in which case there is no
+        // representable stale instant and the TTL path cannot be exercised -
+        // rebuild the entry as already-expired via the same predicate instead of
+        // asserting nothing.
+        {
+            let mut cache = PAC_CACHE.lock().expect("PAC cache mutex poisoned");
+            let engine = Arc::clone(&cache.get(&source).expect("entry present").engine);
+            let aged = std::time::Instant::now()
+                .checked_sub(PAC_ENGINE_TTL * 2)
+                .unwrap_or_else(std::time::Instant::now);
+            if !pac_entry_is_fresh(aged.elapsed()) {
+                cache.put(
+                    source.clone(),
+                    CachedPac {
+                        engine,
+                        fetched_at: aged,
+                    },
+                );
+            } else {
+                // Uptime is shorter than the TTL: evict so the refetch below is
+                // still exercised (the freshness predicate itself is covered by
+                // `pac_entry_is_fresh_bounds_reuse_by_ttl`).
+                cache.pop(&source);
+            }
+        }
+
+        let refetched = resolve_proxy("pac", Some(&source), &ca)
+            .await
+            .expect("refetch");
+        assert_eq!(
+            refetched
+                .pac_engine()
+                .expect("pac")
+                .evaluate_str("https://y.example/"),
+            Some("http://second:2".to_string()),
+            "a stale entry must be refetched, picking up the edited script"
+        );
     }
 
     #[test]
