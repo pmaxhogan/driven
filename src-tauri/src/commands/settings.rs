@@ -2136,10 +2136,17 @@ struct RedactedTelemetry {
 }
 
 /// Redact the secret-bearing fields of a [`SettingsDto`] for the bundle
-/// (SPEC s18): the telemetry install id becomes `installid_<hash>`.
+/// (SPEC s18): the telemetry install id becomes `installid_<hash>`, and the
+/// issue #34 proxy URL has any `user:password@` userinfo stripped.
 fn redact_settings(s: &SettingsDto) -> RedactedSettings {
+    let mut global = s.global.clone();
+    // Issue #34 follow-up: a `manual`-mode proxy URL may embed basic-auth
+    // credentials (`http://user:password@proxy.corp:8080`). The bundle is meant
+    // to be shareable with support, so the userinfo must never ride along - the
+    // host:port survives because that is the diagnostically useful part.
+    global.proxy_url = global.proxy_url.as_deref().map(redact_proxy_userinfo);
     RedactedSettings {
-        global: s.global.clone(),
+        global,
         telemetry: RedactedTelemetry {
             enabled: s.telemetry.enabled,
             install_id: format!("installid_{}", stable_hash(&s.telemetry.install_id)),
@@ -2148,6 +2155,33 @@ fn redact_settings(s: &SettingsDto) -> RedactedSettings {
         updater: s.updater.clone(),
         ui: s.ui.clone(),
         windows: s.windows.clone(),
+    }
+}
+
+/// Strip any `user:password@` userinfo from a proxy URL, keeping the scheme and
+/// `host:port` (issue #34 follow-up; see [`redact_settings`]).
+///
+/// Hand-rolled rather than routed through `url::Url` so a URL the parser rejects
+/// still gets scrubbed: a parse failure must never fall through to emitting the
+/// raw string. The authority is everything between `://` and the first `/`, `?`
+/// or `#`; the LAST `@` in it separates userinfo from the host (a password may
+/// itself contain an `@`).
+fn redact_proxy_userinfo(raw: &str) -> String {
+    let Some(sep) = raw.find("://") else {
+        // No scheme separator: not a URL we can split, so we cannot prove there
+        // is no credential in it. Redact wholesale rather than leak.
+        return if raw.contains('@') {
+            "<redacted>".to_string()
+        } else {
+            raw.to_string()
+        };
+    };
+    let (scheme, rest) = raw.split_at(sep + 3);
+    let authority_end = rest.find(['/', '?', '#']).unwrap_or(rest.len());
+    let (authority, tail) = rest.split_at(authority_end);
+    match authority.rfind('@') {
+        Some(at) => format!("{scheme}<redacted>@{}{tail}", &authority[at + 1..]),
+        None => raw.to_string(),
     }
 }
 
@@ -3103,6 +3137,85 @@ mod tests {
             stable_hash("super-secret-install-id"),
             stable_hash("super-secret-install-id")
         );
+    }
+
+    #[test]
+    fn redact_settings_strips_proxy_basic_auth_credentials() {
+        // Issue #34 follow-up: `settings_redacted.json` carried `global` verbatim,
+        // so a manual-mode proxy URL with `user:password@` userinfo shipped its
+        // password in plaintext inside a bundle meant to be shared with support.
+        let mut global = default_global();
+        global.proxy_mode = "manual".to_string();
+        global.proxy_url = Some("http://corpuser:hunter2@proxy.corp.example:8080".to_string());
+        let dto = SettingsDto {
+            global,
+            telemetry: TelemetrySettings {
+                enabled: false,
+                install_id: "id".to_string(),
+                endpoint: "https://e".to_string(),
+            },
+            updater: default_updater(),
+            ui: default_ui(),
+            windows: None,
+            bundle_small_files: false,
+        };
+        let red = redact_settings(&dto);
+        let url = red.global.proxy_url.as_deref().expect("proxy url present");
+        assert!(!url.contains("hunter2"), "the password must be gone: {url}");
+        assert!(
+            !url.contains("corpuser"),
+            "the username must be gone: {url}"
+        );
+        assert!(
+            url.contains("proxy.corp.example:8080"),
+            "host:port is diagnostically useful and survives: {url}"
+        );
+
+        // The serialized bundle document must not carry the secret either - this
+        // is the artifact that actually leaves the machine.
+        let json = serde_json::to_string(&red).expect("serialize");
+        assert!(
+            !json.contains("hunter2"),
+            "the bundle JSON must not carry the proxy password: {json}"
+        );
+    }
+
+    #[test]
+    fn redact_proxy_userinfo_handles_every_url_shape() {
+        // No credentials: untouched.
+        assert_eq!(
+            redact_proxy_userinfo("http://proxy.corp:8080"),
+            "http://proxy.corp:8080"
+        );
+        // socks5 with credentials.
+        assert_eq!(
+            redact_proxy_userinfo("socks5://u:p@127.0.0.1:1080"),
+            "socks5://<redacted>@127.0.0.1:1080"
+        );
+        // Username only, no password.
+        assert_eq!(
+            redact_proxy_userinfo("http://justuser@h:1"),
+            "http://<redacted>@h:1"
+        );
+        // A password containing '@' - the LAST '@' in the authority splits it.
+        assert_eq!(
+            redact_proxy_userinfo("http://u:p@ss@h:1"),
+            "http://<redacted>@h:1"
+        );
+        // A path/query must not be mistaken for the authority, and an '@' after
+        // the authority (in a path) is not userinfo.
+        assert_eq!(
+            redact_proxy_userinfo("http://u:p@h:1/path?q=1"),
+            "http://<redacted>@h:1/path?q=1"
+        );
+        assert_eq!(
+            redact_proxy_userinfo("http://h:1/pa@th"),
+            "http://h:1/pa@th"
+        );
+        // Unparseable garbage that still contains an '@' is redacted wholesale
+        // rather than passed through.
+        assert_eq!(redact_proxy_userinfo("u:p@h:1"), "<redacted>");
+        assert_eq!(redact_proxy_userinfo("not a url"), "not a url");
     }
 
     #[tokio::test]
