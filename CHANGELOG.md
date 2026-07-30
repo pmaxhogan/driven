@@ -5,6 +5,35 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.0](https://github.com/pmaxhogan/driven/compare/v2.4.0...v2.5.0) (2026-07-30)
+
+
+### Features
+
+* **cli:** import destinations from an existing rclone config ([#213](https://github.com/pmaxhogan/driven/issues/213)) ([baaf7bd](https://github.com/pmaxhogan/driven/commit/baaf7bdfb07f8d1a7a79219f466d370002fd5e66))
+* **core:** enable macOS locked-file backup via the APFS snapshot broker ([#201](https://github.com/pmaxhogan/driven/issues/201)) ([ada822e](https://github.com/pmaxhogan/driven/commit/ada822e969613c3663a6e75faff59e15b4b3ceb8))
+* **core:** local and removable-folder backup destination ([#212](https://github.com/pmaxhogan/driven/issues/212)) ([c416a24](https://github.com/pmaxhogan/driven/commit/c416a2463ff434c0141f93c3b82fb44c7113241c))
+* **core:** macOS APFS snapshot broker for locked files ([#196](https://github.com/pmaxhogan/driven/issues/196)) ([a5f105e](https://github.com/pmaxhogan/driven/commit/a5f105e87677fd946b8d0f0e92dcce505eea4025))
+* **core:** pluggable backup destination backends ([#200](https://github.com/pmaxhogan/driven/issues/200)) ([871df59](https://github.com/pmaxhogan/driven/commit/871df59940d42a1cf3d326aa68d89c19303c9452))
+* **core:** S3-compatible backup destination ([#207](https://github.com/pmaxhogan/driven/issues/207)) ([37acb03](https://github.com/pmaxhogan/driven/commit/37acb03086367141633864380daa89dc8960c4c3))
+* **core:** scheduled integrity scrub of remote objects ([#203](https://github.com/pmaxhogan/driven/issues/203)) ([049c62a](https://github.com/pmaxhogan/driven/commit/049c62a24dcadf27e4481bee7f287e6b081f655e))
+* **ui:** guide macOS users to grant Full Disk Access when files are denied ([#216](https://github.com/pmaxhogan/driven/issues/216)) ([aa5327e](https://github.com/pmaxhogan/driven/commit/aa5327e67e52d84de77b222b96f60855d02a3366))
+
+
+### Bug Fixes
+
+* **ci:** wait for MinIO readiness before the S3 integration suite ([#226](https://github.com/pmaxhogan/driven/issues/226)) ([fff471a](https://github.com/pmaxhogan/driven/commit/fff471ab14a4b0cee1a3f93c58e8c57e2c8b25a1))
+* **core:** classify macOS locked and permission-denied opens into the skip-and-report path ([#195](https://github.com/pmaxhogan/driven/issues/195)) ([08d2864](https://github.com/pmaxhogan/driven/commit/08d286403af1fc6d16c2e2f7ac369ef534ff8911))
+* **core:** downgrade the APFS helper-dir check from fatal to advisory ([#211](https://github.com/pmaxhogan/driven/issues/211)) ([65010ac](https://github.com/pmaxhogan/driven/commit/65010acad0f0b0e9398f21a023139cd34dd86b60))
+* **net:** redact proxy credentials from the diagnostic bundle ([#190](https://github.com/pmaxhogan/driven/issues/190)) ([8e514f3](https://github.com/pmaxhogan/driven/commit/8e514f3ca17f79017e195f353ae4636838fe5e32))
+* **net:** redact userinfo from PAC source in logs ([#208](https://github.com/pmaxhogan/driven/issues/208)) ([8692bc0](https://github.com/pmaxhogan/driven/commit/8692bc041a644a6f5f73365fd67b546aa2de9636))
+* **net:** refresh stale PAC scripts instead of pinning them for the process ([#191](https://github.com/pmaxhogan/driven/issues/191)) ([18b0d43](https://github.com/pmaxhogan/driven/commit/18b0d4397884f7fa9a6b61a63556504fa0c5ae27))
+* **scanner:** route the deep-verify hash through the platform-open helper ([#193](https://github.com/pmaxhogan/driven/issues/193)) ([3af5c65](https://github.com/pmaxhogan/driven/commit/3af5c655eb3ea6b8e7761756f97cc530a3d6339b))
+* **ui:** do not offer versioning on destinations that cannot honour it ([#224](https://github.com/pmaxhogan/driven/issues/224)) ([857c8ba](https://github.com/pmaxhogan/driven/commit/857c8ba81e8012910bffc731c5c44bf768fe5d1b))
+* **ui:** make the destination step backend-driven and stop copy claiming Drive behaviour ([#219](https://github.com/pmaxhogan/driven/issues/219)) ([9d67765](https://github.com/pmaxhogan/driven/commit/9d677653ed7dade15378b107efd0d7084b299eed))
+* **ui:** tear down exclusion-preview listeners lost to an unmount race ([#206](https://github.com/pmaxhogan/driven/issues/206)) ([2656c9f](https://github.com/pmaxhogan/driven/commit/2656c9f8c175ae4ee45a33940ea7547313b267a7))
+* **ui:** use a template tray icon on macOS ([#202](https://github.com/pmaxhogan/driven/issues/202)) ([eaefa9a](https://github.com/pmaxhogan/driven/commit/eaefa9a6e09d5765d3fedf8bbf5985237e131113))
+
 ## [2.4.0](https://github.com/pmaxhogan/driven/compare/v2.3.0...v2.4.0) (2026-07-26)
 
 
