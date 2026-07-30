@@ -48,6 +48,12 @@ maintenance surface stays small:
 - **Backup to anything other than Google Drive.** The architecture has a
   `RemoteStore` trait so a future S3 or OneDrive backend is *possible*, but it
   is not planned and is not allowed to leak into V1 design tradeoffs.
+  **Post-V1 update (v2.5.0):** this was reversed. An S3-compatible backend
+  and a local/removable-folder backend both shipped behind that same trait
+  (now in its own `driven-remote` crate - see §4.2); OneDrive is still
+  unstarted. The reversal came after V1 GA, so it never fed back into the V1
+  design tradeoffs this section describes - the historical reasoning below
+  stays as-is.
 - **Server / multi-user / team admin.** Driven runs on one machine for one user
   with one or more of *their* Google accounts. No web dashboard, no shared
   config service.
@@ -242,8 +248,13 @@ honour them; deviating requires re-asking the user.
 | Crate                  | Responsibility                                         |
 |------------------------|--------------------------------------------------------|
 | `driven-core`          | Pure logic. Sync state machine, scanner, planner, exclusion rules, scheduler, activity log writer, pacer, retry/backoff. **No I/O except via injected traits.** |
-| `driven-drive`         | `RemoteStore` trait + Google Drive implementation + `InMemoryRemoteStore` fake. Owns OAuth flow and refresh-token storage. |
-| `driven-crypto`        | Authenticated encryption format. Filename encryption, chunked file encryption, key wrapping via OS keychain. |
+| `driven-remote`        | The `RemoteStore` trait itself, plus `BackendKind` (the destination taxonomy: `GoogleDrive` / `S3` / `LocalFolder`), shared retry policy, and the remote-side error taxonomy. Backend-agnostic - depends on none of the concrete implementations below. |
+| `driven-drive`         | Google Drive implementation of `RemoteStore` + `InMemoryRemoteStore` fake (used by every backend's contract tests, not just Drive's). Owns the Drive OAuth flow and refresh-token storage. |
+| `driven-s3`            | S3-compatible implementation of `RemoteStore` (AWS S3, Cloudflare R2, MinIO, Backblaze B2 in S3-compatible mode, Wasabi), authenticated with a directly-entered access key pair. |
+| `driven-localfs`       | Local/removable-folder implementation of `RemoteStore`: a plain directory tree, with a destination-identity marker file so an unmounted removable drive is never mistaken for an empty one. Needs no credential. |
+| `driven-backend`       | The factory: turns an account's persisted `BackendKind` + config into the `Arc<dyn RemoteStore>` the sync engine, destination picker, and restore path all run against. The one place a new backend gets wired up. |
+| `driven-rclone`        | CLI-only: reads an existing `rclone.conf` and classifies each remote into what Driven can make of it (`s3` / `drive` / unsupported). Translate-only - it never creates an account or talks to a network API itself. |
+| `driven-crypto`        | Authenticated encryption format. Filename encryption, chunked file encryption, key wrapping via OS keychain. Applied above the `RemoteStore` seam, so it works identically regardless of which backend a source targets. |
 | `driven-power`         | Battery + AC + metered-network detection, normalized across Windows / macOS / Linux. |
 | `driven-test-fixtures` | Shared test helpers: `tempdir` fixtures, file-tree builders, fake clock, assertion helpers. |
 | `driven-app` (src-tauri) | Tauri shell. IPC commands. Tray. Updater glue. Plugin wiring. Pulls the other crates together. Thin. |
@@ -251,6 +262,17 @@ honour them; deviating requires re-asking the user.
 The thin shell + thick core split is so the core can be exercised by
 plain `cargo test --workspace` without ever booting Tauri or a webview.
 Speed of iteration matters more than any micro-elegance.
+
+> **Post-V1 update (v2.5.0):** this table originally listed one backend
+> (`driven-drive` owning the `RemoteStore` trait directly). The trait moved
+> out to its own `driven-remote` crate when a second and third backend
+> (`driven-s3`, `driven-localfs`) landed, so that none of the three
+> concrete implementations - nor `driven-core`, which never depended on
+> any of them - has to depend on the others. `driven-backend` is the new
+> factory that replaced three separate hand-rolled
+> `KeyringTokenStore -> RefreshingTokenSource -> GoogleDriveStore`-shaped
+> call sites. See §2's non-goals note and §5.3.2/§5.3.3 for the platform
+> work that shipped alongside.
 
 ---
 
@@ -2522,7 +2544,11 @@ Rust-side i18n:
 - **Block-level dedup** (CDC) for huge frequently-rewritten files.
 - **Restore-by-date / point-in-time** (requires versioning).
 - **Pre/post backup shell hooks.** (SHIPPED 0.2.0, #16)
-- **Backends beyond Google Drive** (OneDrive, S3, Backblaze B2).
+- **Backends beyond Google Drive.** (SHIPPED v2.5.0 for S3 - AWS S3,
+  Cloudflare R2, MinIO, Backblaze B2 in S3-compatible mode, Wasabi - and for
+  a local/removable folder, both behind the `driven-remote::RemoteStore`
+  trait; see §4.2. OneDrive and a native, non-S3 Backblaze B2 client remain
+  unstarted.)
 - **Schedule windows** (time-of-day rules, e.g. "only sync 23:00-06:00").
   (SHIPPED 0.2.0, #12 - time-of-day backup gating; the §3.5 "V1 does NOT ship
   this" decision was reversed post-GA. The original reservation note is kept for

@@ -12,9 +12,10 @@ ever leave it, so Google stores only ciphertext.
 
 ![Driven's first-run setup wizard in dark mode: a teal-accented welcome step with the top navigation (Activity, Settings, Restore, About).](docs/screenshots/setup-wizard-dark.png)
 
-Driven uses your own Google OAuth credentials, so your files never pass through
-anyone else's servers. The first-run wizard includes a step-by-step, plain-English
-guide to creating that credential in the Google Cloud Console:
+When backing up to Google Drive, Driven uses your own OAuth credentials, so
+your files never pass through anyone else's servers. The first-run wizard
+includes a step-by-step, plain-English guide to creating that credential in
+the Google Cloud Console:
 
 ![The credentials step with an expanded, numbered walkthrough for creating a Google OAuth client ID and secret.](docs/screenshots/oauth-walkthrough-dark.png)
 
@@ -25,7 +26,8 @@ backup to a cloud you already own, plus laptop-friendly touches - gitignore-awar
 excludes, battery and metered-network awareness, and backup work that runs below
 normal CPU and disk priority so it does not fight whatever you are actually using
 the machine for - that CLI backup tools and consumer sync clients skip. Where it
-is thinner today (more backends, block-level dedup) is marked honestly below.
+is thinner today (block-level dedup, breadth of backends versus rclone's dozens)
+is marked honestly below.
 
 Legend: :white_check_mark: yes &nbsp; :large_orange_diamond: partial (see note) &nbsp; :x: no &nbsp; :grey_question: not documented
 
@@ -36,14 +38,14 @@ Legend: :white_check_mark: yes &nbsp; :large_orange_diamond: partial (see note) 
 | Resumable, crash-safe transfers | :white_check_mark: | :large_orange_diamond:⁴ | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: |
 | Backs up to storage you own / control | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: | :white_check_mark: | :x:⁵ |
 | No account with the tool's vendor, no vendor servers | :white_check_mark: | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
-| Choice of multiple storage backends | :x:⁶ | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
+| Choice of multiple storage backends | :white_check_mark:⁴³ | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
 | End-to-end (client-side) encryption | :white_check_mark: | :white_check_mark: | :x:⁷ | :white_check_mark: | :white_check_mark: | :large_orange_diamond:⁸ |
 | Encrypted file names, not just contents | :white_check_mark: | :white_check_mark: | :x: | :white_check_mark: | :white_check_mark: | :x: |
 | Recovery phrase for the encryption key | :white_check_mark: | :x:⁹ | :x: | :x:⁹ | :x:⁹ | :x:⁹ |
 | Point-in-time restore (an earlier version by date) | :white_check_mark:⁴² | :x: | :large_orange_diamond:¹⁰ | :white_check_mark: | :white_check_mark: | :white_check_mark:¹¹ |
 | Block-level deduplication | :x:⁶ | :x: | :x: | :white_check_mark: | :white_check_mark: | :x: |
 | Locked / open-file backup (Windows VSS)⁴¹ | :white_check_mark: | :x: | :large_orange_diamond:¹² | :white_check_mark: | :white_check_mark: | :white_check_mark: |
-| Periodic integrity re-verification | :white_check_mark: | :large_orange_diamond:¹³ | :x: | :white_check_mark: | :large_orange_diamond:¹³ | :large_orange_diamond:¹³ |
+| Periodic integrity re-verification | :white_check_mark:⁴⁴ | :large_orange_diamond:¹³ | :x: | :white_check_mark: | :large_orange_diamond:¹³ | :large_orange_diamond:¹³ |
 | Re-uploads backup copies deleted at the destination | :white_check_mark:¹⁴ | :white_check_mark:¹⁵ | :x:¹⁶ | :large_orange_diamond:¹⁷ | :large_orange_diamond:¹⁷ | :grey_question:¹⁸ |
 | Parallel, multi-threaded local scan | :white_check_mark:¹⁹ | :white_check_mark:²⁰ | :grey_question:²¹ | :x:²² | :large_orange_diamond:²³ | :grey_question:²¹ |
 | OS-level CPU / disk I/O priority for backup work | :white_check_mark:²⁴ | :x:²⁵ | :x:²⁵ | :x:²⁵ | :x:²⁵ | :x:²⁵ |
@@ -64,7 +66,7 @@ Notes:
 - ³ rclone, restic, and Duplicati back up on a schedule (cron / systemd / built-in scheduler), not from a live file-change watcher.
 - ⁴ rclone resumes at file granularity on re-run; mid-file resume of a large object depends on the backend.
 - ⁵ Backblaze Personal Backup targets Backblaze's own cloud, not storage you supply.
-- ⁶ Google Drive is Driven's only backend today; additional backends and block-level dedup are on the post-v1 backlog ([issue #34](https://github.com/pmaxhogan/driven/issues/34)), not shipped.
+- ⁶ Block-level deduplication is on the post-v1 backlog ([issue #34](https://github.com/pmaxhogan/driven/issues/34)), not shipped.
 - ⁷ Drive uses server-side encryption; client-side encryption exists only for eligible Google Workspace accounts an admin configures, not consumer accounts.
 - ⁸ Backblaze defaults to provider-managed keys; a user-set private key is optional, and its passphrase is entered on Backblaze's servers during a web restore.
 - ⁹ These tools protect the key with a passphrase you must remember; only Driven generates a BIP39 recovery phrase you can write down to recover the key.
@@ -101,6 +103,8 @@ Notes:
 - ⁴⁰ The others publish unit-test microbenchmarks, internal tuning harnesses (Duplicati's unreleased AutoTune), or vendor marketing numbers, rather than a runnable end-to-end suite. Backblaze does publish a quarterly benchmark, but of B2 object storage rather than the backup client.
 - ⁴¹ Driven's checkmark is scoped to Windows, where a VSS snapshot lets a locked file (Outlook PST, running DB, VM disk) back up while it is held open. macOS has an equivalent behind an opt-in setting (Settings > Rules): a small privileged helper mounts a read-only APFS local snapshot so a *busy* file can be read: it is off by default, and it does nothing for a Full Disk Access denial. On both macOS and Linux, a file Driven cannot open is in any case classified precisely as a transient lock (`local.file_locked`) versus a macOS Full Disk Access denial (`local.permission_denied`) and skipped with a clear reason in the activity log, rather than misreported as a disk error. Linux has no snapshot equivalent and none is planned. See `design/DESIGN.md` §5.3 and §5.3.2.
 - ⁴² Driven's checkmark is scoped to the Google Drive destination. Keeping previous versions relies on a changed file's re-upload landing on a NEW remote object, which is true of a Drive create but not of a destination whose object key is derived from the file name: on S3-compatible stores and local folders the re-upload overwrites the previous copy. Driven therefore does not offer per-source versioning or a restore-by-date on those destinations at all, rather than reporting a point-in-time restore it cannot perform. For recoverability on S3, enable the provider's own bucket versioning. See [issue #220](https://github.com/pmaxhogan/driven/issues/220).
+- ⁴³ Google Drive (the original destination), any S3-compatible object store (AWS S3, Cloudflare R2, MinIO, Backblaze B2 in S3-compatible mode, Wasabi), and a local or removable folder (USB drive, external disk, NAS share) - all behind one `RemoteStore` trait, shipped in v2.5.0. OneDrive and other non-S3-compatible cloud APIs are not implemented.
+- ⁴⁴ Driven runs three independent periodic checks, not one: a weekly local re-hash (deep-verify) that catches local bit-rot, a startup / deep-verify remote-existence audit that catches an object deleted at the destination outside Driven, and, added in v2.5.0, a weekly rolling integrity scrub that re-checks each already-backed-up object's size against the destination and, where the destination can supply one, its content checksum too - catching remote-side corruption or tampering that neither of the other two checks can see. On by default; a source's population is swept in bounded slices (500 objects per run by default) rather than all at once. Checksum coverage depends on the destination: full on Google Drive and on a local-folder destination (which always re-hashes the bytes it just wrote); size-only for an S3 object uploaded via multipart, because S3 stores no plain content digest for one, only an ETag that digests the individual parts - the scrub reports those as unverifiable rather than guessing, never as falsely clean.
 
 Competitor rows were verified in July 2026 against rclone 1.74.4, restic 0.19.1,
 Duplicati 2.3.0.4, Backblaze Personal Backup 10.0.2, and Drive for desktop 128.0.
@@ -143,20 +147,30 @@ These move: check each project's current docs before relying on a cell.
 - Guided Full Disk Access onboarding for macOS: when macOS privacy protection
   blocks a file, Driven says so and offers a one-click jump to the right
   System Settings pane instead of leaving you to find it.
+- Choice of backup destination: Google Drive, any S3-compatible object store
+  (AWS S3, Cloudflare R2, MinIO, Backblaze B2 in S3-compatible mode, Wasabi),
+  or a plain local / removable folder (USB drive, external disk, NAS share) -
+  all behind one pluggable backend trait, so adding the next one is a new
+  backend crate plus a factory arm rather than a fork of every call site.
+- Scheduled integrity scrub: on top of the local re-hash and the
+  remote-existence audit above, a rolling background pass re-checks each
+  already-backed-up object's size, and its content checksum where the
+  destination can supply one, against what the destination actually holds -
+  catching remote-side corruption that neither of those two checks can see.
+  On by default, weekly, in bounded slices so a huge source never triggers
+  an unbounded sweep.
+- rclone config importer (`driven-cli rclone`): point it at an existing
+  `rclone.conf` and it tells you exactly what to enter for an `s3` or
+  `drive` remote, rather than making you re-type every endpoint and key.
+  Read-only - it never creates an account itself. See "Migrating from
+  rclone" below.
 
 <!--
 DRAFT - do not uncomment until the corresponding PR merges. Flip each bullet
 on individually as its PR lands, then delete this comment wrapper.
-- S3-compatible backup destination, in addition to Google Drive. (#207,
-  unmerged - depends on the pluggable-backend seam / `driven-remote` crate,
-  #200, also unmerged.)
-- Local / removable-drive backup destination. (unmerged - same seam as above.)
-- Scheduled integrity scrub that periodically re-verifies already-backed-up
-  files against the destination. (unmerged.)
 - Restore drill: a one-click "prove the backup actually restores" check.
-  (unmerged.)
-- rclone config importer: point Driven at an existing rclone config to
-  pre-fill setup. (unmerged.)
+  (core engine landed, #215 DRAFT / unmerged - surface is not wired up to
+  anything a user can click yet.)
 -->
 
 ## Install
@@ -344,6 +358,35 @@ walks you through:
 
 The wizard explains each step in-app. If you skip a step you can finish it later
 from Settings.
+
+### Other destinations
+
+The wizard is not Drive-only. At the credentials step you can instead pick an
+S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, Backblaze B2 in
+S3-compatible mode, Wasabi - paste an access key pair, no OAuth) or a local /
+removable folder (pick it with the OS folder dialog - no account, nothing
+leaves the machine). Already have credentials for one of these in an
+`rclone.conf`? See "Migrating from rclone" below.
+
+**Local / removable-folder caveats.** Driven writes a small marker file at the
+destination's root the first time you use it, and every operation re-checks
+it - so an unmounted drive reads as "missing and needs reconnecting," never as
+an empty folder Driven backs up into by mistake (which would silently write
+your whole backup onto the boot disk underneath the mount point). Beyond that:
+
+- **No trash.** Like the S3 destination, a deleted or superseded file is gone
+  immediately; there is no 30-day recovery window the way Drive has one.
+- **FAT32's 4 GiB per-file ceiling is enforced, not silently truncated**: a
+  file at or above that size fails with a clear message naming FAT32, rather
+  than writing a corrupt partial object.
+- **Windows long paths are a real, open caveat.** A deeply nested source tree
+  can still exceed Windows' classic 260-character path limit at the
+  destination; Driven does not yet prefix paths with `\\?\` to lift it, so a
+  backup that hits this reports the underlying I/O error rather than working
+  around it.
+- macOS writes an invisible `._*` "AppleDouble" file beside every object on
+  exFAT/FAT32 (how a USB stick is normally formatted); Driven recognizes and
+  ignores these rather than trying to back them up as your files.
 
 ## Migrating from rclone
 
