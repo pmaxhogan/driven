@@ -372,6 +372,10 @@ describe("SourceTable", () => {
       "settings.sources.versioning.staleEnabled",
       "settings.sources.versioning.disableButton",
       "restore.asOf.unsupported",
+      // `intro` too: the gate test above asserts the promise-shaped copy is
+      // ABSENT on an unsupported destination, and that assertion would pass
+      // trivially if the key itself vanished.
+      "settings.sources.versioning.intro",
     ]) {
       expect(i18n.global.te(key)).toBe(true);
     }
@@ -409,6 +413,44 @@ describe("SourceTable", () => {
     const clean = await openVersioningOn("s3");
     expect(clean.find('[data-testid="versioning-stale"]').exists()).toBe(false);
     expect(clean.find('[data-testid="versioning-disable"]').exists()).toBe(false);
+  });
+
+  it("surfaces a failure to clear the stale flag instead of implying it worked", async () => {
+    // The remedy is the only way out of a dishonest stored setting, so a failed
+    // attempt must not look like a success: silently closing (or leaving the panel
+    // unchanged) would have the user believe they cleared a flag that still claims
+    // a point-in-time restore.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources") return Promise.resolve([makeSource({ accountId: "acc-1" })]);
+      if (cmd === "list_accounts")
+        return Promise.resolve([
+          {
+            id: "acc-1",
+            email: "dest",
+            displayName: null,
+            state: "ok",
+            encryptionEnabled: false,
+            createdAt: 0,
+            lastSyncedAt: null,
+            backendKind: "s3",
+          },
+        ]);
+      if (cmd === "list_backends") return Promise.resolve(VERSIONING_BACKENDS);
+      if (cmd === "get_source_versioning")
+        return Promise.resolve({ enabled: true, countCap: 7, maxBytes: 0 });
+      if (cmd === "set_source_versioning") return Promise.reject(new Error("transient db error"));
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+    await wrapper.get('[data-testid="versioning-button"]').trigger("click");
+    await flushPromises();
+
+    await wrapper.get('[data-testid="versioning-disable"]').trigger("click");
+    await flushPromises();
+    // The panel stays open and reports the failure.
+    expect(wrapper.find('[data-testid="versioning-editor"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="versioning-error"]').exists()).toBe(true);
   });
 
   it("keeps offering versioning when the backend descriptors cannot be fetched", async () => {

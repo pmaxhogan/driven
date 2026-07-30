@@ -323,6 +323,13 @@ async function disableVersioning(source: SourceDto): Promise<void> {
     });
     versioningEnabled.value = false;
     versioningId.value = null;
+  } catch (e) {
+    // Unlike Save (whose worst case is "my cap did not stick"), a silent failure
+    // here would leave the user believing they cleared a setting that still
+    // claims a point-in-time restore. Surface the stable code - same contract as
+    // the recovery-ack error - so the panel says the flag is still on. Re-opening
+    // the panel reloads the real state and offers the remedy again.
+    versioningErrorCode.value = toErrorCode(e);
   } finally {
     savingVersioning.value = false;
   }
