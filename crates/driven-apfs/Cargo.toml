@@ -19,7 +19,8 @@ publish = false
 # are gated on a private entitlement no third party can hold, signed or not),
 # and because mounts preserve ownership the un-elevated app reads the user's
 # files straight from the mounted snapshot - the broker never streams bytes,
-# which keeps its privileged surface to mount/unmount/delete only.
+# which keeps its privileged surface to mount/unmount only (snapshot deletion
+# turned out to need no privilege, so it is not a broker verb - see protocol.rs).
 #
 # The OS-independent surface (wire protocol + framing, tmutil output parsing,
 # snapshot-name/date validation, firmlink-aware path mapping DECISION logic,
