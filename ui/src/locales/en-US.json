@@ -385,7 +385,7 @@
       "vssHelperPending": "Waiting for elevation approval - approve the Windows prompt to enable locked-file backup.",
       "vssHelperDeclined": "Elevation was declined, so locked files are still skipped. Turn this off and on again to retry.",
       "apfsSnapshotLabel": "Back up locked files using an APFS snapshot",
-      "apfsSnapshotNote": "Back up files that are held open (live databases, VM disks, mail stores) by mounting a read-only APFS local snapshot - only a small helper gets administrator access, the app itself stays un-elevated. Turning this on asks for your administrator password once.",
+      "apfsSnapshotNote": "Back up files that are held open (live databases, VM disks, mail stores) by mounting a read-only APFS local snapshot - only a small helper gets administrator access, the app itself stays un-elevated. Turning this on asks for your administrator password once per app session.",
       "apfsSnapshotTccNote": "This does not help with files macOS privacy protection blocks - a snapshot cannot read around a denial. Those need Full Disk Access.",
       "apfsHelperPending": "Waiting for administrator approval - approve the macOS prompt to enable locked-file backup.",
       "apfsHelperDeclined": "Administrator approval was declined, so locked files are still skipped. Turn this off and on again to retry.",

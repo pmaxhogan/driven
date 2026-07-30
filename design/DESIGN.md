@@ -652,8 +652,10 @@ executor's open path are unchanged. Verified on macOS 26 hardware.
   `tmutil` is the design, not a workaround. It needs no configured Time
   Machine destination (measured: ~165 ms to create).
 - **Only the MOUNT needs root.** `mount_apfs -s` requires root; that plus
-  unmount and `tmutil deletelocalsnapshots` is the broker's entire
-  privileged surface.
+  unmount is the broker's entire privileged surface. Snapshot DELETION was
+  measured to need no privilege either, so it is not a broker verb at all -
+  `tmutil deletelocalsnapshots` runs client-side, which removes a
+  client-controlled string from a root process's argv for no functional loss.
 - **No byte streaming.** Mounts preserve ownership, so the un-elevated app
   reads the user's own files directly from the mountpoint. (The Windows
   helper must stream bytes because `\\?\GLOBALROOT` devices are unreadable

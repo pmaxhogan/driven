@@ -37,7 +37,8 @@ pub const MAX_CONTROL_FRAME: usize = 64 * 1024;
 /// A control message. Serialised as JSON in a length-prefixed frame.
 ///
 /// The vocabulary is deliberately tiny (DESIGN s5.3.2): a version handshake,
-/// mount-a-snapshot, unmount-everything, delete-a-snapshot, and shut-down.
+/// mount-a-snapshot, unmount-everything, and shut-down. Deletion is NOT a verb
+/// here - see the module docs above.
 /// Anything the broker does not recognise deserialises to an error at the
 /// boundary.
 #[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
