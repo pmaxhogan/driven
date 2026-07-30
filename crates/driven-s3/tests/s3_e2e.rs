@@ -6,8 +6,10 @@
 //!
 //! 1. **Local MinIO** - runs whenever a `minio` binary is on `PATH`. The test
 //!    spawns `minio server <tempdir>` on a free port with throwaway credentials,
-//!    creates a bucket, runs the whole suite, and kills the server on the way
-//!    out. Install with `brew install minio` (or the upstream binary).
+//!    waits for the server to actually finish initialising (see
+//!    [`wait_for_minio_ready`] - the health endpoint chosen there is load
+//!    bearing), creates a bucket, runs the whole suite, and kills the server on
+//!    the way out. Install with `brew install minio` (or the upstream binary).
 //!
 //! 2. **A remote S3-compatible service** (Cloudflare R2, AWS S3, ...) - runs
 //!    when `DRIVEN_TEST_R2_S3_ENDPOINT`, `DRIVEN_TEST_R2_BUCKET`,
@@ -21,6 +23,8 @@
 
 use std::collections::HashMap;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicUsize, Ordering};
+use std::sync::Arc;
 use std::time::Duration;
 
 use bytes::Bytes;
@@ -137,6 +141,20 @@ impl Drop for MinioServer {
 const MINIO_USER: &str = "drivene2e";
 const MINIO_PASSWORD: &str = "drivene2esecret";
 
+/// How long a freshly spawned MinIO gets to finish initialising before the
+/// suite declares it broken. Generous because this also runs on a shared CI
+/// runner where a cold start competes with a parallel `cargo build`; the wait
+/// exits the instant MinIO is up, so the generosity costs nothing on a fast
+/// machine.
+const MINIO_READY_TIMEOUT: Duration = Duration::from_secs(60);
+
+/// Gap between readiness probes. Short enough that a fast local boot is not
+/// padded, cheap enough to sustain for the whole budget.
+const MINIO_READY_POLL_INTERVAL: Duration = Duration::from_millis(100);
+
+/// How many times `CreateBucket` is attempted against a just-started server.
+const BUCKET_CREATE_ATTEMPTS: u32 = 5;
+
 /// Pick a port the OS says is free right now.
 fn free_port() -> u16 {
     std::net::TcpListener::bind("127.0.0.1:0")
@@ -146,7 +164,84 @@ fn free_port() -> u16 {
         .port()
 }
 
+/// The last `max_lines` lines of MinIO's captured console output, for a failure
+/// message. Never panics: a diagnostic that can itself fail is worse than none.
+fn log_tail(path: &Path, max_lines: usize) -> String {
+    match std::fs::read_to_string(path) {
+        Ok(contents) => {
+            let lines: Vec<&str> = contents.lines().collect();
+            let start = lines.len().saturating_sub(max_lines);
+            let tail = lines[start..].join("\n");
+            if tail.trim().is_empty() {
+                "<minio wrote nothing>".to_string()
+            } else {
+                tail
+            }
+        }
+        Err(err) => format!("<could not read {}: {err}>", path.display()),
+    }
+}
+
+/// Block until MinIO can actually serve S3 requests, or the budget runs out.
+///
+/// Probes `/minio/health/cluster` - NOT `/minio/health/live` or
+/// `/minio/health/ready`. Upstream's `LivenessCheckHandler` and
+/// `ReadinessCheckHandler` both end in `writeResponse(w, http.StatusOK, ..)`
+/// even while the object layer is still nil; they record that only in an
+/// `x-minio-server-status: offline` header, so a status-code gate on either one
+/// passes while the server is still booting. That is exactly how the suite came
+/// to fire `CreateBucket` at a half-started MinIO and get a bare 503 back.
+/// `/minio/health/cluster` runs `checkHealth()`, which answers 503 until the
+/// object layer, the bucket-metadata system AND the IAM system are all
+/// initialised - and IAM matters here because every request this suite makes is
+/// signed. Observed on RELEASE.2025-09-06: within one startup, `live` and
+/// `ready` answer `200 server-status=offline` in the same window where
+/// `cluster` answers `503 offline` then `503 bucket-metadata-offline`.
+///
+/// Returns the reason on timeout instead of panicking, so the caller can attach
+/// MinIO's own output - and so the timeout path is testable.
+async fn wait_for_minio_ready(endpoint: &str, timeout: Duration) -> Result<(), String> {
+    let health = format!("{endpoint}/minio/health/cluster");
+    let client = reqwest::Client::new();
+    let deadline = std::time::Instant::now() + timeout;
+    // Assigned on every path through the loop body before it is read.
+    let mut last: String;
+    loop {
+        match client.get(&health).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                if status.is_success() {
+                    return Ok(());
+                }
+                // `x-minio-server-status` names the subsystem that is still
+                // coming up (`offline` / `bucket-metadata-offline` /
+                // `iam-offline`), which is the single most useful thing to put
+                // in front of whoever reads the failure.
+                let detail = resp
+                    .headers()
+                    .get("x-minio-server-status")
+                    .and_then(|value| value.to_str().ok())
+                    .unwrap_or("<absent>")
+                    .to_string();
+                last = format!("HTTP {status}, x-minio-server-status: {detail}");
+            }
+            Err(err) => last = format!("request failed: {err}"),
+        }
+        if std::time::Instant::now() >= deadline {
+            return Err(format!(
+                "MinIO did not become ready within {}s. Last probe of {health}: {last}",
+                timeout.as_secs()
+            ));
+        }
+        tokio::time::sleep(MINIO_READY_POLL_INTERVAL).await;
+    }
+}
+
 /// Spawn MinIO, or `None` when the binary is not installed.
+///
+/// `None` means "not installed" and ONLY that. A MinIO that is present but
+/// fails to start is a panic, never a `None` - turning that into a gate-skip
+/// would make a broken CI runner read as a passing suite.
 async fn spawn_minio() -> Option<MinioServer> {
     if std::process::Command::new("minio")
         .arg("--version")
@@ -159,12 +254,21 @@ async fn spawn_minio() -> Option<MinioServer> {
         return None;
     }
 
-    let dir = tempfile::tempdir().expect("minio data dir");
+    let dir = tempfile::tempdir().expect("minio temp dir");
+    // MinIO serves every entry at the root of its data dir as a bucket, so the
+    // log file lives BESIDE that dir rather than inside it - otherwise the
+    // suite's own listings would grow a phantom `minio.log` bucket.
+    let data = dir.path().join("data");
+    std::fs::create_dir(&data).expect("minio data dir");
+    let log_path = dir.path().join("minio.log");
+    let log = std::fs::File::create(&log_path).expect("minio log file");
+    let log_err = log.try_clone().expect("clone the minio log handle");
+
     let port = free_port();
     let endpoint = format!("http://127.0.0.1:{port}");
     let child = std::process::Command::new("minio")
         .arg("server")
-        .arg(dir.path())
+        .arg(&data)
         .arg("--address")
         .arg(format!("127.0.0.1:{port}"))
         .env("MINIO_ROOT_USER", MINIO_USER)
@@ -173,8 +277,10 @@ async fn spawn_minio() -> Option<MinioServer> {
         // test's own.
         .env("MINIO_BROWSER", "off")
         .env("MINIO_UPDATE", "off")
-        .stdout(std::process::Stdio::null())
-        .stderr(std::process::Stdio::null())
+        // Captured rather than discarded: when the server never comes up, its
+        // own output is the only thing that says why.
+        .stdout(std::process::Stdio::from(log))
+        .stderr(std::process::Stdio::from(log_err))
         .spawn()
         .expect("spawn minio");
 
@@ -184,26 +290,28 @@ async fn spawn_minio() -> Option<MinioServer> {
         _dir: dir,
     };
 
-    // Wait for readiness rather than sleeping a guessed interval. The budget is
-    // generous (60s) because this also runs on a shared CI runner where a cold
-    // start competes with a parallel cargo build; a tight bound would turn a
-    // slow boot into a flaky failure, and the loop exits the moment MinIO is up
-    // so the generosity costs nothing on a fast machine.
-    let health = format!("{endpoint}/minio/health/live");
-    let client = reqwest::Client::new();
-    for _ in 0..600 {
-        if let Ok(resp) = client.get(&health).send().await {
-            if resp.status().is_success() {
-                return Some(server);
-            }
-        }
-        tokio::time::sleep(Duration::from_millis(100)).await;
+    // Wait for real readiness rather than sleeping a guessed interval: a fixed
+    // sleep is either flaky or slow, and on a loaded runner it is both.
+    if let Err(reason) = wait_for_minio_ready(&endpoint, MINIO_READY_TIMEOUT).await {
+        let tail = log_tail(&log_path, 40);
+        // `server` is still alive here; dropping it during the unwind kills the
+        // child, so the log read above has to happen first.
+        panic!("{reason}\n--- minio output (last 40 lines) ---\n{tail}");
     }
-    panic!("minio did not become healthy within 60s");
+    Some(server)
 }
 
 /// Create a bucket on a freshly spawned MinIO, using a signed request built the
 /// same way the store builds its own.
+///
+/// Retries a bounded number of times on 5xx and on transport errors. The
+/// readiness wait already rules out `ServerNotInitialized`, so this is belt and
+/// braces for the one thing readiness cannot promise: a busy server answering
+/// `503 SlowDown`. `S3Store` itself classifies and retries that (see
+/// `driven_s3::error::classify_s3_response` and `execute_retrying`), so the rest
+/// of the suite is covered; this raw request is the only uncovered call.
+/// A deterministic 4xx breaks out immediately - retrying a real rejection only
+/// delays the failure.
 async fn create_bucket(endpoint: &str, bucket: &str, creds: &S3Credentials) {
     use rusty_s3::{actions, Bucket, Credentials, S3Action, UrlStyle};
     let b = Bucket::new(
@@ -214,17 +322,40 @@ async fn create_bucket(endpoint: &str, bucket: &str, creds: &S3Credentials) {
     )
     .expect("bucket");
     let c = Credentials::new(creds.access_key_id.clone(), creds.secret_access_key.clone());
-    let url = actions::CreateBucket::new(&b, &c).sign(Duration::from_secs(60));
-    let resp = reqwest::Client::new()
-        .put(url)
-        .send()
-        .await
-        .expect("create bucket request");
-    assert!(
-        resp.status().is_success(),
-        "creating the MinIO bucket failed: {}",
-        resp.status()
-    );
+    let client = reqwest::Client::new();
+    let mut attempts = 0;
+    let mut last = "never attempted".to_string();
+    while attempts < BUCKET_CREATE_ATTEMPTS {
+        attempts += 1;
+        // Re-signed per attempt: a URL signed before a backoff is a URL that
+        // much closer to expiry.
+        let url = actions::CreateBucket::new(&b, &c).sign(Duration::from_secs(60));
+        match client.put(url).send().await {
+            Ok(resp) => {
+                let status = resp.status();
+                let body = resp.text().await.unwrap_or_default();
+                if status.is_success() {
+                    return;
+                }
+                // If a previous attempt landed but its response was lost, the
+                // retry meets the bucket it just made. That is success wearing
+                // a 409, not a new failure.
+                if body.contains("BucketAlreadyOwnedByYou") || body.contains("BucketAlreadyExists")
+                {
+                    return;
+                }
+                last = format!("HTTP {status}: {}", body.trim());
+                if !status.is_server_error() {
+                    break;
+                }
+            }
+            Err(err) => last = format!("request failed: {err}"),
+        }
+        if attempts < BUCKET_CREATE_ATTEMPTS {
+            tokio::time::sleep(Duration::from_millis(200 * u64::from(attempts))).await;
+        }
+    }
+    panic!("creating the MinIO bucket `{bucket}` failed after {attempts} attempt(s). Last: {last}");
 }
 
 // -- the shared scenario suite ------------------------------------------------
@@ -561,6 +692,151 @@ async fn run_against(config: S3Config, creds: S3Credentials, label: &str) {
 }
 
 // -- the gated tests ----------------------------------------------------------
+
+/// A stand-in for a MinIO that is accepting connections while its object layer
+/// is still nil - the state the CI flake happened in, which a real MinIO cannot
+/// be held in on demand. It reproduces upstream's handlers exactly:
+///
+/// - `/minio/health/live` and `/minio/health/ready`: ALWAYS `200`, with
+///   `x-minio-server-status: offline`. Both handlers end in
+///   `writeResponse(w, http.StatusOK, ..)` regardless of initialisation state,
+///   so a gate on either is no gate at all - which is what this stub exists to
+///   prove. Answering them `200` unconditionally makes the tests below fail if
+///   anyone points the wait back at them.
+/// - `/minio/health/cluster`: `503` + `x-minio-server-status:
+///   bucket-metadata-offline` for the first `unready_probes` requests, then
+///   `200`. `usize::MAX` means it never finishes booting.
+///
+/// Returns the endpoint and a live count of `cluster` probes served.
+fn spawn_health_stub(unready_probes: usize) -> (String, Arc<AtomicUsize>) {
+    let listener = std::net::TcpListener::bind("127.0.0.1:0").expect("bind the health stub");
+    let port = listener.local_addr().expect("stub addr").port();
+    listener
+        .set_nonblocking(true)
+        .expect("the stub listener must be non-blocking for tokio");
+    let listener = tokio::net::TcpListener::from_std(listener).expect("adopt the stub listener");
+
+    let served = Arc::new(AtomicUsize::new(0));
+    let counter = Arc::clone(&served);
+    tokio::spawn(async move {
+        use tokio::io::{AsyncReadExt, AsyncWriteExt};
+        loop {
+            let Ok((mut sock, _)) = listener.accept().await else {
+                return;
+            };
+            // Drain the request first: replying to an unread socket and closing
+            // it can surface as a reset rather than a response.
+            let mut request = Vec::new();
+            let mut byte = [0u8; 1];
+            while !request.ends_with(b"\r\n\r\n") && request.len() < 8192 {
+                match sock.read(&mut byte).await {
+                    Ok(0) | Err(_) => break,
+                    Ok(_) => request.push(byte[0]),
+                }
+            }
+            let path = String::from_utf8_lossy(&request)
+                .lines()
+                .next()
+                .and_then(|line| line.split_whitespace().nth(1))
+                .unwrap_or_default()
+                .to_string();
+            let response = match path.as_str() {
+                "/minio/health/live" | "/minio/health/ready" => {
+                    "HTTP/1.1 200 OK\r\nx-minio-server-status: offline\r\n\
+                     Content-Length: 0\r\nConnection: close\r\n\r\n"
+                }
+                "/minio/health/cluster" => {
+                    if counter.fetch_add(1, Ordering::SeqCst) < unready_probes {
+                        "HTTP/1.1 503 Service Unavailable\r\n\
+                         x-minio-server-status: bucket-metadata-offline\r\n\
+                         Content-Length: 0\r\nConnection: close\r\n\r\n"
+                    } else {
+                        "HTTP/1.1 200 OK\r\nContent-Length: 0\r\nConnection: close\r\n\r\n"
+                    }
+                }
+                _ => "HTTP/1.1 404 Not Found\r\nContent-Length: 0\r\nConnection: close\r\n\r\n",
+            };
+            let _ = sock.write_all(response.as_bytes()).await;
+            let _ = sock.shutdown().await;
+        }
+    });
+    (format!("http://127.0.0.1:{port}"), served)
+}
+
+/// The regression itself: a server that is listening but not initialised must
+/// NOT satisfy the gate. Before this fix the suite probed
+/// `/minio/health/live`, which answers `200` in exactly this window, so it ran
+/// straight on to `CreateBucket` and took a 503.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_readiness_wait_keeps_waiting_while_minio_is_still_initialising() {
+    let (endpoint, served) = spawn_health_stub(3);
+    wait_for_minio_ready(&endpoint, Duration::from_secs(10))
+        .await
+        .expect("the stub becomes ready on its fourth probe, well inside the budget");
+    // The stub answers `live`/`ready` 200-while-offline, so a wait pointed at
+    // either would return without ever touching `cluster` and this count would
+    // be 0. It is the assertion that the RIGHT endpoint is being gated on.
+    assert!(
+        served.load(Ordering::SeqCst) >= 4,
+        "the wait must probe /minio/health/cluster and ride out all three 503s; \
+         cluster probes served: {}",
+        served.load(Ordering::SeqCst)
+    );
+}
+
+/// A MinIO that never finishes booting must fail the job, loudly, naming both
+/// the budget and the subsystem it stalled on.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_readiness_wait_times_out_on_a_server_that_never_initialises() {
+    let (endpoint, _served) = spawn_health_stub(usize::MAX);
+    let err = tokio::time::timeout(
+        Duration::from_secs(20),
+        wait_for_minio_ready(&endpoint, Duration::from_secs(1)),
+    )
+    .await
+    .expect("the readiness wait must respect its own budget, not hang")
+    .expect_err("a permanently unready server cannot satisfy the gate");
+
+    assert!(
+        err.contains("MinIO did not become ready within 1s"),
+        "the timeout must say so plainly, not surface a bare status: {err}"
+    );
+    assert!(
+        err.contains("bucket-metadata-offline"),
+        "the message must carry the subsystem MinIO reported stalling on: {err}"
+    );
+}
+
+/// The transport-error branch: nothing is listening at all, so every probe
+/// fails to connect and the wait can only end at the deadline.
+#[tokio::test(flavor = "multi_thread")]
+async fn the_readiness_wait_times_out_with_a_diagnosable_message() {
+    let endpoint = format!("http://127.0.0.1:{}", free_port());
+    let started = std::time::Instant::now();
+    // The outer timeout is the assertion that the wait honours ITS deadline: a
+    // wait that never gave up would otherwise hang the suite rather than fail.
+    let err = tokio::time::timeout(
+        Duration::from_secs(20),
+        wait_for_minio_ready(&endpoint, Duration::from_secs(1)),
+    )
+    .await
+    .expect("the readiness wait must respect its own budget, not hang")
+    .expect_err("nothing is listening on that port, so the wait cannot succeed");
+
+    assert!(
+        err.contains("MinIO did not become ready within 1s"),
+        "the timeout must say so plainly, not surface a bare status: {err}"
+    );
+    assert!(
+        err.contains("/minio/health/cluster"),
+        "the message must name the endpoint probed: {err}"
+    );
+    assert!(
+        started.elapsed() >= Duration::from_secs(1),
+        "the wait gave up before its budget elapsed after {:?}",
+        started.elapsed()
+    );
+}
 
 #[tokio::test(flavor = "multi_thread")]
 async fn minio_round_trip() {
