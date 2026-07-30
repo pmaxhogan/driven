@@ -5,6 +5,14 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.5.1](https://github.com/pmaxhogan/driven/compare/v2.5.0...v2.5.1) (2026-07-30)
+
+
+### Bug Fixes
+
+* **build:** ad-hoc sign the macOS bundle so it is not reported as damaged ([#231](https://github.com/pmaxhogan/driven/issues/231)) ([6dd0cf9](https://github.com/pmaxhogan/driven/commit/6dd0cf92d61323b0db4ca5decf4bddf57c4a4f97))
+* **chaos:** expect a permission-denied skip on unix in noaccess-file ([#229](https://github.com/pmaxhogan/driven/issues/229)) ([6bb45df](https://github.com/pmaxhogan/driven/commit/6bb45df6092cb7397df25db33c092bc0fe3da4a4))
+
 ## [2.5.0](https://github.com/pmaxhogan/driven/compare/v2.4.0...v2.5.0) (2026-07-30)
 
 
