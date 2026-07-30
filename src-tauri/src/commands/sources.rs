@@ -693,13 +693,20 @@ pub async fn get_source_versioning(
 /// `set_source_versioning(source_id, config)` - enable/configure per-source
 /// point-in-time versioning (issue #36). `count_cap` is clamped to `[1, 1000]`
 /// (a cap of 0 would prune every version away). Returns the persisted config.
+///
+/// Issue #220: ENABLING it is REJECTED when the source's destination cannot keep
+/// previous versions. The settings UI already hides the editor for those
+/// destinations, but this is the authoritative gate - the UI is only one caller,
+/// and a stale front end must not be able to store a promise the destination
+/// cannot keep.
 #[tauri::command]
 pub async fn set_source_versioning(
     state: State<'_, AppState>,
     source_id: SourceId,
     config: VersioningConfig,
 ) -> CommandResult<VersioningConfig> {
-    find_source(state.state().as_ref(), source_id).await?;
+    let row = find_source(state.state().as_ref(), source_id).await?;
+    reject_versioning_on_unsupported_backend(state.state().as_ref(), &row, config.enabled).await?;
     // Clamp the cap to a sane range so a bad value cannot prune all versions
     // (cap 0) or track an unbounded history.
     let cfg = VersioningConfig {
@@ -1284,6 +1291,47 @@ async fn find_source(state: &dyn StateRepo, id: SourceId) -> CommandResult<Sourc
     rows.into_iter().find(|r| r.id == id).ok_or_else(|| {
         CommandError::with_code(ErrorCode::InternalBug, format!("unknown source id: {id}"))
     })
+}
+
+/// Issue #220 (DATA-SAFETY): reject ENABLING per-source versioning when the
+/// source's destination cannot keep previous versions
+/// (`BackendKind::supports_version_history`).
+///
+/// Versioning promises "restore this source's files as they were on an earlier
+/// date". On a backend whose create key is derived from the file name (S3's
+/// `join_key(parent, name)`, the local folder's name-derived path) the re-upload
+/// overwrites the previous bytes, so the retained `file_versions` row points at
+/// an object holding the CURRENT content and a point-in-time restore hands back
+/// today's bytes while reporting success. Storing the flag at all is therefore
+/// the bug: refuse it up front rather than let the app carry a setting it cannot
+/// honour.
+///
+/// DISABLING is always allowed, whatever the backend. A source that had
+/// versioning turned on before this guard existed (or on a build that predates
+/// it) must keep a way to clear the stale flag - a symmetric rejection would
+/// trap it on forever.
+///
+/// This is the exact predicate `set_source_versioning` enforces.
+async fn reject_versioning_on_unsupported_backend(
+    state: &dyn StateRepo,
+    source: &SourceRow,
+    enabled: bool,
+) -> CommandResult<()> {
+    if !enabled {
+        return Ok(());
+    }
+    let account = find_account(state, source.account_id).await?;
+    if account.backend_kind.supports_version_history() {
+        return Ok(());
+    }
+    Err(CommandError::with_code(
+        ErrorCode::InvalidInput,
+        format!(
+            "this backup destination ({}) cannot keep previous versions of a changed \
+             file, so point-in-time versioning cannot be enabled for this source",
+            account.backend_kind.id()
+        ),
+    ))
 }
 
 /// R4-P1-1: the account owning `source`'s DURABLE pending recovery-ack record,
@@ -2523,5 +2571,91 @@ mod tests {
         assert_eq!(entries[0].id, "0Ateam");
         assert_eq!(entries[0].drive_id.as_deref(), Some("0Ateam"));
         assert!(entries[0].is_shared_drive);
+    }
+
+    // --- Issue #220: the versioning capability gate -------------------------
+
+    /// A persisted account of `kind` plus one source on it, for the versioning
+    /// capability gate. `backend_config_json` is left `None` deliberately: the
+    /// gate only reads `backend_kind`, and it must never need a buildable store.
+    async fn persist_source_on_backend(
+        state: &dyn StateRepo,
+        kind: BackendKind,
+    ) -> (AccountId, SourceRow) {
+        let account_id = AccountId::new_v4();
+        let mut account = drive_account(account_id);
+        account.backend_kind = kind;
+        state
+            .upsert_account(&account)
+            .await
+            .expect("upsert account");
+        let row = SourceRow {
+            id: SourceId::new_v4(),
+            account_id,
+            display_name: "docs".to_string(),
+            enabled: true,
+            local_path: "/home/u/docs".to_string(),
+            drive_folder_id: String::new(),
+            drive_id: None,
+            drive_folder_path: String::new(),
+            encryption_enabled: false,
+            wrapped_source_key: None,
+            respect_gitignore: true,
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            placeholder_policy: Default::default(),
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: default_deep_verify_secs(),
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            mtime_granularity_ns: None,
+            created_at: 0,
+        };
+        state.upsert_source(&row).await.expect("upsert source");
+        (account_id, row)
+    }
+
+    #[tokio::test]
+    async fn versioning_cannot_be_enabled_on_a_destination_that_overwrites_previous_versions() {
+        // Issue #220 (DATA-SAFETY): enabling per-source versioning is REJECTED on
+        // a destination whose create key is derived from the file name (S3, local
+        // folder), because the re-upload overwrites the previous bytes and a
+        // "restore as of an earlier date" would then return TODAY's content while
+        // reporting success. Google Drive, whose create mints a new file id and
+        // whose trash keeps the superseded object, is allowed.
+        //
+        // The UI hides the editor for those destinations, but this is the
+        // authoritative gate: a stale front end or any other caller must not be
+        // able to STORE the promise. This is the exact predicate
+        // `set_source_versioning` enforces.
+        let (repo, dir) = temp_repo().await;
+
+        // Drive: enabling is allowed.
+        let (_, drive_source) = persist_source_on_backend(&repo, BackendKind::GoogleDrive).await;
+        reject_versioning_on_unsupported_backend(&repo, &drive_source, true)
+            .await
+            .expect("Drive really keeps superseded objects, so versioning is honest there");
+
+        for kind in [BackendKind::S3, BackendKind::LocalFolder] {
+            let (_, source) = persist_source_on_backend(&repo, kind).await;
+            let err = reject_versioning_on_unsupported_backend(&repo, &source, true)
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidInput,
+                "enabling versioning on {kind} must be rejected as bad input"
+            );
+            // DISABLING must stay open on every backend: it is the only remedy
+            // for a source whose flag was set before this gate existed. A
+            // symmetric rejection would trap the stale setting on forever.
+            reject_versioning_on_unsupported_backend(&repo, &source, false)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("turning versioning OFF on {kind} must be allowed: {e}")
+                });
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

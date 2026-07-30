@@ -23,6 +23,7 @@ const DRIVE: BackendDto = {
   id: "google_drive",
   usesOauth: true,
   supportsFolderPicker: true,
+  supportsVersionHistory: true,
   isDefault: true,
 };
 
@@ -33,6 +34,7 @@ const OTHER: BackendDto = {
   id: "some_other_store",
   usesOauth: false,
   supportsFolderPicker: false,
+  supportsVersionHistory: false,
   isDefault: false,
 };
 

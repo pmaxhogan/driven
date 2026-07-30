@@ -287,6 +287,7 @@ pub async fn list_backends(_state: State<'_, AppState>) -> CommandResult<Vec<Bac
             id: d.id.to_string(),
             uses_oauth: d.uses_oauth,
             supports_folder_picker: d.supports_folder_picker,
+            supports_version_history: d.supports_version_history,
             is_default: d.kind == default,
         })
         .collect())

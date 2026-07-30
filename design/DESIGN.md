@@ -1037,6 +1037,37 @@ it); and files that were *deleted* locally are out of scope for point-in-time
 restore in this slice (the tree browses current `file_state` only) - restoring
 a since-deleted file as of a past date is the primary follow-up.
 
+**Destination restriction (issue #220).** The whole mechanism above rests on the
+CREATE landing on a NEW remote object. That is a property of the backend, not of
+Driven: a Drive create mints a fresh file id, but `driven-s3`'s create key is
+`join_key(parent, name)` and `driven-localfs` derives a stored object's path from
+its name - both deterministic, so the re-upload OVERWRITES the previous bytes and
+the retained `file_versions` row ends up pointing at an object that now holds the
+CURRENT content. Filename encryption does not change this (SIV-style,
+deterministic nonce). A restore-by-date would then hand back today's bytes while
+reporting a successful restore of an older version.
+
+So versioning is gated on a single declarative capability,
+`BackendKind::supports_version_history` (true for Google Drive, false for S3 and
+local folders), surfaced to the webview as `BackendDto.supports_version_history`:
+
+- the settings UI does not render the per-source versioning editor where it is
+  false (and offers a source whose flag was already set the means to clear it),
+- `set_source_versioning` REJECTS enabling it there (`internal.invalid_input`) -
+  the authoritative gate, since the UI is only one caller - while always allowing
+  it to be turned OFF,
+- `resolve_restore_items` refuses to serve a retained version from such a
+  destination, failing the job closed with `restore.no_version_as_of` rather than
+  substituting the live object, and the restore view does not offer the "as of"
+  picker at all.
+
+ANY change to a backend's create-key derivation must revisit that flag. Giving
+each version its own remote object - which would let the flag become true
+everywhere - is issue #220 part 2, a stored-format change needing a migration
+path (and the remote-existence audit plus the scheduled integrity scrub of issue
+#203 must learn
+about the extra objects so they are not classified as orphans).
+
 ### 5.6 Crash-safe execution & reconciliation
 
 The hard problem: a `pending_op` row + an external Drive create are two

@@ -454,6 +454,60 @@ pub async fn restore_files(
     Ok(RestoreJobId(job_id))
 }
 
+/// Issue #220: whether a source's DESTINATION can really serve a retained
+/// version, memoized per source id.
+///
+/// A retained `file_versions` row is only trustworthy on a backend whose create
+/// path mints a new remote object. Where the create key is derived from the file
+/// name (S3's `join_key(parent, name)`, the local folder's name-derived path) the
+/// re-upload overwrote the previous bytes, so the row now points at an object
+/// holding the CURRENT content. Serving it would hand the user today's bytes and
+/// report a successful restore of an older version.
+///
+/// The lookup is two full table scans (the house style in this command layer, as
+/// there is no get-by-id on `StateRepo`), so it is memoized: a thousand-file
+/// selection over one source does it once. Callers only reach it when `as_of`
+/// actually needs a historical version, so the common restore path pays nothing.
+async fn source_destination_keeps_versions(
+    state: &AppState,
+    source_id: SourceId,
+    memo: &mut std::collections::HashMap<SourceId, bool>,
+) -> CommandResult<bool> {
+    if let Some(&known) = memo.get(&source_id) {
+        return Ok(known);
+    }
+    let source = state
+        .state()
+        .list_sources()
+        .await
+        .map_err(CommandError::from)?
+        .into_iter()
+        .find(|s| s.id == source_id)
+        .ok_or_else(|| {
+            CommandError::with_code(
+                ErrorCode::InvalidInput,
+                format!("unknown source in restore selection: {source_id}"),
+            )
+        })?;
+    let backend_kind = state
+        .state()
+        .list_accounts()
+        .await
+        .map_err(CommandError::from)?
+        .into_iter()
+        .find(|a| a.id == source.account_id)
+        .ok_or_else(|| {
+            CommandError::with_code(
+                ErrorCode::InvalidInput,
+                format!("unknown account for source {source_id} in restore selection"),
+            )
+        })?
+        .backend_kind;
+    let keeps = backend_kind.supports_version_history();
+    memo.insert(source_id, keeps);
+    Ok(keeps)
+}
+
 /// Resolve + validate the selected restore `items` against authoritative
 /// `file_state` (token-INDEPENDENT, so it runs BEFORE the one-shot dialog token is
 /// consumed - R3-P2-1). For each item it:
@@ -478,6 +532,10 @@ async fn resolve_restore_items(
     as_of: Option<i64>,
 ) -> CommandResult<Vec<ResolvedRestore>> {
     let mut resolved: Vec<ResolvedRestore> = Vec::with_capacity(items.len());
+    // Issue #220: memoized per-source "can this destination serve a retained
+    // version". Populated lazily, and only on the point-in-time path.
+    let mut keeps_versions: std::collections::HashMap<SourceId, bool> =
+        std::collections::HashMap::new();
     for item in items {
         let source_id: SourceId = item.source_id.parse().map_err(|e| {
             CommandError::with_code(
@@ -553,6 +611,25 @@ async fn resolve_restore_items(
                 (row.drive_file_id.clone(), row.size, row.hash_blake3)
             }
             Some(t) => {
+                // Issue #220: a retained version is only real where the
+                // destination's create path mints a NEW remote object. On S3 /
+                // local-folder the re-upload overwrote the previous bytes, so
+                // serving the recorded version id would return the CURRENT
+                // content and report it as the older one - the worst failure a
+                // backup tool has. Refuse instead, with the same fail-closed code
+                // as "no version that far back", whose remedy (pick a later date
+                // or clear it to restore the latest) is exactly right here.
+                if !source_destination_keeps_versions(state, source_id, &mut keeps_versions).await?
+                {
+                    return Err(CommandError::with_code(
+                        ErrorCode::RestoreNoVersionAsOf,
+                        format!(
+                            "this backup destination keeps no previous versions, so {} \
+                             cannot be restored as of an earlier date",
+                            item.relative_path
+                        ),
+                    ));
+                }
                 match state
                     .state()
                     .resolve_version_at(source_id, &relative_path, t)
@@ -2787,6 +2864,7 @@ mod confine {
 #[cfg(test)]
 mod tests {
     use super::*;
+    use driven_core::state::BackendKind;
     use driven_core::types::{FileStateStatus, SourceId};
 
     fn row(path: &str, size: u64, drive: Option<&str>) -> RestoreFileRow {
@@ -4377,6 +4455,19 @@ mod tests {
     /// Build a real AppState backed by a fresh SQLite repo + one account/source,
     /// returning the state, the source id, and the temp dir (for cleanup).
     async fn state_with_source() -> (AppState, SourceId, std::path::PathBuf) {
+        state_with_source_on(driven_core::state::BackendKind::GoogleDrive).await
+    }
+
+    /// As [`state_with_source`], but with the account on an explicit destination.
+    /// Issue #220's restore gate reads the account's `backend_kind`, so its tests
+    /// need a source whose destination is NOT Google Drive.
+    ///
+    /// `backend_config_json` stays `None` even for S3: the gate only reads the
+    /// KIND, and `resolve_restore_items` never builds a store, so a valid S3
+    /// config blob would be noise.
+    async fn state_with_source_on(
+        backend_kind: driven_core::state::BackendKind,
+    ) -> (AppState, SourceId, std::path::PathBuf) {
         use crate::app_state::RemoteMode;
         use driven_core::state::StateRepo;
         use std::collections::HashMap;
@@ -4389,7 +4480,7 @@ mod tests {
             .expect("open state repo");
         // Seed one account + one source so file_state rows have a valid FK.
         let account = driven_core::state::AccountRow {
-            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_kind,
             backend_config_json: None,
             id: driven_core::types::AccountId::new_v4(),
             email: "alice@example.com".into(),
@@ -4626,6 +4717,105 @@ mod tests {
             "the rejection must carry the dedicated restore code, not internal.invalid_input"
         );
         let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    // --- Issue #220: a retained version is only real on some destinations ------
+
+    /// Seed a source that HAS a genuine retained version: the current object
+    /// `cur-obj` became live at t = 10_000, and `old-obj` was the content during
+    /// `[0, 10_000)`. An as-of of 5_000 therefore resolves through
+    /// `resolve_version_at` and MUST come back as `old-obj`.
+    ///
+    /// Both halves of the pair below use this identical seed, so the only variable
+    /// is the account's destination. Without the version row the unguarded code
+    /// path already returns `RestoreNoVersionAsOf` (see
+    /// `resolve_restore_as_of_before_first_backup_rejects_with_dedicated_code`)
+    /// and the S3 half would pass for the wrong reason.
+    async fn seed_versioned_doc(state: &AppState, src: SourceId) {
+        use driven_core::state::NewFileVersion;
+        let mut row = file_state_row(src, "doc.txt", Some("cur-obj"), FileStateStatus::Synced);
+        row.last_uploaded_at = Some(10_000);
+        state.state().upsert_file_state(&row).await.unwrap();
+        state
+            .state()
+            .insert_file_version(&NewFileVersion {
+                source_id: src,
+                relative_path: driven_core::types::RelativePath::try_from("doc.txt".to_string())
+                    .unwrap(),
+                drive_file_id: "old-obj".to_string(),
+                size: 3,
+                hash_blake3: [7u8; 32],
+                drive_md5: None,
+                encrypted_remote_path: None,
+                created_at: 0,
+                superseded_at: 10_000,
+            })
+            .await
+            .expect("seed the retained version");
+    }
+
+    #[tokio::test]
+    async fn resolve_restore_as_of_serves_a_retained_version_on_a_drive_destination() {
+        // The POSITIVE half of the issue #220 pair. Google Drive's create mints a
+        // new file id and the superseded object lives on in Drive's trash, so the
+        // retained version's bytes really are still there: the point-in-time
+        // restore must resolve to `old-obj` and NOT be gated away.
+        let (state, src, dir) = state_with_source_on(BackendKind::GoogleDrive).await;
+        seed_versioned_doc(&state, src).await;
+
+        let items = vec![RestoreItem {
+            source_id: src.to_string(),
+            relative_path: "doc.txt".to_string(),
+        }];
+        let resolved = resolve_restore_items(&state, &items, Some(5_000))
+            .await
+            .expect("Drive keeps the superseded object, so this version is restorable");
+        assert_eq!(resolved.len(), 1);
+        assert_eq!(
+            resolved[0].drive_file_id.as_deref(),
+            Some("old-obj"),
+            "the retained version's object must be restored, not the current one"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn resolve_restore_as_of_refuses_a_retained_version_on_an_overwriting_destination() {
+        // The NEGATIVE half, and the regression test for issue #220 itself. On S3
+        // and local-folder destinations the create key is derived from the file
+        // name, so the re-upload OVERWROTE `old-obj`'s bytes: the recorded version
+        // row now points at an object holding the CURRENT content. Serving it
+        // would hand the user today's bytes and report a successful restore of an
+        // older version - the worst failure available to a backup tool. The whole
+        // job must be rejected fail-closed instead.
+        //
+        // The seed is byte-identical to the Drive half above, so this asserts the
+        // DESTINATION gate and nothing else.
+        for kind in [BackendKind::S3, BackendKind::LocalFolder] {
+            let (state, src, dir) = state_with_source_on(kind).await;
+            seed_versioned_doc(&state, src).await;
+
+            let items = vec![RestoreItem {
+                source_id: src.to_string(),
+                relative_path: "doc.txt".to_string(),
+            }];
+            let err = resolve_restore_items(&state, &items, Some(5_000))
+                .await
+                .unwrap_err();
+            assert_eq!(
+                err.code,
+                ErrorCode::RestoreNoVersionAsOf,
+                "a point-in-time restore on {kind} must fail closed, not silently \
+                 substitute the current bytes"
+            );
+            // And the LATEST restore (no as-of) still works on these destinations:
+            // the gate must not break ordinary restores.
+            let latest = resolve_restore_items(&state, &items, None)
+                .await
+                .expect("a latest restore must still work on an overwriting destination");
+            assert_eq!(latest[0].drive_file_id.as_deref(), Some("cur-obj"));
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     // --- R3-P1-2: atomic seed+handle vs a quit in the seed->release window -----

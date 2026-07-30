@@ -71,6 +71,16 @@ export interface BackendDto {
   id: BackendKindId;
   usesOauth: boolean;
   supportsFolderPicker: boolean;
+  /** Whether the destination can really keep PREVIOUS versions of a changed file,
+   * so a point-in-time restore returns the older bytes (issue #220).
+   *
+   * False where the backend's create key is derived from the file name (S3, the
+   * local folder): the re-upload overwrites the previous copy, so the retained
+   * version row ends up pointing at the CURRENT content. The settings UI does not
+   * offer the versioning editor for those, and the restore view does not offer
+   * the "as of" date - the app must never claim a point-in-time capability it
+   * cannot honour. `setSourceVersioning` rejects enabling it regardless. */
+  supportsVersionHistory: boolean;
   isDefault: boolean;
 }
 

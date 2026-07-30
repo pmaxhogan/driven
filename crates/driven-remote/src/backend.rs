@@ -110,6 +110,50 @@ impl BackendKind {
         }
     }
 
+    /// Whether this backend can honour per-source VERSION HISTORY: keeping the
+    /// bytes of a superseded file so a point-in-time restore ("restore this
+    /// source's files as they were on an earlier date") really returns the older
+    /// content.
+    ///
+    /// This is a property of the backend's CREATE path, not a feature toggle.
+    /// Driven versions a change by forcing the create path and leaving the old
+    /// object in place (see the versioned-change branch in
+    /// `driven-core`'s `Executor`, and `resolve_version_supersede`). That only
+    /// preserves anything when a create lands on a NEW remote object. A backend
+    /// whose create key is a pure function of the file's name re-uploads over
+    /// the previous bytes, so the retained `file_versions` row ends up pointing
+    /// at an object that now holds the CURRENT content - a point-in-time restore
+    /// then hands back today's bytes while reporting success. Issue #220.
+    ///
+    /// So this flag gates the offer: the settings UI does not present the
+    /// versioning editor where it is false, `set_source_versioning` refuses to
+    /// enable it, and the restore path refuses to serve a retained version from
+    /// such a destination rather than silently substituting the live object.
+    ///
+    /// ANY change to a backend's create-key derivation must revisit this arm.
+    pub const fn supports_version_history(self) -> bool {
+        match self {
+            // A Drive create always mints a NEW file id even for an identical
+            // name, and the superseded object is moved to Drive's trash where it
+            // stays retrievable by id. The old bytes genuinely survive.
+            BackendKind::GoogleDrive => true,
+            // NO: `driven-s3`'s create key is `join_key(parent, name)`, which is
+            // deterministic, so the re-upload PUTs over the previous object at
+            // the same key. Filename encryption does not help - it is SIV-style
+            // with a deterministic nonce, so an encrypted name is stable too.
+            // Recoverability on S3 comes from the PROVIDER's own bucket
+            // versioning, which is opt-in per bucket and invisible to Driven
+            // (`s3Setup.trashWarning` points users at it). Issue #220 part 2
+            // would give each version a distinct remote object.
+            BackendKind::S3 => false,
+            // NO, for the same reason: `driven-localfs` derives a stored
+            // object's path from its name, so writing the new content lands on
+            // the same path and overwrites the previous bytes. A plain
+            // filesystem also has no trash to fall back on.
+            BackendKind::LocalFolder => false,
+        }
+    }
+
     /// Decodes the persisted `accounts.backend_kind` column.
     ///
     /// `None` and `""` (every pre-`0013` row) decode to
@@ -194,6 +238,20 @@ mod tests {
         let err = BackendKind::from_stored(Some("s3_from_the_future")).unwrap_err();
         assert!(err.to_string().contains("s3_from_the_future"));
         assert!(BackendKind::from_id("nope").is_err());
+    }
+
+    #[test]
+    fn only_backends_with_a_nondeterministic_create_key_support_version_history() {
+        // Issue #220: per-source versioning keeps the OLD remote object and
+        // points a `file_versions` row at it. That only preserves the old bytes
+        // when a create lands on a NEW object. S3 (`join_key(parent, name)`) and
+        // the local folder (path derived from the name) re-upload over the same
+        // key, so a "restore as of an earlier date" there would hand back
+        // TODAY's bytes while reporting success. The values are pinned, not just
+        // asserted present: flipping one silently re-enables that promise.
+        assert!(BackendKind::GoogleDrive.supports_version_history());
+        assert!(!BackendKind::S3.supports_version_history());
+        assert!(!BackendKind::LocalFolder.supports_version_history());
     }
 
     #[test]

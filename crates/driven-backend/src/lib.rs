@@ -123,6 +123,10 @@ pub struct BackendDescriptor {
     pub uses_oauth: bool,
     /// Whether the destination picker can browse a folder tree for it.
     pub supports_folder_picker: bool,
+    /// Whether the destination can really keep previous versions of a changed
+    /// file, so a point-in-time restore returns the older bytes rather than
+    /// today's (`BackendKind::supports_version_history`; issue #220).
+    pub supports_version_history: bool,
 }
 
 /// Every destination this build can construct, in picker order. The first entry
@@ -136,6 +140,7 @@ pub fn descriptors() -> Vec<BackendDescriptor> {
             id: kind.id(),
             uses_oauth: kind.uses_oauth(),
             supports_folder_picker: kind.supports_folder_picker(),
+            supports_version_history: kind.supports_version_history(),
         })
         .collect()
 }
@@ -469,6 +474,16 @@ mod tests {
         for (desc, kind) in d.iter().zip(BackendKind::ALL.iter().copied()) {
             assert_eq!(desc.kind, kind);
             assert_eq!(desc.id, kind.id());
+            // Every capability flag must be COPIED from the kind, never
+            // defaulted: a descriptor that under-reports would hide a control,
+            // and one that over-reports would offer a promise the destination
+            // cannot keep (issue #220).
+            assert_eq!(desc.uses_oauth, kind.uses_oauth());
+            assert_eq!(desc.supports_folder_picker, kind.supports_folder_picker());
+            assert_eq!(
+                desc.supports_version_history,
+                kind.supports_version_history()
+            );
         }
         assert_eq!(d[0].kind, BackendKind::default());
     }

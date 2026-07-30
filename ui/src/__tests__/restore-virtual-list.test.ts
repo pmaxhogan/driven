@@ -25,6 +25,7 @@ vi.mock("@tauri-apps/plugin-dialog", () => ({
 }));
 
 import Restore from "../views/Restore.vue";
+import { useRestoreStore } from "../stores/restore";
 import type { RemoteEntryDto, SourceDto } from "../ipc/types";
 
 function source(id: string, name: string): SourceDto {
@@ -65,6 +66,68 @@ function bigFolder(count: number): RemoteEntryDto[] {
 }
 
 const FILE_COUNT = 5000;
+
+/** `list_backends()` as the Rust `descriptors()` reports it. Only Google Drive can
+ * really keep previous versions: S3 and the local folder derive an object's key
+ * from the file name, so a re-upload overwrites the previous copy (issue #220). */
+const RESTORE_BACKENDS = [
+  {
+    id: "google_drive",
+    usesOauth: true,
+    supportsFolderPicker: true,
+    supportsVersionHistory: true,
+    isDefault: true,
+  },
+  {
+    id: "s3",
+    usesOauth: false,
+    supportsFolderPicker: true,
+    supportsVersionHistory: false,
+    isDefault: false,
+  },
+  {
+    id: "local_folder",
+    usesOauth: false,
+    supportsFolderPicker: false,
+    supportsVersionHistory: false,
+    isDefault: false,
+  },
+];
+
+function account(id: string, backendKind: string) {
+  return {
+    id,
+    email: "user@example.com",
+    displayName: null,
+    state: "ok",
+    encryptionEnabled: false,
+    createdAt: 0,
+    lastSyncedAt: null,
+    backendKind,
+  };
+}
+
+const driveSource = source("s1", "Documents");
+const s3Source: SourceDto = { ...source("s2", "Photos"), accountId: "acct-2" };
+
+/** Re-point the default IPC fake at a single source whose destination is
+ * `backendKind`, with the real descriptor table. */
+function seedBackend(backendKind: string): void {
+  invokeMock.mockImplementation((cmd: string) => {
+    switch (cmd) {
+      case "list_sources":
+        return Promise.resolve([source("s1", "Documents")]);
+      case "list_accounts":
+        return Promise.resolve([account("acct-1", backendKind)]);
+      case "list_backends":
+        return Promise.resolve(RESTORE_BACKENDS);
+      case "list_remote_tree":
+        return Promise.resolve({ entries: bigFolder(FILE_COUNT), truncated: false });
+      default:
+        return Promise.resolve(undefined);
+    }
+  });
+}
 
 beforeEach(() => {
   setActivePinia(createPinia());
@@ -129,6 +192,10 @@ describe("Restore virtualization + sticky action bar (UI #47)", () => {
   });
 
   it("exposes a point-in-time as-of picker that drives the store (issue #36)", async () => {
+    // On a destination that really keeps previous versions. Issue #220 removed the
+    // picker everywhere else, so this case has to name a backend that can honour
+    // it - otherwise the test would be asserting a control production never shows.
+    seedBackend("google_drive");
     const wrapper = mount(Restore, { global: { plugins: [i18n] } });
     await flushPromises();
 
@@ -137,19 +204,82 @@ describe("Restore virtualization + sticky action bar (UI #47)", () => {
     expect(wrapper.find('[data-testid="restore-as-of-note"]').exists()).toBe(false);
 
     // Setting a datetime activates point-in-time and shows the retention notice
-    // for THIS source's destination - an S3 account here, which keeps no older
-    // versions, so it must NOT be told about Drive's 30-day trash.
+    // for THIS source's destination - Drive keeps a superseded object in its
+    // trash, so the ~30-day caveat is the correct thing to say here.
     await asOf.setValue("2026-01-02T03:04");
     await asOf.trigger("change");
     await flushPromises();
     const note = wrapper.get('[data-testid="restore-as-of-note"]');
-    expect(note.text()).toContain(i18n.global.t("versionRetention.s3"));
-    expect(note.text()).not.toContain("trash");
+    expect(note.text()).toContain(i18n.global.t("versionRetention.google_drive"));
 
     // Clearing returns to latest and hides the notice.
     await wrapper.get('[data-testid="restore-as-of-clear"]').trigger("click");
     await flushPromises();
     expect(wrapper.find('[data-testid="restore-as-of-note"]').exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
+  it("does not offer a point-in-time restore on a destination that overwrites versions (issue #220)", async () => {
+    // The defect: on S3 / local-folder destinations the create key is derived from
+    // the file name, so a changed file's re-upload overwrote the previous bytes.
+    // A "restore as of an earlier date" there returns the CURRENT content while
+    // reporting that it restored an older version - the worst failure a backup
+    // tool has. The backend now refuses such a restore fail-closed; the picker
+    // must not offer it in the first place.
+    for (const kind of ["s3", "local_folder"]) {
+      seedBackend(kind);
+      const wrapper = mount(Restore, { global: { plugins: [i18n] } });
+      await flushPromises();
+
+      expect(wrapper.find('[data-testid="restore-as-of"]').exists()).toBe(false);
+      // In its place, the plain reason plus this destination's real behaviour.
+      const why = wrapper.get('[data-testid="restore-as-of-unsupported"]');
+      expect(why.text()).toContain(i18n.global.t("restore.asOf.unsupported"));
+      expect(why.text()).toContain(i18n.global.t(`versionRetention.${kind}`));
+      // #219 regression guard: a destination with no trash is never told about
+      // Drive's.
+      expect(why.text()).not.toContain("trash");
+
+      wrapper.unmount();
+    }
+  });
+
+  it("clears an already-set as-of when switching to such a destination (issue #220)", async () => {
+    // Hiding the picker is not enough: an instant set while browsing a Drive
+    // source would stay applied to the next source, so the restore would silently
+    // run as a point-in-time job with no control on screen saying so. Switching
+    // sources must CLEAR it.
+    invokeMock.mockImplementation((cmd: string) => {
+      switch (cmd) {
+        case "list_sources":
+          return Promise.resolve([driveSource, s3Source]);
+        case "list_accounts":
+          return Promise.resolve([account("acct-1", "google_drive"), account("acct-2", "s3")]);
+        case "list_backends":
+          return Promise.resolve(RESTORE_BACKENDS);
+        case "list_remote_tree":
+          return Promise.resolve({ entries: bigFolder(1), truncated: false });
+        default:
+          return Promise.resolve(undefined);
+      }
+    });
+    const wrapper = mount(Restore, { global: { plugins: [i18n] } });
+    await flushPromises();
+
+    // Browsing the Drive source: set a point-in-time instant.
+    const asOf = wrapper.get('[data-testid="restore-as-of"]');
+    await asOf.setValue("2026-01-02T03:04");
+    await asOf.trigger("change");
+    await flushPromises();
+    expect(useRestoreStore().asOf).not.toBeNull();
+
+    // Switch to the S3 source: the picker goes away AND the instant is dropped.
+    const select = wrapper.get('[data-testid="restore-source"]');
+    await select.setValue("s2");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="restore-as-of"]').exists()).toBe(false);
+    expect(useRestoreStore().asOf).toBeNull();
 
     wrapper.unmount();
   });
