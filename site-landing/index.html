@@ -128,18 +128,47 @@
               names, paths, or content.
             </p>
           </li>
+          <li class="feature">
+            <h3>Choice of backup destination</h3>
+            <p>
+              Back up to Google Drive, any S3-compatible object store (AWS S3,
+              Cloudflare R2, MinIO, Backblaze B2, Wasabi), or a local or
+              removable folder - a USB drive, external disk, or NAS share -
+              with no account needed for the last one.
+            </p>
+          </li>
+          <li class="feature">
+            <h3>Guided macOS Full Disk Access</h3>
+            <p>
+              When macOS privacy protection blocks a file, Driven says so and
+              offers a one-click jump to the right System Settings pane
+              instead of leaving you to find it.
+            </p>
+          </li>
+          <li class="feature">
+            <h3>Scheduled integrity scrub</h3>
+            <p>
+              A weekly rolling pass compares already-backed-up files against
+              what the destination actually holds - size always, content
+              checksum where the destination can supply one - catching
+              remote-side corruption that a normal sync would never notice.
+            </p>
+          </li>
+          <li class="feature">
+            <h3>rclone config importer</h3>
+            <p>
+              Already have an <code>rclone.conf</code>? <code>driven-cli
+              rclone</code> reads it and tells you exactly what to enter,
+              rather than making you re-type every endpoint and key.
+            </p>
+          </li>
         </ul>
         <!--
         DRAFT feature cards - do not uncomment until the corresponding PR
         merges. Add each as a <li class="feature"> once shipped, then delete
         this comment wrapper.
-        - S3-compatible backup destination (#207, unmerged; depends on #200's
-          pluggable-backend seam / driven-remote crate, also unmerged).
-        - Local / removable-drive backup destination (unmerged).
-        - Guided macOS Full Disk Access onboarding (#205, unmerged).
-        - Scheduled integrity scrub (unmerged).
-        - Restore drill (unmerged).
-        - rclone config importer (unmerged).
+        - Restore drill (core engine landed, #215 DRAFT / unmerged - surface
+          is not wired up to anything a user can click yet).
         -->
       </div>
     </section>

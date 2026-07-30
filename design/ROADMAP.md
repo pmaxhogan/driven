@@ -615,16 +615,22 @@ Tracked as separate roadmap items, no fixed sequence yet:
 
 - **macOS Volume Shadow Copy equivalent** (APFS local snapshots via an
   unprivileged `tmutil localsnapshot` plus a root mount broker) for
-  the small subset of macOS files held with exclusive locks - IN
-  PROGRESS. The `driven-apfs` broker crate and its DESIGN §5.3.2
-  writeup landed, and macOS/Linux open failures are now classified
-  precisely into locked-vs-permission-denied and skipped-and-reported
-  (DESIGN §5.3, `local.file_locked` / `local.permission_denied`). Not
-  yet done: the broker is not wired into `driven-vss`'s
-  `map_for_volume` seam, so no macOS file is actually backed up
-  through a lock yet - every locked file still skips. Full Disk Access
-  onboarding UI for TCC-denied files (a separate problem from locked
-  files - see DESIGN §5.3.2) is also still unmerged.
+  the small subset of macOS files held with exclusive locks - SHIPPED
+  (v2.5.0, #196 + #201 + #211). `driven-apfs`'s `ApfsBrokeredProvider`
+  now plugs into `driven-vss`'s `map_for_volume` seam exactly like the
+  Windows VSS provider, so a *busy* file genuinely backs up through a
+  read-only APFS snapshot when the opt-in `macos.apfs_snapshot`
+  setting is on (off by default). The helper-directory
+  co-installation check that a normal drag-installed `.app` fails is
+  advisory, not fatal (#211), so this works on an ordinary install, not
+  just a `.pkg`. macOS/Linux open failures are classified precisely
+  into locked-vs-permission-denied and skipped-and-reported (DESIGN
+  §5.3, `local.file_locked` / `local.permission_denied`). Full Disk
+  Access onboarding UI for TCC-denied files (a separate problem from
+  locked files - see DESIGN §5.3.3) also SHIPPED (#216): a banner opens
+  the exact Full Disk Access System Settings pane. Neither mechanism
+  substitutes for the other - a snapshot cannot read around a TCC
+  denial, and FDA onboarding does nothing for a merely-busy file.
 - **Schedule windows** (time-of-day rules) in the UI.
 - **Pre/post backup shell hooks.**
 - **rclone-crypt-format compatibility** (opt-in second format).
@@ -640,15 +646,39 @@ Tracked as separate roadmap items, no fixed sequence yet:
   escape Drive's per-file API overhead. Opt-in (Settings "Advanced" toggle, off
   by default); coldness + density gated; a reconcile pass GCs emptied bundles.
   See DESIGN.md §17 for the shipped thresholds and rationale.
-- **Backends beyond Google Drive** - IN PROGRESS, unmerged as of this
-  docs pass: a pluggable backend seam plus a new `driven-remote` crate,
-  an S3-compatible backend, and a local/removable-folder backend. Not
-  yet available to users. OneDrive (Graph API) and Backblaze B2 remain
-  unstarted.
-- **Scheduled integrity scrub** and a **restore-drill** feature - IN
-  PROGRESS, unmerged as of this docs pass.
-- **rclone config importer** - IN PROGRESS, unmerged as of this docs
-  pass; would read an existing rclone config to pre-fill Driven setup.
+- **Backends beyond Google Drive** - SHIPPED (v2.5.0, #200/#207/#212):
+  a pluggable `driven-remote::RemoteStore` seam, a `driven-backend`
+  factory, an S3-compatible backend (`driven-s3`: AWS S3, Cloudflare
+  R2, MinIO, Backblaze B2 in S3-compatible mode, Wasabi), and a
+  local/removable-folder backend (`driven-localfs`). The setup wizard
+  and "Add source" flow are backend-driven for all three (#219).
+  OneDrive (Graph API) and a native (non-S3) Backblaze B2 client remain
+  unstarted. Per-source versioning does not actually retain older
+  copies on the S3 or local-folder backends yet (a versioned change
+  overwrites the same deterministic key) - see issue #220, tracked
+  separately from this item.
+- **Scheduled integrity scrub** - SHIPPED (v2.5.0, #203): a weekly
+  rolling pass, on by default, checks a bounded slice (500 objects) of
+  each source's already-backed-up population against the destination's
+  own size and, where the destination can supply one, its content
+  checksum too - catching remote-side corruption that neither the
+  local deep-verify nor the remote-existence audit can see. Checksum
+  coverage is full on Drive and `driven-localfs`, but size-only for an
+  S3 object uploaded via multipart (S3 has no plain content digest for
+  one, only a part-digest ETag); the scrub reports those unverifiable
+  rather than guessing.
+  A **restore-drill** feature is still IN PROGRESS: the core engine
+  landed (#215) but is marked DRAFT and unmerged - it has no UI surface
+  yet.
+- **rclone config importer** - SHIPPED (v2.5.0, #213): `driven-cli
+  rclone list` / `rclone import <remote>` reads an existing
+  `rclone.conf` and reports what Driven can make of each remote.
+  Translate-only - it emits settings for the existing account-creation
+  path rather than writing an account itself. `s3` remotes transfer
+  everything but the bucket (rclone keeps that in the path you type,
+  not the config); `drive` remotes transfer the destination folder and
+  Shared Drive id but never the OAuth token, since a refresh token is
+  redeemable only by the OAuth client that was issued it (RFC 6749 s6).
 - **Web admin / status page** for users who want to monitor multiple
   machines.
 - **mobile companion app** (Tauri mobile) for read-only restore.
