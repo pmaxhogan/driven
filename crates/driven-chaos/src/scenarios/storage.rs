@@ -52,7 +52,7 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 
-use driven_core::executor::{DefaultExecutor, Executor, ExecutorDeps, OpOutcome};
+use driven_core::executor::{DefaultExecutor, Executor, ExecutorDeps, OpOutcome, SkipReason};
 use driven_core::pacer::{Pacer, PacerCeilings, ResponseClass};
 use driven_core::planner;
 use driven_core::scanner;
@@ -539,9 +539,12 @@ impl Scenario for ReadonlyFile {
 
 /// `noaccess-file` (STRESS_HARNESS s3.1): a file that stats but is unreadable
 /// for the current user (POSIX `chmod 000`; Windows ACL Deny:READ). The scan
-/// includes it (it stats fine), the executor fails to open it -> per-file
-/// `local.io_error`; the scan continues and NO other file is trashed as a
-/// cascade.
+/// includes it (it stats fine) and the executor cannot open it. Since #195 the
+/// outcome is per-platform: on Unix an EACCES/EPERM open is a graceful SKIP
+/// carrying `local.permission_denied` (so a macOS TCC denial stops being
+/// misreported as a disk error), while Windows keeps ERROR_ACCESS_DENIED as
+/// `local.io_error`. Either way the scan continues and NO other file is
+/// trashed as a cascade.
 struct NoaccessFile;
 
 #[async_trait]
@@ -551,7 +554,7 @@ impl Scenario for NoaccessFile {
     }
 
     fn description(&self) -> &'static str {
-        "a stat-able but unreadable file; local.io_error logged per file, scan continues, no cascade delete"
+        "a stat-able but unreadable file; skipped as local.permission_denied on Unix / local.io_error on Windows, scan continues, no cascade delete"
     }
 
     fn requires(&self) -> CapabilityRequirements {
@@ -604,6 +607,7 @@ impl Scenario for NoaccessFile {
         // Exactly the unreadable file fails with local.io_error; the two
         // readable ones complete.
         let mut io_errors = 0u32;
+        let mut denied_skips = 0u32;
         let mut other_failures: Vec<ErrorCode> = Vec::new();
         let mut done = 0u32;
         for o in &outcomes {
@@ -615,6 +619,15 @@ impl Scenario for NoaccessFile {
                     io_errors += 1
                 }
                 OpOutcome::Failed { code, .. } => other_failures.push(*code),
+                // Since #195 a Unix EACCES/EPERM open is a graceful SKIP
+                // carrying `local.permission_denied`, not a failure - the
+                // whole point of that change was to stop reporting a TCC
+                // denial as a disk error. Windows keeps ERROR_ACCESS_DENIED
+                // as `local.io_error` (elevation can genuinely read around
+                // some ACL denials), so the expectation is per-platform.
+                OpOutcome::Skipped { reason, .. } if *reason == SkipReason::Denied => {
+                    denied_skips += 1
+                }
                 OpOutcome::Skipped { .. } => {}
             }
         }
@@ -623,11 +636,17 @@ impl Scenario for NoaccessFile {
 
         anyhow::ensure!(
             other_failures.is_empty(),
-            "only the unreadable file may fail, and only with local.io_error: saw {other_failures:?}"
+            "no other failure code is allowed here: saw {other_failures:?}"
         );
+        #[cfg(windows)]
         anyhow::ensure!(
-            io_errors == 1,
-            "exactly one local.io_error (the unreadable file); got {io_errors}"
+            io_errors == 1 && denied_skips == 0,
+            "Windows: exactly one local.io_error (the unreadable file); got              {io_errors} errors / {denied_skips} denied skips"
+        );
+        #[cfg(not(windows))]
+        anyhow::ensure!(
+            denied_skips == 1 && io_errors == 0,
+            "Unix: the unreadable file must be SKIPPED as local.permission_denied              (#195), not failed as a disk error; got {denied_skips} denied skips /              {io_errors} local.io_error"
         );
         anyhow::ensure!(
             done == 2,
@@ -657,12 +676,17 @@ impl Scenario for NoaccessFile {
         let inv_report = reporting::assert_invariants(handle, &remote, src.id, &folder).await?;
 
         Ok(Outcome {
-            error_codes_seen: vec![ErrorCode::LocalIoError],
+            error_codes_seen: vec![if cfg!(windows) {
+                ErrorCode::LocalIoError
+            } else {
+                ErrorCode::LocalPermissionDenied
+            }],
             final_drive_object_count: live,
             final_hash_matches_local: intact,
             invariants: Some(inv_report.to_invariant_outcome(true)),
             notes: vec![format!(
-                "{done} readable files uploaded, 1 local.io_error, 0 trashed (no cascade)"
+                "{done} readable files uploaded, 1 unreadable file reported per platform, \
+                 0 trashed (no cascade)"
             )],
         })
     }
@@ -674,8 +698,18 @@ impl Scenario for NoaccessFile {
     }
 
     fn expected_outcome(&self) -> ExpectedOutcome {
+        // Per-platform since #195: a Unix EACCES/EPERM open is a graceful skip
+        // carrying `local.permission_denied` (a WARN, not an ERROR, and not
+        // counted in the cycle's error total), while Windows keeps
+        // ERROR_ACCESS_DENIED as `local.io_error`. The harness compares this
+        // against the codes the run actually observed, so it must name the
+        // code this platform really produces.
         ExpectedOutcome::GracefulFailureWith {
-            code: ErrorCode::LocalIoError,
+            code: if cfg!(windows) {
+                ErrorCode::LocalIoError
+            } else {
+                ErrorCode::LocalPermissionDenied
+            },
         }
     }
 }
@@ -1115,10 +1149,23 @@ mod tests {
             assert!(f.required.iter().any(|c| matches!(c, Capability::Unix)));
             assert!(d.required.iter().any(|c| matches!(c, Capability::Unix)));
         }
+        // Per-platform since #195: unix EACCES/EPERM is a graceful skip
+        // carrying local.permission_denied; Windows keeps ERROR_ACCESS_DENIED
+        // as local.io_error. Assert the exact code for THIS platform rather
+        // than accepting either, so a regression on one platform cannot hide
+        // behind the other's expectation.
+        #[cfg(windows)]
         assert!(matches!(
             NoaccessFile.expected_outcome(),
             ExpectedOutcome::GracefulFailureWith {
                 code: ErrorCode::LocalIoError
+            }
+        ));
+        #[cfg(not(windows))]
+        assert!(matches!(
+            NoaccessFile.expected_outcome(),
+            ExpectedOutcome::GracefulFailureWith {
+                code: ErrorCode::LocalPermissionDenied
             }
         ));
         assert!(matches!(
