@@ -71,7 +71,8 @@
     "longDescription": "Driven backs up local folders to Google Drive, one way, fast, with encryption, scheduling, and battery awareness.",
     "publisher": "Driven",
     "macOS": {
-      "minimumSystemVersion": "11.0"
+      "minimumSystemVersion": "11.0",
+      "signingIdentity": "-"
     },
     "windows": {
       "wix": {
