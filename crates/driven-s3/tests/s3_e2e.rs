@@ -811,7 +811,12 @@ async fn the_readiness_wait_times_out_on_a_server_that_never_initialises() {
 /// fails to connect and the wait can only end at the deadline.
 #[tokio::test(flavor = "multi_thread")]
 async fn the_readiness_wait_times_out_with_a_diagnosable_message() {
-    let endpoint = format!("http://127.0.0.1:{}", free_port());
+    // Port 1, not a `free_port()`: that helper binds and immediately drops, so
+    // the port is only free until something claims it - and `spawn_minio` draws
+    // from the same pool in a test running concurrently with this one. Port 1
+    // is unbindable without root and unused even then, so every probe gets a
+    // deterministic connection refusal.
+    let endpoint = "http://127.0.0.1:1".to_string();
     let started = std::time::Instant::now();
     // The outer timeout is the assertion that the wait honours ITS deadline: a
     // wait that never gave up would otherwise hang the suite rather than fail.
