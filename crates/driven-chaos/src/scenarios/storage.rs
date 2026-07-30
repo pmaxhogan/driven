@@ -1149,10 +1149,23 @@ mod tests {
             assert!(f.required.iter().any(|c| matches!(c, Capability::Unix)));
             assert!(d.required.iter().any(|c| matches!(c, Capability::Unix)));
         }
+        // Per-platform since #195: unix EACCES/EPERM is a graceful skip
+        // carrying local.permission_denied; Windows keeps ERROR_ACCESS_DENIED
+        // as local.io_error. Assert the exact code for THIS platform rather
+        // than accepting either, so a regression on one platform cannot hide
+        // behind the other's expectation.
+        #[cfg(windows)]
         assert!(matches!(
             NoaccessFile.expected_outcome(),
             ExpectedOutcome::GracefulFailureWith {
                 code: ErrorCode::LocalIoError
+            }
+        ));
+        #[cfg(not(windows))]
+        assert!(matches!(
+            NoaccessFile.expected_outcome(),
+            ExpectedOutcome::GracefulFailureWith {
+                code: ErrorCode::LocalPermissionDenied
             }
         ));
         assert!(matches!(
