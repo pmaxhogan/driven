@@ -272,6 +272,41 @@ unmounts. It works without Time Machine being set up.
 > would already have to be running as you, and would gain a read-only copy of
 > files they could already read. Installing from a `.pkg` would restore the
 > check to full strength; it is an improvement, not a prerequisite.
+#### macOS re-prompts for keychain access after every update
+
+macOS ties a permission grant to the *identity* of the binary that was granted
+it. Driven's macOS build carries no Developer ID signature - the Mach-O is only
+ad-hoc (linker) signed, which gives it no stable
+[designated requirement](https://developer.apple.com/library/archive/technotes/tn2206/_index.html),
+so its code-directory hash changes with every build. A Developer ID signature
+would let the OS recognise version 2.4 and version 2.5 as the same app; without
+one, it cannot.
+
+The practical consequence, once per update:
+
+- **Keychain.** Every credential Driven holds lives in your login keychain: the
+  account master key (service `dev.maxhogan.driven`), the Google refresh token
+  (`driven.google.refresh_token`), your BYO OAuth client credentials
+  (`driven.google.client_creds`), and any S3 key pair
+  (`driven.s3.credentials`). "Always Allow" records the *specific* build you
+  allowed, so after an update macOS asks again. Apple's own description of the
+  dialog is "This dialog appears if you recently updated your system software or
+  the app, or if the app has been modified". Click **Always Allow** once after
+  each update and Driven picks up where it left off. If you deny it, Driven does
+  not quietly fall back to storing your files unencrypted - an encrypted source
+  whose master key it cannot read fails closed and reports `crypto.key_missing`
+  in the activity log.
+- **Full Disk Access.** The same identity check applies to macOS's privacy
+  layer, so a previously granted Full Disk Access can stop taking effect after
+  an update even though Driven still appears (checked) in the list. If backups
+  of protected folders start failing with permission errors right after an
+  update, remove Driven from System Settings > Privacy & Security > Full Disk
+  Access with the "-" button and re-add it with "+". Driven's in-app Full Disk
+  Access banner says the same thing when it detects denied files.
+
+Both go away for good with a Developer ID signature; there is no partial
+workaround that makes an ad-hoc-signed build's grants survive an update. This
+is tracked with the other signing work below.
 
 #### macOS auto-updater caveat
 

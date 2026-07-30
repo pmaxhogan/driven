@@ -16,6 +16,14 @@ async-trait.workspace = true
 tempfile = "3"
 parking_lot = "0.12"
 pretty_assertions = "1"
+# `keychain::isolated` needs BOTH halves of the keyring stack: `keyring` is the
+# facade production uses (and whose one-shot platform-store latch has to be
+# burned first), and `keyring-core` owns the process-global default store plus
+# the in-memory `mock::Store` that replaces it for tests. This crate is
+# `publish = false` and is only ever a `[dev-dependencies]` entry, so neither
+# lands in a shipped dependency graph through here.
+keyring.workspace = true
+keyring-core = "1"
 driven-core = { path = "../driven-core" }
 driven-drive = { path = "../driven-drive" }
 driven-power = { path = "../driven-power" }

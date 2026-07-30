@@ -60,7 +60,10 @@ bytes.workspace = true
 # to verify the fault injector returns a different value (and that
 # re-uploading clears the latch).
 md-5 = "0.11"
-# M4 token_store unit tests bind keyring to an in-memory mock store so they
-# do not touch a real OS keychain in CI (the implementer wires the mock via
-# keyring 4.x's test store API).
+# The token_store round-trip tests bind keyring to an in-memory mock store via
+# `driven_test_fixtures::keychain::isolated()`, so they never touch a real OS
+# keychain. (The dependency edge is a cycle - driven-test-fixtures depends on
+# driven-drive - which cargo permits precisely because it is dev-only and so
+# cannot appear in a shipped build.)
 keyring.workspace = true
+driven-test-fixtures = { path = "../driven-test-fixtures" }

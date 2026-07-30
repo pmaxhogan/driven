@@ -332,6 +332,41 @@ mod tests {
     }
 
     #[test]
+    fn the_test_suite_is_isolated_from_the_os_keychain() {
+        // Several command modules in this crate reach the OS keychain, so this
+        // is the guard: if the isolation mechanism ever stops working, fail HERE
+        // and loudly rather than letting a keychain-touching test start writing
+        // into a developer's real login keychain (which on macOS also blocks the
+        // run on a modal permission prompt).
+        assert!(
+            driven_test_fixtures::keychain::is_isolated(),
+            "the in-memory keyring store must be the effective default store"
+        );
+    }
+
+    #[test]
+    fn an_encrypted_source_with_no_master_key_in_the_keychain_fails_closed() {
+        // GA-critical, and the only path here that actually opens the keystore:
+        // the row HAS a wrapped source key, so resolution gets past the
+        // absent-key short circuit and really consults the keychain. With no
+        // master key stored it must resolve `Unavailable` (the executor then
+        // errors `crypto.key_missing`) and NEVER `Plaintext`.
+        let Some(_g) = driven_test_fixtures::keychain::isolated() else {
+            return;
+        };
+        let account = AccountId::new_v4(); // unique -> no master key stored
+        let sid = SourceId::new_v4();
+        let provider = KeystoreCryptoProvider::new(
+            account,
+            vec![source(sid, account, true, Some(vec![0u8; 64]))],
+        );
+        assert!(matches!(
+            provider.resolve(&sid),
+            CryptoResolution::Unavailable
+        ));
+    }
+
+    #[test]
     fn unknown_source_resolves_plaintext() {
         let account = AccountId::new_v4();
         let provider = KeystoreCryptoProvider::new(account, Vec::new());

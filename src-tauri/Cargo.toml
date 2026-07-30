@@ -199,3 +199,9 @@ base64.workspace = true
 # Pause-persistence tests: RAII temp dir for a throwaway SqliteStateRepo
 # (already in the tree via driven-core's dev-deps; adds no new crate).
 tempfile = "3"
+# `keychain::isolated()` / `is_isolated()`. Several command modules here reach
+# the OS keychain (`accounts`, `sources`, the crypto provider), so any test that
+# exercises those paths MUST bind the in-memory store first - on macOS a test
+# that reaches the real keychain re-prompts on every rebuild and blocks the run
+# on a modal dialog. The crate-level guard test asserts the mechanism is live.
+driven-test-fixtures = { path = "../crates/driven-test-fixtures" }

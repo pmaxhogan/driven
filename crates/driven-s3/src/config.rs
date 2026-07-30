@@ -434,63 +434,31 @@ mod tests {
         assert!(decode_credentials("no-newline-here").is_err());
     }
 
-    /// Install `keyring-core`'s IN-MEMORY store as the process default so the
-    /// keychain round trip is covered by a real test with no OS keychain (which
-    /// headless CI does not have).
+    /// Isolate this test from the OS keychain, so the credential round trip
+    /// runs for real against an in-memory store without touching (or requiring)
+    /// a real one. Returns `None` when isolation could not be established, in
+    /// which case the caller MUST skip - see [`driven_test_fixtures::keychain`]
+    /// for why writing for real is not an acceptable fallback (on macOS it
+    /// blocks the run on a modal permission prompt).
     ///
-    /// Returns `None` when the mock could not be made the effective store, in
-    /// which case the caller MUST skip: the alternative is writing test secrets
-    /// into the developer's real login keychain, which on macOS also blocks the
-    /// run on a modal permission prompt.
-    ///
-    /// ## Ordering is load-bearing
-    ///
-    /// `keyring` 4.x's `Entry::new` installs the PLATFORM-NATIVE store on its
-    /// first call, overwriting whatever default is already set (see
-    /// `keyring-4.1.5/src/v1.rs`, the `SET_CREDENTIAL_STORE` latch). Setting the
-    /// mock first is therefore silently undone by the first real `Entry`, and
-    /// every "mock" write lands in the OS keychain. So this burns that latch
-    /// first with a throwaway `Entry` (constructing one performs no credential
-    /// I/O), THEN installs the mock, and finally PROVES the mock is in effect by
-    /// round-tripping a sentinel before any test is allowed to store a secret.
-    fn keychain() -> Option<std::sync::MutexGuard<'static, ()>> {
-        use std::sync::{Mutex, OnceLock};
-        static LOCK: OnceLock<Mutex<()>> = OnceLock::new();
-        static ACTIVE: OnceLock<bool> = OnceLock::new();
-        let guard = LOCK
-            .get_or_init(|| Mutex::new(()))
-            .lock()
-            .unwrap_or_else(|e| e.into_inner());
-        let active = *ACTIVE.get_or_init(|| {
-            // 1. Burn keyring's one-shot platform-store latch. The error on a
-            //    headless box (no secret service) is expected and ignored.
-            let _ = keyring::Entry::new("driven.test.keyring-latch", "latch");
-            // 2. Now the mock sticks.
-            match keyring_core::mock::Store::new() {
-                Ok(store) => keyring_core::set_default_store(store),
-                Err(_) => return false,
-            }
-            // 3. Prove it. A sentinel round trip through the SAME `keyring`
-            //    façade production uses is the only evidence that matters.
-            let sentinel = match keyring::Entry::new("driven.test.sentinel", "probe") {
-                Ok(e) => e,
-                Err(_) => return false,
-            };
-            if sentinel.set_password("mock-is-active").is_err() {
-                return false;
-            }
-            let ok = sentinel.get_password().ok().as_deref() == Some("mock-is-active");
-            let _ = sentinel.delete_credential();
-            ok
-        });
-        if !active {
-            eprintln!(
-                "skipping the keychain test: the in-memory keyring store is not the effective \
-                 default, and this test will not write to a real OS keychain"
-            );
-            return None;
-        }
-        Some(guard)
+    /// The returned guard also serializes these tests: the default credential
+    /// store is process-global, so they key their entries by a unique account
+    /// id and take turns.
+    fn keychain() -> Option<driven_test_fixtures::keychain::KeychainGuard> {
+        driven_test_fixtures::keychain::isolated()
+    }
+
+    #[test]
+    fn the_test_suite_is_isolated_from_the_os_keychain() {
+        // The guard for this whole crate: if the isolation mechanism ever stops
+        // working (a `keyring` upgrade changing how the default store is
+        // installed, say), fail HERE and loudly rather than letting the round
+        // trips below silently skip - or, worse, start writing into a real
+        // login keychain.
+        assert!(
+            driven_test_fixtures::keychain::is_isolated(),
+            "the in-memory keyring store must be the effective default store"
+        );
     }
 
     #[test]

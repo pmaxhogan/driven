@@ -14,22 +14,23 @@
 //! orchestrator+executor+store yet, so nothing performs that account-state
 //! transition today (codex V-F; tracked in design/CODEX_NOTES.md).
 //!
-//! ## Testability note (keyring 4.1.2 / keyring-core 1.0.0)
+//! ## Testability note (keyring 4.x / keyring-core 1.0.0)
 //!
-//! The workspace resolves `keyring = "4"` to 4.1.2, which is the
-//! `keyring-core` 1.0.0 re-architecture. The brief's
-//! `set_default_credential_builder(mock)` recipe is the keyring 2.x/3.x API
-//! and does NOT exist in 4.1.2; the 4.1.2 mock store lives in
-//! `keyring_core::mock`, which is NOT a declared dependency of `driven-drive`
-//! (and `keyring` does not re-export it), and Cargo.toml is frozen for this
-//! phase. So the keychain ROUND-TRIP itself (keyring's own tested job) is not
-//! re-tested here; instead the keyring-result -> domain mapping that IS
-//! Driven's responsibility is extracted into pure free fns
-//! ([`map_load_result`], [`map_delete_result`]) and unit-tested in-process
-//! with constructed `keyring::Error` values - a real, non-skipped test that
-//! needs no OS keychain (and would otherwise be flaky on headless CI where no
-//! default store initialises). Production uses `keyring::Entry` exactly like
-//! `driven-crypto::keystore`.
+//! The workspace resolves `keyring = "4"`, which is the `keyring-core` 1.0.0
+//! re-architecture: the `set_default_credential_builder(mock)` recipe from
+//! keyring 2.x/3.x no longer exists, and the mock store now lives in
+//! `keyring_core::mock` as a process-global default store. Tests here bind it
+//! via [`driven_test_fixtures::keychain::isolated`], so the round trips below
+//! exercise the real API against an IN-MEMORY store and never reach an OS
+//! keychain. Never write a test here that reaches the real one: on macOS every
+//! `cargo test` rebuild is a new binary identity, so it raises a modal
+//! permission prompt on EVERY rebuild and blocks the run on it.
+//!
+//! The keyring-result -> domain mapping that is Driven's own responsibility is
+//! additionally extracted into pure free fns ([`map_load_result`],
+//! [`map_delete_result`]) and unit-tested with constructed `keyring::Error`
+//! values, because an in-memory store cannot produce a backend failure.
+//! Production uses `keyring::Entry` exactly like `driven-crypto::keystore`.
 
 use std::sync::Arc;
 use std::time::Duration;
@@ -75,8 +76,8 @@ const REFRESH_TOTAL_TIMEOUT: Duration = Duration::from_secs(30);
 /// Keychain wrapper for an account's Google refresh token (SPEC s4.1).
 ///
 /// One entry per account; the account id is the keychain "user" within the
-/// [`KEYRING_SERVICE`] namespace. Tests exercise the result-mapping free fns
-/// rather than a real keychain (see the module docs).
+/// [`KEYRING_SERVICE`] namespace. Tests round-trip this against an in-memory
+/// store, never a real keychain (see the module docs).
 pub struct KeyringTokenStore {
     account: String,
 }
@@ -582,6 +583,85 @@ mod tests {
     fn keyring_token_store_account_accessor() {
         let store = KeyringTokenStore::new("alice@example.com");
         assert_eq!(store.account(), "alice@example.com");
+    }
+
+    #[test]
+    fn the_test_suite_is_isolated_from_the_os_keychain() {
+        // The guard for this whole crate: if the isolation mechanism ever stops
+        // working (a `keyring` upgrade changing how the default store is
+        // installed, say), fail HERE and loudly rather than letting the round
+        // trips below quietly start writing into a real login keychain.
+        assert!(
+            driven_test_fixtures::keychain::is_isolated(),
+            "the in-memory keyring store must be the effective default store"
+        );
+    }
+
+    #[test]
+    fn refresh_tokens_round_trip_and_delete_idempotently() {
+        // SPEC s4.1 over the real API: a never-authenticated account reads back
+        // `None` (not an error), a stored token reads back verbatim, and delete
+        // is idempotent (sign-out runs it unconditionally).
+        let Some(_g) = driven_test_fixtures::keychain::isolated() else {
+            return;
+        };
+        let store = KeyringTokenStore::new("acct-drive-round-trip");
+        assert!(store.load_refresh_token().expect("load").is_none());
+        store
+            .delete_refresh_token()
+            .expect("delete of a missing entry is a no-op");
+
+        store.store_refresh_token("rt-abc123").expect("store");
+        assert_eq!(
+            store.load_refresh_token().expect("load").as_deref(),
+            Some("rt-abc123")
+        );
+        store.delete_refresh_token().expect("delete");
+        assert!(store.load_refresh_token().expect("load").is_none());
+    }
+
+    #[test]
+    fn client_creds_round_trip_and_are_scoped_per_account() {
+        // A1: the refresh token is bound to the client that minted it, so each
+        // account's BYO pair must persist independently - a cross-account read
+        // would authenticate as the wrong client (`invalid_client`).
+        let Some(_g) = driven_test_fixtures::keychain::isolated() else {
+            return;
+        };
+        let a = ClientCredsStore::new("acct-drive-creds-a");
+        let b = ClientCredsStore::new("acct-drive-creds-b");
+        assert!(a.load().expect("load").is_none());
+
+        a.store(&ClientCreds {
+            client_id: "id-a".to_string(),
+            client_secret: "secret-a".to_string(),
+        })
+        .expect("store a");
+        // PKCE installed-app clients have no secret; the empty half must survive.
+        b.store(&ClientCreds {
+            client_id: "id-b".to_string(),
+            client_secret: String::new(),
+        })
+        .expect("store b");
+
+        assert_eq!(
+            a.load().expect("load a"),
+            Some(ClientCreds {
+                client_id: "id-a".to_string(),
+                client_secret: "secret-a".to_string(),
+            })
+        );
+        assert_eq!(
+            b.load().expect("load b"),
+            Some(ClientCreds {
+                client_id: "id-b".to_string(),
+                client_secret: String::new(),
+            })
+        );
+
+        a.delete().expect("delete a");
+        assert!(a.load().expect("load a").is_none());
+        assert!(b.load().expect("load b").is_some(), "b is untouched");
     }
 
     #[test]

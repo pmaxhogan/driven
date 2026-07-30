@@ -6,6 +6,14 @@
 //! Keychain, Windows Credential Manager, Linux Secret Service) automatically.
 //! The 32 raw key bytes are stored via `set_secret`/`get_secret` (binary),
 //! not `set_password` - key bytes are not valid UTF-8.
+//!
+//! ## Tests never touch a real keychain
+//!
+//! The round-trip tests below run against `keyring-core`'s in-memory mock,
+//! installed by [`driven_test_fixtures::keychain::isolated`]. Never write a
+//! test here that reaches the OS keychain: on macOS every `cargo test` rebuild
+//! is a new binary identity, so such a test raises a modal permission prompt on
+//! EVERY rebuild and blocks the run on it.
 
 use keyring::Entry;
 use zeroize::Zeroizing;
@@ -92,10 +100,11 @@ impl Keystore {
 ///
 /// This is the keyring-result -> domain mapping that is Driven's own
 /// responsibility (length validation, `NoEntry` -> recovery-phrase signal),
-/// split out as a PURE free fn so it is unit-tested WITHOUT an OS keychain -
-/// the same testability pattern as `driven-drive`'s
-/// `token_store::map_load_result` (the 4.1.2 mock store is not a declared
-/// dependency and a real round-trip would be flaky on headless CI). A missing
+/// split out as a PURE free fn so the error mapping is unit-tested exhaustively
+/// (including backend errors an in-memory store never produces) - the same
+/// testability pattern as `driven-drive`'s `token_store::map_load_result`. The
+/// happy path is additionally covered end-to-end by the round-trip tests
+/// against the in-memory store. A missing
 /// entry maps to [`KeystoreError::NotFound`]; a secret that is not exactly
 /// [`KEY_LEN`] bytes maps to [`KeystoreError::MalformedKey`]; any other
 /// backend error maps to [`KeystoreError::Backend`]. The retrieved bytes are
@@ -190,5 +199,78 @@ mod tests {
             "boom".to_string(),
         )));
         assert!(matches!(r, Err(KeystoreError::Backend(_))));
+    }
+
+    #[test]
+    fn the_test_suite_is_isolated_from_the_os_keychain() {
+        // The guard for this whole crate: if the isolation mechanism ever stops
+        // working (a `keyring` upgrade changing how the default store is
+        // installed, say), fail HERE and loudly rather than letting the tests
+        // below quietly start writing into a real login keychain.
+        assert!(
+            driven_test_fixtures::keychain::is_isolated(),
+            "the in-memory keyring store must be the effective default store"
+        );
+    }
+
+    #[test]
+    fn master_key_round_trips_through_the_keystore() {
+        // The happy path of the real API (open -> store -> load), which the pure
+        // mapping fns above cannot cover. Runs against the in-memory store.
+        let Some(_g) = driven_test_fixtures::keychain::isolated() else {
+            return;
+        };
+        let ks = Keystore::open("acct-crypto-round-trip").expect("open");
+        let key = MasterKey::from_bytes([9u8; KEY_LEN]);
+        ks.store_master_key(&key).expect("store");
+        assert_eq!(
+            ks.load_master_key().expect("load").as_bytes(),
+            key.as_bytes()
+        );
+    }
+
+    #[test]
+    fn a_missing_master_key_is_not_found_and_delete_is_idempotent() {
+        // First run / wiped keychain: NotFound is the recovery-phrase signal,
+        // and account removal deletes unconditionally so a missing entry must
+        // not error. Both over the real API rather than a constructed result.
+        let Some(_g) = driven_test_fixtures::keychain::isolated() else {
+            return;
+        };
+        let ks = Keystore::open("acct-crypto-absent").expect("open");
+        assert!(matches!(ks.load_master_key(), Err(KeystoreError::NotFound)));
+        ks.delete_master_key()
+            .expect("deleting a missing key is a no-op");
+
+        ks.store_master_key(&MasterKey::from_bytes([1u8; KEY_LEN]))
+            .expect("store");
+        ks.delete_master_key().expect("delete");
+        assert!(
+            matches!(ks.load_master_key(), Err(KeystoreError::NotFound)),
+            "a deleted master key must not read back"
+        );
+    }
+
+    #[test]
+    fn master_keys_are_scoped_per_account() {
+        // One Keystore per account (DESIGN s7.1): two connected accounts must
+        // not read each other's master key.
+        let Some(_g) = driven_test_fixtures::keychain::isolated() else {
+            return;
+        };
+        let a = Keystore::open("acct-crypto-a").expect("open a");
+        let b = Keystore::open("acct-crypto-b").expect("open b");
+        a.store_master_key(&MasterKey::from_bytes([0xAAu8; KEY_LEN]))
+            .expect("store a");
+        b.store_master_key(&MasterKey::from_bytes([0xBBu8; KEY_LEN]))
+            .expect("store b");
+        assert_eq!(
+            a.load_master_key().expect("load a").as_bytes(),
+            &[0xAAu8; KEY_LEN]
+        );
+        assert_eq!(
+            b.load_master_key().expect("load b").as_bytes(),
+            &[0xBBu8; KEY_LEN]
+        );
     }
 }

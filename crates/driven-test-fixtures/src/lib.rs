@@ -17,6 +17,10 @@
 //!   the other failure modes from DESIGN s5.8.1.
 //! - [`assert`]: the [`assert_remote_eq!`] snapshot-diff macro for
 //!   asserting on remote-store listings.
+//! - [`keychain`]: [`keychain::isolated`], the ONE way to make a test that can
+//!   reach the OS keychain safe - it installs (and proves) `keyring-core`'s
+//!   in-memory mock as the process default store so the suite never touches a
+//!   developer's real login keychain.
 //!
 //! All public items are documented and exercised by `#[cfg(test)]`
 //! examples inside each module. The crate is `publish = false` and is
@@ -26,6 +30,7 @@
 pub mod assert;
 pub mod clock;
 pub mod diskstat;
+pub mod keychain;
 pub mod network;
 pub mod power;
 pub mod tree;
