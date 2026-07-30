@@ -89,6 +89,12 @@ pub struct BackendDto {
     pub uses_oauth: bool,
     /// Whether the destination picker can browse a folder tree for it.
     pub supports_folder_picker: bool,
+    /// Whether the destination can really keep previous versions of a changed
+    /// file (issue #220). When false the settings UI does not offer the
+    /// per-source versioning editor at all, because a "restore as of an earlier
+    /// date" against such a destination would return the CURRENT bytes while
+    /// reporting success - see `BackendKind::supports_version_history`.
+    pub supports_version_history: bool,
     /// Whether this is the picker's default selection (the first descriptor).
     pub is_default: bool,
 }

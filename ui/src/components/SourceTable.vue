@@ -16,7 +16,7 @@ import {
 import { useSourcesStore } from "../stores/sources";
 import { useToastsStore } from "../stores/toasts";
 import { isWindows } from "../platform";
-import type { SourceDto } from "../ipc/types";
+import type { BackendDto, SourceDto } from "../ipc/types";
 
 // Sources settings tab body (SPEC s11.2; DESIGN s8.2). A table of sources with
 // the per-row affordances the design calls for: enabled toggle, local path,
@@ -129,8 +129,48 @@ function retentionNote(accountId: string): string {
   return kind !== undefined && te(key) ? t(key) : t("versionRetention.default");
 }
 
+/**
+ * Issue #220: the destination CAPABILITY descriptors, joined to a source by its
+ * account's `backendKind`. Fetched rather than hardcoded, following #219: the set
+ * of backends and what each can do is Rust-owned (`driven_backend::descriptors()`),
+ * so a UI-side "S3 and local cannot version" list would silently rot the moment a
+ * backend's create path changes.
+ */
+const backends = ref<BackendDto[]>([]);
+async function loadBackends(): Promise<void> {
+  try {
+    const list = await ipc.listBackends();
+    backends.value = Array.isArray(list) ? list : [];
+  } catch {
+    // A descriptor-fetch failure must not brick the sources table. See
+    // `keepsVersions` for why falling back to permissive is safe here.
+    backends.value = [];
+  }
+}
+
+/**
+ * Whether this source's DESTINATION can really keep previous versions.
+ *
+ * A destination whose create key is derived from the file name (S3, local folder)
+ * re-uploads over the previous copy, so a retained version points at the CURRENT
+ * bytes and "restore as of an earlier date" would return today's content while
+ * reporting success (issue #220). The editor is not offered there.
+ *
+ * An UNKNOWN or not-yet-loaded backend resolves PERMISSIVE, matching the house
+ * rule from #219 (`setup.ts` / `AddSourceWizard.vue` both `?? true`) so a
+ * descriptor hiccup never hides a control a Drive source legitimately needs. That
+ * is safe because `set_source_versioning` enforces the same rule server-side: the
+ * worst a permissive default can do is render an affordance whose Save fails
+ * loudly, never store a promise the destination cannot keep.
+ */
+function keepsVersions(accountId: string): boolean {
+  const kind = accounts.accounts.find((a) => a.id === accountId)?.backendKind;
+  if (kind === undefined) return true;
+  return backends.value.find((b) => b.id === kind)?.supportsVersionHistory ?? true;
+}
+
 onMounted(async () => {
-  await Promise.all([sources.refresh(), accounts.refresh()]);
+  await Promise.all([sources.refresh(), accounts.refresh(), loadBackends()]);
 });
 
 // The include rules in the open editor that stop the scanner from pruning
@@ -257,6 +297,31 @@ async function saveVersioning(source: SourceDto): Promise<void> {
       countCap: Math.max(1, Math.round(versioningCap.value)),
       maxBytes: current.maxBytes,
     });
+    versioningId.value = null;
+  } finally {
+    savingVersioning.value = false;
+  }
+}
+
+/**
+ * Issue #220: clear a STALE versioning flag on a destination that cannot honour
+ * it - a source switched on before this gate existed (or by an older build).
+ *
+ * This is the remedy half of the gate. Enabling is refused both here and in
+ * `set_source_versioning`, but DISABLING stays open on every destination: without
+ * it such a source would be stuck advertising a point-in-time capability nothing
+ * can deliver, with no way to put it right.
+ */
+async function disableVersioning(source: SourceDto): Promise<void> {
+  savingVersioning.value = true;
+  try {
+    const current = await ipc.getSourceVersioning(source.id);
+    await ipc.setSourceVersioning(source.id, {
+      enabled: false,
+      countCap: current.countCap,
+      maxBytes: current.maxBytes,
+    });
+    versioningEnabled.value = false;
     versioningId.value = null;
   } finally {
     savingVersioning.value = false;
@@ -485,11 +550,23 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
           class="space-y-2 rounded-lg border border-zinc-200 p-3 dark:border-zinc-700"
           data-testid="versioning-editor"
         >
-          <p class="text-sm text-zinc-600 dark:text-zinc-400">
+          <!-- Issue #220: the intro PROMISES point-in-time restore, so it is only
+               honest where the destination can actually keep previous versions.
+               Elsewhere it is replaced by the plain statement that it cannot. -->
+          <p
+            v-if="!keepsVersions(source.accountId)"
+            class="text-sm text-zinc-600 dark:text-zinc-400"
+            data-testid="versioning-unsupported"
+          >
+            {{ t("settings.sources.versioning.unsupported") }}
+          </p>
+          <p v-else class="text-sm text-zinc-600 dark:text-zinc-400">
             {{ t("settings.sources.versioning.intro") }}
           </p>
           <!-- What the DESTINATION does with superseded versions - a per-backend
-               fact, not a wording choice. See retentionNote(). -->
+               fact, not a wording choice. See retentionNote(). For a destination
+               that keeps none this is also the WHY, and for S3 it carries the
+               remedy (the provider's own bucket versioning). -->
           <p class="text-sm text-zinc-600 dark:text-zinc-400" data-testid="versioning-retention">
             {{ retentionNote(source.accountId) }}
           </p>
@@ -503,7 +580,11 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
           >
             {{ t(`errors.${versioningErrorCode}.long`) }}
           </p>
-          <template v-else>
+          <!-- Issue #220: the editor renders ONLY where the destination can
+               honour it. Elsewhere there is deliberately no control at all - not
+               even a disabled one - because a control for something that would
+               silently not work is the promise this gate exists to remove. -->
+          <template v-else-if="keepsVersions(source.accountId)">
             <label class="flex items-center gap-2 text-sm">
               <input
                 v-model="versioningEnabled"
@@ -529,9 +610,19 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
               />
             </label>
           </template>
+          <!-- A source whose flag was already set (before this gate existed, or by
+               an older build) gets the one thing it still needs: the stale setting
+               called out, and the remedy button below to turn it back off. -->
+          <p
+            v-else-if="versioningEnabled"
+            class="rounded-md border border-amber-400 bg-amber-50 px-3 py-2 text-sm text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200"
+            data-testid="versioning-stale"
+          >
+            {{ t("settings.sources.versioning.staleEnabled") }}
+          </p>
           <div class="flex gap-2">
             <button
-              v-if="!versioningErrorCode"
+              v-if="!versioningErrorCode && keepsVersions(source.accountId)"
               type="button"
               :class="primaryBtn"
               :disabled="savingVersioning || versioningLoading"
@@ -539,6 +630,23 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
               @click="saveVersioning(source)"
             >
               {{ t("common.save") }}
+            </button>
+            <!-- The remedy for a stale flag on a destination that cannot honour it.
+                 Offered ONLY in that state: there is nothing else to save here. -->
+            <button
+              v-if="
+                !versioningErrorCode &&
+                !versioningLoading &&
+                !keepsVersions(source.accountId) &&
+                versioningEnabled
+              "
+              type="button"
+              :class="warningBtn"
+              :disabled="savingVersioning"
+              data-testid="versioning-disable"
+              @click="disableVersioning(source)"
+            >
+              {{ t("settings.sources.versioning.disableButton") }}
             </button>
             <button type="button" :class="secondaryBtn" @click="cancelVersioning">
               {{ t("common.cancel") }}

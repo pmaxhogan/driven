@@ -266,6 +266,183 @@ describe("SourceTable", () => {
     expect(unknownNote).not.toContain("trash");
   });
 
+  // --- Issue #220: the versioning capability gate ---------------------------
+
+  /** `list_backends()` as the Rust `descriptors()` reports it: only Google Drive
+   * can really keep previous versions. S3 and the local folder derive an object's
+   * key from the file name, so a re-upload overwrites the previous copy. */
+  const VERSIONING_BACKENDS = [
+    {
+      id: "google_drive",
+      usesOauth: true,
+      supportsFolderPicker: true,
+      supportsVersionHistory: true,
+      isDefault: true,
+    },
+    {
+      id: "s3",
+      usesOauth: false,
+      supportsFolderPicker: true,
+      supportsVersionHistory: false,
+      isDefault: false,
+    },
+    {
+      id: "local_folder",
+      usesOauth: false,
+      supportsFolderPicker: false,
+      supportsVersionHistory: false,
+      isDefault: false,
+    },
+  ];
+
+  /** Mount SourceTable with one source on a `backendKind` account, then open its
+   * versioning panel. `stored` is what `get_source_versioning` returns. */
+  async function openVersioningOn(
+    backendKind: string,
+    stored: { enabled: boolean; countCap: number; maxBytes: number } = {
+      enabled: false,
+      countCap: 10,
+      maxBytes: 0,
+    },
+    onSet?: (args: unknown) => void
+  ) {
+    invokeMock.mockImplementation((cmd: string, args?: unknown) => {
+      if (cmd === "list_sources") return Promise.resolve([makeSource({ accountId: "acc-1" })]);
+      if (cmd === "list_accounts")
+        return Promise.resolve([
+          {
+            id: "acc-1",
+            email: "dest",
+            displayName: null,
+            state: "ok",
+            encryptionEnabled: false,
+            createdAt: 0,
+            lastSyncedAt: null,
+            backendKind,
+          },
+        ]);
+      if (cmd === "list_backends") return Promise.resolve(VERSIONING_BACKENDS);
+      if (cmd === "get_source_versioning") return Promise.resolve(stored);
+      if (cmd === "set_source_versioning") {
+        onSet?.(args);
+        return Promise.resolve({ ...stored, enabled: false });
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+    await wrapper.get('[data-testid="versioning-button"]').trigger("click");
+    await flushPromises();
+    return wrapper;
+  }
+
+  it("does not offer the versioning editor on a destination that cannot keep versions (issue #220)", async () => {
+    // The defect this gate closes: per-source versioning promises "restore this
+    // source's files as they were on an earlier date", but on S3 and local-folder
+    // destinations the create key is derived from the file name, so the re-upload
+    // OVERWRITES the previous bytes. The retained version then points at the
+    // current content and a point-in-time restore silently returns today's file.
+    // Nothing tested versioning against a non-Drive backend, which is why it
+    // shipped. The editor must not be offered where it cannot work.
+    for (const kind of ["s3", "local_folder"]) {
+      const wrapper = await openVersioningOn(kind);
+      // No control that could switch on a promise the destination cannot keep.
+      expect(wrapper.find('[data-testid="versioning-enabled"]').exists()).toBe(false);
+      expect(wrapper.find('[data-testid="versioning-cap"]').exists()).toBe(false);
+      expect(wrapper.find('[data-testid="versioning-save"]').exists()).toBe(false);
+      // ...and the panel says so plainly, instead of the promise-shaped intro.
+      expect(wrapper.find('[data-testid="versioning-unsupported"]').exists()).toBe(true);
+      expect(wrapper.text()).not.toContain(i18n.global.t("settings.sources.versioning.intro"));
+    }
+
+    // Google Drive really does keep a superseded object (its create mints a new
+    // file id and the old one lives on in Drive's trash), so the editor stays.
+    const drive = await openVersioningOn("google_drive");
+    expect(drive.find('[data-testid="versioning-enabled"]').exists()).toBe(true);
+    expect(drive.find('[data-testid="versioning-save"]').exists()).toBe(true);
+    expect(drive.find('[data-testid="versioning-unsupported"]').exists()).toBe(false);
+  });
+
+  it("the unsupported-destination copy resolves to real strings, not the key names", () => {
+    // `en-US.json` has no key-parity lint, and a missing key makes `t()` return
+    // the key itself - so a `toContain(t("..."))` assertion would pass even with
+    // the copy absent. Pin that the keys actually exist.
+    for (const key of [
+      "settings.sources.versioning.unsupported",
+      "settings.sources.versioning.staleEnabled",
+      "settings.sources.versioning.disableButton",
+      "restore.asOf.unsupported",
+    ]) {
+      expect(i18n.global.te(key)).toBe(true);
+    }
+    // And that the offer-removal copy actually says versioning is unavailable
+    // rather than restating the promise.
+    expect(i18n.global.t("settings.sources.versioning.unsupported")).toContain("not available");
+  });
+
+  it("lets a source clear a STALE versioning flag on such a destination (issue #220)", async () => {
+    // A source enabled before this gate existed (or by an older build, or by any
+    // other caller) keeps a flag the destination cannot honour. Enabling is
+    // refused, but DISABLING must stay open - otherwise the source is stuck
+    // advertising a point-in-time capability forever. This is the whole remedy
+    // path, so assert it really sends `enabled: false`: the loaded ref is `true`.
+    let saved: unknown = null;
+    const wrapper = await openVersioningOn(
+      "s3",
+      { enabled: true, countCap: 7, maxBytes: 42 },
+      (args) => {
+        saved = args;
+      }
+    );
+    // The stale flag is called out rather than left to look like it is working.
+    expect(wrapper.find('[data-testid="versioning-stale"]').exists()).toBe(true);
+    await wrapper.get('[data-testid="versioning-disable"]').trigger("click");
+    await flushPromises();
+    expect(saved).toMatchObject({
+      sourceId: "src-1",
+      // The size guard and cap are PRESERVED; only `enabled` flips.
+      config: { enabled: false, countCap: 7, maxBytes: 42 },
+    });
+
+    // A source that never had it on gets no stale warning and no remedy button -
+    // there would be nothing to remedy.
+    const clean = await openVersioningOn("s3");
+    expect(clean.find('[data-testid="versioning-stale"]').exists()).toBe(false);
+    expect(clean.find('[data-testid="versioning-disable"]').exists()).toBe(false);
+  });
+
+  it("keeps offering versioning when the backend descriptors cannot be fetched", async () => {
+    // The #219 house rule: an unknown / unloaded descriptor resolves PERMISSIVE so
+    // a transient fetch failure never hides a control a Drive source needs. Safe
+    // because `set_source_versioning` enforces the same gate server-side - the
+    // worst a permissive default can do is render a Save that fails loudly.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources") return Promise.resolve([makeSource({ accountId: "acc-1" })]);
+      if (cmd === "list_accounts")
+        return Promise.resolve([
+          {
+            id: "acc-1",
+            email: "dest",
+            displayName: null,
+            state: "ok",
+            encryptionEnabled: false,
+            createdAt: 0,
+            lastSyncedAt: null,
+            backendKind: "s3",
+          },
+        ]);
+      if (cmd === "list_backends") return Promise.reject(new Error("transient ipc error"));
+      if (cmd === "get_source_versioning")
+        return Promise.resolve({ enabled: false, countCap: 10, maxBytes: 0 });
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+    await wrapper.get('[data-testid="versioning-button"]').trigger("click");
+    await flushPromises();
+    expect(wrapper.find('[data-testid="versioning-enabled"]').exists()).toBe(true);
+  });
+
   it("shows an error instead of stale inputs when versioning config load fails (issue #36)", async () => {
     // Source A's config loads; source B's REJECTS. Opening B must NOT render the
     // editor over A's stale enabled/cap (Save would persist A's values to B) - it

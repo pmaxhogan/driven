@@ -2,6 +2,9 @@
 import { computed, onMounted, onUnmounted, ref, useTemplateRef, watch } from "vue";
 import { useI18n } from "vue-i18n";
 
+import * as ipc from "../ipc/commands";
+import type { BackendDto } from "../ipc/types";
+
 import { useVirtualList } from "../composables/useVirtualList";
 import { useAccountsStore } from "../stores/accounts";
 import { useRestoreStore } from "../stores/restore";
@@ -21,6 +24,21 @@ const restore = useRestoreStore();
 // point-in-time note can state that destination's real retention behaviour
 // instead of Drive's (see `retentionNote`).
 const accounts = useAccountsStore();
+// Issue #220: the destination CAPABILITY descriptors, joined to the browsed
+// source by its account's `backendKind`. Fetched rather than hardcoded (the #219
+// pattern) because which destinations can keep previous versions is a property of
+// their create path, owned by `driven_backend::descriptors()`.
+const backends = ref<BackendDto[]>([]);
+async function loadBackends(): Promise<void> {
+  try {
+    const list = await ipc.listBackends();
+    backends.value = Array.isArray(list) ? list : [];
+  } catch {
+    // Never block browsing on a descriptor fetch; see `canRestoreAsOf` for why
+    // the resulting permissive default is safe.
+    backends.value = [];
+  }
+}
 
 // Design-system class strings (DRIVEN UI). Defined once so every control in this
 // view stays visually consistent with the rest of the app: teal accent for
@@ -59,14 +77,49 @@ function onClearAsOf(): void {
   restore.setAsOf(null);
 }
 
+/** The BROWSED source's destination kind, or `undefined` while the sources /
+ * accounts lists are still loading. */
+const browsedBackendKind = computed<string | undefined>(() => {
+  const source = restore.sources.find((s) => s.id === restore.sourceId);
+  return accounts.accounts.find((a) => a.id === source?.accountId)?.backendKind;
+});
+
 /** The retention caveat for the BROWSED source's destination. Unknown / not-yet
  * loaded resolves to the neutral `default` rather than asserting Drive's
  * behaviour, which is what the old single hard-coded hint did. */
 const retentionNote = computed<string>(() => {
-  const source = restore.sources.find((s) => s.id === restore.sourceId);
-  const kind = accounts.accounts.find((a) => a.id === source?.accountId)?.backendKind;
+  const kind = browsedBackendKind.value;
   const key = `versionRetention.${kind}`;
   return kind !== undefined && te(key) ? t(key) : t("versionRetention.default");
+});
+
+/**
+ * Issue #220: whether the BROWSED source's destination can really serve an older
+ * version, so the point-in-time picker is honest to offer.
+ *
+ * Where the destination's create key is derived from the file name (S3, local
+ * folder) a changed file's re-upload overwrote the previous bytes, so a restore
+ * "as of" an earlier date would return the CURRENT content while reporting that it
+ * restored an older version. The backend refuses such a restore fail-closed; this
+ * stops the app OFFERING it in the first place.
+ *
+ * Unknown / not-yet-loaded resolves permissive (the #219 house rule) - the control
+ * must not blink away on every mount, and the backend is the real gate.
+ */
+const canRestoreAsOf = computed<boolean>(() => {
+  const kind = browsedBackendKind.value;
+  if (kind === undefined) return true;
+  return backends.value.find((b) => b.id === kind)?.supportsVersionHistory ?? true;
+});
+
+// A previously-selected source may have left an "as of" instant applied. Browsing
+// to a source whose destination cannot honour it must CLEAR it, not just hide the
+// control: a hidden-but-active point-in-time filter is the same silent failure
+// this gate exists to remove.
+watch(canRestoreAsOf, (can) => {
+  if (!can && restore.asOf !== null) {
+    onClearAsOf();
+  }
 });
 
 // Locale-aware byte formatting (DESIGN s8.7: never a hand-rolled formatter).
@@ -111,7 +164,7 @@ onMounted(async () => {
   // The accounts list is only needed to name each source's destination backend
   // for the retention note; a failure there must never block browsing, so it is
   // fired alongside (the store swallows its own error into `accounts.error`).
-  await Promise.all([restore.loadSources(), accounts.refresh()]);
+  await Promise.all([restore.loadSources(), accounts.refresh(), loadBackends()]);
   // A scoped route (/restore/:sourceId) browses that source directly.
   if (props.sourceId) {
     await restore.selectSource(props.sourceId);
@@ -373,8 +426,13 @@ async function onClearSearch(): Promise<void> {
       </button>
 
       <!-- Issue #36: point-in-time "as of" picker. When set, the restore fetches
-           each file as it was backed up at that instant. -->
-      <label class="flex items-center gap-1.5 text-sm">
+           each file as it was backed up at that instant.
+
+           Issue #220: only offered where the destination can really keep previous
+           versions. On a destination whose create key is derived from the file
+           name the older bytes were overwritten, so this control could only ever
+           hand back the current content while claiming otherwise. -->
+      <label v-if="canRestoreAsOf" class="flex items-center gap-1.5 text-sm">
         <span class="text-zinc-600 dark:text-zinc-400">{{ t("restore.asOf.label") }}</span>
         <input
           v-model="asOfInput"
@@ -395,6 +453,17 @@ async function onClearSearch(): Promise<void> {
           {{ t("restore.asOf.clear") }}
         </button>
       </label>
+      <!-- In place of the picker: say plainly that point-in-time restore is not
+           available here, and let `retentionNote` state this destination's real
+           behaviour (for S3 it also carries the remedy - the provider's own bucket
+           versioning). Only shown once a source is actually being browsed. -->
+      <span
+        v-else-if="restore.sourceId"
+        class="text-sm text-zinc-500 dark:text-zinc-400"
+        data-testid="restore-as-of-unsupported"
+      >
+        {{ t("restore.asOf.unsupported") }} {{ retentionNote }}
+      </span>
 
       <span class="flex-1" />
 
