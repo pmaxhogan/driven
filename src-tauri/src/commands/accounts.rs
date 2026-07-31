@@ -1024,6 +1024,15 @@ pub async fn remove_account(
         tracing::info!(target: TARGET, account_id = %account_id, "shutting down orchestrator before account removal");
         handle.shutdown().await;
     }
+    // `handle.shutdown()` drains the state-transition bridge without ever
+    // emitting a final `Idle`, so `menubar::note_state`'s own cleanup path
+    // never fires here - forget the account's tray-menu METRICS entry
+    // directly, or a paused account's reason (and, more generally, any
+    // stale progress counters) can survive removal and keep influencing the
+    // tray for the rest of the process's life. Unconditional (not gated on
+    // `handle` above) and idempotent, since an account that never spawned
+    // an orchestrator (e.g. `needs_reauth`) has no entry to forget either.
+    crate::menubar::forget(account_id);
 
     // Delete the account row (cascades sources / file_state / pending_ops).
     state

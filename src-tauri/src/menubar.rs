@@ -764,6 +764,27 @@ pub fn note_state(account_id: AccountId, state: &OrchestratorState) {
     }
 }
 
+/// Drops an account's [`METRICS`] entry entirely, regardless of its current
+/// `active`/`pause_reason` state (fix round 1, task 9 review). Called from
+/// `commands::accounts::remove_account` once the account's orchestrator has
+/// been shut down: `AccountHandle::shutdown()` drains the state-transition
+/// bridge without emitting a final `Idle`, so `note_state`'s `Remove` arm
+/// never fires on removal, and - since task 9's `Deactivate(Some(reason))`
+/// arm now CREATES an entry for an account paused before it ever synced -
+/// a removed account can otherwise strand a `pause_reason` in the map for
+/// the rest of the process's life, showing a false "Paused - <reason>" menu
+/// row for an account that no longer exists. Idempotent: forgetting an
+/// account with no entry (never spawned, e.g. `needs_reauth`) is a no-op.
+///
+/// This joins [`record_progress`] / [`note_state`] as a writer of
+/// [`METRICS`]; the single-writer constraint elsewhere in this module
+/// (DESIGN s2 "Testing") governs the tray-menu status-row `set_text` calls
+/// in [`tick`] only, not this map.
+pub fn forget(account_id: AccountId) {
+    let mut metrics = METRICS.lock().unwrap_or_else(|e| e.into_inner());
+    metrics.remove(&account_id);
+}
+
 /// Starts the 1 Hz tray-title engine. No-op off macOS: `set_title` is a
 /// no-op on Windows and Linux tray implementations, so the whole task
 /// (and its per-minute idle queries) would be wasted work there.
@@ -1528,6 +1549,56 @@ mod tests {
         assert!(entry.active);
         assert_eq!(entry.pause_reason, None);
         note_state(id, &OrchestratorState::Idle { last_run_at: None });
+    }
+
+    // Fix round 1 (review): account removal must forget the account's
+    // METRICS entry entirely - a paused account that gets removed must not
+    // strand a "Paused - <reason>" status row for the rest of the process's
+    // life. Seeds an entry via `note_state(Paused)` (the exact widened path
+    // called out by review: `Deactivate(Some(reason))` now CREATES an entry
+    // even for an account that never synced), calls `forget`, and asserts
+    // the map no longer influences `paused_reason` (so `status_rows_source`
+    // sees `Idle`, not `Paused`) or `aggregate`.
+    #[test]
+    fn forget_removes_the_entry_so_it_no_longer_influences_status_or_aggregate() {
+        use driven_core::types::{AccountId, PauseReason};
+        let id = AccountId::new_v4();
+        note_state(
+            id,
+            &OrchestratorState::Paused {
+                reason: PauseReason::Battery,
+            },
+        );
+        {
+            let m = METRICS.lock().unwrap_or_else(|e| e.into_inner());
+            assert!(m.contains_key(&id), "sanity: the paused entry exists");
+        }
+
+        forget(id);
+
+        let m = METRICS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!m.contains_key(&id), "forget must drop the entry entirely");
+        assert_eq!(
+            paused_reason(m.values().copied()),
+            None,
+            "a forgotten account must not surface in the paused-reason pick"
+        );
+        assert!(
+            !aggregate(m.values().copied()).active,
+            "a forgotten account must not surface in the aggregate either"
+        );
+    }
+
+    // Fix round 1: `forget` on an account with no entry at all (e.g. one
+    // that never spawned an orchestrator - `needs_reauth`) must be a no-op,
+    // not a panic - `remove_account` calls it unconditionally.
+    #[test]
+    fn forget_is_a_noop_when_no_entry_exists() {
+        use driven_core::types::AccountId;
+        let id = AccountId::new_v4();
+        forget(id); // must not panic
+        let m = METRICS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(!m.contains_key(&id));
     }
 
     // Task 9: `record_progress` implies the account is actively syncing, so
