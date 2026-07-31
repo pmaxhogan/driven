@@ -474,6 +474,80 @@ pub fn aggregate(accounts: impl Iterator<Item = AccountProgress>) -> AccountProg
         })
 }
 
+/// Inserts `,` every three digits of `n`'s decimal representation: "341" ->
+/// "341", "2148" -> "2,148". Used by [`menu_status_lines`] to render the
+/// tray-menu status rows' file counts; kept local rather than pulling in a
+/// number-formatting crate for one call site.
+fn format_with_commas(n: u64) -> String {
+    let digits = n.to_string();
+    let bytes = digits.as_bytes();
+    let mut out = String::with_capacity(bytes.len() + bytes.len() / 3);
+    for (i, b) in bytes.iter().enumerate() {
+        if i > 0 && (bytes.len() - i) % 3 == 0 {
+            out.push(',');
+        }
+        out.push(*b as char);
+    }
+    out
+}
+
+/// Renders the two disabled tray-menu status rows (task 7: SPEC s22, DESIGN
+/// s2) from the same aggregate/rate/ETA inputs the tray title is built from.
+/// `None` unless a sync is active - the rows have nothing to say while idle,
+/// so [`tick`] clears them rather than calling this. Unlike [`format_title`]
+/// this is not gated by [`MenuBarConfig`]'s per-metric toggles: the menu rows
+/// always show everything that has data, independent of what the compact
+/// title string is configured to display.
+///
+/// Line 1: "Backing up - 62%, ~4m left" (the ", ~4m left" clause is omitted
+/// when `eta_secs` is `None`). Line 2: "84 Mbps · 341 of 2,148 files" (the
+/// speed segment is omitted when `rate_bps_bits` is `None`). Both lines pick
+/// between an "everything" and a "missing one field" locale key rather than
+/// interpolating a pre-built clause into a single template, so every word
+/// (including "left"/"of"/"files") stays translatable.
+pub fn menu_status_lines(
+    agg: &AccountProgress,
+    rate_bps_bits: Option<f64>,
+    eta_secs: Option<u64>,
+) -> Option<(String, String)> {
+    if !agg.active {
+        return None;
+    }
+    // Totals can still be unknown this early in a cycle (scan phase); "0%"
+    // is a reasonable placeholder there since, unlike the title bar, this
+    // line always names a percent - there is no "omit the field" option for
+    // the number that anchors the sentence.
+    let percent =
+        format_percent(agg.bytes_done, agg.bytes_total).unwrap_or_else(|| "0%".to_string());
+    let line1 = match eta_secs {
+        Some(secs) => rust_i18n::t!(
+            "tray.menu_status.line1",
+            percent = percent,
+            eta = format_eta(secs)
+        )
+        .into_owned(),
+        None => rust_i18n::t!("tray.menu_status.line1_no_eta", percent = percent).into_owned(),
+    };
+    let done = format_with_commas(agg.files_done);
+    let total = format_with_commas(agg.files_total);
+    let line2 = match rate_bps_bits {
+        Some(rate) => rust_i18n::t!(
+            "tray.menu_status.line2",
+            speed = format_speed_bits(rate),
+            done = done,
+            total = total
+        )
+        .into_owned(),
+        None => rust_i18n::t!(
+            "tray.menu_status.line2_no_speed",
+            done = done,
+            total = total
+        )
+        .into_owned(),
+    };
+    Some((line1, line2))
+}
+
 // -----------------------------------------------------------------------------
 // engine: shared state, recorders, and the 1 Hz title task
 // -----------------------------------------------------------------------------
@@ -595,12 +669,29 @@ pub fn start(app: &AppHandle) {
         // `None` = nothing painted yet, so the first tick always writes
         // (including writing `None` to clear a title left by a previous run).
         let mut painted: Option<Option<String>> = None;
+        // Same "nothing painted yet" convention as `painted`, for the two
+        // tray-menu status rows (task 7).
+        let mut status_painted: Option<Option<(String, String)>> = None;
+        // The `tray::status_menu_generation()` value as of the last tick.
+        // Starts at `0`, which never matches a real (post-first-build)
+        // generation, so the first tick always reconciles against whatever
+        // the tray has actually built.
+        let mut status_gen_seen: u64 = 0;
         // Previous tick's aggregate activity, so the tick can spot the
         // active -> inactive edge and re-query the idle providers.
         let mut was_active = false;
         loop {
             ticker.tick().await;
-            tick(&app, &mut rate, &mut idle, &mut painted, &mut was_active).await;
+            tick(
+                &app,
+                &mut rate,
+                &mut idle,
+                &mut painted,
+                &mut status_painted,
+                &mut status_gen_seen,
+                &mut was_active,
+            )
+            .await;
         }
     });
 }
@@ -836,12 +927,14 @@ fn active_title(
     format_title(cfg, &metrics)
 }
 
-/// Whether the newly rendered title differs from what is on the tray.
+/// Whether a newly rendered value differs from what was last painted.
 /// `last` is `None` before anything has been painted (so the first tick
-/// always paints, including painting `None` to clear a leftover title).
-/// Keeps the OS off the hook for a repaint every second while the title is
-/// unchanged - which, idling, is essentially always.
-fn should_paint(last: &Option<Option<String>>, next: &Option<String>) -> bool {
+/// always paints, including painting `None` to clear a leftover value).
+/// Keeps the OS off the hook for a repaint every second while the value is
+/// unchanged - which, idling, is essentially always. Generic so both the
+/// tray title (`Option<String>`) and the tray-menu status rows
+/// (`Option<(String, String)>`) share the same paint-only-on-change gate.
+fn should_paint<T: PartialEq>(last: &Option<Option<T>>, next: &Option<T>) -> bool {
     match last {
         None => true,
         Some(previous) => previous != next,
@@ -849,12 +942,17 @@ fn should_paint(last: &Option<Option<String>>, next: &Option<String>) -> bool {
 }
 
 /// One engine tick: snapshot the shared state, render a title, and write it
-/// to the tray if it changed.
+/// to the tray if it changed. Also renders the two tray-menu status rows
+/// (task 7) from the same aggregate/rate sample and writes them if they
+/// changed - independently of whether the title changed, since the rows
+/// are not gated by the title's per-metric settings toggles.
 async fn tick(
     app: &AppHandle,
     rate: &mut RateEstimator,
     idle: &mut IdleCache,
     painted: &mut Option<Option<String>>,
+    status_painted: &mut Option<Option<(String, String)>>,
+    status_gen_seen: &mut u64,
     was_active: &mut bool,
 ) {
     // Copy both statics out and drop the guards BEFORE the idle branch's
@@ -872,15 +970,57 @@ async fn tick(
     }
     *was_active = agg.active;
 
-    let title = if agg.active {
+    let (title, status_lines) = if agg.active {
         let rate_bytes = rate.sample(agg.bytes_done, Instant::now());
-        active_title(&cfg, &agg, rate_bytes)
+        let title = active_title(&cfg, &agg, rate_bytes);
+        // The status rows show speed/ETA unconditionally (they are not one
+        // of the title's cfg-gated metrics), so the ETA is recomputed here
+        // rather than reused from `active_title`'s internal (cfg-gated) one.
+        let eta =
+            rate_bytes.and_then(|r| eta_secs(r, agg.bytes_total.saturating_sub(agg.bytes_done)));
+        let rate_bits = rate_bytes.map(|r| r * 8.0);
+        (title, menu_status_lines(&agg, rate_bits, eta))
     } else {
         // Reset the estimator so the next sync cycle starts from a clean
         // sample window instead of inheriting the previous run's EMA.
         *rate = RateEstimator::new();
-        idle.title(app, &cfg).await
+        (idle.title(app, &cfg).await, None)
     };
+
+    let current_status_gen = tray::status_menu_generation();
+    if current_status_gen != *status_gen_seen {
+        // The tray menu was (re)built since the last tick - e.g. a locale
+        // change's `rebuild()` - so `status_painted` describes text on
+        // `MenuItem` handles that no longer exist. Force a repaint against
+        // the fresh (blank) handles rather than trusting the stale cache,
+        // which would otherwise leave the header blank until the derived
+        // lines next happen to differ from what was cached before the
+        // rebuild.
+        *status_painted = None;
+        *status_gen_seen = current_status_gen;
+    }
+
+    if should_paint(status_painted, &status_lines) {
+        if let Some((item1, item2)) = tray::status_menu_items() {
+            // Empty text for the idle/no-lines case: `MenuItem` renders an
+            // empty disabled row rather than nothing. If that reads badly in
+            // the live smoke test, switch both to `set_enabled(false)` +
+            // a single-space (" ") text instead - a judgement call the
+            // brief leaves to that smoke pass, not to a unit test.
+            let (l1, l2) = status_lines.clone().unwrap_or_default();
+            if let Err(err) = item1.set_text(l1) {
+                tracing::debug!(target: TARGET, %err, "set status row 1 text failed");
+            }
+            if let Err(err) = item2.set_text(l2) {
+                tracing::debug!(target: TARGET, %err, "set status row 2 text failed");
+            }
+            *status_painted = Some(status_lines);
+        } else {
+            // Menu not built yet / mid-rebuild. Leave `status_painted`
+            // untouched so the next tick retries against the rebuilt menu.
+            tracing::trace!(target: TARGET, "status menu items absent during tick; skipping");
+        }
+    }
 
     if !should_paint(painted, &title) {
         return;
@@ -1309,11 +1449,52 @@ mod tests {
         let b = Some("63%".to_string());
         // nothing painted yet: always paint, even a `None` title (which
         // clears a title left over from a previous run)
-        assert!(should_paint(&None, &None));
+        assert!(should_paint::<String>(&None, &None));
         assert!(should_paint(&None, &a));
         assert!(!should_paint(&Some(a.clone()), &a));
         assert!(should_paint(&Some(a.clone()), &b));
         assert!(should_paint(&Some(a), &None));
+    }
+
+    // Task 7 brief step 1 (verbatim): the tray-menu status rows render only
+    // while a sync is active, and each line's optional clause (ETA / speed)
+    // disappears cleanly when its input is `None`.
+    #[test]
+    fn menu_status_lines_render_while_active_only() {
+        let idle = AccountProgress::default();
+        assert_eq!(menu_status_lines(&idle, None, None), None);
+        let agg = AccountProgress {
+            bytes_done: 62,
+            bytes_total: 100,
+            files_done: 341,
+            files_total: 2148,
+            active: true,
+        };
+        let (l1, l2) = menu_status_lines(&agg, Some(84_000_000.0), Some(240)).unwrap();
+        assert_eq!(l1, "Backing up - 62%, ~4m left");
+        assert_eq!(l2, "84 Mbps \u{b7} 341 of 2,148 files");
+    }
+
+    #[test]
+    fn menu_status_lines_omit_missing_eta_and_speed() {
+        let agg = AccountProgress {
+            bytes_done: 62,
+            bytes_total: 100,
+            files_done: 341,
+            files_total: 2148,
+            active: true,
+        };
+        let (l1, l2) = menu_status_lines(&agg, None, None).unwrap();
+        assert_eq!(l1, "Backing up - 62%");
+        assert_eq!(l2, "341 of 2,148 files");
+    }
+
+    #[test]
+    fn thousands_separator_inserts_commas() {
+        assert_eq!(format_with_commas(0), "0");
+        assert_eq!(format_with_commas(341), "341");
+        assert_eq!(format_with_commas(2_148), "2,148");
+        assert_eq!(format_with_commas(1_234_567), "1,234,567");
     }
 
     #[test]

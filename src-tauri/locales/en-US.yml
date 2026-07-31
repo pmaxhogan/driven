@@ -27,6 +27,11 @@ tray:
   settings: "Settings"
   restore: "Restore"
   quit: "Quit Driven"
+  menu_status:
+    line1: "Backing up - %{percent}, %{eta} left"
+    line1_no_eta: "Backing up - %{percent}"
+    line2: "%{speed} · %{done} of %{total} files"
+    line2_no_speed: "%{done} of %{total} files"
   tooltip:
     idle: "Driven - idle, last sync OK"
     syncing: "Driven - syncing..."
