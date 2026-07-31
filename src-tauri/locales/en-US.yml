@@ -32,6 +32,8 @@ tray:
     line1_no_eta: "Backing up - %{percent}"
     line2: "%{speed} · %{done} of %{total} files"
     line2_no_speed: "%{done} of %{total} files"
+  menubar:
+    uploaded_today: "%{amount} today"
   tooltip:
     idle: "Driven - idle, last sync OK"
     syncing: "Driven - syncing..."

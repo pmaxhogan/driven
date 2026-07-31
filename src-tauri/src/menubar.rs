@@ -868,7 +868,13 @@ async fn fetch_idle_title(app: &AppHandle, mode: IdleMode) -> Option<String> {
                 .activity_summary(day_start_ms, day_start_ms, day_start_ms, 1)
                 .await
             {
-                Ok(summary) => Some(format!("{} today", format_bytes(summary.bytes_today))),
+                Ok(summary) => Some(
+                    rust_i18n::t!(
+                        "tray.menubar.uploaded_today",
+                        amount = format_bytes(summary.bytes_today)
+                    )
+                    .into_owned(),
+                ),
                 Err(err) => {
                     tracing::debug!(target: TARGET, %err, "idle title: activity_summary failed");
                     None

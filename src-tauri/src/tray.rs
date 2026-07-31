@@ -2042,6 +2042,7 @@ mod tests {
             "tray.menu_status.line1_no_eta",
             "tray.menu_status.line2",
             "tray.menu_status.line2_no_speed",
+            "tray.menubar.uploaded_today",
             "tray.tooltip.idle",
             "tray.tooltip.syncing",
             "tray.tooltip.service_down",
