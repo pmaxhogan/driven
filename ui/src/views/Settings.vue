@@ -18,7 +18,12 @@ import {
   validateCustomCa,
   validateProxy,
 } from "../ipc/commands";
-import type { ApfsHelperStatus, SettingsPatch, VssHelperStatus } from "../ipc/types";
+import type {
+  ApfsHelperStatus,
+  MenuBarSettingsPatch,
+  SettingsPatch,
+  VssHelperStatus,
+} from "../ipc/types";
 
 // Settings view (SPEC s25 /accounts, /sources, /rules, /about; DESIGN s8.2). One
 // view hosts the four routed tabs; the active tab comes from the route (router
@@ -629,6 +634,74 @@ async function setApfsSnapshot(event: Event): Promise<void> {
   }
 }
 
+// Menu bar extra (spec 2026-07-31 s2): each control patches exactly the one
+// changed `macos.menuBar` field - the backend merges field-wise, so sending
+// the whole object would clobber concurrent edits to the others.
+const menuBarIdleOptions = ["none", "lastBackupAge", "uploadedToday"] as const;
+const menuBarIdleLabelKeys: Record<(typeof menuBarIdleOptions)[number], string> = {
+  none: "settings.rules.menuBarIdleNone",
+  lastBackupAge: "settings.rules.menuBarIdleLastBackup",
+  uploadedToday: "settings.rules.menuBarIdleUploadedToday",
+};
+function menuBarIdleLabelKey(idle: (typeof menuBarIdleOptions)[number]): string {
+  return menuBarIdleLabelKeys[idle];
+}
+
+async function patchMenuBar(
+  field: keyof MenuBarSettingsPatch,
+  value: boolean | string
+): Promise<void> {
+  await commitPatch({ macos: { menuBar: { [field]: value } } });
+}
+
+async function setMenuBarSpeed(event: Event): Promise<void> {
+  await patchMenuBar("showUploadSpeed", (event.target as HTMLInputElement).checked);
+}
+
+async function setMenuBarPercent(event: Event): Promise<void> {
+  await patchMenuBar("showPercent", (event.target as HTMLInputElement).checked);
+}
+
+async function setMenuBarFiles(event: Event): Promise<void> {
+  await patchMenuBar("showFiles", (event.target as HTMLInputElement).checked);
+}
+
+async function setMenuBarEta(event: Event): Promise<void> {
+  await patchMenuBar("showEta", (event.target as HTMLInputElement).checked);
+}
+
+async function setMenuBarIdle(event: Event): Promise<void> {
+  await patchMenuBar("idle", (event.target as HTMLSelectElement).value);
+}
+
+// Static preview strip (DESIGN spec 2026-07-31 s2): sample metrics fixed at
+// build time, formatted with the SAME field order + " · " separator as the
+// backend's `format_title` (src-tauri/src/menubar.rs) so the preview never
+// drifts from what actually renders in the real menu bar.
+const SAMPLE_PERCENT = "62%";
+const SAMPLE_SPEED = "84 Mbps";
+const SAMPLE_FILES = "341/2.1k";
+const SAMPLE_ETA = "~4m";
+
+const sampleTitle = computed(() => {
+  const menuBar = settings.settings?.macos?.menuBar;
+  if (!menuBar) return "";
+  const parts: string[] = [];
+  if (menuBar.showPercent) parts.push(SAMPLE_PERCENT);
+  if (menuBar.showUploadSpeed) parts.push(SAMPLE_SPEED);
+  if (menuBar.showFiles) parts.push(SAMPLE_FILES);
+  if (menuBar.showEta) parts.push(SAMPLE_ETA);
+  return parts.join(" \u{b7} ");
+});
+
+const menuBarEnabledCount = computed(() => {
+  const menuBar = settings.settings?.macos?.menuBar;
+  if (!menuBar) return 0;
+  return [menuBar.showUploadSpeed, menuBar.showPercent, menuBar.showFiles, menuBar.showEta].filter(
+    Boolean
+  ).length;
+});
+
 // SPEC s16 (M9b R2-P1-1): toggle anonymous usage telemetry (default ON) via the
 // DEDICATED set_telemetry_enabled command, so the backend flips the in-flight ping
 // cancel flag immediately - a disable click while a ping is building still aborts
@@ -1069,6 +1142,95 @@ const showTelemetryPreview = ref(false);
           >
             {{ t("settings.rules.apfsHelperDeclined") }}
           </p>
+        </section>
+
+        <!-- Menu bar extra (macOS only, spec 2026-07-31 s2). -->
+        <section
+          v-if="settings.settings.macos"
+          class="space-y-2"
+          :class="cardCls"
+          data-testid="menubar-setting"
+        >
+          <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+            {{ t("settings.rules.sections.menuBar") }}
+          </h3>
+          <p class="text-xs text-zinc-500 dark:text-zinc-400">
+            {{ t("settings.rules.menuBarIntro") }}
+          </p>
+
+          <div
+            data-testid="menubar-preview"
+            class="w-fit rounded-full bg-zinc-900 px-3 py-1 text-xs text-white dark:bg-black"
+          >
+            {{ sampleTitle }}
+          </div>
+
+          <div class="space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.menuBarShowLabel")
+            }}</span>
+            <label class="flex items-center gap-2">
+              <input
+                type="checkbox"
+                class="accent-teal-600"
+                data-testid="menubar-speed-toggle"
+                :checked="settings.settings.macos.menuBar?.showUploadSpeed ?? false"
+                @change="setMenuBarSpeed"
+              />
+              {{ t("settings.rules.menuBarSpeed") }}
+            </label>
+            <label class="flex items-center gap-2">
+              <input
+                type="checkbox"
+                class="accent-teal-600"
+                data-testid="menubar-percent-toggle"
+                :checked="settings.settings.macos.menuBar?.showPercent ?? false"
+                @change="setMenuBarPercent"
+              />
+              {{ t("settings.rules.menuBarPercent") }}
+            </label>
+            <label class="flex items-center gap-2">
+              <input
+                type="checkbox"
+                class="accent-teal-600"
+                data-testid="menubar-files-toggle"
+                :checked="settings.settings.macos.menuBar?.showFiles ?? false"
+                @change="setMenuBarFiles"
+              />
+              {{ t("settings.rules.menuBarFiles") }}
+            </label>
+            <label class="flex items-center gap-2">
+              <input
+                type="checkbox"
+                class="accent-teal-600"
+                data-testid="menubar-eta-toggle"
+                :checked="settings.settings.macos.menuBar?.showEta ?? false"
+                @change="setMenuBarEta"
+              />
+              {{ t("settings.rules.menuBarEta") }}
+            </label>
+          </div>
+
+          <p v-if="menuBarEnabledCount >= 3" class="text-xs text-zinc-500 dark:text-zinc-400">
+            {{ t("settings.rules.menuBarWidthHint") }}
+          </p>
+
+          <label class="block space-y-1">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.rules.menuBarIdleLabel")
+            }}</span>
+            <select
+              data-testid="menubar-idle-select"
+              class="w-full"
+              :class="inputCls"
+              :value="settings.settings.macos.menuBar?.idle ?? 'none'"
+              @change="setMenuBarIdle"
+            >
+              <option v-for="idle in menuBarIdleOptions" :key="idle" :value="idle">
+                {{ t(menuBarIdleLabelKey(idle)) }}
+              </option>
+            </select>
+          </label>
         </section>
 
         <!-- Advanced: small-file bundling (issue #35) -->

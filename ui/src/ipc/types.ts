@@ -404,8 +404,20 @@ export interface VssHelperStatus {
   lockedFileBackupDegraded: boolean;
 }
 
+/** Menu bar extra configuration (spec 2026-07-31 s2). */
+export interface MenuBarSettings {
+  showUploadSpeed: boolean;
+  showPercent: boolean;
+  showFiles: boolean;
+  showEta: boolean;
+  /** "none" | "lastBackupAge" | "uploadedToday" */
+  idle: string;
+}
+
 export interface MacosSettings {
   apfsSnapshot: boolean;
+  /** Menu bar extra configuration (spec 2026-07-31 s2). */
+  menuBar: MenuBarSettings;
 }
 
 /** Status of least-privilege locked-file backup on macOS (DESIGN s5.3.2). */
@@ -548,8 +560,17 @@ export interface WindowsSettingsPatch {
   vssHelper?: boolean;
 }
 
+export interface MenuBarSettingsPatch {
+  showUploadSpeed?: boolean;
+  showPercent?: boolean;
+  showFiles?: boolean;
+  showEta?: boolean;
+  idle?: string;
+}
+
 export interface MacosSettingsPatch {
   apfsSnapshot?: boolean;
+  menuBar?: MenuBarSettingsPatch;
 }
 
 export interface SettingsPatch {
