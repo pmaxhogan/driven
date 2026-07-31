@@ -84,6 +84,7 @@
 //! routing are all real.
 
 use std::collections::HashMap;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::{Mutex, OnceLock};
 use std::time::Duration;
 
@@ -97,7 +98,9 @@ use tauri_plugin_notification::NotificationExt;
 const TARGET: &str = "driven::app::tray";
 
 /// Canonical tray id (matches the committed `apply_state` lookup + SPEC s12).
-const TRAY_ID: &str = "driven-main";
+// `pub(crate)` so the menu bar engine (`menubar.rs`) resolves the SAME tray to
+// write its title onto - the title must land on this icon, not a second one.
+pub(crate) const TRAY_ID: &str = "driven-main";
 
 /// Id Tauri assigns to the tray created from `tauri.conf.json`'s
 /// `app.trayIcon` block (it defaults to the main-window label `"main"`). We
@@ -107,6 +110,10 @@ const CONFIG_TRAY_ID: &str = "main";
 
 /// Menu item ids (SPEC s12 `event.id()` dispatch keys).
 mod menu_id {
+    /// Disabled status-header rows (task 7) - never dispatched to
+    /// `on_menu_event` since disabled `MenuItem`s do not fire click events.
+    pub const STATUS_1: &str = "status_1";
+    pub const STATUS_2: &str = "status_2";
     pub const SYNC_NOW: &str = "sync_now";
     pub const PAUSE_30M: &str = "pause_30m";
     pub const PAUSE_INDEFINITE: &str = "pause_indefinite";
@@ -1016,18 +1023,85 @@ pub fn rebuild(app: &AppHandle) -> tauri::Result<()> {
     if app.remove_tray_by_id(TRAY_ID).is_none() {
         tracing::debug!(target: TARGET, "no live tray {TRAY_ID} to remove before rebuild; building fresh");
     }
+    // Clear the stashed status-row handles BEFORE `build` reconstructs the
+    // menu: a tick that races this rebuild must see `None` (skip, retry next
+    // tick) rather than `set_text`-ing a handle from the menu just removed
+    // above. `build_menu` re-populates the static once the new items exist.
+    *STATUS_ITEMS.lock().unwrap_or_else(|e| e.into_inner()) = None;
     build(app)
+}
+
+/// Handles for the two disabled tray-menu status rows (task 7), stashed here
+/// so the menu bar engine's 1 Hz tick ([`crate::menubar`]) can `set_text`
+/// them without owning (or reaching back into) the live `Menu`. [`rebuild`]
+/// clears this BEFORE tearing down the old menu, and [`build_menu`]
+/// re-populates it once the new menu's items exist - so a tick that races a
+/// rebuild either sees the old (still-valid) handles or `None`, never a
+/// stale handle pointing at an already-removed menu.
+static STATUS_ITEMS: Mutex<Option<(MenuItem<tauri::Wry>, MenuItem<tauri::Wry>)>> = Mutex::new(None);
+
+/// The live status-row `MenuItem` handles, if the tray menu has been built
+/// and no rebuild is currently in flight. `None` is a normal, expected state
+/// (very early startup, or the brief window during a locale-change rebuild)
+/// - callers must treat it as "nothing to paint this tick", not an error.
+pub(crate) fn status_menu_items() -> Option<(MenuItem<tauri::Wry>, MenuItem<tauri::Wry>)> {
+    STATUS_ITEMS
+        .lock()
+        .unwrap_or_else(|e| e.into_inner())
+        .clone()
+}
+
+/// Bumped every time [`build_menu`] (re)creates the status-row handles. A
+/// rebuild (locale change) replaces both `MenuItem`s with fresh, blank ones -
+/// the menu bar engine's own "did the derived text change" cache
+/// ([`crate::menubar`]'s `status_painted`) has no way to know that, and would
+/// otherwise leave the header blank for however long it takes the aggregate
+/// to next produce different text. The engine compares this against its last
+/// seen value each tick and forces a repaint on a mismatch.
+static STATUS_MENU_GEN: AtomicU64 = AtomicU64::new(0);
+
+/// Current [`STATUS_MENU_GEN`] value.
+pub(crate) fn status_menu_generation() -> u64 {
+    STATUS_MENU_GEN.load(Ordering::Relaxed)
 }
 
 /// Build the DESIGN s8.1 flat tray menu (every action is a menu item so Linux
 /// users are never stuck on a non-firing left-click). `MenuBuilder` cleanly
 /// mixes id'd items with separators without slice-coercion ambiguity.
+///
+/// The two status rows (task 7) are prepended, disabled and empty at build
+/// time - the menu bar engine fills them in once a sync is active - followed
+/// by a separator so they read as an info header rather than blending into
+/// the action list below. Gated to macOS: [`crate::menubar::start`] bails
+/// immediately on Windows/Linux (module doc above: those platforms keep the
+/// colour-bearing live tray with no title/status engine behind it), so
+/// without this gate the rows would ship as two permanently-empty disabled
+/// items plus an orphan separator on the platforms nothing ever paints.
 fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    // Every build (fresh boot or `rebuild`) hands out brand-new `MenuItem`
+    // handles, so bump the generation unconditionally - even on a platform
+    // with no status rows there is no harm, and it keeps the counter's
+    // meaning simple ("a build happened") rather than conditional.
+    STATUS_MENU_GEN.fetch_add(1, Ordering::Relaxed);
+
     let item = |id: &str, label_key: &str| -> tauri::Result<MenuItem<tauri::Wry>> {
         MenuItem::with_id(app, id, rust_i18n::t!(label_key), true, None::<&str>)
     };
 
-    MenuBuilder::new(app)
+    let mut builder = MenuBuilder::new(app);
+    if cfg!(target_os = "macos") {
+        let status_1 = MenuItem::with_id(app, menu_id::STATUS_1, "", false, None::<&str>)?;
+        let status_2 = MenuItem::with_id(app, menu_id::STATUS_2, "", false, None::<&str>)?;
+        *STATUS_ITEMS.lock().unwrap_or_else(|e| e.into_inner()) =
+            Some((status_1.clone(), status_2.clone()));
+        builder = builder.item(&status_1).item(&status_2).separator();
+    } else {
+        // No engine will ever fill these in on this platform - make sure a
+        // stale handle from a previous (e.g. test-only) build can't linger.
+        *STATUS_ITEMS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+    }
+
+    builder
         .item(&item(menu_id::SYNC_NOW, "tray.sync_now")?)
         .item(&item(menu_id::PAUSE_30M, "tray.pause_30m")?)
         .item(&item(menu_id::PAUSE_INDEFINITE, "tray.pause_indefinite")?)
@@ -1964,6 +2038,20 @@ mod tests {
             "tray.activity",
             "tray.restore",
             "tray.quit",
+            "tray.menu_status.line1",
+            "tray.menu_status.line1_no_eta",
+            "tray.menu_status.line2",
+            "tray.menu_status.line2_no_speed",
+            "tray.menu_status.paused_manual",
+            "tray.menu_status.paused_battery",
+            "tray.menu_status.paused_metered",
+            "tray.menu_status.paused_schedule",
+            "tray.menu_status.paused_offline",
+            "tray.menu_status.paused_no_internet",
+            "tray.menu_status.paused_captive_portal",
+            "tray.menu_status.paused_dns_failed",
+            "tray.menu_status.paused_service_down",
+            "tray.menubar.uploaded_today",
             "tray.tooltip.idle",
             "tray.tooltip.syncing",
             "tray.tooltip.service_down",

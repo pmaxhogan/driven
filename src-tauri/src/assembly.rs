@@ -1142,6 +1142,11 @@ fn spawn_event_bridge(
                 BridgeAction::SyncStatus { state } => {
                     // Reflect the new state on the tray icon (SPEC s12).
                     tray::apply_state(&app, account_id, state.clone());
+                    // spec 2026-07-31 s2: tell the macOS menu bar engine whether
+                    // this account still counts towards the live tray title.
+                    // Takes a reference, so it runs before `state` moves into
+                    // the payload below.
+                    crate::menubar::note_state(account_id, &state);
                     // Push a global-status refresh to the webview (SPEC s11.7).
                     // M5 carries a single-account snapshot in the payload; M6
                     // aggregates across accounts into the full DTO.
@@ -1226,6 +1231,11 @@ fn spawn_event_bridge(
                     // indeterminate sweep for the whole upload. The account id
                     // comes from this bridge (the core event carries only the
                     // source) so the webview can attribute the tick.
+                    //
+                    // spec 2026-07-31 s2: the same tick feeds the macOS menu bar
+                    // title engine. It takes a reference, so it must run BEFORE
+                    // `progress` moves into the payload below.
+                    crate::menubar::record_progress(account_id, &progress);
                     let payload = SourceProgressEvent {
                         account_id: account_id.to_string(),
                         source_id: source_id.to_string(),

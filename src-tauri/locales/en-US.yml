@@ -27,6 +27,22 @@ tray:
   settings: "Settings"
   restore: "Restore"
   quit: "Quit Driven"
+  menu_status:
+    line1: "Backing up - %{percent}, %{eta} left"
+    line1_no_eta: "Backing up - %{percent}"
+    line2: "%{speed} · %{done} of %{total} files"
+    line2_no_speed: "%{done} of %{total} files"
+    paused_manual: "Paused"
+    paused_battery: "Paused - on battery power"
+    paused_metered: "Paused - on metered network"
+    paused_schedule: "Paused - outside the scheduled window"
+    paused_offline: "Paused - no Internet"
+    paused_no_internet: "Paused - no Internet"
+    paused_captive_portal: "Paused - captive portal"
+    paused_dns_failed: "Paused - DNS is not resolving"
+    paused_service_down: "Paused - Google Drive is unavailable"
+  menubar:
+    uploaded_today: "%{amount}"
   tooltip:
     idle: "Driven - idle, last sync OK"
     syncing: "Driven - syncing..."

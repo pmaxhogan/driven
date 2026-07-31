@@ -88,6 +88,12 @@ async-trait.workspace = true
 # version string is used - never a hostname/path/PII. default-features off drops
 # the optional `log` dependency (we do not need its internal logging).
 os_info = { version = "3", default-features = false }
+# spec 2026-07-31 s2: the menu bar's "uploaded today" idle title needs the start
+# of the LOCAL day, which needs the host's timezone + DST rules - `std::time` has
+# no notion of either. `clock` pulls in the local-offset lookup (`Local::now`);
+# default-features stays off so the serde/wasm/oldtime extras are not compiled in.
+# Already in the lock file as a transitive dep, so this adds no new build.
+chrono = { version = "0.4", default-features = false, features = ["std", "clock"] }
 
 driven-core = { path = "../crates/driven-core" }
 driven-drive = { path = "../crates/driven-drive" }

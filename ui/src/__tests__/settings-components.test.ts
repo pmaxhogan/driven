@@ -4,7 +4,7 @@ import { createPinia, setActivePinia } from "pinia";
 import { mount, flushPromises } from "@vue/test-utils";
 
 import { i18n } from "../i18n";
-import type { ScheduleSettings, SettingsDto, SourceDto } from "../ipc/types";
+import type { MenuBarSettings, ScheduleSettings, SettingsDto, SourceDto } from "../ipc/types";
 
 // Component tests for the M6 settings UI: the SourceTable row actions, the
 // AddSourceWizard multi-step flow, and the Rules-tab round-trip. They drive the
@@ -2380,10 +2380,25 @@ describe("Settings Rules tab", () => {
     };
   }
 
+  // Menu bar extra config (spec 2026-07-31 s2) - `MacosSettings.menuBar` is
+  // required now, so every `macos: {...}` fixture below needs one.
+  function menuBarSettings(over: Partial<MenuBarSettings> = {}): MenuBarSettings {
+    return {
+      showUploadSpeed: false,
+      showPercent: false,
+      showFiles: false,
+      showEta: false,
+      idle: "none",
+      ...over,
+    };
+  }
+
   it("DESIGN s5.3.2: renders the APFS snapshot toggle on macOS and toggling it patches macos.apfsSnapshot", async () => {
     invokeMock.mockImplementation((cmd: string, args: unknown) => {
       if (cmd === "get_settings")
-        return Promise.resolve(makeSettings({ macos: { apfsSnapshot: false } }));
+        return Promise.resolve(
+          makeSettings({ macos: { apfsSnapshot: false, menuBar: menuBarSettings() } })
+        );
       if (cmd === "get_vss_helper_status") return Promise.resolve(undefined);
       if (cmd === "get_apfs_helper_status") return Promise.resolve(apfsStatus());
       if (cmd === "update_settings") {
@@ -2440,7 +2455,9 @@ describe("Settings Rules tab", () => {
       let statusCall = 0;
       invokeMock.mockImplementation((cmd: string, args: unknown) => {
         if (cmd === "get_settings")
-          return Promise.resolve(makeSettings({ macos: { apfsSnapshot: false } }));
+          return Promise.resolve(
+            makeSettings({ macos: { apfsSnapshot: false, menuBar: menuBarSettings() } })
+          );
         if (cmd === "get_apfs_helper_status") {
           statusCall += 1;
           // On tab load: idle. After enabling: pending (the admin prompt is up).
@@ -2506,7 +2523,9 @@ describe("Settings Rules tab", () => {
     // with no hints rather than surface an error.
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "get_settings")
-        return Promise.resolve(makeSettings({ macos: { apfsSnapshot: true } }));
+        return Promise.resolve(
+          makeSettings({ macos: { apfsSnapshot: true, menuBar: menuBarSettings() } })
+        );
       if (cmd === "get_apfs_helper_status") return Promise.reject(new Error("status unavailable"));
       return Promise.resolve(undefined);
     });
@@ -2528,7 +2547,9 @@ describe("Settings Rules tab", () => {
     let statusCalls = 0;
     invokeMock.mockImplementation((cmd: string, args: unknown) => {
       if (cmd === "get_settings")
-        return Promise.resolve(makeSettings({ macos: { apfsSnapshot: false } }));
+        return Promise.resolve(
+          makeSettings({ macos: { apfsSnapshot: false, menuBar: menuBarSettings() } })
+        );
       if (cmd === "get_apfs_helper_status") {
         statusCalls += 1;
         // First call (on tab activation) resolves; the post-toggle re-fetch rejects.
@@ -2559,6 +2580,200 @@ describe("Settings Rules tab", () => {
     // Status went null on the rejection, so neither hint is rendered.
     expect(wrapper.find('[data-testid="apfs-helper-pending"]').exists()).toBe(false);
     expect(wrapper.find('[data-testid="apfs-helper-declined"]').exists()).toBe(false);
+  });
+
+  // --- macOS menu bar extra (spec 2026-07-31 s2) ---
+
+  it("menu bar card toggles a metric via a macos.menuBar patch", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(
+          makeSettings({
+            macos: {
+              apfsSnapshot: false,
+              menuBar: menuBarSettings({
+                showUploadSpeed: true,
+                showPercent: true,
+                showFiles: false,
+                showEta: false,
+                idle: "none",
+              }),
+            },
+          })
+        );
+      if (cmd === "get_apfs_helper_status") return Promise.resolve(apfsStatus());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="menubar-setting"]').exists()).toBe(true);
+    const filesToggle = wrapper.get('[data-testid="menubar-files-toggle"]');
+    expect((filesToggle.element as HTMLInputElement).checked).toBe(false);
+    await filesToggle.setValue(true);
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { macos: { menuBar: { showFiles: true } } },
+    });
+
+    // The other three toggles each patch their own single field the same way.
+    // NOTE: the `update_settings` mock above echoes back ONLY the patched keys
+    // (it replaces `macos` wholesale rather than merging), so after the files
+    // toggle every menuBar field but `showFiles` reads back as unset/false -
+    // toggle the rest ON (true) rather than off, or vue-test-utils' setChecked
+    // silently no-ops when the checkbox is already in the target state.
+    await wrapper.get('[data-testid="menubar-speed-toggle"]').setValue(true);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { macos: { menuBar: { showUploadSpeed: true } } },
+    });
+
+    await wrapper.get('[data-testid="menubar-percent-toggle"]').setValue(true);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { macos: { menuBar: { showPercent: true } } },
+    });
+
+    await wrapper.get('[data-testid="menubar-eta-toggle"]').setValue(true);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { macos: { menuBar: { showEta: true } } },
+    });
+  });
+
+  it("menu bar idle select patches macos.menuBar.idle", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(
+          makeSettings({ macos: { apfsSnapshot: false, menuBar: menuBarSettings() } })
+        );
+      if (cmd === "get_apfs_helper_status") return Promise.resolve(apfsStatus());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const idleSelect = wrapper.get('[data-testid="menubar-idle-select"]');
+    await idleSelect.setValue("uploadedToday");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { macos: { menuBar: { idle: "uploadedToday" } } },
+    });
+  });
+
+  it("menu bar shows the width hint once 3 or more metrics are enabled", async () => {
+    // Unlike the naive `makeSettings(patch)` echo used by the other tests here
+    // (which replaces `macos` wholesale, dropping the untouched menuBar fields),
+    // this test needs the enabled-count to accumulate across a real toggle, so
+    // it merges the patch into the current menuBar - matching what the real
+    // backend's field-wise merge (Task 2) actually returns.
+    let currentMenuBar = menuBarSettings({ showUploadSpeed: true, showPercent: true });
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(
+          makeSettings({ macos: { apfsSnapshot: false, menuBar: currentMenuBar } })
+        );
+      if (cmd === "get_apfs_helper_status") return Promise.resolve(apfsStatus());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: { macos?: { menuBar?: Partial<MenuBarSettings> } } }).patch;
+        if (patch.macos?.menuBar) {
+          currentMenuBar = { ...currentMenuBar, ...patch.macos.menuBar };
+        }
+        return Promise.resolve(
+          makeSettings({ macos: { apfsSnapshot: false, menuBar: currentMenuBar } })
+        );
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    // Two enabled metrics: no width hint yet.
+    expect(wrapper.find('[data-testid="menubar-setting"]').text()).not.toContain(
+      i18n.global.t("settings.rules.menuBarWidthHint")
+    );
+
+    // Enabling a third metric (files) crosses the threshold.
+    const filesToggle = wrapper.get('[data-testid="menubar-files-toggle"]');
+    await filesToggle.setValue(true);
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="menubar-setting"]').text()).toContain(
+      i18n.global.t("settings.rules.menuBarWidthHint")
+    );
+  });
+
+  it("menu bar preview reflects enabled metrics", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(
+          makeSettings({
+            macos: {
+              apfsSnapshot: false,
+              menuBar: menuBarSettings({ showUploadSpeed: true, showPercent: true }),
+            },
+          })
+        );
+      if (cmd === "get_apfs_helper_status") return Promise.resolve(apfsStatus());
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const preview = wrapper.get('[data-testid="menubar-preview"]');
+    expect(preview.text()).toContain("62%");
+    expect(preview.text()).toContain("84 Mbps");
+    wrapper.unmount();
+
+    // Turning percent off in the seeded settings drops "62%" from the preview.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(
+          makeSettings({
+            macos: {
+              apfsSnapshot: false,
+              menuBar: menuBarSettings({ showUploadSpeed: true, showPercent: false }),
+            },
+          })
+        );
+      if (cmd === "get_apfs_helper_status") return Promise.resolve(apfsStatus());
+      return Promise.resolve(undefined);
+    });
+    // Fresh Pinia: the settings store otherwise still holds the first mount's
+    // snapshot, and the Rules watcher only refreshes when settings is null - the
+    // second mount would silently reuse the first mount's data.
+    setActivePinia(createPinia());
+    const wrapper2 = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const preview2 = wrapper2.get('[data-testid="menubar-preview"]');
+    expect(preview2.text()).not.toContain("62%");
+    expect(preview2.text()).toContain("84 Mbps");
   });
 
   it("reflects telemetry default ON and toggling it calls set_telemetry_enabled (SPEC s16 R2-P1-1)", async () => {

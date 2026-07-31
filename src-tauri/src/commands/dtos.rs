@@ -832,6 +832,50 @@ pub struct MacosSettings {
     /// Full Disk Access.
     #[serde(default)]
     pub apfs_snapshot: bool,
+    /// Menu bar extra configuration (spec 2026-07-31 s2).
+    #[serde(default)]
+    pub menu_bar: MenuBarSettings,
+}
+
+/// SPEC s22 `macos.menu_bar`: the macOS menu bar extra (live tray title).
+/// Which metrics render while a backup runs, and what shows when idle.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MenuBarSettings {
+    /// "84 Mbps" - last-second upload bandwidth, speedtest-style bit units.
+    pub show_upload_speed: bool,
+    /// "62%" - bytes_done/bytes_total across all running syncs.
+    pub show_percent: bool,
+    /// "341/2.1k" - files done/total, compact counts.
+    pub show_files: bool,
+    /// "~4m" - remaining bytes over the smoothed rate.
+    pub show_eta: bool,
+    /// Idle title mode: `none` (icon only) | `lastBackupAge` ("2h") |
+    /// `uploadedToday` ("1.2 GB today").
+    pub idle: String,
+}
+
+impl Default for MenuBarSettings {
+    fn default() -> Self {
+        MenuBarSettings {
+            show_upload_speed: true,
+            show_percent: true,
+            show_files: false,
+            show_eta: false,
+            idle: "none".to_string(),
+        }
+    }
+}
+
+/// Partial [`MenuBarSettings`].
+#[derive(Debug, Clone, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct MenuBarSettingsPatch {
+    pub show_upload_speed: Option<bool>,
+    pub show_percent: Option<bool>,
+    pub show_files: Option<bool>,
+    pub show_eta: Option<bool>,
+    pub idle: Option<String>,
 }
 
 /// Status of macOS locked-file backup (DESIGN s5.3.2), surfaced to the Settings
@@ -1055,6 +1099,8 @@ pub struct WindowsSettingsPatch {
 pub struct MacosSettingsPatch {
     /// See [`MacosSettings::apfs_snapshot`].
     pub apfs_snapshot: Option<bool>,
+    /// See [`MacosSettings::menu_bar`].
+    pub menu_bar: Option<MenuBarSettingsPatch>,
 }
 
 /// Issue #34: the result of validating a candidate custom-root-CA PEM file for

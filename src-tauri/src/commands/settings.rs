@@ -40,9 +40,9 @@ use driven_vss::VssMode;
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    ApfsHelperStatus, CustomCaValidation, GlobalSettings, MacosSettings, ReleaseDto,
-    ScheduleSettings, SettingsDto, SettingsPatch, TelemetrySettings, UiSettings, UpdateInfo,
-    UpdaterSettings, VssHelperStatus, WindowsSettings,
+    ApfsHelperStatus, CustomCaValidation, GlobalSettings, MacosSettings, MenuBarSettings,
+    ReleaseDto, ScheduleSettings, SettingsDto, SettingsPatch, TelemetrySettings, UiSettings,
+    UpdateInfo, UpdaterSettings, VssHelperStatus, WindowsSettings,
 };
 use crate::commands::{
     atomic_write, validate_writable_dest, CommandError, CommandResult, DialogToken,
@@ -220,6 +220,26 @@ pub async fn load_apfs_snapshot_enabled(state: &dyn StateRepo) -> bool {
         .unwrap_or(false)
 }
 
+/// Read the `macos.menu_bar` group (spec 2026-07-31 s2) for the menu bar
+/// title engine. Falls back to [`MenuBarSettings::default`] when the group is
+/// absent (a DB written before the feature landed) or unreadable - the tray
+/// title is cosmetic, so a read failure degrades to the defaults rather than
+/// surfacing an error. Lives here, next to [`load_apfs_snapshot_enabled`], so
+/// the `storage` structs stay private to this module.
+///
+/// Not gated on `cfg!(target_os = "macos")` (unlike the APFS reader, whose
+/// feature is unsupported elsewhere): the platform gate lives in
+/// `menubar::start`, and keeping this cross-platform keeps it testable on
+/// every CI target.
+pub(crate) async fn load_menubar_settings(state: &dyn StateRepo) -> MenuBarSettings {
+    load_group::<storage::Macos>(state, KEY_MACOS)
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.menu_bar.into())
+        .unwrap_or_default()
+}
+
 /// Pure status derivation (unit-tested on every platform). Locked-file backup is
 /// degraded only where the APFS fallback is supported (macOS) and no snapshot
 /// can be taken: the broker is neither already up (`helper_alive`) nor launchable
@@ -385,6 +405,10 @@ pub async fn update_settings(
     // it actually changed), applied after persistence to (dis)arm + eagerly
     // launch the APFS snapshot broker.
     let mut apfs_snapshot_target: Option<bool> = None;
+    // spec 2026-07-31 s2: whether this patch touched `macos.menu_bar` at all,
+    // so the menubar engine (Task 5) can redraw immediately after persistence
+    // instead of waiting for its next poll tick.
+    let mut menubar_changed = false;
 
     // --- global group -------------------------------------------------------
     if let Some(g) = patch.global {
@@ -699,6 +723,31 @@ pub async fn update_settings(
             }
             cur.apfs_snapshot = v;
         }
+        if let Some(mb) = m.menu_bar {
+            // Menu bar extra (spec 2026-07-31 s2). Persist on every host (same
+            // rationale as apfs_snapshot above); only the macOS tray reads it.
+            // `idle` is validated FIRST and returns early via `?` before any
+            // field is written, so an invalid mode leaves the whole group
+            // untouched (matches the command's all-or-nothing behaviour for
+            // invalid input elsewhere, e.g. the `scrub` group above).
+            if let Some(v) = mb.idle {
+                check_enum("macos.menu_bar.idle", &v, MENU_BAR_IDLE_MODES)?;
+                cur.menu_bar.idle = v;
+            }
+            if let Some(v) = mb.show_upload_speed {
+                cur.menu_bar.show_upload_speed = v;
+            }
+            if let Some(v) = mb.show_percent {
+                cur.menu_bar.show_percent = v;
+            }
+            if let Some(v) = mb.show_files {
+                cur.menu_bar.show_files = v;
+            }
+            if let Some(v) = mb.show_eta {
+                cur.menu_bar.show_eta = v;
+            }
+            menubar_changed = true;
+        }
         store_group(repo, KEY_MACOS, &storage::Macos::from(cur)).await?;
     }
 
@@ -830,6 +879,12 @@ pub async fn update_settings(
         }
     }
 
+    if menubar_changed {
+        // Re-render the menu bar extra with the new config on the next tick
+        // (spec s2: settings apply immediately, no restart).
+        crate::menubar::config_changed(&app);
+    }
+
     // Return the full, freshly-stored settings document.
     load_settings_dto(repo).await
 }
@@ -876,6 +931,8 @@ const COLOR_MODES: &[&str] = &["system", "light", "dark"];
 const TRAY_TARGETS: &[&str] = &["activity", "settings", "restore"];
 /// Valid `vss_mode` values (SPEC s22, Windows-only).
 const VSS_MODES: &[&str] = &["auto", "always", "never"];
+/// Valid `macos.menu_bar.idle` icon modes (spec 2026-07-31 s2, macOS-only).
+const MENU_BAR_IDLE_MODES: &[&str] = &["none", "lastBackupAge", "uploadedToday"];
 
 /// An invalid settings value -> the stable `internal.invalid_input` SPEC s24
 /// error (so the webview shows a "check your input" message).
@@ -968,8 +1025,8 @@ mod storage {
     use serde::{Deserialize, Serialize};
 
     use crate::commands::dtos::{
-        GlobalSettings, MacosSettings, ScheduleSettings, TelemetrySettings, UiSettings,
-        UpdaterSettings, WindowsSettings,
+        GlobalSettings, MacosSettings, MenuBarSettings, ScheduleSettings, TelemetrySettings,
+        UiSettings, UpdaterSettings, WindowsSettings,
     };
 
     /// `snake_case` on-disk form of the V2 schedule window (DESIGN s17).
@@ -1258,12 +1315,17 @@ mod storage {
         // the feature stays opt-in.
         #[serde(default)]
         pub apfs_snapshot: bool,
+        // Absent in DBs written before the menu bar extra landed; defaults
+        // keep older rows valid (spec 2026-07-31 s2).
+        #[serde(default)]
+        pub menu_bar: MenuBar,
     }
 
     impl From<Macos> for MacosSettings {
         fn from(s: Macos) -> Self {
             MacosSettings {
                 apfs_snapshot: s.apfs_snapshot,
+                menu_bar: s.menu_bar.into(),
             }
         }
     }
@@ -1272,6 +1334,48 @@ mod storage {
         fn from(d: MacosSettings) -> Self {
             Macos {
                 apfs_snapshot: d.apfs_snapshot,
+                menu_bar: d.menu_bar.into(),
+            }
+        }
+    }
+
+    /// `snake_case` on-disk form of `macos.menu_bar`. Absent in DBs written
+    /// before the menu bar extra landed; defaults keep older rows valid.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct MenuBar {
+        pub show_upload_speed: bool,
+        pub show_percent: bool,
+        pub show_files: bool,
+        pub show_eta: bool,
+        pub idle: String,
+    }
+
+    impl Default for MenuBar {
+        fn default() -> Self {
+            MenuBarSettings::default().into()
+        }
+    }
+
+    impl From<MenuBar> for MenuBarSettings {
+        fn from(s: MenuBar) -> Self {
+            MenuBarSettings {
+                show_upload_speed: s.show_upload_speed,
+                show_percent: s.show_percent,
+                show_files: s.show_files,
+                show_eta: s.show_eta,
+                idle: s.idle,
+            }
+        }
+    }
+
+    impl From<MenuBarSettings> for MenuBar {
+        fn from(d: MenuBarSettings) -> Self {
+            MenuBar {
+                show_upload_speed: d.show_upload_speed,
+                show_percent: d.show_percent,
+                show_files: d.show_files,
+                show_eta: d.show_eta,
+                idle: d.idle,
             }
         }
     }
@@ -2879,6 +2983,7 @@ fn default_windows() -> WindowsSettings {
 fn default_macos() -> MacosSettings {
     MacosSettings {
         apfs_snapshot: false,
+        menu_bar: MenuBarSettings::default(),
     }
 }
 
@@ -3286,6 +3391,139 @@ mod tests {
         cleanup(dir);
     }
 
+    /// SPEC s22 `macos.menu_bar`: an unseeded group reads as the documented
+    /// defaults (speed+percent on, files/eta off, idle "none"), and a stored
+    /// group round-trips through the storage form unchanged.
+    #[test]
+    fn menu_bar_defaults_and_storage_roundtrip() {
+        let d = default_macos();
+        assert!(d.menu_bar.show_upload_speed);
+        assert!(d.menu_bar.show_percent);
+        assert!(!d.menu_bar.show_files);
+        assert!(!d.menu_bar.show_eta);
+        assert_eq!(d.menu_bar.idle, "none");
+
+        // storage round-trip preserves every field
+        let mut dto = default_macos();
+        dto.menu_bar.show_files = true;
+        dto.menu_bar.idle = "uploadedToday".to_string();
+        let stored = storage::Macos::from(dto.clone());
+
+        // Exercise real serde (de)serialization of the storage form, not just
+        // the `From` impls - so an accidental `#[serde(rename_all =
+        // "camelCase")]` on `storage::Macos`/`MenuBar` would fail this test
+        // instead of silently shipping a camelCase key on disk.
+        let stored_json = serde_json::to_value(&stored).unwrap();
+        assert_eq!(
+            stored_json,
+            serde_json::json!({
+                "apfs_snapshot": false,
+                "menu_bar": {
+                    "show_upload_speed": true,
+                    "show_percent": true,
+                    "show_files": true,
+                    "show_eta": false,
+                    "idle": "uploadedToday",
+                }
+            }),
+            "on-disk keys must stay snake_case"
+        );
+        let back: MacosSettings = serde_json::from_value::<storage::Macos>(stored_json)
+            .unwrap()
+            .into();
+        assert!(back.menu_bar.show_files);
+        assert_eq!(back.menu_bar.idle, "uploadedToday");
+
+        // a legacy on-disk blob without `menu_bar` still deserialises (serde default)
+        let legacy: storage::Macos =
+            serde_json::from_value(serde_json::json!({ "apfs_snapshot": true })).unwrap();
+        let dto: MacosSettings = legacy.into();
+        assert!(dto.apfs_snapshot);
+        assert_eq!(dto.menu_bar.idle, "none");
+    }
+
+    /// spec 2026-07-31 s2 `update_settings`: a `macos.menu_bar` patch merges
+    /// field-wise (untouched fields keep their stored/default values). The
+    /// command itself needs a live `AppHandle` to invoke (see the neighbouring
+    /// `update_settings_merge_round_trips_a_single_field` / `macos_apfs_
+    /// snapshot_setting_round_trips` tests, neither of which calls it directly
+    /// for the same reason), so this exercises the merge arm's logic against
+    /// the real storage layer, matching that established pattern. `dto.macos`
+    /// is `None` off macOS, so the assertions read the group back via
+    /// `load_group::<storage::Macos>` instead of `load_settings_dto` to stay
+    /// platform-neutral.
+    #[tokio::test]
+    async fn update_settings_merges_menu_bar_patch() {
+        let (repo, dir) = seeded_repo().await;
+        let patch = crate::commands::dtos::MenuBarSettingsPatch {
+            show_files: Some(true),
+            idle: Some("lastBackupAge".to_string()),
+            ..Default::default()
+        };
+
+        let mut cur: MacosSettings = load_group::<storage::Macos>(&repo, KEY_MACOS)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap_or_else(default_macos);
+        if let Some(v) = patch.idle {
+            check_enum("macos.menu_bar.idle", &v, MENU_BAR_IDLE_MODES).unwrap();
+            cur.menu_bar.idle = v;
+        }
+        if let Some(v) = patch.show_upload_speed {
+            cur.menu_bar.show_upload_speed = v;
+        }
+        if let Some(v) = patch.show_percent {
+            cur.menu_bar.show_percent = v;
+        }
+        if let Some(v) = patch.show_files {
+            cur.menu_bar.show_files = v;
+        }
+        if let Some(v) = patch.show_eta {
+            cur.menu_bar.show_eta = v;
+        }
+        store_group(&repo, KEY_MACOS, &storage::Macos::from(cur))
+            .await
+            .unwrap();
+
+        let back: MacosSettings = load_group::<storage::Macos>(&repo, KEY_MACOS)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap();
+        assert!(back.menu_bar.show_files, "patched field persisted");
+        assert_eq!(
+            back.menu_bar.idle, "lastBackupAge",
+            "patched field persisted"
+        );
+        assert!(
+            back.menu_bar.show_upload_speed,
+            "untouched field keeps its default"
+        );
+        assert!(!back.menu_bar.show_eta, "untouched field keeps its default");
+        cleanup(dir);
+    }
+
+    /// An unknown `macos.menu_bar.idle` mode is rejected as invalid input
+    /// (SPEC s24 `internal.invalid_input`), and nothing persists - the group
+    /// still reads as its unseeded default.
+    #[tokio::test]
+    async fn update_settings_rejects_bad_menu_bar_idle() {
+        let (repo, dir) = seeded_repo().await;
+        let err = check_enum("macos.menu_bar.idle", "sometimes", MENU_BAR_IDLE_MODES)
+            .expect_err("an unknown idle mode must be rejected");
+        assert_eq!(err.code, ErrorCode::InvalidInput);
+
+        // Nothing was ever written - the group still reads as the default.
+        let back: MacosSettings = load_group::<storage::Macos>(&repo, KEY_MACOS)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap_or_else(default_macos);
+        assert_eq!(back.menu_bar.idle, "none", "nothing persisted");
+        cleanup(dir);
+    }
+
     #[tokio::test]
     async fn apfs_snapshot_toggle_drives_the_orchestrator_vss_mode_on_macos() {
         let (repo, dir) = seeded_repo().await;
@@ -3305,6 +3543,7 @@ mod tests {
             KEY_MACOS,
             &storage::Macos::from(MacosSettings {
                 apfs_snapshot: true,
+                menu_bar: MenuBarSettings::default(),
             }),
         )
         .await

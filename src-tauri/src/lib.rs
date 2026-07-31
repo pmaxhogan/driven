@@ -47,6 +47,10 @@ mod panic_hook;
 // M9b (SPEC s16): anonymous usage telemetry - the install_id + enabled pref, the
 // startup + 24h ping task, and the get/set IPC commands.
 mod telemetry;
+// SPEC s22, DESIGN s2: macOS menu bar extra pure config + formatting core
+// (settings mapping, speed/count/eta/percent/title formatters). Compiled on
+// every target (unit tests only; no platform gate in this module).
+mod menubar;
 mod tray;
 // M9a (SPEC s15): the in-app updater - runtime channel selection, the periodic
 // check task, and the check/install/get-channel/set-channel IPC commands.
@@ -483,6 +487,12 @@ pub fn run() {
                 app_state.reconstruct_recovery_acks_from_db().await;
                 handle.manage(app_state);
                 tray::build(&handle)?;
+                // spec 2026-07-31 s2: start the 1 Hz macOS menu bar title
+                // engine. No-op off macOS, and safe before any sync starts -
+                // it renders the idle title (or nothing) until one does. Must
+                // follow `tray::build` so the first tick finds a tray, and
+                // `handle.manage` above so its settings read finds AppState.
+                menubar::start(&handle);
                 // R8-P1-1: tell the user why sync is held off (after the tray
                 // exists so the notification can route through it).
                 if !assembly::repair_allows_spawn(&repair_result) {
