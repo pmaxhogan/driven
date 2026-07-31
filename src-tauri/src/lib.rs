@@ -487,6 +487,12 @@ pub fn run() {
                 app_state.reconstruct_recovery_acks_from_db().await;
                 handle.manage(app_state);
                 tray::build(&handle)?;
+                // spec 2026-07-31 s2: start the 1 Hz macOS menu bar title
+                // engine. No-op off macOS, and safe before any sync starts -
+                // it renders the idle title (or nothing) until one does. Must
+                // follow `tray::build` so the first tick finds a tray, and
+                // `handle.manage` above so its settings read finds AppState.
+                menubar::start(&handle);
                 // R8-P1-1: tell the user why sync is held off (after the tray
                 // exists so the notification can route through it).
                 if !assembly::repair_allows_spawn(&repair_result) {

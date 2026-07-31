@@ -97,7 +97,9 @@ use tauri_plugin_notification::NotificationExt;
 const TARGET: &str = "driven::app::tray";
 
 /// Canonical tray id (matches the committed `apply_state` lookup + SPEC s12).
-const TRAY_ID: &str = "driven-main";
+// `pub(crate)` so the menu bar engine (`menubar.rs`) resolves the SAME tray to
+// write its title onto - the title must land on this icon, not a second one.
+pub(crate) const TRAY_ID: &str = "driven-main";
 
 /// Id Tauri assigns to the tray created from `tauri.conf.json`'s
 /// `app.trayIcon` block (it defaults to the main-window label `"main"`). We

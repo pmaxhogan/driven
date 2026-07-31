@@ -220,6 +220,26 @@ pub async fn load_apfs_snapshot_enabled(state: &dyn StateRepo) -> bool {
         .unwrap_or(false)
 }
 
+/// Read the `macos.menu_bar` group (spec 2026-07-31 s2) for the menu bar
+/// title engine. Falls back to [`MenuBarSettings::default`] when the group is
+/// absent (a DB written before the feature landed) or unreadable - the tray
+/// title is cosmetic, so a read failure degrades to the defaults rather than
+/// surfacing an error. Lives here, next to [`load_apfs_snapshot_enabled`], so
+/// the `storage` structs stay private to this module.
+///
+/// Not gated on `cfg!(target_os = "macos")` (unlike the APFS reader, whose
+/// feature is unsupported elsewhere): the platform gate lives in
+/// `menubar::start`, and keeping this cross-platform keeps it testable on
+/// every CI target.
+pub(crate) async fn load_menubar_settings(state: &dyn StateRepo) -> MenuBarSettings {
+    load_group::<storage::Macos>(state, KEY_MACOS)
+        .await
+        .ok()
+        .flatten()
+        .map(|m| m.menu_bar.into())
+        .unwrap_or_default()
+}
+
 /// Pure status derivation (unit-tested on every platform). Locked-file backup is
 /// degraded only where the APFS fallback is supported (macOS) and no snapshot
 /// can be taken: the broker is neither already up (`helper_alive`) nor launchable
@@ -859,9 +879,11 @@ pub async fn update_settings(
         }
     }
 
-    // Task 5 (menubar engine) will react to this; keep the flag observable now
-    // so the merge arm stays honest about having a side effect.
-    let _ = menubar_changed;
+    if menubar_changed {
+        // Re-render the menu bar extra with the new config on the next tick
+        // (spec s2: settings apply immediately, no restart).
+        crate::menubar::config_changed(&app);
+    }
 
     // Return the full, freshly-stored settings document.
     load_settings_dto(repo).await
