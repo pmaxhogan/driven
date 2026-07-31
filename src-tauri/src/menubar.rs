@@ -1369,6 +1369,34 @@ mod tests {
         assert_eq!(r.sample(0, t0 + Duration::from_secs(2)), None);
     }
 
+    // Coverage gate fix: the `dt <= 0.0` guard (a duplicate or out-of-order
+    // timestamp) was untested. Both a same-instant duplicate sample and a
+    // strictly-earlier (clock-skew) sample must leave the estimator's state
+    // untouched and just re-report whatever `current()` already knows,
+    // rather than perturbing the EMA with a zero or negative interval.
+    #[test]
+    fn rate_sample_ignores_a_duplicate_or_out_of_order_timestamp() {
+        use std::time::{Duration, Instant};
+        let t0 = Instant::now();
+        let mut r = RateEstimator::new();
+        r.sample(1_000_000, t0);
+        let v1 = r.sample(2_000_000, t0 + Duration::from_secs(3)).unwrap();
+        // Duplicate timestamp: dt == 0, `checked_duration_since` returns
+        // `Some(ZERO)`.
+        let v_dup = r.sample(2_500_000, t0 + Duration::from_secs(3)).unwrap();
+        assert_eq!(
+            v1, v_dup,
+            "a dt == 0 sample must not perturb the smoothed rate"
+        );
+        // Out-of-order (earlier) timestamp: `checked_duration_since` returns
+        // `None`, folded into the same dt <= 0 handling.
+        let v_backwards = r.sample(3_000_000, t0 + Duration::from_secs(1)).unwrap();
+        assert_eq!(
+            v1, v_backwards,
+            "a clock-skew sample must not perturb the smoothed rate"
+        );
+    }
+
     #[test]
     fn aggregate_sums_only_active_accounts() {
         let a = AccountProgress {
@@ -1432,6 +1460,15 @@ mod tests {
         assert_eq!(format_bytes(999_960_000), "1 GB");
     }
 
+    // Coverage gate fix: the TB tier (the top of the unit ladder) was
+    // untested. 999.96 GB must carry into TB same as any other tier, and TB
+    // being the last unit must NOT try to carry further past it.
+    #[test]
+    fn bytes_format_reaches_the_tb_tier() {
+        assert_eq!(format_bytes(1_200_000_000_000), "1.2 TB");
+        assert_eq!(format_bytes(999_960_000_000), "1 TB");
+    }
+
     // Deliberately updated for task 9 (not a verbatim brief test): `Deactivate`
     // now carries the pause reason so `note_state` can track it, so a `Paused`
     // state's classification differs from every other deactivating state.
@@ -1470,6 +1507,51 @@ mod tests {
         assert_eq!(
             classify_state(&OrchestratorState::PowerCheck),
             MetricsUpdate::Deactivate(None)
+        );
+    }
+
+    // Coverage gate fix: the test above only exercises `PowerCheck` from the
+    // catch-all `Deactivate(None)` arm. Exercise the rest of the matrix
+    // explicitly - `Backoff`, `Verifying`, and `Error` - so a future variant
+    // added to `OrchestratorState` that should classify differently (e.g. a
+    // new terminal state that ought to `Remove`) has to break one of these
+    // assertions rather than silently falling into the wrong arm.
+    #[test]
+    fn classify_state_deactivates_every_other_stall_state() {
+        use driven_core::types::{ErrorCode, ErrorDetail};
+        assert_eq!(
+            classify_state(&OrchestratorState::Backoff { until: 0 }),
+            MetricsUpdate::Deactivate(None)
+        );
+        assert_eq!(
+            classify_state(&OrchestratorState::Verifying {
+                sampled: 0,
+                mismatches: 0,
+            }),
+            MetricsUpdate::Deactivate(None)
+        );
+        assert_eq!(
+            classify_state(&OrchestratorState::Error {
+                detail: ErrorDetail::new(ErrorCode::AuthInvalidGrant, "test"),
+            }),
+            MetricsUpdate::Deactivate(None)
+        );
+    }
+
+    // Coverage gate fix: `MetricsUpdate::Deactivate(None)` only PARKS an
+    // existing entry (per the doc comment on `note_state`'s matching arm) -
+    // it must not create one out of nothing for an account that has never
+    // been recorded. Only `Activate` and `Deactivate(Some(reason))` create
+    // entries.
+    #[test]
+    fn note_state_deactivate_none_is_a_noop_with_no_prior_entry() {
+        use driven_core::types::AccountId;
+        let id = AccountId::new_v4();
+        note_state(id, &OrchestratorState::PowerCheck);
+        let m = METRICS.lock().unwrap_or_else(|e| e.into_inner());
+        assert!(
+            !m.contains_key(&id),
+            "a deactivating state must not create an entry from nothing"
         );
     }
 
@@ -1660,6 +1742,39 @@ mod tests {
         assert_eq!(paused_reason(std::iter::empty()), None);
     }
 
+    // Coverage gate fix: `paused_reason_is_deterministic_regardless_of_fold_order`
+    // only exercises `pause_reason_rank`'s Manual/Battery arms. Feed every
+    // reason through `paused_reason` at once so every rank arm runs, and
+    // assert the pick matches `pause_reason_rank`'s declared order (Manual
+    // ranks first) regardless of which order the accounts are folded in.
+    #[test]
+    fn paused_reason_rank_covers_every_reason() {
+        use driven_core::types::PauseReason;
+        let all_reasons = [
+            PauseReason::DnsFailed,
+            PauseReason::Schedule,
+            PauseReason::CaptivePortal,
+            PauseReason::NoInternet,
+            PauseReason::ServiceDown,
+            PauseReason::Offline,
+            PauseReason::Metered,
+            PauseReason::Battery,
+            PauseReason::Manual,
+        ];
+        let accounts: Vec<AccountProgress> = all_reasons
+            .iter()
+            .map(|r| AccountProgress {
+                pause_reason: Some(*r),
+                ..Default::default()
+            })
+            .collect();
+        assert_eq!(
+            paused_reason(accounts.into_iter()),
+            Some(PauseReason::Manual),
+            "Manual is the lowest rank, so it must win no matter the fold order"
+        );
+    }
+
     // Task 9: the tray-menu status rows priority - an active sync always wins
     // over a paused account, and a paused account always wins over plain
     // idle. Pure so this priority is unit-tested without a runtime.
@@ -1691,6 +1806,95 @@ mod tests {
         assert_eq!(l2, "");
         let (l1, _) = paused_status_lines(PauseReason::Manual);
         assert_eq!(l1, "Paused");
+    }
+
+    // Coverage gate fix: the test above only exercises Manual/Battery. Every
+    // one of the nine reasons must resolve to a non-empty row-1 sentence (a
+    // missing locale key would otherwise silently render the raw key
+    // string) with row 2 always blank. `Offline` and `NoInternet`
+    // deliberately share identical wording here (same as `tray.tooltip.*`'s
+    // `offline`/`no_internet` pair) - they stay distinct `PauseReason`
+    // values so the orchestrator preserves the non-online state end-to-end
+    // (CODEX_NOTES P2-9), but "no Internet" is the only distinction a user
+    // needs in the tray text - so uniqueness is checked over the other seven
+    // reasons only, not that pair.
+    #[test]
+    fn paused_status_lines_cover_every_reason() {
+        use driven_core::types::PauseReason;
+        let (offline_l1, offline_l2) = paused_status_lines(PauseReason::Offline);
+        let (no_internet_l1, no_internet_l2) = paused_status_lines(PauseReason::NoInternet);
+        assert_eq!(
+            offline_l1, no_internet_l1,
+            "Offline and NoInternet share wording by design"
+        );
+        assert_eq!(offline_l2, "");
+        assert_eq!(no_internet_l2, "");
+
+        let distinct_reasons = [
+            PauseReason::Manual,
+            PauseReason::Battery,
+            PauseReason::Metered,
+            PauseReason::Schedule,
+            PauseReason::CaptivePortal,
+            PauseReason::DnsFailed,
+            PauseReason::ServiceDown,
+        ];
+        let mut seen = std::collections::HashSet::new();
+        seen.insert(offline_l1);
+        for reason in distinct_reasons {
+            let (l1, l2) = paused_status_lines(reason);
+            assert!(!l1.is_empty(), "{reason:?} must render a row-1 sentence");
+            assert_eq!(l2, "", "{reason:?} row 2 must stay blank");
+            assert!(
+                seen.insert(l1),
+                "{reason:?} must not collide with another reason's row-1 text"
+            );
+        }
+    }
+
+    // Coverage gate fix (task 9 review ledger item 3/4): a realistic mixed
+    // fleet - one account actively syncing, another paused for a different
+    // reason. `aggregate` must see only the active one (a paused account's
+    // stale totals must not dilute the combined picture); `paused_reason`
+    // must still surface the paused one (it scans every account, active or
+    // not - a paused account is inactive by definition and would never
+    // surface through `aggregate`); and `status_rows_source` must prefer
+    // `Active` even though a pause coexists elsewhere, matching `tick`'s
+    // real per-tick inputs rather than isolated booleans.
+    #[test]
+    fn status_pipeline_prefers_active_over_a_coexisting_paused_account() {
+        use driven_core::types::PauseReason;
+        let active = AccountProgress {
+            bytes_done: 10,
+            bytes_total: 20,
+            files_done: 1,
+            files_total: 2,
+            active: true,
+            pause_reason: None,
+        };
+        let paused = AccountProgress {
+            active: false,
+            pause_reason: Some(PauseReason::Metered),
+            ..Default::default()
+        };
+        let accounts = [active, paused];
+        let agg = aggregate(accounts.into_iter());
+        let reason = paused_reason(accounts.into_iter());
+        assert!(agg.active);
+        assert_eq!(
+            agg.bytes_done, 10,
+            "the paused account's stale totals must not dilute the aggregate"
+        );
+        assert_eq!(
+            reason,
+            Some(PauseReason::Metered),
+            "paused_reason scans every account, active or not"
+        );
+        assert_eq!(
+            status_rows_source(agg.active, reason),
+            StatusRowsSource::Active,
+            "an active sync always wins over a coexisting pause elsewhere"
+        );
     }
 
     #[test]
@@ -1726,6 +1930,18 @@ mod tests {
             Some(now - Duration::from_secs(1)),
             0,
             1,
+            none,
+            none,
+            now,
+            ttl
+        ));
+        // exactly at the TTL boundary: `>=` means this counts as stale, not
+        // fresh - the cache re-queries on the tick that reaches the boundary
+        // rather than waiting for it to be strictly exceeded.
+        assert!(idle_cache_is_stale(
+            Some(now - ttl),
+            0,
+            0,
             none,
             none,
             now,
@@ -1936,5 +2152,44 @@ mod tests {
             let m = METRICS.lock().unwrap_or_else(|e| e.into_inner());
             assert!(m.get(&id).is_none(), "idle removes the entry");
         }
+    }
+
+    // Coverage gate fix: `local_day_start_ms` had no test at all. It has no
+    // injectable clock (it reads `chrono::Local::now()` directly), so this
+    // exercises the real system clock/timezone and asserts the DESIGN-s2
+    // properties rather than a specific offset: the result must be a
+    // real past-or-present instant within the last 26h (24h of the day plus
+    // slack for a DST spring-forward that pushes local midnight to
+    // 01:00-03:00, which is exactly the walk-forward this function does),
+    // and it must be stable across two calls made back to back (the local
+    // day cannot roll over between them).
+    #[test]
+    fn local_day_start_is_a_recent_stable_midnight() {
+        let now_ms = SystemClock.now_ms();
+        let start = local_day_start_ms().expect("real timezones resolve within 4 hours");
+        assert!(start <= now_ms, "day start must not be in the future");
+        assert!(
+            start > now_ms - 26 * 3_600 * 1_000,
+            "day start must be within the last 26h (24h + DST walk-forward slack)"
+        );
+        let start2 = local_day_start_ms().expect("still resolvable moments later");
+        assert_eq!(
+            start, start2,
+            "must be stable across consecutive calls within the same local day"
+        );
+    }
+
+    // Coverage gate fix: `CONFIG`'s `LazyLock` initializer (seeding from the
+    // DTO defaults) was never forced to run in a unit test - every other
+    // reader is behind an `AppHandle`. Touching it here both documents the
+    // seeded value `load_config_from_store` degrades to before the async
+    // settings read lands, and exercises the initializer line itself.
+    #[test]
+    fn config_static_seeds_from_dto_defaults() {
+        let cfg = *CONFIG.lock().unwrap_or_else(|e| e.into_inner());
+        assert_eq!(
+            cfg,
+            MenuBarConfig::from_settings(&MenuBarSettings::default())
+        );
     }
 }
