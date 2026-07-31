@@ -47,6 +47,10 @@ mod panic_hook;
 // M9b (SPEC s16): anonymous usage telemetry - the install_id + enabled pref, the
 // startup + 24h ping task, and the get/set IPC commands.
 mod telemetry;
+// SPEC s22, DESIGN s2: macOS menu bar extra pure config + formatting core
+// (settings mapping, speed/count/eta/percent/title formatters). Compiled on
+// every target (unit tests only; no platform gate in this module).
+mod menubar;
 mod tray;
 // M9a (SPEC s15): the in-app updater - runtime channel selection, the periodic
 // check task, and the check/install/get-channel/set-channel IPC commands.
