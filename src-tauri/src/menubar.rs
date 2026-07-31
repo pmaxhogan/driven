@@ -53,7 +53,9 @@ pub enum IdleMode {
     None,
     /// "2h" since the most recent successful sync.
     LastBackupAge,
-    /// "1.2 GB today" via the activity-summary window query.
+    /// "1.2 GB" (uploaded since local midnight) via the activity-summary
+    /// window query. The bare amount is deliberate - the user trimmed the
+    /// original "1.2 GB today" copy for menu bar width.
     UploadedToday,
 }
 

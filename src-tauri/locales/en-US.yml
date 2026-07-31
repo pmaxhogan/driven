@@ -42,7 +42,7 @@ tray:
     paused_dns_failed: "Paused - DNS is not resolving"
     paused_service_down: "Paused - Google Drive is unavailable"
   menubar:
-    uploaded_today: "%{amount} today"
+    uploaded_today: "%{amount}"
   tooltip:
     idle: "Driven - idle, last sync OK"
     syncing: "Driven - syncing..."
