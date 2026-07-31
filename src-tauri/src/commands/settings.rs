@@ -40,9 +40,9 @@ use driven_vss::VssMode;
 
 use crate::app_state::AppState;
 use crate::commands::dtos::{
-    ApfsHelperStatus, CustomCaValidation, GlobalSettings, MacosSettings, ReleaseDto,
-    ScheduleSettings, SettingsDto, SettingsPatch, TelemetrySettings, UiSettings, UpdateInfo,
-    UpdaterSettings, VssHelperStatus, WindowsSettings,
+    ApfsHelperStatus, CustomCaValidation, GlobalSettings, MacosSettings, MenuBarSettings,
+    ReleaseDto, ScheduleSettings, SettingsDto, SettingsPatch, TelemetrySettings, UiSettings,
+    UpdateInfo, UpdaterSettings, VssHelperStatus, WindowsSettings,
 };
 use crate::commands::{
     atomic_write, validate_writable_dest, CommandError, CommandResult, DialogToken,
@@ -968,8 +968,8 @@ mod storage {
     use serde::{Deserialize, Serialize};
 
     use crate::commands::dtos::{
-        GlobalSettings, MacosSettings, ScheduleSettings, TelemetrySettings, UiSettings,
-        UpdaterSettings, WindowsSettings,
+        GlobalSettings, MacosSettings, MenuBarSettings, ScheduleSettings, TelemetrySettings,
+        UiSettings, UpdaterSettings, WindowsSettings,
     };
 
     /// `snake_case` on-disk form of the V2 schedule window (DESIGN s17).
@@ -1258,12 +1258,17 @@ mod storage {
         // the feature stays opt-in.
         #[serde(default)]
         pub apfs_snapshot: bool,
+        // Absent in DBs written before the menu bar extra landed; defaults
+        // keep older rows valid (spec 2026-07-31 s2).
+        #[serde(default)]
+        pub menu_bar: MenuBar,
     }
 
     impl From<Macos> for MacosSettings {
         fn from(s: Macos) -> Self {
             MacosSettings {
                 apfs_snapshot: s.apfs_snapshot,
+                menu_bar: s.menu_bar.into(),
             }
         }
     }
@@ -1272,6 +1277,48 @@ mod storage {
         fn from(d: MacosSettings) -> Self {
             Macos {
                 apfs_snapshot: d.apfs_snapshot,
+                menu_bar: d.menu_bar.into(),
+            }
+        }
+    }
+
+    /// `snake_case` on-disk form of `macos.menu_bar`. Absent in DBs written
+    /// before the menu bar extra landed; defaults keep older rows valid.
+    #[derive(Debug, Clone, Serialize, Deserialize)]
+    pub struct MenuBar {
+        pub show_upload_speed: bool,
+        pub show_percent: bool,
+        pub show_files: bool,
+        pub show_eta: bool,
+        pub idle: String,
+    }
+
+    impl Default for MenuBar {
+        fn default() -> Self {
+            MenuBarSettings::default().into()
+        }
+    }
+
+    impl From<MenuBar> for MenuBarSettings {
+        fn from(s: MenuBar) -> Self {
+            MenuBarSettings {
+                show_upload_speed: s.show_upload_speed,
+                show_percent: s.show_percent,
+                show_files: s.show_files,
+                show_eta: s.show_eta,
+                idle: s.idle,
+            }
+        }
+    }
+
+    impl From<MenuBarSettings> for MenuBar {
+        fn from(d: MenuBarSettings) -> Self {
+            MenuBar {
+                show_upload_speed: d.show_upload_speed,
+                show_percent: d.show_percent,
+                show_files: d.show_files,
+                show_eta: d.show_eta,
+                idle: d.idle,
             }
         }
     }
@@ -2879,6 +2926,7 @@ fn default_windows() -> WindowsSettings {
 fn default_macos() -> MacosSettings {
     MacosSettings {
         apfs_snapshot: false,
+        menu_bar: MenuBarSettings::default(),
     }
 }
 
@@ -3286,6 +3334,35 @@ mod tests {
         cleanup(dir);
     }
 
+    /// SPEC s22 `macos.menu_bar`: an unseeded group reads as the documented
+    /// defaults (speed+percent on, files/eta off, idle "none"), and a stored
+    /// group round-trips through the storage form unchanged.
+    #[test]
+    fn menu_bar_defaults_and_storage_roundtrip() {
+        let d = default_macos();
+        assert!(d.menu_bar.show_upload_speed);
+        assert!(d.menu_bar.show_percent);
+        assert!(!d.menu_bar.show_files);
+        assert!(!d.menu_bar.show_eta);
+        assert_eq!(d.menu_bar.idle, "none");
+
+        // storage round-trip preserves every field
+        let mut dto = default_macos();
+        dto.menu_bar.show_files = true;
+        dto.menu_bar.idle = "uploadedToday".to_string();
+        let stored = storage::Macos::from(dto.clone());
+        let back: MacosSettings = stored.into();
+        assert!(back.menu_bar.show_files);
+        assert_eq!(back.menu_bar.idle, "uploadedToday");
+
+        // a legacy on-disk blob without `menu_bar` still deserialises (serde default)
+        let legacy: storage::Macos =
+            serde_json::from_value(serde_json::json!({ "apfs_snapshot": true })).unwrap();
+        let dto: MacosSettings = legacy.into();
+        assert!(dto.apfs_snapshot);
+        assert_eq!(dto.menu_bar.idle, "none");
+    }
+
     #[tokio::test]
     async fn apfs_snapshot_toggle_drives_the_orchestrator_vss_mode_on_macos() {
         let (repo, dir) = seeded_repo().await;
@@ -3305,6 +3382,7 @@ mod tests {
             KEY_MACOS,
             &storage::Macos::from(MacosSettings {
                 apfs_snapshot: true,
+                menu_bar: MenuBarSettings::default(),
             }),
         )
         .await
