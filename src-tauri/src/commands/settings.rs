@@ -3351,7 +3351,29 @@ mod tests {
         dto.menu_bar.show_files = true;
         dto.menu_bar.idle = "uploadedToday".to_string();
         let stored = storage::Macos::from(dto.clone());
-        let back: MacosSettings = stored.into();
+
+        // Exercise real serde (de)serialization of the storage form, not just
+        // the `From` impls - so an accidental `#[serde(rename_all =
+        // "camelCase")]` on `storage::Macos`/`MenuBar` would fail this test
+        // instead of silently shipping a camelCase key on disk.
+        let stored_json = serde_json::to_value(&stored).unwrap();
+        assert_eq!(
+            stored_json,
+            serde_json::json!({
+                "apfs_snapshot": false,
+                "menu_bar": {
+                    "show_upload_speed": true,
+                    "show_percent": true,
+                    "show_files": true,
+                    "show_eta": false,
+                    "idle": "uploadedToday",
+                }
+            }),
+            "on-disk keys must stay snake_case"
+        );
+        let back: MacosSettings = serde_json::from_value::<storage::Macos>(stored_json)
+            .unwrap()
+            .into();
         assert!(back.menu_bar.show_files);
         assert_eq!(back.menu_bar.idle, "uploadedToday");
 
