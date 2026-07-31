@@ -595,9 +595,12 @@ pub fn start(app: &AppHandle) {
         // `None` = nothing painted yet, so the first tick always writes
         // (including writing `None` to clear a title left by a previous run).
         let mut painted: Option<Option<String>> = None;
+        // Previous tick's aggregate activity, so the tick can spot the
+        // active -> inactive edge and re-query the idle providers.
+        let mut was_active = false;
         loop {
             ticker.tick().await;
-            tick(&app, &mut rate, &mut idle, &mut painted).await;
+            tick(&app, &mut rate, &mut idle, &mut painted, &mut was_active).await;
         }
     });
 }
@@ -715,6 +718,30 @@ impl IdleCache {
         }
         self.value.clone()
     }
+
+    /// Forces the next [`IdleCache::title`] call to re-query, without
+    /// discarding `value` - the stale title keeps rendering for the fraction
+    /// of a tick before the fresh one lands, rather than the tray blanking
+    /// and re-filling.
+    fn invalidate(&mut self) {
+        self.fetched_at = None;
+    }
+}
+
+/// Whether a sync just finished (or otherwise left the active phases) on
+/// this tick. Both idle providers are answers ABOUT completed syncs - "how
+/// long since the last backup", "how many bytes today" - so a run that just
+/// ended invalidates the cached answer no matter how recently it was
+/// computed. Without this, a `lastBackupAge` title can read "2h" for up to
+/// a minute after a backup completes, which is exactly when a user looks at
+/// the menu bar.
+///
+/// Deviation 8 (`Verifying` classifies as `Deactivate`) makes this fire
+/// mid-cycle too, at the execute-to-verify edge. That is harmless: it
+/// re-queries and renders the truth as of that moment, and the edge at the
+/// true end of the cycle still fires afterwards.
+fn sync_just_finished(was_active: bool, is_active: bool) -> bool {
+    was_active && !is_active
 }
 
 /// Queries the state repo for the idle title. Every failure path (missing
@@ -828,6 +855,7 @@ async fn tick(
     rate: &mut RateEstimator,
     idle: &mut IdleCache,
     painted: &mut Option<Option<String>>,
+    was_active: &mut bool,
 ) {
     // Copy both statics out and drop the guards BEFORE the idle branch's
     // `.await` below - a std Mutex guard must never cross a suspend point.
@@ -836,6 +864,13 @@ async fn tick(
         let metrics = METRICS.lock().unwrap_or_else(|e| e.into_inner());
         aggregate(metrics.values().copied())
     };
+
+    if sync_just_finished(*was_active, agg.active) {
+        // Both idle providers describe completed syncs, so the run that just
+        // ended makes the cached answer wrong however fresh it is.
+        idle.invalidate();
+    }
+    *was_active = agg.active;
 
     let title = if agg.active {
         let rate_bytes = rate.sample(agg.bytes_done, Instant::now());
@@ -1194,6 +1229,50 @@ mod tests {
             now,
             ttl
         ));
+    }
+
+    // Review fix (round-1): a finished sync must invalidate the idle cache.
+    // Both idle providers answer questions ABOUT completed syncs, so a
+    // cached "2h" computed one second before the backup finished is wrong
+    // the moment it does - and without this it would keep rendering for the
+    // rest of the 60 s TTL, which is exactly when a user checks the menu bar.
+    #[test]
+    fn idle_cache_invalidated_when_the_aggregate_goes_inactive() {
+        let mut cache = IdleCache {
+            value: Some("2h".to_string()),
+            fetched_at: Some(Instant::now()),
+            generation: 0,
+            mode: IdleMode::LastBackupAge,
+        };
+        let is_stale = |c: &IdleCache| {
+            idle_cache_is_stale(
+                c.fetched_at,
+                c.generation,
+                0,
+                c.mode,
+                IdleMode::LastBackupAge,
+                Instant::now(),
+                IDLE_REFRESH,
+            )
+        };
+        // Freshly fetched under the current generation and mode: not stale,
+        // so nothing else in the staleness rule would re-query it.
+        assert!(!is_stale(&cache));
+
+        // Only the active -> inactive edge counts as "a sync just finished".
+        assert!(sync_just_finished(true, false));
+        assert!(!sync_just_finished(true, true)); // still syncing
+        assert!(!sync_just_finished(false, false)); // idle all along
+        assert!(!sync_just_finished(false, true)); // a sync just started
+
+        cache.invalidate();
+        assert!(
+            is_stale(&cache),
+            "a finished sync must force the next idle render to re-query"
+        );
+        // The old value survives the invalidation, so the tray keeps showing
+        // it for the fraction of a tick before the fresh one lands.
+        assert_eq!(cache.value.as_deref(), Some("2h"));
     }
 
     #[test]
