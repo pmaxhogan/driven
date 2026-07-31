@@ -33,7 +33,7 @@ use tauri::{AppHandle, Manager};
 
 use driven_core::state::StateRepo;
 use driven_core::time::{Clock, SystemClock};
-use driven_core::types::{AccountId, ExecProgress, OrchestratorState};
+use driven_core::types::{AccountId, ExecProgress, OrchestratorState, PauseReason};
 
 use crate::app_state::AppState;
 use crate::commands::dtos::MenuBarSettings;
@@ -444,9 +444,14 @@ pub fn eta_secs(rate_bps_bytes: f64, remaining_bytes: u64) -> Option<u64> {
 /// every currently-running account, not one per account). `active` marks
 /// whether this account currently has a sync in progress; `aggregate` sums
 /// only active accounts so a finished or paused account's stale totals
-/// don't dilute the combined picture. [`record_progress`] / [`note_state`]
-/// maintain one per account in [`METRICS`]; each tick folds them via
-/// [`aggregate`].
+/// don't dilute the combined picture. `pause_reason` is set while (and only
+/// while) this account is in `OrchestratorState::Paused` (task 9: SPEC s22 -
+/// the tray-menu status rows name the reason a paused account isn't
+/// syncing); every other transition - resuming, or moving to a different
+/// non-paused deactivating state - clears it back to `None`.
+/// [`record_progress`] / [`note_state`] maintain one per account in
+/// [`METRICS`]; each tick folds them via [`aggregate`] (for the bytes/files
+/// totals) and [`paused_reason`] (for the pause summary).
 #[derive(Debug, Clone, Copy, Default)]
 pub struct AccountProgress {
     pub bytes_done: u64,
@@ -454,6 +459,7 @@ pub struct AccountProgress {
     pub files_done: u64,
     pub files_total: u64,
     pub active: bool,
+    pub pause_reason: Option<PauseReason>,
 }
 
 /// Sums the four counters over active accounts only; the result's `active`
@@ -472,6 +478,38 @@ pub fn aggregate(accounts: impl Iterator<Item = AccountProgress>) -> AccountProg
             acc.active = true;
             acc
         })
+}
+
+/// Fixed rank for [`paused_reason`]'s cross-account pick, arbitrary but
+/// fixed (declaration order) - it exists only to make the pick
+/// deterministic when several accounts are paused for different reasons at
+/// once, not to claim one reason is more severe than another. Folding a
+/// `HashMap`-backed iterator in whatever order it happens to yield would
+/// otherwise pick a different "first" reason from run to run.
+fn pause_reason_rank(reason: PauseReason) -> u8 {
+    match reason {
+        PauseReason::Manual => 0,
+        PauseReason::Battery => 1,
+        PauseReason::Metered => 2,
+        PauseReason::Offline => 3,
+        PauseReason::ServiceDown => 4,
+        PauseReason::NoInternet => 5,
+        PauseReason::CaptivePortal => 6,
+        PauseReason::DnsFailed => 7,
+        PauseReason::Schedule => 8,
+    }
+}
+
+/// The pause reason to summarize in the tray-menu status rows (task 9), or
+/// `None` if no account is currently paused. When several accounts are
+/// paused for different reasons, picks by [`pause_reason_rank`] rather than
+/// fold order so the result is reproducible. Unlike [`aggregate`] this looks
+/// at EVERY account, not just active ones - a paused account is by
+/// definition inactive, so it would never surface through `aggregate`.
+pub fn paused_reason(accounts: impl Iterator<Item = AccountProgress>) -> Option<PauseReason> {
+    accounts
+        .filter_map(|a| a.pause_reason)
+        .min_by_key(|r| pause_reason_rank(*r))
 }
 
 /// Inserts `,` every three digits of `n`'s decimal representation: "341" ->
@@ -548,6 +586,65 @@ pub fn menu_status_lines(
     Some((line1, line2))
 }
 
+/// Which of the three tray-menu status-rows outcomes applies on a tick
+/// (task 9: SPEC s22, DESIGN s2). An active sync always wins (the title
+/// behavior stays "paused == idle" per spec, but the rows themselves must
+/// not blank out mid-sync just because some OTHER account happens to be
+/// paused); a paused account otherwise wins over plain idle, since there is
+/// something worth telling the user. Pure so this priority is unit-tested
+/// without a runtime; [`tick`] is the only caller.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum StatusRowsSource {
+    /// At least one account is actively syncing - render via
+    /// [`menu_status_lines`].
+    Active,
+    /// No account is active, but at least one is paused - render via
+    /// [`paused_status_lines`] with the given (deterministically picked,
+    /// see [`paused_reason`]) reason.
+    Paused(PauseReason),
+    /// Nothing active, nothing paused - blank rows.
+    Idle,
+}
+
+/// Picks a [`StatusRowsSource`] from this tick's aggregate activity and
+/// cross-account paused reason.
+pub fn status_rows_source(
+    agg_active: bool,
+    paused_reason: Option<PauseReason>,
+) -> StatusRowsSource {
+    if agg_active {
+        StatusRowsSource::Active
+    } else if let Some(reason) = paused_reason {
+        StatusRowsSource::Paused(reason)
+    } else {
+        StatusRowsSource::Idle
+    }
+}
+
+/// Renders the tray-menu status rows for the "paused, nothing active"
+/// case (task 9). Row 1 names the reason ("Paused - on battery power");
+/// row 2 stays blank - there is no progress data to show while paused, so
+/// unlike [`menu_status_lines`] there is nothing for it to say. Mirrors
+/// `tray::tooltip_for_pause`'s reason-to-key mapping, but with menu-specific
+/// keys: composing the tooltip's own full-sentence strings ("Driven -
+/// paused on battery power") into "Paused - <tooltip text>" reads badly, so
+/// each reason gets its own standalone row-1 sentence instead, keeping the
+/// same reason wording as the tooltip.
+pub fn paused_status_lines(reason: PauseReason) -> (String, String) {
+    let key = match reason {
+        PauseReason::Manual => "tray.menu_status.paused_manual",
+        PauseReason::Battery => "tray.menu_status.paused_battery",
+        PauseReason::Metered => "tray.menu_status.paused_metered",
+        PauseReason::Schedule => "tray.menu_status.paused_schedule",
+        PauseReason::Offline => "tray.menu_status.paused_offline",
+        PauseReason::NoInternet => "tray.menu_status.paused_no_internet",
+        PauseReason::CaptivePortal => "tray.menu_status.paused_captive_portal",
+        PauseReason::DnsFailed => "tray.menu_status.paused_dns_failed",
+        PauseReason::ServiceDown => "tray.menu_status.paused_service_down",
+    };
+    (rust_i18n::t!(key).into_owned(), String::new())
+}
+
 // -----------------------------------------------------------------------------
 // engine: shared state, recorders, and the 1 Hz title task
 // -----------------------------------------------------------------------------
@@ -583,7 +680,10 @@ const TICK_INTERVAL: Duration = Duration::from_secs(1);
 
 /// Records one `SourceProgress` tick for an account. The counters are
 /// absolute (not deltas), so this is a straight overwrite; seeing progress
-/// at all means the account is mid-execution, hence `active: true`.
+/// at all means the account is mid-execution, hence `active: true` and (task
+/// 9) `pause_reason: None` - defense in depth alongside `note_state`'s
+/// `Activate` arm, since real progress is conclusive proof the account isn't
+/// paused.
 pub fn record_progress(account_id: AccountId, p: &ExecProgress) {
     let mut metrics = METRICS.lock().unwrap_or_else(|e| e.into_inner());
     let entry = metrics.entry(account_id).or_default();
@@ -592,6 +692,7 @@ pub fn record_progress(account_id: AccountId, p: &ExecProgress) {
     entry.files_done = p.files_done;
     entry.files_total = p.files_total;
     entry.active = true;
+    entry.pause_reason = None;
 }
 
 /// What an [`OrchestratorState`] transition does to an account's entry in
@@ -604,8 +705,10 @@ enum MetricsUpdate {
     /// The cycle stalled but has not finished (paused, backing off, in the
     /// power-check or verify phase, or errored). Keep the counters - the
     /// last-known progress is still the truth - but stop counting the
-    /// account towards the live aggregate.
-    Deactivate,
+    /// account towards the live aggregate. Carries `Some(reason)` only for
+    /// `Paused` (task 9: SPEC s22 - the tray-menu status rows need the
+    /// reason); every other deactivating state carries `None`.
+    Deactivate(Option<PauseReason>),
     /// The cycle finished. Drop the entry entirely so its stale totals
     /// cannot resurface if the account later reappears mid-cycle.
     Remove,
@@ -620,7 +723,8 @@ fn classify_state(state: &OrchestratorState) -> MetricsUpdate {
         | OrchestratorState::Planning { .. }
         | OrchestratorState::Executing { .. } => MetricsUpdate::Activate,
         OrchestratorState::Idle { .. } => MetricsUpdate::Remove,
-        _ => MetricsUpdate::Deactivate,
+        OrchestratorState::Paused { reason } => MetricsUpdate::Deactivate(Some(*reason)),
+        _ => MetricsUpdate::Deactivate(None),
     }
 }
 
@@ -629,14 +733,29 @@ pub fn note_state(account_id: AccountId, state: &OrchestratorState) {
     let mut metrics = METRICS.lock().unwrap_or_else(|e| e.into_inner());
     match classify_state(state) {
         MetricsUpdate::Activate => {
-            metrics.entry(account_id).or_default().active = true;
+            let entry = metrics.entry(account_id).or_default();
+            entry.active = true;
+            entry.pause_reason = None;
         }
-        MetricsUpdate::Deactivate => {
+        MetricsUpdate::Deactivate(Some(reason)) => {
+            // Unlike the non-paused arm below, this CREATES the entry if
+            // needed (task 9): a gate (e.g. battery) can pause an account
+            // before it ever reaches `Scanning`, right at startup, and the
+            // reason must still be trackable in that case.
+            let entry = metrics.entry(account_id).or_default();
+            entry.active = false;
+            entry.pause_reason = Some(reason);
+        }
+        MetricsUpdate::Deactivate(None) => {
             // Only parks an entry that already exists - an inactive entry
             // contributes nothing to `aggregate`, so creating one here would
-            // be pure bookkeeping noise.
+            // be pure bookkeeping noise. Clears any pause reason left over
+            // from a PRIOR `Paused` state (e.g. Paused -> PowerCheck) so a
+            // stale "Paused - ..." row can't survive into a state that is no
+            // longer paused at all.
             if let Some(entry) = metrics.get_mut(&account_id) {
                 entry.active = false;
+                entry.pause_reason = None;
             }
         }
         MetricsUpdate::Remove => {
@@ -949,9 +1068,11 @@ fn should_paint<T: PartialEq>(last: &Option<Option<T>>, next: &Option<T>) -> boo
 
 /// One engine tick: snapshot the shared state, render a title, and write it
 /// to the tray if it changed. Also renders the two tray-menu status rows
-/// (task 7) from the same aggregate/rate sample and writes them if they
-/// changed - independently of whether the title changed, since the rows
-/// are not gated by the title's per-metric settings toggles.
+/// (task 7; extended task 9 to cover the paused case) from the same
+/// aggregate/rate sample (plus, when idle, the cross-account paused reason)
+/// and writes them if they changed - independently of whether the title
+/// changed, since the rows are not gated by the title's per-metric settings
+/// toggles.
 async fn tick(
     app: &AppHandle,
     rate: &mut RateEstimator,
@@ -964,9 +1085,15 @@ async fn tick(
     // Copy both statics out and drop the guards BEFORE the idle branch's
     // `.await` below - a std Mutex guard must never cross a suspend point.
     let cfg = *CONFIG.lock().unwrap_or_else(|e| e.into_inner());
-    let agg = {
+    let (agg, paused) = {
         let metrics = METRICS.lock().unwrap_or_else(|e| e.into_inner());
-        aggregate(metrics.values().copied())
+        (
+            aggregate(metrics.values().copied()),
+            // Looks at EVERY account, not just active ones - a paused
+            // account is inactive by definition, so it never surfaces
+            // through `aggregate` above (task 9: SPEC s22).
+            paused_reason(metrics.values().copied()),
+        )
     };
 
     if sync_just_finished(*was_active, agg.active) {
@@ -988,9 +1115,22 @@ async fn tick(
         (title, menu_status_lines(&agg, rate_bits, eta))
     } else {
         // Reset the estimator so the next sync cycle starts from a clean
-        // sample window instead of inheriting the previous run's EMA.
+        // sample window, and re-query the idle title provider - both apply
+        // identically whether this tick is truly idle or an account is
+        // currently paused (spec: the title itself treats paused the same
+        // as idle), so they live in this single branch rather than being
+        // duplicated per status-rows outcome below.
         *rate = RateEstimator::new();
-        (idle.title(app, &cfg).await, None)
+        let title = idle.title(app, &cfg).await;
+        // `agg.active` is always false here, so this can only resolve to
+        // `Paused` or `Idle` - `status_rows_source` still takes it (rather
+        // than a bespoke two-way branch) so the same priority helper backs
+        // both this call site and its unit tests.
+        let status_lines = match status_rows_source(false, paused) {
+            StatusRowsSource::Paused(reason) => Some(paused_status_lines(reason)),
+            StatusRowsSource::Active | StatusRowsSource::Idle => None,
+        };
+        (title, status_lines)
     };
 
     let current_status_gen = tray::status_menu_generation();
@@ -1214,6 +1354,7 @@ mod tests {
             files_done: 1,
             files_total: 2,
             active: true,
+            pause_reason: None,
         };
         let b = AccountProgress {
             bytes_done: 90,
@@ -1221,6 +1362,7 @@ mod tests {
             files_done: 3,
             files_total: 4,
             active: false,
+            pause_reason: None,
         };
         let agg = aggregate([a, b].into_iter());
         assert_eq!(agg.bytes_done, 10);
@@ -1267,6 +1409,9 @@ mod tests {
         assert_eq!(format_bytes(999_960_000), "1 GB");
     }
 
+    // Deliberately updated for task 9 (not a verbatim brief test): `Deactivate`
+    // now carries the pause reason so `note_state` can track it, so a `Paused`
+    // state's classification differs from every other deactivating state.
     #[test]
     fn state_classification_matches_the_active_phases() {
         use driven_core::types::{ExecProgress, PauseReason, PlanSummary, SourceId};
@@ -1297,12 +1442,182 @@ mod tests {
             classify_state(&OrchestratorState::Paused {
                 reason: PauseReason::Manual,
             }),
-            MetricsUpdate::Deactivate
+            MetricsUpdate::Deactivate(Some(PauseReason::Manual))
         );
         assert_eq!(
             classify_state(&OrchestratorState::PowerCheck),
-            MetricsUpdate::Deactivate
+            MetricsUpdate::Deactivate(None)
         );
+    }
+
+    // Task 9 (SPEC s22): `note_state` must CREATE an entry for a paused
+    // account even when nothing was recorded for it before - the reported bug
+    // is a gate (e.g. battery) pausing an account right at startup, before it
+    // ever reached `Scanning`, so there is no pre-existing entry to park.
+    #[test]
+    fn note_state_paused_creates_an_entry_and_records_the_reason() {
+        use driven_core::types::{AccountId, PauseReason};
+        let id = AccountId::new_v4();
+        note_state(
+            id,
+            &OrchestratorState::Paused {
+                reason: PauseReason::Battery,
+            },
+        );
+        let entry = {
+            let m = METRICS.lock().unwrap_or_else(|e| e.into_inner());
+            m.get(&id).copied().expect("paused account gets an entry")
+        };
+        assert!(!entry.active);
+        assert_eq!(entry.pause_reason, Some(PauseReason::Battery));
+        // Cleanup: METRICS is process-wide and shared across tests.
+        note_state(id, &OrchestratorState::Idle { last_run_at: None });
+    }
+
+    // Task 9: a non-paused deactivating state (power-check, backoff,
+    // verifying, error) must clear a previously recorded pause reason - this
+    // is the line that prevents a stale "Paused - on battery power" menu row
+    // from surviving into a state that is no longer paused at all.
+    #[test]
+    fn note_state_transition_out_of_paused_clears_the_reason() {
+        use driven_core::types::{AccountId, PauseReason};
+        let id = AccountId::new_v4();
+        note_state(
+            id,
+            &OrchestratorState::Paused {
+                reason: PauseReason::Battery,
+            },
+        );
+        note_state(id, &OrchestratorState::PowerCheck);
+        let entry = {
+            let m = METRICS.lock().unwrap_or_else(|e| e.into_inner());
+            m.get(&id).copied().expect("entry parked, not dropped")
+        };
+        assert!(!entry.active);
+        assert_eq!(
+            entry.pause_reason, None,
+            "leaving Paused must clear the stale reason"
+        );
+        note_state(id, &OrchestratorState::Idle { last_run_at: None });
+    }
+
+    // Task 9: resuming (Activate) also clears any parked pause reason - a
+    // paused-then-resumed account must not keep reporting stale paused
+    // status once it is syncing again.
+    #[test]
+    fn note_state_activate_clears_a_prior_pause_reason() {
+        use driven_core::types::{AccountId, PauseReason, SourceId};
+        let id = AccountId::new_v4();
+        note_state(
+            id,
+            &OrchestratorState::Paused {
+                reason: PauseReason::Metered,
+            },
+        );
+        note_state(
+            id,
+            &OrchestratorState::Scanning {
+                source_id: SourceId::new_v4(),
+                scanned: 0,
+            },
+        );
+        let entry = {
+            let m = METRICS.lock().unwrap_or_else(|e| e.into_inner());
+            m.get(&id).copied().expect("entry present")
+        };
+        assert!(entry.active);
+        assert_eq!(entry.pause_reason, None);
+        note_state(id, &OrchestratorState::Idle { last_run_at: None });
+    }
+
+    // Task 9: `record_progress` implies the account is actively syncing, so
+    // it must clear any parked pause reason too - defense in depth alongside
+    // the `note_state` Activate arm above.
+    #[test]
+    fn record_progress_clears_a_prior_pause_reason() {
+        use driven_core::types::{AccountId, ExecProgress, PauseReason};
+        let id = AccountId::new_v4();
+        note_state(
+            id,
+            &OrchestratorState::Paused {
+                reason: PauseReason::Manual,
+            },
+        );
+        record_progress(id, &ExecProgress::default());
+        let entry = {
+            let m = METRICS.lock().unwrap_or_else(|e| e.into_inner());
+            m.get(&id).copied().expect("entry present")
+        };
+        assert!(entry.active);
+        assert_eq!(entry.pause_reason, None);
+        note_state(id, &OrchestratorState::Idle { last_run_at: None });
+    }
+
+    // Task 9: the cross-account pause-reason pick must be deterministic
+    // regardless of which order the (HashMap-backed) accounts are folded in -
+    // a fixed rank, not "first encountered", is what makes that true.
+    #[test]
+    fn paused_reason_is_deterministic_regardless_of_fold_order() {
+        use driven_core::types::PauseReason;
+        let battery = AccountProgress {
+            pause_reason: Some(PauseReason::Battery),
+            ..Default::default()
+        };
+        let manual = AccountProgress {
+            pause_reason: Some(PauseReason::Manual),
+            ..Default::default()
+        };
+        let not_paused = AccountProgress {
+            active: true,
+            ..Default::default()
+        };
+        let a = paused_reason([battery, manual, not_paused].into_iter());
+        let b = paused_reason([manual, not_paused, battery].into_iter());
+        assert_eq!(a, b, "the pick must not depend on fold order");
+        assert_eq!(a, Some(PauseReason::Manual));
+    }
+
+    #[test]
+    fn paused_reason_none_when_nothing_is_paused() {
+        let active = AccountProgress {
+            active: true,
+            ..Default::default()
+        };
+        assert_eq!(paused_reason([active].into_iter()), None);
+        assert_eq!(paused_reason(std::iter::empty()), None);
+    }
+
+    // Task 9: the tray-menu status rows priority - an active sync always wins
+    // over a paused account, and a paused account always wins over plain
+    // idle. Pure so this priority is unit-tested without a runtime.
+    #[test]
+    fn status_rows_source_priority() {
+        use driven_core::types::PauseReason;
+        assert_eq!(
+            status_rows_source(true, Some(PauseReason::Battery)),
+            StatusRowsSource::Active,
+            "active beats paused"
+        );
+        assert_eq!(
+            status_rows_source(false, Some(PauseReason::Battery)),
+            StatusRowsSource::Paused(PauseReason::Battery),
+            "paused beats idle"
+        );
+        assert_eq!(status_rows_source(false, None), StatusRowsSource::Idle);
+        assert_eq!(status_rows_source(true, None), StatusRowsSource::Active);
+    }
+
+    // Task 9: row 1 names the reason, row 2 stays blank - there is no
+    // progress data to show while paused. Text matches the locale file
+    // verbatim, reusing the tray-tooltip pause wording per the brief.
+    #[test]
+    fn paused_status_lines_render_the_reason_with_a_blank_row_two() {
+        use driven_core::types::PauseReason;
+        let (l1, l2) = paused_status_lines(PauseReason::Battery);
+        assert_eq!(l1, "Paused - on battery power");
+        assert_eq!(l2, "");
+        let (l1, _) = paused_status_lines(PauseReason::Manual);
+        assert_eq!(l1, "Paused");
     }
 
     #[test]
@@ -1429,6 +1744,7 @@ mod tests {
             files_done: 1,
             files_total: 2,
             active: true,
+            ..Default::default()
         };
         let cfg = MenuBarConfig {
             speed: true,
@@ -1475,6 +1791,7 @@ mod tests {
             files_done: 341,
             files_total: 2148,
             active: true,
+            ..Default::default()
         };
         let (l1, l2) = menu_status_lines(&agg, Some(84_000_000.0), Some(240)).unwrap();
         assert_eq!(l1, "Backing up - 62%, ~4m left");
@@ -1489,6 +1806,7 @@ mod tests {
             files_done: 341,
             files_total: 2148,
             active: true,
+            ..Default::default()
         };
         let (l1, l2) = menu_status_lines(&agg, None, None).unwrap();
         assert_eq!(l1, "Backing up - 62%");
