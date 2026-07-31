@@ -93,11 +93,44 @@ pub struct TitleMetrics {
     pub eta_secs: Option<u64>,
 }
 
+/// Rounds `value` to the 3-significant-digit precision `format_speed_bits`
+/// renders with (`.0` at/above 100, `.1` at/above 10, `.2` below that) and
+/// returns both the trimmed rendered string and the rounded numeric value,
+/// so a caller can detect a rounding carry (e.g. 999.6 -> "1000") and
+/// re-scale into the next unit instead of printing an overflowed mantissa.
+///
+/// Only called from `format_speed_bits` below, so it goes dead alongside
+/// it until the engine + bridge wiring task starts driving `format_title`.
+#[allow(dead_code)]
+fn round_3sig(value: f64) -> (String, f64) {
+    let rounded = if value >= 100.0 {
+        value.round()
+    } else if value >= 10.0 {
+        (value * 10.0).round() / 10.0
+    } else {
+        (value * 100.0).round() / 100.0
+    };
+    let rendered = if value >= 100.0 {
+        format!("{rounded:.0}")
+    } else if value >= 10.0 {
+        format!("{rounded:.1}")
+    } else {
+        format!("{rounded:.2}")
+    };
+    (trim_trailing_zeros(&rendered), rounded)
+}
+
 /// Speedtest-style auto-scaled bit rate: "84 Mbps", <= 3 significant
 /// digits. Units step at 1000 (bps -> kbps -> Mbps -> Gbps, capping at
 /// Gbps); the mantissa is rendered with 3 significant digits (`.0` under
 /// 1000, `.1` under 10000, `.2` below that) and a trailing `.0`/`.00` is
 /// trimmed so a round number like 84 Mbps doesn't print "84.0 Mbps".
+///
+/// Scaling happens BEFORE rounding to pick the unit, but the display
+/// mantissa is only known AFTER rounding (e.g. 999.6 -> "1000" at 3 sig
+/// digits) - so once rounded, re-check whether it reached the next unit's
+/// threshold and re-scale if so (999,600 bps must render "1 Mbps", not
+/// "1000 kbps").
 ///
 /// Not yet called outside tests - `format_title` (below) calls this once
 /// the engine + bridge wiring task starts feeding it real rate samples.
@@ -110,30 +143,43 @@ pub fn format_speed_bits(bps: f64) -> String {
         value /= 1000.0;
         unit += 1;
     }
-    let rendered = if value >= 100.0 {
-        format!("{value:.0}")
-    } else if value >= 10.0 {
-        format!("{value:.1}")
-    } else {
-        format!("{value:.2}")
-    };
-    format!("{} {}", trim_trailing_zeros(&rendered), UNITS[unit])
+    let (mut rendered, mut rounded) = round_3sig(value);
+    while rounded >= 1000.0 && unit < UNITS.len() - 1 {
+        value /= 1000.0;
+        unit += 1;
+        let next = round_3sig(value);
+        rendered = next.0;
+        rounded = next.1;
+    }
+    format!("{rendered} {}", UNITS[unit])
 }
 
 /// Compact integer count: "341", "2.1k", "3.4M".
+///
+/// Same round-then-check-carry shape as `format_speed_bits`: the `k`/`M`
+/// mantissa is always 1 decimal place, so a value like 999,950 rounds to
+/// "1000.0k" at the `k` tier and must carry into `M` ("1M"), not print
+/// "1000k".
 ///
 /// Not yet called outside tests - `format_title` (below) calls this once
 /// the engine + bridge wiring task starts feeding it real file counts.
 #[allow(dead_code)]
 pub fn format_compact_count(n: u64) -> String {
     if n < 1_000 {
-        n.to_string()
-    } else if n < 1_000_000 {
-        let mantissa = trim_trailing_zeros(&format!("{:.1}", n as f64 / 1_000.0));
-        format!("{mantissa}k")
-    } else {
-        let mantissa = trim_trailing_zeros(&format!("{:.1}", n as f64 / 1_000_000.0));
-        format!("{mantissa}M")
+        return n.to_string();
+    }
+    const UNITS: [&str; 2] = ["k", "M"];
+    let mut value = n as f64 / 1_000.0;
+    let mut unit = 0;
+    loop {
+        let rounded = (value * 10.0).round() / 10.0;
+        if rounded >= 1000.0 && unit < UNITS.len() - 1 {
+            value /= 1000.0;
+            unit += 1;
+        } else {
+            let mantissa = trim_trailing_zeros(&format!("{rounded:.1}"));
+            return format!("{mantissa}{}", UNITS[unit]);
+        }
     }
 }
 
@@ -141,18 +187,25 @@ pub fn format_compact_count(n: u64) -> String {
 /// nearest minute) under an hour, else "~1h 20m" (the minutes are omitted
 /// when they round to 0, e.g. "~1h").
 ///
+/// The whole `secs` value (at/above 60) is rounded to a total minute count
+/// FIRST, then split into hours/minutes - not rounded independently within
+/// an hour/minute branch already chosen - so a remainder that rounds up to
+/// 60 minutes carries into the next hour instead of rendering "~1h 60m",
+/// and a sub-hour total that rounds up to 60 renders "~1h", not "~60m".
+///
 /// Not yet called outside tests - `format_title` (below) calls this once
 /// the engine + bridge wiring task starts feeding it a real ETA estimate.
 #[allow(dead_code)]
 pub fn format_eta(secs: u64) -> String {
     if secs < 60 {
-        format!("~{secs}s")
-    } else if secs < 3600 {
-        let minutes = (secs as f64 / 60.0).round() as u64;
-        format!("~{minutes}m")
+        return format!("~{secs}s");
+    }
+    let total_minutes = (secs as f64 / 60.0).round() as u64;
+    if total_minutes < 60 {
+        format!("~{total_minutes}m")
     } else {
-        let hours = secs / 3600;
-        let minutes = ((secs % 3600) as f64 / 60.0).round() as u64;
+        let hours = total_minutes / 60;
+        let minutes = total_minutes % 60;
         if minutes == 0 {
             format!("~{hours}h")
         } else {
@@ -249,6 +302,26 @@ mod tests {
         assert_eq!(format_compact_count(341), "341");
         assert_eq!(format_compact_count(2_148), "2.1k");
         assert_eq!(format_compact_count(3_400_000), "3.4M");
+    }
+
+    // Review fix (round-1): the mantissa is rounded to display precision
+    // AFTER the unit is picked, so a value just under a unit's threshold
+    // can round UP to that threshold and needs to carry into the next
+    // unit rather than rendering an overflowed mantissa in the old unit.
+    #[test]
+    fn speed_and_count_round_carry_into_next_unit() {
+        assert_eq!(format_speed_bits(999_600.0), "1 Mbps");
+        assert_eq!(format_compact_count(999_950), "1M");
+    }
+
+    // Review fix (round-1): same carry family as above, applied to the
+    // minutes/hours split - a remainder that rounds up to 60 minutes must
+    // carry into the next hour, and a sub-hour total that rounds up to 60
+    // minutes must render as a full hour, not "~60m"/"~Xh 60m".
+    #[test]
+    fn eta_rounds_carry_into_next_unit() {
+        assert_eq!(format_eta(3599), "~1h");
+        assert_eq!(format_eta(7199), "~2h");
     }
 
     #[test]
