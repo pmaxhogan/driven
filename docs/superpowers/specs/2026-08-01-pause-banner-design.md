@@ -50,7 +50,7 @@ the label names the reason, not "everything is stopped".
 | Metered | "Paused - on a metered network" | "Back up anyway" (one-shot bypass) | metered setting |
 | Offline / NoInternet / DnsFailed | "Paused - no internet connection" (one label for the family) | "Retry" (fresh probe + sync tick = existing sync-now path) | NEW offline-gate setting |
 | CaptivePortal | "Paused - Wi-Fi needs sign-in" | "Retry" | none |
-| ServiceDown | "Paused - the backup destination is unreachable" | "Retry" | none |
+| Destination unreachable | "Paused - the backup destination is unreachable" | "Retry" | none |
 | Schedule | "Waiting for backup window - resumes at HH:MM" (computed client-side from the schedule config) | "Back up now" (one-shot bypass) | schedule setting |
 
 All labels via vue-i18n; the reason wording mirrors the tray tooltip copy.
@@ -97,12 +97,30 @@ New global setting `pause_when_offline: bool`, default `true` (SPEC s22
 
 ### Pause-state surface to the UI
 
-The banner needs per-account `(reason, since)`. `sync:status_changed`
-already carries the full `OrchestratorState` per account, including
+The banner needs the per-account reason. `sync:status_changed` already
+carries the full `OrchestratorState` per account, including
 `Paused { reason }` - the UI progress store keeps the latest state per
-account. Reuse that; do NOT add a new event channel. The schedule
-"resumes at HH:MM" is computed in the UI from the settings store's
-schedule config (next window-open time in local tz).
+account. Reuse that; do NOT add a new event channel or timestamps.
+
+Code-reality notes (recon 2026-08-01) the implementation must absorb:
+
+- `PauseReason::ServiceDown` is never produced by the engine. The real
+  "destination unreachable" signal is `OrchestratorState::Backoff { until }`
+  (the Drive circuit breaker). The banner model therefore consumes the
+  WHOLE per-account `OrchestratorState`: `paused` states map by reason,
+  and `backoff` maps to the "destination unreachable" row (priority slot
+  where ServiceDown sits). The wire shapes are
+  `{ state: "paused", reason: "battery" | ... }` (snake_case) and
+  `{ state: "backoff", until: <ms> }`.
+- The schedule "resumes at HH:MM" is computed client-side from the
+  settings store's schedule config by a net-new pure helper that mirrors
+  `ScheduleConfig::allows` (driven-core types.rs:420-446) exactly:
+  fixed `utcOffsetMinutes`, Euclidean minute math, `Date.getDay()`-indexed
+  days, whole-day when start == end, midnight wrap when start > end.
+- The tray/menubar `pause_reason_rank` (v2.6.0) uses a different,
+  deliberately arbitrary order (Manual first) for its single status row.
+  The banner's severity-priority order is a UI-level decision and MAY
+  disagree; do not "fix" the tray to match.
 
 ## UI structure
 
