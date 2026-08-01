@@ -117,6 +117,32 @@ describe("bannerModel", () => {
     });
   });
 
+  it("does NOT fabricate a banner from an elapsed timed pause when no account is actually paused", () => {
+    // The pause store does not self-expire locally - `pause` stays populated
+    // with a past `until_ms` until the backend's `sync:pause_changed(null)`
+    // event lands. An elapsed timed pause must not push the synthetic manual
+    // candidate, or the banner would outlive the pause it describes.
+    const elapsed: PauseState = { kind: "timed", until_ms: 1_000 };
+    const nowMs = 5_000; // now is well past until_ms
+    const model = bannerModel({ a: idle(), b: executing() }, elapsed, null, nowMs);
+    expect(model).toBeNull();
+  });
+
+  it("falls back to manualIndefinite (not a stale manualTimed) when states report manual but the pause has already elapsed", () => {
+    // Here an account's state still says "manual" (the race hasn't cleared
+    // yet), but the standalone PauseState is already expired - rendering
+    // must not show a stale/negative countdown.
+    const elapsed: PauseState = { kind: "timed", until_ms: 1_000 };
+    const nowMs = 5_000;
+    const model = bannerModel({ a: paused("manual") }, elapsed, null, nowMs);
+    expect(model).toEqual({
+      reason: "manualIndefinite",
+      action: "resume",
+      gear: null,
+      resumeAtMinute: null,
+    });
+  });
+
   describe("priority ordering (highest wins)", () => {
     it("captive portal beats offline", () => {
       const states = { a: paused("captive_portal"), b: paused("offline") };
@@ -230,6 +256,27 @@ describe("nextWindowOpenMinute", () => {
     const sched = schedule({
       startMinute: 300,
       endMinute: 300,
+      days: [false, false, true, false, false, false, false],
+    });
+    expect(nextWindowOpenMinute(sched, now)).toBe(0);
+  });
+
+  it("applies a non-zero utcOffsetMinutes and gates on the LOCAL day, not the UTC day", () => {
+    // now = 2026-08-04T04:00:00Z (Tuesday, UTC). With utcOffsetMinutes=-480
+    // (PST, UTC-8) local time is 2026-08-03 20:00 - Monday evening, a
+    // different calendar day than the UTC timestamp. Sunday/Monday are
+    // disabled and Tuesday is enabled (start==end whole-day, so only the
+    // day-of-week gates): the correct LOCAL day is Monday (disabled), so the
+    // window does not open until local Tuesday 00:00. A sign-flip or a
+    // dropped offset would instead evaluate the UTC day (already Tuesday,
+    // enabled) and return the current UTC minute-of-day (240) immediately -
+    // a value distinct enough from the correct answer (0) to catch either
+    // mistake.
+    const now = Date.UTC(2026, 7, 4, 4, 0, 0);
+    const sched = schedule({
+      startMinute: 500,
+      endMinute: 500,
+      utcOffsetMinutes: -480,
       days: [false, false, true, false, false, false, false],
     });
     expect(nextWindowOpenMinute(sched, now)).toBe(0);

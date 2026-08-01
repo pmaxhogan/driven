@@ -208,11 +208,17 @@ function higherPriority(a: CanonicalReason, b: CanonicalReason): CanonicalReason
  * Manual pause is primarily derived from the per-account states (each
  * account's gate check transitions to `Paused { reason: Manual }` -
  * orchestrator.rs's `evaluate_gates`/`GateDecision::Pause` path, applied at
- * orchestrator.rs:2157-2160), but a non-null `pause` ALSO contributes a
- * synthetic lowest-priority "manual" candidate. This covers the gap between
- * the pause store flipping and the next orchestrator tick reflecting it in
- * `states` (or a stale/empty states map) without ever outranking a real
- * gate-driven reason, since manual already sits at the lowest priority slot.
+ * orchestrator.rs:2157-2160), but a NOT-YET-EXPIRED `pause` ALSO contributes
+ * a synthetic lowest-priority "manual" candidate. This covers the gap
+ * between the pause store flipping and the next orchestrator tick reflecting
+ * it in `states` (or a stale/empty states map) without ever outranking a
+ * real gate-driven reason, since manual already sits at the lowest priority
+ * slot. "Not yet expired" matters because the pause store does NOT
+ * self-expire a timed pause locally - `pause` stays populated with a
+ * past `until_ms` until the backend's `sync:pause_changed(null)` event
+ * lands - so an elapsed timed pause with no account actually paused must
+ * NOT fabricate a banner; only `indefinite` or `timed` with `until_ms` still
+ * in the future contributes the synthetic candidate.
  *
  * Manual timed-vs-indefinite is read from `pause` (its `kind` discriminant),
  * never from the per-account reason string - `Paused { reason: Manual }`
@@ -232,14 +238,21 @@ export function bannerModel(
     if (reason === undefined) continue;
     winning = winning === undefined ? reason : higherPriority(winning, reason);
   }
-  if (pause !== null) {
+  const pauseStillActive =
+    pause !== null && (pause.kind === "indefinite" || pause.until_ms > nowMs);
+  if (pauseStillActive) {
     winning = winning === undefined ? "manual" : higherPriority(winning, "manual");
   }
   if (winning === undefined) return null;
 
   if (winning === "manual") {
+    // Render as timed only while the pause is still active (see
+    // `pauseStillActive` above) - an expired-but-not-yet-cleared timed
+    // pause must never render a stale/negative countdown.
     const reason: BannerReason =
-      pause !== null && pause.kind === "timed" ? "manualTimed" : "manualIndefinite";
+      pauseStillActive && pause !== null && pause.kind === "timed"
+        ? "manualTimed"
+        : "manualIndefinite";
     return { reason, action: "resume", gear: null, resumeAtMinute: null };
   }
 
