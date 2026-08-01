@@ -57,6 +57,21 @@ function stopTicking(): void {
   }
 }
 
+/** Re-read the wall clock into both `now` (this component's bannerModel
+ * input) and the pause store's own clock (its `minutesRemaining`). Shared by
+ * the interval AND the moment ticking arms below - `now` is only ever
+ * written here or at component creation, so after an idle stretch with no
+ * timer running (banner hidden, no timed pause) it can sit hours stale; if
+ * the watch only started the interval without refreshing immediately, the
+ * FIRST render after a reason appears (e.g. a schedule pause, or a manual
+ * pause whose expiry needs checking) would use that stale clock for up to a
+ * second - wrong "resumes at HH:MM" or a wrongly-still-active expired pause -
+ * until the first tick corrected it. */
+function refreshClock(): void {
+  pause.tick();
+  now.value = Date.now();
+}
+
 const model = computed<BannerModel | null>(() =>
   bannerModel(
     progress.states,
@@ -71,10 +86,8 @@ watch(
   (shouldTick) => {
     stopTicking();
     if (shouldTick) {
-      timer = setInterval(() => {
-        pause.tick();
-        now.value = Date.now();
-      }, 1_000);
+      refreshClock();
+      timer = setInterval(refreshClock, 1_000);
     }
   },
   { immediate: true }

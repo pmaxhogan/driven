@@ -261,3 +261,35 @@ describe("StatusBanner - gate-driven reasons (Banner Task 6)", () => {
     expect(wrapper.find(BANNER).text()).toContain("Paused - on battery power");
   });
 });
+
+describe("StatusBanner - clock freshness when ticking arms (fix round 1)", () => {
+  // Regression for a stale-clock bug: `now` is only ever refreshed inside the
+  // ticking interval, so if the component sat mounted-but-hidden for a long
+  // stretch (no interval running) before a reason appeared, the FIRST render
+  // used to read `now` from whenever it was last set - potentially hours
+  // stale - rather than the instant the reason appeared. Proven here via the
+  // expired-manual-pause gate: a timed pause whose `until_ms` has ALREADY
+  // passed relative to the real (fresh) clock, but is still in the future
+  // relative to the stale one, must render as expired (no banner), not as a
+  // live countdown.
+  it("gates an already-expired timed pause using a FRESH clock, not the clock from mount time", async () => {
+    vi.useFakeTimers();
+    const mountedAt = Date.now();
+    const { pause, wrapper } = mountBanner();
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).exists()).toBe(false);
+
+    // The component sits idle - hidden, no timer running - for 2 hours. `now`
+    // is never touched during this stretch (nothing ticks while hidden).
+    vi.setSystemTime(mountedAt + 2 * 60 * 60_000);
+
+    // A timed pause arrives whose expiry (1h after mount) is already an hour
+    // in the past relative to the REAL clock, but still looks like 1h in the
+    // FUTURE relative to the stale mount-time clock - the exact condition
+    // that would make the old code show a live (wrong) countdown.
+    pause.ingest({ kind: "timed", until_ms: mountedAt + 60 * 60_000 });
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.find(BANNER).exists()).toBe(false);
+  });
+});
