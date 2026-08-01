@@ -603,6 +603,10 @@ pub async fn update_settings(
                 _ => {}
             }
         }
+        if let Some(v) = g.pause_when_offline {
+            cur.pause_when_offline = v;
+            orchestrator_affecting = true;
+        }
         store_group(repo, KEY_GLOBAL, &storage::Global::from(cur)).await?;
     }
 
@@ -1122,6 +1126,12 @@ mod storage {
         pub proxy_mode: String,
         #[serde(default)]
         pub proxy_url: Option<String>,
+        // spec 2026-08-01 (unified pause/status banner): whether losing network
+        // reachability pauses sync. `serde(default)` so a `global` blob
+        // persisted before this field still deserialises as `true` (today's
+        // unchanged behaviour).
+        #[serde(default = "default_pause_when_offline")]
+        pub pause_when_offline: bool,
     }
 
     /// Default hook timeout (seconds) for a pre-V2 `global` blob missing it.
@@ -1146,6 +1156,14 @@ mod storage {
         "pause".to_string()
     }
 
+    /// Default for a `global` blob predating the pause/status banner: ON (spec
+    /// 2026-08-01 "pause_when_offline" ships default-on, matching today's
+    /// unchanged behaviour - Offline/NoInternet/CaptivePortal still pause a
+    /// cycle).
+    fn default_pause_when_offline() -> bool {
+        true
+    }
+
     impl From<Global> for GlobalSettings {
         fn from(s: Global) -> Self {
             GlobalSettings {
@@ -1168,6 +1186,7 @@ mod storage {
                 custom_root_ca_path: s.custom_root_ca_path,
                 proxy_mode: s.proxy_mode,
                 proxy_url: s.proxy_url,
+                pause_when_offline: s.pause_when_offline,
             }
         }
     }
@@ -1194,6 +1213,7 @@ mod storage {
                 custom_root_ca_path: d.custom_root_ca_path,
                 proxy_mode: d.proxy_mode,
                 proxy_url: d.proxy_url,
+                pause_when_offline: d.pause_when_offline,
             }
         }
     }
@@ -1596,9 +1616,7 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
         default_concurrent_uploads: global.default_concurrent_uploads,
         adaptive_parallelism_enabled: global.adaptive_parallelism_enabled,
         io_priority: WorkPriority::from_setting(&global.io_priority),
-        // Task 3 wires this from settings; default true keeps today's
-        // behaviour until that lands (spec 2026-08-01 "pause_when_offline").
-        pause_when_offline: true,
+        pause_when_offline: global.pause_when_offline,
     })
 }
 
@@ -2935,6 +2953,9 @@ fn default_global() -> GlobalSettings {
         // Issue #34: honour HTTP(S)_PROXY env vars by default (unchanged V1).
         proxy_mode: "system".to_string(),
         proxy_url: None,
+        // spec 2026-08-01: pause on lost network reachability by default
+        // (unchanged V1 behaviour).
+        pause_when_offline: true,
     }
 }
 
@@ -3238,6 +3259,90 @@ mod tests {
         // Untouched fields keep their seeded defaults.
         assert!(dto.global.skip_on_metered, "untouched field unchanged");
         assert_eq!(dto.global.log_level, "info", "untouched field unchanged");
+        cleanup(dir);
+    }
+
+    /// spec 2026-08-01 "pause_when_offline" (unified pause/status banner):
+    /// mirrors the neighbouring `skip_on_battery` round-trip through the real
+    /// storage layer, plus a legacy-blob deserialization assert - a `global`
+    /// blob persisted before this field existed (pre-dating this change) must
+    /// still deserialise, defaulting to `true` (today's unchanged behaviour).
+    #[tokio::test]
+    async fn pause_when_offline_defaults_true_and_round_trips() {
+        let (repo, dir) = seeded_repo().await;
+        let dto = load_settings_dto(&repo).await.expect("load settings");
+        assert!(
+            dto.global.pause_when_offline,
+            "seeded settings default pause_when_offline to true"
+        );
+
+        // Explicit round-trip through the storage layer.
+        let mut cur: GlobalSettings = load_group::<storage::Global>(&repo, KEY_GLOBAL)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap();
+        cur.pause_when_offline = false;
+        store_group(&repo, KEY_GLOBAL, &storage::Global::from(cur))
+            .await
+            .unwrap();
+        let dto = load_settings_dto(&repo).await.expect("load settings");
+        assert!(!dto.global.pause_when_offline, "explicit false persists");
+
+        // A legacy on-disk blob predating this field (no `pause_when_offline`
+        // key at all) still deserialises, defaulting to true.
+        let legacy: storage::Global = serde_json::from_value(serde_json::json!({
+            "auto_start_on_login": true,
+            "default_concurrent_uploads": serde_json::Value::Null,
+            "bandwidth_cap_mbps": serde_json::Value::Null,
+            "skip_on_battery": true,
+            "skip_on_metered": true,
+            "scan_interval_secs": 600,
+            "deep_verify_interval_secs": 604_800,
+            "io_priority": "low",
+            "log_level": "info",
+        }))
+        .expect("a legacy global blob without pause_when_offline must still deserialise");
+        let legacy_dto: GlobalSettings = legacy.into();
+        assert!(
+            legacy_dto.pause_when_offline,
+            "a pre-existing global blob missing pause_when_offline must default to true"
+        );
+
+        cleanup(dir);
+    }
+
+    /// spec 2026-08-01 "pause_when_offline": the merge arm applies the field
+    /// (and, in `update_settings`, marks the patch orchestrator-affecting).
+    /// Mirrors `update_settings_merge_round_trips_a_single_field` - the
+    /// side-effecting command needs a live `AppHandle`, so this exercises the
+    /// merge arm's logic against the real storage layer, matching that
+    /// established pattern.
+    #[tokio::test]
+    async fn update_settings_merges_pause_when_offline() {
+        let (repo, dir) = seeded_repo().await;
+        let patch_global = crate::commands::dtos::GlobalSettingsPatch {
+            pause_when_offline: Some(false),
+            ..Default::default()
+        };
+
+        let mut cur: GlobalSettings = load_group::<storage::Global>(&repo, KEY_GLOBAL)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap();
+        if let Some(v) = patch_global.pause_when_offline {
+            cur.pause_when_offline = v;
+        }
+        store_group(&repo, KEY_GLOBAL, &storage::Global::from(cur))
+            .await
+            .unwrap();
+
+        let dto = load_settings_dto(&repo).await.unwrap();
+        assert!(!dto.global.pause_when_offline, "patched field persisted");
+        // Untouched fields keep their seeded defaults.
+        assert!(dto.global.skip_on_battery, "untouched field unchanged");
+        assert!(dto.global.skip_on_metered, "untouched field unchanged");
         cleanup(dir);
     }
 

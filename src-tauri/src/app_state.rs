@@ -1307,7 +1307,7 @@ impl AppState {
 }
 
 #[cfg(test)]
-mod tests {
+pub(crate) mod tests {
     use super::*;
     use driven_core::orchestrator::{Orchestrator, OrchestratorConfig, TickSource};
     use driven_core::types::OrchestratorState;
@@ -1327,18 +1327,32 @@ mod tests {
     /// signalled - mirroring the real run loop's graceful-drain contract, so the
     /// R-P1-1 shutdown test exercises the clean-join path for the run loop while
     /// the poller (which loops forever) exercises the abort-and-await path.
-    struct FakeOrchestrator {
+    ///
+    /// `pub(crate)` (banner Task 3, spec 2026-08-01): the `sync_now` bypass-
+    /// ordering test in `commands::sync` reuses this fake rather than
+    /// duplicating a second one, recording `trigger`/`bypass_gates_once` calls
+    /// via [`Self::calls`] so that test can assert the bypass is armed BEFORE
+    /// the manual trigger.
+    pub(crate) struct FakeOrchestrator {
         shutdown: watch::Sender<bool>,
         shutdown_rx: watch::Receiver<bool>,
+        calls: std::sync::Mutex<Vec<&'static str>>,
     }
 
     impl FakeOrchestrator {
-        fn new() -> Self {
+        pub(crate) fn new() -> Self {
             let (shutdown, shutdown_rx) = watch::channel(false);
             Self {
                 shutdown,
                 shutdown_rx,
+                calls: std::sync::Mutex::new(Vec::new()),
             }
+        }
+
+        /// The `trigger`/`bypass_gates_once` calls this fake observed, in
+        /// invocation order (banner Task 3).
+        pub(crate) fn calls(&self) -> Vec<&'static str> {
+            self.calls.lock().unwrap_or_else(|e| e.into_inner()).clone()
         }
     }
 
@@ -1355,8 +1369,19 @@ mod tests {
                 }
             }
         }
-        async fn trigger(&self, _reason: TickSource) {}
+        async fn trigger(&self, _reason: TickSource) {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("trigger");
+        }
         async fn set_paused(&self, _paused: bool) {}
+        fn bypass_gates_once(&self) {
+            self.calls
+                .lock()
+                .unwrap_or_else(|e| e.into_inner())
+                .push("bypass_gates_once");
+        }
         async fn state(&self) -> OrchestratorState {
             OrchestratorState::Idle { last_run_at: None }
         }
@@ -1364,6 +1389,28 @@ mod tests {
         fn shutdown(&self) {
             let _ = self.shutdown.send(true);
         }
+    }
+
+    /// Build an [`AccountHandle`] around `orchestrator` with trivial (already-
+    /// finished) task handles, for command-layer tests that only need a real
+    /// `AccountHandle` present in `AppState::accounts()` (banner Task 3: the
+    /// `sync_now` bypass-ordering test). These tests never exercise
+    /// `AccountHandle::shutdown`'s task-draining, so the task handles need not
+    /// do anything.
+    pub(crate) fn build_fake_account_handle(orchestrator: Arc<dyn Orchestrator>) -> AccountHandle {
+        let (bridge_shutdown, _rx) = watch::channel(false);
+        AccountHandle::new(
+            orchestrator,
+            AccountTasks {
+                crypto: test_crypto(),
+                run_loop: tokio::spawn(async {}),
+                watcher_bridge: None,
+                event_bridge: tokio::spawn(async {}),
+                power_poller: tokio::spawn(async {}),
+                sleep_wake_monitor: None,
+                bridge_shutdown,
+            },
+        )
     }
 
     #[tokio::test]

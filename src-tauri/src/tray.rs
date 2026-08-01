@@ -1124,7 +1124,7 @@ fn on_menu_event(app: &AppHandle, id: &str) {
             let Some(state) = app.try_state::<crate::app_state::AppState>() else {
                 return missing_state_err();
             };
-            crate::commands::sync::sync_now(state, None).await
+            crate::commands::sync::sync_now(state, None, None).await
         }),
         menu_id::PAUSE_30M => spawn_command(app, |app| async move {
             let Some(state) = app.try_state::<crate::app_state::AppState>() else {

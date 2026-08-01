@@ -142,7 +142,8 @@ pub struct AccountSyncStatus {
     pub state: OrchestratorState,
 }
 
-/// `sync_now(source_id?)` - trigger an out-of-band cycle now (SPEC s11.3).
+/// `sync_now(source_id?, bypass_gates?)` - trigger an out-of-band cycle now
+/// (SPEC s11.3).
 ///
 /// `source_id = None` triggers every account's orchestrator; `Some` scopes to
 /// the OWNING account (the orchestrator ticks all its enabled sources -
@@ -150,16 +151,41 @@ pub struct AccountSyncStatus {
 /// from the state DB; an unknown source id is a command error rather than a
 /// silent no-op (so a stale webview surfaces the problem).
 ///
+/// `bypass_gates = Some(true)` (spec 2026-08-01, unified pause/status banner:
+/// the banner's "Sync now" while gated) arms
+/// [`Orchestrator::bypass_gates_once`] on every TARGETED account BEFORE the
+/// manual trigger, so the very next cycle skips a Metered/Battery/Schedule
+/// gate that would otherwise re-refuse it. It never overrides the manual
+/// pause, the network family, or the Drive circuit breaker (see
+/// `bypass_gates_once`'s doc). `None`/`Some(false)` is the unchanged
+/// behaviour.
+///
 /// Each [`Orchestrator::trigger`] coalesces into the run loop's capacity-1
 /// trigger channel, so spamming "Sync now" never stacks concurrent cycles.
 #[tauri::command]
 pub async fn sync_now(
     state: State<'_, AppState>,
     source_id: Option<SourceId>,
+    bypass_gates: Option<bool>,
+) -> CommandResult<()> {
+    sync_now_impl(state.inner(), source_id, bypass_gates).await
+}
+
+/// The testable core of [`sync_now`], split out so it is unit-testable
+/// against a real `AppState` (the `#[tauri::command]` itself needs a Tauri
+/// `State`, which cannot be constructed outside a running app - mirrors
+/// `restore::build_restore_plans`).
+async fn sync_now_impl(
+    state: &AppState,
+    source_id: Option<SourceId>,
+    bypass_gates: Option<bool>,
 ) -> CommandResult<()> {
     match source_id {
         None => {
             for (_id, handle) in state.accounts() {
+                if bypass_gates == Some(true) {
+                    handle.orchestrator.bypass_gates_once();
+                }
                 handle.orchestrator.trigger(TickSource::Manual).await;
             }
             Ok(())
@@ -181,6 +207,9 @@ pub async fn sync_now(
             let handle = state.account(account_id).ok_or_else(|| {
                 CommandError::new(format!("no running orchestrator for account {account_id}"))
             })?;
+            if bypass_gates == Some(true) {
+                handle.orchestrator.bypass_gates_once();
+            }
             handle.orchestrator.trigger(TickSource::Manual).await;
             Ok(())
         }
@@ -475,5 +504,72 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(read_pause_state(&repo).await, None);
+    }
+
+    /// spec 2026-08-01 (unified pause/status banner): `sync_now` with
+    /// `bypass_gates: Some(true)` must arm the one-shot gate bypass on EVERY
+    /// targeted account's orchestrator BEFORE the manual trigger, so the very
+    /// next cycle actually sees it armed (arming AFTER the trigger would race
+    /// the run loop and could miss the bypassed cycle entirely).
+    #[tokio::test]
+    async fn sync_now_bypasses_gates_once_before_triggering_when_requested() {
+        use crate::app_state::tests::{build_fake_account_handle, FakeOrchestrator};
+        use crate::app_state::RemoteMode;
+        use std::collections::HashMap;
+
+        let (_dir, repo) = temp_repo().await;
+        let account_id = AccountId::new_v4();
+        let fake = Arc::new(FakeOrchestrator::new());
+        let orchestrator: Arc<dyn Orchestrator> = fake.clone();
+        let mut accounts = HashMap::new();
+        accounts.insert(account_id, build_fake_account_handle(orchestrator));
+        let app_state = AppState::new(
+            Arc::new(repo),
+            accounts,
+            RemoteMode::Fake,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+        );
+
+        sync_now_impl(&app_state, None, Some(true))
+            .await
+            .expect("sync_now with bypass_gates succeeds");
+
+        assert_eq!(
+            fake.calls(),
+            vec!["bypass_gates_once", "trigger"],
+            "bypass_gates_once must be armed before the manual trigger"
+        );
+    }
+
+    /// The unchanged behaviour: without `bypass_gates: Some(true)`, `sync_now`
+    /// never arms the one-shot bypass - only `trigger` fires.
+    #[tokio::test]
+    async fn sync_now_without_bypass_flag_never_arms_the_bypass() {
+        use crate::app_state::tests::{build_fake_account_handle, FakeOrchestrator};
+        use crate::app_state::RemoteMode;
+        use std::collections::HashMap;
+
+        let (_dir, repo) = temp_repo().await;
+        let account_id = AccountId::new_v4();
+        let fake = Arc::new(FakeOrchestrator::new());
+        let orchestrator: Arc<dyn Orchestrator> = fake.clone();
+        let mut accounts = HashMap::new();
+        accounts.insert(account_id, build_fake_account_handle(orchestrator));
+        let app_state = AppState::new(
+            Arc::new(repo),
+            accounts,
+            RemoteMode::Fake,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+        );
+
+        sync_now_impl(&app_state, None, None)
+            .await
+            .expect("sync_now succeeds");
+
+        assert_eq!(
+            fake.calls(),
+            vec!["trigger"],
+            "no bypass_gates flag means no bypass_gates_once call"
+        );
     }
 }
