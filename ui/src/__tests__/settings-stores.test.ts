@@ -85,6 +85,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       customRootCaPath: null,
       proxyMode: "system",
       proxyUrl: null,
+      pauseWhenOffline: true,
     },
     telemetry: {
       enabled: true,
@@ -257,7 +258,10 @@ describe("sources store", () => {
   it("syncNow forwards the source id", async () => {
     const store = useSourcesStore();
     await store.syncNow("src-1");
-    expect(invokeMock).toHaveBeenCalledWith("sync_now", { sourceId: "src-1" });
+    expect(invokeMock).toHaveBeenCalledWith("sync_now", {
+      sourceId: "src-1",
+      bypassGates: null,
+    });
   });
 });
 

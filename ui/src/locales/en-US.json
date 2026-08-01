@@ -352,6 +352,8 @@
       "autoStartOnLoginNote": "Starts Driven in the background at login so backups keep running. Registers as a real startup app (Windows Task Manager, macOS Login Items, Linux autostart).",
       "skipOnBatteryLabel": "Pause backups while on battery",
       "skipOnMeteredLabel": "Limit backups on metered networks",
+      "pauseWhenOfflineLabel": "Pause backups when the internet is unreachable",
+      "pauseWhenOfflineNote": "Turn this off if you back up to a destination that doesn't need internet access, like a LAN server or a local folder - backups keep running even while Driven can't reach the internet.",
       "metered": {
         "modeLabel": "On a metered network",
         "mode": {

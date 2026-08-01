@@ -232,8 +232,13 @@ export function pickSaveZipDialog(): Promise<PickedPath> {
 
 // --- Sync (SPEC s11.3) ---
 
-export function syncNow(sourceId: string | null): Promise<void> {
-  return invoke("sync_now", { sourceId });
+/** Pause-banner spec (2026-08-01): `bypassGates` lets a caller (the banner's
+ * "Sync anyway" action) force a single sync through the offline/battery/
+ * metered gates once, without touching the persisted settings. Omit it (or
+ * pass nothing) for a normal gated sync - the default `null` is a no-op on
+ * the backend. */
+export function syncNow(sourceId: string | null, bypassGates?: boolean): Promise<void> {
+  return invoke("sync_now", { sourceId, bypassGates: bypassGates ?? null });
 }
 
 export function pauseSync(durationSecs: number | null): Promise<void> {

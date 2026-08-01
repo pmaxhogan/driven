@@ -297,7 +297,10 @@ describe("setup store OAuth sequence (SPEC s11.1)", () => {
     const setup = useSetupStore();
     setup.sourceId = "src-1";
     await setup.startInitialSync();
-    expect(invokeMock).toHaveBeenCalledWith("sync_now", { sourceId: "src-1" });
+    expect(invokeMock).toHaveBeenCalledWith("sync_now", {
+      sourceId: "src-1",
+      bypassGates: null,
+    });
   });
 
   it("checkSigninComplete records a failed code without advancing", async () => {
@@ -450,7 +453,10 @@ describe("SetupWizard walks all five steps (DESIGN s8.5)", () => {
     // Step 5: finish -> initial sync -> navigate to /activity.
     await finishBtn().trigger("click");
     await flushPromises();
-    expect(invokeMock).toHaveBeenCalledWith("sync_now", { sourceId: "src-1" });
+    expect(invokeMock).toHaveBeenCalledWith("sync_now", {
+      sourceId: "src-1",
+      bypassGates: null,
+    });
     expect(router.currentRoute.value.path).toBe("/activity");
 
     // The full OAuth sequence fired in contractual order.

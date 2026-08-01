@@ -362,6 +362,14 @@ async function setSkipOnMetered(event: Event): Promise<void> {
   await commitPatch({ global: { skipOnMetered: checked } });
 }
 
+// Pause-banner spec (2026-08-01): pause backups while offline (default ON).
+// Turning it off suits LAN-only / local-folder destinations that don't need
+// internet reachability to back up.
+async function setPauseWhenOffline(event: Event): Promise<void> {
+  const checked = (event.target as HTMLInputElement).checked;
+  await commitPatch({ global: { pauseWhenOffline: checked } });
+}
+
 // Issue #35: opt-in small-file bundling (default OFF). A standalone advanced
 // toggle - the backend writes the `bundle_small_files` KV key the core planner
 // reads; the thresholds stay backend-only.
@@ -817,6 +825,20 @@ const showTelemetryPreview = ref(false);
             />
             {{ t("settings.rules.skipOnBatteryLabel") }}
           </label>
+
+          <label class="flex items-center gap-2">
+            <input
+              type="checkbox"
+              class="accent-teal-600"
+              data-testid="pause-when-offline-toggle"
+              :checked="settings.settings.global.pauseWhenOffline"
+              @change="setPauseWhenOffline"
+            />
+            {{ t("settings.rules.pauseWhenOfflineLabel") }}
+          </label>
+          <p class="text-xs text-zinc-500 dark:text-zinc-400">
+            {{ t("settings.rules.pauseWhenOfflineNote") }}
+          </p>
 
           <label class="flex items-center gap-2">
             <input

@@ -341,6 +341,10 @@ export interface GlobalSettings {
   /** Issue #34: the manual proxy URL (http/https/socks5/socks5h) or PAC file
    * URL/path. null in system/none mode. */
   proxyUrl: string | null;
+  /** Pause-banner spec (2026-08-01): pause backups while offline (default
+   * true). Turning it off is meant for LAN-only / local-folder destinations
+   * that don't need internet reachability to back up. */
+  pauseWhenOffline: boolean;
 }
 
 export interface TelemetrySettings {
@@ -532,6 +536,8 @@ export interface GlobalSettingsPatch {
   proxyMode?: string;
   /** Issue #34: present = set the proxy URL / PAC source; null clears it. */
   proxyUrl?: string | null;
+  /** Pause-banner spec (2026-08-01): present = set pause-while-offline. */
+  pauseWhenOffline?: boolean;
 }
 
 /** Issue #34: result of validating a candidate custom root CA PEM file. */

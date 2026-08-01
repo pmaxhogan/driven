@@ -45,7 +45,15 @@ describe("typed IPC command wrappers", () => {
 
   it("syncNow forwards the camelCase argument name", async () => {
     await ipc.syncNow(null);
-    expect(invokeMock).toHaveBeenCalledWith("sync_now", { sourceId: null });
+    expect(invokeMock).toHaveBeenCalledWith("sync_now", { sourceId: null, bypassGates: null });
+  });
+
+  it("syncNow forwards bypassGates when the caller requests a gate bypass", async () => {
+    await ipc.syncNow("src-1", true);
+    expect(invokeMock).toHaveBeenCalledWith("sync_now", {
+      sourceId: "src-1",
+      bypassGates: true,
+    });
   });
 
   it("updateSettings forwards the patch under `patch`", async () => {
