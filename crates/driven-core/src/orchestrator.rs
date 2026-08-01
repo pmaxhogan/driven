@@ -219,6 +219,16 @@ pub struct OrchestratorConfig {
     /// executor, so a settings save applies to work that STARTS after it; work
     /// already in flight keeps the level it began with.
     pub io_priority: WorkPriority,
+    /// Whether losing network reachability pauses sync (unified pause/status
+    /// banner, spec 2026-08-01 "pause_when_offline"). Default `true` (V1
+    /// behaviour unchanged). When `false`, exempts EXACTLY the reachability
+    /// family of pause reasons - [`PauseReason::Offline`],
+    /// [`PauseReason::NoInternet`], [`PauseReason::DnsFailed`] - intended for
+    /// LAN/local destinations that stay reachable without internet.
+    /// [`PauseReason::CaptivePortal`] is NOT exempted: it still pauses, since
+    /// a captive portal can silently corrupt traffic rather than merely
+    /// blocking it. See [`network_pause_applies`].
+    pub pause_when_offline: bool,
 }
 
 /// What Driven does on a metered network when
@@ -273,6 +283,7 @@ impl Default for OrchestratorConfig {
             // "behave exactly as before" is the right fallback there. The
             // persisted setting is what demotes a real install.
             io_priority: WorkPriority::Normal,
+            pause_when_offline: true,
         }
     }
 }
@@ -991,12 +1002,21 @@ impl SyncOrchestrator {
         // from "network up, Drive down -> Backoff" (the Drive breaker check
         // below), preserving the DESIGN s5.7 precedence
         // manual > network > metered > battery > breaker.
-        if !power.network_reachable {
+        //
+        // pause_when_offline=false (unified pause/status banner, spec
+        // 2026-08-01) exempts exactly the reachability family below via
+        // `network_pause_applies`; when exempted, FALL THROUGH to the probe
+        // rather than returning Proceed directly, so an exempted machine can
+        // still surface CaptivePortal.
+        if !power.network_reachable && network_pause_applies(&cfg, PauseReason::Offline) {
             return GateDecision::Pause(PauseReason::Offline);
         }
         let net = self.network.probe().await;
         if net != NetworkState::Online {
-            return GateDecision::Pause(pause_reason_for_network(net));
+            let reason = pause_reason_for_network(net);
+            if network_pause_applies(&cfg, reason) {
+                return GateDecision::Pause(reason);
+            }
         }
 
         // Metered / battery / schedule are the bypassable gates (spec
@@ -2321,7 +2341,10 @@ impl SyncOrchestrator {
     /// re-probe is not Online it pauses rather than push work through a dead
     /// link, PRESERVING the distinct non-online state (P2-9): a resume into a
     /// captive portal / no-internet / DNS-broken link surfaces that specific
-    /// reason, not a flattened Offline.
+    /// reason, not a flattened Offline. Honours the same
+    /// `pause_when_offline` exemption as `evaluate_gates` (spec 2026-08-01
+    /// "pause_when_offline") via [`network_pause_applies`], so an exempted
+    /// reason falls through to the Wake cycle instead of re-pausing.
     pub async fn complete_resume(&self) -> anyhow::Result<()> {
         // Step 2: re-probe; do not proceed until connectivity is green. Map the
         // observed state to its distinct PauseReason (DESIGN s5.8.1, s5.8.6) so
@@ -2329,9 +2352,13 @@ impl SyncOrchestrator {
         let net = self.network.probe().await;
         if net != NetworkState::Online {
             let reason = pause_reason_for_network(net);
-            tracing::info!(target: TARGET, account_id = %self.account_id, ?reason, "resume: network not yet online; staying paused");
-            self.transition(OrchestratorState::Paused { reason }).await;
-            return Ok(());
+            let cfg = self.config.read().await.clone();
+            if network_pause_applies(&cfg, reason) {
+                tracing::info!(target: TARGET, account_id = %self.account_id, ?reason, "resume: network not yet online; staying paused");
+                self.transition(OrchestratorState::Paused { reason }).await;
+                return Ok(());
+            }
+            tracing::info!(target: TARGET, account_id = %self.account_id, ?reason, "resume: network gate exempted by pause_when_offline=false; proceeding");
         }
         // Steps 5-6: re-scan from scratch and resume normal ticks.
         self.run_cycle(TickSource::Wake).await
@@ -2451,6 +2478,29 @@ fn pause_reason_for_network(state: NetworkState) -> PauseReason {
         NetworkState::DnsFailed => PauseReason::DnsFailed,
         // Unreachable on the live path (callers guard `!= Online`); keep total.
         NetworkState::Online => PauseReason::Offline,
+    }
+}
+
+/// Whether a network-family [`PauseReason`] should actually pause the cycle,
+/// given [`OrchestratorConfig::pause_when_offline`] (unified pause/status
+/// banner, spec 2026-08-01 "pause_when_offline"). Shared by both mapping
+/// sites - `evaluate_gates`'s live gate and `complete_resume`'s post-wake
+/// re-probe - so the exemption rule lives exactly once.
+///
+/// `pause_when_offline=false` exempts EXACTLY the reachability family -
+/// [`PauseReason::Offline`], [`PauseReason::NoInternet`],
+/// [`PauseReason::DnsFailed`] - for destinations (e.g. LAN/local) that stay
+/// reachable without internet. [`PauseReason::CaptivePortal`] is never
+/// exempted: it still pauses regardless of the setting, since a captive
+/// portal can silently corrupt traffic rather than merely blocking it. Any
+/// other reason (not produced by [`pause_reason_for_network`]) always
+/// applies.
+fn network_pause_applies(cfg: &OrchestratorConfig, reason: PauseReason) -> bool {
+    match reason {
+        PauseReason::Offline | PauseReason::NoInternet | PauseReason::DnsFailed => {
+            cfg.pause_when_offline
+        }
+        _ => true,
     }
 }
 
@@ -6014,6 +6064,142 @@ mod tests {
             // A degraded re-probe must not push work through a dead link.
             assert_eq!(exec.executes.load(Ordering::SeqCst), 0);
         }
+    }
+
+    /// pause_when_offline=false exempts exactly the reachability family
+    /// (Offline/NoInternet/DnsFailed) - CaptivePortal still pauses, and the
+    /// OS-reachability short-circuit falls through to the probe rather than
+    /// returning Proceed directly, so an exempted machine can still surface
+    /// CaptivePortal (spec 2026-08-01 "pause_when_offline").
+    #[tokio::test]
+    async fn offline_exemption_skips_reachability_but_not_captive_portal() {
+        let cfg = OrchestratorConfig {
+            pause_when_offline: false,
+            ..Default::default()
+        };
+
+        // (a) OS-level unreachable AND probe -> Offline: the reachability
+        // short-circuit must fall through to the probe (not return Proceed
+        // directly), and the probe's Offline is itself exempted.
+        {
+            let account = AccountId::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let src = source_in(account, dir.path());
+            let (orch, _clock) = build(
+                account,
+                vec![src],
+                Arc::new(RecordingExecutor::default()),
+                PowerState {
+                    ac_connected: true,
+                    battery_percent: Some(100),
+                    on_metered_network: false,
+                    network_reachable: false,
+                },
+                Arc::new(FakeNet::with_state(NetworkState::Offline)),
+                cfg.clone(),
+            );
+            assert_eq!(
+                orch.evaluate_gates().await,
+                GateDecision::Proceed,
+                "reachability=false + probe Offline must be exempted, not paused"
+            );
+        }
+
+        // (b) probe -> NoInternet, (c) probe -> DnsFailed: both exempted.
+        for state in [NetworkState::NoInternet, NetworkState::DnsFailed] {
+            let account = AccountId::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let src = source_in(account, dir.path());
+            let (orch, _clock) = build(
+                account,
+                vec![src],
+                Arc::new(RecordingExecutor::default()),
+                power_on_ac(),
+                Arc::new(FakeNet::with_state(state)),
+                cfg.clone(),
+            );
+            assert_eq!(
+                orch.evaluate_gates().await,
+                GateDecision::Proceed,
+                "{state:?} must be exempted when pause_when_offline=false"
+            );
+        }
+
+        // (d) CaptivePortal always pauses, exemption or not.
+        {
+            let account = AccountId::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let src = source_in(account, dir.path());
+            let (orch, _clock) = build(
+                account,
+                vec![src],
+                Arc::new(RecordingExecutor::default()),
+                power_on_ac(),
+                Arc::new(FakeNet::with_state(NetworkState::CaptivePortal)),
+                cfg,
+            );
+            assert_eq!(
+                orch.evaluate_gates().await,
+                GateDecision::Pause(PauseReason::CaptivePortal),
+                "CaptivePortal must still pause even when pause_when_offline=false"
+            );
+        }
+    }
+
+    /// Default behaviour unchanged: with `pause_when_offline` at its default
+    /// `true`, Offline still pauses (spec 2026-08-01 "pause_when_offline").
+    #[tokio::test]
+    async fn offline_still_pauses_by_default() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            Arc::new(RecordingExecutor::default()),
+            PowerState {
+                ac_connected: true,
+                battery_percent: Some(100),
+                on_metered_network: false,
+                network_reachable: false,
+            },
+            Arc::new(FakeNet::with_state(NetworkState::Offline)),
+            OrchestratorConfig::default(),
+        );
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Offline)
+        );
+    }
+
+    /// The post-wake re-probe (`complete_resume`) must honour the same
+    /// exemption as the live gate: probe -> NoInternet with
+    /// `pause_when_offline=false` must NOT re-pause, but fall through to the
+    /// Wake cycle (spec 2026-08-01 "pause_when_offline").
+    #[tokio::test]
+    async fn resume_reprobe_honours_offline_exemption() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let cfg = OrchestratorConfig {
+            pause_when_offline: false,
+            ..Default::default()
+        };
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::with_state(NetworkState::NoInternet)),
+            cfg,
+        );
+
+        orch.complete_resume().await.unwrap();
+        assert!(
+            matches!(orch.state().await, OrchestratorState::Idle { .. }),
+            "exempted NoInternet must fall through to the Wake cycle, not re-pause"
+        );
     }
 
     #[tokio::test]

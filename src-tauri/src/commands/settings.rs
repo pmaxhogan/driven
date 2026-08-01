@@ -1596,6 +1596,9 @@ pub async fn load_orchestrator_config(state: &dyn StateRepo) -> CommandResult<Or
         default_concurrent_uploads: global.default_concurrent_uploads,
         adaptive_parallelism_enabled: global.adaptive_parallelism_enabled,
         io_priority: WorkPriority::from_setting(&global.io_priority),
+        // Task 3 wires this from settings; default true keeps today's
+        // behaviour until that lands (spec 2026-08-01 "pause_when_offline").
+        pause_when_offline: true,
     })
 }
 
