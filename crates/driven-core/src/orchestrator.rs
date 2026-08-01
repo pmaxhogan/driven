@@ -318,6 +318,15 @@ pub trait Orchestrator: Send + Sync {
     /// `false` resumes.
     async fn set_paused(&self, paused: bool);
 
+    /// Arms a one-shot gate bypass (spec 2026-08-01 s"One-shot gate
+    /// bypass"): the next cycle where a Metered/Battery/Schedule gate would
+    /// otherwise close skips all three of those checks and proceeds, then
+    /// the flag is consumed. It never overrides the manual pause, the
+    /// network family (Offline/NoInternet/CaptivePortal/DnsFailed), or the
+    /// Drive circuit breaker. Default no-op so implementors that don't need
+    /// the bypass (test fakes) compile unchanged.
+    fn bypass_gates_once(&self) {}
+
     /// Returns a snapshot of the current
     /// [`OrchestratorState`] for the tray / Activity dashboard.
     async fn state(&self) -> OrchestratorState;
@@ -480,6 +489,15 @@ pub struct SyncOrchestrator {
     /// token. An atomic so the cycle path can set it and the run loop can read it
     /// without holding a lock across the select.
     suspended: std::sync::atomic::AtomicBool,
+    /// One-shot gate bypass (spec 2026-08-01 s"One-shot gate bypass"): set by
+    /// the app layer via [`Orchestrator::bypass_gates_once`] (e.g. "sync now
+    /// anyway" from the paused banner), consumed by the first cycle where a
+    /// Metered/Battery/Schedule gate would otherwise close (`evaluate_gates`
+    /// swaps it back to `false` and lets that one cycle's bypassable gates
+    /// through). Never consulted by the manual/network/breaker checks. An
+    /// atomic because it is set from the control-method caller and read from
+    /// the run-loop task.
+    bypass_gates_once: std::sync::atomic::AtomicBool,
     /// App-global latency sampler (DESIGN s13 telemetry), or `None` when
     /// telemetry latency capture is not wired (tests / the chaos harness).
     /// Threaded into [`crate::scanner::scan_with_latency`] so each scan records
@@ -547,6 +565,7 @@ impl SyncOrchestrator {
             vss_create_ledger: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             orphan_cleanup_done: Mutex::new(false),
             suspended: std::sync::atomic::AtomicBool::new(false),
+            bypass_gates_once: std::sync::atomic::AtomicBool::new(false),
             latency: None,
             adaptive: None,
         }
@@ -980,26 +999,49 @@ impl SyncOrchestrator {
             return GateDecision::Pause(pause_reason_for_network(net));
         }
 
+        // Metered / battery / schedule are the bypassable gates (spec
+        // 2026-08-01 s"One-shot gate bypass"): a "sync now anyway" from the
+        // paused banner arms `bypass_gates_once`, which lets exactly one
+        // cycle through whichever of these three would otherwise close.
+        // Manual (above) and network/breaker (above/below) are never
+        // bypassable. Evaluate all three before touching the flag so an
+        // open-gates cycle never consumes it (DESIGN s"bypass survives an
+        // open cycle").
+        //
         // Metered network (DESIGN s5.7): in Pause mode pause; in Throttle mode
         // (V2, DESIGN s17) keep syncing - the reduced cap is applied to the
         // pacer in `apply_bandwidth_cap` before the source loop.
-        if cfg.skip_on_metered && power.on_metered_network && cfg.metered_mode == MeteredMode::Pause
+        let bypassable_pause = if cfg.skip_on_metered
+            && power.on_metered_network
+            && cfg.metered_mode == MeteredMode::Pause
         {
-            return GateDecision::Pause(PauseReason::Metered);
-        }
+            Some(PauseReason::Metered)
+        } else if cfg.skip_on_battery && !power.ac_connected {
+            // Battery gate (DESIGN s5.7): pause on battery when skip_on_battery.
+            Some(PauseReason::Battery)
+        } else if !cfg.schedule.allows(self.clock.now_ms()) {
+            // Schedule window (V2 schedule windows, DESIGN s17): pause outside
+            // the user's allowed local-time window. Reads the injected Clock
+            // so the decision is deterministic; the gate re-opens on a later
+            // cycle once the clock re-enters the window (no manual resume
+            // needed). A disabled schedule always allows, so this is inert
+            // under the V1 default.
+            Some(PauseReason::Schedule)
+        } else {
+            None
+        };
 
-        // Battery gate (DESIGN s5.7): pause on battery when skip_on_battery.
-        if cfg.skip_on_battery && !power.ac_connected {
-            return GateDecision::Pause(PauseReason::Battery);
-        }
-
-        // Schedule window (V2 schedule windows, DESIGN s17): pause outside the
-        // user's allowed local-time window. Reads the injected Clock so the
-        // decision is deterministic; the gate re-opens on a later cycle once
-        // the clock re-enters the window (no manual resume needed). A disabled
-        // schedule always allows, so this is inert under the V1 default.
-        if !cfg.schedule.allows(self.clock.now_ms()) {
-            return GateDecision::Pause(PauseReason::Schedule);
+        if let Some(reason) = bypassable_pause {
+            // Ordering note: the flag is only read on the run-loop task,
+            // `SeqCst` is for simplicity not necessity. One `swap` consumes
+            // the flag for the WHOLE cycle - it covers all three bypassable
+            // gates above, not just the one that happened to fail first.
+            if !self
+                .bypass_gates_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return GateDecision::Pause(reason);
+            }
         }
 
         // Drive circuit breaker (DESIGN s5.8.3): if Drive's breaker is open,
@@ -2777,6 +2819,15 @@ impl Orchestrator for SyncOrchestrator {
         }
     }
 
+    fn bypass_gates_once(&self) {
+        // Ordering note: the flag is only ever read on the run-loop task
+        // (inside `evaluate_gates`, between cycles), so `SeqCst` is for
+        // simplicity, not necessity - a `Release` store here would be
+        // equally correct.
+        self.bypass_gates_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
+    }
+
     async fn state(&self) -> OrchestratorState {
         self.state_machine.read().await.clone()
     }
@@ -3865,6 +3916,136 @@ mod tests {
             exec.executes.load(Ordering::SeqCst),
             0,
             "battery pause must not execute any plan"
+        );
+    }
+
+    /// A one-shot bypass lets exactly one cycle through a closed battery gate;
+    /// the next cycle gates again (spec 2026-08-01 s"One-shot gate bypass").
+    #[tokio::test]
+    async fn bypass_gates_once_passes_one_battery_gated_cycle() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec,
+            power_on_battery(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Battery)
+        );
+
+        orch.bypass_gates_once();
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Proceed,
+            "the armed flag lets this one cycle through the battery gate"
+        );
+
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Battery),
+            "the one-shot flag is consumed after a single cycle"
+        );
+    }
+
+    /// The bypass does NOT override the network family or a manual pause.
+    #[tokio::test]
+    async fn bypass_gates_once_never_bypasses_network_or_manual() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let exec = Arc::new(RecordingExecutor::default());
+        let power = Arc::new(FakePowerSource::new(power_on_battery()));
+        let net = Arc::new(FakeNet::with_state(NetworkState::NoInternet));
+        let clock = Arc::new(FakeClock::new());
+        let orch = SyncOrchestrator::new(
+            account,
+            state,
+            exec,
+            power,
+            net.clone(),
+            clock,
+            OrchestratorConfig::default(),
+        );
+
+        orch.bypass_gates_once();
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::NoInternet),
+            "bypass must not override the network gate"
+        );
+
+        // The flag is NOT consumed by the network-gated cycle above: switch
+        // to online (battery stays unplugged) and the still-armed flag now
+        // covers the battery gate.
+        *net.state.lock().unwrap() = NetworkState::Online;
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Proceed,
+            "the flag armed before the network cycle survived it and now bypasses the battery gate"
+        );
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Battery),
+            "the flag is spent after that one use"
+        );
+
+        // A manual pause is never bypassable either.
+        orch.set_paused(true).await;
+        orch.bypass_gates_once();
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Manual),
+            "bypass must not override a manual pause"
+        );
+    }
+
+    /// An open-gates cycle does not burn the flag.
+    #[tokio::test]
+    async fn bypass_survives_an_open_gates_cycle() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let exec = Arc::new(RecordingExecutor::default());
+        let power = Arc::new(FakePowerSource::new(power_on_ac()));
+        let net = Arc::new(FakeNet::online());
+        let clock = Arc::new(FakeClock::new());
+        let orch = SyncOrchestrator::new(
+            account,
+            state,
+            exec,
+            power.clone(),
+            net,
+            clock,
+            OrchestratorConfig::default(),
+        );
+
+        orch.bypass_gates_once();
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Proceed,
+            "an open-gates cycle must not burn the flag"
+        );
+
+        power.set(power_on_battery());
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Proceed,
+            "the still-armed flag from the open cycle now bypasses the battery gate"
+        );
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Battery),
+            "the flag is spent after that one use"
         );
     }
 
