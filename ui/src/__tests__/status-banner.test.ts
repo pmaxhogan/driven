@@ -1,0 +1,263 @@
+// @vitest-environment jsdom
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mount, flushPromises } from "@vue/test-utils";
+import { createPinia, setActivePinia } from "pinia";
+
+// StatusBanner tests (Banner Task 6, docs/superpowers/specs/2026-08-01-pause-banner-design.md).
+// Absorbs the old PausedBanner suite unchanged (manual pause: hidden when
+// unpaused, timed vs indefinite copy, the live countdown, Resume success +
+// failure) and extends it with the gate-driven reasons the new component
+// renders via `bannerModel`: battery/metered bypass, offline retry, schedule
+// "resumes at HH:MM", the gear deep link, and cross-account priority. The
+// backend seams are `invoke` (resume_sync / sync_now) and `listen`, mocked as
+// before; `vue-router` is mocked per settings-components.test.ts so the gear
+// button's `router.push` can be asserted without a real router.
+
+const invokeMock = vi.fn();
+vi.mock("@tauri-apps/api/core", () => ({
+  invoke: (cmd: string, args?: unknown) => invokeMock(cmd, args),
+}));
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: vi.fn(async () => vi.fn()),
+}));
+
+const pushMock = vi.fn();
+vi.mock("vue-router", () => ({
+  useRouter: () => ({ push: pushMock }),
+  useRoute: () => ({ params: {} }),
+}));
+
+import { i18n } from "../i18n";
+import StatusBanner from "../components/StatusBanner.vue";
+import { usePauseStore } from "../stores/pause";
+import { useProgressStore } from "../stores/progress";
+import { useSettingsStore } from "../stores/settings";
+import type { OrchestratorState, ScheduleSettings } from "../ipc/types";
+
+const BANNER = '[data-testid="paused-banner"]';
+const RESUME = '[data-testid="paused-banner-resume"]';
+const ERROR = '[data-testid="paused-banner-error"]';
+const RETRY = '[data-testid="status-banner-retry"]';
+const BYPASS = '[data-testid="status-banner-bypass"]';
+const GEAR = '[data-testid="status-banner-gear"]';
+
+function perAccount(accountId: string, state: OrchestratorState) {
+  return { account_id: accountId, state };
+}
+function paused(reason: string): OrchestratorState {
+  return { state: "paused", reason };
+}
+function backoff(until: number): OrchestratorState {
+  return { state: "backoff", until };
+}
+
+function schedule(overrides: Partial<ScheduleSettings> = {}): ScheduleSettings {
+  return {
+    enabled: true,
+    startMinute: 0,
+    endMinute: 0,
+    days: [true, true, true, true, true, true, true],
+    utcOffsetMinutes: 0,
+    ...overrides,
+  };
+}
+
+// Only `global.schedule` is read by StatusBanner, so a partial cast (same
+// idiom as about-mac-gating.test.ts's FAKE_SETTINGS) is enough here - no need
+// to hand-construct every SettingsDto field.
+function makeSettings(sched: ScheduleSettings) {
+  return { global: { schedule: sched } } as never;
+}
+
+function mountBanner() {
+  const pinia = createPinia();
+  setActivePinia(pinia);
+  const pause = usePauseStore();
+  const progress = useProgressStore();
+  const settings = useSettingsStore();
+  const wrapper = mount(StatusBanner, { global: { plugins: [pinia, i18n] } });
+  return { pause, progress, settings, wrapper };
+}
+
+beforeEach(() => {
+  invokeMock.mockReset();
+  invokeMock.mockResolvedValue(undefined);
+  pushMock.mockReset();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
+
+describe("StatusBanner - manual pause (absorbed PausedBanner behaviour)", () => {
+  it("renders nothing while sync is not paused", async () => {
+    const { wrapper } = mountBanner();
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).exists()).toBe(false);
+  });
+
+  it("shows the indefinite copy for a pause-until-I-resume", async () => {
+    const { pause, wrapper } = mountBanner();
+    pause.ingest({ kind: "indefinite" });
+    await wrapper.vm.$nextTick();
+
+    const banner = wrapper.find(BANNER);
+    expect(banner.exists()).toBe(true);
+    expect(banner.text()).toContain("Backups paused indefinitely");
+    expect(banner.attributes("role")).toBe("status");
+  });
+
+  it("shows the minutes left for a timed pause", async () => {
+    const { pause, wrapper } = mountBanner();
+    pause.ingest({ kind: "timed", until_ms: Date.now() + 27 * 60_000 });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).text()).toContain("Backups paused - 27m left");
+  });
+
+  it("counts the timed pause down on its one-second tick", async () => {
+    vi.useFakeTimers();
+    const { pause, wrapper } = mountBanner();
+    const until = Date.now() + 30 * 60_000;
+    pause.ingest({ kind: "timed", until_ms: until });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).text()).toContain("30m left");
+
+    // Advance real wall-clock time by 5 minutes, then let the component's
+    // interval fire so it re-reads the clock.
+    vi.setSystemTime(Date.now() + 5 * 60_000);
+    await vi.advanceTimersByTimeAsync(1_000);
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).text()).toContain("25m left");
+  });
+
+  it("hides once the pause clears", async () => {
+    const { pause, wrapper } = mountBanner();
+    pause.ingest({ kind: "indefinite" });
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).exists()).toBe(true);
+
+    pause.ingest(null);
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).exists()).toBe(false);
+  });
+
+  it("resumes on a single click of the Resume button", async () => {
+    const { pause, wrapper } = mountBanner();
+    pause.ingest({ kind: "timed", until_ms: Date.now() + 10 * 60_000 });
+    await wrapper.vm.$nextTick();
+
+    await wrapper.find(RESUME).trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("resume_sync", undefined);
+    expect(wrapper.find(BANNER).exists()).toBe(false);
+  });
+
+  it("keeps the banner and surfaces the error when resuming fails", async () => {
+    invokeMock.mockRejectedValue(new Error("resume blew up"));
+    const { pause, wrapper } = mountBanner();
+    pause.ingest({ kind: "indefinite" });
+    await wrapper.vm.$nextTick();
+
+    await wrapper.find(RESUME).trigger("click");
+    await flushPromises();
+
+    // Backups are still paused, so the banner must not disappear.
+    expect(wrapper.find(BANNER).exists()).toBe(true);
+    expect(wrapper.find(ERROR).text()).toContain("resume blew up");
+    // ...and the button is usable again for a retry.
+    expect(wrapper.find(RESUME).attributes("disabled")).toBeUndefined();
+  });
+});
+
+describe("StatusBanner - gate-driven reasons (Banner Task 6)", () => {
+  it("renders the battery label + bypass button, and bypass calls sync_now with bypassGates: true", async () => {
+    const { progress, wrapper } = mountBanner();
+    progress.ingest(perAccount("acct-1", paused("battery")));
+    await wrapper.vm.$nextTick();
+
+    const banner = wrapper.find(BANNER);
+    expect(banner.exists()).toBe(true);
+    expect(banner.text()).toContain("Paused - on battery power");
+
+    await wrapper.find(BYPASS).trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("sync_now", { sourceId: null, bypassGates: true });
+  });
+
+  it("renders the offline label + retry button, and retry calls sync_now with bypassGates: null", async () => {
+    const { progress, wrapper } = mountBanner();
+    progress.ingest(perAccount("acct-1", paused("no_internet")));
+    await wrapper.vm.$nextTick();
+
+    const banner = wrapper.find(BANNER);
+    expect(banner.exists()).toBe(true);
+    expect(banner.text()).toContain("Paused - no internet connection");
+
+    await wrapper.find(RETRY).trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("sync_now", { sourceId: null, bypassGates: null });
+  });
+
+  it("routes the gear on a battery pause to /rules#power", async () => {
+    const { progress, wrapper } = mountBanner();
+    progress.ingest(perAccount("acct-1", paused("battery")));
+    await wrapper.vm.$nextTick();
+
+    await wrapper.find(GEAR).trigger("click");
+
+    expect(pushMock).toHaveBeenCalledWith("/rules#power");
+  });
+
+  it("renders 'resumes at HH:MM' for a schedule pause, computed via nextWindowOpenMinute", async () => {
+    vi.useFakeTimers();
+    // Freeze at local minute 480 (08:00 UTC, utcOffsetMinutes: 0); the window
+    // opens at minute 600 (10:00).
+    vi.setSystemTime(new Date("2026-08-01T08:00:00.000Z"));
+
+    const { progress, settings, wrapper } = mountBanner();
+    settings.settings = makeSettings(schedule({ startMinute: 600, endMinute: 660 }));
+    progress.ingest(perAccount("acct-1", paused("schedule")));
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.find(BANNER).text()).toContain("resumes at 10:00");
+  });
+
+  it("lets captive portal beat a simultaneous battery pause across two accounts", async () => {
+    const { progress, wrapper } = mountBanner();
+    progress.ingest(perAccount("acct-battery", paused("battery")));
+    progress.ingest(perAccount("acct-portal", paused("captive_portal")));
+    await wrapper.vm.$nextTick();
+
+    const banner = wrapper.find(BANNER);
+    expect(banner.text()).toContain("Wi-Fi needs sign-in");
+    expect(banner.text()).not.toContain("battery power");
+    expect(wrapper.find(RETRY).exists()).toBe(true);
+    // Captive portal has no gear target.
+    expect(wrapper.find(GEAR).exists()).toBe(false);
+  });
+
+  it("renders the destination-unreachable label + retry for a Backoff state", async () => {
+    const { progress, wrapper } = mountBanner();
+    progress.ingest(perAccount("acct-1", backoff(Date.now() + 60_000)));
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.find(BANNER).text()).toContain("the backup destination is unreachable");
+    expect(wrapper.find(RETRY).exists()).toBe(true);
+  });
+
+  it("never throws when the on-mount settings refresh fails - the banner still renders", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.reject(new Error("settings backend down"));
+      return Promise.resolve(undefined);
+    });
+    const { progress, wrapper } = mountBanner();
+    progress.ingest(perAccount("acct-1", paused("battery")));
+    await flushPromises();
+    await wrapper.vm.$nextTick();
+
+    expect(wrapper.find(BANNER).text()).toContain("Paused - on battery power");
+  });
+});
