@@ -6136,12 +6136,43 @@ mod tests {
                 Arc::new(RecordingExecutor::default()),
                 power_on_ac(),
                 Arc::new(FakeNet::with_state(NetworkState::CaptivePortal)),
-                cfg,
+                cfg.clone(),
             );
             assert_eq!(
                 orch.evaluate_gates().await,
                 GateDecision::Pause(PauseReason::CaptivePortal),
                 "CaptivePortal must still pause even when pause_when_offline=false"
+            );
+        }
+
+        // (e) The distinguishing case: OS-level unreachable AND probe ->
+        // CaptivePortal, exemption on. Only a REAL fall-through from the
+        // reachability short-circuit to the probe can produce
+        // Pause(CaptivePortal) here - a forbidden "return Proceed directly"
+        // shortcut at the short-circuit would never even call the probe, so
+        // this is the case that (a) alone cannot distinguish from that bug.
+        {
+            let account = AccountId::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let src = source_in(account, dir.path());
+            let (orch, _clock) = build(
+                account,
+                vec![src],
+                Arc::new(RecordingExecutor::default()),
+                PowerState {
+                    ac_connected: true,
+                    battery_percent: Some(100),
+                    on_metered_network: false,
+                    network_reachable: false,
+                },
+                Arc::new(FakeNet::with_state(NetworkState::CaptivePortal)),
+                cfg,
+            );
+            assert_eq!(
+                orch.evaluate_gates().await,
+                GateDecision::Pause(PauseReason::CaptivePortal),
+                "reachability=false must fall through to the probe, which must \
+                 still surface CaptivePortal even though pause_when_offline=false"
             );
         }
     }
