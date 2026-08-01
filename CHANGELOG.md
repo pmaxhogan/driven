@@ -5,6 +5,13 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.6.0](https://github.com/pmaxhogan/driven/compare/v2.5.1...v2.6.0) (2026-07-31)
+
+
+### Features
+
+* **ui:** configurable macOS menu bar extra with live backup metrics ([#233](https://github.com/pmaxhogan/driven/issues/233)) ([8134bb2](https://github.com/pmaxhogan/driven/commit/8134bb26fff185bc21af790314d4851fc02be306))
+
 ## [2.5.1](https://github.com/pmaxhogan/driven/compare/v2.5.0...v2.5.1) (2026-07-30)
 
 
