@@ -134,10 +134,14 @@ to `Some(BackendKind::Sftp)`.
   `InvariantSurface`; hand-add the Sftp arm to the cross-backend scenarios
   (DestinationVanishedAcrossBackends et al.) and register SFTP-specific
   scenarios.
-- e2e: join whatever the agent-test-harness shipped - at minimum a
-  `driven-cli` backup -> restore round trip against a containerized
-  openssh-server (the harness's compose stack gains an sshd service), and a
-  wizard walk in the WebDriver suite if that pillar landed.
+- e2e: join the shipped harness. There is NO compose stack - sidecars are
+  binaries baked into the Dockerfile `e2e-runtime` stage and spawned as
+  subprocesses on free localhost ports (the MinIO/toxiproxy pattern). So:
+  apt `openssh-server` into the image, add an `SftpStack` mirroring
+  `S3Stack` (crates/driven-e2e/src/scenarios/s3.rs), a `SftpRoundTrip`
+  scenario registered in `scenarios::all()` (the ONLY registration point -
+  CI runs `run-all`), and a `flows::create_sftp_account` helper. openssh
+  for e2e realism; the russh `FaultySftpServer` stays a chaos-tier tool.
 - The three-seams exhaustiveness: compile-time (match arms) + the
   descriptor/ids_match_serde/purge tests extended.
 
