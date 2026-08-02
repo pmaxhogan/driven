@@ -18,10 +18,12 @@ import { useUpdaterStore } from "./stores/updater";
 //
 // UI-CORE IA fix: the top nav is the SHELL-level information architecture and
 // lists only the three primary surfaces - Activity | Restore | Settings.
-// Accounts / Sources / Rules / About are NOT top-nav items: they are subtabs
-// INSIDE the Settings page (the only place they live), so the "Settings" item
-// lights up for any of /settings, /accounts, /sources, /rules, /about. Teal is
-// the shell accent (brand wordmark + active/hover link states).
+// Accounts / Sources / Rules / About are NOT top-nav items: they live under
+// /settings (SDD 2026-08-02 settings-sidebar-ia - a sidebar + routed pages,
+// not tabs, as of task 3), so the "Settings" item lights up for any path under
+// that prefix, including the old flat paths (/accounts, /sources, /rules,
+// /about) which now redirect into it. Teal is the shell accent (brand wordmark
+// + active/hover link states).
 const { t } = useI18n();
 const route = useRoute();
 
@@ -95,11 +97,10 @@ onMounted(async () => {
 const navLinks = [
   { to: "/activity", label: "nav.activity", match: ["/activity"] },
   { to: "/restore", label: "nav.restore", match: ["/restore"] },
-  {
-    to: "/settings",
-    label: "nav.settings",
-    match: ["/settings", "/accounts", "/sources", "/rules", "/about"],
-  },
+  // A single prefix match suffices now: /accounts, /sources, /rules and /about
+  // all redirect to a /settings/* child route (router.ts), so their resolved
+  // `route.path` already starts with "/settings/" by the time isActive runs.
+  { to: "/settings", label: "nav.settings", match: ["/settings"] },
 ] as const;
 
 function isActive(matches: readonly string[]): boolean {

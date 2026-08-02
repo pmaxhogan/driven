@@ -253,6 +253,22 @@
       "rules": "Rules",
       "about": "About"
     },
+    "nav": {
+      "ariaLabel": "Settings navigation",
+      "searchPlaceholder": "Search settings",
+      "preferencesGroup": "Preferences",
+      "accounts": "Accounts",
+      "sources": "Sources",
+      "general": "General",
+      "schedulePower": "Schedule & Power",
+      "performance": "Performance",
+      "platformMacos": "macOS",
+      "platformWindows": "Windows",
+      "network": "Network",
+      "privacy": "Privacy & Data",
+      "advanced": "Advanced",
+      "footer": "Driven {version} · {channel} · About"
+    },
     "accounts": {
       "title": "Connected accounts",
       "empty": "No accounts connected yet.",

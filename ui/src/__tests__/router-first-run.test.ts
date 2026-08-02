@@ -108,13 +108,15 @@ describe("first-run navigation guard (createAppRouter)", () => {
     expect(router.currentRoute.value.path).toBe("/activity");
   });
 
-  it("registers the /settings route rendering the accounts tab by default", async () => {
+  // SDD 2026-08-02 settings-sidebar-ia (task 3): /settings is now a shell with
+  // routed children, not a `tab` prop - it redirects to /settings/accounts,
+  // the default landing page.
+  it("redirects /settings to the accounts page by default", async () => {
     backendWithAccounts([ACCOUNT]);
     const router = createAppRouter(createMemoryHistory());
     await router.push("/settings");
     await router.isReady();
-    const matched = router.currentRoute.value.matched[0];
-    expect(router.currentRoute.value.name).toBe("settings");
-    expect(matched.props.default).toEqual({ tab: "accounts" });
+    expect(router.currentRoute.value.path).toBe("/settings/accounts");
+    expect(router.currentRoute.value.name).toBe("settings-accounts");
   });
 });

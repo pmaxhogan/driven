@@ -36,17 +36,30 @@ vi.mock("@tauri-apps/api/app", () => ({
   getVersion: vi.fn().mockResolvedValue("0.1.0"),
 }));
 
-// vue-router is mocked: the components only need useRouter().push (AccountList /
-// Settings) - we never exercise navigation here.
+// vue-router: most of this file only needs useRouter().push (AccountList) - a
+// fake push-only implementation is enough there and is kept for those tests.
+// The "Settings About tab" describe below is the exception: it mounts the
+// Settings SHELL, which now renders real routed children through
+// <RouterView> and a <SettingsNav> full of <RouterLink>s (SDD 2026-08-02
+// settings-sidebar-ia, task 3) - so it needs the REAL router primitives
+// alongside the fake `useRouter`/`useRoute` (which RouterView/RouterLink do
+// not consume - they resolve the router via internal inject keys, not the
+// public composables re-exported here).
 const pushMock = vi.fn();
-vi.mock("vue-router", () => ({
-  useRouter: () => ({ push: pushMock }),
-  useRoute: () => ({ params: {} }),
-}));
+vi.mock("vue-router", async () => {
+  const actual = await vi.importActual<typeof import("vue-router")>("vue-router");
+  return {
+    ...actual,
+    useRouter: () => ({ push: pushMock }),
+    useRoute: () => ({ params: {} }),
+  };
+});
 
+import { createMemoryHistory } from "vue-router";
 import SourceTable from "../components/SourceTable.vue";
 import AddSourceWizard from "../components/AddSourceWizard.vue";
 import Settings from "../views/Settings.vue";
+import { createAppRouter } from "../router";
 
 function makeSource(over: Partial<SourceDto> = {}): SourceDto {
   return {
@@ -1401,47 +1414,42 @@ describe("AddSourceWizard", () => {
   });
 });
 
-// About moved out of the top nav and into the Settings sub-bar as a fourth tab.
-// /about still resolves (the router points it at THIS view with `tab: "about"`),
-// so these cover the new branch: the tab is offered, it is the active one on
-// that route, and it renders the real About surface rather than the Rules form.
+// About moved out of the top nav and, as of SDD 2026-08-02
+// settings-sidebar-ia task 3, out of a tab strip too - it is reached ONLY
+// through the SettingsNav sidebar footer (Locked decisions), which links
+// /settings/about. /about (the old flat path) still resolves via a redirect.
+// These cover the new shape: the footer link is offered and points at the
+// right route, and that route renders the real About surface rather than a
+// Rules page. (A synthetic click-then-assert-navigation test was tried and
+// dropped: RouterLink's own click handling did not resolve in jsdom under
+// VTU's `.trigger` nor a manually dispatched MouseEvent here, so the href
+// target and the navigated-to content are asserted directly instead - which
+// covers the same contract without depending on that click plumbing.)
 describe("Settings About tab", () => {
-  function aboutTab(wrapper: ReturnType<typeof mount>) {
-    return wrapper
-      .findAll("nav button")
-      .find((b) => b.text() === i18n.global.t("settings.tabs.about"));
+  async function mountSettingsAt(path: string) {
+    const router = createAppRouter(createMemoryHistory());
+    await router.push(path);
+    await router.isReady();
+    const wrapper = mount(Settings, {
+      global: { plugins: [...globalMountOptions.plugins, router] },
+    });
+    await flushPromises();
+    return { wrapper, router };
   }
 
-  it("offers About as a subtab alongside Accounts / Sources / Rules", async () => {
+  it("offers a sidebar footer link to About", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_accounts") return Promise.resolve([]);
       return Promise.resolve(undefined);
     });
-    const wrapper = mount(Settings, { props: { tab: "accounts" }, global: globalMountOptions });
-    await flushPromises();
+    const { wrapper } = await mountSettingsAt("/settings/accounts");
 
-    const labels = wrapper.findAll("nav button").map((b) => b.text());
-    expect(labels).toEqual([
-      i18n.global.t("settings.tabs.accounts"),
-      i18n.global.t("settings.tabs.sources"),
-      i18n.global.t("settings.tabs.rules"),
-      i18n.global.t("settings.tabs.about"),
-    ]);
+    const aboutLink = wrapper.find('[data-testid="settings-nav-about"]');
+    expect(aboutLink.exists()).toBe(true);
+    expect(aboutLink.attributes("href")).toBe("/settings/about");
   });
 
-  it("navigates to /about when the About subtab is clicked", async () => {
-    invokeMock.mockImplementation((cmd: string) => {
-      if (cmd === "list_accounts") return Promise.resolve([]);
-      return Promise.resolve(undefined);
-    });
-    const wrapper = mount(Settings, { props: { tab: "accounts" }, global: globalMountOptions });
-    await flushPromises();
-
-    await aboutTab(wrapper)!.trigger("click");
-    expect(pushMock).toHaveBeenCalledWith("/about");
-  });
-
-  it("renders the About surface (not the Rules form) with the tab marked active", async () => {
+  it("renders the About surface (not a Rules page) on /settings/about", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "get_settings") return Promise.resolve(makeSettings());
       if (cmd === "get_update_channel") return Promise.resolve("stable");
@@ -1449,15 +1457,13 @@ describe("Settings About tab", () => {
       return Promise.resolve(undefined);
     });
 
-    const wrapper = mount(Settings, { props: { tab: "about" }, global: globalMountOptions });
-    await flushPromises();
+    const { wrapper } = await mountSettingsAt("/settings/about");
 
-    expect(aboutTab(wrapper)!.classes()).toContain("border-teal-600");
     // The About surface's own controls are present...
     expect(wrapper.find('[data-testid="channel-select"]').exists()).toBe(true);
     expect(wrapper.find('[data-testid="check-updates"]').exists()).toBe(true);
     expect(wrapper.text()).toContain(i18n.global.t("about.updatesTitle"));
-    // ...and the Rules form is not rendered in its place.
+    // ...and no Rules page is rendered in its place.
     expect(wrapper.find('[data-testid="rules-form"]').exists()).toBe(false);
   });
 });

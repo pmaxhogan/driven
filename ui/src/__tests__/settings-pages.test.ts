@@ -23,15 +23,25 @@ const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: unknown) => invokeMock(cmd, args),
 }));
-// Settings.vue (the shell, mounted only by the de-dupe regression test below)
-// calls useRouter() for its tab-strip buttons - stub it out the same way
-// settings-components.test.ts does, since none of the tab navigation is
-// exercised here.
-vi.mock("vue-router", () => ({
-  useRouter: () => ({ push: vi.fn() }),
-  useRoute: () => ({ params: {} }),
+vi.mock("@tauri-apps/api/app", () => ({
+  getVersion: vi.fn().mockResolvedValue("0.1.0"),
 }));
+// Settings.vue (the shell, mounted only by the de-dupe regression test below)
+// now renders real routed children through <RouterView> and a <SettingsNav>
+// full of <RouterLink>s (SDD 2026-08-02 settings-sidebar-ia, task 3) - so the
+// real router primitives are kept alongside the fake `useRouter`/`useRoute`
+// (RouterView/RouterLink resolve the router via internal inject keys, not
+// these public composables, so overriding them here is still safe).
+vi.mock("vue-router", async () => {
+  const actual = await vi.importActual<typeof import("vue-router")>("vue-router");
+  return {
+    ...actual,
+    useRouter: () => ({ push: vi.fn() }),
+    useRoute: () => ({ params: {} }),
+  };
+});
 
+import { createMemoryHistory } from "vue-router";
 import GeneralPage from "../views/settings/GeneralPage.vue";
 import SchedulePowerPage from "../views/settings/SchedulePowerPage.vue";
 import PerformancePage from "../views/settings/PerformancePage.vue";
@@ -40,6 +50,7 @@ import NetworkPage from "../views/settings/NetworkPage.vue";
 import PrivacyPage from "../views/settings/PrivacyPage.vue";
 import AdvancedPage from "../views/settings/AdvancedPage.vue";
 import Settings from "../views/Settings.vue";
+import { createAppRouter } from "../router";
 
 function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
   return {
@@ -1605,21 +1616,30 @@ describe("AdvancedPage", () => {
   });
 });
 
-describe("Settings.vue (stacked Rules pages)", () => {
-  it("issues exactly one get_settings call even though all seven pages mount at once", async () => {
-    // Regression: each page independently calls ensureSettingsLoaded() on
-    // mount (see shared.ts), and Settings.vue mounts all seven simultaneously
-    // for the Rules tab. Without the `!settings.loading` guard, that fired
-    // seven concurrent `get_settings` round-trips - and worse, seven writes
-    // to `settings.errorCode` racing on which response landed last. Pin the
-    // count so a regression here shows up immediately rather than only as an
-    // intermittent error-banner flake.
+describe("Settings.vue (shell + one routed Rules page)", () => {
+  // Regression, updated for SDD 2026-08-02 settings-sidebar-ia task 3: the
+  // seven Rules pages no longer mount stacked together (each is now its own
+  // route), but the underlying race this guards against still exists in a
+  // different shape - SettingsNav and the active routed page both call
+  // ensureSettingsLoaded() on mount (SettingsNav needs `settings.settings`
+  // for the platform item's visibility on EVERY settings route, including
+  // ones - like the default /settings/accounts - whose page never loads
+  // settings itself), and Vue flushes sibling onMounted hooks in one
+  // synchronous pass with no microtask gap between them. Without the
+  // `!settings.loading` guard in shared.ts, that fires two concurrent
+  // `get_settings` round-trips racing on which response lands last in
+  // `settings.errorCode`. Pin the count so a regression here shows up
+  // immediately rather than only as an intermittent error-banner flake.
+  it("issues exactly one get_settings call even though the sidebar and the routed page mount at once", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "get_settings") return Promise.resolve(makeSettings());
       return Promise.resolve(undefined);
     });
 
-    mount(Settings, { props: { tab: "rules" }, global: globalMountOptions });
+    const router = createAppRouter(createMemoryHistory());
+    await router.push("/settings/general");
+    await router.isReady();
+    mount(Settings, { global: { plugins: [...globalMountOptions.plugins, router] } });
     await flushPromises();
 
     const getSettingsCalls = invokeMock.mock.calls.filter((c) => c[0] === "get_settings");

@@ -24,18 +24,33 @@ const openDialogMock = vi.fn();
 vi.mock("@tauri-apps/plugin-dialog", () => ({
   open: (...args: unknown[]) => openDialogMock(...args),
 }));
-
-// vue-router is mocked: AccountList / Settings only need useRouter().push.
-const pushMock = vi.fn();
-vi.mock("vue-router", () => ({
-  useRouter: () => ({ push: pushMock }),
-  useRoute: () => ({ params: {} }),
+vi.mock("@tauri-apps/api/app", () => ({
+  getVersion: vi.fn().mockResolvedValue("0.1.0"),
 }));
 
+// vue-router: AccountList only needs useRouter().push, so a fake push-only
+// implementation covers most of this file. The "Settings subtabs" describe is
+// the exception - it mounts the Settings SHELL, which now renders real routed
+// children via <RouterView> and <SettingsNav>'s <RouterLink>s (SDD
+// 2026-08-02 settings-sidebar-ia, task 3) - so the real router primitives are
+// kept alongside the fake `useRouter`/`useRoute` (RouterView/RouterLink
+// resolve the router via internal inject keys, not these public composables).
+const pushMock = vi.fn();
+vi.mock("vue-router", async () => {
+  const actual = await vi.importActual<typeof import("vue-router")>("vue-router");
+  return {
+    ...actual,
+    useRouter: () => ({ push: pushMock }),
+    useRoute: () => ({ params: {} }),
+  };
+});
+
+import { createMemoryHistory } from "vue-router";
 import AccountList from "../components/AccountList.vue";
 import SourceTable from "../components/SourceTable.vue";
 import AddSourceWizard from "../components/AddSourceWizard.vue";
 import Settings from "../views/Settings.vue";
+import { createAppRouter } from "../router";
 
 function makeAccount(over: Partial<AccountDto> = {}): AccountDto {
   return {
@@ -155,27 +170,26 @@ describe("AddSourceWizard account dropdown empty-state placeholder", () => {
   });
 });
 
-describe("Settings subtabs", () => {
-  it("marks the active subtab with the teal accent class", async () => {
+// SDD 2026-08-02 settings-sidebar-ia (task 3): the tab strip is gone - the
+// active surface is now marked via the SettingsNav sidebar item's
+// `aria-current`, driven by the real current route rather than a `tab` prop.
+describe("Settings sidebar navigation", () => {
+  it("marks the active sidebar item and leaves the others unmarked", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "list_accounts") return Promise.resolve([]);
       return Promise.resolve(undefined);
     });
+    const router = createAppRouter(createMemoryHistory());
+    await router.push("/settings/accounts");
+    await router.isReady();
     const wrapper = mount(Settings, {
-      props: { tab: "accounts" },
-      global: globalMountOptions,
+      global: { plugins: [...globalMountOptions.plugins, router] },
     });
     await flushPromises();
 
-    const tabButtons = wrapper.findAll("nav button");
-    const accountsTab = tabButtons.find(
-      (b) => b.text() === i18n.global.t("settings.tabs.accounts")
-    );
-    expect(accountsTab).toBeTruthy();
-    // The active subtab carries the teal SUBTAB class; inactive tabs do not.
-    expect(accountsTab!.classes()).toContain("border-teal-600");
-    expect(accountsTab!.classes()).toContain("text-teal-700");
-    const sourcesTab = tabButtons.find((b) => b.text() === i18n.global.t("settings.tabs.sources"));
-    expect(sourcesTab!.classes()).not.toContain("border-teal-600");
+    const accountsItem = wrapper.get('[data-testid="settings-nav-item-accounts"]');
+    expect(accountsItem.attributes("aria-current")).toBe("page");
+    const sourcesItem = wrapper.get('[data-testid="settings-nav-item-sources"]');
+    expect(sourcesItem.attributes("aria-current")).toBeUndefined();
   });
 });
