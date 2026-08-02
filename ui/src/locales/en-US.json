@@ -247,12 +247,6 @@
   },
   "settings": {
     "title": "Settings",
-    "tabs": {
-      "accounts": "Accounts",
-      "sources": "Sources",
-      "rules": "Rules",
-      "about": "About"
-    },
     "nav": {
       "ariaLabel": "Settings navigation",
       "searchPlaceholder": "Search settings",
@@ -365,7 +359,6 @@
       "showMore": "Show {count} more"
     },
     "rules": {
-      "title": "Global rules",
       "sections": {
         "startup": "Startup",
         "powerNetwork": "Power and network",
