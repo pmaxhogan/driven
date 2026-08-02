@@ -1,0 +1,30 @@
+[package]
+name = "driven-sftp"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+license.workspace = true
+repository.workspace = true
+description = "Driven SSH (SFTP) RemoteStore backend"
+publish = false
+
+[dependencies]
+# The RemoteStore trait, the SPEC s24 error taxonomy, and the retry middleware.
+# The `russh`/`russh-sftp` session layer (Task 2) is not a dependency yet -
+# this crate is config/keychain/errors only for now.
+driven-remote = { path = "../driven-remote" }
+anyhow.workspace = true
+thiserror.workspace = true
+serde.workspace = true
+serde_json.workspace = true
+# SPEC s4.1 pattern: the SFTP password / private key lives in the OS keychain,
+# never in SQLite and never in a config file.
+keyring.workspace = true
+
+[dev-dependencies]
+# `driven_test_fixtures::keychain::isolated()` installs (and PROVES) an
+# in-memory credential store as the process default, so the
+# `SftpCredentialStore` round trip is covered by a real test that never
+# reaches an OS keychain. Dev-only: production always uses the real per-OS
+# store.
+driven-test-fixtures = { path = "../driven-test-fixtures" }

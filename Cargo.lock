@@ -1997,6 +1997,19 @@ dependencies = [
 ]
 
 [[package]]
+name = "driven-sftp"
+version = "2.8.0"
+dependencies = [
+ "anyhow",
+ "driven-remote",
+ "driven-test-fixtures",
+ "keyring",
+ "serde",
+ "serde_json",
+ "thiserror 2.0.19",
+]
+
+[[package]]
 name = "driven-test-fixtures"
 version = "2.8.0"
 dependencies = [
