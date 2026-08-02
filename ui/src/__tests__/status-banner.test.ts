@@ -130,24 +130,35 @@ describe("StatusBanner - manual pause (absorbed PausedBanner behaviour)", () => 
     expect(wrapper.find(BANNER).text()).toContain("25m left");
   });
 
-  it("hides once the pause clears", async () => {
+  // The banner's hide edge is now debounced 500ms (smoke fix) so a transient
+  // orchestrator blip never flashes the banner away - so an intentional,
+  // durable clear (pause.ingest(null) here) must be observed past that delay,
+  // not on the very next tick.
+  it("hides once the pause clears (past the 500ms hide debounce)", async () => {
+    vi.useFakeTimers();
     const { pause, wrapper } = mountBanner();
     pause.ingest({ kind: "indefinite" });
     await wrapper.vm.$nextTick();
     expect(wrapper.find(BANNER).exists()).toBe(true);
 
     pause.ingest(null);
+    await vi.advanceTimersByTimeAsync(500);
     await wrapper.vm.$nextTick();
     expect(wrapper.find(BANNER).exists()).toBe(false);
   });
 
   it("resumes on a single click of the Resume button", async () => {
+    vi.useFakeTimers();
     const { pause, wrapper } = mountBanner();
     pause.ingest({ kind: "timed", until_ms: Date.now() + 10 * 60_000 });
     await wrapper.vm.$nextTick();
 
     await wrapper.find(RESUME).trigger("click");
-    await flushPromises();
+    // advanceTimersByTimeAsync also drains the microtask queue at each step,
+    // so this both lets the resume_sync promise settle AND clears the 500ms
+    // hide debounce armed the instant the store optimistically clears.
+    await vi.advanceTimersByTimeAsync(500);
+    await wrapper.vm.$nextTick();
 
     expect(invokeMock).toHaveBeenCalledWith("resume_sync", undefined);
     expect(wrapper.find(BANNER).exists()).toBe(false);
@@ -291,5 +302,80 @@ describe("StatusBanner - clock freshness when ticking arms (fix round 1)", () =>
     await wrapper.vm.$nextTick();
 
     expect(wrapper.find(BANNER).exists()).toBe(false);
+  });
+});
+
+describe("StatusBanner - hide debounce (smoke fix)", () => {
+  // Same root cause as GlobalProgressBar's flicker: a paused account's
+  // periodic orchestrator tick briefly clears (PowerCheck) before re-pausing,
+  // and `bannerModel` reads the same `progress.states`, so `model` can blip
+  // to null and back within one tick. Only the HIDE edge debounces here -
+  // showing a fresh reason, and swapping between two different reasons, both
+  // stay instant (proven by the existing gate-driven-reasons tests above,
+  // none of which advance any timer to see their banner appear).
+  it("never unmounts for a blip shorter than 500ms (e.g. a transient PowerCheck tick)", async () => {
+    vi.useFakeTimers();
+    const { progress, wrapper } = mountBanner();
+    progress.ingest(perAccount("acct-1", paused("battery")));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).exists()).toBe(true);
+
+    // The reason clears for 200ms (the transient tick) then comes right back
+    // - well under the debounce window.
+    progress.ingest(perAccount("acct-1", { state: "power_check" }));
+    await vi.advanceTimersByTimeAsync(200);
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).exists()).toBe(true);
+    expect(wrapper.find(BANNER).text()).toContain("Paused - on battery power");
+
+    progress.ingest(perAccount("acct-1", paused("battery")));
+    await vi.advanceTimersByTimeAsync(1_000);
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).exists()).toBe(true);
+  });
+
+  it("hides once the cleared reason holds for the full 500ms", async () => {
+    vi.useFakeTimers();
+    const { progress, wrapper } = mountBanner();
+    progress.ingest(perAccount("acct-1", paused("battery")));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).exists()).toBe(true);
+
+    progress.ingest(perAccount("acct-1", { state: "power_check" }));
+    await vi.advanceTimersByTimeAsync(499);
+    expect(wrapper.find(BANNER).exists()).toBe(true);
+
+    await vi.advanceTimersByTimeAsync(1);
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).exists()).toBe(false);
+  });
+
+  it("swaps reason-to-reason instantly - not a hide+show, no debounce", async () => {
+    const { progress, wrapper } = mountBanner();
+    progress.ingest(perAccount("acct-1", paused("battery")));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).text()).toContain("Paused - on battery power");
+
+    progress.ingest(perAccount("acct-1", paused("captive_portal")));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BANNER).text()).toContain("Wi-Fi needs sign-in");
+  });
+
+  it("disables the action button during the hide linger - no dispatch against a reason that already cleared", async () => {
+    vi.useFakeTimers();
+    const { progress, wrapper } = mountBanner();
+    progress.ingest(perAccount("acct-1", paused("battery")));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BYPASS).attributes("disabled")).toBeUndefined();
+
+    progress.ingest(perAccount("acct-1", { state: "power_check" }));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BYPASS).attributes("disabled")).toBeDefined();
+
+    // ...and re-enables instantly once the reason comes back, same as the
+    // label swap above.
+    progress.ingest(perAccount("acct-1", paused("battery")));
+    await wrapper.vm.$nextTick();
+    expect(wrapper.find(BYPASS).attributes("disabled")).toBeUndefined();
   });
 });

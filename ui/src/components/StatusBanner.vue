@@ -95,6 +95,48 @@ watch(
 
 onBeforeUnmount(stopTicking);
 
+// Smoke fix: the same orchestrator tick that flickers GlobalProgressBar
+// (crates/driven-core/src/orchestrator.rs:2137, :2156-2159 - a paused account
+// briefly passes through PowerCheck before re-pausing) can also blip `model`
+// to null and back within one tick, since `bannerModel` reads the same
+// `progress.states`. Unlike the progress bar this only debounces the HIDE
+// edge: a fresh pause must give immediate feedback (no artificial delay to
+// SHOW), and swapping from one reason to another is a content change, not a
+// flash, so it stays instant too - only "the banner has nothing left to show"
+// lingers for 500ms in case it comes right back.
+const HIDE_DEBOUNCE_MS = 500;
+const displayModel = ref<BannerModel | null>(model.value);
+let hideTimer: ReturnType<typeof setTimeout> | null = null;
+
+function clearHideTimer(): void {
+  if (hideTimer !== null) {
+    clearTimeout(hideTimer);
+    hideTimer = null;
+  }
+}
+
+watch(model, (value) => {
+  clearHideTimer();
+  if (value !== null) {
+    // Instant show, and instant reason-to-reason swap.
+    displayModel.value = value;
+    return;
+  }
+  hideTimer = setTimeout(() => {
+    hideTimer = null;
+    displayModel.value = null;
+  }, HIDE_DEBOUNCE_MS);
+});
+
+onBeforeUnmount(clearHideTimer);
+
+// True while the banner is showing the LAST known model during the hide
+// linger (the live `model` has already gone null, but `displayModel` has not
+// caught up yet). Action buttons disable in this window rather than
+// dispatching against a reason that, per the live model, no longer applies -
+// simpler than threading "is this the live model" through every handler.
+const lingering = computed<boolean>(() => model.value === null && displayModel.value !== null);
+
 const busy = ref(false);
 const actionError = ref<string | null>(null);
 
@@ -123,7 +165,7 @@ function minutesToHHMM(min: number): string {
 }
 
 const label = computed<string>(() => {
-  const m = model.value;
+  const m = displayModel.value;
   if (m === null) return "";
   if (m.reason === "manualTimed") {
     return t("pauseBanner.timed", { minutes: pause.minutesRemaining ?? 0 });
@@ -141,7 +183,9 @@ const label = computed<string>(() => {
 // Battery/metered ("Back up anyway") and schedule ("Back up now") share the
 // `bypass` action but read differently, per the design doc's per-reason table.
 const bypassLabel = computed<string>(() =>
-  model.value?.reason === "schedule" ? t("statusBanner.backUpNow") : t("statusBanner.backUpAnyway")
+  displayModel.value?.reason === "schedule"
+    ? t("statusBanner.backUpNow")
+    : t("statusBanner.backUpAnyway")
 );
 
 async function runAction(action: () => Promise<void>): Promise<void> {
@@ -169,6 +213,9 @@ function onBypass(): Promise<void> {
 }
 
 function onGear(): void {
+  // The LIVE model, not `displayModel` - during the hide linger the live
+  // model is null (nothing left to configure), so this is already a
+  // defensive no-op without needing its own `lingering` disable.
   const gear = model.value?.gear;
   if (!gear) return;
   void router.push(`/rules#${gear}`);
@@ -178,7 +225,7 @@ function onGear(): void {
 <template>
   <Transition name="driven-pause-fade">
     <div
-      v-if="model"
+      v-if="displayModel"
       class="flex flex-wrap items-center gap-x-3 gap-y-1 border-b border-amber-400 bg-amber-50 px-6 py-2 text-sm text-amber-800 dark:border-amber-500/60 dark:bg-amber-950/40 dark:text-amber-200"
       role="status"
       data-testid="paused-banner"
@@ -186,10 +233,10 @@ function onGear(): void {
       <span class="font-medium">{{ label }}</span>
 
       <button
-        v-if="model.action === 'resume'"
+        v-if="displayModel.action === 'resume'"
         type="button"
         class="rounded-sm border border-amber-500 px-2 py-0.5 font-medium text-amber-900 transition-colors hover:bg-amber-100 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600 disabled:cursor-not-allowed disabled:opacity-60 dark:border-amber-400/70 dark:text-amber-100 dark:hover:bg-amber-900/50"
-        :disabled="busy"
+        :disabled="busy || lingering"
         data-testid="paused-banner-resume"
         @click="onResume"
       >
@@ -197,10 +244,10 @@ function onGear(): void {
       </button>
 
       <button
-        v-else-if="model.action === 'retry'"
+        v-else-if="displayModel.action === 'retry'"
         type="button"
         class="rounded-sm border border-amber-500 px-2 py-0.5 font-medium text-amber-900 transition-colors hover:bg-amber-100 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600 disabled:cursor-not-allowed disabled:opacity-60 dark:border-amber-400/70 dark:text-amber-100 dark:hover:bg-amber-900/50"
-        :disabled="busy"
+        :disabled="busy || lingering"
         data-testid="status-banner-retry"
         @click="onRetry"
       >
@@ -211,7 +258,7 @@ function onGear(): void {
         v-else
         type="button"
         class="rounded-sm border border-amber-500 px-2 py-0.5 font-medium text-amber-900 transition-colors hover:bg-amber-100 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600 disabled:cursor-not-allowed disabled:opacity-60 dark:border-amber-400/70 dark:text-amber-100 dark:hover:bg-amber-900/50"
-        :disabled="busy"
+        :disabled="busy || lingering"
         data-testid="status-banner-bypass"
         @click="onBypass"
       >
@@ -219,7 +266,7 @@ function onGear(): void {
       </button>
 
       <button
-        v-if="model.gear"
+        v-if="displayModel.gear"
         type="button"
         class="rounded-sm p-1 text-amber-700 transition-colors hover:bg-amber-100 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-amber-600 dark:text-amber-200 dark:hover:bg-amber-900/50"
         :aria-label="t('statusBanner.gear')"
