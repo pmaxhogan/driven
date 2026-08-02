@@ -96,6 +96,12 @@ const RESTORE_JOB_DRAIN_TIMEOUT: std::time::Duration = std::time::Duration::from
 /// the `driven/` segment keeps the state DB grouped with the logs the panic
 /// hook + diagnostic bundle use.
 fn state_db_path(app: &tauri::AppHandle) -> anyhow::Result<PathBuf> {
+    // Agent-QA seam: `DRIVEN_DATA_DIR` relocates the whole persistent footprint
+    // (state DB + logs) so an isolated e2e/harness instance never collides with
+    // a real install. See `logging::data_dir_override` for the contract.
+    if let Some(dir) = crate::logging::data_dir_override() {
+        return Ok(dir.join("state.db"));
+    }
     let config_dir = app
         .path()
         .app_config_dir()
@@ -374,15 +380,27 @@ pub fn run() {
     // so a panic during plugin init / `.setup()` / assembly is captured too.
     panic_hook::install();
 
-    let build_result = tauri::Builder::default()
-        // SPEC s14: single-instance MUST be registered FIRST so deep-link can
-        // hook its second-launch callback (forwarding URLs + argv to the
-        // primary instance). The callback surfaces the existing window and
-        // applies the forwarded argv (`--quit` / `--minimized` / a deep-link
-        // URL passed as an arg on Windows + Linux).
-        .plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
+    let builder = tauri::Builder::default();
+    // SPEC s14: single-instance MUST be registered FIRST so deep-link can
+    // hook its second-launch callback (forwarding URLs + argv to the
+    // primary instance). The callback surfaces the existing window and
+    // applies the forwarded argv (`--quit` / `--minimized` / a deep-link
+    // URL passed as an arg on Windows + Linux).
+    //
+    // Agent QA harness exception: an e2e-hooks session (DRIVEN_E2E_HOOKS=1,
+    // never a real install) SKIPS the plugin. The harness boots sequential,
+    // DRIVEN_DATA_DIR-isolated instances, and the plugin's per-user
+    // registration (DBus name on Linux) would make every instance after the
+    // first abort at startup - single-instance is a UX affordance, and there
+    // is no user in a harness session.
+    let builder = if commands::e2e_hooks::hooks_enabled() {
+        builder
+    } else {
+        builder.plugin(tauri_plugin_single_instance::init(|app, argv, _cwd| {
             handle_second_launch(app, &argv);
         }))
+    };
+    let build_result = builder
         // SPEC s14: deep-link SECOND so it hooks the single-instance callback.
         .plugin(tauri_plugin_deep_link::init())
         // SPEC s13: autostart (LaunchAgent on macOS; registry/.desktop
@@ -430,6 +448,15 @@ pub fn run() {
         })
         .setup(|app| {
             let handle = app.handle().clone();
+            // Agent QA harness: make a hook-enabled session self-describing in
+            // the logs (and therefore in any diagnostic bundle it produces).
+            if commands::e2e_hooks::hooks_enabled() {
+                tracing::warn!(
+                    target: "driven::app",
+                    "DRIVEN_E2E_HOOKS=1: e2e test hooks are ENABLED for this session \
+                     (headless dialog-token minting). Never enable this on a real install."
+                );
+            }
             // Boot path (SPEC s11): migrations -> assemble + spawn
             // orchestrators -> manage AppState -> build tray. Async work runs
             // on the Tauri async runtime; failures abort startup (and are
@@ -633,6 +660,9 @@ pub fn run() {
             commands::sources::update_source,
             commands::sources::remove_source,
             commands::sources::pick_drive_folder,
+            // Agent QA harness: env-gated headless twin of the native folder
+            // picker (refused unless DRIVEN_E2E_HOOKS=1; see e2e_hooks docs).
+            commands::e2e_hooks::e2e_pick_folder,
             commands::sources::preview_exclusions,
             // The STREAMING exclusion preview behind the editor's live folder
             // tree: start returns a generation id and the walk reports through

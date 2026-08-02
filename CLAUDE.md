@@ -68,3 +68,22 @@ prefer fixing the title over bypassing.
   `git commit --allow-empty -m "feat: <restated summary> (#NN)"` then push.
   release-please will parse it and add the entry (it even linkifies `(#NN)`).
   A revert is not the fix - it would undo the change on `main`.
+
+## Agent QA harness (test the app like a user, without a human)
+
+Before hand-testing anything or asking the owner to QA, read the repo skill
+`.claude/skills/driven-agent-qa/SKILL.md`. It documents the four-layer test
+stack and the agent-facing entry points:
+
+- `just e2e` - containerized app-level e2e: the REAL Linux desktop app driven
+  over WebDriver (wizard, backup -> restore round trips, fault scenarios).
+- `just e2e-hold` - boot the container and drive the app interactively
+  (WebDriver on :4444, IPC via `window.__TAURI_INTERNALS__.invoke`, faults
+  via toxiproxy/iptables, screenshots for vision review).
+- Seams: `DRIVEN_DATA_DIR` (isolated instances), `DRIVEN_TEST_FAULT_PLAN`
+  (fault-inject a running app's fake remote), `DRIVEN_E2E_HOOKS=1`
+  (headless dialog-token minting).
+- `pnpm -C ui run test:visual` - Playwright visual regression against
+  committed linux baselines (`just visual-update` regenerates via Docker).
+- CI: `.github/workflows/e2e.yml` gates releases (tag -> e2e + visual ->
+  build). Deliberately NOT per-PR; manual runs via workflow_dispatch.

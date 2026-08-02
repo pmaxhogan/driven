@@ -1,0 +1,101 @@
+name: E2E
+
+# App-level end-to-end + visual regression (issue #239, agent QA harness).
+#
+# Deliberately NOT a per-PR gate (owner decision 2026-08-02): the container
+# build is heavy, so these run on the RELEASE path and on demand:
+# - release.yml calls this via workflow_call on every v* tag BEFORE building
+#   installers, so a red e2e/visual run blocks the release publish;
+# - workflow_dispatch for manual / agent-driven runs on any ref.
+#
+# Jobs:
+# - e2e: builds the Dockerfile `e2e-runtime` stage (the REAL Linux desktop
+#   app under Xvfb + WebKitWebDriver + tauri-driver, with MinIO/toxiproxy for
+#   wire faults) and runs `driven-e2e run-all` inside it.
+# - visual: the Playwright visual-regression suite against the committed
+#   linux baselines (deterministic pixel diff only - AI review is a local
+#   activity, never CI).
+
+on:
+  workflow_dispatch:
+  workflow_call:
+
+permissions:
+  contents: read
+
+concurrency:
+  group: ${{ github.workflow }}-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  e2e:
+    name: app e2e (container)
+    runs-on: ubuntu-latest
+    timeout-minutes: 90
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: docker/setup-buildx-action@v3
+
+      # Build the e2e image with a GHA-backed layer cache so the (very heavy)
+      # release-profile app build is incremental across runs.
+      - name: Build e2e image
+        uses: docker/build-push-action@v6
+        with:
+          context: .
+          target: e2e-runtime
+          tags: driven-e2e:ci
+          load: true
+          cache-from: type=gha,scope=e2e
+          cache-to: type=gha,scope=e2e,mode=max
+
+      - name: Run the app-level e2e suite
+        run: |
+          mkdir -p e2e-artifacts
+          docker run --rm \
+            --tmpfs /e2e-small-dest:rw,size=1m \
+            -v "$PWD/e2e-artifacts:/tmp/driven-e2e-artifacts" \
+            driven-e2e:ci driven-e2e run-all
+
+      - name: Upload artifacts (screenshots + evidence)
+        if: always()
+        uses: actions/upload-artifact@v4
+        with:
+          name: e2e-artifacts
+          path: e2e-artifacts/
+          if-no-files-found: ignore
+
+  visual:
+    name: visual regression (playwright)
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v7
+
+      - uses: pnpm/action-setup@v4
+
+      - uses: actions/setup-node@v7
+        with:
+          node-version: 22
+          cache: pnpm
+          cache-dependency-path: ui/pnpm-lock.yaml
+
+      - name: Install UI deps + Playwright chromium
+        working-directory: ui
+        run: |
+          pnpm install --frozen-lockfile
+          pnpm exec playwright install --with-deps chromium
+
+      - name: Run the visual suite against committed linux baselines
+        working-directory: ui
+        run: pnpm run test:visual
+
+      - name: Upload diff report on failure
+        if: failure()
+        uses: actions/upload-artifact@v4
+        with:
+          name: visual-diff-report
+          path: |
+            ui/playwright-report/
+            ui/test-results/
+          if-no-files-found: ignore

@@ -60,6 +60,7 @@
 //! the M3 executor tests rely on.
 
 pub mod fault_injection;
+pub mod fault_plan;
 
 use std::collections::{HashMap, HashSet};
 use std::pin::Pin;

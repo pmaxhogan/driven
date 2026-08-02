@@ -10,7 +10,7 @@ cd "$(dirname "$0")/.."
 
 echo "== Rust (library crates) =="
 SQLX_OFFLINE=true cargo llvm-cov --workspace --exclude src-tauri --exclude driven-chaos \
-  --exclude driven-bench \
+  --exclude driven-bench --exclude driven-e2e \
   --summary-only --json --output-path coverage-rust.json
 RUST_PCT=$(jq '.data[0].totals.lines.percent' coverage-rust.json)
 

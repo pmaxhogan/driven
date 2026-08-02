@@ -19,6 +19,7 @@ members = [
     "crates/driven-cli",
     "crates/driven-test-fixtures",
     "crates/driven-chaos",
+    "crates/driven-e2e",
     "crates/driven-bench",
     "src-tauri",
 ]
