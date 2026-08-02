@@ -30,7 +30,7 @@ exclude = [
 ]
 
 [workspace.package]
-version = "2.6.0"
+version = "2.7.0"
 edition = "2021"
 rust-version = "1.85"
 authors = ["Driven contributors"]
