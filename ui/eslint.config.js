@@ -156,8 +156,13 @@ export default [
             "/^nav\\./",
             // toast.kind.<kind>  - ToastHost.vue renders t(KIND_LABEL[kind])
             "/^toast\\.kind\\./",
-            // settings.tabs.<tab>  - Settings.vue renders t(tab.label)
-            "/^settings\\.tabs\\./",
+            // toast.settingsSaved  - useSettingsForm.ts's commitPatch renders
+            // t(successKey), where successKey defaults to this literal string
+            // but is a variable at the call site, so the static analyzer can't
+            // resolve it. Every current caller relies on the default (no
+            // caller overrides successKey), so this key is live on every
+            // settings save despite looking unused.
+            "/^toast\\.settingsSaved$/",
             // settings.accounts.state.<state>  - AccountList.vue
             "/^settings\\.accounts\\.state\\./",
             // settings.addSource.step.<step>  - AddSourceWizard.vue

@@ -212,14 +212,14 @@ describe("StatusBanner - gate-driven reasons (Banner Task 6)", () => {
     expect(invokeMock).toHaveBeenCalledWith("sync_now", { sourceId: null, bypassGates: null });
   });
 
-  it("routes the gear on a battery pause to /rules#power", async () => {
+  it("routes the gear on a battery pause to /settings/schedule-power", async () => {
     const { progress, wrapper } = mountBanner();
     progress.ingest(perAccount("acct-1", paused("battery")));
     await wrapper.vm.$nextTick();
 
     await wrapper.find(GEAR).trigger("click");
 
-    expect(pushMock).toHaveBeenCalledWith("/rules#power");
+    expect(pushMock).toHaveBeenCalledWith("/settings/schedule-power");
   });
 
   it("renders 'resumes at HH:MM' for a schedule pause, computed via nextWindowOpenMinute", async () => {

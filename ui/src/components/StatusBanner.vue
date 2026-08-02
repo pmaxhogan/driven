@@ -212,13 +212,24 @@ function onBypass(): Promise<void> {
   return runAction(() => syncNow(null, true));
 }
 
+// Every gear value currently lands on the same settings page (its
+// battery/metered/offline/schedule controls all live under Schedule &
+// Power), but keeping the mapping explicit per gear value - rather than a
+// single hardcoded push - lets a future gear value diverge without
+// restructuring this function.
+const GEAR_ROUTES: Record<NonNullable<BannerModel["gear"]>, string> = {
+  power: "/settings/schedule-power",
+  schedule: "/settings/schedule-power",
+  offline: "/settings/schedule-power",
+};
+
 function onGear(): void {
   // The LIVE model, not `displayModel` - during the hide linger the live
   // model is null (nothing left to configure), so this is already a
   // defensive no-op without needing its own `lingering` disable.
   const gear = model.value?.gear;
   if (!gear) return;
-  void router.push(`/rules#${gear}`);
+  void router.push(GEAR_ROUTES[gear]);
 }
 </script>
 

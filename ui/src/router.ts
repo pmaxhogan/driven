@@ -8,15 +8,24 @@ import {
 
 import { listAccounts } from "./ipc/commands";
 
-// SPEC s25 route map. The Settings view hosts the Accounts / Sources / Rules /
-// About tabs (DESIGN s8.2); each tab has its own path so the tray menu + deep
-// links can target a specific tab directly. Activity (M7) and Restore (M8) are now
-// fully implemented views; /restore/:sourceId scopes the browser to one source.
+// SPEC s25 route map. The Settings view is a SHELL (sidebar + <RouterView>,
+// SDD 2026-08-02 settings-sidebar-ia): /settings hosts nine child routes -
+// accounts, sources, general, schedule-power, performance, platform, network,
+// privacy, advanced - plus /settings/about, each rendering its own page
+// component with no props. Activity (M7) and Restore (M8) are fully
+// implemented views; /restore/:sourceId scopes the browser to one source.
 //
-// UI-CORE IA fix: /settings is the top-nav entry point to the Settings page; it
-// renders the same view defaulting to the Accounts tab. The per-tab /accounts,
-// /sources and /rules paths are KEPT so tray deep-links and the in-page subtabs
-// continue to navigate directly to a specific tab.
+// The pre-sidebar flat paths (/accounts, /sources, /rules, /about) are kept as
+// REDIRECTS to their nested equivalent so every existing deep link (tray menu,
+// StatusBanner gear, bookmarks) keeps resolving. /settings itself redirects to
+// /settings/accounts (the default landing page).
+//
+// The /settings parent record is deliberately UNNAMED: it now has children AND
+// a redirect, and naming a parent that has children is a vue-router foot-gun -
+// navigating BY that name renders the childless parent with an empty
+// <RouterView>. Nothing in this codebase navigates by route name (verified by
+// grep across ui/src and src-tauri) - every push/link is path-based - so only
+// the child routes carry names, and only for readability in devtools.
 const routes: RouteRecordRaw[] = [
   {
     path: "/setup",
@@ -36,39 +45,68 @@ const routes: RouteRecordRaw[] = [
   },
   {
     path: "/settings",
-    name: "settings",
     component: () => import("./views/Settings.vue"),
-    props: { tab: "accounts" },
+    children: [
+      { path: "", redirect: "/settings/accounts" },
+      {
+        path: "accounts",
+        name: "settings-accounts",
+        component: () => import("./views/settings/AccountsPage.vue"),
+      },
+      {
+        path: "sources",
+        name: "settings-sources",
+        component: () => import("./views/settings/SourcesPage.vue"),
+      },
+      {
+        path: "general",
+        name: "settings-general",
+        component: () => import("./views/settings/GeneralPage.vue"),
+      },
+      {
+        path: "schedule-power",
+        name: "settings-schedule-power",
+        component: () => import("./views/settings/SchedulePowerPage.vue"),
+      },
+      {
+        path: "performance",
+        name: "settings-performance",
+        component: () => import("./views/settings/PerformancePage.vue"),
+      },
+      {
+        path: "platform",
+        name: "settings-platform",
+        component: () => import("./views/settings/PlatformPage.vue"),
+      },
+      {
+        path: "network",
+        name: "settings-network",
+        component: () => import("./views/settings/NetworkPage.vue"),
+      },
+      {
+        path: "privacy",
+        name: "settings-privacy",
+        component: () => import("./views/settings/PrivacyPage.vue"),
+      },
+      {
+        path: "advanced",
+        name: "settings-advanced",
+        component: () => import("./views/settings/AdvancedPage.vue"),
+      },
+      {
+        // About is reached ONLY from the SettingsNav footer (Locked decisions).
+        // Task 4 wraps it (and Accounts/Sources) in thin page components under
+        // views/settings/ so every settings route owns a dedicated component.
+        path: "about",
+        name: "settings-about",
+        component: () => import("./views/settings/AboutPage.vue"),
+      },
+    ],
   },
-  {
-    path: "/accounts",
-    name: "accounts",
-    component: () => import("./views/Settings.vue"),
-    props: { tab: "accounts" },
-  },
-  {
-    path: "/sources",
-    name: "sources",
-    component: () => import("./views/Settings.vue"),
-    props: { tab: "sources" },
-  },
-  {
-    path: "/rules",
-    name: "rules",
-    component: () => import("./views/Settings.vue"),
-    props: { tab: "rules" },
-  },
-  {
-    // About is a Settings SUBTAB, not a top-nav surface. The path is unchanged
-    // so every existing deep link (and any future tray hint) keeps working -
-    // preserving the URL is strictly safer than redirecting it to a new one -
-    // and it follows the same flat per-tab shape as /accounts, /sources and
-    // /rules rather than inventing a nested /settings/about.
-    path: "/about",
-    name: "about",
-    component: () => import("./views/Settings.vue"),
-    props: { tab: "about" },
-  },
+  { path: "/accounts", redirect: "/settings/accounts" },
+  { path: "/sources", redirect: "/settings/sources" },
+  { path: "/rules", redirect: "/settings/general" },
+  { path: "/about", redirect: "/settings/about" },
   {
     path: "/restore",
     name: "restore",

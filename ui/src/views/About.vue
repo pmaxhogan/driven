@@ -5,35 +5,34 @@ import { getVersion } from "@tauri-apps/api/app";
 
 import * as ipc from "../ipc/commands";
 import { flushFrontendLogs } from "../frontendLog";
-import { useSettingsStore } from "../stores/settings";
 import { useToastsStore } from "../stores/toasts";
 import { useUpdaterStore } from "../stores/updater";
 import ChangelogModal from "../components/ChangelogModal.vue";
-import TelemetryPreviewModal from "../components/TelemetryPreviewModal.vue";
 import { isMacOS } from "../platform";
 import type { ReleaseDto } from "../ipc/types";
 
 // About surface (SPEC s11.6, s15, s25 /about; DESIGN s8.2 About tab). Rendered
 // as the About TAB inside Settings.vue: /about resolves to Settings with
 // `tab: "about"`, which embeds this. Its headings are therefore section-level
-// (h2 + h3) under the Settings h1, not a page title of their own. Shows the app
-// version, the update channel selector (stable / dev), Check-for-updates, an
-// in-app "update available" banner with Install + download progress + View
-// changelog, the paginated release-notes viewer (list_releases) with a per-entry
-// ChangelogModal, the license, the telemetry opt-out, and the diagnostic-bundle
-// export. Channel + the updater flow round-trip through the updater store; the
-// telemetry toggle + diagnostics through the settings store; the version comes
-// from the Tauri app metadata; the license is the workspace SPDX id (SPEC s23).
+// (h2 + h3) under the Settings h1, not a page title of their own. As of SDD
+// 2026-08-02 settings-sidebar-ia task 5, About is identity-only: the app
+// version, an in-app "update available" banner with Install + download
+// progress + View changelog, its OWN check-for-updates action + status
+// (DESIGN mock F allows the action to exist here AND on GeneralPage, which
+// also owns the channel selector), the license, the diagnostic-bundle export,
+// and the paginated release-notes viewer (list_releases) with a per-entry
+// ChangelogModal. The channel selector and the telemetry opt-out both moved
+// out (GeneralPage and PrivacyPage respectively) - About no longer touches
+// the settings store at all. The updater flow round-trips through the
+// updater store; the version comes from the Tauri app metadata; the license
+// is the workspace SPDX id (SPEC s23).
 const { t, locale } = useI18n();
-const settings = useSettingsStore();
 const toasts = useToastsStore();
 const updater = useUpdaterStore();
 
 const version = ref<string>("");
 // Workspace license (SPEC s23 workspace.package.license).
 const license = ref<string>("MIT OR Apache-2.0");
-
-const channels = ["stable", "dev"] as const;
 
 // Shared design-system class strings (DRIVEN UI design system). Teal is the
 // accent for primary/interactive affordances; native controls carry explicit
@@ -42,8 +41,6 @@ const primaryBtn =
   "inline-flex items-center justify-center gap-2 rounded-md bg-teal-700 px-4 py-2 text-sm font-medium text-white shadow-xs transition-colors hover:bg-teal-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:cursor-not-allowed disabled:opacity-50";
 const secondaryBtn =
   "inline-flex items-center justify-center gap-2 rounded-md border border-zinc-300 bg-white px-4 py-2 text-sm font-medium text-zinc-700 transition-colors hover:bg-zinc-100 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 disabled:opacity-50 dark:border-zinc-700 dark:bg-zinc-900 dark:text-zinc-200 dark:hover:bg-zinc-800";
-const inputCls =
-  "rounded-md border border-zinc-300 bg-white px-3 py-2 text-sm text-zinc-900 transition-colors focus:border-teal-500 focus:outline-hidden focus:ring-2 focus:ring-teal-500/40 disabled:opacity-60 dark:border-zinc-700 dark:bg-zinc-800 dark:text-zinc-100";
 const cardCls =
   "rounded-lg border border-zinc-200 bg-white p-4 shadow-xs dark:border-zinc-800 dark:bg-zinc-900";
 
@@ -73,13 +70,6 @@ const exporting = ref(false);
 const exportError = ref<string | null>(null);
 const exportedPath = ref<string | null>(null);
 
-const telemetryEnabled = computed(() => settings.settings?.telemetry.enabled ?? false);
-
-// SPEC s16 telemetry preview (#34): shows the exact next-ping JSON payload in a
-// modal, available regardless of the current enabled state - a privacy-
-// conscious user inspects it BEFORE opting in. Mirrors the Settings-tab link.
-const showTelemetryPreview = ref(false);
-
 function formatReleaseDate(iso: string): string {
   const date = new Date(iso);
   if (Number.isNaN(date.getTime())) return iso;
@@ -98,28 +88,14 @@ onMounted(async () => {
   } catch {
     version.value = "";
   }
-  if (settings.settings === null) {
-    await settings.refresh();
-  }
   // R2-P1-3: the updater EVENT subscriptions are owned at the app root (App.vue)
   // so a startup `updater:available` is never lost when About is not mounted.
-  // About only loads the channel + releases list for its own surface; the banner
-  // is driven entirely by the shared store state the root subscription feeds.
-  await updater.loadChannel();
+  // About only loads the releases list for its own surface; the banner is
+  // driven entirely by the shared store state the root subscription feeds.
+  // (The channel itself is now loaded by GeneralPage, the channel selector's
+  // new home - task 5.)
   await updater.loadReleases();
 });
-
-async function onChannelChange(event: Event): Promise<void> {
-  const value = (event.target as HTMLSelectElement).value;
-  await updater.setChannel(value);
-}
-
-async function setTelemetry(event: Event): Promise<void> {
-  const checkedValue = (event.target as HTMLInputElement).checked;
-  // SPEC s16 (M9b R2-P1-1): use the dedicated set_telemetry_enabled command so the
-  // backend flips the in-flight ping cancel flag immediately (opt-out honored mid-ping).
-  await settings.setTelemetryEnabled(checkedValue);
-}
 
 async function exportDiagnostics(): Promise<void> {
   exportError.value = null;
@@ -246,26 +222,12 @@ function viewReleaseChangelog(release: ReleaseDto): void {
       </p>
     </div>
 
-    <!-- Updates: channel + check action + status -->
+    <!-- Updates: check action + status (the channel selector lives on
+         GeneralPage now - task 5) -->
     <div class="space-y-3" :class="cardCls">
       <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
         {{ t("about.updatesTitle") }}
       </h3>
-      <label class="block max-w-xs space-y-1 text-sm">
-        <span class="text-zinc-600 dark:text-zinc-400">{{ t("about.channelLabel") }}</span>
-        <select
-          :value="updater.channel"
-          class="w-full"
-          :class="inputCls"
-          data-testid="channel-select"
-          @change="onChannelChange"
-        >
-          <option v-for="ch in channels" :key="ch" :value="ch">
-            {{ t(`about.channel.${ch}`) }}
-          </option>
-        </select>
-      </label>
-
       <div class="space-y-2">
         <button
           type="button"
@@ -297,34 +259,6 @@ function viewReleaseChangelog(release: ReleaseDto): void {
           {{ t("about.upToDate") }}
         </p>
       </div>
-    </div>
-
-    <!-- Privacy: telemetry opt-out + display language -->
-    <div class="space-y-3" :class="cardCls">
-      <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
-        {{ t("about.privacyTitle") }}
-      </h3>
-      <label class="flex items-center gap-2 text-sm">
-        <input
-          type="checkbox"
-          class="accent-teal-600"
-          :checked="telemetryEnabled"
-          @change="setTelemetry"
-        />
-        {{ t("about.telemetryLabel") }}
-      </label>
-      <button
-        type="button"
-        class="rounded-xs text-xs font-medium text-teal-700 underline transition-colors hover:text-teal-600 focus-visible:outline-solid focus-visible:outline-2 focus-visible:outline-offset-2 focus-visible:outline-teal-500 dark:text-teal-300"
-        data-testid="telemetry-preview-open"
-        @click="showTelemetryPreview = true"
-      >
-        {{ t("settings.rules.telemetryPreviewButton") }}
-      </button>
-      <p class="text-sm text-zinc-500">
-        <span class="text-zinc-600 dark:text-zinc-400">{{ t("about.displayLanguageLabel") }}:</span>
-        {{ t("about.moreLanguagesComing") }}
-      </p>
     </div>
 
     <!-- Diagnostics: export bundle -->
@@ -399,6 +333,5 @@ function viewReleaseChangelog(release: ReleaseDto): void {
     </div>
 
     <ChangelogModal :release="updater.changelogRelease" @close="updater.closeChangelog()" />
-    <TelemetryPreviewModal :open="showTelemetryPreview" @close="showTelemetryPreview = false" />
   </section>
 </template>

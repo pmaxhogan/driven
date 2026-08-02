@@ -247,11 +247,21 @@
   },
   "settings": {
     "title": "Settings",
-    "tabs": {
+    "nav": {
+      "ariaLabel": "Settings navigation",
+      "searchPlaceholder": "Search settings",
+      "preferencesGroup": "Preferences",
       "accounts": "Accounts",
       "sources": "Sources",
-      "rules": "Rules",
-      "about": "About"
+      "general": "General",
+      "schedulePower": "Schedule & Power",
+      "performance": "Performance",
+      "platformMacos": "macOS",
+      "platformWindows": "Windows",
+      "network": "Network",
+      "privacy": "Privacy & Data",
+      "advanced": "Advanced",
+      "footer": "Driven {version} · {channel} · About"
     },
     "accounts": {
       "title": "Connected accounts",
@@ -349,7 +359,6 @@
       "showMore": "Show {count} more"
     },
     "rules": {
-      "title": "Global rules",
       "sections": {
         "startup": "Startup",
         "powerNetwork": "Power and network",
@@ -477,7 +486,6 @@
   "about": {
     "title": "About Driven",
     "updatesTitle": "Updates",
-    "privacyTitle": "Privacy",
     "diagnosticsTitle": "Diagnostics",
     "version": "Version {version}",
     "channelLabel": "Update channel",
@@ -497,7 +505,6 @@
     "releaseNotesTitle": "Release notes",
     "displayLanguageLabel": "Display language",
     "moreLanguagesComing": "More languages coming soon.",
-    "telemetryLabel": "Send anonymous usage stats",
     "exportDiagnosticsButton": "Export diagnostic bundle",
     "installUpdateMacUnsupported": "In-app updates are not available on macOS. Download the latest version manually:",
     "downloadLatestDmgButton": "Download the latest release"

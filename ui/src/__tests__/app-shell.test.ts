@@ -76,12 +76,12 @@ async function mountAppAt(path: string) {
     },
   });
   await flushPromises();
-  return wrapper;
+  return { wrapper, router };
 }
 
 describe("App shell", () => {
   it("renders the top nav with the app wordmark and all three primary surfaces", async () => {
-    const wrapper = await mountAppAt("/activity");
+    const { wrapper } = await mountAppAt("/activity");
     expect(wrapper.find("nav").exists()).toBe(true);
     const links = wrapper.findAll("nav a");
     // Wordmark + Activity | Restore | Settings. About is no longer a top-nav
@@ -96,39 +96,50 @@ describe("App shell", () => {
   });
 
   it("orders Restore before Settings in the nav", async () => {
-    const wrapper = await mountAppAt("/activity");
+    const { wrapper } = await mountAppAt("/activity");
     const hrefs = wrapper.findAll("nav a").map((l) => l.attributes("href"));
     expect(hrefs.indexOf("/restore")).toBeLessThan(hrefs.indexOf("/settings"));
   });
 
   it("offers no top-nav About link (it moved into Settings)", async () => {
-    const wrapper = await mountAppAt("/activity");
+    const { wrapper } = await mountAppAt("/activity");
     expect(wrapper.find('nav a[href="/about"]').exists()).toBe(false);
   });
 
-  // /about still resolves - it renders the Settings view's About tab - so the
-  // Settings nav item must stay lit there, exactly as it does for /accounts.
-  it("keeps Settings active on /about, which now renders the About subtab", async () => {
-    const wrapper = await mountAppAt("/about");
+  // SDD 2026-08-02 settings-sidebar-ia (task 3): Accounts/Sources/Rules/About
+  // are routed pages under /settings now, not tabs - /accounts, /sources,
+  // /rules and /about all redirect into a /settings/* child route. The
+  // Settings nav item must stay lit wherever that redirect lands.
+  it("keeps Settings active on a settings child route (e.g. /settings/accounts)", async () => {
+    const { wrapper } = await mountAppAt("/settings/accounts");
     expect(wrapper.find('a[href="/settings"]').attributes("aria-current")).toBe("page");
   });
 
   it("marks the Activity link active (and no other) when on /activity", async () => {
-    const wrapper = await mountAppAt("/activity");
+    const { wrapper } = await mountAppAt("/activity");
     const activityLink = wrapper.find('a[href="/activity"]');
     const settingsLink = wrapper.find('a[href="/settings"]');
     expect(activityLink.attributes("aria-current")).toBe("page");
     expect(settingsLink.attributes("aria-current")).toBeUndefined();
   });
 
-  it("keeps Settings active for a nested settings subtab (e.g. /accounts)", async () => {
-    const wrapper = await mountAppAt("/accounts");
+  it("keeps Settings active for an old flat path that redirects into settings (e.g. /accounts)", async () => {
+    const { wrapper } = await mountAppAt("/accounts");
     const settingsLink = wrapper.find('a[href="/settings"]');
     expect(settingsLink.attributes("aria-current")).toBe("page");
   });
 
+  // /rules used to be its own tab route; it now redirects to the General page
+  // (Locked decisions), and the Settings nav item stays lit for the resolved
+  // destination exactly as it does for any other settings child route.
+  it("redirects /rules to /settings/general and keeps Settings active", async () => {
+    const { wrapper, router } = await mountAppAt("/rules");
+    expect(router.currentRoute.value.path).toBe("/settings/general");
+    expect(wrapper.find('a[href="/settings"]').attributes("aria-current")).toBe("page");
+  });
+
   it("marks Restore active for a nested route (e.g. /restore/some-source)", async () => {
-    const wrapper = await mountAppAt("/restore/some-source");
+    const { wrapper } = await mountAppAt("/restore/some-source");
     const restoreLink = wrapper.find('a[href="/restore"]');
     expect(restoreLink.attributes("aria-current")).toBe("page");
   });
@@ -139,7 +150,7 @@ describe("App shell", () => {
   // three pin together and the document stays the scroll container (which
   // `useVirtualList` depends on - it windows off window scroll).
   it("pins the progress bar, paused banner and nav in one sticky header", async () => {
-    const wrapper = await mountAppAt("/activity");
+    const { wrapper } = await mountAppAt("/activity");
     const header = wrapper.get('[data-testid="app-header"]');
 
     expect(header.classes()).toContain("sticky");
@@ -156,7 +167,7 @@ describe("App shell", () => {
   // in normal flow, so the shell needs no compensating top padding and there is
   // exactly one scrollbar (the document's).
   it("leaves the document as the only scroll container", async () => {
-    const wrapper = await mountAppAt("/activity");
+    const { wrapper } = await mountAppAt("/activity");
     const root = wrapper.get('[data-testid="app-header"]').element.parentElement!;
 
     expect(root.className).not.toContain("overflow");
@@ -183,7 +194,7 @@ describe("App shell", () => {
     listenMock.mockImplementationOnce(async () => {
       throw new Error("listen failed");
     });
-    const wrapper = await mountAppAt("/activity");
+    const { wrapper } = await mountAppAt("/activity");
     // Boot must complete (no unhandled rejection reaching the test) and the
     // shell still renders.
     expect(wrapper.find("nav").exists()).toBe(true);
