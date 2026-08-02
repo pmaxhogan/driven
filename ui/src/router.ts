@@ -51,12 +51,12 @@ const routes: RouteRecordRaw[] = [
       {
         path: "accounts",
         name: "settings-accounts",
-        component: () => import("./components/AccountList.vue"),
+        component: () => import("./views/settings/AccountsPage.vue"),
       },
       {
         path: "sources",
         name: "settings-sources",
-        component: () => import("./components/SourceTable.vue"),
+        component: () => import("./views/settings/SourcesPage.vue"),
       },
       {
         path: "general",
@@ -95,11 +95,11 @@ const routes: RouteRecordRaw[] = [
       },
       {
         // About is reached ONLY from the SettingsNav footer (Locked decisions).
-        // Task 3 wires it straight to the existing About.vue view - Task 4 will
-        // wrap it (and Accounts/Sources) in thin page components.
+        // Task 4 wraps it (and Accounts/Sources) in thin page components under
+        // views/settings/ so every settings route owns a dedicated component.
         path: "about",
         name: "settings-about",
-        component: () => import("./views/About.vue"),
+        component: () => import("./views/settings/AboutPage.vue"),
       },
     ],
   },

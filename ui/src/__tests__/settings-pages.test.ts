@@ -26,6 +26,12 @@ vi.mock("@tauri-apps/api/core", () => ({
 vi.mock("@tauri-apps/api/app", () => ({
   getVersion: vi.fn().mockResolvedValue("0.1.0"),
 }));
+// AccountsPage mounts AccountList (task 4), whose onMounted subscribes to the
+// account:needs_reauth / oauth:complete events - stub `listen` so that
+// subscription resolves instead of throwing on the missing Tauri runtime.
+vi.mock("@tauri-apps/api/event", () => ({
+  listen: () => Promise.resolve(() => {}),
+}));
 // Settings.vue (the shell, mounted only by the de-dupe regression test below)
 // now renders real routed children through <RouterView> and a <SettingsNav>
 // full of <RouterLink>s (SDD 2026-08-02 settings-sidebar-ia, task 3) - so the
@@ -49,6 +55,9 @@ import PlatformPage from "../views/settings/PlatformPage.vue";
 import NetworkPage from "../views/settings/NetworkPage.vue";
 import PrivacyPage from "../views/settings/PrivacyPage.vue";
 import AdvancedPage from "../views/settings/AdvancedPage.vue";
+import AccountsPage from "../views/settings/AccountsPage.vue";
+import SourcesPage from "../views/settings/SourcesPage.vue";
+import AboutPage from "../views/settings/AboutPage.vue";
 import Settings from "../views/Settings.vue";
 import { createAppRouter } from "../router";
 
@@ -1613,6 +1622,65 @@ describe("AdvancedPage", () => {
     await post.trigger("change");
     await flushPromises();
     expect(lastGlobalPatch("postBackupHook")).toBeNull();
+  });
+});
+
+// Task 4 (SDD 2026-08-02 settings-sidebar-ia): AccountList, SourceTable, and
+// About are now routed directly (Task 3 wired the routes straight to those
+// components). These wrappers give /settings/accounts, /settings/sources, and
+// /settings/about a stable per-route component so the router table matches the
+// other seven settings pages, which each own a page component under
+// views/settings/. AccountList/SourceTable/About already render their own
+// page-level heading internally (settings.accounts.title / settings.sources.title
+// / about.title) - so unlike GeneralPage etc. these wrappers add no heading of
+// their own; they exist purely to give the route a dedicated component and stay
+// a pure pass-through to the unchanged inner component.
+
+describe("AccountsPage", () => {
+  it("renders the wrapped AccountList unchanged", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(AccountsPage, { global: globalMountOptions });
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("list_accounts", undefined);
+    expect(wrapper.text()).toContain(i18n.global.t("settings.accounts.title"));
+    expect(wrapper.find('[data-testid="accounts-empty"]').exists()).toBe(true);
+  });
+});
+
+describe("SourcesPage", () => {
+  it("renders the wrapped SourceTable unchanged", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources") return Promise.resolve([]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      if (cmd === "list_backends") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourcesPage, { global: globalMountOptions });
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("list_sources", undefined);
+    expect(wrapper.text()).toContain(i18n.global.t("settings.sources.title"));
+    expect(wrapper.find('[data-testid="sources-empty"]').exists()).toBe(true);
+  });
+});
+
+describe("AboutPage", () => {
+  it("renders the wrapped About view unchanged", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_update_channel") return Promise.resolve("stable");
+      if (cmd === "list_releases") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(AboutPage, { global: globalMountOptions });
+    await flushPromises();
+
+    expect(wrapper.text()).toContain(i18n.global.t("about.title"));
+    expect(wrapper.find('[data-testid="channel-select"]').exists()).toBe(true);
   });
 });
 
