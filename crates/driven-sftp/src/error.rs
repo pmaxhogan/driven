@@ -1,12 +1,11 @@
 //! Mapping SSH/SFTP failures onto Driven's SPEC s24 error taxonomy.
 //!
-//! There is no `russh` dependency in this crate yet (the session layer is a
-//! later slice), so this module classifies a small, protocol-version-neutral
-//! [`SftpFailure`] summary rather than a real `russh`/`russh-sftp` error type.
-//! When the session layer lands, it maps whatever `russh`/`russh-sftp` hands
-//! back onto [`SftpFailure`] and calls [`sftp_error`] - so the classification
-//! table itself is already fully tested, and the session layer's only job is
-//! an honest translation.
+//! This module classifies a small, protocol-version-neutral [`SftpFailure`]
+//! summary rather than a `russh`/`russh-sftp` error type directly. The
+//! [`session`](crate::session) layer's only job is an honest translation of
+//! whatever those libraries hand back onto [`SftpFailure`] before calling
+//! [`sftp_error`] - so the classification table itself stays independent of
+//! any one library version, and is fully tested on its own.
 //!
 //! The split (design doc, "Error mapping"):
 //!
@@ -16,6 +15,7 @@
 //! | An established connection drops mid-operation (reset, EOF, `SSH_FX_NO_CONNECTION` / `SSH_FX_CONNECTION_LOST`) | [`DriveErrorClassification::Network`] | Same shape as a connect failure - the pipe went away, not a decision the server made. |
 //! | SSH authentication rejected (bad password / key / passphrase) | [`DriveErrorClassification::AuthInvalidGrant`] | The account needs new credentials; moves to `needs_reauth`. |
 //! | The server's host key does not match the pinned fingerprint | [`DriveErrorClassification::AuthInvalidGrant`] | Treated like an auth failure: hard-fail and surface an attention state, never silently retried (a swapped host key could mean a MITM). |
+//! | The account's config carries no pinned fingerprint at all | [`DriveErrorClassification::AuthInvalidGrant`] | Same bucket, different cause: an unpinned account can only be repaired by re-running the creation/reconnect probe, which is exactly what `AuthInvalidGrant` routes to. |
 //! | `SSH_FXP_STATUS` with an ENOSPC-shaped message (`SSH_FX_FAILURE` on a write, "no space left", "disk full", ...) | [`DriveErrorClassification::StorageQuota`] | The remote destination is full. |
 //! | `SSH_FX_FAILURE` with no ENOSPC signature | [`DriveErrorClassification::Transient5xx`] | A generic server-side failure (busy resource, transient lock); worth a retry. |
 //! | Any other `SSH_FXP_STATUS` code | [`DriveErrorClassification::Other`] | Fatal for this op (e.g. `SSH_FX_BAD_MESSAGE`, `SSH_FX_OP_UNSUPPORTED`, a permission refusal on the object itself). |
@@ -80,6 +80,20 @@ pub enum SftpFailure {
         /// observed fingerprint).
         detail: String,
     },
+    /// The account's [`SftpConfig`](crate::SftpConfig) carries no pinned
+    /// host-key fingerprint, so there is nothing to verify the server against.
+    ///
+    /// This is a *precondition* failure, not a network outcome:
+    /// [`SftpSession::connect`](crate::session::SftpSession::connect) refuses
+    /// to open the socket at all. An unpinned config is a transient
+    /// account-creation state that only
+    /// [`connect_and_pin`](crate::session::SftpSession::connect_and_pin) is
+    /// allowed to observe.
+    HostKeyUnpinned {
+        /// A human-readable detail for the error chain (e.g. the host it would
+        /// have connected to).
+        detail: String,
+    },
     /// An `SSH_FXP_STATUS` reply from the SFTP subsystem.
     Status {
         /// The raw status code (see [`status_code`]).
@@ -115,9 +129,9 @@ pub fn sftp_error_classification(failure: &SftpFailure) -> DriveErrorClassificat
         SftpFailure::Connect { .. } | SftpFailure::ConnectionLost { .. } => {
             DriveErrorClassification::Network
         }
-        SftpFailure::AuthFailed { .. } | SftpFailure::HostKeyMismatch { .. } => {
-            DriveErrorClassification::AuthInvalidGrant
-        }
+        SftpFailure::AuthFailed { .. }
+        | SftpFailure::HostKeyMismatch { .. }
+        | SftpFailure::HostKeyUnpinned { .. } => DriveErrorClassification::AuthInvalidGrant,
         SftpFailure::Status { code, message } => classify_status(*code, message),
     }
 }
@@ -147,6 +161,7 @@ pub fn sftp_error(failure: SftpFailure) -> DriveError {
         SftpFailure::ConnectionLost { detail } => format!("sftp.connection_lost: {detail}"),
         SftpFailure::AuthFailed { detail } => format!("sftp.auth_failed: {detail}"),
         SftpFailure::HostKeyMismatch { detail } => format!("sftp.host_key_mismatch: {detail}"),
+        SftpFailure::HostKeyUnpinned { detail } => format!("sftp.host_key_unpinned: {detail}"),
         SftpFailure::Status { code, message } => format!("sftp.status_{code}: {message}"),
     };
     DriveError::Classified {
@@ -188,6 +203,9 @@ mod tests {
             },
             SftpFailure::HostKeyMismatch {
                 detail: "expected SHA256:abc, got SHA256:def".to_string(),
+            },
+            SftpFailure::HostKeyUnpinned {
+                detail: "no pinned fingerprint for nas.example:22".to_string(),
             },
         ] {
             assert_eq!(
@@ -277,6 +295,29 @@ mod tests {
         let chain = format!("{e:?}");
         assert!(chain.contains("sftp.auth_failed"));
         assert!(chain.contains("bad password"));
+    }
+
+    #[test]
+    fn the_local_status_constants_match_the_wire_codes_russh_sftp_sends() {
+        // `status_code` is declared locally (module docs explain why), but the
+        // session layer feeds it `russh_sftp`'s `StatusCode` discriminants. If
+        // the two ever drift, every classification below would silently be
+        // wired to the wrong number - so assert the mapping rather than
+        // assuming it.
+        use russh_sftp::protocol::StatusCode;
+        for (code, constant) in [
+            (StatusCode::Ok, status_code::OK),
+            (StatusCode::Eof, status_code::EOF),
+            (StatusCode::NoSuchFile, status_code::NO_SUCH_FILE),
+            (StatusCode::PermissionDenied, status_code::PERMISSION_DENIED),
+            (StatusCode::Failure, status_code::FAILURE),
+            (StatusCode::BadMessage, status_code::BAD_MESSAGE),
+            (StatusCode::NoConnection, status_code::NO_CONNECTION),
+            (StatusCode::ConnectionLost, status_code::CONNECTION_LOST),
+            (StatusCode::OpUnsupported, status_code::OP_UNSUPPORTED),
+        ] {
+            assert_eq!(code as u32, constant, "{code:?}");
+        }
     }
 
     #[test]

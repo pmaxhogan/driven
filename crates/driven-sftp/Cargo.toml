@@ -8,18 +8,64 @@ repository.workspace = true
 description = "Driven SSH (SFTP) RemoteStore backend"
 publish = false
 
+[features]
+# Exposes `test_support::TestSftpServer` - a real in-process russh + russh-sftp
+# server over a real socket - to OTHER crates (the chaos harness, later
+# backend-level tests). This crate's own `#[cfg(test)]` code gets the module
+# unconditionally, so `cargo test -p driven-sftp` needs no feature flag.
+#
+# NOTE for the gate: `cargo clippy --all-targets` does NOT enable features, so
+# the module is only linted under `--features test-server`. Both runs matter.
+test-server = ["dep:tempfile", "dep:rand"]
+
 [dependencies]
 # The RemoteStore trait, the SPEC s24 error taxonomy, and the retry middleware.
-# The `russh`/`russh-sftp` session layer (Task 2) is not a dependency yet -
-# this crate is config/keychain/errors only for now.
 driven-remote = { path = "../driven-remote" }
 anyhow.workspace = true
 thiserror.workspace = true
 serde.workspace = true
 serde_json.workspace = true
+tokio.workspace = true
+tracing.workspace = true
 # SPEC s4.1 pattern: the SFTP password / private key lives in the OS keychain,
 # never in SQLite and never in a config file.
 keyring.workspace = true
+# The SSH transport (client AND server - `russh` ships both in one crate, no
+# feature split) and the SFTP subsystem on top of it. Pinned to the minor
+# series these were written against; both had API changes recently enough that
+# a silent major bump would not compile anyway:
+#   - russh 0.62 moved `Handler` to native `async fn` (the `async-trait`
+#     feature is now opt-in) and gave `server::Handler::channel_open_session` a
+#     `ChannelOpenHandle` reply argument.
+#
+# `default-features = false` drops exactly ONE default, `rsa`, and re-adds the
+# other two. That is a security decision, not tidying: the `rsa` feature pulls
+# the `rsa` crate, which carries RUSTSEC-2023-0071 (Marvin attack - private-key
+# recovery through a timing sidechannel) with NO fixed release, and `cargo deny`
+# fails on it. Signing an SSH authentication request with a user's own RSA key
+# is precisely the private-key operation that advisory covers, so the mitigation
+# available to us - not compiling it in - is the honest one, rather than adding
+# the first *vulnerability* entry to `deny.toml`'s (otherwise all-unmaintained)
+# ignore list.
+#
+# What it costs: RSA user keys are refused with an explanatory error
+# (`session::unsupported_key_algorithm`), and a server whose ONLY host key is
+# RSA cannot be reached - rare, since sshd has generated an Ed25519 host key
+# alongside since 2014. Re-enabling is this one line, once `rsa` ships a
+# constant-time release.
+#
+# `aws-lc-rs` (russh's default crypto backend) is already in this workspace's
+# tree via rustls, so it adds no new native toolchain requirement.
+russh = { version = "0.62", default-features = false, features = [
+    "aws-lc-rs",
+    "flate2",
+] }
+russh-sftp = "2.3"
+# Both are `test-server`-only. `rand` must track the version russh's own
+# `ssh-key` re-export expects (rand_core 0.10) or `PrivateKey::random` will not
+# accept the RNG; `thread_rng` provides `rand::rng()`.
+tempfile = { version = "3", optional = true }
+rand = { version = "0.10", features = ["thread_rng"], optional = true }
 
 [dev-dependencies]
 # `driven_test_fixtures::keychain::isolated()` installs (and PROVES) an
@@ -28,3 +74,11 @@ keyring.workspace = true
 # reaches an OS keychain. Dev-only: production always uses the real per-OS
 # store.
 driven-test-fixtures = { path = "../driven-test-fixtures" }
+# The `test_support` module is compiled under `cfg(test)` without the
+# `test-server` feature, so its dependencies have to be reachable as dev-deps
+# too (same versions as the optional ones above).
+tempfile = "3"
+rand = { version = "0.10", features = ["thread_rng"] }
+tokio = { workspace = true, features = ["test-util"] }
+# Surfaces the session layer's own warn-level diagnostics in test output.
+tracing-subscriber.workspace = true
