@@ -748,6 +748,11 @@ pub struct GlobalSettings {
     /// Issue #34: the proxy URL (manual mode: `http`/`https`/`socks5`/`socks5h`)
     /// or PAC file URL/path (PAC mode). `null` in `system`/`none` mode.
     pub proxy_url: Option<String>,
+    /// Whether losing network reachability pauses sync (unified pause/status
+    /// banner, spec 2026-08-01 "pause_when_offline"). `true` (default) keeps
+    /// the unchanged V1 behaviour; `false` exempts EXACTLY the reachability
+    /// pause-reason family from the gate (a captive portal still pauses).
+    pub pause_when_offline: bool,
 }
 
 /// V2 schedule-window settings (DESIGN s17). Mirrors
@@ -1051,6 +1056,8 @@ pub struct GlobalSettingsPatch {
     /// clears it; an absent key leaves it unchanged.
     #[serde(default, deserialize_with = "double_option")]
     pub proxy_url: Option<Option<String>>,
+    /// See [`GlobalSettings::pause_when_offline`]. Absent = unchanged.
+    pub pause_when_offline: Option<bool>,
 }
 
 /// Partial SPEC s22 `telemetry` settings.

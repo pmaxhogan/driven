@@ -32,7 +32,7 @@ vi.mock("@tauri-apps/api/event", () => ({
 
 import App from "../App.vue";
 import GlobalProgressBar from "../components/GlobalProgressBar.vue";
-import PausedBanner from "../components/PausedBanner.vue";
+import StatusBanner from "../components/StatusBanner.vue";
 import { i18n } from "../i18n";
 import { createAppRouter } from "../router";
 
@@ -148,7 +148,7 @@ describe("App shell", () => {
     expect(header.classes()).toContain("z-30");
     // All three pieces of chrome live INSIDE it (so none can scroll away alone).
     expect(header.findComponent(GlobalProgressBar).exists()).toBe(true);
-    expect(header.findComponent(PausedBanner).exists()).toBe(true);
+    expect(header.findComponent(StatusBanner).exists()).toBe(true);
     expect(header.find("nav").exists()).toBe(true);
   });
 

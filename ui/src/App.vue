@@ -5,7 +5,7 @@ import { useI18n } from "vue-i18n";
 
 import FdaBanner from "./components/FdaBanner.vue";
 import GlobalProgressBar from "./components/GlobalProgressBar.vue";
-import PausedBanner from "./components/PausedBanner.vue";
+import StatusBanner from "./components/StatusBanner.vue";
 import ToastHost from "./components/ToastHost.vue";
 import { usePauseStore } from "./stores/pause";
 import { useProgressStore } from "./stores/progress";
@@ -129,12 +129,12 @@ const NAV_LINK_ACTIVE = "text-teal-700 dark:text-teal-300 font-semibold";
          stop its scroll events firing and freeze the list on its first window.
          z-30 clears page content and Restore's `sticky bottom-0 z-10` action
          bar while staying under the z-50 modal overlays. The explicit surface
-         color matters: PausedBanner's dark-mode fill is semi-transparent
+         color matters: StatusBanner's dark-mode fill is semi-transparent
          (`bg-amber-950/40`), so it needs an opaque backdrop of its own or
          scrolled content would show through it. -->
     <header class="sticky top-0 z-30 bg-zinc-50 dark:bg-zinc-950" data-testid="app-header">
       <GlobalProgressBar />
-      <PausedBanner />
+      <StatusBanner />
       <!-- macOS TCC (DESIGN s5.3.2): shown only once a read has actually been
            refused, so it costs nothing on Windows/Linux. Lives in the sticky
            header - and therefore mounts for the app's whole lifetime - so it

@@ -1575,6 +1575,49 @@ mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    /// spec 2026-08-01 "pause_when_offline" (unified pause/status banner):
+    /// sibling of `cold_start_config_reflects_persisted_non_default_setting`
+    /// for the new setting - a persisted `false` must reach the cold-start
+    /// `OrchestratorConfig`, not silently default to `true` (Task 2's network-
+    /// gate exemption reads this field, so a wiring bug here would quietly
+    /// re-enable the offline pause on every restart).
+    #[tokio::test]
+    async fn cold_start_config_reflects_persisted_pause_when_offline() {
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo = SqliteStateRepo::open(&dir.path().join("state.db"))
+            .await
+            .expect("open repo");
+
+        let default_cfg = OrchestratorConfig::default();
+        assert!(
+            default_cfg.pause_when_offline,
+            "fixture must differ from the persisted value to prove it wins"
+        );
+        let global = serde_json::json!({
+            "auto_start_on_login": true,
+            "default_concurrent_uploads": serde_json::Value::Null,
+            "bandwidth_cap_mbps": serde_json::Value::Null,
+            "skip_on_battery": true,
+            "skip_on_metered": true,
+            "scan_interval_secs": 600,
+            "deep_verify_interval_secs": 604_800,
+            "io_priority": "low",
+            "log_level": "info",
+            "pause_when_offline": false,
+        });
+        repo.set_setting("global", &global)
+            .await
+            .expect("seed global");
+
+        let cfg = crate::commands::settings::load_orchestrator_config(&repo)
+            .await
+            .expect("load config");
+        assert!(
+            !cfg.pause_when_offline,
+            "cold-start config must reflect the persisted pause_when_offline (spec 2026-08-01)"
+        );
+    }
+
     /// R8-P1-1 (DATA-SAFETY): the boot path must FAIL CLOSED on a repair error -
     /// `repair_allows_spawn` is the gate. A successful repair (`Ok`) permits
     /// spawning the orchestrators; a repair error (`Err`) does NOT, so the boot

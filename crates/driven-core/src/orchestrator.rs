@@ -219,6 +219,16 @@ pub struct OrchestratorConfig {
     /// executor, so a settings save applies to work that STARTS after it; work
     /// already in flight keeps the level it began with.
     pub io_priority: WorkPriority,
+    /// Whether losing network reachability pauses sync (unified pause/status
+    /// banner, spec 2026-08-01 "pause_when_offline"). Default `true` (V1
+    /// behaviour unchanged). When `false`, exempts EXACTLY the reachability
+    /// family of pause reasons - [`PauseReason::Offline`],
+    /// [`PauseReason::NoInternet`], [`PauseReason::DnsFailed`] - intended for
+    /// LAN/local destinations that stay reachable without internet.
+    /// [`PauseReason::CaptivePortal`] is NOT exempted: it still pauses, since
+    /// a captive portal can silently corrupt traffic rather than merely
+    /// blocking it. See [`network_pause_applies`].
+    pub pause_when_offline: bool,
 }
 
 /// What Driven does on a metered network when
@@ -273,6 +283,7 @@ impl Default for OrchestratorConfig {
             // "behave exactly as before" is the right fallback there. The
             // persisted setting is what demotes a real install.
             io_priority: WorkPriority::Normal,
+            pause_when_offline: true,
         }
     }
 }
@@ -317,6 +328,15 @@ pub trait Orchestrator: Send + Sync {
     /// gate-driven pauses, persists across restarts). `true` pauses,
     /// `false` resumes.
     async fn set_paused(&self, paused: bool);
+
+    /// Arms a one-shot gate bypass (spec 2026-08-01 s"One-shot gate
+    /// bypass"): the next cycle where a Metered/Battery/Schedule gate would
+    /// otherwise close skips all three of those checks and proceeds, then
+    /// the flag is consumed. It never overrides the manual pause, the
+    /// network family (Offline/NoInternet/CaptivePortal/DnsFailed), or the
+    /// Drive circuit breaker. Default no-op so implementors that don't need
+    /// the bypass (test fakes) compile unchanged.
+    fn bypass_gates_once(&self) {}
 
     /// Returns a snapshot of the current
     /// [`OrchestratorState`] for the tray / Activity dashboard.
@@ -480,6 +500,15 @@ pub struct SyncOrchestrator {
     /// token. An atomic so the cycle path can set it and the run loop can read it
     /// without holding a lock across the select.
     suspended: std::sync::atomic::AtomicBool,
+    /// One-shot gate bypass (spec 2026-08-01 s"One-shot gate bypass"): set by
+    /// the app layer via [`Orchestrator::bypass_gates_once`] (e.g. "sync now
+    /// anyway" from the paused banner), consumed by the first cycle where a
+    /// Metered/Battery/Schedule gate would otherwise close (`evaluate_gates`
+    /// swaps it back to `false` and lets that one cycle's bypassable gates
+    /// through). Never consulted by the manual/network/breaker checks. An
+    /// atomic because it is set from the control-method caller and read from
+    /// the run-loop task.
+    bypass_gates_once: std::sync::atomic::AtomicBool,
     /// App-global latency sampler (DESIGN s13 telemetry), or `None` when
     /// telemetry latency capture is not wired (tests / the chaos harness).
     /// Threaded into [`crate::scanner::scan_with_latency`] so each scan records
@@ -547,6 +576,7 @@ impl SyncOrchestrator {
             vss_create_ledger: Arc::new(std::sync::Mutex::new(std::collections::HashMap::new())),
             orphan_cleanup_done: Mutex::new(false),
             suspended: std::sync::atomic::AtomicBool::new(false),
+            bypass_gates_once: std::sync::atomic::AtomicBool::new(false),
             latency: None,
             adaptive: None,
         }
@@ -972,34 +1002,66 @@ impl SyncOrchestrator {
         // from "network up, Drive down -> Backoff" (the Drive breaker check
         // below), preserving the DESIGN s5.7 precedence
         // manual > network > metered > battery > breaker.
-        if !power.network_reachable {
+        //
+        // pause_when_offline=false (unified pause/status banner, spec
+        // 2026-08-01) exempts exactly the reachability family below via
+        // `network_pause_applies`; when exempted, FALL THROUGH to the probe
+        // rather than returning Proceed directly, so an exempted machine can
+        // still surface CaptivePortal.
+        if !power.network_reachable && network_pause_applies(&cfg, PauseReason::Offline) {
             return GateDecision::Pause(PauseReason::Offline);
         }
         let net = self.network.probe().await;
         if net != NetworkState::Online {
-            return GateDecision::Pause(pause_reason_for_network(net));
+            let reason = pause_reason_for_network(net);
+            if network_pause_applies(&cfg, reason) {
+                return GateDecision::Pause(reason);
+            }
         }
 
+        // Metered / battery / schedule are the bypassable gates (spec
+        // 2026-08-01 s"One-shot gate bypass"): a "sync now anyway" from the
+        // paused banner arms `bypass_gates_once`, which lets exactly one
+        // cycle through whichever of these three would otherwise close.
+        // Manual (above) and network/breaker (above/below) are never
+        // bypassable. Evaluate all three before touching the flag so an
+        // open-gates cycle never consumes it (DESIGN s"bypass survives an
+        // open cycle").
+        //
         // Metered network (DESIGN s5.7): in Pause mode pause; in Throttle mode
         // (V2, DESIGN s17) keep syncing - the reduced cap is applied to the
         // pacer in `apply_bandwidth_cap` before the source loop.
-        if cfg.skip_on_metered && power.on_metered_network && cfg.metered_mode == MeteredMode::Pause
+        let bypassable_pause = if cfg.skip_on_metered
+            && power.on_metered_network
+            && cfg.metered_mode == MeteredMode::Pause
         {
-            return GateDecision::Pause(PauseReason::Metered);
-        }
+            Some(PauseReason::Metered)
+        } else if cfg.skip_on_battery && !power.ac_connected {
+            // Battery gate (DESIGN s5.7): pause on battery when skip_on_battery.
+            Some(PauseReason::Battery)
+        } else if !cfg.schedule.allows(self.clock.now_ms()) {
+            // Schedule window (V2 schedule windows, DESIGN s17): pause outside
+            // the user's allowed local-time window. Reads the injected Clock
+            // so the decision is deterministic; the gate re-opens on a later
+            // cycle once the clock re-enters the window (no manual resume
+            // needed). A disabled schedule always allows, so this is inert
+            // under the V1 default.
+            Some(PauseReason::Schedule)
+        } else {
+            None
+        };
 
-        // Battery gate (DESIGN s5.7): pause on battery when skip_on_battery.
-        if cfg.skip_on_battery && !power.ac_connected {
-            return GateDecision::Pause(PauseReason::Battery);
-        }
-
-        // Schedule window (V2 schedule windows, DESIGN s17): pause outside the
-        // user's allowed local-time window. Reads the injected Clock so the
-        // decision is deterministic; the gate re-opens on a later cycle once
-        // the clock re-enters the window (no manual resume needed). A disabled
-        // schedule always allows, so this is inert under the V1 default.
-        if !cfg.schedule.allows(self.clock.now_ms()) {
-            return GateDecision::Pause(PauseReason::Schedule);
+        if let Some(reason) = bypassable_pause {
+            // Ordering note: the flag is only read on the run-loop task,
+            // `SeqCst` is for simplicity not necessity. One `swap` consumes
+            // the flag for the WHOLE cycle - it covers all three bypassable
+            // gates above, not just the one that happened to fail first.
+            if !self
+                .bypass_gates_once
+                .swap(false, std::sync::atomic::Ordering::SeqCst)
+            {
+                return GateDecision::Pause(reason);
+            }
         }
 
         // Drive circuit breaker (DESIGN s5.8.3): if Drive's breaker is open,
@@ -2279,7 +2341,10 @@ impl SyncOrchestrator {
     /// re-probe is not Online it pauses rather than push work through a dead
     /// link, PRESERVING the distinct non-online state (P2-9): a resume into a
     /// captive portal / no-internet / DNS-broken link surfaces that specific
-    /// reason, not a flattened Offline.
+    /// reason, not a flattened Offline. Honours the same
+    /// `pause_when_offline` exemption as `evaluate_gates` (spec 2026-08-01
+    /// "pause_when_offline") via [`network_pause_applies`], so an exempted
+    /// reason falls through to the Wake cycle instead of re-pausing.
     pub async fn complete_resume(&self) -> anyhow::Result<()> {
         // Step 2: re-probe; do not proceed until connectivity is green. Map the
         // observed state to its distinct PauseReason (DESIGN s5.8.1, s5.8.6) so
@@ -2287,9 +2352,13 @@ impl SyncOrchestrator {
         let net = self.network.probe().await;
         if net != NetworkState::Online {
             let reason = pause_reason_for_network(net);
-            tracing::info!(target: TARGET, account_id = %self.account_id, ?reason, "resume: network not yet online; staying paused");
-            self.transition(OrchestratorState::Paused { reason }).await;
-            return Ok(());
+            let cfg = self.config.read().await.clone();
+            if network_pause_applies(&cfg, reason) {
+                tracing::info!(target: TARGET, account_id = %self.account_id, ?reason, "resume: network not yet online; staying paused");
+                self.transition(OrchestratorState::Paused { reason }).await;
+                return Ok(());
+            }
+            tracing::info!(target: TARGET, account_id = %self.account_id, ?reason, "resume: network gate exempted by pause_when_offline=false; proceeding");
         }
         // Steps 5-6: re-scan from scratch and resume normal ticks.
         self.run_cycle(TickSource::Wake).await
@@ -2409,6 +2478,29 @@ fn pause_reason_for_network(state: NetworkState) -> PauseReason {
         NetworkState::DnsFailed => PauseReason::DnsFailed,
         // Unreachable on the live path (callers guard `!= Online`); keep total.
         NetworkState::Online => PauseReason::Offline,
+    }
+}
+
+/// Whether a network-family [`PauseReason`] should actually pause the cycle,
+/// given [`OrchestratorConfig::pause_when_offline`] (unified pause/status
+/// banner, spec 2026-08-01 "pause_when_offline"). Shared by both mapping
+/// sites - `evaluate_gates`'s live gate and `complete_resume`'s post-wake
+/// re-probe - so the exemption rule lives exactly once.
+///
+/// `pause_when_offline=false` exempts EXACTLY the reachability family -
+/// [`PauseReason::Offline`], [`PauseReason::NoInternet`],
+/// [`PauseReason::DnsFailed`] - for destinations (e.g. LAN/local) that stay
+/// reachable without internet. [`PauseReason::CaptivePortal`] is never
+/// exempted: it still pauses regardless of the setting, since a captive
+/// portal can silently corrupt traffic rather than merely blocking it. Any
+/// other reason (not produced by [`pause_reason_for_network`]) always
+/// applies.
+fn network_pause_applies(cfg: &OrchestratorConfig, reason: PauseReason) -> bool {
+    match reason {
+        PauseReason::Offline | PauseReason::NoInternet | PauseReason::DnsFailed => {
+            cfg.pause_when_offline
+        }
+        _ => true,
     }
 }
 
@@ -2775,6 +2867,15 @@ impl Orchestrator for SyncOrchestrator {
             })
             .await;
         }
+    }
+
+    fn bypass_gates_once(&self) {
+        // Ordering note: the flag is only ever read on the run-loop task
+        // (inside `evaluate_gates`, between cycles), so `SeqCst` is for
+        // simplicity, not necessity - a `Release` store here would be
+        // equally correct.
+        self.bypass_gates_once
+            .store(true, std::sync::atomic::Ordering::SeqCst);
     }
 
     async fn state(&self) -> OrchestratorState {
@@ -3865,6 +3966,136 @@ mod tests {
             exec.executes.load(Ordering::SeqCst),
             0,
             "battery pause must not execute any plan"
+        );
+    }
+
+    /// A one-shot bypass lets exactly one cycle through a closed battery gate;
+    /// the next cycle gates again (spec 2026-08-01 s"One-shot gate bypass").
+    #[tokio::test]
+    async fn bypass_gates_once_passes_one_battery_gated_cycle() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec,
+            power_on_battery(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Battery)
+        );
+
+        orch.bypass_gates_once();
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Proceed,
+            "the armed flag lets this one cycle through the battery gate"
+        );
+
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Battery),
+            "the one-shot flag is consumed after a single cycle"
+        );
+    }
+
+    /// The bypass does NOT override the network family or a manual pause.
+    #[tokio::test]
+    async fn bypass_gates_once_never_bypasses_network_or_manual() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let exec = Arc::new(RecordingExecutor::default());
+        let power = Arc::new(FakePowerSource::new(power_on_battery()));
+        let net = Arc::new(FakeNet::with_state(NetworkState::NoInternet));
+        let clock = Arc::new(FakeClock::new());
+        let orch = SyncOrchestrator::new(
+            account,
+            state,
+            exec,
+            power,
+            net.clone(),
+            clock,
+            OrchestratorConfig::default(),
+        );
+
+        orch.bypass_gates_once();
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::NoInternet),
+            "bypass must not override the network gate"
+        );
+
+        // The flag is NOT consumed by the network-gated cycle above: switch
+        // to online (battery stays unplugged) and the still-armed flag now
+        // covers the battery gate.
+        *net.state.lock().unwrap() = NetworkState::Online;
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Proceed,
+            "the flag armed before the network cycle survived it and now bypasses the battery gate"
+        );
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Battery),
+            "the flag is spent after that one use"
+        );
+
+        // A manual pause is never bypassable either.
+        orch.set_paused(true).await;
+        orch.bypass_gates_once();
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Manual),
+            "bypass must not override a manual pause"
+        );
+    }
+
+    /// An open-gates cycle does not burn the flag.
+    #[tokio::test]
+    async fn bypass_survives_an_open_gates_cycle() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let exec = Arc::new(RecordingExecutor::default());
+        let power = Arc::new(FakePowerSource::new(power_on_ac()));
+        let net = Arc::new(FakeNet::online());
+        let clock = Arc::new(FakeClock::new());
+        let orch = SyncOrchestrator::new(
+            account,
+            state,
+            exec,
+            power.clone(),
+            net,
+            clock,
+            OrchestratorConfig::default(),
+        );
+
+        orch.bypass_gates_once();
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Proceed,
+            "an open-gates cycle must not burn the flag"
+        );
+
+        power.set(power_on_battery());
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Proceed,
+            "the still-armed flag from the open cycle now bypasses the battery gate"
+        );
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Battery),
+            "the flag is spent after that one use"
         );
     }
 
@@ -5833,6 +6064,173 @@ mod tests {
             // A degraded re-probe must not push work through a dead link.
             assert_eq!(exec.executes.load(Ordering::SeqCst), 0);
         }
+    }
+
+    /// pause_when_offline=false exempts exactly the reachability family
+    /// (Offline/NoInternet/DnsFailed) - CaptivePortal still pauses, and the
+    /// OS-reachability short-circuit falls through to the probe rather than
+    /// returning Proceed directly, so an exempted machine can still surface
+    /// CaptivePortal (spec 2026-08-01 "pause_when_offline").
+    #[tokio::test]
+    async fn offline_exemption_skips_reachability_but_not_captive_portal() {
+        let cfg = OrchestratorConfig {
+            pause_when_offline: false,
+            ..Default::default()
+        };
+
+        // (a) OS-level unreachable AND probe -> Offline: the reachability
+        // short-circuit must fall through to the probe (not return Proceed
+        // directly), and the probe's Offline is itself exempted.
+        {
+            let account = AccountId::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let src = source_in(account, dir.path());
+            let (orch, _clock) = build(
+                account,
+                vec![src],
+                Arc::new(RecordingExecutor::default()),
+                PowerState {
+                    ac_connected: true,
+                    battery_percent: Some(100),
+                    on_metered_network: false,
+                    network_reachable: false,
+                },
+                Arc::new(FakeNet::with_state(NetworkState::Offline)),
+                cfg.clone(),
+            );
+            assert_eq!(
+                orch.evaluate_gates().await,
+                GateDecision::Proceed,
+                "reachability=false + probe Offline must be exempted, not paused"
+            );
+        }
+
+        // (b) probe -> NoInternet, (c) probe -> DnsFailed: both exempted.
+        for state in [NetworkState::NoInternet, NetworkState::DnsFailed] {
+            let account = AccountId::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let src = source_in(account, dir.path());
+            let (orch, _clock) = build(
+                account,
+                vec![src],
+                Arc::new(RecordingExecutor::default()),
+                power_on_ac(),
+                Arc::new(FakeNet::with_state(state)),
+                cfg.clone(),
+            );
+            assert_eq!(
+                orch.evaluate_gates().await,
+                GateDecision::Proceed,
+                "{state:?} must be exempted when pause_when_offline=false"
+            );
+        }
+
+        // (d) CaptivePortal always pauses, exemption or not.
+        {
+            let account = AccountId::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let src = source_in(account, dir.path());
+            let (orch, _clock) = build(
+                account,
+                vec![src],
+                Arc::new(RecordingExecutor::default()),
+                power_on_ac(),
+                Arc::new(FakeNet::with_state(NetworkState::CaptivePortal)),
+                cfg.clone(),
+            );
+            assert_eq!(
+                orch.evaluate_gates().await,
+                GateDecision::Pause(PauseReason::CaptivePortal),
+                "CaptivePortal must still pause even when pause_when_offline=false"
+            );
+        }
+
+        // (e) The distinguishing case: OS-level unreachable AND probe ->
+        // CaptivePortal, exemption on. Only a REAL fall-through from the
+        // reachability short-circuit to the probe can produce
+        // Pause(CaptivePortal) here - a forbidden "return Proceed directly"
+        // shortcut at the short-circuit would never even call the probe, so
+        // this is the case that (a) alone cannot distinguish from that bug.
+        {
+            let account = AccountId::new_v4();
+            let dir = tempfile::tempdir().unwrap();
+            let src = source_in(account, dir.path());
+            let (orch, _clock) = build(
+                account,
+                vec![src],
+                Arc::new(RecordingExecutor::default()),
+                PowerState {
+                    ac_connected: true,
+                    battery_percent: Some(100),
+                    on_metered_network: false,
+                    network_reachable: false,
+                },
+                Arc::new(FakeNet::with_state(NetworkState::CaptivePortal)),
+                cfg,
+            );
+            assert_eq!(
+                orch.evaluate_gates().await,
+                GateDecision::Pause(PauseReason::CaptivePortal),
+                "reachability=false must fall through to the probe, which must \
+                 still surface CaptivePortal even though pause_when_offline=false"
+            );
+        }
+    }
+
+    /// Default behaviour unchanged: with `pause_when_offline` at its default
+    /// `true`, Offline still pauses (spec 2026-08-01 "pause_when_offline").
+    #[tokio::test]
+    async fn offline_still_pauses_by_default() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            Arc::new(RecordingExecutor::default()),
+            PowerState {
+                ac_connected: true,
+                battery_percent: Some(100),
+                on_metered_network: false,
+                network_reachable: false,
+            },
+            Arc::new(FakeNet::with_state(NetworkState::Offline)),
+            OrchestratorConfig::default(),
+        );
+        assert_eq!(
+            orch.evaluate_gates().await,
+            GateDecision::Pause(PauseReason::Offline)
+        );
+    }
+
+    /// The post-wake re-probe (`complete_resume`) must honour the same
+    /// exemption as the live gate: probe -> NoInternet with
+    /// `pause_when_offline=false` must NOT re-pause, but fall through to the
+    /// Wake cycle (spec 2026-08-01 "pause_when_offline").
+    #[tokio::test]
+    async fn resume_reprobe_honours_offline_exemption() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let cfg = OrchestratorConfig {
+            pause_when_offline: false,
+            ..Default::default()
+        };
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::with_state(NetworkState::NoInternet)),
+            cfg,
+        );
+
+        orch.complete_resume().await.unwrap();
+        assert!(
+            matches!(orch.state().await, OrchestratorState::Idle { .. }),
+            "exempted NoInternet must fall through to the Wake cycle, not re-pause"
+        );
     }
 
     #[tokio::test]

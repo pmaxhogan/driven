@@ -2,6 +2,7 @@
 import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 
+import { useDebouncedFlag } from "../composables/useDebouncedFlag";
 import { useProgressStore } from "../stores/progress";
 
 // The global backup progress bar (issue #46). A teal bar pinned to the very top
@@ -20,7 +21,15 @@ import { useProgressStore } from "../stores/progress";
 const { t, locale } = useI18n();
 const progress = useProgressStore();
 
-const active = computed(() => progress.active);
+// Smoke fix: a paused account's periodic orchestrator tick briefly passes
+// through `PowerCheck` (a WORKING_STATES tag) before re-pausing, so
+// `progress.active` flickers true for tens of milliseconds on every tick
+// while paused - popping this bar in and out with no real work happening.
+// 500ms hysteresis on BOTH edges (per the user's ask: "not show or hide for
+// less than .5s at a time") absorbs that blip; a genuine run still appears
+// within half a second, which reads as instant.
+const activeRaw = computed(() => progress.active);
+const active = useDebouncedFlag(activeRaw, 500);
 
 // 0..100 integer width for the determinate fill, or null when indeterminate.
 const widthPct = computed<number | null>(() =>

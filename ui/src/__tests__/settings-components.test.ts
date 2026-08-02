@@ -98,6 +98,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       customRootCaPath: null,
       proxyMode: "system",
       proxyUrl: null,
+      pauseWhenOffline: true,
     },
     telemetry: {
       enabled: true,
@@ -660,7 +661,10 @@ describe("SourceTable", () => {
     expect(runNow).toBeTruthy();
     await runNow!.trigger("click");
     await flushPromises();
-    expect(invokeMock).toHaveBeenCalledWith("sync_now", { sourceId: "src-1" });
+    expect(invokeMock).toHaveBeenCalledWith("sync_now", {
+      sourceId: "src-1",
+      bypassGates: null,
+    });
   });
 
   it("remove confirmation forwards the delete-remote choice", async () => {
@@ -1435,6 +1439,58 @@ describe("Settings Rules tab", () => {
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
       patch: { global: { bandwidthCapMbps: 50 } },
     });
+  });
+
+  it("pause-when-offline toggle patches global.pauseWhenOffline", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const toggle = wrapper.get('[data-testid="pause-when-offline-toggle"]');
+    // Checked by default (makeSettings() defaults pauseWhenOffline: true) -
+    // pins the :checked binding, not just the @change handler, so a wired-
+    // backwards or missing binding would fail here even though the change
+    // event alone can't distinguish it.
+    expect((toggle.element as HTMLInputElement).checked).toBe(true);
+
+    await toggle.setValue(false);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { pauseWhenOffline: false } },
+    });
+  });
+
+  it("renders the pause-when-offline toggle unchecked when the setting is off", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") {
+        return Promise.resolve(
+          makeSettings({
+            global: { ...makeSettings().global, pauseWhenOffline: false },
+          })
+        );
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(Settings, {
+      props: { tab: "rules" },
+      global: globalMountOptions,
+    });
+    await flushPromises();
+
+    const toggle = wrapper.get('[data-testid="pause-when-offline-toggle"]');
+    expect((toggle.element as HTMLInputElement).checked).toBe(false);
   });
 
   it("shows the degraded locked-file-backup banner when the helper status says so", async () => {

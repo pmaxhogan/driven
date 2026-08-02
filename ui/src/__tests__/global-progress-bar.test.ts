@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
-import { describe, it, expect } from "vitest";
-import { mount } from "@vue/test-utils";
+import { describe, it, expect, vi, beforeEach, afterEach } from "vitest";
+import { mount, type VueWrapper } from "@vue/test-utils";
 import { createPinia, setActivePinia } from "pinia";
 
 import { i18n } from "../i18n";
@@ -14,6 +14,17 @@ import type { ExecProgress, OrchestratorState } from "../ipc/types";
 // values) while executing with a known total, and INDETERMINATE (an animated
 // sweep, no aria-valuenow) during scan/plan/verify. These mount the real
 // component and drive it through the store so every render branch is covered.
+//
+// Smoke fix (2026-08-01 pause-banner branch): a paused account's periodic
+// orchestrator tick briefly passes through `PowerCheck` before re-pausing,
+// flickering `progress.active` true for tens of ms with no real work
+// happening. The bar now debounces `active` on BOTH edges (500ms,
+// useDebouncedFlag), so every test that crosses an edge (idle/hidden <->
+// active/visible) must advance fake timers past that delay before asserting
+// the resulting visibility - real content updates within an already-visible
+// bar stay instant and need no advance.
+
+const DEBOUNCE_MS = 500;
 
 function scanning(scanned = 0): OrchestratorState {
   return { state: "scanning", source_id: "src-1", scanned };
@@ -73,9 +84,23 @@ function mountBar() {
   return { store, wrapper };
 }
 
+/** Advance past the visibility debounce and flush the resulting re-render. */
+async function settle(wrapper: VueWrapper, ms = DEBOUNCE_MS): Promise<void> {
+  await vi.advanceTimersByTimeAsync(ms);
+  await wrapper.vm.$nextTick();
+}
+
 const BAR = '[role="progressbar"]';
 const INDETERMINATE = ".global-progress__indeterminate";
 const PHASE_LABEL = '[data-testid="global-progress-label"]';
+
+beforeEach(() => {
+  vi.useFakeTimers();
+});
+
+afterEach(() => {
+  vi.useRealTimers();
+});
 
 describe("GlobalProgressBar", () => {
   it("renders nothing while idle (no run active)", async () => {
@@ -88,7 +113,7 @@ describe("GlobalProgressBar", () => {
   it("shows a determinate fill sized to the byte percent while executing", async () => {
     const { store, wrapper } = mountBar();
     store.ingest(perAccount("a", executing({ bytes_done: 512, bytes_total: 1024 })));
-    await wrapper.vm.$nextTick();
+    await settle(wrapper);
 
     const bar = wrapper.find(BAR);
     expect(bar.exists()).toBe(true);
@@ -105,7 +130,7 @@ describe("GlobalProgressBar", () => {
     const { store, wrapper } = mountBar();
     // 1/3 -> 33%
     store.ingest(perAccount("a", executing({ bytes_done: 1, bytes_total: 3 })));
-    await wrapper.vm.$nextTick();
+    await settle(wrapper);
     expect(wrapper.find(BAR).attributes("aria-valuenow")).toBe("33");
     expect(wrapper.find(BAR).attributes("aria-label")).toBe("Backing up - 33%");
   });
@@ -113,7 +138,7 @@ describe("GlobalProgressBar", () => {
   it("shows an indeterminate sweep (no aria-valuenow) during scan/plan/verify", async () => {
     const { store, wrapper } = mountBar();
     store.ingest(perAccount("a", scanning()));
-    await wrapper.vm.$nextTick();
+    await settle(wrapper);
 
     const bar = wrapper.find(BAR);
     expect(bar.exists()).toBe(true);
@@ -134,7 +159,7 @@ describe("GlobalProgressBar", () => {
   it("renders the scan sweep as a partial-width segment with no inline width", async () => {
     const { store, wrapper } = mountBar();
     store.ingest(perAccount("a", scanning(120)));
-    await wrapper.vm.$nextTick();
+    await settle(wrapper);
 
     const sweep = wrapper.find('[data-testid="global-progress-indeterminate"]');
     expect(sweep.exists()).toBe(true);
@@ -153,7 +178,7 @@ describe("GlobalProgressBar", () => {
     it("names the scan phase and hides the count until the first tick lands", async () => {
       const { store, wrapper } = mountBar();
       store.ingest(perAccount("a", scanning(0)));
-      await wrapper.vm.$nextTick();
+      await settle(wrapper);
 
       expect(wrapper.find(PHASE_LABEL).text()).toBe("Scanning for changes...");
       expect(wrapper.find(BAR).attributes("aria-label")).toBe("Scanning for changes...");
@@ -162,10 +187,11 @@ describe("GlobalProgressBar", () => {
     it("streams the live scanned file count into the readout", async () => {
       const { store, wrapper } = mountBar();
       store.ingest(perAccount("a", scanning(512)));
-      await wrapper.vm.$nextTick();
+      await settle(wrapper);
       expect(wrapper.find(PHASE_LABEL).text()).toBe("Scanning for changes - 512 files");
 
       // A later scan tick updates the same readout in place (locale-grouped).
+      // No edge crossing here (still active), so no further advance needed.
       store.ingest(perAccount("a", scanning(12401)));
       await wrapper.vm.$nextTick();
       expect(wrapper.find(PHASE_LABEL).text()).toBe("Scanning for changes - 12,401 files");
@@ -174,34 +200,36 @@ describe("GlobalProgressBar", () => {
     it("names the planning phase with the planned change count", async () => {
       const { store, wrapper } = mountBar();
       store.ingest(perAccount("a", planning(1200, 34)));
-      await wrapper.vm.$nextTick();
+      await settle(wrapper);
       expect(wrapper.find(PHASE_LABEL).text()).toBe("Preparing 1,234 changes");
     });
 
     it("names the verifying phase with the sampled file count", async () => {
       const { store, wrapper } = mountBar();
       store.ingest(perAccount("a", verifying(42)));
-      await wrapper.vm.$nextTick();
+      await settle(wrapper);
       expect(wrapper.find(PHASE_LABEL).text()).toBe("Verifying backup - 42 files");
     });
 
     it("names the pre-flight power check", async () => {
       const { store, wrapper } = mountBar();
       store.ingest(perAccount("a", powerCheck()));
-      await wrapper.vm.$nextTick();
+      await settle(wrapper);
       expect(wrapper.find(PHASE_LABEL).text()).toBe("Starting backup...");
     });
 
     it("shows the upload percent once execution starts", async () => {
       const { store, wrapper } = mountBar();
       store.ingest(perAccount("a", executing({ bytes_done: 1, bytes_total: 4 })));
-      await wrapper.vm.$nextTick();
+      await settle(wrapper);
       expect(wrapper.find(PHASE_LABEL).text()).toBe("Backing up - 25%");
     });
 
     it("reports the executing account while another is still scanning", async () => {
       const { store, wrapper } = mountBar();
       store.ingest(perAccount("a", scanning(900)));
+      await settle(wrapper);
+      // A second account starting to execute is not a NEW edge (still active).
       store.ingest(perAccount("b", executing({ bytes_done: 1, bytes_total: 2 })));
       await wrapper.vm.$nextTick();
       // Executing outranks scanning: it is the phase with a real percent.
@@ -211,6 +239,10 @@ describe("GlobalProgressBar", () => {
     it("names the file counts once the live ticks carry a total", async () => {
       const { store, wrapper } = mountBar();
       store.ingest(perAccount("a", executing({})));
+      await settle(wrapper);
+      // No progress tick yet, so no measurable total: indeterminate.
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Backing up...");
+
       store.ingestProgress(tick("a", { bytes_done: 512, bytes_total: 1024 }));
       await wrapper.vm.$nextTick();
       // No file total yet (a delete-only plan uploads nothing): bare percent.
@@ -241,7 +273,7 @@ describe("GlobalProgressBar", () => {
   it("goes from indeterminate to determinate when the first live tick lands", async () => {
     const { store, wrapper } = mountBar();
     store.ingest(perAccount("a", executing({})));
-    await wrapper.vm.$nextTick();
+    await settle(wrapper);
     expect(wrapper.find(INDETERMINATE).exists()).toBe(true);
     expect(wrapper.find(BAR).attributes("aria-valuenow")).toBeUndefined();
 
@@ -257,12 +289,43 @@ describe("GlobalProgressBar", () => {
     expect(wrapper.find(BAR).exists()).toBe(false);
 
     store.ingest(perAccount("a", executing({ bytes_done: 1, bytes_total: 4 })));
-    await wrapper.vm.$nextTick();
+    await settle(wrapper);
     expect(wrapper.find(BAR).exists()).toBe(true);
     expect(wrapper.find(BAR).attributes("aria-valuenow")).toBe("25");
 
     store.ingest(perAccount("a", idle()));
-    await wrapper.vm.$nextTick();
+    await settle(wrapper);
     expect(wrapper.find(BAR).exists()).toBe(false);
+  });
+
+  // Smoke fix regression coverage: the exact flicker reported in the field.
+  describe("visibility debounce (smoke fix)", () => {
+    it("never renders a blip shorter than 500ms (e.g. the paused-account PowerCheck tick)", async () => {
+      const { store, wrapper } = mountBar();
+      expect(wrapper.find(BAR).exists()).toBe(false);
+
+      // Simulates a paused account's tick: a working state for 200ms, then
+      // straight back to paused - well under the debounce window.
+      store.ingest(perAccount("a", powerCheck()));
+      await vi.advanceTimersByTimeAsync(200);
+      expect(wrapper.find(BAR).exists()).toBe(false);
+
+      store.ingest(perAccount("a", { state: "paused", reason: "battery" }));
+      await vi.advanceTimersByTimeAsync(1_000);
+      await wrapper.vm.$nextTick();
+      expect(wrapper.find(BAR).exists()).toBe(false);
+    });
+
+    it("renders once a real run holds active for the full 500ms", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", scanning(1)));
+
+      await vi.advanceTimersByTimeAsync(499);
+      expect(wrapper.find(BAR).exists()).toBe(false);
+
+      await vi.advanceTimersByTimeAsync(1);
+      await wrapper.vm.$nextTick();
+      expect(wrapper.find(BAR).exists()).toBe(true);
+    });
   });
 });

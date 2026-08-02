@@ -33,6 +33,19 @@
     "timed": "Backups paused - {minutes}m left",
     "resume": "Resume"
   },
+  "statusBanner": {
+    "battery": "Paused - on battery power",
+    "metered": "Paused - on a metered network",
+    "offline": "Paused - no internet connection",
+    "captivePortal": "Paused - Wi-Fi needs sign-in",
+    "destinationUnreachable": "Paused - the backup destination is unreachable",
+    "schedule": "Waiting for backup window - resumes at {time}",
+    "scheduleUnknown": "Waiting for backup window",
+    "retry": "Retry",
+    "backUpAnyway": "Back up anyway",
+    "backUpNow": "Back up now",
+    "gear": "Open the setting for this pause reason"
+  },
   "fdaBanner": {
     "title": "macOS is blocking Driven from reading some files",
     "body": "macOS privacy protection is stopping Driven from reading {count} file. Driven skips it and retries each run. To back it up, give Driven Full Disk Access. | macOS privacy protection is stopping Driven from reading {count} files. Driven skips them and retries each run. To back them up, give Driven Full Disk Access.",
@@ -352,6 +365,8 @@
       "autoStartOnLoginNote": "Starts Driven in the background at login so backups keep running. Registers as a real startup app (Windows Task Manager, macOS Login Items, Linux autostart).",
       "skipOnBatteryLabel": "Pause backups while on battery",
       "skipOnMeteredLabel": "Limit backups on metered networks",
+      "pauseWhenOfflineLabel": "Pause backups when the internet is unreachable",
+      "pauseWhenOfflineNote": "Turn this off if you back up to a destination that doesn't need internet access, like a LAN server or a local folder - backups keep running even while Driven can't reach the internet.",
       "metered": {
         "modeLabel": "On a metered network",
         "mode": {
