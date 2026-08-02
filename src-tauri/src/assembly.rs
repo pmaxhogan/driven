@@ -1583,13 +1583,8 @@ mod tests {
     /// re-enable the offline pause on every restart).
     #[tokio::test]
     async fn cold_start_config_reflects_persisted_pause_when_offline() {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("driven-assembly-cfg-pwo-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let repo = SqliteStateRepo::open(&dir.join("state.db"))
+        let dir = tempfile::tempdir().expect("create temp dir");
+        let repo = SqliteStateRepo::open(&dir.path().join("state.db"))
             .await
             .expect("open repo");
 
@@ -1621,8 +1616,6 @@ mod tests {
             !cfg.pause_when_offline,
             "cold-start config must reflect the persisted pause_when_offline (spec 2026-08-01)"
         );
-
-        let _ = std::fs::remove_dir_all(dir);
     }
 
     /// R8-P1-1 (DATA-SAFETY): the boot path must FAIL CLOSED on a repair error -
