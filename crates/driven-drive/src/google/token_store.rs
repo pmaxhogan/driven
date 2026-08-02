@@ -105,21 +105,23 @@ impl KeyringTokenStore {
 
     /// Persists `refresh_token` in the keychain for this account (SPEC s4.1).
     pub fn store_refresh_token(&self, refresh_token: &str) -> anyhow::Result<()> {
-        self.entry()?
-            .set_password(refresh_token)
-            .map_err(|e| anyhow::anyhow!("keychain: failed to store refresh token: {e}"))
+        keyring_off_runtime(|| {
+            self.entry()?
+                .set_password(refresh_token)
+                .map_err(|e| anyhow::anyhow!("keychain: failed to store refresh token: {e}"))
+        })
     }
 
     /// Loads the stored refresh token, or `None` if the account has never
     /// authenticated (SPEC s4.1). A `NoEntry` is mapped to `Ok(None)`.
     pub fn load_refresh_token(&self) -> anyhow::Result<Option<String>> {
-        map_load_result(self.entry()?.get_password())
+        keyring_off_runtime(|| map_load_result(self.entry()?.get_password()))
     }
 
     /// Deletes the stored refresh token (e.g. on sign-out / revoke). Absent
     /// entry is a no-op (SPEC s4.1).
     pub fn delete_refresh_token(&self) -> anyhow::Result<()> {
-        map_delete_result(self.entry()?.delete_credential())
+        keyring_off_runtime(|| map_delete_result(self.entry()?.delete_credential()))
     }
 }
 
@@ -162,27 +164,55 @@ impl ClientCredsStore {
     /// `client_id\nclient_secret` in one keychain entry.
     pub fn store(&self, creds: &ClientCreds) -> anyhow::Result<()> {
         let record = encode_client_creds(creds);
-        self.entry()?
-            .set_password(&record)
-            .map_err(|e| anyhow::anyhow!("keychain: failed to store client creds: {e}"))
+        keyring_off_runtime(|| {
+            self.entry()?
+                .set_password(&record)
+                .map_err(|e| anyhow::anyhow!("keychain: failed to store client creds: {e}"))
+        })
     }
 
     /// Loads the stored client creds, or `None` if the account never persisted
     /// any (a default/env-client account). A `NoEntry` maps to `Ok(None)`.
     pub fn load(&self) -> anyhow::Result<Option<ClientCreds>> {
-        match self.entry()?.get_password() {
+        keyring_off_runtime(|| match self.entry()?.get_password() {
             Ok(record) => Ok(Some(decode_client_creds(&record))),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(anyhow::anyhow!(
                 "keychain: failed to load client creds: {e}"
             )),
-        }
+        })
     }
 
     /// Deletes the stored client creds (e.g. on account removal). Absent entry
     /// is a no-op.
     pub fn delete(&self) -> anyhow::Result<()> {
-        map_delete_result(self.entry()?.delete_credential())
+        keyring_off_runtime(|| map_delete_result(self.entry()?.delete_credential()))
+    }
+}
+
+/// Run a keyring operation on a scratch thread on Linux.
+///
+/// The Linux `keyring` backend (Secret Service over DBus) internally
+/// `block_on`s its own async runtime; called from a tokio worker thread
+/// (IPC commands, assembly, the CLI's async main) that panics with
+/// "Cannot start a runtime from within a runtime" and kills the caller
+/// mid-flight. Surfaced by the agent-QA e2e harness (create_s3_account hung
+/// its invoke inside the Linux container; driven-cli reproduced directly).
+/// Keychain ops are rare and short-lived, so a scoped scratch thread - no
+/// ambient runtime - is cheap and keeps the public signatures sync. macOS /
+/// Windows backends are plain native calls and stay on the calling thread.
+fn keyring_off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    #[cfg(target_os = "linux")]
+    {
+        std::thread::scope(|s| {
+            s.spawn(f)
+                .join()
+                .expect("keyring operation thread panicked")
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        f()
     }
 }
 
