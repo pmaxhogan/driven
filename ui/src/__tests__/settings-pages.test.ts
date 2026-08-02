@@ -48,6 +48,7 @@ vi.mock("vue-router", async () => {
 });
 
 import { createMemoryHistory } from "vue-router";
+import StartupCard from "../views/settings/StartupCard.vue";
 import GeneralPage from "../views/settings/GeneralPage.vue";
 import SchedulePowerPage from "../views/settings/SchedulePowerPage.vue";
 import PerformancePage from "../views/settings/PerformancePage.vue";
@@ -116,6 +117,35 @@ beforeEach(() => {
   invokeMock.mockResolvedValue(undefined);
 });
 
+describe("StartupCard", () => {
+  // SDD 2026-08-02 settings-sidebar-ia, task 7 fix (Linux launch-at-login
+  // reachability). StartupCard is the extracted Startup section, now shared
+  // between PlatformPage (macOS/Windows) and GeneralPage (Linux, where
+  // PlatformPage itself is hidden from the nav). This is a direct unit test
+  // of the extracted component, independent of either page.
+  it("toggling auto-start patches global.autoStartOnLogin", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: Record<string, unknown> }).patch;
+        return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
+      }
+      return Promise.resolve(undefined);
+    });
+
+    const wrapper = mount(StartupCard, { global: globalMountOptions });
+    await flushPromises();
+
+    const toggle = wrapper.get('[data-testid="autostart-toggle"]');
+    await toggle.setValue(true);
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { autoStartOnLogin: true } },
+    });
+  });
+});
+
 describe("GeneralPage", () => {
   it("clamps an out-of-range scan interval to the backend range before patching", async () => {
     // Regression (moved from the old combined clamp test): a plausible
@@ -180,6 +210,39 @@ describe("GeneralPage", () => {
 
     expect(invokeMock).toHaveBeenCalledWith("check_for_update", undefined);
     expect(wrapper.find('[data-testid="check-uptodate"]').exists()).toBe(true);
+  });
+
+  // SDD 2026-08-02 settings-sidebar-ia, task 7 fix. On Linux, `macos` and
+  // `windows` are BOTH null, so SettingsNav hides the Platform nav item -
+  // making the Startup card (rendered only on PlatformPage until this fix)
+  // unreachable there. GeneralPage renders the same StartupCard, but only
+  // exactly when PlatformPage is hidden, so exactly one copy of the card is
+  // reachable on every OS.
+  it("shows the Startup card when both macos and windows are null (Linux reachability)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings({ windows: null }));
+      if (cmd === "get_update_channel") return Promise.resolve("stable");
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(GeneralPage, { global: globalMountOptions });
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="startup-setting"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="autostart-toggle"]').exists()).toBe(true);
+  });
+
+  it("hides the Startup card when a platform settings group is present (already reachable via Platform)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      // The default fixture already has `windows` non-null (a non-mac host),
+      // which alone should be enough to suppress GeneralPage's copy.
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_update_channel") return Promise.resolve("stable");
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(GeneralPage, { global: globalMountOptions });
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="startup-setting"]').exists()).toBe(false);
   });
 });
 

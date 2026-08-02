@@ -1,11 +1,12 @@
 <script setup lang="ts">
-import { onMounted } from "vue";
+import { computed, onMounted } from "vue";
 import { useI18n } from "vue-i18n";
 
 import { useSettingsStore } from "../../stores/settings";
 import { useUpdaterStore } from "../../stores/updater";
 import { useSettingsForm } from "../../composables/useSettingsForm";
 import { cardCls, inputCls, ensureSettingsLoaded } from "./shared";
+import StartupCard from "./StartupCard.vue";
 
 // General settings page (SDD 2026-08-02 settings-sidebar-ia, task 2). Holds
 // the scan interval, plus - as of task 5 - the update-channel selector and a
@@ -18,6 +19,13 @@ import { cardCls, inputCls, ensureSettingsLoaded } from "./shared";
 // just render the same `useUpdaterStore` fields with no state of their own -
 // a composable here would be more indirection than the ~15 duplicated lines
 // it would save.
+//
+// Task 7 fix: also renders StartupCard, but ONLY when both `settings.macos`
+// and `settings.windows` are null (Linux) - exactly the condition under which
+// SettingsNav hides the Platform nav item (and therefore its own copy of
+// StartupCard) from both the sidebar and search. autoStartOnLogin is a
+// GLOBAL setting the backend supports on every OS, so it must stay reachable
+// through some page on every OS; this keeps exactly one copy reachable.
 const { t } = useI18n();
 const settings = useSettingsStore();
 const updater = useUpdaterStore();
@@ -26,6 +34,16 @@ const { commitPatch, parseRequiredClamped, RANGES } = useSettingsForm();
 ensureSettingsLoaded();
 
 const channels = ["stable", "dev"] as const;
+
+// Mirrors SettingsNav's own `platformVisible` check (inverted): the Platform
+// nav item - and its StartupCard - is hidden exactly when both groups are
+// null.
+const showStartupCard = computed(
+  () =>
+    settings.settings != null &&
+    settings.settings.macos == null &&
+    settings.settings.windows == null
+);
 
 // Shared design-system class string (DRIVEN UI design system), duplicated
 // from About.vue rather than added to shared.ts - see the module comment.
@@ -74,6 +92,12 @@ function localizeError(code: string | null): string {
     >
       {{ t(`errors.${settings.errorCode}.long`) }}
     </p>
+
+    <!-- Startup (StartupCard.vue - task 7 fix). Linux only: PlatformPage,
+         the card's original home, is hidden from the nav/search whenever
+         both `settings.macos` and `settings.windows` are null, which would
+         otherwise make launch-at-login unreachable there. -->
+    <StartupCard v-if="showStartupCard" />
 
     <section class="space-y-3" :class="cardCls">
       <label class="block space-y-1">

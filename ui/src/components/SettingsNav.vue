@@ -38,7 +38,11 @@ interface NavItem {
 const NAV_KEYWORDS: Record<SettingsPageKey, string[]> = {
   accounts: ["account", "connect", "reauth", "reconnect"],
   sources: ["source", "folder", "backup"],
-  general: ["scan", "interval", "channel", "update", "language"],
+  // "startup"/"login"/"launch" cover GeneralPage's own StartupCard copy
+  // (task 7 fix, Linux only) - harmless duplication of platform's own
+  // keywords on macOS/Windows, where GeneralPage doesn't render the card but
+  // the keyword match still surfaces the (correct) page in search results.
+  general: ["scan", "interval", "channel", "update", "language", "startup", "login", "launch"],
   "schedule-power": ["battery", "metered", "offline", "schedule", "pause", "window"],
   performance: ["bandwidth", "concurrent", "upload", "adaptive", "parallel", "priority"],
   platform: ["launch", "login", "vss", "shadow copy", "apfs", "snapshot", "menu bar"],

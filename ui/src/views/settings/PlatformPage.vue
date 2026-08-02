@@ -7,15 +7,18 @@ import { useSettingsForm } from "../../composables/useSettingsForm";
 import { getApfsHelperStatus, getVssHelperStatus } from "../../ipc/commands";
 import type { ApfsHelperStatus, MenuBarSettingsPatch, VssHelperStatus } from "../../ipc/types";
 import { cardCls, inputCls, ensureSettingsLoaded } from "./shared";
+import StartupCard from "./StartupCard.vue";
 
 // Platform settings page (SDD 2026-08-02 settings-sidebar-ia, task 2). Moved
-// verbatim out of Settings.vue: the "Startup" card (autoStartOnLogin), the
-// Windows VSS / macOS APFS-snapshot locked-file backup controls that used to
-// live inline inside the old "Performance and bandwidth" card, and the
-// macOS-only "Menu bar extra" card. Rendered from the existing
-// `settings.windows` / `settings.macos` nullability - label is "macOS" or
-// "Windows" and the page is hidden from the nav when both are null (Linux);
-// that nav-hiding lands in task 3, this task only carries the moved markup.
+// verbatim out of Settings.vue: the "Startup" card (autoStartOnLogin, now
+// StartupCard.vue - task 7 fix, extracted so GeneralPage can also render it
+// on Linux), the Windows VSS / macOS APFS-snapshot locked-file backup
+// controls that used to live inline inside the old "Performance and
+// bandwidth" card, and the macOS-only "Menu bar extra" card. Rendered from
+// the existing `settings.windows` / `settings.macos` nullability - label is
+// "macOS" or "Windows" and the page is hidden from the nav when both are
+// null (Linux); that nav-hiding lands in task 3, this task only carries the
+// moved markup.
 const { t } = useI18n();
 const settings = useSettingsStore();
 const { commitPatch } = useSettingsForm();
@@ -128,13 +131,6 @@ onMounted(() => {
       apfsStatus.value = null;
     });
 });
-
-// Issue #58: launch Driven at login (default ON). Patches the persisted
-// preference; the backend registers/unregisters the real OS startup entry.
-async function setAutoStartOnLogin(event: Event): Promise<void> {
-  const checked = (event.target as HTMLInputElement).checked;
-  await commitPatch({ global: { autoStartOnLogin: checked } });
-}
 
 async function setVssMode(event: Event): Promise<void> {
   const value = (event.target as HTMLSelectElement).value;
@@ -261,25 +257,8 @@ const menuBarEnabledCount = computed(() => {
       {{ t(`errors.${settings.errorCode}.long`) }}
     </p>
 
-    <!-- Startup -->
-    <section class="space-y-3" :class="cardCls" data-testid="startup-setting">
-      <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
-        {{ t("settings.rules.sections.startup") }}
-      </h3>
-      <label class="flex items-center gap-2">
-        <input
-          type="checkbox"
-          class="accent-teal-600"
-          data-testid="autostart-toggle"
-          :checked="settings.settings.global.autoStartOnLogin"
-          @change="setAutoStartOnLogin"
-        />
-        {{ t("settings.rules.autoStartOnLoginLabel") }}
-      </label>
-      <p class="text-xs text-zinc-500 dark:text-zinc-400">
-        {{ t("settings.rules.autoStartOnLoginNote") }}
-      </p>
-    </section>
+    <!-- Startup (StartupCard.vue - task 7 fix, shared with GeneralPage). -->
+    <StartupCard />
 
     <!-- Locked-file backup: Windows VSS / macOS APFS snapshot -->
     <section class="space-y-3" :class="cardCls">
