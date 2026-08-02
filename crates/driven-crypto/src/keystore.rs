@@ -70,7 +70,7 @@ impl Keystore {
     /// # Errors
     /// Returns [`KeystoreError::Backend`] on a keychain write failure.
     pub fn store_master_key(&self, key: &MasterKey) -> Result<(), KeystoreError> {
-        self.entry.set_secret(key.as_bytes())?;
+        keyring_off_runtime(|| self.entry.set_secret(key.as_bytes()))?;
         Ok(())
     }
 
@@ -82,7 +82,7 @@ impl Keystore {
     /// blob is the wrong length, or [`KeystoreError::Backend`] on a backend
     /// failure.
     pub fn load_master_key(&self) -> Result<MasterKey, KeystoreError> {
-        map_load_secret(self.entry.get_secret())
+        map_load_secret(keyring_off_runtime(|| self.entry.get_secret()))
     }
 
     /// Deletes the master key entry (account removal / encryption opt-out).
@@ -92,7 +92,36 @@ impl Keystore {
     /// Returns [`KeystoreError::Backend`] on a backend failure other than a
     /// missing entry.
     pub fn delete_master_key(&self) -> Result<(), KeystoreError> {
-        map_delete_result(self.entry.delete_credential())
+        map_delete_result(keyring_off_runtime(|| self.entry.delete_credential()))
+    }
+}
+
+
+/// Run a keyring operation on a scratch thread on Linux.
+///
+/// The Linux `keyring` backend (Secret Service over DBus) internally
+/// `block_on`s its own async runtime. Called from a tokio worker thread -
+/// which is exactly where the app's IPC commands and assembly run - that
+/// panics with "Cannot start a runtime from within a runtime", killing the
+/// command mid-flight. The agent-QA e2e harness surfaced this as
+/// `create_s3_account` hanging forever inside the Linux container (the panic
+/// crash-dumped and the invoke promise never settled), and `driven-cli`
+/// reproduced it directly. Keychain ops are rare and short-lived, so hopping
+/// to a scoped scratch thread - which has no ambient runtime - is cheap,
+/// dependency-free, and keeps every public signature sync. macOS / Windows
+/// backends are plain native calls and stay on the calling thread.
+fn keyring_off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    #[cfg(target_os = "linux")]
+    {
+        std::thread::scope(|s| {
+            s.spawn(f)
+                .join()
+                .expect("keyring operation thread panicked")
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        f()
     }
 }
 

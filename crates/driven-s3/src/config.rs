@@ -209,6 +209,32 @@ pub struct S3CredentialStore {
     account: String,
 }
 
+/// Run a keyring operation on a scratch thread on Linux.
+///
+/// The Linux `keyring` backend (Secret Service over DBus) internally
+/// `block_on`s its own async runtime; called from a tokio worker thread
+/// (IPC commands, assembly, the CLI's async main) that panics with
+/// "Cannot start a runtime from within a runtime" and kills the caller
+/// mid-flight. Surfaced by the agent-QA e2e harness (create_s3_account hung
+/// its invoke inside the Linux container; driven-cli reproduced directly).
+/// Keychain ops are rare and short-lived, so a scoped scratch thread - no
+/// ambient runtime - is cheap and keeps the public signatures sync. macOS /
+/// Windows backends are plain native calls and stay on the calling thread.
+fn keyring_off_runtime<T: Send>(f: impl FnOnce() -> T + Send) -> T {
+    #[cfg(target_os = "linux")]
+    {
+        std::thread::scope(|s| {
+            s.spawn(f)
+                .join()
+                .expect("keyring operation thread panicked")
+        })
+    }
+    #[cfg(not(target_os = "linux"))]
+    {
+        f()
+    }
+}
+
 impl S3CredentialStore {
     /// A store for `account` (the `accounts.id` UUID string).
     pub fn new(account: impl Into<String>) -> Self {
@@ -222,34 +248,38 @@ impl S3CredentialStore {
             .map_err(|e| anyhow::anyhow!("failed to open the S3 credential keychain entry: {e}"))
     }
 
+    
+
     /// Persist the credential pair, replacing any existing one.
     pub fn store(&self, creds: &S3Credentials) -> anyhow::Result<()> {
         let encoded = encode_credentials(creds)?;
-        self.entry()?
-            .set_password(&encoded)
-            .map_err(|e| anyhow::anyhow!("failed to store the S3 credentials in the keychain: {e}"))
+        keyring_off_runtime(|| {
+            self.entry()?.set_password(&encoded).map_err(|e| {
+                anyhow::anyhow!("failed to store the S3 credentials in the keychain: {e}")
+            })
+        })
     }
 
     /// Load the credential pair, or `None` when the account has none stored.
     pub fn load(&self) -> anyhow::Result<Option<S3Credentials>> {
-        match self.entry()?.get_password() {
+        keyring_off_runtime(|| match self.entry()?.get_password() {
             Ok(raw) => Ok(Some(decode_credentials(&raw)?)),
             Err(keyring::Error::NoEntry) => Ok(None),
             Err(e) => Err(anyhow::anyhow!(
                 "failed to read the S3 credentials from the keychain: {e}"
             )),
-        }
+        })
     }
 
     /// Remove the credential pair. A missing entry is a no-op (idempotent, so
     /// account removal can call it unconditionally).
     pub fn delete(&self) -> anyhow::Result<()> {
-        match self.entry()?.delete_credential() {
+        keyring_off_runtime(|| match self.entry()?.delete_credential() {
             Ok(()) | Err(keyring::Error::NoEntry) => Ok(()),
             Err(e) => Err(anyhow::anyhow!(
                 "failed to delete the S3 credentials from the keychain: {e}"
             )),
-        }
+        })
     }
 }
 
