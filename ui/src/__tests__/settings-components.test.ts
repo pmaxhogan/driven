@@ -1460,9 +1460,11 @@ describe("Settings About tab", () => {
     const { wrapper } = await mountSettingsAt("/settings/about");
 
     // The About surface's own controls are present...
-    expect(wrapper.find('[data-testid="channel-select"]').exists()).toBe(true);
     expect(wrapper.find('[data-testid="check-updates"]').exists()).toBe(true);
     expect(wrapper.text()).toContain(i18n.global.t("about.updatesTitle"));
+    // ...the channel selector moved to GeneralPage (task 5) so it is gone
+    // from here...
+    expect(wrapper.find('[data-testid="channel-select"]').exists()).toBe(false);
     // ...and no Rules page is rendered in its place.
     expect(wrapper.find('[data-testid="rules-form"]').exists()).toBe(false);
   });

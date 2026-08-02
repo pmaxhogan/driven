@@ -124,6 +124,9 @@ describe("GeneralPage", () => {
     // brick the entire Rules form.
     invokeMock.mockImplementation((cmd: string, args: unknown) => {
       if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      // GeneralPage also loads the update channel on mount (task 5) - stub it
+      // so the channel select never renders with an undefined value here.
+      if (cmd === "get_update_channel") return Promise.resolve("stable");
       if (cmd === "update_settings") {
         const patch = (args as { patch: Record<string, unknown> }).patch;
         return Promise.resolve(makeSettings(patch as Partial<SettingsDto>));
@@ -140,6 +143,43 @@ describe("GeneralPage", () => {
     expect(invokeMock).toHaveBeenCalledWith("update_settings", {
       patch: { global: { scanIntervalSecs: 30 } },
     });
+  });
+
+  it("channel select round-trips through updater.setChannel (moved from About, task 5)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_update_channel") return Promise.resolve("stable");
+      if (cmd === "set_update_channel") return Promise.resolve("dev");
+      if (cmd === "list_releases") return Promise.resolve([]);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(GeneralPage, { global: globalMountOptions });
+    await flushPromises();
+
+    const select = wrapper.get('[data-testid="channel-select"]');
+    expect((select.element as HTMLSelectElement).value).toBe("stable");
+
+    await select.setValue("dev");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("set_update_channel", { channel: "dev" });
+  });
+
+  it("the check-for-updates action calls check_for_update and shows the result (task 5)", async () => {
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "get_update_channel") return Promise.resolve("stable");
+      if (cmd === "check_for_update") return Promise.resolve(null);
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(GeneralPage, { global: globalMountOptions });
+    await flushPromises();
+
+    await wrapper.get('[data-testid="check-updates"]').trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("check_for_update", undefined);
+    expect(wrapper.find('[data-testid="check-uptodate"]').exists()).toBe(true);
   });
 });
 
@@ -1669,7 +1709,7 @@ describe("SourcesPage", () => {
 });
 
 describe("AboutPage", () => {
-  it("renders the wrapped About view unchanged", async () => {
+  it("renders the wrapped About view, now identity-only (task 5)", async () => {
     invokeMock.mockImplementation((cmd: string) => {
       if (cmd === "get_settings") return Promise.resolve(makeSettings());
       if (cmd === "get_update_channel") return Promise.resolve("stable");
@@ -1680,7 +1720,12 @@ describe("AboutPage", () => {
     await flushPromises();
 
     expect(wrapper.text()).toContain(i18n.global.t("about.title"));
-    expect(wrapper.find('[data-testid="channel-select"]').exists()).toBe(true);
+    // About keeps its own check-for-updates action (mock F allows the action
+    // in both places) but no longer renders the channel selector (moved to
+    // GeneralPage) or a telemetry toggle (PrivacyPage is the single home).
+    expect(wrapper.find('[data-testid="check-updates"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="channel-select"]').exists()).toBe(false);
+    expect(wrapper.find('input[type="checkbox"]').exists()).toBe(false);
   });
 });
 
