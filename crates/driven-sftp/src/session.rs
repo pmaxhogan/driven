@@ -794,6 +794,56 @@ mod tests {
     }
 
     #[tokio::test]
+    async fn a_windows_shaped_path_cannot_create_anything_through_a_real_client() {
+        // `virtual_segments` and `resolve` are unit-tested directly in
+        // `test_support`, but those prove the helpers refuse - not that a real
+        // client driving the real protocol cannot get a write through. This
+        // asserts the outcome that actually matters: the create fails AND the
+        // served directory is still empty afterwards.
+        //
+        // The empty-root assertion is the canary, and it catches the bug on
+        // BOTH platforms. Without the guard, `/sub\nested` writes a file
+        // literally named `sub\nested` inside the root on POSIX and nests into
+        // `root/sub/nested` on Windows; `C:/...` escapes the root outright on
+        // Windows because `PathBuf::push` of an absolute path discards the
+        // base. Every one of those shows up here as "the root is no longer
+        // empty".
+        let server = TestSftpServer::spawn().await.unwrap();
+        let session = SftpSession::connect(
+            &server.pinned_config(SftpAuthKind::Password),
+            &server.password_credential(),
+        )
+        .await
+        .unwrap();
+
+        for path in [
+            "/C:\\Windows\\driven-canary.txt",
+            "C:/Windows/driven-canary.txt",
+            "/sub\\driven-canary.txt",
+            "/a\\..\\..\\driven-canary.txt",
+        ] {
+            session
+                .sftp()
+                .open_with_flags(
+                    path,
+                    OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+                )
+                .await
+                .err()
+                .unwrap_or_else(|| panic!("{path:?} must not be creatable"));
+
+            let leftovers: Vec<_> = std::fs::read_dir(server.root())
+                .unwrap()
+                .map(|entry| entry.unwrap().file_name())
+                .collect();
+            assert!(
+                leftovers.is_empty(),
+                "{path:?} created something inside the root: {leftovers:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
     async fn a_wrong_password_is_an_auth_invalid_grant() {
         let server = TestSftpServer::spawn().await.unwrap();
         let config = server.pinned_config(SftpAuthKind::Password);
