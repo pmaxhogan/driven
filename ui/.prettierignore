@@ -5,3 +5,6 @@ coverage
 
 # Auto-generated type shims.
 env.d.ts
+
+# Committed visual baselines (binary).
+e2e-visual/__screenshots__

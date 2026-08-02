@@ -9,11 +9,13 @@
     "preview": "vite preview",
     "lint": "eslint .",
     "lint:fix": "eslint . --fix",
-    "format": "prettier --write src",
-    "format:check": "prettier --check src",
+    "format": "prettier --write src test-support e2e-visual",
+    "format:check": "prettier --check src test-support e2e-visual",
     "test:unit": "vitest run --passWithNoTests",
     "test:coverage": "vitest run --coverage --passWithNoTests",
-    "test:watch": "vitest"
+    "test:watch": "vitest",
+    "test:visual": "playwright test",
+    "test:visual:update": "playwright test --update-snapshots"
   },
   "dependencies": {
     "@tauri-apps/api": "^2",
@@ -30,6 +32,7 @@
   "devDependencies": {
     "@intlify/eslint-plugin-vue-i18n": "^4.0.0",
     "@intlify/unplugin-vue-i18n": "^11.0.0",
+    "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4.3.2",
     "@types/node": "^26",
     "@vitejs/plugin-vue": "^6.0.8",

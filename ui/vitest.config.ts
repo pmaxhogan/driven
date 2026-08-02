@@ -1,4 +1,4 @@
-import { defineConfig, mergeConfig } from "vitest/config";
+import { configDefaults, defineConfig, mergeConfig } from "vitest/config";
 import viteConfig from "./vite.config";
 
 // Coverage / test config lives HERE, not in vite.config.ts, on purpose.
@@ -22,6 +22,12 @@ export default mergeConfig(
   viteConfig,
   defineConfig({
     test: {
+      // The Playwright visual specs (ui/e2e-visual) are named `*.spec.ts` and so
+      // match vitest's default `include`. They import `@playwright/test`, whose
+      // `test()` only runs under the Playwright runner, so collecting them here
+      // fails the whole vitest run. They are a different runner's suite, not a
+      // vitest suite - exclude the directory outright.
+      exclude: [...configDefaults.exclude, "e2e-visual/**"],
       coverage: {
         provider: "v8",
         // `json-summary` feeds the CI coverage gate (.total.lines.pct); `lcov`
