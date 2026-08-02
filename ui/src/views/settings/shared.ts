@@ -22,14 +22,22 @@ export const cardCls =
 // calls this on mount instead, so a page is never stuck showing its loading
 // state just because it happened to render before some sibling page's
 // trigger fired (or, in a page-only test mount, because no sibling exists at
-// all). `settings.refresh()` is idempotent to call redundantly (Pinia store,
-// last write wins), so seven near-simultaneous calls when the whole Rules tab
-// mounts at once cost a few duplicate `get_settings` round-trips, not
-// incorrect behaviour.
+// all).
+//
+// The `!settings.loading` check matters: `settings.refresh()` sets
+// `loading.value = true` SYNCHRONOUSLY before its first `await`, and Vue
+// flushes sibling `onMounted` hooks together in one synchronous pass with no
+// microtask gap between them. So when Settings.vue stacks all seven pages at
+// once, GeneralPage's onMounted sets `loading` true and starts the fetch;
+// SchedulePowerPage's onMounted runs next (still synchronously) and sees
+// `loading` already true, so it skips its own call. Without this guard, all
+// seven pages would fire `get_settings` concurrently AND race to write
+// `settings.errorCode` - the store has no in-flight de-dupe of its own, so
+// the last response to land would silently overwrite the others' result.
 export function ensureSettingsLoaded(): void {
   const settings = useSettingsStore();
   onMounted(() => {
-    if (settings.settings === null) {
+    if (settings.settings === null && !settings.loading) {
       void settings.refresh();
     }
   });

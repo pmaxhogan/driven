@@ -23,6 +23,14 @@ const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
   invoke: (cmd: string, args?: unknown) => invokeMock(cmd, args),
 }));
+// Settings.vue (the shell, mounted only by the de-dupe regression test below)
+// calls useRouter() for its tab-strip buttons - stub it out the same way
+// settings-components.test.ts does, since none of the tab navigation is
+// exercised here.
+vi.mock("vue-router", () => ({
+  useRouter: () => ({ push: vi.fn() }),
+  useRoute: () => ({ params: {} }),
+}));
 
 import GeneralPage from "../views/settings/GeneralPage.vue";
 import SchedulePowerPage from "../views/settings/SchedulePowerPage.vue";
@@ -31,6 +39,7 @@ import PlatformPage from "../views/settings/PlatformPage.vue";
 import NetworkPage from "../views/settings/NetworkPage.vue";
 import PrivacyPage from "../views/settings/PrivacyPage.vue";
 import AdvancedPage from "../views/settings/AdvancedPage.vue";
+import Settings from "../views/Settings.vue";
 
 function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
   return {
@@ -1593,5 +1602,27 @@ describe("AdvancedPage", () => {
     await post.trigger("change");
     await flushPromises();
     expect(lastGlobalPatch("postBackupHook")).toBeNull();
+  });
+});
+
+describe("Settings.vue (stacked Rules pages)", () => {
+  it("issues exactly one get_settings call even though all seven pages mount at once", async () => {
+    // Regression: each page independently calls ensureSettingsLoaded() on
+    // mount (see shared.ts), and Settings.vue mounts all seven simultaneously
+    // for the Rules tab. Without the `!settings.loading` guard, that fired
+    // seven concurrent `get_settings` round-trips - and worse, seven writes
+    // to `settings.errorCode` racing on which response landed last. Pin the
+    // count so a regression here shows up immediately rather than only as an
+    // intermittent error-banner flake.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      return Promise.resolve(undefined);
+    });
+
+    mount(Settings, { props: { tab: "rules" }, global: globalMountOptions });
+    await flushPromises();
+
+    const getSettingsCalls = invokeMock.mock.calls.filter((c) => c[0] === "get_settings");
+    expect(getSettingsCalls).toHaveLength(1);
   });
 });
