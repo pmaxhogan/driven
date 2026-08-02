@@ -29,6 +29,7 @@ use clap::{Parser, Subcommand};
 
 mod inspect;
 mod rclone;
+mod restore;
 
 use driven_drive::google::oauth::{run_pkce_loopback_flow, OAuthProgress};
 use driven_drive::google::token_store::{
@@ -83,6 +84,10 @@ enum Command {
     /// the local state database. With `--fail-on-drift`, exits non-zero when
     /// the latest run of any source found drift it could not repair.
     Scrub(inspect::ScrubArgs),
+    /// Restore one backup source to a local directory (no GUI), optionally
+    /// byte-verifying the result against the original folder. Exits non-zero
+    /// when any file fails to restore or fails verification.
+    Restore(restore::RestoreArgs),
 }
 
 /// Arguments for `driven-cli auth`.
@@ -174,6 +179,7 @@ async fn main() -> anyhow::Result<()> {
             rclone::RcloneCommand::Import(a) => rclone::run_import(a).await,
         },
         Command::Scrub(args) => inspect::run_scrub(args).await,
+        Command::Restore(args) => restore::run_restore(args).await,
     }
 }
 
@@ -489,7 +495,8 @@ fn build_store(account: &str, creds: &ClientCreds) -> anyhow::Result<GoogleDrive
 /// Issue #34: the dev/e2e CLI reads its custom root CA (if any) from the
 /// `DRIVEN_CUSTOM_CA_PATH` env var so it can run behind the same corporate
 /// TLS-inspecting proxy the desktop app supports via its settings. Unset =
-/// system trust only (unchanged behaviour).
+/// system trust only (unchanged behaviour). `restore` passes it into the
+/// `driven-backend` factory, so every subcommand honours the same CA.
 fn cli_custom_ca() -> CustomCaConfig {
     match std::env::var_os("DRIVEN_CUSTOM_CA_PATH") {
         Some(v) if !v.is_empty() => CustomCaConfig::from_path(Some(PathBuf::from(v))),

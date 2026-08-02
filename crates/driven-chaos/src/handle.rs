@@ -145,6 +145,7 @@ pub struct DrivenHandleBuilder {
     remote: Option<Arc<dyn RemoteStore>>,
     power: PowerState,
     config: HermeticConfig,
+    crypto: Option<Arc<dyn driven_core::crypto_provider::CryptoProvider>>,
 }
 
 impl DrivenHandleBuilder {
@@ -155,7 +156,21 @@ impl DrivenHandleBuilder {
             remote: None,
             power: power_on_ac(),
             config: HermeticConfig::default(),
+            crypto: None,
         }
+    }
+
+    /// Wire ONE crypto suite for every source (a
+    /// [`driven_core::crypto_provider::SingleSuiteProvider`]), so scenarios
+    /// can drive the executor's encrypt path and the restore rows can
+    /// round-trip ciphertext. Defaults to no crypto provider (the executor
+    /// then fails closed on any `encryption_enabled` source - the historical
+    /// behaviour every pre-existing scenario relies on).
+    pub fn crypto_suite(mut self, suite: Arc<dyn driven_crypto::SourceCryptoSuite>) -> Self {
+        self.crypto = Some(Arc::new(
+            driven_core::crypto_provider::SingleSuiteProvider::new(suite),
+        ));
+        self
     }
 
     /// Override the remote store (e.g. a fault-injected fake or the real
@@ -225,7 +240,7 @@ impl DrivenHandleBuilder {
                 remote: remote.clone(),
                 state: state.clone(),
                 pacer,
-                crypto: None,
+                crypto: self.crypto,
                 vss: None,
                 network: None,
             },

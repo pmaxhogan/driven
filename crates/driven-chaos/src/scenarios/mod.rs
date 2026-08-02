@@ -36,6 +36,7 @@ pub mod mutator;
 pub mod ntfs;
 pub mod permissions;
 pub mod reporting;
+pub mod restore;
 pub mod storage;
 
 /// Wall-clock Unix milliseconds, for the `now` argument the planner takes (issue
