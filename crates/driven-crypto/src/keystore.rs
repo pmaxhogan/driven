@@ -96,7 +96,6 @@ impl Keystore {
     }
 }
 
-
 /// Run a keyring operation on a scratch thread on Linux.
 ///
 /// The Linux `keyring` backend (Secret Service over DBus) internally

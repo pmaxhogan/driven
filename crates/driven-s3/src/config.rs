@@ -248,8 +248,6 @@ impl S3CredentialStore {
             .map_err(|e| anyhow::anyhow!("failed to open the S3 credential keychain entry: {e}"))
     }
 
-    
-
     /// Persist the credential pair, replacing any existing one.
     pub fn store(&self, creds: &S3Credentials) -> anyhow::Result<()> {
         let encoded = encode_credentials(creds)?;
