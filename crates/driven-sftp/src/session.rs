@@ -46,9 +46,81 @@ use crate::config::{SftpConfig, SftpCredential};
 use crate::error::{sftp_error, SftpFailure};
 
 /// How long to wait for the TCP connect before calling the host unreachable.
-/// The SSH handshake and authentication that follow are governed by russh's
-/// own timeouts.
 const CONNECT_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How long everything between "the socket is open" and "the SFTP channel is
+/// usable" gets: banner exchange, key exchange, authentication, channel open,
+/// subsystem request.
+///
+/// This wrapper is NOT redundant with [`INACTIVITY_TIMEOUT`], and the
+/// difference is load-bearing. Verified against russh 0.62.5
+/// (`src/client/mod.rs`): `connect_stream` reads the server's identification
+/// banner with `SshRead::read_ssh_id()` **inline, before** it spawns the
+/// session task - and neither that call nor `ssh_read.rs` applies any timeout.
+/// The inactivity timer is created inside the session run loop, so it does not
+/// exist yet. A host that completes the TCP handshake and then never writes a
+/// banner - a non-SSH service squatting on port 22, a NAS still waking up, a
+/// silently-dropping middlebox - therefore hangs `connect_stream` forever no
+/// matter what `Config` says. Only an external timeout bounds it.
+const HANDSHAKE_TIMEOUT: Duration = Duration::from_secs(30);
+
+/// How often to send a keepalive on an established session.
+///
+/// With russh's default `keepalive_max` of 3, a peer that stops answering is
+/// declared dead after roughly `KEEPALIVE_INTERVAL * 4`. This is the PRIMARY
+/// half-open detector, and what makes
+/// [`SftpSession::is_connected`] honest: without it, a pipe that died silently
+/// (NAT timeout, yanked cable, sleeping NAS) is indistinguishable from an idle
+/// one, and `ensure_connected` returns `Ok` on a corpse.
+const KEEPALIVE_INTERVAL: Duration = Duration::from_secs(15);
+
+/// Hard cap on how long a session may go without any traffic from the server.
+///
+/// Deliberately several times the keepalive detection window (~60s), because
+/// the ordering matters: russh only resets the inactivity timer on loop
+/// iterations that did NOT just send a keepalive, so on an idle-but-healthy
+/// connection it is the server's keepalive *replies* that keep this timer
+/// alive. Set below the keepalive window, this would kill healthy sessions
+/// against a server that ignores keepalive requests entirely. It is a backstop
+/// for that case, not the main detector.
+const INACTIVITY_TIMEOUT: Duration = Duration::from_secs(120);
+
+/// The russh client config Driven connects with.
+///
+/// `Config::default()` leaves BOTH `inactivity_timeout` and
+/// `keepalive_interval` as `None` - i.e. no liveness detection at all - which
+/// is why this is spelled out rather than defaulted.
+fn client_config() -> russh::client::Config {
+    russh::client::Config {
+        inactivity_timeout: Some(INACTIVITY_TIMEOUT),
+        keepalive_interval: Some(KEEPALIVE_INTERVAL),
+        // `keepalive_max` keeps russh's default of 3.
+        ..Default::default()
+    }
+}
+
+/// The two externally-imposed deadlines on establishing a session.
+///
+/// Carried as a value rather than read from the consts directly so tests can
+/// drive the handshake deadline without a 30s wall-clock wait. Tokio's paused
+/// clock is NOT usable for this: with a real socket it can auto-advance past
+/// the connect deadline before the TCP connect resolves, so the connect
+/// timeout fires instead of the handshake one and the test flakes (observed at
+/// roughly 50%).
+#[derive(Debug, Clone, Copy)]
+struct Timeouts {
+    connect: Duration,
+    handshake: Duration,
+}
+
+impl Default for Timeouts {
+    fn default() -> Self {
+        Self {
+            connect: CONNECT_TIMEOUT,
+            handshake: HANDSHAKE_TIMEOUT,
+        }
+    }
+}
 
 /// Format a public key the way OpenSSH does - `SHA256:<unpadded base64>` -
 /// which is the exact string [`SftpConfig::host_key_fingerprint`] stores and
@@ -92,6 +164,17 @@ impl SftpSession {
         config: &SftpConfig,
         credential: &SftpCredential,
     ) -> Result<Self, DriveError> {
+        Self::connect_with_timeouts(config, credential, Timeouts::default()).await
+    }
+
+    /// [`SftpSession::connect`] with the deadlines supplied, so a test can
+    /// exercise the handshake timeout without waiting 30 real seconds. The
+    /// only difference is the timing.
+    async fn connect_with_timeouts(
+        config: &SftpConfig,
+        credential: &SftpCredential,
+        timeouts: Timeouts,
+    ) -> Result<Self, DriveError> {
         let Some(expected) = config.host_key_fingerprint.clone() else {
             return Err(sftp_error(SftpFailure::HostKeyUnpinned {
                 detail: format!(
@@ -100,7 +183,7 @@ impl SftpSession {
                 ),
             }));
         };
-        let (handle, sftp, _) = establish(config, credential, Some(expected)).await?;
+        let (handle, sftp, _) = establish(config, credential, Some(expected), timeouts).await?;
         Ok(Self {
             config: config.clone(),
             credential: credential.clone(),
@@ -120,7 +203,8 @@ impl SftpSession {
         credential: &SftpCredential,
     ) -> Result<Self, DriveError> {
         let expected = config.host_key_fingerprint.clone();
-        let (handle, sftp, observed) = establish(config, credential, expected).await?;
+        let (handle, sftp, observed) =
+            establish(config, credential, expected, Timeouts::default()).await?;
         config.host_key_fingerprint = Some(observed);
         Ok(Self {
             config: config.clone(),
@@ -145,11 +229,13 @@ impl SftpSession {
 
     /// Is the underlying SSH transport still up?
     ///
-    /// This detects a transport that has gone away (peer closed, keepalives
-    /// exhausted, inactivity timeout). An operation that fails with a
-    /// connection-lost SFTP status while the transport still looks alive
-    /// should call [`SftpSession::reconnect`] directly rather than relying on
-    /// this.
+    /// This detects a peer-initiated close immediately, and a transport that
+    /// died silently within roughly `KEEPALIVE_INTERVAL * (keepalive_max + 1)`
+    /// (about a minute), because [`client_config`] configures keepalives and an
+    /// inactivity backstop. It is NOT instantaneous: a pipe that broke a second
+    /// ago still reads as connected until a keepalive goes unanswered. An
+    /// operation that fails with a connection-lost SFTP status should therefore
+    /// call [`SftpSession::reconnect`] directly rather than asking this first.
     pub fn is_connected(&self) -> bool {
         !self.handle.is_closed()
     }
@@ -175,7 +261,13 @@ impl SftpSession {
                 ),
             }));
         };
-        let (handle, sftp, _) = establish(&self.config, &self.credential, Some(expected)).await?;
+        let (handle, sftp, _) = establish(
+            &self.config,
+            &self.credential,
+            Some(expected),
+            Timeouts::default(),
+        )
+        .await?;
         self.handle = handle;
         self.sftp = sftp;
         Ok(())
@@ -183,20 +275,25 @@ impl SftpSession {
 
     /// Overwrite the pinned fingerprint on a live session.
     ///
-    /// Test-only: it exists so a test can prove that
-    /// [`SftpSession::reconnect`] really re-runs the host-key check rather
-    /// than trusting the connection it already had. There is no production
-    /// path that repins a session in place - the wizard's reconnect flow
-    /// builds a fresh config and calls [`SftpSession::connect_and_pin`].
-    #[cfg(any(test, feature = "test-server"))]
+    /// Test-only, and deliberately gated on `cfg(test)` ALONE rather than
+    /// also on the `test-server` feature: unpinning a live session is exactly
+    /// the operation the host-key policy exists to prevent, so it must not be
+    /// reachable from another crate that merely wants the test server. It
+    /// exists so a test can prove that [`SftpSession::reconnect`] really
+    /// re-runs the host-key check rather than trusting the connection it
+    /// already had. There is no production path that repins a session in
+    /// place - the wizard's reconnect flow builds a fresh config and calls
+    /// [`SftpSession::connect_and_pin`].
+    #[cfg(test)]
     pub fn repin_for_test(&mut self, fingerprint: Option<String>) {
         self.config.host_key_fingerprint = fingerprint;
     }
 
-    /// Tear down the SSH transport. Test-only: it lets a test simulate a dead
-    /// session while the server is still running, which is the only way to
-    /// exercise the reconnect path deterministically.
-    #[cfg(any(test, feature = "test-server"))]
+    /// Tear down the SSH transport. Test-only (`cfg(test)` alone, same
+    /// reasoning as [`SftpSession::repin_for_test`]): it lets a test simulate
+    /// a dead session while the server is still running, which is the only way
+    /// to exercise the reconnect path deterministically.
+    #[cfg(test)]
     pub async fn disconnect_for_test(&mut self) {
         let _ = self
             .handle
@@ -312,6 +409,7 @@ async fn establish(
     config: &SftpConfig,
     credential: &SftpCredential,
     expected: ExpectedFingerprint,
+    timeouts: Timeouts,
 ) -> Result<
     (
         russh::client::Handle<PinningHandler>,
@@ -326,55 +424,90 @@ async fn establish(
     // so that "refused" and "timed out" stay distinguishable from every later
     // failure - they are the only ones that classify as `Connect`.
     let address = (config.host.as_str(), config.port);
-    let stream = match tokio::time::timeout(
-        CONNECT_TIMEOUT,
-        tokio::net::TcpStream::connect(address),
-    )
-    .await
-    {
-        Err(_elapsed) => {
-            return Err(sftp_error(SftpFailure::Connect {
-                detail: format!(
-                    "connecting to {}:{} timed out after {}s",
-                    config.host,
-                    config.port,
-                    CONNECT_TIMEOUT.as_secs()
-                ),
-            }))
-        }
-        Ok(Err(error)) => {
-            return Err(sftp_error(SftpFailure::Connect {
-                detail: format!("connecting to {}:{}: {error}", config.host, config.port),
-            }))
-        }
-        Ok(Ok(stream)) => stream,
-    };
+    let stream =
+        match tokio::time::timeout(timeouts.connect, tokio::net::TcpStream::connect(address)).await
+        {
+            Err(_elapsed) => {
+                return Err(sftp_error(SftpFailure::Connect {
+                    detail: format!(
+                        "connecting to {}:{} timed out after {}s",
+                        config.host,
+                        config.port,
+                        timeouts.connect.as_secs()
+                    ),
+                }))
+            }
+            Ok(Err(error)) => {
+                return Err(sftp_error(SftpFailure::Connect {
+                    detail: format!("connecting to {}:{}: {error}", config.host, config.port),
+                }))
+            }
+            Ok(Ok(stream)) => stream,
+        };
 
     let handler = PinningHandler {
         expected,
         verdict: Arc::clone(&verdict),
     };
-    let mut handle =
-        russh::client::connect_stream(Arc::new(russh::client::Config::default()), stream, handler)
-            .await
-            .map_err(|error| handshake_error(&verdict, error))?;
 
-    authenticate(&mut handle, config, credential, &verdict).await?;
+    // Everything from the banner exchange to a usable SFTP channel is bounded
+    // externally - see HANDSHAKE_TIMEOUT for why russh's own config cannot
+    // cover the banner read.
+    match tokio::time::timeout(
+        timeouts.handshake,
+        handshake(stream, handler, config, credential, &verdict),
+    )
+    .await
+    {
+        Ok(result) => result,
+        Err(_elapsed) => Err(sftp_error(SftpFailure::Connect {
+            detail: format!(
+                "{}:{} accepted the connection but did not complete the SSH handshake within {}s \
+                 (a service that is not SSH, or a host that is not finished waking up, will look \
+                 like this)",
+                config.host,
+                config.port,
+                timeouts.handshake.as_secs()
+            ),
+        })),
+    }
+}
 
-    let channel = handle.channel_open_session().await.map_err(|error| {
-        connection_lost(&verdict, format!("opening a session channel: {error}"))
-    })?;
+/// The post-TCP half of [`establish`], split out so the whole of it sits under
+/// one [`HANDSHAKE_TIMEOUT`].
+async fn handshake(
+    stream: tokio::net::TcpStream,
+    handler: PinningHandler,
+    config: &SftpConfig,
+    credential: &SftpCredential,
+    verdict: &Arc<KeyVerdict>,
+) -> Result<
+    (
+        russh::client::Handle<PinningHandler>,
+        RusshSftpSession,
+        String,
+    ),
+    DriveError,
+> {
+    let mut handle = russh::client::connect_stream(Arc::new(client_config()), stream, handler)
+        .await
+        .map_err(|error| handshake_error(verdict, error))?;
+
+    authenticate(&mut handle, config, credential, verdict).await?;
+
+    let channel = handle
+        .channel_open_session()
+        .await
+        .map_err(|error| connection_lost(verdict, format!("opening a session channel: {error}")))?;
     channel
         .request_subsystem(true, "sftp")
         .await
         .map_err(|error| {
-            connection_lost(&verdict, format!("requesting the sftp subsystem: {error}"))
+            connection_lost(verdict, format!("requesting the sftp subsystem: {error}"))
         })?;
     let sftp = RusshSftpSession::new(channel.into_stream())
         .await
-        .map_err(|error| {
-            connection_lost(&verdict, format!("starting the sftp session: {error}"))
-        })?;
+        .map_err(|error| connection_lost(verdict, format!("starting the sftp session: {error}")))?;
 
     // The handler always records what it saw before returning; a missing value
     // would mean the handshake completed without a key check, which russh does
@@ -886,6 +1019,83 @@ mod tests {
         assert!(
             format!("{error:?}").contains("sftp.connect_failed"),
             "{error:?}"
+        );
+    }
+
+    /// A peer that completes the TCP handshake and then says nothing must not
+    /// hang the connect forever. `CONNECT_TIMEOUT` does not cover this - the
+    /// socket connects fine - and neither does russh's `inactivity_timeout`,
+    /// because the banner is read before the session task (and its timers)
+    /// exist. Only `HANDSHAKE_TIMEOUT` catches it.
+    ///
+    /// Runs on the real clock with an injected short handshake deadline. A
+    /// paused clock was tried first and flaked about half the time: tokio
+    /// auto-advanced past the connect deadline before the real TCP connect
+    /// resolved, so the error was the connect timeout rather than the
+    /// handshake one.
+    #[tokio::test]
+    async fn a_peer_that_never_sends_an_ssh_banner_times_out() {
+        let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+            .await
+            .unwrap();
+        let port = listener.local_addr().unwrap().port();
+        // Accept and then hold the connection open, writing nothing. This is a
+        // non-SSH service on the port, or a host that is not awake yet.
+        let _silent = tokio::spawn(async move {
+            let mut held = Vec::new();
+            while let Ok((stream, _)) = listener.accept().await {
+                held.push(stream);
+            }
+        });
+
+        let config = SftpConfig {
+            host: "127.0.0.1".to_string(),
+            port,
+            root_path: "/".to_string(),
+            username: TEST_USERNAME.to_string(),
+            auth: SftpAuthKind::Password,
+            host_key_fingerprint: Some(
+                "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
+            ),
+        };
+
+        let error = SftpSession::connect_with_timeouts(
+            &config,
+            &SftpCredential::Password {
+                password: "unused".to_string(),
+            },
+            Timeouts {
+                connect: CONNECT_TIMEOUT,
+                handshake: Duration::from_millis(250),
+            },
+        )
+        .await
+        .expect_err("a silent peer must not hang the connect");
+
+        assert_eq!(classification(&error), DriveErrorClassification::Network);
+        let chain = format!("{error:?}");
+        assert!(chain.contains("sftp.connect_failed"), "{chain}");
+        assert!(
+            chain.contains("did not complete the SSH handshake"),
+            "the handshake deadline must be what fired, not the connect one: {chain}"
+        );
+    }
+
+    #[test]
+    fn the_client_config_enables_liveness_detection() {
+        // russh's `Config::default()` leaves both of these `None`, which makes
+        // `is_connected()` blind to a half-open pipe. The ordering assertion
+        // matters too: an inactivity timeout shorter than the keepalive
+        // detection window would kill healthy idle sessions against a server
+        // that ignores keepalives.
+        let config = client_config();
+        assert_eq!(config.keepalive_interval, Some(KEEPALIVE_INTERVAL));
+        assert_eq!(config.inactivity_timeout, Some(INACTIVITY_TIMEOUT));
+        let keepalive_window = KEEPALIVE_INTERVAL * (config.keepalive_max as u32 + 1);
+        assert!(
+            INACTIVITY_TIMEOUT > keepalive_window,
+            "inactivity backstop {INACTIVITY_TIMEOUT:?} must outlast the keepalive window \
+             {keepalive_window:?}"
         );
     }
 

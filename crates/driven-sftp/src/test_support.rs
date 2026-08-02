@@ -361,13 +361,35 @@ impl FsSftpHandler {
         for segment in virtual_segments(path)? {
             real.push(segment);
         }
+        // Belt and braces behind [`virtual_segments`]'s character rules. A
+        // real runtime check rather than a `debug_assert`, because the
+        // `test-server` feature can be built in release (the chaos harness),
+        // and "the guard silently disappears in the build that runs unattended
+        // for hours" is exactly the wrong tradeoff for a containment check.
+        if !real.starts_with(&self.root) {
+            return Err(StatusCode::PermissionDenied);
+        }
         Ok(real)
     }
 }
 
-/// Split a client path into normalized segments, refusing any `..` that would
-/// climb above the virtual root. Relative paths (including `.`) are resolved
+/// Split a client path into normalized segments, refusing anything that would
+/// escape the virtual root. Relative paths (including `.`) are resolved
 /// against `/`, which is what a client's `canonicalize(".")` expects.
+///
+/// Two distinct escapes are refused:
+///
+/// 1. A `..` that pops above the root.
+/// 2. A segment containing `\` or `:`. On POSIX both are ordinary filename
+///    characters, but this server also runs on Windows CI, where
+///    `PathBuf::push` gives them path meaning: pushing `C:\Windows` REPLACES
+///    the root entirely (`push` of an absolute path discards the base), and a
+///    backslash nests into subdirectories instead of being one literal
+///    character. So `/C:\Windows\system32` would serve the real system
+///    directory. Refusing these characters on EVERY platform is deliberate -
+///    it costs a filename shape no Driven object id uses, and it keeps the
+///    server's behaviour identical across CI runners, so a test that passes on
+///    macOS cannot fail on Windows.
 fn virtual_segments(path: &str) -> Result<Vec<String>, StatusCode> {
     let mut segments: Vec<String> = Vec::new();
     for segment in path.split('/') {
@@ -378,7 +400,12 @@ fn virtual_segments(path: &str) -> Result<Vec<String>, StatusCode> {
                     return Err(StatusCode::PermissionDenied);
                 }
             }
-            other => segments.push(other.to_string()),
+            other => {
+                if other.contains('\\') || other.contains(':') {
+                    return Err(StatusCode::PermissionDenied);
+                }
+                segments.push(other.to_string())
+            }
         }
     }
     Ok(segments)
@@ -658,6 +685,48 @@ mod tests {
             virtual_segments("..").unwrap_err(),
             StatusCode::PermissionDenied
         );
+    }
+
+    #[test]
+    fn a_windows_drive_or_backslash_segment_is_refused() {
+        // Both shapes escape the root on Windows via `PathBuf::push`, and both
+        // must be refused on every platform so CI runners agree.
+        for path in [
+            "/C:\\Windows\\system32",
+            "C:/Windows",
+            "/a/C:",
+            "/a\\..\\..\\b",
+            "/sub\\nested",
+        ] {
+            assert_eq!(
+                virtual_segments(path).unwrap_err(),
+                StatusCode::PermissionDenied,
+                "{path:?} must not resolve"
+            );
+        }
+    }
+
+    #[test]
+    fn resolution_never_leaves_the_root() {
+        let root = TempDir::new().unwrap();
+        let handler = FsSftpHandler::new(root.path().to_path_buf());
+
+        // The containment guard holds for everything that IS accepted...
+        for path in ["/", ".", "/a/b", "/a/./b/../c", "deep/nested/leaf.txt"] {
+            let resolved = handler.resolve(path).expect("{path:?} should resolve");
+            assert!(
+                resolved.starts_with(root.path()),
+                "{path:?} resolved outside the root: {resolved:?}"
+            );
+        }
+        // ...and the escapes are refused outright.
+        for path in ["/../outside", "/C:\\Windows"] {
+            assert_eq!(
+                handler.resolve(path).unwrap_err(),
+                StatusCode::PermissionDenied,
+                "{path:?}"
+            );
+        }
     }
 
     #[test]
