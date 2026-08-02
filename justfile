@@ -8,9 +8,9 @@ default: dev
 dev:
     cargo tauri dev
 
-# Run the app against the in-memory fake remote (no Drive account needed).
-# Replaces the stale `dev-seeded` recipe, which invoked a `seed-fixtures`
-# binary that no longer exists.
+# Run the app against the in-memory fake remote (no Drive account needed) -
+# the same mode the e2e harness uses. Replaces the stale `dev-seeded` recipe,
+# which invoked a `seed-fixtures` binary that no longer exists.
 dev-fake:
     DRIVEN_USE_FAKE_REMOTE=1 cargo tauri dev
 
@@ -67,20 +67,57 @@ chaos-soak args="--duration 30m":
     DRIVEN_CHAOS_SOAK=1 cargo run -p driven-chaos -- run-all --hermetic
     cargo run -p driven-chaos -- fuzz {{args}}
 
+# --- app-level e2e harness (crates/driven-e2e, agent QA) ---
+
+# Build the e2e Docker image: the real Linux desktop app + WebDriver stack +
+# fault tooling. First build is long (full release build of the app); cargo
+# cache mounts make rebuilds incremental.
+e2e-build:
+    docker build --target e2e-runtime -t driven-e2e:dev .
+
+# Run the full app-level e2e suite in the container (exit 0 = pass/skip).
+# The tmpfs mount enables the dest-disk-full scenario.
+e2e: e2e-build
+    docker run --rm --tmpfs /e2e-small-dest:rw,size=1m driven-e2e:dev driven-e2e run-all
+
+# Run named scenario(s), e.g. `just e2e-run local-folder-round-trip`.
+e2e-run +names: e2e-build
+    docker run --rm --tmpfs /e2e-small-dest:rw,size=1m driven-e2e:dev driven-e2e run {{names}}
+
+# Boot the e2e container and HOLD it for interactive agent exploration:
+# `docker exec -it driven-e2e-hold bash`, then drive the app over WebDriver on
+# 127.0.0.1:4444, run driven-e2e/driven-cli, inject faults (sudo iptables/tc),
+# poke the state DB with sqlite3. Artifacts land in /tmp/driven-e2e-artifacts.
+e2e-hold: e2e-build
+    docker rm -f driven-e2e-hold 2>/dev/null || true
+    docker run -d --name driven-e2e-hold --tmpfs /e2e-small-dest:rw,size=1m driven-e2e:dev hold
+    @echo "held: docker exec -it driven-e2e-hold bash"
+
 # --- UI visual regression (ui/e2e-visual/README.md) ---
 
-# Run the Playwright visual suite against the committed linux baselines.
-# On a non-linux host the first run generates LOCAL (gitignored) baselines -
-# advisory only; CI/linux is the gate.
+# Runs the real Vue app under Playwright with the Tauri IPC layer scripted by
+# ui/test-support/mock-backend.ts - no Rust, no webview, no network.
+#
+# On macOS or Windows the first run writes its own (gitignored) baselines and
+# reports them as failures; run it again and it passes. Only linux is the gate.
+#
+# Check every UI surface against the committed linux screenshot baselines.
 visual:
     pnpm --dir ui run test:visual
 
-# Regenerate the committed LINUX screenshot baselines via the official
-# Playwright Docker image, so baselines stay linux-rendered no matter the
-# host. The anonymous node_modules volume shadows the host tree - esbuild,
+# Always through the official Playwright container, never the host: text
+# rasterizes differently per OS, so a macOS-generated PNG would fail CI on every
+# single test. The anonymous `node_modules` volume shadows the host tree - esbuild,
 # rollup and @tailwindcss/oxide ship platform-native binaries that hard-fail
-# inside linux - so the container installs its own; the second volume keeps
-# pnpm's fallback store out of the bind mount.
+# inside linux - so the container installs its own. Keep the image tag in step
+# with the `@playwright/test` version in ui/package.json.
+#
+# The second anonymous volume catches pnpm's store: with node_modules on a
+# volume, pnpm cannot hardlink from the container HOME and falls back to a store
+# beside the project - which, on a bind mount, means dumping ~250 MB into the
+# working tree. Shadowing the path keeps it inside the container.
+#
+# Regenerate the committed linux screenshot baselines (needs Docker).
 visual-update:
     docker run --rm \
       -v "$(pwd)":/work -v /work/ui/node_modules -v /work/.pnpm-store -w /work/ui \
@@ -129,7 +166,7 @@ deny:
 # (.github/workflows/coverage.yml). Needs `cargo install cargo-llvm-cov`. For
 # the exact parsed percentages CI compares against main, run ./scripts/coverage.sh.
 coverage:
-    cargo llvm-cov --workspace --exclude src-tauri --exclude driven-chaos --exclude driven-bench --summary-only
+    cargo llvm-cov --workspace --exclude src-tauri --exclude driven-chaos --exclude driven-bench --exclude driven-e2e --summary-only
     pnpm --dir ui run test:coverage
 
 # --- sqlx dev helpers (need `cargo install sqlx-cli`) ---

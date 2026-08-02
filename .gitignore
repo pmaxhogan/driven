@@ -61,8 +61,10 @@ gcp-oauth-*.json
 # Pre-implementation audit (informational; not part of source)
 /.audit-out
 
-# Claude Code session state
-/.claude
+# Claude Code session state stays local, but repo-committed skills (the
+# agent-facing QA runbook lives there - issue #239) are tracked.
+/.claude/*
+!/.claude/skills/
 
 # Tauri build outputs not under src-tauri/target
 /release

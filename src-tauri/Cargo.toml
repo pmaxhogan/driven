@@ -211,3 +211,14 @@ tempfile = "3"
 # that reaches the real keychain re-prompts on every rebuild and blocks the run
 # on a modal dialog. The crate-level guard test asserts the mechanism is live.
 driven-test-fixtures = { path = "../crates/driven-test-fixtures" }
+
+[features]
+# The standard Tauri asset-embedding switch: `cargo tauri build` enables it
+# implicitly, which is how a CLI-built binary serves the embedded ui/dist
+# (tauri's build.rs sets `dev = !custom_protocol`, and dev mode points the
+# webview at devUrl instead). Declared explicitly so the e2e Docker image can
+# produce a production-behaving binary with PLAIN cargo:
+#   cargo build --release -p driven-app --features driven-app/custom-protocol
+# Without this feature a release binary still boots against localhost:5173 and
+# renders nothing headless (discovered building the agent-QA e2e image).
+custom-protocol = ["tauri/custom-protocol"]

@@ -154,8 +154,30 @@ fn file_appender() -> Option<tracing_appender::non_blocking::NonBlocking> {
 /// hook installs before the app handle exists and must keep working for panics
 /// during startup. `None` if the home / config dir cannot be determined.
 pub fn log_dir() -> Option<PathBuf> {
+    if let Some(dir) = data_dir_override() {
+        return Some(dir.join("logs"));
+    }
     config_dir().map(|c| c.join("app.driven").join("logs"))
 }
+
+/// Test/dev seam (agent QA harness): `DRIVEN_DATA_DIR=<absolute dir>` relocates
+/// EVERYTHING Driven persists under the platform config dir - the state DB
+/// (`<dir>/state.db`) and the logs (`<dir>/logs`) - so an isolated instance can
+/// run against a scratch directory without touching (or being blocked by) the
+/// real install's `state.db` lock. Unset / empty / relative = no override
+/// (relative is rejected for the same reason the XDG spec rejects it: the
+/// process cwd is not a stable anchor).
+///
+/// This is deliberately NOT gated behind another env var: pointing the app at a
+/// different data dir is no more dangerous than running a different OS user,
+/// and the fault-injection seams that DO change behaviour are separately gated.
+pub fn data_dir_override() -> Option<PathBuf> {
+    let p = PathBuf::from(non_empty_env(ENV_DATA_DIR)?);
+    p.is_absolute().then_some(p)
+}
+
+/// Env var name for [`data_dir_override`].
+pub const ENV_DATA_DIR: &str = "DRIVEN_DATA_DIR";
 
 /// Platform config dir, equivalent to `dirs::config_dir()` (which Tauri's
 /// `app_config_dir()` builds on), hand-resolved so the panic hook carries no

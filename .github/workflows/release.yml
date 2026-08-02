@@ -29,8 +29,20 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
+  # Issue #239: the app-level e2e + visual-regression suites gate every
+  # release - a red run here stops the installers from ever being built or
+  # published. Owner decision 2026-08-02: these are release-path + manual
+  # only (never per-PR), which is exactly this `needs:` edge plus e2e.yml's
+  # workflow_dispatch.
+  e2e-gate:
+    name: e2e + visual gate
+    uses: ./.github/workflows/e2e.yml
+    permissions:
+      contents: read
+
   build:
     name: build ${{ matrix.target }}
+    needs: e2e-gate
     strategy:
       fail-fast: false
       matrix:

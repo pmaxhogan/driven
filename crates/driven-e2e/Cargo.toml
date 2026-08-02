@@ -1,0 +1,28 @@
+[package]
+name = "driven-e2e"
+description = "WebDriver end-to-end suite driving the REAL Driven desktop app (Linux/WebKitGTK via tauri-driver)"
+version.workspace = true
+edition.workspace = true
+rust-version.workspace = true
+authors.workspace = true
+license.workspace = true
+repository.workspace = true
+homepage.workspace = true
+publish = false
+
+[[bin]]
+name = "driven-e2e"
+path = "src/main.rs"
+
+[dependencies]
+anyhow.workspace = true
+async-trait.workspace = true
+clap = { version = "4", features = ["derive"] }
+reqwest = { workspace = true, features = ["json"] }
+serde.workspace = true
+serde_json.workspace = true
+tempfile = "3"
+thirtyfour = "0.36"
+tokio.workspace = true
+tracing.workspace = true
+tracing-subscriber.workspace = true

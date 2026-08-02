@@ -11,6 +11,7 @@ pub mod accounts;
 pub mod activity;
 pub mod dialogs;
 pub mod dtos;
+pub mod e2e_hooks;
 pub mod exclusion_stream;
 /// Webview console capture: the frontend ships its `console.*` / `onerror` /
 /// `unhandledrejection` output here so it is re-emitted through `tracing` and

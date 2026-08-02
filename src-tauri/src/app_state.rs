@@ -491,8 +491,89 @@ pub fn fake_remote_store_in(
         .lock()
         .unwrap_or_else(|e| e.into_inner())
         .entry(account)
-        .or_default()
+        .or_insert_with(|| new_fake_store(account))
         .clone()
+}
+
+/// Env var naming a JSON [`FaultPlan`](driven_drive::fake::fault_plan::FaultPlan)
+/// file applied to every fake store this process creates (agent QA harness).
+/// DOUBLY gated: it is only honoured when the fake remote is also selected
+/// (`DRIVEN_USE_FAKE_REMOTE=1`), so the plan can never affect a real backend.
+pub const ENV_TEST_FAULT_PLAN: &str = "DRIVEN_TEST_FAULT_PLAN";
+
+/// Build a fresh fake store for the registry, arming the env-configured fault
+/// plan when the harness gate is open (see [`resolve_fault_plan`]).
+fn new_fake_store(account: AccountId) -> InMemoryRemoteStore {
+    let store = InMemoryRemoteStore::new();
+    let use_fake = std::env::var(crate::assembly::ENV_USE_FAKE_REMOTE)
+        .map(|v| v == "1")
+        .unwrap_or(false);
+    let plan_path = std::env::var(ENV_TEST_FAULT_PLAN).ok();
+    match resolve_fault_plan(use_fake, plan_path.as_deref()) {
+        FaultPlanResolution::None => store,
+        FaultPlanResolution::Armed(plan) => {
+            tracing::info!(
+                target: "driven::app::state",
+                account_id = %account,
+                ?plan,
+                "agent QA harness: fault plan armed on the fake remote store"
+            );
+            plan.apply_to(store)
+        }
+        FaultPlanResolution::Error(msg) => {
+            // Fail LOUDLY but not fatally: store creation is infallible by
+            // contract (the picker + assembly paths cannot surface an error
+            // here). The harness asserts plan-armed via this log line + the
+            // fault actually firing, so a broken plan cannot silently pass.
+            tracing::error!(
+                target: "driven::app::state",
+                account_id = %account,
+                %msg,
+                "agent QA harness: DRIVEN_TEST_FAULT_PLAN was set but NOT applied"
+            );
+            store
+        }
+    }
+}
+
+/// Outcome of resolving the env-configured fault plan (pure decision, so the
+/// gating is unit-testable without touching process-global env vars).
+#[derive(Debug, PartialEq)]
+enum FaultPlanResolution {
+    /// No plan configured (or the fake-remote gate is closed with no plan set).
+    None,
+    /// A plan parsed and ready to arm.
+    Armed(driven_drive::fake::fault_plan::FaultPlan),
+    /// The plan was requested but could not be honoured - surfaced as an
+    /// ERROR log so a harness scenario can never silently run fault-free.
+    Error(String),
+}
+
+/// Pure gating + parse for the [`ENV_TEST_FAULT_PLAN`] seam:
+/// - no `plan_path`: nothing to do;
+/// - `plan_path` set while the fake remote is NOT selected: an error (the
+///   harness misconfigured the environment - the plan would never fire);
+/// - otherwise read + parse the JSON plan, propagating read/parse failures.
+fn resolve_fault_plan(use_fake_remote: bool, plan_path: Option<&str>) -> FaultPlanResolution {
+    use driven_drive::fake::fault_plan::FaultPlan;
+    let Some(path) = plan_path.filter(|p| !p.is_empty()) else {
+        return FaultPlanResolution::None;
+    };
+    if !use_fake_remote {
+        return FaultPlanResolution::Error(format!(
+            "{ENV_TEST_FAULT_PLAN} is set ({path}) but DRIVEN_USE_FAKE_REMOTE=1 is not - \
+             the fault plan only exists on the fake remote, so this configuration is a \
+             harness bug"
+        ));
+    }
+    let json = match std::fs::read_to_string(path) {
+        Ok(j) => j,
+        Err(e) => return FaultPlanResolution::Error(format!("failed to read {path}: {e}")),
+    };
+    match FaultPlan::from_json(&json) {
+        Ok(plan) => FaultPlanResolution::Armed(plan),
+        Err(e) => FaultPlanResolution::Error(format!("failed to parse {path}: {e}")),
+    }
 }
 
 /// M8 (P2-3): prune retained TERMINAL restore-job records so the map cannot grow
@@ -2276,6 +2357,78 @@ pub(crate) mod tests {
             app_state.take_dialog_token(&a),
             Some(std::path::PathBuf::from("/a"))
         );
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- agent QA harness: DRIVEN_TEST_FAULT_PLAN gating ---------------------
+
+    #[test]
+    fn fault_plan_unset_resolves_none() {
+        assert_eq!(
+            super::resolve_fault_plan(true, None),
+            FaultPlanResolution::None
+        );
+        assert_eq!(
+            super::resolve_fault_plan(false, None),
+            FaultPlanResolution::None
+        );
+        // Empty value = unset (mirrors the non_empty_env convention).
+        assert_eq!(
+            super::resolve_fault_plan(true, Some("")),
+            FaultPlanResolution::None
+        );
+    }
+
+    #[test]
+    fn fault_plan_without_fake_remote_is_a_loud_error() {
+        // The plan can only ever fire on the fake store; setting it in real
+        // mode is a harness bug that must NOT pass silently.
+        match super::resolve_fault_plan(false, Some("/tmp/plan.json")) {
+            FaultPlanResolution::Error(msg) => {
+                assert!(
+                    msg.contains("DRIVEN_USE_FAKE_REMOTE"),
+                    "actionable message: {msg}"
+                );
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fault_plan_missing_file_is_an_error() {
+        match super::resolve_fault_plan(true, Some("/definitely/not/here.json")) {
+            FaultPlanResolution::Error(msg) => {
+                assert!(msg.contains("failed to read"), "actionable message: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn fault_plan_parses_and_arms() {
+        let dir = std::env::temp_dir().join(format!("driven-fault-plan-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("plan.json");
+        std::fs::write(
+            &path,
+            r#"{"network_drop_after": 3, "dest_folder_readonly": true}"#,
+        )
+        .unwrap();
+        match super::resolve_fault_plan(true, Some(path.to_str().unwrap())) {
+            FaultPlanResolution::Armed(plan) => {
+                assert_eq!(plan.network_drop_after, Some(3));
+                assert!(plan.dest_folder_readonly);
+            }
+            other => panic!("expected Armed, got {other:?}"),
+        }
+        // A typo'd fault name must surface, not arm-nothing (deny_unknown_fields).
+        std::fs::write(&path, r#"{"network_drop_afer": 3}"#).unwrap();
+        match super::resolve_fault_plan(true, Some(path.to_str().unwrap())) {
+            FaultPlanResolution::Error(msg) => {
+                assert!(msg.contains("failed to parse"), "actionable message: {msg}");
+            }
+            other => panic!("expected Error, got {other:?}"),
+        }
         let _ = std::fs::remove_dir_all(dir);
     }
 }

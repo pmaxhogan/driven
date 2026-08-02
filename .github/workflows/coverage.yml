@@ -13,8 +13,9 @@ name: Coverage
 # run, then enforces from the next PR onward.
 #
 # Scope: the library crates (`--exclude src-tauri --exclude driven-chaos
-# --exclude driven-bench`). src-tauri is a thin IPC layer over driven-core;
-# driven-chaos is the stress harness; driven-bench is the benchmark harness,
+# --exclude driven-bench --exclude driven-e2e`). src-tauri is a thin IPC layer over driven-core;
+# driven-chaos is the stress harness; driven-e2e is the app-level WebDriver
+# harness (runs only inside its container); driven-bench is the benchmark harness,
 # which mostly spawns child processes and talks to a real Google account and so
 # is largely unreachable without credentials. All three are excluded from the
 # measured/report set (their tests are not run for coverage), but
@@ -104,7 +105,7 @@ jobs:
       - name: Rust coverage (library crates)
         run: |
           cargo llvm-cov --workspace --exclude src-tauri --exclude driven-chaos \
-            --exclude driven-bench \
+            --exclude driven-bench --exclude driven-e2e \
             --summary-only --json --output-path coverage-rust.json
           RUST_PCT=$(jq '.data[0].totals.lines.percent' coverage-rust.json)
           echo "HEAD_RUST=$RUST_PCT" >> "$GITHUB_ENV"
