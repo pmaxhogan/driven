@@ -1,0 +1,29 @@
+/*
+ * Injected by Playwright at capture time (playwright.config.ts `stylePath`).
+ *
+ * `reducedMotion: "reduce"` already switches off every `motion-safe:animate-*`
+ * skeleton and `animations: "disabled"` freezes CSS animations, so this is the
+ * belt to those braces - it also catches a plain `transition` caught mid-flight,
+ * and removes scrollbars so a container that renders classic scrollbars cannot
+ * shift the layout against a host that renders overlay ones.
+ */
+
+*,
+*::before,
+*::after {
+  animation-duration: 0s !important;
+  animation-delay: 0s !important;
+  animation-iteration-count: 1 !important;
+  transition-duration: 0s !important;
+  transition-delay: 0s !important;
+}
+
+html {
+  scrollbar-width: none;
+}
+
+::-webkit-scrollbar {
+  width: 0;
+  height: 0;
+  display: none;
+}

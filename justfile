@@ -67,6 +67,26 @@ chaos-soak args="--duration 30m":
     DRIVEN_CHAOS_SOAK=1 cargo run -p driven-chaos -- run-all --hermetic
     cargo run -p driven-chaos -- fuzz {{args}}
 
+# --- UI visual regression (ui/e2e-visual/README.md) ---
+
+# Run the Playwright visual suite against the committed linux baselines.
+# On a non-linux host the first run generates LOCAL (gitignored) baselines -
+# advisory only; CI/linux is the gate.
+visual:
+    pnpm --dir ui run test:visual
+
+# Regenerate the committed LINUX screenshot baselines via the official
+# Playwright Docker image, so baselines stay linux-rendered no matter the
+# host. The anonymous node_modules volume shadows the host tree - esbuild,
+# rollup and @tailwindcss/oxide ship platform-native binaries that hard-fail
+# inside linux - so the container installs its own; the second volume keeps
+# pnpm's fallback store out of the bind mount.
+visual-update:
+    docker run --rm \
+      -v "$(pwd)":/work -v /work/ui/node_modules -v /work/.pnpm-store -w /work/ui \
+      mcr.microsoft.com/playwright:v1.62.1-noble \
+      sh -c "corepack enable && pnpm install --frozen-lockfile && pnpm exec playwright test --update-snapshots"
+
 # --- benchmark suite (bench/README.md) ---
 
 # Compare Driven's real engine against rclone on a live Drive account. Uploads

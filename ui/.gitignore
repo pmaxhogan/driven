@@ -1,0 +1,15 @@
+# Playwright visual suite (e2e-visual/README.md).
+#
+# Only the LINUX baselines are committed - CI is the gate and CI is ubuntu.
+# A run on any other platform first-run-generates its own tree here; those are
+# advisory (useful for eyeballing a change locally) and must never be committed,
+# because a reviewer on a third platform would then see two sets of "truth".
+/e2e-visual/__screenshots__/*
+!/e2e-visual/__screenshots__/linux/
+
+# Per-run output: the HTML report, traces, and the actual/diff PNGs of a
+# failure. Regenerated on every run.
+/playwright-report/
+/test-results/
+/blob-report/
+/.playwright/
