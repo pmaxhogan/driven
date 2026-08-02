@@ -1,13 +1,18 @@
-set windows-shell := ["powershell.exe", "-NoLogo", "-Command"]
+# Recipes are POSIX-sh (the primary dev machine is macOS; CI is sh-based).
+# On Windows run the underlying commands directly, or use git-bash/WSL -
+# the old `windows-shell := powershell` setting is gone because it made
+# every env-prefixed recipe (`FOO=1 cmd`) un-runnable on unix and vice versa.
 
 default: dev
 
 dev:
     cargo tauri dev
 
-dev-seeded:
-    cargo run --bin seed-fixtures
-    $env:DRIVEN_USE_FAKE_REMOTE="1"; cargo tauri dev
+# Run the app against the in-memory fake remote (no Drive account needed).
+# Replaces the stale `dev-seeded` recipe, which invoked a `seed-fixtures`
+# binary that no longer exists.
+dev-fake:
+    DRIVEN_USE_FAKE_REMOTE=1 cargo tauri dev
 
 test:
     cargo test --workspace
@@ -59,7 +64,7 @@ chaos-fuzz args="--duration 2m":
 # tiny-files-100k) plus a long seeded fuzz. Override the fuzz duration via the
 # arg, e.g. `just chaos-soak "--duration 6h"`.
 chaos-soak args="--duration 30m":
-    $env:DRIVEN_CHAOS_SOAK="1"; cargo run -p driven-chaos -- run-all --hermetic
+    DRIVEN_CHAOS_SOAK=1 cargo run -p driven-chaos -- run-all --hermetic
     cargo run -p driven-chaos -- fuzz {{args}}
 
 # --- benchmark suite (bench/README.md) ---
@@ -130,4 +135,4 @@ db-reset:
 
 clean:
     cargo clean
-    Remove-Item -Recurse -Force ui/dist, ui/node_modules -ErrorAction SilentlyContinue
+    rm -rf ui/dist ui/node_modules

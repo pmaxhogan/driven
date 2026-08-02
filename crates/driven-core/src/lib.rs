@@ -33,6 +33,9 @@ pub mod planner;
 /// outside `driven-core` never open a source file themselves.
 mod platform_open;
 pub mod priority;
+/// Headless restore (download + decrypt + verify + write) for round-trip
+/// testing without the GUI. The GUI's own restore path stays in `src-tauri`.
+pub mod restore_fetch;
 pub mod scanner;
 pub mod scrub;
 pub mod state;

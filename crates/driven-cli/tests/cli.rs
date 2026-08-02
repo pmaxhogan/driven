@@ -170,7 +170,8 @@ fn top_level_help_lists_every_subcommand() {
             .and(predicate::str::contains("history"))
             .and(predicate::str::contains("verify"))
             .and(predicate::str::contains("rclone"))
-            .and(predicate::str::contains("scrub")),
+            .and(predicate::str::contains("scrub"))
+            .and(predicate::str::contains("restore")),
     );
 }
 
@@ -347,6 +348,7 @@ fn every_subcommand_help_parses() {
         "history",
         "verify",
         "rclone",
+        "restore",
     ] {
         cli()
             .args([sub, "--help"])
@@ -887,4 +889,171 @@ fn rclone_subcommands_require_their_arguments() {
         .success()
         .stdout(predicate::str::contains("list"))
         .stdout(predicate::str::contains("import"));
+}
+
+// ---------------------------------------------------------------------------
+// restore: argument plumbing and source resolution.
+//
+// These stop BEFORE the store is built - resolution happens first - so nothing
+// here touches the OS keychain or the network. The restore engine itself is
+// covered by the round-trip acceptance suite in
+// `driven-core/tests/restore_fetch.rs`.
+// ---------------------------------------------------------------------------
+
+/// Seed `path` with one account and two sources, so a `restore` with no
+/// selector is genuinely ambiguous.
+fn seed_two_sources(path: &Path) -> (SourceId, SourceId) {
+    let (a, b) = (SourceId::new_v4(), SourceId::new_v4());
+    block_on(async {
+        let repo = SqliteStateRepo::open(path).await.unwrap();
+        let acc = AccountId::new_v4();
+        repo.upsert_account(&account(acc)).await.unwrap();
+        repo.upsert_source(&source(acc, a, "Docs")).await.unwrap();
+        repo.upsert_source(&source(acc, b, "Photos")).await.unwrap();
+    });
+    (a, b)
+}
+
+#[test]
+fn restore_requires_a_destination() {
+    cli()
+        .args(["restore"])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("--dest"));
+}
+
+#[test]
+fn restore_on_missing_db_errors_with_the_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("absent.db");
+    cli()
+        .args([
+            "restore",
+            "--db",
+            db.to_str().unwrap(),
+            "--dest",
+            dir.path().to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("absent.db"));
+}
+
+#[test]
+fn restore_rejects_both_source_selectors_at_once() {
+    // They name the same thing two ways; accepting both would leave the
+    // precedence undefined.
+    let dir = tempfile::tempdir().unwrap();
+    cli()
+        .args([
+            "restore",
+            "--dest",
+            dir.path().to_str().unwrap(),
+            "--source-id",
+            "00000000-0000-0000-0000-000000000000",
+            "--source-path",
+            "/data/Docs",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("cannot be used with"));
+}
+
+#[test]
+fn restore_without_a_selector_lists_the_sources_when_ambiguous() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    let (a, b) = seed_two_sources(&db);
+    let out = cli()
+        .args([
+            "restore",
+            "--db",
+            db.to_str().unwrap(),
+            "--dest",
+            dir.path().join("out").to_str().unwrap(),
+        ])
+        .assert()
+        .failure()
+        .get_output()
+        .clone();
+    let stderr = String::from_utf8(out.stderr).unwrap();
+    // The error has to be actionable: it must print the ids to pass next.
+    assert!(stderr.contains(&a.to_string()), "{stderr}");
+    assert!(stderr.contains(&b.to_string()), "{stderr}");
+    assert!(stderr.contains("--source-id"), "{stderr}");
+}
+
+#[test]
+fn restore_reports_an_unknown_source_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    seed_two_sources(&db);
+    let missing = "11111111-2222-3333-4444-555555555555";
+    cli()
+        .args([
+            "restore",
+            "--db",
+            db.to_str().unwrap(),
+            "--dest",
+            dir.path().join("out").to_str().unwrap(),
+            "--source-id",
+            missing,
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains(missing));
+}
+
+#[test]
+fn restore_reports_a_malformed_source_id() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    seed_two_sources(&db);
+    cli()
+        .args([
+            "restore",
+            "--db",
+            db.to_str().unwrap(),
+            "--dest",
+            dir.path().join("out").to_str().unwrap(),
+            "--source-id",
+            "not-a-uuid",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("not a UUID"));
+}
+
+#[test]
+fn restore_reports_an_unmatched_source_path() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    seed_two_sources(&db);
+    cli()
+        .args([
+            "restore",
+            "--db",
+            db.to_str().unwrap(),
+            "--dest",
+            dir.path().join("out").to_str().unwrap(),
+            "--source-path",
+            "/data/NoSuchFolder",
+        ])
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("NoSuchFolder"));
+}
+
+#[test]
+fn restore_help_documents_every_flag() {
+    cli().args(["restore", "--help"]).assert().success().stdout(
+        predicate::str::contains("--db")
+            .and(predicate::str::contains("--source-id"))
+            .and(predicate::str::contains("--source-path"))
+            .and(predicate::str::contains("--dest"))
+            .and(predicate::str::contains("--verify-against"))
+            .and(predicate::str::contains("--allow-missing-crypto"))
+            .and(predicate::str::contains("--overwrite")),
+    );
 }

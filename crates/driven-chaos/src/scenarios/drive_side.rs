@@ -72,7 +72,7 @@ use crate::scenario::{ExpectedOutcome, Outcome, Scenario, ScenarioContext};
 // ---------------------------------------------------------------------------
 
 /// Write `contents` to `root/rel`, creating parent dirs.
-fn write_file(root: &std::path::Path, rel: &str, contents: &[u8]) -> anyhow::Result<()> {
+pub(crate) fn write_file(root: &std::path::Path, rel: &str, contents: &[u8]) -> anyhow::Result<()> {
     let path = root.join(rel);
     if let Some(parent) = path.parent() {
         std::fs::create_dir_all(parent)?;
@@ -83,7 +83,7 @@ fn write_file(root: &std::path::Path, rel: &str, contents: &[u8]) -> anyhow::Res
 
 /// A source rooted at `root` uploading into `folder_id`, gitignore off so
 /// the scenarios are deterministic regardless of any stray ignore file.
-fn source_in(account: AccountId, root: &std::path::Path, folder_id: &str) -> SourceRow {
+pub(crate) fn source_in(account: AccountId, root: &std::path::Path, folder_id: &str) -> SourceRow {
     SourceRow {
         id: SourceId::new_v4(),
         account_id: account,
@@ -127,7 +127,9 @@ async fn live_object_count(remote: &dyn RemoteStore, folder_id: &str) -> anyhow:
 /// is the SPEC s24 dotted code string (see `record_outcome_activity`). This
 /// is the inverse mapping back to [`ErrorCode`], limited to the codes the
 /// s3.7 scenarios can surface; non-error / unknown event types are ignored.
-async fn error_codes_in_activity(state: &dyn StateRepo) -> anyhow::Result<Vec<ErrorCode>> {
+pub(crate) async fn error_codes_in_activity(
+    state: &dyn StateRepo,
+) -> anyhow::Result<Vec<ErrorCode>> {
     let page = state
         .query_activity(
             ActivityFilter {
@@ -167,25 +169,36 @@ fn parse_error_code(event_type: &str) -> Option<ErrorCode> {
 
 /// A booted scenario instance: a [`DrivenHandle`] plus the captured fake
 /// root folder id and the temp dirs that must outlive the run.
-struct Instance {
-    handle: DrivenHandle,
+pub(crate) struct Instance {
+    pub(crate) handle: DrivenHandle,
     /// The fake remote's root folder id (the upload destination).
-    folder: String,
+    pub(crate) folder: String,
     /// Kept alive so the temp source tree + state DB are not removed mid-run.
     _state_dir: tempfile::TempDir,
-    src_dir: tempfile::TempDir,
+    pub(crate) src_dir: tempfile::TempDir,
 }
 
 /// Boot one self-contained scenario instance over `fake` (already carrying
 /// any construction-time fault). Creates a fresh temp source tree + state DB.
-async fn boot_instance(fake: Arc<InMemoryRemoteStore>) -> anyhow::Result<Instance> {
+pub(crate) async fn boot_instance(fake: Arc<InMemoryRemoteStore>) -> anyhow::Result<Instance> {
+    boot_instance_with(fake, None).await
+}
+
+/// [`boot_instance`] with an optional single-suite crypto seam wired into the
+/// executor (the restore rows use it to round-trip an encrypted source).
+pub(crate) async fn boot_instance_with(
+    fake: Arc<InMemoryRemoteStore>,
+    crypto: Option<Arc<dyn driven_crypto::SourceCryptoSuite>>,
+) -> anyhow::Result<Instance> {
     let folder = fake.root_id().to_string();
     let state_dir = tempfile::tempdir()?;
     let src_dir = tempfile::tempdir()?;
-    let handle = DrivenHandleBuilder::new(state_dir.path().join("state.db"))
-        .remote(fake as Arc<dyn RemoteStore>)
-        .boot()
-        .await?;
+    let mut builder = DrivenHandleBuilder::new(state_dir.path().join("state.db"))
+        .remote(fake as Arc<dyn RemoteStore>);
+    if let Some(suite) = crypto {
+        builder = builder.crypto_suite(suite);
+    }
+    let handle = builder.boot().await?;
     Ok(Instance {
         handle,
         folder,
@@ -196,13 +209,13 @@ async fn boot_instance(fake: Arc<InMemoryRemoteStore>) -> anyhow::Result<Instanc
 
 impl Instance {
     /// The temp source root the scenario writes its fixture files into.
-    fn src_root(&self) -> &std::path::Path {
+    pub(crate) fn src_root(&self) -> &std::path::Path {
         self.src_dir.path()
     }
 
     /// Seed a source rooted at this instance's temp tree, pointing at the
     /// fake root folder, and persist it. Returns the source row.
-    async fn add_source(&self) -> anyhow::Result<SourceRow> {
+    pub(crate) async fn add_source(&self) -> anyhow::Result<SourceRow> {
         let src = source_in(self.handle.account_id, self.src_root(), &self.folder);
         self.handle.state.upsert_source(&src).await?;
         Ok(src)
@@ -211,7 +224,7 @@ impl Instance {
 
 /// Snapshot of the s6.3 cross-scenario invariants enforced for EVERY
 /// scenario, in addition to its own outcome.
-struct InvariantReport {
+pub(crate) struct InvariantReport {
     live_objects: usize,
     no_data_loss: bool,
     no_duplicate_op_uuid: bool,
@@ -221,16 +234,33 @@ struct InvariantReport {
 
 /// Run the s6.3 cross-cutting invariant checks over the final state + remote
 /// for one source. Pure observation - only read calls.
-async fn check_invariants(
+pub(crate) async fn check_invariants(
     handle: &DrivenHandle,
     folder: &str,
     source: &SourceRow,
 ) -> anyhow::Result<InvariantReport> {
-    let live = handle
-        .remote
-        .list_folder(folder, &driven_drive::remote_store::DriveContext::MyDrive)
-        .await?;
-    let live_objects = live.iter().filter(|e| !e.trashed).count();
+    // Walk the destination tree BREADTH-FIRST so nested sources are covered:
+    // the original top-level-only listing silently reported every object in a
+    // sub-folder as "missing" once the restore rows introduced nested
+    // fixtures (the drive_side fixtures are all flat, which hid this).
+    let mut live = Vec::new();
+    let mut folders = vec![folder.to_string()];
+    while let Some(f) = folders.pop() {
+        let children = handle
+            .remote
+            .list_folder(&f, &driven_drive::remote_store::DriveContext::MyDrive)
+            .await?;
+        for child in children {
+            if child.mime_type == "application/vnd.google-apps.folder" && !child.trashed {
+                folders.push(child.id.clone());
+            }
+            live.push(child);
+        }
+    }
+    let live_objects = live
+        .iter()
+        .filter(|e| !e.trashed && e.mime_type != "application/vnd.google-apps.folder")
+        .count();
     let mut notes = Vec::new();
 
     // No duplicate client_op_uuid across live objects (s6.3).
@@ -274,8 +304,11 @@ async fn check_invariants(
             continue;
         };
         // The remote object's recorded size must match the local row (an
-        // unencrypted source stores plaintext bytes 1:1).
-        if entry.size.is_some_and(|s| s != row.size) {
+        // unencrypted source stores plaintext bytes 1:1). An ENCRYPTED
+        // source stores header + framed ciphertext, so its remote size is
+        // legitimately larger - the restore rows prove its content by
+        // decrypt-and-compare instead.
+        if !source.encryption_enabled && entry.size.is_some_and(|s| s != row.size) {
             no_data_loss = false;
             notes.push(format!(
                 "data-loss: synced row {rel} remote size {:?} != recorded {}",
@@ -339,7 +372,7 @@ async fn check_invariants(
 /// Whether the orchestrator quiesced to a non-running terminal state
 /// (Idle / Paused / Backoff / Error) - the s6.3 "clean shutdown" check for a
 /// single-cycle scenario (no work left mid-flight, no panic).
-fn is_quiescent(state: &OrchestratorState) -> bool {
+pub(crate) fn is_quiescent(state: &OrchestratorState) -> bool {
     matches!(
         state,
         OrchestratorState::Idle { .. }
@@ -354,7 +387,7 @@ fn is_quiescent(state: &OrchestratorState) -> bool {
 /// runner's `verdict_for` reads [`Outcome::invariants`] after EVERY scenario
 /// and FAILs on any tripped invariant, so this helper no longer short-circuits
 /// with `Err` - it records the snapshot the runner enforces.
-fn finish(
+pub(crate) fn finish(
     mut outcome: Outcome,
     report: InvariantReport,
     clean_shutdown: bool,
