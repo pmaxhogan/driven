@@ -5,6 +5,13 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.7.0](https://github.com/pmaxhogan/driven/compare/v2.6.0...v2.7.0) (2026-08-02)
+
+
+### Features
+
+* **ui:** explain pauses in-app with a status banner and one-shot bypass ([#235](https://github.com/pmaxhogan/driven/issues/235)) ([04d86a0](https://github.com/pmaxhogan/driven/commit/04d86a03afd3f993921913bd83db7bb2fe4951c2))
+
 ## [2.6.0](https://github.com/pmaxhogan/driven/compare/v2.5.1...v2.6.0) (2026-07-31)
 
 
