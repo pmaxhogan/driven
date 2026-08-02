@@ -19,16 +19,37 @@
 //! Exit codes (STRESS_HARNESS s9 semantics): 0 = every scenario passed or
 //! skipped; 1 = at least one failure; 2 = infrastructure error.
 
+// The harness drives WebKitGTK/tauri-driver and injects POSIX permission
+// faults - it is unix-only by design (it ships and runs inside its Linux
+// container). Everything is cfg-gated so `cargo build --workspace
+// --all-targets` on the Windows CI runner compiles a stub instead of
+// tripping over unix-only APIs (PermissionsExt, geteuid).
+#[cfg(unix)]
 mod flows;
+#[cfg(unix)]
 mod scenario;
+#[cfg(unix)]
 mod scenarios;
+#[cfg(unix)]
 mod session;
 
+#[cfg(unix)]
 use clap::{Parser, Subcommand};
 
+#[cfg(unix)]
 use scenario::{Ctx, Verdict};
 
+#[cfg(not(unix))]
+fn main() {
+    eprintln!(
+        "driven-e2e runs only inside its Linux e2e container (see the repo \
+         Dockerfile e2e-runtime stage / `just e2e`)."
+    );
+    std::process::exit(2);
+}
+
 /// Driven app-level e2e suite (WebDriver, Linux container).
+#[cfg(unix)]
 #[derive(Debug, Parser)]
 #[command(name = "driven-e2e", version, about)]
 struct Cli {
@@ -36,6 +57,7 @@ struct Cli {
     command: Command,
 }
 
+#[cfg(unix)]
 #[derive(Debug, Subcommand)]
 enum Command {
     /// List every registered scenario.
@@ -52,6 +74,7 @@ enum Command {
     Doctor,
 }
 
+#[cfg(unix)]
 #[tokio::main]
 async fn main() {
     tracing_subscriber::fmt()
@@ -76,6 +99,7 @@ async fn main() {
     std::process::exit(code);
 }
 
+#[cfg(unix)]
 /// Run the selected scenarios (empty = all). Returns the process exit code.
 async fn run_selected(names: &[String]) -> i32 {
     let all = scenarios::all();
@@ -138,6 +162,7 @@ async fn run_selected(names: &[String]) -> i32 {
     }
 }
 
+#[cfg(unix)]
 /// Environment diagnosis (binaries present, display up, driver bootable).
 async fn doctor() -> i32 {
     let mut ok = true;
