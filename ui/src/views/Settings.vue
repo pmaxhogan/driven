@@ -11,19 +11,14 @@ import TelemetryPreviewModal from "../components/TelemetryPreviewModal.vue";
 // point - the router just resolves /about to THIS view with `tab: "about"`.
 import About from "./About.vue";
 import { useSettingsStore } from "../stores/settings";
-import { useToastsStore } from "../stores/toasts";
+import { minutesToHHMM, hhmmToMinutes, useSettingsForm } from "../composables/useSettingsForm";
 import {
   getApfsHelperStatus,
   getVssHelperStatus,
   validateCustomCa,
   validateProxy,
 } from "../ipc/commands";
-import type {
-  ApfsHelperStatus,
-  MenuBarSettingsPatch,
-  SettingsPatch,
-  VssHelperStatus,
-} from "../ipc/types";
+import type { ApfsHelperStatus, MenuBarSettingsPatch, VssHelperStatus } from "../ipc/types";
 
 // Settings view (SPEC s25 /accounts, /sources, /rules, /about; DESIGN s8.2). One
 // view hosts the four routed tabs; the active tab comes from the route (router
@@ -40,7 +35,7 @@ const props = withDefaults(defineProps<{ tab?: "accounts" | "sources" | "rules" 
 const { t } = useI18n();
 const router = useRouter();
 const settings = useSettingsStore();
-const toasts = useToastsStore();
+const { commitPatch, parseOptionalClamped, parseRequiredClamped, RANGES } = useSettingsForm();
 
 const tabs = [
   { key: "accounts", route: "/accounts", label: "settings.tabs.accounts" },
@@ -186,19 +181,6 @@ const proxyMode = ref("system");
 const proxyUrl = ref("");
 const proxyFeedback = ref<{ ok: boolean; message: string } | null>(null);
 
-function minutesToHHMM(min: number): string {
-  const m = ((Math.floor(min) % 1440) + 1440) % 1440;
-  const hh = String(Math.floor(m / 60)).padStart(2, "0");
-  const mm = String(m % 60).padStart(2, "0");
-  return `${hh}:${mm}`;
-}
-
-function hhmmToMinutes(value: string): number {
-  const [h, m] = value.split(":").map((n) => Number(n));
-  if (!Number.isFinite(h) || !Number.isFinite(m)) return 0;
-  return (((h * 60 + m) % 1440) + 1440) % 1440;
-}
-
 function go(route: string): void {
   void router.push(route);
 }
@@ -272,78 +254,6 @@ watch(
   },
   { immediate: true }
 );
-
-// Backend-enforced numeric ranges (mirror of src-tauri/src/commands/settings.rs:
-// check_range bounds). We clamp every numeric field to its range BEFORE patching
-// so a typed out-of-range value (e.g. 100 concurrent uploads, a 10s scan
-// interval) is corrected in place and never round-trips to a backend rejection -
-// the rejection used to brick the whole Rules form. The backend still validates;
-// this just keeps the UI from ever sending a value it will refuse.
-const RANGES = {
-  bandwidthCapMbps: [1, 100_000],
-  meteredBandwidthCapMbps: [1, 100_000],
-  defaultConcurrentUploads: [1, 32],
-  scanIntervalSecs: [30, 604_800],
-  deepVerifyIntervalSecs: [3_600, 31_536_000],
-  hookTimeoutSecs: [1, 86_400],
-  // The scrub cadence is entered in HOURS but stored in seconds, so this range
-  // is the backend's SCRUB_INTERVAL_MIN..MAX (1 hour .. 1 year) expressed in
-  // hours - keep the two in step.
-  scrubIntervalHours: [1, 8_760],
-  scrubSliceSize: [10, 10_000],
-  scrubDeepSample: [0, 100],
-} as const;
-
-function clampToRange(value: number, [min, max]: readonly [number, number]): number {
-  return Math.min(max, Math.max(min, value));
-}
-
-// Accept `string | number`: an `<input type="number">` bound with `v-model`
-// yields a number, while an `event.target.value` read yields a string. Coerce
-// to a trimmed string first so neither call site crashes on `.trim()`.
-//
-// Parse an OPTIONAL field ("" = the special "null"/unlimited/auto value), clamped
-// to its backend range when a value is present.
-function parseOptionalClamped(
-  input: string | number,
-  range: readonly [number, number]
-): number | null {
-  const trimmed = String(input).trim();
-  if (trimmed === "") return null;
-  const value = Number(trimmed);
-  if (!Number.isFinite(value)) return null;
-  return clampToRange(Math.floor(value), range);
-}
-
-// Parse a REQUIRED field, clamped to its backend range; a non-numeric input
-// keeps the current value (fallback).
-function parseRequiredClamped(
-  input: string | number,
-  range: readonly [number, number],
-  fallback: number
-): number {
-  const value = Number(String(input).trim());
-  if (!Number.isFinite(value)) return fallback;
-  return clampToRange(Math.floor(value), range);
-}
-
-// All Rules commits route through here. The store records the failure as
-// `errorCode` (rendered as the inline banner above the form), so we SWALLOW the
-// rejection rather than let it escape the @change handler as an unhandled promise
-// rejection (which produced a Vue "Unhandled error during execution of native
-// event handler" warning). The form stays usable; the banner explains the error.
-async function commitPatch(p: SettingsPatch): Promise<void> {
-  try {
-    await settings.patch(p);
-    // The Rules form has no Save button - every control commits on change, and
-    // until now did so completely silently. One toast per commit is the whole
-    // confirmation. Rapid toggling does not stack: the toast store folds an
-    // identical consecutive message back into the toast already showing.
-    toasts.push({ kind: "success", message: t("toast.settingsSaved") });
-  } catch {
-    // errorCode is set on the store and surfaced as the banner.
-  }
-}
 
 // Issue #58: launch Driven at login (default ON). Patches the persisted
 // preference; the backend registers/unregisters the real OS startup entry.
@@ -584,8 +494,8 @@ async function commitSchedule(): Promise<void> {
     global: {
       schedule: {
         enabled: scheduleEnabled.value,
-        startMinute: hhmmToMinutes(scheduleStart.value),
-        endMinute: hhmmToMinutes(scheduleEnd.value),
+        startMinute: hhmmToMinutes(scheduleStart.value) ?? 0,
+        endMinute: hhmmToMinutes(scheduleEnd.value) ?? 0,
         days: [...scheduleDays.value],
         utcOffsetMinutes: -new Date().getTimezoneOffset(),
       },
