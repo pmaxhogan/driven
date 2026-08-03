@@ -23,10 +23,23 @@ test-server = ["dep:tempfile", "dep:rand"]
 driven-remote = { path = "../driven-remote" }
 anyhow.workspace = true
 thiserror.workspace = true
+async-trait.workspace = true
+bytes.workspace = true
+futures.workspace = true
 serde.workspace = true
 serde_json.workspace = true
 tokio.workspace = true
 tracing.workspace = true
+uuid.workspace = true
+hex.workspace = true
+# An await-free Mutex over the per-directory name-claim table (the
+# `driven-localfs` pattern). Held only for a short synchronous map edit, never
+# across an await.
+parking_lot.workspace = true
+# Content digests. The executor verifies every upload against
+# `RemoteEntry.md5`, which is an md5 over the exact bytes sent (SPEC s8), so
+# this backend must speak the same digest - it does NOT get to invent one.
+md-5 = "0.11"
 # SPEC s4.1 pattern: the SFTP password / private key lives in the OS keychain,
 # never in SQLite and never in a config file.
 keyring.workspace = true
