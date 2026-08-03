@@ -12,7 +12,7 @@ folders stay the single source of truth. With per-source client-side encryption
 turned on, file names and contents are encrypted on your machine before they
 ever leave it, so Google stores only ciphertext.
 
-![Driven's first-run setup wizard in dark mode: a teal-accented welcome step with the top navigation (Activity, Settings, Restore, About).](docs/screenshots/setup-wizard-dark.png)
+![Driven's first-run setup wizard in dark mode: a teal-accented welcome step offering Google Drive, S3-compatible storage, a local or removable folder, or SSH (SFTP) as the backup destination, under the top navigation (Activity, Restore, Settings).](docs/screenshots/setup-wizard-dark.png)
 
 When backing up to Google Drive, Driven uses your own OAuth credentials, so
 your files never pass through anyone else's servers. The first-run wizard
