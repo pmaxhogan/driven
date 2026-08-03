@@ -192,6 +192,10 @@ impl TestSftpServer {
             username: TEST_USERNAME.to_string(),
             auth,
             host_key_fingerprint: Some(self.host_key_fingerprint.clone()),
+            // The creation probe (and, in this crate's tests, the
+            // `seed_destination` helper) is what initializes a destination and
+            // records its id; a bare config from the fixture has none.
+            destination_id: None,
         }
     }
 

@@ -1054,6 +1054,7 @@ mod tests {
             host_key_fingerprint: Some(
                 "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             ),
+            destination_id: None,
         };
 
         let error = SftpSession::connect(
@@ -1107,6 +1108,7 @@ mod tests {
             host_key_fingerprint: Some(
                 "SHA256:AAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAAA".to_string(),
             ),
+            destination_id: None,
         };
 
         let error = SftpSession::connect_with_timeouts(

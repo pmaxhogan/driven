@@ -59,6 +59,20 @@ pub struct SftpConfig {
     /// only transiently, before the first successful probe.
     #[serde(default)]
     pub host_key_fingerprint: Option<String>,
+    /// The destination's identity, matched against the `destinationId` inside
+    /// the [`names::MARKER_FILE`](crate::names::MARKER_FILE) at `root_path`.
+    ///
+    /// The marker's PRESENCE is what proves the directory is a Driven
+    /// destination rather than a directory of the user's own data; this field
+    /// is what additionally proves it is *this account's* destination, so two
+    /// machines pointed at one shared `root_path` refuse rather than
+    /// overwriting each other's trees.
+    ///
+    /// `None` means the account predates this field, in which case the check
+    /// degrades to presence-only with a warning. The creation probe is what
+    /// writes the marker and records the id here.
+    #[serde(default)]
+    pub destination_id: Option<String>,
 }
 
 const fn default_port() -> u16 {
@@ -118,6 +132,15 @@ impl SftpConfig {
             .map(|f| f.trim().to_string())
             .filter(|f| !f.is_empty());
 
+        // A whitespace-only destination id is the same as none: it must never
+        // be compared against a marker, because it would match nothing and
+        // wedge the account.
+        self.destination_id = self
+            .destination_id
+            .take()
+            .map(|d| d.trim().to_string())
+            .filter(|d| !d.is_empty());
+
         Ok(self)
     }
 
@@ -135,6 +158,45 @@ impl SftpConfig {
         serde_json::to_string(self).map_err(|e| {
             anyhow::anyhow!("sftp.config_invalid: could not serialize backend config: {e}")
         })
+    }
+}
+
+/// The marker Driven writes at an account's `root_path` to prove the directory
+/// is a Driven destination.
+///
+/// **Field-compatible with `driven_localfs::DestinationMarker` on purpose**, at
+/// the same filename ([`crate::names::MARKER_FILE`]), so one backup tree stays
+/// readable by both backends. `destination_id` is the only field either backend
+/// reads; `note` exists so whoever finds the file on a server understands what
+/// deleting it would do.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DestinationMarker {
+    /// Stored-format version of the marker itself.
+    pub version: u32,
+    /// The destination's identity, matched against
+    /// [`SftpConfig::destination_id`] before every mutating operation.
+    pub destination_id: String,
+    /// Unix epoch ms the destination was initialized.
+    pub created_at_ms: i64,
+    /// A human explanation, for whoever finds this file on a server.
+    pub note: String,
+}
+
+/// The marker text a user sees if they open the file.
+const MARKER_NOTE: &str = "This directory is a Driven backup destination. Driven refuses to \
+write here if this file is missing, which is how it tells a real destination apart from a \
+directory of your own data or a volume that is not mounted. Do not delete it.";
+
+impl DestinationMarker {
+    /// A fresh marker for a new destination.
+    pub fn new(destination_id: &str, now_ms: i64) -> Self {
+        Self {
+            version: 1,
+            destination_id: destination_id.to_string(),
+            created_at_ms: now_ms,
+            note: MARKER_NOTE.to_string(),
+        }
     }
 }
 
@@ -275,6 +337,7 @@ mod tests {
             username: username.to_string(),
             auth: SftpAuthKind::Password,
             host_key_fingerprint: None,
+            destination_id: None,
         }
     }
 

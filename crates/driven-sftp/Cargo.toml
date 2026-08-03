@@ -87,6 +87,13 @@ rand = { version = "0.10", features = ["thread_rng"], optional = true }
 # reaches an OS keychain. Dev-only: production always uses the real per-OS
 # store.
 driven-test-fixtures = { path = "../driven-test-fixtures" }
+# Test-only, and for exactly one assertion: that this crate's destination
+# marker filename is byte-identical to the local-folder backend's. A backup
+# tree has to stay interchangeable between an SFTP server and a USB stick, and
+# a comment claiming the two constants agree is not a check. NOT a runtime
+# dependency - `names.rs` is a deliberate copy, per the plan's "a third copy is
+# the pattern, do NOT extract a shared crate".
+driven-localfs = { path = "../driven-localfs" }
 # The `test_support` module is compiled under `cfg(test)` without the
 # `test-server` feature, so its dependencies have to be reachable as dev-deps
 # too (same versions as the optional ones above).

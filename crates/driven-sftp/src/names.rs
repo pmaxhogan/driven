@@ -20,12 +20,9 @@
 //!
 //! This is a verbatim-in-spirit copy of `driven_localfs::names` rather than a
 //! shared crate, matching the established call in this plan for
-//! `keyring_off_runtime` (a third copy is the pattern; do NOT extract). The
-//! two deliberate differences from the local-folder original are:
+//! `keyring_off_runtime` (a third copy is the pattern; do NOT extract). The one
+//! deliberate difference from the local-folder original is:
 //!
-//! - there is no destination-identity MARKER file (a dead SFTP host is a
-//!   connect error, not an empty mount point that could silently swallow a
-//!   backup), so no marker name is reserved; and
 //! - a metadata sidecar is a SUFFIXED SIBLING (`.<stored>.driven-meta`) rather
 //!   than a file inside a `.driven-meta/` directory, because one flat
 //!   namespace costs one round trip per lookup instead of two. That makes the
@@ -71,6 +68,22 @@ pub const META_SUFFIX: &str = ".driven-meta";
 /// filesystem.
 pub const TMP_PREFIX: &str = ".driven-tmp-";
 
+/// The destination-identity marker at the account's `root_path`.
+///
+/// **Byte-identical to `driven_localfs::names::MARKER_FILE` on purpose**, so a
+/// backup tree stays interchangeable between an SFTP server and a local folder.
+///
+/// The hazard it defends against exists verbatim server-side, and is if
+/// anything sharper over SSH than over a USB port: `root_path` is a string the
+/// user typed, and a directory that holds the user's OWN data is
+/// indistinguishable from an initialized-but-empty destination by inspection
+/// alone. Without the marker, `SftpStore`'s adopt-an-unannotated-name path and
+/// its remove-then-rename commit would quietly destroy same-named files the
+/// user put there. It also catches a server-side mount (a NAS's external
+/// volume, an unmounted array) that is not present this cycle - the exact
+/// analogue of the unplugged stick.
+pub const MARKER_FILE: &str = ".driven-destination.json";
+
 /// Prefix macOS gives an "AppleDouble" shadow file.
 ///
 /// Reserved for the same reason `driven-localfs` reserves it: a NAS share is
@@ -105,7 +118,8 @@ const DOS_DEVICE_NAMES: &[&str] = &[
 /// `.X.DRIVEN-META` sidecar would shadow `.x.driven-meta` on NTFS or exFAT.
 pub fn is_reserved_control_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
-    lower.ends_with(META_SUFFIX)
+    lower == MARKER_FILE
+        || lower.ends_with(META_SUFFIX)
         || lower.starts_with(TMP_PREFIX)
         || lower.starts_with(APPLEDOUBLE_PREFIX)
 }
@@ -405,6 +419,16 @@ mod tests {
     }
 
     #[test]
+    fn the_marker_filename_matches_the_local_folder_backend_byte_for_byte() {
+        // A backup tree has to stay interchangeable between an SFTP server and
+        // a USB stick, which it cannot be if the two backends disagree about
+        // what the destination marker is called.
+        assert_eq!(MARKER_FILE, driven_localfs::names::MARKER_FILE);
+        assert!(is_reserved_control_name(MARKER_FILE));
+        assert!(is_reserved_control_name(".DRIVEN-DESTINATION.JSON"));
+    }
+
+    #[test]
     fn no_user_name_can_shadow_a_driven_control_name() {
         for raw in [
             ".driven-tmp-abc",
@@ -414,6 +438,11 @@ mod tests {
             // Both shapes at once: a tmp-prefixed name that also ends in the
             // sidecar suffix.
             ".driven-tmp-x.driven-meta",
+            // The destination marker. If a user file could be stored under this
+            // name it would overwrite the very thing that proves the directory
+            // is a Driven destination.
+            MARKER_FILE,
+            ".DRIVEN-DESTINATION.JSON",
         ] {
             let enc = encode(raw).unwrap();
             assert!(
@@ -532,6 +561,7 @@ mod tests {
             "notes.driven-meta",
             ".driven-tmp-1",
             "._shadow",
+            ".driven-destination.json",
             "CON",
             "nul.txt",
             "COM1",

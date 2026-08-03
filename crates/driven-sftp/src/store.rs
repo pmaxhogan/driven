@@ -56,6 +56,31 @@
 //! it IS weaker than the local backend's atomic rename, and it is stated here
 //! rather than papered over.
 //!
+//! ## Proving the destination is the destination
+//!
+//! `root_path` is a string the user typed, and a directory holding the user's
+//! OWN data is indistinguishable from an initialized-but-empty destination by
+//! inspection alone. That is not a cosmetic problem here, because two of this
+//! store's behaviours are destructive by design when aimed at foreign data:
+//! [`SftpStore::resolve_stored_name`] ADOPTS an unannotated name it finds at a
+//! candidate path (correct for a crashed upload's leftovers), and
+//! [`SftpStore::commit_object`] REMOVES the target before renaming over it.
+//! Pointed at `/home/user/Documents`, those two would quietly destroy
+//! same-named files.
+//!
+//! So every MUTATING operation first proves the root carries Driven's
+//! destination marker ([`crate::names::MARKER_FILE`], the same filename and
+//! schema the local-folder backend uses), and that its `destinationId` is this
+//! account's - see [`SftpStore::guard_root`]. It also catches the server-side
+//! analogue of an unplugged stick: a NAS volume or array that is not mounted
+//! this cycle leaves an ordinary empty directory at the mount point, and a
+//! whole backup written into it vanishes on the next remount while
+//! `file_state` still calls every file synced.
+//!
+//! READS are deliberately not gated; the reasoning and the account-creation
+//! ordering it depends on are in [`SftpStore::guard_root`]'s docs and in the
+//! `reads_are_deliberately_not_marker_gated` test.
+//!
 //! ## Trash
 //!
 //! **SSH has no trash**, and Driven does not simulate one by moving objects
@@ -188,6 +213,26 @@ fn not_found(id: &str) -> anyhow::Error {
         kind: driven_remote::remote_store::DriveErrorClassification::Other,
         source: anyhow::anyhow!("sftp.not_found: no object {id:?} on the server"),
     })
+}
+
+/// The error for "the configured root is not (or is no longer) this account's
+/// Driven destination".
+///
+/// Shaped exactly like `driven_localfs::error::dest_missing`: the returned
+/// error IS a [`DriveError::DestFolderMissing`], so it carries the SPEC s24
+/// `drive.dest_folder_missing` code the tray already surfaces and the "the user
+/// must act" semantics the engine already implements. The `sftp.`-prefixed
+/// reason rides on top as anyhow context, so a log line says WHICH of the
+/// several causes fired without inventing a second classification for a
+/// condition the app already knows how to handle.
+fn dest_missing(code: &str, reason: &str) -> anyhow::Error {
+    tracing::warn!(
+        target: crate::TARGET,
+        %code,
+        %reason,
+        "refusing to write: the SFTP destination is unavailable or is not a Driven destination"
+    );
+    anyhow::Error::new(DriveError::DestFolderMissing).context(format!("{code}: {reason}"))
 }
 
 /// Translate a `russh-sftp` protocol error into Driven's classified taxonomy.
@@ -477,6 +522,113 @@ impl SftpStore {
             );
         }
         error
+    }
+
+    // -- destination identity ------------------------------------------------
+
+    /// The destination marker's absolute remote path.
+    fn marker_path(&self) -> String {
+        join_remote(&self.root, names::MARKER_FILE)
+    }
+
+    /// Prove the configured root really is this account's Driven destination,
+    /// before writing anything into it.
+    ///
+    /// `root_path` is a string the user typed, and a directory holding the
+    /// user's OWN data is indistinguishable from an initialized-but-empty
+    /// destination by inspection alone. That matters here more than anywhere
+    /// else in this crate, because two of the store's own behaviours are
+    /// destructive by design when pointed at foreign data:
+    /// [`Self::resolve_stored_name`] ADOPTS an unannotated name it finds
+    /// sitting at a candidate path (correct for a crashed upload's leftovers),
+    /// and [`Self::commit_object`] REMOVES the target before renaming over it.
+    /// Aimed at `/home/user/Documents`, those two would quietly destroy
+    /// same-named files. The marker is what makes that impossible.
+    ///
+    /// It also catches the server-side analogue of the unplugged stick: a NAS's
+    /// external volume or an array that is not mounted this cycle leaves an
+    /// ordinary empty directory at the mount point, and writing a whole backup
+    /// into it would put the data somewhere the next remount hides forever
+    /// while `file_state` still called every file synced.
+    ///
+    /// Deliberately NOT cached, matching `driven_localfs::LocalFsStore::guard_root`:
+    /// re-reading per operation is the entire point, because a volume can go
+    /// away mid-backup and a cached "yes" would keep writing into the hole. The
+    /// cost is one round trip per mutating operation.
+    ///
+    /// ## What is a missing destination and what is a bad connection
+    ///
+    /// Only `SSH_FX_NO_SUCH_FILE` and an unparseable marker are treated as "not
+    /// a destination". Any OTHER protocol failure propagates as itself, so a
+    /// flapping link stays a retryable network error instead of telling the
+    /// user their backup destination vanished. This is a deliberate divergence
+    /// from the local backend, which maps every marker read error to
+    /// `dest_missing` - correct there, where a failed local read really does
+    /// mean the medium is gone, and wrong over a network.
+    async fn guard_root(&self, sftp: &RusshSftpSession) -> anyhow::Result<()> {
+        let path = self.marker_path();
+        let raw = match sftp.read(path.clone()).await {
+            Ok(raw) => raw,
+            Err(error) if is_no_such_file(&error) => {
+                // One extra round trip, on the failure path only, to tell the
+                // two very different user actions apart: "your root_path is
+                // wrong" versus "this directory is not a Driven destination".
+                return Err(match Self::stat_kind(sftp, &self.root).await? {
+                    None => dest_missing(
+                        "sftp.root_missing",
+                        &format!(
+                            "the configured root path {} does not exist on {}",
+                            self.root, self.config.host
+                        ),
+                    ),
+                    Some(_) => dest_missing(
+                        "sftp.dest_marker_missing",
+                        &format!(
+                            "{path} is not there, so {} is not a Driven destination (or its \
+                             volume is not mounted). Driven will not write into a directory it \
+                             cannot prove is its own",
+                            self.root
+                        ),
+                    ),
+                });
+            }
+            Err(error) => return Err(sftp_op_error(&format!("read {path}"), error)),
+        };
+
+        let marker: crate::config::DestinationMarker = match serde_json::from_slice(&raw) {
+            Ok(marker) => marker,
+            Err(error) => {
+                return Err(dest_missing(
+                    "sftp.dest_marker_unreadable",
+                    &format!("the destination marker at {path} is unreadable: {error}"),
+                ))
+            }
+        };
+
+        match self.config.destination_id.as_deref() {
+            Some(expected) if expected != marker.destination_id.trim() => Err(dest_missing(
+                "sftp.dest_marker_mismatch",
+                &format!(
+                    "{} holds a different Driven destination (expected {expected}, found {})",
+                    self.root,
+                    marker.destination_id.trim()
+                ),
+            )),
+            Some(_) => Ok(()),
+            // An account written before `destination_id` existed. The marker's
+            // presence still proves this is a Driven destination, which is the
+            // half that stops the destructive cases; only the "a DIFFERENT
+            // Driven destination is here" check is unavailable.
+            None => {
+                tracing::warn!(
+                    target: crate::TARGET,
+                    root = %self.root,
+                    "this SFTP account carries no destination id, so the marker can only be \
+                     checked for presence; reconnect the account to record one"
+                );
+                Ok(())
+            }
+        }
     }
 
     // -- paths ---------------------------------------------------------------
@@ -946,8 +1098,20 @@ impl SftpStore {
             return Err(error);
         }
         if let Err(error) = sftp.rename(temp.to_string(), target.clone()).await {
-            let _ = Self::remove_if_present(sftp, temp).await;
-            return Err(sftp_op_error(&format!("commit {target}"), error));
+            // The temp file is deliberately LEFT IN PLACE. The target has
+            // already been removed above, so on an update this temp holds the
+            // only copy of the new bytes; discarding it because the rename hit
+            // ENOSPC or a permissions refusal would turn a recoverable failure
+            // into data that has to be re-uploaded from the source (and, if the
+            // source is gone, cannot be). It is invisible to every listing
+            // (`names::TMP_PREFIX`) and the abandoned-temp sweep collects it.
+            return Err(sftp_op_error(
+                &format!(
+                    "commit {target} (the uploaded bytes are still on the server as {temp} and \
+                     were NOT discarded)"
+                ),
+                error,
+            ));
         }
 
         let (size, actual) = Self::hash_remote_object(sftp, &target).await?;
@@ -1128,6 +1292,7 @@ impl RemoteStore for SftpStore {
     ) -> anyhow::Result<RemoteEntry> {
         let channel = self.channel().await?;
         let sftp = channel.sftp();
+        self.guard_root(sftp).await?;
         let dir_id = folder_prefix(parent_id);
         self.ensure_dir(sftp, &dir_id).await?;
 
@@ -1235,6 +1400,7 @@ impl RemoteStore for SftpStore {
     ) -> anyhow::Result<RemoteEntry> {
         let channel = self.channel().await?;
         let sftp = channel.sftp();
+        self.guard_root(sftp).await?;
         let dir_id = folder_prefix(parent_id);
         self.ensure_dir(sftp, &dir_id).await?;
 
@@ -1288,6 +1454,7 @@ impl RemoteStore for SftpStore {
     ) -> anyhow::Result<RemoteEntry> {
         let channel = self.channel().await?;
         let sftp = channel.sftp();
+        self.guard_root(sftp).await?;
         let dir_id = parent_of(file_id);
         let stored = base_name(file_id).to_string();
         if stored.is_empty() {
@@ -1354,11 +1521,13 @@ impl RemoteStore for SftpStore {
     /// object is success (idempotent).
     async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
         let channel = self.channel().await?;
+        self.guard_root(channel.sftp()).await?;
         self.delete_object(channel.sftp(), file_id).await
     }
 
     async fn delete_permanent(&self, file_id: &str) -> anyhow::Result<()> {
         let channel = self.channel().await?;
+        self.guard_root(channel.sftp()).await?;
         self.delete_object(channel.sftp(), file_id).await
     }
 
@@ -1448,7 +1617,33 @@ mod tests {
     use crate::test_support::TestSftpServer;
     use driven_remote::remote_store::DriveErrorClassification;
 
+    /// Initialize `root` as a Driven destination and return its id.
+    ///
+    /// Stands in for Task 6's creation probe, which is what writes the marker
+    /// for real - the same role `driven_localfs::prepare_destination` plays for
+    /// that crate's `store_in` test helper.
+    fn seed_destination(root: &std::path::Path) -> String {
+        let destination_id = uuid::Uuid::new_v4().to_string();
+        let marker = crate::config::DestinationMarker::new(&destination_id, 1_700_000_000_000);
+        std::fs::write(
+            root.join(names::MARKER_FILE),
+            serde_json::to_vec(&marker).unwrap(),
+        )
+        .unwrap();
+        destination_id
+    }
+
     fn store_for(server: &TestSftpServer) -> SftpStore {
+        let destination_id = seed_destination(server.root());
+        let mut config = server.pinned_config(SftpAuthKind::Password);
+        config.destination_id = Some(destination_id);
+        SftpStore::new(&config, &server.password_credential())
+            .expect("a valid config builds a store")
+    }
+
+    /// A store whose root has NOT been initialized - the shape of `root_path`
+    /// pointing at a directory of the user's own data.
+    fn unprepared_store_for(server: &TestSftpServer) -> SftpStore {
         SftpStore::new(
             &server.pinned_config(SftpAuthKind::Password),
             &server.password_credential(),
@@ -1503,6 +1698,7 @@ mod tests {
             username: "u".to_string(),
             auth: SftpAuthKind::Password,
             host_key_fingerprint: Some("SHA256:x".to_string()),
+            destination_id: None,
         };
         let cred = SftpCredential::Password {
             password: "p".to_string(),
@@ -1531,6 +1727,7 @@ mod tests {
                 username: "u".to_string(),
                 auth: SftpAuthKind::Password,
                 host_key_fingerprint: Some("SHA256:x".to_string()),
+                destination_id: None,
             },
             &SftpCredential::Password {
                 password: "p".to_string(),
@@ -1800,10 +1997,12 @@ mod tests {
             store.metadata("short.bin").await.is_err(),
             "nothing may have been published"
         );
-        // And the temp file it was writing into is cleaned up.
-        let leftovers: Vec<_> = std::fs::read_dir(server.root())
+        // And the temp file it was writing into is cleaned up - nothing but the
+        // destination marker is left behind.
+        let leftovers: Vec<String> = std::fs::read_dir(server.root())
             .unwrap()
             .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|name| name != names::MARKER_FILE)
             .collect();
         assert!(leftovers.is_empty(), "{leftovers:?}");
     }
@@ -1824,12 +2023,155 @@ mod tests {
         // writes beside every object.
         std::fs::write(server.root().join("._real.txt"), b"xattrs").unwrap();
 
-        // The sidecar is genuinely on the server...
+        // The sidecar and the destination marker are genuinely on the server...
         assert!(server.root().join(".real.txt.driven-meta").is_file());
-        // ...and none of the three appear as objects.
+        assert!(server.root().join(names::MARKER_FILE).is_file());
+        // ...and none of the four appear as objects.
         let listed = store.list_folder("", &DriveContext::MyDrive).await.unwrap();
         let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
         assert_eq!(names, vec!["real.txt"], "{names:?}");
+    }
+
+    #[tokio::test]
+    async fn filesystem_hostile_names_round_trip() {
+        // Every one of these is legal on ext4/APFS and is rejected or mangled
+        // by an NTFS or exFAT share - which is exactly why the encoding exists,
+        // and why an SFTP destination needs it as much as a USB stick does.
+        //
+        // `a:b.txt` is deliberately ABSENT despite being the canonical example:
+        // the test fixture refuses `:` in a path segment (stricter than sshd on
+        // purpose), so including it would fail with a PERMISSION_DENIED that
+        // was fixture strictness rather than a backend bug. `names.rs` covers
+        // the colon case directly.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        let hostile = [
+            "a?b|c.txt",
+            "star*.txt",
+            "quote\".txt",
+            "angle<>.txt",
+            "back\\slash.txt",
+            "trailing dot.",
+            "trailing space ",
+            "100% done.txt",
+            "Ünïcödé \u{1f600}.txt",
+            // Looks exactly like a macOS AppleDouble shadow. It must survive as
+            // the user's own file rather than being filtered out as noise.
+            "._notes.txt",
+            // Looks exactly like one of Driven's own control files.
+            "notes.driven-meta",
+            names::MARKER_FILE,
+            // MS-DOS device names. Not merely rejected on a Windows OpenSSH
+            // server - `nul.txt` OPENS THE NULL DEVICE, so the write succeeds
+            // and the bytes vanish.
+            "CON",
+            "nul.txt",
+            "COM1.log",
+        ];
+
+        let mut ids = Vec::new();
+        for (i, name) in hostile.iter().enumerate() {
+            let bytes: Vec<u8> = (0..(512 + i)).map(|b| (b % 251) as u8).collect();
+            let entry = store
+                .create(
+                    "",
+                    name,
+                    "application/octet-stream",
+                    UploadBody::Bytes(Bytes::from(bytes.clone())),
+                    HashMap::new(),
+                )
+                .await
+                .unwrap_or_else(|e| panic!("create {name:?}: {e:?}"));
+            assert_eq!(entry.name, *name, "the ORIGINAL name must be reported back");
+            assert_eq!(entry.md5, Some(digest(&bytes)), "{name:?}");
+            assert_eq!(download_to_vec(&store, &entry.id).await, bytes, "{name:?}");
+            ids.push(entry.id);
+        }
+
+        // Every one is a DISTINCT object, and every one is browsable - the
+        // failure that matters is a hostile name that is written but then
+        // invisible to the listing and the audit.
+        let unique: HashSet<&String> = ids.iter().collect();
+        assert_eq!(unique.len(), hostile.len(), "{ids:?}");
+        let listed = store.list_folder("", &DriveContext::MyDrive).await.unwrap();
+        let mut listed_names: Vec<String> = listed.iter().map(|e| e.name.clone()).collect();
+        listed_names.sort();
+        let mut expected: Vec<String> = hostile.iter().map(|n| n.to_string()).collect();
+        expected.sort();
+        assert_eq!(listed_names, expected);
+    }
+
+    #[tokio::test]
+    async fn very_long_names_stay_distinct_and_restorable() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        // A shared 280-character prefix differing only in the last character -
+        // the worst case for a truncating scheme, and comfortably past the
+        // 255-byte single-component limit every filesystem enforces.
+        let base = "e".repeat(280);
+        let a_name = format!("{base}A");
+        let b_name = format!("{base}B");
+        let a_bytes = vec![1u8; 4096];
+        let b_bytes = vec![2u8; 5000];
+
+        let a = store
+            .create(
+                "",
+                &a_name,
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from(a_bytes.clone())),
+                HashMap::new(),
+            )
+            .await
+            .expect("create the first long name");
+        let b = store
+            .create(
+                "",
+                &b_name,
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from(b_bytes.clone())),
+                HashMap::new(),
+            )
+            .await
+            .expect("create the second long name");
+
+        assert_ne!(a.id, b.id, "two long names must not collapse onto one file");
+        assert_eq!(download_to_vec(&store, &a.id).await, a_bytes);
+        assert_eq!(download_to_vec(&store, &b.id).await, b_bytes);
+        // The ORIGINAL name still round-trips through the sidecar, even though
+        // the remote filename is truncated - which is what makes a restore able
+        // to put the file back under its real name.
+        assert_eq!(a.name, a_name);
+        assert_eq!(b.name, b_name);
+        // The sidecar's own filename has to fit too: it is the stored name plus
+        // a leading dot and the 12-byte suffix.
+        assert!(
+            base_name(&a.id).len() + 1 + names::META_SUFFIX.len() <= 255,
+            "{}",
+            base_name(&a.id).len()
+        );
+
+        // Re-creating the same long name must land on the SAME object (an
+        // overwrite), not accrete one copy per attempt.
+        let again = store
+            .create(
+                "",
+                &a_name,
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from(vec![3u8; 32])),
+                HashMap::new(),
+            )
+            .await
+            .expect("re-create the first long name");
+        assert_eq!(again.id, a.id);
+        assert_eq!(
+            store
+                .list_folder("", &DriveContext::MyDrive)
+                .await
+                .unwrap()
+                .len(),
+            2
+        );
     }
 
     #[tokio::test]
@@ -2028,8 +2370,10 @@ mod tests {
     async fn a_non_root_root_path_scopes_everything_under_it() {
         let server = TestSftpServer::spawn().await.unwrap();
         std::fs::create_dir(server.root().join("backups")).unwrap();
+        let destination_id = seed_destination(&server.root().join("backups"));
         let mut config = server.pinned_config(SftpAuthKind::Password);
         config.root_path = "/backups".to_string();
+        config.destination_id = Some(destination_id);
         let store = SftpStore::new(&config, &server.password_credential()).unwrap();
 
         let entry = store
@@ -2068,7 +2412,197 @@ mod tests {
             format!("{error:?}").contains("sftp.root_missing"),
             "{error:?}"
         );
+        // A wrong root_path and an uninitialized one must not read the same:
+        // the user actions are "fix the path" and "reconnect the account".
+        assert!(
+            !format!("{error:?}").contains("sftp.dest_marker_missing"),
+            "{error:?}"
+        );
         assert!(!server.root().join("not-there").exists());
+    }
+
+    #[tokio::test]
+    async fn no_mutating_operation_will_touch_a_root_that_is_not_a_driven_destination() {
+        // The hazard: `root_path` is a string the user typed, and a directory
+        // of their OWN data looks exactly like an initialized-but-empty
+        // destination. Aimed there, `resolve_stored_name`'s adopt-unannotated
+        // path and `commit_object`'s remove-then-rename would DESTROY the
+        // same-named files sitting in it. The marker is what makes that
+        // impossible - and its absence must fail closed on every write.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = unprepared_store_for(&server);
+        // The user's own file, with a name a backup could plausibly collide on.
+        std::fs::write(server.root().join("report.txt"), b"the user's own data").unwrap();
+
+        let mut errors = vec![
+            store
+                .create(
+                    "",
+                    "report.txt",
+                    "text/plain",
+                    body(b"a backup"),
+                    HashMap::new(),
+                )
+                .await
+                .expect_err("create must refuse"),
+            store
+                .update("report.txt", body(b"a backup"), HashMap::new())
+                .await
+                .expect_err("update must refuse"),
+            store
+                .ensure_folder("", "Docs", &DriveContext::MyDrive)
+                .await
+                .expect_err("ensure_folder must refuse"),
+            store
+                .trash("report.txt")
+                .await
+                .expect_err("trash must refuse"),
+            store
+                .delete_permanent("report.txt")
+                .await
+                .expect_err("delete_permanent must refuse"),
+        ];
+        for error in errors.drain(..) {
+            let chain = format!("{error:?}");
+            assert!(chain.contains("sftp.dest_marker_missing"), "{chain}");
+            // The `sftp.` code rides on top of the taxonomy the app already
+            // knows how to act on, rather than replacing it.
+            assert!(chain.contains("drive.dest_folder_missing"), "{chain}");
+            assert_eq!(
+                driven_remote::classification_of(&error),
+                Some(DriveErrorClassification::Other),
+                "the anyhow context must not hide the DriveError from the breaker: {chain}"
+            );
+        }
+
+        // The canary: the user's file is untouched and nothing was created.
+        assert_eq!(
+            std::fs::read(server.root().join("report.txt")).unwrap(),
+            b"the user's own data"
+        );
+        let leftovers: Vec<String> = std::fs::read_dir(server.root())
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .collect();
+        assert_eq!(leftovers, vec!["report.txt".to_string()], "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn a_root_holding_a_different_driven_destination_is_refused() {
+        // Two machines pointed at one shared `root_path` on a NAS. Each writes
+        // its own marker; the second overwrites the first, and the first must
+        // then refuse rather than interleave two trees in one directory.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        store
+            .create("", "mine.txt", "text/plain", body(b"mine"), HashMap::new())
+            .await
+            .expect("the destination is this account's");
+
+        // The other machine re-initializes the same directory.
+        seed_destination(server.root());
+
+        let error = store
+            .create("", "later.txt", "text/plain", body(b"mine"), HashMap::new())
+            .await
+            .expect_err("a different destination id must be refused");
+        let chain = format!("{error:?}");
+        assert!(chain.contains("sftp.dest_marker_mismatch"), "{chain}");
+        assert!(chain.contains("drive.dest_folder_missing"), "{chain}");
+        assert!(!server.root().join("later.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn an_account_with_no_destination_id_still_gets_the_presence_check() {
+        // An account written before `destination_id` existed. The identity half
+        // of the check is unavailable, but the half that stops the destructive
+        // cases - "is this a Driven destination at all" - must still hold.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let mut config = server.pinned_config(SftpAuthKind::Password);
+        config.destination_id = None;
+        let store = SftpStore::new(&config, &server.password_credential()).unwrap();
+
+        let error = store
+            .create("", "a.txt", "text/plain", body(b"x"), HashMap::new())
+            .await
+            .expect_err("no marker, no write");
+        assert!(
+            format!("{error:?}").contains("sftp.dest_marker_missing"),
+            "{error:?}"
+        );
+
+        seed_destination(server.root());
+        store
+            .create("", "a.txt", "text/plain", body(b"x"), HashMap::new())
+            .await
+            .expect("any marker satisfies an account that carries no id");
+    }
+
+    #[tokio::test]
+    async fn a_marker_written_by_the_local_folder_backend_is_accepted_here() {
+        // The two backends share a marker filename AND a marker schema so one
+        // backup tree stays interchangeable - a user can copy a USB stick onto
+        // a NAS. A comment claiming that is not a check.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let localfs_marker = driven_localfs::DestinationMarker::new("shared-destination", 42);
+        std::fs::write(
+            server.root().join(names::MARKER_FILE),
+            serde_json::to_vec(&localfs_marker).unwrap(),
+        )
+        .unwrap();
+
+        let mut config = server.pinned_config(SftpAuthKind::Password);
+        config.destination_id = Some("shared-destination".to_string());
+        let store = SftpStore::new(&config, &server.password_credential()).unwrap();
+        store
+            .create("", "a.txt", "text/plain", body(b"x"), HashMap::new())
+            .await
+            .expect("the local backend's marker must satisfy this one");
+    }
+
+    #[tokio::test]
+    async fn a_corrupt_marker_fails_closed() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        std::fs::write(server.root().join(names::MARKER_FILE), b"{ truncated").unwrap();
+
+        let error = store
+            .create("", "a.txt", "text/plain", body(b"x"), HashMap::new())
+            .await
+            .expect_err("an unreadable marker cannot prove anything");
+        assert!(
+            format!("{error:?}").contains("sftp.dest_marker_unreadable"),
+            "{error:?}"
+        );
+        assert!(!server.root().join("a.txt").exists());
+    }
+
+    #[tokio::test]
+    async fn reads_are_deliberately_not_marker_gated() {
+        // Unlike the local backend - which gates every method, because its
+        // marker is written by `prepare_destination` BEFORE any store can be
+        // constructed - the SFTP account-creation flow mirrors
+        // `create_s3_account`, whose probe calls `list_folder` on a store built
+        // from unpersisted config against a server that holds nothing yet
+        // (src-tauri/src/commands/accounts.rs). Gating reads would make that
+        // probe fail on a fresh, perfectly good server. The hazard the marker
+        // exists for is entirely write-side, so leaving reads open costs
+        // nothing: a read cannot destroy the user's data.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = unprepared_store_for(&server);
+        std::fs::write(server.root().join("theirs.txt"), b"not ours").unwrap();
+
+        let listed = store
+            .list_folder("", &DriveContext::MyDrive)
+            .await
+            .expect("browsing an uninitialized server is how the picker works");
+        let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["theirs.txt"], "{names:?}");
+        assert!(store.metadata("theirs.txt").await.is_ok());
+        assert!(store
+            .find_by_op_uuid("", "op-1", &DriveContext::MyDrive)
+            .await
+            .is_ok());
     }
 
     #[tokio::test]

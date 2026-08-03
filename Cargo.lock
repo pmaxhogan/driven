@@ -2228,6 +2228,7 @@ dependencies = [
  "anyhow",
  "async-trait",
  "bytes",
+ "driven-localfs",
  "driven-remote",
  "driven-test-fixtures",
  "futures",
