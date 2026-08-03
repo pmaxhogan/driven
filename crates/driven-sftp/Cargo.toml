@@ -24,6 +24,11 @@ driven-remote = { path = "../driven-remote" }
 anyhow.workspace = true
 thiserror.workspace = true
 async-trait.workspace = true
+# `ResumableSession.url` is an opaque handle, not a URL: base64 of a small JSON
+# blob, exactly as `driven-s3` encodes its multipart handle. The executor
+# persists it verbatim in `pending_ops.payload_json`, so it must survive a JSON
+# round trip with no escaping surprises.
+base64.workspace = true
 bytes.workspace = true
 futures.workspace = true
 serde.workspace = true

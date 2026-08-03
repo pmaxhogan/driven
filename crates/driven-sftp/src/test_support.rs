@@ -14,6 +14,20 @@
 //! to the chaos harness's `FaultySftpServer`, which is a separate,
 //! later-landing tool. Keep this one boring.
 //!
+//! **One deliberate exception:
+//! [`TestSftpServer::corrupt_committed_bytes_after_rename`].** The store's
+//! integrity protocol re-downloads and re-hashes every object it commits, and
+//! that step is only load-bearing if something can actually corrupt the bytes
+//! between the rename and the verify - otherwise every test passes just as
+//! happily against an implementation that returns the digest it accumulated
+//! while writing, which is the `x == x` check the module docs of
+//! [`crate::store`] warn about. There is no way to stage that corruption from
+//! the client side, so the fixture grows exactly one switch: after a successful
+//! rename it flips one byte of the destination IN PLACE (the length is
+//! preserved on purpose, so the sidecar's size guard cannot mask the digest
+//! failure). It is off unless a test turns it on, and it is scoped to `rename`
+//! and nothing else. Anything richer than this belongs to the chaos harness.
+//!
 //! ## Fidelity notes (read before writing a test that depends on behaviour)
 //!
 //! The handler is modelled on OpenSSH's `sftp-server` where the two could
@@ -30,8 +44,13 @@
 //! - Paths from the client are **virtual**: rooted at `/`, resolved against
 //!   the temp directory, and any `..` that would climb above the root is
 //!   refused with `SSH_FX_PERMISSION_DENIED`.
-//! - `setstat` / `fsetstat` are accepted no-ops, and symlink / hardlink /
-//!   extended requests are left `unimplemented` (`SSH_FX_OP_UNSUPPORTED`).
+//! - `setstat` / `fsetstat` are accepted no-ops, and symlink / hardlink
+//!   requests are left `unimplemented` (`SSH_FX_OP_UNSUPPORTED`).
+//! - **`statvfs@openssh.com` v2 is advertised and answered**, because OpenSSH's
+//!   `sftp-server` advertises it and `about()` reads it for the quota display.
+//!   Plenty of real servers do not (embedded NAS firmware, restricted
+//!   `internal-sftp` builds), so [`TestSftpServer::spawn_without_statvfs`]
+//!   serves the other half of that fork.
 //!
 //! ## Credentials
 //!
@@ -43,6 +62,7 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
 use std::time::Duration;
 
@@ -50,8 +70,10 @@ use russh::keys::ssh_key::{Algorithm, HashAlg, LineEnding, PublicKey};
 use russh::keys::PrivateKey;
 use russh::server::{Auth, Msg, Session};
 use russh::{Channel, ChannelId};
+use russh_sftp::extensions::{self, Statvfs};
 use russh_sftp::protocol::{
-    Attrs, Data, File, FileAttributes, Handle, Name, OpenFlags, Status, StatusCode,
+    Attrs, Data, ExtendedReply, File, FileAttributes, Handle, Name, OpenFlags, Packet, Status,
+    StatusCode, Version,
 };
 use tempfile::TempDir;
 use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
@@ -77,13 +99,49 @@ pub struct TestSftpServer {
     root: TempDir,
     tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
     accept_task: JoinHandle<()>,
+    corrupt_after_rename: Arc<AtomicBool>,
 }
+
+/// The quota numbers [`TestSftpServer`] reports through `statvfs@openssh.com`.
+///
+/// Chosen so every derived figure is exact in a test assertion and none of them
+/// coincide: a 1 TiB filesystem with 400 GiB free to root and 360 GiB free to
+/// an unprivileged user, so `blocks_free` and `blocks_avail` cannot be confused
+/// for one another by an implementation that reads the wrong field.
+pub const TEST_STATVFS: Statvfs = Statvfs {
+    block_size: 4096,
+    fragment_size: 4096,
+    blocks: 268_435_456,
+    blocks_free: 104_857_600,
+    blocks_avail: 94_371_840,
+    inodes: 65_536_000,
+    inodes_free: 64_000_000,
+    inodes_avail: 64_000_000,
+    fs_id: 0,
+    flags: 0,
+    name_max: 255,
+};
 
 impl TestSftpServer {
     /// Bind a free `127.0.0.1` port, generate a fresh host key and client
     /// keypair, and start serving a fresh temp directory.
+    ///
+    /// Advertises `statvfs@openssh.com` v2, as OpenSSH's own `sftp-server`
+    /// does.
     pub async fn spawn() -> anyhow::Result<Self> {
+        Self::spawn_with_features(ServerFeatures { statvfs: true }).await
+    }
+
+    /// A server that advertises NO extensions - the shape of an embedded NAS
+    /// or a restricted `internal-sftp` build, where `about()` has to report an
+    /// unknown quota rather than guess one.
+    pub async fn spawn_without_statvfs() -> anyhow::Result<Self> {
+        Self::spawn_with_features(ServerFeatures { statvfs: false }).await
+    }
+
+    async fn spawn_with_features(features: ServerFeatures) -> anyhow::Result<Self> {
         let root = TempDir::new()?;
+        let corrupt_after_rename = Arc::new(AtomicBool::new(false));
 
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
         let host_key_fingerprint = fingerprint(host_key.public_key());
@@ -116,13 +174,19 @@ impl TestSftpServer {
         let accept_task = tokio::spawn({
             let tasks = Arc::clone(&tasks);
             let root_path = root.path().to_path_buf();
+            let corrupt_after_rename = Arc::clone(&corrupt_after_rename);
             async move {
                 loop {
                     let Ok((stream, _peer)) = listener.accept().await else {
                         break;
                     };
                     let config = Arc::clone(&config);
-                    let handler = SshHandler::new(root_path.clone(), authorized_key.clone());
+                    let handler = SshHandler::new(
+                        root_path.clone(),
+                        authorized_key.clone(),
+                        features,
+                        Arc::clone(&corrupt_after_rename),
+                    );
                     let connection = tokio::spawn(async move {
                         match russh::server::run_stream(config, stream, handler).await {
                             Ok(session) => {
@@ -147,7 +211,20 @@ impl TestSftpServer {
             root,
             tasks,
             accept_task,
+            corrupt_after_rename,
         })
+    }
+
+    /// Make every subsequent successful `rename` flip one byte of the
+    /// destination file IN PLACE, simulating a server (or a disk, or a link)
+    /// that damaged an object between the publish and the read-back.
+    ///
+    /// The length is deliberately preserved: a truncation would also trip the
+    /// sidecar's size guard, so the test would no longer be evidence that the
+    /// DIGEST check works. This is the only fault this fixture can inject - see
+    /// the module docs for why it exists at all.
+    pub fn corrupt_committed_bytes_after_rename(&self, enabled: bool) {
+        self.corrupt_after_rename.store(enabled, Ordering::SeqCst);
     }
 
     /// The address the server is listening on.
@@ -247,20 +324,35 @@ pub fn fingerprint(key: &PublicKey) -> String {
     key.fingerprint(HashAlg::Sha256).to_string()
 }
 
+/// Which optional SFTP extensions this server advertises.
+#[derive(Clone, Copy, Debug)]
+struct ServerFeatures {
+    statvfs: bool,
+}
+
 /// The per-connection SSH handler: authenticates the one configured user and
 /// hands an accepted `sftp` subsystem request to [`FsSftpHandler`].
 struct SshHandler {
     root: PathBuf,
     authorized_key: PublicKey,
     channels: HashMap<ChannelId, Channel<Msg>>,
+    features: ServerFeatures,
+    corrupt_after_rename: Arc<AtomicBool>,
 }
 
 impl SshHandler {
-    fn new(root: PathBuf, authorized_key: PublicKey) -> Self {
+    fn new(
+        root: PathBuf,
+        authorized_key: PublicKey,
+        features: ServerFeatures,
+        corrupt_after_rename: Arc<AtomicBool>,
+    ) -> Self {
         Self {
             root,
             authorized_key,
             channels: HashMap::new(),
+            features,
+            corrupt_after_rename,
         }
     }
 }
@@ -316,7 +408,15 @@ impl russh::server::Handler for SshHandler {
             return Ok(());
         };
         session.channel_success(channel_id)?;
-        russh_sftp::server::run(channel.into_stream(), FsSftpHandler::new(self.root.clone())).await;
+        russh_sftp::server::run(
+            channel.into_stream(),
+            FsSftpHandler::new(
+                self.root.clone(),
+                self.features,
+                Arc::clone(&self.corrupt_after_rename),
+            ),
+        )
+        .await;
         Ok(())
     }
 }
@@ -334,14 +434,18 @@ struct FsSftpHandler {
     root: PathBuf,
     handles: HashMap<String, OpenHandle>,
     next_handle: u64,
+    features: ServerFeatures,
+    corrupt_after_rename: Arc<AtomicBool>,
 }
 
 impl FsSftpHandler {
-    fn new(root: PathBuf) -> Self {
+    fn new(root: PathBuf, features: ServerFeatures, corrupt_after_rename: Arc<AtomicBool>) -> Self {
         Self {
             root,
             handles: HashMap::new(),
             next_handle: 0,
+            features,
+            corrupt_after_rename,
         }
     }
 
@@ -448,6 +552,26 @@ impl russh_sftp::server::Handler for FsSftpHandler {
 
     fn unimplemented(&self) -> Self::Error {
         StatusCode::OpUnsupported
+    }
+
+    /// Advertise the extensions this server actually answers.
+    ///
+    /// `russh-sftp`'s client reads this list once, at session setup, and
+    /// `SftpSession::fs_info` returns `Ok(None)` without a round trip when
+    /// `statvfs@openssh.com` is not advertised at version `"2"` - so this is
+    /// the ONLY place the two `about()` branches can be told apart.
+    async fn init(
+        &mut self,
+        _version: u32,
+        _extensions: HashMap<String, String>,
+    ) -> Result<Version, Self::Error> {
+        let mut version = Version::new();
+        if self.features.statvfs {
+            version
+                .extensions
+                .insert(extensions::STATVFS.to_string(), "2".to_string());
+        }
+        Ok(version)
     }
 
     async fn open(
@@ -663,6 +787,17 @@ impl russh_sftp::server::Handler for FsSftpHandler {
         tokio::fs::rename(&old, &new)
             .await
             .map_err(|e| io_status(&e))?;
+        if self.corrupt_after_rename.load(Ordering::SeqCst) {
+            // Flip one byte, keeping the length: see the module docs. A failure
+            // here is silent because the caller's next read is what the test
+            // actually asserts on.
+            if let Ok(mut bytes) = tokio::fs::read(&new).await {
+                if let Some(first) = bytes.first_mut() {
+                    *first ^= 0xFF;
+                    let _ = tokio::fs::write(&new, &bytes).await;
+                }
+            }
+        }
         Ok(ok_status(id))
     }
 
@@ -673,11 +808,43 @@ impl russh_sftp::server::Handler for FsSftpHandler {
             files: vec![File::dummy(virtual_path(&segments))],
         })
     }
+
+    /// Answers `statvfs@openssh.com` with [`TEST_STATVFS`] when the extension
+    /// is advertised; every other extension stays `SSH_FX_OP_UNSUPPORTED`.
+    ///
+    /// A server that advertised the extension in `init` and then refused the
+    /// request would be a third case Driven has to survive, so the two are
+    /// wired to the same switch on purpose - there is no way to reach that
+    /// inconsistent state through this fixture.
+    async fn extended(
+        &mut self,
+        id: u32,
+        request: String,
+        _data: Vec<u8>,
+    ) -> Result<Packet, Self::Error> {
+        if request != extensions::STATVFS || !self.features.statvfs {
+            return Err(StatusCode::OpUnsupported);
+        }
+        let data = russh_sftp::ser::to_bytes(&TEST_STATVFS)
+            .map_err(|_| StatusCode::Failure)?
+            .to_vec();
+        Ok(Packet::ExtendedReply(ExtendedReply { id, data }))
+    }
 }
 
 #[cfg(test)]
 mod tests {
     use super::*;
+
+    /// A handler over `root` with the default feature set and no fault
+    /// injection - what a plain connection gets.
+    fn handler_for(root: &Path) -> FsSftpHandler {
+        FsSftpHandler::new(
+            root.to_path_buf(),
+            ServerFeatures { statvfs: true },
+            Arc::new(AtomicBool::new(false)),
+        )
+    }
 
     #[test]
     fn a_path_that_climbs_above_the_root_is_refused() {
@@ -713,7 +880,7 @@ mod tests {
     #[test]
     fn resolution_never_leaves_the_root() {
         let root = TempDir::new().unwrap();
-        let handler = FsSftpHandler::new(root.path().to_path_buf());
+        let handler = handler_for(root.path());
 
         // The containment guard holds for everything that IS accepted...
         for path in ["/", ".", "/a/b", "/a/./b/../c", "deep/nested/leaf.txt"] {
@@ -771,7 +938,7 @@ mod tests {
 
         let root = TempDir::new().unwrap();
         std::fs::write(root.path().join("leaf.txt"), b"leaf").unwrap();
-        let mut handler = FsSftpHandler::new(root.path().to_path_buf());
+        let mut handler = handler_for(root.path());
 
         let handle = handler.opendir(1, "/".to_string()).await.unwrap().handle;
         let names: Vec<String> = handler

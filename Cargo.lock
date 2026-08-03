@@ -2227,6 +2227,7 @@ version = "2.8.0"
 dependencies = [
  "anyhow",
  "async-trait",
+ "base64 0.23.0",
  "bytes",
  "driven-localfs",
  "driven-remote",

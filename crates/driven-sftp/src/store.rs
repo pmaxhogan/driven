@@ -101,10 +101,12 @@
 //! the write guard.
 
 use std::collections::{HashMap, HashSet};
+use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::Arc;
-use std::time::{SystemTime, UNIX_EPOCH};
+use std::time::{Duration, SystemTime, UNIX_EPOCH};
 
 use async_trait::async_trait;
+use base64::Engine as _;
 use bytes::Bytes;
 use driven_remote::remote_store::{
     AboutInfo, DownloadStream, DriveContext, RemoteEntry, RemoteStore, ResumableKind,
@@ -116,8 +118,9 @@ use md5::{Digest, Md5};
 use parking_lot::Mutex;
 use russh_sftp::client::error::Error as SftpProtocolError;
 use russh_sftp::client::SftpSession as RusshSftpSession;
-use russh_sftp::protocol::{OpenFlags, StatusCode};
-use tokio::io::{AsyncReadExt, AsyncWriteExt};
+use russh_sftp::protocol::{FileAttributes, OpenFlags, StatusCode};
+use serde::{Deserialize, Serialize};
+use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
 
 use crate::config::{SftpConfig, SftpCredential};
 use crate::error::{sftp_error, status_code, SftpFailure};
@@ -142,6 +145,19 @@ const READ_CHUNK: usize = 256 * 1024;
 /// of thousands of objects would otherwise queue that many outstanding requests
 /// against a server that has its own limits.
 const SIDECAR_FETCH_CONCURRENCY: usize = 16;
+
+/// Scheme marking a [`ResumableSession::url`] as this backend's encoded handle
+/// rather than a real URL.
+const SESSION_URL_SCHEME: &str = "driven-sftp:";
+
+/// How long an abandoned temp file may sit on the server before the sweep
+/// removes it.
+///
+/// The same seven days `driven-localfs` uses, for the same reason: it is longer
+/// than the trait's own resumable-session window (Driven discards sessions
+/// older than six days), so the sweep can never collect the temp file of a
+/// session the executor might still legitimately resume.
+const TMP_SWEEP_AGE: Duration = Duration::from_secs(7 * 24 * 60 * 60);
 
 // -- object ids ---------------------------------------------------------------
 //
@@ -397,6 +413,91 @@ fn claim_exact(claims: &Arc<NameClaims>, dir_id: &str, stored: &str, original: &
     }
 }
 
+// -- resumable session handles ------------------------------------------------
+
+/// The persisted handle for one resumable upload.
+///
+/// Base64-encoded into [`ResumableSession::url`], which the executor stores in
+/// `pending_ops.payload_json` - so this is the ONLY copy that survives a
+/// process restart and it must carry everything needed to finish the upload.
+///
+/// ## Both paths are ROOT-RELATIVE, and that is a security property
+///
+/// `temp_path` and `rename_to` are object ids, not absolute remote paths. They
+/// are re-resolved through [`SftpStore::remote_path`] on the way back in, which
+/// re-validates every segment. That matters because this handle round-trips
+/// through a SQLite file on the user's disk: an absolute path taken on trust
+/// would let an edited `pending_ops` row aim a write anywhere the SSH account
+/// can reach. It also means a session survives the account's `root_path` being
+/// corrected, which an absolute path would not.
+///
+/// ## There is deliberately no serialized digest state
+///
+/// md-5 0.11 DOES expose one (`digest::crypto_common::hazmat::SerializableState`
+/// is implemented for `Md5Core`), so this is a choice rather than a limitation.
+/// Persisting it would be exactly the bookkeeping
+/// [`RemoteStore::resume_chunk`]'s hydration contract forbids: the number the
+/// state covers is what a previous process BELIEVES it wrote, and a crash
+/// between the write and the acknowledgement leaves fewer bytes than that on
+/// the server. A digest over N bytes replayed against a temp holding M would
+/// match nothing, and the mismatch would only surface at the post-commit
+/// verify: after the rename, with the old object already removed. So the bytes
+/// that actually survived are the sole authority, and hydration re-reads and
+/// re-hashes the remote temp file every time.
+#[derive(Debug, Clone, PartialEq, Eq, Serialize, Deserialize)]
+struct SessionHandle {
+    /// Root-relative id of the temp file accumulating the bytes.
+    temp_path: String,
+    /// Root-relative id the temp file is renamed to on completion.
+    rename_to: String,
+    /// Total content length the session was opened for. Duplicated from
+    /// [`ResumableSession::size`] on purpose: the handle has to be
+    /// self-describing for a reader that only has the URL.
+    size: u64,
+    /// The ORIGINAL (unencoded) name, for the sidecar and for re-claiming the
+    /// destination filename after a restart.
+    name: String,
+    /// MIME type to record.
+    mime: String,
+    /// `app_properties` to attach on completion.
+    props: HashMap<String, String>,
+}
+
+/// In-process state for one live resumable upload.
+struct SessionState {
+    /// Bytes accepted so far, which is always the temp file's length.
+    consumed: u64,
+    /// Running digest over those bytes.
+    md5: Md5,
+    /// Root-relative id of the temp file, so the sweep can recognise it as
+    /// live and spare it.
+    temp_id: String,
+    /// Keeps the destination filename reserved against a colliding parallel
+    /// upload for as long as the session is open in this process.
+    _claim: ClaimGuard,
+}
+
+fn encode_session_url(handle: &SessionHandle) -> anyhow::Result<String> {
+    let json =
+        serde_json::to_vec(handle).map_err(|e| anyhow::anyhow!("sftp.session_invalid: {e}"))?;
+    Ok(format!(
+        "{SESSION_URL_SCHEME}{}",
+        base64::engine::general_purpose::URL_SAFE_NO_PAD.encode(json)
+    ))
+}
+
+fn decode_session_url(url: &str) -> anyhow::Result<SessionHandle> {
+    let encoded = url.strip_prefix(SESSION_URL_SCHEME).ok_or_else(|| {
+        anyhow::anyhow!(
+            "sftp.session_invalid: this resumable session was not issued by the SFTP backend"
+        )
+    })?;
+    let json = base64::engine::general_purpose::URL_SAFE_NO_PAD
+        .decode(encoded)
+        .map_err(|e| anyhow::anyhow!("sftp.session_invalid: {e}"))?;
+    serde_json::from_slice(&json).map_err(|e| anyhow::anyhow!("sftp.session_invalid: {e}"))
+}
+
 // -- the store ----------------------------------------------------------------
 
 /// The SSH (SFTP) [`RemoteStore`].
@@ -408,6 +509,10 @@ pub struct SftpStore {
     root: String,
     session: tokio::sync::RwLock<Option<SftpSession>>,
     claims: Arc<NameClaims>,
+    /// Live resumable uploads, keyed by their [`ResumableSession::url`].
+    sessions: Mutex<HashMap<String, SessionState>>,
+    /// Whether the once-per-store abandoned-temp sweep has already run.
+    swept: AtomicBool,
 }
 
 /// A borrowed, live SFTP channel.
@@ -443,6 +548,8 @@ impl SftpStore {
             root,
             session: tokio::sync::RwLock::new(None),
             claims: Arc::new(NameClaims::default()),
+            sessions: Mutex::new(HashMap::new()),
+            swept: AtomicBool::new(false),
         })
     }
 
@@ -478,6 +585,19 @@ impl SftpStore {
                     let session = SftpSession::connect(&self.config, &self.credential)
                         .await
                         .map_err(Self::note_connect_failure)?;
+                    // Once per store, on the first connection that succeeds -
+                    // the SFTP analogue of `LocalFsStore::new`'s sweep, which
+                    // runs at construction because a local destination is
+                    // reachable then. Here it cannot: constructing a store must
+                    // not require the server to be awake. Running it while the
+                    // WRITE guard is still held is deliberate: at this instant
+                    // the session is not installed yet, so no other operation
+                    // can be using it, and every caller waiting on this lock
+                    // was already waiting for the connect. A later `reconnect`
+                    // does NOT re-sweep.
+                    if !self.swept.swap(true, Ordering::SeqCst) {
+                        self.sweep_stale_temp_files(session.sftp()).await;
+                    }
                     *guard = Some(session);
                 }
             }
@@ -522,6 +642,103 @@ impl SftpStore {
             );
         }
         error
+    }
+
+    // -- abandoned temp files ------------------------------------------------
+
+    /// Collect abandoned upload temp files, returning how many were removed.
+    ///
+    /// Runs automatically once per store on the first successful connection;
+    /// this entry point exists so the sweep can also be driven deliberately
+    /// (and so a test can observe it) without waiting for a fresh store.
+    pub async fn sweep_abandoned_temp_files(&self) -> anyhow::Result<usize> {
+        let channel = self.channel().await?;
+        Ok(self.sweep_stale_temp_files(channel.sftp()).await)
+    }
+
+    /// Remove temp files older than [`TMP_SWEEP_AGE`] anywhere under the root.
+    ///
+    /// Abandoned temps otherwise accumulate INVISIBLY: every listing filters
+    /// `names::TMP_PREFIX` out, so nothing in the UI, the audit or the restore
+    /// path would ever mention them, and nothing else collects them. Two paths
+    /// produce them - a resumable upload whose process is killed, and (since
+    /// Task 3's fix round) a commit whose RENAME failed, where the temp is
+    /// retained on purpose because it holds the only copy of the new bytes.
+    ///
+    /// Two things it must never collect:
+    ///
+    /// - a temp younger than the sweep window, which may be an upload in flight
+    ///   in another process against the same destination;
+    /// - the temp of a LIVE session in THIS process, whatever its age. The age
+    ///   threshold alone would be enough in practice (the sweep runs before any
+    ///   session can be opened), but the invariant belongs in the code rather
+    ///   than in the call order.
+    ///
+    /// Best-effort and deliberately infallible, matching
+    /// `LocalFsStore::sweep_stale_temp_files`: a directory that cannot be
+    /// listed is skipped rather than failing the operation that triggered the
+    /// sweep. That is the OPPOSITE of the rule on the completeness path
+    /// ([`Self::walk_tree`]) and the difference is real - a short sweep collects
+    /// less garbage, while a short LISTING reads as a mass deletion.
+    async fn sweep_stale_temp_files(&self, sftp: &RusshSftpSession) -> usize {
+        let live: HashSet<String> = self
+            .sessions
+            .lock()
+            .values()
+            .map(|state| state.temp_id.clone())
+            .collect();
+        let Ok(now) = SystemTime::now().duration_since(UNIX_EPOCH) else {
+            return 0;
+        };
+
+        let mut removed = 0usize;
+        let mut stack = vec![String::new()];
+        while let Some(dir_id) = stack.pop() {
+            let Ok(dir_path) = self.remote_path(&dir_id) else {
+                continue;
+            };
+            let Ok(entries) = sftp.read_dir(dir_path).await else {
+                continue;
+            };
+            for entry in entries {
+                let name = entry.file_name();
+                let attrs = entry.metadata();
+                if attrs.is_dir() {
+                    if !names::is_reserved_control_name(&name) {
+                        stack.push(folder_id(&dir_id, &name));
+                    }
+                    continue;
+                }
+                if !name.starts_with(names::TMP_PREFIX) {
+                    continue;
+                }
+                let id = join_id(&dir_id, &name);
+                if live.contains(&id) {
+                    continue;
+                }
+                // SFTPv3 reports mtime in whole seconds. No mtime means no way
+                // to tell abandoned from in-flight, so the file is left alone.
+                let stale = attrs.mtime.is_some_and(|m| {
+                    now.as_secs().saturating_sub(u64::from(m)) > TMP_SWEEP_AGE.as_secs()
+                });
+                if !stale {
+                    continue;
+                }
+                if let Ok(path) = self.remote_path(&id) {
+                    if Self::remove_if_present(sftp, &path).await.is_ok() {
+                        removed += 1;
+                    }
+                }
+            }
+        }
+        if removed > 0 {
+            tracing::info!(
+                target: crate::TARGET,
+                removed,
+                "swept abandoned upload temp files from the SFTP destination"
+            );
+        }
+        removed
     }
 
     // -- destination identity ------------------------------------------------
@@ -1040,6 +1257,38 @@ impl SftpStore {
         Ok((written, hasher.finalize().into()))
     }
 
+    /// Read a remote file end to end, returning its length and a digest over
+    /// the bytes that came back.
+    ///
+    /// `purpose` only shapes the error message ("verify it" versus "resume
+    /// it"); the read itself is identical, and the digest is left UNfinalized
+    /// so a resuming session can keep appending to it.
+    async fn read_and_hash(
+        sftp: &RusshSftpSession,
+        path: &str,
+        purpose: &str,
+    ) -> anyhow::Result<(u64, Md5)> {
+        let mut file = sftp
+            .open(path.to_string())
+            .await
+            .map_err(|e| sftp_op_error(&format!("re-open {path} to {purpose} it"), e))?;
+        let mut hasher = Md5::new();
+        let mut buf = vec![0u8; READ_CHUNK];
+        let mut total: u64 = 0;
+        loop {
+            let n = file
+                .read(&mut buf)
+                .await
+                .map_err(|e| sftp_io_error(&format!("{purpose} {path}"), e))?;
+            if n == 0 {
+                break;
+            }
+            hasher.update(&buf[..n]);
+            total += n as u64;
+        }
+        Ok((total, hasher))
+    }
+
     /// Re-download a committed object and hash it, returning `(size, md5)`.
     ///
     /// This is step 4 of the integrity protocol in the module docs. It must
@@ -1050,25 +1299,8 @@ impl SftpStore {
         sftp: &RusshSftpSession,
         path: &str,
     ) -> anyhow::Result<(u64, [u8; 16])> {
-        let mut file = sftp
-            .open(path.to_string())
-            .await
-            .map_err(|e| sftp_op_error(&format!("re-open {path} to verify it"), e))?;
-        let mut hasher = Md5::new();
-        let mut buf = vec![0u8; READ_CHUNK];
-        let mut total: u64 = 0;
-        loop {
-            let n = file
-                .read(&mut buf)
-                .await
-                .map_err(|e| sftp_io_error(&format!("verify {path}"), e))?;
-            if n == 0 {
-                break;
-            }
-            hasher.update(&buf[..n]);
-            total += n as u64;
-        }
-        Ok((total, hasher.finalize().into()))
+        let (size, hasher) = Self::read_and_hash(sftp, path, "verify").await?;
+        Ok((size, hasher.finalize().into()))
     }
 
     /// Publish `temp` as the object `dir_id/stored`, write its sidecar, and
@@ -1104,7 +1336,9 @@ impl SftpStore {
             // ENOSPC or a permissions refusal would turn a recoverable failure
             // into data that has to be re-uploaded from the source (and, if the
             // source is gone, cannot be). It is invisible to every listing
-            // (`names::TMP_PREFIX`) and the abandoned-temp sweep collects it.
+            // (`names::TMP_PREFIX`), so it cannot be mistaken for an object,
+            // and [`SftpStore::sweep_stale_temp_files`] is what eventually
+            // collects it if nothing ever comes back for it.
             return Err(sftp_op_error(
                 &format!(
                     "commit {target} (the uploaded bytes are still on the server as {temp} and \
@@ -1209,28 +1443,83 @@ impl SftpStore {
         &self,
         sftp: &RusshSftpSession,
         dir_id: &str,
-    ) -> anyhow::Result<Vec<(Sidecar, russh_sftp::protocol::FileAttributes)>> {
+    ) -> anyhow::Result<Vec<(Sidecar, FileAttributes)>> {
         let dir_path = self.remote_path(dir_id)?;
         let entries = match sftp.read_dir(dir_path.clone()).await {
             Ok(entries) => entries,
+            // A missing directory is "no orphan to adopt" for the ONE caller
+            // that wants this leniency. It is emphatically NOT a safe answer on
+            // the completeness path - see [`Self::walk_tree`].
             Err(error) if is_no_such_file(&error) => return Ok(Vec::new()),
             Err(error) => return Err(sftp_op_error(&format!("list {dir_path}"), error)),
         };
+        let entries: Vec<(String, FileAttributes)> = entries
+            .map(|entry| (entry.file_name(), entry.metadata()))
+            .collect();
+        Self::annotated_from_entries(sftp, &dir_path, &entries).await
+    }
 
-        let mut data: HashMap<String, russh_sftp::protocol::FileAttributes> = HashMap::new();
+    /// Walk the WHOLE destination subtree, pairing every directory id with its
+    /// raw directory entries (Driven's own control names included, because the
+    /// sidecars are what the callers need).
+    ///
+    /// # Completeness
+    ///
+    /// **Every enumeration failure is an `Err`, including a missing directory.**
+    /// There is no `NO_SUCH_FILE` -> empty branch here, deliberately and
+    /// unlike [`Self::live_annotated_files`]: the callers
+    /// ([`RemoteStore::list_source_object_ids`] and [`RemoteStore::about`])
+    /// compute `dead = recorded - live`, so a path that momentarily fails to
+    /// resolve would read as "this source has nothing on the server" and the
+    /// caller would heal it by re-uploading everything. A short answer here is
+    /// worse than no answer, so there is never a short answer.
+    ///
+    /// Costs one `readdir` per directory, which is the floor: there is no
+    /// recursive listing in SFTPv3.
+    async fn walk_tree(
+        &self,
+        sftp: &RusshSftpSession,
+    ) -> anyhow::Result<Vec<(String, Vec<(String, FileAttributes)>)>> {
+        let mut out: Vec<(String, Vec<(String, FileAttributes)>)> = Vec::new();
+        let mut pending = vec![String::new()];
+        while let Some(dir_id) = pending.pop() {
+            let dir_path = self.remote_path(&dir_id)?;
+            let entries = sftp
+                .read_dir(dir_path.clone())
+                .await
+                .map_err(|error| sftp_op_error(&format!("list {dir_path}"), error))?;
+            let entries: Vec<(String, FileAttributes)> = entries
+                .map(|entry| (entry.file_name(), entry.metadata()))
+                .collect();
+            for (name, attrs) in &entries {
+                if attrs.is_dir() && !names::is_reserved_control_name(name) {
+                    pending.push(folder_id(&dir_id, name));
+                }
+            }
+            out.push((dir_id, entries));
+        }
+        Ok(out)
+    }
+
+    /// Join sidecars onto the data objects in one already-listed directory.
+    async fn annotated_from_entries(
+        sftp: &RusshSftpSession,
+        dir_path: &str,
+        entries: &[(String, FileAttributes)],
+    ) -> anyhow::Result<Vec<(Sidecar, FileAttributes)>> {
+        let mut data: HashMap<String, FileAttributes> = HashMap::new();
         let mut sidecar_names: Vec<String> = Vec::new();
-        for entry in entries {
-            let name = entry.file_name();
-            if let Some(stored) = meta::stored_from_sidecar_name(&name) {
+        for (name, attrs) in entries {
+            if let Some(stored) = meta::stored_from_sidecar_name(name) {
                 sidecar_names.push(stored.to_string());
-            } else if !entry.metadata().is_dir() {
-                data.insert(name, entry.metadata());
+            } else if !attrs.is_dir() {
+                data.insert(name.clone(), attrs.clone());
             }
         }
 
-        let fetched: Vec<Option<(Sidecar, russh_sftp::protocol::FileAttributes)>> =
+        let fetched: Vec<Option<(Sidecar, FileAttributes)>> =
             futures::stream::iter(sidecar_names.into_iter().map(|stored| {
-                let dir_path = dir_path.clone();
+                let dir_path = dir_path.to_string();
                 let attrs = data.get(&stored).cloned();
                 async move {
                     // A sidecar with no live data object is dangling; skip it
@@ -1251,23 +1540,92 @@ impl SftpStore {
         Ok(fetched.into_iter().flatten().collect())
     }
 
-    /// The error every method Task 4 owns returns until it lands.
+    // -- resumable uploads ---------------------------------------------------
+
+    /// Resolve a session handle to the pieces the write path needs, refusing a
+    /// handle whose paths do not survive re-validation.
     ///
-    /// Deliberately an ERROR and never a plausible empty answer. The trait doc
-    /// for `list_source_object_ids` spells out why: a store that answers "no
-    /// live objects" is not degrading safely, it is reporting a mass deletion,
-    /// and the caller would heal every recorded id by re-uploading the whole
-    /// source. The same reasoning makes an invented `AboutInfo` worse than no
-    /// answer.
-    fn not_yet_implemented(method: &str) -> anyhow::Error {
-        anyhow::Error::new(DriveError::Classified {
-            kind: driven_remote::remote_store::DriveErrorClassification::Other,
-            source: anyhow::anyhow!(
-                "sftp.unimplemented: {method} is not implemented for the SFTP backend yet \
-                 (resumable uploads, the complete source listing and quota land in the next \
-                 slice); failing loudly rather than reporting an empty or invented answer"
-            ),
-        })
+    /// Called on EVERY chunk, not just on hydration. The handle round-trips
+    /// through `pending_ops.payload_json` - a SQLite file the user can edit -
+    /// so a path in it is exactly as trustworthy as an id from `file_state`,
+    /// which this store already re-validates ([`Self::remote_path`]).
+    fn resolve_session(
+        &self,
+        handle: &SessionHandle,
+    ) -> anyhow::Result<(String, String, String, String)> {
+        let temp_path = self.remote_path(&handle.temp_path)?;
+        let target_path = self.remote_path(&handle.rename_to)?;
+        let dir_id = parent_of(&handle.rename_to);
+        let stored = base_name(&handle.rename_to).to_string();
+        if stored.is_empty() || !base_name(&handle.temp_path).starts_with(names::TMP_PREFIX) {
+            anyhow::bail!(
+                "sftp.id_invalid: the resumable session handle does not name an object and a \
+                 temp file ({:?} -> {:?})",
+                handle.temp_path,
+                handle.rename_to
+            );
+        }
+        // `remote_path` is what refuses `..`; `target_path` is otherwise unused
+        // on this path, so bind it explicitly rather than dropping it and
+        // leaving the check looking accidental.
+        Ok((temp_path, target_path, dir_id, stored))
+    }
+
+    /// Rebuild in-process state for a session this process did not open.
+    ///
+    /// `Ok(false)` means the session is dead and the caller must report
+    /// [`ResumeProgress::SessionInvalid`].
+    async fn hydrate_session(
+        &self,
+        sftp: &RusshSftpSession,
+        session: &ResumableSession,
+        handle: &SessionHandle,
+        temp_path: &str,
+        dir_id: &str,
+        stored: &str,
+    ) -> anyhow::Result<bool> {
+        let Some(attrs) = Self::stat_kind(sftp, temp_path).await? else {
+            tracing::warn!(
+                target: crate::TARGET,
+                path = %temp_path,
+                "the temp file of a persisted resumable session is gone from the server; \
+                 invalidating the session so the executor restarts from offset 0"
+            );
+            return Ok(false);
+        };
+        // The digest comes back UNfinalized so the session can keep appending
+        // to it. See [`SessionHandle`] for why this re-read is mandatory rather
+        // than an optimization we declined to make.
+        let (consumed, md5) = Self::read_and_hash(sftp, temp_path, "resume").await?;
+
+        // The stat and the re-read must agree, and neither may exceed what the
+        // session was opened for. A disagreement means the file is changing
+        // under us (another process resuming the same session, or a partial
+        // write still landing), and the whole point of re-hashing is that we do
+        // not paper over that with bookkeeping.
+        if attrs.len() != consumed || consumed > session.size {
+            tracing::warn!(
+                target: crate::TARGET,
+                path = %temp_path,
+                stat_len = attrs.len(),
+                read_len = consumed,
+                session_size = session.size,
+                "the temp file of a persisted resumable session is inconsistent; invalidating it"
+            );
+            return Ok(false);
+        }
+
+        let claim = claim_exact(&self.claims, dir_id, stored, &handle.name);
+        self.sessions.lock().insert(
+            session.url.clone(),
+            SessionState {
+                consumed,
+                md5,
+                temp_id: handle.temp_path.clone(),
+                _claim: claim,
+            },
+        );
+        Ok(true)
     }
 }
 
@@ -1496,22 +1854,254 @@ impl RemoteStore for SftpStore {
         .await
     }
 
+    /// Open a resumable upload: a temp file in the target's own remote
+    /// directory that chunks are appended to and that is renamed into place on
+    /// the final one.
+    ///
+    /// The whole handle - the temp file, the destination, the original name,
+    /// the MIME type and the identity stamp - is encoded into
+    /// [`ResumableSession::url`], which the executor persists, so a session
+    /// survives a process restart carrying everything needed to finish.
+    ///
+    /// This is a MUTATING operation (it creates the temp file and reserves the
+    /// destination name), so it proves the destination first, exactly like
+    /// [`Self::create`].
     async fn resumable_session(
         &self,
-        _kind: ResumableKind,
-        _mime: &str,
-        _size: u64,
+        kind: ResumableKind,
+        mime: &str,
+        size: u64,
     ) -> anyhow::Result<ResumableSession> {
-        Err(Self::not_yet_implemented("resumable_session"))
+        let channel = self.channel().await?;
+        let sftp = channel.sftp();
+        self.guard_root(sftp).await?;
+
+        let (dir_id, stored, original, mime, props, claim) = match &kind {
+            ResumableKind::Create {
+                parent_id,
+                name,
+                app_properties,
+            } => {
+                let dir_id = folder_prefix(parent_id);
+                self.ensure_dir(sftp, &dir_id).await?;
+                let (stored, claim) = self
+                    .resolve_stored_name(sftp, &dir_id, name, EntryKind::File)
+                    .await?;
+                (
+                    dir_id,
+                    stored,
+                    name.clone(),
+                    mime.to_string(),
+                    app_properties.clone(),
+                    claim,
+                )
+            }
+            ResumableKind::Update { file_id } => {
+                let dir_id = parent_of(file_id);
+                let stored = base_name(file_id).to_string();
+                if stored.is_empty() {
+                    anyhow::bail!("sftp.id_invalid: {file_id:?} does not name an object");
+                }
+                let dir_path = self.remote_path(&dir_id)?;
+                let _ = self.remote_path(file_id)?;
+                self.ensure_dir(sftp, &dir_id).await?;
+                // A resumable update rewrites the whole object, so the existing
+                // identity stamp has to be carried forward or it is lost - the
+                // original name, the MIME type and the properties alike. One
+                // read serves all three.
+                let existing = Self::read_sidecar(sftp, &dir_path, &stored).await?;
+                let original = existing
+                    .as_ref()
+                    .map(|s| s.name.clone())
+                    .unwrap_or_else(|| names::decode(&stored));
+                // A caller that only knows it is pushing bytes must not
+                // downgrade `text/markdown` to `application/octet-stream`.
+                let inherited = existing
+                    .as_ref()
+                    .and_then(|s| s.mime.clone())
+                    .unwrap_or_else(|| mime.to_string());
+                let props = existing.map(|s| s.props).unwrap_or_default();
+                // The caller carried the id, so it already owns this name;
+                // probing could hand it away while the upload is in flight.
+                let claim = claim_exact(&self.claims, &dir_id, &stored, &original);
+                (dir_id, stored, original, inherited, props, claim)
+            }
+        };
+
+        let handle = SessionHandle {
+            temp_path: join_id(&dir_id, &names::temp_name()),
+            rename_to: join_id(&dir_id, &stored),
+            size,
+            name: original,
+            mime,
+            props,
+        };
+        let url = encode_session_url(&handle)?;
+
+        // Create the temp file up front so `resume_chunk` only ever appends,
+        // and so an offset-0 chunk against a session whose temp was swept away
+        // is distinguishable from a fresh one.
+        let temp_path = self.remote_path(&handle.temp_path)?;
+        let mut file = sftp
+            .open_with_flags(
+                temp_path.clone(),
+                OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
+            )
+            .await
+            .map_err(|e| sftp_op_error(&format!("create {temp_path}"), e))?;
+        file.shutdown()
+            .await
+            .map_err(|e| sftp_io_error(&format!("close {temp_path}"), e))?;
+
+        self.sessions.lock().insert(
+            url.clone(),
+            SessionState {
+                consumed: 0,
+                md5: Md5::new(),
+                temp_id: handle.temp_path.clone(),
+                _claim: claim,
+            },
+        );
+        Ok(ResumableSession {
+            url,
+            issued_at: now_ms(),
+            size,
+            kind,
+        })
     }
 
+    /// Append one chunk to a resumable upload, committing on the final one.
+    ///
+    /// ## Resuming after a restart
+    ///
+    /// A session opened by a PREVIOUS process has no in-memory state, so the
+    /// temp file ON THE SERVER is the authority: it is stat-ed, re-read,
+    /// re-hashed, and its length becomes `received`. That is strictly better
+    /// than the rewind an HTTP backend needs - the executor replays only the
+    /// bytes that are genuinely missing - and it is safe precisely because the
+    /// digest comes from the bytes that ACTUALLY survived the crash rather than
+    /// from a remembered count. If the temp file is gone, or the stat and the
+    /// re-read disagree, the session is reported
+    /// [`ResumeProgress::SessionInvalid`] rather than guessed at.
+    ///
+    /// This relies on the executor treating `received` as AUTHORITATIVE in both
+    /// directions, not merely as a rewind signal. It does: `executor.rs`'s
+    /// `push_chunks` re-slices the body with `offset = received` on every
+    /// `InProgress`, so a `received` behind the executor's persisted
+    /// `acked_offset` simply replays the missing bytes.
+    ///
+    /// ## Completion
+    ///
+    /// The final chunk goes through [`Self::commit_object`] - the SAME
+    /// remove-then-rename, the SAME read-back verify and the SAME sidecar write
+    /// a plain `create` uses. A resumable upload is not a second, weaker write
+    /// path.
+    ///
+    /// Chunk sizes are unconstrained. The 256 KiB multiple rule in the trait
+    /// doc is a Drive protocol requirement with no analogue here.
     async fn resume_chunk(
         &self,
-        _session: &ResumableSession,
-        _offset: u64,
-        _chunk: Bytes,
+        session: &ResumableSession,
+        offset: u64,
+        chunk: Bytes,
     ) -> anyhow::Result<ResumeProgress> {
-        Err(Self::not_yet_implemented("resume_chunk"))
+        let channel = self.channel().await?;
+        let sftp = channel.sftp();
+        // Completing a session renames over the destination, so the marker
+        // check applies to every chunk - it is what proves the volume is still
+        // there, and caching it is exactly what must not happen.
+        self.guard_root(sftp).await?;
+
+        let handle = decode_session_url(&session.url)?;
+        let (temp_path, _target_path, dir_id, stored) = self.resolve_session(&handle)?;
+
+        let known = self.sessions.lock().contains_key(&session.url);
+        if !known
+            && !self
+                .hydrate_session(sftp, session, &handle, &temp_path, &dir_id, &stored)
+                .await?
+        {
+            return Ok(ResumeProgress::SessionInvalid);
+        }
+
+        // Refuse to write at the wrong offset rather than punch a hole in the
+        // middle of the object.
+        {
+            let sessions = self.sessions.lock();
+            let state = sessions
+                .get(&session.url)
+                .ok_or_else(|| anyhow::anyhow!("sftp.session_invalid: session state vanished"))?;
+            if offset != state.consumed {
+                return Ok(ResumeProgress::InProgress {
+                    received: state.consumed,
+                });
+            }
+        }
+        if offset.saturating_add(chunk.len() as u64) > session.size {
+            anyhow::bail!(
+                "sftp.session_overrun: chunk at {offset} (+{}) would push the upload past the \
+                 {} bytes the session was opened for",
+                chunk.len(),
+                session.size
+            );
+        }
+
+        if !chunk.is_empty() {
+            let mut file = sftp
+                .open_with_flags(temp_path.clone(), OpenFlags::WRITE)
+                .await
+                .map_err(|e| sftp_op_error(&format!("open {temp_path} to append"), e))?;
+            // Seek rather than rely on SSH_FXF_APPEND: `offset` has already
+            // been proven equal to the temp file's real length, so the write
+            // lands in exactly one place regardless of how a given server
+            // implements append.
+            file.seek(std::io::SeekFrom::Start(offset))
+                .await
+                .map_err(|e| sftp_io_error(&format!("seek {temp_path}"), e))?;
+            file.write_all(&chunk)
+                .await
+                .map_err(|e| sftp_io_error(&format!("append to {temp_path}"), e))?;
+            file.shutdown()
+                .await
+                .map_err(|e| sftp_io_error(&format!("close {temp_path}"), e))?;
+
+            let mut sessions = self.sessions.lock();
+            let state = sessions
+                .get_mut(&session.url)
+                .ok_or_else(|| anyhow::anyhow!("sftp.session_invalid: session state vanished"))?;
+            state.md5.update(&chunk);
+            state.consumed += chunk.len() as u64;
+        }
+
+        let (consumed, expected) = {
+            let sessions = self.sessions.lock();
+            let state = sessions
+                .get(&session.url)
+                .ok_or_else(|| anyhow::anyhow!("sftp.session_invalid: session state vanished"))?;
+            let digest: [u8; 16] = state.md5.clone().finalize().into();
+            (state.consumed, digest)
+        };
+        if consumed < session.size {
+            return Ok(ResumeProgress::InProgress { received: consumed });
+        }
+
+        let entry = self
+            .commit_object(
+                sftp,
+                &dir_id,
+                &stored,
+                &handle.name,
+                &handle.mime,
+                handle.props.clone(),
+                &temp_path,
+                expected,
+                matches!(session.kind, ResumableKind::Create { .. }),
+            )
+            .await;
+        // The destination-name claim is released with the session state,
+        // whatever the outcome.
+        self.sessions.lock().remove(&session.url);
+        Ok(ResumeProgress::Completed(entry?))
     }
 
     /// SSH has NO trash: this permanently deletes the object, exactly like
@@ -1597,16 +2187,120 @@ impl RemoteStore for SftpStore {
         }))
     }
 
+    /// Every LIVE object id belonging to `source_id`.
+    ///
+    /// Walks the destination subtree once and joins each directory's sidecars
+    /// onto its data entries. An annotated object whose DATA file is gone is
+    /// excluded, which is the point: the caller heals `recorded - live`, so a
+    /// deleted file must read as dead and be re-uploaded, and a dangling
+    /// sidecar must not make it look alive. Folders are excluded too - they
+    /// carry no `driven.source_id` and are not objects the audit owns.
+    ///
+    /// # Completeness
+    ///
+    /// Every enumeration failure propagates, INCLUDING a directory that is not
+    /// there. This never returns a partial set: a truncated answer reads as a
+    /// mass deletion and churns the whole source. See [`Self::walk_tree`],
+    /// which is where that rule lives and where it deliberately diverges from
+    /// [`Self::live_annotated_files`].
+    ///
+    /// Not marker-gated, for the reason in [`Self::guard_root`]: this is a
+    /// read, and a read cannot destroy anything.
     async fn list_source_object_ids(
         &self,
-        _source_id: &str,
+        source_id: &str,
         _drive_context: &DriveContext,
     ) -> anyhow::Result<HashSet<String>> {
-        Err(Self::not_yet_implemented("list_source_object_ids"))
+        let channel = self.channel().await?;
+        let sftp = channel.sftp();
+        let mut out = HashSet::new();
+        for (dir_id, entries) in self.walk_tree(sftp).await? {
+            let dir_path = self.remote_path(&dir_id)?;
+            for (sidecar, _) in Self::annotated_from_entries(sftp, &dir_path, &entries).await? {
+                if sidecar
+                    .props
+                    .get(driven_remote::props::SOURCE_ID_KEY)
+                    .is_some_and(|v| v == source_id)
+                {
+                    out.insert(join_id(&dir_id, &sidecar.stored));
+                }
+            }
+        }
+        Ok(out)
     }
 
+    /// Capacity of the remote FILESYSTEM, plus what Driven's tree occupies.
+    ///
+    /// `limit` and `usage` come from the `statvfs@openssh.com` extension when
+    /// the server offers it, because - unlike an object store - an SFTP
+    /// destination has a hard ceiling the user cares about, and the number that
+    /// predicts running out of room is what is consumed on the volume by
+    /// ANYTHING, not just by Driven. `usage_in_drive` is Driven's own footprint.
+    /// `usage_in_drive_trash` is always 0: SSH has no trash.
+    ///
+    /// A server that does not advertise the extension yields `limit: None`
+    /// (unknown) rather than a guess; plenty do not, including embedded NAS
+    /// firmware and restricted `internal-sftp` builds. A server that advertises
+    /// it and then FAILS the request degrades the same way, with a warning: a
+    /// quota display is not worth failing an operation over, and the caller
+    /// already handles an unknown limit.
+    ///
+    /// Costs one `readdir` per directory in the destination. That is the same
+    /// shape the local-folder backend pays, but each one is a round trip here,
+    /// so this is a "show the user a number" call and not something to put on a
+    /// hot path.
     async fn about(&self) -> anyhow::Result<AboutInfo> {
-        Err(Self::not_yet_implemented("about"))
+        let channel = self.channel().await?;
+        let sftp = channel.sftp();
+
+        let mut used_by_driven: u64 = 0;
+        for (_, entries) in self.walk_tree(sftp).await? {
+            for (name, attrs) in entries {
+                if attrs.is_dir() || names::is_reserved_control_name(&name) {
+                    continue;
+                }
+                used_by_driven = used_by_driven.saturating_add(attrs.len());
+            }
+        }
+
+        let vfs = match sftp.fs_info(self.root.clone()).await {
+            Ok(vfs) => vfs,
+            Err(error) => {
+                tracing::warn!(
+                    target: crate::TARGET,
+                    %error,
+                    root = %self.root,
+                    "the server advertises statvfs@openssh.com but refused the request; \
+                     reporting an unknown quota rather than failing the call"
+                );
+                None
+            }
+        };
+
+        let (limit, usage) = match vfs {
+            Some(vfs) => {
+                // POSIX: sizes are in units of `f_frsize`, with `f_bsize` as
+                // the fallback for a server that reports 0 for it.
+                let unit = if vfs.fragment_size == 0 {
+                    vfs.block_size
+                } else {
+                    vfs.fragment_size
+                };
+                let total = vfs.blocks.saturating_mul(unit);
+                // `blocks_avail`, not `blocks_free`: the reserve a filesystem
+                // keeps for root is not room Driven can actually use.
+                let available = vfs.blocks_avail.saturating_mul(unit);
+                (Some(total), total.saturating_sub(available))
+            }
+            None => (None, used_by_driven),
+        };
+
+        Ok(AboutInfo {
+            limit,
+            usage,
+            usage_in_drive: used_by_driven,
+            usage_in_drive_trash: 0,
+        })
     }
 }
 
@@ -1631,6 +2325,27 @@ mod tests {
         )
         .unwrap();
         destination_id
+    }
+
+    /// The destination id already recorded in `root`'s marker, so a SECOND
+    /// store can be built against the same destination without re-seeding it
+    /// under a new id.
+    fn read_destination_id(root: &std::path::Path) -> String {
+        let raw = std::fs::read(root.join(names::MARKER_FILE)).expect("the marker is there");
+        let marker: crate::config::DestinationMarker =
+            serde_json::from_slice(&raw).expect("the marker parses");
+        marker.destination_id
+    }
+
+    /// Backdate `path`'s mtime well past the sweep window.
+    fn age_file(path: &std::path::Path) {
+        let old = SystemTime::now() - TMP_SWEEP_AGE - std::time::Duration::from_secs(60 * 60);
+        std::fs::File::options()
+            .write(true)
+            .open(path)
+            .expect("open to backdate")
+            .set_modified(old)
+            .expect("backdate");
     }
 
     fn store_for(server: &TestSftpServer) -> SftpStore {
@@ -2661,38 +3376,722 @@ mod tests {
         assert_eq!(download_to_vec(&store, &entry.id).await, b"two");
     }
 
+    // -- resumable uploads ---------------------------------------------------
+
+    #[test]
+    fn session_urls_round_trip_and_a_foreign_one_is_refused() {
+        let handle = SessionHandle {
+            temp_path: "Docs/.driven-tmp-abc".to_string(),
+            rename_to: "Docs/notes.md".to_string(),
+            size: 42,
+            name: "notes.md".to_string(),
+            mime: "text/markdown".to_string(),
+            props: props(&[("driven.source_id", "src-1")]),
+        };
+        let url = encode_session_url(&handle).unwrap();
+        assert!(url.starts_with(SESSION_URL_SCHEME), "{url}");
+        // Opaque: base64, so the handle can never be mistaken for a real URL
+        // and cannot smuggle a `"` through the executor's JSON payload column.
+        assert!(!url.contains('{'), "{url}");
+        assert_eq!(decode_session_url(&url).unwrap(), handle);
+
+        assert!(decode_session_url("https://drive.example/upload/1").is_err());
+        assert!(decode_session_url("driven-sftp:!!!not-base64").is_err());
+        assert!(decode_session_url("driven-sftp:").is_err());
+    }
+
     #[tokio::test]
-    async fn the_methods_the_next_slice_owns_fail_loudly_rather_than_inventing_an_answer() {
-        // `list_source_object_ids` in particular: the trait spells out that an
-        // empty answer is NOT a safe degradation - the caller reads it as a
-        // mass deletion and re-uploads the whole source.
+    async fn a_chunked_upload_resumes_across_a_process_restart() {
         let server = TestSftpServer::spawn().await.unwrap();
         let store = store_for(&server);
+        let payload: Vec<u8> = (0..300_000u32).map(|i| (i % 251) as u8).collect();
+
+        let session = store
+            .resumable_session(
+                ResumableKind::Create {
+                    parent_id: "Docs/".to_string(),
+                    name: "big.bin".to_string(),
+                    app_properties: props(&[(driven_remote::props::SOURCE_ID_KEY, "src-1")]),
+                },
+                "application/octet-stream",
+                payload.len() as u64,
+            )
+            .await
+            .expect("open a resumable session");
+        assert!(
+            session.url.starts_with(SESSION_URL_SCHEME),
+            "{}",
+            session.url
+        );
+
+        match store
+            .resume_chunk(&session, 0, Bytes::from(payload[..100_000].to_vec()))
+            .await
+            .expect("first chunk")
+        {
+            ResumeProgress::InProgress { received } => assert_eq!(received, 100_000),
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+
+        // The executor persists the session in `pending_ops.payload_json` and
+        // reloads it after a restart; go through that exact round trip rather
+        // than reusing the in-memory value.
+        let persisted = serde_json::to_string(&session).expect("persist");
+        drop(store);
+        let restarted = SftpStore::new(
+            &{
+                let mut config = server.pinned_config(SftpAuthKind::Password);
+                config.destination_id = Some(read_destination_id(server.root()));
+                config
+            },
+            &server.password_credential(),
+        )
+        .expect("a second store, as after a restart");
+        let session: ResumableSession = serde_json::from_str(&persisted).expect("reload");
+
+        let entry = match restarted
+            .resume_chunk(&session, 100_000, Bytes::from(payload[100_000..].to_vec()))
+            .await
+            .expect("final chunk")
+        {
+            ResumeProgress::Completed(entry) => entry,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+
+        assert_eq!(entry.name, "big.bin");
+        assert_eq!(entry.id, "Docs/big.bin");
+        assert_eq!(entry.size, Some(payload.len() as u64));
+        assert_eq!(
+            entry.md5,
+            Some(digest(&payload)),
+            "the digest must be the one read BACK off the server"
+        );
+        assert_eq!(
+            entry
+                .app_properties
+                .get(driven_remote::props::SOURCE_ID_KEY),
+            Some(&"src-1".to_string()),
+            "the identity stamp lands with the object"
+        );
+        assert_eq!(download_to_vec(&restarted, &entry.id).await, payload);
+
+        // The temp file is consumed by the rename, not left behind.
+        let leftovers: Vec<String> = std::fs::read_dir(server.root().join("Docs"))
+            .unwrap()
+            .map(|e| e.unwrap().file_name().to_string_lossy().into_owned())
+            .filter(|n| n.starts_with(names::TMP_PREFIX))
+            .collect();
+        assert!(leftovers.is_empty(), "{leftovers:?}");
+    }
+
+    #[tokio::test]
+    async fn a_resumable_update_rewrites_in_place_and_carries_the_identity_stamp_forward() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+
+        let created = store
+            .create(
+                "",
+                "notes.md",
+                "text/markdown",
+                body(b"before"),
+                props(&[
+                    (driven_remote::props::SOURCE_ID_KEY, "src-1"),
+                    ("driven.relative_path_hash", "abc"),
+                ]),
+            )
+            .await
+            .expect("create");
+
+        let session = store
+            .resumable_session(
+                ResumableKind::Update {
+                    file_id: created.id.clone(),
+                },
+                "application/octet-stream",
+                5,
+            )
+            .await
+            .expect("open a resumable update");
+
+        let entry = match store
+            .resume_chunk(&session, 0, Bytes::from_static(b"after"))
+            .await
+            .expect("only chunk")
+        {
+            ResumeProgress::Completed(entry) => entry,
+            other => panic!("expected Completed, got {other:?}"),
+        };
+
+        assert_eq!(entry.id, created.id, "an update lands on the same object");
+        assert_eq!(
+            entry.name, "notes.md",
+            "the original name is carried forward"
+        );
+        assert_eq!(
+            entry.mime_type, "text/markdown",
+            "the MIME type the object was created with survives a resumable update"
+        );
+        assert_eq!(entry.md5, Some(digest(b"after")));
+        assert_eq!(
+            entry.app_properties.get("driven.relative_path_hash"),
+            Some(&"abc".to_string()),
+            "a resumable update must not drop the identity stamp"
+        );
+        assert_eq!(download_to_vec(&store, &entry.id).await, b"after");
+    }
+
+    #[tokio::test]
+    async fn a_session_whose_temp_file_is_gone_is_reported_invalid_rather_than_guessed_at() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+
+        let session = store
+            .resumable_session(
+                ResumableKind::Create {
+                    parent_id: "".to_string(),
+                    name: "gone.bin".to_string(),
+                    app_properties: HashMap::new(),
+                },
+                "application/octet-stream",
+                8,
+            )
+            .await
+            .expect("open a resumable session");
+
+        let handle = decode_session_url(&session.url).unwrap();
+        std::fs::remove_file(server.root().join(&handle.temp_path)).expect("drop the temp file");
+
+        // A store that never opened the session has to hydrate from the remote,
+        // which is where the missing temp is discovered.
+        let restarted = SftpStore::new(store.config(), &server.password_credential()).unwrap();
+        assert!(
+            matches!(
+                restarted
+                    .resume_chunk(&session, 0, Bytes::from_static(b"12345678"))
+                    .await
+                    .expect("a dead session is an ANSWER, not an error"),
+                ResumeProgress::SessionInvalid
+            ),
+            "a vanished temp file must invalidate the session, not silently restart it"
+        );
+        assert!(
+            !server.root().join("gone.bin").exists(),
+            "nothing may be committed for an invalid session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_session_handle_from_a_tampered_state_db_cannot_write_outside_the_root() {
+        // `ResumableSession.url` round-trips through `pending_ops.payload_json`,
+        // i.e. through a SQLite file on the user's disk. Every path in it is
+        // re-validated on the way back in - the handle is not trusted just
+        // because this backend minted its predecessor.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+
+        let real = store
+            .resumable_session(
+                ResumableKind::Create {
+                    parent_id: "".to_string(),
+                    name: "ok.bin".to_string(),
+                    app_properties: HashMap::new(),
+                },
+                "application/octet-stream",
+                4,
+            )
+            .await
+            .expect("open a resumable session");
+
+        for tamper in [
+            SessionHandle {
+                temp_path: "../../escape/.driven-tmp-x".to_string(),
+                ..decode_session_url(&real.url).unwrap()
+            },
+            SessionHandle {
+                rename_to: "../escape.txt".to_string(),
+                ..decode_session_url(&real.url).unwrap()
+            },
+        ] {
+            let forged = ResumableSession {
+                url: encode_session_url(&tamper).unwrap(),
+                issued_at: real.issued_at,
+                size: real.size,
+                kind: ResumableKind::Create {
+                    parent_id: String::new(),
+                    name: "ok.bin".to_string(),
+                    app_properties: HashMap::new(),
+                },
+            };
+            let error = store
+                .resume_chunk(&forged, 0, Bytes::from_static(b"evil"))
+                .await
+                .expect_err("a tampered handle must be refused");
+            assert!(
+                format!("{error:?}").contains("sftp.id_invalid"),
+                "{error:?}"
+            );
+        }
+    }
+
+    #[tokio::test]
+    async fn a_chunk_at_the_wrong_offset_reports_what_the_server_actually_holds() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+
+        let session = store
+            .resumable_session(
+                ResumableKind::Create {
+                    parent_id: "".to_string(),
+                    name: "seq.bin".to_string(),
+                    app_properties: HashMap::new(),
+                },
+                "application/octet-stream",
+                6,
+            )
+            .await
+            .unwrap();
+
+        store
+            .resume_chunk(&session, 0, Bytes::from_static(b"abc"))
+            .await
+            .unwrap();
+
+        // A replay of the FIRST chunk must not punch a hole or double-write; it
+        // reports the true watermark so the executor re-slices from there.
+        match store
+            .resume_chunk(&session, 0, Bytes::from_static(b"abc"))
+            .await
+            .unwrap()
+        {
+            ResumeProgress::InProgress { received } => assert_eq!(received, 3),
+            other => panic!("expected InProgress, got {other:?}"),
+        }
+
+        match store
+            .resume_chunk(&session, 3, Bytes::from_static(b"def"))
+            .await
+            .unwrap()
+        {
+            ResumeProgress::Completed(entry) => {
+                assert_eq!(entry.md5, Some(digest(b"abcdef")));
+                assert_eq!(download_to_vec(&store, &entry.id).await, b"abcdef");
+            }
+            other => panic!("expected Completed, got {other:?}"),
+        }
+    }
+
+    // -- the read-back verify ------------------------------------------------
+
+    #[tokio::test]
+    async fn a_create_whose_bytes_are_corrupted_after_the_rename_fails_the_read_back_verify() {
+        // The integrity protocol's step 4. Without a real corruption in the
+        // window between the rename and the verify, an implementation that
+        // returned its OWN in-memory digest would pass every other test in this
+        // file - the executor's check would be `x == x`. This is the test that
+        // makes the re-read load-bearing.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        server.corrupt_committed_bytes_after_rename(true);
+
+        let error = store
+            .create(
+                "",
+                "report.txt",
+                "text/plain",
+                body(b"the original bytes"),
+                HashMap::new(),
+            )
+            .await
+            .expect_err("a corrupted object must never be reported as created");
+
+        let stranded = error
+            .downcast_ref::<DriveError>()
+            .and_then(|e| match e {
+                DriveError::ChecksumMismatch { stranded_file_id } => Some(stranded_file_id.clone()),
+                _ => None,
+            })
+            .unwrap_or_else(|| panic!("expected a ChecksumMismatch, got {error:?}"));
+        assert_eq!(
+            stranded, None,
+            "a failed CREATE cleans up after itself, so nothing is stranded"
+        );
+        assert!(
+            !server.root().join("report.txt").exists(),
+            "the corrupt object must be removed, not left looking like a good backup"
+        );
+
+        // And with the fault off, the very same call succeeds - so the failure
+        // above is the corruption, not a broken fixture.
+        server.corrupt_committed_bytes_after_rename(false);
+        let entry = store
+            .create(
+                "",
+                "report.txt",
+                "text/plain",
+                body(b"the original bytes"),
+                HashMap::new(),
+            )
+            .await
+            .expect("an uncorrupted create still works");
+        assert_eq!(entry.md5, Some(digest(b"the original bytes")));
+    }
+
+    #[tokio::test]
+    async fn a_resumable_completion_runs_the_same_read_back_verify_as_a_create() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+
+        let session = store
+            .resumable_session(
+                ResumableKind::Create {
+                    parent_id: "".to_string(),
+                    name: "chunked.bin".to_string(),
+                    app_properties: HashMap::new(),
+                },
+                "application/octet-stream",
+                4,
+            )
+            .await
+            .unwrap();
+
+        server.corrupt_committed_bytes_after_rename(true);
+        let error = store
+            .resume_chunk(&session, 0, Bytes::from_static(b"data"))
+            .await
+            .expect_err("the resumable commit must verify exactly as `create` does");
+        assert!(
+            matches!(
+                error.downcast_ref::<DriveError>(),
+                Some(DriveError::ChecksumMismatch { .. })
+            ),
+            "{error:?}"
+        );
+        assert!(
+            !server.root().join("chunked.bin").exists(),
+            "{:?}",
+            std::fs::read_dir(server.root())
+                .unwrap()
+                .map(|e| e.unwrap().file_name())
+                .collect::<Vec<_>>()
+        );
+    }
+
+    // -- the abandoned-temp sweep --------------------------------------------
+
+    #[tokio::test]
+    async fn a_store_sweeps_abandoned_temp_files_on_its_first_connection() {
+        // The trigger, pinned on its own: `LocalFsStore` sweeps in `new()`,
+        // which this store cannot do because constructing it must not require
+        // the server to be awake. The first successful connection is the
+        // equivalent moment, and nothing else in the suite would notice if it
+        // stopped firing.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let abandoned = server.root().join(".driven-tmp-from-a-dead-process");
+        std::fs::write(&abandoned, b"half an upload").unwrap();
+        age_file(&abandoned);
+
+        let store = store_for(&server);
+        assert!(
+            abandoned.exists(),
+            "a store that has not connected yet must not have touched the server"
+        );
+
+        store
+            .list_folder("", &DriveContext::MyDrive)
+            .await
+            .expect("any operation connects");
+        assert!(
+            !abandoned.exists(),
+            "the first connection sweeps abandoned temp files"
+        );
+    }
+
+    #[tokio::test]
+    async fn the_sweep_collects_abandoned_temp_files_and_spares_fresh_and_live_ones() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        // Connect first, so the automatic first-connection sweep runs against
+        // an empty tree and this test measures the explicit sweep alone.
+        store.list_folder("", &DriveContext::MyDrive).await.unwrap();
+        std::fs::create_dir(server.root().join("Docs")).unwrap();
+
+        // An abandoned temp from a long-dead process, nested so the sweep has
+        // to recurse to find it.
+        let abandoned = server.root().join("Docs").join(".driven-tmp-abandoned");
+        std::fs::write(&abandoned, b"half an upload").unwrap();
+        age_file(&abandoned);
+
+        // A temp from a write that is in flight right now.
+        let fresh = server.root().join(".driven-tmp-fresh");
+        std::fs::write(&fresh, b"in flight").unwrap();
+
+        // And the temp of a LIVE resumable session, aged past the threshold so
+        // only the live-session check can save it.
+        let session = store
+            .resumable_session(
+                ResumableKind::Create {
+                    parent_id: "".to_string(),
+                    name: "live.bin".to_string(),
+                    app_properties: HashMap::new(),
+                },
+                "application/octet-stream",
+                4,
+            )
+            .await
+            .unwrap();
+        let live = server
+            .root()
+            .join(&decode_session_url(&session.url).unwrap().temp_path);
+        age_file(&live);
+
+        let removed = store
+            .sweep_abandoned_temp_files()
+            .await
+            .expect("the sweep runs");
+
+        assert_eq!(removed, 1, "exactly the abandoned temp is collected");
+        assert!(!abandoned.exists(), "an abandoned temp must be collected");
+        assert!(
+            fresh.exists(),
+            "a temp younger than the window must survive"
+        );
+        assert!(
+            live.exists(),
+            "the temp of a LIVE session must never be collected, whatever its age"
+        );
+
+        // The live session still completes - the sweep did not disturb it.
+        assert!(matches!(
+            store
+                .resume_chunk(&session, 0, Bytes::from_static(b"data"))
+                .await
+                .unwrap(),
+            ResumeProgress::Completed(_)
+        ));
+    }
+
+    // -- source listing ------------------------------------------------------
+
+    #[tokio::test]
+    async fn list_source_object_ids_reports_the_exact_live_set_across_the_whole_subtree() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+
+        let nested = store
+            .ensure_folder("", "Docs", &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        let deeper = store
+            .ensure_folder(&nested.id, "2026", &DriveContext::MyDrive)
+            .await
+            .unwrap();
+
+        let a = store
+            .create(
+                "",
+                "root.txt",
+                "text/plain",
+                body(b"a"),
+                props(&[(driven_remote::props::SOURCE_ID_KEY, "src-1")]),
+            )
+            .await
+            .unwrap();
+        let b = store
+            .create(
+                &nested.id,
+                "mid.txt",
+                "text/plain",
+                body(b"b"),
+                props(&[(driven_remote::props::SOURCE_ID_KEY, "src-1")]),
+            )
+            .await
+            .unwrap();
+        let c = store
+            .create(
+                &deeper.id,
+                "deep.txt",
+                "text/plain",
+                body(b"c"),
+                props(&[(driven_remote::props::SOURCE_ID_KEY, "src-1")]),
+            )
+            .await
+            .unwrap();
+        // A different source, and an unstamped object: neither belongs to the
+        // set, and including either would make the audit trash a live file.
+        store
+            .create(
+                &nested.id,
+                "other.txt",
+                "text/plain",
+                body(b"d"),
+                props(&[(driven_remote::props::SOURCE_ID_KEY, "src-2")]),
+            )
+            .await
+            .unwrap();
+        store
+            .create(
+                "",
+                "unstamped.txt",
+                "text/plain",
+                body(b"e"),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        // An object whose DATA file is gone but whose sidecar remains must read
+        // as DEAD, or the audit never re-uploads it.
+        let dangling = store
+            .create(
+                "",
+                "vanished.txt",
+                "text/plain",
+                body(b"f"),
+                props(&[(driven_remote::props::SOURCE_ID_KEY, "src-1")]),
+            )
+            .await
+            .unwrap();
+        std::fs::remove_file(server.root().join(&dangling.id)).unwrap();
+
+        let live = store
+            .list_source_object_ids("src-1", &DriveContext::MyDrive)
+            .await
+            .expect("the walk succeeds");
+
+        assert_eq!(
+            live,
+            HashSet::from([a.id.clone(), b.id.clone(), c.id.clone()]),
+            "folders, other sources, unstamped objects and dangling sidecars are all excluded"
+        );
+    }
+
+    #[tokio::test]
+    async fn list_source_object_ids_fails_rather_than_reporting_an_empty_source() {
+        // The completeness invariant, and the one place this store must NOT
+        // reuse `live_annotated_files`' missing-directory-is-empty mapping: an
+        // empty answer reads as a mass deletion and the caller heals it by
+        // re-uploading the entire source.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let mut config = server.pinned_config(SftpAuthKind::Password);
+        config.root_path = "/not-a-real-directory".to_string();
+        let store = SftpStore::new(&config, &server.password_credential()).unwrap();
 
         let error = store
             .list_source_object_ids("src-1", &DriveContext::MyDrive)
             .await
-            .expect_err("an empty live set would read as a mass deletion");
-        assert!(
-            format!("{error:?}").contains("sftp.unimplemented"),
-            "{error:?}"
-        );
-        assert_eq!(
-            driven_remote::classification_of(&error),
-            Some(DriveErrorClassification::Other),
-            "fatal for this op, never a silent success"
-        );
+            .expect_err("an unreachable subtree must never read as an empty one");
+        assert!(format!("{error:?}").contains("list "), "{error:?}");
 
-        assert!(store.about().await.is_err());
-        assert!(store
-            .resumable_session(
-                ResumableKind::Update {
-                    file_id: "a.txt".to_string()
-                },
+        assert!(
+            store.about().await.is_err(),
+            "the same walk backs about(), and the same rule applies"
+        );
+    }
+
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_readdir_failure_part_way_through_the_walk_is_an_error_not_a_short_answer() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        let folder = store
+            .ensure_folder("", "Locked", &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        store
+            .create(
+                &folder.id,
+                "inside.txt",
                 "text/plain",
-                1,
+                body(b"x"),
+                props(&[(driven_remote::props::SOURCE_ID_KEY, "src-1")]),
             )
             .await
-            .is_err());
+            .unwrap();
+
+        let locked = server.root().join("Locked");
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o000)).unwrap();
+        let readable_anyway = std::fs::read_dir(&locked).is_ok();
+        let result = store
+            .list_source_object_ids("src-1", &DriveContext::MyDrive)
+            .await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if readable_anyway {
+            // Running as root: the mode bits do not bite, so there is no fault
+            // to observe. Say so rather than assert something vacuous.
+            eprintln!("skipped: this process can read a mode-000 directory (running as root?)");
+            return;
+        }
+        let error = result.expect_err("a directory the walk cannot read must fail the whole call");
+        assert!(format!("{error:?}").contains("list "), "{error:?}");
+    }
+
+    // -- quota ---------------------------------------------------------------
+
+    #[tokio::test]
+    async fn about_reports_the_servers_own_quota_when_it_offers_statvfs() {
+        use crate::test_support::TEST_STATVFS;
+
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        store
+            .create(
+                "",
+                "a.txt",
+                "text/plain",
+                body(b"0123456789"),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let about = store.about().await.expect("about");
+        let frag = TEST_STATVFS.fragment_size;
+        assert_eq!(
+            about.limit,
+            Some(TEST_STATVFS.blocks * frag),
+            "the limit is the filesystem's real size"
+        );
+        assert_eq!(
+            about.usage,
+            TEST_STATVFS.blocks * frag - TEST_STATVFS.blocks_avail * frag,
+            "usage is what is consumed on the volume, by anything - the number \
+             that predicts running out of room"
+        );
+        assert_eq!(
+            about.usage_in_drive, 10,
+            "usage_in_drive is Driven's own footprint, excluding its control files"
+        );
+        assert_eq!(about.usage_in_drive_trash, 0, "SSH has no trash");
+    }
+
+    #[tokio::test]
+    async fn about_reports_an_unknown_quota_when_the_server_has_no_statvfs() {
+        let server = TestSftpServer::spawn_without_statvfs().await.unwrap();
+        let store = store_for(&server);
+        store
+            .create(
+                "",
+                "a.txt",
+                "text/plain",
+                body(b"0123456789"),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        let about = store.about().await.expect("about");
+        assert_eq!(
+            about.limit, None,
+            "an unknown ceiling is reported as unknown, never guessed"
+        );
+        assert_eq!(
+            about.usage, 10,
+            "with no volume figure the only honest usage is Driven's own"
+        );
+        assert_eq!(about.usage_in_drive, 10);
     }
 }
