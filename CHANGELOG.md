@@ -5,6 +5,21 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.9.0](https://github.com/pmaxhogan/driven/compare/v2.8.0...v2.9.0) (2026-08-03)
+
+
+### Features
+
+* **cli:** headless restore engine, driven-cli restore, chaos restore coverage ([#243](https://github.com/pmaxhogan/driven/issues/243)) ([0e10e56](https://github.com/pmaxhogan/driven/commit/0e10e56939a7cba27c4d4767217a41429af58fae))
+* **core:** SSH (SFTP) backup destination ([#260](https://github.com/pmaxhogan/driven/issues/260)) ([9e41b62](https://github.com/pmaxhogan/driven/commit/9e41b626fc66908c518996c1bae3d73d80109cf4))
+* **e2e:** containerized WebDriver harness driving the real app, gating releases ([#247](https://github.com/pmaxhogan/driven/issues/247)) ([ebf13c3](https://github.com/pmaxhogan/driven/commit/ebf13c3390587d0025850c76a81ae326ac1279f5))
+* **ui:** scripted IPC mock + Playwright visual regression suite ([#244](https://github.com/pmaxhogan/driven/issues/244)) ([8d09d3d](https://github.com/pmaxhogan/driven/commit/8d09d3d7f911fec151aa2570bab3880f0465f748))
+
+
+### Bug Fixes
+
+* keychain operations panic on Linux inside the async runtime ([#242](https://github.com/pmaxhogan/driven/issues/242)) ([7df0102](https://github.com/pmaxhogan/driven/commit/7df01028fa1ebc059381175f524429547e1e1a00))
+
 ## [2.8.0](https://github.com/pmaxhogan/driven/compare/v2.7.0...v2.8.0) (2026-08-02)
 
 
