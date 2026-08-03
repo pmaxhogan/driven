@@ -22,7 +22,7 @@ reqwest = { workspace = true, features = ["json"] }
 serde.workspace = true
 serde_json.workspace = true
 tempfile = "3"
-thirtyfour = "0.36"
+thirtyfour = "0.37"
 tokio.workspace = true
 tracing.workspace = true
 tracing-subscriber.workspace = true

@@ -7900,9 +7900,9 @@ checksum = "b0f7e269b48f0a7dd0146680fa24b50cc67fc0373f086a5b2f99bd084639b482"
 
 [[package]]
 name = "thirtyfour"
-version = "0.36.3"
+version = "0.37.4"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "801f15adc5e2882c13b36d48003e5512b017e7b89ebf5fb35d59074a261e6afb"
+checksum = "7cde234b9eff7d8f7e05e8af9de9c315f4500512a0a52535d7c6140bd2c54b7c"
 dependencies = [
  "arc-swap",
  "async-trait",
@@ -7926,6 +7926,7 @@ dependencies = [
  "thirtyfour-macros",
  "thiserror 2.0.19",
  "tokio",
+ "tokio-stream",
  "tracing",
  "url",
  "zip 8.6.0",
@@ -7933,9 +7934,9 @@ dependencies = [
 
 [[package]]
 name = "thirtyfour-macros"
-version = "0.2.0"
+version = "0.3.0"
 source = "registry+https://github.com/rust-lang/crates.io-index"
-checksum = "5cf0ffc3ba4368e99597bd6afd83f4ff6febad66d9ae541ab46e697d32285fc0"
+checksum = "d712d0fd1988fb67a3fd89d10ead116544448bad01e43d326bd64dd8e09b5ea4"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -8116,6 +8117,7 @@ dependencies = [
  "futures-core",
  "pin-project-lite",
  "tokio",
+ "tokio-util",
 ]
 
 [[package]]
