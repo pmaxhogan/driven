@@ -663,6 +663,106 @@ pub struct SettingsDto {
     /// Scheduled integrity-scrub settings. Standalone KV keys, like
     /// [`Self::bundle_small_files`], because `driven-core` re-reads them per run.
     pub scrub: ScrubSettings,
+    /// Scheduled restore-drill settings. Standalone KV keys, for the same
+    /// reason [`Self::scrub`] is.
+    pub drill: DrillSettings,
+}
+
+/// Scheduled restore-drill settings (`driven_core::drill`).
+///
+/// Three standalone settings KV keys rather than a SPEC s22 group blob, for the
+/// same reason the scrub's are: the core reads them directly and re-reads them
+/// per run, so a change applies on the next cycle with no orchestrator
+/// reconfigure.
+#[derive(Debug, Clone, Copy, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrillSettings {
+    /// Master on/off. Ships `true` - see the migration's rationale.
+    pub enabled: bool,
+    /// Seconds between drills for one source (default monthly). Deliberately
+    /// slower than the scrub: a drill spends real download bandwidth.
+    pub interval_secs: u32,
+    /// How many files one drill restores end to end (default 3).
+    pub sample_size: u32,
+}
+
+impl From<driven_core::drill::DrillConfig> for DrillSettings {
+    fn from(c: driven_core::drill::DrillConfig) -> Self {
+        DrillSettings {
+            enabled: c.enabled,
+            interval_secs: c.interval_secs,
+            sample_size: c.sample_size,
+        }
+    }
+}
+
+/// One failure code from a drill run, with how many of the run's files hit it.
+///
+/// A struct rather than the core's `(String, u64)` tuple so the TypeScript side
+/// reads `{ code, count }` instead of a positional array. `code` is a stable
+/// SPEC s24 dotted code from a closed vocabulary, so this carries no user data.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrillFailureCodeDto {
+    /// The stable SPEC s24 code, e.g. `crypto.decrypt_failed`.
+    pub code: String,
+    /// How many of the run's failures carried it.
+    pub count: u64,
+}
+
+/// One persisted restore-drill run, as rendered by the UI history panel and
+/// `driven-cli drill`.
+///
+/// COUNTS plus stable SPEC s24 error CODES. There is deliberately no path,
+/// remote id, or filename on this DTO - a drill report can therefore never
+/// carry an encrypted source's filename across the IPC boundary.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrillRunDto {
+    /// Row id.
+    pub id: i64,
+    /// Which source this run drilled.
+    pub source_id: String,
+    /// Unix epoch ms the run began.
+    pub started_at: i64,
+    /// Unix epoch ms the run ended.
+    pub finished_at: i64,
+    /// Files selected for this drill.
+    pub sampled: u64,
+    /// Files restored AND verified against the recorded plaintext hash.
+    pub verified: u64,
+    /// Files not attempted for a benign reason (an unavailable key, a file
+    /// deleted between the sample and the restore).
+    pub skipped: u64,
+    /// Files that could not be restored, or whose bytes did not verify.
+    pub failed: u64,
+    /// The failure breakdown, sorted by code.
+    pub failure_codes: Vec<DrillFailureCodeDto>,
+    /// `passed` | `failed` | `inconclusive`. `inconclusive` means nothing was
+    /// actually verified, which must never render as a pass.
+    pub outcome: String,
+}
+
+impl From<driven_core::state::DrillRunRow> for DrillRunDto {
+    fn from(r: driven_core::state::DrillRunRow) -> Self {
+        DrillRunDto {
+            id: r.id,
+            source_id: r.source_id.to_string(),
+            started_at: r.started_at,
+            finished_at: r.finished_at,
+            sampled: r.report.sampled,
+            verified: r.report.verified,
+            skipped: r.report.skipped,
+            failed: r.report.failed,
+            failure_codes: r
+                .report
+                .failure_codes
+                .into_iter()
+                .map(|(code, count)| DrillFailureCodeDto { code, count })
+                .collect(),
+            outcome: r.report.outcome.label().to_string(),
+        }
+    }
 }
 
 /// Scheduled integrity-scrub settings (`driven_core::scrub`).
@@ -1058,6 +1158,9 @@ pub struct SettingsPatch {
     /// so the UI can commit one control at a time, matching how every other
     /// settings control in this app commits on change.
     pub scrub: Option<ScrubSettingsPatch>,
+    /// Partial restore-drill settings. Each field is independently optional for
+    /// the same reason [`Self::scrub`]'s are.
+    pub drill: Option<DrillSettingsPatch>,
 }
 
 /// Partial integrity-scrub settings.
@@ -1072,6 +1175,18 @@ pub struct ScrubSettingsPatch {
     pub slice_size: Option<u32>,
     /// See [`ScrubSettings::deep_sample`].
     pub deep_sample: Option<u32>,
+}
+
+/// Partial restore-drill settings.
+#[derive(Debug, Clone, Copy, Default, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct DrillSettingsPatch {
+    /// See [`DrillSettings::enabled`].
+    pub enabled: Option<bool>,
+    /// See [`DrillSettings::interval_secs`].
+    pub interval_secs: Option<u32>,
+    /// See [`DrillSettings::sample_size`].
+    pub sample_size: Option<u32>,
 }
 
 /// Partial SPEC s22 `global` settings.

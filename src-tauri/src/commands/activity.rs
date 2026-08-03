@@ -219,6 +219,41 @@ pub async fn list_scrub_runs(
     Ok(rows.into_iter().map(Into::into).collect())
 }
 
+/// Max drill-run page the webview may request. Same bound and same rationale as
+/// [`MAX_SCRUB_RUN_LIMIT`]: the per-source history is capped at
+/// `DRILL_RUN_HISTORY_CAP` rows anyway, so a larger request is a caller bug.
+const MAX_DRILL_RUN_LIMIT: u32 = 200;
+
+/// `list_drill_runs(source_id, limit)` - the persisted restore-drill reports,
+/// newest-first (`driven_core::drill`).
+///
+/// `source_id` narrows to one source; omit it for every source interleaved by
+/// time, which is what the history panel shows. Every returned field is a COUNT
+/// or a stable SPEC s24 error CODE from a closed vocabulary - the DTO carries no
+/// path, remote id, or filename - so this command cannot leak an encrypted
+/// source's filenames to the webview.
+#[tauri::command]
+pub async fn list_drill_runs(
+    state: State<'_, AppState>,
+    source_id: Option<String>,
+    limit: Option<u32>,
+) -> CommandResult<Vec<crate::commands::dtos::DrillRunDto>> {
+    let source = match source_id.as_deref() {
+        None => None,
+        Some(s) => Some(driven_core::types::SourceId(s.parse().map_err(|_| {
+            CommandError::with_code(ErrorCode::InvalidInput, "source_id must be a uuid")
+        })?)),
+    };
+    let limit = limit.unwrap_or(25).clamp(1, MAX_DRILL_RUN_LIMIT);
+    let rows = state
+        .state()
+        .list_drill_runs(source, limit)
+        .await
+        .map_err(CommandError::from)?;
+    tracing::debug!(target: TARGET, count = rows.len(), "list_drill_runs");
+    Ok(rows.into_iter().map(Into::into).collect())
+}
+
 /// `activity_summary(day_start_ms, week_start_ms, throughput_window_ms)` - the
 /// Activity dashboard header aggregates (M7-P2-5; DESIGN s8.3): bytes uploaded
 /// today / this week, file count by status, and the current throughput window.

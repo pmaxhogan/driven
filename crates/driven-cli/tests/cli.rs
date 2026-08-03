@@ -171,6 +171,7 @@ fn top_level_help_lists_every_subcommand() {
             .and(predicate::str::contains("verify"))
             .and(predicate::str::contains("rclone"))
             .and(predicate::str::contains("scrub"))
+            .and(predicate::str::contains("drill"))
             .and(predicate::str::contains("restore")),
     );
 }
@@ -303,6 +304,175 @@ fn drifted_report() -> driven_core::scrub::ScrubReport {
     };
     r.finish();
     r
+}
+
+/// Seed `path` with one source and `runs` recorded restore-drill reports.
+fn seed_drill_runs(path: &Path, runs: &[driven_core::drill::DrillReport]) {
+    block_on(async {
+        let repo = SqliteStateRepo::open(path).await.unwrap();
+        let acc = AccountId::new_v4();
+        let src = SourceId::new_v4();
+        repo.upsert_account(&account(acc)).await.unwrap();
+        repo.upsert_source(&source(acc, src, "Docs")).await.unwrap();
+        for (i, report) in runs.iter().enumerate() {
+            repo.insert_drill_run(&driven_core::state::NewDrillRun {
+                source_id: src,
+                started_at: i as i64 + 1,
+                finished_at: i as i64 + 2,
+                report: report.clone(),
+            })
+            .await
+            .unwrap();
+        }
+    });
+}
+
+/// Build a drill report out of `(verified, skipped, failures)`.
+fn drill_report(
+    verified: u64,
+    skipped: u64,
+    failures: &[driven_core::types::ErrorCode],
+) -> driven_core::drill::DrillReport {
+    let mut r = driven_core::drill::DrillReport::default();
+    for _ in 0..verified {
+        r.record(&driven_core::drill::DrillAttempt::Verified);
+    }
+    for _ in 0..skipped {
+        r.record(&driven_core::drill::DrillAttempt::Skipped {
+            code: driven_core::types::ErrorCode::CryptoKeyMissing,
+        });
+    }
+    for code in failures {
+        r.record(&driven_core::drill::DrillAttempt::Failed { code: *code });
+    }
+    r.finish();
+    r
+}
+
+#[test]
+fn drill_on_a_fresh_database_reports_the_shipped_policy_and_no_runs() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    seed_empty(&db);
+
+    cli()
+        .args(["drill", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(
+            // The shipped posture: on, monthly, three files.
+            predicate::str::contains("restore drill: enabled")
+                .and(predicate::str::contains("every 2592000s"))
+                .and(predicate::str::contains("sample 3"))
+                .and(predicate::str::contains("No restore drill has run yet.")),
+        );
+}
+
+#[test]
+fn drill_renders_recorded_runs_with_counts_and_codes_only() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    let passed = drill_report(3, 0, &[]);
+    let failed = drill_report(
+        1,
+        1,
+        &[
+            driven_core::types::ErrorCode::CryptoDecryptFailed,
+            driven_core::types::ErrorCode::CryptoDecryptFailed,
+        ],
+    );
+    seed_drill_runs(&db, &[passed, failed]);
+
+    cli()
+        .args(["drill", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("passed")
+                .and(predicate::str::contains("failed"))
+                .and(predicate::str::contains("verified 1"))
+                .and(predicate::str::contains("skipped 1"))
+                // The breakdown is aggregated with a count, and the code is a
+                // closed-vocabulary dotted string - never a path.
+                .and(predicate::str::contains("crypto.decrypt_failed x2"))
+                .and(predicate::str::contains("Docs")),
+        );
+}
+
+/// An INCONCLUSIVE run must not render as a pass. "We restored nothing" reading
+/// as "we restored everything successfully" is the exact lie the feature exists
+/// to prevent.
+#[test]
+fn drill_renders_an_inconclusive_run_distinctly_from_a_pass() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    seed_drill_runs(&db, &[drill_report(0, 2, &[])]);
+
+    cli()
+        .args(["drill", "--db"])
+        .arg(&db)
+        .assert()
+        .success()
+        .stdout(
+            predicate::str::contains("inconclusive").and(predicate::str::contains("verified 0")),
+        );
+}
+
+/// `--fail-on-failure` makes the command usable as a monitoring check.
+#[test]
+fn drill_fail_on_failure_exits_non_zero_only_when_the_latest_run_still_failed() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    seed_drill_runs(
+        &db,
+        &[drill_report(
+            2,
+            0,
+            &[driven_core::types::ErrorCode::DriveUnreachable],
+        )],
+    );
+
+    cli()
+        .args(["drill", "--fail-on-failure", "--db"])
+        .arg(&db)
+        .assert()
+        .failure()
+        .stderr(predicate::str::contains("could not be restored"));
+
+    // A LATER passing run clears it: a source that failed once and has drilled
+    // clean since is not a live problem.
+    let dir2 = tempfile::tempdir().unwrap();
+    let db2 = dir2.path().join("state.db");
+    seed_drill_runs(
+        &db2,
+        &[
+            drill_report(2, 0, &[driven_core::types::ErrorCode::DriveUnreachable]),
+            drill_report(3, 0, &[]),
+        ],
+    );
+    cli()
+        .args(["drill", "--fail-on-failure", "--db"])
+        .arg(&db2)
+        .assert()
+        .success();
+}
+
+/// An all-SKIPPED (inconclusive) run must NOT fail the monitor. A locked
+/// keychain is not evidence of a broken backup, and failing a monitoring check
+/// on it would train operators to ignore the check that matters.
+#[test]
+fn drill_fail_on_failure_ignores_an_inconclusive_run() {
+    let dir = tempfile::tempdir().unwrap();
+    let db = dir.path().join("state.db");
+    seed_drill_runs(&db, &[drill_report(0, 3, &[])]);
+
+    cli()
+        .args(["drill", "--fail-on-failure", "--db"])
+        .arg(&db)
+        .assert()
+        .success();
 }
 
 #[test]

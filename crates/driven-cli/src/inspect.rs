@@ -49,6 +49,21 @@ pub struct ScrubArgs {
     pub fail_on_drift: bool,
 }
 
+/// Args for `driven-cli drill`.
+#[derive(Debug, Args)]
+pub struct DrillArgs {
+    /// Path to the Driven state database.
+    #[arg(long, default_value = "state.db")]
+    pub db: PathBuf,
+    /// Maximum number of drill runs to show (newest first).
+    #[arg(long, default_value_t = 10)]
+    pub limit: u32,
+    /// Exit non-zero when the most recent run of any source could not restore a
+    /// file it sampled, so the command is usable as a monitoring check.
+    #[arg(long)]
+    pub fail_on_failure: bool,
+}
+
 /// Args for `driven-cli history`.
 #[derive(Debug, Args)]
 pub struct HistoryArgs {
@@ -314,6 +329,107 @@ pub async fn run_scrub(args: ScrubArgs) -> Result<()> {
         }
         if unrecoverable > 0 {
             anyhow::bail!("{unrecoverable} object(s) drifted and could not be repaired");
+        }
+    }
+    Ok(())
+}
+
+/// Everything `drill` needs, gathered in one pass so the rendering is trivial
+/// and the query logic is unit-testable against a seeded temp DB.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrillOverview {
+    /// The configured drill policy, as the engine would actually apply it
+    /// (clamped + defaulted by `load_drill_config`).
+    pub config: driven_core::drill::DrillConfig,
+    /// Recent runs across every source, newest first.
+    pub runs: Vec<driven_core::state::DrillRunRow>,
+    /// Display name per source id, so the report can name sources without the
+    /// caller re-querying. Sources deleted since a run was recorded are absent.
+    pub source_names: std::collections::HashMap<String, String>,
+}
+
+pub async fn gather_drill(repo: &dyn StateRepo, limit: u32) -> Result<DrillOverview> {
+    let config = driven_core::drill::load_drill_config(repo).await;
+    let runs = repo.list_drill_runs(None, limit.max(1)).await?;
+    let source_names = repo
+        .list_sources()
+        .await?
+        .into_iter()
+        .map(|s| (s.id.to_string(), s.display_name))
+        .collect();
+    Ok(DrillOverview {
+        config,
+        runs,
+        source_names,
+    })
+}
+
+pub async fn run_drill(args: DrillArgs) -> Result<()> {
+    let repo = open_existing(&args.db).await?;
+    let overview = gather_drill(&repo, args.limit).await?;
+
+    let c = &overview.config;
+    println!(
+        "restore drill: {}  every {}s  sample {}",
+        if c.enabled { "enabled" } else { "DISABLED" },
+        c.interval_secs,
+        c.sample_size,
+    );
+
+    if overview.runs.is_empty() {
+        println!("No restore drill has run yet.");
+        return Ok(());
+    }
+
+    // Counts and stable SPEC s24 error codes only, never paths - the same rule
+    // the persisted report follows, so piping this into a log or a bug report
+    // cannot leak an encrypted source's filenames.
+    for r in &overview.runs {
+        let name = overview
+            .source_names
+            .get(&r.source_id.to_string())
+            .map_or("(deleted source)", String::as_str);
+        println!(
+            "{}  {:<12}  {}  sampled {} (verified {}, skipped {}, failed {})",
+            fmt_epoch_ms(Some(r.started_at)),
+            r.report.outcome.label(),
+            name,
+            r.report.sampled,
+            r.report.verified,
+            r.report.skipped,
+            r.report.failed,
+        );
+        if !r.report.failure_codes.is_empty() {
+            let codes = r
+                .report
+                .failure_codes
+                .iter()
+                .map(|(code, n)| format!("{code} x{n}"))
+                .collect::<Vec<_>>()
+                .join(", ");
+            println!("    failures: {codes}");
+        }
+    }
+
+    if args.fail_on_failure {
+        // "Most recent run PER SOURCE", same rule as `scrub --fail-on-drift`: a
+        // source that failed a month ago and has drilled clean since is not a
+        // live problem, and reporting it as one would make the check useless as
+        // a monitor.
+        //
+        // Deliberately keyed on `failed`, NOT on the outcome: an INCONCLUSIVE
+        // run (nothing restorable, or every candidate skipped because a key was
+        // unavailable) is not evidence of a broken backup, and failing a monitor
+        // on a locked keychain would train people to ignore it.
+        let mut seen: std::collections::HashSet<String> = std::collections::HashSet::new();
+        let mut failed = 0u64;
+        for r in &overview.runs {
+            if seen.insert(r.source_id.to_string()) {
+                failed = failed.saturating_add(r.report.failed);
+            }
+        }
+        if failed > 0 {
+            anyhow::bail!("{failed} sampled file(s) could not be restored from the backup");
         }
     }
     Ok(())
