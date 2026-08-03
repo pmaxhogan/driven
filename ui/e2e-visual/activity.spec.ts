@@ -7,7 +7,8 @@ import { mockError, mockPending } from "../test-support/mock-backend";
 import { expect, snapshot, test } from "./fixtures";
 
 // The Activity dashboard (DESIGN s8.3): header aggregates + sparkline tiles,
-// the integrity-scrub panel, the filter row and the event table.
+// the integrity-scrub panel, the restore-drill panel, the filter row and the
+// event table.
 
 const HEADING = { name: "Activity", level: 1 } as const;
 
@@ -29,6 +30,7 @@ test("empty", async ({ page, visit }) => {
       activity_throughput_series: ACTIVITY_THROUGHPUT_EMPTY,
       distinct_activity_event_types: [],
       list_scrub_runs: [],
+      list_drill_runs: [],
       list_sources: [],
     },
   });
@@ -43,6 +45,7 @@ test("loading skeletons", async ({ page, visit }) => {
       activity_summary: mockPending(),
       activity_throughput_series: mockPending(),
       list_scrub_runs: mockPending(),
+      list_drill_runs: mockPending(),
     },
   });
   await expect(page.getByRole("heading", HEADING)).toBeVisible();
@@ -56,6 +59,7 @@ test("query failure", async ({ page, visit }) => {
       activity_summary: mockError("state.db_locked"),
       activity_throughput_series: mockError("state.db_locked"),
       list_scrub_runs: mockError("state.db_locked"),
+      list_drill_runs: mockError("state.db_locked"),
     },
   });
   await expect(page.getByRole("heading", HEADING)).toBeVisible();

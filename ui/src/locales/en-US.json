@@ -917,6 +917,10 @@
       "no_version_as_of": {
         "short": "No version that far back",
         "long": "One or more selected files have no backed-up version from before the selected date. Choose a later date, or clear the date to restore the latest backup."
+      },
+      "drill_failed": {
+        "short": "Restore drill failed",
+        "long": "A scheduled restore drill could not bring back one or more of the files it sampled, or the bytes that came back did not match what was backed up. This means a file you believe is safe would not come back. Open the restore drill panel on the Activity page for the counts and the reason codes."
       }
     },
     "harness": {

@@ -339,6 +339,7 @@ export const ACTIVITY_EVENT_TYPES: string[] = [
   "error",
   "local.invalid_filename",
   "paused",
+  "restore.drill_failed",
   "scan_done",
   "scrub_done",
   "scrub_drift_found",
