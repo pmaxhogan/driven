@@ -340,6 +340,44 @@ pub struct ScrubRunRow {
     pub report: crate::scrub::ScrubReport,
 }
 
+/// How many `drill_runs` rows are retained PER SOURCE. Pruned inside
+/// [`StateRepo::insert_drill_run`] for the same reason as
+/// [`SCRUB_RUN_HISTORY_CAP`]: on a monthly cadence nothing else would ever
+/// bound the table, and there is no user-facing "clear drill history".
+pub const DRILL_RUN_HISTORY_CAP: u32 = 200;
+
+/// A row to insert into `drill_runs` (migration 0015): one completed restore
+/// drill's persisted report.
+///
+/// COUNTS plus stable SPEC s24 error CODES only - no path, remote id, or
+/// filename.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct NewDrillRun {
+    /// FK to `backup_sources.id`.
+    pub source_id: SourceId,
+    /// Unix epoch ms the drill began.
+    pub started_at: UnixMs,
+    /// Unix epoch ms the drill ended.
+    pub finished_at: UnixMs,
+    /// The drill's counts.
+    pub report: crate::drill::DrillReport,
+}
+
+/// One persisted `drill_runs` row, as read back for the UI + CLI.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct DrillRunRow {
+    /// Auto-increment row id.
+    pub id: i64,
+    /// Which source this drill exercised.
+    pub source_id: SourceId,
+    /// Unix epoch ms the drill began.
+    pub started_at: UnixMs,
+    /// Unix epoch ms the drill ended.
+    pub finished_at: UnixMs,
+    /// The drill's counts.
+    pub report: crate::drill::DrillReport,
+}
+
 /// Op-type discriminant stored in `pending_ops.op_type` (SPEC s2).
 ///
 /// Held as a plain string rather than the [`crate::types::Op`] enum to
@@ -808,6 +846,9 @@ pub const KNOWN_STATE_TABLES: &[&str] = &[
     // Scheduled integrity scrub (migration 0014_integrity_scrub).
     "scrub_state",
     "scrub_runs",
+    // Scheduled restore drills (migration 0015_restore_drills).
+    "drill_state",
+    "drill_runs",
 ];
 
 /// Storage contract for the SQLite-backed state at
@@ -1764,6 +1805,77 @@ pub trait StateRepo: Send + Sync {
         source: Option<SourceId>,
         limit: u32,
     ) -> Result<Vec<ScrubRunRow>> {
+        let _ = (source, limit);
+        Ok(Vec::new())
+    }
+
+    // --- restore drills (migration 0015) ------------------------------------
+
+    /// How many RESTORABLE files this source has: `Synced` rows that either own
+    /// a standalone remote object or belong to a bundle, and whose plaintext
+    /// size is at or below `max_size`.
+    ///
+    /// The population a drill samples from, counted rather than listed: reading
+    /// every path of a hundred-thousand-file source in order to pick three of
+    /// them would cost far more than the restores do.
+    ///
+    /// The size cap is applied HERE rather than after sampling so the sample is
+    /// drawn from files that are actually eligible - filtering afterwards would
+    /// silently shrink a 3-file drill to 0 on a source of large files.
+    ///
+    /// Default `0` ("nothing to drill"), the safe degradation for a fake that
+    /// models no `file_state`.
+    async fn count_restorable_files(&self, source: SourceId, max_size: u64) -> Result<u64> {
+        let _ = (source, max_size);
+        Ok(0)
+    }
+
+    /// The restorable file at row `offset` in the SAME deterministic ordering
+    /// [`Self::count_restorable_files`] counts (`ORDER BY relative_path`).
+    ///
+    /// Resolved one at a time by offset because a drill picks a handful of rows
+    /// from a potentially huge population; the composite `(source_id,
+    /// relative_path)` PRIMARY KEY makes each lookup an indexed scan rather than
+    /// a table read. `None` when the offset is past the end - which a concurrent
+    /// deletion between the count and the lookup can legitimately cause, so it
+    /// is a benign "skip this candidate", never an error.
+    async fn nth_restorable_file(
+        &self,
+        source: SourceId,
+        max_size: u64,
+        offset: u64,
+    ) -> Result<Option<crate::drill::DrillCandidate>> {
+        let _ = (source, max_size, offset);
+        Ok(None)
+    }
+
+    /// When `source` was last drilled, or `None` before its first drill.
+    async fn drill_cursor(&self, source: SourceId) -> Result<Option<crate::drill::DrillCursor>> {
+        let _ = source;
+        Ok(None)
+    }
+
+    /// Stamp `source` as drilled at `at`. Called only after a drill that
+    /// actually ran, so an aborted one stays due.
+    async fn set_drill_cursor(&self, source: SourceId, at: UnixMs) -> Result<()> {
+        let _ = (source, at);
+        Ok(())
+    }
+
+    /// Append one `drill_runs` row and prune that source's history to the newest
+    /// [`DRILL_RUN_HISTORY_CAP`] rows. Returns the new row id.
+    async fn insert_drill_run(&self, run: &NewDrillRun) -> Result<i64> {
+        let _ = run;
+        Ok(0)
+    }
+
+    /// The newest drill runs, newest-first. `source` narrows to one source;
+    /// `None` returns every source's runs interleaved by time.
+    async fn list_drill_runs(
+        &self,
+        source: Option<SourceId>,
+        limit: u32,
+    ) -> Result<Vec<DrillRunRow>> {
         let _ = (source, limit);
         Ok(Vec::new())
     }

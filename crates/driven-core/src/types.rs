@@ -1153,6 +1153,19 @@ pub enum ErrorCode {
     /// for it, so the UI can point at the date rather than a "highlighted
     /// field". Non-retryable - the user must pick a later date or clear it.
     RestoreNoVersionAsOf,
+    /// `restore.drill_failed` - a scheduled RESTORE DRILL
+    /// (`driven_core::drill`) could not restore one or more of the files it
+    /// sampled, or the bytes that came back did not verify.
+    ///
+    /// The most serious code in this enum, and the only one that says something
+    /// about data the user ALREADY believes is safe: every other failure means
+    /// "this operation did not work", while this one means "a file you think is
+    /// backed up would not come back". Raised on the drill's summary row rather
+    /// than per file so it stays counts-only (a drill report never carries a
+    /// path). Not raised for a SKIPPED candidate - an unavailable key is not
+    /// evidence of a broken backup, and alerting on it would train users to
+    /// ignore the alert that matters.
+    RestoreDrillFailed,
     /// `harness.timeout` - a stress-harness scenario exceeded its budget
     /// (chaos crate only).
     HarnessTimeout,
@@ -1251,6 +1264,7 @@ impl ErrorCode {
             ErrorCode::StateDbCorrupt => "state.db_corrupt",
             ErrorCode::StateReconcileOrphan => "state.reconcile_orphan",
             ErrorCode::RestoreNoVersionAsOf => "restore.no_version_as_of",
+            ErrorCode::RestoreDrillFailed => "restore.drill_failed",
             ErrorCode::HarnessTimeout => "harness.timeout",
             ErrorCode::InternalBug => "internal.bug",
             ErrorCode::InvalidInput => "internal.invalid_input",
@@ -1311,6 +1325,7 @@ impl ErrorCode {
             "state.db_corrupt" => ErrorCode::StateDbCorrupt,
             "state.reconcile_orphan" => ErrorCode::StateReconcileOrphan,
             "restore.no_version_as_of" => ErrorCode::RestoreNoVersionAsOf,
+            "restore.drill_failed" => ErrorCode::RestoreDrillFailed,
             "harness.timeout" => ErrorCode::HarnessTimeout,
             "internal.bug" => ErrorCode::InternalBug,
             "internal.invalid_input" => ErrorCode::InvalidInput,

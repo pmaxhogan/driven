@@ -22,6 +22,7 @@
 pub mod adaptive;
 pub mod bundle;
 pub mod crypto_provider;
+pub mod drill;
 pub mod exclude;
 pub mod executor;
 pub mod hooks;

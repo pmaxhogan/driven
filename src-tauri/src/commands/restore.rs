@@ -747,6 +747,134 @@ pub async fn list_file_versions(
         .collect())
 }
 
+// -----------------------------------------------------------------------------
+// Restore drills (driven_core::drill)
+// -----------------------------------------------------------------------------
+
+/// Restore ONE drill candidate through the REAL restore path, verify it, and
+/// delete the output.
+///
+/// This deliberately reuses [`resolve_restore_items`], [`build_restore_plans`],
+/// and [`restore_one_file`] rather than reimplementing a "lightweight" check.
+/// A drill that took a different code path would prove that the shortcut works,
+/// which is exactly the thing nobody cares about - the whole value is in
+/// exercising the same download, stream-decrypt, bundle-extract, verify, and
+/// atomic-write machinery a user's restore would hit. In particular
+/// [`restore_one_file`] already verifies the plaintext BLAKE3 against
+/// `file_state` on the way through, so `FileOutcome::Done` IS the verification;
+/// hashing the output again here would be a second, weaker check of a different
+/// thing.
+///
+/// # Skipped vs failed
+///
+/// A candidate whose account has no live crypto suite (locked keychain, account
+/// pending re-auth) is SKIPPED, never failed. It is a benign, local, transient
+/// condition that says nothing about the backup - and raising a "your backup
+/// cannot be restored" alert every time a keychain happens to be locked is the
+/// fastest way to make users ignore that alert. Same for a candidate that is no
+/// longer restorable at all (deleted between the sample and the restore).
+///
+/// # Cleanup
+///
+/// The output is written under a fresh temp directory that is removed before
+/// returning, on EVERY path including failure. A drill must never leave
+/// decrypted plaintext behind - that would turn an integrity feature into a
+/// data-exposure one.
+pub(crate) async fn drill_restore_one(
+    state: &AppState,
+    candidate: &driven_core::drill::DrillCandidate,
+) -> driven_core::drill::DrillAttempt {
+    use driven_core::drill::DrillAttempt;
+
+    let item = RestoreItem {
+        source_id: candidate.source_id.to_string(),
+        relative_path: candidate.path.as_str().to_string(),
+    };
+
+    // Not restorable any more (deleted, or no longer synced) - a legitimate
+    // race against the sample, not a restore failure.
+    let resolved = match resolve_restore_items(state, std::slice::from_ref(&item), None).await {
+        Ok(r) => r,
+        Err(e) => return DrillAttempt::Skipped { code: e.code },
+    };
+    let Some(_) = resolved.first() else {
+        return DrillAttempt::Skipped {
+            code: ErrorCode::InvalidInput,
+        };
+    };
+
+    // Setup failures (no account handle, unbuildable store, bad CA/proxy) are
+    // environmental, not evidence that the backup is unrecoverable.
+    let mut plans = match build_restore_plans(state, resolved).await {
+        Ok(p) => p,
+        Err(e) => return DrillAttempt::Skipped { code: e.code },
+    };
+    let Some(plan) = plans.pop() else {
+        return DrillAttempt::Skipped {
+            code: ErrorCode::InternalBug,
+        };
+    };
+    if matches!(plan.crypto, SuiteVerdict::Unavailable) {
+        return DrillAttempt::Skipped {
+            code: ErrorCode::CryptoKeyMissing,
+        };
+    }
+
+    // A fresh temp dir per candidate, removed below. `TempDir` would also clean
+    // up on drop, but the explicit removal keeps the "no plaintext left behind"
+    // guarantee readable at the call site rather than hidden in a destructor.
+    let temp = match tempfile::Builder::new().prefix("driven-drill-").tempdir() {
+        Ok(t) => t,
+        Err(e) => {
+            return DrillAttempt::Skipped {
+                code: map_io_err(e),
+            }
+        }
+    };
+    let token = DialogToken::for_root(temp.path().to_string_lossy().to_string());
+    let dest_root = match confine::ConfinedRoot::bind(token) {
+        Ok(r) => r,
+        Err(code) => return DrillAttempt::Skipped { code },
+    };
+
+    let cancel: RestoreCancel = std::sync::Arc::new(AtomicBool::new(false));
+    let mut bundle_cache = BundleCache::default();
+    let outcome = restore_one_file(
+        &plan.file,
+        plan.store.as_ref(),
+        &plan.crypto,
+        &dest_root,
+        &cancel,
+        &mut bundle_cache,
+        |_| {},
+    )
+    .await;
+
+    // Explicit teardown BEFORE returning, so the plaintext is gone by the time
+    // the caller records the result. A failure to remove is logged, never
+    // reported as a drill failure - the drill's verdict is about the backup,
+    // not about our temp dir.
+    let temp_path = temp.path().to_path_buf();
+    if let Err(err) = std::fs::remove_dir_all(&temp_path) {
+        tracing::warn!(
+            target: TARGET,
+            %err,
+            "restore drill could not remove its temporary output directory"
+        );
+    }
+    drop(temp);
+
+    match outcome {
+        FileOutcome::Done => DrillAttempt::Verified,
+        FileOutcome::Failed(code) => DrillAttempt::Failed { code },
+        // Nothing cancels a drill today; treat it as "did not happen" rather
+        // than as evidence about the backup.
+        FileOutcome::Cancelled => DrillAttempt::Skipped {
+            code: ErrorCode::InternalBug,
+        },
+    }
+}
+
 /// R2-P2-1: build the per-file [`RestorePlan`]s (the fallible job SETUP) WITHOUT
 /// touching the restore-job map. Resolves the source -> account map, builds (and
 /// caches per account) the remote store, and resolves the per-source crypto
