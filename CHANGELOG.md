@@ -5,6 +5,13 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.0](https://github.com/pmaxhogan/driven/compare/v2.9.0...v2.10.0) (2026-08-03)
+
+
+### Features
+
+* **core:** scheduled restore drills that prove the backup restores ([#269](https://github.com/pmaxhogan/driven/issues/269)) ([7b558a6](https://github.com/pmaxhogan/driven/commit/7b558a6f9a00f017109bb40166821ccbee0622b0))
+
 ## [2.9.0](https://github.com/pmaxhogan/driven/compare/v2.8.0...v2.9.0) (2026-08-03)
 
 
