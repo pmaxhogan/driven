@@ -39,15 +39,22 @@
 //! than stacking a second one. Cleaning it up would mean deleting a file from a
 //! stranger's directory on a failure path, which is a worse trade than leaving
 //! a few hundred harmless bytes.
+//!
+//! In practice the commonest failure - an unwritable root - leaves nothing at
+//! all, because step 2 is itself a write: the marker never lands, and the
+//! account is refused with `sftp.root_not_writable` before step 3 runs.
 
-use russh_sftp::client::SftpSession as RusshSftpSession;
+use driven_remote::remote_store::DriveErrorClassification;
+use driven_remote::DriveError;
 use russh_sftp::protocol::OpenFlags;
 use tokio::io::AsyncWriteExt;
 
 use crate::config::{DestinationMarker, SftpConfig, SftpCredential};
 use crate::names;
 use crate::session::SftpSession;
-use crate::store::{dest_missing, is_no_such_file, join_remote, sftp_io_error, sftp_op_error};
+use crate::store::{
+    dest_missing, is_no_such_file, join_remote, sftp_op_error, while_connected, WRITE_DEADLINE,
+};
 
 /// The bytes the writability probe writes. Content is irrelevant beyond being
 /// non-empty and obviously Driven's, in case a probe file ever survives a crash
@@ -116,14 +123,14 @@ pub async fn prepare_destination(
     }
 
     // 2) The identity marker, before any other write.
-    let outcome = stamp_or_adopt_marker(sftp, config, &root, now_ms).await?;
+    let outcome = stamp_or_adopt_marker(&session, config, &root, now_ms).await?;
 
     // 3) A real write, proving the credential's user can actually put bytes
     // here. A permission bit says nothing: a read-only export, a restrictive
     // ACL and a full filesystem all pass inspection and then fail the first
     // upload, leaving an account that looks configured and never backs
     // anything up.
-    probe_writable(sftp, &root).await?;
+    probe_writable(&session, &root, &config.host).await?;
 
     tracing::info!(
         target: crate::TARGET,
@@ -139,11 +146,12 @@ pub async fn prepare_destination(
 /// Adopt the marker already at `root`, or write a fresh one, recording the id
 /// on `config` either way.
 async fn stamp_or_adopt_marker(
-    sftp: &RusshSftpSession,
+    session: &SftpSession,
     config: &mut SftpConfig,
     root: &str,
     now_ms: i64,
 ) -> anyhow::Result<PreparedDestination> {
+    let sftp = session.sftp();
     let path = join_remote(root, names::MARKER_FILE);
     match sftp.read(path.clone()).await {
         Ok(raw) => match serde_json::from_slice::<DestinationMarker>(&raw) {
@@ -190,44 +198,110 @@ async fn stamp_or_adopt_marker(
     let marker = DestinationMarker::new(&destination_id, now_ms);
     let bytes = serde_json::to_vec_pretty(&marker)
         .map_err(|e| anyhow::anyhow!("sftp.config_invalid: could not encode the marker: {e}"))?;
-    write_file(sftp, &path, &bytes).await?;
+    // The marker is the FIRST write into the root, so on a read-only export it
+    // is what fails - before `probe_writable` ever runs. Both paths therefore
+    // report `sftp.root_not_writable`: the user's problem and its remedy are
+    // identical whichever write discovered it, and letting this one through as
+    // a bare protocol status would leave the wizard with nothing to say for the
+    // commonest case.
+    let host = config.host.clone();
+    write_file(session, &path, &bytes)
+        .await
+        .map_err(|error| not_writable(root, &host, &error))?;
     config.destination_id = Some(destination_id);
     Ok(PreparedDestination::Initialized)
 }
 
 /// Write and then remove a real file under `root`.
-async fn probe_writable(sftp: &RusshSftpSession, root: &str) -> anyhow::Result<()> {
+///
+/// A refusal here is mapped to `sftp.root_not_writable` rather than left as a
+/// bare protocol status, because it is the one probe failure the user can
+/// always act on: the host is reachable, the credential authenticated, the
+/// path exists and is a directory - the account simply cannot put bytes there.
+/// A read-only export, a restrictive ACL, or a root owned by another user all
+/// land here, and all have the same remedy.
+async fn probe_writable(session: &SftpSession, root: &str, host: &str) -> anyhow::Result<()> {
     let name = format!("{}{}", names::TMP_PREFIX, uuid::Uuid::new_v4());
     let path = join_remote(root, &name);
-    write_file(sftp, &path, PROBE_CONTENT).await?;
-    match sftp.remove_file(path.clone()).await {
+    write_file(session, &path, PROBE_CONTENT)
+        .await
+        .map_err(|error| not_writable(root, host, &error))?;
+    match session.sftp().remove_file(path.clone()).await {
         Ok(()) => Ok(()),
         Err(error) if is_no_such_file(&error) => Ok(()),
         // A destination that accepts writes but refuses deletes cannot be
         // backed up to: every upload commits through a temp file that is
         // renamed away, and every superseded object is removed. Better to
         // refuse the account than to discover it one cycle later.
-        Err(error) => Err(sftp_op_error(&format!("remove {path}"), error)),
+        Err(error) => Err(not_writable(
+            root,
+            host,
+            &sftp_op_error(&format!("remove {path}"), error),
+        )),
     }
 }
 
+/// The classified error for "this root exists but Driven cannot write into it".
+///
+/// Deliberately NOT [`dest_missing`]: the destination is right there, and
+/// telling the user to reconnect their drive would send them after the wrong
+/// problem. `Other` is the honest classification - a permission bit is not a
+/// transient to retry through, and it is not a credential the reauth flow can
+/// replace either. The wizard turns the code into copy that names the actual
+/// remedy.
+fn not_writable(root: &str, host: &str, cause: &anyhow::Error) -> anyhow::Error {
+    tracing::warn!(
+        target: crate::TARGET,
+        %root,
+        %host,
+        %cause,
+        "refusing the account: the destination exists but Driven cannot write into it"
+    );
+    // The dotted code rides in a `.context`, exactly as `dest_missing` puts its
+    // own there, because that is what `Display` renders - and the command-layer
+    // mapper scans the DISPLAY string. Tucking the code inside
+    // `Classified::source` instead would leave it visible only through `Debug`,
+    // and the wizard would silently fall back to the generic code.
+    anyhow::Error::new(DriveError::Classified {
+        kind: DriveErrorClassification::Other,
+        source: anyhow::anyhow!("{cause}"),
+    })
+    .context(format!(
+        "sftp.root_not_writable: {root} exists on {host} but this account cannot write there"
+    ))
+}
+
 /// Create (or truncate) `path` and write `bytes`.
-async fn write_file(sftp: &RusshSftpSession, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
+///
+/// Guarded by [`while_connected`] like every other write in this crate: the
+/// bytes are few, but an unacknowledged packet is what hangs, not a large one,
+/// and `russh-sftp` never resolves a parked write ack when the link dies. A
+/// probe that wedged would leave account creation spinning with no way out.
+async fn write_file(session: &SftpSession, path: &str, bytes: &[u8]) -> anyhow::Result<()> {
     // CREATE has to be explicit - `SftpSession::write` opens WRITE-only, which
     // a correct server answers with SSH_FX_NO_SUCH_FILE for a new file.
-    let mut file = sftp
+    let mut file = session
+        .sftp()
         .open_with_flags(
             path.to_string(),
             OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
         )
         .await
         .map_err(|e| sftp_op_error(&format!("create {path}"), e))?;
-    file.write_all(bytes)
-        .await
-        .map_err(|e| sftp_io_error(&format!("write {path}"), e))?;
-    file.shutdown()
-        .await
-        .map_err(|e| sftp_io_error(&format!("close {path}"), e))?;
+    while_connected(
+        session,
+        WRITE_DEADLINE,
+        &format!("write {path}"),
+        file.write_all(bytes),
+    )
+    .await?;
+    while_connected(
+        session,
+        WRITE_DEADLINE,
+        &format!("close {path}"),
+        file.shutdown(),
+    )
+    .await?;
     Ok(())
 }
 
@@ -395,6 +469,58 @@ mod tests {
         assert!(
             format!("{error:?}").contains("sftp.root_not_a_directory"),
             "{error:?}"
+        );
+    }
+
+    /// A root the account cannot write into must be refused AT CREATION, with a
+    /// code of its own.
+    ///
+    /// This is the failure a permission bit cannot predict and an existence
+    /// check cannot see: the host answers, the credential authenticates, the
+    /// path is a real directory - and every upload would fail forever. Without
+    /// its own code it would surface as a bare protocol status, and the wizard
+    /// would have nothing actionable to say.
+    ///
+    /// Unix-only: the fault is a mode-000 directory, and Windows ignores those
+    /// bits for the owning user.
+    #[cfg(unix)]
+    #[tokio::test]
+    async fn a_root_the_account_cannot_write_into_is_refused_with_its_own_code() {
+        use std::os::unix::fs::PermissionsExt as _;
+
+        let server = TestSftpServer::spawn().await.unwrap();
+        let locked = server.root().join("read-only");
+        std::fs::create_dir(&locked).unwrap();
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o500)).unwrap();
+        let writable_anyway = std::fs::write(locked.join("probe"), b"x").is_ok();
+
+        let mut config = SftpConfig {
+            root_path: "/read-only".to_string(),
+            ..server.unpinned_config(SftpAuthKind::Password)
+        };
+        let result = prepare_destination(&mut config, &server.password_credential(), NOW).await;
+        std::fs::set_permissions(&locked, std::fs::Permissions::from_mode(0o755)).unwrap();
+
+        if writable_anyway {
+            // Running as root: the mode bits do not bite, so there is no fault
+            // to observe. Say so rather than assert something vacuous.
+            eprintln!("skipped: this process can write to a mode-500 directory (running as root?)");
+            return;
+        }
+        let error = result.expect_err("a root that refuses writes cannot become an account");
+        let chain = format!("{error:?}");
+        assert!(chain.contains("sftp.root_not_writable"), "{chain}");
+        assert_eq!(
+            classification(&error),
+            Some(DriveErrorClassification::Other),
+            "a permission bit is neither a transient to retry nor a credential to replace: {chain}"
+        );
+        // NOT dest_folder_missing: the destination is right there, and telling
+        // the user to reconnect their drive would send them after the wrong
+        // problem.
+        assert!(
+            !chain.contains("dest_folder_missing"),
+            "an unwritable root must not masquerade as a missing one: {chain}"
         );
     }
 

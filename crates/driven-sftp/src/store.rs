@@ -558,7 +558,7 @@ const LIVENESS_POLL: Duration = Duration::from_millis(250);
 /// wire chunk. Ten minutes covers 5 MiB at roughly 70 Kbps, which is slower
 /// than any link a backup could complete over - so this can only fire on a
 /// channel that is genuinely not moving, never on a slow one.
-const WRITE_DEADLINE: Duration = Duration::from_secs(600);
+pub(crate) const WRITE_DEADLINE: Duration = Duration::from_secs(600);
 
 /// Await a write-path future, failing if the SSH transport dies underneath it.
 ///
@@ -611,7 +611,7 @@ const WRITE_DEADLINE: Duration = Duration::from_secs(600);
 /// every other transport fault here - never a hang.
 ///
 /// Removable once russh-sftp fails pending write acks when its stream ends.
-async fn while_connected<T>(
+pub(crate) async fn while_connected<T>(
     session: &SftpSession,
     deadline: Duration,
     what: &str,
@@ -1168,8 +1168,17 @@ impl SftpStore {
     /// authoritative in both directions. Paying two extra round trips per
     /// object to move between two identical outcomes would be a cost with no
     /// benefit.
+    ///
+    /// Guarded by [`while_connected`] like every other write in this crate. A
+    /// sidecar is only a few hundred bytes, but SIZE is not what makes a write
+    /// hang here - an unacknowledged packet does, and the acks
+    /// `russh-sftp` parks are never resolved when the link dies. This write
+    /// also sits in the worst possible window: immediately after the DATA file
+    /// has been committed, which is exactly when a NAS going to sleep would
+    /// otherwise wedge the cycle with the object already published.
     async fn write_sidecar(
-        sftp: &RusshSftpSession,
+        channel: &Channel<'_>,
+        deadline: Duration,
         dir_path: &str,
         sidecar: &Sidecar,
     ) -> anyhow::Result<()> {
@@ -1178,19 +1187,28 @@ impl SftpStore {
         };
         let path = join_remote(dir_path, &name);
         let bytes = sidecar.to_bytes()?;
-        let mut file = sftp
+        let mut file = channel
+            .sftp()
             .open_with_flags(
                 path.clone(),
                 OpenFlags::CREATE | OpenFlags::TRUNCATE | OpenFlags::WRITE,
             )
             .await
             .map_err(|e| sftp_op_error(&format!("open the sidecar {path}"), e))?;
-        file.write_all(&bytes)
-            .await
-            .map_err(|e| sftp_io_error(&format!("write the sidecar {path}"), e))?;
-        file.shutdown()
-            .await
-            .map_err(|e| sftp_io_error(&format!("close the sidecar {path}"), e))?;
+        while_connected(
+            channel.session(),
+            deadline,
+            &format!("write the sidecar {path}"),
+            file.write_all(&bytes),
+        )
+        .await?;
+        while_connected(
+            channel.session(),
+            deadline,
+            &format!("close the sidecar {path}"),
+            file.shutdown(),
+        )
+        .await?;
         Ok(())
     }
 
@@ -1489,7 +1507,7 @@ impl SftpStore {
     #[allow(clippy::too_many_arguments)]
     async fn commit_object(
         &self,
-        sftp: &RusshSftpSession,
+        channel: &Channel<'_>,
         dir_id: &str,
         stored: &str,
         original: &str,
@@ -1499,6 +1517,7 @@ impl SftpStore {
         expected: [u8; 16],
         is_create: bool,
     ) -> anyhow::Result<RemoteEntry> {
+        let sftp = channel.sftp();
         let dir_path = self.remote_path(dir_id)?;
         let target = join_remote(&dir_path, stored);
         let id = join_id(dir_id, stored);
@@ -1545,7 +1564,7 @@ impl SftpStore {
             modified_ms: now_ms(),
             props,
         };
-        Self::write_sidecar(sftp, &dir_path, &sidecar).await?;
+        Self::write_sidecar(channel, self.write_deadline, &dir_path, &sidecar).await?;
         Ok(Self::entry_from_sidecar(&sidecar, &id, dir_id))
     }
 
@@ -1921,7 +1940,7 @@ impl RemoteStore for SftpStore {
             modified_ms: now_ms(),
             props: HashMap::new(),
         };
-        Self::write_sidecar(sftp, &dir_path, &sidecar).await?;
+        Self::write_sidecar(&channel, self.write_deadline, &dir_path, &sidecar).await?;
 
         Ok(RemoteEntry {
             id,
@@ -2026,7 +2045,7 @@ impl RemoteStore for SftpStore {
             }
         };
         self.commit_object(
-            sftp,
+            &channel,
             &dir_id,
             &stored,
             name,
@@ -2100,7 +2119,7 @@ impl RemoteStore for SftpStore {
             }
         };
         self.commit_object(
-            sftp, &dir_id, &stored, &original, &mime, props, &temp, expected, false,
+            &channel, &dir_id, &stored, &original, &mime, props, &temp, expected, false,
         )
         .await
     }
@@ -2350,7 +2369,7 @@ impl RemoteStore for SftpStore {
 
         let entry = self
             .commit_object(
-                sftp,
+                &channel,
                 &dir_id,
                 &stored,
                 &handle.name,
@@ -4628,6 +4647,86 @@ mod tests {
             driven_remote::classification_of(&error),
             Some(DriveErrorClassification::Network),
             "a dead channel is a transport fault like any other - retryable, not fatal: {error:?}"
+        );
+    }
+
+    /// The SIDECAR write is guarded too, and it sits in the worst window there
+    /// is: the DATA file has already been committed.
+    ///
+    /// A sidecar is a few hundred bytes, which is exactly why it was missed the
+    /// first time round - but size is not what hangs a write here. An
+    /// unacknowledged packet is, and `russh-sftp` parks those acks with no
+    /// timeout. A NAS that slept between the data rename and the annotation
+    /// would otherwise wedge the cycle with the object already published.
+    ///
+    /// Driven at `write_sidecar` directly rather than through `create`,
+    /// because a byte budget aimed at a megabyte-scale upload cannot reliably
+    /// land on the few hundred bytes that follow it - a tuned budget would be a
+    /// flake waiting to happen. Here the budget only has to clear the `open`
+    /// request and stop before the write.
+    ///
+    /// The `>= deadline` assertion is what proves the GUARD fired rather than
+    /// some other bound: once the channel is gone, `RawSftpSession::send`
+    /// refuses new requests INSTANTLY (its `tx` is closed), so the only way to
+    /// spend the deadline is to be waiting on a parked write ack - which is
+    /// precisely the hang this guard exists to end.
+    #[tokio::test]
+    async fn a_channel_that_dies_before_the_sidecar_write_fails_bounded_too() {
+        const SHORT_DEADLINE: Duration = Duration::from_secs(2);
+
+        let server = TestSftpServer::spawn().await.unwrap();
+        let mut store = SftpStore::new(
+            &server.prepared_config(SftpAuthKind::Password),
+            &server.password_credential(),
+        )
+        .unwrap();
+        store.set_write_deadline_for_tests(SHORT_DEADLINE);
+        store
+            .list_folder("", &DriveContext::MyDrive)
+            .await
+            .expect("a healthy listing establishes the session");
+
+        let sidecar = Sidecar {
+            version: 1,
+            kind: EntryKind::File,
+            name: "annotated.bin".to_string(),
+            stored: "annotated.bin".to_string(),
+            size: Some(3),
+            md5: None,
+            mime: Some("application/octet-stream".to_string()),
+            modified_ms: 0,
+            props: props(&[(driven_remote::props::SOURCE_ID_KEY, "src-1")]),
+        };
+
+        let channel = store.channel().await.expect("a live channel");
+        // Enough for the `open` request packet, not enough for the write that
+        // follows it.
+        server.arm_channel_close_after_bytes(256);
+
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            SHORT_DEADLINE * 15,
+            SftpStore::write_sidecar(&channel, SHORT_DEADLINE, &store.root, &sidecar),
+        )
+        .await
+        .expect("a dead channel must FAIL the sidecar write, never wedge it")
+        .expect_err("the sidecar cannot be written over a channel that is gone");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            server.fault_counts().channel_closures,
+            1,
+            "the test never reached its fault: the channel was never closed"
+        );
+        assert!(
+            elapsed >= SHORT_DEADLINE,
+            "the failure must come from the write guard - a refused request would have returned \
+             instantly - but this took only {elapsed:?}"
+        );
+        assert_eq!(
+            driven_remote::classification_of(&error),
+            Some(DriveErrorClassification::Network),
+            "a dead channel is a transport fault, retryable like any other: {error:?}"
         );
     }
 

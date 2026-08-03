@@ -1189,6 +1189,19 @@ pub enum ErrorCode {
     /// `SftpStore::guard_root` refuses on every mutating operation - this code
     /// tells the user why creation itself was refused instead.
     SftpDestMarkerMismatch,
+    /// `sftp.root_not_writable` - the SSH (SFTP) destination's configured root
+    /// exists and is a directory, but this account cannot write into it.
+    ///
+    /// Setup-time only, and the one probe failure a user can always act on: the
+    /// host answered, the credential authenticated, the path is real - a
+    /// read-only export, a restrictive ACL, or a root owned by another user is
+    /// all that stands in the way. Deliberately NOT
+    /// [`Self::DriveDestFolderMissing`]: the destination is right there, and
+    /// telling the user to reconnect it would send them after the wrong
+    /// problem. Discovered by whichever of the probe's two writes runs first
+    /// (the identity marker, then the write/remove round trip), since the
+    /// remedy is identical either way.
+    SftpRootNotWritable,
 }
 
 impl ErrorCode {
@@ -1244,6 +1257,7 @@ impl ErrorCode {
             ErrorCode::SftpRootMissing => "sftp.root_missing",
             ErrorCode::SftpRootNotADirectory => "sftp.root_not_a_directory",
             ErrorCode::SftpDestMarkerMismatch => "sftp.dest_marker_mismatch",
+            ErrorCode::SftpRootNotWritable => "sftp.root_not_writable",
         }
     }
 
@@ -1303,6 +1317,7 @@ impl ErrorCode {
             "sftp.root_missing" => ErrorCode::SftpRootMissing,
             "sftp.root_not_a_directory" => ErrorCode::SftpRootNotADirectory,
             "sftp.dest_marker_mismatch" => ErrorCode::SftpDestMarkerMismatch,
+            "sftp.root_not_writable" => ErrorCode::SftpRootNotWritable,
             _ => return None,
         })
     }

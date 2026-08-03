@@ -923,6 +923,10 @@
       "dest_marker_mismatch": {
         "short": "Already a different backup",
         "long": "That folder already holds a Driven backup for a different destination. Point Driven at an empty folder, or the folder holding the backup you actually mean to reconnect to."
+      },
+      "root_not_writable": {
+        "short": "Cannot write there",
+        "long": "That folder exists on the server, but this account cannot write into it. Check the folder's permissions - a read-only export or a folder owned by another user will look fine until Driven tries to save a file."
       }
     }
   }

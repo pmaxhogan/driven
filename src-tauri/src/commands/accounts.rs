@@ -1351,6 +1351,15 @@ fn sftp_probe_command_error(e: anyhow::Error) -> CommandError {
             return CommandError::with_code(ErrorCode::SftpDestMarkerMismatch, msg);
         }
     }
+    // OUTSIDE the `DestFolderMissing` gate on purpose. `sftp.root_not_writable`
+    // is classified `Other`, not `DestFolderMissing`, because the destination
+    // is not missing at all - it is right there and simply refuses our bytes.
+    // Filing it under the missing-destination family would tell the user to
+    // reconnect a drive that never went away.
+    let msg = e.to_string();
+    if msg.contains("sftp.root_not_writable") {
+        return CommandError::with_code(ErrorCode::SftpRootNotWritable, msg);
+    }
     CommandError::from(e)
 }
 
@@ -2570,6 +2579,39 @@ mod tests {
             let mapped = sftp_probe_command_error(err);
             assert_eq!(mapped.code, ErrorCode::SftpDestMarkerMismatch);
             assert!(mapped.message.contains("sftp.dest_marker_mismatch"));
+        }
+
+        #[test]
+        fn the_probe_error_mapper_recognizes_an_unwritable_root() {
+            // The one probe failure that is NOT in the `DestFolderMissing`
+            // family, and the mapper has to find it anyway. `provision.rs`
+            // classifies an unwritable root as `Other` deliberately - the
+            // destination is right there and simply refuses our bytes, so
+            // filing it under the missing-destination codes would tell the user
+            // to reconnect a drive that never went away. If this branch ever
+            // gets moved inside the `is_dest_folder_missing` gate above, the
+            // code silently degrades to the generic one and the wizard loses
+            // the only actionable message it can show for a read-only export.
+            // Built exactly as `provision::not_writable` builds it: the dotted
+            // code in a `.context` (which is what `Display` renders, and what
+            // this mapper scans), the cause underneath a `Classified` carrying
+            // the real classification.
+            let inner = driven_remote::DriveError::Classified {
+                kind: driven_remote::remote_store::DriveErrorClassification::Other,
+                source: anyhow::anyhow!("write /backups/.driven-tmp-x: permission denied"),
+            };
+            let err = anyhow::Error::new(inner).context(
+                "sftp.root_not_writable: /backups exists on nas.example but this account \
+                 cannot write there"
+                    .to_string(),
+            );
+            let mapped = sftp_probe_command_error(err);
+            assert_eq!(mapped.code, ErrorCode::SftpRootNotWritable);
+            assert!(
+                mapped.message.contains("sftp.root_not_writable"),
+                "the classified code must survive the command boundary: {}",
+                mapped.message
+            );
         }
 
         #[tokio::test]

@@ -326,8 +326,12 @@ impl Scenario for SftpRoundTrip {
 /// refusal can only be the write being denied.
 ///
 /// What is NOT asserted here: that the keychain entry is absent too. The
-/// account list is the only surface this tier can see; the keychain rollback is
-/// asserted at the unit tier, which can read the keychain directly.
+/// account list is the only surface this tier can see. Nor is that a
+/// "rollback" - a refused probe never writes a credential in the first place,
+/// because `create_sftp_account` probes BEFORE it persists anything. What the
+/// unit tier asserts is that ORDERING guarantee (and the true rollback, which
+/// only exists on the narrower path where the row write fails after the
+/// keychain write succeeded).
 async fn refused_write_persists_nothing(
     session: &AppSession,
     stack: &SftpStack,
