@@ -524,11 +524,78 @@ struct Channel<'a> {
 }
 
 impl Channel<'_> {
-    fn sftp(&self) -> &RusshSftpSession {
+    fn session(&self) -> &SftpSession {
         self.guard
             .as_ref()
             .expect("a Channel is only ever built around a live session")
-            .sftp()
+    }
+
+    fn sftp(&self) -> &RusshSftpSession {
+        self.session().sftp()
+    }
+}
+
+/// How often a write in flight re-checks that the SSH session is still there.
+///
+/// Short enough that a dead pipe is noticed promptly, long enough that the poll
+/// costs nothing next to the transfer it is guarding.
+const LIVENESS_POLL: Duration = Duration::from_millis(250);
+
+/// Await a write-path future, failing if the SSH transport dies underneath it.
+///
+/// ## Why this guard exists (russh-sftp 2.3)
+///
+/// Every other request this store makes is bounded: `RawSftpSession::request`
+/// wraps the response channel in a 10 second timeout, so a reply that never
+/// arrives becomes an error. **The write path is the exception.**
+/// `File::poll_write` calls `write_nowait`, which parks a `oneshot::Receiver`
+/// in the file's `write_acks` queue with NO timeout, and `poll_flush` /
+/// `poll_shutdown` then drain that queue.
+///
+/// When the transport dies the library's read task breaks on EOF and drops its
+/// `SessionInner` - but the pending senders live in a request map that
+/// `RawSftpSession` CO-OWNS, so they are never dropped and the receivers never
+/// resolve. `file.shutdown()` (and `file.write_all` once the ack queue is full)
+/// therefore waits forever. Not for the inactivity timeout, not for the
+/// keepalive window: forever. A NAS that goes to sleep mid-upload wedges the
+/// sync cycle rather than failing it, which is the one outcome the SPEC s24
+/// taxonomy has no room for.
+///
+/// So the write path is bounded on session LIVENESS rather than on a clock. A
+/// wall-clock write timeout would need a number that is simultaneously long
+/// enough not to strand a slow link and short enough not to look like a hang,
+/// and no such number exists. `russh` already declares a dead peer through the
+/// keepalive window this crate configures
+/// ([`crate::session`]'s `KEEPALIVE_INTERVAL`, with `INACTIVITY_TIMEOUT` as a
+/// backstop), and that is exactly what
+/// [`SftpSession::is_connected`](crate::session::SftpSession::is_connected)
+/// reports - so a healthy slow upload is never interrupted and a dead one fails
+/// as [`SftpFailure::ConnectionLost`], i.e. retryable, like every other
+/// transport fault here.
+///
+/// Removable once russh-sftp fails pending write acks when its stream ends.
+async fn while_connected<T>(
+    session: &SftpSession,
+    what: &str,
+    op: impl std::future::Future<Output = std::io::Result<T>>,
+) -> anyhow::Result<T> {
+    tokio::pin!(op);
+    loop {
+        tokio::select! {
+            // The operation gets first refusal every time, so a write that
+            // completes inside a poll interval never pays for the check.
+            biased;
+            result = &mut op => return result.map_err(|error| sftp_io_error(what, error)),
+            _ = tokio::time::sleep(LIVENESS_POLL) => {
+                if !session.is_connected() {
+                    return Err(anyhow::Error::new(sftp_error(SftpFailure::ConnectionLost {
+                        detail: format!(
+                            "{what}: the SSH session died while the write was in flight"
+                        ),
+                    })));
+                }
+            }
+        }
     }
 }
 
@@ -1226,10 +1293,12 @@ impl SftpStore {
     /// Stream `body` into the remote temp path, returning `(size, md5)` over
     /// the bytes actually written.
     async fn write_temp(
-        sftp: &RusshSftpSession,
+        channel: &Channel<'_>,
         temp: &str,
         body: UploadBody,
     ) -> anyhow::Result<(u64, [u8; 16])> {
+        let sftp = channel.sftp();
+        let session = channel.session();
         // `SftpSession::write` opens with WRITE only and therefore CANNOT
         // create a file - the CREATE flag has to be explicit or a correct
         // server answers SSH_FX_NO_SUCH_FILE.
@@ -1247,9 +1316,7 @@ impl SftpStore {
             UploadBody::Bytes(bytes) => {
                 hasher.update(&bytes);
                 written = bytes.len() as u64;
-                file.write_all(&bytes)
-                    .await
-                    .map_err(|e| sftp_io_error(&format!("write {temp}"), e))?;
+                while_connected(session, &format!("write {temp}"), file.write_all(&bytes)).await?;
                 None
             }
             UploadBody::Stream { len, mut stream } => {
@@ -1257,16 +1324,16 @@ impl SftpStore {
                     let chunk = chunk?;
                     hasher.update(&chunk);
                     written += chunk.len() as u64;
-                    file.write_all(&chunk)
-                        .await
-                        .map_err(|e| sftp_io_error(&format!("write {temp}"), e))?;
+                    while_connected(session, &format!("write {temp}"), file.write_all(&chunk))
+                        .await?;
                 }
                 Some(len)
             }
         };
-        file.shutdown()
-            .await
-            .map_err(|e| sftp_io_error(&format!("close {temp}"), e))?;
+        // The close is where an interrupted upload would otherwise wedge: it
+        // drains every write still waiting for an acknowledgement the dead
+        // server will never send. See [`while_connected`].
+        while_connected(session, &format!("close {temp}"), file.shutdown()).await?;
 
         // The declared length is what the executor hashed and what it will
         // verify against; a stream that produced a different number of bytes is
@@ -1861,7 +1928,7 @@ impl RemoteStore for SftpStore {
 
         let dir_path = self.remote_path(&dir_id)?;
         let temp = join_remote(&dir_path, &names::temp_name());
-        let (_, expected) = match Self::write_temp(sftp, &temp, body).await {
+        let (_, expected) = match Self::write_temp(&channel, &temp, body).await {
             Ok(v) => v,
             Err(error) => {
                 let _ = Self::remove_if_present(sftp, &temp).await;
@@ -1934,7 +2001,7 @@ impl RemoteStore for SftpStore {
         let _claim = claim_exact(&self.claims, &dir_id, &stored, &original);
 
         let temp = join_remote(&dir_path, &names::temp_name());
-        let (_, expected) = match Self::write_temp(sftp, &temp, body).await {
+        let (_, expected) = match Self::write_temp(&channel, &temp, body).await {
             Ok(v) => v,
             Err(error) => {
                 let _ = Self::remove_if_present(sftp, &temp).await;
@@ -2042,9 +2109,12 @@ impl RemoteStore for SftpStore {
             )
             .await
             .map_err(|e| sftp_op_error(&format!("create {temp_path}"), e))?;
-        file.shutdown()
-            .await
-            .map_err(|e| sftp_io_error(&format!("close {temp_path}"), e))?;
+        while_connected(
+            channel.session(),
+            &format!("close {temp_path}"),
+            file.shutdown(),
+        )
+        .await?;
 
         self.sessions.lock().insert(
             url.clone(),
@@ -2151,12 +2221,18 @@ impl RemoteStore for SftpStore {
             file.seek(std::io::SeekFrom::Start(offset))
                 .await
                 .map_err(|e| sftp_io_error(&format!("seek {temp_path}"), e))?;
-            file.write_all(&chunk)
-                .await
-                .map_err(|e| sftp_io_error(&format!("append to {temp_path}"), e))?;
-            file.shutdown()
-                .await
-                .map_err(|e| sftp_io_error(&format!("close {temp_path}"), e))?;
+            while_connected(
+                channel.session(),
+                &format!("append to {temp_path}"),
+                file.write_all(&chunk),
+            )
+            .await?;
+            while_connected(
+                channel.session(),
+                &format!("close {temp_path}"),
+                file.shutdown(),
+            )
+            .await?;
 
             let mut sessions = self.sessions.lock();
             let state = sessions
@@ -2404,30 +2480,11 @@ mod tests {
     use crate::test_support::TestSftpServer;
     use driven_remote::remote_store::DriveErrorClassification;
 
-    /// Initialize `root` as a Driven destination and return its id.
-    ///
-    /// Stands in for Task 6's creation probe, which is what writes the marker
-    /// for real - the same role `driven_localfs::prepare_destination` plays for
-    /// that crate's `store_in` test helper.
-    fn seed_destination(root: &std::path::Path) -> String {
-        let destination_id = uuid::Uuid::new_v4().to_string();
-        let marker = crate::config::DestinationMarker::new(&destination_id, 1_700_000_000_000);
-        std::fs::write(
-            root.join(names::MARKER_FILE),
-            serde_json::to_vec(&marker).unwrap(),
-        )
-        .unwrap();
-        destination_id
-    }
-
     /// The destination id already recorded in `root`'s marker, so a SECOND
-    /// store can be built against the same destination without re-seeding it
+    /// store can be built against the same destination without re-marking it
     /// under a new id.
     fn read_destination_id(root: &std::path::Path) -> String {
-        let raw = std::fs::read(root.join(names::MARKER_FILE)).expect("the marker is there");
-        let marker: crate::config::DestinationMarker =
-            serde_json::from_slice(&raw).expect("the marker parses");
-        marker.destination_id
+        TestSftpServer::destination_id_in(root).expect("the marker is there and parses")
     }
 
     /// Backdate `path`'s mtime well past the sweep window.
@@ -2442,11 +2499,11 @@ mod tests {
     }
 
     fn store_for(server: &TestSftpServer) -> SftpStore {
-        let destination_id = seed_destination(server.root());
-        let mut config = server.pinned_config(SftpAuthKind::Password);
-        config.destination_id = Some(destination_id);
-        SftpStore::new(&config, &server.password_credential())
-            .expect("a valid config builds a store")
+        SftpStore::new(
+            &server.prepared_config(SftpAuthKind::Password),
+            &server.password_credential(),
+        )
+        .expect("a valid config builds a store")
     }
 
     /// A store whose root has NOT been initialized - the shape of `root_path`
@@ -3177,8 +3234,7 @@ mod tests {
     #[tokio::test]
     async fn a_non_root_root_path_scopes_everything_under_it() {
         let server = TestSftpServer::spawn().await.unwrap();
-        std::fs::create_dir(server.root().join("backups")).unwrap();
-        let destination_id = seed_destination(&server.root().join("backups"));
+        let destination_id = server.mark_as_destination_in("backups").unwrap();
         let mut config = server.pinned_config(SftpAuthKind::Password);
         config.root_path = "/backups".to_string();
         config.destination_id = Some(destination_id);
@@ -3308,7 +3364,7 @@ mod tests {
             .expect("the destination is this account's");
 
         // The other machine re-initializes the same directory.
-        seed_destination(server.root());
+        server.mark_as_destination();
 
         let error = store
             .create("", "later.txt", "text/plain", body(b"mine"), HashMap::new())
@@ -3339,7 +3395,7 @@ mod tests {
             "{error:?}"
         );
 
-        seed_destination(server.root());
+        server.mark_as_destination();
         store
             .create("", "a.txt", "text/plain", body(b"x"), HashMap::new())
             .await
@@ -4284,6 +4340,327 @@ mod tests {
             "usage_in_drive is Driven's own footprint, excluding its control files"
         );
         assert_eq!(about.usage_in_drive_trash, 0, "SSH has no trash");
+    }
+
+    /// The third quota case, and the one the fixture could not reach until the
+    /// chaos fault hooks landed: the server ADVERTISES `statvfs@openssh.com`
+    /// and then refuses the request.
+    ///
+    /// `about()` must degrade to an unknown limit with a warning rather than
+    /// failing. A quota display is not worth failing a call over, and the
+    /// caller already handles `limit: None` - whereas an `Err` here would
+    /// surface as a sync error on a server that is otherwise perfectly healthy.
+    #[tokio::test]
+    async fn about_degrades_when_the_server_advertises_statvfs_and_then_refuses_it() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        store
+            .create(
+                "",
+                "a.txt",
+                "text/plain",
+                body(b"0123456789"),
+                HashMap::new(),
+            )
+            .await
+            .unwrap();
+
+        server.arm_statvfs_refusal();
+        let about = store
+            .about()
+            .await
+            .expect("a refused quota extension must not fail the call - the walk still succeeded");
+        assert!(
+            server.fault_counts().statvfs_refusals >= 1,
+            "the test never reached its fault: no statvfs request was refused"
+        );
+        assert_eq!(
+            about.limit, None,
+            "a promise the server did not keep is still an unknown ceiling, never a guess"
+        );
+        assert_eq!(
+            about.usage, 10,
+            "with no volume figure the only honest usage is Driven's own"
+        );
+        assert_eq!(about.usage_in_drive, 10);
+    }
+
+    // -- fault-hook behaviour (the chaos rows build on these) ------------------
+
+    /// A transport cut mid-transfer must be a RETRYABLE network outcome the
+    /// store reconnects through, not a fatal one.
+    ///
+    /// This is the mechanism every SFTP chaos row rests on, asserted here at
+    /// the backend level first: the fixture cuts the TCP socket (not the SFTP
+    /// channel - see its module docs), which is what makes
+    /// `SftpSession::is_connected` go false and the store's `channel()` take
+    /// the reconnect path.
+    #[tokio::test]
+    async fn a_transport_cut_mid_upload_is_retryable_and_the_store_reconnects() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        // A payload comfortably larger than the budget below, so the cut lands
+        // mid-transfer rather than during the handshake.
+        let content: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+
+        // Establish the session first, so the budget is spent on payload rather
+        // than on key exchange.
+        store
+            .list_folder("", &DriveContext::MyDrive)
+            .await
+            .expect("a healthy listing");
+        server.arm_disconnect_after_bytes(64 * 1024);
+
+        // The `timeout` is the REGRESSION GUARD for the hang `while_connected`
+        // exists to prevent: without that guard this call never returns at all
+        // (russh-sftp parks the write acknowledgements on a channel nothing
+        // ever resolves once the stream dies). Asserting only on the error
+        // would make a reintroduced hang look like CI flake rather than the
+        // defect it is. The budget is far above the ~250ms liveness poll and
+        // still far below any wall-clock cap.
+        let error = tokio::time::timeout(
+            Duration::from_secs(90),
+            store.create(
+                "",
+                "big.bin",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from(content.clone())),
+                HashMap::new(),
+            ),
+        )
+        .await
+        .expect("a cut connection must FAIL the upload, never wedge it")
+        .expect_err("the upload cannot finish across a cut connection");
+        assert_eq!(
+            server.fault_counts().disconnects,
+            1,
+            "the test never reached its fault: the socket was never cut"
+        );
+        assert_eq!(
+            driven_remote::classification_of(&error),
+            Some(DriveErrorClassification::Network),
+            "a dropped pipe is a retryable network fault, not a decision the server made: \
+             {error:?}"
+        );
+
+        // The retry: the fault is single-shot, so the store must reconnect and
+        // finish. Anything else means a blip permanently strands a file.
+        let entry = store
+            .create(
+                "",
+                "big.bin",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from(content.clone())),
+                HashMap::new(),
+            )
+            .await
+            .expect("the store must reconnect and complete the upload");
+        assert_eq!(entry.md5, Some(digest(&content)));
+        assert_eq!(download_to_vec(&store, &entry.id).await, content);
+    }
+
+    /// An auth flap - a box that is up but not yet ready - must classify as
+    /// `AuthInvalidGrant` while it lasts and then simply work.
+    ///
+    /// The flap is deliberately longer than one attempt: a single rejection
+    /// could be papered over by any in-session retry, and the row would prove
+    /// nothing about the classification.
+    #[tokio::test]
+    async fn an_auth_flap_is_reported_then_recovers_once_the_server_settles() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        server.arm_auth_failures(4);
+
+        let error = store
+            .list_folder("", &DriveContext::MyDrive)
+            .await
+            .expect_err("a refused credential cannot list");
+        assert!(
+            server.fault_counts().auth_rejections >= 1,
+            "the test never reached its fault: no auth attempt was rejected"
+        );
+        assert_eq!(
+            driven_remote::classification_of(&error),
+            Some(DriveErrorClassification::AuthInvalidGrant),
+            "{error:?}"
+        );
+
+        // Drain whatever is left of the flap, then prove the account is usable
+        // again: a transient auth refusal must not be a one-way trip.
+        server.clear_faults();
+        store
+            .list_folder("", &DriveContext::MyDrive)
+            .await
+            .expect("the server settled; the same credential must work again");
+    }
+
+    /// A host key that changes after pinning must hard-fail as an auth problem,
+    /// and must KEEP failing - it is the MITM signal, not a transient.
+    #[tokio::test]
+    async fn a_swapped_host_key_hard_fails_and_stays_failing() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        store
+            .create("", "before.txt", "text/plain", body(b"x"), HashMap::new())
+            .await
+            .expect("a healthy baseline against the pinned key");
+
+        server.arm_host_key_swap();
+        // A swapped host key is only observable at the NEXT connection - the
+        // pin is verified per connection, and the store correctly keeps using
+        // the live session it already authenticated. Without forcing a fresh
+        // one this test would pass vacuously against a session that never
+        // reconnected.
+        drop(store);
+        let store = SftpStore::new(
+            &SftpConfig {
+                destination_id: Some(read_destination_id(server.root())),
+                ..server.pinned_config(SftpAuthKind::Password)
+            },
+            &server.password_credential(),
+        )
+        .unwrap();
+
+        for attempt in 1..=2 {
+            let error = store
+                .create("", "after.txt", "text/plain", body(b"x"), HashMap::new())
+                .await
+                .expect_err("attempt {attempt}: a changed host key must be refused");
+            assert_eq!(
+                driven_remote::classification_of(&error),
+                Some(DriveErrorClassification::AuthInvalidGrant),
+                "attempt {attempt}: {error:?}"
+            );
+            assert!(
+                format!("{error:?}").contains("sftp.host_key_mismatch"),
+                "attempt {attempt}: {error:?}"
+            );
+        }
+        assert!(
+            server.fault_counts().host_key_swaps >= 1,
+            "the test never reached its fault: no connection saw the alternate key"
+        );
+        assert!(
+            !server.root().join("after.txt").exists(),
+            "nothing may be written to a server that failed the pin check"
+        );
+    }
+
+    /// A full remote disk must classify as `StorageQuota`, which is what makes
+    /// the account PAUSE rather than burn its retry budget - and nothing
+    /// partial may be left readable as a finished object.
+    #[tokio::test]
+    async fn a_full_remote_disk_is_a_quota_failure_that_publishes_nothing() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        let content: Vec<u8> = (0..256 * 1024).map(|i| (i % 241) as u8).collect();
+
+        // Room for a first chunk and nothing more, so the disk fills up with
+        // bytes already at the destination - the case that can publish a
+        // truncated object, unlike "full before we started".
+        server.arm_enospc_after_bytes(32 * 1024);
+        let error = store
+            .create(
+                "",
+                "big.bin",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from(content.clone())),
+                HashMap::new(),
+            )
+            .await
+            .expect_err("a full disk cannot accept the upload");
+        assert!(
+            server.fault_counts().enospc_refusals >= 1,
+            "the test never reached its fault: no write was refused"
+        );
+        assert_eq!(
+            driven_remote::classification_of(&error),
+            Some(DriveErrorClassification::StorageQuota),
+            "SFTPv3 has no ENOSPC code, so the message is the only signal - and it must be \
+             read as a full destination rather than a retryable transient: {error:?}"
+        );
+        assert!(
+            store
+                .list_folder("", &DriveContext::MyDrive)
+                .await
+                .unwrap()
+                .is_empty(),
+            "a partial upload must never appear as a complete object"
+        );
+
+        // Freeing the space must let it finish: a full destination is a pause,
+        // not a permanent loss.
+        server.clear_faults();
+        let entry = store
+            .create(
+                "",
+                "big.bin",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from(content.clone())),
+                HashMap::new(),
+            )
+            .await
+            .expect("space was freed");
+        assert_eq!(entry.md5, Some(digest(&content)));
+    }
+
+    /// A directory enumeration the server cuts short must fail the whole
+    /// listing rather than hand back the partial batch.
+    ///
+    /// This is the completeness invariant at its sharpest: `dead = recorded -
+    /// live`, so a short listing accepted as complete reads as a mass deletion
+    /// and the caller "heals" it by re-uploading everything. The existing
+    /// mode-000 test covers a directory that cannot be OPENED; this covers the
+    /// nastier shape, where the server answers, hands over real entries, and
+    /// only then fails.
+    #[tokio::test]
+    async fn a_truncated_enumeration_fails_the_listing_instead_of_reporting_a_short_one() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+        for name in ["a.txt", "b.txt", "c.txt", "d.txt"] {
+            store
+                .create(
+                    "",
+                    name,
+                    "text/plain",
+                    body(b"x"),
+                    props(&[(driven_remote::props::SOURCE_ID_KEY, "src-1")]),
+                )
+                .await
+                .unwrap();
+        }
+        let full = store
+            .list_source_object_ids("src-1", &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert_eq!(full.len(), 4, "the healthy baseline holds every object");
+
+        // Two entries per batch, against a directory holding four objects,
+        // their four sidecars, the marker and the two dot entries.
+        server.arm_truncated_readdir(2);
+        let error = store
+            .list_source_object_ids("src-1", &DriveContext::MyDrive)
+            .await
+            .expect_err("a cut enumeration must never read as a complete directory");
+        assert!(
+            server.fault_counts().truncated_readdirs >= 1,
+            "the test never reached its fault: no enumeration was truncated"
+        );
+        assert!(format!("{error:?}").contains("list "), "{error:?}");
+        assert!(
+            store.about().await.is_err(),
+            "the same walk backs about(), and the same rule applies"
+        );
+
+        server.clear_faults();
+        assert_eq!(
+            store
+                .list_source_object_ids("src-1", &DriveContext::MyDrive)
+                .await
+                .unwrap(),
+            full,
+            "once the server behaves, the listing is whole again"
+        );
     }
 
     #[tokio::test]

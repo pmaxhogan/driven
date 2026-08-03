@@ -9,24 +9,49 @@
 //! `SftpSession::connect` without a handshake could not tell us whether the
 //! host-key pinning works.
 //!
-//! The server is deliberately **plain**. Fault injection (mid-stream
-//! disconnects, auth flaps, host-key swaps, ENOSPC, truncated readdir) belongs
-//! to the chaos harness's `FaultySftpServer`, which is a separate,
-//! later-landing tool. Keep this one boring.
+//! ## Fault injection
 //!
-//! **One deliberate exception:
-//! [`TestSftpServer::corrupt_committed_bytes_after_rename`].** The store's
-//! integrity protocol re-downloads and re-hashes every object it commits, and
-//! that step is only load-bearing if something can actually corrupt the bytes
-//! between the rename and the verify - otherwise every test passes just as
-//! happily against an implementation that returns the digest it accumulated
-//! while writing, which is the `x == x` check the module docs of
-//! [`crate::store`] warn about. There is no way to stage that corruption from
-//! the client side, so the fixture grows exactly one switch: after a successful
-//! rename it flips one byte of the destination IN PLACE (the length is
-//! preserved on purpose, so the sidecar's size guard cannot mask the digest
-//! failure). It is off unless a test turns it on, and it is scoped to `rename`
-//! and nothing else. Anything richer than this belongs to the chaos harness.
+//! The server is **plain until something arms it**. Every switch in
+//! [`SftpFaultCounts`]'s companion `arm_*` family is off after `spawn()`, so a
+//! test that does not mention faults talks to an honest server, and the chaos
+//! harness's `SftpFixture` is the only caller that turns any of them on. The
+//! set is deliberately closed: it is exactly the hazards the chaos rows
+//! consume (a transport cut mid-stream, an auth flap, a host-key swap, a full
+//! remote disk, a truncated directory enumeration, a `statvfs` extension that
+//! is advertised and then refused) and nothing was added "while we are here" -
+//! this is a fixture, not a general fault framework.
+//!
+//! Two of them are worth reading before use, because what they inject is not
+//! quite what their name suggests:
+//!
+//! - [`TestSftpServer::arm_disconnect_after_bytes`] cuts the **TCP stream**,
+//!   not the SFTP channel. Killing only the channel would leave
+//!   `russh::client::Handle` open, and
+//!   [`SftpSession::is_connected`](crate::session::SftpSession::is_connected)
+//!   reads exactly that - so the store would keep handing out a dead SFTP
+//!   session instead of reconnecting, and the row would be measuring a
+//!   fixture artefact. Cutting the transport is also the more honest model of
+//!   the thing being simulated: a yanked cable, a NAT timeout, a NAS going to
+//!   sleep. The budget counts ENCRYPTED transport bytes arriving from the
+//!   client, so pick one comfortably above a handshake (a few KiB) and below
+//!   the payload.
+//! - [`TestSftpServer::arm_truncated_readdir`] serves a PARTIAL first batch and
+//!   then fails the enumeration. It cannot simulate the other truncation - a
+//!   server that quietly returns fewer entries and then a clean EOF - because
+//!   that is indistinguishable from a smaller directory at the protocol level,
+//!   by any client. See [`TestSftpServer::arm_truncated_readdir`]'s docs.
+//!
+//! **[`TestSftpServer::corrupt_committed_bytes_after_rename`] predates the
+//! rest and is not a chaos switch.** The store's integrity protocol
+//! re-downloads and re-hashes every object it commits, and that step is only
+//! load-bearing if something can actually corrupt the bytes between the rename
+//! and the verify - otherwise every test passes just as happily against an
+//! implementation that returns the digest it accumulated while writing, which
+//! is the `x == x` check the module docs of [`crate::store`] warn about. There
+//! is no way to stage that corruption from the client side, so after a
+//! successful rename it flips one byte of the destination IN PLACE (the length
+//! is preserved on purpose, so the sidecar's size guard cannot mask the digest
+//! failure).
 //!
 //! ## Fidelity notes (read before writing a test that depends on behaviour)
 //!
@@ -62,8 +87,10 @@
 use std::collections::HashMap;
 use std::net::SocketAddr;
 use std::path::{Path, PathBuf};
-use std::sync::atomic::{AtomicBool, Ordering};
+use std::pin::Pin;
+use std::sync::atomic::{AtomicBool, AtomicU64, Ordering};
 use std::sync::{Arc, Mutex as StdMutex};
+use std::task::{Context, Poll};
 use std::time::Duration;
 
 use russh::keys::ssh_key::{Algorithm, HashAlg, LineEnding, PublicKey};
@@ -76,10 +103,11 @@ use russh_sftp::protocol::{
     StatusCode, Version,
 };
 use tempfile::TempDir;
-use tokio::io::{AsyncReadExt, AsyncSeekExt, AsyncWriteExt};
+use tokio::io::{AsyncRead, AsyncReadExt, AsyncSeekExt, AsyncWrite, AsyncWriteExt, ReadBuf};
 use tokio::task::JoinHandle;
 
-use crate::config::{SftpAuthKind, SftpConfig, SftpCredential};
+use crate::config::{DestinationMarker, SftpAuthKind, SftpConfig, SftpCredential};
+use crate::names;
 
 /// The one username the test server accepts. Obviously synthetic.
 pub const TEST_USERNAME: &str = "driven-test-user";
@@ -95,11 +123,181 @@ pub const TEST_PASSWORD: &str = "not-a-real-password-just-a-test-fixture";
 pub struct TestSftpServer {
     addr: SocketAddr,
     host_key_fingerprint: String,
+    alternate_host_key_fingerprint: String,
     client_private_key_pem: String,
     root: TempDir,
     tasks: Arc<StdMutex<Vec<JoinHandle<()>>>>,
     accept_task: JoinHandle<()>,
-    corrupt_after_rename: Arc<AtomicBool>,
+    faults: Arc<SftpFaults>,
+}
+
+/// The value every byte-budget switch holds while it is DISARMED.
+///
+/// `u64::MAX` rather than a `None`, so the hot paths (`poll_read`, `write`)
+/// read one relaxed atomic and compare, with no lock and no allocation.
+const DISARMED: u64 = u64::MAX;
+
+/// How many times each armed fault actually fired.
+///
+/// Every chaos row asserts on one of these before it asserts anything else:
+/// a row that never reached its fault has tested nothing, and every assertion
+/// about "what must not happen afterwards" is trivially true on a run where
+/// nothing happened at all.
+#[derive(Debug, Clone, Copy, Default, PartialEq, Eq)]
+pub struct SftpFaultCounts {
+    /// Transport cuts served (see [`TestSftpServer::arm_disconnect_after_bytes`]).
+    pub disconnects: u64,
+    /// Authentication attempts rejected by the flap, password and key alike.
+    pub auth_rejections: u64,
+    /// Connections served with the ALTERNATE host key.
+    pub host_key_swaps: u64,
+    /// Writes refused because the injected byte budget was exhausted.
+    pub enospc_refusals: u64,
+    /// Directory enumerations cut short after their partial first batch.
+    pub truncated_readdirs: u64,
+    /// `statvfs@openssh.com` requests refused after being advertised.
+    pub statvfs_refusals: u64,
+}
+
+/// The fault switches, shared by the accept loop and every live connection.
+///
+/// All atomics: the switches are flipped from a test's own task while
+/// connection tasks read them, and nothing here is worth a lock.
+#[derive(Debug, Default)]
+struct SftpFaults {
+    // -- transport cut -------------------------------------------------------
+    /// Client-to-server transport bytes allowed before the socket is cut.
+    disconnect_after_bytes: AtomicU64,
+    /// Bytes seen since the switch was armed (reset on each arming).
+    client_bytes: AtomicU64,
+    disconnects: AtomicU64,
+
+    // -- auth flap -----------------------------------------------------------
+    /// Authentication attempts still to be rejected before one is accepted.
+    auth_rejections_remaining: AtomicU64,
+    auth_rejections: AtomicU64,
+
+    // -- host-key swap -------------------------------------------------------
+    /// Latched: once set, EVERY later connection presents the alternate key.
+    swap_host_key: AtomicBool,
+    host_key_swaps: AtomicU64,
+
+    // -- remote disk full ----------------------------------------------------
+    /// Bytes the destination will still accept before it reports ENOSPC.
+    enospc_after_bytes: AtomicU64,
+    /// Bytes written since the switch was armed (reset on each arming).
+    written_bytes: AtomicU64,
+    /// Set the first time a write is refused. Without it a SMALLER write that
+    /// still fits under the budget would succeed after a larger one was
+    /// refused, which is not what a full filesystem does.
+    enospc_latched: AtomicBool,
+    enospc_refusals: AtomicU64,
+
+    // -- truncated enumeration -----------------------------------------------
+    /// Entries the first `readdir` batch may carry before the enumeration is
+    /// failed on the next call.
+    truncate_readdir_after: AtomicU64,
+    truncated_readdirs: AtomicU64,
+
+    // -- statvfs -------------------------------------------------------------
+    /// Refuse `statvfs@openssh.com` even though `init` advertised it.
+    refuse_statvfs: AtomicBool,
+    statvfs_refusals: AtomicU64,
+
+    // -- post-rename corruption (predates the chaos switches) ----------------
+    corrupt_after_rename: AtomicBool,
+}
+
+impl SftpFaults {
+    /// A disarmed set. `Default` would leave the byte budgets at 0, which reads
+    /// as "cut immediately" rather than "off".
+    fn disarmed() -> Self {
+        Self {
+            disconnect_after_bytes: AtomicU64::new(DISARMED),
+            enospc_after_bytes: AtomicU64::new(DISARMED),
+            truncate_readdir_after: AtomicU64::new(DISARMED),
+            ..Self::default()
+        }
+    }
+
+    fn clear(&self) {
+        self.disconnect_after_bytes
+            .store(DISARMED, Ordering::SeqCst);
+        self.client_bytes.store(0, Ordering::SeqCst);
+        self.auth_rejections_remaining.store(0, Ordering::SeqCst);
+        self.swap_host_key.store(false, Ordering::SeqCst);
+        self.enospc_after_bytes.store(DISARMED, Ordering::SeqCst);
+        self.written_bytes.store(0, Ordering::SeqCst);
+        self.enospc_latched.store(false, Ordering::SeqCst);
+        self.truncate_readdir_after
+            .store(DISARMED, Ordering::SeqCst);
+        self.refuse_statvfs.store(false, Ordering::SeqCst);
+        self.corrupt_after_rename.store(false, Ordering::SeqCst);
+    }
+
+    fn counts(&self) -> SftpFaultCounts {
+        SftpFaultCounts {
+            disconnects: self.disconnects.load(Ordering::SeqCst),
+            auth_rejections: self.auth_rejections.load(Ordering::SeqCst),
+            host_key_swaps: self.host_key_swaps.load(Ordering::SeqCst),
+            enospc_refusals: self.enospc_refusals.load(Ordering::SeqCst),
+            truncated_readdirs: self.truncated_readdirs.load(Ordering::SeqCst),
+            statvfs_refusals: self.statvfs_refusals.load(Ordering::SeqCst),
+        }
+    }
+
+    /// Account for `n` transport bytes read from a client. `true` means the
+    /// budget is spent and this socket must die now.
+    ///
+    /// SINGLE-SHOT: the switch disarms itself as it fires, so the client's
+    /// reconnect succeeds and the row measures RECOVERY rather than a permanent
+    /// outage. The `swap` is also what makes the disarm race-free when several
+    /// connections are reading at once - exactly one of them sees the armed
+    /// value and counts the cut.
+    fn note_client_bytes(&self, n: u64) -> bool {
+        let budget = self.disconnect_after_bytes.load(Ordering::SeqCst);
+        if budget == DISARMED {
+            return false;
+        }
+        if self.client_bytes.fetch_add(n, Ordering::SeqCst) + n < budget {
+            return false;
+        }
+        if self.disconnect_after_bytes.swap(DISARMED, Ordering::SeqCst) == DISARMED {
+            return false;
+        }
+        self.disconnects.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Whether this authentication attempt is inside the flap.
+    fn reject_auth(&self) -> bool {
+        let remaining = self.auth_rejections_remaining.load(Ordering::SeqCst);
+        if remaining == 0 {
+            return false;
+        }
+        self.auth_rejections_remaining
+            .store(remaining - 1, Ordering::SeqCst);
+        self.auth_rejections.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Whether this write exceeds the injected byte budget. LATCHED: a full
+    /// disk stays full until [`TestSftpServer::clear_faults`] frees it.
+    fn refuse_write(&self, n: u64) -> bool {
+        let budget = self.enospc_after_bytes.load(Ordering::SeqCst);
+        if budget == DISARMED {
+            return false;
+        }
+        if !self.enospc_latched.load(Ordering::SeqCst)
+            && self.written_bytes.load(Ordering::SeqCst) + n <= budget
+        {
+            self.written_bytes.fetch_add(n, Ordering::SeqCst);
+            return false;
+        }
+        self.enospc_latched.store(true, Ordering::SeqCst);
+        self.enospc_refusals.fetch_add(1, Ordering::SeqCst);
+        true
+    }
 }
 
 /// The quota numbers [`TestSftpServer`] reports through `statvfs@openssh.com`.
@@ -141,25 +339,35 @@ impl TestSftpServer {
 
     async fn spawn_with_features(features: ServerFeatures) -> anyhow::Result<Self> {
         let root = TempDir::new()?;
-        let corrupt_after_rename = Arc::new(AtomicBool::new(false));
+        let faults = Arc::new(SftpFaults::disarmed());
 
         let host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
         let host_key_fingerprint = fingerprint(host_key.public_key());
+        // Generated up front, not on demand: a host-key swap has to be
+        // observable as a DIFFERENT fingerprint the moment it is armed, and
+        // minting one inside the accept loop would make the fixture's own
+        // `alternate_host_key_fingerprint()` a promise it could not keep.
+        let alternate_host_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
+        let alternate_host_key_fingerprint = fingerprint(alternate_host_key.public_key());
 
         let client_key = PrivateKey::random(&mut rand::rng(), Algorithm::Ed25519)?;
         let client_private_key_pem = client_key.to_openssh(LineEnding::LF)?.to_string();
         let authorized_key = client_key.public_key().clone();
 
-        let config = Arc::new(russh::server::Config {
-            keys: vec![host_key],
-            // A test server has no reason to pay the constant-time rejection
-            // delay russh applies for real deployments - a wrong-password test
-            // would sleep a second per run.
-            auth_rejection_time: Duration::ZERO,
-            auth_rejection_time_initial: Some(Duration::ZERO),
-            inactivity_timeout: Some(Duration::from_secs(120)),
-            ..Default::default()
-        });
+        let server_config = |key: PrivateKey| {
+            Arc::new(russh::server::Config {
+                keys: vec![key],
+                // A test server has no reason to pay the constant-time
+                // rejection delay russh applies for real deployments - a
+                // wrong-password test would sleep a second per run.
+                auth_rejection_time: Duration::ZERO,
+                auth_rejection_time_initial: Some(Duration::ZERO),
+                inactivity_timeout: Some(Duration::from_secs(120)),
+                ..Default::default()
+            })
+        };
+        let config = server_config(host_key);
+        let alternate_config = server_config(alternate_host_key);
 
         let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0)).await?;
         let addr = listener.local_addr()?;
@@ -174,19 +382,32 @@ impl TestSftpServer {
         let accept_task = tokio::spawn({
             let tasks = Arc::clone(&tasks);
             let root_path = root.path().to_path_buf();
-            let corrupt_after_rename = Arc::clone(&corrupt_after_rename);
+            let faults = Arc::clone(&faults);
             async move {
                 loop {
                     let Ok((stream, _peer)) = listener.accept().await else {
                         break;
                     };
-                    let config = Arc::clone(&config);
+                    // The host key is chosen PER CONNECTION, so a swap armed
+                    // mid-run is seen by the reconnect rather than needing the
+                    // whole fixture rebuilt (which would discard the objects
+                    // the assertion is about).
+                    let config = if faults.swap_host_key.load(Ordering::SeqCst) {
+                        faults.host_key_swaps.fetch_add(1, Ordering::SeqCst);
+                        Arc::clone(&alternate_config)
+                    } else {
+                        Arc::clone(&config)
+                    };
                     let handler = SshHandler::new(
                         root_path.clone(),
                         authorized_key.clone(),
                         features,
-                        Arc::clone(&corrupt_after_rename),
+                        Arc::clone(&faults),
                     );
+                    let stream = FaultStream {
+                        inner: stream,
+                        faults: Arc::clone(&faults),
+                    };
                     let connection = tokio::spawn(async move {
                         match russh::server::run_stream(config, stream, handler).await {
                             Ok(session) => {
@@ -207,11 +428,12 @@ impl TestSftpServer {
         Ok(Self {
             addr,
             host_key_fingerprint,
+            alternate_host_key_fingerprint,
             client_private_key_pem,
             root,
             tasks,
             accept_task,
-            corrupt_after_rename,
+            faults,
         })
     }
 
@@ -221,10 +443,184 @@ impl TestSftpServer {
     ///
     /// The length is deliberately preserved: a truncation would also trip the
     /// sidecar's size guard, so the test would no longer be evidence that the
-    /// DIGEST check works. This is the only fault this fixture can inject - see
-    /// the module docs for why it exists at all.
+    /// DIGEST check works. See the module docs for why this one exists at all.
     pub fn corrupt_committed_bytes_after_rename(&self, enabled: bool) {
-        self.corrupt_after_rename.store(enabled, Ordering::SeqCst);
+        self.faults
+            .corrupt_after_rename
+            .store(enabled, Ordering::SeqCst);
+    }
+
+    // -- fault injection ------------------------------------------------------
+
+    /// How many times each armed fault has fired.
+    pub fn fault_counts(&self) -> SftpFaultCounts {
+        self.faults.counts()
+    }
+
+    /// Disarm every fault and reset the byte budgets, leaving the counters
+    /// alone so a row can still prove its fault fired earlier.
+    pub fn clear_faults(&self) {
+        self.faults.clear();
+    }
+
+    /// Cut the TCP connection once `bytes` more transport bytes have arrived
+    /// from a client, then disarm.
+    ///
+    /// The cut is at the **transport**, not the SFTP channel: see the module
+    /// docs for why (`is_connected` reads the SSH handle, so a channel-only
+    /// kill would leave the store using a corpse). `bytes` counts ENCRYPTED
+    /// bytes, so it includes framing and any handshake that happens after
+    /// arming - pick a budget well above a handshake (a few KiB) and well below
+    /// the payload, and the cut lands mid-transfer every run.
+    ///
+    /// Single-shot on purpose: the reconnect must succeed, or the row measures
+    /// a permanent outage instead of recovery from a blip.
+    pub fn arm_disconnect_after_bytes(&self, bytes: u64) {
+        self.faults.client_bytes.store(0, Ordering::SeqCst);
+        self.faults
+            .disconnect_after_bytes
+            .store(bytes, Ordering::SeqCst);
+    }
+
+    /// Reject the next `attempts` authentication requests - password and
+    /// public key alike - and accept normally afterwards.
+    ///
+    /// Models a NAS that is up but not yet ready (PAM still starting, a
+    /// directory service briefly unreachable), which is a very different
+    /// thing from a wrong credential even though the wire looks identical.
+    pub fn arm_auth_failures(&self, attempts: u64) {
+        self.faults
+            .auth_rejections_remaining
+            .store(attempts, Ordering::SeqCst);
+    }
+
+    /// Present the ALTERNATE host key on every connection from now on.
+    ///
+    /// Latched rather than single-shot, because that is what the hazard is: a
+    /// server's key does not flicker, it changes - a rebuild, a restored
+    /// image, or someone standing in the middle. Driven must refuse it and
+    /// keep refusing it, not retry until it happens to work.
+    pub fn arm_host_key_swap(&self) {
+        self.faults.swap_host_key.store(true, Ordering::SeqCst);
+    }
+
+    /// Accept `bytes` more bytes of file data, then refuse every write with the
+    /// `SSH_FX_FAILURE` + "No space left on device" shape a real server reports
+    /// a full disk with.
+    ///
+    /// SFTPv3 has no ENOSPC status code, so the MESSAGE is the only signal -
+    /// which is exactly why `driven-sftp` classifies on it
+    /// ([`crate::error`]'s `ENOSPC_MARKERS`) and why this fixture sends a
+    /// realistic one rather than a bare status.
+    ///
+    /// Latched: a full disk stays full until [`Self::clear_faults`].
+    pub fn arm_enospc_after_bytes(&self, bytes: u64) {
+        self.faults.written_bytes.store(0, Ordering::SeqCst);
+        self.faults.enospc_latched.store(false, Ordering::SeqCst);
+        self.faults
+            .enospc_after_bytes
+            .store(bytes, Ordering::SeqCst);
+    }
+
+    /// Serve at most `entries` names in a directory's first `readdir` batch,
+    /// then FAIL the enumeration instead of reporting `SSH_FX_EOF`.
+    ///
+    /// ## What this can and cannot simulate
+    ///
+    /// A client discovers the end of a directory by reading batches until the
+    /// server says `EOF`. There are therefore two ways an enumeration can come
+    /// up short, and only one of them is detectable by anybody:
+    ///
+    /// - **The server cuts the enumeration with an error.** That is this
+    ///   switch, and a client MUST NOT hand the partial batch back as though it
+    ///   were the whole directory. `driven-sftp` relies on that all the way up:
+    ///   `list_source_object_ids` computes `dead = recorded - live`, so a short
+    ///   listing read as complete is a mass-deletion signal.
+    /// - **The server quietly returns fewer entries and then a clean `EOF`.**
+    ///   Indistinguishable from a smaller directory - there is no count to
+    ///   check it against, in this protocol or any other. Not simulated here
+    ///   because it cannot be detected there; recorded as a real gap rather
+    ///   than a fault with a fake assertion attached.
+    ///
+    /// Latched while armed, so a recursive walk fails at the first directory
+    /// large enough to be truncated.
+    pub fn arm_truncated_readdir(&self, entries: u64) {
+        self.faults
+            .truncate_readdir_after
+            .store(entries, Ordering::SeqCst);
+    }
+
+    /// Keep advertising `statvfs@openssh.com` in `init` but refuse the request
+    /// itself with `SSH_FX_OP_UNSUPPORTED`.
+    ///
+    /// This is the third quota case, and the only one
+    /// [`Self::spawn_without_statvfs`] cannot reach: a server that promises the
+    /// extension and then does not answer. `about()` has to degrade to an
+    /// unknown limit rather than failing, because a quota display is not worth
+    /// failing an operation over.
+    pub fn arm_statvfs_refusal(&self) {
+        self.faults.refuse_statvfs.store(true, Ordering::SeqCst);
+    }
+
+    // -- destination provisioning ---------------------------------------------
+
+    /// Write Driven's destination marker into the served root and return the
+    /// destination id it records.
+    ///
+    /// The store proves this marker before every MUTATING operation
+    /// (`SftpStore::guard_root`), so a caller outside this crate cannot drive a
+    /// single upload against a bare fixture. Stamping it directly - rather than
+    /// running [`crate::provision::prepare_destination`] - keeps the helper
+    /// synchronous and usable from a fixture constructor, and the
+    /// `a_marked_root_is_the_same_thing_the_real_probe_produces` test is what
+    /// stops the two shapes drifting.
+    pub fn mark_as_destination(&self) -> String {
+        self.mark_directory(self.root())
+    }
+
+    /// The same, for a sub-directory of the served root (created if needed) -
+    /// the shape an account whose `root_path` is not `/` has.
+    pub fn mark_as_destination_in(&self, relative: &str) -> anyhow::Result<String> {
+        let dir = self.root().join(relative);
+        std::fs::create_dir_all(&dir)?;
+        Ok(self.mark_directory(&dir))
+    }
+
+    fn mark_directory(&self, dir: &Path) -> String {
+        let destination_id = uuid::Uuid::new_v4().to_string();
+        let marker = DestinationMarker::new(&destination_id, 1_700_000_000_000);
+        std::fs::write(
+            dir.join(names::MARKER_FILE),
+            serde_json::to_vec(&marker).expect("a marker serializes"),
+        )
+        .expect("the fixture owns its own temp directory");
+        destination_id
+    }
+
+    /// The destination id recorded in `directory`'s marker, so a SECOND store
+    /// can be built against a root that is already marked instead of re-marking
+    /// it under a new id.
+    pub fn destination_id_in(directory: &Path) -> anyhow::Result<String> {
+        let raw = std::fs::read(directory.join(names::MARKER_FILE))?;
+        let marker: DestinationMarker = serde_json::from_slice(&raw)?;
+        Ok(marker.destination_id)
+    }
+
+    /// A pinned [`SftpConfig`] for a root this call has just marked as a Driven
+    /// destination - everything `SftpStore::new` needs to run a mutating
+    /// operation, in one line.
+    pub fn prepared_config(&self, auth: SftpAuthKind) -> SftpConfig {
+        let destination_id = self.mark_as_destination();
+        SftpConfig {
+            destination_id: Some(destination_id),
+            ..self.pinned_config(auth)
+        }
+    }
+
+    /// The fingerprint the server presents once [`Self::arm_host_key_swap`] has
+    /// been called - the "this is not the server you pinned" value.
+    pub fn alternate_host_key_fingerprint(&self) -> &str {
+        &self.alternate_host_key_fingerprint
     }
 
     /// The address the server is listening on.
@@ -330,6 +726,55 @@ struct ServerFeatures {
     statvfs: bool,
 }
 
+/// The accepted TCP stream, wrapped so an armed budget can cut it mid-transfer.
+///
+/// Wrapping the SOCKET rather than the SFTP channel is the whole point - see
+/// the module docs. Everything except the read budget is a straight delegation.
+struct FaultStream<S> {
+    inner: S,
+    faults: Arc<SftpFaults>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for FaultStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(polled, Poll::Ready(Ok(()))) {
+            let read = (buf.filled().len() - before) as u64;
+            if this.faults.note_client_bytes(read) {
+                return Poll::Ready(Err(std::io::Error::new(
+                    std::io::ErrorKind::ConnectionReset,
+                    "test sftp server: injected transport cut",
+                )));
+            }
+        }
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for FaultStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// The per-connection SSH handler: authenticates the one configured user and
 /// hands an accepted `sftp` subsystem request to [`FsSftpHandler`].
 struct SshHandler {
@@ -337,7 +782,7 @@ struct SshHandler {
     authorized_key: PublicKey,
     channels: HashMap<ChannelId, Channel<Msg>>,
     features: ServerFeatures,
-    corrupt_after_rename: Arc<AtomicBool>,
+    faults: Arc<SftpFaults>,
 }
 
 impl SshHandler {
@@ -345,14 +790,14 @@ impl SshHandler {
         root: PathBuf,
         authorized_key: PublicKey,
         features: ServerFeatures,
-        corrupt_after_rename: Arc<AtomicBool>,
+        faults: Arc<SftpFaults>,
     ) -> Self {
         Self {
             root,
             authorized_key,
             channels: HashMap::new(),
             features,
-            corrupt_after_rename,
+            faults,
         }
     }
 }
@@ -361,6 +806,9 @@ impl russh::server::Handler for SshHandler {
     type Error = anyhow::Error;
 
     async fn auth_password(&mut self, user: &str, password: &str) -> Result<Auth, Self::Error> {
+        if self.faults.reject_auth() {
+            return Ok(Auth::reject());
+        }
         if user == TEST_USERNAME && password == TEST_PASSWORD {
             Ok(Auth::Accept)
         } else {
@@ -373,6 +821,9 @@ impl russh::server::Handler for SshHandler {
         user: &str,
         public_key: &PublicKey,
     ) -> Result<Auth, Self::Error> {
+        if self.faults.reject_auth() {
+            return Ok(Auth::reject());
+        }
         // Compare the key material, not the whole `PublicKey`, so a differing
         // trailing comment does not read as a different key.
         if user == TEST_USERNAME && public_key.key_data() == self.authorized_key.key_data() {
@@ -410,11 +861,7 @@ impl russh::server::Handler for SshHandler {
         session.channel_success(channel_id)?;
         russh_sftp::server::run(
             channel.into_stream(),
-            FsSftpHandler::new(
-                self.root.clone(),
-                self.features,
-                Arc::clone(&self.corrupt_after_rename),
-            ),
+            FsSftpHandler::new(self.root.clone(), self.features, Arc::clone(&self.faults)),
         )
         .await;
         Ok(())
@@ -435,17 +882,17 @@ struct FsSftpHandler {
     handles: HashMap<String, OpenHandle>,
     next_handle: u64,
     features: ServerFeatures,
-    corrupt_after_rename: Arc<AtomicBool>,
+    faults: Arc<SftpFaults>,
 }
 
 impl FsSftpHandler {
-    fn new(root: PathBuf, features: ServerFeatures, corrupt_after_rename: Arc<AtomicBool>) -> Self {
+    fn new(root: PathBuf, features: ServerFeatures, faults: Arc<SftpFaults>) -> Self {
         Self {
             root,
             handles: HashMap::new(),
             next_handle: 0,
             features,
-            corrupt_after_rename,
+            faults,
         }
     }
 
@@ -632,6 +1079,19 @@ impl russh_sftp::server::Handler for FsSftpHandler {
         offset: u64,
         data: Vec<u8>,
     ) -> Result<Status, Self::Error> {
+        if self.faults.refuse_write(data.len() as u64) {
+            // Returned as an `Ok(Status)` carrying a non-OK code, NOT as
+            // `Err(StatusCode)`: the error path builds its message from the
+            // status code's own name, and the MESSAGE is the entire signal
+            // here - SFTPv3 has no ENOSPC code, so a bare `SSH_FX_FAILURE`
+            // would classify as a retryable transient rather than a full disk.
+            return Ok(Status {
+                id,
+                status_code: StatusCode::Failure,
+                error_message: "write failed: No space left on device".to_string(),
+                language_tag: "en-US".to_string(),
+            });
+        }
         let file = self.file_mut(&handle)?;
         file.seek(std::io::SeekFrom::Start(offset))
             .await
@@ -724,18 +1184,31 @@ impl russh_sftp::server::Handler for FsSftpHandler {
     }
 
     async fn readdir(&mut self, id: u32, handle: String) -> Result<Name, Self::Error> {
+        let truncate_after = self.faults.truncate_readdir_after.load(Ordering::SeqCst);
         // The end-of-listing latch is PER HANDLE. A per-session flag would
         // report EOF for a nested listing opened while an outer one is live.
         match self.handles.get_mut(&handle) {
             Some(OpenHandle::Dir { entries, drained }) => {
                 if *drained {
+                    // An armed truncation ends the enumeration with a FAILURE
+                    // where an honest server would say EOF. The client has
+                    // already been handed a partial batch, so this is the
+                    // moment a client that swallowed the error would report a
+                    // short directory as a complete one.
+                    if truncate_after != DISARMED {
+                        self.faults
+                            .truncated_readdirs
+                            .fetch_add(1, Ordering::SeqCst);
+                        return Err(StatusCode::Failure);
+                    }
                     return Err(StatusCode::Eof);
                 }
                 *drained = true;
-                Ok(Name {
-                    id,
-                    files: entries.clone(),
-                })
+                let mut files = entries.clone();
+                if truncate_after != DISARMED {
+                    files.truncate(truncate_after as usize);
+                }
+                Ok(Name { id, files })
             }
             _ => Err(StatusCode::Failure),
         }
@@ -787,7 +1260,7 @@ impl russh_sftp::server::Handler for FsSftpHandler {
         tokio::fs::rename(&old, &new)
             .await
             .map_err(|e| io_status(&e))?;
-        if self.corrupt_after_rename.load(Ordering::SeqCst) {
+        if self.faults.corrupt_after_rename.load(Ordering::SeqCst) {
             // Flip one byte, keeping the length: see the module docs. A failure
             // here is silent because the caller's next read is what the test
             // actually asserts on.
@@ -812,10 +1285,11 @@ impl russh_sftp::server::Handler for FsSftpHandler {
     /// Answers `statvfs@openssh.com` with [`TEST_STATVFS`] when the extension
     /// is advertised; every other extension stays `SSH_FX_OP_UNSUPPORTED`.
     ///
-    /// A server that advertised the extension in `init` and then refused the
-    /// request would be a third case Driven has to survive, so the two are
-    /// wired to the same switch on purpose - there is no way to reach that
-    /// inconsistent state through this fixture.
+    /// A server that advertises the extension in `init` and then refuses the
+    /// request is a third case Driven has to survive. It is reachable only
+    /// through [`TestSftpServer::arm_statvfs_refusal`] - the advertisement and
+    /// the answer are otherwise wired to the same switch, so the fixture cannot
+    /// drift into that state by accident.
     async fn extended(
         &mut self,
         id: u32,
@@ -823,6 +1297,10 @@ impl russh_sftp::server::Handler for FsSftpHandler {
         _data: Vec<u8>,
     ) -> Result<Packet, Self::Error> {
         if request != extensions::STATVFS || !self.features.statvfs {
+            return Err(StatusCode::OpUnsupported);
+        }
+        if self.faults.refuse_statvfs.load(Ordering::SeqCst) {
+            self.faults.statvfs_refusals.fetch_add(1, Ordering::SeqCst);
             return Err(StatusCode::OpUnsupported);
         }
         let data = russh_sftp::ser::to_bytes(&TEST_STATVFS)
@@ -842,7 +1320,7 @@ mod tests {
         FsSftpHandler::new(
             root.to_path_buf(),
             ServerFeatures { statvfs: true },
-            Arc::new(AtomicBool::new(false)),
+            Arc::new(SftpFaults::disarmed()),
         )
     }
 
@@ -969,5 +1447,177 @@ mod tests {
         let a = TestSftpServer::spawn().await.unwrap();
         let b = TestSftpServer::spawn().await.unwrap();
         assert_ne!(a.host_key_fingerprint(), b.host_key_fingerprint());
+        assert_ne!(
+            a.host_key_fingerprint(),
+            a.alternate_host_key_fingerprint(),
+            "the swap key must be a genuinely different key, or arming a swap changes nothing"
+        );
+    }
+
+    /// A freshly spawned server must be indistinguishable from one with no
+    /// fault machinery at all. This is the property that lets every existing
+    /// test keep talking to an honest server, and the reason the byte budgets
+    /// are `DISARMED` rather than `Default`-zero (zero reads as "cut on the
+    /// first byte", which would break every connection ever made).
+    #[tokio::test]
+    async fn every_fault_is_off_until_something_arms_it() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        assert_eq!(server.fault_counts(), SftpFaultCounts::default());
+
+        let faults = SftpFaults::disarmed();
+        assert!(!faults.note_client_bytes(u64::MAX / 2));
+        assert!(!faults.reject_auth());
+        assert!(!faults.refuse_write(u64::MAX / 2));
+        assert!(!faults.refuse_statvfs.load(Ordering::SeqCst));
+        assert!(!faults.swap_host_key.load(Ordering::SeqCst));
+        assert!(!faults.corrupt_after_rename.load(Ordering::SeqCst));
+        assert_eq!(faults.counts(), SftpFaultCounts::default());
+    }
+
+    /// The transport cut fires ONCE, at the budget, and disarms itself so the
+    /// reconnect that follows succeeds.
+    #[test]
+    fn the_transport_cut_fires_once_at_the_budget_and_then_disarms() {
+        let faults = SftpFaults::disarmed();
+        faults.client_bytes.store(0, Ordering::SeqCst);
+        faults.disconnect_after_bytes.store(100, Ordering::SeqCst);
+
+        assert!(!faults.note_client_bytes(60), "still inside the budget");
+        assert!(faults.note_client_bytes(60), "the budget is spent");
+        assert_eq!(faults.counts().disconnects, 1);
+        assert!(
+            !faults.note_client_bytes(10_000),
+            "a single-shot cut must not keep cutting, or the client can never reconnect"
+        );
+        assert_eq!(faults.counts().disconnects, 1);
+    }
+
+    /// The auth flap must be exhaustible: `n` rejections then normal service.
+    #[test]
+    fn the_auth_flap_rejects_exactly_the_armed_number_of_attempts() {
+        let faults = SftpFaults::disarmed();
+        faults.auth_rejections_remaining.store(2, Ordering::SeqCst);
+        assert!(faults.reject_auth());
+        assert!(faults.reject_auth());
+        assert!(!faults.reject_auth(), "the flap is over");
+        assert_eq!(faults.counts().auth_rejections, 2);
+    }
+
+    /// ENOSPC is LATCHED, unlike the transport cut: a full disk does not empty
+    /// itself, and a row that recovers has to free the space explicitly.
+    #[test]
+    fn the_write_budget_latches_once_it_is_exhausted() {
+        let faults = SftpFaults::disarmed();
+        faults.written_bytes.store(0, Ordering::SeqCst);
+        faults.enospc_after_bytes.store(10, Ordering::SeqCst);
+
+        assert!(!faults.refuse_write(6), "room for the first write");
+        assert!(faults.refuse_write(6), "the second write does not fit");
+        assert!(faults.refuse_write(1), "and the disk stays full");
+        assert_eq!(faults.counts().enospc_refusals, 2);
+
+        faults.clear();
+        assert!(!faults.refuse_write(1_000), "clearing frees the space");
+        assert_eq!(
+            faults.counts().enospc_refusals,
+            2,
+            "clearing disarms the switch but must not erase the evidence a row asserts on"
+        );
+    }
+
+    /// A truncated enumeration serves a PARTIAL batch and then fails, which is
+    /// the only truncation a client can detect at all (see the arming doc).
+    #[tokio::test]
+    async fn a_truncated_readdir_serves_a_partial_batch_and_then_fails() {
+        use russh_sftp::server::Handler as _;
+
+        let root = TempDir::new().unwrap();
+        for name in ["a.txt", "b.txt", "c.txt"] {
+            std::fs::write(root.path().join(name), b"x").unwrap();
+        }
+        let faults = Arc::new(SftpFaults::disarmed());
+        // 3 entries + `.` + `..` = 5; ask for 2, so the batch is genuinely short.
+        faults.truncate_readdir_after.store(2, Ordering::SeqCst);
+        let mut handler = FsSftpHandler::new(
+            root.path().to_path_buf(),
+            ServerFeatures { statvfs: true },
+            Arc::clone(&faults),
+        );
+
+        let handle = handler.opendir(1, "/".to_string()).await.unwrap().handle;
+        let first = handler.readdir(2, handle.clone()).await.unwrap();
+        assert_eq!(first.files.len(), 2, "the first batch is truncated");
+        assert_eq!(
+            handler.readdir(3, handle).await.unwrap_err(),
+            StatusCode::Failure,
+            "the enumeration must END IN AN ERROR - an EOF here is the bug this fault hunts"
+        );
+        assert_eq!(faults.counts().truncated_readdirs, 1);
+    }
+
+    /// The marker the fixture stamps must be the SAME artefact the real
+    /// creation probe produces, or every chaos row provisions a destination the
+    /// app would never create.
+    ///
+    /// Asserted by round trip rather than by comparing bytes: the real probe
+    /// ADOPTS a marker it recognizes and reports the id it found, so an
+    /// `Adopted` verdict carrying the fixture's own id is proof the two agree
+    /// about both the filename and the schema.
+    #[tokio::test]
+    async fn a_marked_root_is_the_same_thing_the_real_probe_produces() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let stamped = server.mark_as_destination();
+
+        let mut config = server.unpinned_config(SftpAuthKind::Password);
+        let outcome = crate::provision::prepare_destination(
+            &mut config,
+            &server.password_credential(),
+            1_700_000_000_000,
+        )
+        .await
+        .expect("the real probe accepts a root the fixture marked");
+
+        assert_eq!(
+            outcome,
+            crate::provision::PreparedDestination::Adopted,
+            "the probe must ADOPT the fixture's marker, not re-initialize over it"
+        );
+        assert_eq!(config.destination_id.as_deref(), Some(stamped.as_str()));
+        assert_eq!(
+            TestSftpServer::destination_id_in(server.root()).unwrap(),
+            stamped
+        );
+    }
+
+    /// `prepared_config` is the one-liner outside callers use, so it has to
+    /// produce a config a store will actually mutate through.
+    #[tokio::test]
+    async fn a_prepared_config_is_pinned_and_carries_the_destination_id() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let config = server.prepared_config(SftpAuthKind::Password);
+        assert_eq!(
+            config.host_key_fingerprint.as_deref(),
+            Some(server.host_key_fingerprint())
+        );
+        assert_eq!(
+            config.destination_id,
+            Some(TestSftpServer::destination_id_in(server.root()).unwrap())
+        );
+    }
+
+    /// A sub-directory root is the shape an account whose `root_path` is not
+    /// `/` has, and the store's own scoping tests need it.
+    #[tokio::test]
+    async fn a_sub_directory_can_be_marked_as_its_own_destination() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let id = server.mark_as_destination_in("backups").unwrap();
+        assert_eq!(
+            TestSftpServer::destination_id_in(&server.root().join("backups")).unwrap(),
+            id
+        );
+        assert!(
+            !server.root().join(names::MARKER_FILE).exists(),
+            "marking a sub-directory must not also mark the root"
+        );
     }
 }
