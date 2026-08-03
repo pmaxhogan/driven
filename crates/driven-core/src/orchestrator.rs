@@ -523,6 +523,14 @@ pub struct SyncOrchestrator {
     /// once per throughput window, resize the SAME [`UploadPool`](crate::adaptive::UploadPool)
     /// the executor acquires from. Set via [`Self::with_adaptive_controller`].
     adaptive: Option<Arc<crate::adaptive::AdaptiveController>>,
+    /// Restore-drill probe (`driven_core::drill`), or `None` when the app has
+    /// not wired one (every test, the CLI, the chaos harness). When `None` a
+    /// drill is never dispatched - which is the correct degradation, because
+    /// the probe IS the drill: without a real restore path there is nothing to
+    /// exercise, and reporting a drill that restored nothing as a pass would be
+    /// exactly the lie this feature exists to prevent. Set via
+    /// [`Self::with_restore_probe`].
+    restore_probe: Option<Arc<dyn crate::drill::RestoreProbe>>,
 }
 
 impl SyncOrchestrator {
@@ -579,6 +587,7 @@ impl SyncOrchestrator {
             bypass_gates_once: std::sync::atomic::AtomicBool::new(false),
             latency: None,
             adaptive: None,
+            restore_probe: None,
         }
     }
 
@@ -596,6 +605,23 @@ impl SyncOrchestrator {
         controller: Arc<crate::adaptive::AdaptiveController>,
     ) -> Self {
         self.adaptive = Some(controller);
+        self
+    }
+
+    /// Wire the RESTORE-DRILL probe (`driven_core::drill`).
+    ///
+    /// The probe performs the actual sample restore through the app's real
+    /// restore path (destination confinement, stream decryption, bundle
+    /// extraction, plaintext-hash verification) into a temp directory. It lives
+    /// in the app shell because that path does; this crate owns only the
+    /// schedule, the sampling, and the report.
+    ///
+    /// Without it, drills never run. That is deliberate: a "drill" with no
+    /// restore path would verify nothing while producing a report, and a report
+    /// nobody can distinguish from a real pass is worse than no report.
+    #[must_use]
+    pub fn with_restore_probe(mut self, probe: Arc<dyn crate::drill::RestoreProbe>) -> Self {
+        self.restore_probe = Some(probe);
         self
     }
 
@@ -1429,6 +1455,190 @@ impl SyncOrchestrator {
         }
     }
 
+    /// Runs a RESTORE DRILL for `source` when it is due: restore a small,
+    /// deterministically-sampled set of backed-up files through the REAL
+    /// restore path, verify them, and persist the report.
+    ///
+    /// # Why the read side needs its own check
+    ///
+    /// Every other check verifies the backup from the WRITE side - post-upload
+    /// md5, the deep-verify re-hash, the remote-existence audit, the integrity
+    /// scrub. None of them ever runs the reverse pipeline (download,
+    /// stream-decrypt, extract a bundle member, verify the plaintext hash), so
+    /// a break anywhere in it surfaces exactly once: the day the user needs
+    /// their data.
+    ///
+    /// # Why it never fails the cycle
+    ///
+    /// Same rule as the audit and the scrub. A drill FAILURE is reported
+    /// loudly - it is the point of the feature - but it is reported through the
+    /// durable activity log and the persisted report, not by aborting a backup
+    /// that is otherwise perfectly able to run. Refusing to back up new work
+    /// because an OLD file would not restore would turn one problem into two.
+    async fn drill_if_due(&self, source: &SourceRow) {
+        let Some(probe) = self.restore_probe.clone() else {
+            return;
+        };
+        let cfg = crate::drill::load_drill_config(self.state.as_ref()).await;
+        if !cfg.enabled {
+            return;
+        }
+        let last = match self.state.drill_cursor(source.id).await {
+            Ok(c) => c.and_then(|c| c.last_drill_at),
+            Err(err) => {
+                tracing::warn!(
+                    target: TARGET,
+                    source_id = %source.id,
+                    %err,
+                    "could not read the restore-drill cursor; skipping the drill this cycle"
+                );
+                return;
+            }
+        };
+        let now = self.clock.now_ms();
+        if !crate::drill::drill_due(last, now, cfg.interval_ms()) {
+            return;
+        }
+
+        let started_at = now;
+        let report = self.run_drill(source, &cfg, probe.as_ref()).await;
+        let finished_at = self.clock.now_ms();
+
+        // Stamp the source regardless of the OUTCOME. A drill that failed still
+        // RAN: leaving it un-stamped would re-drill every 10-minute cycle
+        // against a backup that is already known to be broken, spending the
+        // user's bandwidth to re-learn the same fact. The failure is durable in
+        // the activity log and the report; the schedule does not need to shout.
+        if let Err(err) = self.state.set_drill_cursor(source.id, finished_at).await {
+            tracing::warn!(
+                target: TARGET,
+                source_id = %source.id,
+                %err,
+                "failed to stamp the restore-drill schedule"
+            );
+        }
+        if let Err(err) = self
+            .state
+            .insert_drill_run(&crate::state::NewDrillRun {
+                source_id: source.id,
+                started_at,
+                finished_at,
+                report: report.clone(),
+            })
+            .await
+        {
+            tracing::warn!(
+                target: TARGET,
+                source_id = %source.id,
+                %err,
+                "failed to persist the restore-drill report"
+            );
+        }
+
+        // SILENT GREEN on a pass, like every other periodic check here.
+        if !report.found_anything() {
+            tracing::debug!(
+                target: TARGET,
+                source_id = %source.id,
+                verified = report.verified,
+                skipped = report.skipped,
+                "restore drill passed"
+            );
+            return;
+        }
+
+        // A failed drill is the SAME class of event as any other backup
+        // failure, and is surfaced the same way: a durable ERROR-level
+        // `activity_log` row carrying a stable SPEC s24 code, which the Activity
+        // dashboard renders and the tray's error classification already
+        // understands. `file_count` carries the number of files that would not
+        // come back.
+        //
+        // `message` is `None` - the report is counts-and-codes only, so this row
+        // can never carry an encrypted source's filename.
+        tracing::error!(
+            target: TARGET,
+            source_id = %source.id,
+            sampled = report.sampled,
+            failed = report.failed,
+            "restore drill FAILED: sampled files could not be restored from the backup"
+        );
+        self.record_activity(NewActivity {
+            ts: finished_at,
+            source_id: Some(source.id),
+            level: ActivityLevel::Error,
+            event_type: crate::types::ErrorCode::RestoreDrillFailed.to_string(),
+            file_count: Some(report.failed),
+            bytes: None,
+            message: None,
+        })
+        .await;
+    }
+
+    /// Sample and restore, returning the finished report. Split out of
+    /// [`Self::drill_if_due`] so the scheduling/reporting half stays readable
+    /// and this half is a straight loop.
+    async fn run_drill(
+        &self,
+        source: &SourceRow,
+        cfg: &crate::drill::DrillConfig,
+        probe: &dyn crate::drill::RestoreProbe,
+    ) -> crate::drill::DrillReport {
+        let mut report = crate::drill::DrillReport::default();
+
+        let total = match self
+            .state
+            .count_restorable_files(source.id, crate::drill::DRILL_MAX_FILE_BYTES)
+            .await
+        {
+            Ok(n) => n,
+            Err(err) => {
+                tracing::warn!(
+                    target: TARGET,
+                    source_id = %source.id,
+                    %err,
+                    "could not count restorable files; the drill reports inconclusive"
+                );
+                report.finish();
+                return report;
+            }
+        };
+
+        // Seeded on the source plus the current wall clock, so successive runs
+        // move on to different files (a sampler that kept re-testing the same
+        // three would "pass" forever while the rest of the backup rotted). The
+        // seed is NOT persisted, so a run cannot be re-drawn from its stored
+        // report - the report is a counts-and-codes summary, not a replay
+        // handle.
+        let seed = format!("{}|{}", source.id, self.clock.now_ms());
+        for offset in crate::drill::sample_offsets(&seed, total, cfg.sample_size) {
+            let candidate = match self
+                .state
+                .nth_restorable_file(source.id, crate::drill::DRILL_MAX_FILE_BYTES, offset)
+                .await
+            {
+                Ok(Some(c)) => c,
+                // A concurrent deletion between the count and the lookup is
+                // benign - the file is legitimately gone, not un-restorable.
+                Ok(None) => continue,
+                Err(err) => {
+                    tracing::warn!(
+                        target: TARGET,
+                        source_id = %source.id,
+                        %err,
+                        "could not resolve a drill candidate; skipping it"
+                    );
+                    continue;
+                }
+            };
+            let attempt = probe.restore_and_verify(&candidate).await;
+            report.record(&attempt);
+        }
+
+        report.finish();
+        report
+    }
+
     /// Writes a durable `activity_log` ERROR row per NFC collision the planner
     /// dropped (SPEC s24 `local.unicode_collision`, the M2-deferred item in
     /// design/CODEX_NOTES.md).
@@ -1773,6 +1983,12 @@ impl SyncOrchestrator {
         // force-rescan sentinel) before the scan below, so the heal completes
         // in ONE cycle exactly like the audit's.
         self.scrub_if_due(source).await;
+
+        // Restore drill, on its own (much slower) cadence. Runs AFTER the scrub
+        // so a drill never samples a file the scrub is about to re-queue as
+        // missing - which would report a known, already-being-fixed gap as a
+        // restore failure and raise a user alert for it.
+        self.drill_if_due(source).await;
 
         let user_initiated = tick == TickSource::Manual;
         if user_initiated {
@@ -3189,6 +3405,13 @@ mod tests {
         scrub_cursors: StdMutex<HashMap<SourceId, crate::scrub::ScrubCursor>>,
         /// Every persisted scrub run, newest LAST (insertion order).
         scrub_runs: StdMutex<Vec<crate::state::NewScrubRun>>,
+        /// Per-source drill stamps, for the drill-cadence tests.
+        drill_cursors: StdMutex<HashMap<SourceId, UnixMs>>,
+        /// Every persisted drill run, newest LAST.
+        drill_runs: StdMutex<Vec<crate::state::NewDrillRun>>,
+        /// The restorable population this fake reports, as `(path, size)` pairs
+        /// in `relative_path` order - the drill's sampling universe.
+        restorable: StdMutex<Vec<(String, u64)>>,
     }
 
     impl FakeState {
@@ -3202,12 +3425,27 @@ mod tests {
                 settings: StdMutex::new(HashMap::new()),
                 scrub_cursors: StdMutex::new(HashMap::new()),
                 scrub_runs: StdMutex::new(Vec::new()),
+                drill_cursors: StdMutex::new(HashMap::new()),
+                drill_runs: StdMutex::new(Vec::new()),
+                restorable: StdMutex::new(Vec::new()),
             }
         }
 
         /// Snapshot the persisted scrub runs, oldest-first.
         fn scrub_runs_snapshot(&self) -> Vec<crate::state::NewScrubRun> {
             self.scrub_runs.lock().unwrap().clone()
+        }
+
+        /// Snapshot the persisted drill runs, oldest-first.
+        fn drill_runs_snapshot(&self) -> Vec<crate::state::NewDrillRun> {
+            self.drill_runs.lock().unwrap().clone()
+        }
+
+        /// Populate the restorable set the drill samples from.
+        fn with_restorable(self, files: &[(&str, u64)]) -> Self {
+            *self.restorable.lock().unwrap() =
+                files.iter().map(|(p, s)| ((*p).to_string(), *s)).collect();
+            self
         }
 
         /// Snapshot the recorded `mark_account_state` calls (V-F test).
@@ -3228,6 +3466,86 @@ mod tests {
 
     #[async_trait]
     impl StateRepo for FakeState {
+        async fn count_restorable_files(
+            &self,
+            _source: SourceId,
+            max_size: u64,
+        ) -> anyhow::Result<u64> {
+            Ok(self
+                .restorable
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, s)| *s <= max_size)
+                .count() as u64)
+        }
+
+        async fn nth_restorable_file(
+            &self,
+            source: SourceId,
+            max_size: u64,
+            offset: u64,
+        ) -> anyhow::Result<Option<crate::drill::DrillCandidate>> {
+            Ok(self
+                .restorable
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|(_, s)| *s <= max_size)
+                .nth(offset as usize)
+                .map(|(p, s)| crate::drill::DrillCandidate {
+                    source_id: source,
+                    path: RelativePath::try_from(p.clone()).unwrap(),
+                    size: *s,
+                }))
+        }
+
+        async fn drill_cursor(
+            &self,
+            source: SourceId,
+        ) -> anyhow::Result<Option<crate::drill::DrillCursor>> {
+            Ok(self.drill_cursors.lock().unwrap().get(&source).map(|at| {
+                crate::drill::DrillCursor {
+                    last_drill_at: Some(*at),
+                }
+            }))
+        }
+
+        async fn set_drill_cursor(&self, source: SourceId, at: UnixMs) -> anyhow::Result<()> {
+            self.drill_cursors.lock().unwrap().insert(source, at);
+            Ok(())
+        }
+
+        async fn insert_drill_run(&self, run: &crate::state::NewDrillRun) -> anyhow::Result<i64> {
+            let mut runs = self.drill_runs.lock().unwrap();
+            runs.push(run.clone());
+            Ok(runs.len() as i64)
+        }
+
+        async fn list_drill_runs(
+            &self,
+            source: Option<SourceId>,
+            limit: u32,
+        ) -> anyhow::Result<Vec<crate::state::DrillRunRow>> {
+            Ok(self
+                .drill_runs
+                .lock()
+                .unwrap()
+                .iter()
+                .rev()
+                .filter(|r| source.is_none_or(|s| r.source_id == s))
+                .take(limit as usize)
+                .enumerate()
+                .map(|(i, r)| crate::state::DrillRunRow {
+                    id: i as i64,
+                    source_id: r.source_id,
+                    started_at: r.started_at,
+                    finished_at: r.finished_at,
+                    report: r.report.clone(),
+                })
+                .collect())
+        }
+
         async fn scrub_cursor(
             &self,
             source: SourceId,
@@ -3690,6 +4008,128 @@ mod tests {
         );
         (orch, state, clock)
     }
+
+    /// Records every candidate handed to it and returns a scripted outcome.
+    ///
+    /// The scripted outcomes are consumed in order and the LAST one repeats, so
+    /// a test can say "the first restore fails, the rest verify" without
+    /// counting calls.
+    struct FakeRestoreProbe {
+        seen: StdMutex<Vec<String>>,
+        script: StdMutex<Vec<crate::drill::DrillAttempt>>,
+        /// The same [`FakeState`] the orchestrator holds, when a test wants to
+        /// observe what had ALREADY been persisted at the instant the drill
+        /// ran. This is the only seam that can see the scrub-then-drill
+        /// ordering: the two jobs write to different vectors, so comparing
+        /// their contents after the cycle says nothing about which ran first.
+        observed: Option<Arc<FakeState>>,
+        /// `scrub_runs.len()` as seen on each call, via `observed`.
+        scrub_runs_at_call: StdMutex<Vec<usize>>,
+    }
+
+    impl FakeRestoreProbe {
+        fn new(script: Vec<crate::drill::DrillAttempt>) -> Arc<Self> {
+            Arc::new(FakeRestoreProbe {
+                seen: StdMutex::new(Vec::new()),
+                script: StdMutex::new(script),
+                observed: None,
+                scrub_runs_at_call: StdMutex::new(Vec::new()),
+            })
+        }
+
+        fn always(attempt: crate::drill::DrillAttempt) -> Arc<Self> {
+            Self::new(vec![attempt])
+        }
+
+        /// A probe that also samples `state`'s scrub history on every call.
+        fn observing(state: Arc<FakeState>) -> Arc<Self> {
+            Arc::new(FakeRestoreProbe {
+                seen: StdMutex::new(Vec::new()),
+                script: StdMutex::new(vec![crate::drill::DrillAttempt::Verified]),
+                observed: Some(state),
+                scrub_runs_at_call: StdMutex::new(Vec::new()),
+            })
+        }
+
+        fn seen_paths(&self) -> Vec<String> {
+            self.seen.lock().unwrap().clone()
+        }
+
+        /// How many scrub runs had been persisted each time the drill asked for
+        /// a restore.
+        fn scrub_runs_at_call(&self) -> Vec<usize> {
+            self.scrub_runs_at_call.lock().unwrap().clone()
+        }
+    }
+
+    #[async_trait]
+    impl crate::drill::RestoreProbe for FakeRestoreProbe {
+        async fn restore_and_verify(
+            &self,
+            candidate: &crate::drill::DrillCandidate,
+        ) -> crate::drill::DrillAttempt {
+            self.seen
+                .lock()
+                .unwrap()
+                .push(candidate.path.as_str().to_string());
+            if let Some(state) = &self.observed {
+                self.scrub_runs_at_call
+                    .lock()
+                    .unwrap()
+                    .push(state.scrub_runs_snapshot().len());
+            }
+            let mut script = self.script.lock().unwrap();
+            if script.len() > 1 {
+                script.remove(0)
+            } else {
+                script
+                    .first()
+                    .cloned()
+                    .unwrap_or(crate::drill::DrillAttempt::Verified)
+            }
+        }
+    }
+
+    /// [`build_with_state`] plus the two seams a RESTORE DRILL needs: the
+    /// restorable population the sample is drawn from, and the probe standing
+    /// in for the app shell's real restore path.
+    ///
+    /// Takes the already-built [`FakeState`] rather than building one, because
+    /// the ordering test needs to hand the SAME state to the probe.
+    fn build_with_drill(
+        account: AccountId,
+        state: Arc<FakeState>,
+        executor: Arc<RecordingExecutor>,
+        probe: Arc<FakeRestoreProbe>,
+    ) -> (SyncOrchestrator, Arc<FakeClock>) {
+        let clock = Arc::new(FakeClock::new());
+        let orch = SyncOrchestrator::new(
+            account,
+            state,
+            executor,
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock.clone(),
+            OrchestratorConfig::default(),
+        )
+        .with_restore_probe(probe);
+        (orch, clock)
+    }
+
+    /// A [`FakeState`] with one source and a small restorable population.
+    fn drill_state(sources: Vec<SourceRow>, restorable: &[(&str, u64)]) -> Arc<FakeState> {
+        Arc::new(FakeState::with_sources(sources).with_restorable(restorable))
+    }
+
+    /// Five drillable files - more than the default 3-file sample, so a test
+    /// can tell "sampled the configured number" from "restored everything".
+    const DRILLABLE: &[(&str, u64)] = &[
+        ("a.txt", 10),
+        ("b.txt", 10),
+        ("c.txt", 10),
+        ("d.txt", 10),
+        ("e.txt", 10),
+    ];
 
     /// One recorded hook invocation: the command and its env vars.
     type HookCall = (String, Vec<(String, String)>);
@@ -5310,6 +5750,397 @@ mod tests {
         let runs = state.scrub_runs_snapshot();
         assert_eq!(runs.len(), 2);
         assert_eq!(runs[1].report.outcome, crate::scrub::ScrubOutcome::Clean);
+    }
+
+    // --- restore drills (`crate::drill`) -------------------------------------
+
+    /// The cadence gate. A never-drilled source is due immediately; once
+    /// stamped it stays quiet until the monthly interval elapses.
+    ///
+    /// This is what makes the feature affordable at all: a drill DOWNLOADS and
+    /// decrypts real bytes, so a missing gate would spend the user's bandwidth
+    /// on every 10-minute cycle.
+    #[tokio::test]
+    async fn the_drill_runs_on_the_first_cycle_then_waits_out_its_interval() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = drill_state(vec![src], DRILLABLE);
+        let probe = FakeRestoreProbe::always(crate::drill::DrillAttempt::Verified);
+        let (orch, clock) = build_with_drill(account, state.clone(), exec, probe.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            probe.seen_paths().len(),
+            crate::drill::DEFAULT_DRILL_SAMPLE_SIZE as usize,
+            "a never-drilled source is due immediately, and samples the configured count"
+        );
+        assert_eq!(
+            state.drill_runs_snapshot().len(),
+            1,
+            "the run is persisted so the history panel has something to show"
+        );
+        assert_eq!(
+            state.drill_cursor(src_id).await.unwrap(),
+            Some(crate::drill::DrillCursor {
+                last_drill_at: Some(clock.now_ms())
+            }),
+            "a completed drill stamps the source"
+        );
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            probe.seen_paths().len(),
+            crate::drill::DEFAULT_DRILL_SAMPLE_SIZE as usize,
+            "a just-drilled source must not be drilled again on the next cycle"
+        );
+        assert_eq!(state.drill_runs_snapshot().len(), 1);
+
+        // Push past the monthly interval: due again.
+        clock.advance(std::time::Duration::from_secs(
+            crate::drill::DEFAULT_DRILL_INTERVAL_SECS + 1,
+        ));
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            probe.seen_paths().len(),
+            2 * crate::drill::DEFAULT_DRILL_SAMPLE_SIZE as usize,
+            "once the interval elapses the source is due again"
+        );
+        assert_eq!(state.drill_runs_snapshot().len(), 2);
+    }
+
+    /// The kill-switch. `restore_drill_enabled = false` must stop the dispatch
+    /// dead - not merely stop the reporting - so a user on a metered link pays
+    /// for none of the bandwidth.
+    #[tokio::test]
+    async fn a_disabled_drill_never_dispatches() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = drill_state(vec![src], DRILLABLE);
+        state
+            .set_setting(
+                crate::drill::SETTING_DRILL_ENABLED,
+                &serde_json::json!(false),
+            )
+            .await
+            .unwrap();
+        let probe = FakeRestoreProbe::always(crate::drill::DrillAttempt::Verified);
+        let (orch, _clock) = build_with_drill(account, state.clone(), exec.clone(), probe.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert!(
+            probe.seen_paths().is_empty(),
+            "the kill-switch must prevent the restore entirely"
+        );
+        assert!(
+            state.drill_runs_snapshot().is_empty(),
+            "a drill that never ran persists no report"
+        );
+        assert!(
+            exec.executes.load(Ordering::SeqCst) > 0,
+            "disabling the drill must not disable the backup"
+        );
+    }
+
+    /// Without a probe wired (the CLI, the chaos harness, every other test) a
+    /// drill is never dispatched and no report is written.
+    ///
+    /// The probe IS the drill: reporting a run that restored nothing as a pass
+    /// would be exactly the lie the feature exists to prevent, so the correct
+    /// degradation is total silence.
+    #[tokio::test]
+    async fn without_a_restore_probe_nothing_is_drilled_or_reported() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, state, _clock) = build_with_state(account, vec![src], exec.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert!(
+            state.drill_runs_snapshot().is_empty(),
+            "no probe means no drill report at all, not an empty passing one"
+        );
+        assert!(exec.executes.load(Ordering::SeqCst) > 0);
+    }
+
+    /// ORDERING: the drill runs AFTER the scrub within one cycle.
+    ///
+    /// Load-bearing, not cosmetic. The scrub re-queues objects it finds missing;
+    /// a drill that ran first could sample one of those files, fail to restore
+    /// it, and raise a data-loss alert for a gap the very same cycle was already
+    /// repairing. Observed through the probe (which snapshots the persisted
+    /// scrub history at the instant it is called) because the two jobs write to
+    /// different tables - comparing their contents after the cycle would say
+    /// nothing about which ran first.
+    #[tokio::test]
+    async fn the_drill_runs_after_the_scrub_within_a_cycle() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let mut clean = crate::scrub::ScrubReport {
+            checked: 5,
+            ok: 5,
+            ..Default::default()
+        };
+        clean.finish();
+        *exec.scrub_report.lock().unwrap() = Some(clean);
+        let state = drill_state(vec![src], DRILLABLE);
+        let probe = FakeRestoreProbe::observing(state.clone());
+        let (orch, _clock) = build_with_drill(account, state.clone(), exec, probe.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        let observed = probe.scrub_runs_at_call();
+        assert_eq!(
+            observed.len(),
+            crate::drill::DEFAULT_DRILL_SAMPLE_SIZE as usize,
+            "the drill must actually have run for this ordering claim to mean anything"
+        );
+        assert!(
+            observed.iter().all(|n| *n >= 1),
+            "every restore must happen after the scrub persisted its run, got {observed:?}"
+        );
+    }
+
+    /// The outcome the whole feature exists to surface: a file the user believes
+    /// is backed up would not come back.
+    ///
+    /// One durable ERROR row carrying the stable SPEC s24 code and the count of
+    /// files that failed - and NO `message`. That last part is load-bearing: a
+    /// drill report is counts-and-codes only, so it can never carry an encrypted
+    /// source's filename into the activity feed, the diagnostic bundle, or the
+    /// UI.
+    #[tokio::test]
+    async fn a_failed_drill_writes_one_error_activity_row_carrying_no_path() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = drill_state(vec![src], DRILLABLE);
+        // The first restore fails, the rest verify - a partial failure still
+        // fails the run.
+        let probe = FakeRestoreProbe::new(vec![
+            crate::drill::DrillAttempt::Failed {
+                code: crate::types::ErrorCode::CryptoDecryptFailed,
+            },
+            crate::drill::DrillAttempt::Verified,
+        ]);
+        let (orch, _clock) = build_with_drill(account, state.clone(), exec, probe);
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        let rows: Vec<NewActivity> = state
+            .activity_rows()
+            .into_iter()
+            .filter(|r| r.event_type == crate::types::ErrorCode::RestoreDrillFailed.code())
+            .collect();
+        assert_eq!(rows.len(), 1, "one summary row, never one per failed file");
+        assert_eq!(rows[0].level, ActivityLevel::Error);
+        assert_eq!(rows[0].source_id, Some(src_id));
+        assert_eq!(
+            rows[0].file_count,
+            Some(1),
+            "the count of files that would not come back"
+        );
+        assert!(
+            rows[0].message.is_none(),
+            "a drill row is counts-and-codes only: no path can ever reach the feed"
+        );
+
+        let runs = state.drill_runs_snapshot();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].report.outcome, crate::drill::DrillOutcome::Failed);
+        assert_eq!(runs[0].report.failed, 1);
+        assert_eq!(runs[0].report.verified, 2);
+        assert_eq!(
+            runs[0].report.failure_codes,
+            vec![("crypto.decrypt_failed".to_string(), 1)]
+        );
+    }
+
+    /// A failed drill still STAMPS the schedule.
+    ///
+    /// Leaving it unstamped would re-drill every 10-minute cycle against a
+    /// backup already known to be broken, spending the user's bandwidth to
+    /// re-learn the same fact. The failure is durable in the activity log and
+    /// the report; the schedule does not need to shout.
+    #[tokio::test]
+    async fn a_failed_drill_still_stamps_the_schedule_rather_than_retrying_every_cycle() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = drill_state(vec![src], DRILLABLE);
+        let probe = FakeRestoreProbe::always(crate::drill::DrillAttempt::Failed {
+            code: crate::types::ErrorCode::DriveUnreachable,
+        });
+        let (orch, _clock) = build_with_drill(account, state.clone(), exec, probe.clone());
+
+        for _ in 0..4 {
+            orch.run_cycle(TickSource::Scheduled)
+                .await
+                .expect("a failed drill must not fail the cycle");
+        }
+        assert_eq!(
+            probe.seen_paths().len(),
+            crate::drill::DEFAULT_DRILL_SAMPLE_SIZE as usize,
+            "one drill's worth of restores across four cycles"
+        );
+        assert_eq!(state.drill_runs_snapshot().len(), 1);
+    }
+
+    /// "We restored nothing" must never read as "we restored everything
+    /// successfully". A source with nothing restorable records an INCONCLUSIVE
+    /// run - and stays silent, because an inconclusive drill is not evidence of
+    /// a broken backup.
+    #[tokio::test]
+    async fn a_drill_with_nothing_restorable_is_inconclusive_and_silent() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = drill_state(vec![src], &[]);
+        let probe = FakeRestoreProbe::always(crate::drill::DrillAttempt::Verified);
+        let (orch, _clock) = build_with_drill(account, state.clone(), exec, probe.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        assert!(
+            probe.seen_paths().is_empty(),
+            "there was nothing to restore"
+        );
+        let runs = state.drill_runs_snapshot();
+        assert_eq!(runs.len(), 1, "the inconclusive result is still recorded");
+        assert_eq!(
+            runs[0].report.outcome,
+            crate::drill::DrillOutcome::Inconclusive
+        );
+        assert_eq!(runs[0].report.sampled, 0);
+        assert!(
+            !state
+                .activity_rows()
+                .iter()
+                .any(|r| r.event_type == crate::types::ErrorCode::RestoreDrillFailed.code()),
+            "an inconclusive drill raises no data-loss alert"
+        );
+    }
+
+    /// A drill whose every candidate was SKIPPED (a locked keychain, an account
+    /// pending re-auth) is inconclusive too, and raises nothing.
+    ///
+    /// Alerting on a locked keychain would train users to ignore the alert that
+    /// actually matters.
+    #[tokio::test]
+    async fn an_all_skipped_drill_is_inconclusive_and_raises_no_alert() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = drill_state(vec![src], DRILLABLE);
+        let probe = FakeRestoreProbe::always(crate::drill::DrillAttempt::Skipped {
+            code: crate::types::ErrorCode::CryptoKeyMissing,
+        });
+        let (orch, _clock) = build_with_drill(account, state.clone(), exec, probe.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        let runs = state.drill_runs_snapshot();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(
+            runs[0].report.outcome,
+            crate::drill::DrillOutcome::Inconclusive,
+            "skips are not passes"
+        );
+        assert_eq!(
+            runs[0].report.skipped,
+            crate::drill::DEFAULT_DRILL_SAMPLE_SIZE
+        );
+        assert_eq!(runs[0].report.failed, 0);
+        assert!(runs[0].report.failure_codes.is_empty());
+        assert!(
+            !state
+                .activity_rows()
+                .iter()
+                .any(|r| r.event_type == crate::types::ErrorCode::RestoreDrillFailed.code()),
+            "a locked keychain is not evidence of a broken backup"
+        );
+    }
+
+    /// SILENT GREEN, and the durable record. A passing drill writes NO activity
+    /// row but DOES persist its report - "we checked and it was fine" is exactly
+    /// what the history panel exists to show.
+    #[tokio::test]
+    async fn a_passing_drill_persists_its_report_but_writes_no_activity() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let src_id = src.id;
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = drill_state(vec![src], DRILLABLE);
+        let probe = FakeRestoreProbe::always(crate::drill::DrillAttempt::Verified);
+        let (orch, _clock) = build_with_drill(account, state.clone(), exec, probe);
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        let events: Vec<String> = state
+            .activity_rows()
+            .into_iter()
+            .map(|r| r.event_type)
+            .collect();
+        assert!(
+            !events
+                .iter()
+                .any(|e| e == crate::types::ErrorCode::RestoreDrillFailed.code()),
+            "a passing drill must be silent in the activity feed, got: {events:?}"
+        );
+        let runs = state.drill_runs_snapshot();
+        assert_eq!(runs.len(), 1);
+        assert_eq!(runs[0].source_id, src_id);
+        assert_eq!(runs[0].report.outcome, crate::drill::DrillOutcome::Passed);
+        assert_eq!(
+            runs[0].report.verified,
+            crate::drill::DEFAULT_DRILL_SAMPLE_SIZE
+        );
+        assert!(
+            runs[0].finished_at >= runs[0].started_at,
+            "the persisted window must not run backwards"
+        );
+    }
+
+    /// A stored sample size outside the validated range CLAMPS rather than
+    /// wedging the drill - the same fail-safe the scrub uses. A `0` that was
+    /// honoured literally would silently disable the feature while the settings
+    /// UI still reported it on.
+    #[tokio::test]
+    async fn an_out_of_range_stored_sample_size_clamps_instead_of_disabling_the_drill() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let state = drill_state(vec![src], DRILLABLE);
+        state
+            .set_setting(
+                crate::drill::SETTING_DRILL_SAMPLE_SIZE,
+                &serde_json::json!(0),
+            )
+            .await
+            .unwrap();
+        let probe = FakeRestoreProbe::always(crate::drill::DrillAttempt::Verified);
+        let (orch, _clock) = build_with_drill(account, state.clone(), exec, probe.clone());
+
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+        assert_eq!(
+            probe.seen_paths().len(),
+            crate::drill::DRILL_SAMPLE_MIN as usize,
+            "a stored 0 clamps up to the minimum, it does not turn drills off"
+        );
     }
 
     /// SILENT GREEN. A clean audit - the overwhelmingly common case - writes no

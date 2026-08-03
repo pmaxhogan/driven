@@ -56,6 +56,13 @@ describe("activityEventLabel (R1-P2-3)", () => {
     // this code, so the Activity table must have a label for it rather than
     // showing the raw dotted string.
     expect(label("drive.remote_file_missing")).toBe("Remote copy missing");
+    // A failed restore drill writes its SPEC s24 code as the event type. This is
+    // the single most important row this feed can carry - "a file you believe is
+    // backed up would not come back" - so it must never render as the raw dotted
+    // string. Nothing else catches a missing key here: eslint's no-unused-keys
+    // flags a key with no consumer, never a consumer with no key, and vue-i18n
+    // only warns and renders the path.
+    expect(label("restore.drill_failed")).toBe("Restore drill failed");
   });
 
   it("safely falls back to the raw code for an unknown event type", () => {

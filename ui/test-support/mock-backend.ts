@@ -42,6 +42,7 @@ import {
   RELEASES,
   REMOTE_TREE,
   RESTORE_JOB_RUNNING,
+  DRILL_RUNS,
   SCRUB_RUNS,
   SEARCH_HITS,
   SETTINGS,
@@ -209,6 +210,7 @@ export function defaultCommands(): Record<string, MockCommandOverride> {
     clear_activity_older_than: 0,
     distinct_activity_event_types: ACTIVITY_EVENT_TYPES,
     list_scrub_runs: SCRUB_RUNS,
+    list_drill_runs: DRILL_RUNS,
     activity_summary: ACTIVITY_SUMMARY,
     activity_throughput_series: ACTIVITY_THROUGHPUT,
 

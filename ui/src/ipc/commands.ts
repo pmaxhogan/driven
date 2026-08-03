@@ -37,6 +37,7 @@ import type {
   ReauthSession,
   ReleaseDto,
   RemoteTreeDto,
+  DrillRun,
   RestoreItem,
   RestoreJobId,
   RestoreJobStatus,
@@ -461,6 +462,14 @@ export function activityThroughputSeries(
  * filenames. */
 export function listScrubRuns(sourceId?: string, limit?: number): Promise<ScrubRun[]> {
   return invoke("list_scrub_runs", { sourceId, limit });
+}
+
+/** The persisted restore-drill reports, newest first. Omit `sourceId` for every
+ * source interleaved by time. Every field is a COUNT or a stable SPEC s24 error
+ * code from a closed vocabulary - the shape carries no paths or remote ids - so
+ * this can never surface an encrypted source's filenames. */
+export function listDrillRuns(sourceId?: string, limit?: number): Promise<DrillRun[]> {
+  return invoke("list_drill_runs", { sourceId, limit });
 }
 
 // --- Restore (SPEC s11.5; DESIGN s8.4) ---

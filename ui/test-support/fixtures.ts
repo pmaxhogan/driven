@@ -28,6 +28,7 @@ import type {
   ReleaseDto,
   RemoteTreeDto,
   RestoreJobStatus,
+  DrillRun,
   ScrubRun,
   SettingsDto,
   SourceDto,
@@ -338,6 +339,7 @@ export const ACTIVITY_EVENT_TYPES: string[] = [
   "error",
   "local.invalid_filename",
   "paused",
+  "restore.drill_failed",
   "scan_done",
   "scrub_done",
   "scrub_drift_found",
@@ -384,6 +386,51 @@ export const ACTIVITY_THROUGHPUT_EMPTY: ActivityThroughputSeriesDto = {
   bytes: new Array(20).fill(0),
   files: new Array(20).fill(0),
 };
+
+/**
+ * Recent restore-drill runs, newest first. Deliberately covers all three
+ * outcomes: a pass, a run that could not restore a file, and an INCONCLUSIVE
+ * run that verified nothing - the last one exists so a test can prove the UI
+ * never renders "verified nothing" as a pass.
+ */
+export const DRILL_RUNS: DrillRun[] = [
+  {
+    id: 12,
+    sourceId: SOURCE_DOCUMENTS.id,
+    startedAt: FIXED_NOW - 3 * HOUR,
+    finishedAt: FIXED_NOW - 3 * HOUR + 9 * SECOND,
+    sampled: 3,
+    verified: 3,
+    skipped: 0,
+    failed: 0,
+    failureCodes: [],
+    outcome: "passed",
+  },
+  {
+    id: 11,
+    sourceId: SOURCE_PHOTOS.id,
+    startedAt: FIXED_NOW - 30 * HOUR,
+    finishedAt: FIXED_NOW - 30 * HOUR + 21 * SECOND,
+    sampled: 3,
+    verified: 1,
+    skipped: 0,
+    failed: 2,
+    failureCodes: [{ code: "crypto.decrypt_failed", count: 2 }],
+    outcome: "failed",
+  },
+  {
+    id: 10,
+    sourceId: SOURCE_DOCUMENTS.id,
+    startedAt: FIXED_NOW - 60 * HOUR,
+    finishedAt: FIXED_NOW - 60 * HOUR + 2 * SECOND,
+    sampled: 3,
+    verified: 0,
+    skipped: 3,
+    failed: 0,
+    failureCodes: [],
+    outcome: "inconclusive",
+  },
+];
 
 export const SCRUB_RUNS: ScrubRun[] = [
   {
@@ -504,6 +551,7 @@ export const SETTINGS: SettingsDto = {
   macos: null,
   bundleSmallFiles: true,
   scrub: { enabled: true, intervalSecs: 604800, sliceSize: 500, deepSample: 0 },
+  drill: { enabled: true, intervalSecs: 2592000, sampleSize: 3 },
 };
 
 export const VSS_HELPER_STATUS: VssHelperStatus = {

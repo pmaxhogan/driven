@@ -84,6 +84,10 @@ enum Command {
     /// the local state database. With `--fail-on-drift`, exits non-zero when
     /// the latest run of any source found drift it could not repair.
     Scrub(inspect::ScrubArgs),
+    /// Show the restore-drill configuration and recent drill reports from the
+    /// local state database. With `--fail-on-failure`, exits non-zero when the
+    /// latest run of any source could not restore a file it sampled.
+    Drill(inspect::DrillArgs),
     /// Restore one backup source to a local directory (no GUI), optionally
     /// byte-verifying the result against the original folder. Exits non-zero
     /// when any file fails to restore or fails verification.
@@ -179,6 +183,7 @@ async fn main() -> anyhow::Result<()> {
             rclone::RcloneCommand::Import(a) => rclone::run_import(a).await,
         },
         Command::Scrub(args) => inspect::run_scrub(args).await,
+        Command::Drill(args) => inspect::run_drill(args).await,
         Command::Restore(args) => restore::run_restore(args).await,
     }
 }

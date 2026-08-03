@@ -6,6 +6,7 @@ import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
 import { flushFrontendLogs } from "../frontendLog";
 import FilesUploadedStatTile from "../components/FilesUploadedStatTile.vue";
+import DrillHistoryPanel from "../components/DrillHistoryPanel.vue";
 import ScrubHistoryPanel from "../components/ScrubHistoryPanel.vue";
 import ThroughputStatTile from "../components/ThroughputStatTile.vue";
 import { activityEventLabel } from "../stores/activityEventLabel";
@@ -386,6 +387,12 @@ onUnmounted(() => {
          mount and shows counts only (never paths). Rendered after the header
          stats so a drift warning sits above the fold. -->
     <ScrubHistoryPanel />
+
+    <!-- Restore-drill history. Same status-surface rationale as the scrub above,
+         and placed right after it because the two answer the two halves of the
+         same question: the scrub proves the bytes are still there, the drill
+         proves they still come back. Counts and error codes only, never paths. -->
+    <DrillHistoryPanel />
 
     <!-- Placeholder for the filter bar. Its dropdowns are populated by their own
          queries, so rendering the real controls straight away would show every

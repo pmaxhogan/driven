@@ -151,6 +151,14 @@ driven-vss-helper = { path = "../crates/driven-vss-helper" }
 # compiles on every target; the socket/mount/osascript bits are macOS-gated
 # inside the crate.
 driven-apfs = { path = "../crates/driven-apfs" }
+# Restore drills (`driven_core::drill`): a drill restores a sampled file into a
+# throwaway directory, verifies it, and deletes it. Promoted from a dev-dep to a
+# real one because the DRILL is production code. Not hand-rolled: a
+# random-name-plus-create_dir of our own is exactly the pattern CodeQL's
+# path-injection rule flags in this repo, and `tempfile` additionally applies
+# 0700 and O_EXCL semantics we would otherwise have to re-derive. Already in the
+# lockfile via driven-core's dev-deps, so this adds no new crate to the tree.
+tempfile = "3"
 
 # R2-P1-1 (SPEC s11.6.1): handle-based restore confinement on Unix. The restore
 # sink opens a verified no-follow parent-directory fd and does BOTH the temp
@@ -207,9 +215,9 @@ tokio = { workspace = true, features = ["test-util"] }
 # every build with only the committed pubkey + fixture + sig.
 minisign-verify = "0.2.5"
 base64.workspace = true
-# Pause-persistence tests: RAII temp dir for a throwaway SqliteStateRepo
-# (already in the tree via driven-core's dev-deps; adds no new crate).
-tempfile = "3"
+# NOTE: `tempfile` moved to [dependencies] with the restore-drill work (the
+# drill restores into a throwaway directory in production code), so it is
+# available to the pause-persistence tests without being re-declared here.
 # `keychain::isolated()` / `is_isolated()`. Several command modules here reach
 # the OS keychain (`accounts`, `sources`, the crypto provider), so any test that
 # exercises those paths MUST bind the in-memory store first - on macOS a test

@@ -503,6 +503,30 @@ export interface SettingsDto {
   bundleSmallFiles: boolean;
   /** Scheduled integrity scrub of remote objects. */
   scrub: ScrubSettings;
+  /** Scheduled restore drills: the only check that exercises the READ side. */
+  drill: DrillSettings;
+}
+
+/**
+ * Scheduled restore-drill policy. Backed by standalone settings KV keys the
+ * backup engine re-reads per run, so a change applies on the next cycle.
+ */
+export interface DrillSettings {
+  /** Master on/off. Ships enabled. */
+  enabled: boolean;
+  /**
+   * Seconds between drills for one source (default monthly = 2592000).
+   * Deliberately slower than the scrub: a drill spends real download bandwidth.
+   */
+  intervalSecs: number;
+  /** How many files one drill restores end to end (default 3). */
+  sampleSize: number;
+}
+
+export interface DrillSettingsPatch {
+  enabled?: boolean;
+  intervalSecs?: number;
+  sampleSize?: number;
 }
 
 /**
@@ -556,6 +580,38 @@ export interface ScrubRun {
   deepFailed: number;
   wrapped: boolean;
   /** `clean` | `drift` | `incomplete`. */
+  outcome: string;
+}
+
+/** One failure code from a drill run, with how many of its files hit it. */
+export interface DrillFailureCode {
+  /** A stable SPEC s24 dotted code, e.g. `crypto.decrypt_failed`. */
+  code: string;
+  count: number;
+}
+
+/**
+ * One persisted restore-drill run.
+ *
+ * COUNTS plus stable SPEC s24 error CODES, deliberately: there is no path,
+ * remote id, or filename on this shape, so a drill report can never carry an
+ * encrypted source's filenames into the UI. Error codes are a closed,
+ * non-user vocabulary, so `failureCodes` carries no user data either.
+ */
+export interface DrillRun {
+  id: number;
+  sourceId: string;
+  startedAt: number;
+  finishedAt: number;
+  sampled: number;
+  verified: number;
+  skipped: number;
+  failed: number;
+  failureCodes: DrillFailureCode[];
+  /**
+   * `passed` | `failed` | `inconclusive`. `inconclusive` means nothing was
+   * actually verified, which must never render as a pass.
+   */
   outcome: string;
 }
 
@@ -639,6 +695,8 @@ export interface SettingsPatch {
   bundleSmallFiles?: boolean;
   /** Partial integrity-scrub policy. Absent = leave unchanged. */
   scrub?: ScrubSettingsPatch;
+  /** Partial restore-drill policy. Absent = leave unchanged. */
+  drill?: DrillSettingsPatch;
 }
 
 export interface UpdateInfo {

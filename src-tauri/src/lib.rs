@@ -27,6 +27,7 @@ mod assembly;
 // `DialogToken`) against the real implementation.
 pub mod commands;
 mod crypto_provider_impl;
+mod drill_probe;
 // NOTE: the "run elevated" module was removed pre-V1 (2026-06-25). It implemented
 // WHOLE-APP elevation (a /RL HIGHEST Task Scheduler logon task + a UAC restart),
 // which is not the least-privilege model we want. The intended V1.x design is a
@@ -721,6 +722,7 @@ pub fn run() {
             // M7-P2-4 / P2-5: filter facets + DESIGN s8.3 header aggregates.
             commands::activity::distinct_activity_event_types,
             commands::activity::list_scrub_runs,
+            commands::activity::list_drill_runs,
             commands::activity::activity_summary,
             commands::activity::activity_throughput_series,
             // SPEC s11.5 restore (M8).

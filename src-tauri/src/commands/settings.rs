@@ -330,6 +330,10 @@ async fn load_settings_dto(state: &dyn StateRepo) -> CommandResult<SettingsDto> 
     // engine would not actually use.
     let scrub = driven_core::scrub::load_scrub_config(state).await.into();
 
+    // Scheduled restore drills: three standalone KV keys, read the same way and
+    // for the same reason as the scrub's above.
+    let drill = driven_core::drill::load_drill_config(state).await.into();
+
     Ok(SettingsDto {
         global,
         telemetry,
@@ -339,6 +343,7 @@ async fn load_settings_dto(state: &dyn StateRepo) -> CommandResult<SettingsDto> 
         macos,
         bundle_small_files,
         scrub,
+        drill,
     })
 }
 
@@ -817,6 +822,51 @@ pub async fn update_settings(
             ),
             (driven_core::scrub::SETTING_SCRUB_SLICE_SIZE, s.slice_size),
             (driven_core::scrub::SETTING_SCRUB_DEEP_SAMPLE, s.deep_sample),
+        ] {
+            if let Some(v) = value {
+                repo.set_setting(key, &serde_json::Value::from(v))
+                    .await
+                    .map_err(CommandError::from)?;
+            }
+        }
+    }
+
+    // --- restore drills (migration 0015) ------------------------------------
+    // Same shape as the scrub above: standalone KV keys the core re-reads per
+    // run, every numeric field range-checked BEFORE anything is written, so a
+    // patch carrying one bad field cannot half-apply and the UI can never end up
+    // showing a value the engine silently clamped away.
+    if let Some(d) = patch.drill {
+        if let Some(v) = d.interval_secs {
+            check_range(
+                "drill.interval_secs",
+                v,
+                driven_core::drill::DRILL_INTERVAL_MIN,
+                driven_core::drill::DRILL_INTERVAL_MAX,
+            )?;
+        }
+        if let Some(v) = d.sample_size {
+            check_range(
+                "drill.sample_size",
+                v,
+                driven_core::drill::DRILL_SAMPLE_MIN,
+                driven_core::drill::DRILL_SAMPLE_MAX,
+            )?;
+        }
+        if let Some(v) = d.enabled {
+            repo.set_setting(
+                driven_core::drill::SETTING_DRILL_ENABLED,
+                &serde_json::Value::Bool(v),
+            )
+            .await
+            .map_err(CommandError::from)?;
+        }
+        for (key, value) in [
+            (
+                driven_core::drill::SETTING_DRILL_INTERVAL_SECS,
+                d.interval_secs,
+            ),
+            (driven_core::drill::SETTING_DRILL_SAMPLE_SIZE, d.sample_size),
         ] {
             if let Some(v) = value {
                 repo.set_setting(key, &serde_json::Value::from(v))
@@ -3827,6 +3877,7 @@ mod tests {
             macos: None,
             bundle_small_files: false,
             scrub: driven_core::scrub::ScrubConfig::default().into(),
+            drill: driven_core::drill::DrillConfig::default().into(),
         };
         let red = redact_settings(&dto);
         assert!(red.telemetry.install_id.starts_with("installid_"));
@@ -3862,6 +3913,7 @@ mod tests {
             macos: None,
             bundle_small_files: false,
             scrub: driven_core::scrub::ScrubConfig::default().into(),
+            drill: driven_core::drill::DrillConfig::default().into(),
         };
         let red = redact_settings(&dto);
         let url = red.global.proxy_url.as_deref().expect("proxy url present");
@@ -4309,6 +4361,79 @@ mod tests {
             s::SCRUB_DEEP_SAMPLE_MAX,
         )
         .expect("the shipped deep sample (0) is valid");
+    }
+
+    /// The drill's IPC bounds must be the CORE's bounds.
+    ///
+    /// Same rule as the scrub above, and it matters more here: `load_drill_config`
+    /// CLAMPS an out-of-range stored value, so an unvalidated write would succeed,
+    /// the settings screen would render what it sent, and the engine would quietly
+    /// drill on a different cadence. A user who set "every day" and got "every
+    /// month" would have no way to tell.
+    #[test]
+    fn drill_settings_bounds_match_the_core_and_reject_out_of_range_input() {
+        use driven_core::drill as d;
+
+        for (field, value, min, max) in [
+            (
+                "drill.interval_secs",
+                0,
+                d::DRILL_INTERVAL_MIN,
+                d::DRILL_INTERVAL_MAX,
+            ),
+            (
+                "drill.interval_secs",
+                d::DRILL_INTERVAL_MIN - 1,
+                d::DRILL_INTERVAL_MIN,
+                d::DRILL_INTERVAL_MAX,
+            ),
+            (
+                "drill.interval_secs",
+                d::DRILL_INTERVAL_MAX + 1,
+                d::DRILL_INTERVAL_MIN,
+                d::DRILL_INTERVAL_MAX,
+            ),
+            // Zero would be a second, redundant kill-switch: `enabled = false`
+            // is the way to turn drills off.
+            (
+                "drill.sample_size",
+                0,
+                d::DRILL_SAMPLE_MIN,
+                d::DRILL_SAMPLE_MAX,
+            ),
+            (
+                "drill.sample_size",
+                d::DRILL_SAMPLE_MAX + 1,
+                d::DRILL_SAMPLE_MIN,
+                d::DRILL_SAMPLE_MAX,
+            ),
+        ] {
+            let err = check_range(field, value, min, max)
+                .expect_err(&format!("{field}={value} must be rejected"));
+            assert_eq!(
+                err.code,
+                ErrorCode::InvalidInput,
+                "{field}={value} must use the stable invalid-input code"
+            );
+        }
+
+        // The shipped defaults sit inside every bound - a fresh install must not
+        // be able to fail its own validator.
+        let cfg = d::DrillConfig::default();
+        check_range(
+            "drill.interval_secs",
+            cfg.interval_secs,
+            d::DRILL_INTERVAL_MIN,
+            d::DRILL_INTERVAL_MAX,
+        )
+        .expect("the shipped monthly cadence is valid");
+        check_range(
+            "drill.sample_size",
+            cfg.sample_size,
+            d::DRILL_SAMPLE_MIN,
+            d::DRILL_SAMPLE_MAX,
+        )
+        .expect("the shipped 3-file sample is valid");
     }
 
     // R2-P1-4: whole-line / all-path-shape redaction tests (Windows shapes).
