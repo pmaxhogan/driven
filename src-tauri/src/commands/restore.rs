@@ -5304,8 +5304,6 @@ mod tests {
             .unwrap_or_default()
     }
 
-    /// Assert the drill left none of its scratch directories behind. `before` is
-    /// the set captured under [`DRILL_TEMP_LOCK`] immediately before the call.
     /// Filename prefix for the TEST harness's own scratch directories. Must never
     /// begin with [`DRILL_TEMP_PREFIX`] - see
     /// `the_harness_temp_prefix_cannot_be_mistaken_for_a_drill_leak`.
@@ -5338,6 +5336,8 @@ mod tests {
         assert!(!format!("{HARNESS_TEMP_PREFIX}1a2b3c").starts_with(DRILL_TEMP_PREFIX));
     }
 
+    /// Assert the drill left none of its scratch directories behind. `before` is
+    /// the set captured under [`DRILL_TEMP_LOCK`] immediately before the call.
     fn assert_no_drill_temp_leaked(before: &std::collections::BTreeSet<String>, context: &str) {
         let leaked: Vec<String> = drill_temp_dirs().difference(before).cloned().collect();
         assert!(
