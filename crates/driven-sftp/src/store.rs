@@ -513,6 +513,12 @@ pub struct SftpStore {
     sessions: Mutex<HashMap<String, SessionState>>,
     /// Whether the once-per-store abandoned-temp sweep has already run.
     swept: AtomicBool,
+    /// The [`while_connected`] backstop deadline. Carried as a value rather
+    /// than read from [`WRITE_DEADLINE`] directly so a test can drive the
+    /// channel-death path without a ten-minute wall-clock wait - the same
+    /// reason `session.rs` carries its `Timeouts` as a value. Production always
+    /// uses the constant.
+    write_deadline: Duration,
 }
 
 /// A borrowed, live SFTP channel.
@@ -541,6 +547,19 @@ impl Channel<'_> {
 /// costs nothing next to the transfer it is guarding.
 const LIVENESS_POLL: Duration = Duration::from_millis(250);
 
+/// The longest a SINGLE guarded write or close may make no progress before it
+/// is called dead, whatever the session handle claims.
+///
+/// A backstop, not the primary guard - see [`while_connected`]. It only has to
+/// be longer than the slowest link that could plausibly finish the transfer at
+/// all, because a guarded call moves a BOUNDED amount of data: an
+/// `UploadBody::Bytes` is under the executor's 5 MiB `RESUMABLE_THRESHOLD` (a
+/// larger file takes the resumable path instead) and a resumable chunk is one
+/// wire chunk. Ten minutes covers 5 MiB at roughly 70 Kbps, which is slower
+/// than any link a backup could complete over - so this can only fire on a
+/// channel that is genuinely not moving, never on a slow one.
+const WRITE_DEADLINE: Duration = Duration::from_secs(600);
+
 /// Await a write-path future, failing if the SSH transport dies underneath it.
 ///
 /// ## Why this guard exists (russh-sftp 2.3)
@@ -561,25 +580,45 @@ const LIVENESS_POLL: Duration = Duration::from_millis(250);
 /// sync cycle rather than failing it, which is the one outcome the SPEC s24
 /// taxonomy has no room for.
 ///
-/// So the write path is bounded on session LIVENESS rather than on a clock. A
-/// wall-clock write timeout would need a number that is simultaneously long
-/// enough not to strand a slow link and short enough not to look like a hang,
-/// and no such number exists. `russh` already declares a dead peer through the
-/// keepalive window this crate configures
-/// ([`crate::session`]'s `KEEPALIVE_INTERVAL`, with `INACTIVITY_TIMEOUT` as a
-/// backstop), and that is exactly what
+/// So the write path is bounded, and by TWO different things, because one
+/// covers only the common case.
+///
+/// **1. Session liveness, checked every [`LIVENESS_POLL`].** This is the
+/// primary guard and the precise one: `russh` already declares a dead peer
+/// through the keepalive window this crate configures ([`crate::session`]'s
+/// `KEEPALIVE_INTERVAL`, with `INACTIVITY_TIMEOUT` as a backstop), and that is
+/// exactly what
 /// [`SftpSession::is_connected`](crate::session::SftpSession::is_connected)
-/// reports - so a healthy slow upload is never interrupted and a dead one fails
-/// as [`SftpFailure::ConnectionLost`], i.e. retryable, like every other
-/// transport fault here.
+/// reports. A healthy slow upload is never interrupted, and a lost transport
+/// fails in well under a second. A wall-clock timeout could not do this job:
+/// it would need a number simultaneously long enough not to strand a slow link
+/// and short enough not to look like a hang, and no such number exists.
+///
+/// **2. An absolute deadline ([`WRITE_DEADLINE`]), as a backstop.** Liveness is
+/// necessary but NOT sufficient, and the gap is real: `is_connected` reads the
+/// SSH SESSION handle, while every SFTP request rides a CHANNEL on top of it.
+/// If the far end's `sftp-server` subsystem dies - crashed, OOM-killed, its
+/// stream closed - while `sshd` carries on, the channel is gone, the acks are
+/// parked exactly as above, and the session handle still reports HEALTHY. The
+/// liveness check would then poll a live session forever while the write it is
+/// guarding can never complete. The deadline is what makes the guarantee
+/// unconditional rather than "unconditional except for one shape nobody
+/// tested". `a_channel_that_dies_under_a_live_transport_still_fails_bounded`
+/// covers it, and measurably: with the deadline raised the same case takes the
+/// whole deadline, proving liveness alone never fires.
+///
+/// Either way the failure is [`SftpFailure::ConnectionLost`] - retryable, like
+/// every other transport fault here - never a hang.
 ///
 /// Removable once russh-sftp fails pending write acks when its stream ends.
 async fn while_connected<T>(
     session: &SftpSession,
+    deadline: Duration,
     what: &str,
     op: impl std::future::Future<Output = std::io::Result<T>>,
 ) -> anyhow::Result<T> {
     tokio::pin!(op);
+    let started = std::time::Instant::now();
     loop {
         tokio::select! {
             // The operation gets first refusal every time, so a write that
@@ -591,6 +630,16 @@ async fn while_connected<T>(
                     return Err(anyhow::Error::new(sftp_error(SftpFailure::ConnectionLost {
                         detail: format!(
                             "{what}: the SSH session died while the write was in flight"
+                        ),
+                    })));
+                }
+                let waited = started.elapsed();
+                if waited >= deadline {
+                    return Err(anyhow::Error::new(sftp_error(SftpFailure::ConnectionLost {
+                        detail: format!(
+                            "{what}: the server accepted no more of this write for {waited:?} \
+                             while its SSH session still looked healthy - the SFTP channel is \
+                             gone even though the transport is not"
                         ),
                     })));
                 }
@@ -617,7 +666,35 @@ impl SftpStore {
             claims: Arc::new(NameClaims::default()),
             sessions: Mutex::new(HashMap::new()),
             swept: AtomicBool::new(false),
+            write_deadline: WRITE_DEADLINE,
         })
+    }
+
+    /// Shorten the [`while_connected`] backstop so a test can reach the
+    /// channel-death path without a ten-minute wall-clock wait.
+    ///
+    /// Test-only by construction (the `test-server` feature is never on in a
+    /// shipped build), and deliberately not a general knob: the deadline is a
+    /// backstop whose value is reasoned about in [`WRITE_DEADLINE`], not
+    /// something a caller should be tuning.
+    #[cfg(any(test, feature = "test-server"))]
+    pub fn set_write_deadline_for_tests(&mut self, deadline: Duration) {
+        self.write_deadline = deadline;
+    }
+
+    /// Whether the SSH SESSION (not the SFTP channel on top of it) is still
+    /// live, as [`while_connected`]'s liveness check sees it.
+    ///
+    /// Exists so the channel-death test can prove it is measuring the gap it
+    /// claims to: if the transport had died too, the row would be a duplicate
+    /// of the ordinary transport-cut test.
+    #[cfg(any(test, feature = "test-server"))]
+    pub async fn session_is_connected(&self) -> bool {
+        self.session
+            .read()
+            .await
+            .as_ref()
+            .is_some_and(|session| session.is_connected())
     }
 
     /// The destination root "folder" id: the empty relative path.
@@ -1294,6 +1371,7 @@ impl SftpStore {
     /// the bytes actually written.
     async fn write_temp(
         channel: &Channel<'_>,
+        deadline: Duration,
         temp: &str,
         body: UploadBody,
     ) -> anyhow::Result<(u64, [u8; 16])> {
@@ -1316,7 +1394,13 @@ impl SftpStore {
             UploadBody::Bytes(bytes) => {
                 hasher.update(&bytes);
                 written = bytes.len() as u64;
-                while_connected(session, &format!("write {temp}"), file.write_all(&bytes)).await?;
+                while_connected(
+                    session,
+                    deadline,
+                    &format!("write {temp}"),
+                    file.write_all(&bytes),
+                )
+                .await?;
                 None
             }
             UploadBody::Stream { len, mut stream } => {
@@ -1324,8 +1408,13 @@ impl SftpStore {
                     let chunk = chunk?;
                     hasher.update(&chunk);
                     written += chunk.len() as u64;
-                    while_connected(session, &format!("write {temp}"), file.write_all(&chunk))
-                        .await?;
+                    while_connected(
+                        session,
+                        deadline,
+                        &format!("write {temp}"),
+                        file.write_all(&chunk),
+                    )
+                    .await?;
                 }
                 Some(len)
             }
@@ -1333,7 +1422,7 @@ impl SftpStore {
         // The close is where an interrupted upload would otherwise wedge: it
         // drains every write still waiting for an acknowledgement the dead
         // server will never send. See [`while_connected`].
-        while_connected(session, &format!("close {temp}"), file.shutdown()).await?;
+        while_connected(session, deadline, &format!("close {temp}"), file.shutdown()).await?;
 
         // The declared length is what the executor hashed and what it will
         // verify against; a stream that produced a different number of bytes is
@@ -1928,7 +2017,8 @@ impl RemoteStore for SftpStore {
 
         let dir_path = self.remote_path(&dir_id)?;
         let temp = join_remote(&dir_path, &names::temp_name());
-        let (_, expected) = match Self::write_temp(&channel, &temp, body).await {
+        let (_, expected) = match Self::write_temp(&channel, self.write_deadline, &temp, body).await
+        {
             Ok(v) => v,
             Err(error) => {
                 let _ = Self::remove_if_present(sftp, &temp).await;
@@ -2001,7 +2091,8 @@ impl RemoteStore for SftpStore {
         let _claim = claim_exact(&self.claims, &dir_id, &stored, &original);
 
         let temp = join_remote(&dir_path, &names::temp_name());
-        let (_, expected) = match Self::write_temp(&channel, &temp, body).await {
+        let (_, expected) = match Self::write_temp(&channel, self.write_deadline, &temp, body).await
+        {
             Ok(v) => v,
             Err(error) => {
                 let _ = Self::remove_if_present(sftp, &temp).await;
@@ -2111,6 +2202,7 @@ impl RemoteStore for SftpStore {
             .map_err(|e| sftp_op_error(&format!("create {temp_path}"), e))?;
         while_connected(
             channel.session(),
+            self.write_deadline,
             &format!("close {temp_path}"),
             file.shutdown(),
         )
@@ -2223,12 +2315,14 @@ impl RemoteStore for SftpStore {
                 .map_err(|e| sftp_io_error(&format!("seek {temp_path}"), e))?;
             while_connected(
                 channel.session(),
+                self.write_deadline,
                 &format!("append to {temp_path}"),
                 file.write_all(&chunk),
             )
             .await?;
             while_connected(
                 channel.session(),
+                self.write_deadline,
                 &format!("close {temp_path}"),
                 file.shutdown(),
             )
@@ -4457,6 +4551,84 @@ mod tests {
             .expect("the store must reconnect and complete the upload");
         assert_eq!(entry.md5, Some(digest(&content)));
         assert_eq!(download_to_vec(&store, &entry.id).await, content);
+    }
+
+    /// The SFTP CHANNEL dies while the SSH transport underneath stays up, and
+    /// the write must STILL fail rather than wait forever.
+    ///
+    /// This is the gap session-liveness alone cannot close, and it is not
+    /// hypothetical: `sftp-server` is a separate process on the far end, and a
+    /// crash or an OOM kill takes the subsystem down while `sshd` carries on.
+    /// `SftpSession::is_connected` reads the SSH session handle, so it reports
+    /// HEALTHY throughout - the liveness check polls a live session forever
+    /// while the write it guards can never complete. Only
+    /// [`WRITE_DEADLINE`] ends it.
+    ///
+    /// The deadline is shortened here rather than waited out, exactly as
+    /// `session.rs` shortens its handshake deadline: the value under test is
+    /// "does the backstop fire at all", not "is ten minutes ten minutes".
+    ///
+    /// The `>= deadline` assertion is what proves the backstop is doing the
+    /// work: if liveness could catch this, the call would fail in well under a
+    /// second and the elapsed time would be nowhere near the deadline.
+    #[tokio::test]
+    async fn a_channel_that_dies_under_a_live_transport_still_fails_bounded() {
+        const SHORT_DEADLINE: Duration = Duration::from_secs(2);
+
+        let server = TestSftpServer::spawn().await.unwrap();
+        let mut store = SftpStore::new(
+            &server.prepared_config(SftpAuthKind::Password),
+            &server.password_credential(),
+        )
+        .unwrap();
+        store.set_write_deadline_for_tests(SHORT_DEADLINE);
+
+        // Establish the session first, so the budget below is spent on the
+        // upload rather than on the SFTP handshake.
+        store
+            .list_folder("", &DriveContext::MyDrive)
+            .await
+            .expect("a healthy listing");
+
+        let content: Vec<u8> = (0..512 * 1024).map(|i| (i % 251) as u8).collect();
+        server.arm_channel_close_after_bytes(64 * 1024);
+
+        let started = std::time::Instant::now();
+        let error = tokio::time::timeout(
+            SHORT_DEADLINE * 15,
+            store.create(
+                "",
+                "big.bin",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::from(content.clone())),
+                HashMap::new(),
+            ),
+        )
+        .await
+        .expect("a dead SFTP channel must FAIL the upload, never wedge it")
+        .expect_err("the upload cannot finish over a channel that is gone");
+        let elapsed = started.elapsed();
+
+        assert_eq!(
+            server.fault_counts().channel_closures,
+            1,
+            "the test never reached its fault: the channel was never closed"
+        );
+        assert!(
+            store.session_is_connected().await,
+            "the SSH transport must still be UP - if it died too, this test is measuring the \
+             ordinary transport cut and proves nothing about the channel-only gap"
+        );
+        assert!(
+            elapsed >= SHORT_DEADLINE,
+            "the failure must come from the DEADLINE backstop, not from the liveness check - a \
+             liveness catch would have fired in milliseconds, but this took {elapsed:?}"
+        );
+        assert_eq!(
+            driven_remote::classification_of(&error),
+            Some(DriveErrorClassification::Network),
+            "a dead channel is a transport fault like any other - retryable, not fatal: {error:?}"
+        );
     }
 
     /// An auth flap - a box that is up but not yet ready - must classify as

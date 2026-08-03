@@ -147,6 +147,13 @@ const DISARMED: u64 = u64::MAX;
 pub struct SftpFaultCounts {
     /// Transport cuts served (see [`TestSftpServer::arm_disconnect_after_bytes`]).
     pub disconnects: u64,
+    /// SFTP channels ended while the SSH transport underneath stayed up
+    /// (see [`TestSftpServer::arm_channel_close_after_bytes`]).
+    pub channel_closures: u64,
+    /// Bytes of file data the destination accepted before it started reporting
+    /// ENOSPC. A row asserting "the disk filled up MID-transfer" needs this to
+    /// be non-zero, or it is really testing "full before we started".
+    pub bytes_accepted_before_enospc: u64,
     /// Authentication attempts rejected by the flap, password and key alike.
     pub auth_rejections: u64,
     /// Connections served with the ALTERNATE host key.
@@ -171,6 +178,14 @@ struct SftpFaults {
     /// Bytes seen since the switch was armed (reset on each arming).
     client_bytes: AtomicU64,
     disconnects: AtomicU64,
+
+    // -- channel-only death --------------------------------------------------
+    /// Bytes the SFTP CHANNEL will carry before it reports end-of-stream,
+    /// leaving the SSH transport alive underneath it.
+    close_channel_after_bytes: AtomicU64,
+    /// Bytes seen on the channel since the switch was armed.
+    channel_bytes: AtomicU64,
+    channel_closures: AtomicU64,
 
     // -- auth flap -----------------------------------------------------------
     /// Authentication attempts still to be rejected before one is accepted.
@@ -214,6 +229,7 @@ impl SftpFaults {
     fn disarmed() -> Self {
         Self {
             disconnect_after_bytes: AtomicU64::new(DISARMED),
+            close_channel_after_bytes: AtomicU64::new(DISARMED),
             enospc_after_bytes: AtomicU64::new(DISARMED),
             truncate_readdir_after: AtomicU64::new(DISARMED),
             ..Self::default()
@@ -224,6 +240,9 @@ impl SftpFaults {
         self.disconnect_after_bytes
             .store(DISARMED, Ordering::SeqCst);
         self.client_bytes.store(0, Ordering::SeqCst);
+        self.close_channel_after_bytes
+            .store(DISARMED, Ordering::SeqCst);
+        self.channel_bytes.store(0, Ordering::SeqCst);
         self.auth_rejections_remaining.store(0, Ordering::SeqCst);
         self.swap_host_key.store(false, Ordering::SeqCst);
         self.enospc_after_bytes.store(DISARMED, Ordering::SeqCst);
@@ -238,6 +257,8 @@ impl SftpFaults {
     fn counts(&self) -> SftpFaultCounts {
         SftpFaultCounts {
             disconnects: self.disconnects.load(Ordering::SeqCst),
+            channel_closures: self.channel_closures.load(Ordering::SeqCst),
+            bytes_accepted_before_enospc: self.written_bytes.load(Ordering::SeqCst),
             auth_rejections: self.auth_rejections.load(Ordering::SeqCst),
             host_key_swaps: self.host_key_swaps.load(Ordering::SeqCst),
             enospc_refusals: self.enospc_refusals.load(Ordering::SeqCst),
@@ -266,6 +287,35 @@ impl SftpFaults {
             return false;
         }
         self.disconnects.fetch_add(1, Ordering::SeqCst);
+        true
+    }
+
+    /// Account for `n` bytes read off the SFTP CHANNEL. `true` means the
+    /// channel must now report end-of-stream, leaving the transport alive.
+    ///
+    /// End-of-stream rather than an io error, on purpose: `russh_sftp`'s server
+    /// loop breaks only on `UnexpectedEof` and merely warns-and-continues on any
+    /// other error, so an error would spin the loop instead of ending the
+    /// subsystem. EOF is also the truthful shape - `sftp-server` exiting closes
+    /// its stdout.
+    ///
+    /// Single-shot, like the transport cut, so a reconnect can succeed.
+    fn note_channel_bytes(&self, n: u64) -> bool {
+        let budget = self.close_channel_after_bytes.load(Ordering::SeqCst);
+        if budget == DISARMED {
+            return false;
+        }
+        if self.channel_bytes.fetch_add(n, Ordering::SeqCst) + n < budget {
+            return false;
+        }
+        if self
+            .close_channel_after_bytes
+            .swap(DISARMED, Ordering::SeqCst)
+            == DISARMED
+        {
+            return false;
+        }
+        self.channel_closures.fetch_add(1, Ordering::SeqCst);
         true
     }
 
@@ -479,6 +529,25 @@ impl TestSftpServer {
         self.faults.client_bytes.store(0, Ordering::SeqCst);
         self.faults
             .disconnect_after_bytes
+            .store(bytes, Ordering::SeqCst);
+    }
+
+    /// End the SFTP CHANNEL once `bytes` more have crossed it, leaving the SSH
+    /// transport alive underneath - the shape of `sftp-server` crashing or
+    /// being OOM-killed while `sshd` carries on.
+    ///
+    /// This is a strictly nastier hazard than
+    /// [`Self::arm_disconnect_after_bytes`] and it exists to prove a specific
+    /// guard: `SftpSession::is_connected` reads the SSH session handle, so it
+    /// reports HEALTHY here even though the channel carrying every SFTP request
+    /// is gone. A write path bounded on liveness alone would wait forever. See
+    /// `driven_sftp::store::while_connected`.
+    ///
+    /// Single-shot, so a reconnect succeeds and recovery is measurable.
+    pub fn arm_channel_close_after_bytes(&self, bytes: u64) {
+        self.faults.channel_bytes.store(0, Ordering::SeqCst);
+        self.faults
+            .close_channel_after_bytes
             .store(bytes, Ordering::SeqCst);
     }
 
@@ -775,6 +844,58 @@ impl<S: AsyncWrite + Unpin> AsyncWrite for FaultStream<S> {
     }
 }
 
+/// The SFTP channel stream, wrapped so an armed budget can END THE SUBSYSTEM
+/// while the SSH transport underneath stays up.
+///
+/// Reports end-of-stream rather than an error: `russh_sftp`'s server loop
+/// breaks on `UnexpectedEof` and warns-and-continues on anything else, so an
+/// error would busy-spin the loop instead of ending the subsystem. EOF is also
+/// what really happens when `sftp-server` exits - its stdout closes.
+struct ChannelFaultStream<S> {
+    inner: S,
+    faults: Arc<SftpFaults>,
+}
+
+impl<S: AsyncRead + Unpin> AsyncRead for ChannelFaultStream<S> {
+    fn poll_read(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &mut ReadBuf<'_>,
+    ) -> Poll<std::io::Result<()>> {
+        let this = self.get_mut();
+        let before = buf.filled().len();
+        let polled = Pin::new(&mut this.inner).poll_read(cx, buf);
+        if matches!(polled, Poll::Ready(Ok(()))) {
+            let read = (buf.filled().len() - before) as u64;
+            if this.faults.note_channel_bytes(read) {
+                // Rewind to an EMPTY read, which is how tokio spells EOF.
+                // Handing back the bytes AND the EOF would let the server
+                // process one more packet before noticing.
+                buf.set_filled(before);
+            }
+        }
+        polled
+    }
+}
+
+impl<S: AsyncWrite + Unpin> AsyncWrite for ChannelFaultStream<S> {
+    fn poll_write(
+        self: Pin<&mut Self>,
+        cx: &mut Context<'_>,
+        buf: &[u8],
+    ) -> Poll<std::io::Result<usize>> {
+        Pin::new(&mut self.get_mut().inner).poll_write(cx, buf)
+    }
+
+    fn poll_flush(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_flush(cx)
+    }
+
+    fn poll_shutdown(self: Pin<&mut Self>, cx: &mut Context<'_>) -> Poll<std::io::Result<()>> {
+        Pin::new(&mut self.get_mut().inner).poll_shutdown(cx)
+    }
+}
+
 /// The per-connection SSH handler: authenticates the one configured user and
 /// hands an accepted `sftp` subsystem request to [`FsSftpHandler`].
 struct SshHandler {
@@ -859,8 +980,15 @@ impl russh::server::Handler for SshHandler {
             return Ok(());
         };
         session.channel_success(channel_id)?;
+        // The channel stream gets its OWN wrapper, separate from the socket's:
+        // ending the subsystem while `sshd` lives is a different hazard from
+        // losing the transport, and the store's guards answer them differently.
+        let stream = ChannelFaultStream {
+            inner: channel.into_stream(),
+            faults: Arc::clone(&self.faults),
+        };
         russh_sftp::server::run(
-            channel.into_stream(),
+            stream,
             FsSftpHandler::new(self.root.clone(), self.features, Arc::clone(&self.faults)),
         )
         .await;
