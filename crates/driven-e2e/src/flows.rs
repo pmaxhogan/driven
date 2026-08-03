@@ -80,6 +80,48 @@ pub async fn create_s3_account(
         .with_context(|| format!("create_s3_account returned no id: {dto}"))
 }
 
+/// Create an SSH (SFTP) destination account against a live sshd, authenticating
+/// with a PEM private key.
+///
+/// Unlike its siblings this returns the WHOLE `SftpAccountCreatedDto`, not just
+/// the id: the pinned `hostKeyFingerprint` and the `adopted` flag are the two
+/// things worth asserting about a first-contact SFTP probe, and they exist
+/// nowhere else. Use [`account_id`] to pull the id back out.
+pub async fn create_sftp_account(
+    session: &AppSession,
+    host: &str,
+    port: u16,
+    root_path: &Path,
+    username: &str,
+    private_key_pem: &str,
+) -> anyhow::Result<Value> {
+    session
+        .invoke(
+            "create_sftp_account",
+            json!({ "req": {
+                "displayName": "e2e sshd",
+                "host": host,
+                "port": port,
+                "rootPath": root_path.display().to_string(),
+                "username": username,
+                "auth": "privateKey",
+                "password": null,
+                "privateKey": private_key_pem,
+                "passphrase": null,
+            }}),
+        )
+        .await
+}
+
+/// The account id inside an `SftpAccountCreatedDto`.
+pub fn account_id(created: &Value) -> anyhow::Result<String> {
+    created
+        .pointer("/account/id")
+        .and_then(Value::as_str)
+        .map(String::from)
+        .with_context(|| format!("no account id in {created}"))
+}
+
 /// Add `src_dir` as a backup source on `account_id` (destination = the
 /// backend root). Returns the new source id.
 pub async fn add_source(
