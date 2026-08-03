@@ -595,7 +595,23 @@ impl SftpStore {
                     // can be using it, and every caller waiting on this lock
                     // was already waiting for the connect. A later `reconnect`
                     // does NOT re-sweep.
-                    if !self.swept.swap(true, Ordering::SeqCst) {
+                    //
+                    // GATED ON THE MARKER, because the sweep DELETES files and
+                    // recursively walks the tree to find them. Both halves of
+                    // that are wrong against a root Driven has not proven is
+                    // its own: a misconfigured `root_path` would have Driven
+                    // removing `.driven-tmp-*` files out of a stranger's
+                    // directory, which is exactly the discipline `guard_root`
+                    // exists to enforce, and it would pay a full recursive walk
+                    // (round trips per level) before anything else noticed the
+                    // root was wrong. `is_ok()` rather than `?` keeps the sweep
+                    // best-effort: a markerless root must not fail the
+                    // operation that triggered the connect, only skip the
+                    // sweep. The real marker check still runs, and still
+                    // fails, inside whichever mutating call follows.
+                    if !self.swept.swap(true, Ordering::SeqCst)
+                        && self.guard_root(session.sftp()).await.is_ok()
+                    {
                         self.sweep_stale_temp_files(session.sftp()).await;
                     }
                     *guard = Some(session);
@@ -651,8 +667,17 @@ impl SftpStore {
     /// Runs automatically once per store on the first successful connection;
     /// this entry point exists so the sweep can also be driven deliberately
     /// (and so a test can observe it) without waiting for a fresh store.
+    ///
+    /// Proves the destination marker first. The sweep DELETES files, so it is a
+    /// mutating operation and gets the same guard every other one does - Driven
+    /// does not remove anything from a directory it cannot prove is its own.
+    /// Unlike the automatic run (which skips silently, so a markerless root
+    /// cannot fail an unrelated operation) an explicit call REPORTS the
+    /// refusal: the caller asked for this and deserves to know it did not
+    /// happen.
     pub async fn sweep_abandoned_temp_files(&self) -> anyhow::Result<usize> {
         let channel = self.channel().await?;
+        self.guard_root(channel.sftp()).await?;
         Ok(self.sweep_stale_temp_files(channel.sftp()).await)
     }
 
@@ -1575,6 +1600,42 @@ impl SftpStore {
     ///
     /// `Ok(false)` means the session is dead and the caller must report
     /// [`ResumeProgress::SessionInvalid`].
+    ///
+    /// ## The re-read is a CHOICE, and it has a price
+    ///
+    /// Hydration re-downloads the whole temp file to re-derive its digest, so
+    /// restarting into a 20 GB upload that was 90% done re-fetches 18 GB before
+    /// a single new byte goes out. That is not free and it is not forced: the
+    /// alternative (persisting the md5 state, which md-5 0.11 does support -
+    /// see [`SessionHandle`]) would cost nothing at all.
+    ///
+    /// It is chosen anyway because the cheap option is only cheap when it is
+    /// right, and it is wrong exactly when it matters: after a crash, the byte
+    /// count a persisted state covers is what the dead process BELIEVED it
+    /// wrote, and the digest it implies matches the surviving bytes only if
+    /// nothing was lost - which is the assumption a crash exists to violate.
+    /// Being wrong there is not a slow resume, it is a silently corrupt object
+    /// discovered (at best) at the post-commit verify, after the rename, with
+    /// the previous object already removed.
+    ///
+    /// So: bandwidth on an uncommon path, in exchange for the guarantee on
+    /// every path. If the re-read ever becomes the dominant cost, the honest
+    /// improvement is a server-side digest (an `md5sum` over the exec channel,
+    /// or `check-file@openssh.com` where it is offered) - NOT trusting local
+    /// bookkeeping.
+    ///
+    /// ## Known residual hole in the ownership check below
+    ///
+    /// [`Self::read_sidecar`] maps an UNPARSEABLE sidecar to `Ok(None)`, the
+    /// same as a missing one, so a torn sidecar at a usurped destination reads
+    /// as "unowned" and the ownership check passes - and the completion then
+    /// removes an object that is not this session's. Deliberately left as-is
+    /// rather than failing closed: reading a torn sidecar as unannotated is a
+    /// property the whole crate is built on (`meta::parse`, every listing, the
+    /// collision probe), and changing it here alone would make the rule
+    /// inconsistent without closing it anywhere else. Task 8's fault-injection
+    /// tier is where a fail-closed sidecar read should be decided, for all of
+    /// them at once.
     async fn hydrate_session(
         &self,
         sftp: &RusshSftpSession,
@@ -3909,6 +3970,58 @@ mod tests {
         assert!(
             !abandoned.exists(),
             "the first connection sweeps abandoned temp files"
+        );
+    }
+
+    #[tokio::test]
+    async fn no_sweep_ever_deletes_from_a_root_that_is_not_a_driven_destination() {
+        // The sweep REMOVES files, which makes it a mutating operation and puts
+        // it under the same marker discipline as every other one. A user whose
+        // `root_path` has a typo in it must not have Driven quietly deleting
+        // out of a stranger's directory - and must not pay a full recursive
+        // walk of it either.
+        let server = TestSftpServer::spawn().await.unwrap();
+        // Someone else's file that merely LOOKS like one of Driven's temps.
+        let planted = server.root().join(".driven-tmp-not-ours");
+        std::fs::write(&planted, b"not Driven's to delete").unwrap();
+        age_file(&planted);
+
+        let store = unprepared_store_for(&server);
+        // Reads are deliberately ungated, so this connects and would have
+        // triggered the automatic sweep.
+        store
+            .list_folder("", &DriveContext::MyDrive)
+            .await
+            .expect("a read against a markerless root still works");
+        assert!(
+            planted.exists(),
+            "the first-connection sweep must not touch a root with no Driven marker"
+        );
+
+        // And an EXPLICIT sweep says so out loud rather than silently doing
+        // nothing.
+        let error = store
+            .sweep_abandoned_temp_files()
+            .await
+            .expect_err("an explicit sweep of a markerless root must be refused");
+        assert!(
+            format!("{error:?}").contains("sftp.dest_marker_missing"),
+            "{error:?}"
+        );
+        assert!(planted.exists(), "still not ours to delete");
+
+        // Once the root IS a Driven destination, the very same file IS
+        // collected - so the refusals above are the marker check biting, not a
+        // sweep that never worked. (`store_for` seeds the marker, and this
+        // store's own first connection is what sweeps.)
+        let prepared = store_for(&server);
+        prepared
+            .list_folder("", &DriveContext::MyDrive)
+            .await
+            .unwrap();
+        assert!(
+            !planted.exists(),
+            "with the marker in place the identical file is swept"
         );
     }
 
