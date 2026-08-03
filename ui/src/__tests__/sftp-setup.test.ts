@@ -71,6 +71,16 @@ const FAKE_ACCOUNT = {
   backendKind: "sftp",
 };
 const FINGERPRINT = "SHA256:abcDEF0123456789abcDEF0123456789abcDEF012";
+const FAKE_S3_ACCOUNT = {
+  id: "acct-s3-1",
+  email: "my-backups/",
+  displayName: null,
+  state: "ok",
+  encryptionEnabled: false,
+  createdAt: 0,
+  lastSyncedAt: null,
+  backendKind: "s3",
+};
 
 const VALID_REQ: CreateSftpAccountRequest = {
   host: "nas.example.com",
@@ -94,6 +104,8 @@ function installFakeBackend(opts: { adopted?: boolean } = {}): void {
           hostKeyFingerprint: FINGERPRINT,
           adopted: opts.adopted ?? false,
         });
+      case "create_s3_account":
+        return Promise.resolve(FAKE_S3_ACCOUNT);
       case "begin_add_account_wizard":
         return Promise.resolve("sess-1");
       case "pick_drive_folder":
@@ -233,6 +245,54 @@ describe("setup wizard: SSH (SFTP) branch", () => {
     expect(wrapper.find('[data-testid="sftp-adopted-note"]').exists()).toBe(false);
   });
 
+  it("REGRESSION: does not show a stale SFTP fingerprint after abandoning SFTP for S3", async () => {
+    // Create an SFTP account, go Back, then create an S3 account instead. The
+    // fingerprint/adopted note is keyed off `sftpHostKeyFingerprint` alone
+    // being set, which survives a Back - without a backendId gate (and the
+    // store clearing it on a DIFFERENT backend's successful create), the S3
+    // account's source step would render SFTP's TOFU confirmation for a
+    // destination it has nothing to do with.
+    installFakeBackend();
+    const wrapper = await mountWizard();
+    const setup = useSetupStore();
+
+    setup.selectBackend("sftp");
+    setup.next();
+    await flushPromises();
+    wrapper.findComponent(SshCredentialsForm).vm.$emit("submit", VALID_REQ);
+    await flushPromises();
+    expect(setup.step).toBe("source");
+    expect(setup.sftpHostKeyFingerprint).toBe(FINGERPRINT);
+
+    // back() from "source" lands on "credentials" directly - no second next()
+    // needed (or wanted: it would skip the S3 form entirely).
+    setup.back();
+    expect(setup.step).toBe("credentials");
+    setup.selectBackend("s3");
+    await flushPromises();
+
+    const s3Req = {
+      endpoint: "https://example.r2.cloudflarestorage.com",
+      bucket: "my-backups",
+      region: null,
+      prefix: null,
+      pathStyle: true,
+      accessKeyId: "AKIAEXAMPLE",
+      secretAccessKey: "super-secret",
+    };
+    wrapper.findComponent(S3CredentialsForm).vm.$emit("submit", s3Req);
+    await flushPromises();
+
+    expect(setup.step).toBe("source");
+    expect(setup.accountId).toBe("acct-s3-1");
+    // The store itself no longer carries the abandoned attempt's fingerprint -
+    // not just the template's backendId gate hiding it.
+    expect(setup.sftpHostKeyFingerprint).toBeNull();
+    expect(setup.sftpAdopted).toBe(false);
+    expect(wrapper.find('[data-testid="sftp-fingerprint-confirmation"]').exists()).toBe(false);
+    expect(wrapper.find('[data-testid="sftp-adopted-note"]').exists()).toBe(false);
+  });
+
   it("shows the adopted note when the probe reused an existing destination", async () => {
     installFakeBackend({ adopted: true });
     const wrapper = await mountWizard();
@@ -288,6 +348,68 @@ describe("setup wizard: SSH (SFTP) branch", () => {
     // internal.bug fallback, and not a raw echo of the backend's message.
     const shown = wrapper.text();
     expect(shown).toContain(i18n.global.t("errors.sftp.root_missing.long"));
+    expect(shown).not.toContain(i18n.global.t("errors.internal.bug.long"));
+  });
+
+  it("stays on the form and renders a distinct message when the root points at a file", async () => {
+    installFakeBackend();
+    const wrapper = await mountWizard();
+    const setup = useSetupStore();
+    setup.selectBackend("sftp");
+    setup.next();
+    await flushPromises();
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_sftp_account") {
+        return Promise.reject({
+          code: "sftp.root_not_a_directory",
+          message: "sftp.root_not_a_directory: /backups/driven exists but is not a directory",
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    wrapper.findComponent(SshCredentialsForm).vm.$emit("submit", VALID_REQ);
+    await flushPromises();
+
+    expect(setup.step).toBe("credentials");
+    expect(setup.errorCode).toBe("sftp.root_not_a_directory");
+    const shown = wrapper.text();
+    expect(shown).toContain(i18n.global.t("errors.sftp.root_not_a_directory.long"));
+    expect(shown).not.toContain(i18n.global.t("errors.internal.bug.long"));
+  });
+
+  it("stays on the form and renders a distinct message when the root already holds a different destination", async () => {
+    // The backend cannot actually produce sftp.dest_marker_mismatch through
+    // create_sftp_account today (see the Rust-side unit test on the mapper
+    // for why: a fresh account's config never carries a pre-set destination
+    // id). This still proves the WIZARD side of the contract - if that code
+    // ever arrives (a future reauth/re-probe path), the UI already renders it
+    // distinctly rather than falling back to internal.bug.
+    installFakeBackend();
+    const wrapper = await mountWizard();
+    const setup = useSetupStore();
+    setup.selectBackend("sftp");
+    setup.next();
+    await flushPromises();
+
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "create_sftp_account") {
+        return Promise.reject({
+          code: "sftp.dest_marker_mismatch",
+          message: "sftp.dest_marker_mismatch: /backups/driven holds a different destination",
+        });
+      }
+      return Promise.resolve(undefined);
+    });
+
+    wrapper.findComponent(SshCredentialsForm).vm.$emit("submit", VALID_REQ);
+    await flushPromises();
+
+    expect(setup.step).toBe("credentials");
+    expect(setup.errorCode).toBe("sftp.dest_marker_mismatch");
+    const shown = wrapper.text();
+    expect(shown).toContain(i18n.global.t("errors.sftp.dest_marker_mismatch.long"));
     expect(shown).not.toContain(i18n.global.t("errors.internal.bug.long"));
   });
 });

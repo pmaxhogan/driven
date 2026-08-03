@@ -230,6 +230,12 @@ export const useSetupStore = defineStore("setup", () => {
       const account = await ipc.createS3Account(req);
       accountId.value = account.id;
       accountEmail.value = account.email;
+      // A stale SFTP fingerprint/adoption note from an abandoned attempt on
+      // this wizard run (Back, then a different backend) must not survive
+      // onto THIS account's source step - see the step-3 template's own
+      // backendId gate for the belt half of this guard.
+      sftpHostKeyFingerprint.value = null;
+      sftpAdopted.value = false;
       // The source step gates on a chosen destination; an S3 account has no
       // consent round trip, so mark the sign-in resolved here.
       oauthStatus.value = { kind: "complete" };
@@ -257,6 +263,11 @@ export const useSetupStore = defineStore("setup", () => {
       accountId.value = account.id;
       accountEmail.value = account.email;
       localFolderRoot.value = req.root;
+      // See `createS3Account`'s identical guard: clears a stale SFTP
+      // fingerprint/adoption note from an abandoned attempt earlier in this
+      // wizard run.
+      sftpHostKeyFingerprint.value = null;
+      sftpAdopted.value = false;
       // The source step gates on a resolved destination; a local folder has no
       // consent round trip, so mark the sign-in resolved here.
       oauthStatus.value = { kind: "complete" };

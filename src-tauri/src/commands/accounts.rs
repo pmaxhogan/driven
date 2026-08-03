@@ -1309,34 +1309,47 @@ struct ProbedSftpAccount {
 }
 
 /// Map an error from [`driven_sftp::prepare_destination`] to the IPC boundary
-/// shape, special-casing the one case the wizard must tell apart from a
-/// generic "destination unreachable": the configured root path does not exist
-/// on the server.
+/// shape, special-casing the three setup-time conditions the wizard must tell
+/// apart from a generic "destination unreachable": the configured root path
+/// does not exist, it names a file rather than a directory, or it already
+/// carries a DIFFERENT Driven destination's marker.
 ///
-/// The generic path ([`CommandError::from`]) already gets this WRONG for that
-/// case: `prepare_destination` reports a missing root as
-/// `DriveError::DestFolderMissing` (so later store operations classify it the
-/// same way `driven_localfs` does), but `DestFolderMissing`'s PACER
-/// classification is `Other`, and `code_from_anyhow` maps every `Other`
-/// straight to `drive.unreachable` BEFORE it ever looks at the message - so the
-/// `sftp.root_missing` marker `driven_sftp::provision::dest_missing` embeds via
-/// `.context()` survives into `message` (proven by the
-/// `a_missing_root_path_persists_nothing_and_says_which_one` test below) but
-/// never reaches `code`, and the wizard's error surface reads `.code` only
-/// (`ipc/errors.ts` deliberately never trusts `.message` - it is unredacted
-/// backend English, not an i18n key). Reclassifying `DestFolderMissing`
-/// globally would also change what a MISSING destination on an existing S3 /
-/// local-folder account reports, which is out of scope here - so this checks
-/// the message for the specific `sftp.root_missing` marker ONLY when the error
-/// really is a `DestFolderMissing`, and defers to the generic mapping for
-/// everything else (auth / network / the other `dest_missing` reasons).
+/// The generic path ([`CommandError::from`]) gets all three WRONG:
+/// `prepare_destination` reports each as `DriveError::DestFolderMissing` (so
+/// later store operations classify it the same way `driven_localfs` does),
+/// but `DestFolderMissing`'s PACER classification is `Other`, and
+/// `code_from_anyhow` maps every `Other` straight to `drive.unreachable`
+/// BEFORE it ever looks at the message - so the `sftp.*` marker
+/// `driven_sftp::provision::dest_missing` embeds via `.context()` survives
+/// into `message` (proven by the tests below) but never reaches `code`, and
+/// the wizard's error surface reads `.code` only (`ipc/errors.ts`
+/// deliberately never trusts `.message` - it is unredacted backend English,
+/// not an i18n key). Reclassifying `DestFolderMissing` globally would also
+/// change what a MISSING destination on an existing S3 / local-folder account
+/// reports, which is out of scope here - so this checks the message for one
+/// of the three specific `sftp.*` markers ONLY when the error really is a
+/// `DestFolderMissing`, and defers to the generic mapping for everything else
+/// (auth / network classification is untouched).
 fn sftp_probe_command_error(e: anyhow::Error) -> CommandError {
     let is_dest_folder_missing = matches!(
         e.downcast_ref::<driven_remote::DriveError>(),
         Some(driven_remote::DriveError::DestFolderMissing)
     );
-    if is_dest_folder_missing && e.to_string().contains("sftp.root_missing") {
-        return CommandError::with_code(ErrorCode::SftpRootMissing, e.to_string());
+    if is_dest_folder_missing {
+        let msg = e.to_string();
+        // Longest/most-specific marker first is not a concern here (the three
+        // are disjoint substrings, unlike the CANDIDATES scan in
+        // `commands::code_from_message`), but order still matches
+        // `provision.rs`'s own check sequence for readability.
+        if msg.contains("sftp.root_missing") {
+            return CommandError::with_code(ErrorCode::SftpRootMissing, msg);
+        }
+        if msg.contains("sftp.root_not_a_directory") {
+            return CommandError::with_code(ErrorCode::SftpRootNotADirectory, msg);
+        }
+        if msg.contains("sftp.dest_marker_mismatch") {
+            return CommandError::with_code(ErrorCode::SftpDestMarkerMismatch, msg);
+        }
     }
     CommandError::from(e)
 }
@@ -2498,6 +2511,65 @@ mod tests {
                 .load()
                 .unwrap()
                 .is_none());
+        }
+
+        #[tokio::test]
+        async fn a_root_path_pointing_at_a_file_persists_nothing_and_says_which_code() {
+            // The root-path sibling of the missing-root test: the path exists,
+            // but names a FILE. Same distinct-message requirement, different
+            // marker (`sftp.root_not_a_directory`) - a "point at a folder, not a
+            // file" message is a different fix than "create the folder".
+            let Some(_g) = keychain() else { return };
+            let server = TestSftpServer::spawn().await.unwrap();
+            std::fs::write(server.root().join("not-a-folder"), b"just a file").unwrap();
+            let id = AccountId::new_v4();
+            let (seen, insert) = recording();
+
+            let req = CreateSftpAccountRequest {
+                root_path: "/not-a-folder".to_string(),
+                ..password_request(&server)
+            };
+            let err = probe_and_persist_sftp_account(id, &req, NOW, insert)
+                .await
+                .expect_err("a root path naming a file is not a destination");
+
+            assert_eq!(err.code, ErrorCode::SftpRootNotADirectory);
+            assert!(
+                err.message.contains("sftp.root_not_a_directory"),
+                "the classified code must survive the command boundary: {}",
+                err.message
+            );
+            assert!(seen.lock().unwrap().is_none());
+            assert!(SftpCredentialStore::new(id.to_string())
+                .load()
+                .unwrap()
+                .is_none());
+        }
+
+        #[test]
+        fn the_probe_error_mapper_recognizes_a_dest_marker_mismatch() {
+            // Unlike `sftp.root_missing` / `sftp.root_not_a_directory` (both
+            // reachable end to end through `create_sftp_account`, tested above),
+            // `sftp.dest_marker_mismatch` can never actually fire through THIS
+            // command: `sftp_config_and_credential` always builds a config with
+            // `destination_id: None`, and `driven_sftp::provision`'s mismatch
+            // check only triggers when the config ALREADY carries an id before
+            // the probe runs (a re-probe of an EXISTING account, which
+            // `create_sftp_account` never does - it always constructs a fresh
+            // one). So this tests the mapper function directly against the
+            // exact error shape `driven_sftp::provision::dest_missing` produces
+            // for that marker, proving the mapping is correct and ready for
+            // whatever future re-probe path needs it (a reauth-style flow, say)
+            // without pretending today's command can reach it.
+            let inner = driven_remote::DriveError::DestFolderMissing;
+            let err = anyhow::Error::new(inner).context(
+                "sftp.dest_marker_mismatch: /backups holds a different Driven destination \
+                 (expected aaa, found bbb)"
+                    .to_string(),
+            );
+            let mapped = sftp_probe_command_error(err);
+            assert_eq!(mapped.code, ErrorCode::SftpDestMarkerMismatch);
+            assert!(mapped.message.contains("sftp.dest_marker_mismatch"));
         }
 
         #[tokio::test]

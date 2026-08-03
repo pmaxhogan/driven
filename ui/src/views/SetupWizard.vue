@@ -379,9 +379,16 @@ function baseName(p: string): string {
            card is unreachable by the time there is anything to show (this
            step is only reached AFTER `onSftpSubmit` advances past it), so the
            pinned host key - and, if the root already held a Driven backup,
-           the adoption note - render here instead. -->
+           the adoption note - render here instead.
+
+           Gated on backendId TOO, not just the fingerprint being set: Back
+           from this step, then creating an S3 or local-folder account
+           instead, leaves `sftpHostKeyFingerprint` set from the abandoned
+           SFTP attempt (it is cleared only by `reset()` or a later SUCCESSFUL
+           SFTP create) - without this second gate that stale value renders
+           here for a destination it has nothing to do with. -->
       <p
-        v-if="setup.sftpHostKeyFingerprint"
+        v-if="setup.backendId === SFTP_BACKEND_ID && setup.sftpHostKeyFingerprint"
         class="rounded-md bg-teal-50 px-3 py-2 text-sm text-teal-800 dark:bg-teal-950/40 dark:text-teal-300"
         data-testid="sftp-fingerprint-confirmation"
       >

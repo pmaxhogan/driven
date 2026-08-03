@@ -1173,6 +1173,22 @@ pub enum ErrorCode {
     /// [`Self::DriveDestFolderMissing`]'s "an EXISTING destination vanished"
     /// meaning for an already-created account.
     SftpRootMissing,
+    /// `sftp.root_not_a_directory` - the SSH (SFTP) destination's configured
+    /// root path exists on the server but names a FILE, not a directory.
+    /// Setup-time only, alongside [`Self::SftpRootMissing`] - the probe never
+    /// creates or replaces anything at the root, so a path that resolves to a
+    /// file must surface as a distinct "point at a folder" condition rather
+    /// than the generic unreachable code.
+    SftpRootNotADirectory,
+    /// `sftp.dest_marker_mismatch` - the SSH (SFTP) destination's root already
+    /// carries a Driven destination marker naming a DIFFERENT destination id
+    /// than the one this account's config expects. Setup-time only (a
+    /// re-probe of an account whose config already recorded an id): adopting
+    /// the other id here would silently repoint the account at a different
+    /// server's (or a different account's) backup tree, which is exactly what
+    /// `SftpStore::guard_root` refuses on every mutating operation - this code
+    /// tells the user why creation itself was refused instead.
+    SftpDestMarkerMismatch,
 }
 
 impl ErrorCode {
@@ -1226,6 +1242,8 @@ impl ErrorCode {
             ErrorCode::InternalBug => "internal.bug",
             ErrorCode::InvalidInput => "internal.invalid_input",
             ErrorCode::SftpRootMissing => "sftp.root_missing",
+            ErrorCode::SftpRootNotADirectory => "sftp.root_not_a_directory",
+            ErrorCode::SftpDestMarkerMismatch => "sftp.dest_marker_mismatch",
         }
     }
 
@@ -1283,6 +1301,8 @@ impl ErrorCode {
             "internal.bug" => ErrorCode::InternalBug,
             "internal.invalid_input" => ErrorCode::InvalidInput,
             "sftp.root_missing" => ErrorCode::SftpRootMissing,
+            "sftp.root_not_a_directory" => ErrorCode::SftpRootNotADirectory,
+            "sftp.dest_marker_mismatch" => ErrorCode::SftpDestMarkerMismatch,
             _ => return None,
         })
     }

@@ -915,6 +915,14 @@
       "root_missing": {
         "short": "Folder not found",
         "long": "That path does not exist on the server. Driven never creates it for you - create the folder over SSH first, or fix the path, then try again."
+      },
+      "root_not_a_directory": {
+        "short": "Not a folder",
+        "long": "That path points at a file, not a folder. Choose (or create) a folder on the server for Driven to back up into."
+      },
+      "dest_marker_mismatch": {
+        "short": "Already a different backup",
+        "long": "That folder already holds a Driven backup for a different destination. Point Driven at an empty folder, or the folder holding the backup you actually mean to reconnect to."
       }
     }
   }
