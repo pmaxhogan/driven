@@ -29,6 +29,13 @@ export const RANGES = {
   scrubIntervalHours: [1, 8_760],
   scrubSliceSize: [10, 10_000],
   scrubDeepSample: [0, 100],
+  // The drill cadence is entered in DAYS but stored in seconds, so this range is
+  // the backend's DRILL_INTERVAL_MIN..MAX (1 day .. 1 year) expressed in days -
+  // keep the two in step.
+  drillIntervalDays: [1, 365],
+  // Matches DRILL_SAMPLE_MIN..MAX. The floor is 1, not 0: zero would be a
+  // second, redundant kill-switch when `enabled` already is one.
+  drillSampleSize: [1, 50],
 } as const;
 
 export function clampToRange(value: number, [min, max]: readonly [number, number]): number {

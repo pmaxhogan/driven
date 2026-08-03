@@ -126,6 +126,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     macos: null,
     bundleSmallFiles: false,
     scrub: { enabled: true, intervalSecs: 604800, sliceSize: 500, deepSample: 0 },
+    drill: { enabled: true, intervalSecs: 2592000, sampleSize: 3 },
     ...over,
   };
 }

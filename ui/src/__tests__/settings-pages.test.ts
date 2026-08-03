@@ -105,6 +105,7 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
     macos: null,
     bundleSmallFiles: false,
     scrub: { enabled: true, intervalSecs: 604800, sliceSize: 500, deepSample: 0 },
+    drill: { enabled: true, intervalSecs: 2592000, sampleSize: 3 },
     ...over,
   };
 }
@@ -1688,6 +1689,112 @@ describe("AdvancedPage", () => {
     expect(
       (wrapper.get('[data-testid="scrub-deep-sample"]').element as HTMLInputElement).value
     ).toBe("4");
+  });
+
+  it("restore drill: renders the shipped defaults", async () => {
+    const wrapper = await mountAdvancedPage();
+    expect(wrapper.find('[data-testid="drill-setting"]').exists()).toBe(true);
+    expect(
+      (wrapper.get('[data-testid="drill-enabled-toggle"]').element as HTMLInputElement).checked
+    ).toBe(true);
+    // Monthly, shown in DAYS: 2592000 seconds is unreadable in a box.
+    expect((wrapper.get('[data-testid="drill-interval"]').element as HTMLInputElement).value).toBe(
+      "30"
+    );
+    expect((wrapper.get('[data-testid="drill-sample"]').element as HTMLInputElement).value).toBe(
+      "3"
+    );
+  });
+
+  it("restore drill: the kill-switch patches the standalone drill group", async () => {
+    const wrapper = await mountAdvancedPage();
+    await wrapper.get('[data-testid="drill-enabled-toggle"]').setValue(false);
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { drill: { enabled: false } },
+    });
+  });
+
+  it("restore drill: the cadence is entered in days and patched in seconds", async () => {
+    const wrapper = await mountAdvancedPage();
+    const input = wrapper.get('[data-testid="drill-interval"]');
+    await input.setValue("7");
+    await input.trigger("change");
+    await flushPromises();
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { drill: { intervalSecs: 7 * 86_400 } },
+    });
+  });
+
+  it("restore drill: an out-of-range cadence is clamped in place, not sent", async () => {
+    // Same rule as the scrub: the backend REJECTS an out-of-range value (it does
+    // not clamp at the IPC boundary), so sending one would surface an error
+    // banner over the whole page.
+    const wrapper = await mountAdvancedPage();
+    const input = wrapper.get('[data-testid="drill-interval"]');
+    await input.setValue("99999");
+    await input.trigger("change");
+    await flushPromises();
+    // 365 days = 1 year, the backend's DRILL_INTERVAL_MAX.
+    expect((input.element as HTMLInputElement).value).toBe("365");
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { drill: { intervalSecs: 365 * 86_400 } },
+    });
+  });
+
+  it("restore drill: the sample size floors at one rather than zero", async () => {
+    // Unlike the scrub's deep sample, zero is NOT legitimate here: it would be a
+    // second, redundant kill-switch, and a "drill" that restores nothing would
+    // report a run that proved nothing. `enabled = false` is how you turn drills
+    // off.
+    const wrapper = await mountAdvancedPage();
+    const input = wrapper.get('[data-testid="drill-sample"]');
+
+    await input.setValue("0");
+    await input.trigger("change");
+    await flushPromises();
+    expect((input.element as HTMLInputElement).value).toBe("1");
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { drill: { sampleSize: 1 } },
+    });
+
+    await input.setValue("999");
+    await input.trigger("change");
+    await flushPromises();
+    expect((input.element as HTMLInputElement).value).toBe("50");
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { drill: { sampleSize: 50 } },
+    });
+  });
+
+  it("restore drill: an emptied field clamps to the minimum and never sends NaN", async () => {
+    // Same property the scrub's equivalent test pins: a garbage entry can never
+    // put `NaN` on the wire, where it would serialize as `null` and fail the
+    // backend's range validator with an error banner over the whole page.
+    const wrapper = await mountAdvancedPage();
+    const input = wrapper.get('[data-testid="drill-sample"]');
+    await input.setValue("not a number");
+    await input.trigger("change");
+    await flushPromises();
+    expect((input.element as HTMLInputElement).value).toBe("1");
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { drill: { sampleSize: 1 } },
+    });
+  });
+
+  it("restore drill: hydrates a non-default persisted policy", async () => {
+    const wrapper = await mountAdvancedPage({
+      drill: { enabled: false, intervalSecs: 7 * 86_400, sampleSize: 10 },
+    });
+    expect(
+      (wrapper.get('[data-testid="drill-enabled-toggle"]').element as HTMLInputElement).checked
+    ).toBe(false);
+    expect((wrapper.get('[data-testid="drill-interval"]').element as HTMLInputElement).value).toBe(
+      "7"
+    );
+    expect((wrapper.get('[data-testid="drill-sample"]').element as HTMLInputElement).value).toBe(
+      "10"
+    );
   });
 
   it("backup hooks: setting a command patches it, clearing patches null", async () => {

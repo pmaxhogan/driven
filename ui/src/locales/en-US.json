@@ -78,6 +78,30 @@
       "deepSampleHelp": "0 uses the storage provider's own checksum, which costs no bandwidth. A higher number downloads that many files to verify them end to end."
     }
   },
+  "drill": {
+    "title": "Restore drill",
+    "refresh": "Refresh",
+    "explainer": "Periodically restores a few of your backed-up files for real and checks they come back intact. It is the only check that tests actually getting your data back, rather than that it is still stored.",
+    "empty": "No restore drill has run yet.",
+    "attention": "{count} file could not be restored | {count} files could not be restored",
+    "inconclusive": "The last drill could not verify anything, so it proves nothing about your backup.",
+    "verifiedCount": "{count} restored",
+    "skippedCount": "{count} skipped",
+    "failedCount": "{count} failed",
+    "outcome": {
+      "passed": "All good",
+      "failed": "Needs attention",
+      "inconclusive": "Could not check"
+    },
+    "settings": {
+      "heading": "Restore drill",
+      "description": "Restores a few backed-up files for real, on its own schedule, to prove they can be recovered.",
+      "enabledLabel": "Run a periodic restore drill",
+      "intervalLabel": "Drill every (days)",
+      "sampleLabel": "Files restored per drill",
+      "sampleHelp": "Each drilled file is downloaded and decrypted in full, then deleted. A higher number tests more of your backup but uses more bandwidth."
+    }
+  },
   "toast": {
     "dismiss": "Dismiss notification",
     "kind": {

@@ -27,6 +27,11 @@ const scrubIntervalHoursText = ref("");
 const scrubSliceText = ref("");
 const scrubDeepSampleText = ref("");
 
+// Scheduled restore-drill local mirrors. The cadence is stored in SECONDS but
+// entered in DAYS (a monthly default reads as `30`, not `2592000`).
+const drillIntervalDaysText = ref("");
+const drillSampleText = ref("");
+
 watch(
   () => settings.settings,
   (s) => {
@@ -40,6 +45,9 @@ watch(
     scrubIntervalHoursText.value = String(Math.round((s.scrub?.intervalSecs ?? 604_800) / 3600));
     scrubSliceText.value = String(s.scrub?.sliceSize ?? 500);
     scrubDeepSampleText.value = String(s.scrub?.deepSample ?? 0);
+    // Drill: seconds -> days for display, with the same older-snapshot fallback.
+    drillIntervalDaysText.value = String(Math.round((s.drill?.intervalSecs ?? 2_592_000) / 86_400));
+    drillSampleText.value = String(s.drill?.sampleSize ?? 3);
   },
   { immediate: true }
 );
@@ -98,6 +106,34 @@ async function commitScrubDeepSample(): Promise<void> {
   );
   scrubDeepSampleText.value = String(value);
   await commitPatch({ scrub: { deepSample: value } });
+}
+
+// Scheduled restore drill. The cadence is stored in SECONDS but shown in DAYS:
+// the monthly default is `2592000`, which is unreadable in a box, while `30` is
+// a duration a person can reason about.
+async function setDrillEnabled(event: Event): Promise<void> {
+  const checked = (event.target as HTMLInputElement).checked;
+  await commitPatch({ drill: { enabled: checked } });
+}
+
+async function commitDrillInterval(): Promise<void> {
+  const days = parseRequiredClamped(
+    drillIntervalDaysText.value,
+    RANGES.drillIntervalDays,
+    Math.round((settings.settings?.drill?.intervalSecs ?? 2_592_000) / 86_400)
+  );
+  drillIntervalDaysText.value = String(days);
+  await commitPatch({ drill: { intervalSecs: days * 86_400 } });
+}
+
+async function commitDrillSample(): Promise<void> {
+  const value = parseRequiredClamped(
+    drillSampleText.value,
+    RANGES.drillSampleSize,
+    settings.settings?.drill?.sampleSize ?? 3
+  );
+  drillSampleText.value = String(value);
+  await commitPatch({ drill: { sampleSize: value } });
 }
 
 // Backup hooks (DESIGN s17). A blank command clears the hook (sent as null).
@@ -240,6 +276,58 @@ async function commitHookTimeout(event: Event): Promise<void> {
       </label>
       <p class="text-xs text-zinc-500 dark:text-zinc-400">
         {{ t("scrub.settings.deepSampleHelp") }}
+      </p>
+    </section>
+
+    <!-- Scheduled restore drill. Sits right after the scrub because the two are
+         the write-side and read-side halves of the same guarantee. -->
+    <section class="space-y-2" :class="cardCls" data-testid="drill-setting">
+      <h3 class="text-sm font-semibold text-zinc-800 dark:text-zinc-200">
+        {{ t("drill.settings.heading") }}
+      </h3>
+      <p class="text-xs text-zinc-500 dark:text-zinc-400">
+        {{ t("drill.settings.description") }}
+      </p>
+      <label class="flex items-center gap-2">
+        <input
+          type="checkbox"
+          class="accent-teal-600"
+          data-testid="drill-enabled-toggle"
+          :checked="settings.settings?.drill?.enabled ?? true"
+          @change="setDrillEnabled"
+        />
+        {{ t("drill.settings.enabledLabel") }}
+      </label>
+      <label class="block space-y-1">
+        <span class="text-zinc-600 dark:text-zinc-400">{{
+          t("drill.settings.intervalLabel")
+        }}</span>
+        <input
+          v-model="drillIntervalDaysText"
+          type="number"
+          min="1"
+          max="365"
+          data-testid="drill-interval"
+          class="w-full"
+          :class="inputCls"
+          @change="commitDrillInterval"
+        />
+      </label>
+      <label class="block space-y-1">
+        <span class="text-zinc-600 dark:text-zinc-400">{{ t("drill.settings.sampleLabel") }}</span>
+        <input
+          v-model="drillSampleText"
+          type="number"
+          min="1"
+          max="50"
+          data-testid="drill-sample"
+          class="w-full"
+          :class="inputCls"
+          @change="commitDrillSample"
+        />
+      </label>
+      <p class="text-xs text-zinc-500 dark:text-zinc-400">
+        {{ t("drill.settings.sampleHelp") }}
       </p>
     </section>
 
