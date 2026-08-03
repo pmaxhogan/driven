@@ -133,12 +133,32 @@ fn install() -> bool {
 }
 
 /// The one-shot install + proof. See the module docs for why each step exists.
+///
+/// Runs entirely on a scoped scratch thread. On Linux, `keyring`'s
+/// Secret-Service backend connects to DBus with an internal `block_on` the
+/// moment an `Entry` is constructed, so the latch burn in step 1 - documented
+/// below as "no credential I/O" - still performs CONNECTION I/O there. When
+/// the first test to call [`isolated`] in a binary is a `#[tokio::test]`,
+/// that `block_on` lands inside the test's runtime and panics with "Cannot
+/// start a runtime from within a runtime" (the exact production bug class the
+/// `keyring_off_runtime` hop exists for; this is its test-fixture twin, first
+/// hit by the sftp account tests on ubuntu CI). The scratch thread has no
+/// runtime, so the burn is safe regardless of which test gets here first.
 fn install_once() -> bool {
+    std::thread::scope(|s| {
+        s.spawn(install_once_off_runtime)
+            .join()
+            .expect("keychain isolation install thread panicked")
+    })
+}
+
+fn install_once_off_runtime() -> bool {
     // 1. Burn `keyring`'s one-shot platform-store latch, so it cannot overwrite
     //    the mock later. Constructing an entry performs no credential I/O, so
-    //    this raises no prompt and creates nothing. Its error on a headless box
-    //    (no Secret Service) is expected and ignored - the latch is set either
-    //    way, which is all this call is for.
+    //    this raises no prompt and creates nothing (on Linux it does open a
+    //    DBus connection - see `install_once` for why that is safe here). Its
+    //    error on a headless box (no Secret Service) is expected and ignored -
+    //    the latch is set either way, which is all this call is for.
     let _ = keyring::Entry::new(LATCH_SERVICE, "latch");
 
     // 2. Now the mock sticks.
