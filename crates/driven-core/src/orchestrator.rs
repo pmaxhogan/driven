@@ -1604,10 +1604,12 @@ impl SyncOrchestrator {
             }
         };
 
-        // Seeded on the source plus the run's start time, so a given run's
-        // sample is reproducible from its report while successive runs move on
-        // to different files (a sampler that kept re-testing the same three
-        // would "pass" forever while the rest of the backup rotted).
+        // Seeded on the source plus the current wall clock, so successive runs
+        // move on to different files (a sampler that kept re-testing the same
+        // three would "pass" forever while the rest of the backup rotted). The
+        // seed is NOT persisted, so a run cannot be re-drawn from its stored
+        // report - the report is a counts-and-codes summary, not a replay
+        // handle.
         let seed = format!("{}|{}", source.id, self.clock.now_ms());
         for offset in crate::drill::sample_offsets(&seed, total, cfg.sample_size) {
             let candidate = match self

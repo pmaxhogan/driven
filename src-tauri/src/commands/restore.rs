@@ -751,6 +751,14 @@ pub async fn list_file_versions(
 // Restore drills (driven_core::drill)
 // -----------------------------------------------------------------------------
 
+/// Filename prefix for the throwaway directory a drill restores into.
+///
+/// Named rather than inlined because the test harness asserts on it: the
+/// no-plaintext-left-behind check scans the process-wide temp dir for this
+/// prefix, so anything else the tests create must NOT begin with it or a
+/// perfectly-clean drill reads as a leak.
+pub(crate) const DRILL_TEMP_PREFIX: &str = "driven-drill-";
+
 /// Restore ONE drill candidate through the REAL restore path, verify it, and
 /// delete the output.
 ///
@@ -823,7 +831,7 @@ pub(crate) async fn drill_restore_one(
     // A fresh temp dir per candidate, removed below. `TempDir` would also clean
     // up on drop, but the explicit removal keeps the "no plaintext left behind"
     // guarantee readable at the call site rather than hidden in a destructor.
-    let temp = match tempfile::Builder::new().prefix("driven-drill-").tempdir() {
+    let temp = match tempfile::Builder::new().prefix(DRILL_TEMP_PREFIX).tempdir() {
         Ok(t) => t,
         Err(e) => {
             return DrillAttempt::Skipped {
@@ -5127,21 +5135,42 @@ mod tests {
     ///
     /// A local variant rather than a change to `state_with_source_on`: four other
     /// tests depend on that helper's signature.
+    ///
+    /// The returned [`TempDir`](tempfile::TempDir) owns the scratch directory and
+    /// must be held for the body of the test; dropping it early would delete the
+    /// state DB out from under the `AppState`.
+    ///
+    /// Two things about that directory are load-bearing:
+    ///
+    /// 1. The prefix is `driven-e2e-drill-`, NOT `driven-drill-e2e-`. The
+    ///    production drill names its own scratch directory `driven-drill-*`, and
+    ///    [`drill_temp_dirs`] scans for exactly that prefix to prove the drill
+    ///    cleaned up after itself. A helper directory that also began
+    ///    `driven-drill-` would be indistinguishable from a leak: a test creating
+    ///    one in parallel would land inside another test's measured window and
+    ///    fail the leak assertion for a drill that behaved perfectly. Reordering
+    ///    the words makes the collision impossible rather than merely unlikely.
+    /// 2. It comes from `tempfile` rather than a hand-rolled `create_dir_all`
+    ///    under a random name - the same reason `src-tauri/Cargo.toml` gives for
+    ///    depending on the crate at all: the hand-rolled form is what CodeQL's
+    ///    path-injection rule flags in this repo, and `tempfile` applies the 0700
+    ///    and `O_EXCL` semantics we would otherwise have to re-derive.
     async fn drill_state_with_account() -> (
         AppState,
         SourceId,
         driven_core::types::AccountId,
-        std::path::PathBuf,
+        tempfile::TempDir,
     ) {
         use crate::app_state::RemoteMode;
         use driven_core::state::StateRepo;
         use std::collections::HashMap;
         use std::sync::Arc;
 
-        let nonce = uuid::Uuid::new_v4();
-        let dir = std::env::temp_dir().join(format!("driven-drill-e2e-{nonce}"));
-        std::fs::create_dir_all(&dir).unwrap();
-        let repo = driven_core::state::SqliteStateRepo::open(&dir.join("state.db"))
+        let temp = tempfile::Builder::new()
+            .prefix(HARNESS_TEMP_PREFIX)
+            .tempdir()
+            .expect("create the test scratch directory");
+        let repo = driven_core::state::SqliteStateRepo::open(&temp.path().join("state.db"))
             .await
             .expect("open state repo");
         let account = driven_core::state::AccountRow {
@@ -5190,7 +5219,7 @@ mod tests {
             RemoteMode::Fake,
             Arc::new(std::sync::Mutex::new(HashMap::new())),
         );
-        (app_state, src_id, account.id, dir)
+        (app_state, src_id, account.id, temp)
     }
 
     /// Store `plaintext` in the account's shared fake remote and record a matching
@@ -5245,9 +5274,14 @@ mod tests {
     /// temp dir with a fixed prefix, so two drills running concurrently see each
     /// other's directories and a before/after comparison would report a
     /// perfectly-cleaned drill as a leak. `cargo test` runs these in parallel by
-    /// default, so the comparison window has to be exclusive. Only the drill
-    /// tests create `driven-drill-` directories, so a guard shared between them
-    /// is sufficient.
+    /// default, so the comparison window has to be exclusive.
+    ///
+    /// This guard covers the PRODUCTION prefix only. Nothing else in the suite
+    /// creates a `driven-drill-` directory - the drill tests' own scratch dirs
+    /// deliberately use `driven-e2e-drill-` so they can never be mistaken for a
+    /// leak (see [`drill_state_with_account`]) - so a guard shared between the
+    /// two measuring tests is sufficient. Both of them acquire it BEFORE building
+    /// any state, so no helper work happens inside another test's window.
     ///
     /// A `tokio` mutex rather than a `std` one because the guard is held ACROSS
     /// the `drill_restore_one().await` - which is the entire point, since that
@@ -5264,7 +5298,7 @@ mod tests {
             .map(|rd| {
                 rd.filter_map(Result::ok)
                     .map(|e| e.file_name().to_string_lossy().into_owned())
-                    .filter(|n| n.starts_with("driven-drill-"))
+                    .filter(|n| n.starts_with(DRILL_TEMP_PREFIX))
                     .collect()
             })
             .unwrap_or_default()
@@ -5272,6 +5306,38 @@ mod tests {
 
     /// Assert the drill left none of its scratch directories behind. `before` is
     /// the set captured under [`DRILL_TEMP_LOCK`] immediately before the call.
+    /// Filename prefix for the TEST harness's own scratch directories. Must never
+    /// begin with [`DRILL_TEMP_PREFIX`] - see
+    /// `the_harness_temp_prefix_cannot_be_mistaken_for_a_drill_leak`.
+    const HARNESS_TEMP_PREFIX: &str = "driven-e2e-drill-";
+
+    /// The invariant the leak detector rests on, pinned so it cannot regress
+    /// silently.
+    ///
+    /// This test exists because the harness prefix WAS `driven-drill-e2e-`,
+    /// which starts with the production prefix and so was indistinguishable from
+    /// a leaked drill directory. The failure it caused was real but rare - a
+    /// harness directory had to be created by a parallel test inside another
+    /// test's few-millisecond measurement window - so repeated full-suite runs
+    /// did NOT reliably surface it, and a green run was not evidence of absence.
+    /// A one-line string comparison is; hence this rather than more soak runs.
+    #[test]
+    fn the_harness_temp_prefix_cannot_be_mistaken_for_a_drill_leak() {
+        assert!(
+            !HARNESS_TEMP_PREFIX.starts_with(DRILL_TEMP_PREFIX),
+            "the harness scratch prefix {HARNESS_TEMP_PREFIX:?} must not begin with the \
+             production drill prefix {DRILL_TEMP_PREFIX:?}, or every harness directory a \
+             parallel test creates inside a measurement window reads as leaked plaintext"
+        );
+        // And the detector really would have matched the old name, so the
+        // assertion above is guarding something real rather than a tautology.
+        assert!(
+            "driven-drill-e2e-1a2b3c".starts_with(DRILL_TEMP_PREFIX),
+            "sanity: the pre-fix harness name did collide"
+        );
+        assert!(!format!("{HARNESS_TEMP_PREFIX}1a2b3c").starts_with(DRILL_TEMP_PREFIX));
+    }
+
     fn assert_no_drill_temp_leaked(before: &std::collections::BTreeSet<String>, context: &str) {
         let leaked: Vec<String> = drill_temp_dirs().difference(before).cloned().collect();
         assert!(
@@ -5288,11 +5354,14 @@ mod tests {
         // and reports Verified - through `resolve_restore_items` ->
         // `build_restore_plans` -> `restore_one_file` (download, stream, BLAKE3
         // verify, confined atomic write), not a shortcut.
-        let (state, src, account, dir) = drill_state_with_account().await;
+        // The lock is taken FIRST: building the state creates a scratch directory
+        // of its own, and doing that inside another measuring test's window is
+        // exactly the race this guard exists to prevent.
+        let guard = DRILL_TEMP_LOCK.lock().await;
+        let (state, src, account, _temp) = drill_state_with_account().await;
         let plaintext = b"the bytes a user would get back on the worst day of their year";
         seed_drillable_file(&state, src, account, "taxes.pdf", plaintext).await;
 
-        let guard = DRILL_TEMP_LOCK.lock().await;
         let before = drill_temp_dirs();
         let attempt = drill_restore_one(
             &state,
@@ -5307,7 +5376,6 @@ mod tests {
         );
         assert_no_drill_temp_leaked(&before, "a passing drill");
         drop(guard);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -5318,7 +5386,9 @@ mod tests {
         // integrity scrub would call this object clean. Only actually restoring it
         // and re-hashing the bytes that come back reveals that the content is not
         // what was uploaded.
-        let (state, src, account, dir) = drill_state_with_account().await;
+        // Lock first, for the same reason as the passing-drill test above.
+        let guard = DRILL_TEMP_LOCK.lock().await;
+        let (state, src, account, _temp) = drill_state_with_account().await;
         let plaintext = b"the original, correct backup contents";
         let object_id = seed_drillable_file(&state, src, account, "taxes.pdf", plaintext).await;
 
@@ -5328,7 +5398,6 @@ mod tests {
             .rot_object_bytes(&object_id, b"silently corrupted at rest".to_vec());
         assert!(rotted, "the object must exist to be rotted");
 
-        let guard = DRILL_TEMP_LOCK.lock().await;
         let before = drill_temp_dirs();
         let attempt = drill_restore_one(
             &state,
@@ -5350,7 +5419,6 @@ mod tests {
         }
         assert_no_drill_temp_leaked(&before, "a failing drill");
         drop(guard);
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -5358,7 +5426,7 @@ mod tests {
         // A file deleted between the sample and the restore is a benign race, not
         // evidence of a broken backup. Raising a data-loss alert for it would
         // train users to ignore the alert that matters.
-        let (state, src, _account, dir) = drill_state_with_account().await;
+        let (state, src, _account, _temp) = drill_state_with_account().await;
 
         let attempt =
             drill_restore_one(&state, &drill_candidate(src, "never-existed.pdf", 10)).await;
@@ -5367,7 +5435,6 @@ mod tests {
             matches!(attempt, driven_core::drill::DrillAttempt::Skipped { .. }),
             "an unresolvable candidate is SKIPPED, never failed; got {attempt:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 
     #[tokio::test]
@@ -5376,7 +5443,7 @@ mod tests {
         // the user either, so a drill must not report it as a restore FAILURE -
         // it would be alarming about a file the restore browser would not even
         // offer.
-        let (state, src, _account, dir) = drill_state_with_account().await;
+        let (state, src, _account, _temp) = drill_state_with_account().await;
         let row = file_state_row(src, "pending.bin", None, FileStateStatus::Synced);
         state.state().upsert_file_state(&row).await.unwrap();
 
@@ -5386,6 +5453,5 @@ mod tests {
             matches!(attempt, driven_core::drill::DrillAttempt::Skipped { .. }),
             "a never-uploaded row is SKIPPED, never failed; got {attempt:?}"
         );
-        let _ = std::fs::remove_dir_all(&dir);
     }
 }

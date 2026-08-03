@@ -25,13 +25,21 @@
 //! verify the plaintext hash exactly as a user-initiated restore would, delete
 //! the output, and persist a counts-only report.
 //!
-//! # Determinism
+//! # Sampling
 //!
-//! The sample is seeded by the run id, so re-running a drill picks the SAME
-//! files. Reproducibility is the whole point of a diagnostic: a report saying
-//! "3 of 5 failed" is only actionable if the next run examines the same three.
-//! Sampling reuses [`crate::scrub::deterministic_sample`] rather than growing a
-//! second implementation.
+//! [`sample_offsets`] is a PURE function of its seed: the same seed over the
+//! same population always picks the same rows, with no RNG state to thread
+//! through. The orchestrator seeds each run with the source id plus the current
+//! wall clock, so successive drills cover DIFFERENT files - a sampler that kept
+//! re-testing the same three would "pass" forever while the rest of the backup
+//! rotted.
+//!
+//! That seed is not persisted, so a run is NOT reproducible from its stored
+//! report; the report is a counts-and-codes summary, not a way to re-run the
+//! same sample. Reproducing a specific failure means calling [`sample_offsets`]
+//! with a known seed, which is what the unit tests do. Sampling reuses
+//! [`crate::scrub::deterministic_sample`] rather than growing a second
+//! implementation.
 //!
 //! # I/O-free
 //!
@@ -362,8 +370,18 @@ pub fn sample_offsets(run_seed: &str, total: u64, sample_size: u32) -> Vec<u64> 
     //
     // For a large population, scoring every offset would be wasteful, so the
     // candidate window is capped: we score at most `SCORING_WINDOW` evenly
-    // spaced offsets and pick from those. The result is still uniform-ish,
-    // still deterministic, and bounded regardless of source size.
+    // spaced offsets and pick from those.
+    //
+    // Be precise about what that costs. The draw is uniform over the STRATUM -
+    // the roughly `SCORING_WINDOW` lattice offsets `0, stride, 2*stride, ...` -
+    // not over every file. On a source larger than the window, a file whose
+    // offset is not on the lattice is never drilled while the population stays
+    // that size. That is an accepted trade: the drill exists to catch SYSTEMIC
+    // failures (a broken restore path, an unusable key), which any sample
+    // exposes, and the alternative is hashing a million keys to pick three. The
+    // lattice also shifts whenever the population size changes, since `stride`
+    // is derived from `total`. Deterministic and bounded regardless of source
+    // size.
     const SCORING_WINDOW: u64 = 4_096;
     let stride = total.div_ceil(SCORING_WINDOW).max(1);
     let window: Vec<u64> = (0..total).step_by(stride as usize).collect();
