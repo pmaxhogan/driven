@@ -147,11 +147,8 @@ impl AppSession {
         wait_http_ready(&format!("{driver_url}/status"), Duration::from_secs(15)).await?;
 
         let mut caps = Capabilities::new();
-        caps.set(
-            "tauri:options",
-            json!({ "application": Env::app_binary() }),
-        )
-        .context("setting the tauri:options capability")?;
+        caps.set("tauri:options", json!({ "application": Env::app_binary() }))
+            .context("setting the tauri:options capability")?;
         let driver = WebDriver::new(&driver_url, caps)
             .await
             .context("creating the WebDriver session (app launch)")?;
