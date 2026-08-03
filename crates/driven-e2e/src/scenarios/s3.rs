@@ -327,17 +327,100 @@ impl Scenario for S3NetworkCutMidSync {
         stack.heal().await?;
         // Lift the throttle so the healed retry completes promptly.
         let _ = stack.remove_toxic("upload-bandwidth").await;
-        flows::sync_now(&session, &source).await?;
-        let healed = wait_for_minio_objects(&bucket_dir, 32, Duration::from_secs(240)).await;
+        let healed = wait_out_backoff_for_objects(&session, &source, &bucket_dir, 32).await;
         session.screenshot(&ctx.artifacts, "02-after-heal").await?;
         if let Err(e) = healed {
-            let final_status = session.invoke("get_sync_status", Value::Null).await?;
             session.preserve_evidence(&ctx.artifacts).await;
             return Ok(Verdict::Fail(format!(
-                "healed wire but the destination never completed: {e:#}; status={final_status}"
+                "healed wire but the destination never completed: {e:#}"
             )));
         }
         Ok(Verdict::Pass)
+    }
+}
+
+/// Ceiling on the healed-retry phase (issue #248).
+///
+/// A hard TCP cut fails every in-flight request, and each failure past the
+/// breaker's 5-failure threshold re-arms the window at the NEXT rung of
+/// driven-core's `BACKOFF_SCHEDULE_MS` (30s, 1m, 2m, 5m, 10m, then plateau).
+/// A parallel upload therefore saturates the schedule within one burst, and
+/// the executor keeps retrying for a while after the wire is healed - so the
+/// window can legitimately lift ~10 minutes after the LAST failed request,
+/// not after the cut. Budget that plus the unthrottled re-upload.
+const HEAL_CEILING: Duration = Duration::from_secs(16 * 60);
+
+/// How often the heal phase re-triggers a sync while the account is NOT
+/// backing off (a manual trigger coalesces, so this cannot stack cycles).
+const HEAL_TRIGGER_EVERY: Duration = Duration::from_secs(20);
+
+/// Destination poll cadence during the heal phase: short enough that a wait
+/// on a distant backoff deadline is still tracked (progress is observed every
+/// slice, never slept through blind).
+const HEAL_POLL_SLICE: Duration = Duration::from_secs(2);
+
+/// Wait for the healed sync to land `want` objects in MinIO, staying aware of
+/// the orchestrator's circuit-breaker backoff (issue #248).
+///
+/// `sync_now(bypassGates)` opens the metered / battery / schedule gates only -
+/// it deliberately does NOT bypass the Drive circuit breaker - so after a hard
+/// cut the account parks in `Backoff{until}` and a fire-and-poll heal phase
+/// just watches a fixed timer expire. This instead reads `until` out of the
+/// live `get_sync_status` payload and waits it out, re-triggering a sync
+/// whenever the account is not gated (an already-expired `until` still reads
+/// as `Backoff` until the next gate evaluation rewrites the state, so an
+/// elapsed deadline falls through to the trigger branch rather than parking).
+async fn wait_out_backoff_for_objects(
+    session: &AppSession,
+    source: &str,
+    bucket_dir: &std::path::Path,
+    want: usize,
+) -> anyhow::Result<usize> {
+    let start = std::time::Instant::now();
+    let mut last_trigger: Option<std::time::Instant> = None;
+    let mut saw_backoff = false;
+    let mut logged_until: Option<i64> = None;
+    let mut status = Value::Null;
+    loop {
+        let count = count_minio_objects(bucket_dir)?;
+        if count >= want {
+            return Ok(count);
+        }
+        if start.elapsed() > HEAL_CEILING {
+            let still_gated = flows::backoff_until(&status).is_some();
+            anyhow::bail!(
+                "destination stalled at {count}/{want} objects after {:?} (backoff observed: \
+                 {saw_backoff}; still reporting backoff at timeout: {still_gated}); \
+                 status={status}",
+                start.elapsed()
+            );
+        }
+        status = session.invoke("get_sync_status", Value::Null).await?;
+        let remaining_ms = flows::backoff_until(&status).map(|until| until - flows::now_ms());
+        match remaining_ms {
+            Some(remaining) if remaining > 0 => {
+                saw_backoff = true;
+                // Log each DISTINCT deadline (a re-open moves it), so the run
+                // log shows how long the phase waited and why.
+                let until = flows::backoff_until(&status);
+                if logged_until != until {
+                    logged_until = until;
+                    tracing::info!(
+                        remaining_secs = remaining / 1000,
+                        "heal phase: account is in circuit-breaker backoff; waiting it out"
+                    );
+                }
+                let wait = Duration::from_millis(remaining as u64).min(HEAL_POLL_SLICE);
+                tokio::time::sleep(wait).await;
+            }
+            _ => {
+                if last_trigger.is_none_or(|t| t.elapsed() >= HEAL_TRIGGER_EVERY) {
+                    flows::sync_now(session, source).await?;
+                    last_trigger = Some(std::time::Instant::now());
+                }
+                tokio::time::sleep(HEAL_POLL_SLICE).await;
+            }
+        }
     }
 }
 

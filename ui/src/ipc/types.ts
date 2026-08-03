@@ -27,6 +27,17 @@ export const DEFAULT_BACKEND_ID: BackendKindId = "google_drive";
  * is a per-backend question that no boolean on `BackendDto` answers. */
 export const LOCAL_FOLDER_BACKEND_ID: BackendKindId = "local_folder";
 
+/** The S3-compatible destination (`BackendKind::S3::id`). Named here (rather
+ * than inlined) for the same reason as `LOCAL_FOLDER_BACKEND_ID`: with three
+ * non-OAuth destinations now in the picker (local folder, S3, SSH/SFTP), "which
+ * credentials form" has to be answered by id, not by an `else` catch-all - a
+ * catch-all would silently route a fourth destination to the wrong form. */
+export const S3_BACKEND_ID: BackendKindId = "s3";
+
+/** The SSH (SFTP) destination (`BackendKind::Sftp::id`). See
+ * `LOCAL_FOLDER_BACKEND_ID` / `S3_BACKEND_ID`. */
+export const SFTP_BACKEND_ID: BackendKindId = "sftp";
+
 export interface AccountDto {
   id: string;
   email: string;
@@ -62,6 +73,44 @@ export interface CreateS3AccountRequest {
 export interface CreateLocalFolderAccountRequest {
   displayName?: string | null;
   root: string;
+}
+
+/** Which credential a new SSH (SFTP) destination authenticates with (mirrors
+ * the Rust `SftpAuthMethodDto`). A TAG only - it says which of
+ * `CreateSftpAccountRequest`'s secret fields the command reads, never the
+ * secret itself. */
+export type SftpAuthMethodDto = "password" | "privateKey";
+
+/** The settings for a new SSH (SFTP) destination (`createSftpAccount`).
+ *
+ * `password` / `privateKey` / `passphrase` are IN-FLIGHT ONLY - the backend
+ * writes them straight to the OS keychain and persists only the rest. Nothing
+ * reads them back, which is why there is no corresponding "read the SFTP
+ * config" DTO (mirrors `CreateS3AccountRequest`'s doc). */
+export interface CreateSftpAccountRequest {
+  displayName?: string | null;
+  host: string;
+  port?: number | null;
+  rootPath: string;
+  username: string;
+  auth: SftpAuthMethodDto;
+  password?: string | null;
+  privateKey?: string | null;
+  passphrase?: string | null;
+}
+
+/** The result of `createSftpAccount`: the new account plus the host-key
+ * fingerprint the creation probe PINNED, and whether the root's destination
+ * marker was ADOPTED (already someone else's Driven backup) rather than
+ * freshly stamped (mirrors the Rust `SftpAccountCreatedDto`).
+ *
+ * A distinct response SHAPE from `createS3Account` / `createLocalFolderAccount`
+ * (which both return a bare `AccountDto`) - the setup store's `createSftpAccount`
+ * action must unwrap `.account` rather than treat the whole response as one. */
+export interface SftpAccountCreatedDto {
+  account: AccountDto;
+  hostKeyFingerprint: string;
+  adopted: boolean;
 }
 
 /** One selectable backup destination, as reported by `listBackends()`. Mirrors

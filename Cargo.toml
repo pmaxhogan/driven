@@ -6,6 +6,7 @@ members = [
     "crates/driven-backend",
     "crates/driven-drive",
     "crates/driven-s3",
+    "crates/driven-sftp",
     "crates/driven-rclone",
     "crates/driven-localfs",
     "crates/driven-crypto",

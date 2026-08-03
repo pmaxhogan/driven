@@ -12,7 +12,7 @@
 //! - [`config_file`] - the INI-ish parser, the default-location search path, and
 //!   whole-file-encryption detection.
 //! - [`import`] - [`classify`], which maps one remote onto an S3 destination, a
-//!   Drive destination, or an explained refusal.
+//!   Drive destination, an SSH (SFTP) destination, or an explained refusal.
 //! - [`render`] - the human and JSON renderings the CLI prints.
 //! - [`secret`] - [`Secret`], the wrapper that keeps a credential out of `Debug`,
 //!   `Display`, logs and error messages.
@@ -45,18 +45,25 @@
 //! ## Obscured values
 //!
 //! rclone can store an option "obscured" (AES-256-CTR under a hard-coded key -
-//! obfuscation, not encryption). **Neither importable remote type has one.**
-//! Obscuring is applied only to options a backend declares with
-//! `IsPassword: true`; `backend/s3/s3.go` declares none at all
+//! obfuscation, not encryption). Obscuring is applied only to options a backend
+//! declares with `IsPassword: true`; `backend/s3/s3.go` declares none at all
 //! (`secret_access_key` is `Sensitive: true`, which only affects redaction in
 //! rclone's own output, not how it is stored), and `backend/drive/drive.go` has
-//! no password option either. Obscured values belong to `crypt`'s
-//! `password`/`password2`, `sftp`'s `pass`, and similar - all of which are
-//! remote types Driven cannot target anyway.
+//! no password option either. `backend/sftp/sftp.go` DOES declare one -
+//! `pass` - so an imported `type = sftp` remote is the one case where this
+//! crate reads past an obscured value.
 //!
-//! So this crate ships no cipher and no `reveal`. Adding AES to decode a value
-//! that cannot appear in an imported remote would be untested-in-anger code
-//! sitting on the credential path, which is the wrong trade.
+//! It never decodes it. [`import::SftpRemote`] reports only THAT a `pass` is
+//! present, never its content: de-obscuring would mean shipping rclone's
+//! hard-coded AES key inside Driven, which turns a merely inconvenient value
+//! into a directly usable one for anyone who reads `rclone.conf` off disk -
+//! the opposite of what obscuring is even for. The user re-enters the
+//! password (or pastes their private key - `key_file` in `rclone.conf` is only
+//! a PATH to one, never the key material) once, in Driven's own setup wizard.
+//!
+//! So this crate ships no cipher and no `reveal` for `pass`. Adding AES to
+//! decode a value this crate deliberately never decodes would be untested-in-
+//! anger code sitting on the credential path, which is the wrong trade.
 //!
 //! ## Encrypted configs
 //!
@@ -75,7 +82,7 @@ pub use config_file::{
     config_search_path, find_config_file, locate_config, ConfigCandidate, ConfigParseError,
     EnvLookup, ProcessEnv, RcloneConfig, RcloneRemote,
 };
-pub use import::{classify, DriveRemote, RemoteImport, S3Remote, UnsupportedReason};
+pub use import::{classify, DriveRemote, RemoteImport, S3Remote, SftpRemote, UnsupportedReason};
 pub use render::{render_detail, render_list, to_json, to_json_pretty, RenderOptions};
 pub use secret::Secret;
 
@@ -90,19 +97,21 @@ mod tests {
 
     #[test]
     fn classify_all_preserves_file_order_and_covers_every_section() {
-        let cfg =
-            RcloneConfig::parse("[one]\ntype = s3\n[two]\ntype = drive\n[three]\ntype = sftp\n")
-                .unwrap();
+        let cfg = RcloneConfig::parse(
+            "[one]\ntype = s3\n[two]\ntype = drive\n[three]\ntype = sftp\n[four]\ntype = webdav\n",
+        )
+        .unwrap();
         let out = classify_all(&cfg);
         assert_eq!(
             out.iter()
                 .map(RemoteImport::remote_name)
                 .collect::<Vec<_>>(),
-            vec!["one", "two", "three"]
+            vec!["one", "two", "three", "four"]
         );
         assert!(matches!(out[0], RemoteImport::S3(_)));
         assert!(matches!(out[1], RemoteImport::Drive(_)));
-        assert!(matches!(out[2], RemoteImport::Unsupported { .. }));
+        assert!(matches!(out[2], RemoteImport::Sftp(_)));
+        assert!(matches!(out[3], RemoteImport::Unsupported { .. }));
     }
 
     #[test]

@@ -29,6 +29,14 @@ driven-s3 = { path = "../driven-s3" }
 # states (an abandoned temp file, a rename that cannot land, a marker belonging
 # to a different volume) byte-for-byte rather than modelling them.
 driven-localfs = { path = "../driven-localfs" }
+# The SSH (SFTP) backend under test, plus its `test-server` feature - a REAL
+# in-process russh + russh-sftp server over a real socket. The sftp rows drive
+# the real `SftpStore` through real key exchange, authentication and SFTP
+# framing, and inject their faults at the layer each hazard actually lives at
+# (the TCP stream for a mid-transfer cut, the auth handler for a flap, the
+# server's host key for a swap, the `write`/`readdir` handlers for a full disk
+# and a truncated enumeration). Every fault switch is off unless a row arms it.
+driven-sftp = { path = "../driven-sftp", features = ["test-server"] }
 # `S3Store::new` takes the shared custom-CA + proxy config (issue #34); the
 # harness passes the "none / system" pair.
 driven-tls = { path = "../driven-tls" }

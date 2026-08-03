@@ -283,8 +283,9 @@ describe("SourceTable", () => {
   // --- Issue #220: the versioning capability gate ---------------------------
 
   /** `list_backends()` as the Rust `descriptors()` reports it: only Google Drive
-   * can really keep previous versions. S3 and the local folder derive an object's
-   * key from the file name, so a re-upload overwrites the previous copy. */
+   * can really keep previous versions. S3, the local folder and SFTP all derive
+   * an object's key from the file name, so a re-upload overwrites the previous
+   * copy. */
   const VERSIONING_BACKENDS = [
     {
       id: "google_drive",
@@ -304,6 +305,13 @@ describe("SourceTable", () => {
       id: "local_folder",
       usesOauth: false,
       supportsFolderPicker: false,
+      supportsVersionHistory: false,
+      isDefault: false,
+    },
+    {
+      id: "sftp",
+      usesOauth: false,
+      supportsFolderPicker: true,
       supportsVersionHistory: false,
       isDefault: false,
     },
@@ -352,13 +360,14 @@ describe("SourceTable", () => {
 
   it("does not offer the versioning editor on a destination that cannot keep versions (issue #220)", async () => {
     // The defect this gate closes: per-source versioning promises "restore this
-    // source's files as they were on an earlier date", but on S3 and local-folder
-    // destinations the create key is derived from the file name, so the re-upload
-    // OVERWRITES the previous bytes. The retained version then points at the
-    // current content and a point-in-time restore silently returns today's file.
-    // Nothing tested versioning against a non-Drive backend, which is why it
-    // shipped. The editor must not be offered where it cannot work.
-    for (const kind of ["s3", "local_folder"]) {
+    // source's files as they were on an earlier date", but on S3, local-folder
+    // and SFTP destinations the create key is derived from the file name, so
+    // the re-upload OVERWRITES the previous bytes. The retained version then
+    // points at the current content and a point-in-time restore silently
+    // returns today's file. Nothing tested versioning against a non-Drive
+    // backend, which is why it shipped. The editor must not be offered where
+    // it cannot work.
+    for (const kind of ["s3", "local_folder", "sftp"]) {
       const wrapper = await openVersioningOn(kind);
       // No control that could switch on a promise the destination cannot keep.
       expect(wrapper.find('[data-testid="versioning-enabled"]').exists()).toBe(false);

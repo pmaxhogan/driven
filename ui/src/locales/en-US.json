@@ -131,6 +131,10 @@
       "local_folder": {
         "name": "Local or removable folder",
         "description": "Back up to a USB drive, an external disk, a NAS share, or any folder on this computer. No account and no network."
+      },
+      "sftp": {
+        "name": "SSH (SFTP)",
+        "description": "Back up to a home server, a NAS, or a VPS over plain SSH - anywhere you can already reach with the `ssh` command."
       }
     }
   },
@@ -170,12 +174,39 @@
     "connectButton": "Use this folder",
     "connecting": "Checking the folder..."
   },
+  "sftpSetup": {
+    "title": "Connect over SSH (SFTP)",
+    "body": "Driven talks directly to your server over SFTP with the credentials below. Nothing passes through anyone else's servers.",
+    "hostLabel": "Host",
+    "hostPlaceholder": "nas.example.com",
+    "portLabel": "Port",
+    "portPlaceholder": "22",
+    "rootPathLabel": "Backup folder on the server",
+    "rootPathPlaceholder": "/backups/driven",
+    "rootPathHint": "This folder must already exist on the server - Driven never creates it for you. Create it over SSH first, then point Driven at it.",
+    "usernameLabel": "Username",
+    "authMethodLabel": "Authenticate with",
+    "authMethodPassword": "Password",
+    "authMethodPrivateKey": "Private key",
+    "passwordLabel": "Password",
+    "privateKeyLabel": "Private key",
+    "privateKeyPlaceholder": "-----BEGIN OPENSSH PRIVATE KEY-----",
+    "privateKeyHint": "Paste the PEM-encoded private key text, not a file path.",
+    "passphraseLabel": "Passphrase (optional)",
+    "passphraseHint": "Leave blank if the key has no passphrase.",
+    "connectButton": "Connect",
+    "connecting": "Checking your server...",
+    "trashWarning": "This destination has no trash: when Driven removes a backed-up file it is deleted permanently.",
+    "fingerprintConfirmed": "Connected. Driven pinned this server's host key: {fingerprint}. Every later connection is checked against it.",
+    "adoptedNote": "This server already held a Driven backup at this path - Driven is reusing it, so everything already there stays reachable."
+  },
   "drivePicker": {
     "rootName": "Top level",
     "root": {
       "google_drive": "My Drive",
       "s3": "Bucket root",
-      "local_folder": "Destination root"
+      "local_folder": "Destination root",
+      "sftp": "Server root"
     },
     "destinationLabel": "Backing up to",
     "empty": "No subfolders here - this folder is the destination.",
@@ -185,7 +216,8 @@
     "default": "How long an older version stays recoverable depends on your destination.",
     "google_drive": "Older versions are kept in Drive's trash, which Drive may purge after about 30 days.",
     "s3": "This destination keeps no older versions of its own: a changed file overwrites the previous copy, so in practice only the most recent backup can be restored. Turn on bucket versioning at your provider if you need older copies.",
-    "local_folder": "This destination keeps no older versions: a changed file overwrites the previous copy, so in practice only the most recent backup can be restored."
+    "local_folder": "This destination keeps no older versions: a changed file overwrites the previous copy, so in practice only the most recent backup can be restored.",
+    "sftp": "This destination keeps no older versions: a changed file overwrites the previous copy, so in practice only the most recent backup can be restored."
   },
   "wizard": {
     "title": "Set up Driven",
@@ -197,6 +229,8 @@
     "step2": {
       "title": "Connect your Google account",
       "body": "Driven uses your own Google OAuth credentials so your data never passes through anyone else's servers.",
+      "unsupportedTitle": "Destination not available",
+      "unsupportedBody": "This destination isn't supported by this build of Driven yet. Go back and choose another one.",
       "clientIdLabel": "Client ID",
       "clientIdPlaceholder": "Your OAuth client ID",
       "clientSecretLabel": "Client secret",
@@ -875,6 +909,24 @@
       "invalid_input": {
         "short": "Invalid input",
         "long": "One of the values you entered is not valid. Check the highlighted field and try again."
+      }
+    },
+    "sftp": {
+      "root_missing": {
+        "short": "Folder not found",
+        "long": "That path does not exist on the server. Driven never creates it for you - create the folder over SSH first, or fix the path, then try again."
+      },
+      "root_not_a_directory": {
+        "short": "Not a folder",
+        "long": "That path points at a file, not a folder. Choose (or create) a folder on the server for Driven to back up into."
+      },
+      "dest_marker_mismatch": {
+        "short": "Already a different backup",
+        "long": "That folder already holds a Driven backup for a different destination. Point Driven at an empty folder, or the folder holding the backup you actually mean to reconnect to."
+      },
+      "root_not_writable": {
+        "short": "Cannot write there",
+        "long": "That folder exists on the server, but this account cannot write into it. Check the folder's permissions - a read-only export or a folder owned by another user will look fine until Driven tries to save a file."
       }
     }
   }

@@ -45,6 +45,13 @@ impl Env {
             .unwrap_or_else(|_| "/usr/bin/WebKitWebDriver".to_string())
     }
 
+    /// Path to the debugging CLI (`driven-cli`), which scenarios run against
+    /// the app's OWN persisted state + keychain for a GUI-free restore leg.
+    pub fn cli_binary() -> String {
+        std::env::var("DRIVEN_E2E_CLI_BINARY")
+            .unwrap_or_else(|_| "/usr/local/bin/driven-cli".to_string())
+    }
+
     /// The artifacts dir (screenshots, page sources, preserved logs).
     pub fn artifacts_dir() -> PathBuf {
         std::env::var("DRIVEN_E2E_ARTIFACTS")

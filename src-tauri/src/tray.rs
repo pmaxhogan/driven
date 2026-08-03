@@ -786,7 +786,15 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         | ErrorCode::InternalBug
         // Invalid input crossing the IPC boundary is a user/renderer error,
         // not a network condition -> red error (not yellow-bang).
-        | ErrorCode::InvalidInput => false,
+        | ErrorCode::InvalidInput
+        // An SFTP root path that is missing, names a file, cannot be written
+        // into, or already belongs to a different Driven destination are all
+        // setup-time "fix the configuration" conditions (the server answered
+        // fine), not reachability problems.
+        | ErrorCode::SftpRootMissing
+        | ErrorCode::SftpRootNotADirectory
+        | ErrorCode::SftpRootNotWritable
+        | ErrorCode::SftpDestMarkerMismatch => false,
     }
 }
 

@@ -48,7 +48,13 @@
 //! | `s3-kill-mid-upload-then-reboot` | fault + crash + reboot | an orphaned object with no `file_state` row; a duplicate |
 //! | `s3-destination-full-mid-upload` | byte budget exhausted mid-multipart | a partial object marked complete |
 //! | `localfs-crash-between-temp-write-and-rename` | a commit whose `rename` cannot land, plus the temp file a killed process leaves | a half-written object readable as a complete one |
-//! | `destination-vanished-across-backends` | destination vanishes mid-cycle on ALL THREE backends, one body | anything written after the destination vanished |
+//! | `sftp-transport-cut-mid-upload` | the TCP connection dies mid-transfer | a WEDGED cycle; a synced row for an interrupted transfer |
+//! | `sftp-auth-flap-latches-needs-reauth` | credentials refused, then accepted | anything written while refused; a silent, unreported latch |
+//! | `sftp-host-key-swapped-mid-run` | the server presents a different host key | a changed host key retried through instead of refused |
+//! | `sftp-destination-full-mid-upload` | ENOSPC-shaped `SSH_FX_FAILURE` mid-transfer | a full disk read as a retryable transient; a partial object published |
+//! | `sftp-truncated-listing-is-an-error` | enumeration cut after a partial batch | a short listing read as a complete one - i.e. as a mass deletion |
+//! | `sftp-torn-sidecar-residue` | a metadata sidecar truncated by a crash | data loss or a duplicate from an unreadable annotation |
+//! | `destination-vanished-across-backends` | destination vanishes mid-cycle on ALL FOUR backends, one body | anything written after the destination vanished |
 //!
 //! ## The local-folder rows
 //!
@@ -75,6 +81,28 @@
 //!   `QuotaExceeded` produces, and that row drives the end-to-end behaviour
 //!   (account pauses, nothing partial published, recovery once space is freed)
 //!   mid-MULTIPART with bytes already at the destination.
+//!
+//! ## The SSH (SFTP) rows
+//!
+//! The SFTP backend sits between the two shapes above. Its faults live BELOW
+//! the trait, like S3's - a transport cut, a refused credential, a changed host
+//! key, a full remote disk, an abandoned enumeration have no representation at
+//! the `RemoteStore` seam at all - but its destination is a directory this
+//! process can read, like the local folder's, because
+//! [`driven_sftp::test_support::TestSftpServer`] serves a temp directory over a
+//! real socket. So the faults go in at the layer each hazard occupies (the TCP
+//! stream, the auth handler, the server's host key, the `write` and `readdir`
+//! handlers) while the ground truth is read straight off disk. See
+//! [`crate::sftp_fixture`].
+//!
+//! One of these rows found a REAL DEFECT rather than confirming a guarantee:
+//! `sftp-transport-cut-mid-upload` did not fail, it HUNG, because
+//! `russh-sftp` 2.3 never resolves a pending write acknowledgement when its
+//! stream dies. That wedged a sync cycle instead of failing it - an s6.3 "no
+//! infinite loop" violation in production code - and is now fixed by
+//! `driven_sftp::store::while_connected`, with that row as its regression
+//! guard. The row runs the faulted cycle under an explicit timeout, because a
+//! reintroduced hang must fail loudly rather than look like CI flake.
 //!
 //!   The one thing NOT covered is the localfs errno path itself, end to end,
 //!   because a real `ENOSPC` needs a real constrained VOLUME: unprivileged on
@@ -106,6 +134,7 @@ use crate::localfs_fixture::{LocalFsFixture, LocalFsOracle, CHAOS_SUBFOLDER};
 use crate::s3_server::{store_for, FaultyS3Server, CHAOS_BUCKET, CHAOS_PREFIX};
 use crate::scenario::{ExpectedOutcome, Outcome, Scenario, ScenarioContext};
 use crate::scenarios::reporting::{assert_invariants, InvariantReport};
+use crate::sftp_fixture::{SftpFixture, SftpOracle, SFTP_SUBFOLDER};
 
 /// Every s3.9 backend-hazard scenario.
 pub fn scenarios() -> Vec<Box<dyn Scenario>> {
@@ -118,6 +147,12 @@ pub fn scenarios() -> Vec<Box<dyn Scenario>> {
         Box::new(S3KillMidUploadThenReboot),
         Box::new(S3DestinationFullMidUpload),
         Box::new(LocalFsCrashBetweenTempWriteAndRename),
+        Box::new(SftpTransportCutMidUpload),
+        Box::new(SftpAuthFlapThenRecovers),
+        Box::new(SftpHostKeySwappedMidRun),
+        Box::new(SftpDestinationFullMidUpload),
+        Box::new(SftpTruncatedListingIsAnError),
+        Box::new(SftpTornSidecarResidue),
         Box::new(DestinationVanishedAcrossBackends),
     ]
 }
@@ -198,7 +233,7 @@ fn write_file(root: &std::path::Path, rel: &str, contents: &[u8]) -> anyhow::Res
 }
 
 /// A source rooted at `root` uploading into `folder_id`.
-fn source_in(account: AccountId, root: &std::path::Path, folder_id: &str) -> SourceRow {
+pub(crate) fn source_in(account: AccountId, root: &std::path::Path, folder_id: &str) -> SourceRow {
     SourceRow {
         id: SourceId::new_v4(),
         account_id: account,
@@ -321,6 +356,12 @@ impl DestinationBytes for FaultyS3Server {
 }
 
 impl DestinationBytes for LocalFsOracle {
+    fn bytes_at(&self, id: &str) -> Option<Vec<u8>> {
+        self.object_bytes(id)
+    }
+}
+
+impl DestinationBytes for SftpOracle {
     fn bytes_at(&self, id: &str) -> Option<Vec<u8>> {
         self.object_bytes(id)
     }
@@ -1421,6 +1462,1020 @@ async fn local_source(fx: &LocalFsFixture, handle: &DrivenHandle) -> anyhow::Res
 }
 
 // ===========================================================================
+// s3.9 the SSH (SFTP) rows
+// ===========================================================================
+//
+// Payload size for the SFTP rows that need a transfer long enough to be cut or
+// to run out of room part way through. Deliberately BELOW the executor's 5 MiB
+// `RESUMABLE_THRESHOLD`: these rows are about the transport and the remote
+// filesystem, not about the resumable ladder (which the S3 rows already drive),
+// and a debug-build run of every row pays for every byte.
+const SFTP_TRANSFER_LEN: usize = 1024 * 1024;
+const _: () = assert!((SFTP_TRANSFER_LEN as u64) < driven_core::executor::RESUMABLE_THRESHOLD);
+
+/// The shared tail of an SFTP row: run the s6.3 sweep, prove the synced bytes
+/// match the local file, require exactly `expect_objects` live objects, and
+/// prove no abandoned temp file is reachable as one.
+async fn sftp_settle_and_assert(
+    fx: &SftpFixture,
+    handle: &DrivenHandle,
+    source: &SourceRow,
+    expect_objects: u64,
+) -> anyhow::Result<(InvariantReport, Vec<String>)> {
+    let oracle = fx.oracle();
+    let report = assert_invariants(handle, &oracle, source.id, SFTP_SUBFOLDER).await?;
+    anyhow::ensure!(
+        report.ok(),
+        "s6.3 invariants violated: {}",
+        report.violation_summary()
+    );
+    anyhow::ensure!(
+        report.live_object_count == expect_objects,
+        "expected exactly {expect_objects} live object(s), found {}",
+        report.live_object_count
+    );
+    let checked = assert_synced_bytes_match_local(handle, &oracle, source).await?;
+
+    // An interrupted transfer leaves a temp file holding real bytes. It may
+    // legitimately still be there (the sweep spares anything younger than its
+    // window, because it could belong to a session the executor can resume),
+    // but it must never be reachable as an OBJECT - not through the oracle and
+    // not through the store's own listing, where the remote-existence audit
+    // would see something Driven owns with no `file_state` row and try to heal
+    // it forever.
+    let residue = oracle.temp_files();
+    let store = fx.store()?;
+    let listed = store
+        .list_folder(
+            SFTP_SUBFOLDER,
+            &driven_remote::remote_store::DriveContext::MyDrive,
+        )
+        .await?;
+    anyhow::ensure!(
+        listed.len() as u64 == expect_objects,
+        "the backend's own listing must agree with the oracle: expected {expect_objects}, got {:?}",
+        listed.iter().map(|e| &e.id).collect::<Vec<_>>()
+    );
+
+    let counts = fx.server().fault_counts();
+    let mut notes = vec![format!(
+        "{checked} synced row(s) byte-verified; faults fired: {} cut(s), {} auth rejection(s), \
+         {} host-key swap(s), {} ENOSPC refusal(s), {} truncated listing(s)",
+        counts.disconnects,
+        counts.auth_rejections,
+        counts.host_key_swaps,
+        counts.enospc_refusals,
+        counts.truncated_readdirs
+    )];
+    if !residue.is_empty() {
+        notes.push(format!(
+            "{} abandoned upload temp file(s) remain on the server and are invisible as objects, \
+             as designed: {:?}",
+            residue.len(),
+            residue
+                .iter()
+                .map(|p| p.file_name().unwrap_or_default().to_string_lossy())
+                .collect::<Vec<_>>()
+        ));
+    }
+    Ok((report, notes))
+}
+
+// ---------------------------------------------------------------------------
+// sftp-transport-cut-mid-upload
+// ---------------------------------------------------------------------------
+
+/// The TCP connection dies in the middle of an upload.
+///
+/// The single most likely real SFTP failure: a NAS goes to sleep, wifi drops, a
+/// NAT table entry expires. Driven must recover to exactly ONE object whose
+/// bytes equal the local file, with nothing recorded synced in between.
+///
+/// ## The bug this row found
+///
+/// The first version of this row did not fail - it HUNG, past a 420 second
+/// wall clock, and it was the harness rather than the fixture that was right.
+/// `russh-sftp` 2.3 parks each write's acknowledgement on a `oneshot` with no
+/// timeout, and when the stream dies the pending senders are never dropped
+/// (the request map is co-owned by the session), so `File::shutdown` waits
+/// forever. `SftpStore::write_temp` therefore wedged an entire sync cycle
+/// instead of failing it - the one outcome the SPEC s24 taxonomy has no room
+/// for, and a direct s6.3 "no infinite loop" violation.
+///
+/// The fix is `driven_sftp::store::while_connected`, which bounds the write
+/// path on SESSION LIVENESS rather than on a clock. This row is its regression
+/// guard: without it, the row hangs rather than fails, and a hang in CI reads
+/// as infrastructure flake instead of a defect - so the faulted cycle is run
+/// under an explicit `timeout` and "it took too long" is asserted as a
+/// failure in its own right.
+///
+/// The cut is single-shot, so what is measured afterwards is RECOVERY from a
+/// blip rather than behaviour during a permanent outage.
+struct SftpTransportCutMidUpload;
+
+#[async_trait]
+impl Scenario for SftpTransportCutMidUpload {
+    fn name(&self) -> &'static str {
+        "sftp-transport-cut-mid-upload"
+    }
+    fn description(&self) -> &'static str {
+        "SFTP transport cut mid-transfer: fails BOUNDED (never hangs) and recovers byte-exact"
+    }
+    fn requires(&self) -> CapabilityRequirements {
+        CapabilityRequirements::none()
+    }
+    async fn setup(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn teardown(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
+        let fx = SftpFixture::new().await?;
+        let handle = fx.boot().await?;
+        let src = fx.add_source(&handle).await?;
+
+        // A healthy first cycle, so the session is already established and the
+        // byte budget below is spent on PAYLOAD rather than on a handshake.
+        write_file(fx.src_root(), "before.bin", &payload(SMALL_FIXTURE_LEN, 41))?;
+        handle.run_one_cycle().await?;
+        let baseline = assert_invariants(&handle, &fx.oracle(), src.id, SFTP_SUBFOLDER).await?;
+        anyhow::ensure!(
+            baseline.live_object_count == 1 && baseline.ok(),
+            "the row needs a healthy baseline, got {} object(s): {}",
+            baseline.live_object_count,
+            baseline.violation_summary()
+        );
+
+        let content = payload(SFTP_TRANSFER_LEN, 42);
+        write_file(fx.src_root(), "big.bin", &content)?;
+        // Comfortably above a handshake and comfortably below the payload, so
+        // the cut lands mid-transfer on every run rather than by luck.
+        fx.server().arm_disconnect_after_bytes(256 * 1024);
+
+        // The bounded-failure guard. See the type docs: an unbounded write path
+        // makes this cycle never return, and a hang must fail the row loudly
+        // rather than time the whole harness out.
+        let cut_cycle =
+            tokio::time::timeout(Duration::from_secs(120), handle.run_one_cycle()).await;
+        anyhow::ensure!(
+            cut_cycle.is_ok(),
+            "a cut connection must FAIL the cycle, never wedge it - this is the regression guard \
+             for the unbounded russh-sftp write-ack wait (driven_sftp::store::while_connected)"
+        );
+        anyhow::ensure!(
+            fx.server().fault_counts().disconnects == 1,
+            "the row never reached its fault: {} connection(s) were cut",
+            fx.server().fault_counts().disconnects
+        );
+
+        // Mid-scenario: whatever the executor did with the failure, it must not
+        // have recorded the interrupted file as synced.
+        let rows = handle.state.load_source_file_state(src.id).await?;
+        let falsely_synced: Vec<String> = rows
+            .iter()
+            .filter(|(rel, r)| r.status == FileStateStatus::Synced && rel.as_str().contains("big"))
+            .map(|(rel, _)| rel.to_string())
+            .collect();
+        anyhow::ensure!(
+            falsely_synced.is_empty(),
+            "a cut transfer must not be recorded synced: {falsely_synced:?}"
+        );
+
+        let cycles = run_until_all_synced(&handle, src.id).await?;
+        let codes = error_codes_in_activity(handle.state.as_ref()).await?;
+
+        // A dropped pipe is a NETWORK fault, and the difference is the whole
+        // reason recovery is possible. `sftp-auth-flap-latches-needs-reauth`
+        // proves the neighbouring case: one AuthInvalidGrant parks the account
+        // and `account_is_runnable` then skips every later cycle in silence. If
+        // a cut connection were ever classified that way - a reconnect that
+        // lost its pin would do it - `run_until_all_synced` would spin through
+        // its whole budget doing NOTHING and the row would report a confusing
+        // object count instead of the actual cause. Assert the cause.
+        anyhow::ensure!(
+            !codes.contains(&ErrorCode::AuthInvalidGrant),
+            "a cut connection must classify as a retryable network fault; auth.invalid_grant here \
+             would park the account and make every recovery cycle a silent no-op: {codes:?}"
+        );
+        let account_state = handle
+            .state
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|a| a.id == handle.account_id)
+            .map(|a| a.state)
+            .ok_or_else(|| anyhow::anyhow!("the handle has no account row"))?;
+        anyhow::ensure!(
+            account_state == driven_core::types::AccountState::Ok,
+            "a transport blip must leave the account usable, got {account_state:?}"
+        );
+
+        let quiesced = is_quiescent(&handle.state().await);
+        let (report, mut notes) = sftp_settle_and_assert(&fx, &handle, &src, 2).await?;
+        notes.push(format!(
+            "the transport was cut mid-transfer, the cycle FAILED rather than hanging, the account \
+             stayed usable, and the upload converged after {cycles} further cycle(s)"
+        ));
+        Ok(finish(&report, quiesced, codes, notes))
+    }
+
+    fn expected_outcome(&self) -> ExpectedOutcome {
+        // The assertions above ARE the check: the executor may absorb a
+        // single-shot transport failure inside its own retry ladder without
+        // recording an Error-level row, so pinning a code here would assert the
+        // ladder's current shape rather than the invariant that matters.
+        ExpectedOutcome::DocumentedBehaviour
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sftp-auth-flap-then-recovers
+// ---------------------------------------------------------------------------
+
+/// The server is up but refusing credentials, and then settles - and the
+/// account does NOT come back on its own.
+///
+/// ## The finding this row records
+///
+/// A NAS whose PAM stack or directory service is still starting rejects a
+/// perfectly good password, and on the wire that is indistinguishable from a
+/// wrong one. Driven treats every refusal as permanent: one
+/// `AuthInvalidGrant` outcome moves the account to `NeedsReauth` and SUSPENDS
+/// the orchestrator (`orchestrator.rs::handle_auth_failure` -> V-F, DESIGN
+/// s5.4), after which `account_is_runnable` skips every cycle and issues zero
+/// remote calls until a human reconnects.
+///
+/// For Google Drive that is plainly correct - `invalid_grant` from a token
+/// endpoint really is permanent. **For SFTP it is a sharper trade than it looks,
+/// and this row is where it is written down:** a home NAS refusing SSH auth for
+/// twenty seconds while it boots is common and self-healing, yet it parks the
+/// account in an attention state that only the user can clear. The row was
+/// originally written expecting recovery and did not get it; rather than
+/// weaken the assertion, it now asserts the behaviour that actually exists.
+///
+/// The row is deliberately built so it cannot pass vacuously: after the flap it
+/// CLEARS every fault, runs more cycles, proves the destination is still empty,
+/// and then proves the server itself is perfectly healthy by uploading through
+/// a fresh store. So "nothing was backed up" is demonstrably the account gate
+/// latching, not the server still refusing.
+///
+/// The flap is longer than one attempt on purpose: a single rejection could be
+/// papered over by an in-cycle retry, and the row would prove nothing about the
+/// classification (the shape of the #192 flake).
+struct SftpAuthFlapThenRecovers;
+
+#[async_trait]
+impl Scenario for SftpAuthFlapThenRecovers {
+    fn name(&self) -> &'static str {
+        "sftp-auth-flap-latches-needs-reauth"
+    }
+    fn description(&self) -> &'static str {
+        "SFTP credentials refused: auth.invalid_grant latches needs-reauth and does NOT self-heal"
+    }
+    fn requires(&self) -> CapabilityRequirements {
+        CapabilityRequirements::none()
+    }
+    async fn setup(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn teardown(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
+        let fx = SftpFixture::new().await?;
+        let handle = fx.boot().await?;
+        let src = fx.add_source(&handle).await?;
+        write_file(fx.src_root(), "a.bin", &payload(SMALL_FIXTURE_LEN, 43))?;
+
+        // Armed BEFORE the first cycle, so the flap lands on the initial
+        // connect: the store holds one session for its lifetime, so a flap
+        // armed after a healthy cycle would never be seen at all.
+        const FLAP: u64 = 6;
+        fx.server().arm_auth_failures(FLAP);
+
+        let _ = handle.run_one_cycle().await;
+        anyhow::ensure!(
+            fx.server().fault_counts().auth_rejections >= 1,
+            "the row never reached its fault: no authentication attempt was rejected"
+        );
+        let flapping_codes = error_codes_in_activity(handle.state.as_ref()).await?;
+        anyhow::ensure!(
+            flapping_codes.contains(&ErrorCode::AuthInvalidGrant),
+            "expected auth.invalid_grant while the credential was refused, got {flapping_codes:?}"
+        );
+        let published = fx.oracle().entries(SFTP_SUBFOLDER);
+        anyhow::ensure!(
+            published.is_empty(),
+            "a refused credential must publish NOTHING, found {:?}",
+            published.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+        let rows = handle.state.load_source_file_state(src.id).await?;
+        anyhow::ensure!(
+            rows.values().all(|r| r.status != FileStateStatus::Synced),
+            "nothing may be synced while the server is refusing the credential"
+        );
+
+        // The account is parked, and the parking is what the row is about.
+        let account_state = handle
+            .state
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|a| a.id == handle.account_id)
+            .map(|a| a.state)
+            .ok_or_else(|| anyhow::anyhow!("the handle has no account row"))?;
+        anyhow::ensure!(
+            account_state == driven_core::types::AccountState::NeedsReauth,
+            "a refused credential must park the account for a human, got {account_state:?}"
+        );
+
+        // The box settles - and the account still does not come back.
+        fx.server().clear_faults();
+        for _ in 0..MAX_RECOVERY_CYCLES {
+            let _ = handle.run_one_cycle().await;
+        }
+        let still_empty = fx.oracle().entries(SFTP_SUBFOLDER);
+        anyhow::ensure!(
+            still_empty.is_empty(),
+            "the account was suspended, so these cycles must have issued NO remote calls at all, \
+             but {} object(s) appeared: {:?}",
+            still_empty.len(),
+            still_empty.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+
+        // The anti-vacuous-green guard, and the whole reason the row is
+        // trustworthy: prove the SERVER is fine, so the empty destination above
+        // is the account gate latching rather than a fault still armed.
+        {
+            let store = fx.store()?;
+            store
+                .create(
+                    SFTP_SUBFOLDER,
+                    "proof-the-server-is-healthy.bin",
+                    "application/octet-stream",
+                    driven_remote::remote_store::UploadBody::Bytes(bytes::Bytes::from_static(
+                        b"the credential works again",
+                    )),
+                    Default::default(),
+                )
+                .await
+                .map_err(|e| {
+                    anyhow::anyhow!(
+                        "the server must accept the same credential again, or this row proves \
+                         nothing about the ACCOUNT being what stopped: {e:#}"
+                    )
+                })?;
+        }
+
+        let codes = error_codes_in_activity(handle.state.as_ref()).await?;
+        let quiesced = is_quiescent(&handle.state().await);
+        // Swept against the SOURCE, which still has no synced row: the object
+        // written just above belongs to the harness, not to the source.
+        let report = assert_invariants(&handle, &fx.oracle(), src.id, SFTP_SUBFOLDER).await?;
+        anyhow::ensure!(
+            report.data_loss_paths.is_empty() && report.duplicate_op_uuids.is_empty(),
+            "s6.3 invariants violated: {}",
+            report.violation_summary()
+        );
+        let notes = vec![
+            format!(
+                "{} authentication attempt(s) were refused and surfaced as auth.invalid_grant; \
+                 nothing was written and no file was synced",
+                fx.server().fault_counts().auth_rejections
+            ),
+            "FINDING (documented behaviour, sharper on SFTP than on Drive): the refusal LATCHED. \
+             The account moved to needs_reauth and the orchestrator suspended, so every later \
+             cycle issued zero remote calls even after the server started accepting the same \
+             credential again - proven here by uploading through a fresh store against the same \
+             box. Correct for an OAuth invalid_grant, which really is permanent; a NAS that \
+             refuses SSH auth for a few seconds while it boots is not, and it costs the user a \
+             manual reconnect."
+                .to_string(),
+        ];
+        Ok(finish(&report, quiesced, codes, notes))
+    }
+
+    fn expected_outcome(&self) -> ExpectedOutcome {
+        ExpectedOutcome::GracefulFailureWith {
+            code: ErrorCode::AuthInvalidGrant,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sftp-host-key-swapped-mid-run
+// ---------------------------------------------------------------------------
+
+/// The server presents a DIFFERENT host key than the one the account pinned.
+///
+/// Either the box was rebuilt or somebody is standing in the middle, and
+/// nothing on the wire can tell those apart. Driven pins on first use and
+/// hard-fails on any change: the connection is refused INSIDE the key check,
+/// before any credential is sent, and it keeps being refused - a swapped host
+/// key is not a transient to retry through.
+///
+/// ## Why the run has to reboot
+///
+/// A pin is verified per CONNECTION, and the store correctly keeps using the
+/// session it already authenticated. So a swap armed against a live session
+/// changes nothing until that session ends - and a row that armed it and simply
+/// ran another cycle would pass vacuously, proving only that a healthy session
+/// stays healthy. Dropping the handle and booting a fresh one over the same
+/// state DB and the same server is the honest way to reach the next connection,
+/// and it is also the real-world shape: the app restarts, or the account
+/// reconnects, and THAT is when the changed key is discovered.
+struct SftpHostKeySwappedMidRun;
+
+#[async_trait]
+impl Scenario for SftpHostKeySwappedMidRun {
+    fn name(&self) -> &'static str {
+        "sftp-host-key-swapped-mid-run"
+    }
+    fn description(&self) -> &'static str {
+        "SFTP host key changes after pinning: auth.invalid_grant, nothing written, baseline kept"
+    }
+    fn requires(&self) -> CapabilityRequirements {
+        CapabilityRequirements::none()
+    }
+    async fn setup(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn teardown(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
+        let fx = SftpFixture::new().await?;
+        let src;
+        {
+            let handle = fx.boot().await?;
+            src = fx.add_source(&handle).await?;
+            write_file(fx.src_root(), "before.bin", &payload(SMALL_FIXTURE_LEN, 44))?;
+            handle.run_one_cycle().await?;
+            let baseline = assert_invariants(&handle, &fx.oracle(), src.id, SFTP_SUBFOLDER).await?;
+            anyhow::ensure!(
+                baseline.live_object_count == 1 && baseline.ok(),
+                "the row needs a healthy baseline, got {} object(s): {}",
+                baseline.live_object_count,
+                baseline.violation_summary()
+            );
+        }
+
+        // The key changes, and the app comes back to a server it no longer
+        // recognizes.
+        fx.server().arm_host_key_swap();
+        write_file(fx.src_root(), "after.bin", &payload(SMALL_FIXTURE_LEN, 45))?;
+        let reopened = fx.boot().await?;
+        for _ in 0..2 {
+            let _ = reopened.run_one_cycle().await;
+        }
+
+        anyhow::ensure!(
+            fx.server().fault_counts().host_key_swaps >= 1,
+            "the row never reached its fault: no connection was served the alternate host key"
+        );
+        let codes = error_codes_in_activity(reopened.state.as_ref()).await?;
+        anyhow::ensure!(
+            codes.contains(&ErrorCode::AuthInvalidGrant),
+            "a changed host key must surface as auth.invalid_grant - the account needs a human, \
+             not a retry - got {codes:?}"
+        );
+        // The ATTENTION STATE, not just the log line. An activity row is
+        // something a user might scroll past; `NeedsReauth` is what actually
+        // stops the account and raises the reauth prompt, and it is the half
+        // that makes "blocks sync" true rather than "complains about sync".
+        let account_state = reopened
+            .state
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|a| a.id == reopened.account_id)
+            .map(|a| a.state)
+            .ok_or_else(|| anyhow::anyhow!("the rebooted handle has no account row"))?;
+        anyhow::ensure!(
+            account_state == driven_core::types::AccountState::NeedsReauth,
+            "a server that failed the host-key pin must park the account for a human - a possible \
+             MITM is not something to retry through - got {account_state:?}"
+        );
+
+        let oracle = fx.oracle();
+        let after = assert_invariants(&reopened, &oracle, src.id, SFTP_SUBFOLDER).await?;
+        anyhow::ensure!(
+            after.live_object_count == 1,
+            "nothing may be written to a server that failed the pin check, but the destination \
+             holds {} object(s)",
+            after.live_object_count
+        );
+        anyhow::ensure!(
+            after.ok(),
+            "s6.3 invariants violated: {}",
+            after.violation_summary()
+        );
+        let rows = reopened.state.load_source_file_state(src.id).await?;
+        let synced_after: Vec<String> = rows
+            .iter()
+            .filter(|(rel, r)| {
+                r.status == FileStateStatus::Synced && rel.as_str().contains("after")
+            })
+            .map(|(rel, _)| rel.to_string())
+            .collect();
+        anyhow::ensure!(
+            synced_after.is_empty(),
+            "{synced_after:?} was marked synced although the server failed the host-key check"
+        );
+
+        let quiesced = is_quiescent(&reopened.state().await);
+        let notes = vec![format!(
+            "the server presented a different host key on {} connection(s); every one was refused \
+             before a credential was sent, the pre-swap object survived untouched, and nothing new \
+             was written",
+            fx.server().fault_counts().host_key_swaps
+        )];
+        Ok(finish(&after, quiesced, codes, notes))
+    }
+
+    fn expected_outcome(&self) -> ExpectedOutcome {
+        ExpectedOutcome::GracefulFailureWith {
+            code: ErrorCode::AuthInvalidGrant,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sftp-destination-full-mid-upload
+// ---------------------------------------------------------------------------
+
+/// The remote filesystem runs out of room in the MIDDLE of an upload.
+///
+/// SFTPv3 has no ENOSPC status code: every server folds a full disk into
+/// `SSH_FX_FAILURE` and leaves the human-readable MESSAGE as the only signal.
+/// Read by status alone that is a generic transient, so Driven would retry a
+/// full NAS forever instead of pausing the account and telling the user. This
+/// row drives the message-based classification end to end.
+///
+/// The budget runs out with bytes ALREADY on the server, because "full before
+/// we started" is the easy case and "full halfway through" is the one that can
+/// publish a truncated object.
+struct SftpDestinationFullMidUpload;
+
+#[async_trait]
+impl Scenario for SftpDestinationFullMidUpload {
+    fn name(&self) -> &'static str {
+        "sftp-destination-full-mid-upload"
+    }
+    fn description(&self) -> &'static str {
+        "remote disk full mid-transfer: drive.quota_exhausted, nothing partial, recovers when freed"
+    }
+    fn requires(&self) -> CapabilityRequirements {
+        CapabilityRequirements::none()
+    }
+    async fn setup(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn teardown(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
+        let fx = SftpFixture::new().await?;
+        let handle = fx.boot().await?;
+        let src = fx.add_source(&handle).await?;
+        write_file(fx.src_root(), "big.bin", &payload(SFTP_TRANSFER_LEN, 46))?;
+
+        // Room for ONE write packet of a 1 MiB transfer and nothing more.
+        //
+        // The budget has to clear a single packet or the row silently degrades
+        // into the easy "full before we started" case: `russh-sftp` writes in
+        // packets just under its 256 KiB `max_packet_len`, and a budget below
+        // that refuses the very FIRST write, leaving nothing on the server. The
+        // `bytes_accepted_before_enospc` guard below is what caught exactly
+        // that - this row previously armed 128 KiB and never once filled up
+        // mid-transfer.
+        fx.server().arm_enospc_after_bytes(384 * 1024);
+        let _ = handle.run_one_cycle().await;
+
+        anyhow::ensure!(
+            fx.server().fault_counts().enospc_refusals >= 1,
+            "the row never reached its fault: no write was refused for space"
+        );
+        // The budget must have run out with bytes ALREADY on the server, or
+        // this is the easy "full before we started" case rather than the one
+        // that can publish a truncated object. Mirrors the S3 sibling's
+        // `upload_part >= 1` guard.
+        anyhow::ensure!(
+            fx.server().fault_counts().bytes_accepted_before_enospc > 0,
+            "the disk must fill up MID-transfer, with bytes already written - a destination that \
+             refused the very first byte tests a different, easier failure"
+        );
+        let codes = error_codes_in_activity(handle.state.as_ref()).await?;
+        anyhow::ensure!(
+            codes.contains(&ErrorCode::DriveQuotaExhausted),
+            "an ENOSPC-shaped SSH_FX_FAILURE must classify as drive.quota_exhausted rather than a \
+             retryable transient, got {codes:?}"
+        );
+
+        let published = fx.oracle().entries(SFTP_SUBFOLDER);
+        anyhow::ensure!(
+            published.is_empty(),
+            "a full destination published {} object(s); a partial upload must never appear as a \
+             complete object: {:?}",
+            published.len(),
+            published
+                .iter()
+                .map(|e| (&e.id, e.size))
+                .collect::<Vec<_>>()
+        );
+        let rows = handle.state.load_source_file_state(src.id).await?;
+        anyhow::ensure!(
+            rows.values().all(|r| r.status != FileStateStatus::Synced),
+            "no file may be synced when the destination refused its bytes"
+        );
+        let quiesced = is_quiescent(&handle.state().await);
+
+        // Freeing space must let the backup finish: a full destination is a
+        // pause, not a permanent loss.
+        fx.server().clear_faults();
+        let cycles = run_until_all_synced(&handle, src.id).await?;
+        let (report, mut notes) = sftp_settle_and_assert(&fx, &handle, &src, 1).await?;
+        notes.push(format!(
+            "the disk filled up with bytes already written; nothing partial was published, and the \
+             upload completed after {cycles} cycle(s) once space was freed"
+        ));
+        Ok(finish(&report, quiesced, codes, notes))
+    }
+
+    fn expected_outcome(&self) -> ExpectedOutcome {
+        ExpectedOutcome::GracefulFailureWith {
+            code: ErrorCode::DriveQuotaExhausted,
+        }
+    }
+}
+
+// ---------------------------------------------------------------------------
+// sftp-truncated-listing-is-an-error
+// ---------------------------------------------------------------------------
+
+/// A directory enumeration the server abandons half way must fail the LISTING,
+/// never come back as a short one.
+///
+/// This is the completeness invariant at its sharpest.
+/// `list_source_object_ids` feeds a `dead = recorded - live` computation, so a
+/// truncated listing accepted as complete reads as a MASS DELETION and the
+/// caller "heals" it by re-uploading the entire source - or, worse, by trashing
+/// what it believes is gone. Over a network the window for a short answer is
+/// wide: a server under load, an interrupted enumeration, a directory handle
+/// that expired.
+///
+/// The fault serves a genuinely PARTIAL first batch and then fails the next
+/// `readdir`, which is the only truncation any client can detect: a server that
+/// quietly returns fewer entries and then a clean EOF is indistinguishable from
+/// a smaller directory, in this protocol or any other. That gap is recorded on
+/// `TestSftpServer::arm_truncated_readdir` rather than papered over with an
+/// assertion that could not fail.
+///
+/// The row asserts two things, and the second is the one that matters: the call
+/// errors, AND a full cycle over the truncated destination deletes nothing and
+/// unsyncs nothing.
+struct SftpTruncatedListingIsAnError;
+
+#[async_trait]
+impl Scenario for SftpTruncatedListingIsAnError {
+    fn name(&self) -> &'static str {
+        "sftp-truncated-listing-is-an-error"
+    }
+    fn description(&self) -> &'static str {
+        "SFTP enumeration cut short fails the listing and never reads as a mass deletion"
+    }
+    fn requires(&self) -> CapabilityRequirements {
+        CapabilityRequirements::none()
+    }
+    async fn setup(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn teardown(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
+        let fx = SftpFixture::new().await?;
+        let handle = fx.boot().await?;
+        let src = fx.add_source(&handle).await?;
+        for (i, name) in ["a.bin", "b.bin", "c.bin"].iter().enumerate() {
+            write_file(
+                fx.src_root(),
+                name,
+                &payload(SMALL_FIXTURE_LEN, 50 + i as u64),
+            )?;
+        }
+        handle.run_one_cycle().await?;
+        let baseline = assert_invariants(&handle, &fx.oracle(), src.id, SFTP_SUBFOLDER).await?;
+        anyhow::ensure!(
+            baseline.live_object_count == 3 && baseline.ok(),
+            "the row needs three healthy objects, got {}: {}",
+            baseline.live_object_count,
+            baseline.violation_summary()
+        );
+
+        let store = fx.store()?;
+        let context = driven_remote::remote_store::DriveContext::MyDrive;
+        let whole = store
+            .list_source_object_ids(&src.id.to_string(), &context)
+            .await?;
+        anyhow::ensure!(
+            whole.len() == 3,
+            "the healthy audit must see all three objects, got {whole:?}"
+        );
+
+        // Two names per batch, against directories holding far more than two
+        // entries - so the batch really is partial before the failure.
+        fx.server().arm_truncated_readdir(2);
+        let error = store
+            .list_source_object_ids(&src.id.to_string(), &context)
+            .await
+            .err()
+            .ok_or_else(|| {
+                anyhow::anyhow!(
+                    "a cut enumeration was reported as a COMPLETE listing - this is the mass \
+                     deletion signal the whole row exists to prevent"
+                )
+            })?;
+        anyhow::ensure!(
+            fx.server().fault_counts().truncated_readdirs >= 1,
+            "the row never reached its fault: no enumeration was truncated"
+        );
+
+        // The consequence that matters, one level up: a CYCLE over a
+        // destination whose listing cannot be trusted must change nothing.
+        //
+        // Reaching the audit takes a REBOOT, and the reason is worth stating -
+        // an earlier version of this row ran a cycle here and proved nothing.
+        // `audit_remote_existence_if_due` is gated on a per-source `audited`
+        // latch held in the orchestrator's memory, so the healthy first cycle
+        // already consumed this source's one non-deep-verify audit and every
+        // later cycle on the SAME orchestrator returns before issuing a single
+        // remote call. (The deep-verify path is no help either: the source's
+        // interval is 7 days against a `FakeClock` that never advances.) A
+        // fresh handle over the same DB and the same server starts with an
+        // empty latch, which is also the real-world shape - the app restarts
+        // and re-audits.
+        drop(handle);
+        let rebooted = fx.boot().await?;
+        let before_cycle = fx.server().fault_counts().truncated_readdirs;
+        let _ = rebooted.run_one_cycle().await;
+        let audited_in_cycle = fx.server().fault_counts().truncated_readdirs - before_cycle;
+
+        // The anti-vacuous-green guard this row previously lacked: if the cycle
+        // never enumerated, everything below is trivially true and the row is
+        // measuring nothing.
+        anyhow::ensure!(
+            audited_in_cycle >= 1,
+            "the cycle never reached the audit, so it cannot show what a failed listing does to \
+             one: the truncation counter did not move across it"
+        );
+
+        let during = fx.oracle().entries(SFTP_SUBFOLDER);
+        anyhow::ensure!(
+            during.len() == 3,
+            "a failed listing must not delete anything: {} object(s) remain",
+            during.len()
+        );
+        let rows = rebooted.state.load_source_file_state(src.id).await?;
+        anyhow::ensure!(
+            rows.len() == 3 && rows.values().all(|r| r.status == FileStateStatus::Synced),
+            "a failed listing must not unsync anything: {:?}",
+            rows.iter()
+                .map(|(rel, r)| (rel.to_string(), r.status))
+                .collect::<Vec<_>>()
+        );
+
+        // Once the server behaves, the audit is whole again.
+        fx.server().clear_faults();
+        let recovered = store
+            .list_source_object_ids(&src.id.to_string(), &context)
+            .await?;
+        anyhow::ensure!(
+            recovered == whole,
+            "the recovered audit must match the baseline exactly: {recovered:?} vs {whole:?}"
+        );
+
+        let codes = error_codes_in_activity(rebooted.state.as_ref()).await?;
+        let quiesced = is_quiescent(&rebooted.state().await);
+        let (report, mut notes) = sftp_settle_and_assert(&fx, &rebooted, &src, 3).await?;
+        notes.push(format!(
+            "the enumeration was cut after a partial batch and surfaced as an error ({}); a \
+             rebooted orchestrator's remote-existence audit then hit the same truncation \
+             {audited_in_cycle} time(s) in one cycle and deleted nothing, unsynced nothing; the \
+             audit recovered to the same three ids once the server behaved",
+            first_line(&format!("{error:#}"))
+        ));
+        Ok(finish(&report, quiesced, codes, notes))
+    }
+
+    fn expected_outcome(&self) -> ExpectedOutcome {
+        ExpectedOutcome::DocumentedBehaviour
+    }
+}
+
+/// The first line of an error chain, for a note that has to stay one line.
+fn first_line(text: &str) -> String {
+    text.lines().next().unwrap_or_default().to_string()
+}
+
+// ---------------------------------------------------------------------------
+// sftp-torn-sidecar-residue
+// ---------------------------------------------------------------------------
+
+/// A metadata sidecar torn in half by a crash, and what it costs.
+///
+/// ## The ruling this row records
+///
+/// `driven_sftp::meta::parse` maps an unparseable sidecar to `None` - "this
+/// object is not annotated" - rather than to an error. So does
+/// `driven_localfs::meta::read_sidecar`, for the same stated reason: the
+/// sidecar is Driven's OWN annotation, and failing the whole listing on one
+/// truncated file would let a single bad byte wedge every audit against the
+/// server, permanently, for every source. This row exists to decide whether
+/// that leniency is acceptable on a network destination or has to be made
+/// fail-closed, and the answer is **accepted, with a bounded residue** - which
+/// is a claim, so the row measures it rather than asserting it.
+///
+/// What the leniency costs is visible here: an object whose annotation is
+/// unreadable drops out of `list_source_object_ids`, so the remote-existence
+/// audit no longer counts it as live. The object itself is untouched and its
+/// bytes still match, and a later upload of the same name lands on exactly the
+/// same path (an overwrite, never a duplicate), so this is COST, not data loss.
+///
+/// What bounds it is `guard_root`. The dangerous version of this - a torn
+/// sidecar at a destination that is not really ours, where "unannotated" makes
+/// the store adopt and overwrite a stranger's file - cannot happen while the
+/// account carries a `destination_id`, because every mutating operation proves
+/// the marker's identity first. It remains reachable only for an account
+/// written before `destination_id` existed, where `guard_root` can check the
+/// marker for PRESENCE alone; those accounts are asked to reconnect, and the
+/// creation probe has recorded an id since Task 6.
+///
+/// Fail-closed was rejected on that evidence: it would trade a bounded,
+/// recoverable residue for an unbounded wedge, and diverge from the sibling
+/// backend for a hazard the marker already contains.
+struct SftpTornSidecarResidue;
+
+#[async_trait]
+impl Scenario for SftpTornSidecarResidue {
+    fn name(&self) -> &'static str {
+        "sftp-torn-sidecar-residue"
+    }
+    fn description(&self) -> &'static str {
+        "a torn metadata sidecar reads as unannotated: bounded residue, no data loss, no duplicate"
+    }
+    fn requires(&self) -> CapabilityRequirements {
+        CapabilityRequirements::none()
+    }
+    async fn setup(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+    async fn teardown(&self, _ctx: &mut ScenarioContext) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    async fn run_assertions(&self, _handle: &DrivenHandle) -> anyhow::Result<Outcome> {
+        let fx = SftpFixture::new().await?;
+        let handle = fx.boot().await?;
+        let src = fx.add_source(&handle).await?;
+        let content = payload(SMALL_FIXTURE_LEN, 47);
+        write_file(fx.src_root(), "torn.bin", &content)?;
+        write_file(fx.src_root(), "intact.bin", &payload(SMALL_FIXTURE_LEN, 48))?;
+        handle.run_one_cycle().await?;
+
+        let oracle = fx.oracle();
+        let baseline = assert_invariants(&handle, &oracle, src.id, SFTP_SUBFOLDER).await?;
+        anyhow::ensure!(
+            baseline.live_object_count == 2 && baseline.ok(),
+            "the row needs two healthy objects, got {}: {}",
+            baseline.live_object_count,
+            baseline.violation_summary()
+        );
+
+        let store = fx.store()?;
+        let context = driven_remote::remote_store::DriveContext::MyDrive;
+        let before = store
+            .list_source_object_ids(&src.id.to_string(), &context)
+            .await?;
+        anyhow::ensure!(before.len() == 2, "the healthy audit sees both: {before:?}");
+
+        // The crash: a sidecar written half way and then abandoned.
+        let torn = fx.tear_sidecar(SFTP_SUBFOLDER, "torn.bin")?;
+        anyhow::ensure!(
+            fx.oracle().sidecars_in(SFTP_SUBFOLDER).len() == 2,
+            "the torn sidecar must still be PRESENT - the row is about an unreadable annotation, \
+             not a missing one"
+        );
+
+        // Measured, not predicted: this is the residue the ruling accepts, and
+        // it is ASSERTED rather than merely reported, so a later change that
+        // made an unreadable sidecar fail closed (or made the audit data-driven)
+        // has to revisit the ruling instead of silently rewriting the note.
+        let after_tear = store
+            .list_source_object_ids(&src.id.to_string(), &context)
+            .await?;
+        anyhow::ensure!(
+            after_tear.len() == 1 && !after_tear.contains(&format!("{SFTP_SUBFOLDER}/torn.bin")),
+            "the residue: an object whose annotation cannot be read must drop OUT of the \
+             remote-existence audit (that is the accepted cost), got {after_tear:?}"
+        );
+        // The other half of the asymmetry, and the reason this is cost rather
+        // than loss: `list_folder` is driven by the DATA files and joins the
+        // sidecar onto them, so the object is still plainly there and still
+        // restorable. Only the annotation-driven audit loses sight of it.
+        let listed = store.list_folder(SFTP_SUBFOLDER, &context).await?;
+        anyhow::ensure!(
+            listed.len() == 2,
+            "the object itself must remain visible and restorable through the store's own \
+             listing, got {:?}",
+            listed.iter().map(|e| &e.id).collect::<Vec<_>>()
+        );
+
+        // The object itself must be untouched, whatever the audit thinks of it.
+        let torn_id = format!("{SFTP_SUBFOLDER}/torn.bin");
+        anyhow::ensure!(
+            oracle.object_bytes(&torn_id).as_deref() == Some(content.as_slice()),
+            "a torn ANNOTATION must never disturb the DATA it annotates"
+        );
+
+        // What the ORCHESTRATOR does about it, which is the half that decides
+        // whether the residue is permanent or self-healing.
+        //
+        // Reaching that takes a REBOOT, for the reason the truncated-listing
+        // row documents: `audit_remote_existence_if_due` is gated on a
+        // per-source latch held in the orchestrator's memory, and the healthy
+        // first cycle already spent this source's audit - so a further cycle on
+        // the SAME orchestrator returns before issuing a remote call and would
+        // prove nothing at all. A fresh handle re-audits, which is also the
+        // real shape: the app restarts and looks again.
+        drop(handle);
+        let rebooted = fx.boot().await?;
+        let _ = rebooted.run_one_cycle().await;
+        let after_cycle = store
+            .list_source_object_ids(&src.id.to_string(), &context)
+            .await?;
+
+        let codes = error_codes_in_activity(rebooted.state.as_ref()).await?;
+        let quiesced = is_quiescent(&rebooted.state().await);
+        let report = assert_invariants(&rebooted, &oracle, src.id, SFTP_SUBFOLDER).await?;
+        anyhow::ensure!(
+            report.ok(),
+            "s6.3 invariants violated: {}",
+            report.violation_summary()
+        );
+        anyhow::ensure!(
+            report.live_object_count == 2,
+            "a torn sidecar must not produce, remove or duplicate an object: {} live",
+            report.live_object_count
+        );
+        let checked = assert_synced_bytes_match_local(&rebooted, &oracle, &src).await?;
+        anyhow::ensure!(
+            checked == 2,
+            "both objects must still be byte-verifiable against their local files, checked \
+             {checked}"
+        );
+        // Whatever the audit decided, the DATA is what must never move.
+        anyhow::ensure!(
+            oracle.object_bytes(&torn_id).as_deref() == Some(content.as_slice()),
+            "the object's bytes must survive the audit's opinion of its annotation"
+        );
+        let _ = &torn;
+        let notes = vec![
+            format!(
+                "RULING (accepted behaviour): a torn sidecar reads as UNANNOTATED. The \
+                 remote-existence audit dropped the object from {} live id(s) to {} while \
+                 `list_folder` still reported {} object(s), so the object stayed visible and \
+                 restorable throughout. After a rebooted orchestrator re-ran the audit the set \
+                 was {} - and either way the data, its bytes and its file_state row were \
+                 untouched, with no duplicate and no deletion.",
+                before.len(),
+                after_tear.len(),
+                listed.len(),
+                after_cycle.len()
+            ),
+            "cost, not data loss: an object the audit cannot see is one nothing will ever \
+             reclaim if its file_state row also goes - the same bounded-residue trade the \
+             abandoned-multipart finding records. Fail-closed was rejected: erroring on an \
+             unreadable sidecar would let ONE bad byte wedge every audit against the server, and \
+             `guard_root` already contains the dangerous variant (adopting a stranger's file at a \
+             usurped destination) for every account carrying a destination_id."
+                .to_string(),
+        ];
+        Ok(finish(&report, quiesced, codes, notes))
+    }
+
+    fn expected_outcome(&self) -> ExpectedOutcome {
+        ExpectedOutcome::DocumentedBehaviour
+    }
+}
+
+// ===========================================================================
 // s3.9 destination-vanished-across-backends
 // ===========================================================================
 
@@ -1696,6 +2751,96 @@ impl Scenario for DestinationVanishedAcrossBackends {
             notes.push(format!(
                 "local-folder arm (marker holds a different destination id): baseline kept, \
                  nothing new written, {} live object(s)",
+                after.live_object_count
+            ));
+            reports.push(after);
+        }
+
+        // -- arm D: the SSH (SFTP) backend, via its identity marker -----------
+        //
+        // Hand-copied from arm C rather than dispatched over a shared trait,
+        // deliberately and in keeping with the rest of this module: the arms
+        // differ in how the fault is INJECTED (a marker rewritten on the served
+        // directory, a `NoSuchBucket` on the wire, a latched flag) and any
+        // abstraction that hid that would also hide the thing each arm is here
+        // to prove. The duplication is the point - it is what makes "the
+        // invariants are backend-independent" a test of four independent
+        // detectors rather than of one shared code path called four times.
+        //
+        // The SFTP hazard is the same one the local-folder marker exists for,
+        // one network hop further away. A NAS whose external volume or array is
+        // not mounted this cycle leaves an ordinary empty directory at the
+        // mount point: the connection succeeds, the credential authenticates,
+        // the path exists and is writable, and a whole backup written into it
+        // disappears on the next remount while `file_state` still calls every
+        // file synced. Existence proves nothing over SSH either, which is why
+        // this backend carries the same `.driven-destination.json`, byte for
+        // byte, and verifies it on EVERY mutating operation.
+        //
+        // As in arm C the injected fault is the NASTIER of the two the marker
+        // catches: not a missing marker, but one naming a DIFFERENT destination
+        // - a second machine that re-initialized the same shared export.
+        {
+            let fx = SftpFixture::new().await?;
+            let handle = fx.boot().await?;
+            let src = fx.add_source(&handle).await?;
+            write_file(fx.src_root(), "before.bin", &payload(SMALL_FIXTURE_LEN, 25))?;
+            let oracle = fx.oracle();
+
+            handle.run_one_cycle().await?;
+            let baseline = assert_invariants(&handle, &oracle, src.id, SFTP_SUBFOLDER).await?;
+            anyhow::ensure!(
+                baseline.live_object_count == 1 && baseline.ok(),
+                "the SFTP arm needs a healthy baseline, got {} object(s): {}",
+                baseline.live_object_count,
+                baseline.violation_summary()
+            );
+
+            fx.swap_marker_identity()?;
+            write_file(fx.src_root(), "after.bin", &payload(SMALL_FIXTURE_LEN, 26))?;
+            let _ = handle.run_one_cycle().await;
+
+            let arm_codes = error_codes_in_activity(handle.state.as_ref()).await?;
+            anyhow::ensure!(
+                arm_codes.contains(&ErrorCode::DriveDestFolderMissing),
+                "SFTP arm: a marker naming a different destination must raise \
+                 drive.dest_folder_missing, got {arm_codes:?}"
+            );
+            let after = assert_invariants(&handle, &oracle, src.id, SFTP_SUBFOLDER).await?;
+            anyhow::ensure!(
+                after.live_object_count == 1,
+                "SFTP arm: NOTHING may be written to a destination that is not ours - that is the \
+                 whole point of the marker - but the destination holds {} object(s)",
+                after.live_object_count
+            );
+            anyhow::ensure!(
+                after.ok(),
+                "SFTP arm: s6.3 invariants violated: {}",
+                after.violation_summary()
+            );
+            let rows = handle.state.load_source_file_state(src.id).await?;
+            let synced_after: Vec<String> = rows
+                .iter()
+                .filter(|(rel, r)| {
+                    r.status == FileStateStatus::Synced && rel.as_str().contains("after")
+                })
+                .map(|(rel, _)| rel.to_string())
+                .collect();
+            anyhow::ensure!(
+                synced_after.is_empty(),
+                "SFTP arm: {synced_after:?} was marked synced although the destination belonged to \
+                 a different Driven install"
+            );
+
+            quiesced &= is_quiescent(&handle.state().await);
+            for c in arm_codes {
+                if !codes.contains(&c) {
+                    codes.push(c);
+                }
+            }
+            notes.push(format!(
+                "SFTP arm (marker holds a different destination id): baseline kept, nothing new \
+                 written, {} live object(s)",
                 after.live_object_count
             ));
             reports.push(after);

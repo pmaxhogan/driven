@@ -37,6 +37,7 @@ use driven_localfs::{LocalFsConfig, LocalFsStore};
 use driven_remote::remote_store::RemoteStore;
 use driven_remote::BackendKind;
 use driven_s3::{S3Config, S3CredentialStore, S3Credentials, S3Store};
+use driven_sftp::{SftpConfig, SftpCredentialStore, SftpStore};
 use driven_tls::{CustomCaConfig, ProxyConfig};
 
 /// Tracing target for the backend factory.
@@ -160,6 +161,12 @@ pub fn picker_root_id(kind: BackendKind) -> &'static str {
         // it, so nothing browses this today - but the factory must still have an
         // answer, and a wrong one would be worse than none.)
         BackendKind::LocalFolder => "",
+        // Same shape as S3: an SFTP "folder" id is a path RELATIVE to the
+        // account's configured `root_path`, so the empty path is the root -
+        // matching `SftpStore::root_id()`. Unlike LocalFolder this value is
+        // actually reached: `supports_folder_picker` is true here, so the
+        // destination picker browses from it.
+        BackendKind::Sftp => "",
     }
 }
 
@@ -179,6 +186,7 @@ pub fn build_store(
         BackendKind::GoogleDrive => build_google_drive(&account.account_id, ctx),
         BackendKind::S3 => build_s3(account, ctx),
         BackendKind::LocalFolder => build_local_folder(account),
+        BackendKind::Sftp => build_sftp(account),
     }
 }
 
@@ -210,6 +218,41 @@ fn build_s3(account: &AccountBackend, ctx: BackendContext<'_>) -> anyhow::Result
     Ok(StoreOutcome::Store(Arc::new(store)))
 }
 
+/// The SFTP arm: persisted non-secret config + keychain password/private key ->
+/// `SftpStore`.
+///
+/// Unlike [`build_s3`] and [`build_google_drive`] this takes no
+/// [`BackendContext`]: SSH is its own transport, not TLS, so there is no
+/// custom CA or HTTP proxy to thread through (issue #34 applies to the
+/// backends that speak HTTPS).
+fn build_sftp(account: &AccountBackend) -> anyhow::Result<StoreOutcome> {
+    let json = account.config_json.as_deref().ok_or_else(|| {
+        anyhow::anyhow!("sftp.config_invalid: the account has no stored SFTP backend configuration")
+    })?;
+    let config = SftpConfig::from_json(json)?;
+    let Some(creds) = SftpCredentialStore::new(account.account_id.clone()).load()? else {
+        tracing::warn!(
+            target: TARGET,
+            account_id = %account.account_id,
+            "no stored SFTP credential; account needs reauth (NOT falling back to a fake store)"
+        );
+        return Ok(StoreOutcome::NeedsReauth);
+    };
+    let store = SftpStore::new(&config, &creds)?;
+    tracing::info!(
+        target: TARGET,
+        account_id = %account.account_id,
+        // Host, port and root path are NOT secrets and are what an operator
+        // needs to debug a destination that stopped being reachable. The
+        // password/private key is never logged.
+        host = %config.host,
+        port = config.port,
+        root_path = %config.root_path,
+        "built real SftpStore (keyring password/private key)"
+    );
+    Ok(StoreOutcome::Store(Arc::new(store)))
+}
+
 /// Persist an account's S3 destination: validate + normalize the non-secret
 /// config into the blob for `accounts.backend_config_json`, and put the access
 /// key pair in the OS keychain.
@@ -223,6 +266,29 @@ pub fn store_s3_credentials(
 ) -> anyhow::Result<String> {
     let config = config.normalized()?;
     S3CredentialStore::new(account_id.to_string()).store(creds)?;
+    config.to_json()
+}
+
+/// Persist an account's SSH (SFTP) destination: validate + normalize the
+/// non-secret config into the blob for `accounts.backend_config_json`, and put
+/// the password / private key in the OS keychain.
+///
+/// Returns the config JSON for the caller to store on the account row. The
+/// credential is NOT returned and never reaches the caller's storage.
+///
+/// `config` is expected to carry the pinned host-key fingerprint and the
+/// destination id the CREATION PROBE recorded
+/// ([`driven_sftp::prepare_destination`]) - this function only persists what it
+/// is handed, and an account stored without a pinned fingerprint could never
+/// connect again ([`driven_sftp::session::SftpSession::connect`] refuses an
+/// unpinned config before it opens a socket).
+pub fn store_sftp_credentials(
+    account_id: &str,
+    config: SftpConfig,
+    credential: &driven_sftp::SftpCredential,
+) -> anyhow::Result<String> {
+    let config = config.normalized()?;
+    SftpCredentialStore::new(account_id.to_string()).store(credential)?;
     config.to_json()
 }
 
@@ -245,6 +311,7 @@ pub fn purge_account_secrets(account: &AccountBackend) -> anyhow::Result<()> {
         // what lets the folder be re-added later and ADOPT the objects already
         // on it, and it is not Driven's to delete from the user's disk.
         BackendKind::LocalFolder => Ok(()),
+        BackendKind::Sftp => SftpCredentialStore::new(account.account_id.clone()).purge(),
     }
 }
 
@@ -500,6 +567,7 @@ mod tests {
         assert_eq!(picker_root_id(BackendKind::GoogleDrive), "root");
         assert_eq!(picker_root_id(BackendKind::S3), "");
         assert_eq!(picker_root_id(BackendKind::LocalFolder), "");
+        assert_eq!(picker_root_id(BackendKind::Sftp), "");
     }
 
     #[test]
@@ -580,6 +648,61 @@ mod tests {
             prefix: None,
         };
         assert!(store_s3_credentials("acct-never-created", bad, &creds).is_err());
+    }
+
+    #[test]
+    fn store_sftp_credentials_validates_before_touching_the_keychain() {
+        // Same discipline as the S3 sibling: a config that could never work
+        // must not leave a password behind in the user's keychain.
+        let credential = driven_sftp::SftpCredential::Password {
+            password: "hunter2".to_string(),
+        };
+        let bad = SftpConfig {
+            host: String::new(),
+            port: driven_sftp::DEFAULT_PORT,
+            root_path: "/backups".to_string(),
+            username: "driven".to_string(),
+            auth: driven_sftp::SftpAuthKind::Password,
+            host_key_fingerprint: Some("SHA256:whatever".to_string()),
+            destination_id: Some("dest-1".to_string()),
+        };
+        assert!(store_sftp_credentials("acct-never-created", bad, &credential).is_err());
+    }
+
+    #[test]
+    fn a_persisted_sftp_config_blob_carries_no_credential_material() {
+        // The blob is what lands in SQLite and the diagnostic bundle. The
+        // fingerprint and destination id belong there (they are public facts
+        // about the server); the password never does.
+        //
+        // Rendered through the same `normalized().to_json()` path
+        // `store_sftp_credentials` uses, rather than through the function
+        // itself, so this test never reaches a keychain at all (the S3 sibling
+        // above is written the same way for the same reason).
+        let blob = SftpConfig {
+            host: "nas.example".to_string(),
+            port: 2222,
+            root_path: "/backups/".to_string(),
+            username: "driven".to_string(),
+            auth: driven_sftp::SftpAuthKind::Password,
+            host_key_fingerprint: Some("SHA256:abc".to_string()),
+            destination_id: Some("dest-1".to_string()),
+        }
+        .normalized()
+        .expect("valid")
+        .to_json()
+        .expect("json");
+        // Matched as a JSON KEY, because `"auth":"password"` is the (non-secret)
+        // auth-method tag and must not trip the guard.
+        for forbidden in ["password", "passphrase", "pem", "secret"] {
+            assert!(
+                !blob.to_lowercase().contains(&format!("\"{forbidden}\":")),
+                "the persisted blob must carry no {forbidden:?} field: {blob}"
+            );
+        }
+        assert!(blob.contains("SHA256:abc"));
+        assert!(blob.contains("dest-1"));
+        assert!(blob.contains("/backups"), "normalized root path: {blob}");
     }
 
     #[test]
@@ -687,6 +810,147 @@ mod tests {
             config_json: None,
         };
         purge_account_secrets(&account).expect("purging a credential-free backend is a no-op");
+    }
+
+    /// A minimal but valid `accounts.backend_config_json` blob for an SFTP
+    /// account, matching `SftpConfig`'s camelCase field names.
+    fn sftp_config_json() -> String {
+        r#"{"host":"example.com","port":22,"rootPath":"/backups","username":"alice","auth":"password"}"#
+            .to_string()
+    }
+
+    #[test]
+    fn an_sftp_account_without_config_is_an_error_not_a_needs_reauth() {
+        // A missing CONFIG is a bug (the account row was written wrong); a
+        // missing CREDENTIAL is a reauth. Conflating them would send the user
+        // round the credential prompt forever on a malformed row.
+        let account = AccountBackend {
+            account_id: "acct-sftp".to_string(),
+            kind: BackendKind::Sftp,
+            config_json: None,
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        // `StoreOutcome` holds a `dyn RemoteStore`, which has no `Debug`, so
+        // unwrap the Result by hand rather than via `expect_err`.
+        let err = match build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            },
+        ) {
+            Ok(_) => panic!("a missing SFTP config must be an error"),
+            Err(e) => e,
+        };
+        assert!(err.to_string().contains("sftp.config_invalid"), "{err}");
+    }
+
+    #[test]
+    fn an_invalid_sftp_config_blob_is_rejected_before_any_keychain_read() {
+        let account = AccountBackend {
+            account_id: "acct-sftp".to_string(),
+            kind: BackendKind::Sftp,
+            config_json: Some(
+                r#"{"host":"","rootPath":"/","username":"a","auth":"password"}"#.to_string(),
+            ),
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        assert!(build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            }
+        )
+        .is_err());
+    }
+
+    #[test]
+    fn an_sftp_account_with_a_valid_config_but_no_stored_credential_needs_reauth() {
+        // C5-P1-1 again, for the third backend that has a real credential: a
+        // syntactically valid config with nothing in the keychain must come
+        // back as NeedsReauth, never a store that cannot actually connect.
+        let Some(_g) = keychain() else { return };
+        let account = AccountBackend {
+            account_id: "acct-sftp-no-cred".to_string(),
+            kind: BackendKind::Sftp,
+            config_json: Some(sftp_config_json()),
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        let outcome = build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            },
+        )
+        .expect("an empty keychain is not an error");
+        assert!(matches!(outcome, StoreOutcome::NeedsReauth));
+        assert!(
+            outcome.store().is_none(),
+            "NeedsReauth must not yield a store"
+        );
+    }
+
+    #[test]
+    fn an_sftp_account_with_a_stored_credential_builds_a_real_store() {
+        let Some(_g) = keychain() else { return };
+        let account_id = "acct-sftp-with-cred";
+        driven_sftp::SftpCredentialStore::new(account_id.to_string())
+            .store(&driven_sftp::SftpCredential::Password {
+                password: "hunter2".to_string(),
+            })
+            .expect("store the credential in the in-memory keychain");
+        let account = AccountBackend {
+            account_id: account_id.to_string(),
+            kind: BackendKind::Sftp,
+            config_json: Some(sftp_config_json()),
+        };
+        let ca = CustomCaConfig::none();
+        let proxy = ProxyConfig::system();
+        let outcome = build_store(
+            &account,
+            BackendContext {
+                ca: &ca,
+                proxy: &proxy,
+            },
+        )
+        .expect("build the store");
+        assert!(matches!(outcome, StoreOutcome::Store(_)));
+        assert!(outcome.store().is_some());
+    }
+
+    #[test]
+    fn purging_an_sftp_account_deletes_its_keychain_credential() {
+        // The MANDATORY purge arm: without it, deleting the account leaves a
+        // live password/private key in the user's keychain forever.
+        let Some(_g) = keychain() else { return };
+        let account_id = "acct-sftp-purge";
+        let store = driven_sftp::SftpCredentialStore::new(account_id.to_string());
+        store
+            .store(&driven_sftp::SftpCredential::Password {
+                password: "hunter2".to_string(),
+            })
+            .expect("store the credential");
+        assert!(
+            store.load().expect("load").is_some(),
+            "the credential must be present before purging"
+        );
+
+        let account = AccountBackend {
+            account_id: account_id.to_string(),
+            kind: BackendKind::Sftp,
+            config_json: Some(sftp_config_json()),
+        };
+        purge_account_secrets(&account).expect("purge");
+
+        assert!(
+            store.load().expect("load after purge").is_none(),
+            "the credential must be gone after purging"
+        );
     }
 
     fn ctx<'a>(ca: &'a CustomCaConfig, proxy: &'a ProxyConfig) -> BackendContext<'a> {

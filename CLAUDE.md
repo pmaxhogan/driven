@@ -77,6 +77,10 @@ stack and the agent-facing entry points:
 
 - `just e2e` - containerized app-level e2e: the REAL Linux desktop app driven
   over WebDriver (wizard, backup -> restore round trips, fault scenarios).
+  Real destinations are sidecar subprocesses inside that image, not a compose
+  stack: MinIO + toxiproxy (`crates/driven-e2e/src/scenarios/s3.rs`) and an
+  OpenSSH server (`.../scenarios/sftp.rs`, key auth against an unprivileged
+  sshd). Copy one of those two stacks when adding a backend.
 - `just e2e-hold` - boot the container and drive the app interactively
   (WebDriver on :4444, IPC via `window.__TAURI_INTERNALS__.invoke`, faults
   via toxiproxy/iptables, screenshots for vision review).

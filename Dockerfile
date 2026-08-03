@@ -86,6 +86,9 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # recipes); never the default target.
 FROM debian:bookworm-slim AS e2e-runtime
 
+# openssh-server pulls in debconf prompts on an interactive frontend.
+ENV DEBIAN_FRONTEND=noninteractive
+
 RUN apt-get update \
  && apt-get install -y --no-install-recommends \
       ca-certificates \
@@ -95,9 +98,18 @@ RUN apt-get update \
       xvfb xauth webkit2gtk-driver \
       # secret-service so the OS-keychain seam (`keyring`) works headless
       dbus dbus-x11 gnome-keyring libsecret-1-0 \
+      # a REAL SSH server for the SFTP backend scenarios. openssh-client is
+      # named explicitly (not leaned on as a dependency) because the suite
+      # needs `ssh-keygen` to mint a fresh host key AND client keypair per
+      # scenario, in that scenario's tempdir.
+      openssh-server openssh-client \
       # fault injection + debugging tools for agents
       iproute2 iptables sudo procps curl jq sqlite3 \
- && rm -rf /var/lib/apt/lists/*
+ && rm -rf /var/lib/apt/lists/* \
+ # The postinst generates /etc/ssh/ssh_host_* keys. Nothing uses them (every
+ # scenario generates its own), and a published image carrying one fixed
+ # private host key is a smell worth not having - so drop them.
+ && rm -f /etc/ssh/ssh_host_*
 
 # MinIO (a real S3 destination for round-trip + wire-fault scenarios) and
 # toxiproxy (the network-fault proxy the suite parks between the app and

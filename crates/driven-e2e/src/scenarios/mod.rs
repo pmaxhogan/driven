@@ -3,6 +3,7 @@
 mod basic;
 mod faults;
 mod s3;
+mod sftp;
 
 use crate::scenario::Scenario;
 
@@ -17,5 +18,6 @@ pub fn all() -> Vec<Box<dyn Scenario>> {
         Box::new(faults::DestDiskFull),
         Box::new(s3::S3RoundTrip),
         Box::new(s3::S3NetworkCutMidSync),
+        Box::new(sftp::SftpRoundTrip),
     ]
 }

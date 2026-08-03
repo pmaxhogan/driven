@@ -27,7 +27,8 @@ bug class you care about:
 The Dockerfile `e2e-runtime` stage packages the REAL desktop app (release
 profile, embedded UI) with Xvfb + WebKitWebDriver + tauri-driver, a headless
 gnome-keyring (so OS-keychain code paths are real), MinIO + toxiproxy +
-iptables/tc for fault injection, and the `driven-e2e` suite binary.
+iptables/tc for fault injection, an OpenSSH server for the SFTP backend, and
+the `driven-e2e` suite binary.
 
 - `just e2e` - build the image + run every scenario (exit 0 = pass/skip).
 - `just e2e-run <names...>` - run specific scenarios (`driven-e2e list`).
@@ -69,6 +70,16 @@ surface - and `GET /session/<id>/screenshot` for visuals. The suite's
 - Wire faults for the S3 backend: toxiproxy sits between app and MinIO
   (see `crates/driven-e2e/src/scenarios/s3.rs`); `sudo iptables`/`tc` are
   available in-container for total-loss / shaping.
+- Real network destinations are SIDECAR SUBPROCESSES on free localhost ports,
+  not a compose stack: `S3Stack` (minio + toxiproxy) in `scenarios/s3.rs` and
+  `SftpStack` (a real `sshd`) in `scenarios/sftp.rs` are the two templates to
+  copy for a new backend. `SftpStack` runs sshd as the non-root `driven` user
+  with a per-scenario ed25519 host key + client key minted by `ssh-keygen`
+  into the scenario tempdir - no key material is baked into the image. That
+  unprivileged server is also what makes the read-only-root probe real (root
+  would bypass the mode bits); the flip side is that password auth cannot work
+  there (it needs `/etc/shadow`), so the e2e tier uses key auth and password
+  auth is covered by the driven-sftp unit tests + chaos `TestSftpServer`.
 - Disk-full: run the container with `--tmpfs /e2e-small-dest:rw,size=1m`
   (the justfile recipes already do).
 

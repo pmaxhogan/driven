@@ -129,6 +129,82 @@ pub struct CreateS3AccountRequest {
     pub secret_access_key: String,
 }
 
+/// Which credential a new SSH (SFTP) destination authenticates with.
+///
+/// A TAG only - it says which of [`CreateSftpAccountRequest`]'s secret fields
+/// the command must read, never the secret itself. Serialized as `password` /
+/// `privateKey` to match the wizard's radio values.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub enum SftpAuthMethodDto {
+    /// A plain SSH password.
+    Password,
+    /// A pasted SSH private key, optionally passphrase-protected.
+    PrivateKey,
+}
+
+/// The user-supplied settings for a new SSH (SFTP) destination
+/// (`create_sftp_account`).
+///
+/// `password` / `privateKey` / `passphrase` are IN-FLIGHT ONLY: the command
+/// writes them straight to the OS keychain and persists only the rest. They must
+/// never be echoed back to the webview, logged, or stored in SQLite - which is
+/// why there is no `SftpConfigDto` reading them back out, and why the command's
+/// tracing lines name only the host, port and root path.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct CreateSftpAccountRequest {
+    /// Optional human label for the account; defaults to
+    /// `{username}@{host}:{rootPath}`.
+    pub display_name: Option<String>,
+    /// The SSH server hostname or IP address (no scheme, no port).
+    pub host: String,
+    /// The SSH port; defaults to 22 when omitted.
+    pub port: Option<u16>,
+    /// The remote path Driven treats as the destination root. It must already
+    /// exist on the server - the probe never creates it, because a typo would
+    /// otherwise start a backup in a brand-new directory beside the intended
+    /// one.
+    pub root_path: String,
+    /// The SSH username to authenticate as.
+    pub username: String,
+    /// Which of the two credential fields below to read.
+    pub auth: SftpAuthMethodDto,
+    /// The SSH password, when `auth` is `password`. Keychain-bound; never
+    /// persisted anywhere else.
+    pub password: Option<String>,
+    /// The PEM-encoded SSH private key, when `auth` is `privateKey`.
+    /// Keychain-bound; never persisted anywhere else.
+    pub private_key: Option<String>,
+    /// The passphrase protecting `privateKey`, if it has one. Keychain-bound;
+    /// never persisted anywhere else.
+    pub passphrase: Option<String>,
+}
+
+/// The result of `create_sftp_account`: the new account plus the host-key
+/// fingerprint the creation probe PINNED.
+///
+/// The fingerprint is returned so the wizard can show the user what Driven
+/// trusted, in the OpenSSH `SHA256:<base64>` form they can compare against
+/// `ssh-keyscan` output. Trust-on-first-use is only honest if the user is told
+/// what was trusted; every later connection hard-fails if the server presents a
+/// different key.
+#[derive(Debug, Clone, Serialize, Deserialize)]
+#[serde(rename_all = "camelCase")]
+pub struct SftpAccountCreatedDto {
+    /// The account row that was persisted.
+    pub account: AccountDto,
+    /// The pinned host-key fingerprint, e.g. `SHA256:0Kx...`.
+    pub host_key_fingerprint: String,
+    /// Whether the root already carried another Driven destination marker that
+    /// this probe ADOPTED (`driven_sftp::PreparedDestination::Adopted`), rather
+    /// than stamping a fresh one. True means every object already on the server
+    /// stays reachable under this account - worth telling the user, since
+    /// silently reusing a stranger's-looking directory would otherwise read as
+    /// a bug rather than the intended re-add-an-existing-server behaviour.
+    pub adopted: bool,
+}
+
 /// The user-supplied settings for a new local / removable-folder destination
 /// (`create_local_folder_account`).
 ///
