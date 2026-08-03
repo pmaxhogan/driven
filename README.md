@@ -106,7 +106,7 @@ Notes:
 - ⁴¹ Driven's checkmark is scoped to Windows, where a VSS snapshot lets a locked file (Outlook PST, running DB, VM disk) back up while it is held open. macOS has an equivalent behind an opt-in setting (Settings > macOS): a small privileged helper mounts a read-only APFS local snapshot so a *busy* file can be read: it is off by default, and it does nothing for a Full Disk Access denial. On both macOS and Linux, a file Driven cannot open is in any case classified precisely as a transient lock (`local.file_locked`) versus a macOS Full Disk Access denial (`local.permission_denied`) and skipped with a clear reason in the activity log, rather than misreported as a disk error. Linux has no snapshot equivalent and none is planned. See `design/DESIGN.md` §5.3 and §5.3.2.
 - ⁴² Driven's checkmark is scoped to the Google Drive destination. Keeping previous versions relies on a changed file's re-upload landing on a NEW remote object, which is true of a Drive create but not of a destination whose object key is derived from the file name: on S3-compatible stores, SFTP servers, and local folders the re-upload overwrites the previous copy. Driven therefore does not offer per-source versioning or a restore-by-date on those destinations at all, rather than reporting a point-in-time restore it cannot perform. For recoverability on S3, enable the provider's own bucket versioning. See [issue #220](https://github.com/pmaxhogan/driven/issues/220).
 - ⁴³ Google Drive (the original destination), any S3-compatible object store (AWS S3, Cloudflare R2, MinIO, Backblaze B2 in S3-compatible mode, Wasabi), any SSH server with SFTP (a NAS, home server, or VPS - added in v2.9.0, with TOFU host-key pinning and password or private-key auth), and a local or removable folder (USB drive, external disk, NAS share) - all behind one `RemoteStore` trait. OneDrive and other non-S3-compatible cloud APIs are not implemented.
-- ⁴⁴ Driven runs three independent periodic checks, not one: a weekly local re-hash (deep-verify) that catches local bit-rot, a startup / deep-verify remote-existence audit that catches an object deleted at the destination outside Driven, and, added in v2.5.0, a weekly rolling integrity scrub that re-checks each already-backed-up object's size against the destination and, where the destination can supply one, its content checksum too - catching remote-side corruption or tampering that neither of the other two checks can see. On by default; a source's population is swept in bounded slices (500 objects per run by default) rather than all at once. Checksum coverage depends on the destination: full on Google Drive and on a local-folder destination (which always re-hashes the bytes it just wrote); size-only for an S3 object uploaded via multipart, because S3 stores no plain content digest for one, only an ETag that digests the individual parts - the scrub reports those as unverifiable rather than guessing, never as falsely clean.
+- ⁴⁴ Driven runs four independent periodic checks, not one: a weekly local re-hash (deep-verify) that catches local bit-rot, a startup / deep-verify remote-existence audit that catches an object deleted at the destination outside Driven, and, added in v2.5.0, a weekly rolling integrity scrub that re-checks each already-backed-up object's size against the destination and, where the destination can supply one, its content checksum too - catching remote-side corruption or tampering that neither of the other two checks can see. On by default; a source's population is swept in bounded slices (500 objects per run by default) rather than all at once. Checksum coverage depends on the destination: full on Google Drive and on a local-folder destination (which always re-hashes the bytes it just wrote); size-only for an S3 object uploaded via multipart, because S3 stores no plain content digest for one, only an ETag that digests the individual parts - the scrub reports those as unverifiable rather than guessing, never as falsely clean. The fourth check is the restore drill: every one of the three above verifies the backup from the WRITE side ("is what we wrote still there?"), and none of them ever runs the reverse pipeline, so a broken restore path or an unusable key stays invisible until the day you actually need your data. Once a month Driven therefore restores a few of your backed-up files for real - download, decrypt, extract, verify the plaintext hash - into a temporary directory, then deletes them. On by default, three files per drill; both the cadence and the sample size are configurable, and the whole thing has a kill switch. A drill that verifies nothing (nothing restorable yet, or a locked keychain) is reported as inconclusive, never as a pass.
 
 Competitor rows were verified in July 2026 against rclone 1.74.4, restic 0.19.1,
 Duplicati 2.3.0.4, Backblaze Personal Backup 10.0.2, and Drive for desktop 128.0.
@@ -174,19 +174,19 @@ These move: check each project's current docs before relying on a cell.
   catching remote-side corruption that neither of those two checks can see.
   On by default, weekly, in bounded slices so a huge source never triggers
   an unbounded sweep.
+- Restore drill: the only check that exercises the READ side. Every other
+  check asks "is what we wrote still there?"; a drill periodically restores a
+  small, deterministically-sampled set of your backed-up files through the
+  real restore path - download, decrypt, extract, verify the plaintext hash -
+  into a temp directory, then deletes them, proving your data actually comes
+  back rather than merely that it is still stored. On by default, monthly,
+  three files per drill. Reports are counts and error codes only, so a drill
+  report can never leak an encrypted source's filenames.
 - rclone config importer (`driven-cli rclone`): point it at an existing
   `rclone.conf` and it tells you exactly what to enter for an `s3` or
   `drive` remote, rather than making you re-type every endpoint and key.
   Read-only - it never creates an account itself. See "Migrating from
   rclone" below.
-
-<!--
-DRAFT - do not uncomment until the corresponding PR merges. Flip each bullet
-on individually as its PR lands, then delete this comment wrapper.
-- Restore drill: a one-click "prove the backup actually restores" check.
-  (core engine landed, #215 DRAFT / unmerged - surface is not wired up to
-  anything a user can click yet.)
--->
 
 ## Install
 

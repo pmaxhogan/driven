@@ -5111,4 +5111,281 @@ mod tests {
             "unencrypted DB row forces plaintext even on an Unavailable provider"
         );
     }
+
+    // --- restore drills end to end (driven_core::drill) -----------------------
+    //
+    // These drive `drill_restore_one` against a REAL `AppState` (real SQLite
+    // repo, real source/account rows, real `InMemoryRemoteStore`) rather than a
+    // fake probe. That is the whole point of the drill: unit tests can prove the
+    // scheduling and the report arithmetic, but only running a real restore
+    // proves the thing the feature claims - that a backed-up file actually comes
+    // back. A drill test that stubbed the restore would be testing nothing.
+
+    /// [`state_with_source_on`] plus the account id, which the drill tests need
+    /// in order to reach the account's SHARED fake remote store (the same store
+    /// `build_restore_store` hands the restore path in `RemoteMode::Fake`).
+    ///
+    /// A local variant rather than a change to `state_with_source_on`: four other
+    /// tests depend on that helper's signature.
+    async fn drill_state_with_account() -> (
+        AppState,
+        SourceId,
+        driven_core::types::AccountId,
+        std::path::PathBuf,
+    ) {
+        use crate::app_state::RemoteMode;
+        use driven_core::state::StateRepo;
+        use std::collections::HashMap;
+        use std::sync::Arc;
+
+        let nonce = uuid::Uuid::new_v4();
+        let dir = std::env::temp_dir().join(format!("driven-drill-e2e-{nonce}"));
+        std::fs::create_dir_all(&dir).unwrap();
+        let repo = driven_core::state::SqliteStateRepo::open(&dir.join("state.db"))
+            .await
+            .expect("open state repo");
+        let account = driven_core::state::AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
+            id: driven_core::types::AccountId::new_v4(),
+            email: "alice@example.com".into(),
+            display_name: Some("Alice".into()),
+            state: driven_core::types::AccountState::Ok,
+            encryption_master_key_id: Some("kc:alice".into()),
+            created_at: 1_700_000_000_000,
+            last_synced_at: None,
+        };
+        repo.upsert_account(&account).await.unwrap();
+        let src_id = SourceId::new_v4();
+        let source = driven_core::state::SourceRow {
+            id: src_id,
+            account_id: account.id,
+            display_name: "Docs".into(),
+            enabled: true,
+            local_path: "/home/alice/docs".into(),
+            drive_folder_id: "folder-1".into(),
+            drive_id: None,
+            drive_folder_path: "/Driven/Docs".into(),
+            // Plaintext: the drill under test is about the RESTORE pipeline, and
+            // an encrypted source would need a live keychain suite, which
+            // `drill_restore_one` correctly SKIPS rather than fails. The skip
+            // path is asserted separately below.
+            encryption_enabled: false,
+            wrapped_source_key: None,
+            respect_gitignore: true,
+            include_patterns: vec!["**/*".into()],
+            exclude_patterns: vec![],
+            placeholder_policy: Default::default(),
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: 604_800,
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            mtime_granularity_ns: None,
+            created_at: 1_700_000_000_000,
+        };
+        repo.upsert_source(&source).await.unwrap();
+        let app_state = AppState::new(
+            Arc::new(repo),
+            HashMap::new(),
+            RemoteMode::Fake,
+            Arc::new(std::sync::Mutex::new(HashMap::new())),
+        );
+        (app_state, src_id, account.id, dir)
+    }
+
+    /// Store `plaintext` in the account's shared fake remote and record a matching
+    /// SYNCED `file_state` row, returning the remote object id.
+    ///
+    /// The `hash_blake3` on the row is the REAL hash of `plaintext`. That is
+    /// load-bearing, not incidental: `restore_one_file` verifies the restored
+    /// bytes against `file_state`, so seeding the usual `[0u8; 32]` placeholder
+    /// would make every drill report `Failed` and the "passing drill" test would
+    /// pass for exactly the wrong reason.
+    async fn seed_drillable_file(
+        state: &AppState,
+        src: SourceId,
+        account: driven_core::types::AccountId,
+        rel: &str,
+        plaintext: &[u8],
+    ) -> String {
+        use driven_drive::remote_store::UploadBody;
+
+        let store = state.fake_remote_store(account);
+        let parent = store.root_id().to_string();
+        let entry = store
+            .create(
+                &parent,
+                rel,
+                "application/octet-stream",
+                UploadBody::Bytes(bytes::Bytes::from(plaintext.to_vec())),
+                std::collections::HashMap::new(),
+            )
+            .await
+            .expect("store the backed-up object");
+
+        let mut row = file_state_row(src, rel, Some(&entry.id), FileStateStatus::Synced);
+        row.size = plaintext.len() as u64;
+        row.hash_blake3 = *blake3::hash(plaintext).as_bytes();
+        row.last_uploaded_at = Some(1_700_000_000_000);
+        state.state().upsert_file_state(&row).await.unwrap();
+        entry.id
+    }
+
+    fn drill_candidate(src: SourceId, rel: &str, size: u64) -> driven_core::drill::DrillCandidate {
+        driven_core::drill::DrillCandidate {
+            source_id: src,
+            path: driven_core::types::RelativePath::try_from(rel.to_string()).unwrap(),
+            size,
+        }
+    }
+
+    /// Serialises the two tests that assert the drill's temp-directory cleanup.
+    ///
+    /// `drill_restore_one` creates its scratch directory under the PROCESS-WIDE
+    /// temp dir with a fixed prefix, so two drills running concurrently see each
+    /// other's directories and a before/after comparison would report a
+    /// perfectly-cleaned drill as a leak. `cargo test` runs these in parallel by
+    /// default, so the comparison window has to be exclusive. Only the drill
+    /// tests create `driven-drill-` directories, so a guard shared between them
+    /// is sufficient.
+    ///
+    /// A `tokio` mutex rather than a `std` one because the guard is held ACROSS
+    /// the `drill_restore_one().await` - which is the entire point, since that
+    /// call is the window being measured.
+    static DRILL_TEMP_LOCK: tokio::sync::Mutex<()> = tokio::sync::Mutex::const_new(());
+
+    /// The names of the drill's own temp directories that currently exist. The
+    /// drill creates them with a fixed `driven-drill-` prefix and must remove
+    /// them before returning, so comparing this set across a call is how the
+    /// no-plaintext-left-behind guarantee gets checked without naming a
+    /// directory the function creates internally.
+    fn drill_temp_dirs() -> std::collections::BTreeSet<String> {
+        std::fs::read_dir(std::env::temp_dir())
+            .map(|rd| {
+                rd.filter_map(Result::ok)
+                    .map(|e| e.file_name().to_string_lossy().into_owned())
+                    .filter(|n| n.starts_with("driven-drill-"))
+                    .collect()
+            })
+            .unwrap_or_default()
+    }
+
+    /// Assert the drill left none of its scratch directories behind. `before` is
+    /// the set captured under [`DRILL_TEMP_LOCK`] immediately before the call.
+    fn assert_no_drill_temp_leaked(before: &std::collections::BTreeSet<String>, context: &str) {
+        let leaked: Vec<String> = drill_temp_dirs().difference(before).cloned().collect();
+        assert!(
+            leaked.is_empty(),
+            "{context}: the drill must leave NO temp directory behind - one that \
+             left decrypted plaintext lying around would turn an integrity \
+             feature into a data-exposure one. Leaked: {leaked:?}"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_drill_verifies_a_genuinely_restorable_file_through_the_real_restore_path() {
+        // The headline test: a file that really is backed up restores, verifies,
+        // and reports Verified - through `resolve_restore_items` ->
+        // `build_restore_plans` -> `restore_one_file` (download, stream, BLAKE3
+        // verify, confined atomic write), not a shortcut.
+        let (state, src, account, dir) = drill_state_with_account().await;
+        let plaintext = b"the bytes a user would get back on the worst day of their year";
+        seed_drillable_file(&state, src, account, "taxes.pdf", plaintext).await;
+
+        let guard = DRILL_TEMP_LOCK.lock().await;
+        let before = drill_temp_dirs();
+        let attempt = drill_restore_one(
+            &state,
+            &drill_candidate(src, "taxes.pdf", plaintext.len() as u64),
+        )
+        .await;
+
+        assert_eq!(
+            attempt,
+            driven_core::drill::DrillAttempt::Verified,
+            "a genuinely restorable file must verify through the real restore path"
+        );
+        assert_no_drill_temp_leaked(&before, "a passing drill");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_drill_fails_when_the_stored_bytes_no_longer_match_what_was_backed_up() {
+        // The failure this whole feature exists to catch, and the one NO write-side
+        // check can see: the destination still reports the size and checksum Driven
+        // recorded (rot_object_bytes pins the pre-rot md5), so the metadata-only
+        // integrity scrub would call this object clean. Only actually restoring it
+        // and re-hashing the bytes that come back reveals that the content is not
+        // what was uploaded.
+        let (state, src, account, dir) = drill_state_with_account().await;
+        let plaintext = b"the original, correct backup contents";
+        let object_id = seed_drillable_file(&state, src, account, "taxes.pdf", plaintext).await;
+
+        // Rot the stored bytes UNDER the recorded metadata.
+        let rotted = state
+            .fake_remote_store(account)
+            .rot_object_bytes(&object_id, b"silently corrupted at rest".to_vec());
+        assert!(rotted, "the object must exist to be rotted");
+
+        let guard = DRILL_TEMP_LOCK.lock().await;
+        let before = drill_temp_dirs();
+        let attempt = drill_restore_one(
+            &state,
+            &drill_candidate(src, "taxes.pdf", plaintext.len() as u64),
+        )
+        .await;
+
+        // FAILED, specifically - not Skipped. A skip says "we could not check",
+        // raises no alert, and would let this corruption go unreported forever.
+        match attempt {
+            driven_core::drill::DrillAttempt::Failed { code } => {
+                assert_eq!(
+                    code,
+                    ErrorCode::CryptoDecryptFailed,
+                    "a plaintext-hash mismatch is reported with the restore path's own code"
+                );
+            }
+            other => panic!("rotted bytes must FAIL the drill, not {other:?}"),
+        }
+        assert_no_drill_temp_leaked(&before, "a failing drill");
+        drop(guard);
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_drill_skips_rather_than_fails_a_candidate_that_is_no_longer_restorable() {
+        // A file deleted between the sample and the restore is a benign race, not
+        // evidence of a broken backup. Raising a data-loss alert for it would
+        // train users to ignore the alert that matters.
+        let (state, src, _account, dir) = drill_state_with_account().await;
+
+        let attempt =
+            drill_restore_one(&state, &drill_candidate(src, "never-existed.pdf", 10)).await;
+
+        assert!(
+            matches!(attempt, driven_core::drill::DrillAttempt::Skipped { .. }),
+            "an unresolvable candidate is SKIPPED, never failed; got {attempt:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
+
+    #[tokio::test]
+    async fn a_drill_skips_a_file_whose_row_was_never_uploaded() {
+        // A SYNCED row with no remote object and no bundle cannot be restored by
+        // the user either, so a drill must not report it as a restore FAILURE -
+        // it would be alarming about a file the restore browser would not even
+        // offer.
+        let (state, src, _account, dir) = drill_state_with_account().await;
+        let row = file_state_row(src, "pending.bin", None, FileStateStatus::Synced);
+        state.state().upsert_file_state(&row).await.unwrap();
+
+        let attempt = drill_restore_one(&state, &drill_candidate(src, "pending.bin", 3)).await;
+
+        assert!(
+            matches!(attempt, driven_core::drill::DrillAttempt::Skipped { .. }),
+            "a never-uploaded row is SKIPPED, never failed; got {attempt:?}"
+        );
+        let _ = std::fs::remove_dir_all(&dir);
+    }
 }
