@@ -40,7 +40,7 @@ jobs:
       # Build the e2e image with a GHA-backed layer cache so the (very heavy)
       # release-profile app build is incremental across runs.
       - name: Build e2e image
-        uses: docker/build-push-action@v6
+        uses: docker/build-push-action@v7
         with:
           context: .
           target: e2e-runtime
