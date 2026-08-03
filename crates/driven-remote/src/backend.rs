@@ -53,6 +53,11 @@ pub enum BackendKind {
     /// mount, or any local folder. Needs no credential at all - the user
     /// already has write access to the folder they chose.
     LocalFolder,
+    /// A remote directory reached over SSH/SFTP: a home server, a NAS, or a
+    /// VPS, with nothing installed server-side beyond `sshd`. Authorized by a
+    /// directly-entered password or private key rather than an OAuth consent
+    /// flow.
+    Sftp,
 }
 
 impl BackendKind {
@@ -62,6 +67,7 @@ impl BackendKind {
         BackendKind::GoogleDrive,
         BackendKind::S3,
         BackendKind::LocalFolder,
+        BackendKind::Sftp,
     ];
 
     /// The stable stored/wire identifier. This string is written to
@@ -72,6 +78,7 @@ impl BackendKind {
             BackendKind::GoogleDrive => "google_drive",
             BackendKind::S3 => "s3",
             BackendKind::LocalFolder => "local_folder",
+            BackendKind::Sftp => "sftp",
         }
     }
 
@@ -91,6 +98,9 @@ impl BackendKind {
             // A folder the user can already write to needs no credential, so
             // there is nothing to consent to and nothing in the keychain.
             BackendKind::LocalFolder => false,
+            // A password or private key the user pastes in; there is no
+            // consent flow to run.
+            BackendKind::Sftp => false,
         }
     }
 
@@ -107,6 +117,8 @@ impl BackendKind {
             // remote tree afterwards would only offer the user a way to nest
             // one backup inside another.
             BackendKind::LocalFolder => false,
+            // SFTP readdir drives the same prefix-browse the S3 picker uses.
+            BackendKind::Sftp => true,
         }
     }
 
@@ -151,6 +163,12 @@ impl BackendKind {
             // the same path and overwrites the previous bytes. A plain
             // filesystem also has no trash to fall back on.
             BackendKind::LocalFolder => false,
+            // NO, same reason again: an SFTP create writes to a path derived
+            // from the file's name (`driven-sftp` mirrors `driven-localfs`
+            // here), so a re-upload overwrites the previous bytes at the same
+            // remote path and there is no server-side trash to recover from.
+            // Issue #220 part 2 would give each version a distinct object.
+            BackendKind::Sftp => false,
         }
     }
 
@@ -252,6 +270,7 @@ mod tests {
         assert!(BackendKind::GoogleDrive.supports_version_history());
         assert!(!BackendKind::S3.supports_version_history());
         assert!(!BackendKind::LocalFolder.supports_version_history());
+        assert!(!BackendKind::Sftp.supports_version_history());
     }
 
     #[test]

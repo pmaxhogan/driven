@@ -1,18 +1,21 @@
 //! Translating one `rclone.conf` remote into Driven destination settings.
 //!
 //! [`classify`] is the whole surface: hand it an [`RcloneRemote`] and it
-//! returns what Driven can make of it. Three outcomes:
+//! returns what Driven can make of it. Four outcomes:
 //!
 //! - [`RemoteImport::S3`] - a `type = s3` remote. Everything Driven's S3
 //!   backend needs EXCEPT the bucket (see [`S3Remote`]).
 //! - [`RemoteImport::Drive`] - a `type = drive` remote. The non-secret settings
 //!   only; the OAuth grant cannot come along (see [`DriveRemote`]).
+//! - [`RemoteImport::Sftp`] - a `type = sftp` remote. Host/port/username carry
+//!   across; the password or private key never does (see [`SftpRemote`]).
 //! - [`RemoteImport::Unsupported`] - anything else, with the reason spelled out.
 //!
 //! Nothing in this module performs I/O, so every mapping decision below is
 //! covered by a plain unit test against a fixture.
 
 use driven_s3::{S3Config, S3ConfigError, DEFAULT_REGION};
+use driven_sftp::DEFAULT_PORT as SFTP_DEFAULT_PORT;
 
 use crate::config_file::RcloneRemote;
 use crate::secret::Secret;
@@ -244,6 +247,59 @@ impl DriveRemote {
     }
 }
 
+/// A `type = sftp` remote translated into what Driven can and cannot take.
+///
+/// ## The password / private key is never carried across
+///
+/// rclone stores `pass` "obscured" - AES-256-CTR under a hard-coded key baked
+/// into rclone's own source (obfuscation, not encryption; see the crate docs'
+/// "Obscured values" section). De-obscuring it would mean shipping rclone's
+/// key inside Driven, turning a merely inconvenient value into a directly
+/// usable one for anyone who reads `rclone.conf` off disk - the opposite of
+/// what obscuring is for. And `key_file` in `rclone.conf` is only a PATH to a
+/// private key on the machine that wrote the config, never the key material
+/// itself - there is nothing here to import even in principle.
+///
+/// So the credential ALWAYS has to be re-entered by hand in Driven's setup
+/// wizard, the same "settings carry across, the secret does not" split
+/// [`DriveRemote`] documents for the OAuth grant - which is why, like
+/// [`DriveRemote`], this type carries no `is_complete`/`to_config`: there is
+/// no path to a one-step import.
+///
+/// ## The root path is not in `rclone.conf` either
+///
+/// Same shape as [`S3Remote`]: rclone's sftp remote is a SERVICE (host + auth
+/// only), and the remote PATH is part of what you type at the CLI
+/// (`myremote:/some/dir`), never part of the config section. The rendering
+/// asks the caller for it, the same way [`render::RenderOptions::bucket`]
+/// does for S3.
+///
+/// [`render::RenderOptions::bucket`]: crate::render::RenderOptions::bucket
+#[derive(Debug, Clone)]
+pub struct SftpRemote {
+    /// The rclone remote name (the `[section]` header).
+    pub remote_name: String,
+    /// `host` as written, or `None` when absent (always a blocker: there is
+    /// nothing to connect to without it).
+    pub host: Option<String>,
+    /// The resolved port. Falls back to [`SFTP_DEFAULT_PORT`] (22) when `port`
+    /// is absent or does not parse as one.
+    pub port: u16,
+    /// `user` as written, or `None` when absent (always a blocker).
+    pub user: Option<String>,
+    /// Whether a `pass` option is present. The VALUE is never read - see the
+    /// type docs.
+    pub has_password: bool,
+    /// The `key_file` PATH as written, purely informational: the file's
+    /// contents are never read by this crate.
+    pub key_file: Option<String>,
+    /// Per-setting remarks, in the order they were produced.
+    pub notes: Vec<Note>,
+    /// Things that must be answered before the destination can be created.
+    /// NEVER empty for this type - see the type docs.
+    pub blockers: Vec<Note>,
+}
+
 /// What Driven can make of one rclone remote.
 #[derive(Debug, Clone)]
 pub enum RemoteImport {
@@ -251,6 +307,8 @@ pub enum RemoteImport {
     S3(Box<S3Remote>),
     /// A Google Drive destination.
     Drive(Box<DriveRemote>),
+    /// An SSH (SFTP) destination.
+    Sftp(Box<SftpRemote>),
     /// Nothing Driven can target.
     Unsupported {
         /// The rclone remote name.
@@ -268,6 +326,7 @@ impl RemoteImport {
         match self {
             RemoteImport::S3(r) => &r.remote_name,
             RemoteImport::Drive(r) => &r.remote_name,
+            RemoteImport::Sftp(r) => &r.remote_name,
             RemoteImport::Unsupported { remote_name, .. } => remote_name,
         }
     }
@@ -277,6 +336,7 @@ impl RemoteImport {
         match self {
             RemoteImport::S3(_) => Some(driven_remote::backend::BackendKind::S3),
             RemoteImport::Drive(_) => Some(driven_remote::backend::BackendKind::GoogleDrive),
+            RemoteImport::Sftp(_) => Some(driven_remote::backend::BackendKind::Sftp),
             RemoteImport::Unsupported { .. } => None,
         }
     }
@@ -296,6 +356,10 @@ impl RemoteImport {
             ),
             RemoteImport::Drive(_) => {
                 "Google Drive - imports partially (sign in to Driven to authorize)".to_string()
+            }
+            RemoteImport::Sftp(_) => {
+                "SSH (SFTP) - imports partially (re-enter the password or key in Driven)"
+                    .to_string()
             }
             RemoteImport::Unsupported {
                 remote_type,
@@ -340,7 +404,7 @@ impl std::fmt::Display for UnsupportedReason {
             ),
             UnsupportedReason::NoDrivenBackend => write!(
                 f,
-                "Driven backs up to Google Drive and S3-compatible storage only"
+                "Driven backs up to Google Drive, S3-compatible storage, and SSH (SFTP) servers only"
             ),
         }
     }
@@ -364,6 +428,7 @@ pub fn classify(remote: &RcloneRemote) -> RemoteImport {
     match remote_type.as_str() {
         "s3" => RemoteImport::S3(Box::new(classify_s3(remote))),
         "drive" => RemoteImport::Drive(Box::new(classify_drive(remote))),
+        "sftp" => RemoteImport::Sftp(Box::new(classify_sftp(remote))),
         "" => RemoteImport::Unsupported {
             remote_name: remote.name.clone(),
             remote_type,
@@ -636,6 +701,83 @@ fn classify_drive(remote: &RcloneRemote) -> DriveRemote {
         blockers,
         byo_client_id,
         byo_client_secret,
+    }
+}
+
+fn classify_sftp(remote: &RcloneRemote) -> SftpRemote {
+    let mut notes = Vec::new();
+    let mut blockers = Vec::new();
+
+    let host = remote.get("host").map(str::to_string);
+    if host.is_none() {
+        blockers.push("no `host` set - the SFTP server address is required".to_string());
+    }
+
+    let port = match remote.get("port") {
+        Some(raw) => match raw.trim().parse::<u16>() {
+            Ok(p) => p,
+            Err(_) => {
+                notes.push(format!(
+                    "`port` ({raw:?}) could not be parsed as a port number; defaulting to {SFTP_DEFAULT_PORT}"
+                ));
+                SFTP_DEFAULT_PORT
+            }
+        },
+        None => SFTP_DEFAULT_PORT,
+    };
+
+    let user = remote.get("user").map(str::to_string);
+    if user.is_none() {
+        blockers.push("no `user` set - the SSH username is required".to_string());
+    }
+
+    let has_password = remote.get("pass").is_some();
+    let key_file = remote.get("key_file").map(str::to_string);
+    let key_use_agent = remote
+        .get("key_use_agent")
+        .and_then(parse_bool)
+        .unwrap_or(false);
+
+    match (has_password, &key_file) {
+        (true, _) => notes.push(
+            "a `pass` is configured, but rclone stores it obscured (obfuscated, not encrypted) \
+             - Driven does not de-obscure it. Re-enter the password in Driven's setup wizard"
+                .to_string(),
+        ),
+        (false, Some(path)) => notes.push(format!(
+            "a private key is referenced at `{path}` on the machine that wrote this config; only \
+             the PATH is in rclone.conf, never the key material - paste the key into Driven's \
+             setup wizard"
+        )),
+        (false, None) if key_use_agent => notes.push(
+            "`key_use_agent = true`: this remote authenticates via ssh-agent, which Driven does \
+             not support in v1 - use a password or a pasted private key instead"
+                .to_string(),
+        ),
+        (false, None) => notes.push(
+            "no password or private key found in this remote's config - enter one in Driven's \
+             setup wizard"
+                .to_string(),
+        ),
+    }
+    // Unconditional: whatever the state above, Driven never has a usable
+    // credential to carry across - see the type docs.
+    blockers.push(
+        "the password or private key cannot be imported: rclone stores a password obscured \
+         (not encrypted) and a private key only by file path, so re-enter your credential in \
+         Driven's setup wizard - it takes one form"
+            .to_string(),
+    );
+
+    SftpRemote {
+        remote_name: remote.name.clone(),
+        host,
+        port,
+        user,
+        has_password,
+        key_file,
+        notes,
+        blockers,
     }
 }
 
@@ -1025,15 +1167,16 @@ mod tests {
 
     #[test]
     fn an_unrelated_backend_says_what_driven_supports() {
-        let out = classify(&remote("[sftp]\ntype = sftp\nhost = example.com\n"));
+        let out = classify(&remote("[wd]\ntype = webdav\nhost = example.com\n"));
         assert!(out.summary().contains("not importable"));
-        assert!(out.summary().contains("sftp"));
+        assert!(out.summary().contains("webdav"));
         match out {
             RemoteImport::Unsupported { reason, .. } => {
                 assert_eq!(reason, UnsupportedReason::NoDrivenBackend);
                 assert!(reason.to_string().contains("S3-compatible"));
+                assert!(reason.to_string().contains("SSH (SFTP)"));
             }
-            _ => panic!("sftp must not import"),
+            _ => panic!("webdav must not import"),
         }
     }
 
@@ -1074,7 +1217,8 @@ mod tests {
         let cases = [
             ("[a]\ntype = s3\n", Some(BackendKind::S3)),
             ("[a]\ntype = drive\n", Some(BackendKind::GoogleDrive)),
-            ("[a]\ntype = sftp\n", None),
+            ("[a]\ntype = sftp\n", Some(BackendKind::Sftp)),
+            ("[a]\ntype = webdav\n", None),
         ];
         for (text, expected) in cases {
             let out = classify(&remote(text));
@@ -1082,5 +1226,148 @@ mod tests {
             assert_eq!(out.remote_name(), "a");
             assert!(!out.summary().is_empty());
         }
+    }
+
+    // -----------------------------------------------------------------
+    // SFTP
+    // -----------------------------------------------------------------
+
+    fn sftp(text: &str) -> SftpRemote {
+        match classify(&remote(text)) {
+            RemoteImport::Sftp(r) => *r,
+            other => panic!("expected an sftp import, got {}", other.summary()),
+        }
+    }
+
+    #[test]
+    fn an_sftp_remote_carries_across_host_port_and_user() {
+        let r = sftp("[nas]\ntype = sftp\nhost = nas.example\nport = 2222\nuser = alice\n");
+        assert_eq!(r.host.as_deref(), Some("nas.example"));
+        assert_eq!(r.port, 2222);
+        assert_eq!(r.user.as_deref(), Some("alice"));
+    }
+
+    #[test]
+    fn an_sftp_remote_without_a_port_defaults_to_22() {
+        let r = sftp("[nas]\ntype = sftp\nhost = nas.example\nuser = alice\n");
+        assert_eq!(r.port, driven_sftp::DEFAULT_PORT);
+        assert_eq!(driven_sftp::DEFAULT_PORT, 22);
+    }
+
+    #[test]
+    fn an_unparsable_port_falls_back_to_the_default_with_a_note() {
+        let r = sftp("[nas]\ntype = sftp\nhost = nas.example\nuser = alice\nport = not-a-port\n");
+        assert_eq!(r.port, driven_sftp::DEFAULT_PORT);
+        assert!(r.notes.iter().any(|n| n.contains("port")), "{:?}", r.notes);
+    }
+
+    #[test]
+    fn a_missing_host_is_a_blocker() {
+        let r = sftp("[nas]\ntype = sftp\nuser = alice\n");
+        assert!(r.host.is_none());
+        assert!(
+            r.blockers.iter().any(|b| b.contains("host")),
+            "{:?}",
+            r.blockers
+        );
+    }
+
+    #[test]
+    fn a_missing_user_is_a_blocker() {
+        let r = sftp("[nas]\ntype = sftp\nhost = nas.example\n");
+        assert!(r.user.is_none());
+        assert!(
+            r.blockers.iter().any(|b| b.contains("user")),
+            "{:?}",
+            r.blockers
+        );
+    }
+
+    #[test]
+    fn the_password_is_reported_present_but_never_carried_across() {
+        let r = sftp(
+            "[nas]\ntype = sftp\nhost = nas.example\nuser = alice\npass = super-obscured-garbage\n",
+        );
+        assert!(r.has_password);
+        assert!(
+            r.notes.iter().any(|n| n.contains("obscured")),
+            "{:?}",
+            r.notes
+        );
+        assert!(
+            r.blockers
+                .iter()
+                .any(|b| b.contains("re-enter your credential")),
+            "{:?}",
+            r.blockers
+        );
+        let rendered = format!("{r:?}");
+        assert!(
+            !rendered.contains("super-obscured-garbage"),
+            "the obscured value must never be echoed back: {rendered}"
+        );
+    }
+
+    #[test]
+    fn a_private_key_file_path_is_noted_but_never_read() {
+        let r = sftp(
+            "[nas]\ntype = sftp\nhost = nas.example\nuser = alice\nkey_file = /home/u/.ssh/id_ed25519\n",
+        );
+        assert_eq!(r.key_file.as_deref(), Some("/home/u/.ssh/id_ed25519"));
+        assert!(!r.has_password);
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("/home/u/.ssh/id_ed25519") && n.contains("PATH")),
+            "{:?}",
+            r.notes
+        );
+    }
+
+    #[test]
+    fn key_use_agent_is_noted_as_unsupported_in_v1() {
+        let r =
+            sftp("[nas]\ntype = sftp\nhost = nas.example\nuser = alice\nkey_use_agent = true\n");
+        assert!(
+            r.notes.iter().any(|n| n.contains("ssh-agent")),
+            "{:?}",
+            r.notes
+        );
+    }
+
+    #[test]
+    fn an_sftp_remote_with_nothing_credential_shaped_still_explains_what_to_do() {
+        let r = sftp("[nas]\ntype = sftp\nhost = nas.example\nuser = alice\n");
+        assert!(!r.has_password);
+        assert!(r.key_file.is_none());
+        assert!(
+            r.notes
+                .iter()
+                .any(|n| n.contains("no password or private key")),
+            "{:?}",
+            r.notes
+        );
+    }
+
+    #[test]
+    fn an_sftp_remote_is_never_reported_as_a_one_step_import() {
+        // Unlike S3, the credential ALWAYS has to be re-entered by hand, so
+        // there is no state where an sftp remote imports fully.
+        for text in [
+            "[nas]\ntype = sftp\nhost = nas.example\nuser = alice\npass = x\n",
+            "[nas]\ntype = sftp\n",
+        ] {
+            let r = sftp(text);
+            assert!(!r.blockers.is_empty(), "{text}");
+        }
+    }
+
+    #[test]
+    fn no_sftp_note_or_blocker_ever_contains_the_password_value() {
+        let r = sftp(
+            "[nas]\ntype = sftp\nhost = nas.example\nuser = alice\npass = TOPSECRETOBSCURED\n",
+        );
+        let rendered = format!("{:?} {:?} {:?}", r.notes, r.blockers, r);
+        assert!(!rendered.contains("TOPSECRETOBSCURED"), "{rendered}");
     }
 }

@@ -12,7 +12,7 @@
 
 use serde_json::{json, Map, Value};
 
-use crate::import::{DriveRemote, RemoteImport, S3Remote};
+use crate::import::{DriveRemote, RemoteImport, S3Remote, SftpRemote};
 use crate::secret::Secret;
 
 /// How much to render, and whether credentials may be printed.
@@ -24,6 +24,12 @@ pub struct RenderOptions {
     pub bucket: Option<String>,
     /// An optional key prefix to confine Driven to a subtree.
     pub prefix: Option<String>,
+    /// The destination root path the user named for an SFTP import. rclone
+    /// remotes carry no path (it is part of the remote you type, e.g.
+    /// `remote:/some/dir`), the same way they carry no S3 bucket - without
+    /// this the SFTP rendering shows the setting as outstanding rather than
+    /// guessing.
+    pub root_path: Option<String>,
     /// Print secret values instead of `<redacted>`.
     ///
     /// OFF by default, and the CLI flag that turns it on says in its help that
@@ -89,6 +95,7 @@ pub fn render_detail(import: &RemoteImport, opts: &RenderOptions) -> String {
     match import {
         RemoteImport::S3(r) => render_s3_detail(r, opts, &mut out),
         RemoteImport::Drive(r) => render_drive_detail(r, opts, &mut out),
+        RemoteImport::Sftp(r) => render_sftp_detail(r, opts, &mut out),
         RemoteImport::Unsupported {
             remote_type,
             reason,
@@ -232,6 +239,43 @@ fn render_drive_detail(r: &DriveRemote, opts: &RenderOptions, out: &mut String) 
     );
 }
 
+fn render_sftp_detail(r: &SftpRemote, opts: &RenderOptions, out: &mut String) {
+    out.push_str("Type:   sftp -> Driven destination \"SSH (SFTP)\"\n\n");
+    out.push_str("Settings that carry across:\n");
+    push_field(out, "Host", r.host.as_deref().unwrap_or("(missing)"));
+    push_field(out, "Port", &r.port.to_string());
+    push_field(out, "Username", r.user.as_deref().unwrap_or("(missing)"));
+    match &opts.root_path {
+        Some(p) => push_field(out, "Path", p),
+        None => push_field(
+            out,
+            "Path",
+            "(not in rclone.conf - rclone puts the path in the REMOTE you type, \
+             e.g. `remote:/some/dir`. Re-run with --root-path <path>.)",
+        ),
+    }
+
+    out.push_str("\nSettings that CANNOT carry across:\n");
+    push_field(
+        out,
+        "Password / private key",
+        if r.has_password {
+            "a password is present in rclone.conf but obscured, NOT imported (see below)"
+        } else if r.key_file.is_some() {
+            "a private key is referenced by file path only, NOT imported (see below)"
+        } else {
+            "(none in rclone.conf)"
+        },
+    );
+
+    push_notes(out, &r.notes, &r.blockers);
+    out.push_str(
+        "\nNext: Driven -> Add account -> SSH (SFTP), and enter the settings above plus the \
+         password or private key by hand - it is stored in your OS keychain, never in Driven's \
+         config.\n",
+    );
+}
+
 fn push_field(out: &mut String, label: &str, value: &str) {
     out.push_str(&format!("  {label:<22} {value}\n"));
 }
@@ -321,6 +365,19 @@ pub fn to_json(import: &RemoteImport, opts: &RenderOptions) -> Value {
             root.insert("notes".into(), json!(r.notes));
             root.insert("blockers".into(), json!(r.blockers));
         }
+        RemoteImport::Sftp(r) => {
+            // Never `true`: the credential always has to be re-entered by
+            // hand (see the type docs), so there is no one-step import.
+            root.insert("importable".into(), json!(false));
+            root.insert("host".into(), json!(r.host));
+            root.insert("port".into(), json!(r.port));
+            root.insert("user".into(), json!(r.user));
+            root.insert("rootPath".into(), json!(opts.root_path));
+            root.insert("hasPassword".into(), json!(r.has_password));
+            root.insert("keyFile".into(), json!(r.key_file));
+            root.insert("notes".into(), json!(r.notes));
+            root.insert("blockers".into(), json!(r.blockers));
+        }
         RemoteImport::Unsupported {
             remote_type,
             reason,
@@ -354,6 +411,7 @@ mod tests {
 
     const R2: &str = "[r2]\ntype = s3\nprovider = Cloudflare\naccess_key_id = AKIDEXAMPLE\nsecret_access_key = TOPSECRETVALUE\nendpoint = https://acct.r2.cloudflarestorage.com\nregion = auto\n";
     const GDRIVE: &str = "[gd]\ntype = drive\nroot_folder_id = 1AbC\nteam_drive = 0XYZ\nclient_id = cid.apps.googleusercontent.com\nclient_secret = GOCSPX-TOPSECRETCLIENT\ntoken = {\"refresh_token\":\"1//0eTOPSECRETTOKEN\"}\n";
+    const NAS_SFTP: &str = "[nas]\ntype = sftp\nhost = nas.example\nport = 2222\nuser = alice\npass = TOPSECRETOBSCURED\n";
 
     fn one(text: &str) -> RemoteImport {
         let cfg = RcloneConfig::parse(text).unwrap();
@@ -363,14 +421,17 @@ mod tests {
     #[test]
     fn the_listing_shows_every_remote_and_a_count() {
         let cfg = RcloneConfig::parse(
-            "[r2]\ntype = s3\nprovider = Cloudflare\naccess_key_id = k\nsecret_access_key = s\nendpoint = https://e.example\n[gd]\ntype = drive\n[nas]\ntype = sftp\n",
+            "[r2]\ntype = s3\nprovider = Cloudflare\naccess_key_id = k\nsecret_access_key = s\nendpoint = https://e.example\n[gd]\ntype = drive\n[nas]\ntype = sftp\nhost = nas.example\nuser = alice\n[wd]\ntype = webdav\n",
         )
         .unwrap();
         let listing = render_list(&crate::classify_all(&cfg));
-        for name in ["r2", "gd", "nas"] {
+        for name in ["r2", "gd", "nas", "wd"] {
             assert!(listing.contains(name), "{name} missing from:\n{listing}");
         }
-        assert!(listing.contains("2 of 3 remote(s)"), "{listing}");
+        // r2, gd and nas all map to a Driven backend (sftp is now supported,
+        // even though its own credential still has to be re-entered by
+        // hand); wd does not.
+        assert!(listing.contains("3 of 4 remote(s)"), "{listing}");
         assert!(listing.contains("not importable"), "{listing}");
     }
 
@@ -601,6 +662,7 @@ mod tests {
                 prefix: Some("/laptop/".into()),
                 reveal_secrets: true,
                 config_path: None,
+                root_path: None,
             },
         );
         assert_eq!(v["secretAccessKey"], json!("TOPSECRETVALUE"));
@@ -658,5 +720,78 @@ mod tests {
         assert_eq!(v["importable"], json!(false));
         assert_eq!(v["rcloneType"], json!("b2"));
         assert!(v["reason"].as_str().unwrap().contains("backblazeb2.com"));
+    }
+
+    // -----------------------------------------------------------------
+    // SFTP
+    // -----------------------------------------------------------------
+
+    #[test]
+    fn the_sftp_detail_carries_across_host_port_and_user_but_never_the_password() {
+        let out = render_detail(&one(NAS_SFTP), &RenderOptions::default());
+        assert!(out.contains("nas.example"), "{out}");
+        assert!(out.contains("2222"), "{out}");
+        assert!(out.contains("alice"), "{out}");
+        assert!(
+            !out.contains("TOPSECRETOBSCURED"),
+            "the obscured password must never be rendered:\n{out}"
+        );
+        assert!(out.contains("NOT imported"), "{out}");
+
+        // reveal_secrets does not change anything here - there is no secret
+        // this crate holds to reveal.
+        let shown = render_detail(
+            &one(NAS_SFTP),
+            &RenderOptions {
+                reveal_secrets: true,
+                ..Default::default()
+            },
+        );
+        assert!(!shown.contains("TOPSECRETOBSCURED"), "{shown}");
+    }
+
+    #[test]
+    fn without_a_root_path_the_sftp_detail_explains_where_rclone_keeps_it() {
+        let out = render_detail(&one(NAS_SFTP), &RenderOptions::default());
+        assert!(out.contains("--root-path"), "{out}");
+        assert!(out.contains("remote:/some/dir"), "{out}");
+    }
+
+    #[test]
+    fn a_supplied_root_path_is_rendered_in_the_sftp_detail() {
+        let out = render_detail(
+            &one(NAS_SFTP),
+            &RenderOptions {
+                root_path: Some("/srv/backups/laptop".into()),
+                ..Default::default()
+            },
+        );
+        assert!(out.contains("/srv/backups/laptop"), "{out}");
+    }
+
+    #[test]
+    fn the_json_sftp_form_reports_settings_without_the_password() {
+        let v = to_json(&one(NAS_SFTP), &RenderOptions::default());
+        assert_eq!(v["backend"], json!("sftp"));
+        assert_eq!(
+            v["importable"],
+            json!(false),
+            "the credential always has to be re-entered by hand"
+        );
+        assert_eq!(v["host"], json!("nas.example"));
+        assert_eq!(v["port"], json!(2222));
+        assert_eq!(v["user"], json!("alice"));
+        assert_eq!(v["hasPassword"], json!(true));
+        assert_eq!(v["rootPath"], Value::Null);
+        assert!(!v.to_string().contains("TOPSECRETOBSCURED"));
+
+        let v = to_json(
+            &one(NAS_SFTP),
+            &RenderOptions {
+                root_path: Some("/data".into()),
+                ..Default::default()
+            },
+        );
+        assert_eq!(v["rootPath"], json!("/data"));
     }
 }

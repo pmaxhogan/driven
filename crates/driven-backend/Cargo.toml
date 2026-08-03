@@ -17,6 +17,8 @@ driven-drive = { path = "../driven-drive" }
 driven-s3 = { path = "../driven-s3" }
 # The local / removable-folder backend (USB drives, NAS mounts, restore drills).
 driven-localfs = { path = "../driven-localfs" }
+# The SSH (SFTP) backend (a home server, NAS, or VPS reached over plain SSH).
+driven-sftp = { path = "../driven-sftp" }
 # Corporate custom-CA + proxy config, threaded into every client the factory
 # builds (issue #34).
 driven-tls = { path = "../driven-tls" }

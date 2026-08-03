@@ -14,6 +14,9 @@ driven-remote = { path = "../driven-remote" }
 # `S3Config` - the exact non-secret shape an imported `type = s3` remote
 # produces, so the importer can never emit a blob the backend would reject.
 driven-s3 = { path = "../driven-s3" }
+# `SftpConfig::DEFAULT_PORT` - the port an imported `type = sftp` remote falls
+# back to when `rclone.conf` omits one.
+driven-sftp = { path = "../driven-sftp" }
 anyhow.workspace = true
 thiserror.workspace = true
 # The `--json` rendering only. Nothing in this crate derives Serialize - the
@@ -21,10 +24,15 @@ thiserror.workspace = true
 # never silently start being emitted (which, on a type that holds credentials,
 # is exactly the accident to design out).
 serde_json.workspace = true
-# NOTE: no cipher dependency. `rclone obscure` only ever applies to options
-# rclone marks `IsPassword: true`, and NEITHER importable remote type has one -
-# see the `obscured values` section of `lib.rs`. Adding AES to reveal a value
-# that cannot appear would be dead code guarding a hazard we do not have.
+# NOTE: no cipher dependency. `rclone obscure` applies to options rclone marks
+# `IsPassword: true` - `sftp`'s `pass` is the one importable case, and it is
+# deliberately left obscured rather than decoded: de-obscuring would mean
+# shipping rclone's hard-coded AES key inside Driven, turning a merely
+# inconvenient value into a directly-usable one for anyone who reads
+# `rclone.conf` off disk. See the `obscured values` section of `lib.rs`. The
+# other two importable types (`s3`, `drive`) have no password-shaped option at
+# all, so adding AES only to decode the one value we deliberately never decode
+# would be dead code guarding a hazard we do not have.
 
 [dev-dependencies]
 tempfile = "3"

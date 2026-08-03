@@ -77,6 +77,13 @@ pub struct ImportArgs {
     /// An optional key prefix, to confine Driven to a subtree of the bucket.
     #[arg(long)]
     pub prefix: Option<String>,
+    /// The destination root path for an SSH (SFTP) remote.
+    ///
+    /// rclone remotes carry no path either - same reason as `--bucket` - so
+    /// this is the SFTP equivalent: the one setting that cannot come from the
+    /// config file.
+    #[arg(long)]
+    pub root_path: Option<String>,
     /// Emit JSON instead of text.
     #[arg(long)]
     pub json: bool,
@@ -140,6 +147,7 @@ pub async fn run_import(args: ImportArgs) -> Result<()> {
         prefix: args.prefix,
         reveal_secrets: args.reveal_secrets,
         config_path: Some(path.display().to_string()),
+        root_path: args.root_path,
     };
 
     if args.json {
