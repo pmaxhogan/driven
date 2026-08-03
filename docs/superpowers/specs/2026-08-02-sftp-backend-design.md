@@ -55,6 +55,13 @@ not from model memory (repo rule).
   LocalFs layout (folder markers, `driven.*` app_properties in a JSON sidecar
   companion per object - the `driven-localfs` `meta.rs` Sidecar pattern,
   since SFTP has no user-metadata headers).
+- Destination-identity marker (review amendment 2026-08-02): the LocalFs
+  MARKER_FILE hazard exists verbatim server-side (an unmounted NAS volume is
+  an ordinary empty directory; a wrong root full of user files must never be
+  adopted and overwritten). The creation probe WRITES an identity marker in
+  root_path; the store VERIFIES it before mutating ops and fails closed with
+  a distinct classified error when absent; names.rs reserves the marker
+  filename.
 - Integrity: write to a remote temp name, `SSH_FXP_RENAME` into place, then
   re-download and re-hash to verify (LocalFs's read-back pattern; closes the
   x==x checksum gap both existing backends document).

@@ -56,6 +56,8 @@
 
 **Files:** Modify `crates/driven-sftp/src/store.rs`.
 
+**Also owed from Task 3 review (binding):** a stale-temp sweep mirroring localfs `sweep_stale_temp_files` (abandoned resumable temps otherwise accumulate invisibly - every listing filters them); a mutation-catching test for read-back verify (corrupt the committed bytes server-side between rename and verify -> create/update FAILS); `list_source_object_ids` must NOT inherit `live_annotated_files`' missing-dir->Ok(empty) mapping (missing source dir is an ERROR).
+
 **Interfaces produced:** resumable_session/resume_chunk with opaque handle `driven-sftp:<base64 json>{temp_path, rename_to, size, digest_state}` - hydration of a foreign session stats + re-reads + re-hashes the remote temp file (LocalFs hydration pattern); list_source_object_ids walking the FULL source subtree - any readdir failure is an ERROR, never an empty/partial set (completeness invariant); about() via statvfs extension when offered else unknown.
 
 - [ ] Step 1: failing tests - chunked upload resumes across a NEW SftpSession (simulated process restart); SessionInvalid on missing temp file; list_source_object_ids exact-set test + a readdir-error-fails test (delete perms on a subdir in the test server root); about() with/without statvfs.
