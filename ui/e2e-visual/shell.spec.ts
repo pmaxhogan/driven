@@ -21,6 +21,22 @@ test("idle shell", async ({ page, visit }) => {
 test("a backup is running", async ({ page, visit }) => {
   await visit("/activity", { commands: { get_sync_status: SYNC_STATUS_RUNNING } });
   await expect(page.getByText("Showing 12 of 12 events")).toBeVisible();
+  // Issue #270. The activity table above is NOT a readiness signal for the
+  // progress bar, which is the whole point of this scenario: the table comes
+  // from `query_activity`, while the bar belongs to the progress store
+  // (`get_sync_status`, hydrated separately during app boot) and its visibility
+  // additionally runs through a deliberate 500ms debounce - `useDebouncedFlag`,
+  // so a paused account's per-tick `active` blip cannot flash the bar in and
+  // out. Snapshotting on the table alone therefore raced that debounce and
+  // sometimes captured a page with NO bar at all, which shifts every element up
+  // by its ~30px height and diffs the entire image.
+  //
+  // Waiting on the label's settled TEXT (not merely its presence) closes all
+  // three gaps at once: the store has hydrated, the debounce has elapsed, and
+  // the bar is rendering its final value rather than an intermediate one.
+  await expect(page.getByTestId("global-progress-label")).toHaveText(
+    "Backing up - 40% (128 of 320 files)"
+  );
   await snapshot(page, "backup-running.png");
 });
 
