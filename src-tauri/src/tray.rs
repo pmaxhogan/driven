@@ -786,7 +786,10 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         | ErrorCode::InternalBug
         // Invalid input crossing the IPC boundary is a user/renderer error,
         // not a network condition -> red error (not yellow-bang).
-        | ErrorCode::InvalidInput => false,
+        | ErrorCode::InvalidInput
+        // A missing SFTP root path is a setup-time "fix the path" condition
+        // (the server answered fine), not a reachability problem.
+        | ErrorCode::SftpRootMissing => false,
     }
 }
 

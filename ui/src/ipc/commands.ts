@@ -20,6 +20,7 @@ import type {
   BackendKindId,
   CreateS3AccountRequest,
   CreateLocalFolderAccountRequest,
+  CreateSftpAccountRequest,
   CustomCaValidation,
   DriveFolderListing,
   ExclusionPreview,
@@ -43,6 +44,7 @@ import type {
   SessionId,
   SettingsDto,
   SettingsPatch,
+  SftpAccountCreatedDto,
   SourceDto,
   SourcePatch,
   TelemetryPreviewPayload,
@@ -92,6 +94,21 @@ export function createLocalFolderAccount(
   req: CreateLocalFolderAccountRequest
 ): Promise<AccountDto> {
   return invoke("create_local_folder_account", { req });
+}
+
+/** Create an account backed by an SSH (SFTP) destination: a home server, a
+ * NAS, or a VPS the user can already reach with `ssh`.
+ *
+ * The SFTP counterpart of the whole OAuth begin/submit/signin/finish
+ * sequence: there is no consent round trip, so one call collects the
+ * settings, PROVES them against the live server (reachability, auth, the root
+ * path, a real write), pins the host key, stores the secret in the OS
+ * keychain and writes the account row. Unlike `createS3Account` /
+ * `createLocalFolderAccount`, the result is NOT a bare `AccountDto` - it also
+ * carries the pinned fingerprint and whether an existing destination marker
+ * was adopted. */
+export function createSftpAccount(req: CreateSftpAccountRequest): Promise<SftpAccountCreatedDto> {
+  return invoke("create_sftp_account", { req });
 }
 
 export function submitOauthCredentials(

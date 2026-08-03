@@ -68,8 +68,9 @@ function bigFolder(count: number): RemoteEntryDto[] {
 const FILE_COUNT = 5000;
 
 /** `list_backends()` as the Rust `descriptors()` reports it. Only Google Drive can
- * really keep previous versions: S3 and the local folder derive an object's key
- * from the file name, so a re-upload overwrites the previous copy (issue #220). */
+ * really keep previous versions: S3, the local folder and SFTP all derive an
+ * object's key from the file name, so a re-upload overwrites the previous copy
+ * (issue #220). */
 const RESTORE_BACKENDS = [
   {
     id: "google_drive",
@@ -89,6 +90,13 @@ const RESTORE_BACKENDS = [
     id: "local_folder",
     usesOauth: false,
     supportsFolderPicker: false,
+    supportsVersionHistory: false,
+    isDefault: false,
+  },
+  {
+    id: "sftp",
+    usesOauth: false,
+    supportsFolderPicker: true,
     supportsVersionHistory: false,
     isDefault: false,
   },
@@ -221,13 +229,13 @@ describe("Restore virtualization + sticky action bar (UI #47)", () => {
   });
 
   it("does not offer a point-in-time restore on a destination that overwrites versions (issue #220)", async () => {
-    // The defect: on S3 / local-folder destinations the create key is derived from
-    // the file name, so a changed file's re-upload overwrote the previous bytes.
-    // A "restore as of an earlier date" there returns the CURRENT content while
-    // reporting that it restored an older version - the worst failure a backup
-    // tool has. The backend now refuses such a restore fail-closed; the picker
-    // must not offer it in the first place.
-    for (const kind of ["s3", "local_folder"]) {
+    // The defect: on S3 / local-folder / SFTP destinations the create key is
+    // derived from the file name, so a changed file's re-upload overwrote the
+    // previous bytes. A "restore as of an earlier date" there returns the
+    // CURRENT content while reporting that it restored an older version - the
+    // worst failure a backup tool has. The backend now refuses such a restore
+    // fail-closed; the picker must not offer it in the first place.
+    for (const kind of ["s3", "local_folder", "sftp"]) {
       seedBackend(kind);
       const wrapper = mount(Restore, { global: { plugins: [i18n] } });
       await flushPromises();

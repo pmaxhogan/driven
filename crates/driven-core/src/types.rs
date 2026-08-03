@@ -1165,6 +1165,14 @@ pub enum ErrorCode {
     /// not an internal programming error, so the UI shows a "check your input"
     /// message rather than "please report a bug".
     InvalidInput,
+    /// `sftp.root_missing` - the SSH (SFTP) destination's configured root path
+    /// does not exist on the server. Surfaced only at account-creation time
+    /// (`create_sftp_account`'s probe never creates the root - a typo must not
+    /// quietly start a backup in a brand-new directory beside the intended
+    /// one), so this is a setup-time "fix the path" condition, distinct from
+    /// [`Self::DriveDestFolderMissing`]'s "an EXISTING destination vanished"
+    /// meaning for an already-created account.
+    SftpRootMissing,
 }
 
 impl ErrorCode {
@@ -1217,6 +1225,7 @@ impl ErrorCode {
             ErrorCode::HarnessTimeout => "harness.timeout",
             ErrorCode::InternalBug => "internal.bug",
             ErrorCode::InvalidInput => "internal.invalid_input",
+            ErrorCode::SftpRootMissing => "sftp.root_missing",
         }
     }
 
@@ -1273,6 +1282,7 @@ impl ErrorCode {
             "harness.timeout" => ErrorCode::HarnessTimeout,
             "internal.bug" => ErrorCode::InternalBug,
             "internal.invalid_input" => ErrorCode::InvalidInput,
+            "sftp.root_missing" => ErrorCode::SftpRootMissing,
             _ => return None,
         })
     }

@@ -12,6 +12,7 @@ import type {
   BackendKindId,
   CreateS3AccountRequest,
   CreateLocalFolderAccountRequest,
+  CreateSftpAccountRequest,
   OAuthStatus,
   SessionId,
 } from "../ipc/types";
@@ -55,6 +56,15 @@ export const useSetupStore = defineStore("setup", () => {
   // source step (which shows the resolved `<root>/<sub-folder>` the backup will
   // land in). Not sent anywhere - the account row already holds it.
   const localFolderRoot = ref<string | null>(null);
+  // The SSH (SFTP) creation probe's TOFU (trust-on-first-use) result, kept for
+  // display on the source step (step 2's own card is unreachable once
+  // `onSftpSubmit` advances past it on success - see `SftpAccountCreatedDto`'s
+  // doc). `sftpHostKeyFingerprint` is the pinned host key so the user can see
+  // what was trusted; `sftpAdopted` is whether the root already carried
+  // another Driven destination marker that this probe reused rather than
+  // stamping fresh (so every object already there stays reachable).
+  const sftpHostKeyFingerprint = ref<string | null>(null);
+  const sftpAdopted = ref(false);
 
   // Cross-step staged inputs. Kept here (not component-local) so navigating
   // back/forward preserves what the user already entered.
@@ -249,6 +259,42 @@ export const useSetupStore = defineStore("setup", () => {
       localFolderRoot.value = req.root;
       // The source step gates on a resolved destination; a local folder has no
       // consent round trip, so mark the sign-in resolved here.
+      oauthStatus.value = { kind: "complete" };
+      return true;
+    } catch (e) {
+      errorCode.value = toErrorCode(e);
+      return false;
+    } finally {
+      busy.value = false;
+    }
+  }
+
+  /**
+   * Create an SSH (SFTP) backed account from the credentials step's form (the
+   * non-OAuth, non-local, non-S3 branch). One call: the backend validates the
+   * settings, PROVES a real SSH session can reach the server and the root path
+   * with a real write, PINS the host key (trust on first use), stores the
+   * secret in the OS keychain and writes the account row - so on success the
+   * wizard is in exactly the state the OAuth path reaches after `finish`.
+   *
+   * Unlike `createS3Account` / `createLocalFolderAccount`, the response is NOT
+   * a bare `AccountDto` - `create_sftp_account` returns `SftpAccountCreatedDto`
+   * (`{ account, hostKeyFingerprint, adopted }`), so this unwraps `.account`
+   * and records the fingerprint + adoption flag for the source step to display
+   * (step 2's own card is unreachable by the time it would need to show them -
+   * this action advances the wizard past it on success).
+   */
+  async function createSftpAccount(req: CreateSftpAccountRequest): Promise<boolean> {
+    busy.value = true;
+    errorCode.value = null;
+    try {
+      const result = await ipc.createSftpAccount(req);
+      accountId.value = result.account.id;
+      accountEmail.value = result.account.email;
+      sftpHostKeyFingerprint.value = result.hostKeyFingerprint;
+      sftpAdopted.value = result.adopted;
+      // The source step gates on a chosen destination; SFTP has no consent
+      // round trip, so mark the sign-in resolved here.
       oauthStatus.value = { kind: "complete" };
       return true;
     } catch (e) {
@@ -539,6 +585,8 @@ export const useSetupStore = defineStore("setup", () => {
     // it survives a reset; only the user's choice is reverted to the default.
     backendId.value = backends.value.find((b) => b.isDefault)?.id ?? DEFAULT_BACKEND_ID;
     localFolderRoot.value = null;
+    sftpHostKeyFingerprint.value = null;
+    sftpAdopted.value = false;
     accountId.value = null;
     accountEmail.value = null;
     localPath.value = null;
@@ -591,6 +639,8 @@ export const useSetupStore = defineStore("setup", () => {
     backendId,
     selectedBackend,
     localFolderRoot,
+    sftpHostKeyFingerprint,
+    sftpAdopted,
     backendUsesOauth,
     backendSupportsFolderPicker,
     destinationSelected,
@@ -598,6 +648,7 @@ export const useSetupStore = defineStore("setup", () => {
     selectBackend,
     createS3Account,
     createLocalFolderAccount,
+    createSftpAccount,
     destinationFolderIdFor,
     accountId,
     accountEmail,

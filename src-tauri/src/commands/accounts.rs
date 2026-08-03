@@ -1293,6 +1293,54 @@ fn sftp_config_and_credential(
     Ok((config, credential))
 }
 
+/// What [`probe_and_persist_sftp_account`] persisted: the account row, the
+/// host-key fingerprint the probe pinned, and whether the root's destination
+/// marker was ADOPTED (already someone else's Driven backup) rather than
+/// freshly stamped.
+///
+/// A named struct rather than a tuple: a third `bool` field landing at the end
+/// of a `(AccountRow, String)` tuple is exactly the kind of positional
+/// ambiguity that invites a silently-swapped argument at a call site.
+#[derive(Debug)]
+struct ProbedSftpAccount {
+    row: AccountRow,
+    host_key_fingerprint: String,
+    adopted: bool,
+}
+
+/// Map an error from [`driven_sftp::prepare_destination`] to the IPC boundary
+/// shape, special-casing the one case the wizard must tell apart from a
+/// generic "destination unreachable": the configured root path does not exist
+/// on the server.
+///
+/// The generic path ([`CommandError::from`]) already gets this WRONG for that
+/// case: `prepare_destination` reports a missing root as
+/// `DriveError::DestFolderMissing` (so later store operations classify it the
+/// same way `driven_localfs` does), but `DestFolderMissing`'s PACER
+/// classification is `Other`, and `code_from_anyhow` maps every `Other`
+/// straight to `drive.unreachable` BEFORE it ever looks at the message - so the
+/// `sftp.root_missing` marker `driven_sftp::provision::dest_missing` embeds via
+/// `.context()` survives into `message` (proven by the
+/// `a_missing_root_path_persists_nothing_and_says_which_one` test below) but
+/// never reaches `code`, and the wizard's error surface reads `.code` only
+/// (`ipc/errors.ts` deliberately never trusts `.message` - it is unredacted
+/// backend English, not an i18n key). Reclassifying `DestFolderMissing`
+/// globally would also change what a MISSING destination on an existing S3 /
+/// local-folder account reports, which is out of scope here - so this checks
+/// the message for the specific `sftp.root_missing` marker ONLY when the error
+/// really is a `DestFolderMissing`, and defers to the generic mapping for
+/// everything else (auth / network / the other `dest_missing` reasons).
+fn sftp_probe_command_error(e: anyhow::Error) -> CommandError {
+    let is_dest_folder_missing = matches!(
+        e.downcast_ref::<driven_remote::DriveError>(),
+        Some(driven_remote::DriveError::DestFolderMissing)
+    );
+    if is_dest_folder_missing && e.to_string().contains("sftp.root_missing") {
+        return CommandError::with_code(ErrorCode::SftpRootMissing, e.to_string());
+    }
+    CommandError::from(e)
+}
+
 /// The probe-then-persist half of [`create_sftp_account`], with the account row
 /// write behind a closure.
 ///
@@ -1302,14 +1350,12 @@ fn sftp_config_and_credential(
 /// `#[tauri::command]` cannot be called from a test. `insert_row` is a closure
 /// rather than a `StateRepo` call so a test can force the row write to fail and
 /// assert the rollback.
-///
-/// Returns the persisted row plus the host-key fingerprint the probe pinned.
 async fn probe_and_persist_sftp_account<F, Fut>(
     account_id: AccountId,
     req: &CreateSftpAccountRequest,
     now_ms: i64,
     insert_row: F,
-) -> CommandResult<(AccountRow, String)>
+) -> CommandResult<ProbedSftpAccount>
 where
     F: FnOnce(AccountRow) -> Fut,
     Fut: std::future::Future<Output = anyhow::Result<()>>,
@@ -1324,9 +1370,10 @@ where
     // the way down (`russh` over a tokio socket), so there is nothing here that
     // would occupy a worker thread the way the local-folder backend's
     // synchronous `write`+`fsync` does.
-    driven_sftp::prepare_destination(&mut config, &credential, now_ms)
+    let outcome = driven_sftp::prepare_destination(&mut config, &credential, now_ms)
         .await
-        .map_err(CommandError::from)?;
+        .map_err(sftp_probe_command_error)?;
+    let adopted = matches!(outcome, driven_sftp::PreparedDestination::Adopted);
 
     // `prepare_destination` returns Ok only after `connect_and_pin` recorded
     // what the server presented, so this is unreachable in practice; it is an
@@ -1390,7 +1437,11 @@ where
         return Err(CommandError::from(e));
     }
 
-    Ok((row, fingerprint))
+    Ok(ProbedSftpAccount {
+        row,
+        host_key_fingerprint: fingerprint,
+        adopted,
+    })
 }
 
 /// `create_sftp_account(req)` - create an account backed by an SSH (SFTP)
@@ -1427,13 +1478,13 @@ pub async fn create_sftp_account(
 ) -> CommandResult<SftpAccountCreatedDto> {
     let account_id = AccountId::new_v4();
     let repo = state.state();
-    let (row, host_key_fingerprint) =
+    let probed =
         probe_and_persist_sftp_account(account_id, &req, SystemClock.now_ms(), |row| async move {
             repo.upsert_account(&row).await
         })
         .await?;
 
-    tracing::info!(target: TARGET, account_id = %account_id, "SFTP account persisted");
+    tracing::info!(target: TARGET, account_id = %account_id, adopted = probed.adopted, "SFTP account persisted");
 
     // A2: hot-spawn so the wizard's initial sync finds a live handle.
     match crate::assembly::spawn_account(&app, &state, account_id).await {
@@ -1447,8 +1498,9 @@ pub async fn create_sftp_account(
     }
 
     Ok(SftpAccountCreatedDto {
-        account: account_row_to_dto(&row),
-        host_key_fingerprint,
+        account: account_row_to_dto(&probed.row),
+        host_key_fingerprint: probed.host_key_fingerprint,
+        adopted: probed.adopted,
     })
 }
 
@@ -2208,10 +2260,11 @@ mod tests {
             let id = AccountId::new_v4();
             let (seen, insert) = recording();
 
-            let (row, fingerprint) =
+            let probed =
                 probe_and_persist_sftp_account(id, &password_request(&server), NOW, insert)
                     .await
                     .expect("a reachable server with a good password creates an account");
+            let row = probed.row;
 
             // The row: kind, label and timestamps.
             assert_eq!(row.backend_kind, BackendKind::Sftp);
@@ -2224,6 +2277,12 @@ mod tests {
                 Some(id),
                 "the row really reached the state repo"
             );
+            // A fresh root has no prior marker, so this probe STAMPED one rather
+            // than adopting an existing destination.
+            assert!(
+                !probed.adopted,
+                "a first-ever probe against an empty root must not adopt"
+            );
 
             // The persisted config carries what the probe learned, and no secret.
             let config =
@@ -2234,7 +2293,7 @@ mod tests {
                 Some(server.host_key_fingerprint())
             );
             assert_eq!(
-                fingerprint,
+                probed.host_key_fingerprint,
                 server.host_key_fingerprint(),
                 "the UI displays what was pinned"
             );
@@ -2285,10 +2344,10 @@ mod tests {
             let id = AccountId::new_v4();
             let (_seen, insert) = recording();
 
-            let (row, _) =
-                probe_and_persist_sftp_account(id, &password_request(&server), NOW, insert)
-                    .await
-                    .expect("create");
+            let row = probe_and_persist_sftp_account(id, &password_request(&server), NOW, insert)
+                .await
+                .expect("create")
+                .row;
 
             let ca = driven_tls::CustomCaConfig::default();
             let proxy = driven_tls::ProxyConfig::default();
@@ -2425,8 +2484,10 @@ mod tests {
                 .await
                 .expect_err("a root path that does not exist is not a destination");
 
-            // The wizard keys on this code to tell the user to create the
+            // The wizard keys on `.code` (never `.message` - see
+            // `sftp_probe_command_error`'s docs) to tell the user to create the
             // directory (or fix the path) rather than re-enter their password.
+            assert_eq!(err.code, ErrorCode::SftpRootMissing);
             assert!(
                 err.message.contains("sftp.root_missing"),
                 "the classified code must survive the command boundary: {}",
@@ -2473,9 +2534,10 @@ mod tests {
                 root_path: "/".to_string(),
                 ..password_request(&server)
             };
-            let (row, _) = probe_and_persist_sftp_account(AccountId::new_v4(), &req, NOW, insert)
+            let row = probe_and_persist_sftp_account(AccountId::new_v4(), &req, NOW, insert)
                 .await
-                .expect("create");
+                .expect("create")
+                .row;
 
             assert_eq!(row.email, "  Home NAS  ");
             assert_eq!(row.display_name.as_deref(), Some("  Home NAS  "));
@@ -2495,15 +2557,74 @@ mod tests {
                 root_path: "/srv/backups/".to_string(),
                 ..password_request(&server)
             };
-            let (row, _) = probe_and_persist_sftp_account(AccountId::new_v4(), &req, NOW, insert)
+            let row = probe_and_persist_sftp_account(AccountId::new_v4(), &req, NOW, insert)
                 .await
-                .expect("create");
+                .expect("create")
+                .row;
 
             assert_eq!(
                 row.email,
                 format!("{TEST_USERNAME}@{}:/srv/backups", server.host())
             );
             assert_eq!(row.display_name, None);
+        }
+
+        #[tokio::test]
+        async fn re_probing_the_same_root_adopts_rather_than_re_stamps() {
+            // The whole point of the marker: a user re-adding a server that
+            // already holds their backups must keep every object reachable, not
+            // silently start a second, disconnected destination. Two probes
+            // against the same root must agree on `destination_id`, and the
+            // second must report `adopted: true` so the wizard can tell the user.
+            let Some(_g) = keychain() else { return };
+            let server = TestSftpServer::spawn().await.unwrap();
+            let (_seen1, insert1) = recording();
+            let (_seen2, insert2) = recording();
+
+            let first = probe_and_persist_sftp_account(
+                AccountId::new_v4(),
+                &password_request(&server),
+                NOW,
+                insert1,
+            )
+            .await
+            .expect("first probe stamps a fresh marker");
+            assert!(!first.adopted);
+
+            let second = probe_and_persist_sftp_account(
+                AccountId::new_v4(),
+                &password_request(&server),
+                NOW,
+                insert2,
+            )
+            .await
+            .expect("second probe against the same root adopts the existing marker");
+            assert!(
+                second.adopted,
+                "a root that already carries a marker must be adopted"
+            );
+
+            let first_config = SftpConfig::from_json(
+                first
+                    .row
+                    .backend_config_json
+                    .as_deref()
+                    .expect("a config blob"),
+            )
+            .expect("the stored blob parses");
+            let second_config = SftpConfig::from_json(
+                second
+                    .row
+                    .backend_config_json
+                    .as_deref()
+                    .expect("a config blob"),
+            )
+            .expect("the stored blob parses");
+            assert_eq!(
+                first_config.destination_id, second_config.destination_id,
+                "adoption must keep the same destination id, or every object on \
+                 the server would become unreachable under the new account"
+            );
         }
 
         #[test]

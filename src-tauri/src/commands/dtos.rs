@@ -196,6 +196,13 @@ pub struct SftpAccountCreatedDto {
     pub account: AccountDto,
     /// The pinned host-key fingerprint, e.g. `SHA256:0Kx...`.
     pub host_key_fingerprint: String,
+    /// Whether the root already carried another Driven destination marker that
+    /// this probe ADOPTED (`driven_sftp::PreparedDestination::Adopted`), rather
+    /// than stamping a fresh one. True means every object already on the server
+    /// stays reachable under this account - worth telling the user, since
+    /// silently reusing a stranger's-looking directory would otherwise read as
+    /// a bug rather than the intended re-add-an-existing-server behaviour.
+    pub adopted: bool,
 }
 
 /// The user-supplied settings for a new local / removable-folder destination

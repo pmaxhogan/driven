@@ -6,13 +6,18 @@ import { useRouter } from "vue-router";
 import BackendPicker from "../components/BackendPicker.vue";
 import CredentialsWalkthrough from "../components/CredentialsWalkthrough.vue";
 import S3CredentialsForm from "../components/S3CredentialsForm.vue";
+import SshCredentialsForm from "../components/SshCredentialsForm.vue";
 import DriveFolderPicker from "../components/DriveFolderPicker.vue";
 import LocalFolderForm from "../components/LocalFolderForm.vue";
 import RecoveryPhraseReveal from "../components/RecoveryPhraseReveal.vue";
 import { pickFolderDialog } from "../ipc/commands";
 import { useSetupStore, WIZARD_STEPS } from "../stores/setup";
-import type { CreateLocalFolderAccountRequest, CreateS3AccountRequest } from "../ipc/types";
-import { LOCAL_FOLDER_BACKEND_ID } from "../ipc/types";
+import type {
+  CreateLocalFolderAccountRequest,
+  CreateS3AccountRequest,
+  CreateSftpAccountRequest,
+} from "../ipc/types";
+import { LOCAL_FOLDER_BACKEND_ID, S3_BACKEND_ID, SFTP_BACKEND_ID } from "../ipc/types";
 
 // Setup wizard (SPEC s25 /setup; DESIGN s8.5 5-step wizard). Drives the whole
 // first-run flow as a stepper:
@@ -78,12 +83,23 @@ const errorLong = computed<string | null>(() =>
   setup.errorCode ? t(`errors.${setup.errorCode}.long`) : null
 );
 
-/** Step 2's heading, which names the destination being connected. */
+/** Step 2's heading, which names the destination being connected.
+ *
+ * Explicit per-backend branches (rather than a two-way OAuth/not-OAuth split
+ * that defaulted anything non-OAuth to the S3 title): with three non-OAuth
+ * destinations now offered (local folder, S3, SSH/SFTP), "which title" is a
+ * per-backend question, and a catch-all silently mislabels whichever one it
+ * was not written for - which is exactly what happened here before SFTP
+ * existed to expose it. */
 const credentialsStepTitle = computed<string>(() => {
   if (setup.backendUsesOauth) return t("wizard.step2.title");
-  return setup.backendId === LOCAL_FOLDER_BACKEND_ID
-    ? t("localFolderSetup.title")
-    : t("s3Setup.title");
+  if (setup.backendId === LOCAL_FOLDER_BACKEND_ID) return t("localFolderSetup.title");
+  if (setup.backendId === S3_BACKEND_ID) return t("s3Setup.title");
+  if (setup.backendId === SFTP_BACKEND_ID) return t("sftpSetup.title");
+  // A destination this build's picker offers but that has no dedicated
+  // credentials form (should not happen - `list_backends` and this wizard
+  // ship together - but a neutral title beats a wrong one).
+  return t("wizard.step2.unsupportedTitle");
 });
 
 // --- Per-step "can advance" gating -------------------------------------------
@@ -182,6 +198,21 @@ async function onS3Submit(req: CreateS3AccountRequest): Promise<void> {
  */
 async function onLocalFolderSubmit(req: CreateLocalFolderAccountRequest): Promise<void> {
   const ok = await setup.createLocalFolderAccount(req);
+  if (ok && setup.step === "credentials") setup.next();
+}
+
+/**
+ * The SSH (SFTP) branch's "sign in": one call that validates the settings,
+ * PROVES a real SSH session can reach the server and the root path with a real
+ * write, pins the host key, stores the secret in the OS keychain and writes
+ * the account. Only on success does the wizard advance - a refused credential
+ * or a missing root path leaves the user on the form with the specific
+ * reason, exactly as a failed OAuth consent does. The pinned fingerprint (and,
+ * if the root already held a Driven backup, the adoption note) render on the
+ * SOURCE step below, since this call also advances past step 2's own card.
+ */
+async function onSftpSubmit(req: CreateSftpAccountRequest): Promise<void> {
+  const ok = await setup.createSftpAccount(req);
   if (ok && setup.step === "credentials") setup.next();
 }
 
@@ -295,12 +326,18 @@ function baseName(p: string): string {
     </div>
 
     <!-- Step 2: credentials. Which form depends on the destination chosen on
-         step 1: Google Drive runs the BYO-OAuth consent flow; an S3-compatible
-         destination takes an access key pair directly; a local or removable
-         folder just needs the folder, and has no credential at all. The
-         non-OAuth destinations are told apart by id rather than by a second
-         boolean, because "which form" is a per-backend question, not a
-         two-valued one. -->
+         step 1: Google Drive runs the BYO-OAuth consent flow; a local or
+         removable folder just needs the folder (no credential at all); an
+         S3-compatible destination takes an access key pair; an SSH (SFTP)
+         destination takes a password or a private key. Every non-OAuth
+         destination is an EXPLICIT branch keyed on its id, not a two-valued
+         OAuth/not-OAuth split whose `v-else` used to catch "anything else" -
+         with three non-OAuth destinations now offered, that catch-all would
+         silently route SFTP into the S3 form and submit the wrong request
+         shape. The terminal `v-else` below is for a destination this build's
+         picker offers but this wizard has no form for - it should not happen
+         (they ship together), but it must fail visibly, not as a blank card
+         above a dead Next. -->
     <div v-else-if="setup.step === 'credentials'" :class="CARD" class="space-y-3">
       <h2 class="text-lg font-medium text-zinc-900 dark:text-zinc-100">
         {{ credentialsStepTitle }}
@@ -312,12 +349,21 @@ function baseName(p: string): string {
         :error-message="errorLong"
         @submit="onLocalFolderSubmit"
       />
-      <template v-else>
+      <template v-else-if="setup.backendId === S3_BACKEND_ID">
         <S3CredentialsForm :busy="setup.busy" :error-message="errorLong" @submit="onS3Submit" />
         <p class="text-xs text-amber-700 dark:text-amber-400">
           {{ t("s3Setup.trashWarning") }}
         </p>
       </template>
+      <SshCredentialsForm
+        v-else-if="setup.backendId === SFTP_BACKEND_ID"
+        :busy="setup.busy"
+        :error-message="errorLong"
+        @submit="onSftpSubmit"
+      />
+      <p v-else class="text-sm text-zinc-600 dark:text-zinc-400">
+        {{ t("wizard.step2.unsupportedBody") }}
+      </p>
     </div>
 
     <!-- Step 3: First backup source -->
@@ -327,6 +373,22 @@ function baseName(p: string): string {
       </h2>
       <p class="text-zinc-600 dark:text-zinc-400">
         {{ t("wizard.step3.body") }}
+      </p>
+
+      <!-- SSH (SFTP)'s TOFU (trust-on-first-use) confirmation: step 2's own
+           card is unreachable by the time there is anything to show (this
+           step is only reached AFTER `onSftpSubmit` advances past it), so the
+           pinned host key - and, if the root already held a Driven backup,
+           the adoption note - render here instead. -->
+      <p
+        v-if="setup.sftpHostKeyFingerprint"
+        class="rounded-md bg-teal-50 px-3 py-2 text-sm text-teal-800 dark:bg-teal-950/40 dark:text-teal-300"
+        data-testid="sftp-fingerprint-confirmation"
+      >
+        {{ t("sftpSetup.fingerprintConfirmed", { fingerprint: setup.sftpHostKeyFingerprint }) }}
+        <span v-if="setup.sftpAdopted" data-testid="sftp-adopted-note">
+          {{ t("sftpSetup.adoptedNote") }}
+        </span>
       </p>
 
       <div class="space-y-2">
