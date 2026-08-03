@@ -23,8 +23,14 @@ on:
 permissions:
   contents: read
 
+# The group MUST NOT use github.workflow: in a workflow_call context that
+# expression resolves to the CALLER's workflow name, which made this group
+# identical to release.yml's own concurrency group - so the called run
+# deadlocked behind its parent and failed at startup with zero jobs (the
+# v2.9.0 release, twice). A literal prefix keeps dispatch dedup per ref
+# while never colliding with a caller.
 concurrency:
-  group: ${{ github.workflow }}-${{ github.ref }}
+  group: e2e-${{ github.ref }}
   cancel-in-progress: false
 
 jobs:
