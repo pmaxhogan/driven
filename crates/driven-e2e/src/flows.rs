@@ -253,6 +253,43 @@ pub async fn wait_for_activity(
     .await
 }
 
+/// The wall-clock ms an account's circuit-breaker backoff window lifts, read
+/// out of a `get_sync_status` payload; `None` when no account is parked in
+/// `OrchestratorState::Backoff`.
+///
+/// The orchestrator's Drive circuit breaker is NOT bypassable: `sync_now`'s
+/// `bypassGates` only opens the metered / battery / schedule gates, so a
+/// scenario that cut the wire has to wait the breaker's window out rather than
+/// re-trigger through it. The state serialises internally tagged on `state`
+/// (snake_case), i.e. `{"state":"backoff","until":<epoch ms>}`.
+///
+/// Scans every account rather than matching an id: the harness runs one account
+/// per session, and matching by id would bind the helper to the DTO's field
+/// naming (`account_id` vs `accountId`) for no gain.
+pub fn backoff_until(status: &Value) -> Option<i64> {
+    status
+        .get("accounts")?
+        .as_array()?
+        .iter()
+        .filter_map(|account| {
+            let state = account.get("state")?;
+            if state.get("state").and_then(Value::as_str)? != "backoff" {
+                return None;
+            }
+            state.get("until")?.as_i64()
+        })
+        .max()
+}
+
+/// Wall clock in Unix epoch ms - the same base the app's `Clock` stamps
+/// `Backoff.until` with, so the two are directly comparable.
+pub fn now_ms() -> i64 {
+    std::time::SystemTime::now()
+        .duration_since(std::time::UNIX_EPOCH)
+        .map(|d| d.as_millis() as i64)
+        .unwrap_or(0)
+}
+
 /// Restore `relative_paths` of `source_id` into `dest_dir` through the
 /// production restore job machinery; waits for the job to finish and returns
 /// the terminal job status JSON.
@@ -372,4 +409,54 @@ pub fn seed_source_tree(dir: &Path) -> anyhow::Result<Vec<String>> {
         rels.push(rel.to_string());
     }
     Ok(rels)
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    /// Pins the `get_sync_status` wire shape [`backoff_until`] reads: the
+    /// orchestrator state is internally tagged on a snake_case `state` key, so
+    /// a backing-off account is `{"state":"backoff","until":<epoch ms>}`. A
+    /// rename on the app side would otherwise make the heal phase silently
+    /// blind to backoff again (issue #248).
+    #[test]
+    fn backoff_until_reads_the_tagged_state() {
+        let status = json!({ "accounts": [
+            { "account_id": "1", "state": { "state": "backoff", "until": 1_784_933_394_028_i64 } },
+        ]});
+        assert_eq!(backoff_until(&status), Some(1_784_933_394_028));
+    }
+
+    /// Every non-backoff state (and an empty account list) reads as "no
+    /// backoff" - the heal loop must trigger a sync in those, not sit waiting.
+    #[test]
+    fn backoff_until_is_none_off_the_backoff_state() {
+        for state in [
+            json!({ "state": "idle", "last_run_at": null }),
+            json!({ "state": "executing", "progress": { "files_done": 1 } }),
+            json!({ "state": "paused", "reason": "offline" }),
+        ] {
+            let status = json!({ "accounts": [{ "account_id": "1", "state": state }] });
+            assert_eq!(
+                backoff_until(&status),
+                None,
+                "state must not read as backoff"
+            );
+        }
+        assert_eq!(backoff_until(&json!({ "accounts": [] })), None);
+        assert_eq!(backoff_until(&Value::Null), None);
+    }
+
+    /// Multi-account payloads take the LATEST deadline: waiting for the
+    /// earliest would return to polling while another account is still gated.
+    #[test]
+    fn backoff_until_takes_the_latest_deadline() {
+        let status = json!({ "accounts": [
+            { "account_id": "1", "state": { "state": "backoff", "until": 10_i64 } },
+            { "account_id": "2", "state": { "state": "idle", "last_run_at": null } },
+            { "account_id": "3", "state": { "state": "backoff", "until": 99_i64 } },
+        ]});
+        assert_eq!(backoff_until(&status), Some(99));
+    }
 }
