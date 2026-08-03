@@ -41,7 +41,7 @@ jobs:
     steps:
       - uses: actions/checkout@v7
 
-      - uses: docker/setup-buildx-action@v3
+      - uses: docker/setup-buildx-action@v4
 
       # Build the e2e image with a GHA-backed layer cache so the (very heavy)
       # release-profile app build is incremental across runs.
