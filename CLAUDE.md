@@ -91,3 +91,21 @@ stack and the agent-facing entry points:
   committed linux baselines (`just visual-update` regenerates via Docker).
 - CI: `.github/workflows/e2e.yml` gates releases (tag -> e2e + visual ->
   build). Deliberately NOT per-PR; manual runs via workflow_dispatch.
+
+## README review is part of EVERY PR (load-bearing)
+
+Whenever you open a PR, check `README.md` before creating it, and update it in
+the SAME PR when either applies:
+
+- **Out-of-date claims**: anything the PR makes stale - feature lists, backend
+  or destination lists, settings locations (pages move), keychain service
+  names, comparison-table cells and their numbered notes, CLI flags, version
+  references, caveats that no longer hold.
+- **Missing / omitted information**: a user-visible feature, destination,
+  setting, or caveat the PR adds that the README does not mention.
+
+The README is the public front door of a public repo; a shipped feature that
+is not in it effectively does not exist, and a stale claim is worse than no
+claim. Doc-only follow-ups get forgotten - that is why this rides in the same
+PR. Pure-internal PRs (CI, tests, refactors with no user-visible change) can
+state "README checked, no changes needed" in the PR body and move on.
