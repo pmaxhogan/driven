@@ -1615,6 +1615,38 @@ impl SftpStore {
             return Ok(false);
         }
 
+        // Has anything else taken the DESTINATION while this session was
+        // parked? The in-process claim table died with the previous process,
+        // and `claim_exact` below re-takes the name without asking, so this is
+        // the only place the question gets put to the server.
+        //
+        // It matters because completing the session REMOVES whatever is at the
+        // target before renaming (SFTPv3 has no overwriting rename). Without
+        // this check, a session that sat through a restart could delete a
+        // DIFFERENT source file's object that legitimately landed on the same
+        // remote name in the meantime - reachable on a case-folding or
+        // Unicode-normalizing remote, where `Foo.txt` and `foo.txt` are one
+        // path and `resolve_stored_name` adopts an unannotated one.
+        //
+        // A sidecar naming the SAME original is this session's own destination
+        // (always so for a resumable update, and for a create whose object
+        // already landed), so only a DIFFERENT name is a conflict.
+        let dir_path = self.remote_path(dir_id)?;
+        if let Some(existing) = Self::read_sidecar(sftp, &dir_path, stored).await? {
+            if existing.name != handle.name {
+                tracing::warn!(
+                    target: crate::TARGET,
+                    target_id = %handle.rename_to,
+                    session_name = %handle.name,
+                    holder = %existing.name,
+                    "the destination of a persisted resumable session now belongs to a \
+                     different file; invalidating the session rather than removing an object \
+                     Driven does not own"
+                );
+                return Ok(false);
+            }
+        }
+
         let claim = claim_exact(&self.claims, dir_id, stored, &handle.name);
         self.sessions.lock().insert(
             session.url.clone(),
@@ -3578,6 +3610,79 @@ mod tests {
         assert!(
             !server.root().join("gone.bin").exists(),
             "nothing may be committed for an invalid session"
+        );
+    }
+
+    #[tokio::test]
+    async fn a_parked_session_never_removes_an_object_that_became_someone_elses() {
+        // Completing a session REMOVES whatever is at the target before
+        // renaming, and the in-process name claim dies with the process. So a
+        // session that sat through a restart must re-ask the server who owns
+        // the destination before it deletes anything. Reachable on a
+        // case-folding remote, where `Foo.txt` and `foo.txt` are one path.
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+
+        let session = store
+            .resumable_session(
+                ResumableKind::Create {
+                    parent_id: "".to_string(),
+                    name: "notes.txt".to_string(),
+                    app_properties: HashMap::new(),
+                },
+                "text/plain",
+                4,
+            )
+            .await
+            .unwrap();
+
+        // Stage the outcome of the race directly: a DIFFERENT original name now
+        // owns the remote path this session claimed.
+        drop(store);
+        let restarted = SftpStore::new(
+            &{
+                let mut config = server.pinned_config(SftpAuthKind::Password);
+                config.destination_id = Some(read_destination_id(server.root()));
+                config
+            },
+            &server.password_credential(),
+        )
+        .unwrap();
+        let usurper = restarted
+            .create(
+                "",
+                "notes.txt",
+                "text/plain",
+                body(b"someone else's backup"),
+                props(&[("driven.relative_path_hash", "a-different-file")]),
+            )
+            .await
+            .unwrap();
+        // Rewrite the sidecar so it records a different ORIGINAL name, which is
+        // what a fold collision produces and what the check reads.
+        let raw = std::fs::read(server.root().join(".notes.txt.driven-meta")).unwrap();
+        let mut sidecar: serde_json::Value = serde_json::from_slice(&raw).unwrap();
+        sidecar["name"] = serde_json::json!("Notes.txt");
+        std::fs::write(
+            server.root().join(".notes.txt.driven-meta"),
+            serde_json::to_vec(&sidecar).unwrap(),
+        )
+        .unwrap();
+
+        assert!(
+            matches!(
+                restarted
+                    .resume_chunk(&session, 0, Bytes::from_static(b"mine"))
+                    .await
+                    .expect("a lost destination is an ANSWER, not an error"),
+                ResumeProgress::SessionInvalid
+            ),
+            "the session must stand down rather than delete an object it no longer owns"
+        );
+        assert_eq!(
+            download_to_vec(&restarted, &usurper.id).await,
+            b"someone else's backup",
+            "the other file's bytes must be untouched"
         );
     }
 
