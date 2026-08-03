@@ -75,9 +75,13 @@ pub const SFTP_SUBFOLDER: &str = "backups";
 /// and the hermetic state DB - everything that must SURVIVE a simulated crash.
 ///
 /// The handle is deliberately NOT a field, for the same reason as the S3 and
-/// local-folder fixtures: a crash-recovery row has to DROP the orchestrator and
-/// then boot a fresh one over the same DB and the same destination, which it
-/// cannot do while the fixture it is borrowing owns the handle.
+/// local-folder fixtures: a row that has to DROP the orchestrator and boot a
+/// fresh one over the same DB and the same destination cannot do that while the
+/// fixture it is borrowing owns the handle. Two SFTP rows need exactly that -
+/// [`crate::scenarios::backends`]'s host-key row (a pin is verified per
+/// CONNECTION, so a swap is only observable at the next one) and its
+/// truncated-listing row (the remote-existence audit is gated on a per-source
+/// latch held in the orchestrator's memory, so only a fresh one re-audits).
 pub struct SftpFixture {
     server: TestSftpServer,
     config: SftpConfig,

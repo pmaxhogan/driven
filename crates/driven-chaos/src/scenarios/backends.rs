@@ -1943,6 +1943,23 @@ impl Scenario for SftpHostKeySwappedMidRun {
             "a changed host key must surface as auth.invalid_grant - the account needs a human, \
              not a retry - got {codes:?}"
         );
+        // The ATTENTION STATE, not just the log line. An activity row is
+        // something a user might scroll past; `NeedsReauth` is what actually
+        // stops the account and raises the reauth prompt, and it is the half
+        // that makes "blocks sync" true rather than "complains about sync".
+        let account_state = reopened
+            .state
+            .list_accounts()
+            .await?
+            .into_iter()
+            .find(|a| a.id == reopened.account_id)
+            .map(|a| a.state)
+            .ok_or_else(|| anyhow::anyhow!("the rebooted handle has no account row"))?;
+        anyhow::ensure!(
+            account_state == driven_core::types::AccountState::NeedsReauth,
+            "a server that failed the host-key pin must park the account for a human - a possible \
+             MITM is not something to retry through - got {account_state:?}"
+        );
 
         let oracle = fx.oracle();
         let after = assert_invariants(&reopened, &oracle, src.id, SFTP_SUBFOLDER).await?;
@@ -2028,13 +2045,30 @@ impl Scenario for SftpDestinationFullMidUpload {
         let src = fx.add_source(&handle).await?;
         write_file(fx.src_root(), "big.bin", &payload(SFTP_TRANSFER_LEN, 46))?;
 
-        // Room for a chunk or two of a 1 MiB transfer and nothing more.
-        fx.server().arm_enospc_after_bytes(128 * 1024);
+        // Room for ONE write packet of a 1 MiB transfer and nothing more.
+        //
+        // The budget has to clear a single packet or the row silently degrades
+        // into the easy "full before we started" case: `russh-sftp` writes in
+        // packets just under its 256 KiB `max_packet_len`, and a budget below
+        // that refuses the very FIRST write, leaving nothing on the server. The
+        // `bytes_accepted_before_enospc` guard below is what caught exactly
+        // that - this row previously armed 128 KiB and never once filled up
+        // mid-transfer.
+        fx.server().arm_enospc_after_bytes(384 * 1024);
         let _ = handle.run_one_cycle().await;
 
         anyhow::ensure!(
             fx.server().fault_counts().enospc_refusals >= 1,
             "the row never reached its fault: no write was refused for space"
+        );
+        // The budget must have run out with bytes ALREADY on the server, or
+        // this is the easy "full before we started" case rather than the one
+        // that can publish a truncated object. Mirrors the S3 sibling's
+        // `upload_part >= 1` guard.
+        anyhow::ensure!(
+            fx.server().fault_counts().bytes_accepted_before_enospc > 0,
+            "the disk must fill up MID-transfer, with bytes already written - a destination that \
+             refused the very first byte tests a different, easier failure"
         );
         let codes = error_codes_in_activity(handle.state.as_ref()).await?;
         anyhow::ensure!(
@@ -2173,16 +2207,42 @@ impl Scenario for SftpTruncatedListingIsAnError {
             "the row never reached its fault: no enumeration was truncated"
         );
 
-        // The consequence that matters: a cycle over a destination whose
-        // listing cannot be trusted must change nothing.
-        let _ = handle.run_one_cycle().await;
+        // The consequence that matters, one level up: a CYCLE over a
+        // destination whose listing cannot be trusted must change nothing.
+        //
+        // Reaching the audit takes a REBOOT, and the reason is worth stating -
+        // an earlier version of this row ran a cycle here and proved nothing.
+        // `audit_remote_existence_if_due` is gated on a per-source `audited`
+        // latch held in the orchestrator's memory, so the healthy first cycle
+        // already consumed this source's one non-deep-verify audit and every
+        // later cycle on the SAME orchestrator returns before issuing a single
+        // remote call. (The deep-verify path is no help either: the source's
+        // interval is 7 days against a `FakeClock` that never advances.) A
+        // fresh handle over the same DB and the same server starts with an
+        // empty latch, which is also the real-world shape - the app restarts
+        // and re-audits.
+        drop(handle);
+        let rebooted = fx.boot().await?;
+        let before_cycle = fx.server().fault_counts().truncated_readdirs;
+        let _ = rebooted.run_one_cycle().await;
+        let audited_in_cycle = fx.server().fault_counts().truncated_readdirs - before_cycle;
+
+        // The anti-vacuous-green guard this row previously lacked: if the cycle
+        // never enumerated, everything below is trivially true and the row is
+        // measuring nothing.
+        anyhow::ensure!(
+            audited_in_cycle >= 1,
+            "the cycle never reached the audit, so it cannot show what a failed listing does to \
+             one: the truncation counter did not move across it"
+        );
+
         let during = fx.oracle().entries(SFTP_SUBFOLDER);
         anyhow::ensure!(
             during.len() == 3,
             "a failed listing must not delete anything: {} object(s) remain",
             during.len()
         );
-        let rows = handle.state.load_source_file_state(src.id).await?;
+        let rows = rebooted.state.load_source_file_state(src.id).await?;
         anyhow::ensure!(
             rows.len() == 3 && rows.values().all(|r| r.status == FileStateStatus::Synced),
             "a failed listing must not unsync anything: {:?}",
@@ -2201,13 +2261,14 @@ impl Scenario for SftpTruncatedListingIsAnError {
             "the recovered audit must match the baseline exactly: {recovered:?} vs {whole:?}"
         );
 
-        let codes = error_codes_in_activity(handle.state.as_ref()).await?;
-        let quiesced = is_quiescent(&handle.state().await);
-        let (report, mut notes) = sftp_settle_and_assert(&fx, &handle, &src, 3).await?;
+        let codes = error_codes_in_activity(rebooted.state.as_ref()).await?;
+        let quiesced = is_quiescent(&rebooted.state().await);
+        let (report, mut notes) = sftp_settle_and_assert(&fx, &rebooted, &src, 3).await?;
         notes.push(format!(
-            "the enumeration was cut after a partial batch and surfaced as an error ({}); the \
-             cycle that followed deleted nothing and unsynced nothing, and the audit recovered to \
-             the same three ids",
+            "the enumeration was cut after a partial batch and surfaced as an error ({}); a \
+             rebooted orchestrator's remote-existence audit then hit the same truncation \
+             {audited_in_cycle} time(s) in one cycle and deleted nothing, unsynced nothing; the \
+             audit recovered to the same three ids once the server behaved",
             first_line(&format!("{error:#}"))
         ));
         Ok(finish(&report, quiesced, codes, notes))
@@ -2343,11 +2404,26 @@ impl Scenario for SftpTornSidecarResidue {
             "a torn ANNOTATION must never disturb the DATA it annotates"
         );
 
-        // A further cycle must not duplicate it, delete it, or wedge.
-        let _ = handle.run_one_cycle().await;
-        let codes = error_codes_in_activity(handle.state.as_ref()).await?;
-        let quiesced = is_quiescent(&handle.state().await);
-        let report = assert_invariants(&handle, &oracle, src.id, SFTP_SUBFOLDER).await?;
+        // What the ORCHESTRATOR does about it, which is the half that decides
+        // whether the residue is permanent or self-healing.
+        //
+        // Reaching that takes a REBOOT, for the reason the truncated-listing
+        // row documents: `audit_remote_existence_if_due` is gated on a
+        // per-source latch held in the orchestrator's memory, and the healthy
+        // first cycle already spent this source's audit - so a further cycle on
+        // the SAME orchestrator returns before issuing a remote call and would
+        // prove nothing at all. A fresh handle re-audits, which is also the
+        // real shape: the app restarts and looks again.
+        drop(handle);
+        let rebooted = fx.boot().await?;
+        let _ = rebooted.run_one_cycle().await;
+        let after_cycle = store
+            .list_source_object_ids(&src.id.to_string(), &context)
+            .await?;
+
+        let codes = error_codes_in_activity(rebooted.state.as_ref()).await?;
+        let quiesced = is_quiescent(&rebooted.state().await);
+        let report = assert_invariants(&rebooted, &oracle, src.id, SFTP_SUBFOLDER).await?;
         anyhow::ensure!(
             report.ok(),
             "s6.3 invariants violated: {}",
@@ -2358,27 +2434,30 @@ impl Scenario for SftpTornSidecarResidue {
             "a torn sidecar must not produce, remove or duplicate an object: {} live",
             report.live_object_count
         );
-        let checked = assert_synced_bytes_match_local(&handle, &oracle, &src).await?;
+        let checked = assert_synced_bytes_match_local(&rebooted, &oracle, &src).await?;
         anyhow::ensure!(
             checked == 2,
             "both objects must still be byte-verifiable against their local files, checked \
              {checked}"
         );
-
+        // Whatever the audit decided, the DATA is what must never move.
         anyhow::ensure!(
-            torn.exists(),
-            "the row's own fault must survive the cycle it is measuring"
+            oracle.object_bytes(&torn_id).as_deref() == Some(content.as_slice()),
+            "the object's bytes must survive the audit's opinion of its annotation"
         );
+        let _ = &torn;
         let notes = vec![
             format!(
                 "RULING (accepted behaviour): a torn sidecar reads as UNANNOTATED. The \
                  remote-existence audit dropped the object from {} live id(s) to {} while \
-                 `list_folder` still reported {} object(s); the data, its bytes and its \
-                 file_state row were untouched, and a further cycle produced no duplicate and \
-                 no deletion.",
+                 `list_folder` still reported {} object(s), so the object stayed visible and \
+                 restorable throughout. After a rebooted orchestrator re-ran the audit the set \
+                 was {} - and either way the data, its bytes and its file_state row were \
+                 untouched, with no duplicate and no deletion.",
                 before.len(),
                 after_tear.len(),
-                listed.len()
+                listed.len(),
+                after_cycle.len()
             ),
             "cost, not data loss: an object the audit cannot see is one nothing will ever \
              reclaim if its file_state row also goes - the same bounded-residue trade the \
