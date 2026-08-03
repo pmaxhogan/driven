@@ -59,7 +59,7 @@ jobs:
 
       - name: Upload artifacts (screenshots + evidence)
         if: always()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: e2e-artifacts
           path: e2e-artifacts/
@@ -92,7 +92,7 @@ jobs:
 
       - name: Upload diff report on failure
         if: failure()
-        uses: actions/upload-artifact@v4
+        uses: actions/upload-artifact@v7
         with:
           name: visual-diff-report
           path: |
