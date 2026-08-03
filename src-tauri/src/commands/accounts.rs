@@ -49,7 +49,8 @@ use driven_remote::remote_store::{DriveContext, RemoteStore};
 use crate::app_state::AppState;
 use crate::commands::dtos::{
     AccountDto, AddAccountWizardSessionId, BackendDto, CreateLocalFolderAccountRequest,
-    CreateS3AccountRequest, OAuthAuthUrl, OAuthStatus, ReauthSession, SessionId,
+    CreateS3AccountRequest, CreateSftpAccountRequest, OAuthAuthUrl, OAuthStatus, ReauthSession,
+    SessionId, SftpAccountCreatedDto, SftpAuthMethodDto,
 };
 use crate::commands::{CommandError, CommandResult};
 use crate::events::EVENT_OAUTH_COMPLETE;
@@ -1208,6 +1209,249 @@ pub async fn create_s3_account(
     Ok(account_row_to_dto(&row))
 }
 
+/// Turn a webview-supplied [`CreateSftpAccountRequest`] into the two halves the
+/// SFTP backend keeps apart: the non-secret [`driven_sftp::SftpConfig`] that
+/// will land in `accounts.backend_config_json`, and the
+/// [`driven_sftp::SftpCredential`] that will only ever live in the OS keychain.
+///
+/// Extracted from the command so it is reachable by tests: a `#[tauri::command]`
+/// needs a live `AppHandle` and `State`, which a unit test has no way to build,
+/// and the input rules are exactly the part worth pinning.
+///
+/// Control characters are refused in the host, username and root path (they
+/// would be smuggled into remote paths and log lines), and in the PASSWORD,
+/// which is a single line by construction. The private key deliberately is NOT
+/// checked that way: a PEM is newline-delimited, so the same rule would reject
+/// every valid key.
+fn sftp_config_and_credential(
+    req: &CreateSftpAccountRequest,
+) -> CommandResult<(driven_sftp::SftpConfig, driven_sftp::SftpCredential)> {
+    use driven_sftp::{SftpAuthKind, SftpConfig, SftpCredential};
+
+    reject_control_chars(&req.host, "SSH host")?;
+    reject_control_chars(&req.username, "SSH username")?;
+    reject_control_chars(&req.root_path, "remote path")?;
+
+    let port = req.port.unwrap_or(driven_sftp::DEFAULT_PORT);
+    if port == 0 {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "the SSH port must be between 1 and 65535",
+        ));
+    }
+
+    let (auth, credential) = match req.auth {
+        SftpAuthMethodDto::Password => {
+            let password = req.password.clone().unwrap_or_default();
+            if password.is_empty() {
+                return Err(CommandError::with_code(
+                    ErrorCode::InvalidInput,
+                    "enter the SSH password",
+                ));
+            }
+            reject_control_chars(&password, "SSH password")?;
+            (
+                SftpAuthKind::Password,
+                SftpCredential::Password { password },
+            )
+        }
+        SftpAuthMethodDto::PrivateKey => {
+            let pem = req.private_key.clone().unwrap_or_default();
+            if pem.trim().is_empty() {
+                return Err(CommandError::with_code(
+                    ErrorCode::InvalidInput,
+                    "paste the SSH private key",
+                ));
+            }
+            (
+                SftpAuthKind::PrivateKey,
+                SftpCredential::PrivateKey {
+                    pem,
+                    // An empty passphrase is no passphrase: the form submits ""
+                    // when the user leaves the field alone, and passing that to
+                    // the key decoder would fail every unprotected key.
+                    passphrase: req.passphrase.clone().filter(|p| !p.is_empty()),
+                },
+            )
+        }
+    };
+
+    let config = SftpConfig {
+        host: req.host.clone(),
+        port,
+        root_path: req.root_path.clone(),
+        username: req.username.clone(),
+        auth,
+        // Both are what the creation probe is FOR; a config that arrived with
+        // either already set would be claiming a trust decision no one made.
+        host_key_fingerprint: None,
+        destination_id: None,
+    }
+    .normalized()
+    .map_err(|e| CommandError::with_code(ErrorCode::InvalidInput, e.to_string()))?;
+
+    Ok((config, credential))
+}
+
+/// The probe-then-persist half of [`create_sftp_account`], with the account row
+/// write behind a closure.
+///
+/// Split out for the same reason [`persist_new_account`] is: the ordering here
+/// is the whole safety property (nothing persisted until the destination is
+/// proven; the keychain rolled back if the row write fails), and a
+/// `#[tauri::command]` cannot be called from a test. `insert_row` is a closure
+/// rather than a `StateRepo` call so a test can force the row write to fail and
+/// assert the rollback.
+///
+/// Returns the persisted row plus the host-key fingerprint the probe pinned.
+async fn probe_and_persist_sftp_account<F, Fut>(
+    account_id: AccountId,
+    req: &CreateSftpAccountRequest,
+    now_ms: i64,
+    insert_row: F,
+) -> CommandResult<(AccountRow, String)>
+where
+    F: FnOnce(AccountRow) -> Fut,
+    Fut: std::future::Future<Output = anyhow::Result<()>>,
+{
+    let (mut config, credential) = sftp_config_and_credential(req)?;
+
+    // Prove the destination BEFORE anything is persisted: connect, authenticate,
+    // pin the host key, stamp (or adopt) the destination marker, and write +
+    // remove a real file. A failure here leaves no keychain entry and no row.
+    //
+    // Awaited rather than moved onto a blocking thread because SSH is async all
+    // the way down (`russh` over a tokio socket), so there is nothing here that
+    // would occupy a worker thread the way the local-folder backend's
+    // synchronous `write`+`fsync` does.
+    driven_sftp::prepare_destination(&mut config, &credential, now_ms)
+        .await
+        .map_err(CommandError::from)?;
+
+    // `prepare_destination` returns Ok only after `connect_and_pin` recorded
+    // what the server presented, so this is unreachable in practice; it is an
+    // error rather than an `expect` because persisting an unpinned account
+    // would leave one that can never connect again.
+    let fingerprint = config.host_key_fingerprint.clone().ok_or_else(|| {
+        CommandError::with_code(
+            ErrorCode::InternalBug,
+            "the SFTP probe succeeded without pinning a host key",
+        )
+    })?;
+
+    let label = req
+        .display_name
+        .clone()
+        .filter(|d| !d.trim().is_empty())
+        // The normalized config, not the raw request: the label has to name the
+        // destination Driven actually probed.
+        .unwrap_or_else(|| format!("{}@{}:{}", config.username, config.host, config.root_path));
+
+    let config_json = driven_backend::store_sftp_credentials(
+        &account_id.to_string(),
+        config.clone(),
+        &credential,
+    )
+    .map_err(|e| {
+        CommandError::with_code(
+            ErrorCode::CryptoKeyMissing,
+            format!("failed to persist the SSH credential in the keychain: {e}"),
+        )
+    })?;
+
+    let row = AccountRow {
+        id: account_id,
+        // SFTP has no account identity to fetch; `user@host:/path` IS the
+        // account's human label, and `email` is the field the UI renders.
+        email: label,
+        display_name: req.display_name.clone().filter(|d| !d.trim().is_empty()),
+        state: AccountState::Ok,
+        encryption_master_key_id: None,
+        created_at: now_ms,
+        last_synced_at: None,
+        backend_kind: BackendKind::Sftp,
+        backend_config_json: Some(config_json),
+    };
+
+    if let Err(e) = insert_row(row.clone()).await {
+        // Roll the keychain entry back so a failed create leaves no orphaned
+        // secret behind (the same discipline `persist_new_account` and
+        // `create_s3_account` apply). The destination MARKER stays on the
+        // server: it is inert without an account carrying its id, and the next
+        // attempt adopts it rather than stamping a second one.
+        let spec = driven_backend::AccountBackend {
+            account_id: account_id.to_string(),
+            kind: BackendKind::Sftp,
+            config_json: None,
+        };
+        if let Err(purge) = driven_backend::purge_account_secrets(&spec) {
+            tracing::warn!(target: TARGET, account_id = %account_id, error = %purge, "rollback of the SSH keychain entry failed");
+        }
+        return Err(CommandError::from(e));
+    }
+
+    Ok((row, fingerprint))
+}
+
+/// `create_sftp_account(req)` - create an account backed by an SSH (SFTP)
+/// destination: a home server, a NAS, or a VPS the user can already reach with
+/// `ssh`.
+///
+/// The SSH counterpart of the OAuth wizard's
+/// `begin -> submit -> signin -> finish` sequence, collapsed into one call
+/// because there is no consent round trip: the user supplies a password or a
+/// private key directly. As with the OAuth and S3 paths, the SECRET is written
+/// to the OS keychain and only the non-secret config (host, port, root path,
+/// username, auth-method tag, pinned host-key fingerprint, destination id)
+/// reaches SQLite.
+///
+/// The destination is PROVED usable before the account row is written - the
+/// server must be reachable, the credential must authenticate, the root path
+/// must exist, and it must accept a real write - because an account that cannot
+/// reach its destination is worse than no account: it sits in the sources list
+/// looking configured while every backup cycle fails. The probe also PINS the
+/// server's host key (trust on first use) and stamps or ADOPTS the
+/// destination-identity marker, which is what later lets the store tell "the
+/// NAS volume is not mounted" apart from "an empty directory at the mount
+/// point"; adopting means re-adding a server that already holds a Driven backup
+/// keeps every object on it.
+///
+/// Ordering mirrors `create_s3_account`: keychain first, then the row, with the
+/// keychain entry rolled back if the row write fails, so a failure leaves no
+/// orphaned secret and no half-account.
+#[tauri::command]
+pub async fn create_sftp_account(
+    app: AppHandle,
+    state: State<'_, AppState>,
+    req: CreateSftpAccountRequest,
+) -> CommandResult<SftpAccountCreatedDto> {
+    let account_id = AccountId::new_v4();
+    let repo = state.state();
+    let (row, host_key_fingerprint) =
+        probe_and_persist_sftp_account(account_id, &req, SystemClock.now_ms(), |row| async move {
+            repo.upsert_account(&row).await
+        })
+        .await?;
+
+    tracing::info!(target: TARGET, account_id = %account_id, "SFTP account persisted");
+
+    // A2: hot-spawn so the wizard's initial sync finds a live handle.
+    match crate::assembly::spawn_account(&app, &state, account_id).await {
+        Ok(true) => {}
+        Ok(false) => {
+            tracing::warn!(target: TARGET, account_id = %account_id, "SFTP account persisted but orchestrator not spawned");
+        }
+        Err(err) => {
+            tracing::error!(target: TARGET, account_id = %account_id, %err, "hot-spawn after create_sftp_account failed; orchestrator will start on next launch");
+        }
+    }
+
+    Ok(SftpAccountCreatedDto {
+        account: account_row_to_dto(&row),
+        host_key_fingerprint,
+    })
+}
+
 /// Validate + normalize the destination folder path a webview supplied for
 /// `create_local_folder_account`.
 ///
@@ -1883,5 +2127,521 @@ mod tests {
         let mut row = fresh_row(AccountId::new_v4());
         row.backend_kind = BackendKind::GoogleDrive;
         assert_eq!(account_row_to_dto(&row).backend_kind, "google_drive");
+    }
+
+    // -- create_sftp_account -------------------------------------------------
+    //
+    // These drive a REAL in-process SSH + SFTP server over a real socket
+    // (`driven_sftp::test_support::TestSftpServer`), so the probe they exercise
+    // is the production one: key exchange, authentication, the host-key pin, the
+    // destination marker and a real write. A mocked probe could not tell a
+    // working command from one that persists an account it never proved.
+
+    mod sftp {
+        // `KeychainGuard` is a `std::sync::MutexGuard` over the process-global
+        // keychain, and holding it across an await is exactly what these tests
+        // need: it SERIALIZES them against every other keychain test in this
+        // binary, which share one in-memory store. It cannot deadlock - each
+        // `#[tokio::test]` runs its own runtime on its own thread, so no task
+        // that could contend for the lock is ever scheduled behind the await.
+        #![allow(clippy::await_holding_lock)]
+
+        use super::*;
+        use driven_sftp::test_support::{TestSftpServer, TEST_PASSWORD, TEST_USERNAME};
+        use driven_sftp::{names, SftpConfig, SftpCredential, SftpCredentialStore};
+
+        const NOW: i64 = 1_700_000_000_000;
+
+        /// Isolate the test from the OS keychain. See
+        /// `driven_test_fixtures::keychain` for why writing for real is not an
+        /// acceptable fallback (on macOS it blocks the run on a modal prompt).
+        fn keychain() -> Option<driven_test_fixtures::keychain::KeychainGuard> {
+            driven_test_fixtures::keychain::isolated()
+        }
+
+        /// A password request against `server`, with every optional field at the
+        /// shape the wizard submits for the simplest case.
+        fn password_request(server: &TestSftpServer) -> CreateSftpAccountRequest {
+            CreateSftpAccountRequest {
+                display_name: None,
+                host: server.host(),
+                port: Some(server.port()),
+                root_path: "/".to_string(),
+                username: TEST_USERNAME.to_string(),
+                auth: SftpAuthMethodDto::Password,
+                password: Some(TEST_PASSWORD.to_string()),
+                private_key: None,
+                passphrase: None,
+            }
+        }
+
+        /// The names the server's own filesystem holds, sorted.
+        fn names_in(root: &std::path::Path) -> Vec<String> {
+            let mut names: Vec<String> = std::fs::read_dir(root)
+                .expect("read the served directory")
+                .map(|entry| entry.unwrap().file_name().to_string_lossy().into_owned())
+                .collect();
+            names.sort();
+            names
+        }
+
+        /// Where a [`recording`] closure puts the row it was handed.
+        type RowSink = std::sync::Arc<Mutex<Option<AccountRow>>>;
+
+        /// An `insert_row` closure that records the row it was handed.
+        fn recording() -> (
+            RowSink,
+            impl FnOnce(AccountRow) -> std::future::Ready<anyhow::Result<()>>,
+        ) {
+            let seen = std::sync::Arc::new(Mutex::new(None));
+            let sink = std::sync::Arc::clone(&seen);
+            (seen, move |row: AccountRow| {
+                *sink.lock().expect("row sink poisoned") = Some(row);
+                std::future::ready(Ok(()))
+            })
+        }
+
+        #[tokio::test]
+        async fn a_successful_create_persists_the_credential_the_row_and_the_marker() {
+            let Some(_g) = keychain() else { return };
+            let server = TestSftpServer::spawn().await.unwrap();
+            let id = AccountId::new_v4();
+            let (seen, insert) = recording();
+
+            let (row, fingerprint) =
+                probe_and_persist_sftp_account(id, &password_request(&server), NOW, insert)
+                    .await
+                    .expect("a reachable server with a good password creates an account");
+
+            // The row: kind, label and timestamps.
+            assert_eq!(row.backend_kind, BackendKind::Sftp);
+            assert_eq!(row.email, format!("{TEST_USERNAME}@{}:/", server.host()));
+            assert_eq!(row.display_name, None);
+            assert_eq!(row.state, AccountState::Ok);
+            assert_eq!(row.created_at, NOW);
+            assert_eq!(
+                seen.lock().unwrap().as_ref().map(|r| r.id),
+                Some(id),
+                "the row really reached the state repo"
+            );
+
+            // The persisted config carries what the probe learned, and no secret.
+            let config =
+                SftpConfig::from_json(row.backend_config_json.as_deref().expect("a config blob"))
+                    .expect("the stored blob parses");
+            assert_eq!(
+                config.host_key_fingerprint.as_deref(),
+                Some(server.host_key_fingerprint())
+            );
+            assert_eq!(
+                fingerprint,
+                server.host_key_fingerprint(),
+                "the UI displays what was pinned"
+            );
+            assert!(config.destination_id.is_some());
+            let blob = row.backend_config_json.as_deref().unwrap();
+            assert!(
+                !blob.contains(TEST_PASSWORD),
+                "the password must never reach SQLite: {blob}"
+            );
+
+            // The marker is really on the server, under the id the config
+            // recorded - without it every mutating store op fails closed.
+            let raw = std::fs::read(server.root().join(names::MARKER_FILE))
+                .expect("the probe wrote a destination marker");
+            let marker: driven_sftp::DestinationMarker =
+                serde_json::from_slice(&raw).expect("the marker parses");
+            assert_eq!(
+                config.destination_id.as_deref(),
+                Some(&*marker.destination_id)
+            );
+            assert_eq!(
+                names_in(server.root()),
+                vec![names::MARKER_FILE.to_string()],
+                "the writability probe cleans up after itself"
+            );
+
+            // The credential is in the keychain, and only there.
+            assert_eq!(
+                SftpCredentialStore::new(id.to_string())
+                    .load()
+                    .expect("keychain read"),
+                Some(SftpCredential::Password {
+                    password: TEST_PASSWORD.to_string()
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn the_account_the_command_persists_can_immediately_write_to_its_destination() {
+            // The end the whole probe exists for: everything the command stored
+            // (keychain credential, pinned fingerprint, destination id) has to
+            // be enough for the FACTORY to build a store that passes
+            // `guard_root` and mutates the destination on its first try. Any one
+            // of the three missing turns this into a failure - which is exactly
+            // what a persisted-but-unusable account would be.
+            let Some(_g) = keychain() else { return };
+            let server = TestSftpServer::spawn().await.unwrap();
+            let id = AccountId::new_v4();
+            let (_seen, insert) = recording();
+
+            let (row, _) =
+                probe_and_persist_sftp_account(id, &password_request(&server), NOW, insert)
+                    .await
+                    .expect("create");
+
+            let ca = driven_tls::CustomCaConfig::default();
+            let proxy = driven_tls::ProxyConfig::default();
+            let outcome = driven_backend::build_store(
+                &driven_backend::AccountBackend {
+                    account_id: id.to_string(),
+                    kind: row.backend_kind,
+                    config_json: row.backend_config_json.clone(),
+                },
+                driven_backend::BackendContext {
+                    ca: &ca,
+                    proxy: &proxy,
+                },
+            )
+            .expect("the factory builds the account's store");
+            let driven_backend::StoreOutcome::Store(store) = outcome else {
+                panic!("a freshly created SFTP account must not need reauth");
+            };
+
+            store
+                .ensure_folder("", "Driven", &DriveContext::MyDrive)
+                .await
+                .expect("a mutating op must pass guard_root on the prepared destination");
+            assert!(server.root().join("Driven").is_dir());
+        }
+
+        #[tokio::test]
+        async fn a_private_key_account_stores_the_key_and_drops_an_empty_passphrase() {
+            let Some(_g) = keychain() else { return };
+            let server = TestSftpServer::spawn().await.unwrap();
+            let id = AccountId::new_v4();
+            let (_seen, insert) = recording();
+
+            let req = CreateSftpAccountRequest {
+                auth: SftpAuthMethodDto::PrivateKey,
+                password: None,
+                private_key: Some(server.client_private_key_pem().to_string()),
+                // The form submits "" when the user leaves the field alone; an
+                // empty passphrase is no passphrase, not a wrong one.
+                passphrase: Some(String::new()),
+                ..password_request(&server)
+            };
+            probe_and_persist_sftp_account(id, &req, NOW, insert)
+                .await
+                .expect("key auth creates an account");
+
+            assert_eq!(
+                SftpCredentialStore::new(id.to_string()).load().unwrap(),
+                Some(SftpCredential::PrivateKey {
+                    pem: server.client_private_key_pem().to_string(),
+                    passphrase: None,
+                })
+            );
+        }
+
+        #[tokio::test]
+        async fn a_refused_credential_persists_nothing() {
+            // Acceptance criterion 1: bad credentials leave NO keychain entry
+            // and NO row - an account that cannot reach its destination is
+            // worse than no account.
+            let Some(_g) = keychain() else { return };
+            let server = TestSftpServer::spawn().await.unwrap();
+            let id = AccountId::new_v4();
+            let (seen, insert) = recording();
+
+            let req = CreateSftpAccountRequest {
+                password: Some("wrong-password".to_string()),
+                ..password_request(&server)
+            };
+            let err = probe_and_persist_sftp_account(id, &req, NOW, insert)
+                .await
+                .expect_err("a bad password cannot create an account");
+
+            assert_eq!(err.code, ErrorCode::AuthInvalidGrant);
+            assert!(seen.lock().unwrap().is_none(), "no row was written");
+            assert!(SftpCredentialStore::new(id.to_string())
+                .load()
+                .unwrap()
+                .is_none());
+            assert!(
+                names_in(server.root()).is_empty(),
+                "and nothing was written to the server either"
+            );
+        }
+
+        #[tokio::test]
+        async fn an_unreachable_host_persists_nothing() {
+            let Some(_g) = keychain() else { return };
+            // A port nothing is listening on: bind one, learn its number, drop it.
+            let dead_port = {
+                let listener = tokio::net::TcpListener::bind(("127.0.0.1", 0))
+                    .await
+                    .unwrap();
+                listener.local_addr().unwrap().port()
+            };
+            let id = AccountId::new_v4();
+            let (seen, insert) = recording();
+
+            let req = CreateSftpAccountRequest {
+                display_name: None,
+                host: "127.0.0.1".to_string(),
+                port: Some(dead_port),
+                root_path: "/".to_string(),
+                username: TEST_USERNAME.to_string(),
+                auth: SftpAuthMethodDto::Password,
+                password: Some(TEST_PASSWORD.to_string()),
+                private_key: None,
+                passphrase: None,
+            };
+            let err = probe_and_persist_sftp_account(id, &req, NOW, insert)
+                .await
+                .expect_err("nothing is listening there");
+
+            assert_eq!(err.code, ErrorCode::NetIntermittent);
+            assert!(seen.lock().unwrap().is_none());
+            assert!(SftpCredentialStore::new(id.to_string())
+                .load()
+                .unwrap()
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn a_missing_root_path_persists_nothing_and_says_which_one() {
+            let Some(_g) = keychain() else { return };
+            let server = TestSftpServer::spawn().await.unwrap();
+            let id = AccountId::new_v4();
+            let (seen, insert) = recording();
+
+            let req = CreateSftpAccountRequest {
+                root_path: "/not-there".to_string(),
+                ..password_request(&server)
+            };
+            let err = probe_and_persist_sftp_account(id, &req, NOW, insert)
+                .await
+                .expect_err("a root path that does not exist is not a destination");
+
+            // The wizard keys on this code to tell the user to create the
+            // directory (or fix the path) rather than re-enter their password.
+            assert!(
+                err.message.contains("sftp.root_missing"),
+                "the classified code must survive the command boundary: {}",
+                err.message
+            );
+            assert!(seen.lock().unwrap().is_none());
+            assert!(SftpCredentialStore::new(id.to_string())
+                .load()
+                .unwrap()
+                .is_none());
+        }
+
+        #[tokio::test]
+        async fn a_row_write_failure_rolls_the_keychain_entry_back() {
+            let Some(_g) = keychain() else { return };
+            let server = TestSftpServer::spawn().await.unwrap();
+            let id = AccountId::new_v4();
+
+            let err =
+                probe_and_persist_sftp_account(id, &password_request(&server), NOW, |_row| async {
+                    Err(anyhow::anyhow!("forced row insert failure"))
+                })
+                .await
+                .expect_err("a row-insert failure must propagate");
+
+            assert_eq!(err.code, ErrorCode::InternalBug);
+            assert!(
+                SftpCredentialStore::new(id.to_string())
+                    .load()
+                    .unwrap()
+                    .is_none(),
+                "a failed create must leave no orphaned secret in the keychain"
+            );
+        }
+
+        #[tokio::test]
+        async fn a_display_name_overrides_the_derived_label() {
+            let Some(_g) = keychain() else { return };
+            let server = TestSftpServer::spawn().await.unwrap();
+            let (_seen, insert) = recording();
+
+            let req = CreateSftpAccountRequest {
+                display_name: Some("  Home NAS  ".to_string()),
+                root_path: "/".to_string(),
+                ..password_request(&server)
+            };
+            let (row, _) = probe_and_persist_sftp_account(AccountId::new_v4(), &req, NOW, insert)
+                .await
+                .expect("create");
+
+            assert_eq!(row.email, "  Home NAS  ");
+            assert_eq!(row.display_name.as_deref(), Some("  Home NAS  "));
+        }
+
+        #[tokio::test]
+        async fn a_blank_display_name_falls_back_to_the_derived_label() {
+            let Some(_g) = keychain() else { return };
+            let server = TestSftpServer::spawn().await.unwrap();
+            std::fs::create_dir_all(server.root().join("srv/backups")).unwrap();
+            let (_seen, insert) = recording();
+
+            let req = CreateSftpAccountRequest {
+                display_name: Some("   ".to_string()),
+                // A trailing slash on the root path must not reach the label -
+                // it names the NORMALIZED destination Driven probed.
+                root_path: "/srv/backups/".to_string(),
+                ..password_request(&server)
+            };
+            let (row, _) = probe_and_persist_sftp_account(AccountId::new_v4(), &req, NOW, insert)
+                .await
+                .expect("create");
+
+            assert_eq!(
+                row.email,
+                format!("{TEST_USERNAME}@{}:/srv/backups", server.host())
+            );
+            assert_eq!(row.display_name, None);
+        }
+
+        #[test]
+        fn a_request_missing_its_secret_is_refused_before_any_connection() {
+            let base = CreateSftpAccountRequest {
+                display_name: None,
+                host: "nas.example".to_string(),
+                port: None,
+                root_path: "/backups".to_string(),
+                username: "driven".to_string(),
+                auth: SftpAuthMethodDto::Password,
+                password: None,
+                private_key: None,
+                passphrase: None,
+            };
+            assert_eq!(
+                sftp_config_and_credential(&base).unwrap_err().code,
+                ErrorCode::InvalidInput,
+                "password auth with no password"
+            );
+            assert_eq!(
+                sftp_config_and_credential(&CreateSftpAccountRequest {
+                    password: Some(String::new()),
+                    ..base.clone()
+                })
+                .unwrap_err()
+                .code,
+                ErrorCode::InvalidInput,
+                "an empty password is no password"
+            );
+            assert_eq!(
+                sftp_config_and_credential(&CreateSftpAccountRequest {
+                    auth: SftpAuthMethodDto::PrivateKey,
+                    private_key: Some("   \n".to_string()),
+                    ..base.clone()
+                })
+                .unwrap_err()
+                .code,
+                ErrorCode::InvalidInput,
+                "a whitespace-only private key is no key"
+            );
+        }
+
+        #[test]
+        fn the_request_is_validated_and_normalized_into_a_config() {
+            let req = CreateSftpAccountRequest {
+                display_name: None,
+                host: "  nas.example  ".to_string(),
+                port: None,
+                root_path: "/backups/".to_string(),
+                username: "  driven  ".to_string(),
+                auth: SftpAuthMethodDto::Password,
+                password: Some("hunter2".to_string()),
+                private_key: None,
+                passphrase: None,
+            };
+            let (config, credential) = sftp_config_and_credential(&req).expect("valid");
+            assert_eq!(config.host, "nas.example");
+            assert_eq!(config.username, "driven");
+            assert_eq!(config.root_path, "/backups");
+            assert_eq!(config.port, driven_sftp::DEFAULT_PORT, "22 by default");
+            // The probe is the only thing allowed to fill these in.
+            assert_eq!(config.host_key_fingerprint, None);
+            assert_eq!(config.destination_id, None);
+            assert_eq!(
+                credential,
+                SftpCredential::Password {
+                    password: "hunter2".to_string()
+                }
+            );
+
+            // A root path that escapes its own subtree is refused by the
+            // backend's own normalization, surfaced as invalid input.
+            assert_eq!(
+                sftp_config_and_credential(&CreateSftpAccountRequest {
+                    root_path: "/backups/../../etc".to_string(),
+                    ..req.clone()
+                })
+                .unwrap_err()
+                .code,
+                ErrorCode::InvalidInput
+            );
+            // Control characters in the host / username / path, and port 0.
+            for bad in [
+                CreateSftpAccountRequest {
+                    host: "nas\nexample".to_string(),
+                    ..req.clone()
+                },
+                CreateSftpAccountRequest {
+                    username: "dri\tven".to_string(),
+                    ..req.clone()
+                },
+                CreateSftpAccountRequest {
+                    root_path: "/back\0ups".to_string(),
+                    ..req.clone()
+                },
+                CreateSftpAccountRequest {
+                    password: Some("hunter2\n".to_string()),
+                    ..req.clone()
+                },
+                CreateSftpAccountRequest {
+                    port: Some(0),
+                    ..req.clone()
+                },
+            ] {
+                assert_eq!(
+                    sftp_config_and_credential(&bad).unwrap_err().code,
+                    ErrorCode::InvalidInput,
+                    "{:?}",
+                    bad.host
+                );
+            }
+        }
+
+        #[test]
+        fn a_multiline_private_key_is_accepted_despite_the_control_char_rule() {
+            // The PEM is newline-delimited by construction, so the rule that
+            // protects the single-line fields must not be applied to it.
+            let pem = "-----BEGIN OPENSSH PRIVATE KEY-----\nb3BlbnNza\n-----END OPENSSH PRIVATE KEY-----\n";
+            let (_, credential) = sftp_config_and_credential(&CreateSftpAccountRequest {
+                display_name: None,
+                host: "nas.example".to_string(),
+                port: Some(2222),
+                root_path: "/backups".to_string(),
+                username: "driven".to_string(),
+                auth: SftpAuthMethodDto::PrivateKey,
+                password: None,
+                private_key: Some(pem.to_string()),
+                passphrase: Some("phrase".to_string()),
+            })
+            .expect("a PEM is not a malformed field");
+            assert_eq!(
+                credential,
+                SftpCredential::PrivateKey {
+                    pem: pem.to_string(),
+                    passphrase: Some("phrase".to_string()),
+                }
+            );
+        }
     }
 }

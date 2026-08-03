@@ -203,7 +203,7 @@ fn parent_of(id: &str) -> String {
 
 /// Join a remote directory path and a single component, SFTP-style (always
 /// `/`, never the host platform's separator).
-fn join_remote(dir: &str, name: &str) -> String {
+pub(crate) fn join_remote(dir: &str, name: &str) -> String {
     if dir.ends_with('/') {
         format!("{dir}{name}")
     } else {
@@ -241,7 +241,7 @@ fn not_found(id: &str) -> anyhow::Error {
 /// reason rides on top as anyhow context, so a log line says WHICH of the
 /// several causes fired without inventing a second classification for a
 /// condition the app already knows how to handle.
-fn dest_missing(code: &str, reason: &str) -> anyhow::Error {
+pub(crate) fn dest_missing(code: &str, reason: &str) -> anyhow::Error {
     tracing::warn!(
         target: crate::TARGET,
         %code,
@@ -259,7 +259,7 @@ fn dest_missing(code: &str, reason: &str) -> anyhow::Error {
 /// connection loss, which is retryable; a protocol-level surprise
 /// (`UnexpectedPacket`, a limit violation) is reported as a bad message, which
 /// is not - retrying a malformed exchange just repeats it.
-fn sftp_op_error(context: &str, error: SftpProtocolError) -> anyhow::Error {
+pub(crate) fn sftp_op_error(context: &str, error: SftpProtocolError) -> anyhow::Error {
     let failure = match &error {
         SftpProtocolError::Status(status) => SftpFailure::Status {
             code: status.status_code as u32,
@@ -289,7 +289,7 @@ fn sftp_op_error(context: &str, error: SftpProtocolError) -> anyhow::Error {
 /// classifies as `StorageQuota`; anything else is reported as the generic
 /// server-side failure it is (retryable), except a broken pipe, which is the
 /// transport going away.
-fn sftp_io_error(context: &str, error: std::io::Error) -> anyhow::Error {
+pub(crate) fn sftp_io_error(context: &str, error: std::io::Error) -> anyhow::Error {
     let code = if error.kind() == std::io::ErrorKind::BrokenPipe {
         status_code::CONNECTION_LOST
     } else {
@@ -302,7 +302,7 @@ fn sftp_io_error(context: &str, error: std::io::Error) -> anyhow::Error {
 }
 
 /// Is `error` an `SSH_FX_NO_SUCH_FILE`?
-fn is_no_such_file(error: &SftpProtocolError) -> bool {
+pub(crate) fn is_no_such_file(error: &SftpProtocolError) -> bool {
     matches!(error, SftpProtocolError::Status(status) if status.status_code == StatusCode::NoSuchFile)
 }
 

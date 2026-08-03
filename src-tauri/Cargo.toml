@@ -104,6 +104,11 @@ driven-backend = { path = "../crates/driven-backend" }
 # The S3 destination's config + credential types, which the setup command
 # validates before persisting anything.
 driven-s3 = { path = "../crates/driven-s3" }
+# The SSH (SFTP) destination's config + credential types, and the creation probe
+# (`prepare_destination`) that pins the host key, stamps the destination marker
+# and proves the root is writable before `create_sftp_account` persists an
+# account.
+driven-sftp = { path = "../crates/driven-sftp" }
 # The backend-neutral RemoteStore trait, for the create-time reachability
 # probe that proves a destination works before an account row exists.
 driven-remote = { path = "../crates/driven-remote" }
@@ -211,6 +216,12 @@ tempfile = "3"
 # that reaches the real keychain re-prompts on every rebuild and blocks the run
 # on a modal dialog. The crate-level guard test asserts the mechanism is live.
 driven-test-fixtures = { path = "../crates/driven-test-fixtures" }
+# `test-server` exposes `driven_sftp::test_support::TestSftpServer` - a REAL
+# in-process russh + russh-sftp server over a real socket - so the
+# `create_sftp_account` tests probe an actual SSH destination (handshake, auth,
+# host-key pin, marker write) instead of a mock that could not tell a working
+# command from a broken one.
+driven-sftp = { path = "../crates/driven-sftp", features = ["test-server"] }
 
 [features]
 # The standard Tauri asset-embedding switch: `cargo tauri build` enables it

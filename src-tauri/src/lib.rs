@@ -646,6 +646,7 @@ pub fn run() {
             commands::accounts::list_backends,
             commands::accounts::create_s3_account,
             commands::accounts::create_local_folder_account,
+            commands::accounts::create_sftp_account,
             commands::accounts::begin_add_account_wizard,
             commands::accounts::submit_oauth_credentials,
             commands::accounts::start_oauth_signin,

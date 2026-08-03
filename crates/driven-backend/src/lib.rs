@@ -269,6 +269,29 @@ pub fn store_s3_credentials(
     config.to_json()
 }
 
+/// Persist an account's SSH (SFTP) destination: validate + normalize the
+/// non-secret config into the blob for `accounts.backend_config_json`, and put
+/// the password / private key in the OS keychain.
+///
+/// Returns the config JSON for the caller to store on the account row. The
+/// credential is NOT returned and never reaches the caller's storage.
+///
+/// `config` is expected to carry the pinned host-key fingerprint and the
+/// destination id the CREATION PROBE recorded
+/// ([`driven_sftp::prepare_destination`]) - this function only persists what it
+/// is handed, and an account stored without a pinned fingerprint could never
+/// connect again ([`driven_sftp::session::SftpSession::connect`] refuses an
+/// unpinned config before it opens a socket).
+pub fn store_sftp_credentials(
+    account_id: &str,
+    config: SftpConfig,
+    credential: &driven_sftp::SftpCredential,
+) -> anyhow::Result<String> {
+    let config = config.normalized()?;
+    SftpCredentialStore::new(account_id.to_string()).store(credential)?;
+    config.to_json()
+}
+
 /// Remove every keychain secret an account's backend owns.
 ///
 /// Called on account removal. Idempotent per backend, and deliberately a
@@ -625,6 +648,61 @@ mod tests {
             prefix: None,
         };
         assert!(store_s3_credentials("acct-never-created", bad, &creds).is_err());
+    }
+
+    #[test]
+    fn store_sftp_credentials_validates_before_touching_the_keychain() {
+        // Same discipline as the S3 sibling: a config that could never work
+        // must not leave a password behind in the user's keychain.
+        let credential = driven_sftp::SftpCredential::Password {
+            password: "hunter2".to_string(),
+        };
+        let bad = SftpConfig {
+            host: String::new(),
+            port: driven_sftp::DEFAULT_PORT,
+            root_path: "/backups".to_string(),
+            username: "driven".to_string(),
+            auth: driven_sftp::SftpAuthKind::Password,
+            host_key_fingerprint: Some("SHA256:whatever".to_string()),
+            destination_id: Some("dest-1".to_string()),
+        };
+        assert!(store_sftp_credentials("acct-never-created", bad, &credential).is_err());
+    }
+
+    #[test]
+    fn a_persisted_sftp_config_blob_carries_no_credential_material() {
+        // The blob is what lands in SQLite and the diagnostic bundle. The
+        // fingerprint and destination id belong there (they are public facts
+        // about the server); the password never does.
+        //
+        // Rendered through the same `normalized().to_json()` path
+        // `store_sftp_credentials` uses, rather than through the function
+        // itself, so this test never reaches a keychain at all (the S3 sibling
+        // above is written the same way for the same reason).
+        let blob = SftpConfig {
+            host: "nas.example".to_string(),
+            port: 2222,
+            root_path: "/backups/".to_string(),
+            username: "driven".to_string(),
+            auth: driven_sftp::SftpAuthKind::Password,
+            host_key_fingerprint: Some("SHA256:abc".to_string()),
+            destination_id: Some("dest-1".to_string()),
+        }
+        .normalized()
+        .expect("valid")
+        .to_json()
+        .expect("json");
+        // Matched as a JSON KEY, because `"auth":"password"` is the (non-secret)
+        // auth-method tag and must not trip the guard.
+        for forbidden in ["password", "passphrase", "pem", "secret"] {
+            assert!(
+                !blob.to_lowercase().contains(&format!("\"{forbidden}\":")),
+                "the persisted blob must carry no {forbidden:?} field: {blob}"
+            );
+        }
+        assert!(blob.contains("SHA256:abc"));
+        assert!(blob.contains("dest-1"));
+        assert!(blob.contains("/backups"), "normalized root path: {blob}");
     }
 
     #[test]

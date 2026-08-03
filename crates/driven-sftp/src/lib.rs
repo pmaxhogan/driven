@@ -27,6 +27,10 @@
 //!   SFTP server and a USB stick untouched.
 //! - [`meta`] - the per-object metadata sidecar carrying `app_properties`
 //!   through a protocol that has nowhere to put them.
+//! - [`provision`] - [`prepare_destination`], the account-creation probe. It
+//!   pins the host key, stamps (or adopts) the destination-identity marker and
+//!   proves the root is writable, in that order, BEFORE the caller persists an
+//!   account.
 //! - [`store`] - [`SftpStore`], the trait implementation. Read its module docs
 //!   before touching an upload path: because SFTP returns no server-computed
 //!   digest, every committed object is **re-downloaded and re-hashed**, and
@@ -46,6 +50,7 @@ pub mod config;
 pub mod error;
 pub mod meta;
 pub mod names;
+pub mod provision;
 pub mod session;
 pub mod store;
 
@@ -53,9 +58,11 @@ pub mod store;
 pub mod test_support;
 
 pub use config::{
-    SftpAuthKind, SftpConfig, SftpConfigError, SftpCredential, SftpCredentialStore, DEFAULT_PORT,
+    DestinationMarker, SftpAuthKind, SftpConfig, SftpConfigError, SftpCredential,
+    SftpCredentialStore, DEFAULT_PORT,
 };
 pub use error::{sftp_error, sftp_error_classification, SftpFailure};
+pub use provision::{prepare_destination, PreparedDestination};
 pub use session::{host_key_fingerprint, SftpSession};
 pub use store::SftpStore;
 
