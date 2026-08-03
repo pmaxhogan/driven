@@ -57,7 +57,13 @@ jobs:
 
       - name: Run the app-level e2e suite
         run: |
-          mkdir -p e2e-artifacts
+          # World-writable on purpose: the runner user (uid 1001) creates the
+          # dir but the container's non-root `driven` user writes into it via
+          # the bind mount - without this every scenario dies at artifacts-dir
+          # creation with EACCES on Linux hosts (Docker Desktop's VirtioFS is
+          # permissive about bind-mount ownership, which is why local runs
+          # never hit it).
+          mkdir -p e2e-artifacts && chmod 777 e2e-artifacts
           docker run --rm \
             --tmpfs /e2e-small-dest:rw,size=1m \
             -v "$PWD/e2e-artifacts:/tmp/driven-e2e-artifacts" \
