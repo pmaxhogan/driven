@@ -19,6 +19,10 @@
 //! [`localfs_fixture`] - a local-folder destination fixture + its fault-free
 //! oracle (s5.2), so the removable-media and crash-mid-commit states can be
 //! built on disk exactly as the failure leaves them
+//! [`sftp_fixture`] - an SSH (SFTP) destination fixture + its fault-free oracle
+//! (s5.2), driving the REAL `driven_sftp::SftpStore` against a real in-process
+//! russh server whose faults go in at the transport, the auth handler and the
+//! SFTP handler
 //! [`scenarios`] - the s3 catalogue, one submodule per category
 //!
 //! The Phase-1 interface fixes these types and trait signatures; the
@@ -36,3 +40,4 @@ pub mod runner;
 pub mod s3_server;
 pub mod scenario;
 pub mod scenarios;
+pub mod sftp_fixture;

@@ -156,6 +156,22 @@ impl InvariantSurface for crate::localfs_fixture::LocalFsOracle {
     }
 }
 
+#[async_trait]
+impl InvariantSurface for crate::sftp_fixture::SftpOracle {
+    async fn invariant_listing(&self, folder_id: &str) -> anyhow::Result<Vec<RemoteEntry>> {
+        // Read off the SERVED DIRECTORY, never through `SftpStore`. Two of the
+        // sftp faults latch (a swapped host key, a marker naming a different
+        // destination) and both make every client-side read fail, so a
+        // store-backed sweep would report "could not verify" exactly on the
+        // runs whose invariants matter most.
+        Ok(self.entries(folder_id))
+    }
+
+    async fn retained_content(&self, id: &str) -> Option<ObjectContent> {
+        self.object_bytes(id).map(ObjectContent::Literal)
+    }
+}
+
 /// Delegating impl so a scenario holding an `Arc<...>` (most of them do, since
 /// the handle needs an `Arc<dyn RemoteStore>` too) can pass it straight to
 /// [`assert_invariants`] with no call-site change.

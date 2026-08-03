@@ -1964,6 +1964,7 @@ dependencies = [
  "driven-power",
  "driven-remote",
  "driven-s3",
+ "driven-sftp",
  "driven-test-fixtures",
  "driven-tls",
  "driven-vss",
