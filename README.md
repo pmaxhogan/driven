@@ -1,10 +1,12 @@
 # Driven
 
-One-way, encrypted backup of your local folders to your own Google Drive. Fast,
-battery- and network-aware, with an in-app restore browser. Desktop app for
-Windows, macOS, and Linux, built with Tauri 2 + Vue 3 + Rust.
+One-way, encrypted backup of your local folders to storage you own: your own
+Google Drive, any S3-compatible bucket, any SSH (SFTP) server, or a plain
+local / removable folder. Fast, battery- and network-aware, with an in-app
+restore browser. Desktop app for Windows, macOS, and Linux, built with
+Tauri 2 + Vue 3 + Rust.
 
-Driven mirrors the folders you choose into your own Google Drive in one
+Driven mirrors the folders you choose into your chosen destination in one
 direction only: local additions and changes are uploaded, and your source
 folders stay the single source of truth. With per-source client-side encryption
 turned on, file names and contents are encrypted on your machine before they
@@ -101,9 +103,9 @@ Notes:
 - ³⁸ Windows and macOS only; Linux needs third-party tools.
 - ³⁹ `bench/` runs Driven's real engine and rclone over identical seeded fixtures against a live Drive account, reporting wall time, throughput, API calls, CPU time, and peak memory for a cold and an incremental pass. See [`bench/README.md`](bench/README.md) for scales, costs, and what is and is not apples-to-apples.
 - ⁴⁰ The others publish unit-test microbenchmarks, internal tuning harnesses (Duplicati's unreleased AutoTune), or vendor marketing numbers, rather than a runnable end-to-end suite. Backblaze does publish a quarterly benchmark, but of B2 object storage rather than the backup client.
-- ⁴¹ Driven's checkmark is scoped to Windows, where a VSS snapshot lets a locked file (Outlook PST, running DB, VM disk) back up while it is held open. macOS has an equivalent behind an opt-in setting (Settings > Rules): a small privileged helper mounts a read-only APFS local snapshot so a *busy* file can be read: it is off by default, and it does nothing for a Full Disk Access denial. On both macOS and Linux, a file Driven cannot open is in any case classified precisely as a transient lock (`local.file_locked`) versus a macOS Full Disk Access denial (`local.permission_denied`) and skipped with a clear reason in the activity log, rather than misreported as a disk error. Linux has no snapshot equivalent and none is planned. See `design/DESIGN.md` §5.3 and §5.3.2.
-- ⁴² Driven's checkmark is scoped to the Google Drive destination. Keeping previous versions relies on a changed file's re-upload landing on a NEW remote object, which is true of a Drive create but not of a destination whose object key is derived from the file name: on S3-compatible stores and local folders the re-upload overwrites the previous copy. Driven therefore does not offer per-source versioning or a restore-by-date on those destinations at all, rather than reporting a point-in-time restore it cannot perform. For recoverability on S3, enable the provider's own bucket versioning. See [issue #220](https://github.com/pmaxhogan/driven/issues/220).
-- ⁴³ Google Drive (the original destination), any S3-compatible object store (AWS S3, Cloudflare R2, MinIO, Backblaze B2 in S3-compatible mode, Wasabi), and a local or removable folder (USB drive, external disk, NAS share) - all behind one `RemoteStore` trait, shipped in v2.5.0. OneDrive and other non-S3-compatible cloud APIs are not implemented.
+- ⁴¹ Driven's checkmark is scoped to Windows, where a VSS snapshot lets a locked file (Outlook PST, running DB, VM disk) back up while it is held open. macOS has an equivalent behind an opt-in setting (Settings > macOS): a small privileged helper mounts a read-only APFS local snapshot so a *busy* file can be read: it is off by default, and it does nothing for a Full Disk Access denial. On both macOS and Linux, a file Driven cannot open is in any case classified precisely as a transient lock (`local.file_locked`) versus a macOS Full Disk Access denial (`local.permission_denied`) and skipped with a clear reason in the activity log, rather than misreported as a disk error. Linux has no snapshot equivalent and none is planned. See `design/DESIGN.md` §5.3 and §5.3.2.
+- ⁴² Driven's checkmark is scoped to the Google Drive destination. Keeping previous versions relies on a changed file's re-upload landing on a NEW remote object, which is true of a Drive create but not of a destination whose object key is derived from the file name: on S3-compatible stores, SFTP servers, and local folders the re-upload overwrites the previous copy. Driven therefore does not offer per-source versioning or a restore-by-date on those destinations at all, rather than reporting a point-in-time restore it cannot perform. For recoverability on S3, enable the provider's own bucket versioning. See [issue #220](https://github.com/pmaxhogan/driven/issues/220).
+- ⁴³ Google Drive (the original destination), any S3-compatible object store (AWS S3, Cloudflare R2, MinIO, Backblaze B2 in S3-compatible mode, Wasabi), any SSH server with SFTP (a NAS, home server, or VPS - added in v2.9.0, with TOFU host-key pinning and password or private-key auth), and a local or removable folder (USB drive, external disk, NAS share) - all behind one `RemoteStore` trait. OneDrive and other non-S3-compatible cloud APIs are not implemented.
 - ⁴⁴ Driven runs three independent periodic checks, not one: a weekly local re-hash (deep-verify) that catches local bit-rot, a startup / deep-verify remote-existence audit that catches an object deleted at the destination outside Driven, and, added in v2.5.0, a weekly rolling integrity scrub that re-checks each already-backed-up object's size against the destination and, where the destination can supply one, its content checksum too - catching remote-side corruption or tampering that neither of the other two checks can see. On by default; a source's population is swept in bounded slices (500 objects per run by default) rather than all at once. Checksum coverage depends on the destination: full on Google Drive and on a local-folder destination (which always re-hashes the bytes it just wrote); size-only for an S3 object uploaded via multipart, because S3 stores no plain content digest for one, only an ETag that digests the individual parts - the scrub reports those as unverifiable rather than guessing, never as falsely clean.
 
 Competitor rows were verified in July 2026 against rclone 1.74.4, restic 0.19.1,
@@ -125,7 +127,18 @@ These move: check each project's current docs before relying on a cell.
 - Configurable OS priority (`low` by default) for the scan, upload reads, and
   bundle builds, so backups yield CPU and disk to whatever is in the foreground.
 - Battery and network awareness: backups defer on battery and on metered or
-  offline networks, then resume automatically.
+  offline networks, then resume automatically. A persistent in-app banner says
+  exactly why syncing is paused and offers the right one-click action - a
+  one-shot "Back up anyway" for battery/metered/schedule pauses, a retry for
+  network ones - and a setting lets backups keep running without internet
+  access for LAN or local-only destinations.
+- macOS menu bar live status: configurable metrics next to the tray icon while
+  backing up (upload speed, percent, files, time remaining) and a configurable
+  idle readout (last backup age or today's uploaded total).
+- Settings organized as a sidebar of focused pages (General, Schedule & Power,
+  Performance, a macOS/Windows platform page, Network, Privacy & Data,
+  Advanced) with search; About is identity-only, reached from the sidebar
+  footer.
 - Remote-existence audit that re-queues files whose Drive copies were deleted
   outside Driven, so a destination-side deletion cannot leave a file silently
   un-backed-up.
@@ -134,7 +147,7 @@ These move: check each project's current docs before relying on a cell.
   is classified precisely - a transient lock versus a macOS Full Disk Access
   denial - and skipped with a clear reason rather than reported as a generic
   disk error. macOS can also back up a *busy* file through an opt-in APFS
-  snapshot (Settings > Rules), which does not help with a Full Disk Access
+  snapshot (Settings > macOS), which does not help with a Full Disk Access
   denial; there is no Linux equivalent.
 - In-app restore browser with full-text file-name search and streaming decrypt.
 - Activity dashboard with a live tail and filterable history.
@@ -149,9 +162,11 @@ These move: check each project's current docs before relying on a cell.
   System Settings pane instead of leaving you to find it.
 - Choice of backup destination: Google Drive, any S3-compatible object store
   (AWS S3, Cloudflare R2, MinIO, Backblaze B2 in S3-compatible mode, Wasabi),
-  or a plain local / removable folder (USB drive, external disk, NAS share) -
-  all behind one pluggable backend trait, so adding the next one is a new
-  backend crate plus a factory arm rather than a fork of every call site.
+  any SSH server with SFTP (NAS, home server, VPS - host key pinned on first
+  contact, password or private-key auth, nothing installed server-side), or a
+  plain local / removable folder (USB drive, external disk, NAS share) - all
+  behind one pluggable backend trait, so adding the next one is a new backend
+  crate plus a factory arm rather than a fork of every call site.
 - Scheduled integrity scrub: on top of the local re-hash and the
   remote-existence audit above, a rolling background pass re-checks each
   already-backed-up object's size, and its content checksum where the
@@ -262,7 +277,7 @@ different fixes:
 
 | Situation | Reported as | Fix |
 |-----------|-------------|-----|
-| The file is held open / busy - a live database, a VM disk, a mail store | `local.file_locked` | Turn on **Back up locked files using an APFS snapshot** in Settings > Rules |
+| The file is held open / busy - a live database, a VM disk, a mail store | `local.file_locked` | Turn on **Back up locked files using an APFS snapshot** in Settings > macOS |
 | macOS privacy protection denies the read | `local.permission_denied` | Grant Full Disk Access (above). Nothing else works. |
 
 The APFS snapshot option is **off by default**. Turning it on asks for your
@@ -302,8 +317,9 @@ The practical consequence, once per update:
 - **Keychain.** Every credential Driven holds lives in your login keychain: the
   account master key (service `dev.maxhogan.driven`), the Google refresh token
   (`driven.google.refresh_token`), your BYO OAuth client credentials
-  (`driven.google.client_creds`), and any S3 key pair
-  (`driven.s3.credentials`). "Always Allow" records the *specific* build you
+  (`driven.google.client_creds`), any S3 key pair
+  (`driven.s3.credentials`), and any SFTP credential
+  (`driven.sftp.credentials`). "Always Allow" records the *specific* build you
   allowed, so after an update macOS asks again. Apple's own description of the
   dialog is "This dialog appears if you recently updated your system software or
   the app, or if the app has been modified". Click **Always Allow** once after
@@ -363,10 +379,18 @@ from Settings.
 
 The wizard is not Drive-only. At the credentials step you can instead pick an
 S3-compatible bucket (AWS S3, Cloudflare R2, MinIO, Backblaze B2 in
-S3-compatible mode, Wasabi - paste an access key pair, no OAuth) or a local /
-removable folder (pick it with the OS folder dialog - no account, nothing
-leaves the machine). Already have credentials for one of these in an
+S3-compatible mode, Wasabi - paste an access key pair, no OAuth), an SSH
+(SFTP) server (host, path, and a password or pasted private key; Driven
+probes the connection, pins the server's host key on first contact, and shows
+you the fingerprint - a later host-key change blocks syncing until you
+reconnect), or a local / removable folder (pick it with the OS folder
+dialog - no account, nothing leaves the machine). Nothing is saved unless the
+probe succeeds. Already have credentials for one of these in an
 `rclone.conf`? See "Migrating from rclone" below.
+
+The destination-marker protection described below for local folders applies
+to SFTP destinations too: a wrong or unmounted server-side path reads as
+"needs reconnecting," never as an empty directory to silently fill.
 
 **Local / removable-folder caveats.** Driven writes a small marker file at the
 destination's root the first time you use it, and every operation re-checks
@@ -407,6 +431,9 @@ It finds the config in the same places rclone does (override with `--config`;
   scheme-less endpoint gains `https://`. The one thing that cannot come from the
   file is the **bucket**: rclone puts it in the path you type
   (`remote:mybucket/dir`), not in the config, so pass `--bucket`.
+- **`type = sftp`** - host, port, user, and path transfer; the password or
+  key material cannot (rclone obscures passwords, and key files stay where
+  they are), so you re-enter the credential in the wizard.
 - **`type = drive`** - the destination folder id and Shared Drive id. The OAuth
   token **cannot** transfer: a refresh token is redeemable only by the OAuth
   client it was issued to (RFC 6749 s6), and rclone's grant was issued to
@@ -420,13 +447,14 @@ rather than prompting you for your rclone password.
 
 ## Update channels
 
-Driven has two update channels, selectable in Settings > About:
+Driven has two update channels, selectable in Settings > General:
 
 - Stable: tagged releases (recommended for everyone).
 - Dev: pre-release builds for testing upcoming changes; expect rough edges.
 
-The About screen shows the current version, the active channel, and the release
-notes for the installed version (sourced from `CHANGELOG.md`). See the macOS
+The About page (reached from the settings sidebar's footer) shows the current
+version, the active channel, and the release notes for the installed version
+(sourced from `CHANGELOG.md`). See the macOS
 updater caveat above before relying on in-app updates on macOS.
 
 ## Build from source
@@ -464,6 +492,8 @@ just lint    # cargo fmt --check + clippy + eslint
 just bundle  # cargo tauri build
 just deny    # cargo deny check
 just bench   # benchmark the real engine against rclone (needs live credentials)
+just e2e     # containerized app-level e2e suite (real Linux app + sshd/MinIO; needs Docker)
+just visual  # Playwright visual regression against the committed baselines (Docker)
 ```
 
 `just bench` uploads to a real Drive account and costs real bandwidth; read
