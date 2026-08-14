@@ -947,6 +947,17 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
 
     // --- phase 2: a fresh executor reconciles -> resumes the session --------
     // The network drop was single-shot, so phase 2's requests all succeed.
+    //
+    // 2026-08-14 OOM regression guard: the resume re-read must STREAM, never
+    // buffer the body (the original implementation read the ENTIRE file into
+    // one `Vec` during reconcile - an interrupted 88 GB upload then OOM-killed
+    // the app on every launch). The MemGauge is bumped by the resume loop as
+    // bytes are buffered and released as Drive acks them; `peak > 0` proves
+    // the resume actually routed through the instrumented streaming path (a
+    // non-instrumented buffered path would read 0 and pass a bare `<=` bound
+    // vacuously), and the ceiling proves boundedness: ~2 wire chunks in
+    // flight, far below the ~16 MiB tail this file resumes.
+    let resume_gauge = Arc::new(MemGauge::default());
     let exec2 = DefaultExecutor::with_clock(
         ExecutorDeps {
             remote: remote.clone(),
@@ -957,8 +968,20 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
             network: None,
         },
         clock.clone(),
-    );
+    )
+    .with_mem_gauge(resume_gauge.clone());
     exec2.reconcile(&src).await.unwrap();
+
+    let peak = resume_gauge.peak();
+    assert!(
+        peak > 0,
+        "the resume must route through the gauge-instrumented streaming loop"
+    );
+    assert!(
+        peak <= 3 * WIRE_CHUNK as u64,
+        "resume memory must stay bounded at a few wire chunks regardless of \
+         file size; peak was {peak} bytes for a {total_len}-byte file"
+    );
 
     // The upload completed via byte-level resume: exactly one object, and it
     // carries the full byte count (proving the resumed tail bytes landed, NOT a

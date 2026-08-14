@@ -43,6 +43,7 @@ mod i18n;
 // of `<config_dir>/app.driven/logs`, shared with the panic hook (SPEC s17) and
 // the diagnostic-bundle collector (SPEC s18).
 mod logging;
+mod memlog;
 mod migrations;
 mod panic_hook;
 // M9b (SPEC s16): anonymous usage telemetry - the install_id + enabled pref, the
@@ -556,6 +557,10 @@ pub fn run() {
                 // shutdown sender are tracked on AppState so the quit drain joins
                 // it with no orphan.
                 updater::spawn_periodic_check(&handle);
+                // 2026-08-14 incident: RSS watchdog so a runaway allocation is
+                // visible in the diagnostic bundle's logs (detached on
+                // purpose - see memlog.rs on why it skips the quit drain).
+                memlog::spawn_sampler();
                 // M9b R2-P2-3 (SPEC s16): record an `update_applied` activity row
                 // when the running version differs from the last-recorded one, so
                 // the telemetry `update_applied` aggregate is driven by a real

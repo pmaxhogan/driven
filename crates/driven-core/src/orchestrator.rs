@@ -99,6 +99,24 @@ const VSS_ORPHAN_SETTING_KEY: &str = "vss.orphans";
 /// `tokio::sync::Mutex` (held across the `.await`s of the DB read + write) makes
 /// each account's whole RMW atomic with respect to the others. `OnceLock` so
 /// every orchestrator in the process shares the same instance.
+/// The bare variant name of an [`OrchestratorState`], for the transition log
+/// (2026-08-14 incident). Deliberately NOT the Debug form: `Error` carries
+/// free-text details that can embed local paths, which must never enter a log
+/// line un-redacted.
+fn state_name(state: &OrchestratorState) -> &'static str {
+    match state {
+        OrchestratorState::Idle { .. } => "idle",
+        OrchestratorState::PowerCheck => "power_check",
+        OrchestratorState::Scanning { .. } => "scanning",
+        OrchestratorState::Planning { .. } => "planning",
+        OrchestratorState::Executing { .. } => "executing",
+        OrchestratorState::Verifying { .. } => "verifying",
+        OrchestratorState::Backoff { .. } => "backoff",
+        OrchestratorState::Paused { .. } => "paused",
+        OrchestratorState::Error { .. } => "error",
+    }
+}
+
 fn orphan_registry_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -932,7 +950,28 @@ impl SyncOrchestrator {
     /// a tray-facing event - the next [`Orchestrator::state`] read still
     /// reflects the stored state.
     async fn transition(&self, next: OrchestratorState) {
-        *self.state_machine.write().await = next.clone();
+        let changed = {
+            let mut guard = self.state_machine.write().await;
+            let changed = *guard != next;
+            *guard = next.clone();
+            changed
+        };
+        // 2026-08-14 incident: log every REAL state change at INFO so a
+        // diagnostics bundle shows which phase (reconcile / scan / plan /
+        // execute) the app was in when something went sideways - the
+        // incident's bundle had no phase breadcrumbs at all. A handful of
+        // lines per cycle; same-state re-writes (e.g. Idle timestamp bumps on
+        // consecutive quiet cycles carry differing `last_run_at`, so those
+        // still log once per cycle) are the volume ceiling.
+        //
+        // Log the variant NAME only, never the Debug dump: the `Error`
+        // variant carries free-text error details that routinely embed local
+        // paths, and the bundle redactor's unquoted-run scanner truncates a
+        // path at its first space - so a raw `?next` here would leak
+        // partially-redacted paths into exported bundles.
+        if changed {
+            tracing::info!(target: TARGET, account_id = %self.account_id, state = state_name(&next), "state transition");
+        }
         let _ = self
             .events
             .send(OrchestratorEvent::StateChanged { state: next });
@@ -2339,6 +2378,12 @@ impl SyncOrchestrator {
             );
             return Ok(());
         }
+
+        // 2026-08-14 incident: one INFO breadcrumb per cycle naming what
+        // triggered it. The incident's diagnostics bundle could not even show
+        // whether the user's "Sync now" click had reached the orchestrator -
+        // the whole fatal phase (reconcile, pre-scan) logged nothing at INFO.
+        tracing::info!(target: TARGET, account_id = %self.account_id, ?tick, "cycle start");
 
         // P1-6 (DESIGN s5.6, s5.7): the startup reconcile (DESIGN s5.6) is a
         // REMOTE pass - it issues Drive find/metadata calls to adopt orphaned
