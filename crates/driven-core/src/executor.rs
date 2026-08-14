@@ -40,7 +40,7 @@ use driven_drive::remote_store::{
 use driven_vss::{fallback_decision, FallbackDecision, OpenAttempt, SnapshotOutcome, VssMode};
 use serde::{Deserialize, Serialize};
 use tokio::io::AsyncReadExt;
-use tracing::{debug, warn};
+use tracing::{debug, info, warn};
 
 use crate::network::{NetworkProbe, ServiceName};
 use crate::pacer::{Pacer, ResponseClass};
@@ -4779,6 +4779,13 @@ impl Executor for DefaultExecutor {
 
     async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()> {
         let pending = self.state.get_pending_ops_for_source(source.id).await?;
+        // 2026-08-14 incident: reconcile can do HEAVY work (a resumed session
+        // re-reads the whole file) yet used to enter it silently - the
+        // incident's diagnostics bundle showed nothing between app start and
+        // the OOM kill. One INFO line when there is anything to recover.
+        if !pending.is_empty() {
+            info!(target: TARGET, source = %source.id, pending_ops = pending.len(), "reconcile: recovering pending ops");
+        }
 
         // --- V5-P2-4: suite-FREE corrupt-create cleanup FIRST --------------
         // An op carrying a `corrupt_file_id` is the recovery handle for a corrupt
@@ -4790,6 +4797,12 @@ impl Executor for DefaultExecutor {
         // retried until the key returns. So process these BEFORE the crypto
         // gate's early-return.
         let mut remaining: Vec<crate::state::PendingOpRow> = Vec::with_capacity(pending.len());
+        // 2026-08-14 incident: the CURRENT exclude matcher, built lazily on the
+        // first plain upload-recovery op (the common zero-pending reconcile
+        // pays nothing). Built on the blocking pool - the gitignore-cascade
+        // collection walks the source tree.
+        let mut current_matcher: Option<crate::exclude::SourceMatcher> = None;
+        let mut matcher_failed = false;
         for op in pending {
             let payload = PendingOpPayload::from_value(&op.payload_json);
             if let Some(corrupt_file_id) = payload.corrupt_file_id.clone() {
@@ -4917,6 +4930,47 @@ impl Executor for DefaultExecutor {
                 }
                 self.state.delete_pending_op(op.id).await?;
                 continue;
+            }
+
+            // 2026-08-14 incident: a plain upload-recovery op whose path the
+            // user has since EXCLUDED is dropped instead of recovered -
+            // resuming it would keep reading and uploading a file the user
+            // explicitly opted out of (the incident's was an 88 GB disk image
+            // whose folder had just been excluded). The suite-free cleanup
+            // handles above still ran: they are remote hygiene, not uploads.
+            // Fails OPEN on a matcher build error (op kept) so a broken ignore
+            // file cannot strand crash recovery.
+            if op.op_type == OP_TYPE_UPLOAD {
+                if current_matcher.is_none() && !matcher_failed {
+                    let source_clone = source.clone();
+                    match tokio::task::spawn_blocking(move || {
+                        crate::exclude::build_source_matcher(&source_clone)
+                    })
+                    .await
+                    {
+                        Ok(Ok(m)) => current_matcher = Some(m),
+                        Ok(Err(err)) => {
+                            matcher_failed = true;
+                            warn!(target: TARGET, source = %source.id, %err, "reconcile: could not build the exclude matcher; recovering pending ops without the exclusion check");
+                        }
+                        Err(err) => {
+                            matcher_failed = true;
+                            warn!(target: TARGET, source = %source.id, %err, "reconcile: exclude matcher build task failed; recovering pending ops without the exclusion check");
+                        }
+                    }
+                }
+                if let Some(matcher) = current_matcher.as_ref() {
+                    if !matcher.is_included(Path::new(op.relative_path.as_str()), false) {
+                        info!(
+                            target: TARGET,
+                            source = %source.id,
+                            path = %op.relative_path,
+                            "reconcile: dropping pending upload op for a now-excluded path (any partial upload session is abandoned)"
+                        );
+                        self.state.delete_pending_op(op.id).await?;
+                        continue;
+                    }
+                }
             }
 
             remaining.push(op);
@@ -5304,12 +5358,23 @@ impl DefaultExecutor {
     /// P1-2 / P1-3: resume a persisted resumable session after a restart.
     /// Discards the session (returns `None`) when it is older than
     /// [`SESSION_MAX_AGE_MS`], the local file changed, or Drive
-    /// 4xx-invalidates it; otherwise it re-reads the local file, re-derives
-    /// the exact upload body, and pushes the remaining bytes from the
-    /// persisted acked offset. A successful resume returns the finalized
-    /// [`RemoteEntry`] together with the plaintext blake3 computed over the
-    /// re-read stream (the caller adopts it as the proven content hash, so
-    /// the now-Synced row never carries a placeholder).
+    /// 4xx-invalidates it; otherwise it re-reads the local file in a SINGLE
+    /// STREAMING pass - hashing every byte, discarding the prefix Drive
+    /// already acked, and pushing the remaining bytes in [`WIRE_CHUNK`]
+    /// slices from the persisted acked offset. A successful resume returns
+    /// the finalized [`RemoteEntry`] together with the plaintext blake3
+    /// computed over the re-read stream (the caller adopts it as the proven
+    /// content hash, so the now-Synced row never carries a placeholder).
+    ///
+    /// MEMORY BOUND (2026-08-14 incident): this path runs during the startup
+    /// reconcile on files of ARBITRARY size, so it must never buffer the
+    /// body. The original implementation called [`read_hash_encrypt`], which
+    /// accumulates the whole file into one `Vec` - resuming an interrupted
+    /// 88 GB disk-image upload read the entire file into memory at disk
+    /// speed, OOM-killed the app in under a minute, and (because the pending
+    /// op survives an OOM kill) did it again on every subsequent launch. The
+    /// streaming pass keeps at most ~2 wire chunks (~8 MiB) in flight,
+    /// asserted by the [`MemGauge`] regression test.
     ///
     /// P1-2: resume validation does NOT depend on the final content hash -
     /// the streaming pipeline only produces that hash DURING the upload, so a
@@ -5347,7 +5412,15 @@ impl DefaultExecutor {
         // offset 0, which DESIGN s5.4 already sanctions ("any 4xx -> recreate
         // from scratch"). True encrypted resume (persisting the crypto
         // header) is an M4 follow-up.
+        use md5::{Digest, Md5};
+
         if crypto.is_some() {
+            info!(
+                target: TARGET,
+                source = %source.id,
+                path = %op.relative_path,
+                "reconcile: not resuming an encrypted source's session (a fresh nonce cannot splice onto the old partial bytes); restarting from scratch"
+            );
             return Ok(None);
         }
         let now = self.clock.now_ms();
@@ -5360,6 +5433,22 @@ impl DefaultExecutor {
             return Ok(None);
         }
 
+        let total = resumable.session.size;
+        let resume_from = resumable.acked_offset;
+        // 2026-08-14 incident: announce the resume BEFORE the heavy work, with
+        // the numbers that size it. The incident's diagnostics bundle carried
+        // ZERO log lines for the entire fatal phase; this line alone would
+        // have named the file, its 88 GB size, and the resume offset.
+        info!(
+            target: TARGET,
+            source = %source.id,
+            path = %op.relative_path,
+            size = total,
+            resume_from,
+            session_age_ms = now - resumable.session.issued_at,
+            "reconcile: resuming persisted resumable upload (streaming re-read)"
+        );
+
         // Re-open the local file and check the resume-safe IDENTITY recorded
         // at session start (P1-2). The identity - not the content hash - is
         // what proves the bytes we are about to re-read are the same ones the
@@ -5368,18 +5457,37 @@ impl DefaultExecutor {
         let mut file = match open_shared(&full_path, self.priority.get()).await {
             Ok(f) => f,
             // File gone/locked: cannot resume; let the caller requeue.
-            Err(_) => return Ok(None),
+            Err(err) => {
+                let reason = match err {
+                    OpenError::Locked => "locked",
+                    OpenError::Denied => "permission denied",
+                    OpenError::Io(_) => "io error (gone?)",
+                };
+                info!(target: TARGET, source = %source.id, path = %op.relative_path, reason, "reconcile: cannot open local file to resume; falling through to adopt-or-requeue");
+                return Ok(None);
+            }
         };
         match payload.resume_identity {
             Some(expected) => {
                 let cur = match fstat_identity(&file).await {
                     Ok(id) => id,
-                    Err(_) => return Ok(None),
+                    Err(err) => {
+                        info!(target: TARGET, source = %source.id, path = %op.relative_path, %err, "reconcile: cannot fstat local file to resume; abandoning the session");
+                        return Ok(None);
+                    }
                 };
                 if !expected.matches(&cur) {
                     // Local file changed since the crash: the partial bytes
                     // are stale. Discard the session and requeue a clean
                     // upload (the partial create is GC'd by Drive on expiry).
+                    info!(
+                        target: TARGET,
+                        source = %source.id,
+                        path = %op.relative_path,
+                        expected_size = expected.size,
+                        current_size = cur.size,
+                        "reconcile: local file changed since the session started (identity mismatch); abandoning the session, requeueing a clean upload"
+                    );
                     return Ok(None);
                 }
             }
@@ -5389,66 +5497,238 @@ impl DefaultExecutor {
                 // `uploaded_blake3_hex` is still accepted via the hash check
                 // below.)
                 if payload.uploaded_blake3_hex.is_none() {
+                    info!(target: TARGET, source = %source.id, path = %op.relative_path, "reconcile: no resume identity and no recorded hash; refusing to resume");
                     return Ok(None);
                 }
             }
         }
 
-        // Re-derive the exact bytes that were being uploaded + the plaintext
-        // blake3 over the full re-read stream (the final integrity check).
-        let HashedBody {
-            blake3, sent_bytes, ..
-        } = match read_hash_encrypt(&mut file, crypto).await {
-            Ok(h) => h,
-            Err(_) => return Ok(None),
-        };
-        // Legacy cross-check: a row written by the buffered path recorded the
-        // uploaded blake3 up front; honour it if present (identity already
-        // covered the streaming path).
-        if let Some(expected_hex) = payload.uploaded_blake3_hex.as_deref() {
-            if hex::encode(blake3) != expected_hex {
-                return Ok(None);
-            }
-        }
-        if sent_bytes.bytes.len() as u64 != resumable.session.size {
-            // Body length disagrees with the session's declared size; the
-            // resume would be rejected. Requeue.
-            return Ok(None);
-        }
-
-        // Push the remaining bytes from the last-acked offset. A fresh
-        // payload copy carries the live session so push_chunks can persist
-        // progress against the same op.
+        // --- single streaming pass (2026-08-14 incident fix) ----------------
+        // Hash every byte (blake3 over the plaintext + md5 over the exact
+        // sent bytes - identical for this plaintext-only path); DISCARD the
+        // prefix Drive already acked; accumulate the tail into wire chunks
+        // and push them as they fill. `acc` always covers exactly
+        // [offset, pos) and is bounded at ~2 wire chunks: full chunks flush
+        // as soon as they are provably NON-final, and the final chunk is held
+        // back until EOF so the legacy-hash cross-check runs BEFORE anything
+        // can finalize the object (matching the buffered code's
+        // check-then-push ordering; an abandoned unfinalized session never
+        // mutates an UPDATE target and never materializes a CREATE).
         let mut live = payload.clone();
         live.resumable = Some(resumable.clone());
-        match self
-            .push_chunks(
-                &resumable.session,
-                &sent_bytes.bytes,
-                resumable.acked_offset,
-                op.id,
-                &mut live,
-            )
-            .await
-        {
-            Ok(Some(entry)) => {
-                // Verify md5 over the exact bytes sent (SPEC s8).
-                match entry.md5 {
-                    Some(remote) if remote == sent_bytes.md5 => Ok(Some((entry, blake3))),
-                    _ => {
-                        warn!(
-                            target: TARGET,
-                            path = %op.relative_path,
-                            "resumed upload md5 mismatch; requeueing"
-                        );
-                        Ok(None)
+
+        let mut hasher = blake3::Hasher::new();
+        let mut md5 = Md5::new();
+        let mut read_buf = vec![0u8; READ_BUF];
+        // File bytes consumed (hashed) so far.
+        let mut pos: u64 = 0;
+        // The next session offset to push at; advances on Drive acks.
+        let mut offset = resume_from;
+        let mut acc: Vec<u8> = Vec::with_capacity(2 * WIRE_CHUNK);
+        let mut entry: Option<RemoteEntry> = None;
+
+        // MemGauge bookkeeping on abandon: whatever `acc` still holds leaves
+        // the pipeline unpushed.
+        let drop_acc = |n: usize| {
+            if let Some(g) = self.mem_gauge.as_ref() {
+                g.sub(n as u64);
+            }
+        };
+
+        loop {
+            let n = match file.read(&mut read_buf).await {
+                Ok(n) => n,
+                Err(err) => {
+                    warn!(target: TARGET, source = %source.id, path = %op.relative_path, %err, "reconcile: read failed mid-resume; abandoning the session");
+                    drop_acc(acc.len());
+                    return Ok(None);
+                }
+            };
+            if n == 0 {
+                break;
+            }
+            let chunk = &read_buf[..n];
+            hasher.update(chunk);
+            md5.update(chunk);
+            let chunk_start = pos;
+            pos += n as u64;
+            if pos > total {
+                // File larger than the session's declared size: it changed
+                // since the crash (the identity gate passed on open, so this
+                // is a mid-read change). Same outcome as the old length
+                // compare: abandon + requeue.
+                warn!(target: TARGET, source = %source.id, path = %op.relative_path, session_size = total, "reconcile: local file is larger than the session's declared size; abandoning the session");
+                drop_acc(acc.len());
+                return Ok(None);
+            }
+            // Bytes at/after the resume offset join the send accumulator
+            // (unless a rogue early-Complete already ended the upload - then
+            // the rest of the file is hashed for the md5 check but never
+            // buffered).
+            if entry.is_none() && pos > resume_from {
+                let skip = usize::try_from(resume_from.saturating_sub(chunk_start)).unwrap_or(n);
+                let tail = &chunk[skip..];
+                if let Some(g) = self.mem_gauge.as_ref() {
+                    g.add(tail.len() as u64);
+                }
+                acc.extend_from_slice(tail);
+            }
+            // Flush every full wire chunk that is provably NON-final (its end
+            // strictly below the declared size).
+            while entry.is_none() && acc.len() >= WIRE_CHUNK && offset + (WIRE_CHUNK as u64) < total
+            {
+                match self
+                    .resume_push_chunk(
+                        &resumable.session,
+                        &mut acc,
+                        WIRE_CHUNK,
+                        &mut offset,
+                        op,
+                        &mut live,
+                    )
+                    .await?
+                {
+                    ResumePushOutcome::Acked => {}
+                    ResumePushOutcome::Completed(e) => entry = Some(e),
+                    ResumePushOutcome::Abandon => {
+                        drop_acc(acc.len());
+                        return Ok(None);
                     }
                 }
             }
-            // Session invalidated (4xx) or could not complete: discard +
-            // requeue (DESIGN s5.4 never reuse a 4xx-d session).
-            Ok(None) => Ok(None),
-            Err(e) => Err(e),
+        }
+
+        if pos != total {
+            warn!(target: TARGET, source = %source.id, path = %op.relative_path, read = pos, session_size = total, "reconcile: local file is smaller than the session's declared size; abandoning the session");
+            drop_acc(acc.len());
+            return Ok(None);
+        }
+        let blake3_hash: [u8; 32] = hasher.finalize().into();
+        // Legacy cross-check: a row written by the buffered path recorded the
+        // uploaded blake3 up front; honour it if present (identity already
+        // covered the streaming path). Runs BEFORE the held-back final chunk,
+        // so a mismatch abandons an unfinalized session (nothing corrupted).
+        if let Some(expected_hex) = payload.uploaded_blake3_hex.as_deref() {
+            if hex::encode(blake3_hash) != expected_hex {
+                warn!(target: TARGET, source = %source.id, path = %op.relative_path, "reconcile: re-read content does not match the op's recorded hash; abandoning the session");
+                drop_acc(acc.len());
+                return Ok(None);
+            }
+        }
+        // Tail flush: whatever remains, the last push finalizing the session.
+        while entry.is_none() && !acc.is_empty() {
+            let take = acc.len().min(WIRE_CHUNK);
+            let is_final = take == acc.len();
+            // A non-final chunk must be a 256-KiB multiple (WIRE_CHUNK is);
+            // the final chunk may be any size.
+            let take = if is_final {
+                take
+            } else {
+                (take / CHUNK_MULTIPLE) * CHUNK_MULTIPLE
+            };
+            match self
+                .resume_push_chunk(
+                    &resumable.session,
+                    &mut acc,
+                    take,
+                    &mut offset,
+                    op,
+                    &mut live,
+                )
+                .await?
+            {
+                ResumePushOutcome::Acked => {}
+                ResumePushOutcome::Completed(e) => entry = Some(e),
+                ResumePushOutcome::Abandon => {
+                    drop_acc(acc.len());
+                    return Ok(None);
+                }
+            }
+        }
+        let Some(entry) = entry else {
+            // Every byte was already acked but the session never finalized
+            // (or the store never returned Completed). Requeue a clean upload.
+            info!(target: TARGET, source = %source.id, path = %op.relative_path, "reconcile: session consumed every byte without finalizing; requeueing a clean upload");
+            return Ok(None);
+        };
+
+        // Verify md5 over the exact bytes sent (SPEC s8).
+        let md5_local: [u8; 16] = md5.finalize().into();
+        match entry.md5 {
+            Some(remote) if remote == md5_local => {
+                info!(
+                    target: TARGET,
+                    source = %source.id,
+                    path = %op.relative_path,
+                    bytes_resumed = total.saturating_sub(resume_from),
+                    "reconcile: resumed upload finalized and verified"
+                );
+                Ok(Some((entry, blake3_hash)))
+            }
+            _ => {
+                warn!(
+                    target: TARGET,
+                    path = %op.relative_path,
+                    "resumed upload md5 mismatch; requeueing"
+                );
+                Ok(None)
+            }
+        }
+    }
+
+    /// Push ONE wire chunk of a resumed persisted session (`acc[..take]` at
+    /// `offset`), draining `acc` by however many bytes Drive actually acked
+    /// (a partial 308 keeps the unacked tail for the next push) and
+    /// persisting the advanced offset. The pacer is charged ONLY for pushed
+    /// wire bytes - the hashed-and-discarded prefix below the resume offset
+    /// never spends bandwidth-cap budget.
+    async fn resume_push_chunk(
+        &self,
+        session: &ResumableSession,
+        acc: &mut Vec<u8>,
+        take: usize,
+        offset: &mut u64,
+        op: &crate::state::PendingOpRow,
+        live: &mut PendingOpPayload,
+    ) -> anyhow::Result<ResumePushOutcome> {
+        let wire = Bytes::copy_from_slice(&acc[..take]);
+        self.pacer.permit_request().await;
+        self.pacer.permit_bytes(take as u64).await;
+        match self.remote.resume_chunk(session, *offset, wire).await? {
+            ResumeProgress::Completed(entry) => {
+                if let Some(g) = self.mem_gauge.as_ref() {
+                    g.sub(acc.len() as u64);
+                }
+                acc.clear();
+                Ok(ResumePushOutcome::Completed(entry))
+            }
+            ResumeProgress::InProgress { received } => {
+                if received <= *offset {
+                    // No forward progress: a stalled or misbehaving session
+                    // would otherwise loop forever. Abandon; the caller
+                    // requeues a clean upload.
+                    warn!(target: TARGET, path = %op.relative_path, received, offset = *offset, "reconcile: resumed session made no progress on a pushed chunk; abandoning");
+                    return Ok(ResumePushOutcome::Abandon);
+                }
+                let advance = usize::try_from(received - *offset)
+                    .unwrap_or(usize::MAX)
+                    .min(acc.len());
+                acc.drain(..advance);
+                if let Some(g) = self.mem_gauge.as_ref() {
+                    g.sub(advance as u64);
+                }
+                *offset = received;
+                if let Some(r) = live.resumable.as_mut() {
+                    r.acked_offset = received;
+                }
+                // Persist the new acked offset so a crash resumes from here.
+                self.persist_payload(op.id, live).await?;
+                Ok(ResumePushOutcome::Acked)
+            }
+            ResumeProgress::SessionInvalid => {
+                info!(target: TARGET, path = %op.relative_path, "reconcile: Drive invalidated the resumed session (4xx); abandoning, requeueing a clean upload");
+                Ok(ResumePushOutcome::Abandon)
+            }
         }
     }
 
@@ -5708,10 +5988,13 @@ impl DefaultExecutor {
     async fn rehash_local_plaintext(&self, full_path: &Path) -> Option<([u8; 32], u64, i64)> {
         let mut file = open_shared(full_path, self.priority.get()).await.ok()?;
         let id = fstat_identity(&file).await.ok()?;
-        // We only need the blake3-over-plaintext; pass crypto=None so the
-        // body bytes are not built up unnecessarily - read_hash_encrypt still
-        // hashes the plaintext identically in both arms.
-        let HashedBody { blake3, .. } = read_hash_encrypt(&mut file, None).await.ok()?;
+        // 2026-08-14 incident: this MUST stream. It runs during reconcile
+        // adoption on files of arbitrary size, and the previous call here
+        // (`read_hash_encrypt`, whose plaintext arm still accumulates the
+        // whole body into a `Vec` despite only the hash being needed) was the
+        // same whole-file buffering that OOM-killed the app on an 88 GB file
+        // in the resume path.
+        let (blake3, _len) = hash_plaintext_streaming(&mut file).await.ok()?;
         Some((blake3, id.size, id.mtime_ns))
     }
 }
@@ -5966,6 +6249,21 @@ enum PushOne {
     Done(RemoteEntry),
     /// The session 4xx'd; abort the streamed transfer.
     Invalid,
+}
+
+/// Outcome of pushing one wire chunk of a RESUMED persisted session
+/// ([`DefaultExecutor::resume_push_chunk`]). Mirrors [`PushOne`], but the
+/// caller's `acc`/`offset` are advanced in place (partial acks keep the
+/// unacked tail buffered), and both terminal-abandon shapes (stall, 4xx)
+/// collapse into one variant - the resume's only recovery is a clean requeue.
+enum ResumePushOutcome {
+    /// Chunk (fully or partially) acked; `offset`/`acc` advanced; keep going.
+    Acked,
+    /// Drive finalized the object.
+    Completed(RemoteEntry),
+    /// Session stalled or was invalidated: abandon the resume (the caller
+    /// falls through to adopt-or-requeue).
+    Abandon,
 }
 
 /// Error from the reader / cpu pipeline stages. Distinguishes a local
@@ -6242,6 +6540,31 @@ fn bundle_sent_bytes(
     })
 }
 
+/// Stream-hash a file's plaintext blake3 WITHOUT buffering the body.
+///
+/// 2026-08-14 incident: the reconcile paths (session resume, orphan-adopt
+/// re-hash) run on files of ARBITRARY size, and both used to route through
+/// [`read_hash_encrypt`] - whose plaintext arm accumulates the whole body
+/// into a `Vec` even when only the hash is wanted. On an 88 GB file that
+/// buffered the entire file into memory at disk speed and OOM-killed the
+/// app. Any future hash-only caller must use this, never `read_hash_encrypt`.
+async fn hash_plaintext_streaming(
+    file: &mut tokio::fs::File,
+) -> Result<([u8; 32], u64), std::io::Error> {
+    let mut hasher = blake3::Hasher::new();
+    let mut buf = vec![0u8; READ_BUF];
+    let mut len: u64 = 0;
+    loop {
+        let n = file.read(&mut buf).await?;
+        if n == 0 {
+            break;
+        }
+        hasher.update(&buf[..n]);
+        len += n as u64;
+    }
+    Ok((hasher.finalize().into(), len))
+}
+
 /// Read the whole file, hashing blake3 over the plaintext and producing the
 /// exact bytes to send. When `crypto` is `Some`, the body is the
 /// XChaCha20-Poly1305 STREAM ciphertext (header + per-chunk sealed bytes)
@@ -6249,10 +6572,13 @@ fn bundle_sent_bytes(
 /// the plaintext and the md5 is over the plaintext.
 ///
 /// Reads in [`READ_BUF`]-sized chunks so no full-size buffer is
-/// preallocated (DESIGN s11.4.6 memory bound). The accumulation into a
-/// single `Vec` is bounded by the file size; the streaming pipeline
-/// refinement (DESIGN s11.4.3) would replace this with a bounded channel,
-/// but the observable contract is identical.
+/// preallocated (DESIGN s11.4.6 memory bound) - but the accumulation into a
+/// single `Vec` is bounded ONLY by the file size, so this is safe solely for
+/// callers whose input is already size-capped: the sub-[`PIPELINE_THRESHOLD`]
+/// buffered upload band and the planner-capped bundle path. It must NEVER be
+/// called on an arbitrary-size file (the 2026-08-14 OOM incident was exactly
+/// that, from the reconcile resume path - since moved to a streaming pass;
+/// hash-only callers use [`hash_plaintext_streaming`]).
 async fn read_hash_encrypt(
     file: &mut tokio::fs::File,
     crypto: Option<&dyn SourceCryptoSuite>,
@@ -10992,6 +11318,54 @@ mod tests {
             .await
             .unwrap()
             .is_none());
+    }
+
+    /// 2026-08-14 incident: a pending upload op whose path the user has since
+    /// EXCLUDED must be DROPPED by reconcile, not recovered - resuming or
+    /// requeueing it would keep reading + uploading a file the user explicitly
+    /// opted out of (the incident's was an 88 GB disk image whose folder had
+    /// just been excluded).
+    #[tokio::test]
+    async fn reconcile_drops_pending_upload_op_for_now_excluded_path() {
+        let h = harness().await;
+        let (rel, _size) = h.write_file("excluded-later.bin", b"bytes the user opted out of");
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let now = h.clock.now_ms();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                payload_json: serde_json::json!({ "client_op_uuid": op_uuid, "drive_file_id": null }),
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+
+        // The user excluded the path AFTER the op was enqueued.
+        let mut source = h.source.clone();
+        source.exclude_patterns = vec!["excluded-later.bin".to_string()];
+
+        let exec = h.executor();
+        exec.reconcile(&source).await.unwrap();
+
+        assert!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .is_empty(),
+            "the now-excluded op must be dropped, not recovered"
+        );
+        assert!(
+            h.state
+                .get_file_state(h.source.id, &rel)
+                .await
+                .unwrap()
+                .is_none(),
+            "dropping the op must not manufacture a file_state row"
+        );
     }
 
     // --- R2-P1-1: invalid_grant during a NORMAL reconcile -> needs_reauth ----

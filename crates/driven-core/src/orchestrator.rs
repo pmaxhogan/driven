@@ -932,7 +932,22 @@ impl SyncOrchestrator {
     /// a tray-facing event - the next [`Orchestrator::state`] read still
     /// reflects the stored state.
     async fn transition(&self, next: OrchestratorState) {
-        *self.state_machine.write().await = next.clone();
+        let changed = {
+            let mut guard = self.state_machine.write().await;
+            let changed = *guard != next;
+            *guard = next.clone();
+            changed
+        };
+        // 2026-08-14 incident: log every REAL state change at INFO so a
+        // diagnostics bundle shows which phase (reconcile / scan / plan /
+        // execute) the app was in when something went sideways - the
+        // incident's bundle had no phase breadcrumbs at all. A handful of
+        // lines per cycle; same-state re-writes (e.g. Idle timestamp bumps on
+        // consecutive quiet cycles carry differing `last_run_at`, so those
+        // still log once per cycle) are the volume ceiling.
+        if changed {
+            tracing::info!(target: TARGET, account_id = %self.account_id, state = ?next, "state transition");
+        }
         let _ = self
             .events
             .send(OrchestratorEvent::StateChanged { state: next });
@@ -2339,6 +2354,12 @@ impl SyncOrchestrator {
             );
             return Ok(());
         }
+
+        // 2026-08-14 incident: one INFO breadcrumb per cycle naming what
+        // triggered it. The incident's diagnostics bundle could not even show
+        // whether the user's "Sync now" click had reached the orchestrator -
+        // the whole fatal phase (reconcile, pre-scan) logged nothing at INFO.
+        tracing::info!(target: TARGET, account_id = %self.account_id, ?tick, "cycle start");
 
         // P1-6 (DESIGN s5.6, s5.7): the startup reconcile (DESIGN s5.6) is a
         // REMOTE pass - it issues Drive find/metadata calls to adopt orphaned

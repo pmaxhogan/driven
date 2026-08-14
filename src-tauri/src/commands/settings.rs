@@ -1830,6 +1830,19 @@ async fn build_diagnostic_zip(app: &AppHandle, state: &dyn StateRepo) -> Command
     let schema = build_schema_summary(state).await;
     zip.add_file("schema.txt", schema.as_bytes());
 
+    // pending_ops.txt (2026-08-14 incident): the in-flight / crash-recovery
+    // op queue, summarised. The incident was diagnosable from pending_ops
+    // alone (an 88 GB resumable session the startup reconcile re-buffered on
+    // every launch), but the bundle only carried the row COUNT in schema.txt;
+    // this makes the shape of each op visible. Paths go through the redactor;
+    // session URLs (capability secrets) are never included.
+    let pending_txt = build_pending_ops_summary(state, &redactor).await;
+    zip.add_file("pending_ops.txt", pending_txt.as_bytes());
+
+    // memory.txt (2026-08-14 incident): current + peak process RSS at capture
+    // time, so a bundle exported mid-runaway carries the number directly.
+    zip.add_file("memory.txt", build_memory_summary().as_bytes());
+
     // activity_last_30d.csv (SPEC s18): the activity_log for the last 30 days,
     // with the free-text message column passed through the redaction pipeline
     // (paths / drive ids / emails / tokens become stable per-bundle hashes).
@@ -1963,6 +1976,126 @@ async fn build_activity_csv_paged(
                 break;
             }
         }
+    }
+    out
+}
+
+/// Build `pending_ops.txt` (2026-08-14 incident): one line per pending
+/// (in-flight / crash-recovery) op, per source. Everything included is either
+/// metadata (sizes, offsets, ages, flag presence) or passes through the
+/// [`Redactor`]; the resumable session URL is a capability secret (anyone
+/// holding it can write bytes into the upload) and is NEVER included, not
+/// even hashed. Best-effort: a query failure yields a note, not a bundle
+/// failure.
+async fn build_pending_ops_summary(state: &dyn StateRepo, redactor: &Redactor) -> String {
+    use driven_core::time::{Clock, SystemClock};
+
+    let mut out = String::from(
+        "# Pending (in-flight / crash-recovery) ops per source (SPEC s18).\n\
+         # Session URLs are capability secrets and are never included.\n",
+    );
+    let now = SystemClock.now_ms();
+    let sources = match state.list_sources().await {
+        Ok(s) => s,
+        Err(e) => {
+            out.push_str(&format!("# list_sources failed: {e}\n"));
+            return out;
+        }
+    };
+    let mut any = false;
+    for source in sources {
+        let ops = match state.get_pending_ops_for_source(source.id).await {
+            Ok(o) => o,
+            Err(e) => {
+                out.push_str(&format!("# get_pending_ops failed for one source: {e}\n"));
+                continue;
+            }
+        };
+        if ops.is_empty() {
+            continue;
+        }
+        any = true;
+        out.push_str(&format!(
+            "source_{}: {} pending op(s)\n",
+            stable_hash(&source.id.to_string()),
+            ops.len()
+        ));
+        for op in ops {
+            let p = &op.payload_json;
+            let mut line = format!(
+                "  - type={} attempts={} age_ms={} path={}",
+                op.op_type,
+                op.attempts,
+                now.saturating_sub(op.created_at),
+                redactor.redact_text(op.relative_path.as_str()),
+            );
+            // The incident signature: a persisted resumable session's size +
+            // acked offset name exactly how much file the startup reconcile
+            // will re-read (and, pre-fix, buffer) on the next launch.
+            if let Some(size) = p
+                .pointer("/resumable/session/size")
+                .and_then(|v| v.as_u64())
+            {
+                let acked = p
+                    .pointer("/resumable/acked_offset")
+                    .and_then(|v| v.as_u64())
+                    .unwrap_or(0);
+                let issued = p
+                    .pointer("/resumable/session/issued_at")
+                    .and_then(|v| v.as_i64())
+                    .unwrap_or(0);
+                line.push_str(&format!(
+                    " resumable{{size={size} acked_offset={acked} session_age_ms={}}}",
+                    now.saturating_sub(issued)
+                ));
+            }
+            if let Some(id_size) = p.pointer("/resume_identity/size").and_then(|v| v.as_u64()) {
+                line.push_str(&format!(" identity_size={id_size}"));
+            }
+            // Presence flags only - the values are ids/hashes with no
+            // diagnostic value beyond "this recovery handle is set".
+            for flag in [
+                "uploaded_blake3_hex",
+                "drive_file_id",
+                "corrupt_file_id",
+                "redundant_duplicate_file_id",
+                "supersedes_drive_file_id",
+            ] {
+                if p.get(flag).is_some_and(|v| !v.is_null()) {
+                    line.push_str(&format!(" +{flag}"));
+                }
+            }
+            line.push('\n');
+            out.push_str(&line);
+        }
+    }
+    if !any {
+        out.push_str("(no pending ops)\n");
+    }
+    out
+}
+
+/// Build `memory.txt` (2026-08-14 incident): the process's current + peak
+/// resident-set size, sampled fresh at bundle capture, plus the watchdog's
+/// trailing sample window so the TREND is visible - a flat line rules memory
+/// out; a staircase names when the runaway started and how fast it grew.
+fn build_memory_summary() -> String {
+    let (current, peak) = crate::memlog::snapshot();
+    let mut out = format!(
+        "# Process memory at bundle capture (SPEC s18). 0 = unreadable on this platform.\n\
+         rss_bytes={current}\n\
+         peak_rss_bytes={peak}\n"
+    );
+    let samples = crate::memlog::recent_samples();
+    out.push_str(&format!(
+        "# Trailing samples (oldest first, ~15s cadence, last {} of up to 60):\n",
+        samples.len()
+    ));
+    for (ts_ms, rss) in samples {
+        out.push_str(&format!(
+            "sample ts_ms={ts_ms} rss_bytes={rss} rss_mb={}\n",
+            rss / (1024 * 1024)
+        ));
     }
     out
 }
@@ -2646,6 +2779,13 @@ What this bundle contains:
 - schema.txt   : state-DB schema version (PRAGMA user_version) + table counts.
 - activity_last_30d.csv : the last 30 days of the activity log, with the
   free-text message + source id passed through the redaction pipeline below.
+- pending_ops.txt : a summary of in-flight / crash-recovery upload ops
+  (op type, redacted path, sizes, offsets, ages, and which recovery fields
+  are set). Upload-session URLs are capability secrets and are never
+  included, not even hashed.
+- memory.txt   : the app process's current + peak resident memory at the
+  moment the bundle was captured, plus a trailing window (~15 minutes) of
+  periodic samples so a memory trend is visible.
 - logs/        : recent tracing output (driven.<date>.log), passed through the
   redaction pipeline. These files interleave backend lines with the app
   window's own console output, which is captured under the target
@@ -4544,6 +4684,107 @@ mod tests {
             "the configured source root must be redacted: {out}"
         );
         assert!(out.contains("<path:"), "hashed placeholder: {out}");
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn pending_ops_summary_names_resumable_sessions_without_urls() {
+        // 2026-08-14 incident: the bundle must carry each pending op's shape -
+        // the incident (an 88 GB resumable session the startup reconcile
+        // re-read on every launch) was diagnosable from exactly these fields -
+        // while the session URL (a capability secret: holding it allows
+        // writing bytes into the upload) must never appear, even hashed.
+        use driven_core::state::{AccountRow, NewPendingOp, SourceRow};
+        use driven_core::types::{AccountId, AccountState, RelativePath, SourceId};
+        let (repo, dir) = seeded_repo().await;
+        let account_id = AccountId::new_v4();
+        repo.upsert_account(&AccountRow {
+            backend_kind: driven_core::state::BackendKind::GoogleDrive,
+            backend_config_json: None,
+            id: account_id,
+            email: "u@example.com".to_string(),
+            display_name: None,
+            state: AccountState::Ok,
+            encryption_master_key_id: None,
+            created_at: 0,
+            last_synced_at: None,
+        })
+        .await
+        .unwrap();
+        let source_id = SourceId::new_v4();
+        repo.upsert_source(&SourceRow {
+            id: source_id,
+            account_id,
+            display_name: "docs".to_string(),
+            enabled: true,
+            local_path: "D:\\Users\\someone\\Documents".to_string(),
+            drive_folder_id: String::new(),
+            drive_id: None,
+            drive_folder_path: String::new(),
+            encryption_enabled: false,
+            wrapped_source_key: None,
+            respect_gitignore: true,
+            include_patterns: Vec::new(),
+            exclude_patterns: Vec::new(),
+            placeholder_policy: Default::default(),
+            schedule_json_v2_reserved: None,
+            deep_verify_interval_secs: 604_800,
+            last_full_scan_at: None,
+            last_deep_verify_at: None,
+            mtime_granularity_ns: None,
+            created_at: 0,
+        })
+        .await
+        .unwrap();
+        repo.enqueue_pending_op(NewPendingOp {
+            source_id,
+            op_type: "upload".to_string(),
+            relative_path: RelativePath::try_from("dev-drives/dev.vhdx".to_string()).unwrap(),
+            payload_json: serde_json::json!({
+                "client_op_uuid": "9ceeab5f",
+                "drive_file_id": "some-drive-id",
+                "resumable": {
+                    "acked_offset": 7_436_500_992u64,
+                    "session": {
+                        "issued_at": 0,
+                        "kind": {"Update": {"file_id": "some-drive-id"}},
+                        "size": 88_655_003_648u64,
+                        "url": "https://www.googleapis.com/upload/drive/v3/files/x?upload_id=SECRET-CAPABILITY"
+                    }
+                },
+                "resume_identity": {
+                    "dev": 0, "inode": 0, "size": 88_655_003_648u64,
+                    "mtime_ns": 1, "ctime_ns": 1
+                }
+            }),
+            scheduled_for: 0,
+            created_at: 0,
+        })
+        .await
+        .unwrap();
+
+        let redactor = Redactor::for_bundle(&repo).await;
+        let summary = build_pending_ops_summary(&repo, &redactor).await;
+        assert!(
+            summary.contains("size=88655003648"),
+            "the session size is the incident's headline number: {summary}"
+        );
+        assert!(
+            summary.contains("acked_offset=7436500992"),
+            "the acked offset sizes the resume: {summary}"
+        );
+        assert!(
+            summary.contains("identity_size=88655003648"),
+            "the identity size cross-checks the session: {summary}"
+        );
+        assert!(
+            summary.contains("+drive_file_id"),
+            "recovery-handle presence flags are carried: {summary}"
+        );
+        assert!(
+            !summary.contains("SECRET-CAPABILITY") && !summary.contains("upload_id"),
+            "the session URL must never appear in the bundle: {summary}"
+        );
         cleanup(dir);
     }
 
