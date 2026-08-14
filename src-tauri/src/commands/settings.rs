@@ -1767,12 +1767,9 @@ pub async fn export_diagnostic_bundle(
     // C1: resolve the save path from the backend-minted dialog token (single-use).
     // Reject any request without a matching token - the webview never supplies a
     // raw path here.
-    let dest = state.take_dialog_token(&token).ok_or_else(|| {
-        CommandError::with_code(
-            ErrorCode::LocalIoError,
-            "no matching dialog token for the export destination; pick a save location first",
-        )
-    })?;
+    let dest = state
+        .take_dialog_token(&token)
+        .ok_or_else(crate::commands::stale_dialog_token_error)?;
 
     // C2: the token's path is a concrete FILE. Confine the write to its parent
     // directory (the dialog-approved root) and re-validate the leaf.

@@ -6,7 +6,7 @@ import DriveFolderPicker from "./DriveFolderPicker.vue";
 import ExclusionPreviewTree from "./ExclusionPreviewTree.vue";
 import RecoveryPhraseReveal from "./RecoveryPhraseReveal.vue";
 import * as ipc from "../ipc/commands";
-import { toErrorCode } from "../ipc/errors";
+import { toErrorCode, toErrorMessage } from "../ipc/errors";
 import { useAccountsStore } from "../stores/accounts";
 import {
   appendPatternLine,
@@ -145,9 +145,37 @@ const submitting = ref(false);
 // "[object Object]" and can leak backend English). The template localizes it via
 // t(`errors.${code}.long`).
 const errorCode = ref<string | null>(null);
+// The backend's redacted `message` for the SAME failure, rendered as a muted
+// technical-detail line UNDER the localized text (never instead of it). Two
+// failures sharing one code must be tellable apart on screen - an expired
+// dialog token and a genuinely unreadable folder used to render as the same
+// red line, which cost weeks of "disk error" misdiagnosis.
+const errorDetail = ref<string | null>(null);
 // R8-P2-1: the recovery reveal/ack error on the reveal step, same stable-code
 // treatment, localized on the reveal step.
 const revealErrorCode = ref<string | null>(null);
+// The reveal-step counterpart of `errorDetail`.
+const revealErrorDetail = ref<string | null>(null);
+
+/** The rendered technical-detail line: stable code, plus the backend's
+ * redacted message when one accompanied the failure. Composed here (not in the
+ * template) so the template carries no raw string literals (i18n no-raw-text) -
+ * the line itself is intentionally untranslated diagnostic text. */
+const errorDetailLine = computed<string | null>(() =>
+  errorCode.value
+    ? errorDetail.value
+      ? `${errorCode.value} - ${errorDetail.value}`
+      : errorCode.value
+    : null
+);
+/** The reveal-step counterpart of `errorDetailLine`. */
+const revealErrorDetailLine = computed<string | null>(() =>
+  revealErrorCode.value
+    ? revealErrorDetail.value
+      ? `${revealErrorCode.value} - ${revealErrorDetail.value}`
+      : revealErrorCode.value
+    : null
+);
 
 const includePatterns = computed(() => splitPatterns(includePatternsText.value));
 const excludePatterns = computed(() => splitPatterns(excludePatternsText.value));
@@ -222,7 +250,9 @@ function reset(): void {
   createdSource.value = null;
   pendingRecoveryAck.value = false;
   errorCode.value = null;
+  errorDetail.value = null;
   revealErrorCode.value = null;
+  revealErrorDetail.value = null;
   submitting.value = false;
 }
 
@@ -232,6 +262,7 @@ function close(): void {
 
 async function chooseLocalFolder(): Promise<void> {
   errorCode.value = null;
+  errorDetail.value = null;
   try {
     // C1: the BACKEND owns the folder dialog and returns { path, token }. We
     // never accept a typed path - only this dialog result + its token.
@@ -246,6 +277,7 @@ async function chooseLocalFolder(): Promise<void> {
 /** Surface a Drive-picker failure on the wizard's shared error line. */
 function onDrivePickerError(e: unknown): void {
   errorCode.value = toErrorCode(e);
+  errorDetail.value = toErrorMessage(e);
 }
 
 /** Re-run the live preview under the current rules. The tree mounts (and starts
@@ -291,6 +323,7 @@ async function confirm(): Promise<void> {
   }
   submitting.value = true;
   errorCode.value = null;
+  errorDetail.value = null;
   try {
     const displayName = localPath.value.split(/[\\/]/).filter(Boolean).pop();
     const result = await sources.add({
@@ -328,6 +361,7 @@ async function confirm(): Promise<void> {
     }
   } catch (e) {
     errorCode.value = toErrorCode(e);
+    errorDetail.value = toErrorMessage(e);
   } finally {
     submitting.value = false;
   }
@@ -346,6 +380,7 @@ async function finishReveal(): Promise<void> {
   if (created && pendingRecoveryAck.value) {
     submitting.value = true;
     revealErrorCode.value = null;
+    revealErrorDetail.value = null;
     try {
       const enabled = await sources.ackRecoveryPhrase(created.id);
       pendingRecoveryAck.value = false;
@@ -354,6 +389,7 @@ async function finishReveal(): Promise<void> {
     } catch (e) {
       // R8-P2-1: store the stable code; the reveal step localizes it.
       revealErrorCode.value = toErrorCode(e);
+      revealErrorDetail.value = toErrorMessage(e);
     } finally {
       submitting.value = false;
     }
@@ -386,6 +422,7 @@ async function revealPhraseAction(): Promise<string[]> {
  * - never `[object Object]` / leaked backend English. */
 function onPhraseRevealError(code: unknown): void {
   revealErrorCode.value = toErrorCode(code);
+  revealErrorDetail.value = toErrorMessage(code);
 }
 
 defineExpose({ start });
@@ -576,6 +613,17 @@ defineExpose({ start });
         <p v-if="revealErrorCode" class="text-sm text-red-600" data-testid="reveal-error">
           {{ t(`errors.${revealErrorCode}.long`) }}
         </p>
+        <!-- The technical detail for the same failure: the stable code plus the
+             backend's redacted message, muted and secondary. Localized text
+             stays the primary line; this is what makes the failure reportable
+             and two same-code failures distinguishable. -->
+        <p
+          v-if="revealErrorDetailLine"
+          class="break-words font-mono text-xs text-zinc-500 dark:text-zinc-400"
+          data-testid="reveal-error-detail"
+        >
+          {{ revealErrorDetailLine }}
+        </p>
       </div>
 
       <!-- Step 5: confirm -->
@@ -597,6 +645,17 @@ defineExpose({ start });
 
       <p v-if="errorCode" class="text-sm text-red-600" role="alert">
         {{ t(`errors.${errorCode}.long`) }}
+      </p>
+      <!-- The technical detail for the same failure (stable code + backend's
+           redacted message), muted under the localized line - so "the folder
+           pick expired" and "the folder is unreadable" never look identical
+           again, and a screenshot of the wizard is enough to diagnose. -->
+      <p
+        v-if="errorDetailLine"
+        class="break-words font-mono text-xs text-zinc-500 dark:text-zinc-400"
+        data-testid="error-detail"
+      >
+        {{ errorDetailLine }}
       </p>
 
       <div class="flex justify-between gap-2">

@@ -118,6 +118,12 @@ fn file_path_to_pathbuf(fp: tauri_plugin_dialog::FilePath) -> Option<std::path::
 }
 
 /// The shared "user cancelled the dialog" error (a benign no-advance signal).
+/// The message is the [`crate::commands::DIALOG_CANCELLED_MSG`] sentinel the
+/// IPC-boundary logging recognises, so a cancelled picker is not logged as a
+/// command failure.
 fn cancelled() -> CommandError {
-    CommandError::with_code(ErrorCode::LocalIoError, "dialog cancelled")
+    CommandError::with_code(
+        ErrorCode::LocalIoError,
+        crate::commands::DIALOG_CANCELLED_MSG,
+    )
 }

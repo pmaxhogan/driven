@@ -20,3 +20,22 @@ export function toErrorCode(e: unknown): string {
   }
   return "internal.bug";
 }
+
+/**
+ * Extract the backend's redacted `message` from a rejected IPC error, for the
+ * SUPPLEMENTARY technical-detail line under a localized error (never as the
+ * primary message - that stays `t(\`errors.${code}.long\`)`). Two failures
+ * sharing one code (e.g. "folder unreadable: os error 5" vs an expired token)
+ * were previously indistinguishable on screen, which is how a token expiry
+ * spent weeks masquerading as a disk error. Returns `null` when there is no
+ * usable string message (the detail line is simply omitted).
+ */
+export function toErrorMessage(e: unknown): string | null {
+  if (e && typeof e === "object" && "message" in e) {
+    const message = (e as { message: unknown }).message;
+    if (typeof message === "string" && message.length > 0) {
+      return message;
+    }
+  }
+  return null;
+}

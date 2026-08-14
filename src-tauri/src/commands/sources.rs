@@ -40,7 +40,9 @@ use crate::commands::dtos::{
     AddSourceRequest, AddSourceResult, DriveFolderEntry, DriveFolderListing, ExclusionPreview,
     ExclusionPreviewRequest, SourceDto, SourcePatch,
 };
-use crate::commands::{validate_readable_dir, CommandError, CommandResult};
+use crate::commands::{
+    stale_dialog_token_error, validate_readable_dir, CommandError, CommandResult,
+};
 
 /// Tracing target for the sources command layer.
 const TARGET: &str = "driven::app::sources";
@@ -133,16 +135,18 @@ pub async fn add_source(
     let account = find_account(state.state().as_ref(), req.account_id).await?;
 
     // C1 (SPEC s11.6.1): resolve the local path from the backend-minted dialog
-    // token (single-use) - NOT the webview-supplied `local_path` string. Reject
-    // any request whose token does not map to a backend-dialog path.
+    // token - NOT the webview-supplied `local_path` string. PEEK (do NOT
+    // consume) here, mirroring the restore command's R3-P2-1 pattern: any
+    // validation failure below (an overlapping root, a bad glob, junk
+    // metadata, a pending-ack gate) must leave the token INTACT so the user
+    // can fix the input and finish WITHOUT re-picking the folder. The single
+    // use is spent only immediately before the source row is actually
+    // inserted. Before this, the token was taken up front, so the FIRST
+    // failed Finish silently destroyed it and every retry in the same wizard
+    // session failed with the same (then misleadingly disk-flavoured) error.
     let dialog_path = state
-        .take_dialog_token(&req.local_path_token)
-        .ok_or_else(|| {
-            CommandError::with_code(
-                ErrorCode::LocalIoError,
-                "no matching dialog token for the source folder; pick a folder first",
-            )
-        })?;
+        .peek_dialog_token(&req.local_path_token)
+        .ok_or_else(stale_dialog_token_error)?;
 
     // Validate the dialog-derived folder before any walk (canonicalise, reject
     // `..`, require an existing directory).
@@ -290,6 +294,23 @@ pub async fn add_source(
         mtime_granularity_ns: None,
         created_at: now,
     };
+
+    // R3-P2-1 pattern (as in restore): ALL token-independent validation has now
+    // succeeded, so the add WILL be accepted. CONSUME the one-shot token now,
+    // immediately before the first irreversible step (the insert), so a failed
+    // validation above never spends it. The peeked `dialog_path` equals the
+    // path bound to the token (peek and take resolve the same binding); a
+    // concurrent take that already consumed it (None) rejects this add without
+    // inserting.
+    if state.take_dialog_token(&req.local_path_token).is_none() {
+        if newly_generated_key {
+            // The keychain master key was just minted for this add; roll it
+            // back so the account is not left provisioned-without-a-revealed-
+            // phrase (R1-P1-1) when the add is rejected.
+            let _ = delete_master_key(&req.account_id);
+        }
+        return Err(stale_dialog_token_error());
+    }
 
     // R1-P1-1 / R2-P1-1 / R4-P1-1: ATOMIC account-stamp + source-insert (+ durable
     // pending-ack record on the first encrypted source). On the FIRST encrypted
@@ -936,14 +957,9 @@ pub(crate) async fn resolve_preview_root(
                 let row = find_source(state.state().as_ref(), source_id).await?;
                 std::path::PathBuf::from(row.local_path)
             }
-            PreviewRootSelector::Token(token) => {
-                state.peek_dialog_token(token).ok_or_else(|| {
-                    CommandError::with_code(
-                        ErrorCode::LocalIoError,
-                        "no matching dialog token for the preview folder; pick a folder first",
-                    )
-                })?
-            }
+            PreviewRootSelector::Token(token) => state
+                .peek_dialog_token(token)
+                .ok_or_else(stale_dialog_token_error)?,
         };
 
     validate_readable_dir(&root)

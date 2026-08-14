@@ -1178,6 +1178,16 @@ pub enum ErrorCode {
     /// not an internal programming error, so the UI shows a "check your input"
     /// message rather than "please report a bug".
     InvalidInput,
+    /// `internal.stale_dialog_token` - a path-bearing command presented a
+    /// backend-minted dialog token that is unknown, already spent, or past its
+    /// TTL (SPEC s11.6.1 C1). The remedy is always the same: re-open the native
+    /// picker so a fresh token is minted, then retry - nothing else about the
+    /// request needs to change. Deliberately DISTINCT from
+    /// [`Self::LocalIoError`]: for months an expired add-source token surfaced
+    /// as "Driven hit a disk error reading a file", sending users off to check
+    /// a perfectly healthy drive when the wizard had simply outlived the
+    /// token's TTL.
+    StaleDialogToken,
     /// `sftp.root_missing` - the SSH (SFTP) destination's configured root path
     /// does not exist on the server. Surfaced only at account-creation time
     /// (`create_sftp_account`'s probe never creates the root - a typo must not
@@ -1268,6 +1278,7 @@ impl ErrorCode {
             ErrorCode::HarnessTimeout => "harness.timeout",
             ErrorCode::InternalBug => "internal.bug",
             ErrorCode::InvalidInput => "internal.invalid_input",
+            ErrorCode::StaleDialogToken => "internal.stale_dialog_token",
             ErrorCode::SftpRootMissing => "sftp.root_missing",
             ErrorCode::SftpRootNotADirectory => "sftp.root_not_a_directory",
             ErrorCode::SftpDestMarkerMismatch => "sftp.dest_marker_mismatch",
@@ -1329,6 +1340,7 @@ impl ErrorCode {
             "harness.timeout" => ErrorCode::HarnessTimeout,
             "internal.bug" => ErrorCode::InternalBug,
             "internal.invalid_input" => ErrorCode::InvalidInput,
+            "internal.stale_dialog_token" => ErrorCode::StaleDialogToken,
             "sftp.root_missing" => ErrorCode::SftpRootMissing,
             "sftp.root_not_a_directory" => ErrorCode::SftpRootNotADirectory,
             "sftp.dest_marker_mismatch" => ErrorCode::SftpDestMarkerMismatch,

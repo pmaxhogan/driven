@@ -263,9 +263,9 @@ pub struct AppState {
     /// bound to the path the USER actually chose. A path-bearing write command
     /// (`add_source`, `export_diagnostic_bundle`) must present a token that maps
     /// to exactly that path - so the (untrusted) webview can never inject an
-    /// arbitrary path. Single-use (taken on validation) with a short TTL so a
-    /// leaked token cannot be replayed later. Behind a sync `Mutex` (only ever
-    /// held for a quick insert / take, never across an await).
+    /// arbitrary path. Single-use (spent when the write commits) with a bounded
+    /// TTL so a leaked token cannot be replayed later. Behind a sync `Mutex`
+    /// (only ever held for a quick insert / take, never across an await).
     dialog_tokens: std::sync::Mutex<HashMap<String, DialogTokenBinding>>,
     /// R2-P1-1: per-account ASYNC lock serialising the FIRST-encrypted-source
     /// critical section (ensure-master-key -> stamp -> insert source). Without
@@ -606,20 +606,30 @@ fn prune_terminal_jobs(map: &mut HashMap<String, RestoreJobEntry>) {
 }
 
 /// C1: one backend-minted dialog-token binding - the path the user chose via a
-/// native dialog plus the instant it was minted (for the short single-use TTL).
+/// native dialog plus the instant the binding expires (single-use TTL).
 struct DialogTokenBinding {
     /// The path the native dialog returned (a folder for the folder dialog, a
     /// concrete file path for the save dialog).
     path: std::path::PathBuf,
-    /// When the token was minted (for TTL expiry).
-    minted_at: std::time::Instant,
+    /// When the token stops being valid (mint time + [`DIALOG_TOKEN_TTL`]).
+    /// Stored as the deadline rather than the mint instant so tests can force
+    /// expiry without `Instant` subtraction (which can underflow soon after
+    /// boot in CI).
+    expires_at: std::time::Instant,
 }
 
-/// C1: how long a backend-minted dialog token stays valid. The webview calls the
-/// dialog command then immediately calls the write command with the token, so a
-/// few minutes is generous; a token older than this is rejected so a leaked one
-/// cannot be replayed much later.
-const DIALOG_TOKEN_TTL: Duration = Duration::from_secs(300);
+/// C1: how long a backend-minted dialog token stays valid.
+///
+/// This must cover the LONGEST honest gap between the native dialog and the
+/// write command that spends the token - which is NOT "immediately": the
+/// add-source wizard picks the local folder first and then walks the whole
+/// tree for the exclusion preview, browses the destination, and waits on the
+/// user to think, which on a big source is well over the 5 minutes this
+/// originally allowed. An expired token used to surface as `local.io_error`
+/// ("disk error"), sending users to check a healthy drive. An hour keeps the
+/// replay window bounded (the token is also single-use and process-local)
+/// without a live wizard session ever outrunning it.
+const DIALOG_TOKEN_TTL: Duration = Duration::from_secs(3600);
 
 impl AppState {
     /// Build the managed state from the state repo, the per-account handles,
@@ -1208,12 +1218,12 @@ impl AppState {
         let token = uuid::Uuid::new_v4().to_string();
         let mut map = self.lock_dialog_tokens();
         let now = std::time::Instant::now();
-        map.retain(|_, b| now.duration_since(b.minted_at) < DIALOG_TOKEN_TTL);
+        map.retain(|_, b| now < b.expires_at);
         map.insert(
             token.clone(),
             DialogTokenBinding {
                 path,
-                minted_at: now,
+                expires_at: now + DIALOG_TOKEN_TTL,
             },
         );
         token
@@ -1226,7 +1236,7 @@ impl AppState {
     pub fn take_dialog_token(&self, token: &str) -> Option<std::path::PathBuf> {
         let mut map = self.lock_dialog_tokens();
         let binding = map.remove(token)?;
-        if std::time::Instant::now().duration_since(binding.minted_at) >= DIALOG_TOKEN_TTL {
+        if std::time::Instant::now() >= binding.expires_at {
             return None;
         }
         Some(binding.path)
@@ -1242,10 +1252,21 @@ impl AppState {
     pub fn peek_dialog_token(&self, token: &str) -> Option<std::path::PathBuf> {
         let map = self.lock_dialog_tokens();
         let binding = map.get(token)?;
-        if std::time::Instant::now().duration_since(binding.minted_at) >= DIALOG_TOKEN_TTL {
+        if std::time::Instant::now() >= binding.expires_at {
             return None;
         }
         Some(binding.path.clone())
+    }
+
+    /// Test-only: force `token`'s binding past its TTL so expiry behaviour can
+    /// be exercised without sleeping or `Instant` arithmetic that underflows
+    /// soon after boot.
+    #[cfg(test)]
+    pub fn expire_dialog_token_for_test(&self, token: &str) {
+        let mut map = self.lock_dialog_tokens();
+        if let Some(b) = map.get_mut(token) {
+            b.expires_at = std::time::Instant::now();
+        }
     }
 
     /// The streaming-exclusion-preview registry (see the
@@ -2064,6 +2085,34 @@ pub(crate) mod tests {
         assert_eq!(app_state.take_dialog_token(&token), None);
         // An unknown token never resolves.
         assert_eq!(app_state.peek_dialog_token("nope"), None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn expired_dialog_token_is_rejected_by_peek_and_take() {
+        // C1: a token past its TTL must resolve for NEITHER the non-consuming
+        // peek nor the consuming take - the wizard gets the stable
+        // `internal.stale_dialog_token` rejection (never a phantom disk error)
+        // and re-picking mints a fresh, working token.
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+        let path = std::path::PathBuf::from("/home/u/slow-wizard-root");
+        let token = app_state.mint_dialog_token(path.clone());
+        assert_eq!(app_state.peek_dialog_token(&token), Some(path.clone()));
+
+        app_state.expire_dialog_token_for_test(&token);
+        assert_eq!(app_state.peek_dialog_token(&token), None);
+        assert_eq!(app_state.take_dialog_token(&token), None);
+
+        // Re-picking (a fresh mint of the same path) works immediately.
+        let fresh = app_state.mint_dialog_token(path.clone());
+        assert_eq!(app_state.take_dialog_token(&fresh), Some(path));
 
         let _ = std::fs::remove_dir_all(dir);
     }

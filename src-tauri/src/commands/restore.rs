@@ -298,12 +298,9 @@ pub async fn restore_files(
     // token is CONSUMED only immediately before the job is actually accepted (just
     // before the atomic seed+spawn), so the single use is spent only on a real
     // restore. A missing / replayed / expired token is still rejected here.
-    let dest_dir = state.peek_dialog_token(&dest_token).ok_or_else(|| {
-        CommandError::with_code(
-            ErrorCode::LocalIoError,
-            "no matching destination folder; pick a restore folder first",
-        )
-    })?;
+    let dest_dir = state
+        .peek_dialog_token(&dest_token)
+        .ok_or_else(crate::commands::stale_dialog_token_error)?;
     // The destination directory must exist + be a directory (the user picked it).
     let dest_meta = std::fs::metadata(&dest_dir).map_err(|e| {
         CommandError::with_code(
@@ -346,10 +343,7 @@ pub async fn restore_files(
     // spend the single use so the token cannot be replayed. A concurrent take that
     // already consumed it (None) is rejected without spawning a job.
     if state.take_dialog_token(&dest_token).is_none() {
-        return Err(CommandError::with_code(
-            ErrorCode::LocalIoError,
-            "no matching destination folder; pick a restore folder first",
-        ));
+        return Err(crate::commands::stale_dialog_token_error());
     }
     // R5-P1-3 (DATA-SAFETY): BIND the approved root to a STABLE identity (canonical
     // path + on-disk dev/inode or volume file-id) right now, at consume time. The

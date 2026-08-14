@@ -5,11 +5,15 @@ import { mount, flushPromises } from "@vue/test-utils";
 
 // R8-P2-1: the recovery reveal/ack error handling must normalize a Tauri
 // STRUCTURED error ({ code, message }) into its stable SPEC s24 code and render
-// the LOCALIZED `t(\`errors.${code}.long\`)` string - never `String(e)` (which
-// renders a structured error as `[object Object]`) and never the raw backend
-// English `message`. These tests drive the SourceTable post-restart reveal/ack
-// panel and the AddSourceWizard reveal step and assert the rendered error text is
-// the localized long message for the code, not `[object Object]`.
+// the LOCALIZED `t(\`errors.${code}.long`)` string as the PRIMARY error - never
+// `String(e)` (which renders a structured error as `[object Object]`). The
+// AddSourceWizard additionally renders a separate, muted TECHNICAL-DETAIL line
+// (`data-testid="reveal-error-detail"`) carrying the stable code plus the
+// backend's redacted message - deliberately, so two failures sharing one code
+// are distinguishable on screen (an expired dialog token spent weeks
+// masquerading as a disk error because they were not). The invariant these
+// tests keep is that the PRIMARY line is exactly the localized text; backend
+// English may appear ONLY inside the dedicated detail element.
 
 const invokeMock = vi.fn();
 vi.mock("@tauri-apps/api/core", () => ({
@@ -164,6 +168,14 @@ describe("AddSourceWizard reveal-step error localization (R8-P2-1)", () => {
     expect(err.exists()).toBe(true);
     expect(err.text()).toBe(EXPECTED_LONG);
     expect(err.text()).not.toContain("[object Object]");
-    expect(wrapper.text()).not.toContain("keychain entry not found");
+
+    // The technical-detail line is a SEPARATE, muted element carrying the
+    // stable code + the backend's redacted message, so same-code failures are
+    // distinguishable. The primary line above stays purely localized.
+    const detail = wrapper.find('[data-testid="reveal-error-detail"]');
+    expect(detail.exists()).toBe(true);
+    expect(detail.text()).toContain("crypto.key_missing");
+    expect(detail.text()).toContain(STRUCTURED_ERROR.message);
+    expect(detail.text()).not.toContain("[object Object]");
   });
 });

@@ -1821,6 +1821,7 @@ Stable codes (V1):
 | `drive.dest_folder_permission_denied` | Destination folder's sharing changed to read-only for this account |
 | `harness.timeout`            | A stress-harness scenario exceeded its budget (chaos crate only) |
 | `internal.bug`               | Programming error — please report             |
+| `internal.stale_dialog_token` | A backend-minted dialog token (§11.6.1 C1) was unknown, already spent, or past its TTL — re-open the native picker and retry. Distinct from `local.io_error`: the disk is fine |
 
 Frontend maps these to user-friendly messages via
 `t('errors.${code}.short')` and `t('errors.${code}.long')` per DESIGN

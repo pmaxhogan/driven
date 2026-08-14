@@ -791,8 +791,11 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         | ErrorCode::HarnessTimeout
         | ErrorCode::InternalBug
         // Invalid input crossing the IPC boundary is a user/renderer error,
-        // not a network condition -> red error (not yellow-bang).
+        // not a network condition -> red error (not yellow-bang). A stale
+        // dialog token is the same family: re-pick the folder, no network
+        // involved.
         | ErrorCode::InvalidInput
+        | ErrorCode::StaleDialogToken
         // An SFTP root path that is missing, names a file, cannot be written
         // into, or already belongs to a different Driven destination are all
         // setup-time "fix the configuration" conditions (the server answered
