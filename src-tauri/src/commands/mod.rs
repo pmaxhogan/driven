@@ -44,7 +44,7 @@ use driven_core::types::ErrorCode;
 /// (not the SPEC s24 example's literal `retry_after_ms`). `code` + `message` are
 /// identical in both casings and `details` is single-word; only the retry-after
 /// hint differs, and the frontend reads only `.code`.
-#[derive(Debug, Clone, Serialize, Deserialize)]
+#[derive(Debug, Clone, Deserialize)]
 #[serde(rename_all = "camelCase")]
 pub struct CommandError {
     /// The stable dotted SPEC s24 error code (i18n key), e.g.
@@ -91,6 +91,46 @@ impl CommandError {
     pub fn with_retry_after_ms(mut self, retry_after_ms: u64) -> Self {
         self.retry_after_ms = Some(retry_after_ms);
         self
+    }
+}
+
+/// The benign "user closed the native dialog" sentinel message. It rides the
+/// normal error channel purely as a no-advance signal to the webview (see
+/// [`dialogs`]), so the boundary logging below must not turn every cancelled
+/// picker into a scary WARN line.
+pub(crate) const DIALOG_CANCELLED_MSG: &str = "dialog cancelled";
+
+impl Serialize for CommandError {
+    /// Serialise the stable SPEC s24 wire shape - and, because a command's
+    /// `Err` is serialised exactly once, HERE, as it crosses the IPC boundary
+    /// to the webview, this is the single seam where every command rejection
+    /// can be logged into the rolling log file (and thus the SPEC s18
+    /// diagnostic bundle). Before this, a rejected command left no backend
+    /// trace at all: six straight failed `add_source` calls produced a
+    /// diagnostic bundle with zero ERROR/WARN lines about them, and the bug
+    /// had to be reconstructed from what was ABSENT from the log.
+    fn serialize<S: serde::Serializer>(&self, serializer: S) -> Result<S::Ok, S::Error> {
+        if self.message != DIALOG_CANCELLED_MSG {
+            tracing::warn!(
+                target: "driven::app::ipc",
+                code = %self.code,
+                message = %self.message,
+                "IPC command rejected"
+            );
+        }
+        use serde::ser::SerializeStruct as _;
+        let fields =
+            2 + usize::from(self.retry_after_ms.is_some()) + usize::from(self.details.is_some());
+        let mut s = serializer.serialize_struct("CommandError", fields)?;
+        s.serialize_field("code", &self.code)?;
+        s.serialize_field("message", &self.message)?;
+        if let Some(retry_after_ms) = self.retry_after_ms {
+            s.serialize_field("retryAfterMs", &retry_after_ms)?;
+        }
+        if let Some(details) = &self.details {
+            s.serialize_field("details", details)?;
+        }
+        s.end()
     }
 }
 
@@ -543,6 +583,22 @@ pub fn atomic_write(dest: &Path, bytes: &[u8]) -> CommandResult<()> {
 /// component, (2) canonicalise via `dunce` (rejecting a non-existent path), and
 /// (3) require the canonical target to be a directory. Returns the canonical
 /// root the scanner then walks.
+/// The stable rejection for a backend-minted dialog token that is unknown,
+/// already spent, or past its TTL (SPEC s11.6.1 C1) - shared by every
+/// path-bearing command that resolves one (`add_source`, the exclusion
+/// previews, restore, the diagnostic-bundle export).
+///
+/// `internal.stale_dialog_token`, deliberately NOT `local.io_error`: the disk
+/// is fine, the folder pick just needs redoing. The io_error mapping made an
+/// expired add-source token render as "Driven hit a disk error reading a
+/// file", pointing users at a healthy drive.
+pub(crate) fn stale_dialog_token_error() -> CommandError {
+    CommandError::with_code(
+        ErrorCode::StaleDialogToken,
+        "the folder selection expired or was already used; open the folder picker again",
+    )
+}
+
 pub fn validate_readable_dir(path: &Path) -> CommandResult<PathBuf> {
     if path.components().any(|c| matches!(c, Component::ParentDir)) {
         return Err(CommandError::with_code(

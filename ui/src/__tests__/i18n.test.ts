@@ -11,4 +11,15 @@ describe("i18n setup", () => {
     // every edit without checking that i18n works.
     expect(t("app.tagline")).toMatch(/backup/i);
   });
+
+  it("has copy for the stale-dialog-token error code", () => {
+    // `internal.stale_dialog_token` is what an expired/spent folder-pick token
+    // rejects with (it used to be local.io_error, which told the user their
+    // DISK was failing). An unknown code renders as the raw key, so a missing
+    // bundle entry would silently regress the fix - pin that both strings
+    // resolve and that the long copy points at the actual remedy.
+    const t = i18n.global.t;
+    expect(t("errors.internal.stale_dialog_token.short")).not.toContain("stale_dialog_token");
+    expect(t("errors.internal.stale_dialog_token.long")).toMatch(/pick the folder again/i);
+  });
 });

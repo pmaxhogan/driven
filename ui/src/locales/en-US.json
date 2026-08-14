@@ -937,6 +937,10 @@
       "invalid_input": {
         "short": "Invalid input",
         "long": "One of the values you entered is not valid. Check the highlighted field and try again."
+      },
+      "stale_dialog_token": {
+        "short": "Folder pick expired",
+        "long": "Your folder selection expired or was already used. Pick the folder again, then finish - everything else you set up is kept."
       }
     },
     "sftp": {

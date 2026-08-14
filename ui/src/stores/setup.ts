@@ -3,7 +3,7 @@ import { computed, ref } from "vue";
 import { openUrl } from "@tauri-apps/plugin-opener";
 
 import * as ipc from "../ipc/commands";
-import { toErrorCode } from "../ipc/errors";
+import { toErrorCode, toErrorMessage } from "../ipc/errors";
 import { useSourcesStore } from "./sources";
 import type {
   AddAccountWizardSessionId,
@@ -106,6 +106,12 @@ export const useSetupStore = defineStore("setup", () => {
   const busy = ref(false);
   // Stable error code (SPEC s24) the view maps via t(`errors.${code}.long`).
   const errorCode = ref<string | null>(null);
+  // The backend's redacted `message` for the same failure - the view renders it
+  // as a muted technical-detail line under the localized text, so two failures
+  // sharing one code are distinguishable on screen. Only meaningful while
+  // `errorCode` is set; sites that set a literal code (no thrown error object)
+  // null it so a stale detail from an earlier failure never rides along.
+  const errorDetail = ref<string | null>(null);
 
   const step = computed<WizardStep>(() => WIZARD_STEPS[stepIndex.value]);
   const canGoBack = computed(() => stepIndex.value > 0);
@@ -140,6 +146,14 @@ export const useSetupStore = defineStore("setup", () => {
 
   function clearError(): void {
     errorCode.value = null;
+    errorDetail.value = null;
+  }
+
+  /** Record a rejected IPC call: the stable code for the localized line plus
+   * the backend's redacted message for the technical-detail line. */
+  function setIpcError(e: unknown): void {
+    errorCode.value = toErrorCode(e);
+    errorDetail.value = toErrorMessage(e);
   }
 
   /** The descriptor for the currently-selected destination, if it is one the
@@ -202,7 +216,7 @@ export const useSetupStore = defineStore("setup", () => {
         backendId.value = backends.value.find((b) => b.isDefault)?.id ?? DEFAULT_BACKEND_ID;
       }
     } catch (e) {
-      errorCode.value = toErrorCode(e);
+      setIpcError(e);
     }
   }
 
@@ -241,7 +255,7 @@ export const useSetupStore = defineStore("setup", () => {
       oauthStatus.value = { kind: "complete" };
       return true;
     } catch (e) {
-      errorCode.value = toErrorCode(e);
+      setIpcError(e);
       return false;
     } finally {
       busy.value = false;
@@ -273,7 +287,7 @@ export const useSetupStore = defineStore("setup", () => {
       oauthStatus.value = { kind: "complete" };
       return true;
     } catch (e) {
-      errorCode.value = toErrorCode(e);
+      setIpcError(e);
       return false;
     } finally {
       busy.value = false;
@@ -309,7 +323,7 @@ export const useSetupStore = defineStore("setup", () => {
       oauthStatus.value = { kind: "complete" };
       return true;
     } catch (e) {
-      errorCode.value = toErrorCode(e);
+      setIpcError(e);
       return false;
     } finally {
       busy.value = false;
@@ -408,9 +422,10 @@ export const useSetupStore = defineStore("setup", () => {
         // user can finish via the manual fallback. Surface a clear code instead
         // of wedging on a silent "waiting" state.
         errorCode.value = "auth.browser_open_failed";
+        errorDetail.value = null;
       }
     } catch (e) {
-      errorCode.value = toErrorCode(e);
+      setIpcError(e);
       throw e;
     } finally {
       busy.value = false;
@@ -434,6 +449,7 @@ export const useSetupStore = defineStore("setup", () => {
       errorCode.value = null;
     } catch {
       errorCode.value = "auth.browser_open_failed";
+      errorDetail.value = null;
     }
   }
 
@@ -453,10 +469,11 @@ export const useSetupStore = defineStore("setup", () => {
       }
       if (status.kind === "failed") {
         errorCode.value = status.code;
+        errorDetail.value = null;
       }
       return false;
     } catch (e) {
-      errorCode.value = toErrorCode(e);
+      setIpcError(e);
       return false;
     } finally {
       busy.value = false;
@@ -523,7 +540,7 @@ export const useSetupStore = defineStore("setup", () => {
       // R3-P1-1: a fresh phrase must be revealed before it can be acknowledged.
       phraseRevealed.value = false;
     } catch (e) {
-      errorCode.value = toErrorCode(e);
+      setIpcError(e);
       throw e;
     } finally {
       busy.value = false;
@@ -580,7 +597,7 @@ export const useSetupStore = defineStore("setup", () => {
       }
       await ipc.syncNow(sid);
     } catch (e) {
-      errorCode.value = toErrorCode(e);
+      setIpcError(e);
       throw e;
     } finally {
       busy.value = false;
@@ -677,6 +694,7 @@ export const useSetupStore = defineStore("setup", () => {
     pendingRecoveryAck,
     busy,
     errorCode,
+    errorDetail,
     canGoBack,
     canGoNext,
     signedIn,

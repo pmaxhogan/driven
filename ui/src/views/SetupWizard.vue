@@ -11,6 +11,7 @@ import DriveFolderPicker from "../components/DriveFolderPicker.vue";
 import LocalFolderForm from "../components/LocalFolderForm.vue";
 import RecoveryPhraseReveal from "../components/RecoveryPhraseReveal.vue";
 import { pickFolderDialog } from "../ipc/commands";
+import { toErrorMessage } from "../ipc/errors";
 import { useSetupStore, WIZARD_STEPS } from "../stores/setup";
 import type {
   CreateLocalFolderAccountRequest,
@@ -81,6 +82,18 @@ onBeforeUnmount(() => {
 
 const errorLong = computed<string | null>(() =>
   setup.errorCode ? t(`errors.${setup.errorCode}.long`) : null
+);
+
+/** The technical-detail line under the localized error: stable code, plus the
+ * backend's redacted message when one accompanied the failure. Composed here so
+ * the template carries no raw string literals (i18n no-raw-text) - the line is
+ * intentionally untranslated diagnostic text. */
+const errorDetailLine = computed<string | null>(() =>
+  setup.errorCode
+    ? setup.errorDetail
+      ? `${setup.errorCode} - ${setup.errorDetail}`
+      : setup.errorCode
+    : null
 );
 
 /** Step 2's heading, which names the destination being connected.
@@ -168,6 +181,7 @@ function onDrivePickerError(e: unknown): void {
     e && typeof e === "object" && "code" in e
       ? String((e as { code: unknown }).code)
       : "drive.unreachable";
+  setup.errorDetail = toErrorMessage(e);
 }
 
 // --- Navigation --------------------------------------------------------------
@@ -283,6 +297,7 @@ function onPhraseRevealError(code: unknown): void {
     code && typeof code === "object" && "code" in code
       ? String((code as { code: unknown }).code)
       : "internal.bug";
+  setup.errorDetail = toErrorMessage(code);
 }
 
 function baseName(p: string): string {
@@ -495,6 +510,16 @@ function baseName(p: string): string {
 
     <p v-if="errorLong" class="text-sm text-red-600" role="alert">
       {{ errorLong }}
+    </p>
+    <!-- Technical detail under the localized line: the stable code plus the
+         backend's redacted message, so distinct failures behind one code are
+         tellable apart and a screenshot alone is diagnosable. -->
+    <p
+      v-if="errorLong && errorDetailLine"
+      class="break-words font-mono text-xs text-zinc-500 dark:text-zinc-400"
+      data-testid="setup-error-detail"
+    >
+      {{ errorDetailLine }}
     </p>
 
     <footer class="flex justify-between">
