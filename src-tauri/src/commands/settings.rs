@@ -1987,6 +1987,11 @@ async fn build_activity_csv_paged(
 /// holding it can write bytes into the upload) and is NEVER included, not
 /// even hashed. Best-effort: a query failure yields a note, not a bundle
 /// failure.
+///
+/// The field names below shadow driven-core's executor-private
+/// `PendingOpPayload` (crates/driven-core/src/executor.rs); a field added
+/// there must be mirrored here or it will silently not appear in bundles
+/// (there is a matching NOTE on that struct).
 async fn build_pending_ops_summary(state: &dyn StateRepo, redactor: &Redactor) -> String {
     use driven_core::time::{Clock, SystemClock};
 
@@ -2080,11 +2085,17 @@ async fn build_pending_ops_summary(state: &dyn StateRepo, redactor: &Redactor) -
 /// trailing sample window so the TREND is visible - a flat line rules memory
 /// out; a staircase names when the runaway started and how fast it grew.
 fn build_memory_summary() -> String {
-    let (current, peak) = crate::memlog::snapshot();
+    let (current, peak, fresh) = crate::memlog::snapshot();
+    // `sample=fresh` = read at capture time; `sample=stale-or-unread` = the
+    // capture-time read FAILED, so the numbers are the last-known values (up
+    // to a sampler interval old) or 0 if never sampled - never present a
+    // stale number as live.
     let mut out = format!(
-        "# Process memory at bundle capture (SPEC s18). 0 = unreadable on this platform.\n\
+        "# Process memory at bundle capture (SPEC s18).\n\
+         sample={}\n\
          rss_bytes={current}\n\
-         peak_rss_bytes={peak}\n"
+         peak_rss_bytes={peak}\n",
+        if fresh { "fresh" } else { "stale-or-unread" }
     );
     let samples = crate::memlog::recent_samples();
     out.push_str(&format!(

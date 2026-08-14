@@ -99,6 +99,24 @@ const VSS_ORPHAN_SETTING_KEY: &str = "vss.orphans";
 /// `tokio::sync::Mutex` (held across the `.await`s of the DB read + write) makes
 /// each account's whole RMW atomic with respect to the others. `OnceLock` so
 /// every orchestrator in the process shares the same instance.
+/// The bare variant name of an [`OrchestratorState`], for the transition log
+/// (2026-08-14 incident). Deliberately NOT the Debug form: `Error` carries
+/// free-text details that can embed local paths, which must never enter a log
+/// line un-redacted.
+fn state_name(state: &OrchestratorState) -> &'static str {
+    match state {
+        OrchestratorState::Idle { .. } => "idle",
+        OrchestratorState::PowerCheck => "power_check",
+        OrchestratorState::Scanning { .. } => "scanning",
+        OrchestratorState::Planning { .. } => "planning",
+        OrchestratorState::Executing { .. } => "executing",
+        OrchestratorState::Verifying { .. } => "verifying",
+        OrchestratorState::Backoff { .. } => "backoff",
+        OrchestratorState::Paused { .. } => "paused",
+        OrchestratorState::Error { .. } => "error",
+    }
+}
+
 fn orphan_registry_lock() -> &'static tokio::sync::Mutex<()> {
     static LOCK: std::sync::OnceLock<tokio::sync::Mutex<()>> = std::sync::OnceLock::new();
     LOCK.get_or_init(|| tokio::sync::Mutex::new(()))
@@ -945,8 +963,14 @@ impl SyncOrchestrator {
         // lines per cycle; same-state re-writes (e.g. Idle timestamp bumps on
         // consecutive quiet cycles carry differing `last_run_at`, so those
         // still log once per cycle) are the volume ceiling.
+        //
+        // Log the variant NAME only, never the Debug dump: the `Error`
+        // variant carries free-text error details that routinely embed local
+        // paths, and the bundle redactor's unquoted-run scanner truncates a
+        // path at its first space - so a raw `?next` here would leak
+        // partially-redacted paths into exported bundles.
         if changed {
-            tracing::info!(target: TARGET, account_id = %self.account_id, state = ?next, "state transition");
+            tracing::info!(target: TARGET, account_id = %self.account_id, state = state_name(&next), "state transition");
         }
         let _ = self
             .events

@@ -53,26 +53,36 @@ pub fn recent_samples() -> Vec<(i64, u64)> {
         .unwrap_or_default()
 }
 
-/// `(current, peak)` resident-set bytes for the diagnostic bundle's
-/// `memory.txt`. Takes a FRESH sample first, so a bundle captured before the
-/// first tick (or during a fast runaway) still reports live numbers.
-pub fn snapshot() -> (u64, u64) {
-    if let Some(rss) = process_rss_bytes() {
-        record(rss);
-    }
+/// `(current, peak, fresh)` resident-set bytes for the diagnostic bundle's
+/// `memory.txt`. Attempts a FRESH sample first, so a bundle captured before
+/// the first sampler tick (or during a fast runaway) still reports live
+/// numbers. `fresh` is false when that sample attempt FAILED - the returned
+/// numbers are then the last-known values (possibly 15s+ old, or 0 if never
+/// sampled), and the bundle must say so rather than presenting them as live.
+pub fn snapshot() -> (u64, u64, bool) {
+    let fresh = match process_rss_bytes() {
+        Some(rss) => {
+            record(rss);
+            true
+        }
+        None => false,
+    };
     (
         CURRENT_RSS.load(Ordering::Relaxed),
         PEAK_RSS.load(Ordering::Relaxed),
+        fresh,
     )
 }
 
 fn record(rss: u64) {
+    // The shared SystemClock, not a hand-rolled SystemTime conversion: its
+    // now_ms deliberately stays SIGNED on a pre-epoch reading so a
+    // backwards-jumped clock is representable in the trend window instead of
+    // silently clamping to 0 (see driven-core time.rs).
+    use driven_core::time::{Clock, SystemClock};
     CURRENT_RSS.store(rss, Ordering::Relaxed);
     PEAK_RSS.fetch_max(rss, Ordering::Relaxed);
-    let now_ms = std::time::SystemTime::now()
-        .duration_since(std::time::UNIX_EPOCH)
-        .map(|d| d.as_millis() as i64)
-        .unwrap_or(0);
+    let now_ms = SystemClock.now_ms();
     if let Ok(mut q) = RECENT_SAMPLES.lock() {
         if q.len() >= RECENT_SAMPLES_CAP {
             q.pop_front();
@@ -87,22 +97,36 @@ pub fn spawn_sampler() {
     tokio::spawn(async move {
         let mut ticker = tokio::time::interval(SAMPLE_INTERVAL);
         ticker.set_missed_tick_behavior(tokio::time::MissedTickBehavior::Skip);
-        let mut last_logged: u64 = 0;
+        // None = no sample logged yet (a plain 0 would collide with a
+        // degenerate-but-legitimate 0 reading).
+        let mut last_logged: Option<u64> = None;
         loop {
             ticker.tick().await;
-            let Some(rss) = process_rss_bytes() else {
-                tracing::warn!(target: TARGET, "cannot read process RSS on this platform; memory watchdog exiting");
-                return;
+            // The read is a normally-fast sync syscall, but /proc reads can
+            // stall under unusual VFS/container conditions - park it on the
+            // blocking pool rather than a runtime worker (matches the
+            // exclude-matcher build's treatment in driven-core).
+            let sampled = tokio::task::spawn_blocking(process_rss_bytes).await;
+            let rss = match sampled {
+                Ok(Some(rss)) => rss,
+                Ok(None) => {
+                    tracing::warn!(target: TARGET, "cannot read process RSS on this platform; memory watchdog exiting");
+                    return;
+                }
+                Err(err) => {
+                    tracing::warn!(target: TARGET, %err, "RSS sample task failed; memory watchdog exiting");
+                    return;
+                }
             };
             record(rss);
-            if last_logged == 0 || rss.abs_diff(last_logged) >= LOG_DELTA_BYTES {
+            if last_logged.is_none_or(|prev| rss.abs_diff(prev) >= LOG_DELTA_BYTES) {
                 tracing::info!(
                     target: TARGET,
                     rss_mb = rss / (1024 * 1024),
                     peak_mb = PEAK_RSS.load(Ordering::Relaxed) / (1024 * 1024),
                     "process memory sample"
                 );
-                last_logged = rss;
+                last_logged = Some(rss);
             }
         }
     });
@@ -213,8 +237,9 @@ mod tests {
     /// in the trailing window the bundle prints as the trend.
     #[test]
     fn snapshot_self_samples_and_feeds_the_trailing_window() {
-        let (current, peak) = snapshot();
+        let (current, peak, fresh) = snapshot();
         assert!(current > 0, "snapshot must take a fresh sample");
+        assert!(fresh, "a healthy platform read must report fresh");
         assert!(peak >= current || peak > 0);
         let samples = recent_samples();
         assert!(
