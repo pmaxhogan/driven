@@ -3272,6 +3272,11 @@ mod tests {
         /// "reconcile invalid_grant -> needs_reauth + suspend" test can assert
         /// the orchestrator runs the V-F transition off the reconcile path.
         reconcile_auth_fail: std::sync::atomic::AtomicBool,
+        /// 2026-08-14 follow-up: when `> 0`, `reconcile` fires the recover
+        /// sink this many times (bytes climbing 0 -> total) with the clock
+        /// STATIONARY - drives the "throttle emits only the first and final
+        /// Recovering states" test.
+        recover_ticks: AtomicU64,
         /// R2-P2-1: when `> 0`, `execute` STREAMS this many op outcomes through
         /// the per-op `on_outcome` sink (so their activity is persisted) and
         /// THEN returns `Err` - simulating a crash/shutdown PART-WAY through a
@@ -3448,12 +3453,26 @@ mod tests {
         async fn reconcile(
             &self,
             source: &SourceRow,
-            _on_recover: &crate::executor::RecoverProgressSink<'_>,
+            on_recover: &crate::executor::RecoverProgressSink<'_>,
         ) -> anyhow::Result<()> {
             // Count every attempt. A configured transient failure returns Err
             // WITHOUT recording the source as adopted, so the P1-1 test can
             // assert the failed source is retried on the next cycle.
             self.reconciles.fetch_add(1, Ordering::SeqCst);
+            // 2026-08-14 follow-up: emulate a resume's progress stream (start
+            // tick at 0, evenly spaced acks, final tick at total).
+            let ticks = self.recover_ticks.load(Ordering::SeqCst);
+            if ticks > 1 {
+                let total = 1_000u64;
+                for i in 0..ticks {
+                    on_recover(crate::executor::RecoverProgress {
+                        path: "big/file.bin".to_string(),
+                        bytes_done: i * total / (ticks - 1),
+                        bytes_total: total,
+                    })
+                    .await;
+                }
+            }
             // R-P2-2: a revoked token during the reconcile corrupt-trash retry
             // surfaces as a CLASSIFIED error the orchestrator must turn into
             // needs_reauth + suspend (not a plain transient retry).
@@ -6627,6 +6646,56 @@ mod tests {
                 .any(|r| matches!(r.level, crate::state::ActivityLevel::Error)
                     && r.event_type == expected_code),
             "a durable activity Error row records the failed op: {rows:?}"
+        );
+    }
+
+    /// 2026-08-14 follow-up: the reconcile recovery sink's orchestrator-side
+    /// throttle. Five rapid ticks with a STATIONARY clock must surface exactly
+    /// TWO `Recovering` states: the first tick (the immediate flip out of the
+    /// indeterminate sweep) and the final tick (bytes_done == bytes_total,
+    /// exempt from the throttle). The middle ticks are within the 1s window
+    /// and suppressed.
+    #[tokio::test]
+    async fn reconcile_recovery_ticks_throttle_to_first_and_final() {
+        let account = AccountId::new_v4();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = source_in(account, tmp.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        exec.recover_ticks.store(5, Ordering::SeqCst);
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let clock = Arc::new(FakeClock::new());
+        clock.advance(std::time::Duration::from_millis(5_000));
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec.clone(),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock.clone(),
+            OrchestratorConfig::default(),
+        );
+
+        let mut events = orch.subscribe();
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        let mut recovering: Vec<(u64, u64)> = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let OrchestratorEvent::StateChanged {
+                state:
+                    OrchestratorState::Recovering {
+                        bytes_done,
+                        bytes_total,
+                        ..
+                    },
+            } = ev
+            {
+                recovering.push((bytes_done, bytes_total));
+            }
+        }
+        assert_eq!(
+            recovering,
+            vec![(0, 1_000), (1_000, 1_000)],
+            "first and final ticks pass; the stationary-clock middle ticks are throttled"
         );
     }
 
