@@ -107,15 +107,25 @@ fn should_skip_placeholder(file_attributes: u32, policy: PlaceholderPolicy) -> b
         && file_attributes & FILE_ATTRIBUTE_RECALL_ON_OPEN != 0
 }
 
-/// Whether `path` carries one or more NTFS Alternate Data Streams beyond its
-/// main unnamed `::$DATA` stream (DESIGN s5.2.1, STRESS_HARNESS s3.5
-/// `ads-alternate-data-stream`).
+/// Whether `path` carries one or more WARN-WORTHY NTFS Alternate Data Streams
+/// beyond its main unnamed `::$DATA` stream (DESIGN s5.2.1, STRESS_HARNESS
+/// s3.5 `ads-alternate-data-stream`).
 ///
 /// Driven backs up the main stream only; a file with named streams (e.g.
 /// `foo.txt:secret`) silently loses those streams. The scanner detects them
 /// so the orchestrator can surface a one-per-file `local.ads_skipped` warning
 /// (SPEC s24) rather than dropping them silently - silent data loss in a
 /// backup tool.
+///
+/// EXEMPTION: `Zone.Identifier` - the mark-of-the-web tag Windows attaches to
+/// every downloaded file - is deliberately NOT warn-worthy. It is transient
+/// browser provenance metadata, not user data; a Documents tree full of
+/// downloads carries it on thousands of files, and warning on each buried the
+/// real signal in the 2026-08-14 incident's logs (14,098 of that day's 14,174
+/// lines were `ads_skipped`). A file whose ONLY named stream is
+/// `Zone.Identifier` returns `false`; any other named stream still warns,
+/// Zone.Identifier alongside it or not. Zero extra I/O either way: the stream
+/// NAMES arrive in the same enumeration this probe already runs.
 ///
 /// Windows enumerates streams via `FindFirstStreamW` / `FindNextStreamW`
 /// (`STREAM_INFO_LEVELS::FindStreamInfoStandard`). The main stream reports as
@@ -149,12 +159,29 @@ fn has_alternate_data_streams(path: &Path) -> bool {
         fn FindClose(handle: isize) -> i32;
     }
 
+    // The stream name up to its NUL terminator.
+    fn stream_name(name: &[u16]) -> &[u16] {
+        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
+        &name[..len]
+    }
+
     // The unnamed main stream's name, as FindFirstStreamW reports it.
     fn is_main_stream(name: &[u16]) -> bool {
-        // Compare against the literal "::$DATA" up to the first NUL.
         let main: Vec<u16> = "::$DATA".encode_utf16().collect();
-        let len = name.iter().position(|&c| c == 0).unwrap_or(name.len());
-        name[..len] == main[..]
+        stream_name(name) == main
+    }
+
+    // The mark-of-the-web tag (see the fn doc's EXEMPTION). NTFS stream names
+    // are case-insensitive and this one is pure ASCII, so an ASCII
+    // case-insensitive compare is exact.
+    fn is_zone_identifier_stream(name: &[u16]) -> bool {
+        const ZONE: &str = ":Zone.Identifier:$DATA";
+        let name = stream_name(name);
+        name.len() == ZONE.len()
+            && name
+                .iter()
+                .zip(ZONE.bytes())
+                .all(|(&c, e)| c < 128 && (c as u8).eq_ignore_ascii_case(&e))
     }
 
     let wide: Vec<u16> = path
@@ -180,7 +207,7 @@ fn has_alternate_data_streams(path: &Path) -> bool {
         }
         let mut found_ads = false;
         loop {
-            if !is_main_stream(&data.stream_name) {
+            if !is_main_stream(&data.stream_name) && !is_zone_identifier_stream(&data.stream_name) {
                 found_ads = true;
                 break;
             }
@@ -1354,6 +1381,63 @@ mod tests {
     use async_trait::async_trait;
 
     use super::*;
+
+    /// `Zone.Identifier` alone must NOT flag a file (log-noise follow-up to
+    /// the 2026-08-14 incident, where it accounted for ~all `ads_skipped`
+    /// warnings); any OTHER named stream still must, with or without a
+    /// Zone.Identifier alongside. Skips gracefully when the temp volume
+    /// cannot hold ADS (non-NTFS).
+    #[cfg(windows)]
+    #[test]
+    fn ads_probe_exempts_zone_identifier_only_files() {
+        let dir = tempfile::tempdir().unwrap();
+
+        let plain = dir.path().join("plain.txt");
+        fs::write(&plain, b"body").unwrap();
+        assert!(!has_alternate_data_streams(&plain), "no streams, no flag");
+
+        let zoned = dir.path().join("zoned.txt");
+        fs::write(&zoned, b"body").unwrap();
+        if fs::write(
+            format!("{}:Zone.Identifier", zoned.display()),
+            b"[ZoneTransfer]\r\nZoneId=3\r\n",
+        )
+        .is_err()
+        {
+            eprintln!("temp volume does not support ADS; skipping");
+            return;
+        }
+        assert!(
+            !has_alternate_data_streams(&zoned),
+            "Zone.Identifier alone is exempt (mark-of-the-web metadata)"
+        );
+
+        // NTFS stream names are case-insensitive; the exemption must be too.
+        let cased = dir.path().join("cased.txt");
+        fs::write(&cased, b"body").unwrap();
+        fs::write(format!("{}:zone.identifier", cased.display()), b"x").unwrap();
+        assert!(
+            !has_alternate_data_streams(&cased),
+            "the exemption is case-insensitive"
+        );
+
+        let secret = dir.path().join("secret.txt");
+        fs::write(&secret, b"body").unwrap();
+        fs::write(format!("{}:secret", secret.display()), b"hidden").unwrap();
+        assert!(
+            has_alternate_data_streams(&secret),
+            "a real named stream still flags"
+        );
+
+        let both = dir.path().join("both.txt");
+        fs::write(&both, b"body").unwrap();
+        fs::write(format!("{}:Zone.Identifier", both.display()), b"x").unwrap();
+        fs::write(format!("{}:extra", both.display()), b"y").unwrap();
+        assert!(
+            has_alternate_data_streams(&both),
+            "Zone.Identifier must not mask another named stream"
+        );
+    }
     use crate::state::{
         AccountRow, ActivityFilter, ActivityPage, FileSearchHit, FileStateRow, NewActivity,
         NewPendingOp, PageRequest, PendingOpRow,
