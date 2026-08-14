@@ -11661,6 +11661,10 @@ mod tests {
         /// Any call fails loudly - for tests asserting the resume path is
         /// never entered at all.
         NeverCalled,
+        /// EVERY call answers `InProgress {{ received: 0 }}` - a misbehaving
+        /// server that rewinds forever. The resume must abandon after its
+        /// one-restart budget, never loop.
+        RewindAlways,
     }
 
     /// Delegates everything to a real [`InMemoryRemoteStore`] but SHIMS
@@ -11758,6 +11762,7 @@ mod tests {
                 ShimMode::NeverCalled => {
                     anyhow::bail!("ResumeShimStore: resume_chunk must not be called")
                 }
+                ShimMode::RewindAlways => Ok(ResumeProgress::InProgress { received: 0 }),
             }
         }
         async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
@@ -12050,6 +12055,196 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// [`ResumeAcc`]'s gauge accounting is symmetric across push / partial
+    /// drain / clear, the drain clamps at the buffered length, and DROP
+    /// refunds whatever is left - the guarantee the error-unwind test relies
+    /// on, exercised here without a store in the loop.
+    #[test]
+    fn resume_acc_gauge_accounting_is_symmetric() {
+        let gauge = MemGauge::default();
+        {
+            let mut acc = ResumeAcc::new(Some(&gauge));
+            acc.push(&[1u8; 100]);
+            acc.push(&[2u8; 50]);
+            assert_eq!(gauge.current(), 150);
+            assert_eq!(acc.len(), 150);
+            assert!(!acc.is_empty());
+            assert_eq!(acc.slice(3), &[1, 1, 1]);
+            acc.drain_front(60);
+            assert_eq!(gauge.current(), 90);
+            // Over-drain clamps at the buffered length (never underflows).
+            acc.drain_front(10_000);
+            assert_eq!(gauge.current(), 0);
+            acc.push(&[3u8; 40]);
+            acc.clear();
+            assert_eq!(gauge.current(), 0);
+            acc.push(&[4u8; 25]);
+            // Dropped holding 25 bytes: Drop refunds them.
+        }
+        assert_eq!(gauge.current(), 0, "Drop must refund the remainder");
+        assert_eq!(gauge.peak(), 150);
+    }
+
+    /// A fabricated pending-op payload around a hand-built session (never
+    /// registered with any store - these tests only exercise the resume
+    /// GATES, all of which fire before a single store call).
+    fn fabricated_resumable_payload(
+        uuid: &str,
+        issued_at: i64,
+        size: u64,
+        acked: u64,
+        uploaded_blake3_hex: Option<String>,
+    ) -> serde_json::Value {
+        serde_json::to_value(PendingOpPayload {
+            client_op_uuid: Some(uuid.to_string()),
+            drive_file_id: None,
+            uploaded_blake3_hex,
+            resumable: Some(PersistedResumable {
+                session: ResumableSession {
+                    url: "https://example.invalid/never-contacted".into(),
+                    issued_at,
+                    size,
+                    kind: ResumableKind::Update {
+                        file_id: "unused".into(),
+                    },
+                },
+                acked_offset: acked,
+            }),
+            corrupt_file_id: None,
+            supersedes_drive_file_id: None,
+            redundant_duplicate_file_id: None,
+            resume_identity: None,
+        })
+        .unwrap()
+    }
+
+    async fn enqueue_op(h: &Harness, rel: &RelativePath, payload_json: serde_json::Value) {
+        let now = h.clock.now_ms();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                payload_json,
+                scheduled_for: now,
+                created_at: now,
+            })
+            .await
+            .unwrap();
+    }
+
+    /// The resume gates each abandon WITHOUT any store traffic and fall
+    /// through to the clean requeue: a session past the 6-day window, a
+    /// legacy row whose recorded hash does not match the file, and a row
+    /// with neither identity nor hash. The NeverCalled shim proves not one
+    /// `resume_chunk` fires.
+    #[tokio::test]
+    async fn resume_gates_abandon_without_store_traffic() {
+        // (a) session older than 6 days (FakeClock now = 0, issued_at deep
+        //     in the negative past).
+        let h = harness().await;
+        let (rel, size) = h.write_file("stale.bin", b"stale session body");
+        let uuid = uuid::Uuid::new_v4().to_string();
+        enqueue_op(
+            &h,
+            &rel,
+            fabricated_resumable_payload(&uuid, -(SESSION_MAX_AGE_MS + 1000), size, 5, None),
+        )
+        .await;
+        let shim = ResumeShimStore::new(h.remote.clone(), ShimMode::NeverCalled);
+        executor_over(&h, shim.clone())
+            .reconcile(&h.source)
+            .await
+            .expect("too-old session abandons pre-push and requeues cleanly");
+        assert_eq!(shim.resume_calls.load(Ordering::SeqCst), 0);
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // (b) legacy row (hash, no identity) whose hash does NOT match: the
+        //     prepass refuses before any push.
+        let h = harness().await;
+        let (rel, size) = h.write_file("legacy.bin", b"the real bytes");
+        let uuid = uuid::Uuid::new_v4().to_string();
+        let wrong_hex = hex::encode(blake3::hash(b"different bytes").as_bytes());
+        enqueue_op(
+            &h,
+            &rel,
+            fabricated_resumable_payload(&uuid, 0, size, 3, Some(wrong_hex)),
+        )
+        .await;
+        let shim = ResumeShimStore::new(h.remote.clone(), ShimMode::NeverCalled);
+        executor_over(&h, shim.clone())
+            .reconcile(&h.source)
+            .await
+            .expect("legacy hash mismatch abandons pre-push");
+        assert_eq!(shim.resume_calls.load(Ordering::SeqCst), 0);
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // (c) neither identity nor hash: refuse to resume at all.
+        let h = harness().await;
+        let (rel, size) = h.write_file("naked.bin", b"nothing to validate against");
+        let uuid = uuid::Uuid::new_v4().to_string();
+        enqueue_op(
+            &h,
+            &rel,
+            fabricated_resumable_payload(&uuid, 0, size, 3, None),
+        )
+        .await;
+        let shim = ResumeShimStore::new(h.remote.clone(), ShimMode::NeverCalled);
+        executor_over(&h, shim.clone())
+            .reconcile(&h.source)
+            .await
+            .expect("no identity + no hash refuses the resume");
+        assert_eq!(shim.resume_calls.load(Ordering::SeqCst), 0);
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
+    /// A server that rewinds FOREVER must exhaust the one-restart budget and
+    /// abandon (first answer restarts the pass from 0; the second - now
+    /// `received == offset == 0` - reads as a stall), never loop. The op
+    /// resolves through the clean requeue.
+    #[tokio::test]
+    async fn resume_abandons_a_server_that_rewinds_forever() {
+        let h = harness().await;
+        let body = vec![9u8; 6 * 1024 * 1024];
+        let (rel, size) = h.write_file("loop.bin", &body);
+        seed_crashed_resumable_op(&h, &rel, size, WIRE_CHUNK as u64).await;
+
+        let shim = ResumeShimStore::new(h.remote.clone(), ShimMode::RewindAlways);
+        let gauge = Arc::new(MemGauge::default());
+        executor_over(&h, shim.clone())
+            .with_mem_gauge(gauge.clone())
+            .reconcile(&h.source)
+            .await
+            .expect("the endless rewinder abandons + requeues, never errors or loops");
+        assert_eq!(
+            shim.resume_calls.load(Ordering::SeqCst),
+            2,
+            "one rewind honoured, the second read as a stall"
+        );
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+        assert_eq!(gauge.current(), 0, "window refunded on abandon");
     }
 
     // --- R2-P1-1: invalid_grant during a NORMAL reconcile -> needs_reauth ----
