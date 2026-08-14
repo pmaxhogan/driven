@@ -271,7 +271,10 @@ export const useRestoreStore = defineStore("restore", () => {
    * after the call; the live progress arrives on `restore:progress`. */
   async function startRestore(): Promise<void> {
     if (destToken.value === null) {
-      errorCode.value = "local.io_error";
+      // No destination token in hand - the same "pick the folder (again)"
+      // condition the backend reports for a spent/expired token, so use the
+      // same honest code rather than local.io_error's phantom disk error.
+      errorCode.value = "internal.stale_dialog_token";
       return;
     }
     const items = selectedItems();
