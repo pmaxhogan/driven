@@ -24,11 +24,7 @@ vi.mock("@tauri-apps/api/event", () => ({
   listen: (event: string, cb: (e: { payload: unknown }) => void) => listenMock(event, cb),
 }));
 
-import {
-  useIostatStore,
-  IO_WINDOW_SAMPLES,
-  IO_HEADLINE_SAMPLES,
-} from "../stores/iostat";
+import { useIostatStore, IO_WINDOW_SAMPLES, IO_HEADLINE_SAMPLES } from "../stores/iostat";
 
 function sample(tsMs: number, diskBytes: number, netBytes: number) {
   return { tsMs, diskBytes, netBytes };

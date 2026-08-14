@@ -397,8 +397,7 @@ export const IO_THROUGHPUT: IoThroughputSeriesDto = {
   bucketMs: 1000,
   samples: Array.from({ length: 60 }, (_, i) => ({
     tsMs: FIXED_NOW - (60 - i) * 1000,
-    diskBytes:
-      i < 10 ? 0 : i < 40 ? 180_000_000 + (i % 5) * 8_000_000 : i < 50 ? 60_000_000 : 0,
+    diskBytes: i < 10 ? 0 : i < 40 ? 180_000_000 + (i % 5) * 8_000_000 : i < 50 ? 60_000_000 : 0,
     netBytes: i < 5 ? 0 : 15_000_000 + (i % 7) * 1_500_000,
   })),
 };

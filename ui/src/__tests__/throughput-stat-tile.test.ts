@@ -201,4 +201,3 @@ describe("disk variant", () => {
     wrapper.unmount();
   });
 });
-

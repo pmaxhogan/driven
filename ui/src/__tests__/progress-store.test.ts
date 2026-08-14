@@ -605,9 +605,7 @@ describe("recovering state", () => {
     store.ingest(perAccount("a", recovering(1, 10)));
     store.ingest(perAccount("b", scanning(5)));
     expect(store.phase).toBe("recovering");
-    store.ingest(
-      perAccount("c", executing({ bytes_done: 1, bytes_total: 2, files_total: 1 }))
-    );
+    store.ingest(perAccount("c", executing({ bytes_done: 1, bytes_total: 2, files_total: 1 })));
     expect(store.phase).toBe("executing");
   });
 
@@ -618,4 +616,3 @@ describe("recovering state", () => {
     expect(store.percent).toBeNull();
   });
 });
-
