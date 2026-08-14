@@ -56,7 +56,9 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 
-use driven_core::executor::{DefaultExecutor, Executor, ExecutorDeps, OpOutcome, SkipReason};
+use driven_core::executor::{
+    noop_recover_sink, DefaultExecutor, Executor, ExecutorDeps, OpOutcome, SkipReason,
+};
 use driven_core::orchestrator::{SyncOrchestrator, TickSource};
 use driven_core::state::SourceRow;
 use driven_core::types::{
@@ -1048,7 +1050,7 @@ impl Scenario for AppendOnlyLog {
                 },
                 clock,
             );
-            exec.reconcile(&h.source).await?;
+            exec.reconcile(&h.source, &noop_recover_sink).await?;
         }
         drain_to_steady_state(&h).await?;
 

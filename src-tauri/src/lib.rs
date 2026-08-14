@@ -42,6 +42,7 @@ mod i18n;
 // The layered tracing subscriber (stdout + rolling file) and the ONE resolution
 // of `<config_dir>/app.driven/logs`, shared with the panic hook (SPEC s17) and
 // the diagnostic-bundle collector (SPEC s18).
+mod iostat_hub;
 mod logging;
 mod memlog;
 mod migrations;
@@ -267,6 +268,9 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
     // aborts-and-awaits it if it is mid-ping (e.g. a slow best-effort POST) so quit
     // cannot hang.
     let telemetry_handle = state.shutdown_telemetry_task();
+    // 2026-08-14 follow-up: signal + take the io-throughput sampler the same
+    // way (a 1s tokio-interval task select!ing on its shutdown watch).
+    let iostat_handle = state.shutdown_iostat_task();
     tauri::async_runtime::block_on(async move {
         // R3-P1-1: drive ALL per-account shutdowns concurrently. Each
         // `handle.shutdown()` self-bounds its per-task drains and aborts-and-
@@ -313,6 +317,12 @@ fn shutdown_orchestrators(app: &tauri::AppHandle) {
         if let Some(handle) = telemetry_handle {
             drain_restore_handle(handle).await;
             tracing::info!(target: "driven::app", "telemetry ping task drained (no orphan)");
+        }
+
+        // 2026-08-14 follow-up: drain the io-throughput sampler the same way.
+        if let Some(handle) = iostat_handle {
+            drain_restore_handle(handle).await;
+            tracing::info!(target: "driven::app", "io throughput sampler drained (no orphan)");
         }
 
         // Stop the cosmetic tray syncing-spinner LAST - AFTER every orchestrator
@@ -561,6 +571,9 @@ pub fn run() {
                 // visible in the diagnostic bundle's logs (detached on
                 // purpose - see memlog.rs on why it skips the quit drain).
                 memlog::spawn_sampler();
+                // 2026-08-14 follow-up: the live disk/network throughput
+                // sampler behind the Activity dashboard's split graphs.
+                iostat_hub::spawn_sampler(&handle);
                 // M9b R2-P2-3 (SPEC s16): record an `update_applied` activity row
                 // when the running version differs from the last-recorded one, so
                 // the telemetry `update_applied` aggregate is driven by a real
@@ -647,6 +660,8 @@ pub fn run() {
             commands::sync::resume_sync,
             commands::sync::get_pause_state,
             commands::sync::get_sync_status,
+            // 2026-08-14 follow-up: live disk/network throughput series.
+            commands::sync::io_throughput_series,
             // SPEC s11.1 accounts (M6).
             commands::accounts::list_accounts,
             commands::accounts::list_backends,

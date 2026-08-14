@@ -185,6 +185,7 @@ impl TrayIcon {
         match state {
             OrchestratorState::Idle { .. } => TrayIcon::Idle,
             OrchestratorState::PowerCheck
+            | OrchestratorState::Recovering { .. }
             | OrchestratorState::Scanning { .. }
             | OrchestratorState::Planning { .. }
             | OrchestratorState::Executing { .. }
@@ -810,6 +811,7 @@ fn tooltip_for(state: &OrchestratorState) -> String {
     match state {
         OrchestratorState::Idle { .. } => rust_i18n::t!("tray.tooltip.idle").into_owned(),
         OrchestratorState::PowerCheck
+        | OrchestratorState::Recovering { .. }
         | OrchestratorState::Scanning { .. }
         | OrchestratorState::Planning { .. }
         | OrchestratorState::Executing { .. }
@@ -931,6 +933,7 @@ fn state_severity(state: &OrchestratorState) -> u8 {
             }
         }
         OrchestratorState::PowerCheck
+        | OrchestratorState::Recovering { .. }
         | OrchestratorState::Scanning { .. }
         | OrchestratorState::Planning { .. }
         | OrchestratorState::Executing { .. }
@@ -1439,6 +1442,7 @@ enum NotifyOutcome {
 fn decide_notify(s: &mut NotifyState, state: &OrchestratorState) -> NotifyOutcome {
     match state {
         OrchestratorState::PowerCheck
+        | OrchestratorState::Recovering { .. }
         | OrchestratorState::Scanning { .. }
         | OrchestratorState::Planning { .. }
         | OrchestratorState::Executing { .. }

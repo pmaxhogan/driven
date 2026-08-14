@@ -550,6 +550,33 @@ pub fn noop_outcome_sink(_outcome: &OpOutcome) -> futures::future::BoxFuture<'st
     Box::pin(async {})
 }
 
+/// One progress tick of a reconcile-phase upload recovery (the streaming
+/// resume of an interrupted resumable session, 2026-08-14 follow-up). Emitted
+/// at resume start (with `bytes_done` = the previously-acked offset - a large
+/// prefix re-read can run for minutes before the first new ack) and then on
+/// every destination ack; the orchestrator throttles + rebroadcasts it as
+/// [`OrchestratorState::Recovering`](crate::types::OrchestratorState).
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct RecoverProgress {
+    /// Source-relative path of the file being resumed (display only).
+    pub path: String,
+    /// Bytes the destination has acked so far.
+    pub bytes_done: u64,
+    /// The session's total byte count.
+    pub bytes_total: u64,
+}
+
+/// The reconcile-phase recovery progress sink (mirrors [`OutcomeSink`]'s
+/// shape: async-capable, borrow tied to the call).
+pub type RecoverProgressSink<'a> =
+    dyn Fn(RecoverProgress) -> futures::future::BoxFuture<'a, ()> + Send + Sync + 'a;
+
+/// A no-op [`RecoverProgressSink`] for callers without the orchestrator's
+/// state wiring (tests, the chaos harness).
+pub fn noop_recover_sink(_progress: RecoverProgress) -> futures::future::BoxFuture<'static, ()> {
+    Box::pin(async {})
+}
+
 /// The plan-execution contract the orchestrator drives (SPEC s8).
 ///
 /// Mirrors the SPEC s8 `execute(plan, remote, state, pacer, crypto,
@@ -588,7 +615,11 @@ pub trait Executor: Send + Sync {
     /// `appProperties` compare for updates) or re-run it. Cheap - touches
     /// only `pending_ops`, not every file. Run once before the first
     /// normal cycle.
-    async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()>;
+    async fn reconcile(
+        &self,
+        source: &SourceRow,
+        on_recover: &RecoverProgressSink<'_>,
+    ) -> anyhow::Result<()>;
 
     /// Runs the REMOTE-EXISTENCE AUDIT for `source`: proactively detect
     /// `file_state` rows and `bundles` rows whose Drive object no longer
@@ -1039,6 +1070,10 @@ pub struct DefaultExecutor {
     /// the file size - the one qualitative pipeline contract that IS
     /// deterministically measurable against the instantaneous fake.
     mem_gauge: Option<Arc<MemGauge>>,
+    /// App-global cumulative disk/network byte counters behind the Activity
+    /// dashboard's live throughput graphs (2026-08-14 follow-up), or `None`
+    /// when not wired (tests, the chaos harness, the CLI).
+    io_counters: Option<Arc<crate::iostat::IoCounters>>,
     /// App-global latency sampler (DESIGN s13 telemetry), or `None` when
     /// telemetry latency capture is not wired (every test + the chaos harness).
     /// When `Some`, each completed upload op records its wall-clock latency
@@ -1158,6 +1193,7 @@ impl DefaultExecutor {
             pool,
             throughput: None,
             mem_gauge: None,
+            io_counters: None,
             latency: None,
             priority: crate::priority::PriorityCell::default(),
             parent_dirs: std::sync::Mutex::new(HashMap::new()),
@@ -1289,6 +1325,17 @@ impl DefaultExecutor {
     #[doc(hidden)]
     pub fn with_mem_gauge(mut self, gauge: Arc<MemGauge>) -> Self {
         self.mem_gauge = Some(gauge);
+        self
+    }
+
+    /// Attach the app-global [`IoCounters`](crate::iostat::IoCounters) so this
+    /// executor's disk reads and destination-acked wire bytes feed the live
+    /// throughput graphs (2026-08-14 follow-up). Each byte is credited exactly
+    /// once: reads at the read site, wire bytes on destination ack (per chunk
+    /// for resumable sessions, on completion for single-request uploads;
+    /// bundles are covered by their session's chunk acks alone).
+    pub fn with_io_counters(mut self, io: Arc<crate::iostat::IoCounters>) -> Self {
+        self.io_counters = Some(io);
         self
     }
 
@@ -2555,6 +2602,9 @@ impl DefaultExecutor {
         } = read_hash_encrypt(file, crypto)
             .await
             .map_err(UploadError::from_read)?;
+        if let Some(io) = self.io_counters.as_ref() {
+            io.add_disk_read(plaintext_len);
+        }
 
         // --- post-read fstat identity check (SPEC s8 defence #3) -----------
         let post = fstat_identity(file).await.map_err(UploadError::Fatal)?;
@@ -2662,7 +2712,14 @@ impl DefaultExecutor {
         // chunk is read/emitted, so the bandwidth cap + backpressure are at
         // the source of the data flow (SPEC s8 / DESIGN s5.4).
         let pacer = self.pacer.clone();
-        let reader = read_stage(file, size, pacer, raw_tx, self.mem_gauge.clone());
+        let reader = read_stage(
+            file,
+            size,
+            pacer,
+            raw_tx,
+            self.mem_gauge.clone(),
+            self.io_counters.clone(),
+        );
         let cpu = cpu_stage(raw_rx, out_tx, crypto, size);
         let uploader = self.upload_stage(
             target,
@@ -2788,6 +2845,7 @@ impl DefaultExecutor {
         out_rx: tokio::sync::mpsc::Receiver<Bytes>,
     ) -> Result<RemoteEntry, UploadError> {
         use futures::StreamExt;
+        let io_counters = self.io_counters.clone();
         let stream = tokio_stream::wrappers::ReceiverStream::new(out_rx).map(Ok);
         let body = UploadBody::Stream {
             len: total,
@@ -2810,7 +2868,13 @@ impl DefaultExecutor {
                 )
                 .await
         };
-        result.map_err(|e| {
+        result
+            .inspect(|_entry| {
+                if let Some(io) = io_counters.as_ref() {
+                    io.add_net_wire(total);
+                }
+            })
+            .map_err(|e| {
             let class = classify_drive_error(&e);
             self.pacer.note_response(class.response_class());
             // The UPDATE's target object is gone from Drive (404): no retry and
@@ -3053,6 +3117,9 @@ impl DefaultExecutor {
         if let Some(probe) = self.throughput.as_ref() {
             probe.record_bytes(wire_len);
         }
+        if let Some(io) = self.io_counters.as_ref() {
+            io.add_net_wire(wire_len);
+        }
         recorded.fetch_add(wire_len, std::sync::atomic::Ordering::Relaxed);
         match progress {
             ResumeProgress::Completed(entry) => Ok(PushOne::Done(entry)),
@@ -3222,11 +3289,11 @@ impl DefaultExecutor {
         mime: &str,
     ) -> anyhow::Result<RemoteEntry> {
         let body = UploadBody::Bytes(sent.bytes.clone());
-        if let Some(file_id) = existing_file_id {
+        let entry = if let Some(file_id) = existing_file_id {
             self.pacer.permit_request().await;
             self.remote
                 .update(file_id, body, target.app_props.clone())
-                .await
+                .await?
         } else {
             self.pacer.permit_file_create().await;
             self.remote
@@ -3237,8 +3304,12 @@ impl DefaultExecutor {
                     body,
                     target.app_props.clone(),
                 )
-                .await
+                .await?
+        };
+        if let Some(io) = self.io_counters.as_ref() {
+            io.add_net_wire(sent.bytes.len() as u64);
         }
+        Ok(entry)
     }
 
     /// Resumable create/update for files at or above [`RESUMABLE_THRESHOLD`].
@@ -3438,7 +3509,12 @@ impl DefaultExecutor {
                 .resume_chunk(session, offset as u64, chunk)
                 .await?
             {
-                ResumeProgress::Completed(entry) => return Ok(Some(entry)),
+                ResumeProgress::Completed(entry) => {
+                    if let Some(io) = self.io_counters.as_ref() {
+                        io.add_net_wire((end - offset) as u64);
+                    }
+                    return Ok(Some(entry));
+                }
                 ResumeProgress::InProgress { received } => {
                     // Stall guard (2026-08-14 follow-up, mirrors the resume
                     // path's): a session that reports zero forward progress
@@ -3455,6 +3531,9 @@ impl DefaultExecutor {
                             "resumable session made no progress on a pushed chunk; treating as invalidated"
                         );
                         return Ok(None);
+                    }
+                    if let Some(io) = self.io_counters.as_ref() {
+                        io.add_net_wire(received.saturating_sub(offset as u64));
                     }
                     offset = received as usize;
                     // Persist the new acked offset so a crash resumes here.
@@ -4806,9 +4885,13 @@ impl Executor for DefaultExecutor {
         Ok(report)
     }
 
-    async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()> {
+    async fn reconcile(
+        &self,
+        source: &SourceRow,
+        on_recover: &RecoverProgressSink<'_>,
+    ) -> anyhow::Result<()> {
         let pending = self.state.get_pending_ops_for_source(source.id).await?;
-        self.reconcile_inner(source, pending).await
+        self.reconcile_inner(source, pending, on_recover).await
     }
 }
 
@@ -4857,6 +4940,7 @@ impl DefaultExecutor {
         &self,
         source: &SourceRow,
         pending: Vec<crate::state::PendingOpRow>,
+        on_recover: &RecoverProgressSink<'_>,
     ) -> anyhow::Result<()> {
         // 2026-08-14 incident: reconcile can do HEAVY work (a resumed session
         // re-reads the whole file) yet used to enter it silently - the
@@ -5119,7 +5203,7 @@ impl DefaultExecutor {
                     // error to ReconcileError::AuthInvalidGrant so reconcile_once's
                     // enter_needs_reauth fires.
                     let resumed = self
-                        .resume_persisted(source, &op, &payload, resumable, crypto)
+                        .resume_persisted(source, &op, &payload, resumable, crypto, on_recover)
                         .await
                         .map_err(to_reconcile_err)?;
                     match resumed {
@@ -5480,6 +5564,7 @@ impl DefaultExecutor {
         resumable: PersistedResumable,
         // M5 per-source crypto (resolved FAIL-CLOSED by the caller).
         crypto: Option<&dyn SourceCryptoSuite>,
+        on_recover: &RecoverProgressSink<'_>,
     ) -> anyhow::Result<Option<(RemoteEntry, [u8; 32])>> {
         // Byte-level resume is only sound when re-reading the local file
         // reproduces the EXACT bytes already pushed. For an ENCRYPTED source
@@ -5525,6 +5610,15 @@ impl DefaultExecutor {
             session_age_ms = now - resumable.session.issued_at,
             "reconcile: resuming persisted resumable upload (streaming re-read)"
         );
+        // Flip the UI into Recovering IMMEDIATELY (2026-08-14 follow-up): a
+        // large prefix re-read produces no destination acks for minutes, and
+        // the state must not stay in the indeterminate PowerCheck sweep.
+        on_recover(RecoverProgress {
+            path: op.relative_path.as_str().to_string(),
+            bytes_done: resumable.acked_offset,
+            bytes_total: total,
+        })
+        .await;
 
         // Re-open the local file and check the resume-safe IDENTITY recorded
         // at session start (P1-2). The identity - not the content hash - is
@@ -5583,13 +5677,16 @@ impl DefaultExecutor {
                 // acked_offset past bytes from a file we then discover does
                 // not match. Costs one extra full read, only for these
                 // ancient rows.
-                let (prepass_hash, _len) = match hash_plaintext_streaming(&mut file).await {
+                let (prepass_hash, prepass_len) = match hash_plaintext_streaming(&mut file).await {
                     Ok(h) => h,
                     Err(err) => {
                         info!(target: TARGET, source = %source.id, path = %op.relative_path, %err, "reconcile: legacy-row hash prepass failed to read the file; abandoning the session");
                         return Ok(None);
                     }
                 };
+                if let Some(io) = self.io_counters.as_ref() {
+                    io.add_disk_read(prepass_len);
+                }
                 if hex::encode(prepass_hash) != expected_hex {
                     warn!(target: TARGET, source = %source.id, path = %op.relative_path, "reconcile: legacy-row content does not match the op's recorded hash; abandoning the session");
                     return Ok(None);
@@ -5621,6 +5718,7 @@ impl DefaultExecutor {
                     &mut live,
                     &mut file,
                     attempt_from,
+                    on_recover,
                 )
                 .await?
             {
@@ -5705,6 +5803,7 @@ impl DefaultExecutor {
         live: &mut PendingOpPayload,
         file: &mut tokio::fs::File,
         resume_from: u64,
+        on_recover: &RecoverProgressSink<'_>,
     ) -> anyhow::Result<ResumePassOutcome> {
         use md5::{Digest, Md5};
 
@@ -5732,6 +5831,9 @@ impl DefaultExecutor {
                 break;
             }
             let chunk = &read_buf[..n];
+            if let Some(io) = self.io_counters.as_ref() {
+                io.add_disk_read(n as u64);
+            }
             hasher.update(chunk);
             md5.update(chunk);
             let chunk_start = pos;
@@ -5765,6 +5867,7 @@ impl DefaultExecutor {
                         pos,
                         op,
                         live,
+                        on_recover,
                     )
                     .await?
                 {
@@ -5827,6 +5930,7 @@ impl DefaultExecutor {
                     pos,
                     op,
                     live,
+                    on_recover,
                 )
                 .await?
             {
@@ -5882,12 +5986,22 @@ impl DefaultExecutor {
         pos: u64,
         op: &crate::state::PendingOpRow,
         live: &mut PendingOpPayload,
+        on_recover: &RecoverProgressSink<'_>,
     ) -> anyhow::Result<ResumePushOutcome> {
         let wire = Bytes::copy_from_slice(acc.slice(take));
         self.pacer.permit_request().await;
         self.pacer.permit_bytes(take as u64).await;
         match self.remote.resume_chunk(session, *offset, wire).await? {
             ResumeProgress::Completed(entry) => {
+                if let Some(io) = self.io_counters.as_ref() {
+                    io.add_net_wire(take as u64);
+                }
+                on_recover(RecoverProgress {
+                    path: op.relative_path.as_str().to_string(),
+                    bytes_done: session.size,
+                    bytes_total: session.size,
+                })
+                .await;
                 acc.clear();
                 Ok(ResumePushOutcome::Completed(entry))
             }
@@ -5911,8 +6025,17 @@ impl DefaultExecutor {
                 if let Some(r) = live.resumable.as_mut() {
                     r.acked_offset = received;
                 }
+                if let Some(io) = self.io_counters.as_ref() {
+                    io.add_net_wire(advance as u64);
+                }
                 // Persist the new acked offset so a crash resumes from here.
                 self.persist_payload(op.id, live).await?;
+                on_recover(RecoverProgress {
+                    path: op.relative_path.as_str().to_string(),
+                    bytes_done: received,
+                    bytes_total: session.size,
+                })
+                .await;
                 Ok(ResumePushOutcome::Acked)
             }
             ResumeProgress::SessionInvalid => {
@@ -6184,7 +6307,10 @@ impl DefaultExecutor {
         // whole body into a `Vec` despite only the hash being needed) was the
         // same whole-file buffering that OOM-killed the app on an 88 GB file
         // in the resume path.
-        let (blake3, _len) = hash_plaintext_streaming(&mut file).await.ok()?;
+        let (blake3, len) = hash_plaintext_streaming(&mut file).await.ok()?;
+        if let Some(io) = self.io_counters.as_ref() {
+            io.add_disk_read(len);
+        }
         Some((blake3, id.size, id.mtime_ns))
     }
 }
@@ -6621,6 +6747,7 @@ async fn read_stage(
     pacer: Arc<dyn Pacer>,
     raw_tx: tokio::sync::mpsc::Sender<Bytes>,
     mem_gauge: Option<Arc<MemGauge>>,
+    io_counters: Option<Arc<crate::iostat::IoCounters>>,
 ) -> Result<(), StageError> {
     // V5-P1-2: emit DETERMINISTIC fixed-READ_BUF (64 KiB) plaintext chunks,
     // INDEPENDENT of what a single `read()` returns. The cpu stage encrypts
@@ -6647,6 +6774,9 @@ async fn read_stage(
             return Err(StageError::Changed);
         }
         pacer.permit_bytes(n).await;
+        if let Some(io) = io_counters.as_ref() {
+            io.add_disk_read(n);
+        }
         // Record the bytes entering the pipeline (test instrumentation; the
         // matching `sub` happens once Drive accepts the wire chunk).
         if let Some(g) = mem_gauge.as_ref() {
@@ -8605,7 +8735,7 @@ mod tests {
             .unwrap();
 
         let exec = h.executor();
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
 
         // The orphan object was trashed (list_folder omits trashed) and the op is
         // gone.
@@ -8677,7 +8807,7 @@ mod tests {
 
         let exec = h.executor();
         let err = exec
-            .reconcile(&h.source)
+            .reconcile(&h.source, &noop_recover_sink)
             .await
             .expect_err("invalid_grant on the bundle lookup must fail the reconcile");
         assert!(
@@ -8707,7 +8837,7 @@ mod tests {
 
         let exec = h.executor();
         let err = exec
-            .reconcile(&h.source)
+            .reconcile(&h.source, &noop_recover_sink)
             .await
             .expect_err("a transient error propagates so the source retries next cycle");
         assert!(
@@ -8756,7 +8886,7 @@ mod tests {
         );
 
         // Reconcile SUCCEEDS (no propagated error to wedge the account)...
-        exec.reconcile(&h.source)
+        exec.reconcile(&h.source, &noop_recover_sink)
             .await
             .expect("a definitive trash failure must not fail reconcile");
         // ...and the stuck op is dropped so it never recurs every cycle.
@@ -8918,7 +9048,7 @@ mod tests {
         );
 
         // Reconcile sweeps it: the object is trashed and the row is dropped.
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
         let after = h
             .remote
             .list_folder(h.source.drive_folder_id.as_str(), &DriveContext::MyDrive)
@@ -10874,7 +11004,7 @@ mod tests {
 
         // --- reconcile with the trash now SUCCEEDING -> op dropped, dup trashed ---
         store.trash_fails.store(false, Ordering::SeqCst);
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
         assert_eq!(
             store.trash_calls.load(Ordering::SeqCst),
             2,
@@ -10978,7 +11108,7 @@ mod tests {
             .unwrap();
 
         let exec = h.executor();
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
 
         // The OLD object stays current (no flip to the identical orphan) and NO
         // version is recorded (a repeated touch cannot evict genuine history).
@@ -11099,7 +11229,7 @@ mod tests {
             .unwrap();
 
         let exec = h.executor();
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
 
         // Requeue: the file_state points at the orphan but is NOT Synced.
         let cur = h
@@ -11447,7 +11577,7 @@ mod tests {
             .unwrap();
 
         let exec = h.executor();
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
 
         // Pointer flipped to the adopted orphan; the OLD object is a trashed version.
         let cur = h
@@ -11542,7 +11672,7 @@ mod tests {
             .unwrap();
 
         let exec = h.executor();
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
 
         // The orphan is adopted: file_state has a drive_file_id, pending drained.
         let row = h
@@ -11585,7 +11715,7 @@ mod tests {
             .await
             .unwrap();
         let exec = h.executor();
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
         // No remote object => op dropped, no file_state row.
         assert!(h
             .state
@@ -11628,7 +11758,7 @@ mod tests {
         source.exclude_patterns = vec!["excluded-later.bin".to_string()];
 
         let exec = h.executor();
-        exec.reconcile(&source).await.unwrap();
+        exec.reconcile(&source, &noop_recover_sink).await.unwrap();
 
         assert!(
             h.state
@@ -11812,13 +11942,14 @@ mod tests {
     /// Seed the exact pending-op row a mid-stream crash leaves behind: a LIVE
     /// resumable session (created against the shared backing store) + the
     /// resume identity of the real on-disk file + a claimed acked offset.
-    /// Returns the op uuid.
+    /// Returns the live session (so a test can pre-push the "already acked"
+    /// prefix into the store, mirroring a real crashed upload).
     async fn seed_crashed_resumable_op(
         h: &Harness,
         rel: &RelativePath,
         size: u64,
         claimed_acked: u64,
-    ) -> String {
+    ) -> ResumableSession {
         let uuid = uuid::Uuid::new_v4().to_string();
         let mut app = HashMap::new();
         app.insert(CLIENT_OP_UUID_KEY.to_string(), uuid.clone());
@@ -11846,7 +11977,7 @@ mod tests {
             drive_file_id: None,
             uploaded_blake3_hex: None,
             resumable: Some(PersistedResumable {
-                session,
+                session: session.clone(),
                 acked_offset: claimed_acked,
             }),
             corrupt_file_id: None,
@@ -11866,7 +11997,7 @@ mod tests {
             })
             .await
             .unwrap();
-        uuid
+        session
     }
 
     /// driven-s3's post-hydration contract: the FIRST `resume_chunk` against a
@@ -11890,7 +12021,7 @@ mod tests {
         );
         let gauge = Arc::new(MemGauge::default());
         let exec = executor_over(&h, shim.clone()).with_mem_gauge(gauge.clone());
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
 
         // The object finalized at full size via the restarted pass.
         let children = h
@@ -11940,7 +12071,7 @@ mod tests {
         let shim = ResumeShimStore::new(h.remote.clone(), ShimMode::ErrOnCall(2));
         let gauge = Arc::new(MemGauge::default());
         let exec = executor_over(&h, shim).with_mem_gauge(gauge.clone());
-        let res = exec.reconcile(&h.source).await;
+        let res = exec.reconcile(&h.source, &noop_recover_sink).await;
         assert!(res.is_err(), "the forced RPC error surfaces: {res:?}");
         assert!(gauge.peak() > 0, "bytes were in flight before the error");
         assert_eq!(
@@ -11966,7 +12097,7 @@ mod tests {
         let exec = executor_over(&h, shim.clone());
         let mut source = h.source.clone();
         source.exclude_patterns = vec!["excluded-resume.bin".to_string()];
-        exec.reconcile(&source)
+        exec.reconcile(&source, &noop_recover_sink)
             .await
             .expect("resume skipped, so the NeverCalled shim never fires");
         assert_eq!(shim.resume_calls.load(Ordering::SeqCst), 0);
@@ -11988,7 +12119,10 @@ mod tests {
         let shim2 = ResumeShimStore::new(h2.remote.clone(), ShimMode::NeverCalled);
         let exec2 = executor_over(&h2, shim2.clone());
         assert!(
-            exec2.reconcile(&h2.source).await.is_err(),
+            exec2
+                .reconcile(&h2.source, &noop_recover_sink)
+                .await
+                .is_err(),
             "control: without the exclusion the resume path runs (and trips the shim)"
         );
         assert!(shim2.resume_calls.load(Ordering::SeqCst) > 0);
@@ -12039,7 +12173,7 @@ mod tests {
         let mut source = h.source.clone();
         source.exclude_patterns = vec!["excluded-orphan.txt".to_string()];
         let exec = h.executor();
-        exec.reconcile(&source).await.unwrap();
+        exec.reconcile(&source, &noop_recover_sink).await.unwrap();
 
         let row = h
             .state
@@ -12055,6 +12189,97 @@ mod tests {
             .await
             .unwrap()
             .is_empty());
+    }
+
+    /// The reconcile resume emits [`RecoverProgress`] ticks (2026-08-14
+    /// follow-up): one at resume start carrying the previously-acked offset
+    /// (the UI must flip out of the indeterminate sweep before the first new
+    /// ack), then per destination ack, ending at bytes_done == bytes_total.
+    #[tokio::test]
+    async fn resume_emits_recover_progress_ticks() {
+        let h = harness().await;
+        let total = 6 * 1024 * 1024 + 17;
+        let body: Vec<u8> = (0..total).map(|i| (i % 251) as u8).collect();
+        let (rel, size) = h.write_file("ticks.bin", &body);
+        seed_crashed_resumable_op(&h, &rel, size, 0).await;
+
+        let ticks: std::sync::Mutex<Vec<RecoverProgress>> = std::sync::Mutex::new(Vec::new());
+        let sink = |p: RecoverProgress| -> futures::future::BoxFuture<'_, ()> {
+            let ticks = &ticks;
+            Box::pin(async move {
+                ticks.lock().unwrap().push(p);
+            })
+        };
+        let exec = h.executor();
+        exec.reconcile(&h.source, &sink).await.unwrap();
+
+        let ticks = ticks.into_inner().unwrap();
+        assert!(
+            ticks.len() >= 2,
+            "at least a start tick and a completion tick: {ticks:?}"
+        );
+        assert_eq!(
+            ticks[0].bytes_done, 0,
+            "start tick carries the acked offset"
+        );
+        assert_eq!(ticks[0].bytes_total, size);
+        assert_eq!(ticks[0].path, "ticks.bin");
+        let last = ticks.last().unwrap();
+        assert_eq!(
+            last.bytes_done, last.bytes_total,
+            "the final tick reports completion"
+        );
+        assert!(
+            ticks.windows(2).all(|w| w[0].bytes_done <= w[1].bytes_done),
+            "ticks are monotonic: {ticks:?}"
+        );
+        // And the op actually resolved (adopted Synced).
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("adopted row");
+        assert_eq!(row.status, FileStateStatus::Synced);
+    }
+
+    /// The IoCounters see a resume's disk re-read AND its acked wire bytes
+    /// (2026-08-14 follow-up: the whole reconcile phase previously credited
+    /// no throughput surface at all).
+    #[tokio::test]
+    async fn resume_credits_io_counters() {
+        let h = harness().await;
+        let total: usize = 6 * 1024 * 1024;
+        let body = vec![5u8; total];
+        let (rel, size) = h.write_file("io.bin", &body);
+        // 4 MiB genuinely acked pre-"crash": push the prefix straight into
+        // the store (no executor, so no credit), then claim it. The resume
+        // re-reads the FULL file from disk but wires only the 2 MiB tail.
+        let session = seed_crashed_resumable_op(&h, &rel, size, WIRE_CHUNK as u64).await;
+        h.remote
+            .resume_chunk(&session, 0, Bytes::from(body[..WIRE_CHUNK].to_vec()))
+            .await
+            .unwrap();
+
+        let io = Arc::new(crate::iostat::IoCounters::default());
+        let exec = h.executor().with_io_counters(io.clone());
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
+
+        let snap = io.snapshot();
+        // 2x: the resume re-reads the whole file, then adopt_reconciled's
+        // P1-2 re-hash reads it AGAIN before committing the row - both are
+        // real disk passes and both must show on the graph. (Collapsing the
+        // second pass for the just-resumed case is a tracked follow-up.)
+        assert_eq!(
+            snap.disk_read_bytes,
+            2 * size,
+            "resume re-read + adopt re-hash both credit"
+        );
+        assert_eq!(
+            snap.net_wire_bytes,
+            size - WIRE_CHUNK as u64,
+            "only the unacked tail goes over (and credits) the wire"
+        );
     }
 
     /// [`ResumeAcc`]'s gauge accounting is symmetric across push / partial
@@ -12155,7 +12380,7 @@ mod tests {
         .await;
         let shim = ResumeShimStore::new(h.remote.clone(), ShimMode::NeverCalled);
         executor_over(&h, shim.clone())
-            .reconcile(&h.source)
+            .reconcile(&h.source, &noop_recover_sink)
             .await
             .expect("too-old session abandons pre-push and requeues cleanly");
         assert_eq!(shim.resume_calls.load(Ordering::SeqCst), 0);
@@ -12180,7 +12405,7 @@ mod tests {
         .await;
         let shim = ResumeShimStore::new(h.remote.clone(), ShimMode::NeverCalled);
         executor_over(&h, shim.clone())
-            .reconcile(&h.source)
+            .reconcile(&h.source, &noop_recover_sink)
             .await
             .expect("legacy hash mismatch abandons pre-push");
         assert_eq!(shim.resume_calls.load(Ordering::SeqCst), 0);
@@ -12203,7 +12428,7 @@ mod tests {
         .await;
         let shim = ResumeShimStore::new(h.remote.clone(), ShimMode::NeverCalled);
         executor_over(&h, shim.clone())
-            .reconcile(&h.source)
+            .reconcile(&h.source, &noop_recover_sink)
             .await
             .expect("no identity + no hash refuses the resume");
         assert_eq!(shim.resume_calls.load(Ordering::SeqCst), 0);
@@ -12230,7 +12455,7 @@ mod tests {
         let gauge = Arc::new(MemGauge::default());
         executor_over(&h, shim.clone())
             .with_mem_gauge(gauge.clone())
-            .reconcile(&h.source)
+            .reconcile(&h.source, &noop_recover_sink)
             .await
             .expect("the endless rewinder abandons + requeues, never errors or loops");
         assert_eq!(
@@ -12290,7 +12515,7 @@ mod tests {
 
         let exec = h.executor();
         let err = exec
-            .reconcile(&h.source)
+            .reconcile(&h.source, &noop_recover_sink)
             .await
             .expect_err("invalid_grant on the create lookup must fail the reconcile");
         assert!(
@@ -12339,7 +12564,7 @@ mod tests {
 
         let exec = h.executor();
         let err = exec
-            .reconcile(&h.source)
+            .reconcile(&h.source, &noop_recover_sink)
             .await
             .expect_err("invalid_grant on the metadata read must fail the reconcile");
         assert!(
@@ -12387,7 +12612,7 @@ mod tests {
 
         let exec = h.executor();
         let err = exec
-            .reconcile(&h.source)
+            .reconcile(&h.source, &noop_recover_sink)
             .await
             .expect_err("a transient metadata error must fail the reconcile (retry next cycle)");
         // A plain transient error - NOT an auth one (so the orchestrator simply
@@ -12472,7 +12697,7 @@ mod tests {
 
         let exec = h.executor();
         // The account is NOT wedged: reconcile returns Ok (not a forever-Err).
-        exec.reconcile(&h.source)
+        exec.reconcile(&h.source, &noop_recover_sink)
             .await
             .expect("a definitive 404 must NOT wedge the account; reconcile returns Ok");
 
@@ -12547,7 +12772,7 @@ mod tests {
             .unwrap();
 
         let exec = h.executor();
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
 
         // The orphan is adopted as an object id (no duplicate) BUT the row is
         // NOT Synced - the changed local bytes must be re-uploaded. It must
@@ -12784,7 +13009,10 @@ mod tests {
 
         // Simulate a restart: a FRESH executor over the same state + remote runs
         // reconcile. No op exists, so it must be a no-op.
-        h.executor().reconcile(&h.source).await.unwrap();
+        h.executor()
+            .reconcile(&h.source, &noop_recover_sink)
+            .await
+            .unwrap();
 
         let after = h
             .remote
@@ -14763,7 +14991,7 @@ mod tests {
 
         // --- reconcile with the trash now SUCCEEDING -> the op is dropped ----
         store.trash_fails.store(false, Ordering::SeqCst);
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
         assert_eq!(
             store.trash_calls.load(Ordering::SeqCst),
             2,
@@ -14806,7 +15034,7 @@ mod tests {
         );
 
         // Reconcile re-trashes, fails again -> op KEPT.
-        exec.reconcile(&h.source).await.unwrap();
+        exec.reconcile(&h.source, &noop_recover_sink).await.unwrap();
         assert_eq!(
             store.trash_calls.load(Ordering::SeqCst),
             2,
@@ -15298,7 +15526,7 @@ mod tests {
         // Phase 2: reconcile with a fresh executor. It must find the orphan
         // under the NESTED encrypted parent (not the root) and adopt it.
         let exec2 = make_exec();
-        exec2.reconcile(&source).await.unwrap();
+        exec2.reconcile(&source, &noop_recover_sink).await.unwrap();
 
         // The SAME object was adopted: still exactly one object in the leaf
         // folder, file_state restored Synced with that id, op drained.

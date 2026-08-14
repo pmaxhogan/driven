@@ -3,6 +3,7 @@ import { computed } from "vue";
 import { useI18n } from "vue-i18n";
 
 import { useDebouncedFlag } from "../composables/useDebouncedFlag";
+import { formatBytes } from "../stores/formatBytes";
 import { useProgressStore } from "../stores/progress";
 
 // The global backup progress bar (issue #46). A teal bar pinned to the very top
@@ -64,6 +65,18 @@ const label = computed<string>(() => {
         : t("progress.verifying");
     case "power_check":
       return t("progress.starting");
+    case "recovering": {
+      // 2026-08-14 follow-up: the reconcile-phase resume of an interrupted
+      // upload, with its real byte totals ("8.2 GB of 88.6 GB") - this used
+      // to be an unlabelled indeterminate "Starting backup..." sweep.
+      const r = progress.recoveringBytes;
+      return r.total > 0
+        ? t("progress.recoveringBytes", {
+            done: formatBytes(r.done, locale.value),
+            total: formatBytes(r.total, locale.value),
+          })
+        : t("progress.recovering");
+    }
     default:
       if (widthPct.value === null) return t("progress.backingUp");
       // Once the executor's live ticks arrive the file totals are real, so name

@@ -53,7 +53,7 @@ use std::time::Duration;
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 
-use driven_core::executor::{DefaultExecutor, Executor, ExecutorDeps};
+use driven_core::executor::{noop_recover_sink, DefaultExecutor, Executor, ExecutorDeps};
 use driven_core::orchestrator::OrchestratorConfig;
 use driven_core::pacer::{Pacer, PacerCeilings, ResponseClass};
 use driven_core::state::{
@@ -358,7 +358,7 @@ impl Scenario for PauseMidResumable5m {
 
         // Resume: a fresh executor over the SAME state + remote reconciles.
         let exec2 = executor(remote.clone(), state.clone(), clock.clone());
-        exec2.reconcile(&src).await?;
+        exec2.reconcile(&src, &noop_recover_sink).await?;
 
         // The upload completed via byte-level resume: exactly one object, full
         // size, the SAME session consumed (not a from-zero re-do).
@@ -501,7 +501,7 @@ impl Scenario for PauseMidResumable7d {
         // upload. It must NOT feed a Drive-dead session forward, and reconcile
         // returns Ok (no error leaks past the executor).
         let exec2 = executor(remote.clone(), state.clone(), clock.clone());
-        exec2.reconcile(&src).await?;
+        exec2.reconcile(&src, &noop_recover_sink).await?;
 
         // The stale create op was dropped (the create never finalised, so
         // find_by_op_uuid finds nothing -> requeue clean). No partial object.

@@ -40,6 +40,7 @@ import type { ExecProgress, GlobalSyncStatus, OrchestratorState } from "../ipc/t
  * serializes (`#[serde(rename_all = "snake_case", tag = "state")]`). */
 const WORKING_STATES: ReadonlySet<string> = new Set([
   "power_check",
+  "recovering",
   "scanning",
   "planning",
   "executing",
@@ -50,7 +51,14 @@ const WORKING_STATES: ReadonlySet<string> = new Set([
  * working at once. Executing is the most informative (it has a real percent), so
  * it outranks the pre-flight phases; `power_check` is the least. Mirrors the
  * WORKING_STATES set - anything not listed here is not an active run. */
-const PHASE_PRECEDENCE = ["executing", "verifying", "planning", "scanning", "power_check"] as const;
+const PHASE_PRECEDENCE = [
+  "executing",
+  "recovering",
+  "verifying",
+  "planning",
+  "scanning",
+  "power_check",
+] as const;
 
 /** One of PHASE_PRECEDENCE, or null when no run is active. */
 export type SyncPhase = (typeof PHASE_PRECEDENCE)[number] | null;
@@ -201,6 +209,16 @@ export const useProgressStore = defineStore("progress", () => {
   /** Files sampled so far, summed across accounts in `verifying`. */
   const verified = computed<number>(() => sumOver("verifying", "sampled"));
 
+  /** Byte progress of the reconcile-phase upload recovery (2026-08-14
+   * follow-up), summed across accounts in `recovering`. The state itself
+   * carries the moving counters (the orchestrator re-enters `recovering`
+   * with fresh bytes on each throttled tick), so no separate tick channel is
+   * needed. */
+  const recoveringBytes = computed<{ done: number; total: number }>(() => ({
+    done: sumOver("recovering", "bytes_done"),
+    total: sumOver("recovering", "bytes_total"),
+  }));
+
   /** Aggregate execution progress across every account currently `executing`.
    * Scan/plan/verify carry no reliable total, so they contribute nothing here.
    *
@@ -251,6 +269,12 @@ export const useProgressStore = defineStore("progress", () => {
     if (opsTotal > 0) return clamp01((e.filesDone + e.trashesDone) / opsTotal);
     // Active with measurable bytes but no op counts (rare): use the byte fraction.
     if (e.bytesTotal > 0) return clamp01(e.bytesDone / e.bytesTotal);
+    // Reconcile-phase recovery: the resume knows its exact byte totals, so the
+    // bar is determinate for it (2026-08-14 follow-up - this phase used to be
+    // an indeterminate "Starting backup..." sweep for however long an 88 GB
+    // resume ran).
+    const r = recoveringBytes.value;
+    if (r.total > 0) return clamp01(r.done / r.total);
     return null;
   });
 
@@ -317,6 +341,7 @@ export const useProgressStore = defineStore("progress", () => {
     scanned,
     plannedFiles,
     verified,
+    recoveringBytes,
     percent,
     filesDone,
     filesTotal,

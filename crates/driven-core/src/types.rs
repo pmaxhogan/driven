@@ -480,6 +480,23 @@ pub enum OrchestratorState {
     /// Checking the power / network gates (DESIGN s5.7) before starting a
     /// batch. A failed gate transitions to [`OrchestratorState::Paused`].
     PowerCheck,
+    /// The startup reconcile is recovering an interrupted upload by
+    /// byte-level resume (2026-08-14 follow-up): re-reading the local file
+    /// and pushing the unacked tail. Previously this ran invisibly inside
+    /// [`OrchestratorState::PowerCheck`] - for the incident's 88 GB disk
+    /// image that meant a multi-minute "Starting backup..." sweep while
+    /// 140 Mbps of upload showed nowhere in the UI.
+    Recovering {
+        /// Source whose pending op is being recovered.
+        source_id: SourceId,
+        /// Source-relative path of the file being resumed (display only).
+        path: String,
+        /// Bytes the destination has acked so far (the resume's progress
+        /// numerator; starts at the previously-acked offset, not 0).
+        bytes_done: u64,
+        /// The session's total byte count.
+        bytes_total: u64,
+    },
     /// Walking + diffing one source's local tree (SPEC s6). `scanned` is a
     /// running count of files visited, for a live progress readout.
     Scanning {

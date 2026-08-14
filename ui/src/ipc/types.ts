@@ -805,6 +805,23 @@ export interface ActivityThroughputSeriesDto {
 
 // --- Sync (SPEC s11.3) - mirrors src-tauri/src/commands/sync.rs ---
 
+/** One live disk/network throughput sample (2026-08-14 follow-up): byte DELTAS
+ * over one `bucketMs`-wide interval, camelCase on the wire
+ * (src-tauri/src/iostat_hub.rs `IoSample`). */
+export interface IoSample {
+  tsMs: number;
+  diskBytes: number;
+  netBytes: number;
+}
+
+/** The `io_throughput_series` reply: the trailing live-sample ring, oldest
+ * first, plus the interval width both the ring and the `sync:io_throughput`
+ * events use. */
+export interface IoThroughputSeriesDto {
+  bucketMs: number;
+  samples: IoSample[];
+}
+
 /** Mirrors the Rust `OrchestratorState` (driven_core::types). Carried as an
  * opaque tagged object; the UI reads the discriminant for the status pill.
  * On the wire it is internally tagged on a snake_case `state` field (e.g.

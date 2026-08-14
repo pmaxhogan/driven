@@ -36,6 +36,7 @@ import type {
   UpdateInfo,
   VersioningConfig,
   VssHelperStatus,
+  IoThroughputSeriesDto,
 } from "../src/ipc/types";
 
 /** The instant every fixture is anchored to: 2026-03-15T12:00:00Z.
@@ -385,6 +386,21 @@ export const ACTIVITY_THROUGHPUT: ActivityThroughputSeriesDto = {
 export const ACTIVITY_THROUGHPUT_EMPTY: ActivityThroughputSeriesDto = {
   bytes: new Array(20).fill(0),
   files: new Array(20).fill(0),
+};
+
+/** 2026-08-14 follow-up: a FIXED trailing window for the live disk/network
+ * tiles. Deterministic (pinned to FIXED_NOW, and the mock never emits
+ * `sync:io_throughput` events) so the visual baselines cannot drift: a
+ * disk-read burst racing ahead of a steadier upload - the shape a reconcile
+ * resume actually produces. */
+export const IO_THROUGHPUT: IoThroughputSeriesDto = {
+  bucketMs: 1000,
+  samples: Array.from({ length: 60 }, (_, i) => ({
+    tsMs: FIXED_NOW - (60 - i) * 1000,
+    diskBytes:
+      i < 10 ? 0 : i < 40 ? 180_000_000 + (i % 5) * 8_000_000 : i < 50 ? 60_000_000 : 0,
+    netBytes: i < 5 ? 0 : 15_000_000 + (i % 7) * 1_500_000,
+  })),
 };
 
 /**

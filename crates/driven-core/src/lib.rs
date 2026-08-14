@@ -26,6 +26,7 @@ pub mod drill;
 pub mod exclude;
 pub mod executor;
 pub mod hooks;
+pub mod iostat;
 pub mod network;
 pub mod orchestrator;
 pub mod pacer;
