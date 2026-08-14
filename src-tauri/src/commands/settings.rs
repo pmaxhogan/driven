@@ -2060,6 +2060,7 @@ async fn build_pending_ops_summary(state: &dyn StateRepo, redactor: &Redactor) -
             // Presence flags only - the values are ids/hashes with no
             // diagnostic value beyond "this recovery handle is set".
             for flag in [
+                "client_op_uuid",
                 "uploaded_blake3_hex",
                 "drive_file_id",
                 "corrupt_file_id",
