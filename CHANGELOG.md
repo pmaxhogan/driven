@@ -5,6 +5,13 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.10.1](https://github.com/pmaxhogan/driven/compare/v2.10.0...v2.10.1) (2026-08-14)
+
+
+### Bug Fixes
+
+* **core:** stream the resumable-upload resume instead of buffering the whole file ([#279](https://github.com/pmaxhogan/driven/issues/279)) ([adc81fa](https://github.com/pmaxhogan/driven/commit/adc81fad148ab664485dab35813f0d075a0bacec))
+
 ## [2.10.0](https://github.com/pmaxhogan/driven/compare/v2.9.0...v2.10.0) (2026-08-03)
 
 
