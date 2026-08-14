@@ -17,6 +17,7 @@ import type {
   PauseState,
   RestoreJobStatus,
   UpdateInfo,
+  IoSample,
 } from "./types";
 
 /** The live payload of `sync:status_changed`. SPEC s11.7 documents the aggregate
@@ -62,6 +63,14 @@ export function onSyncSourceProgress(
   handler: (payload: SourceProgressPayload) => void
 ): Promise<UnlistenFn> {
   return listen<SourceProgressPayload>("sync:source_progress", (e) => handler(e.payload));
+}
+
+/** `sync:io_throughput` payload: one live throughput sample (camelCase, the
+ * same `IoSample` shape `io_throughput_series` returns). Emitted ~1/s while
+ * any disk/network backup work is moving; suppressed (after one trailing
+ * zero) while fully idle. */
+export function onSyncIoThroughput(handler: (sample: IoSample) => void): Promise<UnlistenFn> {
+  return listen<IoSample>("sync:io_throughput", (e) => handler(e.payload));
 }
 
 /** `activity:new` payload: ActivityEntry (SPEC s11.7). The Activity dashboard's

@@ -41,6 +41,15 @@ function powerCheck(): OrchestratorState {
 function idle(): OrchestratorState {
   return { state: "idle", last_run_at: null };
 }
+function recovering(bytesDone: number, bytesTotal: number): OrchestratorState {
+  return {
+    state: "recovering",
+    source_id: "src-1",
+    path: "dev-drives/dev.vhdx",
+    bytes_done: bytesDone,
+    bytes_total: bytesTotal,
+  };
+}
 function executing(p: Partial<ExecProgress>): OrchestratorState {
   const progress: ExecProgress = {
     files_done: 0,
@@ -216,6 +225,26 @@ describe("GlobalProgressBar", () => {
       store.ingest(perAccount("a", powerCheck()));
       await settle(wrapper);
       expect(wrapper.find(PHASE_LABEL).text()).toBe("Starting backup...");
+    });
+
+    it("names the reconcile-phase recovery with its byte totals, determinate", async () => {
+      // 2026-08-14 follow-up: an interrupted-upload resume used to render as
+      // the bare indeterminate "Starting backup..." sweep for its whole run.
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", recovering(25 * 1024 * 1024, 100 * 1024 * 1024)));
+      await settle(wrapper);
+      expect(wrapper.find(PHASE_LABEL).text()).toBe(
+        "Recovering interrupted upload - 25 MB of 100 MB"
+      );
+      const bar = wrapper.find('[role="progressbar"]');
+      expect(bar.attributes("aria-valuenow")).toBe("25");
+    });
+
+    it("falls back to the bare recovering label when totals are unknown", async () => {
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", recovering(0, 0)));
+      await settle(wrapper);
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Recovering an interrupted upload...");
     });
 
     it("shows the upload percent once execution starts", async () => {

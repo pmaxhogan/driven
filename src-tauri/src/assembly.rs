@@ -139,6 +139,12 @@ pub async fn build_and_spawn(
         telemetry_enabled,
     ));
 
+    // 2026-08-14 follow-up: the app-global live-throughput hub. Its counters
+    // are threaded into EVERY account's executor below; the SAME hub is then
+    // installed on AppState so the sampler + the series command read what the
+    // executors credit.
+    let iostat_hub = Arc::new(crate::iostat_hub::IoStatHub::default());
+
     let mut handles: HashMap<AccountId, AccountHandle> = HashMap::new();
 
     for account in &accounts {
@@ -183,6 +189,7 @@ pub async fn build_and_spawn(
             vss_helper.as_ref(),
             apfs_helper.as_ref(),
             &latency,
+            &iostat_hub.counters(),
         )
         .await
         {
@@ -221,6 +228,7 @@ pub async fn build_and_spawn(
     }
 
     let mut app_state = AppState::new(state, handles, remote_mode, fake_remote_stores);
+    app_state.install_iostat_hub(iostat_hub);
     // DESIGN s13: share the SAME reservoir the executors + orchestrators record
     // into with the AppState so the ping task snapshots those samples (replaces
     // the default-ON placeholder).
@@ -352,6 +360,10 @@ pub async fn spawn_account(
     // reservoir the running AppState + ping task already share.
     let latency = app_state.telemetry_latency();
 
+    // 2026-08-14 follow-up: likewise credit the SAME live-throughput counters
+    // the running sampler reads.
+    let io_counters = app_state.iostat_hub().counters();
+
     match build_account(
         app,
         &state,
@@ -362,6 +374,7 @@ pub async fn spawn_account(
         vss_helper.as_ref(),
         apfs_helper.as_ref(),
         &latency,
+        &io_counters,
     )
     .await?
     {
@@ -430,6 +443,7 @@ async fn build_account(
     vss_helper: Option<&Arc<VssHelperManager>>,
     apfs_helper: Option<&Arc<ApfsHelperManager>>,
     latency: &Arc<driven_core::telemetry::LatencyReservoir>,
+    io_counters: &Arc<driven_core::iostat::IoCounters>,
 ) -> anyhow::Result<BuildOutcome> {
     let clock: Arc<dyn Clock> = Arc::new(SystemClock);
 
@@ -603,7 +617,11 @@ async fn build_account(
     // kill-switch is off, honouring `default_concurrent_uploads` either way).
     .with_upload_pool(upload_pool.clone())
     // SPEC s22: the SAME cell the orchestrator republishes on a settings change.
-    .with_priority_cell(priority.clone());
+    .with_priority_cell(priority.clone())
+    // 2026-08-14 follow-up: the app-global disk/network byte counters behind
+    // the live throughput graphs (always on - unlike the adaptive probe there
+    // is always a consumer, the 1s sampler).
+    .with_io_counters(io_counters.clone());
     if adaptive_enabled {
         // DESIGN s11.4.7: the SAME probe the controller drains.
         exec = exec.with_throughput_probe(throughput.clone());

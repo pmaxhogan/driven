@@ -9,6 +9,7 @@ import FilesUploadedStatTile from "../components/FilesUploadedStatTile.vue";
 import DrillHistoryPanel from "../components/DrillHistoryPanel.vue";
 import ScrubHistoryPanel from "../components/ScrubHistoryPanel.vue";
 import ThroughputStatTile from "../components/ThroughputStatTile.vue";
+import { useIostatStore } from "../stores/iostat";
 import { activityEventLabel } from "../stores/activityEventLabel";
 import {
   ACTIVITY_PAGE_SIZE,
@@ -28,6 +29,10 @@ import type { ActivityEntry, ActivityLevel, FileStateStatus } from "../ipc/types
 // minimum level, event type) that re-query, and an empty state.
 const { t, te, locale } = useI18n();
 const activity = useActivityStore();
+// 2026-08-14 follow-up: the LIVE disk/network throughput store behind the two
+// split tiles (probe-fed 1s samples; moves during reconcile-phase recovery,
+// unlike the activity-log-backed series which only updates on completed rows).
+const iostat = useIostatStore();
 const sources = useSourcesStore();
 const toasts = useToastsStore();
 
@@ -97,11 +102,6 @@ const bytesWeek = computed(() =>
 // The headline rate for the throughput tile, in bytes/sec. Null until the
 // summary loads (the tile renders its own unknown state for that); the tile owns
 // the formatting so its sparkline tooltip and its big number agree.
-const throughputPerSecond = computed<number | null>(() => {
-  const s = activity.summary;
-  if (!s || s.throughputWindowMs <= 0) return null;
-  return s.throughputWindowBytes / (s.throughputWindowMs / 1000);
-});
 // The files tile's headline: files uploaded over the SAME window the throughput
 // headline covers (the backend counts them in the same query), so the two tiles
 // are one window read two ways rather than two windows that drift apart. Null
@@ -258,6 +258,7 @@ onMounted(async () => {
   // The subscription also reconciles from the durable log on `activity:lagged`
   // (M7-P1-1), so a broadcast-lag burst loses no rows.
   await activity.subscribeLive();
+  await iostat.start();
   try {
     await Promise.all([
       sources.refresh(),
@@ -276,6 +277,7 @@ onMounted(async () => {
 
 onUnmounted(() => {
   activity.unsubscribeLive();
+  iostat.stop();
 });
 </script>
 
@@ -319,7 +321,7 @@ onUnmounted(() => {
            `aria-busy` already says a load is in flight. -->
       <div
         v-if="!firstLoadDone"
-        class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5"
+        class="grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6"
         data-testid="activity-summary-skeleton"
         aria-hidden="true"
       >
@@ -352,9 +354,15 @@ onUnmounted(() => {
           </dd>
         </div>
         <ThroughputStatTile
-          :series="activity.throughputSeries"
-          :bucket-ms="SPARKLINE_BUCKET_MS"
-          :rate-per-second="throughputPerSecond"
+          :series="iostat.netSeries"
+          :bucket-ms="iostat.bucketMs"
+          :rate-per-second="iostat.netRate"
+        />
+        <ThroughputStatTile
+          :series="iostat.diskSeries"
+          :bucket-ms="iostat.bucketMs"
+          :rate-per-second="iostat.diskRate"
+          variant="disk"
         />
         <FilesUploadedStatTile
           :series="activity.filesSeries"

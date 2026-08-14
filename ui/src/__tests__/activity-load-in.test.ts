@@ -155,8 +155,12 @@ describe("Activity files-uploaded tile (Feature A)", () => {
     const tiles = Array.from(wrapper.find(SUMMARY).element.children);
     const throughputAt = tiles.findIndex((el) => el.matches(THROUGHPUT_TILE));
     const filesAt = tiles.findIndex((el) => el.matches(FILES_TILE));
+    const diskAt = tiles.findIndex((el) => el.matches('[data-testid="disk-throughput-tile"]'));
     expect(throughputAt).toBeGreaterThanOrEqual(0);
-    expect(filesAt).toBe(throughputAt + 1);
+    // 2026-08-14 follow-up: the disk tile sits between the network tile and
+    // the files tile.
+    expect(diskAt).toBe(throughputAt + 1);
+    expect(filesAt).toBe(diskAt + 1);
 
     wrapper.unmount();
   });

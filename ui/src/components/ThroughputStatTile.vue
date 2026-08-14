@@ -17,14 +17,23 @@ import { formatBytes } from "../stores/formatBytes";
 // seconds, so the headline, the hover readout and the screen-reader summary are
 // all in bytes/sec and directly comparable.
 
-const props = defineProps<{
-  /** Bytes uploaded per bucket over the rolling window, OLDEST first. */
-  series: number[];
-  /** Width of one bucket in ms (the series' time resolution). */
-  bucketMs: number;
-  /** The headline rate in bytes/sec, or null while it is unknown. */
-  ratePerSecond: number | null;
-}>();
+const props = withDefaults(
+  defineProps<{
+    /** Bytes per bucket over the rolling window, OLDEST first. */
+    series: number[];
+    /** Width of one bucket in ms (the series' time resolution). */
+    bucketMs: number;
+    /** The headline rate in bytes/sec, or null while it is unknown. */
+    ratePerSecond: number | null;
+    /** Which throughput this tile shows (2026-08-14 follow-up: the graph
+     * split). "net" = wire bytes the destination acked (the original tile);
+     * "disk" = plaintext bytes Driven read from local files. Only the copy
+     * and testids differ - every key is a literal at its call site so the
+     * i18n no-unused-keys lint can see them. */
+    variant?: "net" | "disk";
+  }>(),
+  { variant: "net" }
+);
 
 const { t, locale } = useI18n();
 
@@ -54,22 +63,34 @@ function formatBucket(bytes: number): string {
  * (and to anyone for whom the wash behind the number is not legible). */
 const chartLabel = computed<string>(() => {
   const peak = Math.max(0, ...props.series);
-  return t("activity.summary.sparklineLabel", {
+  const args = {
     minutes: Math.round((props.series.length * props.bucketMs) / 60000),
     peak: formatBytes(bucketSeconds.value > 0 ? peak / bucketSeconds.value : 0, locale.value),
-  });
+  };
+  return props.variant === "disk"
+    ? t("activity.summary.diskSparklineLabel", args)
+    : t("activity.summary.sparklineLabel", args);
 });
+
+const label = computed<string>(() =>
+  props.variant === "disk" ? t("activity.summary.diskThroughput") : t("activity.summary.throughput")
+);
+const emptyLabel = computed<string>(() =>
+  props.variant === "disk"
+    ? t("activity.summary.noDiskThroughput")
+    : t("activity.summary.noThroughput")
+);
 </script>
 
 <template>
   <SparklineStatTile
-    :label="t('activity.summary.throughput')"
+    :label="label"
     :series="series"
     :bucket-ms="bucketMs"
     :headline="headline"
-    :empty-label="t('activity.summary.noThroughput')"
+    :empty-label="emptyLabel"
     :format-bucket="formatBucket"
     :chart-label="chartLabel"
-    testid-prefix="throughput"
+    :testid-prefix="variant === 'disk' ? 'disk-throughput' : 'throughput'"
   />
 </template>

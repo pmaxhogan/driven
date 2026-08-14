@@ -52,6 +52,7 @@ import type {
   UpdateInfo,
   VersioningConfig,
   VssHelperStatus,
+  IoThroughputSeriesDto,
 } from "./types";
 
 // --- Accounts (SPEC s11.1) ---
@@ -454,6 +455,15 @@ export function activityThroughputSeries(
   bucketMs: number
 ): Promise<ActivityThroughputSeriesDto> {
   return invoke("activity_throughput_series", { windowMs, bucketMs });
+}
+
+/** The trailing window of LIVE disk/network throughput samples (2026-08-14
+ * follow-up), for the Activity dashboard's split graphs' initial paint; live
+ * updates then ride the `sync:io_throughput` event. Unlike
+ * `activity_throughput_series` this is probe-fed, so it moves during the
+ * reconcile-phase resume (which writes no activity rows until it completes). */
+export function ioThroughputSeries(): Promise<IoThroughputSeriesDto> {
+  return invoke("io_throughput_series");
 }
 
 /** The persisted integrity-scrub reports, newest first. Omit `sourceId` for

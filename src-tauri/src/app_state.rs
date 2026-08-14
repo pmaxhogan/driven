@@ -303,6 +303,8 @@ pub struct AppState {
     /// app-quit drain joins it with NO orphan (mirrors the M5 no-orphan
     /// bookkeeping).
     updater: UpdaterRuntime,
+    /// 2026-08-14 follow-up: live disk/network throughput sampling runtime.
+    iostat: IostatRuntime,
     /// The ONE in-flight streaming exclusion preview
     /// ([`crate::commands::exclusion_stream`]). The exclusion editor re-previews
     /// on every rule edit, so without a single-slot registry a user tweaking
@@ -396,6 +398,23 @@ pub struct UpdaterRuntime {
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// The shutdown signal the periodic-check task `select!`s on, so it exits
     /// promptly on quit rather than waiting out its 6h interval.
+    shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
+}
+
+/// 2026-08-14 follow-up: the live disk/network throughput runtime held on
+/// [`AppState`] - the app-global counters+ring hub every executor credits,
+/// plus the sampler task's lifecycle slots (mirrors [`UpdaterRuntime`] so the
+/// quit drain stops + joins it with no orphan).
+#[derive(Default)]
+pub struct IostatRuntime {
+    /// The counters + trailing-sample ring. Installed by assembly (the SAME
+    /// hub whose counters the executors were built with); the quiesced boot
+    /// path keeps the default hub (all-zero graphs).
+    hub: std::sync::Mutex<Arc<crate::iostat_hub::IoStatHub>>,
+    /// The spawned sampler task, behind `Option` so the shutdown drain can
+    /// TAKE + await it by value; `None` once drained / never spawned.
+    task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The shutdown signal the sampler `select!`s on.
     shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
 }
 
@@ -659,6 +678,7 @@ impl AppState {
             fake_remote_stores,
             restore_jobs: std::sync::Mutex::new(HashMap::new()),
             updater: UpdaterRuntime::default(),
+            iostat: IostatRuntime::default(),
             exclusion_previews: Arc::default(),
             preview_tree_cache: Arc::default(),
             telemetry: TelemetryRuntime::default(),
@@ -961,6 +981,56 @@ impl AppState {
             let _ = tx.send(true);
         }
         self.updater
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    // --- 2026-08-14 follow-up: io throughput runtime ------------------------
+
+    /// The live-throughput hub (counters + trailing ring) the sampler and the
+    /// `io_throughput_series` command read.
+    pub fn iostat_hub(&self) -> Arc<crate::iostat_hub::IoStatHub> {
+        self.iostat
+            .hub
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .clone()
+    }
+
+    /// Install the assembly-built hub (the one whose counters the executors
+    /// credit). Called once at boot before `.manage(..)`; the quiesced boot
+    /// path skips it and keeps the default (all-zero) hub.
+    pub fn install_iostat_hub(&self, hub: Arc<crate::iostat_hub::IoStatHub>) {
+        *self.iostat.hub.lock().unwrap_or_else(|e| e.into_inner()) = hub;
+    }
+
+    /// Register the spawned sampler task + its shutdown sender so the app-quit
+    /// drain can stop + join it with no orphan (mirrors the updater task).
+    pub fn set_iostat_task(&self, task: JoinHandle<()>, shutdown: watch::Sender<bool>) {
+        *self.iostat.task.lock().unwrap_or_else(|e| e.into_inner()) = Some(task);
+        *self
+            .iostat
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(shutdown);
+    }
+
+    /// Signal the sampler to stop and TAKE its handle so the quit drain can
+    /// await it. Mirrors [`Self::shutdown_updater_task`].
+    #[must_use]
+    pub fn shutdown_iostat_task(&self) -> Option<JoinHandle<()>> {
+        if let Some(tx) = self
+            .iostat
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = tx.send(true);
+        }
+        self.iostat
             .task
             .lock()
             .unwrap_or_else(|e| e.into_inner())

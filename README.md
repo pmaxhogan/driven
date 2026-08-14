@@ -123,7 +123,10 @@ These move: check each project's current docs before relying on a cell.
   directories instead of descending them.
 - Live exclusion preview that re-classifies the folder tree as you edit a rule,
   from an in-memory tree rather than a fresh walk of the disk.
-- Concurrent, paced executor with retries and resumable uploads.
+- Concurrent, paced executor with retries and resumable uploads. An upload
+  interrupted by a quit or crash resumes byte-for-byte across restarts, with
+  the recovery shown live in the app ("Recovering interrupted upload - 8.2 GB
+  of 88.6 GB") instead of an unlabeled startup phase.
 - Configurable OS priority (`low` by default) for the scan, upload reads, and
   bundle builds, so backups yield CPU and disk to whatever is in the foreground.
 - Battery and network awareness: backups defer on battery and on metered or
@@ -150,9 +153,14 @@ These move: check each project's current docs before relying on a cell.
   snapshot (Settings > macOS), which does not help with a Full Disk Access
   denial; there is no Linux equivalent.
 - In-app restore browser with full-text file-name search and streaming decrypt.
-- Activity dashboard with a live tail and filterable history.
+- Activity dashboard with a live tail, filterable history, and real-time
+  disk-read and network-upload throughput graphs (probe-fed, one-second
+  resolution - they move during every phase of a backup, including crash
+  recovery).
 - Rolling local log files covering both the backend and the webview console,
-  collected into a one-click diagnostics bundle.
+  collected into a one-click diagnostics bundle alongside a redacted summary of
+  in-flight upload recovery state and a trailing window of process-memory
+  samples.
 - In-app auto-update with signed update manifests and a stable / dev channel
   selector.
 - Anonymous, opt-out telemetry (coarse counts only; never file names, paths, or

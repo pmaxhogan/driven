@@ -174,3 +174,30 @@ describe("ThroughputStatTile", () => {
     });
   });
 });
+
+// --- 2026-08-14 follow-up: the disk variant of the same tile ----------------
+
+describe("disk variant", () => {
+  it("renders under disk testids with the disk copy, leaving net untouched", () => {
+    const wrapper = mount(ThroughputStatTile, {
+      props: {
+        series: [1000, 2000],
+        bucketMs: 1000,
+        ratePerSecond: 1500,
+        variant: "disk" as const,
+      },
+      global: { plugins: [i18n] },
+    });
+    expect(wrapper.find('[data-testid="disk-throughput-tile"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="throughput-tile"]').exists()).toBe(false);
+    expect(wrapper.text()).toContain("Disk read");
+    wrapper.unmount();
+  });
+
+  it("defaults to the network variant (the original tile, unchanged)", () => {
+    const wrapper = mountTile({ series: [1000], ratePerSecond: 100 });
+    expect(wrapper.find('[data-testid="throughput-tile"]').exists()).toBe(true);
+    expect(wrapper.text()).toContain("Network throughput");
+    wrapper.unmount();
+  });
+});

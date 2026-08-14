@@ -86,6 +86,11 @@ const WATCHER_CHANNEL_CAPACITY: usize = 64;
 /// long (measured on the injected [`Clock`]) before re-probing and resuming.
 const RESUME_DEFER_MS: i64 = 30_000;
 
+/// Minimum gap between two [`OrchestratorState::Recovering`] state emissions
+/// (2026-08-14 follow-up). Resume acks land several times per second at
+/// 100+ Mbps; the UI needs ~1/s. Measured on the injected [`Clock`].
+const RECOVER_EMIT_MIN_INTERVAL_MS: i64 = 1_000;
+
 /// Settings key holding the [`driven_vss::OrphanRegistry`] JSON - the ledger of
 /// Driven-created VSS shadow copies, the cleanup authority for the >1h orphan
 /// sweep (ROADMAP M3.5). Not in SPEC s22's enumerated keys; an internal
@@ -107,6 +112,7 @@ fn state_name(state: &OrchestratorState) -> &'static str {
     match state {
         OrchestratorState::Idle { .. } => "idle",
         OrchestratorState::PowerCheck => "power_check",
+        OrchestratorState::Recovering { .. } => "recovering",
         OrchestratorState::Scanning { .. } => "scanning",
         OrchestratorState::Planning { .. } => "planning",
         OrchestratorState::Executing { .. } => "executing",
@@ -950,11 +956,11 @@ impl SyncOrchestrator {
     /// a tray-facing event - the next [`Orchestrator::state`] read still
     /// reflects the stored state.
     async fn transition(&self, next: OrchestratorState) {
-        let changed = {
+        let name_changed = {
             let mut guard = self.state_machine.write().await;
-            let changed = *guard != next;
+            let name_changed = state_name(&guard) != state_name(&next);
             *guard = next.clone();
-            changed
+            name_changed
         };
         // 2026-08-14 incident: log every REAL state change at INFO so a
         // diagnostics bundle shows which phase (reconcile / scan / plan /
@@ -968,8 +974,13 @@ impl SyncOrchestrator {
         // variant carries free-text error details that routinely embed local
         // paths, and the bundle redactor's unquoted-run scanner truncates a
         // path at its first space - so a raw `?next` here would leak
-        // partially-redacted paths into exported bundles.
-        if changed {
+        // partially-redacted paths into exported bundles. Gated on the NAME
+        // changing (not full struct inequality): counter-carrying states
+        // (Scanning{scanned}, Recovering{bytes_done}) re-enter with new
+        // counters on every progress tick, and logging each produced 12
+        // lines in 60ms in the 2026-08-14 follow-up bundle. The EVENT below
+        // still fires on every change - the UI needs the ticks.
+        if name_changed {
             tracing::info!(target: TARGET, account_id = %self.account_id, state = state_name(&next), "state transition");
         }
         let _ = self
@@ -1184,7 +1195,41 @@ impl SyncOrchestrator {
                 }
             }
             tracing::debug!(target: TARGET, source_id = %source.id, "startup reconcile");
-            match self.executor.reconcile(source).await {
+            // 2026-08-14 follow-up: surface reconcile-phase upload recovery as
+            // a live [`OrchestratorState::Recovering`] instead of leaving the
+            // UI in the indeterminate PowerCheck sweep for however long a
+            // multi-GB resume runs. The executor emits a tick at resume start
+            // (a long prefix re-read produces no acks for minutes, but the
+            // state must flip immediately) and on every destination ack; this
+            // sink throttles the ack ticks to ~1/s on the INJECTED clock (the
+            // module's determinism rule - never tokio/Instant time) and always
+            // lets the first and the final tick through.
+            let last_emit = tokio::sync::Mutex::new(None::<i64>);
+            let source_id = source.id;
+            let on_recover =
+                |p: crate::executor::RecoverProgress| -> futures::future::BoxFuture<'_, ()> {
+                    let last_emit = &last_emit;
+                    Box::pin(async move {
+                        let now = self.clock.now_ms();
+                        {
+                            let mut guard = last_emit.lock().await;
+                            let throttled = matches!(*guard, Some(last) if now - last < RECOVER_EMIT_MIN_INTERVAL_MS)
+                                && p.bytes_done < p.bytes_total;
+                            if throttled {
+                                return;
+                            }
+                            *guard = Some(now);
+                        }
+                        self.transition(OrchestratorState::Recovering {
+                            source_id,
+                            path: p.path,
+                            bytes_done: p.bytes_done,
+                            bytes_total: p.bytes_total,
+                        })
+                        .await;
+                    })
+                };
+            match self.executor.reconcile(source, &on_recover).await {
                 Ok(()) => {
                     self.reconciled.lock().await.done.insert(source.id);
                 }
@@ -3227,6 +3272,11 @@ mod tests {
         /// "reconcile invalid_grant -> needs_reauth + suspend" test can assert
         /// the orchestrator runs the V-F transition off the reconcile path.
         reconcile_auth_fail: std::sync::atomic::AtomicBool,
+        /// 2026-08-14 follow-up: when `> 0`, `reconcile` fires the recover
+        /// sink this many times (bytes climbing 0 -> total) with the clock
+        /// STATIONARY - drives the "throttle emits only the first and final
+        /// Recovering states" test.
+        recover_ticks: AtomicU64,
         /// R2-P2-1: when `> 0`, `execute` STREAMS this many op outcomes through
         /// the per-op `on_outcome` sink (so their activity is persisted) and
         /// THEN returns `Err` - simulating a crash/shutdown PART-WAY through a
@@ -3400,11 +3450,29 @@ mod tests {
             Ok(outcomes)
         }
 
-        async fn reconcile(&self, source: &SourceRow) -> anyhow::Result<()> {
+        async fn reconcile(
+            &self,
+            source: &SourceRow,
+            on_recover: &crate::executor::RecoverProgressSink<'_>,
+        ) -> anyhow::Result<()> {
             // Count every attempt. A configured transient failure returns Err
             // WITHOUT recording the source as adopted, so the P1-1 test can
             // assert the failed source is retried on the next cycle.
             self.reconciles.fetch_add(1, Ordering::SeqCst);
+            // 2026-08-14 follow-up: emulate a resume's progress stream (start
+            // tick at 0, evenly spaced acks, final tick at total).
+            let ticks = self.recover_ticks.load(Ordering::SeqCst);
+            if ticks > 1 {
+                let total = 1_000u64;
+                for i in 0..ticks {
+                    on_recover(crate::executor::RecoverProgress {
+                        path: "big/file.bin".to_string(),
+                        bytes_done: i * total / (ticks - 1),
+                        bytes_total: total,
+                    })
+                    .await;
+                }
+            }
             // R-P2-2: a revoked token during the reconcile corrupt-trash retry
             // surfaces as a CLASSIFIED error the orchestrator must turn into
             // needs_reauth + suspend (not a plain transient retry).
@@ -6581,6 +6649,56 @@ mod tests {
         );
     }
 
+    /// 2026-08-14 follow-up: the reconcile recovery sink's orchestrator-side
+    /// throttle. Five rapid ticks with a STATIONARY clock must surface exactly
+    /// TWO `Recovering` states: the first tick (the immediate flip out of the
+    /// indeterminate sweep) and the final tick (bytes_done == bytes_total,
+    /// exempt from the throttle). The middle ticks are within the 1s window
+    /// and suppressed.
+    #[tokio::test]
+    async fn reconcile_recovery_ticks_throttle_to_first_and_final() {
+        let account = AccountId::new_v4();
+        let tmp = tempfile::tempdir().unwrap();
+        let src = source_in(account, tmp.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        exec.recover_ticks.store(5, Ordering::SeqCst);
+        let state = Arc::new(FakeState::with_sources(vec![src]));
+        let clock = Arc::new(FakeClock::new());
+        clock.advance(std::time::Duration::from_millis(5_000));
+        let orch = SyncOrchestrator::new(
+            account,
+            state.clone(),
+            exec.clone(),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            clock.clone(),
+            OrchestratorConfig::default(),
+        );
+
+        let mut events = orch.subscribe();
+        orch.run_cycle(TickSource::Scheduled).await.unwrap();
+
+        let mut recovering: Vec<(u64, u64)> = Vec::new();
+        while let Ok(ev) = events.try_recv() {
+            if let OrchestratorEvent::StateChanged {
+                state:
+                    OrchestratorState::Recovering {
+                        bytes_done,
+                        bytes_total,
+                        ..
+                    },
+            } = ev
+            {
+                recovering.push((bytes_done, bytes_total));
+            }
+        }
+        assert_eq!(
+            recovering,
+            vec![(0, 1_000), (1_000, 1_000)],
+            "first and final ticks pass; the stationary-clock middle ticks are throttled"
+        );
+    }
+
     #[tokio::test]
     async fn auth_invalid_grant_marks_needs_reauth_emits_event_and_stops_cycle() {
         // V-F (DESIGN s5.4): an op failing with `auth.invalid_grant` must move
@@ -7458,7 +7576,11 @@ mod tests {
             Ok(vec![])
         }
 
-        async fn reconcile(&self, _source: &SourceRow) -> anyhow::Result<()> {
+        async fn reconcile(
+            &self,
+            _source: &SourceRow,
+            _on_recover: &crate::executor::RecoverProgressSink<'_>,
+        ) -> anyhow::Result<()> {
             Ok(())
         }
 

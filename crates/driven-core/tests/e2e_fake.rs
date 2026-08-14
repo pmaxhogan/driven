@@ -32,7 +32,9 @@ use std::sync::Arc;
 use async_trait::async_trait;
 use tokio::io::AsyncReadExt;
 
-use driven_core::executor::{DefaultExecutor, Executor, ExecutorDeps, MemGauge, OpOutcome};
+use driven_core::executor::{
+    noop_recover_sink, DefaultExecutor, Executor, ExecutorDeps, MemGauge, OpOutcome,
+};
 use driven_core::network::{NetworkProbe, NetworkState, ServiceHealth, ServiceName};
 use driven_core::orchestrator::{Orchestrator, OrchestratorConfig, SyncOrchestrator, TickSource};
 use driven_core::state::{AccountRow, NewPendingOp, SourceRow, SqliteStateRepo, StateRepo};
@@ -776,7 +778,7 @@ async fn crash_mid_upload_adopts_orphan_without_duplicate() {
         },
         clock.clone(),
     );
-    exec2.reconcile(&src).await.unwrap();
+    exec2.reconcile(&src, &noop_recover_sink).await.unwrap();
 
     // The orphan was adopted, NOT re-uploaded: still exactly one object.
     assert_eq!(
@@ -970,7 +972,7 @@ async fn crash_mid_upload_resumes_persisted_session_byte_for_byte() {
         clock.clone(),
     )
     .with_mem_gauge(resume_gauge.clone());
-    exec2.reconcile(&src).await.unwrap();
+    exec2.reconcile(&src, &noop_recover_sink).await.unwrap();
 
     let peak = resume_gauge.peak();
     assert!(
@@ -1129,7 +1131,7 @@ async fn reconcile_requeue_reuploads_changed_bytes_on_next_cycle() {
         },
         clock.clone(),
     );
-    exec.reconcile(&src).await.unwrap();
+    exec.reconcile(&src, &noop_recover_sink).await.unwrap();
     assert_eq!(
         live_object_count(&remote, &folder).await,
         1,

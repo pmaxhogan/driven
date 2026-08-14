@@ -26,7 +26,9 @@
     "planning": "Preparing changes...",
     "planningCount": "Preparing {count} changes",
     "verifying": "Verifying backup...",
-    "verifyingCount": "Verifying backup - {count} files"
+    "verifyingCount": "Verifying backup - {count} files",
+    "recovering": "Recovering an interrupted upload...",
+    "recoveringBytes": "Recovering interrupted upload - {done} of {total}"
   },
   "pauseBanner": {
     "indefinite": "Backups paused indefinitely",
@@ -657,7 +659,7 @@
     "summary": {
       "bytesToday": "Uploaded today",
       "bytesWeek": "Uploaded this week",
-      "throughput": "Current throughput",
+      "throughput": "Network throughput",
       "perSecond": "{rate}/s",
       "noThroughput": "No recent uploads",
       "sparklineLabel": "Upload throughput over the last {minutes} minutes, peaking at {peak} per second",
@@ -665,7 +667,10 @@
       "filesValue": "{count} file | {count} files",
       "filesSparklineLabel": "Files uploaded over the last {minutes} minutes, peaking at {peak} in a single {seconds}-second interval",
       "byStatus": "Files by status",
-      "noFiles": "No files tracked yet"
+      "noFiles": "No files tracked yet",
+      "diskThroughput": "Disk read",
+      "noDiskThroughput": "No recent disk activity",
+      "diskSparklineLabel": "Disk read throughput over the last {minutes} minutes, peaking at {peak} per second"
     },
     "status": {
       "synced": "Synced",

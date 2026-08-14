@@ -32,6 +32,7 @@ import {
   ACTIVITY_PAGE,
   ACTIVITY_SUMMARY,
   ACTIVITY_THROUGHPUT,
+  IO_THROUGHPUT,
   APFS_HELPER_STATUS,
   BACKENDS,
   DRIVE_FOLDER_LISTING,
@@ -213,6 +214,7 @@ export function defaultCommands(): Record<string, MockCommandOverride> {
     list_drill_runs: DRILL_RUNS,
     activity_summary: ACTIVITY_SUMMARY,
     activity_throughput_series: ACTIVITY_THROUGHPUT,
+    io_throughput_series: IO_THROUGHPUT,
 
     // --- Restore (SPEC s11.5) ---
     list_remote_tree: REMOTE_TREE,

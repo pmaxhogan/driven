@@ -48,6 +48,15 @@ function verifying(sampled = 0): OrchestratorState {
 function powerCheck(): OrchestratorState {
   return { state: "power_check" };
 }
+function recovering(bytesDone: number, bytesTotal: number): OrchestratorState {
+  return {
+    state: "recovering",
+    source_id: "src-1",
+    path: "dev-drives/dev.vhdx",
+    bytes_done: bytesDone,
+    bytes_total: bytesTotal,
+  };
+}
 function backoff(): OrchestratorState {
   return { state: "backoff", until: 0 };
 }
@@ -576,5 +585,34 @@ describe("progress store - source_progress ticks", () => {
     });
     // The embedded snapshot still stands; nothing threw.
     expect(store.percent).toBeCloseTo(0.25, 5);
+  });
+});
+
+// --- 2026-08-14 follow-up: the reconcile-phase Recovering state -------------
+
+describe("recovering state", () => {
+  it("is an active working phase with a DETERMINATE byte percent", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", recovering(25, 100)));
+    expect(store.active).toBe(true);
+    expect(store.phase).toBe("recovering");
+    expect(store.percent).toBeCloseTo(0.25, 5);
+    expect(store.recoveringBytes).toEqual({ done: 25, total: 100 });
+  });
+
+  it("is outranked by executing but outranks the pre-flight phases", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", recovering(1, 10)));
+    store.ingest(perAccount("b", scanning(5)));
+    expect(store.phase).toBe("recovering");
+    store.ingest(perAccount("c", executing({ bytes_done: 1, bytes_total: 2, files_total: 1 })));
+    expect(store.phase).toBe("executing");
+  });
+
+  it("falls back to indeterminate when the recovery total is unknown", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", recovering(0, 0)));
+    expect(store.active).toBe(true);
+    expect(store.percent).toBeNull();
   });
 });

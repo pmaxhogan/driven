@@ -26,6 +26,10 @@ pub const EVENT_SYNC_STATUS_CHANGED: &str = "sync:status_changed";
 /// The account id is added by the bridge (the core event carries only the
 /// source) so the webview can attribute the tick to the right orchestrator.
 pub const EVENT_SYNC_SOURCE_PROGRESS: &str = "sync:source_progress";
+
+/// One live disk/network throughput sample from the app-global sampler
+/// (2026-08-14 follow-up; payload is `iostat_hub::IoSample`, camelCase).
+pub const EVENT_SYNC_IO_THROUGHPUT: &str = "sync:io_throughput";
 /// `activity:new` - a new activity-log entry (payload: `ActivityEntry`,
 /// SPEC s11.7).
 ///
@@ -177,6 +181,14 @@ pub fn emit_sync_source_progress<P: Serialize + Clone>(
     progress: &P,
 ) -> tauri::Result<()> {
     app.emit(EVENT_SYNC_SOURCE_PROGRESS, progress)
+}
+
+/// Broadcast `sync:io_throughput` with one live throughput sample (the
+/// 2026-08-14 follow-up's split disk/network graphs). Fire-and-forget like the
+/// other live-telemetry events: a failed emit is logged by the caller's
+/// tracing, never propagated.
+pub fn emit_sync_io_throughput(app: &AppHandle, sample: crate::iostat_hub::IoSample) {
+    let _ = app.emit(EVENT_SYNC_IO_THROUGHPUT, sample);
 }
 
 /// Broadcast `activity:new` with the new activity entry (SPEC s11.7).

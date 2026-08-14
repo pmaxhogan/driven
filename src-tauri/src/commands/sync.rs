@@ -374,6 +374,17 @@ pub async fn restore_persisted_pause(app: &AppHandle) {
     emit_pause_changed(app, Some(pause));
 }
 
+/// `io_throughput_series()` - the trailing window of live disk/network
+/// throughput samples (2026-08-14 follow-up), for the Activity dashboard's
+/// split graphs' initial load; live updates ride the `sync:io_throughput`
+/// event. Always available (the quiesced boot path serves an all-zero hub).
+#[tauri::command]
+pub async fn io_throughput_series(
+    state: State<'_, AppState>,
+) -> CommandResult<crate::iostat_hub::IoThroughputSeriesDto> {
+    Ok(state.iostat_hub().series())
+}
+
 /// `get_sync_status()` - snapshot the aggregate sync state (SPEC s11.3).
 ///
 /// Reads each account orchestrator's current [`OrchestratorState`] into the
