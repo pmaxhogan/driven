@@ -5,6 +5,19 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.0](https://github.com/pmaxhogan/driven/compare/v2.10.1...v2.11.0) (2026-08-14)
+
+
+### Features
+
+* **ui:** live disk/network throughput graphs + visible upload recovery ([#290](https://github.com/pmaxhogan/driven/issues/290)) ([4fe156c](https://github.com/pmaxhogan/driven/commit/4fe156c8710a9e3f266d72fab92c8ee73497ac44))
+
+
+### Bug Fixes
+
+* **core:** exempt Zone.Identifier from the ads_skipped warning ([#288](https://github.com/pmaxhogan/driven/issues/288)) ([f37ff68](https://github.com/pmaxhogan/driven/commit/f37ff68a3fdb2cfded8516a0e843afd256fbddd7))
+* let a slow add-source wizard finish instead of failing with a phantom disk error ([#291](https://github.com/pmaxhogan/driven/issues/291)) ([1fbba98](https://github.com/pmaxhogan/driven/commit/1fbba9836d67f9c7c79875d98407b316628bc8ed))
+
 ## [2.10.1](https://github.com/pmaxhogan/driven/compare/v2.10.0...v2.10.1) (2026-08-14)
 
 
