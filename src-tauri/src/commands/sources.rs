@@ -152,18 +152,30 @@ pub async fn add_source(
     // `..`, require an existing directory).
     let canon = validate_readable_dir(&dialog_path)?;
 
-    // R1-P2-2 (DESIGN s5.2.2): reject a new source root that overlaps an
-    // EXISTING source root (one is an ancestor of the other, or they are
-    // identical). Sibling / disjoint roots are allowed. Checked BEFORE any
-    // master-key generation so an overlap never provisions a key.
-    reject_overlapping_root(state.state().as_ref(), &canon).await?;
-
     // R2-P1-3 (DESIGN s5.2): validate the candidate include / exclude globs
     // BEFORE any master-key generation or persistence - max count, max length
     // per pattern, and compile each with the SAME matcher the scanner uses. An
     // invalid / oversized glob is rejected up front (a stable s24 code) rather
     // than slipping into SQLite and breaking the next scan's matcher build.
+    // Runs before the overlap check below, which compiles these same patterns.
     validate_source_patterns(&req.include_patterns, &req.exclude_patterns)?;
+
+    // R1-P2-2 (DESIGN s5.2.2): reject a new source root that overlaps an
+    // EXISTING source root (one is an ancestor of the other, or they are
+    // identical) - UNLESS the shallower source's own exclude patterns fully
+    // cover the deeper root, in which case the trees are guaranteed disjoint
+    // and the nesting is allowed (e.g. back up `~` with `~/Documents`
+    // excluded while `~/Documents` is its own source). Sibling / disjoint
+    // roots are always allowed. Checked BEFORE any master-key generation so a
+    // rejected overlap never provisions a key.
+    reject_overlapping_root(
+        state.state().as_ref(),
+        &canon,
+        &req.include_patterns,
+        &req.exclude_patterns,
+        None,
+    )
+    .await?;
 
     // R4-P2-3: validate the renderer-supplied metadata (display name + Drive
     // destination fields) before persisting - non-empty, no control chars,
@@ -585,6 +597,21 @@ pub async fn update_source(
     // sneak an invalid / oversized glob past the add-time check and break the
     // next scan's matcher build.
     validate_source_patterns(&row.include_patterns, &row.exclude_patterns)?;
+
+    // DESIGN s5.2.2: re-run the overlap check with the EFFECTIVE patterns. A
+    // nested source pair is only ever admitted because the shallower source's
+    // own excludes cover the deeper root; a pattern patch that removes that
+    // coverage would silently make both sources back up the same subtree, so
+    // it is rejected here (the add-time check alone would leave the invariant
+    // enforceable only once).
+    reject_overlapping_root(
+        state.state().as_ref(),
+        Path::new(&row.local_path),
+        &row.include_patterns,
+        &row.exclude_patterns,
+        Some(source_id),
+    )
+    .await?;
 
     state
         .state()
@@ -1525,9 +1552,21 @@ fn delete_master_key(account_id: &AccountId) -> anyhow::Result<()> {
 
 /// R1-P2-2 (DESIGN s5.2.2): reject a candidate source root that OVERLAPS any
 /// existing source root - i.e. the candidate is an ancestor of, a descendant of,
-/// or identical to an existing root. Sibling / disjoint roots are allowed.
-/// Applied GLOBALLY across all accounts (DESIGN s5.2.2 does not scope it
-/// per-account).
+/// or identical to an existing root - UNLESS the nesting is EXCLUDE-COVERED:
+/// the shallower source's OWN exclude patterns force-exclude the deeper root's
+/// entire subtree ([`driven_core::exclude::own_rules_exclude_subtree`]), so the
+/// two sources' backed-up trees are provably disjoint. Identical roots are
+/// always rejected. Sibling / disjoint roots are allowed. Applied GLOBALLY
+/// across all accounts (DESIGN s5.2.2 does not scope it per-account).
+///
+/// `candidate` + `include_patterns` / `exclude_patterns` describe the source
+/// being added (or, via `update_source`, the source being patched - then
+/// `skip` is its id so it is not compared against itself). Only the sources'
+/// OWN stored patterns count toward coverage - never a gitignore tier, which
+/// can change on disk at any time after this check (see
+/// `own_rules_exclude_subtree`); the stored patterns can only change through
+/// `update_source`, which re-runs this check, so the disjointness invariant
+/// holds continuously, not just at add time.
 ///
 /// R4-P2-6 (fail-CLOSED): every `backup_sources.local_path` is already stored in
 /// CANONICAL form (`add_source` persists `dunce::canonicalize(dialog_path)`), so
@@ -1542,9 +1581,18 @@ fn delete_master_key(account_id: &AccountId) -> anyhow::Result<()> {
 /// root is offline). A stored path that is somehow not absolute (legacy / bad
 /// data) is treated as un-comparable and, to stay fail-closed, rejects the add
 /// with a clear error rather than being silently skipped.
-async fn reject_overlapping_root(state: &dyn StateRepo, candidate: &Path) -> CommandResult<()> {
+async fn reject_overlapping_root(
+    state: &dyn StateRepo,
+    candidate: &Path,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    skip: Option<SourceId>,
+) -> CommandResult<()> {
     let existing = state.list_sources().await.map_err(CommandError::from)?;
     for src in &existing {
+        if skip == Some(src.id) {
+            continue;
+        }
         // The stored path is canonical from add time; compare it directly (no
         // re-canonicalise, so a temporarily-missing root is still compared).
         let other = Path::new(&src.local_path);
@@ -1559,15 +1607,67 @@ async fn reject_overlapping_root(state: &dyn StateRepo, candidate: &Path) -> Com
                  path; cannot safely check for overlap - please remove and re-add it",
             ));
         }
-        if candidate == other || candidate.starts_with(other) || other.starts_with(candidate) {
+        if candidate == other {
             return Err(CommandError::with_code(
                 ErrorCode::LocalIoError,
-                "this folder overlaps a folder that is already being backed up \
-                 (one is inside the other); pick one or the other, or split them",
+                "this folder is already being backed up as another source",
             ));
+        }
+        if other.starts_with(candidate) {
+            // The candidate CONTAINS an existing root: allowed only when the
+            // candidate's own patterns force-exclude that root's subtree.
+            // `strip_prefix` cannot fail after `starts_with`.
+            let rel = other.strip_prefix(candidate).expect("checked starts_with");
+            if !subtree_excluded(candidate, include_patterns, exclude_patterns, rel)? {
+                return Err(CommandError::with_code(
+                    ErrorCode::LocalIoError,
+                    format!(
+                        "this folder contains \"{}\", which is already backed up as \
+                         its own source; that folder must be covered by this \
+                         source's exclude patterns (or remove the other source)",
+                        other.display()
+                    ),
+                ));
+            }
+        } else if candidate.starts_with(other) {
+            // The candidate is INSIDE an existing root: allowed only when the
+            // existing source's own patterns force-exclude the candidate.
+            let rel = candidate.strip_prefix(other).expect("checked starts_with");
+            if !subtree_excluded(other, &src.include_patterns, &src.exclude_patterns, rel)? {
+                return Err(CommandError::with_code(
+                    ErrorCode::LocalIoError,
+                    format!(
+                        "this folder is inside \"{}\", which is already being backed \
+                         up; exclude this folder from that source first, then add it \
+                         as its own source",
+                        other.display()
+                    ),
+                ));
+            }
         }
     }
     Ok(())
+}
+
+/// [`driven_core::exclude::own_rules_exclude_subtree`] with its build error
+/// mapped to a stable command error. The patterns were already validated with
+/// the same compiler ([`validate_source_patterns`]), so a failure here is
+/// unexpected - surfaced rather than swallowed because answering "not covered"
+/// on a compile error would produce a misleading "add an exclusion" message
+/// for input the user cannot fix.
+fn subtree_excluded(
+    root: &Path,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    rel: &Path,
+) -> CommandResult<bool> {
+    driven_core::exclude::own_rules_exclude_subtree(root, include_patterns, exclude_patterns, rel)
+        .map_err(|e| {
+            CommandError::with_code(
+                ErrorCode::LocalIoError,
+                format!("could not evaluate exclude patterns for the overlap check: {e:#}"),
+            )
+        })
 }
 
 /// Reconfigure `account_id`'s running orchestrator (if one is live) with a
@@ -1859,14 +1959,29 @@ mod tests {
 
     /// tests. Inserts the owning account first so the FK is satisfied.
     async fn persist_source_at(state: &dyn StateRepo, root: &Path) -> AccountId {
+        persist_source_with_patterns(state, root, Vec::new(), Vec::new())
+            .await
+            .0
+    }
+
+    /// [`persist_source_at`] with the source's own include / exclude patterns,
+    /// for the exclude-covered-nesting overlap tests. Returns the ids so a
+    /// test can patch or skip the row.
+    async fn persist_source_with_patterns(
+        state: &dyn StateRepo,
+        root: &Path,
+        include_patterns: Vec<String>,
+        exclude_patterns: Vec<String>,
+    ) -> (AccountId, SourceId) {
         let account_id = AccountId::new_v4();
         let account = drive_account(account_id);
         state
             .upsert_account(&account)
             .await
             .expect("upsert account");
+        let source_id = SourceId::new_v4();
         let row = SourceRow {
-            id: SourceId::new_v4(),
+            id: source_id,
             account_id,
             display_name: "existing".to_string(),
             enabled: true,
@@ -1877,8 +1992,8 @@ mod tests {
             encryption_enabled: false,
             wrapped_source_key: None,
             respect_gitignore: true,
-            include_patterns: Vec::new(),
-            exclude_patterns: Vec::new(),
+            include_patterns,
+            exclude_patterns,
             placeholder_policy: Default::default(),
             schedule_json_v2_reserved: None,
             deep_verify_interval_secs: default_deep_verify_secs(),
@@ -1888,7 +2003,7 @@ mod tests {
             created_at: 0,
         };
         state.upsert_source(&row).await.expect("upsert source");
-        account_id
+        (account_id, source_id)
     }
 
     #[tokio::test]
@@ -1911,25 +2026,154 @@ mod tests {
         persist_source_at(&repo, &canon_parent).await;
 
         // Identical root -> rejected.
-        let err = reject_overlapping_root(&repo, &canon_parent)
+        let err = reject_overlapping_root(&repo, &canon_parent, &[], &[], None)
             .await
             .expect_err("identical root must be rejected");
         assert_eq!(err.code, ErrorCode::LocalIoError);
         // Descendant (nested under the existing root) -> rejected.
-        let err = reject_overlapping_root(&repo, &canon_nested)
+        let err = reject_overlapping_root(&repo, &canon_nested, &[], &[], None)
             .await
             .expect_err("nested root must be rejected");
         assert_eq!(err.code, ErrorCode::LocalIoError);
         // Ancestor (the existing root is nested under the candidate) -> rejected.
         let canon_dir = dunce::canonicalize(&dir).unwrap();
-        let err = reject_overlapping_root(&repo, &canon_dir)
+        let err = reject_overlapping_root(&repo, &canon_dir, &[], &[], None)
             .await
             .expect_err("ancestor root must be rejected");
         assert_eq!(err.code, ErrorCode::LocalIoError);
         // A sibling (disjoint) -> allowed.
-        reject_overlapping_root(&repo, &canon_sibling)
+        reject_overlapping_root(&repo, &canon_sibling, &[], &[], None)
             .await
             .expect("a sibling root must be allowed");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn overlap_allowed_when_candidate_root_excludes_existing_source() {
+        // DESIGN s5.2.2 (exclude-covered nesting): a candidate that CONTAINS an
+        // existing source root is allowed exactly when the candidate's own
+        // exclude patterns force-exclude that root's subtree.
+        let (repo, dir) = temp_repo().await;
+        let home = dir.join("home");
+        let docs = home.join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        let canon_home = dunce::canonicalize(&home).unwrap();
+        let canon_docs = dunce::canonicalize(&docs).unwrap();
+        persist_source_at(&repo, &canon_docs).await;
+
+        // The anchored dir glob the exclusion editor emits -> allowed.
+        let excludes = vec!["/Documents/".to_string()];
+        reject_overlapping_root(&repo, &canon_home, &[], &excludes, None)
+            .await
+            .expect("a candidate whose excludes cover the nested source must be allowed");
+
+        // Same excludes, but an include pattern re-includes a path UNDER the
+        // nested root -> the subtree is no longer provably disjoint -> rejected.
+        let includes = vec!["Documents/keep.txt".to_string()];
+        let err = reject_overlapping_root(&repo, &canon_home, &includes, &excludes, None)
+            .await
+            .expect_err("an include reaching under the nested root must reject the overlap");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
+
+        // An exclusion of an unrelated folder does not cover it -> rejected,
+        // and the error names the conflicting folder.
+        let unrelated = vec!["/Downloads/".to_string()];
+        let err = reject_overlapping_root(&repo, &canon_home, &[], &unrelated, None)
+            .await
+            .expect_err("an uncovered nested source must still be rejected");
+        assert!(
+            err.message.contains("Documents"),
+            "error should name the conflicting folder: {}",
+            err.message
+        );
+
+        // Identical roots stay rejected even with excludes present.
+        let err = reject_overlapping_root(&repo, &canon_docs, &[], &excludes, None)
+            .await
+            .expect_err("an identical root is rejected regardless of patterns");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn overlap_allowed_when_existing_parent_excludes_candidate() {
+        // DESIGN s5.2.2, other direction: a candidate INSIDE an existing source
+        // is allowed exactly when the EXISTING source's own patterns exclude it.
+        let (repo, dir) = temp_repo().await;
+        let home = dir.join("home");
+        let docs = home.join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        let canon_home = dunce::canonicalize(&home).unwrap();
+        let canon_docs = dunce::canonicalize(&docs).unwrap();
+        persist_source_with_patterns(
+            &repo,
+            &canon_home,
+            Vec::new(),
+            vec!["/Documents/".to_string()],
+        )
+        .await;
+
+        reject_overlapping_root(&repo, &canon_docs, &[], &[], None)
+            .await
+            .expect("a candidate under the existing source's exclusion must be allowed");
+
+        // A deeper path under the exclusion is covered too.
+        let deeper = canon_docs.join("projects");
+        std::fs::create_dir_all(&deeper).unwrap();
+        reject_overlapping_root(&repo, &deeper, &[], &[], None)
+            .await
+            .expect("a deeper candidate under the exclusion must be allowed");
+
+        // A sibling folder the parent does NOT exclude stays rejected, and the
+        // error points at the existing parent source.
+        let pics = canon_home.join("Pictures");
+        std::fs::create_dir_all(&pics).unwrap();
+        let err = reject_overlapping_root(&repo, &pics, &[], &[], None)
+            .await
+            .expect_err("a candidate the parent does not exclude must be rejected");
+        assert!(
+            err.message.contains("exclude this folder from that source"),
+            "error should tell the user the fix: {}",
+            err.message
+        );
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn overlap_recheck_skips_self_and_blocks_uncovering_patch() {
+        // The `update_source` re-check: `skip` keeps the row from being
+        // compared against itself, and effective patterns that no longer cover
+        // a nested source's root are rejected (the un-exclude guard).
+        let (repo, dir) = temp_repo().await;
+        let home = dir.join("home");
+        let docs = home.join("Documents");
+        std::fs::create_dir_all(&docs).unwrap();
+        let canon_home = dunce::canonicalize(&home).unwrap();
+        let canon_docs = dunce::canonicalize(&docs).unwrap();
+        let (_, home_id) = persist_source_with_patterns(
+            &repo,
+            &canon_home,
+            Vec::new(),
+            vec!["/Documents/".to_string()],
+        )
+        .await;
+        persist_source_at(&repo, &canon_docs).await;
+
+        // Effective patterns keep the coverage -> the patch passes (and the
+        // row is not rejected against itself thanks to `skip`).
+        let keep = vec!["/Documents/".to_string()];
+        reject_overlapping_root(&repo, &canon_home, &[], &keep, Some(home_id))
+            .await
+            .expect("a patch that keeps the covering exclusion must pass");
+
+        // Effective patterns drop the coverage -> rejected.
+        let err = reject_overlapping_root(&repo, &canon_home, &[], &[], Some(home_id))
+            .await
+            .expect_err("a patch that un-excludes the nested source's root must be rejected");
+        assert_eq!(err.code, ErrorCode::LocalIoError);
 
         let _ = std::fs::remove_dir_all(dir);
     }
@@ -1954,7 +2198,7 @@ mod tests {
         // (fail-closed): the path comparison still fires even though the root is
         // gone from disk.
         let nested = canon_parent.join("child");
-        let err = reject_overlapping_root(&repo, &nested)
+        let err = reject_overlapping_root(&repo, &nested, &[], &[], None)
             .await
             .expect_err("a candidate nested under a missing existing root must be rejected");
         assert_eq!(err.code, ErrorCode::LocalIoError);

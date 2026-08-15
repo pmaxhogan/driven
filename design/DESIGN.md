@@ -433,11 +433,27 @@ Default V1 policy (each per-source overridable):
 #### 5.2.2 Overlapping / nested sources
 
 Two backup sources whose local paths overlap (one is an ancestor of the
-other) are **rejected** at add time with a clear error: "Folder A is
-already inside folder B, which is also being backed up. Pick one or
-the other, or split them." Reasoning: deduplicating uploads across
-overlapping sources is doable but the UX gets confusing fast, and we
-have no use case for it. V2 may revisit.
+other) are **rejected** at add time - **unless** the shallower source's
+own exclude patterns fully cover the deeper source's root (the
+directory is force-excluded and no `!` re-include can reach beneath
+it), in which case the two backed-up trees are provably disjoint and
+the nesting is **allowed**. This is the "back up `~`, but `~/Documents`
+is already its own source and is excluded here" use case. Identical
+roots are always rejected.
+
+Only the sources' **own stored patterns** count toward coverage - never
+the gitignore cascade or the default excludes, because a `.gitignore`
+on disk can change at any time and must not be what keeps two sources
+from double-backing-up the same subtree. The stored patterns change
+only through `update_source`, which re-runs the same check, so a later
+pattern edit cannot silently un-exclude a nested source's root - the
+disjointness invariant holds continuously, not just at add time.
+
+A genuinely-overlapping pair (no covering exclusion) is still rejected
+with a clear, actionable error naming the other folder and the fix.
+Reasoning: deduplicating uploads across truly overlapping sources is
+doable but the UX gets confusing fast, and we have no use case for it.
+V2 may revisit.
 
 #### 5.2.3 Unicode normalization & case
 
