@@ -123,6 +123,11 @@ These move: check each project's current docs before relying on a cell.
   directories instead of descending them.
 - Live exclusion preview that re-classifies the folder tree as you edit a rule,
   from an in-memory tree rather than a fresh walk of the disk.
+- Nested backup sources, as long as they cannot overlap: a source may contain
+  another source's folder when its own exclude rules cover that folder (e.g.
+  back up your home folder with `Documents` excluded while `Documents` is
+  already its own source), and Driven keeps enforcing that exclusion when
+  rules are later edited. Genuinely overlapping sources are still rejected.
 - Concurrent, paced executor with retries and resumable uploads. An upload
   interrupted by a quit or crash resumes byte-for-byte across restarts, with
   the recovery shown live in the app ("Recovering interrupted upload - 8.2 GB

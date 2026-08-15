@@ -1113,21 +1113,10 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
 
     // (highest) the source's own overrides: exclude_patterns force-out (bare
     // glob), then include_patterns opt-back-in (`!`-prefixed), one root-rooted
-    // scope added LAST so it beats both gitignore and the defaults. Built in a
-    // single scope so the include (`!`) rules override the exclude rules within
-    // it (last-match-wins inside the one Gitignore). Built up front because the
-    // pruned ignore-file collection below evaluates the same cascade.
-    let override_lines: Vec<String> = source
-        .exclude_patterns
-        .iter()
-        .cloned()
-        .chain(source.include_patterns.iter().map(|inc| format!("!{inc}")))
-        .collect();
-    let overrides = scope_from_lines(
-        &root,
-        override_lines.iter().map(String::as_str),
-        "source override pattern",
-    )?;
+    // scope added LAST so it beats both gitignore and the defaults. Built up
+    // front because the pruned ignore-file collection below evaluates the same
+    // cascade.
+    let overrides = override_scope(&root, &source.include_patterns, &source.exclude_patterns)?;
 
     // The gitignore tier (DESIGN s5.2: respect .gitignore, .ignore,
     // .git/info/exclude, and the global gitignore), each ABOVE the defaults and
@@ -1217,6 +1206,77 @@ pub fn build_source_matcher(source: &SourceRow) -> anyhow::Result<SourceMatcher>
         negation_subtree,
         has_negations,
     })
+}
+
+/// Build the source's OWN override scope: `exclude_patterns` verbatim (bare
+/// glob = force-out) then `include_patterns` `!`-prefixed (re-include), ONE
+/// root-rooted scope so the include rules override the exclude rules within it
+/// (last-match-wins inside the one [`Gitignore`]).
+///
+/// Shared by [`build_source_matcher`] (which appends it LAST, making it the
+/// highest-precedence tier of the full cascade) and
+/// [`own_rules_exclude_subtree`] (which evaluates it ALONE) - sharing the
+/// construction is what keeps the standalone evaluation's verdicts identical
+/// to this tier's verdicts inside the full matcher.
+fn override_scope(
+    root: &Path,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+) -> anyhow::Result<Scope> {
+    let override_lines: Vec<String> = exclude_patterns
+        .iter()
+        .cloned()
+        .chain(include_patterns.iter().map(|inc| format!("!{inc}")))
+        .collect();
+    scope_from_lines(
+        root,
+        override_lines.iter().map(String::as_str),
+        "source override pattern",
+    )
+}
+
+/// Whether a source's OWN patterns (`exclude_patterns` + `include_patterns`),
+/// evaluated alone, force-exclude the ENTIRE subtree rooted at `rel_dir`
+/// (source-root-relative): the directory itself is excluded and no own
+/// `!`-re-include rule could match at or under it.
+///
+/// This is the predicate behind allowing NESTED source roots (DESIGN s5.2.2):
+/// a source may contain another source's root exactly when its own patterns
+/// guarantee it never backs up that subtree. The guarantee is sound against
+/// the FULL matcher because the own-override scope is that matcher's
+/// highest-precedence tier: an `Ignore` verdict from it cannot be flipped by
+/// the defaults or any gitignore tier (last-match-wins, own scope last), and
+/// a directory rule reaches every descendant through
+/// [`Gitignore::matched_path_or_any_parents`]. The only rules that could
+/// re-include a descendant past the own tier's exclude are the own
+/// `!`-re-includes - ruled out by [`SourceMatcher::negations_could_match_under`]
+/// on the single-scope matcher (conservative: any uncertain rule answers
+/// "could match" and fails this predicate).
+///
+/// DELIBERATELY ignores the gitignore cascade and the default excludes: a
+/// `.gitignore` on disk can change (or vanish) at any time after the check,
+/// so it must never be what keeps two sources' trees disjoint. Only the
+/// stored patterns - which change exclusively through the guarded
+/// `update_source` path - count. Purely computational: never touches the
+/// filesystem, so it answers the same while a root is offline.
+pub fn own_rules_exclude_subtree(
+    root: &Path,
+    include_patterns: &[String],
+    exclude_patterns: &[String],
+    rel_dir: &Path,
+) -> anyhow::Result<bool> {
+    let overrides = override_scope(root, include_patterns, exclude_patterns)?;
+    let scopes = vec![overrides];
+    let (by_dir, negation_subtree) = index_scopes(root, &scopes);
+    let num_whitelists: u64 = scopes.iter().map(|s| s.matcher.num_whitelists()).sum();
+    let matcher = SourceMatcher {
+        root: root.to_path_buf(),
+        scopes,
+        by_dir,
+        negation_subtree,
+        has_negations: !include_patterns.is_empty() || num_whitelists > 0,
+    };
+    Ok(!matcher.is_included(rel_dir, true) && !matcher.negations_could_match_under(rel_dir))
 }
 
 /// The glob a UI affordance emits to target EXACTLY ONE path in a source, and
@@ -3244,5 +3304,48 @@ mod tests {
         let matcher = build_source_matcher(&src).expect("matcher");
         let compared = assert_cursor_matches_walk(root, &matcher);
         assert!(compared >= 5, "compared only {compared}");
+    }
+
+    /// [`own_rules_exclude_subtree`] with `Vec<String>` args, against a root
+    /// that never needs to exist (the predicate is purely computational).
+    fn own_covers(includes: &[&str], excludes: &[&str], rel: &str) -> bool {
+        let dir = tempfile::tempdir().unwrap();
+        let includes: Vec<String> = includes.iter().map(|s| s.to_string()).collect();
+        let excludes: Vec<String> = excludes.iter().map(|s| s.to_string()).collect();
+        own_rules_exclude_subtree(dir.path(), &includes, &excludes, Path::new(rel))
+            .expect("valid patterns")
+    }
+
+    #[test]
+    fn own_rules_exclude_subtree_requires_a_covering_exclude() {
+        // The anchored dir glob the exclusion editor emits covers the root and
+        // everything beneath it.
+        assert!(own_covers(&[], &["/Documents/"], "Documents"));
+        assert!(own_covers(&[], &["/Documents/"], "Documents/projects"));
+        // An unanchored form covers too (matched at the top level).
+        assert!(own_covers(&[], &["Documents"], "Documents"));
+        // No patterns, or an exclusion of an unrelated folder, is not coverage.
+        assert!(!own_covers(&[], &[], "Documents"));
+        assert!(!own_covers(&[], &["/Downloads/"], "Documents"));
+    }
+
+    #[test]
+    fn own_rules_exclude_subtree_denies_reachable_reinclude() {
+        // An include pattern (stored bare; the matcher prepends the `!`) that
+        // could re-include a path UNDER the excluded root breaks the
+        // whole-subtree guarantee.
+        assert!(!own_covers(
+            &["Documents/keep.txt"],
+            &["/Documents/"],
+            "Documents"
+        ));
+        // An unanchored include can match at any depth, so it reaches under
+        // the root as well (the conservative answer).
+        assert!(!own_covers(&["keep.txt"], &["/Documents/"], "Documents"));
+        // The subtree check is what rejects this - the root itself still
+        // counts as excluded (the `!` rule targets a file beneath it).
+        // Deliberately NOT asserted the other way: gitignore precision for
+        // negations anchored elsewhere is conservative, and this predicate is
+        // allowed to say "not covered" whenever it is unsure.
     }
 }
