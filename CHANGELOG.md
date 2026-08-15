@@ -5,6 +5,13 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.11.1](https://github.com/pmaxhogan/driven/compare/v2.11.0...v2.11.1) (2026-08-15)
+
+
+### Bug Fixes
+
+* republish 2.11.0 as 2.11.1 after a red release gate ([3e206c4](https://github.com/pmaxhogan/driven/commit/3e206c4f7f49a3ef181cc5e49a7919cf791387e0))
+
 ## [2.11.0](https://github.com/pmaxhogan/driven/compare/v2.10.1...v2.11.0) (2026-08-14)
 
 
