@@ -122,11 +122,12 @@ const accountEmailById = computed<Record<string, string>>(() => {
  *
  * This genuinely differs per backend rather than being a wording choice, so a
  * single sentence could only ever be wrong somewhere: Drive keeps a superseded
- * object in its trash (recoverable for ~30 days), while an S3 or local-folder
- * destination has no trash and the re-upload lands on the SAME deterministic key,
- * overwriting the previous copy. The versioning panel used to state Drive's
- * behaviour unconditionally, directly contradicting the S3 setup screen's own
- * "S3 has no trash" warning inside the same app.
+ * object in its trash (recoverable for ~30 days), an S3 or local-folder
+ * destination keeps it in a `.driven-versions` area Driven owns there (pruned to
+ * the per-source limit, and NOT a recovery path for deletions), and SFTP keeps
+ * nothing at all. The versioning panel used to state Drive's behaviour
+ * unconditionally, directly contradicting the S3 setup screen's own "S3 has no
+ * trash" warning inside the same app.
  *
  * Unseeded / unknown backends fall back to the neutral `default`, because
  * `BackendKind::ALL` is Rust-owned and gains entries ahead of the locale file.
@@ -141,8 +142,9 @@ function retentionNote(accountId: string): string {
  * Issue #220: the destination CAPABILITY descriptors, joined to a source by its
  * account's `backendKind`. Fetched rather than hardcoded, following #219: the set
  * of backends and what each can do is Rust-owned (`driven_backend::descriptors()`),
- * so a UI-side "S3 and local cannot version" list would silently rot the moment a
- * backend's create path changes.
+ * so a UI-side list of which backends can version would silently rot the moment
+ * one gains or loses the ability - as S3 and the local folder did when #220 part 2
+ * gave them a real version store.
  */
 const backends = ref<BackendDto[]>([]);
 async function loadBackends(): Promise<void> {
@@ -159,10 +161,12 @@ async function loadBackends(): Promise<void> {
 /**
  * Whether this source's DESTINATION can really keep previous versions.
  *
- * A destination whose create key is derived from the file name (S3, local folder)
- * re-uploads over the previous copy, so a retained version points at the CURRENT
- * bytes and "restore as of an earlier date" would return today's content while
- * reporting success (issue #220). The editor is not offered there.
+ * A destination that cannot put the superseded bytes under an object of their own
+ * re-uploads over the previous copy, so a retained version would point at the
+ * CURRENT bytes and "restore as of an earlier date" would return today's content
+ * while reporting success (issue #220). Since part 2 that is SFTP alone - Drive,
+ * S3 and the local folder all keep the old bytes - but the answer is read from the
+ * descriptors, never assumed. The editor is not offered where it is false.
  *
  * An UNKNOWN or not-yet-loaded backend resolves PERMISSIVE, matching the house
  * rule from #219 (`setup.ts` / `AddSourceWizard.vue` both `?? true`) so a
