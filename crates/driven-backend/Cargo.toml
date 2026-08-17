@@ -24,6 +24,10 @@ driven-sftp = { path = "../driven-sftp" }
 driven-tls = { path = "../driven-tls" }
 anyhow.workspace = true
 tracing.workspace = true
+# Only for `Handle::try_current()` + `spawn`: the S3 arm detaches its
+# abandoned-multipart-upload sweep rather than making account assembly wait on a
+# network round trip (issue #222).
+tokio = { workspace = true }
 
 [dev-dependencies]
 # `driven_test_fixtures::keychain::isolated()` installs (and PROVES) an

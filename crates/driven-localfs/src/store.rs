@@ -599,6 +599,29 @@ fn hash_committed_file(path: &Path) -> std::io::Result<[u8; 16]> {
     Ok(hasher.finalize().into())
 }
 
+/// Total bytes of every file under `dir`, recursively. Best-effort: an
+/// unreadable directory contributes 0 rather than failing a usage report.
+fn directory_bytes(dir: &Path) -> u64 {
+    let mut total: u64 = 0;
+    let mut stack = vec![dir.to_path_buf()];
+    while let Some(next) = stack.pop() {
+        let Ok(entries) = std::fs::read_dir(&next) else {
+            continue;
+        };
+        for entry in entries.flatten() {
+            let Ok(meta) = entry.metadata() else {
+                continue;
+            };
+            if meta.is_dir() {
+                stack.push(entry.path());
+            } else if meta.is_file() {
+                total = total.saturating_add(meta.len());
+            }
+        }
+    }
+    total
+}
+
 fn now_ms() -> i64 {
     SystemTime::now()
         .duration_since(UNIX_EPOCH)
@@ -1095,9 +1118,117 @@ impl RemoteStore for LocalFsStore {
     /// simulate a trash by moving objects aside - nothing would ever empty it,
     /// and a backup destination that only grows fills the drive it lives on. A
     /// missing object is success (idempotent).
+    ///
+    /// ## The one exception: Driven's own version store
+    ///
+    /// An object under [`names::VERSIONS_DIR`] is a retained version that
+    /// [`Self::archive_version`] put there, and trashing it is a NO-OP.
+    ///
+    /// After a versioned change the executor "trashes" the superseded object,
+    /// meaning "move it out of the live tree but keep it restorable" - which is
+    /// what Drive's trash does, and what the archive copy already did. Deleting
+    /// it here would destroy the version the same cycle just recorded. The
+    /// count-cap prune, which really must free the space, goes through
+    /// [`Self::delete_permanent`] and still does.
     async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
         self.guard_root()?;
+        if layout::is_in_version_store(file_id) {
+            tracing::debug!(
+                target: crate::TARGET,
+                id = %file_id,
+                "trash of an archived version is a no-op; it already lives in the version store"
+            );
+            return Ok(());
+        }
         self.delete_object(file_id).await
+    }
+
+    /// Copies the object at `file_id` into the destination's version store so a
+    /// subsequent write to its path cannot destroy it (issue #220).
+    ///
+    /// A local destination derives an object's path from its name, so the
+    /// versioned re-upload lands on the SAME file. The copy - data and sidecar
+    /// alike - goes to a path that is a pure function of `(file_id,
+    /// content_token)` inside [`names::VERSIONS_DIR`], and an archive that
+    /// already exists is returned WITHOUT re-copying.
+    ///
+    /// Both properties are load-bearing for crash safety: an op that dies
+    /// between the archive and its commit is replayed with the same token, by
+    /// which time the live path may already hold the NEW bytes - so a blind
+    /// re-copy would overwrite a correct archive with the content it exists to
+    /// preserve.
+    async fn archive_version(
+        &self,
+        file_id: &str,
+        content_token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        self.guard_root()?;
+        let dest_id = layout::version_id(file_id, content_token);
+        let dest_path = self.path_for(&dest_id)?;
+        if dest_path.is_file() {
+            tracing::debug!(
+                target: crate::TARGET,
+                id = %dest_id,
+                "version already archived; reusing it rather than re-copying"
+            );
+            return Ok(Some(dest_id));
+        }
+        let src_path = self.path_for(file_id)?;
+        let src_dir = self.path_for(&layout::parent_of(file_id))?;
+        let src_stored = layout::base_name(file_id).to_string();
+        let dest_dir = self.path_for(&layout::parent_of(&dest_id))?;
+        let dest_stored = layout::base_name(&dest_id).to_string();
+        let src_id = file_id.to_string();
+
+        tokio::task::spawn_blocking(move || -> anyhow::Result<()> {
+            if !src_path.is_file() {
+                // Nothing to preserve. An `Err` rather than a silent success:
+                // the caller must not record a version row pointing at an
+                // archive that was never written.
+                return Err(not_found(&src_id));
+            }
+            std::fs::create_dir_all(&dest_dir)
+                .map_err(|e| io_err(&format!("create {}", dest_dir.display()), e))?;
+            // Copy into a temp beside the target, then publish atomically: a
+            // half-written archive that a later run mistook for a complete one
+            // would be a silently truncated "previous version".
+            let temp = dest_dir.join(crate::fsx::temp_name());
+            let copied = std::fs::copy(&src_path, &temp)
+                .map_err(|e| io_err(&format!("copy {}", src_path.display()), e));
+            if let Err(e) = copied {
+                let _ = std::fs::remove_file(&temp);
+                return Err(e);
+            }
+            let handle = std::fs::OpenOptions::new()
+                .write(true)
+                .open(&temp)
+                .map_err(|e| io_err(&format!("reopen {}", temp.display()), e))?;
+            crate::fsx::sync_file(&handle)
+                .map_err(|e| io_err(&format!("sync {}", temp.display()), e))?;
+            drop(handle);
+            if let Err(e) = crate::fsx::commit_rename(&temp, &dest_path) {
+                let _ = std::fs::remove_file(&temp);
+                return Err(io_err(&format!("commit {}", dest_path.display()), e));
+            }
+
+            // The archive carries the ORIGINAL object's annotation (its name,
+            // mime, digest and `driven.*` props), only re-pointed at its new
+            // stored name - so a restore reads back exactly what the live object
+            // would have returned before it was superseded. An unannotated
+            // archive would read back as a nameless blob with no digest to
+            // verify against.
+            if let Some(mut sidecar) = meta::read_sidecar(&src_dir, &src_stored) {
+                sidecar.stored = dest_stored;
+                meta::write_sidecar(&dest_dir, &sidecar).map_err(|e| {
+                    io_err(&format!("write sidecar for {}", dest_path.display()), e)
+                })?;
+            }
+            Ok(())
+        })
+        .await
+        .map_err(|e| anyhow::anyhow!("localfs.internal: archive task panicked: {e}"))??;
+
+        Ok(Some(dest_id))
     }
 
     async fn delete_permanent(&self, file_id: &str) -> anyhow::Result<()> {
@@ -1208,10 +1339,16 @@ impl RemoteStore for LocalFsStore {
     ///
     /// A platform that cannot report volume capacity yields `limit: None`
     /// (unknown) rather than a guess.
+    ///
+    /// Retained versions COUNT toward `usage_in_drive`: they are bytes Driven
+    /// put on the user's drive, and a footprint that quietly omitted them would
+    /// under-report exactly the storage a versioning setting is spending. They
+    /// are added explicitly because the version store is a reserved control
+    /// directory, which the walk below deliberately skips.
     async fn about(&self) -> anyhow::Result<AboutInfo> {
         self.guard_root()?;
         let capacity = crate::fsx::volume_capacity(&self.root);
-        let mut used_by_driven: u64 = 0;
+        let mut used_by_driven: u64 = directory_bytes(&self.root.join(names::VERSIONS_DIR));
         for (_, dir_path) in self.walk_dirs()? {
             let entries = std::fs::read_dir(&dir_path)
                 .map_err(|e| io_err(&format!("list {}", dir_path.display()), e))?;

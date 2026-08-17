@@ -283,10 +283,11 @@ describe("SourceTable", () => {
 
   // --- Issue #220: the versioning capability gate ---------------------------
 
-  /** `list_backends()` as the Rust `descriptors()` reports it: only Google Drive
-   * can really keep previous versions. S3, the local folder and SFTP all derive
-   * an object's key from the file name, so a re-upload overwrites the previous
-   * copy. */
+  /** `list_backends()` as the Rust `descriptors()` reports it: Google Drive, S3
+   * and the local folder can all keep previous versions by archiving the
+   * superseded object aside before a re-upload overwrites the create key. SFTP
+   * cannot - it has no server-side copy, so archiving a version there would mean
+   * re-uploading the whole file over the same link. */
   const VERSIONING_BACKENDS = [
     {
       id: "google_drive",
@@ -299,14 +300,14 @@ describe("SourceTable", () => {
       id: "s3",
       usesOauth: false,
       supportsFolderPicker: true,
-      supportsVersionHistory: false,
+      supportsVersionHistory: true,
       isDefault: false,
     },
     {
       id: "local_folder",
       usesOauth: false,
       supportsFolderPicker: false,
-      supportsVersionHistory: false,
+      supportsVersionHistory: true,
       isDefault: false,
     },
     {
@@ -361,14 +362,12 @@ describe("SourceTable", () => {
 
   it("does not offer the versioning editor on a destination that cannot keep versions (issue #220)", async () => {
     // The defect this gate closes: per-source versioning promises "restore this
-    // source's files as they were on an earlier date", but on S3, local-folder
-    // and SFTP destinations the create key is derived from the file name, so
-    // the re-upload OVERWRITES the previous bytes. The retained version then
-    // points at the current content and a point-in-time restore silently
-    // returns today's file. Nothing tested versioning against a non-Drive
-    // backend, which is why it shipped. The editor must not be offered where
-    // it cannot work.
-    for (const kind of ["s3", "local_folder", "sftp"]) {
+    // source's files as they were on an earlier date", but SFTP has no
+    // server-side copy to archive a superseded object into, so a re-upload
+    // OVERWRITES the previous bytes. The retained version then points at the
+    // current content and a point-in-time restore silently returns today's
+    // file. The editor must not be offered where it cannot work.
+    for (const kind of ["sftp"]) {
       const wrapper = await openVersioningOn(kind);
       // No control that could switch on a promise the destination cannot keep.
       expect(wrapper.find('[data-testid="versioning-enabled"]').exists()).toBe(false);
@@ -385,6 +384,16 @@ describe("SourceTable", () => {
     expect(drive.find('[data-testid="versioning-enabled"]').exists()).toBe(true);
     expect(drive.find('[data-testid="versioning-save"]').exists()).toBe(true);
     expect(drive.find('[data-testid="versioning-unsupported"]').exists()).toBe(false);
+  });
+
+  it("offers the versioning editor on an S3 source (issue #220)", async () => {
+    // S3 now archives the superseded object into .driven-versions before a
+    // changed file is re-uploaded, so it belongs on the "can keep versions"
+    // side of the gate. A regression that re-hides it should fail here.
+    const wrapper = await openVersioningOn("s3");
+    expect(wrapper.find('[data-testid="versioning-enabled"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="versioning-cap"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="versioning-unsupported"]').exists()).toBe(false);
   });
 
   it("the unsupported-destination copy resolves to real strings, not the key names", () => {
@@ -416,7 +425,7 @@ describe("SourceTable", () => {
     // path, so assert it really sends `enabled: false`: the loaded ref is `true`.
     let saved: unknown = null;
     const wrapper = await openVersioningOn(
-      "s3",
+      "sftp",
       { enabled: true, countCap: 7, maxBytes: 42 },
       (args) => {
         saved = args;
@@ -434,7 +443,7 @@ describe("SourceTable", () => {
 
     // A source that never had it on gets no stale warning and no remedy button -
     // there would be nothing to remedy.
-    const clean = await openVersioningOn("s3");
+    const clean = await openVersioningOn("sftp");
     expect(clean.find('[data-testid="versioning-stale"]').exists()).toBe(false);
     expect(clean.find('[data-testid="versioning-disable"]').exists()).toBe(false);
   });
@@ -456,7 +465,7 @@ describe("SourceTable", () => {
             encryptionEnabled: false,
             createdAt: 0,
             lastSyncedAt: null,
-            backendKind: "s3",
+            backendKind: "sftp",
           },
         ]);
       if (cmd === "list_backends") return Promise.resolve(VERSIONING_BACKENDS);

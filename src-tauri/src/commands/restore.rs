@@ -4885,43 +4885,55 @@ mod tests {
     }
 
     #[tokio::test]
-    async fn resolve_restore_as_of_serves_a_retained_version_on_a_drive_destination() {
-        // The POSITIVE half of the issue #220 pair. Google Drive's create mints a
-        // new file id and the superseded object lives on in Drive's trash, so the
-        // retained version's bytes really are still there: the point-in-time
-        // restore must resolve to `old-obj` and NOT be gated away.
-        let (state, src, dir) = state_with_source_on(BackendKind::GoogleDrive).await;
-        seed_versioned_doc(&state, src).await;
+    async fn resolve_restore_as_of_serves_a_retained_version_on_every_destination_that_keeps_one() {
+        // The POSITIVE half of the issue #220 pair. Drive's create mints a new
+        // file id and the superseded object lives on in Drive's trash; S3 and the
+        // local folder copy the superseded object into their `.driven-versions`
+        // area before the re-upload (#220 part 2), so the version row's object
+        // holds the OLD bytes there too. On all three the retained version's bytes
+        // really are still there: the point-in-time restore must resolve to
+        // `old-obj` and NOT be gated away.
+        for kind in [
+            BackendKind::GoogleDrive,
+            BackendKind::S3,
+            BackendKind::LocalFolder,
+        ] {
+            let (state, src, dir) = state_with_source_on(kind).await;
+            seed_versioned_doc(&state, src).await;
 
-        let items = vec![RestoreItem {
-            source_id: src.to_string(),
-            relative_path: "doc.txt".to_string(),
-        }];
-        let resolved = resolve_restore_items(&state, &items, Some(5_000))
-            .await
-            .expect("Drive keeps the superseded object, so this version is restorable");
-        assert_eq!(resolved.len(), 1);
-        assert_eq!(
-            resolved[0].drive_file_id.as_deref(),
-            Some("old-obj"),
-            "the retained version's object must be restored, not the current one"
-        );
-        let _ = std::fs::remove_dir_all(&dir);
+            let items = vec![RestoreItem {
+                source_id: src.to_string(),
+                relative_path: "doc.txt".to_string(),
+            }];
+            let resolved = resolve_restore_items(&state, &items, Some(5_000))
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{kind} keeps the superseded object, so this version is restorable: {e}")
+                });
+            assert_eq!(resolved.len(), 1);
+            assert_eq!(
+                resolved[0].drive_file_id.as_deref(),
+                Some("old-obj"),
+                "the retained version's object must be restored on {kind}, not the current one"
+            );
+            let _ = std::fs::remove_dir_all(&dir);
+        }
     }
 
     #[tokio::test]
     async fn resolve_restore_as_of_refuses_a_retained_version_on_an_overwriting_destination() {
-        // The NEGATIVE half, and the regression test for issue #220 itself. On S3
-        // and local-folder destinations the create key is derived from the file
-        // name, so the re-upload OVERWROTE `old-obj`'s bytes: the recorded version
-        // row now points at an object holding the CURRENT content. Serving it
-        // would hand the user today's bytes and report a successful restore of an
-        // older version - the worst failure available to a backup tool. The whole
-        // job must be rejected fail-closed instead.
+        // The NEGATIVE half, and the regression test for issue #220 itself. On an
+        // SFTP destination the path is derived from the file name and there is no
+        // server-side copy to archive the superseded object into, so the re-upload
+        // OVERWROTE `old-obj`'s bytes: the recorded version row now points at an
+        // object holding the CURRENT content. Serving it would hand the user
+        // today's bytes and report a successful restore of an older version - the
+        // worst failure available to a backup tool. The whole job must be rejected
+        // fail-closed instead.
         //
-        // The seed is byte-identical to the Drive half above, so this asserts the
-        // DESTINATION gate and nothing else.
-        for kind in [BackendKind::S3, BackendKind::LocalFolder] {
+        // The seed is byte-identical to the positive half above, so this asserts
+        // the DESTINATION gate and nothing else.
+        for kind in [BackendKind::Sftp] {
             let (state, src, dir) = state_with_source_on(kind).await;
             seed_versioned_doc(&state, src).await;
 

@@ -48,6 +48,7 @@ pub mod keys;
 pub mod store;
 
 pub use config::{S3Config, S3ConfigError, S3CredentialStore, S3Credentials, DEFAULT_REGION};
+pub use keys::VERSIONS_SEGMENT;
 pub use store::{S3Store, MULTIPART_THRESHOLD, PART_SIZE};
 
 /// Tracing target for the S3 backend.

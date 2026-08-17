@@ -1075,19 +1075,76 @@ it); and files that were *deleted* locally are out of scope for point-in-time
 restore in this slice (the tree browses current `file_state` only) - restoring
 a since-deleted file as of a past date is the primary follow-up.
 
-**Destination restriction (issue #220).** The whole mechanism above rests on the
-CREATE landing on a NEW remote object. That is a property of the backend, not of
-Driven: a Drive create mints a fresh file id, but `driven-s3`'s create key is
-`join_key(parent, name)` and `driven-localfs` derives a stored object's path from
-its name - both deterministic, so the re-upload OVERWRITES the previous bytes and
-the retained `file_versions` row ends up pointing at an object that now holds the
-CURRENT content. Filename encryption does not change this (SIV-style,
-deterministic nonce). A restore-by-date would then hand back today's bytes while
-reporting a successful restore of an older version.
+**Destination capability (issue #220).** The whole mechanism above rests on the
+superseded bytes ending up under an object of their OWN. That is a property of
+the backend, not of Driven: a Drive create mints a fresh file id, but
+`driven-s3`'s create key is `join_key(parent, name)` and `driven-localfs` derives
+a stored object's path from its name - both deterministic, so the re-upload
+OVERWRITES the previous bytes. Filename encryption does not change this
+(SIV-style, deterministic nonce). Left alone, the retained `file_versions` row
+would point at an object that now holds the CURRENT content, and a restore-by-date
+would hand back today's bytes while reporting a successful restore of an older
+version. That was the shipped defect; part 1 (v2.5.0) gated the offer off, and
+part 2 (v2.12.0) makes it work.
 
-So versioning is gated on a single declarative capability,
-`BackendKind::supports_version_history` (true for Google Drive, false for S3 and
-local folders), surfaced to the webview as `BackendDto.supports_version_history`:
+The seam is one trait method:
+
+```rust
+async fn archive_version(&self, file_id: &str, content_token: &str)
+    -> anyhow::Result<Option<String>>;    // default: Ok(None)
+```
+
+`None` means "no archival needed here" - the backend's create already leaves the
+superseded object intact under its own id, which is Google Drive. `Some(id)` is
+an object holding the bytes `file_id` held at call time, and the version row
+points THERE rather than at the live object. The executor calls it once, right
+after `resolve_version_supersede` and BEFORE the upload; the archive id rides in
+`VersionSupersede::archive_file_id` and in the op payload's
+`supersedes_archive_file_id` (an additive, unmigrated JSON field - an older row
+that lacks it decodes as `None`, i.e. the Drive behaviour). `supersedes_drive_file_id`
+keeps naming the ORIGINAL object, because that is what the pre-flip `file_state`
+row points at and what every recovery guard compares against.
+
+Three properties are load-bearing:
+
+- **Deterministic id.** The archive key is a pure function of `(object, content
+  token)`, the token being the OLD plaintext BLAKE3. `driven-s3` uses
+  `<root>.driven-versions/<relative key>@<token>` (falling back to a digest of
+  the relative key when that would breach S3's 1024-byte key limit);
+  `driven-localfs` mirrors the live tree under `.driven-versions/`.
+- **No re-copy over an existing archive.** An op can die between the archive and
+  its commit and be replayed, by which time the live object may already hold the
+  NEW bytes. A blind re-copy would then overwrite a correct archive with the
+  content it exists to preserve - the original bug, one layer down. Together with
+  the deterministic id this also stops a replay accumulating copies.
+- **`trash` is a NO-OP for an archived id.** After a versioned change the
+  executor "trashes" the object the version row names, meaning "move it out of
+  the live tree, keep it restorable" - which is what Drive's trash does and what
+  the archive copy already did. On S3 and a local folder `trash` is a PERMANENT
+  delete, so without this it would destroy the version just recorded. The
+  count-cap prune goes through `delete_permanent`, which still frees it.
+
+The version store is invisible to everything that enumerates the live tree: the
+folder picker (`list_folder`) skips it, and `list_source_object_ids` excludes it,
+so neither the remote-existence audit nor the s5.9 integrity scrub sees an
+archived version as an object with no `file_state` row to heal forever. The
+localfs `about()` still counts its bytes as Driven's own footprint, since they
+are real storage a versioning setting is spending.
+
+When the copy FAILS, the upload proceeds as a plain in-place update and NO
+version is recorded. Failing the file instead would trade a certain loss (this
+backup does not happen) for a hypothetical one (a version cannot be kept). It is
+not silent, though: a `drive.version_archive_failed` Warn row lands in the
+activity log, so a destination that keeps failing to archive shows up as one that
+is not delivering the point-in-time restore its settings page offers - rather
+than looking, from the outside, exactly like one that is.
+
+`BackendKind::supports_version_history` remains the single declarative capability
+(now true for Google Drive, S3 and the local folder; false for SFTP, which has no
+server-side copy - archiving a version there would mean re-uploading the whole
+file over the link that is already the bottleneck). It is surfaced to the webview
+as `BackendDto.supports_version_history`, and the three gates it drives are
+unchanged:
 
 - the settings UI does not render the per-source versioning editor where it is
   false (and offers a source whose flag was already set the means to clear it),
@@ -1099,12 +1156,9 @@ local folders), surfaced to the webview as `BackendDto.supports_version_history`
   substituting the live object, and the restore view does not offer the "as of"
   picker at all.
 
-ANY change to a backend's create-key derivation must revisit that flag. Giving
-each version its own remote object - which would let the flag become true
-everywhere - is issue #220 part 2, a stored-format change needing a migration
-path (and the remote-existence audit plus the scheduled integrity scrub of issue
-#203 must learn
-about the extra objects so they are not classified as orphans).
+ANY change to a backend's create-key derivation must revisit that flag, and a
+backend that answers `true` without implementing `archive_version` is straight
+back to the #220 bug.
 
 ### 5.6 Crash-safe execution & reconciliation
 

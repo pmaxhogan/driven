@@ -523,9 +523,9 @@ fn merge_reports(reports: Vec<InvariantReport>) -> InvariantReport {
 /// The shared tail of every S3 row: run the s6.3 sweep, prove the synced bytes
 /// match the local file, and require exactly `expect_objects` live objects.
 ///
-/// `max_stranded_uploads` caps the multipart uploads that may still be in
-/// flight at the end. It is NOT zero, and the reason is a real finding this
-/// module surfaced - see [`STRANDED_UPLOAD_FINDING`].
+/// `max_stranded_uploads` caps the multipart uploads that may still be in flight
+/// at the end. It is a TIGHT bound rather than zero, and the reason is
+/// structural - see [`STRANDED_UPLOAD_BOUND`].
 async fn settle_and_assert(
     fx: &S3Fixture,
     handle: &DrivenHandle,
@@ -546,21 +546,21 @@ async fn settle_and_assert(
     );
     let checked = assert_synced_bytes_match_local(handle, fx.server.as_ref(), source).await?;
 
-    // Abandoned multipart uploads. See STRANDED_UPLOAD_FINDING: the cap is
-    // BOUNDED rather than zero because a transport failure mid-`UploadPart`
-    // genuinely leaves one behind today. Asserting zero would make the gate red
-    // over a real, unfixed cost issue; asserting nothing would let it grow
-    // without bound unnoticed. Bounding it does neither.
+    // Abandoned multipart uploads. Issue #222 removed every unbounded source of
+    // these; what remains is bounded by the injected faults - see
+    // [`STRANDED_UPLOAD_BOUND`] for exactly which case survives a single
+    // harness run and why. Asserting zero would make the gate red over that
+    // structural case; asserting nothing would let a regression grow unnoticed.
     let stranded = fx.server.in_flight_upload_keys();
     anyhow::ensure!(
         stranded.len() <= max_stranded_uploads,
         "{} multipart upload(s) left in flight, more than the {max_stranded_uploads} this row \
-         accounts for - the leak is growing: {stranded:?}",
+         accounts for: {stranded:?}. {STRANDED_UPLOAD_BOUND}",
         stranded.len()
     );
 
     let counts = fx.server.counts();
-    let mut notes = vec![format!(
+    let notes = vec![format!(
         "{checked} synced row(s) byte-verified; requests: {} total, {} parts, {} completes, \
          {} aborts, {} dropped connections",
         counts.total,
@@ -569,48 +569,42 @@ async fn settle_and_assert(
         counts.abort_multipart,
         counts.dropped_connections
     )];
-    if !stranded.is_empty() {
-        notes.push(format!(
-            "FINDING (cost, not data loss): {} abandoned multipart upload(s) still hold their \
-             parts on the bucket: {:?}. {}",
-            stranded.len(),
-            stranded,
-            STRANDED_UPLOAD_FINDING
-        ));
-    }
     Ok((report, notes))
 }
 
-/// The explanation attached to any row that ends with an abandoned multipart
-/// upload, so the finding travels with the report instead of living only in a
-/// PR description.
+/// Why a row may still end with ONE abandoned multipart upload, after issue #222
+/// removed every unbounded source of them.
 ///
-/// `S3Store` aborts a multipart upload on exactly two paths: the non-resumable
-/// `multipart_stream` failure path, and a completion failure that
-/// `is_session_fatal` calls terminal. A TRANSPORT failure mid-`UploadPart` on
-/// the RESUMABLE path is neither: `resume_chunk` propagates the error and leaves
-/// the upload id alive, which is correct in itself, because the startup
-/// `reconcile` -> `resume_persisted` path may still resume that exact session
-/// after a crash - aborting it eagerly would destroy a recoverable upload.
+/// The fix has three parts, and two of them are absolute. `S3Store` implements
+/// `RemoteStore::abandon_resumable_session` as a real `AbortMultipartUpload`,
+/// and the executor calls it wherever a session becomes permanently unreachable:
+/// a fresh session replacing a persisted one, a discarded invalid session, a
+/// streaming upload whose op is about to be DELETED, and every path by which
+/// reconcile's `resume_persisted` declines to resume (a changed file, an expired
+/// session, an encrypted source, a misbehaving server - all funnelled through
+/// one wrapper so a new decline condition cannot forget). `S3Store` also sweeps
+/// with `ListMultipartUploads` for anything an earlier build or a hard crash
+/// left behind.
 ///
-/// The leak comes from the other side. `upload_stage_resumable` (the streaming
-/// path every file >= 4 MiB takes) calls `open_resumable_session`
-/// UNCONDITIONALLY at the top of each attempt, so the next cycle's retry mints a
-/// NEW `CreateMultipartUpload` and never touches the previous upload id again.
-/// Its parts stay on the bucket, billed, one abandoned upload per failed
-/// attempt, and `S3Store::new` performs no sweep - unlike `driven-localfs`,
-/// which explicitly sweeps abandoned resumable temp files at construction using
-/// the trait's own 6-day session window.
+/// What it deliberately does NOT do is abort a session on a `Fatal` mid-stream
+/// error, because that outcome KEEPS the op precisely so the session can be
+/// RESUMED - `resume_persisted` re-attaches to that upload id and finishes it
+/// instead of re-sending everything already on the wire. That is the behaviour
+/// `crash_mid_upload_resumes_persisted_session_byte_for_byte` pins.
 ///
-/// Not data loss, so no s6.3 invariant is violated and these rows do not fail on
-/// it. It is real money on a real bucket, and the fix belongs in `driven-s3`
-/// (a `ListMultipartUploads` sweep at construction, mirroring the localfs one)
-/// rather than in the harness.
-const STRANDED_UPLOAD_FINDING: &str = "cause: the streaming upload path opens a FRESH \
-     CreateMultipartUpload on every attempt (executor.rs::upload_stage_resumable), while \
-     S3Store only aborts an upload on the non-resumable path or a fatal completion - so a \
-     transport failure mid-UploadPart abandons the parts with no sweep at store construction \
-     (driven-localfs sweeps its equivalent temp files; driven-s3 does not)";
+/// The residual case is the interaction between those two facts: reconcile is a
+/// per-process STARTUP pass (`orchestrator.rs::reconcile_once` skips sources it
+/// has already done), while a scan later in the SAME run will re-plan the failed
+/// path and upload it under a new op. So an upload kept for a resume that the
+/// next restart would have performed can be overtaken mid-run, and its parts sit
+/// until that restart - where reconcile now either resumes them (no waste at
+/// all) or abandons them (aborted). Bounded by restarts, not unbounded in time,
+/// and backstopped by the sweep.
+const STRANDED_UPLOAD_BOUND: &str = "issue #222 bounded this: the executor aborts a resumable \
+     session wherever one becomes unreachable, and S3Store sweeps what a crash left behind. The \
+     one upload that can outlive a single run is one kept ON PURPOSE for a crash-resume (a Fatal \
+     mid-stream error) that a later scan overtook - the next start resumes or aborts it. More \
+     than this row's fault count means one of the abort hooks stopped firing";
 
 // ===========================================================================
 // s3.9 s3-multipart-interrupted-between-parts
@@ -926,7 +920,7 @@ impl Scenario for S3SlowDownThrottling {
         );
         let codes = error_codes_in_activity(handle.state.as_ref()).await?;
         let quiesced = is_quiescent(&handle.state().await);
-        let (report, mut notes) = settle_and_assert(&fx, &handle, &src, 1, 0).await?;
+        let (report, mut notes) = settle_and_assert(&fx, &handle, &src, 1, 1).await?;
         notes.push(format!(
             "{THROTTLE_BURST} consecutive 503 SlowDown responses (more than the 6-attempt 5xx \
              budget) did not strand the file; backed up after {cycles} cycle(s)"

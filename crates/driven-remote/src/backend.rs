@@ -154,15 +154,23 @@ impl BackendKind {
     /// source's files as they were on an earlier date") really returns the older
     /// content.
     ///
-    /// This is a property of the backend's CREATE path, not a feature toggle.
-    /// Driven versions a change by forcing the create path and leaving the old
-    /// object in place (see the versioned-change branch in
-    /// `driven-core`'s `Executor`, and `resolve_version_supersede`). That only
-    /// preserves anything when a create lands on a NEW remote object. A backend
-    /// whose create key is a pure function of the file's name re-uploads over
-    /// the previous bytes, so the retained `file_versions` row ends up pointing
-    /// at an object that now holds the CURRENT content - a point-in-time restore
-    /// then hands back today's bytes while reporting success. Issue #220.
+    /// This is a property of the backend's storage model, not a feature toggle.
+    /// Driven versions a change by forcing the create path and recording the
+    /// superseded object as a retained version (see the versioned-change branch
+    /// in `driven-core`'s `Executor`, and `resolve_version_supersede`). That
+    /// only preserves anything when the superseded bytes end up under an id of
+    /// their own. A backend whose object id is a pure function of the file's
+    /// name re-writes the same object, so without help the retained
+    /// `file_versions` row would end up pointing at an object that now holds the
+    /// CURRENT content - a point-in-time restore then hands back today's bytes
+    /// while reporting success. Issue #220.
+    ///
+    /// A name-keyed backend earns a `true` here by implementing
+    /// [`RemoteStore::archive_version`], which copies the superseded bytes to a
+    /// distinct, content-addressed object in a Driven-owned version store
+    /// BEFORE the overwrite. The flag and that implementation are one fact: a
+    /// backend that returns `true` here without archiving is back to the #220
+    /// bug.
     ///
     /// So this flag gates the offer: the settings UI does not present the
     /// versioning editor where it is false, `set_source_versioning` refuses to
@@ -170,31 +178,39 @@ impl BackendKind {
     /// such a destination rather than silently substituting the live object.
     ///
     /// ANY change to a backend's create-key derivation must revisit this arm.
+    ///
+    /// [`RemoteStore::archive_version`]: crate::remote_store::RemoteStore::archive_version
     pub const fn supports_version_history(self) -> bool {
         match self {
             // A Drive create always mints a NEW file id even for an identical
             // name, and the superseded object is moved to Drive's trash where it
-            // stays retrievable by id. The old bytes genuinely survive.
+            // stays retrievable by id. The old bytes genuinely survive, so
+            // `archive_version` returns `None` (nothing to do).
             BackendKind::GoogleDrive => true,
-            // NO: `driven-s3`'s create key is `join_key(parent, name)`, which is
-            // deterministic, so the re-upload PUTs over the previous object at
-            // the same key. Filename encryption does not help - it is SIV-style
-            // with a deterministic nonce, so an encrypted name is stable too.
-            // Recoverability on S3 comes from the PROVIDER's own bucket
-            // versioning, which is opt-in per bucket and invisible to Driven
-            // (`s3Setup.trashWarning` points users at it). Issue #220 part 2
-            // would give each version a distinct remote object.
-            BackendKind::S3 => false,
-            // NO, for the same reason: `driven-localfs` derives a stored
-            // object's path from its name, so writing the new content lands on
-            // the same path and overwrites the previous bytes. A plain
-            // filesystem also has no trash to fall back on.
-            BackendKind::LocalFolder => false,
-            // NO, same reason again: an SFTP create writes to a path derived
-            // from the file's name (`driven-sftp` mirrors `driven-localfs`
-            // here), so a re-upload overwrites the previous bytes at the same
-            // remote path and there is no server-side trash to recover from.
-            // Issue #220 part 2 would give each version a distinct object.
+            // YES, via `archive_version`. The create key is `join_key(parent,
+            // name)` and therefore deterministic (filename encryption does not
+            // change that - it is SIV-style with a deterministic nonce), so a
+            // versioned change would overwrite the previous object. `S3Store`
+            // first server-side-copies it to `<root>.driven-versions/...`, which
+            // is what the retained version row points at. This is Driven's OWN
+            // version store and is independent of the PROVIDER's bucket
+            // versioning, which remains the right answer for recovering
+            // DELETIONS (`s3Setup.trashWarning` still points users at it).
+            BackendKind::S3 => true,
+            // YES, by the same mechanism: `driven-localfs` derives a stored
+            // object's path from its name, so `LocalFsStore::archive_version`
+            // copies the superseded bytes (and their sidecar) into the
+            // `.driven-versions` area under the destination root before the
+            // overwrite. A copy inside the destination root is a local
+            // file-to-file copy, so a retained version costs disk, not traffic.
+            BackendKind::LocalFolder => true,
+            // NO. SFTP shares the local folder's PATH-keyed model but has no
+            // server-side copy primitive: preserving a superseded version would
+            // mean downloading the old object and re-uploading it over the very
+            // link that is already the bottleneck, doubling the cost of every
+            // versioned change. So this stays gated OFF - honestly, with the
+            // "this destination keeps no older versions" copy - rather than
+            // shipping a feature that silently makes backups twice as slow.
             BackendKind::Sftp => false,
         }
     }
@@ -286,17 +302,20 @@ mod tests {
     }
 
     #[test]
-    fn only_backends_with_a_nondeterministic_create_key_support_version_history() {
-        // Issue #220: per-source versioning keeps the OLD remote object and
-        // points a `file_versions` row at it. That only preserves the old bytes
-        // when a create lands on a NEW object. S3 (`join_key(parent, name)`) and
-        // the local folder (path derived from the name) re-upload over the same
-        // key, so a "restore as of an earlier date" there would hand back
-        // TODAY's bytes while reporting success. The values are pinned, not just
-        // asserted present: flipping one silently re-enables that promise.
+    fn only_backends_that_give_each_version_its_own_object_support_version_history() {
+        // Issue #220: per-source versioning records the superseded bytes as a
+        // `file_versions` row, which only preserves them when those bytes end up
+        // under an id of their own. Drive gets that for free (a create mints a
+        // new file id); S3 and the local folder earn it by archiving the
+        // superseded object through `RemoteStore::archive_version` before the
+        // overwrite. SFTP has no server-side copy, so it stays gated off.
+        //
+        // The values are pinned, not just asserted present: flipping one
+        // silently makes a promise the backend may not keep - the exact shape of
+        // the original bug.
         assert!(BackendKind::GoogleDrive.supports_version_history());
-        assert!(!BackendKind::S3.supports_version_history());
-        assert!(!BackendKind::LocalFolder.supports_version_history());
+        assert!(BackendKind::S3.supports_version_history());
+        assert!(BackendKind::LocalFolder.supports_version_history());
         assert!(!BackendKind::Sftp.supports_version_history());
     }
 
