@@ -1537,9 +1537,9 @@ describe("PrivacyPage", () => {
     });
     // The backend-computed expiry round-trips back into the toggle's checked
     // state (the store replaces the snapshot with the command's response).
-    expect((wrapper.get('[data-testid="debug-logging-toggle"]').element as HTMLInputElement).checked).toBe(
-      true
-    );
+    expect(
+      (wrapper.get('[data-testid="debug-logging-toggle"]').element as HTMLInputElement).checked
+    ).toBe(true);
   });
 
   it("issue #309: while debug logging is on, the bundle note shows the persisted expiry", async () => {
@@ -1560,9 +1560,9 @@ describe("PrivacyPage", () => {
     const wrapper = mount(PrivacyPage, { global: globalMountOptions });
     await flushPromises();
 
-    expect((wrapper.get('[data-testid="debug-logging-toggle"]').element as HTMLInputElement).checked).toBe(
-      true
-    );
+    expect(
+      (wrapper.get('[data-testid="debug-logging-toggle"]').element as HTMLInputElement).checked
+    ).toBe(true);
     expect(wrapper.get('[data-testid="debug-logging-setting"]').text()).toContain(
       i18n.global.t("settings.rules.debugLogging.includeInBundle")
     );

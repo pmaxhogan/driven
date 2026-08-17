@@ -81,7 +81,14 @@ function stubBackend(debugLoggingEnabled: boolean): void {
       case "get_settings":
         return makeSettings(debugLoggingEnabled);
       case "query_activity":
-        return { entries: [], total: 0, limit: 100, hasMore: false, nextBeforeTs: null, nextBeforeId: null };
+        return {
+          entries: [],
+          total: 0,
+          limit: 100,
+          hasMore: false,
+          nextBeforeTs: null,
+          nextBeforeId: null,
+        };
       case "distinct_activity_event_types":
         return ["upload_done"];
       case "activity_summary":
@@ -127,7 +134,9 @@ describe("Activity debug-data chip (issue #309)", () => {
     const chip = wrapper.get(CHIP);
     expect(chip.text()).toBe(i18n.global.t("activity.debugDataIncludedChip"));
     // Sits next to the export button (same flex row).
-    expect(chip.element.parentElement?.querySelector('[data-testid="activity-export-bundle"]')).toBeTruthy();
+    expect(
+      chip.element.parentElement?.querySelector('[data-testid="activity-export-bundle"]')
+    ).toBeTruthy();
 
     wrapper.unmount();
   });
