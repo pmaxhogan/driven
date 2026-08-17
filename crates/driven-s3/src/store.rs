@@ -1645,6 +1645,12 @@ impl RemoteStore for S3Store {
         content_token: &str,
     ) -> anyhow::Result<Option<String>> {
         let dest = keys::version_key(&self.prefix, file_id, content_token);
+        // An archive that EXISTS is a whole archive, so its mere presence is
+        // enough to reuse it without re-verifying the size. Neither copy path can
+        // publish a partial object: a single `CopyObject` is atomic, and a
+        // multipart copy materializes the object only at
+        // `CompleteMultipartUpload` (and aborts its upload on any failure before
+        // that). The size check further down covers the copy this call performs.
         if self.head(&dest).await.is_ok() {
             tracing::debug!(
                 target: crate::TARGET,
