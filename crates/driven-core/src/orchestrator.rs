@@ -4939,6 +4939,86 @@ mod tests {
     }
 
     #[test]
+    fn pacer_backoff_and_backend_label_default_when_unwired() {
+        // issue #308: a trait object built without `with_pacer` /
+        // `with_backend_label` (the historical construction, and every test
+        // fake elsewhere in this crate) must read as "clear" with a generic
+        // label, never panic or silently misreport a backoff.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec,
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+        assert_eq!(orch.pacer_backoff_remaining_ms(), None);
+        assert_eq!(orch.backend_label(), "your destination");
+    }
+
+    #[test]
+    fn pacer_backoff_delegates_to_the_wired_pacer_when_clear() {
+        // issue #308: a wired-but-not-throttling pacer (`FakePacer`'s default
+        // `backoff_remaining_ms`, which it does not override) still reads as
+        // clear through the orchestrator - `with_pacer` alone must not
+        // fabricate a backoff.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec,
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+        let orch = orch
+            .with_pacer(Arc::new(FakePacer::default()))
+            .with_backend_label("Drive");
+        assert_eq!(orch.pacer_backoff_remaining_ms(), None);
+        assert_eq!(orch.backend_label(), "Drive");
+    }
+
+    #[test]
+    fn pacer_backoff_reports_the_live_deadline_from_a_throttled_pacer() {
+        // issue #308: a REAL AimdPacer that has actually throttled reports its
+        // live remaining-ms through the orchestrator, non-blocking (no
+        // `.await`, no clock advance needed to observe it).
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec,
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+
+        let pacer_clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let pacer = crate::pacer::AimdPacer::new(pacer_clock, None);
+        pacer.note_response(crate::pacer::ResponseClass::RateLimited {
+            retry_after: std::time::Duration::from_secs(5),
+        });
+        let pacer: Arc<dyn Pacer> = Arc::new(pacer);
+        let orch = orch.with_pacer(pacer).with_backend_label("S3");
+
+        let remaining = orch
+            .pacer_backoff_remaining_ms()
+            .expect("the pacer is mid-backoff");
+        assert!(remaining >= 5_000, "remaining_ms = {remaining}");
+        assert_eq!(orch.backend_label(), "S3");
+    }
+
+    #[test]
     fn effective_cap_throttles_only_when_metered_and_throttle_mode() {
         let base = OrchestratorConfig {
             bandwidth_cap_mbps: Some(100),

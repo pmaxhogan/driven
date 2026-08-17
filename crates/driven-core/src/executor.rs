@@ -13278,6 +13278,65 @@ mod tests {
         );
     }
 
+    /// issue #308 bottleneck classifier: a fresh small-file upload (the
+    /// BUFFERED `inline_upload` path, below [`PIPELINE_THRESHOLD`]) credits
+    /// the hash counter with the whole plaintext, alongside the existing
+    /// disk-read credit - both happen in the same `read_hash_encrypt` pass.
+    #[tokio::test]
+    async fn inline_upload_credits_hashed_bytes() {
+        let h = harness().await;
+        let body = vec![7u8; 4096];
+        let (rel, size) = h.write_file("small.bin", &body);
+
+        let io = Arc::new(crate::iostat::IoCounters::default());
+        let exec = h.executor().with_io_counters(io.clone());
+        let out = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
+
+        let snap = io.snapshot();
+        assert_eq!(snap.hashed_bytes, size, "the whole plaintext was hashed");
+        assert_eq!(snap.disk_read_bytes, size, "and read from disk");
+    }
+
+    /// issue #308 bottleneck classifier: a fresh large-file upload (the
+    /// STREAMING `cpu_stage` path, at/above [`PIPELINE_THRESHOLD`]) credits
+    /// the hash counter chunk-by-chunk as it streams, summing to the whole
+    /// plaintext by the time the upload completes.
+    #[tokio::test]
+    async fn stream_upload_credits_hashed_bytes() {
+        let h = harness().await;
+        let size_bytes = (PIPELINE_THRESHOLD + 64 * 1024) as usize;
+        let body: Vec<u8> = (0..size_bytes).map(|i| (i % 251) as u8).collect();
+        let (rel, size) = h.write_file("streamed.bin", &body);
+
+        let io = Arc::new(crate::iostat::IoCounters::default());
+        let exec = h.executor().with_io_counters(io.clone());
+        let out = exec
+            .execute(
+                &h.source,
+                &h.upload_plan(&rel, size),
+                &noop_progress,
+                &noop_outcome,
+            )
+            .await
+            .unwrap();
+        assert!(matches!(out[0], OpOutcome::Done { .. }), "got {:?}", out[0]);
+
+        let snap = io.snapshot();
+        assert_eq!(
+            snap.hashed_bytes, size,
+            "every streamed chunk's bytes were credited to the hash counter"
+        );
+    }
+
     /// [`ResumeAcc`]'s gauge accounting is symmetric across push / partial
     /// drain / clear, the drain clamps at the buffered length, and DROP
     /// refunds whatever is left - the guarantee the error-unwind test relies

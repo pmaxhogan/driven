@@ -2062,6 +2062,63 @@ pub(crate) mod tests {
         let _ = std::fs::remove_dir_all(dir);
     }
 
+    #[test]
+    fn fake_orchestrator_inherits_the_orchestrator_traits_default_bottleneck_methods() {
+        // issue #308: `FakeOrchestrator` deliberately does not override
+        // `pacer_backoff_remaining_ms` / `backend_label` - it exists to
+        // exercise the `Orchestrator` trait's DEFAULT bodies (a pacer-less /
+        // label-less trait object must read as clear with a generic label,
+        // never panic), the same contract the bottleneck sampler leans on
+        // for any account whose orchestrator was built without those seams.
+        let orch = FakeOrchestrator::new();
+        assert_eq!(orch.pacer_backoff_remaining_ms(), None);
+        assert_eq!(orch.backend_label(), "your destination");
+    }
+
+    #[tokio::test]
+    async fn bottleneck_runtime_hub_task_and_shutdown_round_trip() {
+        // issue #308: the bottleneck sampler's runtime bookkeeping. Unlike
+        // `IostatRuntime` there is no "install" step - the hub is always
+        // available, defaulting to `NotBackingUp` - so this only needs to
+        // cover the getter plus the set/shutdown task pair (mirrors
+        // `set_iostat_task`/`shutdown_iostat_task`'s no-orphan drain).
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+
+        let hub = app_state.bottleneck_hub();
+        assert_eq!(
+            hub.latest().state,
+            crate::bottleneck_hub::BottleneckState::NotBackingUp
+        );
+
+        // No task registered yet: shutdown is a safe no-op.
+        assert!(app_state.shutdown_bottleneck_task().is_none());
+
+        // Register a task that exits promptly on the shutdown signal (the
+        // real sampler's own shape), then confirm shutdown signals + hands
+        // back the handle so the quit drain can join it.
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _ = shutdown_rx.changed().await;
+        });
+        app_state.set_bottleneck_task(task, shutdown_tx);
+
+        let handle = app_state
+            .shutdown_bottleneck_task()
+            .expect("the just-registered task round-trips");
+        handle.await.unwrap();
+
+        // Taken: a second shutdown call is again a safe no-op.
+        assert!(app_state.shutdown_bottleneck_task().is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
     #[tokio::test]
     async fn vss_helper_manager_installs_and_shutdown_is_noop() {
         // Issue #25: AppState owns the least-privilege VSS helper broker manager -

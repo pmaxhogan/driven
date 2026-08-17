@@ -1419,12 +1419,41 @@ struct SourceProgressEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_bridge_event, BridgeAction};
+    use super::{bottleneck_backend_label, classify_bridge_event, BridgeAction};
     use driven_core::orchestrator::OrchestratorConfig;
     use driven_core::state::sqlite::SqliteStateRepo;
     use driven_core::state::StateRepo;
     use driven_core::types::{AccountId, ActivityEntry, ExecProgress, OrchestratorEvent, SourceId};
     use tokio::sync::broadcast::error::RecvError;
+
+    /// issue #308: every `BackendKind` variant maps to a distinct, non-empty
+    /// display label for the bottleneck classifier's "X rate-limited"
+    /// sub-line, matching the mockup's short-form wording ("Drive", not
+    /// "Google Drive").
+    #[test]
+    fn bottleneck_backend_label_covers_every_backend_kind_distinctly() {
+        use driven_remote::BackendKind;
+        let labels: Vec<&'static str> = BackendKind::ALL
+            .iter()
+            .map(|&kind| bottleneck_backend_label(kind))
+            .collect();
+        assert_eq!(bottleneck_backend_label(BackendKind::GoogleDrive), "Drive");
+        assert_eq!(bottleneck_backend_label(BackendKind::S3), "S3");
+        assert_eq!(
+            bottleneck_backend_label(BackendKind::LocalFolder),
+            "your local folder"
+        );
+        assert_eq!(bottleneck_backend_label(BackendKind::Sftp), "SFTP");
+        for label in &labels {
+            assert!(!label.is_empty());
+        }
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "every backend gets its own label"
+        );
+    }
 
     /// M7-P1-1: a broadcast `Lagged` MUST classify as an `ActivityReconcile`
     /// (carrying the dropped count) so the bridge emits `activity:lagged` and the

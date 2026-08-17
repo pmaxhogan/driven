@@ -223,12 +223,94 @@ impl BottleneckHub {
     }
 }
 
+/// One account's contribution to the aggregate signals: whether it is
+/// mid-cycle, and (if so) its resolved backoff, if any. Pure - the async
+/// orchestrator polling (`state().await`, `pacer_backoff_remaining_ms()`,
+/// `backend_label()`) lives in `tick_once`; this is the unit-test seam for
+/// the DECISION those reads feed into.
+///
+/// The account-level circuit-breaker/rate-limit trip (`Backoff { until }`)
+/// carries its own deadline; a mid-cycle account otherwise defers to its
+/// rate pacer's live backoff window (`pacer_backoff_remaining_ms`, issue
+/// #308's primary signal) - passed in already resolved, since only the
+/// caller has an `Arc<dyn Orchestrator>` to poll.
+fn account_signal(
+    state: &OrchestratorState,
+    now_ms: i64,
+    pacer_backoff_remaining_ms: Option<i64>,
+    backend_label: &str,
+) -> (bool, Option<(String, i64)>) {
+    let active = is_active(state);
+    let remaining_ms = match state {
+        OrchestratorState::Backoff { until } => Some((*until - now_ms).max(0)),
+        _ if active => pacer_backoff_remaining_ms,
+        _ => None,
+    };
+    let backoff = remaining_ms.map(|r| (backend_label.to_string(), r));
+    (active, backoff)
+}
+
+/// Fold every account's [`account_signal`] result into the aggregate
+/// `(active_cycle, backoff)` pair [`BottleneckSignals`] carries: ANY account
+/// active makes the whole app active, and the LONGEST remaining backoff wins
+/// (so the tile never undersells how long the app will stay paced). Pure.
+fn aggregate_accounts(
+    per_account: &[(bool, Option<(String, i64)>)],
+) -> (bool, Option<(String, i64)>) {
+    let active_cycle = per_account.iter().any(|(active, _)| *active);
+    let backoff = per_account
+        .iter()
+        .filter_map(|(_, backoff)| backoff.clone())
+        .max_by_key(|(_, remaining_ms)| *remaining_ms);
+    (active_cycle, backoff)
+}
+
+/// Assemble the `sync:bottleneck` / `bottleneck_status` payload from a
+/// classification result. Pure: the Api-only fields (`backend`,
+/// `backoff_remaining_ms`) are gated on `state` rather than merely on
+/// `backoff.is_some()`, so a future classifier bug that returns a non-`Api`
+/// state alongside a backoff can never leak the backoff fields onto the
+/// wrong tile reading.
+fn build_snapshot(
+    now_ms: i64,
+    state: BottleneckState,
+    rate_bytes_per_sec: Option<u64>,
+    backoff: Option<(String, i64)>,
+) -> BottleneckSnapshot {
+    let is_api = state == BottleneckState::Api;
+    BottleneckSnapshot {
+        ts_ms: now_ms,
+        state,
+        rate_bytes_per_sec,
+        backend: if is_api {
+            backoff.as_ref().map(|(b, _)| b.clone())
+        } else {
+            None
+        },
+        backoff_remaining_ms: if is_api {
+            backoff.as_ref().map(|(_, r)| *r)
+        } else {
+            None
+        },
+    }
+}
+
+/// Whether this tick's classification should be broadcast on `sync:bottleneck`
+/// (idle suppression, mirrors `iostat_hub::tick`): once a `NotBackingUp` has
+/// been emitted, further identical ticks are recorded (so a late
+/// `bottleneck_status` hydration is still correct) but not re-broadcast - an
+/// idle app costs nothing on the IPC bridge. Pure.
+fn should_emit(state: BottleneckState, last_emitted: Option<BottleneckState>) -> bool {
+    !(state == BottleneckState::NotBackingUp && last_emitted == Some(state))
+}
+
 /// One sampler tick: reads the app-global IO counters + every account's
 /// orchestrator, classifies, records the snapshot on `hub`, and - unless
-/// idle-suppressed - emits `sync:bottleneck`. Returns the delta rates purely
-/// so the caller can carry `prev_io`/`prev_ms` forward; the emit decision
-/// lives here so the idle-suppression state (`last_emitted`) stays local to
-/// the sampler loop, mirroring `iostat_hub::tick`.
+/// idle-suppressed - emits `sync:bottleneck`. Thin by design: every actual
+/// decision (per-account resolution, aggregation, DTO assembly, the emit
+/// gate) lives in a pure helper above with its own unit tests; this function
+/// is just the AppHandle/AppState plumbing those helpers cannot see without
+/// a real app.
 async fn tick_once(
     app: &AppHandle,
     hub: &BottleneckHub,
@@ -254,34 +336,17 @@ async fn tick_once(
         rate_bytes_per_sec(cur_io.hashed_bytes, prev_io.hashed_bytes, elapsed_ms);
     *prev_io = cur_io;
 
-    let mut active_cycle = false;
-    let mut chosen_backoff: Option<(String, i64)> = None;
+    let mut per_account = Vec::new();
     for (_, handle) in state.accounts() {
         let account_state = handle.orchestrator.state().await;
-        let account_active = is_active(&account_state);
-        // The account-level circuit-breaker/rate-limit trip carries its own
-        // deadline; a mid-cycle account otherwise defers to its rate
-        // pacer's live backoff window (issue #308's primary signal).
-        let remaining_ms = match &account_state {
-            OrchestratorState::Backoff { until } => Some((*until - now_ms).max(0)),
-            _ if account_active => handle.orchestrator.pacer_backoff_remaining_ms(),
-            _ => None,
-        };
-        if account_active {
-            active_cycle = true;
-        }
-        if let Some(remaining_ms) = remaining_ms {
-            let better = chosen_backoff
-                .as_ref()
-                .is_none_or(|(_, r)| remaining_ms > *r);
-            if better {
-                chosen_backoff = Some((
-                    handle.orchestrator.backend_label().to_string(),
-                    remaining_ms,
-                ));
-            }
-        }
+        per_account.push(account_signal(
+            &account_state,
+            now_ms,
+            handle.orchestrator.pacer_backoff_remaining_ms(),
+            handle.orchestrator.backend_label(),
+        ));
     }
+    let (active_cycle, chosen_backoff) = aggregate_accounts(&per_account);
 
     let signals = BottleneckSignals {
         active_cycle,
@@ -291,31 +356,10 @@ async fn tick_once(
         hash_bytes_per_sec,
     };
     let (bottleneck_state, rate_bytes_per_sec) = classify(&signals);
-    let is_api = bottleneck_state == BottleneckState::Api;
-    let snapshot = BottleneckSnapshot {
-        ts_ms: now_ms,
-        state: bottleneck_state,
-        rate_bytes_per_sec,
-        backend: if is_api {
-            chosen_backoff.as_ref().map(|(b, _)| b.clone())
-        } else {
-            None
-        },
-        backoff_remaining_ms: if is_api {
-            chosen_backoff.as_ref().map(|(_, r)| *r)
-        } else {
-            None
-        },
-    };
+    let snapshot = build_snapshot(now_ms, bottleneck_state, rate_bytes_per_sec, chosen_backoff);
     hub.push(snapshot.clone());
 
-    // Idle suppression (mirrors `iostat_hub::tick`): once a `NotBackingUp`
-    // has been emitted, further identical ticks are recorded (so a late
-    // `bottleneck_status` hydration is still correct) but not re-broadcast -
-    // an idle app costs nothing on the IPC bridge.
-    let suppress = bottleneck_state == BottleneckState::NotBackingUp
-        && *last_emitted == Some(bottleneck_state);
-    if !suppress {
+    if should_emit(bottleneck_state, *last_emitted) {
         *last_emitted = Some(bottleneck_state);
         crate::events::emit_sync_bottleneck(app, snapshot);
     }
@@ -509,5 +553,176 @@ mod tests {
         }));
         assert!(is_active(&OrchestratorState::PowerCheck));
         assert!(is_active(&OrchestratorState::Backoff { until: 0 }));
+    }
+
+    // --- account_signal / aggregate_accounts --------------------------------
+
+    #[test]
+    fn account_signal_is_inactive_and_backoff_free_at_rest() {
+        for state in [
+            OrchestratorState::Idle { last_run_at: None },
+            OrchestratorState::Paused {
+                reason: driven_core::types::PauseReason::Manual,
+            },
+            OrchestratorState::Error {
+                detail: driven_core::types::ErrorDetail::new(
+                    driven_core::types::ErrorCode::AuthInvalidGrant,
+                    "boom",
+                ),
+            },
+        ] {
+            // Even a pacer that WOULD report a backoff is ignored at rest -
+            // an Idle/Paused/Error account cannot be "rate-limited right now".
+            let (active, backoff) = account_signal(&state, 1_000, Some(5_000), "Drive");
+            assert!(!active, "{state:?} must not count as mid-cycle");
+            assert_eq!(backoff, None);
+        }
+    }
+
+    #[test]
+    fn account_signal_backoff_prefers_the_orchestrator_level_deadline() {
+        // A circuit-breaker/rate-limit trip carries its own deadline,
+        // independent of (and NOT summed with) any pacer reading.
+        let (active, backoff) = account_signal(
+            &OrchestratorState::Backoff { until: 9_000 },
+            1_000,
+            Some(500),
+            "S3",
+        );
+        assert!(active);
+        assert_eq!(backoff, Some(("S3".to_string(), 8_000)));
+    }
+
+    #[test]
+    fn account_signal_backoff_deadline_never_goes_negative() {
+        // A stale `until` in the past (clock skew, or the deadline just
+        // lifted) floors at zero rather than reporting a negative remaining.
+        let (_, backoff) = account_signal(
+            &OrchestratorState::Backoff { until: 500 },
+            1_000,
+            None,
+            "Drive",
+        );
+        assert_eq!(backoff, Some(("Drive".to_string(), 0)));
+    }
+
+    #[test]
+    fn account_signal_mid_cycle_defers_to_the_pacer_reading() {
+        let (active, backoff) =
+            account_signal(&OrchestratorState::PowerCheck, 1_000, Some(3_000), "Drive");
+        assert!(active);
+        assert_eq!(backoff, Some(("Drive".to_string(), 3_000)));
+
+        // Mid-cycle but the pacer reports clear: active, no backoff.
+        let (active, backoff) =
+            account_signal(&OrchestratorState::PowerCheck, 1_000, None, "Drive");
+        assert!(active);
+        assert_eq!(backoff, None);
+    }
+
+    #[test]
+    fn aggregate_accounts_any_active_and_longest_backoff_wins() {
+        let per_account = vec![
+            (false, None),
+            (true, Some(("Drive".to_string(), 2_000))),
+            (true, Some(("S3".to_string(), 9_000))),
+            (true, None),
+        ];
+        let (active_cycle, backoff) = aggregate_accounts(&per_account);
+        assert!(active_cycle);
+        assert_eq!(
+            backoff,
+            Some(("S3".to_string(), 9_000)),
+            "the longer window wins"
+        );
+    }
+
+    #[test]
+    fn aggregate_accounts_empty_or_all_at_rest_is_inactive_with_no_backoff() {
+        assert_eq!(aggregate_accounts(&[]), (false, None));
+        assert_eq!(
+            aggregate_accounts(&[(false, None), (false, None)]),
+            (false, None)
+        );
+    }
+
+    // --- build_snapshot ------------------------------------------------------
+
+    #[test]
+    fn build_snapshot_gates_backend_and_backoff_fields_to_the_api_state() {
+        let snap = build_snapshot(
+            1_234,
+            BottleneckState::Api,
+            None,
+            Some(("Drive".to_string(), 8_000)),
+        );
+        assert_eq!(snap.ts_ms, 1_234);
+        assert_eq!(snap.state, BottleneckState::Api);
+        assert_eq!(snap.rate_bytes_per_sec, None);
+        assert_eq!(snap.backend, Some("Drive".to_string()));
+        assert_eq!(snap.backoff_remaining_ms, Some(8_000));
+    }
+
+    #[test]
+    fn build_snapshot_never_leaks_a_backoff_onto_a_non_api_state() {
+        // Defensive: even if a caller somehow hands in a `backoff` alongside
+        // a non-Api state, the DTO must not surface it.
+        let snap = build_snapshot(
+            1_234,
+            BottleneckState::Disk,
+            Some(100_000),
+            Some(("Drive".to_string(), 8_000)),
+        );
+        assert_eq!(snap.rate_bytes_per_sec, Some(100_000));
+        assert_eq!(snap.backend, None);
+        assert_eq!(snap.backoff_remaining_ms, None);
+    }
+
+    #[test]
+    fn build_snapshot_not_backing_up_carries_no_rate_or_backoff() {
+        let snap = build_snapshot(0, BottleneckState::NotBackingUp, None, None);
+        assert_eq!(snap.rate_bytes_per_sec, None);
+        assert_eq!(snap.backend, None);
+        assert_eq!(snap.backoff_remaining_ms, None);
+    }
+
+    // --- should_emit -----------------------------------------------------------
+
+    #[test]
+    fn should_emit_suppresses_only_a_repeated_not_backing_up() {
+        assert!(
+            should_emit(BottleneckState::NotBackingUp, None),
+            "first tick always emits"
+        );
+        assert!(
+            !should_emit(
+                BottleneckState::NotBackingUp,
+                Some(BottleneckState::NotBackingUp)
+            ),
+            "repeat idle is suppressed"
+        );
+        assert!(
+            should_emit(BottleneckState::NotBackingUp, Some(BottleneckState::Disk)),
+            "the transition INTO idle still emits once"
+        );
+        assert!(
+            should_emit(BottleneckState::Disk, Some(BottleneckState::Disk)),
+            "a non-idle state always emits, even unchanged"
+        );
+    }
+
+    // --- BottleneckHub ---------------------------------------------------------
+
+    #[test]
+    fn bottleneck_hub_defaults_to_not_backing_up_and_push_updates_latest() {
+        let hub = BottleneckHub::default();
+        assert_eq!(hub.latest().state, BottleneckState::NotBackingUp);
+
+        let snap = build_snapshot(42, BottleneckState::Cpu, Some(900_000), None);
+        hub.push(snap.clone());
+        assert_eq!(hub.latest(), snap);
+
+        // `latest()` is a peek, not a drain - repeated reads see the same value.
+        assert_eq!(hub.latest(), snap);
     }
 }

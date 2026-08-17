@@ -2080,6 +2080,51 @@ mod tests {
         assert!(res.new_or_changed.is_empty(), "{:?}", res.new_or_changed);
     }
 
+    /// issue #308 bottleneck classifier: a deep-verify re-hash credits the
+    /// app-global hash counter with the WHOLE file's bytes, whether the
+    /// content turns out unchanged (this test) or changed (the mismatch
+    /// path re-hashes exactly the same way before it can tell the
+    /// difference). `scan_with_priority` is called directly (rather than the
+    /// `scan`/`scan_with_progress` wrappers, which always pass `None`) since
+    /// only it threads the counters through.
+    #[tokio::test]
+    async fn deep_verify_credits_the_hash_counter() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        let p = root.join("a.txt");
+        write(&p, b"hello");
+
+        let src = source_at(root);
+        let state = FakeState::default();
+        let (size, mtime) = stat_of(&p);
+        state.put(row(
+            src.id,
+            "a.txt",
+            size,
+            mtime,
+            *blake3::hash(b"hello").as_bytes(),
+        ));
+
+        let io = Arc::new(crate::iostat::IoCounters::default());
+        let res = scan_with_priority(
+            &src,
+            &state,
+            ScanMode::DeepVerify,
+            None,
+            None,
+            WorkPriority::Normal,
+            Some(io.clone()),
+        )
+        .await
+        .unwrap();
+        assert!(res.new_or_changed.is_empty(), "{:?}", res.new_or_changed);
+        assert_eq!(
+            io.snapshot().hashed_bytes,
+            size,
+            "the whole file was hashed"
+        );
+    }
+
     /// Issue #35 item e: a BUNDLED member - a `file_state` row with
     /// `drive_file_id = NULL` (its bytes live inside a `.tar.gz` bundle), status
     /// Synced, and a matching stored hash - must NOT be re-emitted as changed by a
