@@ -30,6 +30,10 @@ pub const EVENT_SYNC_SOURCE_PROGRESS: &str = "sync:source_progress";
 /// One live disk/network throughput sample from the app-global sampler
 /// (2026-08-14 follow-up; payload is `iostat_hub::IoSample`, camelCase).
 pub const EVENT_SYNC_IO_THROUGHPUT: &str = "sync:io_throughput";
+/// One live bottleneck classification from the app-global sampler (issue
+/// #308, 2026-08-17 follow-up; payload is `bottleneck_hub::BottleneckSnapshot`,
+/// camelCase).
+pub const EVENT_SYNC_BOTTLENECK: &str = "sync:bottleneck";
 /// `activity:new` - a new activity-log entry (payload: `ActivityEntry`,
 /// SPEC s11.7).
 ///
@@ -208,6 +212,13 @@ pub fn emit_sync_source_progress<P: Serialize + Clone>(
 /// tracing, never propagated.
 pub fn emit_sync_io_throughput(app: &AppHandle, sample: crate::iostat_hub::IoSample) {
     let _ = app.emit(EVENT_SYNC_IO_THROUGHPUT, sample);
+}
+
+/// Broadcast `sync:bottleneck` with one live bottleneck classification
+/// (issue #308). Fire-and-forget like the other live-telemetry events: a
+/// failed emit is logged by the caller's tracing, never propagated.
+pub fn emit_sync_bottleneck(app: &AppHandle, snapshot: crate::bottleneck_hub::BottleneckSnapshot) {
+    let _ = app.emit(EVENT_SYNC_BOTTLENECK, snapshot);
 }
 
 /// Broadcast `activity:new` with the new activity entry (SPEC s11.7).

@@ -5,10 +5,12 @@ import { useI18n } from "vue-i18n";
 import * as ipc from "../ipc/commands";
 import { toErrorCode } from "../ipc/errors";
 import { flushFrontendLogs } from "../frontendLog";
+import BottleneckStatTile from "../components/BottleneckStatTile.vue";
 import FilesUploadedStatTile from "../components/FilesUploadedStatTile.vue";
 import DrillHistoryPanel from "../components/DrillHistoryPanel.vue";
 import ScrubHistoryPanel from "../components/ScrubHistoryPanel.vue";
 import ThroughputStatTile from "../components/ThroughputStatTile.vue";
+import { useBottleneckStore } from "../stores/bottleneck";
 import { useIostatStore } from "../stores/iostat";
 import { activityEventLabel } from "../stores/activityEventLabel";
 import {
@@ -33,6 +35,9 @@ const activity = useActivityStore();
 // split tiles (probe-fed 1s samples; moves during reconcile-phase recovery,
 // unlike the activity-log-backed series which only updates on completed rows).
 const iostat = useIostatStore();
+// issue #308: the live bottleneck-classification store behind the Bottleneck
+// tile (debounced 5s with hysteresis so the tile does not flap tick to tick).
+const bottleneck = useBottleneckStore();
 const sources = useSourcesStore();
 const toasts = useToastsStore();
 
@@ -259,6 +264,7 @@ onMounted(async () => {
   // (M7-P1-1), so a broadcast-lag burst loses no rows.
   await activity.subscribeLive();
   await iostat.start();
+  await bottleneck.start();
   try {
     await Promise.all([
       sources.refresh(),
@@ -278,6 +284,7 @@ onMounted(async () => {
 onUnmounted(() => {
   activity.unsubscribeLive();
   iostat.stop();
+  bottleneck.stop();
 });
 </script>
 
@@ -325,16 +332,19 @@ onUnmounted(() => {
         data-testid="activity-summary-skeleton"
         aria-hidden="true"
       >
-        <div v-for="n in 5" :key="n" :class="STAT_TILE">
+        <div v-for="n in 7" :key="n" :class="STAT_TILE">
           <div class="h-3 w-20" :class="SKELETON_BAR"></div>
           <div class="mt-2 h-5 w-16" :class="SKELETON_BAR"></div>
         </div>
       </div>
 
-      <!-- M7-P2-5 (DESIGN s8.3): header aggregate stats. -->
+      <!-- M7-P2-5 (DESIGN s8.3): header aggregate stats. issue #308: 7 tiles
+           now that Bottleneck joined the grid, so the large breakpoint moved
+           from 5 to 6 columns (matches the skeleton above) so nothing wraps
+           awkwardly. -->
       <dl
         v-else-if="activity.summary"
-        class="activity-load-in grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-5"
+        class="activity-load-in grid grid-cols-2 gap-3 sm:grid-cols-3 lg:grid-cols-6"
         data-testid="activity-summary"
       >
         <div :class="STAT_TILE">
@@ -369,6 +379,7 @@ onUnmounted(() => {
           :bucket-ms="SPARKLINE_BUCKET_MS"
           :files-uploaded="filesUploaded"
         />
+        <BottleneckStatTile :snapshot="bottleneck.displayed" />
         <div :class="STAT_TILE">
           <dt class="text-xs text-zinc-500 dark:text-zinc-400">
             {{ t("activity.summary.byStatus") }}

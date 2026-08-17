@@ -305,6 +305,9 @@ pub struct AppState {
     updater: UpdaterRuntime,
     /// 2026-08-14 follow-up: live disk/network throughput sampling runtime.
     iostat: IostatRuntime,
+    /// issue #308 (2026-08-17 follow-up): live bottleneck-classification
+    /// sampling runtime (the Activity dashboard's Bottleneck stat tile).
+    bottleneck: BottleneckRuntime,
     /// The ONE in-flight streaming exclusion preview
     /// ([`crate::commands::exclusion_stream`]). The exclusion editor re-previews
     /// on every rule edit, so without a single-slot registry a user tweaking
@@ -411,6 +414,25 @@ pub struct IostatRuntime {
     /// hub whose counters the executors were built with); the quiesced boot
     /// path keeps the default hub (all-zero graphs).
     hub: std::sync::Mutex<Arc<crate::iostat_hub::IoStatHub>>,
+    /// The spawned sampler task, behind `Option` so the shutdown drain can
+    /// TAKE + await it by value; `None` once drained / never spawned.
+    task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The shutdown signal the sampler `select!`s on.
+    shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
+}
+
+/// issue #308 (2026-08-17 follow-up): the live bottleneck-classification
+/// runtime held on [`AppState`] - the latest-snapshot hub plus the sampler
+/// task's lifecycle slots (mirrors [`IostatRuntime`], which this sampler
+/// reads from). Unlike `IostatRuntime` there is nothing to "install" from
+/// assembly: the hub reads the app-global IO counters and the accounts map
+/// straight off `AppState` each tick, so the default hub is already correct
+/// even in the quiesced boot path (it just classifies `NotBackingUp`).
+#[derive(Default)]
+pub struct BottleneckRuntime {
+    /// The latest-snapshot hub the sampler pushes into and the
+    /// `bottleneck_status` command reads.
+    hub: Arc<crate::bottleneck_hub::BottleneckHub>,
     /// The spawned sampler task, behind `Option` so the shutdown drain can
     /// TAKE + await it by value; `None` once drained / never spawned.
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -679,6 +701,7 @@ impl AppState {
             restore_jobs: std::sync::Mutex::new(HashMap::new()),
             updater: UpdaterRuntime::default(),
             iostat: IostatRuntime::default(),
+            bottleneck: BottleneckRuntime::default(),
             exclusion_previews: Arc::default(),
             preview_tree_cache: Arc::default(),
             telemetry: TelemetryRuntime::default(),
@@ -1031,6 +1054,50 @@ impl AppState {
             let _ = tx.send(true);
         }
         self.iostat
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    // --- issue #308: bottleneck-classification runtime -----------------------
+
+    /// The live bottleneck-classification hub the sampler pushes into and the
+    /// `bottleneck_status` command reads. Always available (no "install"
+    /// step needed - it reads `AppState` directly each tick).
+    pub fn bottleneck_hub(&self) -> Arc<crate::bottleneck_hub::BottleneckHub> {
+        self.bottleneck.hub.clone()
+    }
+
+    /// Register the spawned sampler task + its shutdown sender so the app-quit
+    /// drain can stop + join it with no orphan (mirrors [`Self::set_iostat_task`]).
+    pub fn set_bottleneck_task(&self, task: JoinHandle<()>, shutdown: watch::Sender<bool>) {
+        *self
+            .bottleneck
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(task);
+        *self
+            .bottleneck
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(shutdown);
+    }
+
+    /// Signal the sampler to stop and TAKE its handle so the quit drain can
+    /// await it. Mirrors [`Self::shutdown_iostat_task`].
+    #[must_use]
+    pub fn shutdown_bottleneck_task(&self) -> Option<JoinHandle<()>> {
+        if let Some(tx) = self
+            .bottleneck
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = tx.send(true);
+        }
+        self.bottleneck
             .task
             .lock()
             .unwrap_or_else(|e| e.into_inner())
@@ -1991,6 +2058,63 @@ pub(crate) mod tests {
         assert_eq!(app_state.take_dialog_token(&token), None);
         // An unknown token is rejected.
         assert_eq!(app_state.take_dialog_token("not-a-real-token"), None);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn fake_orchestrator_inherits_the_orchestrator_traits_default_bottleneck_methods() {
+        // issue #308: `FakeOrchestrator` deliberately does not override
+        // `pacer_backoff_remaining_ms` / `backend_label` - it exists to
+        // exercise the `Orchestrator` trait's DEFAULT bodies (a pacer-less /
+        // label-less trait object must read as clear with a generic label,
+        // never panic), the same contract the bottleneck sampler leans on
+        // for any account whose orchestrator was built without those seams.
+        let orch = FakeOrchestrator::new();
+        assert_eq!(orch.pacer_backoff_remaining_ms(), None);
+        assert_eq!(orch.backend_label(), "your destination");
+    }
+
+    #[tokio::test]
+    async fn bottleneck_runtime_hub_task_and_shutdown_round_trip() {
+        // issue #308: the bottleneck sampler's runtime bookkeeping. Unlike
+        // `IostatRuntime` there is no "install" step - the hub is always
+        // available, defaulting to `NotBackingUp` - so this only needs to
+        // cover the getter plus the set/shutdown task pair (mirrors
+        // `set_iostat_task`/`shutdown_iostat_task`'s no-orphan drain).
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+
+        let hub = app_state.bottleneck_hub();
+        assert_eq!(
+            hub.latest().state,
+            crate::bottleneck_hub::BottleneckState::NotBackingUp
+        );
+
+        // No task registered yet: shutdown is a safe no-op.
+        assert!(app_state.shutdown_bottleneck_task().is_none());
+
+        // Register a task that exits promptly on the shutdown signal (the
+        // real sampler's own shape), then confirm shutdown signals + hands
+        // back the handle so the quit drain can join it.
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _ = shutdown_rx.changed().await;
+        });
+        app_state.set_bottleneck_task(task, shutdown_tx);
+
+        let handle = app_state
+            .shutdown_bottleneck_task()
+            .expect("the just-registered task round-trips");
+        handle.await.unwrap();
+
+        // Taken: a second shutdown call is again a safe no-op.
+        assert!(app_state.shutdown_bottleneck_task().is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }

@@ -471,6 +471,27 @@ pub trait Orchestrator: Send + Sync {
     /// [`OrchestratorState`] for the tray / Activity dashboard.
     async fn state(&self) -> OrchestratorState;
 
+    /// Non-blocking snapshot of this account's rate pacer (issue #308
+    /// bottleneck classifier): `Some(remaining_ms)` when the pacer is
+    /// presently inside a backoff window (a rate-limit or circuit-breaker
+    /// trip), `None` when it is clear or no pacer is wired. Delegates to
+    /// [`Pacer::backoff_remaining_ms`](crate::pacer::Pacer::backoff_remaining_ms);
+    /// the default `None` covers pacer-less trait objects (tests / the
+    /// chaos harness), and [`SyncOrchestrator`] overrides it by reading its
+    /// shared pacer (wired via [`SyncOrchestrator::with_pacer`]).
+    fn pacer_backoff_remaining_ms(&self) -> Option<i64> {
+        None
+    }
+
+    /// Short display label for this account's destination ("Google Drive",
+    /// "S3", "SFTP", "your local folder"), for the bottleneck classifier's
+    /// "Drive rate-limited" / "S3 rate-limited" sub-line. Defaults to a
+    /// generic label so a trait object built without
+    /// [`SyncOrchestrator::with_backend_label`] still reads sensibly.
+    fn backend_label(&self) -> &'static str {
+        "your destination"
+    }
+
     /// Applies a new [`OrchestratorConfig`], taking effect on the next
     /// cycle (the `Arc<RwLock<OrchestratorConfig>>` swap, SPEC s5).
     async fn reconfigure(&self, config: OrchestratorConfig);
@@ -683,6 +704,18 @@ pub struct SyncOrchestrator {
     /// exactly the lie this feature exists to prevent. Set via
     /// [`Self::with_restore_probe`].
     restore_probe: Option<Arc<dyn crate::drill::RestoreProbe>>,
+    /// Short destination display label (issue #308 bottleneck classifier's
+    /// "X rate-limited" sub-line). Set via [`Self::with_backend_label`];
+    /// defaults to a generic label when unset (tests / chaos harness).
+    backend_label: &'static str,
+    /// App-global disk/net/hash byte counters (issue #308 bottleneck
+    /// classifier, 2026-08-17 follow-up): threaded into
+    /// [`crate::scanner::scan_with_priority`] so a deep-verify's blake3 pass
+    /// credits the SAME counters the upload pipeline's cpu stage does. `None`
+    /// in tests / the chaos harness (deep-verify hashing then credits
+    /// nothing - the same degradation as [`Self::latency`]). Set via
+    /// [`Self::with_io_counters`].
+    io_counters: Option<Arc<crate::iostat::IoCounters>>,
 }
 
 impl SyncOrchestrator {
@@ -744,6 +777,8 @@ impl SyncOrchestrator {
             latency: None,
             adaptive: None,
             restore_probe: None,
+            backend_label: "your destination",
+            io_counters: None,
         }
     }
 
@@ -866,6 +901,28 @@ impl SyncOrchestrator {
     /// throttle is inert (the pacer keeps its construction-time cap).
     pub fn with_pacer(mut self, pacer: Arc<dyn Pacer>) -> Self {
         self.pacer = Some(pacer);
+        self
+    }
+
+    /// Set the destination's short display label for the bottleneck
+    /// classifier (issue #308). Pass a literal matching the account's
+    /// `BackendKind` ("Google Drive" / "S3" / "SFTP" / "your local folder");
+    /// unset accounts (tests, chaos harness) keep the generic default.
+    #[must_use]
+    pub fn with_backend_label(mut self, label: &'static str) -> Self {
+        self.backend_label = label;
+        self
+    }
+
+    /// Share the app-global disk/net/hash byte counters (issue #308
+    /// bottleneck classifier). Pass the SAME `Arc` the executor was built
+    /// with (via `DefaultExecutor::with_io_counters`) so a deep-verify
+    /// re-hash and an upload's cpu stage credit one counter. Without this
+    /// call `scan_with_priority` runs with no hash instrumentation (the
+    /// cpu bottleneck signal then always reads zero).
+    #[must_use]
+    pub fn with_io_counters(mut self, io_counters: Arc<crate::iostat::IoCounters>) -> Self {
+        self.io_counters = Some(io_counters);
         self
     }
 
@@ -2276,6 +2333,10 @@ impl SyncOrchestrator {
                 // foreground apps (the same cell the executor's bundle path
                 // reads).
                 self.priority.get(),
+                // issue #308: the SAME app-global counters the upload
+                // pipeline credits, so a deep-verify re-hash moves the
+                // bottleneck classifier's cpu rate too.
+                self.io_counters.clone(),
             )
             .await?
         };
@@ -3615,6 +3676,14 @@ impl Orchestrator for SyncOrchestrator {
         self.state_machine.read().await.clone()
     }
 
+    fn pacer_backoff_remaining_ms(&self) -> Option<i64> {
+        self.pacer.as_ref()?.backoff_remaining_ms()
+    }
+
+    fn backend_label(&self) -> &'static str {
+        self.backend_label
+    }
+
     async fn reconfigure(&self, config: OrchestratorConfig) {
         // P1-5 (M3.5 codex): thread the (possibly changed) VSS mode to the
         // attached provider so `vss_mode = never` actually disables snapshots
@@ -4867,6 +4936,86 @@ mod tests {
             on_metered_network: true,
             network_reachable: true,
         }
+    }
+
+    #[test]
+    fn pacer_backoff_and_backend_label_default_when_unwired() {
+        // issue #308: a trait object built without `with_pacer` /
+        // `with_backend_label` (the historical construction, and every test
+        // fake elsewhere in this crate) must read as "clear" with a generic
+        // label, never panic or silently misreport a backoff.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec,
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+        assert_eq!(orch.pacer_backoff_remaining_ms(), None);
+        assert_eq!(orch.backend_label(), "your destination");
+    }
+
+    #[test]
+    fn pacer_backoff_delegates_to_the_wired_pacer_when_clear() {
+        // issue #308: a wired-but-not-throttling pacer (`FakePacer`'s default
+        // `backoff_remaining_ms`, which it does not override) still reads as
+        // clear through the orchestrator - `with_pacer` alone must not
+        // fabricate a backoff.
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec,
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+        let orch = orch
+            .with_pacer(Arc::new(FakePacer::default()))
+            .with_backend_label("Drive");
+        assert_eq!(orch.pacer_backoff_remaining_ms(), None);
+        assert_eq!(orch.backend_label(), "Drive");
+    }
+
+    #[test]
+    fn pacer_backoff_reports_the_live_deadline_from_a_throttled_pacer() {
+        // issue #308: a REAL AimdPacer that has actually throttled reports its
+        // live remaining-ms through the orchestrator, non-blocking (no
+        // `.await`, no clock advance needed to observe it).
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            exec,
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+
+        let pacer_clock: Arc<dyn Clock> = Arc::new(FakeClock::new());
+        let pacer = crate::pacer::AimdPacer::new(pacer_clock, None);
+        pacer.note_response(crate::pacer::ResponseClass::RateLimited {
+            retry_after: std::time::Duration::from_secs(5),
+        });
+        let pacer: Arc<dyn Pacer> = Arc::new(pacer);
+        let orch = orch.with_pacer(pacer).with_backend_label("S3");
+
+        let remaining = orch
+            .pacer_backoff_remaining_ms()
+            .expect("the pacer is mid-backoff");
+        assert!(remaining >= 5_000, "remaining_ms = {remaining}");
+        assert_eq!(orch.backend_label(), "S3");
     }
 
     #[test]

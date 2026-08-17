@@ -33,6 +33,7 @@ import {
   ACTIVITY_SUMMARY,
   ACTIVITY_THROUGHPUT,
   IO_THROUGHPUT,
+  BOTTLENECK_STATUS,
   APFS_HELPER_STATUS,
   BACKENDS,
   DRIVE_FOLDER_LISTING,
@@ -219,6 +220,7 @@ export function defaultCommands(): Record<string, MockCommandOverride> {
     activity_summary: ACTIVITY_SUMMARY,
     activity_throughput_series: ACTIVITY_THROUGHPUT,
     io_throughput_series: IO_THROUGHPUT,
+    bottleneck_status: BOTTLENECK_STATUS,
 
     // --- Restore (SPEC s11.5) ---
     list_remote_tree: REMOTE_TREE,

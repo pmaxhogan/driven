@@ -851,6 +851,24 @@ export interface IoThroughputSeriesDto {
   samples: IoSample[];
 }
 
+/** Which stage of the backup pipeline is presently limiting throughput
+ * (issue #308, mirrors src-tauri `bottleneck_hub::BottleneckState`). */
+export type BottleneckState = "not_backing_up" | "disk" | "network" | "api" | "cpu" | "mixed";
+
+/** One live bottleneck classification (issue #308), the `sync:bottleneck`
+ * event and `bottleneck_status` command payload, camelCase on the wire
+ * (src-tauri/src/bottleneck_hub.rs `BottleneckSnapshot`). */
+export interface BottleneckSnapshot {
+  tsMs: number;
+  state: BottleneckState;
+  /** The saturated stage's rate in bytes/sec, present only for Disk/Network/Cpu. */
+  rateBytesPerSec: number | null;
+  /** The rate-limited destination's short label, present only for Api. */
+  backend: string | null;
+  /** Ms remaining in the active backoff window, present only for Api. */
+  backoffRemainingMs: number | null;
+}
+
 /** Mirrors the Rust `OrchestratorState` (driven_core::types). Carried as an
  * opaque tagged object; the UI reads the discriminant for the status pill.
  * On the wire it is internally tagged on a snake_case `state` field (e.g.

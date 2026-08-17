@@ -658,6 +658,13 @@ async fn build_account(
     // SPEC s22 `io_priority`: the SAME cell the executor reads, so a settings
     // save reaches the backup threads on the next piece of work.
     orchestrator = orchestrator.with_priority_cell(priority);
+    // issue #308 bottleneck classifier: the destination's short display
+    // label ("Drive rate-limited...") and the SAME app-global disk/net/hash
+    // counters the executor was built with, so a deep-verify re-hash credits
+    // the same cpu-rate signal an upload's cpu stage does.
+    orchestrator = orchestrator
+        .with_backend_label(bottleneck_backend_label(account.backend_kind))
+        .with_io_counters(io_counters.clone());
     // DESIGN s13: the SAME reservoir the executor holds, so per-file scan latency
     // and upload-per-MB latency feed one app-global sampler.
     orchestrator = orchestrator.with_latency_reservoir(latency.clone());
@@ -816,6 +823,19 @@ pub(crate) fn account_backend(account: &AccountRow) -> driven_backend::AccountBa
         account_id: account.id.to_string(),
         kind: account.backend_kind,
         config_json: account.backend_config_json.clone(),
+    }
+}
+
+/// Short destination display label for the bottleneck classifier's "X
+/// rate-limited" sub-line (issue #308). Matches the wording the mockup used
+/// ("Drive rate-limited...") rather than the longer `BackendKind::id()` wire
+/// identifiers.
+fn bottleneck_backend_label(kind: driven_remote::BackendKind) -> &'static str {
+    match kind {
+        driven_remote::BackendKind::GoogleDrive => "Drive",
+        driven_remote::BackendKind::S3 => "S3",
+        driven_remote::BackendKind::LocalFolder => "your local folder",
+        driven_remote::BackendKind::Sftp => "SFTP",
     }
 }
 
@@ -1399,12 +1419,41 @@ struct SourceProgressEvent {
 
 #[cfg(test)]
 mod tests {
-    use super::{classify_bridge_event, BridgeAction};
+    use super::{bottleneck_backend_label, classify_bridge_event, BridgeAction};
     use driven_core::orchestrator::OrchestratorConfig;
     use driven_core::state::sqlite::SqliteStateRepo;
     use driven_core::state::StateRepo;
     use driven_core::types::{AccountId, ActivityEntry, ExecProgress, OrchestratorEvent, SourceId};
     use tokio::sync::broadcast::error::RecvError;
+
+    /// issue #308: every `BackendKind` variant maps to a distinct, non-empty
+    /// display label for the bottleneck classifier's "X rate-limited"
+    /// sub-line, matching the mockup's short-form wording ("Drive", not
+    /// "Google Drive").
+    #[test]
+    fn bottleneck_backend_label_covers_every_backend_kind_distinctly() {
+        use driven_remote::BackendKind;
+        let labels: Vec<&'static str> = BackendKind::ALL
+            .iter()
+            .map(|&kind| bottleneck_backend_label(kind))
+            .collect();
+        assert_eq!(bottleneck_backend_label(BackendKind::GoogleDrive), "Drive");
+        assert_eq!(bottleneck_backend_label(BackendKind::S3), "S3");
+        assert_eq!(
+            bottleneck_backend_label(BackendKind::LocalFolder),
+            "your local folder"
+        );
+        assert_eq!(bottleneck_backend_label(BackendKind::Sftp), "SFTP");
+        for label in &labels {
+            assert!(!label.is_empty());
+        }
+        let unique: std::collections::HashSet<_> = labels.iter().collect();
+        assert_eq!(
+            unique.len(),
+            labels.len(),
+            "every backend gets its own label"
+        );
+    }
 
     /// M7-P1-1: a broadcast `Lagged` MUST classify as an `ActivityReconcile`
     /// (carrying the dropped count) so the bridge emits `activity:lagged` and the

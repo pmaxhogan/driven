@@ -38,6 +38,7 @@ import type {
   VersioningConfig,
   VssHelperStatus,
   IoThroughputSeriesDto,
+  BottleneckSnapshot,
 } from "../src/ipc/types";
 
 /** The instant every fixture is anchored to: 2026-03-15T12:00:00Z.
@@ -404,6 +405,19 @@ export const IO_THROUGHPUT: IoThroughputSeriesDto = {
     diskBytes: i < 10 ? 0 : i < 40 ? 180_000_000 + (i % 5) * 8_000_000 : i < 50 ? 60_000_000 : 0,
     netBytes: i < 5 ? 0 : 15_000_000 + (i % 7) * 1_500_000,
   })),
+};
+
+/** issue #308: a deterministic "network-bound upload" bottleneck reading for
+ * the Activity dashboard's Bottleneck stat tile, matching the shape
+ * `IO_THROUGHPUT` implies (a steadier upload trailing a disk-read burst). The
+ * store adopts the FIRST snapshot immediately (no debounce on a hydration
+ * read), so this renders straight away in the visual baselines. */
+export const BOTTLENECK_STATUS: BottleneckSnapshot = {
+  tsMs: FIXED_NOW,
+  state: "network",
+  rateBytesPerSec: 42_000_000,
+  backend: null,
+  backoffRemainingMs: null,
 };
 
 /**

@@ -9,6 +9,7 @@ import { listen, type UnlistenFn } from "@tauri-apps/api/event";
 import type {
   AccountSyncStatus,
   ActivityEntry,
+  BottleneckSnapshot,
   ExclusionPreviewBatch,
   ExclusionPreviewDone,
   ExclusionPreviewError,
@@ -83,6 +84,16 @@ export function onSyncIoThroughput(handler: (sample: IoSample) => void): Promise
  * same shape at boot. */
 export function onQueueChanged(handler: (snapshot: QueueSnapshot) => void): Promise<UnlistenFn> {
   return listen<QueueSnapshot>("queue:changed", (e) => handler(e.payload));
+}
+
+/** `sync:bottleneck` payload: one live bottleneck classification (issue
+ * #308, camelCase, the same `BottleneckSnapshot` shape `bottleneck_status`
+ * returns). Emitted ~1/s while any account is mid-cycle; suppressed while
+ * fully idle after one trailing `not_backing_up`. */
+export function onSyncBottleneck(
+  handler: (snapshot: BottleneckSnapshot) => void
+): Promise<UnlistenFn> {
+  return listen<BottleneckSnapshot>("sync:bottleneck", (e) => handler(e.payload));
 }
 
 /** `activity:new` payload: ActivityEntry (SPEC s11.7). The Activity dashboard's
