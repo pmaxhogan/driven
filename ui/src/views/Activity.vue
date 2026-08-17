@@ -20,8 +20,10 @@ import {
   useActivityStore,
 } from "../stores/activity";
 import { formatBytes as formatByteCount } from "../stores/formatBytes";
+import { useSettingsStore } from "../stores/settings";
 import { useSourcesStore } from "../stores/sources";
 import { useToastsStore } from "../stores/toasts";
+import { ensureSettingsLoaded } from "./settings/shared";
 import type { ActivityEntry, ActivityLevel, FileStateStatus } from "../ipc/types";
 
 // Activity dashboard (SPEC s11.4; DESIGN s8.3). A live tail (subscribes to
@@ -40,6 +42,13 @@ const iostat = useIostatStore();
 const bottleneck = useBottleneckStore();
 const sources = useSourcesStore();
 const toasts = useToastsStore();
+// Issue #309: the settings snapshot, read-only here, just for the "Debug data
+// included" chip below - Activity does not otherwise depend on Settings, so
+// this loads its own snapshot on mount rather than assuming the Settings
+// view has already run.
+const settings = useSettingsStore();
+ensureSettingsLoaded();
+const debugLoggingEnabled = computed(() => settings.settings?.global.debugLoggingEnabled ?? false);
 
 // Design-system class strings (DRIVEN UI). Defined once so every control in this
 // view stays visually consistent with the rest of the app: teal accent, dark-mode
@@ -300,16 +309,24 @@ onUnmounted(() => {
             {{ t("activity.subtitle") }}
           </p>
         </div>
-        <button
-          type="button"
-          class="shrink-0"
-          :class="SECONDARY_BTN"
-          :disabled="exporting"
-          data-testid="activity-export-bundle"
-          @click="exportBundle"
-        >
-          {{ exporting ? t("activity.exporting") : t("activity.exportBundleButton") }}
-        </button>
+        <div class="flex shrink-0 items-center gap-2">
+          <span
+            v-if="debugLoggingEnabled"
+            class="rounded-full border border-amber-300 bg-amber-50 px-2 py-0.5 text-xs font-medium text-amber-800 dark:border-amber-800 dark:bg-amber-950/40 dark:text-amber-300"
+            data-testid="activity-debug-data-chip"
+          >
+            {{ t("activity.debugDataIncludedChip") }}
+          </span>
+          <button
+            type="button"
+            :class="SECONDARY_BTN"
+            :disabled="exporting"
+            data-testid="activity-export-bundle"
+            @click="exportBundle"
+          >
+            {{ exporting ? t("activity.exporting") : t("activity.exportBundleButton") }}
+          </button>
+        </div>
       </div>
       <p
         v-if="exportErrorCode"

@@ -544,6 +544,13 @@
       "telemetryLabel": "Send anonymous usage stats",
       "telemetryNote": "Anonymous usage stats only - no file names or contents are ever sent. One click to disable.",
       "telemetryPreviewButton": "Preview data",
+      "debugLogging": {
+        "label": "Debug logging",
+        "note": "Records detailed per-file activity, IPC traces, and full engine state snapshots to help diagnose problems.",
+        "warning": "Debug logs and diagnostic bundles will include file names, full paths, timing data, and other personal information. Backups may run noticeably slower. Turns itself off automatically after 24 hours.",
+        "includeInBundle": "Diagnostic bundles will include this debug data while it's on.",
+        "activeUntil": "Debug logging is on until {time}."
+      },
       "hooks": {
         "title": "Backup hooks",
         "preLabel": "Before each backup (shell command)",
@@ -709,6 +716,7 @@
     "exportBundleButton": "Export diagnostic bundle",
     "exporting": "Exporting...",
     "exportedTo": "Saved diagnostic bundle to {path}",
+    "debugDataIncludedChip": "Debug data included",
     "summary": {
       "bytesToday": "Uploaded today",
       "bytesWeek": "Uploaded this week",

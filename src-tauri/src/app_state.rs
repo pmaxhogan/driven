@@ -308,6 +308,12 @@ pub struct AppState {
     /// issue #308 (2026-08-17 follow-up): live bottleneck-classification
     /// sampling runtime (the Activity dashboard's Bottleneck stat tile).
     bottleneck: BottleneckRuntime,
+    /// issue #309: the debug-logging-mode 24h auto-off watchdog's task handle
+    /// + shutdown signal, so the app-quit drain joins it with no orphan
+    /// (mirrors [`UpdaterRuntime`]/[`IostatRuntime`]). No shared "hub" field
+    /// like those two - the watchdog only reads/writes the persisted settings
+    /// KV directly, nothing else on `AppState` needs to observe it.
+    debug_mode: DebugModeRuntime,
     /// The ONE in-flight streaming exclusion preview
     /// ([`crate::commands::exclusion_stream`]). The exclusion editor re-previews
     /// on every rule edit, so without a single-slot registry a user tweaking
@@ -437,6 +443,22 @@ pub struct BottleneckRuntime {
     /// TAKE + await it by value; `None` once drained / never spawned.
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
     /// The shutdown signal the sampler `select!`s on.
+    shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
+}
+
+/// issue #309: the debug-logging-mode 24h auto-off watchdog's runtime state
+/// held on [`AppState`] - just the task's lifecycle slots (mirrors
+/// [`UpdaterRuntime`]/[`TelemetryRuntime`]'s task+shutdown pair). No "hub"
+/// field like [`BottleneckRuntime`]/[`IostatRuntime`]: the watchdog reads and
+/// writes the persisted `global.debug_logging_*` settings directly via its
+/// `StateRepo` handle, so there is nothing else on `AppState` for another
+/// caller to read.
+#[derive(Default)]
+pub struct DebugModeRuntime {
+    /// The spawned watchdog task, behind `Option` so the shutdown drain can
+    /// TAKE + await it by value; `None` once drained / never spawned.
+    task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The shutdown signal the watchdog `select!`s on.
     shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
 }
 
@@ -702,6 +724,7 @@ impl AppState {
             updater: UpdaterRuntime::default(),
             iostat: IostatRuntime::default(),
             bottleneck: BottleneckRuntime::default(),
+            debug_mode: DebugModeRuntime::default(),
             exclusion_previews: Arc::default(),
             preview_tree_cache: Arc::default(),
             telemetry: TelemetryRuntime::default(),
@@ -1098,6 +1121,44 @@ impl AppState {
             let _ = tx.send(true);
         }
         self.bottleneck
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    // --- issue #309: debug-logging-mode watchdog runtime ----------------------
+
+    /// Register the spawned watchdog task + its shutdown sender so the
+    /// app-quit drain can stop + join it with no orphan (mirrors
+    /// [`Self::set_bottleneck_task`]).
+    pub fn set_debug_mode_task(&self, task: JoinHandle<()>, shutdown: watch::Sender<bool>) {
+        *self
+            .debug_mode
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(task);
+        *self
+            .debug_mode
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(shutdown);
+    }
+
+    /// Signal the watchdog to stop and TAKE its handle so the quit drain can
+    /// await it. Mirrors [`Self::shutdown_bottleneck_task`].
+    #[must_use]
+    pub fn shutdown_debug_mode_task(&self) -> Option<JoinHandle<()>> {
+        if let Some(tx) = self
+            .debug_mode
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = tx.send(true);
+        }
+        self.debug_mode
             .task
             .lock()
             .unwrap_or_else(|e| e.into_inner())

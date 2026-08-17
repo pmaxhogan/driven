@@ -96,7 +96,7 @@ Notes:
 - ³¹ rclone and restic are command-line tools; their GUIs are separate third-party projects (for example RcloneView, Backrest).
 - ³² Duplicati runs as a background service with a local web UI plus a tray helper, not a native desktop app.
 - ³³ restic search and selective restore are driven from the CLI (or a mounted snapshot), not an in-app browser.
-- ³⁴ Driven writes daily rolling logs (pruned at 14 days / 25 MB) that interleave backend tracing with the webview's own console output, and the in-app diagnostics export bundles them.
+- ³⁴ Driven writes daily rolling logs (pruned at 14 days / 25 MB, widened to 250 MB while the opt-in Debug logging toggle is on) that interleave backend tracing with the webview's own console output, and the in-app diagnostics export bundles them.
 - ³⁵ rclone logs to a file only when you pass `--log-file` (rotation via `--log-file-max-size` and friends), and has no bundle export; its bug template asks you to attach a log you produced by hand.
 - ³⁶ Duplicati's "Create bug report" export is a genuine one-click bundle (system info plus an obfuscated copy of the local database), and its web UI has a live log view; file logging is opt-in via `--log-file`, defaults to warnings only, and does not rotate.
 - ³⁷ restic has no log-file option at all - output goes to stdout, and the only file logging is an unrotated `DEBUG_LOG` env var that its contributing guide asks you to redact yourself.
@@ -189,7 +189,12 @@ These move: check each project's current docs before relying on a cell.
 - Rolling local log files covering both the backend and the webview console,
   collected into a one-click diagnostics bundle alongside a redacted summary of
   in-flight upload recovery state and a trailing window of process-memory
-  samples.
+  samples. An opt-in Debug logging toggle (Settings > Privacy & Data) raises
+  logs to per-file / IPC-trace / engine-state detail and widens the bundle
+  with an unredacted engine-state snapshot for the hardest bugs - it warns you
+  up front that this logs file names, full paths, and timing data, can slow
+  backups down, and turns itself off automatically after 24 hours; every other
+  part of the bundle stays redacted regardless.
 - In-app auto-update with signed update manifests and a stable / dev channel
   selector.
 - Anonymous, opt-out telemetry (coarse counts only; never file names, paths, or

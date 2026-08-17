@@ -30,6 +30,10 @@ mod bottleneck_hub;
 // `DialogToken`) against the real implementation.
 pub mod commands;
 mod crypto_provider_impl;
+// Issue #309: debug logging mode's POLICY half (persisted 24h auto-off
+// watchdog + applying the toggle to the live process). `logging.rs` owns the
+// MECHANISM (the reloadable tracing filter + dynamic log-file cap).
+mod debug_mode;
 mod drill_probe;
 // NOTE: the "run elevated" module was removed pre-V1 (2026-06-25). It implemented
 // WHOLE-APP elevation (a /RL HIGHEST Task Scheduler logon task + a UAC restart),
@@ -287,6 +291,9 @@ struct ShutdownHandles {
     iostat: Option<JoinHandle<()>>,
     /// issue #308: the 1 Hz bottleneck-classification sampler, if it was started.
     bottleneck: Option<JoinHandle<()>>,
+    /// issue #309: the debug-logging-mode 24h auto-off watchdog, if it was
+    /// started.
+    debug_mode: Option<JoinHandle<()>>,
 }
 
 /// Signal every shutdown-able task and TAKE its handle, synchronously.
@@ -324,6 +331,8 @@ fn take_shutdown_handles(app: &tauri::AppHandle) -> Option<ShutdownHandles> {
         iostat: state.shutdown_iostat_task(),
         // issue #308: the bottleneck-classification sampler, same shape again.
         bottleneck: state.shutdown_bottleneck_task(),
+        // issue #309: the debug-logging-mode watchdog, same shape again.
+        debug_mode: state.shutdown_debug_mode_task(),
     })
 }
 
@@ -358,6 +367,7 @@ async fn drain_shutdown_handles(handles: ShutdownHandles) {
         telemetry,
         iostat,
         bottleneck,
+        debug_mode,
     } = handles;
 
     // R3-P1-1: drive ALL per-account shutdowns concurrently. Each
@@ -417,6 +427,12 @@ async fn drain_shutdown_handles(handles: ShutdownHandles) {
     if let Some(handle) = bottleneck {
         drain_restore_handle(handle).await;
         tracing::info!(target: "driven::app", "bottleneck sampler drained (no orphan)");
+    }
+
+    // issue #309: drain the debug-logging-mode watchdog the same way.
+    if let Some(handle) = debug_mode {
+        drain_restore_handle(handle).await;
+        tracing::info!(target: "driven::app", "debug logging mode watchdog drained (no orphan)");
     }
 
     // Stop the cosmetic tray syncing-spinner LAST - AFTER every orchestrator
@@ -728,6 +744,11 @@ pub fn run() {
                 // issue #308: the live bottleneck-classification sampler
                 // behind the Activity dashboard's Bottleneck stat tile.
                 bottleneck_hub::spawn_sampler(&handle);
+                // Issue #309: reconcile the live process against the persisted
+                // debug-logging-mode state (auto-off if the 24h window already
+                // elapsed while the app was closed) and start the watchdog that
+                // keeps re-checking while the app runs.
+                debug_mode::spawn_watchdog(&handle);
                 // M9b R2-P2-3 (SPEC s16): record an `update_applied` activity row
                 // when the running version differs from the last-recorded one, so
                 // the telemetry `update_applied` aggregate is driven by a real

@@ -968,6 +968,23 @@ pub struct GlobalSettings {
     /// the unchanged V1 behaviour; `false` exempts EXACTLY the reachability
     /// pause-reason family from the gate (a captive portal still pauses).
     pub pause_when_offline: bool,
+    /// Issue #309: debug logging mode. When `true` the live `tracing` filter
+    /// is raised to a verbose directive (per-file activity, IPC traces, state
+    /// transitions, reconcile/queue decisions) and the diagnostic bundle
+    /// gains a debug section; both cost noticeable performance and log
+    /// verbose paths/timings, so this defaults `false` and auto-clears itself
+    /// (see [`Self::debug_logging_expires_at_ms`]). `serde(default)` so a
+    /// `global` blob persisted before this field still deserialises as off.
+    #[serde(default)]
+    pub debug_logging_enabled: bool,
+    /// Issue #309: the epoch-ms deadline [`Self::debug_logging_enabled`]
+    /// auto-turns-off at (set to `now + 24h` whenever the toggle is switched
+    /// on). Persisted (not just an in-memory timer) so a restart mid-window
+    /// still honours the original deadline rather than granting a fresh 24h.
+    /// `None` when debug logging is off. `serde(default)` for the same
+    /// pre-#309 backward-compat reason as the toggle itself.
+    #[serde(default)]
+    pub debug_logging_expires_at_ms: Option<i64>,
 }
 
 /// V2 schedule-window settings (DESIGN s17). Mirrors
@@ -1288,6 +1305,11 @@ pub struct GlobalSettingsPatch {
     pub proxy_url: Option<Option<String>>,
     /// See [`GlobalSettings::pause_when_offline`]. Absent = unchanged.
     pub pause_when_offline: Option<bool>,
+    /// See [`GlobalSettings::debug_logging_enabled`]. Absent = unchanged;
+    /// present = set it (the backend computes/clears
+    /// `debug_logging_expires_at_ms` itself - that field is not directly
+    /// patchable from the webview).
+    pub debug_logging_enabled: Option<bool>,
 }
 
 /// Partial SPEC s22 `telemetry` settings.

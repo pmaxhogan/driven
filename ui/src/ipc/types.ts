@@ -423,6 +423,16 @@ export interface GlobalSettings {
    * true). Turning it off is meant for LAN-only / local-folder destinations
    * that don't need internet reachability to back up. */
   pauseWhenOffline: boolean;
+  /** Issue #309: debug logging mode. When true the live log filter is raised
+   * to a verbose directive (per-file activity, IPC traces, state
+   * transitions, reconcile/queue decisions) and diagnostic bundles gain a
+   * debug section; both cost noticeable performance and log paths/timings,
+   * so this defaults false and auto-clears itself (see
+   * debugLoggingExpiresAtMs). */
+  debugLoggingEnabled: boolean;
+  /** Issue #309: epoch-ms deadline debugLoggingEnabled auto-turns-off at (set
+   * to now + 24h whenever the toggle is switched on). null when off. */
+  debugLoggingExpiresAtMs: number | null;
 }
 
 export interface TelemetrySettings {
@@ -672,6 +682,9 @@ export interface GlobalSettingsPatch {
   proxyUrl?: string | null;
   /** Pause-banner spec (2026-08-01): present = set pause-while-offline. */
   pauseWhenOffline?: boolean;
+  /** Issue #309: present = set debug logging mode. The backend computes/
+   * clears debugLoggingExpiresAtMs itself - it is not directly patchable. */
+  debugLoggingEnabled?: boolean;
 }
 
 /** Issue #34: result of validating a candidate custom root CA PEM file. */

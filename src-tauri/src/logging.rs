@@ -9,8 +9,15 @@
 //! [`init`] now installs a LAYERED subscriber: the original stdout `fmt` layer
 //! (unchanged, so `cargo tauri dev` still prints) plus a DAILY-rolling file layer
 //! writing `driven.YYYY-MM-DD.log` into [`log_dir`]. [`prune`] bounds that
-//! directory (14 days / 25 MB) so an always-on background daemon cannot fill the
+//! directory (14 days / 25 MB, widened to 250 MB while issue #309 debug
+//! logging mode is on) so an always-on background daemon cannot fill the
 //! user's disk.
+//!
+//! Issue #309 (debug logging mode): the filter layer is wrapped in a
+//! [`tracing_subscriber::reload`] layer, so [`set_filter`] can raise/restore
+//! the LIVE process's verbosity at runtime (no restart) when the user flips
+//! the Settings toggle. `debug_mode.rs` owns the policy (persisted expiry,
+//! 24h auto-off watchdog); this module owns the mechanism.
 //!
 //! This module is also the ONE place the log directory is resolved. The panic
 //! hook (crash dumps, SPEC s17) and the diagnostic-bundle collector (SPEC s18)
@@ -19,19 +26,115 @@
 //! which is why the bundle collected nothing even when crash dumps existed.
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU64, Ordering};
 use std::sync::OnceLock;
 use std::time::Duration;
 
 use tracing_appender::non_blocking::WorkerGuard;
 use tracing_subscriber::layer::SubscriberExt as _;
 use tracing_subscriber::util::SubscriberInitExt as _;
-use tracing_subscriber::{fmt, EnvFilter, Layer as _};
+use tracing_subscriber::{fmt, reload, EnvFilter, Layer as _, Registry};
 
 const TARGET: &str = "driven::logging";
 
 /// Default level filter when `RUST_LOG` is unset. `info` keeps the file useful
 /// for field diagnosis without the per-file debug spam a backup run produces.
-const DEFAULT_FILTER: &str = "info";
+pub const DEFAULT_FILTER: &str = "info";
+
+/// Issue #309 (debug logging mode): the directive applied to the LIVE filter
+/// while debug logging is on. Driven's own crates go to `trace` (per-file
+/// activity, IPC command traces, state transitions, reconcile/queue
+/// decisions - the exact detail issue #309 asks for); everything else
+/// (reqwest, hyper, boa's PAC engine, ...) stays at `info` so the log is still
+/// dominated by Driven's own signal rather than drowned in dependency noise.
+///
+/// Two directive families are needed to cover every `tracing::` call site in
+/// this workspace: most calls pass an explicit `target: TARGET` string that
+/// is a hand-written `"driven::..."` / `"driven_tls::..."` path (covered by
+/// the `driven=trace` / `driven_tls=trace` directives below); calls with no
+/// explicit target default to `module_path!()`, i.e. the crate's actual
+/// (underscored) library name (the `driven_core=trace`, `driven_s3=trace`,
+/// ... directives).
+pub const DEBUG_MODE_FILTER: &str = "info,\
+driven=trace,\
+driven_app_lib=trace,\
+driven_core=trace,\
+driven_s3=trace,\
+driven_sftp=trace,\
+driven_drive=trace,\
+driven_tls=trace,\
+driven_vss=trace,\
+driven_backend=trace,\
+driven_net=trace,\
+driven_crypto=trace,\
+driven_remote=trace,\
+driven_localfs=trace,\
+driven_power=trace,\
+driven_diskstat=trace,\
+driven_apfs=trace,\
+driven_rclone=trace";
+
+/// Default rolling-log total-byte cap (see [`MAX_LOG_TOTAL_BYTES`] doc). Kept
+/// as the fallback [`effective_max_log_total_bytes`] restores on debug-mode
+/// off.
+const DEFAULT_MAX_LOG_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
+
+/// Issue #309: the rolling-log cap while debug logging mode is on. Debug mode
+/// raises the filter to `trace` on every Driven crate, which produces far
+/// more log volume per day than the steady-state 25 MB budget can hold - a
+/// 250 MB budget (SPEC/issue #309 "rotating cap ~250 MB") keeps a full day of
+/// verbose logs available for the diagnostic bundle without letting an
+/// abandoned toggle fill the user's disk indefinitely (the 24h auto-off in
+/// `debug_mode.rs` is the other half of that guarantee).
+const DEBUG_MODE_MAX_LOG_TOTAL_BYTES: u64 = 250 * 1024 * 1024;
+
+/// The live rolling-log total-byte cap [`prune`] enforces, switched between
+/// [`DEFAULT_MAX_LOG_TOTAL_BYTES`] and [`DEBUG_MODE_MAX_LOG_TOTAL_BYTES`] by
+/// [`set_debug_log_cap`]. An `AtomicU64` (not a plain const) because debug
+/// logging mode is a runtime toggle, not a compile-time choice.
+static MAX_LOG_TOTAL_BYTES: AtomicU64 = AtomicU64::new(DEFAULT_MAX_LOG_TOTAL_BYTES);
+
+/// Widen or restore the rolling-log cap for debug logging mode (issue #309).
+/// Best-effort/instant: the next [`prune`] pass (at boot, or from the
+/// `debug_mode` watchdog) enforces the new budget; nothing is deleted here.
+pub fn set_debug_log_cap(debug_enabled: bool) {
+    let cap = if debug_enabled {
+        DEBUG_MODE_MAX_LOG_TOTAL_BYTES
+    } else {
+        DEFAULT_MAX_LOG_TOTAL_BYTES
+    };
+    MAX_LOG_TOTAL_BYTES.store(cap, Ordering::Relaxed);
+}
+
+/// The live rolling-log total-byte cap (see [`MAX_LOG_TOTAL_BYTES`]).
+fn effective_max_log_total_bytes() -> u64 {
+    MAX_LOG_TOTAL_BYTES.load(Ordering::Relaxed)
+}
+
+/// The process's reloadable tracing filter handle (issue #309), installed by
+/// [`init`]. `None` until `init` runs (or if a subscriber was already
+/// installed by a double-init race / a test harness), in which case
+/// [`set_filter`] is a documented no-op rather than a panic - the previous
+/// filter keeps running.
+static FILTER_HANDLE: OnceLock<reload::Handle<EnvFilter, Registry>> = OnceLock::new();
+
+/// Reload the LIVE tracing filter to `directive` (an `EnvFilter` directive
+/// string, e.g. `"info"` or [`DEBUG_MODE_FILTER`]).
+///
+/// Returns `false` (and leaves the previous filter running) when the reload
+/// handle is not installed yet, `directive` fails to parse, or the reload
+/// itself errors (the subscriber was replaced from under us) - every case
+/// fails closed to "still logging at the old level" rather than silently
+/// going filter-less.
+pub fn set_filter(directive: &str) -> bool {
+    let Some(handle) = FILTER_HANDLE.get() else {
+        return false;
+    };
+    let Ok(new_filter) = EnvFilter::try_new(directive) else {
+        return false;
+    };
+    handle.reload(new_filter).is_ok()
+}
 
 /// Filename prefix of a rolling log file. `tracing-appender` joins prefix, the
 /// rotation date, and the suffix with `.`, so files are `driven.2026-07-25.log`.
@@ -42,11 +145,6 @@ const LOG_SUFFIX: &str = "log";
 /// Retention: delete rolling logs older than this. 14 days comfortably covers
 /// "it broke sometime last week, send me a bundle".
 const MAX_LOG_AGE: Duration = Duration::from_secs(14 * 24 * 60 * 60);
-
-/// Retention: total bytes the rolling logs may occupy. Beyond this the OLDEST
-/// files are deleted first. 25 MB is a fraction of the SPEC s18 bundle's 50 MB
-/// log budget, so a full log dir still fits in one bundle.
-const MAX_LOG_TOTAL_BYTES: u64 = 25 * 1024 * 1024;
 
 /// Keeps the `tracing-appender` non-blocking writer's worker thread alive.
 ///
@@ -76,6 +174,14 @@ pub fn init() {
     let filter =
         EnvFilter::try_from_default_env().unwrap_or_else(|_| EnvFilter::new(DEFAULT_FILTER));
 
+    // Issue #309: wrap the filter in a reload layer so `set_filter` can raise
+    // / restore it at runtime with no restart. The handle is parked in
+    // `FILTER_HANDLE` BEFORE `try_init` so it is available the instant the
+    // subscriber is live; a failed `try_init` below leaves it set but unused
+    // (harmless - `set_filter` would just reload a filter nothing reads).
+    let (filter_layer, filter_handle) = reload::Layer::new(filter);
+    let _ = FILTER_HANDLE.set(filter_handle);
+
     // The original stdout layer, unchanged: `cargo tauri dev` and any
     // console-attached launch keep printing exactly as before.
     let stdout_layer = fmt::layer();
@@ -100,7 +206,7 @@ pub fn init() {
     // nothing to report - reporting would need the subscriber that did not
     // install.
     if tracing_subscriber::registry()
-        .with(filter)
+        .with(filter_layer)
         .with(stdout_layer)
         .with(file_layer)
         .try_init()
@@ -330,7 +436,11 @@ pub fn prune(dir: &std::path::Path) {
         });
     }
 
-    for name in plan_prune(&files, MAX_LOG_AGE.as_secs(), MAX_LOG_TOTAL_BYTES) {
+    for name in plan_prune(
+        &files,
+        MAX_LOG_AGE.as_secs(),
+        effective_max_log_total_bytes(),
+    ) {
         let path = dir.join(&name);
         if let Err(e) = std::fs::remove_file(&path) {
             tracing::debug!(target: TARGET, file = %path.display(), error = %e, "log retention: could not delete stale log");
