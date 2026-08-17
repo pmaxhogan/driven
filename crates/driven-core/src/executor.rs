@@ -3650,11 +3650,13 @@ impl DefaultExecutor {
     /// session currently in `payload`, because the caller is about to drop the
     /// only handle to it.
     ///
-    /// Called at the two points a session becomes unreachable: a fresh session
-    /// replacing a persisted one, and an invalidated session being discarded
-    /// before a restart. Without it, `S3Store` accumulated one abandoned
-    /// multipart upload - parts on the bucket, billed, invisible to
-    /// `ListObjectsV2` - per failed attempt, forever.
+    /// Called wherever a session becomes unreachable: a fresh session replacing
+    /// a persisted one, an invalidated session discarded before a restart, and a
+    /// streaming upload whose op is about to be deleted. (Reconcile's
+    /// `resume_persisted` releases its own, from the session it was handed.)
+    /// Without it, `S3Store` accumulated one abandoned multipart upload - parts
+    /// on the bucket, billed, invisible to `ListObjectsV2` - per failed attempt,
+    /// forever.
     ///
     /// Deliberately BEST-EFFORT and never fatal: a leaked upload is a cost
     /// problem, and failing a backup over one would be a much worse trade. The

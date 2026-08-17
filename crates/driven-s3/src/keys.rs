@@ -144,10 +144,10 @@ pub fn is_version_key(root_prefix: &str, key: &str) -> bool {
 ///
 /// The readable form keeps the original path visible - a user browsing the
 /// bucket sees `.driven-versions/notes/todo.txt@<token>` beside their backup
-/// rather than an opaque digest. When that would breach S3's 1024-byte key
-/// limit (only reachable for a live key already within ~40 bytes of the limit)
-/// it falls back to a digest of the relative key, which stays under the limit
-/// for any input while remaining just as deterministic.
+/// rather than an opaque digest. The prefix and the token add a fixed ~80 bytes
+/// (the token is a full hex BLAKE3), so a live key within that of S3's
+/// 1024-byte limit would breach it; those fall back to a digest of the relative
+/// key, which fits any input while staying just as deterministic.
 pub fn version_key(root_prefix: &str, live_key: &str, content_token: &str) -> String {
     let prefix = versions_prefix(root_prefix);
     let relative = live_key.strip_prefix(root_prefix).unwrap_or(live_key);
