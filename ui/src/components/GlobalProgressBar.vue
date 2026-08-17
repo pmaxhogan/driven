@@ -70,10 +70,20 @@ const label = computed<string>(() => {
       // upload, with its real byte totals ("8.2 GB of 88.6 GB") - this used
       // to be an unlabelled indeterminate "Starting backup..." sweep.
       const r = progress.recoveringBytes;
-      return r.total > 0
-        ? t("progress.recoveringBytes", {
-            done: formatBytes(r.done, locale.value),
-            total: formatBytes(r.total, locale.value),
+      if (r.total > 0) {
+        return t("progress.recoveringBytes", {
+          done: formatBytes(r.done, locale.value),
+          total: formatBytes(r.total, locale.value),
+        });
+      }
+      // Issue #301: the rest of the pass is one remote lookup per interrupted
+      // upload - no bytes move, so name the OPS instead of falling back to the
+      // bare "Recovering an interrupted upload..." for a minute.
+      const ro = progress.recoveringOps;
+      return ro.total > 0
+        ? t("progress.recoveringOps", {
+            done: count.format(ro.done),
+            total: count.format(ro.total),
           })
         : t("progress.recovering");
     }

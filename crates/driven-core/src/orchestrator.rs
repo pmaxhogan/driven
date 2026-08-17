@@ -1358,8 +1358,19 @@ impl SyncOrchestrator {
                         let now = self.clock.now_ms();
                         {
                             let mut guard = last_emit.lock().await;
+                            // Issue #301: the pass now emits an OP tick per
+                            // recovered pending op as well as the BYTE ticks of
+                            // a streaming resume, so "is this the final tick"
+                            // has to consider BOTH dimensions - a byte tick that
+                            // finished its file is not final if ops remain, and
+                            // an op tick (which carries 0/0 bytes) is final only
+                            // once every op is done. Anything else throttles to
+                            // ~1/s on the INJECTED clock (the module's
+                            // determinism rule - never tokio/Instant time).
+                            let is_final =
+                                p.bytes_done >= p.bytes_total && p.ops_done >= p.ops_total;
                             let throttled = matches!(*guard, Some(last) if now - last < RECOVER_EMIT_MIN_INTERVAL_MS)
-                                && p.bytes_done < p.bytes_total;
+                                && !is_final;
                             if throttled {
                                 return;
                             }
@@ -1370,6 +1381,8 @@ impl SyncOrchestrator {
                             path: p.path,
                             bytes_done: p.bytes_done,
                             bytes_total: p.bytes_total,
+                            ops_done: p.ops_done,
+                            ops_total: p.ops_total,
                         })
                         .await;
                     })
@@ -3883,11 +3896,11 @@ mod tests {
             if ticks > 1 {
                 let total = 1_000u64;
                 for i in 0..ticks {
-                    on_recover(crate::executor::RecoverProgress {
-                        path: "big/file.bin".to_string(),
-                        bytes_done: i * total / (ticks - 1),
-                        bytes_total: total,
-                    })
+                    on_recover(crate::executor::RecoverProgress::bytes(
+                        "big/file.bin".to_string(),
+                        i * total / (ticks - 1),
+                        total,
+                    ))
                     .await;
                 }
             }

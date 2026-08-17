@@ -219,6 +219,17 @@ export const useProgressStore = defineStore("progress", () => {
     total: sumOver("recovering", "bytes_total"),
   }));
 
+  /** Issue #301: OP progress of the reconcile-phase recovery, summed across
+   * accounts in `recovering`. Most of a recovery is one remote round trip per
+   * pending op - work that moves no bytes at all - so `recoveringBytes` above
+   * stays 0/0 for it and the UI had nothing to show. These counters are what
+   * make the phase honest ("Recovering - resuming 7 of 18 uploads") instead of
+   * a generic "Starting backup..." for a measured 65 seconds. */
+  const recoveringOps = computed<{ done: number; total: number }>(() => ({
+    done: sumOver("recovering", "ops_done"),
+    total: sumOver("recovering", "ops_total"),
+  }));
+
   /** Aggregate execution progress across every account currently `executing`.
    * Scan/plan/verify carry no reliable total, so they contribute nothing here.
    *
@@ -275,6 +286,11 @@ export const useProgressStore = defineStore("progress", () => {
     // resume ran).
     const r = recoveringBytes.value;
     if (r.total > 0) return clamp01(r.done / r.total);
+    // Issue #301: no byte dimension (the pass is doing per-op remote lookups),
+    // but the op counters are a real, determinate total - use them rather than
+    // falling back to an indeterminate sweep.
+    const ro = recoveringOps.value;
+    if (ro.total > 0) return clamp01(ro.done / ro.total);
     return null;
   });
 
@@ -355,6 +371,7 @@ export const useProgressStore = defineStore("progress", () => {
     plannedFiles,
     verified,
     recoveringBytes,
+    recoveringOps,
     percent,
     filesDone,
     filesTotal,

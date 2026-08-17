@@ -550,20 +550,114 @@ pub fn noop_outcome_sink(_outcome: &OpOutcome) -> futures::future::BoxFuture<'st
     Box::pin(async {})
 }
 
-/// One progress tick of a reconcile-phase upload recovery (the streaming
-/// resume of an interrupted resumable session, 2026-08-14 follow-up). Emitted
-/// at resume start (with `bytes_done` = the previously-acked offset - a large
-/// prefix re-read can run for minutes before the first new ack) and then on
-/// every destination ack; the orchestrator throttles + rebroadcasts it as
+/// One progress tick of the reconcile-phase recovery pass (2026-08-14
+/// follow-up; issue #301). Two flavours, distinguished by which pair of
+/// counters moves:
+///
+/// - a BYTE tick, emitted at a resumable session's resume start (with
+///   `bytes_done` = the previously-acked offset - a large prefix re-read can
+///   run for minutes before the first new ack) and then on every destination
+///   ack;
+/// - an OP tick (issue #301), emitted as each pending op's remote lookup
+///   completes. Most of a reconcile's wall clock is exactly these lookups - one
+///   `metadata` read or `find_by_op_uuid` per op, ~2-4s each against Drive -
+///   and they move no bytes, so without this the UI sees a generic
+///   "Starting backup..." for the whole pass (a measured 65s on a 18-op source).
+///
+/// The orchestrator throttles + rebroadcasts either as
 /// [`OrchestratorState::Recovering`](crate::types::OrchestratorState).
 #[derive(Debug, Clone, PartialEq, Eq)]
 pub struct RecoverProgress {
-    /// Source-relative path of the file being resumed (display only).
+    /// Source-relative path of the file being resumed (display only). Empty on
+    /// an op tick, which describes the whole pass rather than one file.
     pub path: String,
-    /// Bytes the destination has acked so far.
+    /// Bytes the destination has acked so far. Zero on an op tick.
     pub bytes_done: u64,
-    /// The session's total byte count.
+    /// The session's total byte count. Zero on an op tick.
     pub bytes_total: u64,
+    /// Issue #301: pending ops of this pass recovered so far.
+    pub ops_done: u64,
+    /// Issue #301: total pending ops in this pass.
+    pub ops_total: u64,
+}
+
+impl RecoverProgress {
+    /// A BYTE tick: one resumable session's re-read progress. The op counters
+    /// are left at zero - `reconcile_inner` stamps the pass's live values on
+    /// before forwarding, so a deep call site never has to thread them.
+    #[must_use]
+    pub fn bytes(path: String, bytes_done: u64, bytes_total: u64) -> Self {
+        Self {
+            path,
+            bytes_done,
+            bytes_total,
+            ops_done: 0,
+            ops_total: 0,
+        }
+    }
+
+    /// An OP tick (issue #301): whole-pass op progress, no byte dimension and
+    /// no single file to name. Both counters are stamped by the same wrapper as
+    /// the byte ticks, so this is the zero value it starts from.
+    #[must_use]
+    pub fn op_tick() -> Self {
+        Self {
+            path: String::new(),
+            bytes_done: 0,
+            bytes_total: 0,
+            ops_done: 0,
+            ops_total: 0,
+        }
+    }
+}
+
+/// How many reconcile adopt-or-requeue lookups may be in flight at once
+/// (issue #301).
+///
+/// Modest on purpose. These are metadata round trips, not transfers, and they
+/// already pass through [`AimdPacer::permit_request`](crate::pacer::AimdPacer)
+/// so a rate-limit or an open circuit breaker still gates them - the bound just
+/// keeps a large pending set from queueing hundreds of permits at once. Six
+/// turns the measured 18-op / 65s serial pass into roughly a sixth of the round
+/// trips' wall clock while staying well inside Drive's per-user concurrency.
+const RECONCILE_LOOKUP_CONCURRENCY: usize = 6;
+
+/// The result of ONE prefetched adopt-or-requeue lookup (issue #301).
+///
+/// Each variant carries exactly what the sequential decision pass would have
+/// gotten from making the call itself, so the decision logic is unchanged - it
+/// just reads a value instead of awaiting one.
+enum ReconcileLookup {
+    /// UPDATE path: the `remote.metadata(drive_file_id)` result.
+    Metadata(anyhow::Result<RemoteEntry>),
+    /// CREATE path, in two layers because the sequential pass treats the two
+    /// failures differently. The OUTER `Err` is a failed parent-folder-chain
+    /// walk, propagated verbatim (unclassified, straight through
+    /// `to_reconcile_err`, aborting the source's pass); the INNER result is
+    /// `find_by_op_uuid`'s, which IS classified (transient keeps the op and
+    /// aborts, definitive drops just this op).
+    Orphan(anyhow::Result<anyhow::Result<Option<RemoteEntry>>>),
+}
+
+impl ReconcileLookup {
+    /// Did this lookup fail in a way that makes the sequential pass ABORT the
+    /// source's reconcile and retry next cycle? Used to stop issuing further
+    /// prefetches, so a Drive outage costs one failed request rather than one
+    /// per pending op.
+    ///
+    /// A `ParentFailed` counts: the sequential pass propagates it unclassified,
+    /// which aborts the pass just the same.
+    fn is_retryable_failure(&self) -> bool {
+        match self {
+            ReconcileLookup::Metadata(Err(e)) | ReconcileLookup::Orphan(Ok(Err(e))) => {
+                reconcile_metadata_error_is_retryable(classify_drive_error(e))
+            }
+            // A parent-walk failure propagates unclassified and aborts the pass
+            // just the same, so it halts the prefetch too.
+            ReconcileLookup::Orphan(Err(_)) => true,
+            ReconcileLookup::Metadata(Ok(_)) | ReconcileLookup::Orphan(Ok(Ok(_))) => false,
+        }
+    }
 }
 
 /// The reconcile-phase recovery progress sink (mirrors [`OutcomeSink`]'s
@@ -5088,6 +5182,169 @@ impl DefaultExecutor {
         }
     }
 
+    /// One paced UPDATE-path lookup: read the recorded object's metadata and
+    /// account the response with the pacer/breaker, exactly as the sequential
+    /// path did inline. A pure READ - safe to run concurrently with its peers
+    /// (issue #301).
+    async fn reconcile_metadata_lookup(&self, file_id: &str) -> anyhow::Result<RemoteEntry> {
+        self.pacer.permit_request().await;
+        match self.remote.metadata(file_id).await {
+            Ok(entry) => {
+                self.pacer.note_response(ResponseClass::Ok);
+                Ok(entry)
+            }
+            Err(e) => {
+                self.pacer
+                    .note_response(classify_drive_error(&e).response_class());
+                Err(e)
+            }
+        }
+    }
+
+    /// One paced CREATE-path lookup: re-derive the parent folder chain, then
+    /// search it for the orphan carrying `uuid`. The OUTER `Err` is a failed
+    /// parent walk (propagated verbatim, aborting the pass); the INNER one is
+    /// `find_by_op_uuid`'s, which the caller classifies.
+    ///
+    /// Safe to run concurrently (issue #301). The parent walk
+    /// ([`Self::ensure_parents_once`]) is idempotent AND single-flighted behind
+    /// `parent_walk` with a per-source `parent_dirs` cache - it was built for
+    /// exactly this, so that concurrent uploads into one new directory cannot
+    /// race duplicate `ensure_folder` calls. `find_by_op_uuid` is a pure read.
+    /// Neither touches the state DB, so no per-op durability ordering is at
+    /// stake here; every commit still happens in the sequential pass below.
+    async fn reconcile_orphan_lookup(
+        &self,
+        source: &SourceRow,
+        relative_path: &RelativePath,
+        uuid: &str,
+        crypto: Option<&dyn SourceCryptoSuite>,
+    ) -> anyhow::Result<anyhow::Result<Option<RemoteEntry>>> {
+        let parent_id = self
+            .reconcile_parent_id(source, relative_path, crypto)
+            .await?;
+        self.pacer.permit_request().await;
+        Ok(
+            match self
+                .remote
+                .find_by_op_uuid(&parent_id, uuid, &source.drive_context())
+                .await
+            {
+                Ok(found) => {
+                    self.pacer.note_response(ResponseClass::Ok);
+                    Ok(found)
+                }
+                Err(e) => {
+                    self.pacer
+                        .note_response(classify_drive_error(&e).response_class());
+                    Err(e)
+                }
+            },
+        )
+    }
+
+    /// Issue #301: run every op's adopt-or-requeue lookup with BOUNDED
+    /// concurrency, ahead of the sequential decision pass.
+    ///
+    /// # Why
+    ///
+    /// The lookups are where a reconcile spends its wall clock: one Drive
+    /// round trip per op at ~2-4s apiece. Serially that is a minute of dead
+    /// air before the first scan (measured on maxbook 2026-08-16: 18 pending
+    /// ops, 65.2s between "recovering pending ops" and the first `Scanning`
+    /// transition). They are also the only part of the pass that is provably
+    /// independent - see [`Self::reconcile_orphan_lookup`] for why the parent
+    /// walk is concurrency-safe, and note that NOTHING here writes to the state
+    /// DB. Every `delete_pending_op` / `adopt_reconciled` / `clear_file_state_*`
+    /// still runs one at a time, in the original op order, in the pass below,
+    /// so per-op durability is byte-for-byte unchanged.
+    ///
+    /// # What is deliberately excluded
+    ///
+    /// - Ops carrying a live `resumable` session. Those stream a whole file and
+    ///   own the byte-progress ticks; they stay strictly sequential, and their
+    ///   fall-through lookup (when a session turns out to be stale) is done
+    ///   inline below.
+    /// - Ops with no `client_op_uuid` (older rows the normal queue picks up).
+    ///
+    /// # Fail-fast
+    ///
+    /// The sequential pass ABORTS the source's reconcile on the first RETRYABLE
+    /// lookup error (keeping the op for the next cycle). Prefetching would
+    /// otherwise turn one failed request during a Drive outage into N failed
+    /// requests. So the first future to see a retryable error sets `halt`, and
+    /// every future that has not started yet returns `None` - the pass below
+    /// then does that one lookup inline and hits the same abort. Bounded by
+    /// [`RECONCILE_LOOKUP_CONCURRENCY`].
+    async fn prefetch_reconcile_lookups(
+        &self,
+        source: &SourceRow,
+        ops: &[crate::state::PendingOpRow],
+        crypto: Option<&dyn SourceCryptoSuite>,
+    ) -> Vec<Option<ReconcileLookup>> {
+        use futures::StreamExt;
+
+        let halt = std::sync::atomic::AtomicBool::new(false);
+        let halt = &halt;
+
+        // Owned per-op inputs: the futures below must not borrow from `ops`, or
+        // the closure fails the higher-ranked lifetime bound `buffer_unordered`
+        // needs.
+        let prefetchable: Vec<(usize, RelativePath, String, Option<String>)> = ops
+            .iter()
+            .enumerate()
+            .filter_map(|(idx, op)| {
+                let payload = PendingOpPayload::from_value(&op.payload_json);
+                // A live session is resumed sequentially; an op with no uuid is
+                // skipped entirely by the pass below.
+                if payload.resumable.is_some() {
+                    return None;
+                }
+                payload.client_op_uuid.map(|uuid| {
+                    (
+                        idx,
+                        op.relative_path.clone(),
+                        uuid,
+                        payload.drive_file_id.clone(),
+                    )
+                })
+            })
+            .collect();
+
+        let mut out: Vec<Option<ReconcileLookup>> = (0..ops.len()).map(|_| None).collect();
+        if prefetchable.is_empty() {
+            return out;
+        }
+
+        let results = futures::stream::iter(prefetchable)
+            .map(|(idx, relative_path, uuid, drive_file_id)| async move {
+                if halt.load(std::sync::atomic::Ordering::Acquire) {
+                    return (idx, None);
+                }
+                let lookup = match drive_file_id.as_deref() {
+                    Some(file_id) => {
+                        ReconcileLookup::Metadata(self.reconcile_metadata_lookup(file_id).await)
+                    }
+                    None => ReconcileLookup::Orphan(
+                        self.reconcile_orphan_lookup(source, &relative_path, &uuid, crypto)
+                            .await,
+                    ),
+                };
+                if lookup.is_retryable_failure() {
+                    halt.store(true, std::sync::atomic::Ordering::Release);
+                }
+                (idx, Some(lookup))
+            })
+            .buffer_unordered(RECONCILE_LOOKUP_CONCURRENCY)
+            .collect::<Vec<_>>()
+            .await;
+
+        for (idx, lookup) in results {
+            out[idx] = lookup;
+        }
+        out
+    }
+
     /// Body of [`Executor::reconcile`], split out so the trait impl stays a
     /// one-line fetch + delegate.
     async fn reconcile_inner(
@@ -5307,11 +5564,47 @@ impl DefaultExecutor {
         // when actually needed.
         let mut exclusion_matcher: Option<Option<crate::exclude::SourceMatcher>> = None;
 
-        for op in remaining {
+        // --- issue #301: honest, granular progress for the whole pass -------
+        // The pass is dominated by one remote round trip per op, which moves no
+        // bytes - so the byte ticks alone left the UI on a generic
+        // "Starting backup..." for the entire recovery. Count ops here and stamp
+        // the running total onto EVERY tick (byte ticks included), so
+        // `OrchestratorState::Recovering` always carries both dimensions and the
+        // deep resume call sites do not have to thread the counters down.
+        let ops_total = remaining.len() as u64;
+        let ops_done = std::sync::atomic::AtomicU64::new(0);
+        let ops_done = &ops_done;
+        let stamped = |mut p: RecoverProgress| -> futures::future::BoxFuture<'_, ()> {
+            Box::pin(async move {
+                p.ops_done = ops_done.load(std::sync::atomic::Ordering::Relaxed);
+                p.ops_total = ops_total;
+                on_recover(p).await;
+            })
+        };
+
+        // Announce the pass BEFORE the first round trip, so the UI leaves the
+        // indeterminate PowerCheck sweep immediately rather than after however
+        // long the first lookup takes.
+        if ops_total > 0 {
+            stamped(RecoverProgress::op_tick()).await;
+        }
+
+        // --- issue #301: prefetch the independent lookups concurrently -------
+        let mut lookups = self
+            .prefetch_reconcile_lookups(source, &remaining, crypto)
+            .await;
+
+        for (idx, op) in remaining.into_iter().enumerate() {
             let payload = PendingOpPayload::from_value(&op.payload_json);
+            // Take this op's prefetched lookup (if any). `None` means it was
+            // deliberately skipped (a live resumable session / no uuid) or the
+            // prefetch halted early on a retryable failure - either way the
+            // branches below fall back to making the call inline.
+            let prefetched = lookups.get_mut(idx).and_then(Option::take);
 
             let Some(uuid) = payload.client_op_uuid.clone() else {
                 // No UUID carried (older row): leave it for the normal queue.
+                ops_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
                 continue;
             };
 
@@ -5357,7 +5650,7 @@ impl DefaultExecutor {
                     // error to ReconcileError::AuthInvalidGrant so reconcile_once's
                     // enter_needs_reauth fires.
                     let resumed = self
-                        .resume_persisted(source, &op, &payload, resumable, crypto, on_recover)
+                        .resume_persisted(source, &op, &payload, resumable, crypto, &stamped)
                         .await
                         .map_err(to_reconcile_err)?;
                     match resumed {
@@ -5377,6 +5670,8 @@ impl DefaultExecutor {
                             self.adopt_reconciled(source, &op, &adopted, entry, crypto)
                                 .await
                                 .map_err(to_reconcile_err)?;
+                            ops_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                            stamped(RecoverProgress::op_tick()).await;
                             continue;
                         }
                         None => {
@@ -5390,8 +5685,18 @@ impl DefaultExecutor {
 
             if let Some(file_id) = payload.drive_file_id.clone() {
                 // Update path: compare the existing object's appProperties.
-                self.pacer.permit_request().await;
-                match self.remote.metadata(&file_id).await {
+                // Issue #301: the round trip normally already happened, in
+                // parallel with its peers; the pacer/breaker accounting moved
+                // into `reconcile_metadata_lookup` with it, so the arms below no
+                // longer call `note_response` themselves.
+                let metadata = match prefetched {
+                    Some(ReconcileLookup::Metadata(result)) => result,
+                    // Prefetch halted (a peer hit a retryable failure) or this
+                    // op fell through from a stale resumable session: make the
+                    // call inline, exactly as the pre-#301 path did.
+                    _ => self.reconcile_metadata_lookup(&file_id).await,
+                };
+                match metadata {
                     // R2-P1-1: a SUCCESSFUL metadata read decides the op's fate.
                     Ok(entry)
                         if entry
@@ -5400,7 +5705,6 @@ impl DefaultExecutor {
                             .map(|v| v == &uuid)
                             .unwrap_or(false) =>
                     {
-                        self.pacer.note_response(ResponseClass::Ok);
                         // Already committed remotely; re-hash + finish.
                         // adopt_reconciled re-derives the encrypted parent chain
                         // (remote ensure_folder) - map an invalid_grant there.
@@ -5414,7 +5718,6 @@ impl DefaultExecutor {
                         // committed. Only THEN drop the stale op so the next scan
                         // re-enqueues it cleanly (the prior file_state row keeps
                         // the existing drive_file_id for the update).
-                        self.pacer.note_response(ResponseClass::Ok);
                         self.state.delete_pending_op(op.id).await?;
                     }
                     Err(e) => {
@@ -5434,7 +5737,6 @@ impl DefaultExecutor {
                         // whole account. Instead clear the stale id so the next scan
                         // re-plans a fresh CREATE (re-upload), and drop this op.
                         let class = classify_drive_error(&e);
-                        self.pacer.note_response(class.response_class());
                         if reconcile_metadata_error_is_retryable(class) {
                             warn!(
                                 target: TARGET,
@@ -5467,20 +5769,32 @@ impl DefaultExecutor {
                 //
                 // R2-P1-1: reconcile_parent_id + find_by_op_uuid + adopt each
                 // do remote awaits; map an invalid_grant to needs_reauth.
-                let parent_id = self
-                    .reconcile_parent_id(source, &op.relative_path, crypto)
-                    .await
-                    .map_err(to_reconcile_err)?;
-                self.pacer.permit_request().await;
-                let found = match self
-                    .remote
-                    .find_by_op_uuid(&parent_id, &uuid, &source.drive_context())
-                    .await
-                {
-                    Ok(found) => {
-                        self.pacer.note_response(ResponseClass::Ok);
-                        found
+                //
+                // Issue #301: the parent walk + lookup normally already ran, in
+                // parallel with its peers (both are concurrency-safe - see
+                // `reconcile_orphan_lookup`), and carried the pacer accounting
+                // with them. Fall back to an inline lookup when the prefetch was
+                // skipped or halted.
+                let orphan = match prefetched {
+                    Some(ReconcileLookup::Orphan(result)) => result,
+                    // Not prefetched (this op fell through from a stale
+                    // resumable session, or the prefetch halted on a peer's
+                    // retryable failure). A `Metadata` result cannot belong to
+                    // this branch - it is selected by the ABSENCE of a recorded
+                    // `drive_file_id` - so the same fallback covers both.
+                    _ => {
+                        self.reconcile_orphan_lookup(source, &op.relative_path, &uuid, crypto)
+                            .await
                     }
+                };
+                let found = match orphan {
+                    Ok(found) => found,
+                    // The parent-folder-chain walk failed: propagate verbatim
+                    // (an invalid_grant in there still maps to needs_reauth).
+                    Err(e) => return Err(to_reconcile_err(e)),
+                };
+                let found = match found {
+                    Ok(found) => found,
                     Err(e) => {
                         // R2-P1-1 / R3-P1-2: a lookup ERROR proves nothing about
                         // whether the create committed. For a TRANSIENT / rate-
@@ -5496,7 +5810,6 @@ impl DefaultExecutor {
                         // drive_file_id to clear, so drop the op; the next scan
                         // re-plans a fresh CREATE from the live file.
                         let class = classify_drive_error(&e);
-                        self.pacer.note_response(class.response_class());
                         if reconcile_metadata_error_is_retryable(class) {
                             warn!(
                                 target: TARGET,
@@ -5513,6 +5826,8 @@ impl DefaultExecutor {
                             "reconcile: find_by_op_uuid returned a definitive not-found; dropping the op so the next scan re-creates the object (R3-P1-2): {e}"
                         );
                         self.state.delete_pending_op(op.id).await?;
+                        ops_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+                        stamped(RecoverProgress::op_tick()).await;
                         continue;
                     }
                 };
@@ -5528,6 +5843,13 @@ impl DefaultExecutor {
                     }
                 }
             }
+
+            // Issue #301: this op is fully handled (adopted, requeued, or
+            // dropped) and durably committed. Count it and tick, so the UI's
+            // "Recovering - N of M" advances per op rather than only when a
+            // resumable session happens to move bytes.
+            ops_done.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+            stamped(RecoverProgress::op_tick()).await;
         }
         Ok(())
     }
@@ -5767,11 +6089,11 @@ impl DefaultExecutor {
         // Flip the UI into Recovering IMMEDIATELY (2026-08-14 follow-up): a
         // large prefix re-read produces no destination acks for minutes, and
         // the state must not stay in the indeterminate PowerCheck sweep.
-        on_recover(RecoverProgress {
-            path: op.relative_path.as_str().to_string(),
-            bytes_done: resumable.acked_offset,
-            bytes_total: total,
-        })
+        on_recover(RecoverProgress::bytes(
+            op.relative_path.as_str().to_string(),
+            resumable.acked_offset,
+            total,
+        ))
         .await;
 
         // Re-open the local file and check the resume-safe IDENTITY recorded
@@ -6150,11 +6472,11 @@ impl DefaultExecutor {
                 if let Some(io) = self.io_counters.as_ref() {
                     io.add_net_wire(take as u64);
                 }
-                on_recover(RecoverProgress {
-                    path: op.relative_path.as_str().to_string(),
-                    bytes_done: session.size,
-                    bytes_total: session.size,
-                })
+                on_recover(RecoverProgress::bytes(
+                    op.relative_path.as_str().to_string(),
+                    session.size,
+                    session.size,
+                ))
                 .await;
                 acc.clear();
                 Ok(ResumePushOutcome::Completed(entry))
@@ -6184,11 +6506,11 @@ impl DefaultExecutor {
                 }
                 // Persist the new acked offset so a crash resumes from here.
                 self.persist_payload(op.id, live).await?;
-                on_recover(RecoverProgress {
-                    path: op.relative_path.as_str().to_string(),
-                    bytes_done: received,
-                    bytes_total: session.size,
-                })
+                on_recover(RecoverProgress::bytes(
+                    op.relative_path.as_str().to_string(),
+                    received,
+                    session.size,
+                ))
                 .await;
                 Ok(ResumePushOutcome::Acked)
             }
@@ -11962,6 +12284,306 @@ mod tests {
         assert!(h.pacer.backoff_hits.load(Ordering::SeqCst) >= 1);
     }
 
+    // --- issue #301: reconcile speed + honest op progress -------------------
+
+    /// Issue #301: the adopt-or-requeue lookups must run CONCURRENTLY, and the
+    /// pass must report per-op progress.
+    ///
+    /// Evidence this replaces (maxbook 2026-08-16): 18 pending ops, one Drive
+    /// round trip apiece, 65.2s between "reconcile: recovering pending ops" and
+    /// the first `Scanning` transition - with NOT ONE state transition emitted
+    /// in between, so the UI sat on the generic "Starting backup...".
+    ///
+    /// Here 12 ops each cost a fixed `DELAY` on the fake store. Serially that is
+    /// a hard floor of `12 * DELAY`; with [`RECONCILE_LOOKUP_CONCURRENCY`] = 6
+    /// it is two rounds. The bound asserted below sits between the two, so this
+    /// FAILS if the prefetch is ever removed or silently serialised - it is not
+    /// a "sleep and hope" timing test.
+    #[tokio::test]
+    async fn reconcile_lookups_run_concurrently_and_report_op_progress() {
+        const OPS: usize = 12;
+        const DELAY: std::time::Duration = std::time::Duration::from_millis(120);
+
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_slow_responses(DELAY)).await;
+
+        // 12 create-path ops whose objects never landed (no orphan on the fake),
+        // so each one costs exactly one `find_by_op_uuid` and is then dropped.
+        for i in 0..OPS {
+            let rel = RelativePath::try_from(format!("f{i}.txt")).unwrap();
+            h.state
+                .enqueue_pending_op(NewPendingOp {
+                    source_id: h.source.id,
+                    op_type: OP_TYPE_UPLOAD.to_string(),
+                    relative_path: rel,
+                    payload_json: PendingOpPayload {
+                        client_op_uuid: Some(uuid::Uuid::new_v4().to_string()),
+                        ..PendingOpPayload::default()
+                    }
+                    .to_value(),
+                    scheduled_for: 0,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        let ticks: std::sync::Mutex<Vec<RecoverProgress>> = std::sync::Mutex::new(Vec::new());
+        let sink = |p: RecoverProgress| -> futures::future::BoxFuture<'_, ()> {
+            let ticks = &ticks;
+            Box::pin(async move {
+                ticks.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+            })
+        };
+
+        let exec = h.executor();
+        let started = std::time::Instant::now();
+        exec.reconcile(&h.source, &sink).await.unwrap();
+        let elapsed = started.elapsed();
+
+        // Serial floor is OPS * DELAY = 1440ms; two concurrent rounds is ~240ms.
+        // The bound is deliberately loose (a slow CI box still passes) but far
+        // below the serial floor.
+        let serial_floor = DELAY * OPS as u32;
+        assert!(
+            elapsed < serial_floor / 2,
+            "reconcile lookups must run concurrently: took {elapsed:?}, a serial \
+             pass would need at least {serial_floor:?}"
+        );
+
+        // Every op was resolved (none landed, so all were dropped).
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+
+        // Honest progress: the pass announced itself BEFORE the first round trip
+        // and finished at OPS of OPS.
+        let ticks = ticks.into_inner().unwrap_or_else(|e| e.into_inner());
+        assert!(!ticks.is_empty(), "the pass must report op progress");
+        assert_eq!(
+            ticks[0].ops_done, 0,
+            "the first tick announces the pass before any lookup"
+        );
+        assert!(
+            ticks.iter().all(|t| t.ops_total == OPS as u64),
+            "every tick carries the pass total"
+        );
+        let last = ticks.last().expect("at least one tick");
+        assert_eq!(
+            last.ops_done, OPS as u64,
+            "the final tick reports every op recovered"
+        );
+        // Monotonic: `ops_done` never goes backwards.
+        assert!(
+            ticks.windows(2).all(|w| w[0].ops_done <= w[1].ops_done),
+            "op progress must be monotonic"
+        );
+    }
+
+    /// A reconcile with NOTHING pending emits no op ticks at all (the common
+    /// case must stay free - no state transition churn on every clean boot).
+    #[tokio::test]
+    async fn reconcile_with_no_pending_ops_emits_no_op_ticks() {
+        let h = harness().await;
+        let ticks: std::sync::Mutex<Vec<RecoverProgress>> = std::sync::Mutex::new(Vec::new());
+        let sink = |p: RecoverProgress| -> futures::future::BoxFuture<'_, ()> {
+            let ticks = &ticks;
+            Box::pin(async move {
+                ticks.lock().unwrap_or_else(|e| e.into_inner()).push(p);
+            })
+        };
+        h.executor().reconcile(&h.source, &sink).await.unwrap();
+        assert!(
+            ticks
+                .into_inner()
+                .unwrap_or_else(|e| e.into_inner())
+                .is_empty(),
+            "a clean boot must not emit Recovering ticks"
+        );
+    }
+
+    /// Issue #301 fail-fast: the prefetch stops issuing lookups once one has
+    /// failed RETRYABLY, so a Drive outage costs a handful of requests rather
+    /// than one per pending op. Drives the classifier directly - it is what the
+    /// prefetch's halt flag keys off.
+    #[test]
+    fn reconcile_lookup_classifies_which_failures_halt_the_prefetch() {
+        use driven_drive::google::DriveError as DriveStoreError;
+        use driven_drive::remote_store::DriveErrorClassification;
+
+        let transient = || {
+            anyhow::Error::new(DriveStoreError::Classified {
+                kind: DriveErrorClassification::Transient5xx,
+                source: anyhow::anyhow!("503"),
+            })
+        };
+        assert!(
+            ReconcileLookup::Metadata(Err(transient())).is_retryable_failure(),
+            "a transient metadata failure aborts the pass, so it must halt the prefetch"
+        );
+        assert!(
+            ReconcileLookup::Orphan(Ok(Err(transient()))).is_retryable_failure(),
+            "a transient orphan lookup failure must halt the prefetch"
+        );
+        assert!(
+            ReconcileLookup::Orphan(Err(anyhow::anyhow!("folder chain"))).is_retryable_failure(),
+            "a parent-walk failure propagates unclassified and aborts the pass, so it halts too"
+        );
+        // A DEFINITIVE not-found drops the single op and the pass CONTINUES -
+        // halting on it would needlessly serialise the rest.
+        let definitive = anyhow::anyhow!("drive.dest_folder_missing");
+        assert!(
+            !ReconcileLookup::Orphan(Ok(Err(definitive))).is_retryable_failure(),
+            "a definitive failure is per-op; it must NOT halt the prefetch"
+        );
+        assert!(!ReconcileLookup::Orphan(Ok(Ok(None))).is_retryable_failure());
+    }
+
+    /// Issue #301 fail-fast, end to end: when the parent-folder-chain walk
+    /// fails, the pass aborts with EVERY pending op kept (they retry next
+    /// cycle), and the prefetch stops issuing lookups rather than burning one
+    /// doomed round trip per op.
+    ///
+    /// `with_dest_folder_missing` fails every write-target request, which is
+    /// what `ensure_folder` is - so each op's parent walk fails. There are more
+    /// ops than [`RECONCILE_LOOKUP_CONCURRENCY`], so the ones queued behind the
+    /// first batch observe the halt flag and are left for the sequential pass
+    /// (which never reaches them - it aborts on the first).
+    #[tokio::test]
+    async fn reconcile_parent_walk_failure_aborts_the_pass_and_keeps_every_op() {
+        const OPS: usize = 8;
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_dest_folder_missing()).await;
+
+        for i in 0..OPS {
+            // NESTED, so the parent walk actually has a folder to ensure.
+            let rel = RelativePath::try_from(format!("sub/f{i}.txt")).unwrap();
+            h.state
+                .enqueue_pending_op(NewPendingOp {
+                    source_id: h.source.id,
+                    op_type: OP_TYPE_UPLOAD.to_string(),
+                    relative_path: rel,
+                    payload_json: PendingOpPayload {
+                        client_op_uuid: Some(uuid::Uuid::new_v4().to_string()),
+                        ..PendingOpPayload::default()
+                    }
+                    .to_value(),
+                    scheduled_for: 0,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        let err = h
+            .executor()
+            .reconcile(&h.source, &noop_recover_sink)
+            .await
+            .expect_err("a failed parent walk must abort the source's reconcile");
+        assert!(
+            err.to_string().contains("dest_folder_missing")
+                || err
+                    .chain()
+                    .any(|c| c.to_string().contains("dest_folder_missing")),
+            "the parent-walk error propagates verbatim: {err:?}"
+        );
+
+        // NOTHING was dropped: a failed lookup proves nothing about whether the
+        // create landed, so every op is kept for the next cycle.
+        assert_eq!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .len(),
+            OPS,
+            "an aborted pass must keep every pending op"
+        );
+    }
+
+    /// The UPDATE path through the prefetched lookup: a crash after the update
+    /// landed on the remote leaves an object already carrying the op's uuid, so
+    /// reconcile ADOPTS it (marks the row Synced) and drops the op.
+    #[tokio::test]
+    async fn reconcile_adopts_an_update_whose_object_already_carries_the_op_uuid() {
+        let h = harness().await;
+        let body = b"updated bytes";
+        let (rel, size) = h.write_file("u.txt", body);
+
+        // The object as it exists remotely AFTER the update committed: it
+        // carries this op's uuid in appProperties.
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let mut app = HashMap::new();
+        app.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.clone());
+        let entry = h
+            .remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "u.txt",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::copy_from_slice(body)),
+                app,
+            )
+            .await
+            .unwrap();
+
+        // The pre-update row (an UPDATE op is selected by a recorded id).
+        h.state
+            .upsert_file_state(&crate::state::FileStateRow {
+                source_id: h.source.id,
+                relative_path: rel.clone(),
+                size,
+                mtime_ns: 1,
+                hash_blake3: *blake3::hash(b"older bytes").as_bytes(),
+                drive_file_id: Some(entry.id.clone()),
+                drive_md5: None,
+                encrypted_remote_path: None,
+                status: FileStateStatus::Pending,
+                last_uploaded_at: Some(0),
+                last_verified_at: Some(0),
+            })
+            .await
+            .unwrap();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                payload_json: PendingOpPayload {
+                    client_op_uuid: Some(op_uuid),
+                    drive_file_id: Some(entry.id.clone()),
+                    uploaded_blake3_hex: Some(hex::encode(blake3::hash(body).as_bytes())),
+                    ..PendingOpPayload::default()
+                }
+                .to_value(),
+                scheduled_for: 0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+
+        h.executor()
+            .reconcile(&h.source, &noop_recover_sink)
+            .await
+            .unwrap();
+
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("file_state row");
+        assert_eq!(row.status, FileStateStatus::Synced, "the update is adopted");
+        assert_eq!(row.drive_file_id.as_deref(), Some(entry.id.as_str()));
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
+    }
+
     // --- crash mid-resumable resumes via reconcile --------------------------
 
     #[tokio::test]
@@ -12530,6 +13152,12 @@ mod tests {
     /// follow-up): one at resume start carrying the previously-acked offset
     /// (the UI must flip out of the indeterminate sweep before the first new
     /// ack), then per destination ack, ending at bytes_done == bytes_total.
+    ///
+    /// Issue #301 added a second flavour of tick - whole-pass OP progress -
+    /// which now leads the stream (the pass announces itself before the first
+    /// round trip) and trails it (each recovered op counts). The BYTE ticks
+    /// asserted here are the ones carrying a path and a non-zero total; every
+    /// tick, of either flavour, carries the pass's op counters.
     #[tokio::test]
     async fn resume_emits_recover_progress_ticks() {
         let h = harness().await;
@@ -12549,24 +13177,44 @@ mod tests {
         exec.reconcile(&h.source, &sink).await.unwrap();
 
         let ticks = ticks.into_inner().unwrap();
+        // Issue #301: the pass announces itself first, with no byte dimension.
+        assert_eq!(
+            (ticks[0].ops_done, ticks[0].ops_total, ticks[0].bytes_total),
+            (0, 1, 0),
+            "the pass announces 0 of 1 ops before the first round trip: {ticks:?}"
+        );
         assert!(
-            ticks.len() >= 2,
-            "at least a start tick and a completion tick: {ticks:?}"
+            ticks.iter().all(|t| t.ops_total == 1),
+            "every tick carries the pass total: {ticks:?}"
+        );
+        let last = ticks.last().expect("at least one tick");
+        assert_eq!(
+            last.ops_done, 1,
+            "the final tick reports the op recovered: {ticks:?}"
+        );
+
+        let byte_ticks: Vec<&RecoverProgress> =
+            ticks.iter().filter(|t| t.bytes_total > 0).collect();
+        assert!(
+            byte_ticks.len() >= 2,
+            "at least a resume-start tick and a completion tick: {ticks:?}"
         );
         assert_eq!(
-            ticks[0].bytes_done, 0,
+            byte_ticks[0].bytes_done, 0,
             "start tick carries the acked offset"
         );
-        assert_eq!(ticks[0].bytes_total, size);
-        assert_eq!(ticks[0].path, "ticks.bin");
-        let last = ticks.last().unwrap();
+        assert_eq!(byte_ticks[0].bytes_total, size);
+        assert_eq!(byte_ticks[0].path, "ticks.bin");
+        let last_byte = byte_ticks.last().expect("a byte tick");
         assert_eq!(
-            last.bytes_done, last.bytes_total,
-            "the final tick reports completion"
+            last_byte.bytes_done, last_byte.bytes_total,
+            "the final byte tick reports completion"
         );
         assert!(
-            ticks.windows(2).all(|w| w[0].bytes_done <= w[1].bytes_done),
-            "ticks are monotonic: {ticks:?}"
+            byte_ticks
+                .windows(2)
+                .all(|w| w[0].bytes_done <= w[1].bytes_done),
+            "byte ticks are monotonic: {ticks:?}"
         );
         // And the op actually resolved (adopted Synced).
         let row = h

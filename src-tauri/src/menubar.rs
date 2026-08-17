@@ -1105,6 +1105,26 @@ async fn tick(
     status_gen_seen: &mut u64,
     was_active: &mut bool,
 ) {
+    // Issue #300: a quit is draining and the tray now belongs to the quitting
+    // affordance. Keeping a live "12.3 MB/s, 4 min left" title next to the
+    // quitting icon would contradict it, so clear the title ONCE and stop
+    // ticking. The `painted` cache makes the clear idempotent across the
+    // remaining ticks, and the status rows need no handling here -
+    // `tray::enter_quitting` already dropped their handles, so the block below
+    // would skip them anyway.
+    if crate::is_quitting() {
+        if should_paint(painted, &None) {
+            if let Some(tray) = app.tray_by_id(tray::TRAY_ID) {
+                if let Err(err) = tray.set_title(None::<&str>) {
+                    tracing::debug!(target: TARGET, %err, "clear tray title on quit failed");
+                } else {
+                    *painted = Some(None);
+                }
+            }
+        }
+        return;
+    }
+
     // Copy both statics out and drop the guards BEFORE the idle branch's
     // `.await` below - a std Mutex guard must never cross a suspend point.
     let cfg = *CONFIG.lock().unwrap_or_else(|e| e.into_inner());
