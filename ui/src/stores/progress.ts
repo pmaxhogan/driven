@@ -278,6 +278,19 @@ export const useProgressStore = defineStore("progress", () => {
     return null;
   });
 
+  /** The freshest execution progress for ONE account, or null when that account
+   * is not currently executing (issue #303: the work-queue panel renders the
+   * running item's own counters, and with two accounts running the aggregate
+   * above would be the wrong number for either row).
+   *
+   * Same freshness rule as `exec`: the latest `sync:source_progress` tick when
+   * there is one, else the zeroed snapshot the `executing` transition carried. */
+  function accountProgress(accountId: string): ExecProgress | null {
+    const state = states.value[accountId];
+    if (!state || stateTag(state) !== "executing") return null;
+    return ticks.value[accountId] ?? execProgressOf(state);
+  }
+
   /** Files uploaded so far across executing accounts (for the bar's a11y label). */
   const filesDone = computed<number>(() => exec.value.filesDone);
   /** Total upload ops across executing accounts (0 when nothing is executing). */
@@ -346,6 +359,7 @@ export const useProgressStore = defineStore("progress", () => {
     filesDone,
     filesTotal,
     exec,
+    accountProgress,
     ingest,
     ingestProgress,
     subscribe,

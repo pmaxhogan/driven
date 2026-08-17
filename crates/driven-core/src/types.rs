@@ -741,6 +741,17 @@ pub enum OrchestratorEvent {
         /// The entry just persisted (the wire shape the webview consumes).
         entry: ActivityEntry,
     },
+    /// The account's PENDING-WORK QUEUE changed (issue #303): an item was
+    /// queued, started, finished, or cancelled.
+    ///
+    /// Carries the whole queue rather than a delta, so a webview that missed an
+    /// event (or attached late) is correct again on the very next one - the same
+    /// self-healing property the status events have. The app shell re-emits it
+    /// as `queue:changed` for the top-bar badge + dropdown panel.
+    WorkQueueChanged {
+        /// The queue as it now stands.
+        snapshot: crate::queue::QueueSnapshot,
+    },
 }
 
 // -----------------------------------------------------------------------------

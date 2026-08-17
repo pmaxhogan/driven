@@ -160,8 +160,10 @@ pub struct AccountSyncStatus {
 /// `bypass_gates_once`'s doc). `None`/`Some(false)` is the unchanged
 /// behaviour.
 ///
-/// Each [`Orchestrator::trigger`] coalesces into the run loop's capacity-1
-/// trigger channel, so spamming "Sync now" never stacks concurrent cycles.
+/// Issue #303: each trigger lands on the account's visible PENDING-WORK QUEUE,
+/// coalescing per (kind, source) - so spamming "Sync now" never stacks
+/// concurrent cycles, while a manual click no longer vanishes into an unrelated
+/// pending watcher tick the way the old capacity-1 channel let it.
 #[tauri::command]
 pub async fn sync_now(
     state: State<'_, AppState>,
@@ -210,7 +212,13 @@ async fn sync_now_impl(
             if bypass_gates == Some(true) {
                 handle.orchestrator.bypass_gates_once();
             }
-            handle.orchestrator.trigger(TickSource::Manual).await;
+            // Issue #303: attribute the request to its source so the work queue
+            // can name it ("Back up now - Music") and coalesce repeat clicks per
+            // source rather than folding unrelated requests together.
+            handle
+                .orchestrator
+                .trigger_source(TickSource::Manual, Some(source_id))
+                .await;
             Ok(())
         }
     }
@@ -399,6 +407,77 @@ pub async fn get_sync_status(state: State<'_, AppState>) -> CommandResult<Global
         });
     }
     Ok(GlobalSyncStatus { accounts })
+}
+
+/// `get_work_queue()` - snapshot every account's pending-work queue (issue
+/// #303).
+///
+/// One [`QueueSnapshot`](driven_core::queue::QueueSnapshot) per account that
+/// runs a queue, in account order. This is the HYDRATION path: the live updates
+/// ride `queue:changed`, and this fills the panel for a webview that attached
+/// after the last change (or was never open).
+#[tauri::command]
+pub async fn get_work_queue(
+    state: State<'_, AppState>,
+) -> CommandResult<Vec<driven_core::queue::QueueSnapshot>> {
+    Ok(state
+        .accounts()
+        .into_iter()
+        .filter_map(|(_id, handle)| handle.orchestrator.work_queue())
+        .collect())
+}
+
+/// `cancel_work_item(account_id, item_id)` - cancel ONE queued item (issue
+/// #303).
+///
+/// A PENDING item is dropped. The RUNNING item is stopped GRACEFULLY: no new
+/// ops are dispatched, the ops already in flight finish and durably commit, and
+/// the remainder is re-planned by a later scan. Nothing is ever torn mid-file
+/// and nothing already uploaded is removed.
+///
+/// Returns `true` when an item was found and acted on; `false` for a stale
+/// click on an item that has since finished (never an error - a queue the user
+/// is looking at is always a little behind the one that is running).
+#[tauri::command]
+pub async fn cancel_work_item(
+    state: State<'_, AppState>,
+    account_id: AccountId,
+    item_id: driven_core::queue::WorkItemId,
+) -> CommandResult<bool> {
+    let handle = state.account(account_id).ok_or_else(|| {
+        CommandError::new(format!("no running orchestrator for account {account_id}"))
+    })?;
+    let outcome = handle.orchestrator.cancel_work_item(item_id).await;
+    Ok(!matches!(
+        outcome,
+        driven_core::queue::CancelOutcome::NotFound
+    ))
+}
+
+/// `clear_work_queue(account_id)` - cancel everything pending and gracefully
+/// stop what is running (issue #303).
+///
+/// `account_id = null` clears EVERY account, which is what the panel's
+/// "Clear all" does (it shows all accounts' work merged into one list). The
+/// running item is asked no more than a single X on it would ask: stop
+/// dispatching, finish what is in flight.
+///
+/// Returns how many pending items were dropped across the accounts touched.
+#[tauri::command]
+pub async fn clear_work_queue(
+    state: State<'_, AppState>,
+    account_id: Option<AccountId>,
+) -> CommandResult<u32> {
+    let mut cleared = 0u32;
+    for (id, handle) in state.accounts() {
+        if account_id.is_some_and(|wanted| wanted != id) {
+            continue;
+        }
+        let outcome = handle.orchestrator.clear_work_queue().await;
+        cleared =
+            cleared.saturating_add(u32::try_from(outcome.cancelled_pending).unwrap_or(u32::MAX));
+    }
+    Ok(cleared)
 }
 
 #[cfg(test)]

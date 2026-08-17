@@ -52,6 +52,7 @@ import {
   SYNC_STATUS_IDLE,
   TELEMETRY_PREVIEW,
   VERSIONING_CONFIG,
+  WORK_QUEUE_IDLE,
   VSS_HELPER_STATUS,
 } from "./fixtures";
 
@@ -145,6 +146,9 @@ export function defaultCommands(): Record<string, MockCommandOverride> {
     resume_sync: undefined,
     get_pause_state: null,
     get_sync_status: SYNC_STATUS_IDLE,
+    get_work_queue: WORK_QUEUE_IDLE,
+    cancel_work_item: true,
+    clear_work_queue: 0,
 
     // --- Accounts (SPEC s11.1) ---
     list_accounts: ACCOUNTS,

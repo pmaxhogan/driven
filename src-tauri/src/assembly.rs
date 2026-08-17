@@ -1275,6 +1275,19 @@ fn spawn_event_bridge(
                         );
                     }
                 }
+                BridgeAction::WorkQueue { snapshot } => {
+                    // Issue #303: forward the whole queue so the top-bar badge
+                    // and dropdown track it without polling. Whole-snapshot (not
+                    // a delta), so a missed event self-heals on the next one.
+                    if let Err(err) = events::emit_queue_changed(&app, &snapshot) {
+                        tracing::debug!(
+                            target: TARGET,
+                            account_id = %account_id,
+                            %err,
+                            "emit queue:changed failed"
+                        );
+                    }
+                }
                 BridgeAction::Ignore => {
                     // Power / Network events: not bridged to the webview - the
                     // tray's coarse state is driven by StateChanged above and
@@ -1320,6 +1333,12 @@ enum BridgeAction {
         source_id: driven_core::types::SourceId,
         progress: driven_core::types::ExecProgress,
     },
+    /// Emit `queue:changed` with the account's whole pending-work queue
+    /// (issue #303), so the top-bar badge + dropdown reflect what is running
+    /// and what is waiting.
+    WorkQueue {
+        snapshot: driven_core::queue::QueueSnapshot,
+    },
     /// A non-bridged event (power / network); do nothing.
     Ignore,
     /// The broadcast closed (orchestrator dropped); end the bridge.
@@ -1346,6 +1365,9 @@ fn classify_bridge_event(
             source_id,
             progress,
         },
+        Ok(OrchestratorEvent::WorkQueueChanged { snapshot }) => {
+            BridgeAction::WorkQueue { snapshot }
+        }
         Ok(_) => BridgeAction::Ignore,
         Err(tokio::sync::broadcast::error::RecvError::Lagged(skipped)) => {
             BridgeAction::ActivityReconcile { skipped }
@@ -1517,6 +1539,7 @@ mod tests {
         ActivityNew,
         ActivityReconcile,
         SourceProgress,
+        WorkQueue,
         Ignore,
         Stop,
     }
@@ -1528,6 +1551,7 @@ mod tests {
                 BridgeAction::ActivityNew { .. } => Self::ActivityNew,
                 BridgeAction::ActivityReconcile { .. } => Self::ActivityReconcile,
                 BridgeAction::SourceProgress { .. } => Self::SourceProgress,
+                BridgeAction::WorkQueue { .. } => Self::WorkQueue,
                 BridgeAction::Ignore => Self::Ignore,
                 BridgeAction::Stop => Self::Stop,
             }

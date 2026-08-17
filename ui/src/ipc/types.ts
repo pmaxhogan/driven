@@ -977,3 +977,48 @@ export interface FrontendLogEntryDto {
   ts: number;
   text: string;
 }
+
+// --- pending-work queue (issue #303) ----------------------------------------
+
+/** What one queued item represents (mirrors driven-core `WorkKind`, snake_case
+ * on the wire). It is the display kind AND the backend's coalescing key: two
+ * watcher ticks for one source are the same pending work, a watcher tick and a
+ * manual "Back up now" are not. */
+export type WorkKind = "recovery" | "watcher" | "manual" | "scheduled";
+
+/** One item in an account's pending-work queue (mirrors driven-core
+ * `WorkItem`). snake_case on the wire, like the other core (non-DTO) shapes
+ * such as `ExecProgress`.
+ *
+ * `source_id` is the source the request was ATTRIBUTED to (a watcher tick names
+ * its source; the scheduled timer names none) - what the panel shows after the
+ * title, not a promise that the cycle touches only that source. */
+export interface WorkItem {
+  /** Stable id, unique per process run; what `cancelWorkItem` names. */
+  id: number;
+  kind: WorkKind;
+  source_id: string | null;
+  /** Wall-clock ms the item was FIRST queued (a coalesced repeat keeps the
+   * original time, so "queued 2 min ago" means what it says). */
+  enqueued_at: number;
+  /** The tick the cycle will run with. Carried for parity with the backend
+   * snapshot; the panel does not render it. */
+  tick: string;
+}
+
+/** One account's whole pending-work queue (mirrors driven-core
+ * `QueueSnapshot`): the `queue:changed` payload AND one element of the
+ * `getWorkQueue` hydration result. Whole-snapshot, never a delta, so a missed
+ * event self-heals on the next one. */
+export interface QueueSnapshot {
+  account_id: string;
+  /** The item currently running, if any. */
+  running: WorkItem | null;
+  /** True while the running item is DRAINING after a cancel: no new files are
+   * dispatched, the ones already in flight still finish and commit. */
+  running_cancelled: boolean;
+  /** Items waiting, in the order they will run. */
+  pending: WorkItem[];
+  /** Wall-clock ms of the next scheduled scan, when one is armed. */
+  next_scheduled_at: number | null;
+}

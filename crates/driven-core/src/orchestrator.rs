@@ -59,6 +59,7 @@ use crate::hooks::{CommandRunner, HookKind, NoopCommandRunner};
 use crate::network::{NetworkProbe, NetworkState, ServiceHealth, ServiceName};
 use crate::pacer::{Pacer, PacerCeilings};
 use crate::priority::{PriorityCell, WorkPriority};
+use crate::queue::{WorkKind, WorkQueue};
 use crate::state::{ActivityLevel, NewActivity, SourceRow, StateRepo};
 use crate::time::Clock;
 use crate::types::{
@@ -85,6 +86,17 @@ const WATCHER_CHANNEL_CAPACITY: usize = 64;
 /// and keychain services are not yet ready, so the orchestrator waits this
 /// long (measured on the injected [`Clock`]) before re-probing and resuming.
 const RESUME_DEFER_MS: i64 = 30_000;
+
+/// How long after the LAST include/exclude edit the orchestrator runs its ONE
+/// coalesced follow-up rescan (issue #302).
+///
+/// The per-op re-check in the executor stops newly-excluded work immediately;
+/// this rescan is what makes the TOTALS honest again (a plan built before the
+/// edit still counts the dropped ops in its denominator) and picks up paths the
+/// same edit RE-INCLUDED. Editing rules is bursty - a user toggling a handful
+/// of folders in the exclusions browser saves several times in a few seconds -
+/// so the timer restarts on every edit and the burst earns exactly one rescan.
+const EXCLUSION_RESCAN_DEBOUNCE: std::time::Duration = std::time::Duration::from_secs(2);
 
 /// Minimum gap between two [`OrchestratorState::Recovering`] state emissions
 /// (2026-08-14 follow-up). Resume acks land several times per second at
@@ -328,6 +340,45 @@ pub enum TickSource {
     Wake,
 }
 
+/// One wake source's request to put work on the queue (issue #303).
+///
+/// The run loop's `select!` arms yield this instead of running a cycle
+/// directly, so every wake source - the timer, the watcher, a manual click, a
+/// power/pause transition - goes through the SAME visible, cancellable queue.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+struct QueuedRequest {
+    /// Display kind + coalescing key.
+    kind: WorkKind,
+    /// The tick the cycle runs with.
+    tick: TickSource,
+    /// The source the request is attributed to, when it came from one.
+    source_id: Option<crate::types::SourceId>,
+}
+
+impl QueuedRequest {
+    /// The unattributed, account-wide scheduled request: the scheduled timer
+    /// and the gate re-evaluations (power / network / pause transitions).
+    fn scheduled() -> Self {
+        Self {
+            kind: WorkKind::Scheduled,
+            tick: TickSource::Scheduled,
+            source_id: None,
+        }
+    }
+}
+
+/// The queue kind one out-of-band [`Orchestrator::trigger`] reason maps to.
+///
+/// `Wake` (the post-sleep re-scan) is scheduled work, not something the user
+/// asked for, so it reads as a scheduled item rather than a manual one.
+fn work_kind_for(reason: TickSource) -> WorkKind {
+    match reason {
+        TickSource::Manual => WorkKind::Manual,
+        TickSource::Watcher => WorkKind::Watcher,
+        TickSource::Scheduled | TickSource::Wake => WorkKind::Scheduled,
+    }
+}
+
 /// The orchestrator control surface (SPEC s5).
 ///
 /// One instance per account. The owning process spawns [`Self::run`] as a
@@ -347,6 +398,60 @@ pub trait Orchestrator: Send + Sync {
     /// Requests an out-of-band cycle now, recording `reason` as the tick
     /// source (DESIGN s5.1). Ticks every enabled source for the account.
     async fn trigger(&self, reason: TickSource);
+
+    /// Like [`Orchestrator::trigger`], but ATTRIBUTED to one source so the
+    /// pending-work queue can name it ("Back up now - Music") and coalesce
+    /// per source (issue #303).
+    ///
+    /// `source_id = None` is exactly [`Orchestrator::trigger`]. The cycle it
+    /// schedules still covers every enabled source of the account - the
+    /// attribution is for the queue's display + coalescing key, not a promise
+    /// of per-source execution. Default body delegates to `trigger`, so
+    /// implementors without a queue (test fakes) are unchanged.
+    async fn trigger_source(&self, reason: TickSource, source_id: Option<crate::types::SourceId>) {
+        let _ = source_id;
+        self.trigger(reason).await;
+    }
+
+    /// A snapshot of this account's pending-work queue (issue #303) for the
+    /// webview's hydration command.
+    ///
+    /// `None` means this implementor runs no queue at all (test fakes), which
+    /// the IPC layer reports as "this account contributes no items" - distinct
+    /// from `Some(empty snapshot)`, which is a real, currently-idle queue.
+    fn work_queue(&self) -> Option<crate::queue::QueueSnapshot> {
+        None
+    }
+
+    /// Cancels ONE queued item by id (issue #303).
+    ///
+    /// A PENDING item is simply dropped. The RUNNING item is stopped
+    /// GRACEFULLY through the existing pause-drain: no new ops are dispatched,
+    /// in-flight ops finish and durably commit, and everything left is re-planned
+    /// by a later scan. Nothing is ever torn mid-file. Default: nothing to cancel.
+    async fn cancel_work_item(&self, id: crate::queue::WorkItemId) -> crate::queue::CancelOutcome {
+        let _ = id;
+        crate::queue::CancelOutcome::NotFound
+    }
+
+    /// Cancels every PENDING item and gracefully stops the running one
+    /// ("Clear all", issue #303). Default: nothing to clear.
+    async fn clear_work_queue(&self) -> crate::queue::ClearOutcome {
+        crate::queue::ClearOutcome::default()
+    }
+
+    /// Publishes `source_id`'s freshly persisted include/exclude rules into the
+    /// RUNNING cycle and arms the ONE coalesced follow-up rescan (issue #302).
+    ///
+    /// Called by the IPC layer right after `update_source` persists a pattern
+    /// change, with the row it just wrote (the authoritative copy - no re-read,
+    /// no chance of racing a later edit). Without this the change only takes
+    /// effect on the NEXT cycle, so a long initial backup keeps uploading a
+    /// folder the user just excluded for as long as that plan runs.
+    /// Default: no-op.
+    async fn refresh_source_exclusions(&self, source: &SourceRow) {
+        let _ = source;
+    }
 
     /// Sets the manual-pause signal (DESIGN s5.7: orthogonal to the
     /// gate-driven pauses, persists across restarts). `true` pauses,
@@ -457,14 +562,37 @@ pub struct SyncOrchestrator {
     /// errored is absent from the set and is retried on the next cycle rather
     /// than being skipped until restart.
     audited: Mutex<std::collections::HashSet<crate::types::SourceId>>,
-    /// Manual out-of-band trigger (SPEC s5 "Sync now", DESIGN s5.1).
-    /// Capacity-1 mpsc: a `try_send` that finds the buffer full means a
-    /// trigger is already pending, so the surplus is COALESCED into the one
-    /// queued follow-up (the run loop runs exactly one extra cycle no matter
-    /// how many triggers land mid-cycle). The receiver is taken once by
-    /// [`Orchestrator::run`].
-    trigger_tx: mpsc::Sender<TickSource>,
-    trigger_rx: Mutex<Option<mpsc::Receiver<TickSource>>>,
+    /// The VISIBLE pending-work queue (issue #303): what is running, what is
+    /// waiting, and the coalescing / cancel rules for both.
+    ///
+    /// This REPLACED the old capacity-1 trigger channel as the place work is
+    /// held. That channel silently collapsed a burst of unrelated requests
+    /// (recovery, three watcher ticks, a manual click) into one anonymous
+    /// follow-up that the user could neither see nor cancel. Now every request
+    /// lands here as an addressable item and [`Self::wake_tx`] is only a
+    /// wake-up nudge.
+    queue: Arc<WorkQueue>,
+    /// Wake-up nudge for the run loop (capacity 1). The VALUE carries nothing:
+    /// after any wake the loop consults [`Self::queue`], which is the single
+    /// source of truth for what runs next. Coalescing wakes is therefore
+    /// harmless - a full buffer means "the loop is already about to look".
+    /// The receiver is taken once by [`Orchestrator::run`].
+    wake_tx: mpsc::Sender<()>,
+    wake_rx: Mutex<Option<mpsc::Receiver<()>>>,
+    /// Monotonic generation for live exclusion publishes (issue #302), assigned
+    /// BEFORE a matcher build starts so a slow build cannot overwrite a newer
+    /// one that finished first.
+    exclusions_generation: std::sync::atomic::AtomicU64,
+    /// The debounce task for the ONE coalesced follow-up rescan that a burst of
+    /// exclusion edits earns (issue #302). Each new edit aborts the previous
+    /// task and arms a fresh one, so ten saves in a row produce exactly one
+    /// rescan, [`EXCLUSION_RESCAN_DEBOUNCE`] after the LAST of them.
+    exclusion_rescan: Mutex<Option<tokio::task::JoinHandle<()>>>,
+    /// How long the debounce above waits. [`EXCLUSION_RESCAN_DEBOUNCE`] in
+    /// production; tests shorten it via
+    /// [`Self::with_exclusion_rescan_debounce`] so they assert the coalescing
+    /// behaviour rather than the wall-clock constant.
+    exclusion_rescan_debounce: std::time::Duration,
     /// Debounced watcher scan-tick stream (DESIGN s5.9.1). The app shell
     /// bridges the real [`SourceWatcher::subscribe`](crate::watcher::SourceWatcher::subscribe)
     /// receiver into `watcher_tx`; tests push [`ScanTickRequest`]s directly.
@@ -576,9 +704,9 @@ impl SyncOrchestrator {
     ) -> Self {
         let (events, _rx) = broadcast::channel(EVENT_CHANNEL_CAPACITY);
         let (pause_tx, _pause_rx) = watch::channel(false);
-        // Capacity-1 manual trigger so a `try_send` coalesces a burst of
-        // mid-cycle "Sync now" clicks into exactly one queued follow-up.
-        let (trigger_tx, trigger_rx) = mpsc::channel(1);
+        // Capacity-1 wake nudge: the work queue (not this channel) holds the
+        // requests, so coalescing wakes loses nothing.
+        let (wake_tx, wake_rx) = mpsc::channel(1);
         let (watcher_tx, watcher_rx) = mpsc::channel(WATCHER_CHANNEL_CAPACITY);
         let (shutdown_tx, shutdown_rx) = watch::channel(false);
         let priority = PriorityCell::new(config.io_priority);
@@ -595,8 +723,12 @@ impl SyncOrchestrator {
             events,
             reconciled: Mutex::new(ReconcileProgress::default()),
             audited: Mutex::new(std::collections::HashSet::new()),
-            trigger_tx,
-            trigger_rx: Mutex::new(Some(trigger_rx)),
+            queue: Arc::new(WorkQueue::new()),
+            wake_tx,
+            wake_rx: Mutex::new(Some(wake_rx)),
+            exclusions_generation: std::sync::atomic::AtomicU64::new(0),
+            exclusion_rescan: Mutex::new(None),
+            exclusion_rescan_debounce: EXCLUSION_RESCAN_DEBOUNCE,
             watcher_tx,
             watcher_rx: Mutex::new(Some(watcher_rx)),
             shutdown_tx,
@@ -613,6 +745,19 @@ impl SyncOrchestrator {
             adaptive: None,
             restore_probe: None,
         }
+    }
+
+    /// Shorten the issue-#302 follow-up-rescan debounce.
+    ///
+    /// Doc-hidden and test-only: the production value is
+    /// [`EXCLUSION_RESCAN_DEBOUNCE`], and the tests that assert "an edit BURST
+    /// earns exactly ONE rescan" care about the coalescing, not about waiting
+    /// out two real seconds.
+    #[doc(hidden)]
+    #[must_use]
+    pub fn with_exclusion_rescan_debounce(mut self, debounce: std::time::Duration) -> Self {
+        self.exclusion_rescan_debounce = debounce;
+        self
     }
 
     /// Attach the adaptive upload-parallelism controller (DESIGN s11.4.7). The
@@ -2865,6 +3010,100 @@ fn log_outcomes(source: &SourceRow, outcomes: &[OpOutcome]) {
     }
 }
 
+// --- pending-work queue plumbing (issue #303) --------------------------------
+
+impl SyncOrchestrator {
+    /// Nudges the run loop to look at the queue. The channel value carries
+    /// nothing, so a full buffer ("a look is already pending") is a no-op, and
+    /// a closed one just means the loop is not running - the next `run()` drains
+    /// whatever accumulated.
+    fn wake(&self) {
+        let _ = self.wake_tx.try_send(());
+    }
+
+    /// Broadcasts the current queue so the webview's panel and badge track it
+    /// without polling. Fire-and-forget, like every other event on this
+    /// channel: no subscribers is the normal state with the window closed.
+    fn broadcast_queue(&self) {
+        let _ = self.events.send(OrchestratorEvent::WorkQueueChanged {
+            snapshot: self.queue.snapshot(self.account_id),
+        });
+    }
+
+    /// Enqueues work and wakes the run loop. Broadcasts only when the queue
+    /// actually CHANGED - a coalesced duplicate must not flicker the panel.
+    fn enqueue_work(
+        &self,
+        kind: WorkKind,
+        tick: TickSource,
+        source_id: Option<crate::types::SourceId>,
+    ) -> crate::queue::EnqueueOutcome {
+        let outcome = self
+            .queue
+            .enqueue(kind, tick, source_id, self.clock.now_ms());
+        if outcome.is_new() {
+            tracing::debug!(target: TARGET, account_id = %self.account_id, ?kind, ?tick, item = %outcome.id(), "work queued");
+            self.broadcast_queue();
+        } else {
+            tracing::debug!(target: TARGET, account_id = %self.account_id, ?kind, ?tick, item = %outcome.id(), "work coalesced into an already-queued item");
+        }
+        self.wake();
+        outcome
+    }
+
+    /// Records when the next scheduled scan is due, for the queue panel's
+    /// "next scheduled backup HH:MM" empty state. Measured on the INJECTED
+    /// clock like every other time in this module.
+    fn arm_next_scheduled(&self, interval_secs: u64) {
+        let due = self
+            .clock
+            .now_ms()
+            .saturating_add(i64::try_from(interval_secs.saturating_mul(1000)).unwrap_or(i64::MAX));
+        self.queue.set_next_scheduled_at(Some(due));
+    }
+
+    /// Puts a CRASH-RECOVERY item at the head of the queue when an interrupted
+    /// run left pending ops behind (issue #303).
+    ///
+    /// Purely a display + ordering affordance: the reconcile itself is driven by
+    /// `reconcile_once` inside the first cycle either way. So a state-repo error
+    /// here is logged and swallowed - failing to LABEL the recovery must never
+    /// stop the recovery.
+    ///
+    /// Attribution: named after the source only when exactly one source has
+    /// pending ops, because one cycle reconciles them all - claiming a single
+    /// source when three are recovering would be a lie.
+    async fn enqueue_startup_recovery(&self) {
+        let sources = match self.state.list_enabled_sources_for(self.account_id).await {
+            Ok(sources) => sources,
+            Err(err) => {
+                tracing::debug!(target: TARGET, account_id = %self.account_id, %err, "could not list sources to look for interrupted work; no recovery item shown");
+                return;
+            }
+        };
+        let mut with_pending = Vec::new();
+        for source in &sources {
+            match self.state.get_pending_ops_for_source(source.id).await {
+                Ok(pending) if !pending.is_empty() => with_pending.push(source.id),
+                Ok(_) => {}
+                Err(err) => {
+                    tracing::debug!(target: TARGET, account_id = %self.account_id, source_id = %source.id, %err, "could not read pending ops; no recovery item shown for this source");
+                }
+            }
+        }
+        if with_pending.is_empty() {
+            return;
+        }
+        let source_id = if with_pending.len() == 1 {
+            Some(with_pending[0])
+        } else {
+            None
+        };
+        tracing::info!(target: TARGET, account_id = %self.account_id, sources = with_pending.len(), "interrupted work found; queueing a crash-recovery item");
+        self.enqueue_work(WorkKind::Recovery, TickSource::Scheduled, source_id);
+    }
+}
+
 #[async_trait]
 impl Orchestrator for SyncOrchestrator {
     async fn run(&self) -> anyhow::Result<()> {
@@ -2889,7 +3128,7 @@ impl Orchestrator for SyncOrchestrator {
         // only between cycles (the select arms), so the current cycle always
         // finishes first (DESIGN s5.10.2).
         let mut watcher_rx = self.watcher_rx.lock().await.take();
-        let mut trigger_rx = self.trigger_rx.lock().await.take();
+        let mut wake_rx = self.wake_rx.lock().await.take();
         let mut power_rx = Some(self.power.subscribe());
         // Sleep/wake EDGE stream (DESIGN s5.10.1). Separate from `power_rx`
         // (steady state): the app-shell's per-OS monitor broadcasts suspend /
@@ -2922,6 +3161,9 @@ impl Orchestrator for SyncOrchestrator {
         // instant it is spawned purely from the interval (a watcher/manual
         // trigger or the next period drives the first real cycle).
         scheduled.tick().await;
+        // Publish when that next period lands, so the queue panel's empty state
+        // can say "next scheduled backup HH:MM" from the moment the app starts.
+        self.arm_next_scheduled(interval_secs);
 
         // Adaptive upload-parallelism sampler (DESIGN s11.4.7 / s18.2). Spawned
         // as a SEPARATE task - NOT a run-loop select arm - so it keeps ticking
@@ -2963,26 +3205,51 @@ impl Orchestrator for SyncOrchestrator {
             })
         });
 
+        // Issue #303: surface a CRASH-RECOVERY item before anything else when an
+        // interrupted run left pending ops behind, so the queue explains the
+        // long silent reconcile the next launch starts with. Best-effort: a
+        // state-repo error here just means no item is shown - the reconcile
+        // itself still runs inside the first cycle, exactly as before.
+        self.enqueue_startup_recovery().await;
+
         loop {
-            // Pick the next wake. Each arm yields an `Option<TickSource>`:
-            // `Some(tick)` runs a cycle; `None` means "loop control only"
-            // (a closed branch we drop, or shutdown which breaks below).
-            let next: Option<TickSource> = tokio::select! {
-                _ = scheduled.tick() => Some(TickSource::Scheduled),
+            // Pick the next wake. Each arm yields an `Option<QueuedRequest>`:
+            // `Some(req)` ENQUEUES work (which the drain below then runs, oldest
+            // first); `None` means "loop control only" (a closed branch we drop,
+            // an edge handled in the arm itself, or shutdown which breaks below).
+            //
+            // Every wake source funnels through the queue rather than running a
+            // cycle directly, so nothing runs invisibly and everything waiting
+            // is cancellable.
+            let next: Option<QueuedRequest> = tokio::select! {
+                _ = scheduled.tick() => {
+                    // The scheduled run is enqueued only now that it is ACTUALLY
+                    // due - a future tick is not pending work and never appears
+                    // in the queue.
+                    self.arm_next_scheduled(interval_secs);
+                    Some(QueuedRequest::scheduled())
+                }
 
                 req = recv_opt(&mut watcher_rx) => match req {
                     Some(req) => {
                         tracing::debug!(target: TARGET, account_id = %self.account_id, source_id = %req.source_id, reason = ?req.reason, "watcher scan-tick");
-                        Some(TickSource::Watcher)
+                        Some(QueuedRequest {
+                            kind: WorkKind::Watcher,
+                            tick: TickSource::Watcher,
+                            source_id: Some(req.source_id),
+                        })
                     }
                     // Watcher channel closed: drop the branch, keep running on
                     // the scheduled fallback (DESIGN s5.9.4).
                     None => { watcher_rx = None; None }
                 },
 
-                trig = recv_opt(&mut trigger_rx) => match trig {
-                    Some(reason) => Some(reason),
-                    None => { trigger_rx = None; None }
+                // A wake nudge: something (a manual trigger, a cancel, the tail
+                // of a previous cycle) changed the queue. Nothing to enqueue -
+                // the drain below is what acts on it.
+                nudge = recv_opt(&mut wake_rx) => {
+                    if nudge.is_none() { wake_rx = None; }
+                    None
                 },
 
                 recvd = power_recv_opt(&mut power_rx) => match recvd {
@@ -2997,12 +3264,12 @@ impl Orchestrator for SyncOrchestrator {
                         // (`on_power_event`), not on this steady-state channel,
                         // so we do NOT synthesize one here.
                         tracing::debug!(target: TARGET, account_id = %self.account_id, ac = state.ac_connected, reachable = state.network_reachable, metered = state.on_metered_network, "power/network transition; re-evaluating gates");
-                        Some(TickSource::Scheduled)
+                        Some(QueuedRequest::scheduled())
                     }
                     // `Lagged` is benign: we missed an intermediate snapshot but
                     // the next cycle's gate check re-reads `current()` (the
                     // documented recovery contract), so still run a cycle.
-                    Err(broadcast::error::RecvError::Lagged(_)) => Some(TickSource::Scheduled),
+                    Err(broadcast::error::RecvError::Lagged(_)) => Some(QueuedRequest::scheduled()),
                     // Closed: the source was dropped. `power_recv_opt` has set
                     // the receiver to `None`, so this arm is now inert and the
                     // scheduled loop keeps running.
@@ -3071,7 +3338,11 @@ impl Orchestrator for SyncOrchestrator {
                         Ok(()) => {
                             let paused = *pause_rx.borrow();
                             tracing::debug!(target: TARGET, account_id = %self.account_id, paused, "manual-pause signal changed; re-evaluating gates");
-                            Some(TickSource::Manual)
+                            // A gate re-evaluation, not user-requested work:
+                            // queued as a Scheduled item so the cycle it causes
+                            // is visible, without claiming the user asked for a
+                            // backup.
+                            Some(QueuedRequest::scheduled())
                         }
                         Err(_) => None,
                     }
@@ -3096,12 +3367,42 @@ impl Orchestrator for SyncOrchestrator {
                 }
             };
 
-            if let Some(tick) = next {
+            if let Some(req) = next {
+                self.enqueue_work(req.kind, req.tick, req.source_id);
+            }
+
+            // Run at most ONE queued item per loop iteration, then go back
+            // through the `select!`. Draining the whole queue in an inner loop
+            // would starve the shutdown / pause / power arms for as long as the
+            // backlog took to run; instead the tail re-nudges the wake channel,
+            // so the remaining items are picked up on the very next iteration
+            // with every arm still live.
+            if let Some(item) = self.queue.start_next() {
+                let tick = item.tick;
+                self.broadcast_queue();
                 // Inline await = the in-flight guard. A failed cycle is logged,
                 // never fatal: the next tick retries and the Error surfaces via
                 // the activity log + state machine.
                 if let Err(err) = self.run_cycle(tick).await {
                     tracing::warn!(target: TARGET, account_id = %self.account_id, ?tick, %err, "cycle failed; continuing");
+                }
+                // Scope a cancel to the cycle it was aimed at: the cancel raised
+                // the executor's dispatch gate (a graceful pause-drain), and
+                // that gate must NOT leak into the next item. Restore it to the
+                // account's real manual-pause state - which is the truth even if
+                // the user paused while this cycle was draining.
+                if self.queue.running_cancel_requested() {
+                    let manually_paused = *self.pause_tx.borrow();
+                    self.executor.set_paused(manually_paused);
+                    tracing::info!(target: TARGET, account_id = %self.account_id, ?tick, manually_paused, "cancelled item finished draining; dispatch gate restored");
+                }
+                self.queue.finish_running();
+                self.broadcast_queue();
+                // More work waiting? Nudge ourselves so the next `select!`
+                // iteration picks it up immediately instead of idling until the
+                // next external wake.
+                if self.queue.has_pending() {
+                    self.wake();
                 }
                 // C5-P1-2: a V-F `auth.invalid_grant` during the cycle SUSPENDS
                 // this account. STOP the loop entirely (not just the current
@@ -3112,6 +3413,16 @@ impl Orchestrator for SyncOrchestrator {
                     break;
                 }
             }
+        }
+
+        // Issue #303: the loop is over - a graceful shutdown, or an account
+        // suspended by a revoked credential - so nothing still queued will ever
+        // run. Drop it rather than leave the panel showing phantom work that no
+        // one is going to start. (In-memory only, so there is nothing to
+        // persist; the durable safety net - `pending_ops` plus the next
+        // scheduled scan after a restart - is untouched.)
+        if self.queue.clear().changed() {
+            self.broadcast_queue();
         }
 
         // Drain the adaptive sampler (F1): `run` never returns while it is still
@@ -3130,24 +3441,127 @@ impl Orchestrator for SyncOrchestrator {
     }
 
     async fn trigger(&self, reason: TickSource) {
+        self.trigger_source(reason, None).await;
+    }
+
+    async fn trigger_source(&self, reason: TickSource, source_id: Option<crate::types::SourceId>) {
         // Out-of-band cycle request. Hand it to the run loop rather than run a
         // cycle inline here: running `run_cycle` directly from `trigger()` while
         // the loop is already mid-cycle would start a SECOND concurrent cycle -
         // the exact overlap the single-inflight guard exists to prevent.
         //
-        // `try_send` into the capacity-1 channel: a full buffer means a trigger
-        // is already queued, so this one is COALESCED into that single pending
-        // follow-up (DESIGN s5.1). If the loop is not running (no receiver), the
-        // send errors and is dropped - the next scheduled tick covers it.
-        match self.trigger_tx.try_send(reason) {
-            Ok(()) => {}
-            Err(mpsc::error::TrySendError::Full(_)) => {
-                tracing::debug!(target: TARGET, account_id = %self.account_id, ?reason, "trigger coalesced into pending follow-up");
+        // Issue #303: the request lands on the visible work queue (coalescing
+        // per kind + source) and the run loop is nudged. Unlike the old
+        // capacity-1 channel this coalesces only genuinely-equivalent requests,
+        // so a manual click no longer disappears into a pending watcher tick,
+        // and everything waiting is listed and cancellable. If the loop is not
+        // running the item simply waits there for the next `run()`.
+        self.enqueue_work(work_kind_for(reason), reason, source_id);
+    }
+
+    fn work_queue(&self) -> Option<crate::queue::QueueSnapshot> {
+        Some(self.queue.snapshot(self.account_id))
+    }
+
+    async fn cancel_work_item(&self, id: crate::queue::WorkItemId) -> crate::queue::CancelOutcome {
+        let outcome = self.queue.cancel(id);
+        match outcome {
+            crate::queue::CancelOutcome::Pending => {
+                tracing::info!(target: TARGET, account_id = %self.account_id, item = %id, "pending work item cancelled");
+                self.broadcast_queue();
             }
-            Err(mpsc::error::TrySendError::Closed(_)) => {
-                tracing::debug!(target: TARGET, account_id = %self.account_id, ?reason, "trigger dropped; run loop not active");
+            crate::queue::CancelOutcome::Running => {
+                // Graceful stop, NOT an abort: raise the executor's dispatch
+                // gate so no further ops start, while the ops already in flight
+                // finish and durably commit. Whatever is left keeps no
+                // `file_state` row, so a later scan re-plans it. The run loop
+                // restores this gate when the cycle returns, so the cancel is
+                // scoped to exactly this item.
+                self.executor.set_paused(true);
+                tracing::info!(target: TARGET, account_id = %self.account_id, item = %id, "running work item cancelled; draining in-flight ops");
+                self.broadcast_queue();
+            }
+            crate::queue::CancelOutcome::NotFound => {
+                tracing::debug!(target: TARGET, account_id = %self.account_id, item = %id, "cancel for an item that is no longer queued; ignored");
             }
         }
+        outcome
+    }
+
+    async fn clear_work_queue(&self) -> crate::queue::ClearOutcome {
+        let outcome = self.queue.clear();
+        if outcome.cancelled_running {
+            // Same graceful stop as a single cancel - "Clear all" asks the
+            // running item nothing more than one X on it would.
+            self.executor.set_paused(true);
+        }
+        if outcome.changed() {
+            tracing::info!(target: TARGET, account_id = %self.account_id, pending = outcome.cancelled_pending, running = outcome.cancelled_running, "work queue cleared");
+            self.broadcast_queue();
+        }
+        outcome
+    }
+
+    async fn refresh_source_exclusions(&self, source: &SourceRow) {
+        let source_id = source.id;
+        // Assign the generation BEFORE the (blocking, potentially slow) matcher
+        // build so two overlapping edits can never publish out of order.
+        let generation = self
+            .exclusions_generation
+            .fetch_add(1, std::sync::atomic::Ordering::SeqCst);
+        let row = source.clone();
+
+        // Building a matcher walks the ignore-file cascade (real file I/O), so
+        // it goes on the blocking pool. A build FAILURE publishes `None`, which
+        // the executor treats as fail-OPEN - a broken ignore file must never
+        // strand a running backup.
+        let matcher = match tokio::task::spawn_blocking(move || {
+            crate::exclude::build_source_matcher(&row)
+        })
+        .await
+        {
+            Ok(Ok(matcher)) => Some(Arc::new(matcher)),
+            Ok(Err(err)) => {
+                tracing::warn!(target: TARGET, account_id = %self.account_id, source_id = %source_id, %err, "could not build the updated exclude matcher; the running cycle keeps dispatching (fail open)");
+                None
+            }
+            Err(err) => {
+                tracing::warn!(target: TARGET, account_id = %self.account_id, source_id = %source_id, %err, "exclude matcher build task failed; the running cycle keeps dispatching (fail open)");
+                None
+            }
+        };
+        self.executor
+            .set_live_exclusions(source_id, generation, matcher);
+
+        // ONE coalesced follow-up rescan per edit BURST (locked spec
+        // 2026-08-17): the per-op gate above stops the newly-excluded work
+        // immediately, and this rescan is what re-derives honest totals and
+        // picks up anything the same edit RE-included. Each edit aborts the
+        // previous timer, so ten saves in a row cost exactly one rescan.
+        let mut pending = self.exclusion_rescan.lock().await;
+        if let Some(previous) = pending.take() {
+            previous.abort();
+        }
+        let wake_tx = self.wake_tx.clone();
+        let queue = self.queue.clone();
+        let events = self.events.clone();
+        let account_id = self.account_id;
+        let now = self.clock.now_ms();
+        let debounce = self.exclusion_rescan_debounce;
+        *pending = Some(tokio::spawn(async move {
+            tokio::time::sleep(debounce).await;
+            // Enqueued directly (not via `enqueue_work`) because this task
+            // outlives the borrow of `&self`; it does the same three things:
+            // enqueue, broadcast if it changed anything, nudge the loop.
+            let outcome = queue.enqueue(WorkKind::Scheduled, TickSource::Scheduled, None, now);
+            if outcome.is_new() {
+                let _ = events.send(OrchestratorEvent::WorkQueueChanged {
+                    snapshot: queue.snapshot(account_id),
+                });
+            }
+            tracing::info!(target: TARGET, account_id = %account_id, "exclusion edits settled; queueing the follow-up rescan");
+            let _ = wake_tx.try_send(());
+        }));
     }
 
     async fn set_paused(&self, paused: bool) {
@@ -3254,6 +3668,10 @@ mod tests {
         /// [`Executor::set_paused`], so a test can assert the manual pause
         /// actually reaches the executor's dispatch gate.
         paused: AtomicBool,
+        /// Issue #302: every `set_live_exclusions` publish, as
+        /// `(source_id, generation, matcher_built)`, so a test can assert a
+        /// pattern edit reaches the RUNNING cycle's executor.
+        live_exclusions: StdMutex<Vec<(SourceId, u64, bool)>>,
         /// When `> 0`, every `execute` op returns `OpOutcome::Failed` (a
         /// `DriveChecksumMismatch`) instead of `Done` - drives the recheck2
         /// "failed op defers the timestamp advance + records activity" test.
@@ -3493,6 +3911,22 @@ mod tests {
         fn set_paused(&self, paused: bool) {
             self.paused.store(paused, Ordering::SeqCst);
         }
+
+        fn set_live_exclusions(
+            &self,
+            source_id: SourceId,
+            generation: u64,
+            matcher: Option<Arc<crate::exclude::SourceMatcher>>,
+        ) {
+            // Issue #302: record WHAT was published (id + generation + whether a
+            // matcher was actually built) so the orchestrator-side test can
+            // assert the refresh reached the executor without needing a real
+            // matcher on hand.
+            self.live_exclusions
+                .lock()
+                .unwrap()
+                .push((source_id, generation, matcher.is_some()));
+        }
     }
 
     // --- a minimal in-memory StateRepo -------------------------------------
@@ -3525,6 +3959,10 @@ mod tests {
         /// The restorable population this fake reports, as `(path, size)` pairs
         /// in `relative_path` order - the drill's sampling universe.
         restorable: StdMutex<Vec<(String, u64)>>,
+        /// Rows the run loop's issue-#303 startup probe reads to decide whether
+        /// an interrupted run left work behind (and therefore whether to show a
+        /// crash-recovery queue item). Empty unless a test seeds it.
+        pending_ops: StdMutex<Vec<PendingOpRow>>,
     }
 
     impl FakeState {
@@ -3541,7 +3979,25 @@ mod tests {
                 drill_cursors: StdMutex::new(HashMap::new()),
                 drill_runs: StdMutex::new(Vec::new()),
                 restorable: StdMutex::new(Vec::new()),
+                pending_ops: StdMutex::new(Vec::new()),
             }
+        }
+
+        /// Seed one `pending_ops` row for `source`, as an interrupted run would
+        /// have left behind (issue #303 crash-recovery queue item).
+        fn with_pending_op(self, source: SourceId) -> Self {
+            self.pending_ops.lock().unwrap().push(PendingOpRow {
+                id: PendingOpId(1),
+                source_id: source,
+                op_type: "upload".to_string(),
+                relative_path: RelativePath::try_from("interrupted.bin".to_string()).unwrap(),
+                payload_json: serde_json::json!({}),
+                attempts: 1,
+                last_error: None,
+                scheduled_for: 0,
+                created_at: 0,
+            });
+            self
         }
 
         /// Snapshot the persisted scrub runs, oldest-first.
@@ -3890,9 +4346,20 @@ mod tests {
         }
         async fn get_pending_ops_for_source(
             &self,
-            _source: SourceId,
+            source: SourceId,
         ) -> anyhow::Result<Vec<PendingOpRow>> {
-            unimplemented!()
+            // Issue #303: the run loop probes this at startup to decide whether
+            // to show a crash-recovery queue item, so it must answer rather than
+            // panic. Empty unless a test seeded `pending_ops` (the fake's
+            // executor is a double - it never enqueues any itself).
+            Ok(self
+                .pending_ops
+                .lock()
+                .unwrap()
+                .iter()
+                .filter(|row| row.source_id == source)
+                .cloned()
+                .collect())
         }
         async fn mark_pending_op_attempted(
             &self,
@@ -7607,6 +8074,16 @@ mod tests {
         fn set_paused(&self, paused: bool) {
             self.paused.store(paused, Ordering::SeqCst);
         }
+
+        fn set_live_exclusions(
+            &self,
+            _source_id: SourceId,
+            _generation: u64,
+            _matcher: Option<Arc<crate::exclude::SourceMatcher>>,
+        ) {
+            // This double exists to block inside `execute` for the pause /
+            // shutdown timing tests; live exclusion updates are not part of that.
+        }
     }
 
     /// Build an orchestrator with a non-empty source (so the executor runs) and
@@ -8504,6 +8981,325 @@ mod tests {
                 .iter()
                 .any(|&c| c > 0 && c < files as u64),
             "at least one tick lands mid-walk, so the UI updates DURING the scan: {counts:?}"
+        );
+    }
+
+    // --- pending-work queue + live exclusions (issues #302, #303) -----------
+
+    /// Issue #302: saving new include/exclude rules must publish a FRESH
+    /// matcher into the executor that is running RIGHT NOW, with a generation
+    /// that rises per publish (so a slow build can never clobber a newer one).
+    #[tokio::test]
+    async fn refresh_source_exclusions_publishes_a_fresh_matcher_into_the_executor() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src.clone()],
+            exec.clone(),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+
+        let mut edited = src.clone();
+        edited.exclude_patterns = vec!["build/".to_string()];
+        orch.refresh_source_exclusions(&edited).await;
+        orch.refresh_source_exclusions(&edited).await;
+
+        let published = exec.live_exclusions.lock().unwrap().clone();
+        assert_eq!(
+            published.len(),
+            2,
+            "each save publishes once: {published:?}"
+        );
+        assert!(
+            published
+                .iter()
+                .all(|(id, _, built)| *id == src.id && *built),
+            "both publishes name this source and carry a built matcher: {published:?}"
+        );
+        assert!(
+            published[0].1 < published[1].1,
+            "the generation rises per publish so ordering is decidable: {published:?}"
+        );
+    }
+
+    /// Issue #302: a BURST of edits (the exclusions browser saves on every
+    /// toggle) must earn exactly ONE follow-up rescan, and only after the burst
+    /// settles - not one rescan per save.
+    #[tokio::test]
+    async fn an_exclusion_edit_burst_earns_exactly_one_follow_up_rescan() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        std::fs::write(dir.path().join("a.txt"), b"hello").unwrap();
+        let src = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src.clone()],
+            exec,
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+        let orch = orch.with_exclusion_rescan_debounce(std::time::Duration::from_millis(120));
+
+        for pattern in ["a/", "b/", "c/"] {
+            let mut edited = src.clone();
+            edited.exclude_patterns = vec![pattern.to_string()];
+            orch.refresh_source_exclusions(&edited).await;
+        }
+
+        assert!(
+            orch.work_queue().expect("a real queue").pending.is_empty(),
+            "the rescan waits for the burst to settle rather than firing per edit"
+        );
+
+        tokio::time::sleep(std::time::Duration::from_millis(600)).await;
+        let pending = orch.work_queue().expect("a real queue").pending;
+        assert_eq!(
+            pending.len(),
+            1,
+            "three edits in a burst earn ONE rescan: {pending:?}"
+        );
+        assert_eq!(pending[0].kind, WorkKind::Scheduled);
+
+        // ...and the superseded timers never fire a second one later.
+        tokio::time::sleep(std::time::Duration::from_millis(300)).await;
+        assert_eq!(
+            orch.work_queue().expect("a real queue").pending.len(),
+            1,
+            "the superseded debounce timers were cancelled, not merely delayed"
+        );
+    }
+
+    /// Issue #303: when an interrupted run left pending ops behind, the queue
+    /// opens with a CRASH-RECOVERY item at its head - so the long silent
+    /// reconcile the next launch starts with has a name on screen instead of
+    /// looking like a hang.
+    #[tokio::test]
+    async fn interrupted_work_opens_the_queue_with_a_crash_recovery_item() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let state = Arc::new(FakeState::with_sources(vec![src.clone()]).with_pending_op(src.id));
+        let orch = SyncOrchestrator::new(
+            account,
+            state,
+            Arc::new(RecordingExecutor::default()),
+            Arc::new(FakePowerSource::new(power_on_ac())),
+            Arc::new(FakeNet::online()),
+            Arc::new(FakeClock::new()),
+            OrchestratorConfig::default(),
+        );
+
+        // A manual request already waiting must NOT run before the recovery:
+        // a fresh scan ahead of it would re-upload bytes the interrupted run
+        // already put on the remote.
+        orch.trigger(TickSource::Manual).await;
+        orch.enqueue_startup_recovery().await;
+
+        let pending = orch.work_queue().expect("a real queue").pending;
+        assert_eq!(pending.len(), 2, "{pending:?}");
+        assert_eq!(pending[0].kind, WorkKind::Recovery, "recovery runs first");
+        assert_eq!(
+            pending[0].source_id,
+            Some(src.id),
+            "one recovering source, so the item names it"
+        );
+        assert_eq!(pending[1].kind, WorkKind::Manual);
+    }
+
+    /// Issue #303: the common case - a clean previous shutdown - shows NO
+    /// recovery item. An item claiming a recovery that is not happening would
+    /// be worse than no item at all.
+    #[tokio::test]
+    async fn a_clean_start_shows_no_crash_recovery_item() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let (orch, _clock) = build(
+            account,
+            vec![src],
+            Arc::new(RecordingExecutor::default()),
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+
+        orch.enqueue_startup_recovery().await;
+
+        assert!(orch.work_queue().expect("a real queue").pending.is_empty());
+    }
+
+    /// Issue #303: a manual "Back up now" for a source becomes a VISIBLE,
+    /// named queue item; repeating it folds into that item, while a different
+    /// kind or a different source is genuinely separate work.
+    #[tokio::test]
+    async fn triggers_become_visible_queue_items_and_coalesce_per_kind_and_source() {
+        let account = AccountId::new_v4();
+        let dir = tempfile::tempdir().unwrap();
+        let src = source_in(account, dir.path());
+        let other = source_in(account, dir.path());
+        let exec = Arc::new(RecordingExecutor::default());
+        let (orch, _clock) = build(
+            account,
+            vec![src.clone()],
+            exec,
+            power_on_ac(),
+            Arc::new(FakeNet::online()),
+            OrchestratorConfig::default(),
+        );
+
+        orch.trigger_source(TickSource::Manual, Some(src.id)).await;
+        orch.trigger_source(TickSource::Manual, Some(src.id)).await;
+        let snapshot = orch.work_queue().expect("a real queue");
+        assert_eq!(
+            snapshot.pending.len(),
+            1,
+            "a second click on the same source folds in: {snapshot:?}"
+        );
+        assert_eq!(snapshot.pending[0].kind, WorkKind::Manual);
+        assert_eq!(snapshot.pending[0].source_id, Some(src.id));
+        assert_eq!(snapshot.outstanding(), 1, "nothing is running yet");
+
+        orch.trigger_source(TickSource::Watcher, Some(src.id)).await;
+        orch.trigger_source(TickSource::Manual, Some(other.id))
+            .await;
+        assert_eq!(
+            orch.work_queue().expect("a real queue").pending.len(),
+            3,
+            "a different kind, and a different source, are separate work"
+        );
+    }
+
+    /// Issue #303: cancelling the RUNNING item is a graceful pause-drain, and
+    /// it is SCOPED to that item - the dispatch gate must be restored once the
+    /// cycle ends, or every later item would silently refuse to upload.
+    #[tokio::test]
+    async fn cancelling_the_running_item_drains_it_then_restores_the_dispatch_gate() {
+        let executes = Arc::new(AtomicU64::new(0));
+        let paused = Arc::new(AtomicBool::new(false));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        let exec = Arc::new(BlockingExecutor {
+            executes: executes.clone(),
+            entered_tx,
+            release_rx: tokio::sync::Mutex::new(release_rx),
+            paused: paused.clone(),
+        });
+        let cfg = OrchestratorConfig {
+            scan_interval_secs: 3_600,
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _dir) = build_arc(exec, Arc::new(FakePowerSource::new(power_on_ac())), cfg);
+        let handle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run().await })
+        };
+
+        orch.trigger(TickSource::Manual).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("the trigger must start a cycle")
+            .expect("entered open");
+
+        let running = orch
+            .work_queue()
+            .expect("a real queue")
+            .running
+            .expect("the in-flight cycle is visible as the running item");
+        assert!(!paused.load(Ordering::SeqCst));
+
+        assert_eq!(
+            orch.cancel_work_item(running.id).await,
+            crate::queue::CancelOutcome::Running
+        );
+        assert!(
+            paused.load(Ordering::SeqCst),
+            "cancelling the running item raises the executor's dispatch gate (a graceful drain)"
+        );
+        assert!(
+            orch.work_queue().expect("a real queue").running_cancelled,
+            "the item stays visible, flagged as draining"
+        );
+
+        let _ = release_tx.send(());
+        // The gate must come back down once that cycle is over.
+        tokio::time::timeout(std::time::Duration::from_secs(30), async {
+            while paused.load(Ordering::SeqCst) {
+                tokio::time::sleep(std::time::Duration::from_millis(10)).await;
+            }
+        })
+        .await
+        .expect("the cancel must not leak into the next item");
+
+        orch.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("run loop must exit after shutdown")
+            .expect("join")
+            .expect("run ok");
+        let snapshot = orch.work_queue().expect("a real queue");
+        assert!(snapshot.running.is_none() && snapshot.pending.is_empty());
+    }
+
+    /// Issue #303: "Clear all" drops every pending item and asks the running
+    /// one to drain - it never starts the work it just cancelled.
+    #[tokio::test]
+    async fn clear_all_cancels_pending_work_before_it_can_run() {
+        let executes = Arc::new(AtomicU64::new(0));
+        let (entered_tx, mut entered_rx) = tokio::sync::mpsc::unbounded_channel();
+        let (release_tx, release_rx) = tokio::sync::mpsc::unbounded_channel();
+        let exec = Arc::new(BlockingExecutor {
+            executes: executes.clone(),
+            entered_tx,
+            release_rx: tokio::sync::Mutex::new(release_rx),
+            paused: Arc::new(AtomicBool::new(false)),
+        });
+        let cfg = OrchestratorConfig {
+            scan_interval_secs: 3_600,
+            ..OrchestratorConfig::default()
+        };
+        let (orch, _dir) = build_arc(exec, Arc::new(FakePowerSource::new(power_on_ac())), cfg);
+        let handle = {
+            let orch = orch.clone();
+            tokio::spawn(async move { orch.run().await })
+        };
+
+        orch.trigger(TickSource::Manual).await;
+        tokio::time::timeout(std::time::Duration::from_secs(30), entered_rx.recv())
+            .await
+            .expect("the trigger must start a cycle")
+            .expect("entered open");
+
+        // Queue up more work behind the in-flight cycle, then clear everything.
+        orch.trigger_source(TickSource::Watcher, Some(SourceId::new_v4()))
+            .await;
+        orch.trigger_source(TickSource::Watcher, Some(SourceId::new_v4()))
+            .await;
+        assert_eq!(orch.work_queue().expect("a real queue").pending.len(), 2);
+
+        let cleared = orch.clear_work_queue().await;
+        assert_eq!(cleared.cancelled_pending, 2);
+        assert!(cleared.cancelled_running);
+        assert!(orch.work_queue().expect("a real queue").pending.is_empty());
+
+        let _ = release_tx.send(());
+        orch.shutdown();
+        tokio::time::timeout(std::time::Duration::from_secs(30), handle)
+            .await
+            .expect("run loop must exit after shutdown")
+            .expect("join")
+            .expect("run ok");
+        assert_eq!(
+            executes.load(Ordering::SeqCst),
+            1,
+            "the cleared items never ran"
         );
     }
 }

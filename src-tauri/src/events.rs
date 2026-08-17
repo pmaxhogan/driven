@@ -94,6 +94,25 @@ pub const EVENT_RESTORE_PROGRESS: &str = "restore:progress";
 /// appears and disappears without the user refreshing.
 pub const EVENT_PAUSE_CHANGED: &str = "sync:pause_changed";
 
+/// `queue:changed` - an account's pending-work queue changed (payload:
+/// `QueueSnapshot`, issue #303).
+///
+/// Emitted whenever an item is queued, started, finished, or cancelled. The
+/// payload is the WHOLE queue for that account, not a delta, so a webview that
+/// missed an event (or attached late) is correct again on the very next one -
+/// the same self-healing shape the sync-status events have. `get_work_queue`
+/// hydrates the same snapshots at boot.
+pub const EVENT_QUEUE_CHANGED: &str = "queue:changed";
+
+/// Broadcast `queue:changed` with one account's whole pending-work queue
+/// (issue #303).
+pub fn emit_queue_changed<P: Serialize + Clone>(
+    app: &AppHandle,
+    snapshot: &P,
+) -> tauri::Result<()> {
+    app.emit(EVENT_QUEUE_CHANGED, snapshot)
+}
+
 /// `exclusion_preview:batch` - a slice of the streaming exclusion preview's
 /// walk (payload: `ExclusionPreviewBatch`).
 ///

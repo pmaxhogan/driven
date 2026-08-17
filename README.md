@@ -123,6 +123,18 @@ These move: check each project's current docs before relying on a cell.
   directories instead of descending them.
 - Live exclusion preview that re-classifies the folder tree as you edit a rule,
   from an in-memory tree rather than a fresh walk of the disk.
+- Exclusion rules that take effect immediately, even mid-backup: saving a new
+  rule stops the running backup from uploading anything it newly excludes at the
+  next file boundary (the file already in flight still finishes cleanly), and
+  one follow-up scan re-derives the totals once your edits settle. Files
+  uploaded before the edit are left alone - excluding a folder never deletes
+  what is already backed up.
+- A visible work queue in the top bar: crash-recovery passes, watcher ticks,
+  "Back up now" clicks, and due scheduled runs are listed with what is running
+  and what is waiting, instead of silently collapsing into one anonymous
+  follow-up. Items run one at a time per account, each can be cancelled, and
+  cancelling the running one is a graceful stop - it stops starting new files,
+  lets the in-flight ones finish and commit, and re-plans the rest later.
 - Nested backup sources, as long as they cannot overlap: a source may contain
   another source's folder when its own exclude rules cover that folder (e.g.
   back up your home folder with `Documents` excluded while `Documents` is

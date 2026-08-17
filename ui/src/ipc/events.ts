@@ -15,6 +15,7 @@ import type {
   ExecProgress,
   GlobalSyncStatus,
   PauseState,
+  QueueSnapshot,
   RestoreJobStatus,
   UpdateInfo,
   IoSample,
@@ -71,6 +72,17 @@ export function onSyncSourceProgress(
  * zero) while fully idle. */
 export function onSyncIoThroughput(handler: (sample: IoSample) => void): Promise<UnlistenFn> {
   return listen<IoSample>("sync:io_throughput", (e) => handler(e.payload));
+}
+
+/** `queue:changed` payload: one account's whole pending-work queue (issue
+ * #303; mirrors src-tauri `emit_queue_changed`). Emitted whenever an item is
+ * queued, started, finished, or cancelled.
+ *
+ * Whole-snapshot rather than a delta: a webview that missed an event, or
+ * attached late, is correct again on the very next one. `getWorkQueue` fills the
+ * same shape at boot. */
+export function onQueueChanged(handler: (snapshot: QueueSnapshot) => void): Promise<UnlistenFn> {
+  return listen<QueueSnapshot>("queue:changed", (e) => handler(e.payload));
 }
 
 /** `activity:new` payload: ActivityEntry (SPEC s11.7). The Activity dashboard's

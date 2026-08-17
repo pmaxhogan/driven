@@ -34,6 +34,7 @@ import type {
   OAuthStatus,
   PageRequestDto,
   PickedPath,
+  QueueSnapshot,
   ReauthSession,
   ReleaseDto,
   RemoteTreeDto,
@@ -276,6 +277,29 @@ export function getSyncStatus(): Promise<GlobalSyncStatus> {
  * already-elapsed timed pause reads as null, never as a stale countdown. */
 export function getPauseState(): Promise<PauseState | null> {
   return invoke("get_pause_state");
+}
+
+// --- pending-work queue (issue #303) ---
+
+/** Every account's pending-work queue, one snapshot per account. The HYDRATION
+ * path for the top-bar queue panel; live updates ride `queue:changed`. */
+export function getWorkQueue(): Promise<QueueSnapshot[]> {
+  return invoke("get_work_queue");
+}
+
+/** Cancel ONE queued item. A pending item is dropped; the RUNNING item is
+ * stopped gracefully (no new files dispatched, in-flight ones finish and
+ * commit, nothing already uploaded is removed). Resolves `false` for a stale
+ * click on an item that has since finished - never an error. */
+export function cancelWorkItem(accountId: string, itemId: number): Promise<boolean> {
+  return invoke("cancel_work_item", { accountId, itemId });
+}
+
+/** Cancel everything pending and gracefully stop what is running. `accountId`
+ * null clears EVERY account (what the panel's "Clear all" does). Resolves the
+ * number of pending items dropped. */
+export function clearWorkQueue(accountId: string | null = null): Promise<number> {
+  return invoke("clear_work_queue", { accountId });
 }
 
 // --- Settings & misc (SPEC s11.6) ---

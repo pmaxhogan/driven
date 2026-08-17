@@ -30,6 +30,39 @@
     "recovering": "Recovering an interrupted upload...",
     "recoveringBytes": "Recovering interrupted upload - {done} of {total}"
   },
+  "queue": {
+    "trigger": "Work queue ({count} items)",
+    "clearAll": "Clear all",
+    "footer": "Items run one at a time per account.",
+    "empty": "No pending work",
+    "emptyWithNext": "No pending work · next scheduled backup {time}",
+    "cancelItem": "Cancel {item}",
+    "cancelPendingHint": "Remove this from the queue",
+    "cancelRunningHint": "Stop after the files already in flight finish",
+    "title": {
+      "panel": "Work queue",
+      "running": "Backing up",
+      "stopping": "Finishing up",
+      "recovery": "Recover interrupted backup",
+      "watcher": "Changed files",
+      "manual": "Backup now",
+      "scheduled": "Scheduled backup"
+    },
+    "sub": {
+      "running": "{done} / {total} files · {left} left",
+      "starting": "starting",
+      "stopping": "finishing the files already in flight",
+      "recovery": "resumes interrupted uploads",
+      "watcher": "watcher · queued {ago}",
+      "manual": "queued by you · {ago}",
+      "scheduled": "queued {ago}"
+    },
+    "age": {
+      "justNow": "just now",
+      "minutes": "{n} min ago",
+      "hours": "{n} hr ago"
+    }
+  },
   "pauseBanner": {
     "indefinite": "Backups paused indefinitely",
     "timed": "Backups paused - {minutes}m left",
