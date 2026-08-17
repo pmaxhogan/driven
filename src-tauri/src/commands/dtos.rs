@@ -447,6 +447,13 @@ pub struct DriveFolderEntry {
     /// picker can badge it and know selecting it targets the drive root.
     #[serde(default)]
     pub is_shared_drive: bool,
+    /// Last-modified time as Unix epoch ms, where the backend provides one
+    /// (issue #306: the picker's Modified sort/column). `None` for a backend
+    /// whose "folders" carry no timestamp of their own (S3 key prefixes) - the
+    /// UI falls back to hiding the column value / excluding the row from a
+    /// Modified sort rather than showing a fabricated date.
+    #[serde(default)]
+    pub modified_time: Option<i64>,
 }
 
 /// The result of `pick_drive_folder` (SPEC s11.2 `DriveFolderListing`): the
@@ -539,6 +546,28 @@ pub struct ExclusionPreviewNode {
     pub included: bool,
     /// File size in bytes; always 0 for a directory.
     pub size: u64,
+    /// Directories only (issue #305): the number of FILES discovered so far
+    /// anywhere beneath this directory, regardless of their own individual
+    /// verdict. Always 0 for a file.
+    ///
+    /// For a directory the walk DESCENDS into, this SETTLES upward as
+    /// descendants stream in - the value in an early batch is a partial count,
+    /// and a later batch re-emits the same node (same `path`) with the
+    /// updated total once more of its subtree has been classified. For a
+    /// directory the walk PRUNES (excluded with no reachable negation, so it
+    /// is never descended - see `exclusion_stream`'s pruning rule), this is
+    /// filled by one lightweight recursive disk count (no classification, just
+    /// `read_dir` + `metadata`) at the moment the directory is streamed, so it
+    /// already carries its final answer - "what would be freed" if the rule
+    /// stays.
+    #[serde(default)]
+    pub file_count: u64,
+    /// Directories only: the total bytes of every file discovered so far
+    /// beneath this directory (see `file_count` for the settling / pruned-dir
+    /// rules, which apply identically here). Always equal to `size` for a
+    /// file, so the frontend can treat this as "the rollup" uniformly.
+    #[serde(default)]
+    pub byte_size: u64,
 }
 
 /// One streamed batch of the exclusion preview (`exclusion_preview:batch`).
@@ -563,6 +592,12 @@ pub struct ExclusionPreviewBatch {
     pub excluded_count: u64,
     /// Total bytes of the included files so far (exact, never truncated).
     pub included_bytes: u64,
+    /// Total bytes of the EXCLUDED files so far (exact, never truncated;
+    /// issue #305 summary line - "N would be freed"). Mirrors
+    /// `included_bytes`, which the one-shot `preview_exclusions` already had;
+    /// the streaming path only gained the excluded side with the rollups.
+    #[serde(default)]
+    pub excluded_bytes: u64,
     /// `true` once the streamed node cap was hit: the TREE stops growing but the
     /// counts above stay live and exact.
     pub truncated: bool,
@@ -582,6 +617,10 @@ pub struct ExclusionPreviewDone {
     pub excluded_count: u64,
     /// Final total bytes of the included files.
     pub included_bytes: u64,
+    /// Final total bytes of the EXCLUDED files - issue #305's "would be
+    /// freed" figure.
+    #[serde(default)]
+    pub excluded_bytes: u64,
     /// `true` if the streamed TREE was capped (the counts are still exact).
     pub truncated: bool,
     /// `true` when the walk stopped early because it was cancelled (superseded

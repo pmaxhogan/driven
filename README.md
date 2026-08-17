@@ -122,7 +122,9 @@ These move: check each project's current docs before relying on a cell.
   exclude rules, and a configurable symlink policy, and that skips excluded
   directories instead of descending them.
 - Live exclusion preview that re-classifies the folder tree as you edit a rule,
-  from an in-memory tree rather than a fresh walk of the disk.
+  from an in-memory tree rather than a fresh walk of the disk, with a
+  per-folder file-count and size rollup so an exclude rule's actual weight -
+  or what re-including it would cost - is visible before you commit to it.
 - Exclusion rules that take effect immediately, even mid-backup: saving a new
   rule stops the running backup from uploading anything it newly excludes at the
   next file boundary (the file already in flight still finishes cleanly), and
@@ -200,6 +202,11 @@ These move: check each project's current docs before relying on a cell.
   plain local / removable folder (USB drive, external disk, NAS share) - all
   behind one pluggable backend trait, so adding the next one is a new backend
   crate plus a factory arm rather than a fork of every call site.
+- Destination folder picker with client-side sort (name or last-modified) and
+  type-to-filter, a "New folder" button on every browsable destination, and
+  inline rename on Google Drive and SFTP (S3's key-prefix "folders" have no
+  separate identity to rename, so that control is disabled there with an
+  explanation instead of hidden outright).
 - Scheduled integrity scrub: on top of the local re-hash and the
   remote-existence audit above, a rolling background pass re-checks each
   already-backed-up object's size, and its content checksum where the

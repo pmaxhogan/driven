@@ -62,6 +62,15 @@ export interface PreviewTreeNode {
   depth: number;
   /** Children discovered so far, directories first then name-sorted. */
   children: PreviewTreeNode[];
+  /** Directories only (issue #305): files discovered so far anywhere beneath
+   * this directory, regardless of their own verdict. 0 for a file. SETTLES
+   * upward across later batches - see `ExclusionPreviewNode.fileCount`'s
+   * doc for the exact rule (a descended directory's rollup grows as its
+   * subtree streams in; a pruned excluded directory's is already final). */
+  fileCount: number;
+  /** Directories only: total bytes beneath this directory (see `fileCount`
+   * for the settling rule). Equal to `size` for a file. */
+  byteSize: number;
 }
 
 /** The glob a "+" / "-" click appends to the include / exclude patterns to
@@ -219,6 +228,9 @@ export function createExclusionPreview() {
   const includedCount = ref(0);
   const excludedCount = ref(0);
   const includedBytes = ref(0);
+  /** Total bytes of the EXCLUDED files (issue #305 summary line - "N would
+   *  be freed"). Mirrors `includedBytes`. */
+  const excludedBytes = ref(0);
   /** The streamed TREE hit the node cap; the counts above are still exact. */
   const truncated = ref(false);
   /** A stable SPEC s24 error code from `preview_exclusions_start` (invalid
@@ -304,6 +316,7 @@ export function createExclusionPreview() {
       includedCount.value = 0;
       excludedCount.value = 0;
       includedBytes.value = 0;
+      excludedBytes.value = 0;
       truncated.value = false;
       treeVersion.value += 1;
     }
@@ -323,18 +336,28 @@ export function createExclusionPreview() {
     const parentPath = path.slice(0, cut);
     const existing = index.get(parentPath);
     if (existing) return { list: existing.children, parent: existing };
-    const created = upsert(parentPath, true, true, 0);
+    const created = upsert(parentPath, true, true, 0, 0, 0);
     return { list: created.children, parent: created };
   }
 
   /** Insert `path`, or update it in place if it was already seen (a placeholder
-   *  ancestor, or a duplicate the backend re-sent). Returns the node. */
-  function upsert(path: string, isDir: boolean, included: boolean, size: number): PreviewTreeNode {
+   *  ancestor, a rollup that settled further, or a duplicate the backend
+   *  re-sent). Returns the node. */
+  function upsert(
+    path: string,
+    isDir: boolean,
+    included: boolean,
+    size: number,
+    fileCount: number,
+    byteSize: number
+  ): PreviewTreeNode {
     const found = index.get(path);
     if (found) {
       found.isDir = isDir || found.isDir;
       found.included = included;
       found.size = size;
+      found.fileCount = fileCount;
+      found.byteSize = byteSize;
       return found;
     }
     const cut = path.lastIndexOf("/");
@@ -346,6 +369,8 @@ export function createExclusionPreview() {
       size,
       depth: 0,
       children: [],
+      fileCount,
+      byteSize,
     };
     // `containerFor` may create ancestors, which re-enters `upsert`; register
     // this node FIRST so a cycle of missing parents cannot recurse forever.
@@ -365,7 +390,7 @@ export function createExclusionPreview() {
     let latest: ExclusionPreviewBatch | null = null;
     for (const batch of pending.splice(0)) {
       for (const node of batch.nodes) {
-        upsert(node.path, node.isDir, node.included, node.size);
+        upsert(node.path, node.isDir, node.included, node.size, node.fileCount, node.byteSize);
       }
       latest = batch;
     }
@@ -402,6 +427,7 @@ export function createExclusionPreview() {
       includedCount.value = latest.includedCount;
       excludedCount.value = latest.excludedCount;
       includedBytes.value = latest.includedBytes;
+      excludedBytes.value = latest.excludedBytes;
       truncated.value = latest.truncated;
     }
 
@@ -409,6 +435,7 @@ export function createExclusionPreview() {
       includedCount.value = done.includedCount;
       excludedCount.value = done.excludedCount;
       includedBytes.value = done.includedBytes;
+      excludedBytes.value = done.excludedBytes;
       truncated.value = done.truncated;
       scanning.value = false;
       complete.value = !done.cancelled;
@@ -555,6 +582,7 @@ export function createExclusionPreview() {
     includedCount,
     excludedCount,
     includedBytes,
+    excludedBytes,
     truncated,
     errorCode,
     roots,

@@ -48,8 +48,15 @@ import type { ExclusionPreviewBatch, ExclusionPreviewNode } from "../ipc/types";
 
 const globalMountOptions = { plugins: [i18n] };
 
-function node(path: string, isDir: boolean, included: boolean, size = 0): ExclusionPreviewNode {
-  return { path, isDir, included, size };
+function node(
+  path: string,
+  isDir: boolean,
+  included: boolean,
+  size = 0,
+  fileCount = 0,
+  byteSize = 0
+): ExclusionPreviewNode {
+  return { path, isDir, included, size, fileCount, byteSize };
 }
 
 function batch(nodes: ExclusionPreviewNode[], previewId = "gen-1"): ExclusionPreviewBatch {
@@ -60,6 +67,7 @@ function batch(nodes: ExclusionPreviewNode[], previewId = "gen-1"): ExclusionPre
     includedCount: files.filter((n) => n.included).length,
     excludedCount: files.filter((n) => !n.included).length,
     includedBytes: files.filter((n) => n.included).reduce((a, n) => a + n.size, 0),
+    excludedBytes: files.filter((n) => !n.included).reduce((a, n) => a + n.size, 0),
     truncated: false,
   };
 }
@@ -166,6 +174,87 @@ describe("ExclusionPreviewTree", () => {
     expect(wrapper.find('[data-testid="preview-row-a.txt"]').exists()).toBe(true);
   });
 
+  // Issue #305: per-folder rollups.
+  it("shows a folder row's file-count and byte rollup, right of the name", async () => {
+    const wrapper = await mountWithNodes([
+      node("node_modules", true, false, 0, 31_204, 2_254_857_830),
+    ]);
+    const row = wrapper.get('[data-testid="preview-row-node_modules"]');
+    expect(row.text()).toContain(
+      i18n.global.t("settings.exclusionPreview.rollup", { count: "31,204", size: "2.1 GB" })
+    );
+    const rollup = wrapper.get('[data-testid="preview-rollup-node_modules"]');
+    expect(rollup.text()).toBe(
+      i18n.global.t("settings.exclusionPreview.rollup", { count: "31,204", size: "2.1 GB" })
+    );
+  });
+
+  it("settles a folder's rollup across later batches without duplicating the row", async () => {
+    const wrapper = await mountWithNodes([node("docs", true, true, 0, 0, 0)]);
+    expect(wrapper.get('[data-testid="preview-rollup-docs"]').text()).toContain("0 files");
+
+    batchHandler!(batch([node("docs", true, true, 0, 5, 500)]));
+    await settle();
+
+    expect(wrapper.findAll('[data-testid="preview-row-docs"]')).toHaveLength(1);
+    expect(wrapper.get('[data-testid="preview-rollup-docs"]').text()).toContain(
+      i18n.global.t("settings.exclusionPreview.rollup", { count: "5", size: "500 B" })
+    );
+  });
+
+  it("shows the would-be-freed total for excluded bytes in the summary line", async () => {
+    const wrapper = mount(ExclusionPreviewTree, {
+      global: globalMountOptions,
+      props: {
+        sourceId: "src-1",
+        respectGitignore: true,
+        includePatterns: [],
+        excludePatterns: [],
+      },
+    });
+    await flushPromises();
+    batchHandler!({
+      ...batch([node("skip.log", false, false, 1024)]),
+      excludedBytes: 1024,
+    });
+    vi.advanceTimersByTime(20);
+    await flushPromises();
+
+    expect(wrapper.get('[data-testid="preview-excluded-bytes"]').text()).toBe(
+      i18n.global.t("settings.addSource.preview.excludedBytes", { size: "1 KB" })
+    );
+  });
+
+  it("flexes to fill its container when `fill` is set, instead of a fixed cap", async () => {
+    const capped = await mountWithNodes([node("a.txt", false, true)]);
+    expect(capped.get('[data-testid="exclusion-preview"]').classes()).not.toContain("flex-col");
+    const cappedTree = capped.get('[role="tree"]').element.parentElement;
+    expect(cappedTree?.className).toContain("max-h-64");
+
+    const filled = mount(ExclusionPreviewTree, {
+      global: globalMountOptions,
+      props: {
+        sourceId: "src-1",
+        respectGitignore: true,
+        includePatterns: [],
+        excludePatterns: [],
+        fill: true,
+      },
+    });
+    await flushPromises();
+    batchHandler!(batch([node("a.txt", false, true)]));
+    vi.advanceTimersByTime(20);
+    await flushPromises();
+
+    // The root becomes a flex column in fill mode...
+    expect(filled.get('[data-testid="exclusion-preview"]').classes()).toContain("flex-col");
+    // ...and the old fixed cap on the scrollable tree body is gone, replaced
+    // by flex-fill sizing.
+    const filledTree = filled.get('[role="tree"]').element.parentElement;
+    expect(filledTree?.className).not.toContain("max-h-64");
+    expect(filledTree?.className).toContain("flex-1");
+  });
+
   it("renders streamed rows with live counts while the walk is in flight", async () => {
     const wrapper = await mountWithNodes([
       node("docs", true, true),
@@ -191,6 +280,7 @@ describe("ExclusionPreviewTree", () => {
       includedCount: 1,
       excludedCount: 0,
       includedBytes: 4,
+      excludedBytes: 0,
       truncated: false,
       cancelled: false,
     });

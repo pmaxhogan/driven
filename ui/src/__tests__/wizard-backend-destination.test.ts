@@ -57,6 +57,7 @@ const BACKENDS: BackendDto[] = [
     usesOauth: true,
     supportsFolderPicker: true,
     supportsVersionHistory: true,
+    supportsRename: true,
     isDefault: true,
   },
   {
@@ -64,6 +65,7 @@ const BACKENDS: BackendDto[] = [
     usesOauth: false,
     supportsFolderPicker: true,
     supportsVersionHistory: false,
+    supportsRename: false,
     isDefault: false,
   },
   {
@@ -71,6 +73,7 @@ const BACKENDS: BackendDto[] = [
     usesOauth: false,
     supportsFolderPicker: false,
     supportsVersionHistory: false,
+    supportsRename: false,
     isDefault: false,
   },
 ];

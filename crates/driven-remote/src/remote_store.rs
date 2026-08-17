@@ -294,6 +294,37 @@ pub trait RemoteStore: Send + Sync {
         drive_context: &DriveContext,
     ) -> anyhow::Result<Vec<RemoteEntry>>;
 
+    /// Renames a folder IN PLACE - its LOCATION (parent) never changes, only
+    /// its display name (issue #307, the destination picker's inline rename).
+    ///
+    /// The returned [`RemoteEntry::id`] is the folder's id to use from now on.
+    /// For Drive this is always the SAME id the caller passed in (a rename is
+    /// a pure metadata patch by opaque file id). For SFTP it can DIFFER: an
+    /// SFTP id is built from encoded path components, so a rename that
+    /// actually changes the encoded name moves the real directory and mints a
+    /// new id at the new path - the caller MUST replace any id it was holding
+    /// with the one this call returns, never assume the input `folder_id`
+    /// still resolves.
+    ///
+    /// The default degrades to an explicit, stably-coded "unsupported" error
+    /// rather than a silent no-op: [`BackendKind::supports_rename`] is what
+    /// tells the picker UI whether to offer the affordance at all, so reaching
+    /// this default means a stale client called it anyway and must be told
+    /// clearly, not left to wonder why nothing changed. S3 "folders" are key
+    /// prefixes with no separate identity to rename (renaming one would mean
+    /// copying every object under the prefix to a new key and deleting the
+    /// old ones - a bulk operation the picker's inline affordance does not
+    /// attempt), so it keeps this default.
+    async fn rename_folder(
+        &self,
+        folder_id: &str,
+        new_name: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<RemoteEntry> {
+        let _ = (folder_id, new_name, drive_context);
+        anyhow::bail!("remote.rename_unsupported: this destination cannot rename folders")
+    }
+
     /// Enumerates the Shared Drives the authenticated account can access
     /// (Drive `drives.list`), for the destination picker to show Shared Drive
     /// roots beside My Drive (issue #7).

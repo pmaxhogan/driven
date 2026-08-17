@@ -1133,13 +1133,21 @@ describe("AddSourceWizard", () => {
       previewBatchHandler!({
         previewId: "gen-1",
         nodes: [
-          { path: "keep.txt", isDir: false, included: true, size: 4 },
-          { path: "build", isDir: true, included: true, size: 0 },
-          { path: "secret.env", isDir: false, included: false, size: 2 },
+          { path: "keep.txt", isDir: false, included: true, size: 4, fileCount: 0, byteSize: 4 },
+          { path: "build", isDir: true, included: true, size: 0, fileCount: 0, byteSize: 0 },
+          {
+            path: "secret.env",
+            isDir: false,
+            included: false,
+            size: 2,
+            fileCount: 0,
+            byteSize: 2,
+          },
         ],
         includedCount: 1,
         excludedCount: 1,
         includedBytes: 4,
+        excludedBytes: 2,
         truncated: false,
       });
       await new Promise((r) => setTimeout(r, 25));

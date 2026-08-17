@@ -1108,6 +1108,33 @@ impl RemoteStore for GoogleDriveStore {
         self.list_query(&q, drive_context).await
     }
 
+    /// Renames a folder via `PATCH /files/{id}` with just the `name` field -
+    /// the id and `parents` are untouched (issue #307). Unlike `create_folder`
+    /// this is a PATCH-by-id, which is idempotent, so it is safe to blind-retry
+    /// through the normal `send_json` path.
+    async fn rename_folder(
+        &self,
+        folder_id: &str,
+        new_name: &str,
+        _drive_context: &DriveContext,
+    ) -> anyhow::Result<RemoteEntry> {
+        let body = json_body(&serde_json::json!({ "name": new_name }))?;
+        let file: DriveFile = self
+            .send_json(|token| {
+                self.http
+                    .patch(format!("{DRIVE_API_BASE}/files/{folder_id}"))
+                    .query(&[("fields", pagination::FILE_FIELDS), SUPPORTS_ALL_DRIVES])
+                    .bearer_auth(token)
+                    .header(reqwest::header::CONTENT_TYPE, "application/json")
+                    .body(body.clone())
+            })
+            .await
+            // The target is `folder_id`; a 404 / unclassified 403 is a
+            // dest-folder condition, not a transient (mirrors `create_folder`).
+            .map_err(map_parent_write_error)?;
+        Ok(file.into_remote_entry())
+    }
+
     async fn create(
         &self,
         parent_id: &str,

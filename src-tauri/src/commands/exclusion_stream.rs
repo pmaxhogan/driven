@@ -69,7 +69,7 @@
 //! updating to the exact end of the pass - the summary line stays truthful even
 //! when the tree is a partial view.
 
-use std::collections::VecDeque;
+use std::collections::{HashMap, HashSet, VecDeque};
 use std::path::{Path, PathBuf};
 use std::sync::atomic::{AtomicBool, Ordering};
 use std::sync::{Arc, Mutex};
@@ -279,6 +279,143 @@ impl Default for StreamConfig {
     }
 }
 
+/// The live per-directory rollup a batch can settle over time (issue #305):
+/// the total FILE COUNT and BYTE SIZE discovered so far anywhere beneath one
+/// directory, regardless of the individual verdict of what is under it - the
+/// same "how big is this folder" answer a file browser would give, which is
+/// exactly the number the exclusions browser needs to show what an exclude
+/// rule actually costs (or, for an excluded folder, what it would free).
+///
+/// Tracked only for directories that were actually STREAMED as nodes (see
+/// [`stream_classify_tree`]'s per-entry cap check) - a directory nobody has a
+/// row for has nothing to update.
+struct RollupAcc {
+    /// The directory's own include/exclude verdict, carried so a settled
+    /// update can be re-emitted as a full [`ExclusionPreviewNode`] without
+    /// looking the verdict back up.
+    included: bool,
+    file_count: u64,
+    byte_size: u64,
+}
+
+/// Recursively counts files and sums bytes under `path` WITHOUT classifying
+/// anything.
+///
+/// Used only for a directory [`stream_classify_tree`] PRUNES (excluded, with
+/// no reachable negation - see its module docs), so that row's rollup can
+/// still answer "what would be freed" without descending it for real
+/// classification. Cheaper than the classification pass it stands in for: no
+/// matcher calls, and the subtree is walked and discarded in one call rather
+/// than growing the BFS queue or streaming node by node.
+///
+/// Follows the same walk policy as [`read_dir_entries`]: symlinks are never
+/// followed, and an unreadable directory is skipped (logged at debug) rather
+/// than failing the whole preview. The cancel flag is polled periodically so
+/// an enormous excluded tree - the exact case pruning exists to avoid paying
+/// for - cannot hang a preview that has already been asked to stop.
+///
+/// Not cache-backed (unlike the classification pass): a rule edit that keeps
+/// this same directory pruned re-walks its subtree from disk every time. That
+/// is an accepted cost for a feature whose whole point is to show the size of
+/// a subtree the classification pass deliberately never reads.
+fn count_pruned_subtree(path: &Path, cancel: &AtomicBool) -> (u64, u64) {
+    let mut file_count: u64 = 0;
+    let mut byte_size: u64 = 0;
+    let mut stack: Vec<PathBuf> = vec![path.to_path_buf()];
+    let mut polled: usize = 0;
+    while let Some(dir) = stack.pop() {
+        polled += 1;
+        if polled % CANCEL_POLL_ENTRIES == 0 && cancel.load(Ordering::SeqCst) {
+            return (file_count, byte_size);
+        }
+        let Ok(read) = std::fs::read_dir(&dir) else {
+            tracing::debug!(target: TARGET, dir = %dir.display(), "pruned-subtree count: skipping unreadable directory");
+            continue;
+        };
+        for entry in read.flatten() {
+            polled += 1;
+            if polled % CANCEL_POLL_ENTRIES == 0 && cancel.load(Ordering::SeqCst) {
+                return (file_count, byte_size);
+            }
+            let Ok(file_type) = entry.file_type() else {
+                continue;
+            };
+            if file_type.is_symlink() {
+                continue;
+            }
+            if file_type.is_dir() {
+                stack.push(entry.path());
+            } else if file_type.is_file() {
+                file_count += 1;
+                byte_size =
+                    byte_size.saturating_add(entry.metadata().map(|m| m.len()).unwrap_or(0));
+            }
+        }
+    }
+    (file_count, byte_size)
+}
+
+/// Adds `(file_count_delta, byte_delta)` to the rollup of EVERY ancestor
+/// directory of `rel_str` that is currently tracked in `rollups` (see
+/// [`RollupAcc`]'s doc for why an untracked ancestor is silently skipped
+/// rather than an error), marking each one dirty so the next flush re-emits
+/// its settled node. Walks the full ancestor chain, not just the immediate
+/// parent, by repeatedly trimming the last `/`-separated component.
+fn bump_ancestors(
+    rollups: &mut HashMap<String, RollupAcc>,
+    dirty: &mut HashSet<String>,
+    rel_str: &str,
+    file_count_delta: u64,
+    byte_delta: u64,
+) {
+    let mut cur = rel_str;
+    while let Some((parent, _)) = cur.rsplit_once('/') {
+        if let Some(acc) = rollups.get_mut(parent) {
+            acc.file_count += file_count_delta;
+            acc.byte_size = acc.byte_size.saturating_add(byte_delta);
+            dirty.insert(parent.to_string());
+        }
+        cur = parent;
+    }
+}
+
+/// Applies every dirty rollup to `pending`, clearing the dirty set. Called
+/// right before a batch flushes, so a rollup update rides the SAME cadence as
+/// new nodes rather than needing its own timer.
+///
+/// A directory whose ORIGINAL node has not been flushed out of `pending` yet
+/// (it streamed and settled within the same batch - the common case for a
+/// small tree, or any directory near the end of a walk) is updated IN PLACE,
+/// so the wire never carries two entries for one path where one would do. A
+/// directory flushed in an EARLIER batch instead gets a fresh
+/// [`ExclusionPreviewNode`] re-emission with the same `path` - the webview's
+/// `upsert` updates that row in place rather than duplicating it, which is
+/// the whole mechanism that lets a rollup "settle" visibly on a large tree.
+fn drain_dirty_rollups(
+    rollups: &HashMap<String, RollupAcc>,
+    dirty: &mut HashSet<String>,
+    pending: &mut Vec<ExclusionPreviewNode>,
+) {
+    for path in dirty.drain() {
+        let Some(acc) = rollups.get(&path) else {
+            continue;
+        };
+        if let Some(existing) = pending.iter_mut().find(|n| n.path == path) {
+            existing.file_count = acc.file_count;
+            existing.byte_size = acc.byte_size;
+            continue;
+        }
+        pending.push(ExclusionPreviewNode {
+            path,
+            is_dir: true,
+            included: acc.included,
+            size: 0,
+            file_count: acc.file_count,
+            byte_size: acc.byte_size,
+        });
+    }
+}
+
 /// A directory waiting to be classified, in BFS order.
 struct QueuedDir {
     /// Path relative to the source root; empty for the root itself.
@@ -373,8 +510,19 @@ pub fn stream_classify_tree(
     let mut included_count: u64 = 0;
     let mut excluded_count: u64 = 0;
     let mut included_bytes: u64 = 0;
+    // Issue #305 summary line: the excluded-side counterpart of
+    // `included_bytes` - "N would be freed".
+    let mut excluded_bytes: u64 = 0;
     let mut streamed_nodes: usize = 0;
     let mut truncated = false;
+
+    // Issue #305 per-folder rollups: tracked only for directories that were
+    // actually streamed (see the per-entry cap check below), bumped for every
+    // classified entry regardless of the cap (like `included_count` /
+    // `excluded_count`, the rollup a tracked ancestor sees stays exact), and
+    // re-emitted through `dirty_rollups` at the next flush once they change.
+    let mut rollups: HashMap<String, RollupAcc> = HashMap::new();
+    let mut dirty_rollups: HashSet<String> = HashSet::new();
 
     let mut pending: Vec<ExclusionPreviewNode> = Vec::with_capacity(cfg.batch_max_nodes);
     let mut last_flush = Instant::now();
@@ -435,20 +583,56 @@ pub fn stream_classify_tree(
             // `rel`.
             let rel_str = rel.to_string_lossy().replace('\\', "/");
 
+            // Issue #305: this node's OWN rollup. Stays 0/0 for a file (its
+            // `size` already carries the weight) and for a directory the walk
+            // is about to DESCEND (its rollup starts empty and settles from
+            // its streamed descendants via `bump_ancestors`); a directory the
+            // walk PRUNES gets its final answer right now, from one
+            // lightweight recursive disk count.
+            let mut node_file_count: u64 = 0;
+            let mut node_byte_size: u64 = 0;
+
             if is_dir {
                 // Descend unless this dir is excluded AND pruning it is safe -
                 // i.e. no `!`-rule anywhere could re-include something beneath
                 // THIS directory (the scanner's own per-directory rule).
-                if included || matcher.negations_could_match_under(&rel) {
-                    if let Some(decision) = child_state {
-                        queue.push_back(QueuedDir { rel, decision });
+                let will_descend = (included || matcher.negations_could_match_under(&rel))
+                    && child_state.is_some();
+                if will_descend {
+                    if streamed_nodes < cfg.node_stream_cap {
+                        rollups.insert(
+                            rel_str.clone(),
+                            RollupAcc {
+                                included,
+                                file_count: 0,
+                                byte_size: 0,
+                            },
+                        );
                     }
+                    queue.push_back(QueuedDir {
+                        rel,
+                        decision: child_state.expect("will_descend checked child_state.is_some()"),
+                    });
+                } else {
+                    let (sub_count, sub_bytes) = count_pruned_subtree(&root.join(&rel), cancel);
+                    node_file_count = sub_count;
+                    node_byte_size = sub_bytes;
+                    bump_ancestors(
+                        &mut rollups,
+                        &mut dirty_rollups,
+                        &rel_str,
+                        sub_count,
+                        sub_bytes,
+                    );
                 }
             } else if included {
                 included_count += 1;
                 included_bytes = included_bytes.saturating_add(size);
+                bump_ancestors(&mut rollups, &mut dirty_rollups, &rel_str, 1, size);
             } else {
                 excluded_count += 1;
+                excluded_bytes = excluded_bytes.saturating_add(size);
+                bump_ancestors(&mut rollups, &mut dirty_rollups, &rel_str, 1, size);
             }
 
             // Past the cap the tree stops growing but the counts above keep
@@ -461,6 +645,8 @@ pub fn stream_classify_tree(
                     is_dir,
                     included,
                     size,
+                    file_count: node_file_count,
+                    byte_size: node_byte_size,
                 });
             } else if !truncated {
                 truncated = true;
@@ -470,12 +656,14 @@ pub fn stream_classify_tree(
             if pending.len() >= cfg.batch_max_nodes
                 || last_flush.elapsed() >= cfg.batch_max_interval
             {
+                drain_dirty_rollups(&rollups, &mut dirty_rollups, &mut pending);
                 emit(ExclusionPreviewBatch {
                     preview_id: preview_id.to_string(),
                     nodes: std::mem::take(&mut pending),
                     included_count,
                     excluded_count,
                     included_bytes,
+                    excluded_bytes,
                     truncated,
                 });
                 pending.reserve(cfg.batch_max_nodes);
@@ -493,8 +681,11 @@ pub fn stream_classify_tree(
         }
     };
 
-    // Final partial batch (also the ONLY batch for a small tree). Skipped when
-    // empty so a finished pass does not emit a redundant no-op event.
+    // Final partial batch (also the ONLY batch for a small tree). Drains any
+    // rollup still dirty so every directory's settled total reaches the
+    // webview even when the pass finished inside one batch. Skipped when both
+    // are empty so a finished pass does not emit a redundant no-op event.
+    drain_dirty_rollups(&rollups, &mut dirty_rollups, &mut pending);
     if !pending.is_empty() {
         emit(ExclusionPreviewBatch {
             preview_id: preview_id.to_string(),
@@ -502,6 +693,7 @@ pub fn stream_classify_tree(
             included_count,
             excluded_count,
             included_bytes,
+            excluded_bytes,
             truncated,
         });
     }
@@ -511,6 +703,7 @@ pub fn stream_classify_tree(
         included_count,
         excluded_count,
         included_bytes,
+        excluded_bytes,
         truncated,
         cancelled,
     }
@@ -787,6 +980,7 @@ mod tests {
         assert_eq!(done.included_count, 2, "keep.txt + docs/inner.txt");
         assert_eq!(done.excluded_count, 2, "drop.log + docs/inner.log");
         assert_eq!(done.included_bytes, 8, "5 + 3 bytes of included files");
+        assert_eq!(done.excluded_bytes, 3, "2 + 1 bytes of excluded files");
         assert!(!done.truncated);
         assert!(!done.cancelled);
         assert_eq!(done.preview_id, "gen-1");
@@ -1605,6 +1799,158 @@ mod tests {
             cache.entry_count(),
             0,
             "the editor closed, so the tree is released"
+        );
+    }
+
+    // ---------------------------------------------------------------------
+    // Per-folder rollups (issue #305)
+    // ---------------------------------------------------------------------
+
+    /// The LAST-emitted node for `path` across every batch - a directory's
+    /// rollup can be re-emitted as it settles, so the last one is its final
+    /// answer.
+    fn last_node<'a>(
+        batches: &'a [ExclusionPreviewBatch],
+        path: &str,
+    ) -> Option<&'a ExclusionPreviewNode> {
+        batches
+            .iter()
+            .flat_map(|b| b.nodes.iter())
+            .rfind(|n| n.path == path)
+    }
+
+    #[test]
+    fn a_descended_directory_rollup_settles_to_the_total_of_everything_beneath_it() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("docs/a.txt"), "abcde");
+        write(&root.join("docs/b.txt"), "xy");
+        write(&root.join("docs/sub/c.txt"), "zzz");
+
+        let source = source_at(root, &[], &[]);
+        let (batches, _done) = run(root, &source, &StreamConfig::default());
+
+        let docs = last_node(&batches, "docs").expect("docs streamed");
+        assert!(docs.is_dir);
+        assert_eq!(docs.file_count, 3, "a.txt + b.txt + sub/c.txt");
+        assert_eq!(docs.byte_size, 10, "5 + 2 + 3 bytes");
+
+        let sub = last_node(&batches, "docs/sub").expect("docs/sub streamed");
+        assert_eq!(sub.file_count, 1);
+        assert_eq!(sub.byte_size, 3);
+    }
+
+    #[test]
+    fn a_pruned_excluded_directory_rollup_is_final_on_its_own_first_batch() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("node_modules/pkg/index.js"), "abcdefgh");
+        write(&root.join("node_modules/pkg/readme.md"), "xy");
+        write(&root.join("src/app.js"), "z");
+
+        let source = source_at(root, &[], &["/node_modules/"]);
+        let (batches, done) = run(root, &source, &StreamConfig::default());
+
+        // node_modules itself is streamed (excluded, one node) but never
+        // descended - its children never stream as their own nodes.
+        assert!(
+            !batches
+                .iter()
+                .flat_map(|b| b.nodes.iter())
+                .any(|n| n.path.starts_with("node_modules/")),
+            "a pruned directory streams no children"
+        );
+
+        let first_batch_with_nm = batches
+            .iter()
+            .find(|b| b.nodes.iter().any(|n| n.path == "node_modules"))
+            .expect("some batch streamed node_modules");
+        let first_seen = first_batch_with_nm
+            .nodes
+            .iter()
+            .find(|n| n.path == "node_modules")
+            .unwrap();
+        assert!(!first_seen.included);
+        // Final on the FIRST (only) batch that streamed it - a pruned
+        // directory needs no settling, unlike a descended one.
+        assert_eq!(
+            first_seen.file_count, 2,
+            "index.js + readme.md, counted off disk"
+        );
+        assert_eq!(first_seen.byte_size, 10, "8 + 2 bytes");
+
+        assert_eq!(done.included_count, 1, "only src/app.js");
+        assert_eq!(
+            done.excluded_count, 0,
+            "node_modules' children were never visited, so they are not in the exact count either"
+        );
+    }
+
+    #[test]
+    fn a_rollup_propagates_to_every_ancestor_not_just_the_immediate_parent() {
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("a/b/c/leaf.txt"), "abcd");
+
+        let source = source_at(root, &[], &[]);
+        let (batches, _done) = run(root, &source, &StreamConfig::default());
+
+        for path in ["a", "a/b", "a/b/c"] {
+            let node = last_node(&batches, path).unwrap_or_else(|| panic!("{path} streamed"));
+            assert_eq!(node.file_count, 1, "{path}");
+            assert_eq!(node.byte_size, 4, "{path}");
+        }
+    }
+
+    #[test]
+    fn a_descended_but_excluded_directory_rollup_counts_everything_beneath_it_either_way() {
+        // A directory can be excluded yet still DESCENDED when a negation
+        // could reach inside it (see the pruning-exception test above); its
+        // rollup counts every file beneath it regardless of each file's OWN
+        // individual verdict - "how big is this folder", not "how much of it
+        // is included".
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        write(&root.join("vendor/lib.js"), "x");
+        write(&root.join("vendor/keep.js"), "yy");
+
+        let source = source_at(root, &["/vendor/keep.js"], &["/vendor/"]);
+        let (batches, _done) = run(root, &source, &StreamConfig::default());
+
+        let vendor = last_node(&batches, "vendor").expect("vendor streamed");
+        assert!(!vendor.included);
+        assert_eq!(vendor.file_count, 2, "lib.js + keep.js, included or not");
+        assert_eq!(vendor.byte_size, 3, "1 + 2 bytes");
+    }
+
+    #[test]
+    fn a_directory_past_the_node_cap_is_never_seeded_and_bumps_nothing() {
+        // A directory the cap kept off the wire has no row on the webview, so
+        // seeding (and later bumping) its rollup would be dead weight held
+        // for the life of the pass. This pins that it simply never appears as
+        // a rollup target: the pass must not panic or misbehave when an
+        // ancestor is untracked.
+        let dir = tempfile::tempdir().unwrap();
+        let root = dir.path();
+        for i in 0..5 {
+            write(&root.join(format!("d{i}/leaf.txt")), "x");
+        }
+
+        let source = source_at(root, &[], &[]);
+        let cfg = StreamConfig {
+            node_stream_cap: 2,
+            ..StreamConfig::default()
+        };
+        let (batches, done) = run(root, &source, &cfg);
+
+        assert_eq!(
+            done.included_count, 5,
+            "the exact count is unaffected by the cap"
+        );
+        assert_eq!(
+            all_nodes(&batches).len(),
+            2,
+            "the streamed tree itself stops at the cap"
         );
     }
 }

@@ -1110,6 +1110,34 @@ impl RemoteStore for InMemoryRemoteStore {
             .collect())
     }
 
+    /// Renames a folder in place, mirroring `GoogleDriveStore::rename_folder`
+    /// (issue #307): only `name` changes, id and `parent_id` are untouched.
+    async fn rename_folder(
+        &self,
+        folder_id: &str,
+        new_name: &str,
+        drive_context: &DriveContext,
+    ) -> anyhow::Result<RemoteEntry> {
+        self.record_context(drive_context);
+        self.check_request_faults(RequestKind::WriteTarget).await?;
+        let mut guard = self.inner.lock();
+        if !guard
+            .objects
+            .get(folder_id)
+            .is_some_and(FileEntry::is_folder)
+        {
+            anyhow::bail!("fake: no folder with file_id {folder_id}");
+        }
+        let new_now = guard.tick();
+        let entry = guard
+            .objects
+            .get_mut(folder_id)
+            .expect("presence just checked above");
+        entry.name = new_name.to_string();
+        entry.modified_time_ms = new_now;
+        Ok(entry.to_remote_entry())
+    }
+
     async fn create(
         &self,
         parent_id: &str,

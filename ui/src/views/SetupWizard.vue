@@ -443,6 +443,7 @@ function baseName(p: string): string {
           v-model:drive-id="setup.driveId"
           :account-id="setup.accountId"
           :backend-kind="setup.backendId"
+          :supports-rename="setup.selectedBackend?.supportsRename ?? false"
           @error="onDrivePickerError"
         />
         <!-- A destination with no browsable tree (a local or removable folder):
