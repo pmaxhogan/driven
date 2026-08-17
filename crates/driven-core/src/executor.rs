@@ -630,12 +630,13 @@ const RECONCILE_LOOKUP_CONCURRENCY: usize = 6;
 enum ReconcileLookup {
     /// UPDATE path: the `remote.metadata(drive_file_id)` result.
     Metadata(anyhow::Result<RemoteEntry>),
-    /// CREATE path: re-deriving the parent folder chain failed. Propagated
-    /// verbatim (it is not classified - the sequential path mapped it straight
-    /// through `to_reconcile_err`).
-    ParentFailed(anyhow::Error),
-    /// CREATE path: the `find_by_op_uuid` result under the resolved parent.
-    Orphan(anyhow::Result<Option<RemoteEntry>>),
+    /// CREATE path, in two layers because the sequential pass treats the two
+    /// failures differently. The OUTER `Err` is a failed parent-folder-chain
+    /// walk, propagated verbatim (unclassified, straight through
+    /// `to_reconcile_err`, aborting the source's pass); the INNER result is
+    /// `find_by_op_uuid`'s, which IS classified (transient keeps the op and
+    /// aborts, definitive drops just this op).
+    Orphan(anyhow::Result<anyhow::Result<Option<RemoteEntry>>>),
 }
 
 impl ReconcileLookup {
@@ -648,11 +649,13 @@ impl ReconcileLookup {
     /// which aborts the pass just the same.
     fn is_retryable_failure(&self) -> bool {
         match self {
-            ReconcileLookup::Metadata(Err(e)) | ReconcileLookup::Orphan(Err(e)) => {
+            ReconcileLookup::Metadata(Err(e)) | ReconcileLookup::Orphan(Ok(Err(e))) => {
                 reconcile_metadata_error_is_retryable(classify_drive_error(e))
             }
-            ReconcileLookup::ParentFailed(_) => true,
-            ReconcileLookup::Metadata(Ok(_)) | ReconcileLookup::Orphan(Ok(_)) => false,
+            // A parent-walk failure propagates unclassified and aborts the pass
+            // just the same, so it halts the prefetch too.
+            ReconcileLookup::Orphan(Err(_)) => true,
+            ReconcileLookup::Metadata(Ok(_)) | ReconcileLookup::Orphan(Ok(Ok(_))) => false,
         }
     }
 }
@@ -5045,7 +5048,9 @@ impl DefaultExecutor {
     }
 
     /// One paced CREATE-path lookup: re-derive the parent folder chain, then
-    /// search it for the orphan carrying `uuid`.
+    /// search it for the orphan carrying `uuid`. The OUTER `Err` is a failed
+    /// parent walk (propagated verbatim, aborting the pass); the INNER one is
+    /// `find_by_op_uuid`'s, which the caller classifies.
     ///
     /// Safe to run concurrently (issue #301). The parent walk
     /// ([`Self::ensure_parents_once`]) is idempotent AND single-flighted behind
@@ -5060,31 +5065,28 @@ impl DefaultExecutor {
         relative_path: &RelativePath,
         uuid: &str,
         crypto: Option<&dyn SourceCryptoSuite>,
-    ) -> ReconcileLookup {
-        let parent_id = match self
+    ) -> anyhow::Result<anyhow::Result<Option<RemoteEntry>>> {
+        let parent_id = self
             .reconcile_parent_id(source, relative_path, crypto)
-            .await
-        {
-            Ok(id) => id,
-            Err(e) => return ReconcileLookup::ParentFailed(e),
-        };
+            .await?;
         self.pacer.permit_request().await;
-        let found = match self
-            .remote
-            .find_by_op_uuid(&parent_id, uuid, &source.drive_context())
-            .await
-        {
-            Ok(found) => {
-                self.pacer.note_response(ResponseClass::Ok);
-                Ok(found)
-            }
-            Err(e) => {
-                self.pacer
-                    .note_response(classify_drive_error(&e).response_class());
-                Err(e)
-            }
-        };
-        ReconcileLookup::Orphan(found)
+        Ok(
+            match self
+                .remote
+                .find_by_op_uuid(&parent_id, uuid, &source.drive_context())
+                .await
+            {
+                Ok(found) => {
+                    self.pacer.note_response(ResponseClass::Ok);
+                    Ok(found)
+                }
+                Err(e) => {
+                    self.pacer
+                        .note_response(classify_drive_error(&e).response_class());
+                    Err(e)
+                }
+            },
+        )
     }
 
     /// Issue #301: run every op's adopt-or-requeue lookup with BOUNDED
@@ -5169,10 +5171,10 @@ impl DefaultExecutor {
                     Some(file_id) => {
                         ReconcileLookup::Metadata(self.reconcile_metadata_lookup(file_id).await)
                     }
-                    None => {
+                    None => ReconcileLookup::Orphan(
                         self.reconcile_orphan_lookup(source, &relative_path, &uuid, crypto)
-                            .await
-                    }
+                            .await,
+                    ),
                 };
                 if lookup.is_retryable_failure() {
                     halt.store(true, std::sync::atomic::Ordering::Release);
@@ -5619,23 +5621,23 @@ impl DefaultExecutor {
                 // `reconcile_orphan_lookup`), and carried the pacer accounting
                 // with them. Fall back to an inline lookup when the prefetch was
                 // skipped or halted.
-                let lookup = match prefetched {
-                    Some(
-                        lookup @ (ReconcileLookup::ParentFailed(_) | ReconcileLookup::Orphan(_)),
-                    ) => lookup,
+                let orphan = match prefetched {
+                    Some(ReconcileLookup::Orphan(result)) => result,
+                    // Not prefetched (this op fell through from a stale
+                    // resumable session, or the prefetch halted on a peer's
+                    // retryable failure). A `Metadata` result cannot belong to
+                    // this branch - it is selected by the ABSENCE of a recorded
+                    // `drive_file_id` - so the same fallback covers both.
                     _ => {
                         self.reconcile_orphan_lookup(source, &op.relative_path, &uuid, crypto)
                             .await
                     }
                 };
-                let found = match lookup {
-                    ReconcileLookup::ParentFailed(e) => return Err(to_reconcile_err(e)),
-                    // The update path never reaches here (it is selected by a
-                    // recorded `drive_file_id`), so a Metadata result cannot
-                    // belong to this branch; treat it as "no orphan found",
-                    // which requeues the op - the safe direction.
-                    ReconcileLookup::Metadata(_) => Ok(None),
-                    ReconcileLookup::Orphan(found) => found,
+                let found = match orphan {
+                    Ok(found) => found,
+                    // The parent-folder-chain walk failed: propagate verbatim
+                    // (an invalid_grant in there still maps to needs_reauth).
+                    Err(e) => return Err(to_reconcile_err(e)),
                 };
                 let found = match found {
                     Ok(found) => found,
@@ -12087,21 +12089,164 @@ mod tests {
             "a transient metadata failure aborts the pass, so it must halt the prefetch"
         );
         assert!(
-            ReconcileLookup::Orphan(Err(transient())).is_retryable_failure(),
+            ReconcileLookup::Orphan(Ok(Err(transient()))).is_retryable_failure(),
             "a transient orphan lookup failure must halt the prefetch"
         );
         assert!(
-            ReconcileLookup::ParentFailed(anyhow::anyhow!("folder chain")).is_retryable_failure(),
+            ReconcileLookup::Orphan(Err(anyhow::anyhow!("folder chain"))).is_retryable_failure(),
             "a parent-walk failure propagates unclassified and aborts the pass, so it halts too"
         );
         // A DEFINITIVE not-found drops the single op and the pass CONTINUES -
         // halting on it would needlessly serialise the rest.
         let definitive = anyhow::anyhow!("drive.dest_folder_missing");
         assert!(
-            !ReconcileLookup::Orphan(Err(definitive)).is_retryable_failure(),
+            !ReconcileLookup::Orphan(Ok(Err(definitive))).is_retryable_failure(),
             "a definitive failure is per-op; it must NOT halt the prefetch"
         );
-        assert!(!ReconcileLookup::Orphan(Ok(None)).is_retryable_failure());
+        assert!(!ReconcileLookup::Orphan(Ok(Ok(None))).is_retryable_failure());
+    }
+
+    /// Issue #301 fail-fast, end to end: when the parent-folder-chain walk
+    /// fails, the pass aborts with EVERY pending op kept (they retry next
+    /// cycle), and the prefetch stops issuing lookups rather than burning one
+    /// doomed round trip per op.
+    ///
+    /// `with_dest_folder_missing` fails every write-target request, which is
+    /// what `ensure_folder` is - so each op's parent walk fails. There are more
+    /// ops than [`RECONCILE_LOOKUP_CONCURRENCY`], so the ones queued behind the
+    /// first batch observe the halt flag and are left for the sequential pass
+    /// (which never reaches them - it aborts on the first).
+    #[tokio::test]
+    async fn reconcile_parent_walk_failure_aborts_the_pass_and_keeps_every_op() {
+        const OPS: usize = 8;
+        let h = harness_with_remote(InMemoryRemoteStore::new().with_dest_folder_missing()).await;
+
+        for i in 0..OPS {
+            // NESTED, so the parent walk actually has a folder to ensure.
+            let rel = RelativePath::try_from(format!("sub/f{i}.txt")).unwrap();
+            h.state
+                .enqueue_pending_op(NewPendingOp {
+                    source_id: h.source.id,
+                    op_type: OP_TYPE_UPLOAD.to_string(),
+                    relative_path: rel,
+                    payload_json: PendingOpPayload {
+                        client_op_uuid: Some(uuid::Uuid::new_v4().to_string()),
+                        ..PendingOpPayload::default()
+                    }
+                    .to_value(),
+                    scheduled_for: 0,
+                    created_at: 0,
+                })
+                .await
+                .unwrap();
+        }
+
+        let err = h
+            .executor()
+            .reconcile(&h.source, &noop_recover_sink)
+            .await
+            .expect_err("a failed parent walk must abort the source's reconcile");
+        assert!(
+            err.to_string().contains("dest_folder_missing")
+                || err
+                    .chain()
+                    .any(|c| c.to_string().contains("dest_folder_missing")),
+            "the parent-walk error propagates verbatim: {err:?}"
+        );
+
+        // NOTHING was dropped: a failed lookup proves nothing about whether the
+        // create landed, so every op is kept for the next cycle.
+        assert_eq!(
+            h.state
+                .get_pending_ops_for_source(h.source.id)
+                .await
+                .unwrap()
+                .len(),
+            OPS,
+            "an aborted pass must keep every pending op"
+        );
+    }
+
+    /// The UPDATE path through the prefetched lookup: a crash after the update
+    /// landed on the remote leaves an object already carrying the op's uuid, so
+    /// reconcile ADOPTS it (marks the row Synced) and drops the op.
+    #[tokio::test]
+    async fn reconcile_adopts_an_update_whose_object_already_carries_the_op_uuid() {
+        let h = harness().await;
+        let body = b"updated bytes";
+        let (rel, size) = h.write_file("u.txt", body);
+
+        // The object as it exists remotely AFTER the update committed: it
+        // carries this op's uuid in appProperties.
+        let op_uuid = uuid::Uuid::new_v4().to_string();
+        let mut app = HashMap::new();
+        app.insert(CLIENT_OP_UUID_KEY.to_string(), op_uuid.clone());
+        let entry = h
+            .remote
+            .create(
+                h.source.drive_folder_id.as_str(),
+                "u.txt",
+                "application/octet-stream",
+                UploadBody::Bytes(Bytes::copy_from_slice(body)),
+                app,
+            )
+            .await
+            .unwrap();
+
+        // The pre-update row (an UPDATE op is selected by a recorded id).
+        h.state
+            .upsert_file_state(&crate::state::FileStateRow {
+                source_id: h.source.id,
+                relative_path: rel.clone(),
+                size,
+                mtime_ns: 1,
+                hash_blake3: *blake3::hash(b"older bytes").as_bytes(),
+                drive_file_id: Some(entry.id.clone()),
+                drive_md5: None,
+                encrypted_remote_path: None,
+                status: FileStateStatus::Pending,
+                last_uploaded_at: Some(0),
+                last_verified_at: Some(0),
+            })
+            .await
+            .unwrap();
+        h.state
+            .enqueue_pending_op(NewPendingOp {
+                source_id: h.source.id,
+                op_type: OP_TYPE_UPLOAD.to_string(),
+                relative_path: rel.clone(),
+                payload_json: PendingOpPayload {
+                    client_op_uuid: Some(op_uuid),
+                    drive_file_id: Some(entry.id.clone()),
+                    uploaded_blake3_hex: Some(hex::encode(blake3::hash(body).as_bytes())),
+                    ..PendingOpPayload::default()
+                }
+                .to_value(),
+                scheduled_for: 0,
+                created_at: 0,
+            })
+            .await
+            .unwrap();
+
+        h.executor()
+            .reconcile(&h.source, &noop_recover_sink)
+            .await
+            .unwrap();
+
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .expect("file_state row");
+        assert_eq!(row.status, FileStateStatus::Synced, "the update is adopted");
+        assert_eq!(row.drive_file_id.as_deref(), Some(entry.id.as_str()));
+        assert!(h
+            .state
+            .get_pending_ops_for_source(h.source.id)
+            .await
+            .unwrap()
+            .is_empty());
     }
 
     // --- crash mid-resumable resumes via reconcile --------------------------
