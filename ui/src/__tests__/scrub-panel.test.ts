@@ -106,14 +106,26 @@ describe("ScrubHistoryPanel", () => {
     expect(row.text()).not.toContain("All good");
   });
 
-  it("raises a banner summarising drift it could not repair", async () => {
+  it("raises a banner keyed on the newest run only, not summed across history", async () => {
     const wrapper = await mountPanel([
       run({ id: 2, outcome: "drift", hashMismatch: 1, unrecoverable: 1 }),
       run({ id: 1, outcome: "drift", sizeMismatch: 2, unrecoverable: 2 }),
     ]);
-    // Summed across the loaded window: the scrub walks a rolling slice, so
-    // damage found two runs ago is just as unresolved as damage found today.
-    expect(wrapper.find('[data-testid="scrub-attention"]').text()).toContain("3");
+    // The newest run (id 2) has 1 unrecoverable object; the older run's 2 do
+    // not add in. See #271: summing across the whole loaded window kept the
+    // banner red long after the underlying drift was resolved.
+    expect(wrapper.find('[data-testid="scrub-attention"]').text()).toContain("1");
+    expect(wrapper.find('[data-testid="scrub-attention"]').text()).not.toContain("3");
+  });
+
+  it("clears the attention banner once a later scrub is clean (#271)", async () => {
+    // The exact regression from #271, applied to the scrub panel per the
+    // issue ("applies to the scrub panel too, which uses the same pattern").
+    const wrapper = await mountPanel([
+      run({ id: 2, outcome: "clean", ok: 40 }),
+      run({ id: 1, outcome: "drift", sizeMismatch: 2, unrecoverable: 2 }),
+    ]);
+    expect(wrapper.find('[data-testid="scrub-attention"]').exists()).toBe(false);
   });
 
   it("surfaces a failed load as a translated error code, not a raw message", async () => {
@@ -157,7 +169,7 @@ describe("useScrubStore", () => {
     expect(store.needsAttention).toBe(false);
   });
 
-  it("exposes the newest run and the summed unrepaired drift", async () => {
+  it("exposes the newest run and keys unrecoverableTotal off it alone", async () => {
     invokeMock.mockResolvedValue([
       run({ id: 3, unrecoverable: 1 }),
       run({ id: 2, unrecoverable: 4 }),
@@ -167,10 +179,31 @@ describe("useScrubStore", () => {
     const store = useScrubStore();
     await store.refresh();
     expect(store.latest?.id).toBe(3);
-    expect(store.unrecoverableTotal).toBe(5);
+    // Only the newest run's unrecoverable count, not the 4 from run 2 - #271.
+    expect(store.unrecoverableTotal).toBe(1);
     expect(store.needsAttention).toBe(true);
     expect(store.loaded).toBe(true);
     expect(store.errorCode).toBeNull();
+  });
+
+  it("clears needsAttention the moment the newest loaded run is clean (#271)", async () => {
+    // Regression coverage for the store layer, independent of the panel: a
+    // run with drift followed by a refresh that returns a clean newest run
+    // must flip needsAttention back to false, not keep it pinned by history.
+    invokeMock.mockResolvedValue([run({ id: 1, outcome: "drift", unrecoverable: 3 })]);
+    setActivePinia(createPinia());
+    const store = useScrubStore();
+    await store.refresh();
+    expect(store.needsAttention).toBe(true);
+    expect(store.unrecoverableTotal).toBe(3);
+
+    invokeMock.mockResolvedValue([
+      run({ id: 2, outcome: "clean", ok: 40 }),
+      run({ id: 1, outcome: "drift", unrecoverable: 3 }),
+    ]);
+    await store.refresh();
+    expect(store.needsAttention).toBe(false);
+    expect(store.unrecoverableTotal).toBe(0);
   });
 
   it("keeps the previous runs and records a code when a reload fails", async () => {

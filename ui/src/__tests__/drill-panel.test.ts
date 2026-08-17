@@ -123,14 +123,26 @@ describe("DrillHistoryPanel", () => {
     expect(some.find('[data-testid="drill-run-skipped"]').text()).toContain("2");
   });
 
-  it("raises a banner summarising files that could not be restored", async () => {
+  it("raises a banner keyed on the newest run only, not summed across history", async () => {
     const wrapper = await mountPanel([
       run({ id: 2, outcome: "failed", verified: 2, failed: 1 }),
       run({ id: 1, outcome: "failed", verified: 1, failed: 2 }),
     ]);
-    // Summed across the loaded window: a file that would not come back two
-    // drills ago is just as unrestorable today unless something was done.
-    expect(wrapper.find('[data-testid="drill-attention"]').text()).toContain("3");
+    // The newest run (id 2) failed 1 file; the older run's 2 failures do not
+    // add in. See #271: summing across the whole loaded window kept the
+    // banner red for months after the underlying problem cleared.
+    expect(wrapper.find('[data-testid="drill-attention"]').text()).toContain("1");
+    expect(wrapper.find('[data-testid="drill-attention"]').text()).not.toContain("3");
+  });
+
+  it("clears the attention banner once a later drill passes (#271)", async () => {
+    // The exact regression from #271: one bad run must not keep the banner
+    // red once a subsequent run comes back clean.
+    const wrapper = await mountPanel([
+      run({ id: 2, outcome: "passed", verified: 3, failed: 0 }),
+      run({ id: 1, outcome: "failed", verified: 1, failed: 2 }),
+    ]);
+    expect(wrapper.find('[data-testid="drill-attention"]').exists()).toBe(false);
   });
 
   it("renders counts and codes only, never a path", async () => {
@@ -182,7 +194,7 @@ describe("useDrillStore", () => {
     expect(store.inconclusive).toBe(false);
   });
 
-  it("exposes the newest run and the summed unrestorable count", async () => {
+  it("exposes the newest run and keys failedTotal off it alone", async () => {
     invokeMock.mockResolvedValue([
       run({ id: 3, outcome: "failed", verified: 2, failed: 1 }),
       run({ id: 2, outcome: "failed", verified: 0, failed: 4 }),
@@ -192,10 +204,31 @@ describe("useDrillStore", () => {
     const store = useDrillStore();
     await store.refresh();
     expect(store.latest?.id).toBe(3);
-    expect(store.failedTotal).toBe(5);
+    // Only the newest run's failures count, not the 4 from run 2 - see #271.
+    expect(store.failedTotal).toBe(1);
     expect(store.needsAttention).toBe(true);
     expect(store.loaded).toBe(true);
     expect(store.errorCode).toBeNull();
+  });
+
+  it("clears needsAttention the moment the newest loaded run passes (#271)", async () => {
+    // Regression coverage for the store layer, independent of the panel: a
+    // failed run followed by a refresh that returns a passing newest run
+    // must flip needsAttention back to false, not keep it pinned by history.
+    invokeMock.mockResolvedValue([run({ id: 1, outcome: "failed", verified: 1, failed: 3 })]);
+    setActivePinia(createPinia());
+    const store = useDrillStore();
+    await store.refresh();
+    expect(store.needsAttention).toBe(true);
+    expect(store.failedTotal).toBe(3);
+
+    invokeMock.mockResolvedValue([
+      run({ id: 2, outcome: "passed", verified: 3, failed: 0 }),
+      run({ id: 1, outcome: "failed", verified: 1, failed: 3 }),
+    ]);
+    await store.refresh();
+    expect(store.needsAttention).toBe(false);
+    expect(store.failedTotal).toBe(0);
   });
 
   it("reports inconclusive off the NEWEST run only", async () => {

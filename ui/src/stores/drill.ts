@@ -34,17 +34,19 @@ export const useDrillStore = defineStore("drill", () => {
   const latest = computed<DrillRun | null>(() => runs.value[0] ?? null);
 
   /**
-   * Files across the loaded runs that could NOT be restored.
+   * Files the NEWEST run could not restore.
    *
-   * Summed over the LOADED window rather than only the newest run, for the same
-   * reason the scrub sums its unrecoverable count: a file that would not come
-   * back three drills ago is just as unrestorable today unless something was
-   * done about it. This answers "how much needs attention", not "how much
-   * needed attention in the most recent sample".
+   * Keyed on the latest run only, not summed across the loaded window (see
+   * #271): the drill draws a fresh time-seeded sample every pass, so a run
+   * that fails to restore a file has no way to "prove" that file is fine
+   * later - only a subsequent run reporting on the current state can speak to
+   * the current state. Summing meant one bad monthly drill kept the banner
+   * red for ~10 subsequent passing drills with no way for a later success to
+   * ever clear it.
    */
-  const failedTotal = computed<number>(() => runs.value.reduce((sum, r) => sum + r.failed, 0));
+  const failedTotal = computed<number>(() => latest.value?.failed ?? 0);
 
-  /** True when any loaded run could not restore a file it sampled. */
+  /** True when the NEWEST run could not restore a file it sampled. */
   const needsAttention = computed<boolean>(() => failedTotal.value > 0);
 
   /**

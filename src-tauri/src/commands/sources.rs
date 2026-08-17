@@ -630,10 +630,13 @@ pub async fn update_source(
 /// `remove_source(source_id, delete_remote)` - remove a source (SPEC s11.2).
 ///
 /// Deletes the `backup_sources` row (cascading its `file_state` + `pending_ops`)
-/// and reconfigures the owning orchestrator. `delete_remote` (trash the source's
-/// backed-up Drive content) is NOT performed in this slice (no standalone Drive
-/// store handle is exposed to IPC for a bulk remote trash); a `true` request is
-/// rejected so the caller is never told the remote was deleted when it was not.
+/// and reconfigures the owning orchestrator. `delete_remote` additionally
+/// deletes the source's backed-up files from its destination FIRST, before any
+/// local row is touched (issue #227) - this works on every destination backend
+/// (Google Drive, S3, the local folder, SFTP), not Drive only: it is plumbing
+/// over [`RemoteStore::list_source_object_ids`] + [`RemoteStore::trash`], the
+/// same backend-neutral primitives the integrity scrub and the remote-existence
+/// audit already use for every backend. See [`delete_source_remote_objects`].
 ///
 /// R5-P1-1 (DATA-SAFETY): a source still holding a DURABLE pending recovery-phrase
 /// ack (a first encrypted source the user never saved the phrase for) is removed
@@ -647,16 +650,17 @@ pub async fn remove_source(
     source_id: SourceId,
     delete_remote: bool,
 ) -> CommandResult<()> {
-    if delete_remote {
-        return Err(CommandError::with_code(
-            ErrorCode::DriveUnreachable,
-            "remote deletion on source removal is not available in this build; \
-             the source's Drive content was left intact. Remove it from Google Drive directly.",
-        ));
-    }
-
     let row = find_source(state.state().as_ref(), source_id).await?;
     let account_id = row.account_id;
+
+    // Issue #227: delete the remote objects BEFORE any local row is touched, so
+    // a failure here (enumeration or an individual delete) leaves the source in
+    // place for the user to retry, exactly the "loud and atomic" behaviour the
+    // issue asked to keep. Deletion is idempotent per object, so a retry after a
+    // partial failure only re-deletes what is still actually there.
+    if delete_remote {
+        delete_source_remote_objects(&state, &row).await?;
+    }
 
     // R5-P1-1 (DATA-SAFETY): if this source still has a DURABLE pending
     // recovery-phrase ack (a first encrypted source the user never acked), a plain
@@ -719,6 +723,83 @@ pub async fn remove_source(
 
     reconfigure_account(&state, account_id).await;
     tracing::info!(target: TARGET, source_id = %source_id, "source removed");
+    Ok(())
+}
+
+/// Builds the account's real (or fake-mode) [`RemoteStore`] and deletes every
+/// remote object this source's backup still has on its destination, as part
+/// of `remove_source(delete_remote: true)` (issue #227). Thin AppState wiring
+/// over [`delete_source_remote_objects_via`], which carries the actual logic
+/// and is unit-tested directly against a [`RemoteStore`] fake.
+async fn delete_source_remote_objects(
+    state: &State<'_, AppState>,
+    source: &SourceRow,
+) -> CommandResult<()> {
+    let account = find_account(state.state().as_ref(), source.account_id).await?;
+
+    // Issue #34: resolve the custom root CA / proxy for the one-off store's
+    // client build, exactly as the picker and the restore path do.
+    let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
+        .await
+        .unwrap_or_default();
+    let proxy = crate::commands::settings::load_proxy_config(state.state().as_ref()).await?;
+    let store = build_restore_store(state.inner(), &account, &ca, &proxy)?;
+
+    delete_source_remote_objects_via(state.state().as_ref(), store.as_ref(), source).await
+}
+
+/// The actual delete-on-removal logic (issue #227), decoupled from
+/// [`AppState`] so it is directly unit-testable against a [`RemoteStore`]
+/// fake instead of needing a live account/credential/orchestrator harness.
+///
+/// Backend-neutral BY CONSTRUCTION: it is built entirely from
+/// [`RemoteStore::list_source_object_ids`] and [`RemoteStore::trash`], and
+/// EVERY [`RemoteStore`] implementation (`GoogleDriveStore`, `S3Store`,
+/// `LocalFsStore`, `SftpStore`) provides both - the same primitives the
+/// integrity scrub and the executor's remote-existence audit already use to
+/// enumerate a source's live objects. There is no per-backend branch here and
+/// none is needed: whichever store `delete_source_remote_objects` built for
+/// the account's configured `BackendKind`, this routes through it exactly the
+/// same way.
+///
+/// Enumerates the LIVE remote object set FIRST and aborts with zero deletions
+/// if that enumeration fails - mirroring the remote-existence audit's "abort
+/// with zero writes" rule (a truncated or failed listing must never be
+/// misread as "nothing to delete"). A source with nothing recorded in
+/// `file_state`/bundles skips the remote call entirely (nothing to delete, and
+/// this lets a source removed before its first upload cycle be cleaned up even
+/// if the account's credentials have since gone stale).
+///
+/// [`RemoteStore::trash`] is idempotent (an already-gone object is success), so
+/// a retry after a partial failure only re-deletes what genuinely remains.
+async fn delete_source_remote_objects_via(
+    state: &dyn StateRepo,
+    store: &dyn RemoteStore,
+    source: &SourceRow,
+) -> CommandResult<()> {
+    let recorded_files = state
+        .list_file_state_drive_ids(source.id)
+        .await
+        .map_err(CommandError::from)?;
+    let recorded_bundles = state
+        .list_bundles_for_source(source.id)
+        .await
+        .map_err(CommandError::from)?;
+    if recorded_files.is_empty() && recorded_bundles.is_empty() {
+        tracing::debug!(target: TARGET, source_id = %source.id, "no recorded remote objects; skipping remote deletion");
+        return Ok(());
+    }
+
+    let live_ids = store
+        .list_source_object_ids(&source.id.to_string(), &source.drive_context())
+        .await
+        .map_err(CommandError::from)?;
+
+    tracing::info!(target: TARGET, source_id = %source.id, object_count = live_ids.len(), "deleting source's remote objects before removal");
+    for object_id in &live_ids {
+        store.trash(object_id).await.map_err(CommandError::from)?;
+    }
+
     Ok(())
 }
 
@@ -2915,6 +2996,178 @@ mod tests {
                     panic!("turning versioning OFF on {kind} must be allowed: {e}")
                 });
         }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- Issue #227: delete-remote-on-removal is backend-neutral ------------
+
+    /// A minimal `file_state` row recording `drive_file_id` as already
+    /// uploaded, for the tests that need [`delete_source_remote_objects_via`]
+    /// to see the source as having something to delete.
+    fn file_state_row(
+        source_id: SourceId,
+        relative_path: &str,
+        drive_file_id: &str,
+    ) -> driven_core::state::FileStateRow {
+        driven_core::state::FileStateRow {
+            source_id,
+            relative_path: relative_path
+                .to_string()
+                .try_into()
+                .expect("valid relative path"),
+            size: 3,
+            mtime_ns: 0,
+            hash_blake3: [0u8; 32],
+            drive_file_id: Some(drive_file_id.to_string()),
+            drive_md5: None,
+            encrypted_remote_path: None,
+            status: driven_core::types::FileStateStatus::Synced,
+            last_uploaded_at: None,
+            last_verified_at: None,
+        }
+    }
+
+    #[tokio::test]
+    async fn delete_source_remote_objects_skips_the_remote_call_when_nothing_was_uploaded() {
+        // A source removed before its first backup cycle (or one whose
+        // account credentials have since gone stale) has nothing recorded, so
+        // deletion must not even ATTEMPT a remote call - proven here by
+        // arming a fault that fails every `list_source_object_ids` call: if
+        // the skip did not fire, this would return `Err`.
+        let (repo, dir) = temp_repo().await;
+        let (_, source) = persist_source_on_backend(&repo, BackendKind::S3).await;
+        let store = driven_drive::fake::InMemoryRemoteStore::new().with_source_listing_broken();
+
+        delete_source_remote_objects_via(&repo, &store, &source)
+            .await
+            .expect("nothing recorded means nothing to delete, even with listing broken");
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn delete_source_remote_objects_deletes_every_live_object_on_every_backend_kind() {
+        // Issue #227: the fix is that remote deletion works on EVERY
+        // destination, not Drive only. The deletion logic itself
+        // (`delete_source_remote_objects_via`) never branches on
+        // `BackendKind` - it only ever talks to the `RemoteStore` trait - so
+        // this proves the SAME code path deletes correctly regardless of
+        // which backend the source's account declares.
+        let (repo, dir) = temp_repo().await;
+
+        for kind in BackendKind::ALL.iter().copied() {
+            let (_, source) = persist_source_on_backend(&repo, kind).await;
+            repo.upsert_file_state(&file_state_row(source.id, "a.txt", "obj-1"))
+                .await
+                .expect("upsert file_state");
+
+            let store = driven_drive::fake::InMemoryRemoteStore::new();
+            let root = store.root_id().to_string();
+            let mut props = std::collections::HashMap::new();
+            props.insert(
+                driven_drive::fake::SOURCE_ID_KEY.to_string(),
+                source.id.to_string(),
+            );
+            store
+                .create(
+                    &root,
+                    "a.txt",
+                    "application/octet-stream",
+                    driven_drive::remote_store::UploadBody::Bytes(bytes::Bytes::from_static(b"hi")),
+                    props,
+                )
+                .await
+                .expect("seed remote object");
+
+            let live_before = store
+                .list_source_object_ids(&source.id.to_string(), &source.drive_context())
+                .await
+                .expect("list before delete");
+            assert_eq!(
+                live_before.len(),
+                1,
+                "backend {kind}: seeded object must be live before deletion"
+            );
+
+            delete_source_remote_objects_via(&repo, &store, &source)
+                .await
+                .unwrap_or_else(|e| panic!("backend {kind}: deletion must succeed: {e}"));
+
+            let live_after = store
+                .list_source_object_ids(&source.id.to_string(), &source.drive_context())
+                .await
+                .expect("list after delete");
+            assert!(
+                live_after.is_empty(),
+                "backend {kind}: the object must no longer be live after deletion"
+            );
+        }
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn delete_source_remote_objects_aborts_with_zero_deletions_when_enumeration_fails() {
+        // Mirrors the remote-existence audit's "abort with zero writes" rule:
+        // a listing that could not be completed must never be read as
+        // "nothing to delete". The object seeded below must survive
+        // untouched.
+        let (repo, dir) = temp_repo().await;
+        let (_, source) = persist_source_on_backend(&repo, BackendKind::Sftp).await;
+        repo.upsert_file_state(&file_state_row(source.id, "a.txt", "obj-1"))
+            .await
+            .expect("upsert file_state");
+
+        // `with_source_listing_broken` targets `list_source_object_ids` only
+        // (every other call, including `create`, keeps working), so the
+        // fault can be armed up front and the seed below still lands.
+        let broken = driven_drive::fake::InMemoryRemoteStore::new().with_source_listing_broken();
+        let root = broken.root_id().to_string();
+        let mut props = std::collections::HashMap::new();
+        props.insert(
+            driven_drive::fake::SOURCE_ID_KEY.to_string(),
+            source.id.to_string(),
+        );
+        let seeded = broken
+            .create(
+                &root,
+                "a.txt",
+                "application/octet-stream",
+                driven_drive::remote_store::UploadBody::Bytes(bytes::Bytes::from_static(b"hi")),
+                props,
+            )
+            .await
+            .expect("seed remote object on the broken store");
+
+        // The fake's fault is a plain unclassified `anyhow::bail!` (unlike a
+        // real backend's error, which the production `DriveErrorClassification`
+        // machinery maps to a specific code - `drive.unreachable` / `net.*` -
+        // via `CommandError::from`), so it lands on the generic fallback code.
+        // What matters here is that it IS an `Err`, and that nothing below got
+        // deleted as a result.
+        let err = delete_source_remote_objects_via(&repo, &broken, &source)
+            .await
+            .unwrap_err();
+        assert_eq!(
+            err.code,
+            ErrorCode::InternalBug,
+            "an unclassified enumeration failure must still surface as an error, not succeed"
+        );
+
+        // Nothing was deleted: the object is still present and NOT trashed.
+        // `list_folder_with_trashed` is a fault-free inherent test hook (the
+        // latched fault targets `list_source_object_ids` only), so this is a
+        // reliable post-condition check even against the broken store.
+        let entries = broken.list_folder_with_trashed(broken.root_id());
+        let entry = entries
+            .iter()
+            .find(|e| e.id == seeded.id)
+            .expect("seeded object must still exist");
+        assert!(
+            !entry.trashed,
+            "the seeded object must not have been trashed when enumeration aborted first"
+        );
 
         let _ = std::fs::remove_dir_all(dir);
     }

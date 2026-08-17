@@ -83,6 +83,14 @@ const savingEdit = ref(false);
 // Inline remove-confirmation state.
 const confirmingRemoveId = ref<string | null>(null);
 const deleteRemote = ref(false);
+const removing = ref(false);
+// Issue #227: a "delete the backed-up files too" removal can genuinely fail
+// (destination unreachable, permission revoked, ...) - the stable SPEC s24
+// CODE (localized via t(`errors.${code}.long`)), same contract as the
+// versioning / reveal panels' inline errors. `remove_source` aborts BEFORE
+// touching anything local on any such failure, so the source stays listed
+// and the confirm panel stays open for a retry.
+const removeErrorCode = ref<string | null>(null);
 
 // R5-P1-2 (DATA-SAFETY): post-restart recovery-phrase reveal/ack state, keyed by
 // the pending source being remediated. The wizard's reveal/ack flow lives only in
@@ -338,17 +346,32 @@ async function disableVersioning(source: SourceDto): Promise<void> {
 function beginRemove(sourceId: string): void {
   confirmingRemoveId.value = sourceId;
   deleteRemote.value = false;
+  removeErrorCode.value = null;
 }
 
 function cancelRemove(): void {
   confirmingRemoveId.value = null;
   deleteRemote.value = false;
+  removeErrorCode.value = null;
 }
 
 async function confirmRemove(sourceId: string): Promise<void> {
-  await sources.remove(sourceId, deleteRemote.value);
-  confirmingRemoveId.value = null;
-  deleteRemote.value = false;
+  removeErrorCode.value = null;
+  removing.value = true;
+  try {
+    await sources.remove(sourceId, deleteRemote.value);
+    confirmingRemoveId.value = null;
+    deleteRemote.value = false;
+  } catch (e) {
+    // Issue #227: `remove_source` aborts with nothing removed on a failed
+    // remote deletion (destination unreachable, permission revoked, ...).
+    // Keep the confirm panel open with the checkbox still ticked so the
+    // error is visible and a retry is one click away, rather than silently
+    // leaving the source in the list with no explanation.
+    removeErrorCode.value = toErrorCode(e);
+  } finally {
+    removing.value = false;
+  }
 }
 
 // R5-P1-2 / R7-P2-1 (DATA-SAFETY): open the post-restart reveal/ack panel for a
@@ -815,11 +838,24 @@ async function confirmRevealAck(sourceId: string): Promise<void> {
             <input v-model="deleteRemote" type="checkbox" class="accent-teal-600" />
             {{ t("settings.sources.deleteRemoteLabel") }}
           </label>
+          <p
+            v-if="removeErrorCode"
+            class="text-red-700 dark:text-red-400"
+            data-testid="remove-error"
+          >
+            {{ t(`errors.${removeErrorCode}.long`) }}
+          </p>
           <div class="flex gap-2">
-            <button type="button" :class="destructiveBtn" @click="confirmRemove(source.id)">
+            <button
+              type="button"
+              :class="destructiveBtn"
+              :disabled="removing"
+              data-testid="source-remove-confirm-button"
+              @click="confirmRemove(source.id)"
+            >
               {{ t("settings.sources.removeButton") }}
             </button>
-            <button type="button" :class="secondaryBtn" @click="cancelRemove">
+            <button type="button" :class="secondaryBtn" :disabled="removing" @click="cancelRemove">
               {{ t("common.cancel") }}
             </button>
           </div>
