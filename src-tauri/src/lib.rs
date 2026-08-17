@@ -63,9 +63,13 @@ mod updater;
 mod vss_helper;
 
 use std::path::PathBuf;
+use std::sync::atomic::{AtomicU8, Ordering};
+use std::sync::Arc;
 
+use driven_core::types::AccountId;
 use tauri::{Manager, RunEvent, WindowEvent};
 use tauri_plugin_deep_link::DeepLinkExt;
+use tokio::task::JoinHandle;
 
 pub use app_state::{AccountHandle, AppState, RemoteMode};
 
@@ -213,6 +217,109 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: &[String]) {
     show_main_window(app);
 }
 
+// -----------------------------------------------------------------------------
+// Quit lifecycle (issue #299 / #300)
+// -----------------------------------------------------------------------------
+
+/// No quit in progress.
+const QUIT_IDLE: u8 = 0;
+/// A graceful quit is running its drain OFF the event-loop thread.
+const QUIT_DRAINING: u8 = 1;
+/// The drain finished (or the user force-quit): the next `ExitRequested` must
+/// be allowed through so the process actually exits.
+const QUIT_READY: u8 = 2;
+
+/// The quit lifecycle phase (issue #299).
+///
+/// Process-global because the quit path is inherently process-wide and is
+/// driven from three places that cannot share a value: the Tauri `RunEvent`
+/// callback (`&AppHandle` only), the detached drain task, and the tray menu's
+/// "Force quit now" item.
+static QUIT_PHASE: AtomicU8 = AtomicU8::new(QUIT_IDLE);
+
+/// `true` while the graceful quit drain is running.
+///
+/// The tray reads this so a `StateChanged` arriving mid-drain (the run loop is
+/// still finishing its cycle, so it keeps emitting transitions) cannot repaint
+/// over the "quitting" icon/tooltip that [`tray::enter_quitting`] just set.
+pub(crate) fn is_quitting() -> bool {
+    QUIT_PHASE.load(Ordering::Acquire) == QUIT_DRAINING
+}
+
+/// Issue #300: abandon the graceful drain and exit NOW.
+///
+/// Wired to the quitting-state tray menu's single enabled item. Every in-flight
+/// upload is hard-cancelled by the process exit itself, which is safe because
+/// the resume point is already durable: the streaming resumable uploader
+/// persists `resumable.acked_offset` into the pending op's payload after EVERY
+/// acked wire chunk (`executor.rs` `push_one`), so the next launch's reconcile
+/// pass resumes the session from the last acked byte (at most one wire chunk is
+/// re-sent). Restore jobs are likewise safe to kill - their writers stage into
+/// a temp that is never promoted, so a half-restored file cannot be published.
+///
+/// Marks the phase [`QUIT_READY`] BEFORE asking for the exit so the
+/// `ExitRequested` this raises is not prevented by the graceful path.
+pub(crate) fn force_quit(app: &tauri::AppHandle) {
+    QUIT_PHASE.store(QUIT_READY, Ordering::Release);
+    tracing::warn!(
+        target: "driven::app",
+        "force quit requested from the tray; abandoning the graceful drain (in-flight uploads resume from their persisted offset on next launch)"
+    );
+    app.exit(0);
+}
+
+/// Everything an explicit Quit must drive to a true stop, TAKEN out of
+/// [`AppState`] synchronously on the event-loop thread so the async drain owns
+/// it outright and never has to borrow the Tauri-managed state across an await.
+struct ShutdownHandles {
+    /// Per-account task sets (run loop, watcher/event bridges, power poller).
+    accounts: Vec<(AccountId, Arc<AccountHandle>)>,
+    /// M8-P1-1: the already-cancelled in-flight restore job tasks.
+    restore_jobs: Vec<JoinHandle<()>>,
+    /// M9a: the periodic updater-check task, if it was started.
+    updater: Option<JoinHandle<()>>,
+    /// M9b: the periodic telemetry-ping task, if it was started.
+    telemetry: Option<JoinHandle<()>>,
+    /// 2026-08-14 follow-up: the 1 Hz io-throughput sampler, if it was started.
+    iostat: Option<JoinHandle<()>>,
+}
+
+/// Signal every shutdown-able task and TAKE its handle, synchronously.
+///
+/// Every call here is a cheap, non-blocking mutex-take or watch-send - there is
+/// no `await` and no I/O - so this is safe to run on the event-loop thread.
+/// Returns `None` when no [`AppState`] is managed (assembly never ran), i.e.
+/// there is nothing to drain.
+fn take_shutdown_handles(app: &tauri::AppHandle) -> Option<ShutdownHandles> {
+    let state = app.try_state::<AppState>()?;
+    // Signal every orchestrator to stop AFTER its current cycle up front, so the
+    // concurrent drains below see the stop flag already set (each account's
+    // in-flight cycle winds down in parallel instead of one-at-a-time).
+    let accounts = state.accounts();
+    for (account_id, handle) in &accounts {
+        tracing::info!(target: "driven::app", account_id = %account_id, "signalling graceful shutdown on quit");
+        handle.orchestrator.shutdown();
+    }
+    Some(ShutdownHandles {
+        accounts,
+        // M8-P1-1: cancel every in-flight RESTORE job up front too (mirrors the
+        // no-orphan AccountHandle drain). Setting each job's cancel flag makes
+        // its task delete the in-flight temp + emit a terminal CANCELLED status,
+        // so quit leaves no orphaned restore task and no partial files.
+        restore_jobs: state.cancel_all_restore_jobs(),
+        // M9a: signal + take the periodic updater-check task so the drain joins
+        // it too (no orphan). It is a tokio-interval task that select!s on its
+        // shutdown watch, so it exits promptly once signalled; the bounded drain
+        // still aborts-and-awaits it if it is mid-check (e.g. a slow network
+        // request) so quit cannot hang.
+        updater: state.shutdown_updater_task(),
+        // M9b: the periodic telemetry-ping task, same shape as the updater one.
+        telemetry: state.shutdown_telemetry_task(),
+        // 2026-08-14 follow-up: the io-throughput sampler, same shape again.
+        iostat: state.shutdown_iostat_task(),
+    })
+}
+
 /// GRACEFULLY shut down every per-account task set on an explicit Quit
 /// (R-P1-1 / R3-P1-1, ROADMAP M5 "no orphaned tokio tasks"; DESIGN s5.10.2
 /// in-flight drain). For each account [`AccountHandle::shutdown`] signals the
@@ -221,9 +328,6 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: &[String]) {
 /// power poller) so the process exits with zero orphaned tasks while still
 /// giving an in-flight backup cycle a chance to finish rather than being killed
 /// mid-upload.
-///
-/// Runs on the Tauri async runtime via `block_on` because the Tauri event-loop
-/// callback (`RunEvent`) is synchronous.
 ///
 /// R3-P1-1 (concurrency + no outer cancellation): the per-account drains run
 /// CONCURRENTLY via [`futures::future::join_all`] - NOT serially - so two slow
@@ -236,117 +340,150 @@ fn handle_second_launch(app: &tauri::AppHandle, argv: &[String]) {
 /// already self-bounds (await up to its budget, then `abort()` AND await the
 /// aborted handle), so every per-account drain completes on its own; we let them
 /// all finish instead of racing an outer cancellation that could orphan a task.
-fn shutdown_orchestrators(app: &tauri::AppHandle) {
-    let Some(state) = app.try_state::<AppState>() else {
+///
+/// Issue #299: this future is SPAWNED on the Tauri async runtime, never
+/// `block_on`d from the `RunEvent` callback. See [`begin_graceful_quit`].
+async fn drain_shutdown_handles(handles: ShutdownHandles) {
+    let ShutdownHandles {
+        accounts,
+        restore_jobs,
+        updater,
+        telemetry,
+        iostat,
+    } = handles;
+
+    // R3-P1-1: drive ALL per-account shutdowns concurrently. Each
+    // `handle.shutdown()` self-bounds its per-task drains and aborts-and-
+    // awaits anything that overruns, so no outer timeout is needed (and an
+    // outer timeout would risk dropping a cancellation-unsafe drain mid-abort
+    // -> an orphaned task). `join_all` returns only once EVERY account's
+    // every task is finished.
+    let drains = accounts.into_iter().map(|(account_id, handle)| async move {
+        handle.shutdown().await;
+        tracing::info!(target: "driven::app", account_id = %account_id, "all per-account tasks shut down (no orphans)");
+    });
+    futures::future::join_all(drains).await;
+
+    // M8-P1-1 / R2-P2-2: drain every cancelled restore task with a BOUNDED,
+    // abort-capable budget. Each task observes its cancel flag between frames,
+    // deletes its in-flight temp, and exits - normally well within the budget.
+    // But a task stuck BEFORE it next checks the flag (e.g. blocked on a slow
+    // download read) would hang an explicit Quit forever if we awaited it
+    // unconditionally. So we await each handle up to RESTORE_JOB_DRAIN_TIMEOUT
+    // and, on timeout, `abort()` it and AWAIT the aborted handle so the task is
+    // genuinely GONE before quit proceeds (no orphan). The task's temp is
+    // cleaned even on the abort path because the restore writer holds a
+    // Drop-based temp guard (see `restore.rs` TempFileGuard), so dropping the
+    // aborted future removes any in-flight temp. Mirrors the M5 per-account
+    // `drain_or_abort` shape. The drains run concurrently so two stuck jobs do
+    // not sum their budgets.
+    let restore_drains = restore_jobs
+        .into_iter()
+        .map(|h| async move { drain_restore_handle(h).await });
+    futures::future::join_all(restore_drains).await;
+    tracing::info!(target: "driven::app", "all in-flight restore jobs cancelled + drained (no orphans)");
+
+    // M9a: drain the periodic updater-check task with the SAME bounded,
+    // abort-capable budget so quit never hangs on a mid-check task and leaves
+    // no orphan.
+    if let Some(handle) = updater {
+        drain_restore_handle(handle).await;
+        tracing::info!(target: "driven::app", "updater periodic check task drained (no orphan)");
+    }
+
+    // M9b: drain the periodic telemetry-ping task with the SAME bounded,
+    // abort-capable budget so quit never hangs on a mid-ping task and leaves no
+    // orphan.
+    if let Some(handle) = telemetry {
+        drain_restore_handle(handle).await;
+        tracing::info!(target: "driven::app", "telemetry ping task drained (no orphan)");
+    }
+
+    // 2026-08-14 follow-up: drain the io-throughput sampler the same way.
+    if let Some(handle) = iostat {
+        drain_restore_handle(handle).await;
+        tracing::info!(target: "driven::app", "io throughput sampler drained (no orphan)");
+    }
+
+    // Stop the cosmetic tray syncing-spinner LAST - AFTER every orchestrator
+    // is dropped (so the per-account event bridges' broadcasts are closed and
+    // no further `StateChanged` can drive `apply_state` -> restart the
+    // spinner). Stopping it earlier would race a still-queued syncing event
+    // that could re-spawn the detached timer task after the stop. It is a
+    // pure timer loop (set_icon only) that the process exit then tears down;
+    // stopping it here keeps the no-orphan drain honest.
+    tray::stop_sync_animation();
+    tracing::info!(target: "driven::app", "tray syncing animation stopped (no orphan)");
+}
+
+/// Issue #299: start an explicit Quit WITHOUT ever blocking the event loop.
+///
+/// The old shape ran [`drain_shutdown_handles`] inline via
+/// `tauri::async_runtime::block_on` straight from the `RunEvent::ExitRequested`
+/// callback - i.e. on the main thread that owns the platform event loop. On
+/// Windows that stalls the Win32 message pump for the whole drain budget (up to
+/// `RUN_LOOP_DRAIN_TIMEOUT` = 20s while a backup cycle finishes), so the shell
+/// ghosts the window at ~5s, paints "Not Responding", and Windows Error
+/// Reporting kills the process at ~14s. That is worse than a slow quit: the
+/// drain never completes, so the graceful semantics it was blocking FOR are
+/// lost too (maxbook 2026-08-16 - two "Application Hang" events for
+/// driven-app.exe, and the log has "signalling graceful shutdown on quit" with
+/// no matching "all per-account tasks shut down" line).
+///
+/// So: hide the window and repaint the tray synchronously (both are single fast
+/// platform calls), then SPAWN the drain on the Tauri async runtime and return
+/// immediately. The event loop keeps pumping the whole time, so the app can
+/// never be declared hung; the caller prevents the exit and the drain re-raises
+/// it via [`AppHandle::exit`](tauri::AppHandle::exit) once it is genuinely done.
+fn begin_graceful_quit(app: &tauri::AppHandle) {
+    // Hide the window FIRST: it is the one thing the user is waiting to see, it
+    // is a single fast platform call, and it must happen even if there is
+    // nothing to drain.
+    if let Some(window) = app.get_webview_window(MAIN_WINDOW) {
+        if let Err(err) = window.hide() {
+            tracing::warn!(target: "driven::app", %err, "hide main window on quit failed");
+        }
+    }
+    // Issue #300: the tray becomes the quit progress surface for however long
+    // the drain runs - distinct icon + tooltip, and a menu whose only action is
+    // "Force quit now".
+    tray::enter_quitting(app);
+
+    let Some(handles) = take_shutdown_handles(app) else {
         // No managed state => no orchestrators ran => no event bridge => the
         // syncing spinner was never started, so there is nothing to stop.
+        tracing::info!(target: "driven::app", "quit with no managed state; exiting immediately");
+        finish_quit(app);
         return;
     };
-    // Signal every orchestrator to stop AFTER its current cycle up front, so the
-    // concurrent drains below see the stop flag already set (each account's
-    // in-flight cycle winds down in parallel instead of one-at-a-time).
-    let handles = state.accounts();
-    for (account_id, handle) in &handles {
-        tracing::info!(target: "driven::app", account_id = %account_id, "signalling graceful shutdown on quit");
-        handle.orchestrator.shutdown();
-    }
-    // M8-P1-1: cancel every in-flight RESTORE job up front too (mirrors the
-    // no-orphan AccountHandle drain). Setting each job's cancel flag makes its
-    // task delete the in-flight temp + emit a terminal CANCELLED status, so quit
-    // leaves no orphaned restore task and no partial files. We take the handles
-    // here and await them in the block_on below.
-    let restore_handles = state.cancel_all_restore_jobs();
-    // M9a: signal + take the periodic updater-check task so the drain below joins
-    // it too (no orphan). It is a tokio-interval task that select!s on its
-    // shutdown watch, so it exits promptly once signalled; the bounded drain
-    // below still aborts-and-awaits it if it is mid-check (e.g. a slow network
-    // request) so quit cannot hang.
-    let updater_handle = state.shutdown_updater_task();
-    // M9b: signal + take the periodic telemetry-ping task so the drain below joins
-    // it too (no orphan). It is a tokio-interval task that select!s on its shutdown
-    // watch, so it exits promptly once signalled; the bounded drain below still
-    // aborts-and-awaits it if it is mid-ping (e.g. a slow best-effort POST) so quit
-    // cannot hang.
-    let telemetry_handle = state.shutdown_telemetry_task();
-    // 2026-08-14 follow-up: signal + take the io-throughput sampler the same
-    // way (a 1s tokio-interval task select!ing on its shutdown watch).
-    let iostat_handle = state.shutdown_iostat_task();
-    tauri::async_runtime::block_on(async move {
-        // R3-P1-1: drive ALL per-account shutdowns concurrently. Each
-        // `handle.shutdown()` self-bounds its per-task drains and aborts-and-
-        // awaits anything that overruns, so no outer timeout is needed (and an
-        // outer timeout would risk dropping a cancellation-unsafe drain mid-abort
-        // -> an orphaned task). `join_all` returns only once EVERY account's
-        // every task is finished.
-        let drains = handles.into_iter().map(|(account_id, handle)| async move {
-            handle.shutdown().await;
-            tracing::info!(target: "driven::app", account_id = %account_id, "all per-account tasks shut down (no orphans)");
-        });
-        futures::future::join_all(drains).await;
 
-        // M8-P1-1 / R2-P2-2: drain every cancelled restore task with a BOUNDED,
-        // abort-capable budget. Each task observes its cancel flag between frames,
-        // deletes its in-flight temp, and exits - normally well within the budget.
-        // But a task stuck BEFORE it next checks the flag (e.g. blocked on a slow
-        // download read) would hang an explicit Quit forever if we awaited it
-        // unconditionally. So we await each handle up to RESTORE_JOB_DRAIN_TIMEOUT
-        // and, on timeout, `abort()` it and AWAIT the aborted handle so the task is
-        // genuinely GONE before quit proceeds (no orphan). The task's temp is
-        // cleaned even on the abort path because the restore writer holds a
-        // Drop-based temp guard (see `restore.rs` TempFileGuard), so dropping the
-        // aborted future removes any in-flight temp. Mirrors the M5 per-account
-        // `drain_or_abort` shape. The drains run concurrently so two stuck jobs do
-        // not sum their budgets.
-        let restore_drains = restore_handles
-            .into_iter()
-            .map(|h| async move { drain_restore_handle(h).await });
-        futures::future::join_all(restore_drains).await;
-        tracing::info!(target: "driven::app", "all in-flight restore jobs cancelled + drained (no orphans)");
+    let app = app.clone();
+    tauri::async_runtime::spawn(async move {
+        drain_shutdown_handles(handles).await;
 
-        // M9a: drain the periodic updater-check task with the SAME bounded,
-        // abort-capable budget so quit never hangs on a mid-check task and leaves
-        // no orphan.
-        if let Some(handle) = updater_handle {
-            drain_restore_handle(handle).await;
-            tracing::info!(target: "driven::app", "updater periodic check task drained (no orphan)");
+        if let Some(state) = app.try_state::<AppState>() {
+            // Issue #25 (DESIGN s5.3.1): shut the least-privilege VSS helper
+            // broker down (best-effort; no-op if it was never launched) so no
+            // elevated process outlives the app. Done AFTER the orchestrator
+            // drain above so no locked-file backup is mid-stream on the pipe.
+            state.shutdown_vss_helper();
+            // DESIGN s5.3.2: the macOS mirror - shut the APFS snapshot broker
+            // down so no root process, and no mounted snapshot, outlives the app
+            // session. Same ordering rationale as the VSS sweep above.
+            state.shutdown_apfs_helper();
         }
 
-        // M9b: drain the periodic telemetry-ping task with the SAME bounded,
-        // abort-capable budget so quit never hangs on a mid-ping task and leaves no
-        // orphan.
-        if let Some(handle) = telemetry_handle {
-            drain_restore_handle(handle).await;
-            tracing::info!(target: "driven::app", "telemetry ping task drained (no orphan)");
-        }
-
-        // 2026-08-14 follow-up: drain the io-throughput sampler the same way.
-        if let Some(handle) = iostat_handle {
-            drain_restore_handle(handle).await;
-            tracing::info!(target: "driven::app", "io throughput sampler drained (no orphan)");
-        }
-
-        // Stop the cosmetic tray syncing-spinner LAST - AFTER every orchestrator
-        // is dropped (so the per-account event bridges' broadcasts are closed and
-        // no further `StateChanged` can drive `apply_state` -> restart the
-        // spinner). Stopping it earlier would race a still-queued syncing event
-        // that could re-spawn the detached timer task after the stop. It is a
-        // pure timer loop (set_icon only) that the process exit then tears down;
-        // stopping it here keeps the no-orphan drain honest.
-        tray::stop_sync_animation();
-        tracing::info!(target: "driven::app", "tray syncing animation stopped (no orphan)");
+        finish_quit(&app);
     });
+}
 
-    // Issue #25 (DESIGN s5.3.1): shut the least-privilege VSS helper broker down
-    // (best-effort; no-op if it was never launched) so no elevated process
-    // outlives the app. Done AFTER the orchestrator drain above so no locked-file
-    // backup is mid-stream on the pipe. Sync (a quick pipe Shutdown), so it runs
-    // on this thread rather than the async runtime.
-    state.shutdown_vss_helper();
-
-    // DESIGN s5.3.2: the macOS mirror - shut the APFS snapshot broker down so no
-    // root process, and no mounted snapshot, outlives the app session. Same
-    // ordering rationale as the VSS sweep above.
-    state.shutdown_apfs_helper();
+/// The drain is done (or there was nothing to drain): flip the phase to
+/// [`QUIT_READY`] and ask for the exit again. The `RunEvent::ExitRequested` this
+/// raises sees `QUIT_READY` and lets the process go.
+fn finish_quit(app: &tauri::AppHandle) {
+    tracing::info!(target: "driven::app", "graceful quit drain complete; exiting");
+    QUIT_PHASE.store(QUIT_READY, Ordering::Release);
+    app.exit(0);
 }
 
 /// R2-P2-2: drive ONE cancelled restore task to a true stop with a bounded budget.
@@ -774,19 +911,47 @@ pub fn run() {
     //
     // `RunEvent::ExitRequested.code`:
     //   - `Some(_)` => an explicit exit (`app.exit(code)` from the tray Quit /
-    //     `--quit`). Drain + let the process exit.
+    //     `--quit`). Start the drain + keep the loop alive until it finishes.
     //   - `None`    => an incidental exit (the last window was closed). Since the
     //     app is a background tray daemon, `prevent_exit()` keeps it alive so
     //     sync survives. (The window-close handler already hid the window, but
     //     this guards the path where the platform still raises ExitRequested.)
+    //
+    // Issue #299: the explicit-quit arm is a THREE-phase state machine keyed off
+    // `QUIT_PHASE`, because the drain now runs off this thread and therefore has
+    // to come back through this same callback to actually exit:
+    //   IDLE     -> prevent the exit, start the drain, return at once (the event
+    //               loop keeps pumping, so the app can never be declared hung);
+    //   DRAINING -> a second explicit quit arrived while the first is still
+    //               draining (a repeat `--quit`, or an OS session-end). Prevent
+    //               the exit again and let the in-flight drain finish - the tray's
+    //               "Force quit now" is the deliberate escape hatch;
+    //   READY    -> the drain finished (or the user force-quit): do NOT prevent,
+    //               and the process exits.
     app.run(|app_handle, event| {
         if let RunEvent::ExitRequested { code, api, .. } = &event {
             if code.is_none() {
                 tracing::debug!(target: "driven::app", "incidental exit (last window closed); staying alive in tray");
                 api.prevent_exit();
-            } else {
-                tracing::info!(target: "driven::app", "explicit quit; draining orchestrators");
-                shutdown_orchestrators(app_handle);
+                return;
+            }
+            match QUIT_PHASE.compare_exchange(
+                QUIT_IDLE,
+                QUIT_DRAINING,
+                Ordering::AcqRel,
+                Ordering::Acquire,
+            ) {
+                Ok(_) => {
+                    tracing::info!(target: "driven::app", "explicit quit; draining orchestrators off the event loop");
+                    api.prevent_exit();
+                    begin_graceful_quit(app_handle);
+                }
+                Err(QUIT_DRAINING) => {
+                    tracing::info!(target: "driven::app", "quit requested again while already draining; ignoring (use the tray's Force quit now)");
+                    api.prevent_exit();
+                }
+                // QUIT_READY (and any value we never write): let the exit happen.
+                Err(_) => {}
             }
         }
     });

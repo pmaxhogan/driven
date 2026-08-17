@@ -28,7 +28,8 @@
     "verifying": "Verifying backup...",
     "verifyingCount": "Verifying backup - {count} files",
     "recovering": "Recovering an interrupted upload...",
-    "recoveringBytes": "Recovering interrupted upload - {done} of {total}"
+    "recoveringBytes": "Recovering interrupted upload - {done} of {total}",
+    "recoveringOps": "Recovering - resuming {done} of {total} uploads"
   },
   "pauseBanner": {
     "indefinite": "Backups paused indefinitely",

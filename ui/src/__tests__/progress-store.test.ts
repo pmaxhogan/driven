@@ -48,13 +48,20 @@ function verifying(sampled = 0): OrchestratorState {
 function powerCheck(): OrchestratorState {
   return { state: "power_check" };
 }
-function recovering(bytesDone: number, bytesTotal: number): OrchestratorState {
+function recovering(
+  bytesDone: number,
+  bytesTotal: number,
+  opsDone = 0,
+  opsTotal = 0
+): OrchestratorState {
   return {
     state: "recovering",
     source_id: "src-1",
     path: "dev-drives/dev.vhdx",
     bytes_done: bytesDone,
     bytes_total: bytesTotal,
+    ops_done: opsDone,
+    ops_total: opsTotal,
   };
 }
 function backoff(): OrchestratorState {
@@ -614,5 +621,34 @@ describe("recovering state", () => {
     store.ingest(perAccount("a", recovering(0, 0)));
     expect(store.active).toBe(true);
     expect(store.percent).toBeNull();
+  });
+
+  // --- issue #301: op progress for the byte-free part of the pass -----------
+
+  it("uses the OP counters for a determinate percent when no bytes move", () => {
+    // The bulk of a reconcile is one remote lookup per interrupted upload -
+    // work with no byte dimension at all. Before #301 that read as an
+    // indeterminate sweep for a measured 65s.
+    const store = useProgressStore();
+    store.ingest(perAccount("a", recovering(0, 0, 7, 18)));
+    expect(store.active).toBe(true);
+    expect(store.phase).toBe("recovering");
+    expect(store.recoveringOps).toEqual({ done: 7, total: 18 });
+    expect(store.percent).toBeCloseTo(7 / 18, 5);
+  });
+
+  it("prefers the byte percent over the op percent while a resume is streaming", () => {
+    // A byte tick carries BOTH dimensions; bytes are the finer-grained signal
+    // for the file actually on the wire, so they win.
+    const store = useProgressStore();
+    store.ingest(perAccount("a", recovering(25, 100, 3, 18)));
+    expect(store.percent).toBeCloseTo(0.25, 5);
+  });
+
+  it("sums op counters across accounts", () => {
+    const store = useProgressStore();
+    store.ingest(perAccount("a", recovering(0, 0, 2, 5)));
+    store.ingest(perAccount("b", recovering(0, 0, 4, 10)));
+    expect(store.recoveringOps).toEqual({ done: 6, total: 15 });
   });
 });

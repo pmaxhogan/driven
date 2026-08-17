@@ -130,8 +130,12 @@ These move: check each project's current docs before relying on a cell.
   rules are later edited. Genuinely overlapping sources are still rejected.
 - Concurrent, paced executor with retries and resumable uploads. An upload
   interrupted by a quit or crash resumes byte-for-byte across restarts, with
-  the recovery shown live in the app ("Recovering interrupted upload - 8.2 GB
-  of 88.6 GB") instead of an unlabeled startup phase.
+  the recovery shown live in the app - both the per-file byte progress
+  ("Recovering interrupted upload - 8.2 GB of 88.6 GB") and, while the recovery
+  works through the interrupted uploads themselves, the op counts
+  ("Recovering - resuming 7 of 18 uploads") - instead of an unlabeled startup
+  phase. The startup recovery runs its remote lookups concurrently, so a large
+  backlog of interrupted uploads no longer delays the first scan by a minute.
 - Configurable OS priority (`low` by default) for the scan, upload reads, and
   bundle builds, so backups yield CPU and disk to whatever is in the foreground.
 - Battery and network awareness: backups defer on battery and on metered or
@@ -143,6 +147,10 @@ These move: check each project's current docs before relying on a cell.
 - macOS menu bar live status: configurable metrics next to the tray icon while
   backing up (upload speed, percent, files, time remaining) and a configurable
   idle readout (last backup age or today's uploaded total).
+- Quit never freezes the app. Quitting mid-backup hides the window instantly and
+  lets the current cycle finish in the background; the tray shows a distinct
+  "quitting" icon, and its menu offers "Force quit now" if you would rather not
+  wait (in-flight uploads resume from where they stopped on the next launch).
 - Settings organized as a sidebar of focused pages (General, Schedule & Power,
   Performance, a macOS/Windows platform page, Network, Privacy & Data,
   Advanced) with search; About is identity-only, reached from the sidebar

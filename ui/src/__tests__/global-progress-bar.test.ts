@@ -41,13 +41,20 @@ function powerCheck(): OrchestratorState {
 function idle(): OrchestratorState {
   return { state: "idle", last_run_at: null };
 }
-function recovering(bytesDone: number, bytesTotal: number): OrchestratorState {
+function recovering(
+  bytesDone: number,
+  bytesTotal: number,
+  opsDone = 0,
+  opsTotal = 0
+): OrchestratorState {
   return {
     state: "recovering",
     source_id: "src-1",
     path: "dev-drives/dev.vhdx",
     bytes_done: bytesDone,
     bytes_total: bytesTotal,
+    ops_done: opsDone,
+    ops_total: opsTotal,
   };
 }
 function executing(p: Partial<ExecProgress>): OrchestratorState {
@@ -245,6 +252,18 @@ describe("GlobalProgressBar", () => {
       store.ingest(perAccount("a", recovering(0, 0)));
       await settle(wrapper);
       expect(wrapper.find(PHASE_LABEL).text()).toBe("Recovering an interrupted upload...");
+    });
+
+    it("names the op counts for the byte-free part of the recovery (issue #301)", async () => {
+      // Most of a reconcile is one remote lookup per interrupted upload - no
+      // bytes move, so before #301 this rendered as a generic "Starting
+      // backup..." for a measured 65 seconds.
+      const { store, wrapper } = mountBar();
+      store.ingest(perAccount("a", recovering(0, 0, 7, 18)));
+      await settle(wrapper);
+      expect(wrapper.find(PHASE_LABEL).text()).toBe("Recovering - resuming 7 of 18 uploads");
+      const bar = wrapper.find('[role="progressbar"]');
+      expect(bar.attributes("aria-valuenow")).toBe("39");
     });
 
     it("shows the upload percent once execution starts", async () => {

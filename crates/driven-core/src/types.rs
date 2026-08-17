@@ -480,22 +480,35 @@ pub enum OrchestratorState {
     /// Checking the power / network gates (DESIGN s5.7) before starting a
     /// batch. A failed gate transitions to [`OrchestratorState::Paused`].
     PowerCheck,
-    /// The startup reconcile is recovering an interrupted upload by
-    /// byte-level resume (2026-08-14 follow-up): re-reading the local file
-    /// and pushing the unacked tail. Previously this ran invisibly inside
-    /// [`OrchestratorState::PowerCheck`] - for the incident's 88 GB disk
-    /// image that meant a multi-minute "Starting backup..." sweep while
-    /// 140 Mbps of upload showed nowhere in the UI.
+    /// The startup reconcile is recovering interrupted work (2026-08-14
+    /// follow-up; issue #301): adopting or re-queuing each pending op, and
+    /// byte-level resuming any op that carries a live upload session.
+    /// Previously this ran invisibly inside [`OrchestratorState::PowerCheck`] -
+    /// for the incident's 88 GB disk image that meant a multi-minute
+    /// "Starting backup..." sweep while 140 Mbps of upload showed nowhere in
+    /// the UI, and (issue #301) a 22-op reconcile meant a full minute of
+    /// generic "Starting backup..." with nothing moving at all.
     Recovering {
         /// Source whose pending op is being recovered.
         source_id: SourceId,
-        /// Source-relative path of the file being resumed (display only).
+        /// Source-relative path of the op being recovered (display only).
+        /// Empty when the tick reports whole-pass op progress rather than one
+        /// file's byte progress.
         path: String,
         /// Bytes the destination has acked so far (the resume's progress
-        /// numerator; starts at the previously-acked offset, not 0).
+        /// numerator; starts at the previously-acked offset, not 0). Zero on
+        /// an op-progress tick, which carries no byte dimension.
         bytes_done: u64,
-        /// The session's total byte count.
+        /// The session's total byte count. Zero on an op-progress tick.
         bytes_total: u64,
+        /// Issue #301: pending ops of this source's pass recovered so far.
+        /// The reconcile spends most of its wall clock on one remote
+        /// round trip per op (a `metadata` read or a `find_by_op_uuid`
+        /// lookup), which carries no bytes at all - so without this counter
+        /// the UI has nothing to show for the majority of a recovery.
+        ops_done: u64,
+        /// Issue #301: total pending ops in this source's pass.
+        ops_total: u64,
     },
     /// Walking + diffing one source's local tree (SPEC s6). `scanned` is a
     /// running count of files visited, for a live progress readout.

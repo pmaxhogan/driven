@@ -122,6 +122,12 @@ mod menu_id {
     pub const ACTIVITY: &str = "activity";
     pub const RESTORE: &str = "restore";
     pub const QUIT: &str = "quit";
+    /// Issue #300: the disabled status line of the QUITTING menu ("Quitting -
+    /// finishing current backup..."). Disabled, so it never dispatches.
+    pub const QUITTING_STATUS: &str = "quitting_status";
+    /// Issue #300: the only enabled item of the QUITTING menu - abandon the
+    /// graceful drain and exit now.
+    pub const FORCE_QUIT: &str = "force_quit";
 }
 
 /// Tiny generated-tile dimensions. A 16x16 RGBA tile is a valid tray icon on
@@ -161,6 +167,20 @@ pub enum TrayIcon {
     NetworkAttention,
     /// Red: an error needs attention (auth needed, decrypt failure, disk full).
     Error,
+    /// Issue #300: neutral slate with a stop square - an explicit Quit is
+    /// draining the current backup cycle. Deliberately NOT amber: the approved
+    /// mockup used amber, but amber is already spent twice over on
+    /// [`TrayIcon::Paused`] and [`TrayIcon::NetworkAttention`], and "quitting"
+    /// must not read as "paused, still running". A desaturated slate badge plus
+    /// the universal stop square says "winding down" by hue AND by shape, and it
+    /// is the only badged state that is not a saturated colour - so it reads
+    /// distinctly even on the macOS template path, where hue is discarded
+    /// entirely and only the punched glyph survives.
+    ///
+    /// Never produced by [`TrayIcon::for_state`]: quitting is a shell lifecycle
+    /// phase, not an [`OrchestratorState`]. It is set directly by
+    /// [`enter_quitting`].
+    Quitting,
 }
 
 impl TrayIcon {
@@ -223,6 +243,9 @@ impl TrayIcon {
             TrayIcon::NetworkAttention => [0xff, 0x8c, 0x00, 0xff],
             // Red - error needs attention.
             TrayIcon::Error => [0xdc, 0x26, 0x26, 0xff],
+            // Slate (zinc-500) - quitting: the one desaturated badge, so it can
+            // never be mistaken for the amber Paused / NetworkAttention pair.
+            TrayIcon::Quitting => [0x71, 0x71, 0x7a, 0xff],
         }
     }
 
@@ -342,6 +365,7 @@ impl TrayIcon {
             TrayIcon::Paused => draw_pause_glyph(rgba, width, height, geom),
             TrayIcon::NetworkAttention => draw_bang_glyph(rgba, width, height, geom),
             TrayIcon::Error => draw_cross_glyph(rgba, width, height, geom),
+            TrayIcon::Quitting => draw_stop_glyph(rgba, width, height, geom),
         }
     }
 
@@ -696,6 +720,19 @@ fn draw_cross_glyph(rgba: &mut [u8], width: u32, height: u32, geom: &BadgeGeom) 
             }
         }
     }
+}
+
+/// Draw the QUITTING glyph (issue #300): a white filled square - the universal
+/// "stop" mark - centred in the badge disc. Distinct in SHAPE from the pause
+/// bars, the `!`, and the `X`, so the quitting state is readable on the macOS
+/// template path too (where the slate hue is discarded).
+fn draw_stop_glyph(rgba: &mut [u8], width: u32, height: u32, geom: &BadgeGeom) {
+    let &BadgeGeom { cx, cy, r_fill } = geom;
+    // Half-extent chosen so the square sits comfortably inside the disc: at
+    // 0.42 * r_fill its corners land at ~0.59 * r_fill from the centre, well
+    // short of the rim even after the white contrast ring is drawn.
+    let half = (r_fill * 0.42).max(1.0);
+    fill_rect(rgba, width, height, cx, cy, half, half);
 }
 
 /// Is this pause reason a network / reachability condition (DESIGN s8.1
@@ -1135,6 +1172,91 @@ fn build_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
         .build()
 }
 
+/// Issue #300: the QUITTING tray menu - a disabled status line plus the single
+/// enabled "Force quit now" escape hatch, and nothing else.
+///
+/// Every normal action is deliberately absent: "Sync now" / "Pause" / "Resume"
+/// would all queue work against orchestrators that are already winding down,
+/// and a second "Quit" is a no-op the shell already ignores (see the
+/// `QUIT_DRAINING` arm of the `RunEvent` handler). The only two things a user
+/// can usefully learn or do here are "it is finishing the current backup" and
+/// "stop waiting".
+fn build_quitting_menu(app: &AppHandle) -> tauri::Result<Menu<tauri::Wry>> {
+    let status = MenuItem::with_id(
+        app,
+        menu_id::QUITTING_STATUS,
+        rust_i18n::t!("tray.quitting_status"),
+        false,
+        None::<&str>,
+    )?;
+    let force = MenuItem::with_id(
+        app,
+        menu_id::FORCE_QUIT,
+        rust_i18n::t!("tray.force_quit"),
+        true,
+        None::<&str>,
+    )?;
+    MenuBuilder::new(app)
+        .item(&status)
+        .separator()
+        .item(&force)
+        .build()
+}
+
+/// Issue #300: flip the whole tray into the QUITTING affordance - distinct
+/// icon, distinct tooltip, and the [`build_quitting_menu`] two-item menu.
+///
+/// Called from the shell's quit path ([`crate::begin_graceful_quit`]) on the
+/// event-loop thread, BEFORE the drain is spawned, so the tray tells the truth
+/// from the very first moment of a quit that may take up to
+/// [`crate::app_state::RUN_LOOP_DRAIN_TIMEOUT`] to finish.
+///
+/// Holds `TRAY_APPLY` for the icon swap for the same reason [`apply_state`]
+/// does: a concurrent `StateChanged` must not restart the spinner after we stop
+/// it. Beyond this call, [`apply_state`] additionally checks
+/// [`crate::is_quitting`] and returns before touching the tray at all, so a
+/// transition emitted by a still-draining run loop cannot repaint over us.
+pub fn enter_quitting(app: &AppHandle) {
+    {
+        let _apply = TRAY_APPLY.lock().unwrap_or_else(|e| e.into_inner());
+        // The spinner task owns the icon while it runs - stop it first or its
+        // next frame would overwrite the quitting icon 125ms later.
+        stop_sync_animation();
+        let Some(tray) = app.tray_by_id(TRAY_ID) else {
+            tracing::warn!(target: TARGET, "tray {TRAY_ID} not found; cannot show the quitting state");
+            return;
+        };
+        if let Err(err) = tray.set_icon(Some(TrayIcon::Quitting.image())) {
+            tracing::warn!(target: TARGET, "set quitting tray icon failed: {err}");
+        }
+        set_template_mode(&tray);
+        if let Err(err) =
+            tray.set_tooltip(Some(rust_i18n::t!("tray.tooltip.quitting").into_owned()))
+        {
+            tracing::warn!(target: TARGET, "set quitting tray tooltip failed: {err}");
+        }
+        // Drop the status-row handles BEFORE swapping the menu out, so the macOS
+        // menu bar engine's 1 Hz tick cannot `set_text` a handle belonging to
+        // the menu we are about to replace (same discipline as `rebuild`).
+        *STATUS_ITEMS.lock().unwrap_or_else(|e| e.into_inner()) = None;
+        match build_quitting_menu(app) {
+            Ok(menu) => {
+                if let Err(err) = tray.set_menu(Some(menu)) {
+                    tracing::warn!(target: TARGET, "set quitting tray menu failed: {err}");
+                }
+            }
+            Err(err) => {
+                // The normal menu stays up. Its Quit item is now a no-op (the
+                // shell is already draining), which is survivable - the drain
+                // still finishes on its own; the user just loses the force-quit
+                // shortcut.
+                tracing::warn!(target: TARGET, "build quitting tray menu failed: {err}");
+            }
+        }
+    }
+    tracing::info!(target: TARGET, "tray switched to the quitting state (force quit available)");
+}
+
 /// Dispatch a tray menu click to the M5 sync commands / window show / quit
 /// (SPEC s12). Async commands run on the Tauri runtime so the menu callback
 /// returns immediately.
@@ -1174,7 +1296,12 @@ fn on_menu_event(app: &AppHandle, id: &str) {
             show_main_window(app);
             navigate_hint(app, id);
         }
+        // Routes into `RunEvent::ExitRequested`, which starts the GRACEFUL quit
+        // off the event-loop thread (issue #299) and swaps this menu for
+        // `build_quitting_menu`.
         menu_id::QUIT => app.exit(0),
+        // Issue #300: abandon the drain and exit now.
+        menu_id::FORCE_QUIT => crate::force_quit(app),
         other => tracing::warn!(target: TARGET, "unknown tray menu id: {other}"),
     }
 }
@@ -1379,6 +1506,19 @@ pub fn apply_state(app: &AppHandle, account_id: AccountId, state: OrchestratorSt
         // goes idle (the old last-writer-wins bug). The icon + tooltip reflect
         // the aggregate; the notification below stays PER ACCOUNT.
         let aggregate = aggregate_state(account_id, state.clone());
+
+        // Issue #300: a quit is draining. The run loop is still finishing its
+        // cycle, so it keeps emitting transitions - but the tray now belongs to
+        // the quitting affordance ([`enter_quitting`]), and repainting a syncing
+        // spinner over it would tell the user the quit had not registered. The
+        // aggregate map above is still updated (it is process state, and a
+        // force-quit is the only way out of here anyway), but nothing below this
+        // point runs: no icon, no tooltip, no spinner, and no OS notification -
+        // a "first sync complete" toast fired while the app is closing is noise.
+        if crate::is_quitting() {
+            return;
+        }
+
         let icon = TrayIcon::for_state(&aggregate);
 
         // Drive the animation purely off the aggregate icon: start the spinner
@@ -1963,6 +2103,7 @@ mod tests {
             TrayIcon::Paused,
             TrayIcon::NetworkAttention,
             TrayIcon::Error,
+            TrayIcon::Quitting,
         ] {
             let buf = icon.rgba_buffer();
             // TILE x TILE pixels, 4 bytes (RGBA) each.
@@ -1984,6 +2125,9 @@ mod tests {
             TrayIcon::Paused.rgba(),
             TrayIcon::NetworkAttention.rgba(),
             TrayIcon::Error.rgba(),
+            // Issue #300: the quitting slate must not collide with any of the
+            // above - especially the two ambers it deliberately avoids.
+            TrayIcon::Quitting.rgba(),
         ];
         for i in 0..colours.len() {
             for j in (i + 1)..colours.len() {
@@ -2018,6 +2162,12 @@ mod tests {
             ("tray.activity", "Activity"),
             ("tray.restore", "Restore"),
             ("tray.quit", "Quit Driven"),
+            // Issue #300: the two labels of the QUITTING menu.
+            (
+                "tray.quitting_status",
+                "Quitting - finishing current backup...",
+            ),
+            ("tray.force_quit", "Force quit now"),
         ];
         for (key, expected) in cases {
             let got = rust_i18n::t!(key);
@@ -2059,6 +2209,8 @@ mod tests {
             "tray.activity",
             "tray.restore",
             "tray.quit",
+            "tray.quitting_status",
+            "tray.force_quit",
             "tray.menu_status.line1",
             "tray.menu_status.line1_no_eta",
             "tray.menu_status.line2",
@@ -2079,6 +2231,7 @@ mod tests {
             "tray.tooltip.needs_reauth",
             "tray.tooltip.error",
             "tray.tooltip.suspending",
+            "tray.tooltip.quitting",
             "notifications.first_sync_complete.title",
             "notifications.first_sync_complete.body",
             "notifications.error.title",
@@ -2157,6 +2310,7 @@ mod tests {
             TrayIcon::Paused,
             TrayIcon::NetworkAttention,
             TrayIcon::Error,
+            TrayIcon::Quitting,
         ];
         let mut variants: Vec<(TrayIcon, Vec<u8>)> = Vec::new();
         for s in states {
@@ -2195,6 +2349,7 @@ mod tests {
             TrayIcon::Paused,
             TrayIcon::NetworkAttention,
             TrayIcon::Error,
+            TrayIcon::Quitting,
         ] {
             let Some([r, g, b]) = s.badge_color() else {
                 panic!("non-idle state {s:?} must have a badge colour");
@@ -2222,6 +2377,7 @@ mod tests {
             TrayIcon::Paused,
             TrayIcon::NetworkAttention,
             TrayIcon::Error,
+            TrayIcon::Quitting,
         ] {
             let img = s.image();
             assert_eq!(img.width(), base.width, "{s:?} width");
@@ -2259,6 +2415,10 @@ mod tests {
             TrayIcon::Paused,
             TrayIcon::NetworkAttention,
             TrayIcon::Error,
+            // Issue #300: the stop square must be distinct from the pause bars,
+            // the `!`, and the `X` - it is the ONLY state cue that survives the
+            // macOS template path, where the slate hue is discarded.
+            TrayIcon::Quitting,
         ] {
             // Badge-only baseline (disc + ring, no glyph) vs the full glyphed icon.
             let mut badge_only = base.rgba.clone();
@@ -2295,6 +2455,7 @@ mod tests {
             TrayIcon::Paused,
             TrayIcon::NetworkAttention,
             TrayIcon::Error,
+            TrayIcon::Quitting,
         ] {
             let f0 = s.brand_rgba_frame(base, 0);
             let f5 = s.brand_rgba_frame(base, 5);
@@ -2416,11 +2577,12 @@ mod tests {
             rgba.chunks_exact(4).map(|px| px[3]).collect()
         }
 
-        const STATES: [TrayIcon; 4] = [
+        const STATES: [TrayIcon; 5] = [
             TrayIcon::Syncing,
             TrayIcon::Paused,
             TrayIcon::NetworkAttention,
             TrayIcon::Error,
+            TrayIcon::Quitting,
         ];
 
         /// THE guard against a solid black square: the template source must be
@@ -2537,6 +2699,7 @@ mod tests {
                 TrayIcon::Paused,
                 TrayIcon::NetworkAttention,
                 TrayIcon::Error,
+                TrayIcon::Quitting,
             ] {
                 assert_eq!(
                     s.template_rgba_frame(base, 0),

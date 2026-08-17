@@ -27,6 +27,8 @@ tray:
   settings: "Settings"
   restore: "Restore"
   quit: "Quit Driven"
+  quitting_status: "Quitting - finishing current backup..."
+  force_quit: "Force quit now"
   menu_status:
     line1: "Backing up - %{percent}, %{eta} left"
     line1_no_eta: "Backing up - %{percent}"
@@ -58,6 +60,7 @@ tray:
     needs_reauth: "Driven needs to sign in again"
     error: "Driven - error, attention needed"
     suspending: "Suspending..."
+    quitting: "Driven - quitting (finishing backup, right-click to force quit)"
 
 notifications:
   first_sync_complete:
