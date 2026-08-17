@@ -305,6 +305,9 @@ pub struct AppState {
     updater: UpdaterRuntime,
     /// 2026-08-14 follow-up: live disk/network throughput sampling runtime.
     iostat: IostatRuntime,
+    /// issue #308 (2026-08-17 follow-up): live bottleneck-classification
+    /// sampling runtime (the Activity dashboard's Bottleneck stat tile).
+    bottleneck: BottleneckRuntime,
     /// The ONE in-flight streaming exclusion preview
     /// ([`crate::commands::exclusion_stream`]). The exclusion editor re-previews
     /// on every rule edit, so without a single-slot registry a user tweaking
@@ -411,6 +414,25 @@ pub struct IostatRuntime {
     /// hub whose counters the executors were built with); the quiesced boot
     /// path keeps the default hub (all-zero graphs).
     hub: std::sync::Mutex<Arc<crate::iostat_hub::IoStatHub>>,
+    /// The spawned sampler task, behind `Option` so the shutdown drain can
+    /// TAKE + await it by value; `None` once drained / never spawned.
+    task: std::sync::Mutex<Option<JoinHandle<()>>>,
+    /// The shutdown signal the sampler `select!`s on.
+    shutdown: std::sync::Mutex<Option<watch::Sender<bool>>>,
+}
+
+/// issue #308 (2026-08-17 follow-up): the live bottleneck-classification
+/// runtime held on [`AppState`] - the latest-snapshot hub plus the sampler
+/// task's lifecycle slots (mirrors [`IostatRuntime`], which this sampler
+/// reads from). Unlike `IostatRuntime` there is nothing to "install" from
+/// assembly: the hub reads the app-global IO counters and the accounts map
+/// straight off `AppState` each tick, so the default hub is already correct
+/// even in the quiesced boot path (it just classifies `NotBackingUp`).
+#[derive(Default)]
+pub struct BottleneckRuntime {
+    /// The latest-snapshot hub the sampler pushes into and the
+    /// `bottleneck_status` command reads.
+    hub: Arc<crate::bottleneck_hub::BottleneckHub>,
     /// The spawned sampler task, behind `Option` so the shutdown drain can
     /// TAKE + await it by value; `None` once drained / never spawned.
     task: std::sync::Mutex<Option<JoinHandle<()>>>,
@@ -679,6 +701,7 @@ impl AppState {
             restore_jobs: std::sync::Mutex::new(HashMap::new()),
             updater: UpdaterRuntime::default(),
             iostat: IostatRuntime::default(),
+            bottleneck: BottleneckRuntime::default(),
             exclusion_previews: Arc::default(),
             preview_tree_cache: Arc::default(),
             telemetry: TelemetryRuntime::default(),
@@ -1031,6 +1054,50 @@ impl AppState {
             let _ = tx.send(true);
         }
         self.iostat
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+    }
+
+    // --- issue #308: bottleneck-classification runtime -----------------------
+
+    /// The live bottleneck-classification hub the sampler pushes into and the
+    /// `bottleneck_status` command reads. Always available (no "install"
+    /// step needed - it reads `AppState` directly each tick).
+    pub fn bottleneck_hub(&self) -> Arc<crate::bottleneck_hub::BottleneckHub> {
+        self.bottleneck.hub.clone()
+    }
+
+    /// Register the spawned sampler task + its shutdown sender so the app-quit
+    /// drain can stop + join it with no orphan (mirrors [`Self::set_iostat_task`]).
+    pub fn set_bottleneck_task(&self, task: JoinHandle<()>, shutdown: watch::Sender<bool>) {
+        *self
+            .bottleneck
+            .task
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(task);
+        *self
+            .bottleneck
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner()) = Some(shutdown);
+    }
+
+    /// Signal the sampler to stop and TAKE its handle so the quit drain can
+    /// await it. Mirrors [`Self::shutdown_iostat_task`].
+    #[must_use]
+    pub fn shutdown_bottleneck_task(&self) -> Option<JoinHandle<()>> {
+        if let Some(tx) = self
+            .bottleneck
+            .shutdown
+            .lock()
+            .unwrap_or_else(|e| e.into_inner())
+            .take()
+        {
+            let _ = tx.send(true);
+        }
+        self.bottleneck
             .task
             .lock()
             .unwrap_or_else(|e| e.into_inner())

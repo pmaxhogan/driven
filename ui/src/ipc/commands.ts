@@ -18,6 +18,7 @@ import type {
   ApfsHelperStatus,
   BackendDto,
   BackendKindId,
+  BottleneckSnapshot,
   CreateS3AccountRequest,
   CreateLocalFolderAccountRequest,
   CreateSftpAccountRequest,
@@ -488,6 +489,13 @@ export function activityThroughputSeries(
  * reconcile-phase resume (which writes no activity rows until it completes). */
 export function ioThroughputSeries(): Promise<IoThroughputSeriesDto> {
   return invoke("io_throughput_series");
+}
+
+/** The latest live bottleneck classification (issue #308), for the Activity
+ * dashboard's Bottleneck stat tile's initial paint; live updates then ride
+ * the `sync:bottleneck` event. */
+export function bottleneckStatus(): Promise<BottleneckSnapshot> {
+  return invoke("bottleneck_status");
 }
 
 /** The persisted integrity-scrub reports, newest first. Omit `sourceId` for

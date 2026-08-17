@@ -344,6 +344,12 @@ struct WalkCtx {
     /// walk (spawned and joined inside `build_parallel().visit()`), so a
     /// one-shot apply with no restore is correct - nothing pooled is demoted.
     priority: WorkPriority,
+    /// App-global disk/net/hash byte counters (issue #308 bottleneck
+    /// classifier), or `None` when not wired (tests / chaos harness). A
+    /// deep-verify (or coarse-fs-fallback) re-hash credits the file's size
+    /// here so the bottleneck classifier's cpu rate reflects scan-time
+    /// hashing, not just the upload pipeline's.
+    io_counters: Option<Arc<crate::iostat::IoCounters>>,
 }
 
 /// What a worker concluded about ONE file. Deliberately excludes every
@@ -665,7 +671,18 @@ fn process_file(ctx: &WalkCtx, entry: &DirEntry, rel: RelativePath) -> FileRecor
             );
         if ctx.mode == ScanMode::DeepVerify || coarse_suspect {
             let stored_hash = stored.map(|r| r.hash_blake3);
-            match hash_file(abs, ctx.priority) {
+            let hash_result = hash_file(abs, ctx.priority);
+            // issue #308: credit the WHOLE file's bytes on a successful hash,
+            // win or lose the comparison below - the bottleneck classifier
+            // cares that hashing happened, not what it concluded. A failed
+            // read (handled in the `Err` arm) credits nothing, matching the
+            // "no evidence" treatment the rest of this branch already gives it.
+            if hash_result.is_ok() {
+                if let Some(io) = ctx.io_counters.as_ref() {
+                    io.add_hashed(size);
+                }
+            }
+            match hash_result {
                 Ok(hash) if stored_hash != Some(hash) => {
                     let reason = if ctx.mode == ScanMode::DeepVerify {
                         "deep-verify"
@@ -718,6 +735,7 @@ pub async fn scan_with_progress(
         latency,
         on_progress,
         WorkPriority::Normal,
+        None,
     )
     .await
 }
@@ -737,6 +755,11 @@ pub async fn scan_with_priority(
     latency: Option<&crate::telemetry::LatencyReservoir>,
     on_progress: Option<&ScanProgressSink<'_>>,
     priority: WorkPriority,
+    // issue #308: the app-global disk/net/hash byte counters, so a
+    // deep-verify (or coarse-fs fallback) re-hash credits the SAME hash
+    // counter the upload pipeline's cpu stage does. `None` in tests / the
+    // chaos harness - the walk still runs, it just credits nothing.
+    io_counters: Option<Arc<crate::iostat::IoCounters>>,
 ) -> anyhow::Result<ScanResult> {
     let known = state
         .load_source_file_state(source.id)
@@ -889,6 +912,7 @@ pub async fn scan_with_priority(
             last_scan_end_ns,
             capture_latency,
             priority,
+            io_counters,
         });
         let mut wb = build_walker_with_matcher(&walk_source, Arc::clone(&matcher));
         wb.threads(walk_threads());

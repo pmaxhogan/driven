@@ -2746,6 +2746,10 @@ impl DefaultExecutor {
             .map_err(UploadError::from_read)?;
         if let Some(io) = self.io_counters.as_ref() {
             io.add_disk_read(plaintext_len);
+            // issue #308 bottleneck classifier: this buffered path both reads
+            // and blake3-hashes the whole file in one pass, so both counters
+            // move together here.
+            io.add_hashed(plaintext_len);
         }
 
         // --- post-read fstat identity check (SPEC s8 defence #3) -----------
@@ -2862,7 +2866,7 @@ impl DefaultExecutor {
             self.mem_gauge.clone(),
             self.io_counters.clone(),
         );
-        let cpu = cpu_stage(raw_rx, out_tx, crypto, size);
+        let cpu = cpu_stage(raw_rx, out_tx, crypto, size, self.io_counters.clone());
         let uploader = self.upload_stage(
             target,
             existing_file_id,
@@ -7292,6 +7296,10 @@ async fn cpu_stage(
     out_tx: tokio::sync::mpsc::Sender<Bytes>,
     crypto: Option<Arc<dyn SourceCryptoSuite>>,
     size: u64,
+    // issue #308 bottleneck classifier: credited alongside the disk/net
+    // counters the reader/uploader stages already feed, so the "cpu" state
+    // has a real hash-bytes/sec rate to compare against them.
+    io_counters: Option<Arc<crate::iostat::IoCounters>>,
 ) -> Result<CpuOutput, StageError> {
     use md5::{Digest, Md5};
 
@@ -7299,12 +7307,17 @@ async fn cpu_stage(
     let use_rayon = size >= RAYON_HASH_THRESHOLD;
     let mut md5 = Md5::new();
 
-    // Hash a plaintext chunk into blake3, multi-core for big files.
+    // Hash a plaintext chunk into blake3, multi-core for big files. Credits
+    // the hash counter (issue #308) on every chunk regardless of path
+    // (encrypted or not) since both arms below call this closure.
     let hash_chunk = |h: &mut blake3::Hasher, chunk: &[u8]| {
         if use_rayon {
             h.update_rayon(chunk);
         } else {
             h.update(chunk);
+        }
+        if let Some(io) = io_counters.as_ref() {
+            io.add_hashed(chunk.len() as u64);
         }
     };
 

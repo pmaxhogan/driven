@@ -658,6 +658,13 @@ async fn build_account(
     // SPEC s22 `io_priority`: the SAME cell the executor reads, so a settings
     // save reaches the backup threads on the next piece of work.
     orchestrator = orchestrator.with_priority_cell(priority);
+    // issue #308 bottleneck classifier: the destination's short display
+    // label ("Drive rate-limited...") and the SAME app-global disk/net/hash
+    // counters the executor was built with, so a deep-verify re-hash credits
+    // the same cpu-rate signal an upload's cpu stage does.
+    orchestrator = orchestrator
+        .with_backend_label(bottleneck_backend_label(account.backend_kind))
+        .with_io_counters(io_counters.clone());
     // DESIGN s13: the SAME reservoir the executor holds, so per-file scan latency
     // and upload-per-MB latency feed one app-global sampler.
     orchestrator = orchestrator.with_latency_reservoir(latency.clone());
@@ -816,6 +823,19 @@ pub(crate) fn account_backend(account: &AccountRow) -> driven_backend::AccountBa
         account_id: account.id.to_string(),
         kind: account.backend_kind,
         config_json: account.backend_config_json.clone(),
+    }
+}
+
+/// Short destination display label for the bottleneck classifier's "X
+/// rate-limited" sub-line (issue #308). Matches the wording the mockup used
+/// ("Drive rate-limited...") rather than the longer `BackendKind::id()` wire
+/// identifiers.
+fn bottleneck_backend_label(kind: driven_remote::BackendKind) -> &'static str {
+    match kind {
+        driven_remote::BackendKind::GoogleDrive => "Drive",
+        driven_remote::BackendKind::S3 => "S3",
+        driven_remote::BackendKind::LocalFolder => "your local folder",
+        driven_remote::BackendKind::Sftp => "SFTP",
     }
 }
 

@@ -393,6 +393,17 @@ pub async fn io_throughput_series(
     Ok(state.iostat_hub().series())
 }
 
+/// `bottleneck_status()` - the latest live bottleneck classification (issue
+/// #308), for the Activity dashboard's Bottleneck stat tile's initial paint;
+/// live updates then ride the `sync:bottleneck` event. Always available (the
+/// quiesced boot path serves a `NotBackingUp` default).
+#[tauri::command]
+pub async fn bottleneck_status(
+    state: State<'_, AppState>,
+) -> CommandResult<crate::bottleneck_hub::BottleneckSnapshot> {
+    Ok(state.bottleneck_hub().latest())
+}
+
 /// `get_sync_status()` - snapshot the aggregate sync state (SPEC s11.3).
 ///
 /// Reads each account orchestrator's current [`OrchestratorState`] into the

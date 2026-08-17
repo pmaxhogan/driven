@@ -21,11 +21,17 @@
 //!   completion for single-request uploads). Each byte is credited exactly
 //!   once; bundle members are covered by their bundle's wire push, never
 //!   double-counted at completion.
+//! - `hashed`: plaintext bytes blake3-hashed (issue #308 bottleneck
+//!   classifier, 2026-08-17 follow-up). Credited from the two hot hashing
+//!   paths - the upload pipeline's cpu stage (streamed and buffered) and the
+//!   scanner's deep-verify re-hash - so the "cpu" bottleneck state has a real
+//!   rate to compare against `disk_read` and `net_wire`. Deliberately its own
+//!   counter rather than folded into `disk_read`: a deep-verify re-hash of an
+//!   already-synced file hashes bytes without any corresponding upload, so
+//!   conflating the two would make a hash-only scan look like disk activity.
 //!
-//! v1 scope notes: the scanner's deep-verify hashing and the restore path do
-//! not credit `disk_read` yet, and bundle ASSEMBLY reads (tar-ing members)
-//! are approximated by the bundle's wire push rather than counted at read
-//! time.
+//! v1 scope notes: bundle ASSEMBLY reads (tar-ing members) are approximated
+//! by the bundle's wire push rather than counted at read time.
 
 use std::sync::atomic::{AtomicU64, Ordering};
 
@@ -36,6 +42,7 @@ use std::sync::atomic::{AtomicU64, Ordering};
 pub struct IoCounters {
     disk_read: AtomicU64,
     net_wire: AtomicU64,
+    hashed: AtomicU64,
 }
 
 /// One peek of the cumulative totals.
@@ -45,6 +52,8 @@ pub struct IoSnapshot {
     pub disk_read_bytes: u64,
     /// Total wire bytes accepted by the destination.
     pub net_wire_bytes: u64,
+    /// Total plaintext bytes blake3-hashed (issue #308).
+    pub hashed_bytes: u64,
 }
 
 impl IoCounters {
@@ -58,11 +67,20 @@ impl IoCounters {
         self.net_wire.fetch_add(n, Ordering::Relaxed);
     }
 
-    /// Peek both totals. Never resets - samplers diff consecutive snapshots.
+    /// Credit `n` plaintext bytes blake3-hashed (issue #308 bottleneck
+    /// classifier's cpu signal). A single relaxed atomic add on the same
+    /// buffer the hashing path already owns - zero measurable overhead in
+    /// the hot loop.
+    pub fn add_hashed(&self, n: u64) {
+        self.hashed.fetch_add(n, Ordering::Relaxed);
+    }
+
+    /// Peek all totals. Never resets - samplers diff consecutive snapshots.
     pub fn snapshot(&self) -> IoSnapshot {
         IoSnapshot {
             disk_read_bytes: self.disk_read.load(Ordering::Relaxed),
             net_wire_bytes: self.net_wire.load(Ordering::Relaxed),
+            hashed_bytes: self.hashed.load(Ordering::Relaxed),
         }
     }
 }
@@ -78,15 +96,18 @@ mod tests {
             c.snapshot(),
             IoSnapshot {
                 disk_read_bytes: 0,
-                net_wire_bytes: 0
+                net_wire_bytes: 0,
+                hashed_bytes: 0,
             }
         );
         c.add_disk_read(100);
         c.add_net_wire(40);
         c.add_disk_read(1);
+        c.add_hashed(7);
         let s1 = c.snapshot();
         assert_eq!(s1.disk_read_bytes, 101);
         assert_eq!(s1.net_wire_bytes, 40);
+        assert_eq!(s1.hashed_bytes, 7);
         // Peek-only: a second reader sees the same cumulative totals.
         assert_eq!(c.snapshot(), s1);
     }

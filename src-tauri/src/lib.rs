@@ -22,6 +22,9 @@ rust_i18n::i18n!("locales", fallback = "en-US");
 mod apfs_helper;
 mod app_state;
 mod assembly;
+// issue #308: live bottleneck classification behind the Activity dashboard's
+// Bottleneck stat tile (mirrors `iostat_hub`'s sampler lifecycle).
+mod bottleneck_hub;
 // `pub` so the integration tests (`tests/ipc_path_validation.rs`, SPEC s11.6.1)
 // can exercise the path-validation helpers (`validate_writable_dest`,
 // `DialogToken`) against the real implementation.
@@ -282,6 +285,8 @@ struct ShutdownHandles {
     telemetry: Option<JoinHandle<()>>,
     /// 2026-08-14 follow-up: the 1 Hz io-throughput sampler, if it was started.
     iostat: Option<JoinHandle<()>>,
+    /// issue #308: the 1 Hz bottleneck-classification sampler, if it was started.
+    bottleneck: Option<JoinHandle<()>>,
 }
 
 /// Signal every shutdown-able task and TAKE its handle, synchronously.
@@ -317,6 +322,8 @@ fn take_shutdown_handles(app: &tauri::AppHandle) -> Option<ShutdownHandles> {
         telemetry: state.shutdown_telemetry_task(),
         // 2026-08-14 follow-up: the io-throughput sampler, same shape again.
         iostat: state.shutdown_iostat_task(),
+        // issue #308: the bottleneck-classification sampler, same shape again.
+        bottleneck: state.shutdown_bottleneck_task(),
     })
 }
 
@@ -350,6 +357,7 @@ async fn drain_shutdown_handles(handles: ShutdownHandles) {
         updater,
         telemetry,
         iostat,
+        bottleneck,
     } = handles;
 
     // R3-P1-1: drive ALL per-account shutdowns concurrently. Each
@@ -403,6 +411,12 @@ async fn drain_shutdown_handles(handles: ShutdownHandles) {
     if let Some(handle) = iostat {
         drain_restore_handle(handle).await;
         tracing::info!(target: "driven::app", "io throughput sampler drained (no orphan)");
+    }
+
+    // issue #308: drain the bottleneck sampler the same way.
+    if let Some(handle) = bottleneck {
+        drain_restore_handle(handle).await;
+        tracing::info!(target: "driven::app", "bottleneck sampler drained (no orphan)");
     }
 
     // Stop the cosmetic tray syncing-spinner LAST - AFTER every orchestrator
@@ -711,6 +725,9 @@ pub fn run() {
                 // 2026-08-14 follow-up: the live disk/network throughput
                 // sampler behind the Activity dashboard's split graphs.
                 iostat_hub::spawn_sampler(&handle);
+                // issue #308: the live bottleneck-classification sampler
+                // behind the Activity dashboard's Bottleneck stat tile.
+                bottleneck_hub::spawn_sampler(&handle);
                 // M9b R2-P2-3 (SPEC s16): record an `update_applied` activity row
                 // when the running version differs from the last-recorded one, so
                 // the telemetry `update_applied` aggregate is driven by a real
@@ -803,6 +820,7 @@ pub fn run() {
             commands::sync::get_work_queue,
             commands::sync::cancel_work_item,
             commands::sync::clear_work_queue,
+            commands::sync::bottleneck_status,
             // SPEC s11.1 accounts (M6).
             commands::accounts::list_accounts,
             commands::accounts::list_backends,

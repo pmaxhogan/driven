@@ -178,10 +178,12 @@ These move: check each project's current docs before relying on a cell.
   snapshot (Settings > macOS), which does not help with a Full Disk Access
   denial; there is no Linux equivalent.
 - In-app restore browser with full-text file-name search and streaming decrypt.
-- Activity dashboard with a live tail, filterable history, and real-time
+- Activity dashboard with a live tail, filterable history, real-time
   disk-read and network-upload throughput graphs (probe-fed, one-second
   resolution - they move during every phase of a backup, including crash
-  recovery).
+  recovery), and a live Bottleneck tile naming which stage - disk, network,
+  a rate-limited destination, or CPU hashing - is presently the limiting
+  factor (debounced a few seconds so it does not flicker between readings).
 - Rolling local log files covering both the backend and the webview console,
   collected into a one-click diagnostics bundle alongside a redacted summary of
   in-flight upload recovery state and a trailing window of process-memory

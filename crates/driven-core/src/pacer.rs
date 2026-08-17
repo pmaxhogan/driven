@@ -156,6 +156,17 @@ pub trait Pacer: Send + Sync {
     fn last_throttle_ms(&self) -> i64 {
         i64::MIN
     }
+
+    /// Non-blocking snapshot of the CURRENT backoff window (issue #308
+    /// bottleneck classifier): `Some(remaining_ms)` when `permit_request`
+    /// would presently sleep before proceeding, `None` when the pacer is
+    /// clear. Never sleeps and never mutates - a plain read against the
+    /// injected clock, safe to poll every tick from outside the upload path.
+    /// The default `None` makes a simple/fake pacer read as "not backing
+    /// off"; [`AimdPacer`] overrides it with the real deadline.
+    fn backoff_remaining_ms(&self) -> Option<i64> {
+        None
+    }
 }
 
 /// `serde` helper: (de)serialise a [`Duration`] as integer milliseconds so
@@ -512,6 +523,21 @@ impl AimdPacer {
         }
     }
 
+    /// Non-blocking snapshot of the current backoff window (issue #308
+    /// bottleneck classifier): `Some(remaining_ms)` when `permit_request`
+    /// would presently sleep before proceeding, `None` when the pacer is
+    /// clear. Never sleeps and never mutates - a plain read of the atomic
+    /// deadline against the injected clock. `backoff_until_ms` itself stays
+    /// private; this is the read-only surface for callers outside the pacer
+    /// (the [`Pacer::backoff_remaining_ms`] trait method delegates here so a
+    /// caller holding only `Arc<dyn Pacer>` can poll it too).
+    pub fn backoff_remaining_ms(&self) -> Option<i64> {
+        let until = self.backoff_until_ms.load(Ordering::Acquire);
+        let now = self.clock.now_ms();
+        let remaining = until.saturating_sub(now);
+        (remaining > 0).then_some(remaining)
+    }
+
     /// Applies the additive increase if a full clean window has accrued
     /// (DESIGN s18.1: +5 qps, +1/s file-create per 10 clean minutes, capped
     /// at the hard cap). Called on each clean (`Ok`) response. Multiple
@@ -703,6 +729,10 @@ impl Pacer for AimdPacer {
     fn last_throttle_ms(&self) -> i64 {
         self.last_throttle_ms.load(Ordering::Acquire)
     }
+
+    fn backoff_remaining_ms(&self) -> Option<i64> {
+        AimdPacer::backoff_remaining_ms(self)
+    }
 }
 
 /// Applies a backoff with jitter to Drive's `Retry-After` (DESIGN s5.4:
@@ -841,6 +871,30 @@ mod tests {
             "backoff held until >= 2s, clock at {}",
             fake.now_ms()
         );
+    }
+
+    #[test]
+    fn backoff_remaining_ms_reports_none_when_clear_and_some_while_throttled() {
+        let (fake, c) = clock();
+        let pacer = AimdPacer::new(c, None);
+        // No throttle yet: the pacer reads as clear.
+        assert_eq!(pacer.backoff_remaining_ms(), None);
+        assert_eq!(Pacer::backoff_remaining_ms(&pacer), None);
+
+        pacer.note_response(ResponseClass::RateLimited {
+            retry_after: Duration::from_secs(2),
+        });
+        // A non-blocking read (no `.await`, no clock advance) sees the live
+        // window: at least the 2s floor, never blocking the caller.
+        let remaining = pacer.backoff_remaining_ms().expect("backoff active");
+        assert!(remaining >= 2_000, "remaining_ms = {remaining}");
+        // Reachable through the trait object too (the orchestrator only ever
+        // holds `Arc<dyn Pacer>`).
+        assert_eq!(Pacer::backoff_remaining_ms(&pacer), Some(remaining));
+
+        // Advancing the clock past the deadline clears it again.
+        fake.advance(Duration::from_secs(3));
+        assert_eq!(pacer.backoff_remaining_ms(), None);
     }
 
     #[tokio::test]

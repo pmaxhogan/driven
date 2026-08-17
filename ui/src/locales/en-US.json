@@ -704,7 +704,21 @@
       "noFiles": "No files tracked yet",
       "diskThroughput": "Disk read",
       "noDiskThroughput": "No recent disk activity",
-      "diskSparklineLabel": "Disk read throughput over the last {minutes} minutes, peaking at {peak} per second"
+      "diskSparklineLabel": "Disk read throughput over the last {minutes} minutes, peaking at {peak} per second",
+      "bottleneck": "Bottleneck",
+      "bottleneckUnknown": "...",
+      "bottleneckNotBackingUp": "Not backing up",
+      "bottleneckDisk": "Disk",
+      "bottleneckNetwork": "Network",
+      "bottleneckApi": "API",
+      "bottleneckCpu": "CPU",
+      "bottleneckMixed": "Mixed",
+      "bottleneckDiskSub": "read-bound · {rate}",
+      "bottleneckNetworkSub": "upload-bound · {rate}",
+      "bottleneckCpuSub": "hash-bound · {rate}",
+      "bottleneckApiSub": "{backend} rate-limited · backing off {seconds}s",
+      "bottleneckApiGenericBackend": "the destination",
+      "bottleneckMixedSub": "no clear limiter"
     },
     "status": {
       "synced": "Synced",
