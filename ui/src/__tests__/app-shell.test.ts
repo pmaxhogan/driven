@@ -183,11 +183,16 @@ describe("App shell", () => {
     // source_progress for the moving counters) + the pause event registered +
     // the two ToastHost subscriptions (status_changed for "Backup started",
     // activity:new for the backup_done row behind "Backup complete") + the
-    // FdaBanner's own activity:new subscription (the macOS TCC denial row).
-    expect(listenMock).toHaveBeenCalledTimes(9);
+    // FdaBanner's own activity:new subscription (the macOS TCC denial row) +
+    // the work queue's `queue:changed` (issue #303: the top-bar badge must be
+    // right the moment the window opens, including for work queued while it was
+    // closed, so the subscription is owned here rather than by the collapsed
+    // menu).
+    expect(listenMock).toHaveBeenCalledTimes(10);
     expect(invokeMock).toHaveBeenCalledWith("get_pending_update_info", undefined);
     expect(invokeMock).toHaveBeenCalledWith("get_sync_status", undefined);
     expect(invokeMock).toHaveBeenCalledWith("get_pause_state", undefined);
+    expect(invokeMock).toHaveBeenCalledWith("get_work_queue", undefined);
   });
 
   it("never throws when a subscribe registration fails - hydration still runs", async () => {

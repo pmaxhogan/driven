@@ -25,6 +25,7 @@ import type {
   FileSearchHitDto,
   FileVersionDto,
   GlobalSyncStatus,
+  QueueSnapshot,
   ReleaseDto,
   RemoteTreeDto,
   RestoreJobStatus,
@@ -519,6 +520,60 @@ export const SYNC_STATUS_RUNNING: GlobalSyncStatus = {
     { account_id: ACCOUNT_S3.id, state: { state: "idle", last_run_at: FIXED_NOW - 2 * HOUR } },
   ],
 };
+
+// --- Pending-work queue (issue #303) ---
+
+/** The common case: nothing queued, with the next scheduled scan armed - the
+ * panel's empty state ("No pending work - next scheduled backup HH:MM"). */
+export const WORK_QUEUE_IDLE: QueueSnapshot[] = [
+  {
+    account_id: ACCOUNT_DRIVE.id,
+    running: null,
+    running_cancelled: false,
+    pending: [],
+    next_scheduled_at: FIXED_NOW + 30 * MINUTE,
+  },
+];
+
+/** A busy queue: one item running plus one of every pending kind, so a single
+ * screenshot exercises every row glyph, title, and subtitle. */
+export const WORK_QUEUE_BUSY: QueueSnapshot[] = [
+  {
+    account_id: ACCOUNT_DRIVE.id,
+    running: {
+      id: 1,
+      kind: "manual",
+      source_id: SOURCE_DOCUMENTS.id,
+      enqueued_at: FIXED_NOW - 4 * MINUTE,
+      tick: "manual",
+    },
+    running_cancelled: false,
+    pending: [
+      {
+        id: 2,
+        kind: "recovery",
+        source_id: SOURCE_PHOTOS.id,
+        enqueued_at: FIXED_NOW - 3 * MINUTE,
+        tick: "scheduled",
+      },
+      {
+        id: 3,
+        kind: "watcher",
+        source_id: SOURCE_PHOTOS.id,
+        enqueued_at: FIXED_NOW - 2 * MINUTE,
+        tick: "watcher",
+      },
+      {
+        id: 4,
+        kind: "scheduled",
+        source_id: null,
+        enqueued_at: FIXED_NOW - 1 * MINUTE,
+        tick: "scheduled",
+      },
+    ],
+    next_scheduled_at: FIXED_NOW + 30 * MINUTE,
+  },
+];
 
 // --- Settings ---
 

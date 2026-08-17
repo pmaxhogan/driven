@@ -662,6 +662,10 @@ pub fn run() {
             commands::sync::get_sync_status,
             // 2026-08-14 follow-up: live disk/network throughput series.
             commands::sync::io_throughput_series,
+            // Issue #303: the visible pending-work queue.
+            commands::sync::get_work_queue,
+            commands::sync::cancel_work_item,
+            commands::sync::clear_work_queue,
             // SPEC s11.1 accounts (M6).
             commands::accounts::list_accounts,
             commands::accounts::list_backends,

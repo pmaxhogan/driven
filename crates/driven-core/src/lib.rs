@@ -35,6 +35,9 @@ pub mod planner;
 /// outside `driven-core` never open a source file themselves.
 mod platform_open;
 pub mod priority;
+/// The per-account visible pending-work queue (issue #303): what is running,
+/// what is waiting, and the coalescing / ordering / cancel rules for both.
+pub mod queue;
 /// Headless restore (download + decrypt + verify + write) for round-trip
 /// testing without the GUI. The GUI's own restore path stays in `src-tauri`.
 pub mod restore_fetch;

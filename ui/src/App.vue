@@ -7,9 +7,11 @@ import FdaBanner from "./components/FdaBanner.vue";
 import GlobalProgressBar from "./components/GlobalProgressBar.vue";
 import StatusBanner from "./components/StatusBanner.vue";
 import ToastHost from "./components/ToastHost.vue";
+import WorkQueueMenu from "./components/WorkQueueMenu.vue";
 import { usePauseStore } from "./stores/pause";
 import { useProgressStore } from "./stores/progress";
 import { useUpdaterStore } from "./stores/updater";
+import { useWorkQueueStore } from "./stores/workQueue";
 
 // M6 shell: the app is a router host. Each SPEC s25 route renders its own view
 // (Settings tabs, SetupWizard, About, and the M7/M8 Activity / Restore). A
@@ -49,6 +51,12 @@ const progress = useProgressStore();
 // previous run at boot.
 const pause = usePauseStore();
 
+// Pending-work queue (issue #303/#304): the top-bar badge must be right the
+// moment the window opens, including for work queued while it was closed - so
+// the `queue:changed` subscription is owned here, at the app-lifetime root, like
+// the three above rather than by the (collapsed, unmounted-content) menu.
+const workQueue = useWorkQueueStore();
+
 // R4-P2-1: subscribe() can reject on a partial listener-registration failure (it
 // now cleans up + resets state so a later retry can re-subscribe). A failed
 // subscribe must NOT skip pending-update hydration: the backend's startup check
@@ -85,6 +93,16 @@ onMounted(async () => {
     console.error("pause subscribe failed at app boot", e);
   } finally {
     await pause.hydrate();
+  }
+  // Same pattern for the work queue: subscribe first so no live change is
+  // missed, then hydrate the current queues (and the source names that label
+  // them) so work already waiting at boot shows immediately.
+  try {
+    await workQueue.subscribe();
+  } catch (e) {
+    console.error("work queue subscribe failed at app boot", e);
+  } finally {
+    await workQueue.hydrate();
   }
 });
 
@@ -160,6 +178,10 @@ const NAV_LINK_ACTIVE = "text-teal-700 dark:text-teal-300 font-semibold";
         >
           {{ t(link.label) }}
         </RouterLink>
+        <!-- Pushed to the trailing edge: the queue is a check-on-demand
+             affordance, not a navigation target, so it sits apart from the
+             three primary surfaces. -->
+        <WorkQueueMenu class="ml-auto" />
       </nav>
     </header>
     <main class="flex-1 p-6">

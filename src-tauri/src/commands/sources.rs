@@ -552,6 +552,13 @@ pub async fn update_source(
     // Read the current row by id (strongly consistent).
     let mut row = find_source(state.state().as_ref(), source_id).await?;
 
+    // Issue #302: did this patch touch the EXCLUSION RULES? Only then is the
+    // live-matcher swap + follow-up rescan below worth doing (a rename or a
+    // cadence change cannot make a planned op newly excluded).
+    let patterns_changed = patch.include_patterns.is_some()
+        || patch.exclude_patterns.is_some()
+        || patch.respect_gitignore.is_some();
+
     if let Some(display_name) = patch.display_name {
         // R4-P2-3: validate the patched display name (non-empty, no control
         // chars, length-capped) before it lands in SQLite.
@@ -622,6 +629,18 @@ pub async fn update_source(
     // Reconfigure the owning orchestrator so a toggled `enabled` / changed globs
     // / cadence take effect without a restart.
     reconfigure_account(&state, row.account_id).await;
+
+    // Issue #302: a reconfigure only reaches the NEXT cycle. When the rules
+    // themselves changed, push them into the cycle that is running RIGHT NOW -
+    // otherwise a long initial backup keeps uploading a folder the user just
+    // excluded for as long as that plan runs (minutes to hours). This also arms
+    // the single coalesced follow-up rescan that re-derives honest totals and
+    // picks up anything the same edit re-included.
+    if patterns_changed {
+        if let Some(handle) = state.account(row.account_id) {
+            handle.orchestrator.refresh_source_exclusions(&row).await;
+        }
+    }
 
     tracing::info!(target: TARGET, source_id = %source_id, "source updated");
     Ok(source_row_to_dto(&row))

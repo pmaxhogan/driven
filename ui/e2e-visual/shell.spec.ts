@@ -4,6 +4,7 @@ import {
   FIXED_NOW,
   SYNC_STATUS_RUNNING,
   UPDATE_INFO,
+  WORK_QUEUE_BUSY,
 } from "../test-support/fixtures";
 import { expect, snapshot, test } from "./fixtures";
 
@@ -38,6 +39,36 @@ test("a backup is running", async ({ page, visit }) => {
     "Backing up - 40% (128 of 320 files)"
   );
   await snapshot(page, "backup-running.png");
+});
+
+// The pending-work queue (issue #304). Two shots: the busy panel - one running
+// item with its progress bar plus one of every pending kind, so every glyph and
+// subtitle is asserted - and the empty state with its next-scheduled line. The
+// panel is default-collapsed, so both open it first; the badge on the collapsed
+// trigger is covered by the shots above.
+test("the work queue panel, busy", async ({ page, visit }) => {
+  await visit("/activity", {
+    commands: { get_work_queue: WORK_QUEUE_BUSY, get_sync_status: SYNC_STATUS_RUNNING },
+  });
+  // Wait out the global progress bar's 500ms debounce FIRST (see the
+  // "a backup is running" scenario above): it is ~30px of sticky chrome that
+  // shifts the whole page, so opening the panel before it settles would bake a
+  // race into this baseline.
+  await expect(page.getByTestId("global-progress-label")).toHaveText(
+    "Backing up - 40% (128 of 320 files)"
+  );
+  await page.getByTestId("dropdown-trigger").click();
+  // Then wait on the settled row text, not merely the panel's presence: the
+  // running row's counters come from the separately-hydrated progress store.
+  await expect(page.getByText("128 / 320 files")).toBeVisible();
+  await snapshot(page, "work-queue-busy.png");
+});
+
+test("the work queue panel, empty", async ({ page, visit }) => {
+  await visit("/activity");
+  await page.getByTestId("dropdown-trigger").click();
+  await expect(page.getByTestId("work-queue-empty")).toBeVisible();
+  await snapshot(page, "work-queue-empty.png");
 });
 
 test("backups paused indefinitely", async ({ page, visit }) => {

@@ -710,6 +710,47 @@ pub trait Executor: Send + Sync {
     /// Not a cancel and not persisted: an in-flight op is never torn mid-file,
     /// and durable pause state lives in the orchestrator/state DB.
     fn set_paused(&self, paused: bool);
+
+    /// Publishes freshly persisted include/exclude rules for ONE source into
+    /// the RUNNING cycle (issue #302).
+    ///
+    /// The exclusion matcher is otherwise snapshotted once per scan
+    /// (`scanner.rs`), so a plan built before the user edited the rules keeps
+    /// uploading paths the user just opted out of - for the whole remainder of
+    /// a plan that can be hours long. This is the seam that fixes that: the
+    /// caller (the orchestrator, on `refresh_source_exclusions`) builds a fresh
+    /// [`SourceMatcher`](crate::exclude::SourceMatcher) off-thread and swaps it
+    /// in here; the `execute` dispatch loop re-checks each op against it before
+    /// dispatching, exactly like it re-checks the manual-pause gate.
+    ///
+    /// - `matcher = None` means "the matcher could not be built": the executor
+    ///   FAILS OPEN (dispatches everything) rather than stranding a backup on a
+    ///   broken ignore file - the same rule the reconcile-time check follows.
+    /// - `generation` is a monotonic counter assigned by the caller BEFORE it
+    ///   starts building, so a slow build cannot clobber a newer one that
+    ///   finished first. A lower generation than the one already published for
+    ///   the source is DROPPED.
+    ///
+    /// Not persisted and not a cancel: skipped ops keep no `file_state` row, so
+    /// the next scan simply re-plans whatever is still included.
+    fn set_live_exclusions(
+        &self,
+        source_id: SourceId,
+        generation: u64,
+        matcher: Option<Arc<crate::exclude::SourceMatcher>>,
+    );
+}
+
+/// The live exclusion rules published for one source by
+/// [`Executor::set_live_exclusions`] (issue #302).
+#[derive(Clone)]
+struct LiveExclusions {
+    /// Caller-assigned monotonic generation; a publish with a lower generation
+    /// than the stored one is dropped (out-of-order matcher builds).
+    generation: u64,
+    /// The matcher, or `None` when its build failed (fail OPEN - see
+    /// [`Executor::set_live_exclusions`]).
+    matcher: Option<Arc<crate::exclude::SourceMatcher>>,
 }
 
 /// How many per-file `drive.remote_file_missing` WARN rows one audit may write
@@ -1106,6 +1147,12 @@ pub struct DefaultExecutor {
     /// already in flight run to their durable commit, so a pause never tears a
     /// file mid-upload.
     paused: AtomicBool,
+    /// LIVE exclusion rules per source (issue #302), published by
+    /// [`Executor::set_live_exclusions`] whenever the user saves new
+    /// include/exclude patterns, and read by the `execute` dispatch loop before
+    /// each op. Empty (the normal case) = no live override has ever been
+    /// published, so the loop does zero extra work.
+    live_exclusions: std::sync::Mutex<HashMap<SourceId, LiveExclusions>>,
     #[cfg(test)]
     mid_upload_hook: Option<MidUploadHook>,
     #[cfg(test)]
@@ -1199,6 +1246,7 @@ impl DefaultExecutor {
             parent_dirs: std::sync::Mutex::new(HashMap::new()),
             parent_walk: tokio::sync::Mutex::new(()),
             paused: AtomicBool::new(false),
+            live_exclusions: std::sync::Mutex::new(HashMap::new()),
             #[cfg(test)]
             mid_upload_hook: None,
             #[cfg(test)]
@@ -4446,6 +4494,9 @@ impl Executor for DefaultExecutor {
         let mut outcomes = Vec::with_capacity(plan.ops.len());
         let mut ops = plan.ops.iter();
         let mut next_op = ops.next();
+        // Ops dropped by the live exclusion gate below (issue #302), for the
+        // one summary log line this run emits.
+        let mut excluded_mid_cycle: u64 = 0;
 
         loop {
             // Manual-pause dispatch gate (DESIGN s5.7). Checked EVERY iteration,
@@ -4465,6 +4516,23 @@ impl Executor for DefaultExecutor {
                     "manual pause: halting op dispatch; draining in-flight uploads"
                 );
                 next_op = None;
+            }
+            // LIVE exclusion gate (issue #302). Checked EVERY iteration for the
+            // same reason as the pause gate above: the user edits the source's
+            // rules mid-plan, and a plan is routinely thousands of ops long, so
+            // a matcher snapshotted at scan time is the same as no check at all.
+            // Dropping the op here means it is never dispatched, produces no
+            // outcome, and - crucially - leaves NO `file_state` row behind, so
+            // the coalesced follow-up scan re-plans cleanly and the totals
+            // correct themselves. Fail-open (no live matcher published, or its
+            // build failed) dispatches everything, mirroring the reconcile-time
+            // check in `op_path_now_excluded`.
+            while let Some(op) = next_op {
+                if !self.op_is_live_excluded(source, op) {
+                    break;
+                }
+                excluded_mid_cycle = excluded_mid_cycle.saturating_add(1);
+                next_op = ops.next();
             }
             if next_op.is_none() && in_flight.is_empty() {
                 break;
@@ -4505,6 +4573,16 @@ impl Executor for DefaultExecutor {
             }
         }
 
+        if excluded_mid_cycle > 0 {
+            info!(
+                target: TARGET,
+                source = %source.id,
+                dropped = excluded_mid_cycle,
+                planned = plan.ops.len(),
+                "live exclusion update: dropped planned ops the user excluded mid-cycle"
+            );
+        }
+
         Ok(outcomes)
     }
 
@@ -4513,6 +4591,49 @@ impl Executor for DefaultExecutor {
         // the dispatch loop, and "one more op starts" on a racing write is
         // already the accepted graceful-drain behaviour.
         self.paused.store(paused, Ordering::Relaxed);
+    }
+
+    fn set_live_exclusions(
+        &self,
+        source_id: SourceId,
+        generation: u64,
+        matcher: Option<Arc<crate::exclude::SourceMatcher>>,
+    ) {
+        // A poisoned lock only means some other thread panicked while holding
+        // it; the map itself is a plain `HashMap` with no torn invariant, so
+        // recovering the guard is strictly better than propagating a panic into
+        // a running backup.
+        let mut live = self
+            .live_exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner());
+        if let Some(existing) = live.get(&source_id) {
+            if existing.generation > generation {
+                debug!(
+                    target: TARGET,
+                    source = %source_id,
+                    stale = generation,
+                    current = existing.generation,
+                    "dropping a stale live-exclusion publish (an out-of-order matcher build)"
+                );
+                return;
+            }
+        }
+        let built = matcher.is_some();
+        live.insert(
+            source_id,
+            LiveExclusions {
+                generation,
+                matcher,
+            },
+        );
+        debug!(
+            target: TARGET,
+            source = %source_id,
+            generation,
+            built,
+            "live exclusion rules published into the running cycle"
+        );
     }
 
     async fn audit_remote_existence(
@@ -4896,6 +5017,39 @@ impl Executor for DefaultExecutor {
 }
 
 impl DefaultExecutor {
+    /// The live matcher published for `source_id`, or `None` when none has been
+    /// published or its build failed (both mean FAIL OPEN - issue #302).
+    fn live_matcher(&self, source_id: SourceId) -> Option<Arc<crate::exclude::SourceMatcher>> {
+        self.live_exclusions
+            .lock()
+            .unwrap_or_else(|poisoned| poisoned.into_inner())
+            .get(&source_id)
+            .and_then(|live| live.matcher.clone())
+    }
+
+    /// Has the user excluded this planned op's path SINCE the plan was built
+    /// (issue #302)? Consulted per op by the `execute` dispatch loop.
+    ///
+    /// A bundle op is dropped only when EVERY member is now excluded: the
+    /// members are packed into one remote object, so a partially-excluded
+    /// bundle cannot be trimmed in flight. Its newly-excluded members are
+    /// handled the same way as files already uploaded before the edit - the
+    /// next cycle re-plans from the current rules (no retro-trash).
+    fn op_is_live_excluded(&self, source: &SourceRow, op: &Op) -> bool {
+        let Some(matcher) = self.live_matcher(source.id) else {
+            return false;
+        };
+        let excluded = |rel: &RelativePath| !matcher.is_included(Path::new(rel.as_str()), false);
+        match op {
+            Op::HashThenUpload { relative_path, .. } | Op::Trash { relative_path, .. } => {
+                excluded(relative_path)
+            }
+            Op::UploadBundle { members, .. } => {
+                !members.is_empty() && members.iter().all(|m| excluded(&m.relative_path))
+            }
+        }
+    }
+
     /// Is `rel` EXCLUDED by the source's CURRENT ignore rules? (2026-08-14
     /// incident: reconcile must not resume-upload a path the user has since
     /// opted out of.) The matcher is built lazily into `cache` on first use -
@@ -8166,6 +8320,187 @@ mod tests {
             .await
             .unwrap();
         assert_eq!(outcomes.len(), plan.ops.len(), "resume re-opens the gate");
+    }
+
+    // --- live exclusion pickup (issue #302) ---------------------------------
+
+    /// Build the plan the live-exclusion tests run: `keep/f{i}.txt` and
+    /// `drop/f{i}.txt` INTERLEAVED, so a test that asserts "everything under
+    /// drop/ was skipped" cannot pass merely because dispatch stopped early.
+    fn interleaved_plan(h: &Harness, pairs: usize) -> Plan {
+        let mut ops = Vec::with_capacity(pairs * 2);
+        for i in 0..pairs {
+            for dir in ["keep", "drop"] {
+                let (relative_path, size) = h.write_file(
+                    &format!("{dir}/f{i}.txt"),
+                    format!("body {dir} {i}").as_bytes(),
+                );
+                ops.push(Op::HashThenUpload {
+                    source_id: h.source.id,
+                    relative_path,
+                    size,
+                });
+            }
+        }
+        Plan {
+            ops,
+            collisions: vec![],
+        }
+    }
+
+    /// A matcher over `h.source` with `patterns` as its exclude rules - what
+    /// the orchestrator builds after the user saves new rules.
+    fn matcher_excluding(h: &Harness, patterns: &[&str]) -> Arc<crate::exclude::SourceMatcher> {
+        let mut row = h.source.clone();
+        row.exclude_patterns = patterns.iter().map(|p| (*p).to_string()).collect();
+        Arc::new(crate::exclude::build_source_matcher(&row).expect("the matcher builds"))
+    }
+
+    /// Issue #302: rules saved WHILE a plan is executing must stop the ops the
+    /// user just excluded, right now - not at the next cycle. The matcher is
+    /// otherwise snapshotted once per scan, so a plan that takes hours kept
+    /// uploading an excluded folder for its whole run.
+    ///
+    /// Deterministic without sleeping, exactly like the manual-pause test: one
+    /// permit means one op in flight, and the swap happens from the per-op
+    /// outcome sink, which the executor awaits before the next dispatch.
+    #[tokio::test]
+    async fn live_exclusions_saved_mid_plan_stop_dispatching_the_excluded_ops() {
+        let h = harness().await;
+        let plan = interleaved_plan(&h, 8);
+        let exec = h
+            .executor()
+            .with_upload_pool(crate::adaptive::UploadPool::with_bounds(1, 1, 1));
+        let matcher = matcher_excluding(&h, &["drop/"]);
+
+        // Swap the fresh rules in from the FIRST completed op's sink.
+        let swap_once = |_o: &OpOutcome| -> futures::future::BoxFuture<'_, ()> {
+            exec.set_live_exclusions(h.source.id, 1, Some(matcher.clone()));
+            Box::pin(async {})
+        };
+        let outcomes = exec
+            .execute(&h.source, &plan, &noop_progress, &swap_once)
+            .await
+            .unwrap();
+
+        // Everything still included ran; nothing under `drop/` did. (With one
+        // permit, `keep/f0` is the only op that was ever in flight when the
+        // rules changed, so no `drop/` op even started here. An op that HAD
+        // been in flight would still finish and commit - the gate stops
+        // dispatch, it never tears a file.)
+        assert_eq!(
+            outcomes.len(),
+            8,
+            "the 8 still-included keep/ ops, and nothing else: {outcomes:?}"
+        );
+        assert!(
+            outcomes.iter().all(|o| match o {
+                OpOutcome::Done { relative_path, .. } =>
+                    relative_path.as_str().starts_with("keep/"),
+                other => panic!("unexpected outcome {other:?}"),
+            }),
+            "no newly-excluded op may be dispatched: {outcomes:?}"
+        );
+        for i in 0..8 {
+            let keep = RelativePath::try_from(format!("keep/f{i}.txt")).unwrap();
+            assert!(
+                h.state
+                    .get_file_state(h.source.id, &keep)
+                    .await
+                    .unwrap()
+                    .is_some(),
+                "{keep} is still included and must have been uploaded"
+            );
+        }
+        // The skipped ops must leave NO durable trace, so the follow-up scan
+        // re-plans cleanly from the current rules.
+        for i in 0..8 {
+            let dropped = RelativePath::try_from(format!("drop/f{i}.txt")).unwrap();
+            assert!(
+                h.state
+                    .get_file_state(h.source.id, &dropped)
+                    .await
+                    .unwrap()
+                    .is_none(),
+                "{dropped} was excluded mid-cycle, so it must have no file_state row"
+            );
+        }
+    }
+
+    /// Issue #302 fail-OPEN: when the matcher could not be built (a broken
+    /// ignore file, a vanished root), the publish carries `None` and the
+    /// executor keeps dispatching EVERYTHING. A backup that stops because an
+    /// ignore file is malformed would be far worse than one that backs up a
+    /// little too much - the same rule the reconcile-time check follows.
+    #[tokio::test]
+    async fn a_failed_live_exclusion_build_fails_open_and_dispatches_everything() {
+        let h = harness().await;
+        let plan = interleaved_plan(&h, 4);
+        let exec = h.executor();
+
+        exec.set_live_exclusions(h.source.id, 1, None);
+        let outcomes = exec
+            .execute(&h.source, &plan, &noop_progress, &noop_outcome)
+            .await
+            .unwrap();
+
+        assert_eq!(
+            outcomes.len(),
+            plan.ops.len(),
+            "a matcher that could not be built must never strand a backup: {outcomes:?}"
+        );
+    }
+
+    /// Issue #302: publishes are ordered by the generation the CALLER assigns
+    /// before it starts building, so a slow build finishing late can never
+    /// clobber a newer, already-published one. Here the newer publish (an empty
+    /// rule set) lands first; the stale one (exclude everything) must be
+    /// dropped, and the plan must still run in full.
+    #[tokio::test]
+    async fn a_stale_live_exclusion_publish_is_dropped() {
+        let h = harness().await;
+        let plan = interleaved_plan(&h, 3);
+        let exec = h.executor();
+
+        // Generation 7 = the user's LATEST save: nothing excluded.
+        exec.set_live_exclusions(h.source.id, 7, Some(matcher_excluding(&h, &[])));
+        // Generation 3 = an earlier save whose matcher build was slower.
+        exec.set_live_exclusions(h.source.id, 3, Some(matcher_excluding(&h, &["drop/"])));
+
+        let outcomes = exec
+            .execute(&h.source, &plan, &noop_progress, &noop_outcome)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes.len(),
+            plan.ops.len(),
+            "the stale publish must not resurrect a rule the user already removed: {outcomes:?}"
+        );
+    }
+
+    /// Issue #302: a source with no live publish at all (every source, until
+    /// the user edits its rules) is completely unaffected - the gate is inert.
+    #[tokio::test]
+    async fn live_exclusions_for_another_source_do_not_affect_this_one() {
+        let h = harness().await;
+        let plan = interleaved_plan(&h, 3);
+        let exec = h.executor();
+
+        exec.set_live_exclusions(
+            SourceId::new_v4(),
+            1,
+            Some(matcher_excluding(&h, &["drop/"])),
+        );
+
+        let outcomes = exec
+            .execute(&h.source, &plan, &noop_progress, &noop_outcome)
+            .await
+            .unwrap();
+        assert_eq!(
+            outcomes.len(),
+            plan.ops.len(),
+            "rules published for a DIFFERENT source must not gate this one: {outcomes:?}"
+        );
     }
 
     // --- V2 small-file bundling (issue #35) ---------------------------------
