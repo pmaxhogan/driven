@@ -716,6 +716,47 @@ describe("SourceTable", () => {
     });
   });
 
+  it("keeps the source listed and shows the error when remote deletion fails (#227)", async () => {
+    // Issue #227: `remove_source(delete_remote: true)` aborts with nothing
+    // removed on a destination failure - backend-neutral now (S3, SFTP, the
+    // local folder), not just Drive. The UI must surface that loudly rather
+    // than silently doing nothing: the source stays listed, the confirm
+    // panel stays open with the checkbox still ticked, and the error shows.
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "list_sources") return Promise.resolve([makeSource()]);
+      if (cmd === "list_accounts") return Promise.resolve([]);
+      if (cmd === "remove_source") {
+        return Promise.reject({ code: "drive.unreachable", message: "backend English" });
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(SourceTable, { global: globalMountOptions });
+    await flushPromises();
+    const removeButton = wrapper
+      .findAll("button")
+      .find((b) => b.text() === i18n.global.t("settings.sources.removeButton"));
+    await removeButton!.trigger("click");
+    await flushPromises();
+    const confirmPanel = wrapper.get('[data-testid="source-remove-confirm"]');
+    await confirmPanel.get('input[type="checkbox"]').setValue(true);
+    await confirmPanel.get('[data-testid="source-remove-confirm-button"]').trigger("click");
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("remove_source", {
+      sourceId: "src-1",
+      deleteRemote: true,
+    });
+    // Nothing was removed and the panel is still open for a retry.
+    expect(wrapper.find('[data-testid="source-remove-confirm"]').exists()).toBe(true);
+    expect((confirmPanel.get('input[type="checkbox"]').element as HTMLInputElement).checked).toBe(
+      true
+    );
+    const err = wrapper.find('[data-testid="remove-error"]');
+    expect(err.exists()).toBe(true);
+    // The stable code is localized, never the raw backend message.
+    expect(err.text()).not.toContain("backend English");
+  });
+
   it("re-runs the streaming preview when a rule changes in the open editor", async () => {
     // The editor's panel lives inside the per-source v-for, so the tree's
     // template ref is registered in a v-for scope; a blur must still reach the

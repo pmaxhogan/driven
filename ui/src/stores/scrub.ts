@@ -33,19 +33,18 @@ export const useScrubStore = defineStore("scrub", () => {
   const latest = computed<ScrubRun | null>(() => runs.value[0] ?? null);
 
   /**
-   * Objects across the loaded runs that drifted and could NOT be repaired.
+   * Objects the NEWEST run found that drifted and could NOT be repaired.
    *
-   * Deliberately summed over the LOADED window rather than only the newest run:
-   * the scrub walks a rolling slice, so damage found three runs ago is just as
-   * unresolved as damage found today - it is not "old news", it simply has not
-   * been fixed. A user looking at this number wants "how much needs attention",
-   * not "how much needed attention in the most recent slice".
+   * Keyed on the latest run only, not summed across the loaded window (see
+   * #271): the scrub walks a rolling slice of the backup, so a later run
+   * covering different objects is the only thing that can speak to the
+   * CURRENT state. Summing meant one bad weekly scrub kept the banner red for
+   * ~10 subsequent clean scrubs with no way for a later success to ever clear
+   * it.
    */
-  const unrecoverableTotal = computed<number>(() =>
-    runs.value.reduce((sum, r) => sum + r.unrecoverable, 0)
-  );
+  const unrecoverableTotal = computed<number>(() => latest.value?.unrecoverable ?? 0);
 
-  /** True when any loaded run reports drift that could not be repaired. */
+  /** True when the NEWEST run reports drift that could not be repaired. */
   const needsAttention = computed<boolean>(() => unrecoverableTotal.value > 0);
 
   /** Load (or reload) the recent scrub runs. */
