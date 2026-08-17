@@ -292,8 +292,8 @@
   "versionRetention": {
     "default": "How long an older version stays recoverable depends on your destination.",
     "google_drive": "Older versions are kept in Drive's trash, which Drive may purge after about 30 days.",
-    "s3": "This destination keeps no older versions of its own: a changed file overwrites the previous copy, so in practice only the most recent backup can be restored. Turn on bucket versioning at your provider if you need older copies.",
-    "local_folder": "This destination keeps no older versions: a changed file overwrites the previous copy, so in practice only the most recent backup can be restored.",
+    "s3": "Older versions are kept in a .driven-versions folder in your bucket and pruned to the limit you set here. Deleting a file is separate: turn on bucket versioning at your provider if you also want to recover files Driven removes.",
+    "local_folder": "Older versions are kept in a .driven-versions folder on the destination drive and pruned to the limit you set here. They count toward the space Driven uses there.",
     "sftp": "This destination keeps no older versions: a changed file overwrites the previous copy, so in practice only the most recent backup can be restored."
   },
   "wizard": {
@@ -853,6 +853,10 @@
       "resumable_session_invalid": {
         "short": "Upload interrupted",
         "long": "A resumable upload session expired. Driven will restart the upload."
+      },
+      "version_archive_failed": {
+        "short": "Previous version not kept",
+        "long": "This file was backed up and is up to date, but Driven could not keep a copy of the previous version at the destination, so that earlier version cannot be restored."
       },
       "dest_folder_missing": {
         "short": "Destination missing",

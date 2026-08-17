@@ -99,8 +99,9 @@ export const ACCOUNT_NEEDS_REAUTH: AccountDto = {
 export const ACCOUNTS: AccountDto[] = [ACCOUNT_DRIVE, ACCOUNT_S3];
 
 /** Mirrors `driven_backend::descriptors()` in picker order (Drive, S3, folder),
- * including the issue #220 `supportsVersionHistory` split - only Drive can
- * honour a point-in-time restore. */
+ * including the issue #220 `supportsVersionHistory` split - Drive, S3 and the
+ * local folder can all honour a point-in-time restore; SFTP cannot, since it
+ * has no server-side copy to archive a superseded version into. */
 export const BACKENDS: BackendDto[] = [
   {
     id: "google_drive",
@@ -114,7 +115,7 @@ export const BACKENDS: BackendDto[] = [
     id: "s3",
     usesOauth: false,
     supportsFolderPicker: true,
-    supportsVersionHistory: false,
+    supportsVersionHistory: true,
     supportsRename: false,
     isDefault: false,
   },
@@ -122,7 +123,7 @@ export const BACKENDS: BackendDto[] = [
     id: "local_folder",
     usesOauth: false,
     supportsFolderPicker: false,
-    supportsVersionHistory: false,
+    supportsVersionHistory: true,
     supportsRename: false,
     isDefault: false,
   },

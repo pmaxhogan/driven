@@ -3077,25 +3077,36 @@ mod tests {
     #[tokio::test]
     async fn versioning_cannot_be_enabled_on_a_destination_that_overwrites_previous_versions() {
         // Issue #220 (DATA-SAFETY): enabling per-source versioning is REJECTED on
-        // a destination whose create key is derived from the file name (S3, local
-        // folder), because the re-upload overwrites the previous bytes and a
-        // "restore as of an earlier date" would then return TODAY's content while
-        // reporting success. Google Drive, whose create mints a new file id and
-        // whose trash keeps the superseded object, is allowed.
+        // a destination that cannot keep the superseded bytes under an object of
+        // their own, because the re-upload overwrites them and a "restore as of
+        // an earlier date" would then return TODAY's content while reporting
+        // success. Since #220 part 2 that is SFTP alone: it has no server-side
+        // copy, so archiving a version would mean re-uploading the whole file
+        // over the same link. Google Drive (a create mints a new file id), S3 and
+        // the local folder (both archive the superseded object into
+        // `.driven-versions` first) are all allowed.
         //
-        // The UI hides the editor for those destinations, but this is the
+        // The UI hides the editor for an unsupported destination, but this is the
         // authoritative gate: a stale front end or any other caller must not be
         // able to STORE the promise. This is the exact predicate
         // `set_source_versioning` enforces.
         let (repo, dir) = temp_repo().await;
 
-        // Drive: enabling is allowed.
-        let (_, drive_source) = persist_source_on_backend(&repo, BackendKind::GoogleDrive).await;
-        reject_versioning_on_unsupported_backend(&repo, &drive_source, true)
-            .await
-            .expect("Drive really keeps superseded objects, so versioning is honest there");
+        // The destinations that really keep versions: enabling is allowed.
+        for kind in [
+            BackendKind::GoogleDrive,
+            BackendKind::S3,
+            BackendKind::LocalFolder,
+        ] {
+            let (_, source) = persist_source_on_backend(&repo, kind).await;
+            reject_versioning_on_unsupported_backend(&repo, &source, true)
+                .await
+                .unwrap_or_else(|e| {
+                    panic!("{kind} really keeps superseded objects, so versioning is honest: {e}")
+                });
+        }
 
-        for kind in [BackendKind::S3, BackendKind::LocalFolder] {
+        for kind in [BackendKind::Sftp] {
             let (_, source) = persist_source_on_backend(&repo, kind).await;
             let err = reject_versioning_on_unsupported_backend(&repo, &source, true)
                 .await

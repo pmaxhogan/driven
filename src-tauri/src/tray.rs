@@ -790,6 +790,10 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         // scan re-uploads it), and it says nothing about reachability - Drive
         // answered, the object was simply gone. Non-network either way.
         | ErrorCode::DriveRemoteFileMissing
+        // A version that could not be archived is a per-file warning about the
+        // destination's version store, not about reachability: the backup
+        // itself went through on the very connection that would be in question.
+        | ErrorCode::DriveVersionArchiveFailed
         // Local filesystem / VSS errors -> red error. (The transient
         // vss_helper_pending skip is not an error condition, but it is not a
         // network one either, so it classifies here as non-network.)

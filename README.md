@@ -104,7 +104,7 @@ Notes:
 - ³⁹ `bench/` runs Driven's real engine and rclone over identical seeded fixtures against a live Drive account, reporting wall time, throughput, API calls, CPU time, and peak memory for a cold and an incremental pass. See [`bench/README.md`](bench/README.md) for scales, costs, and what is and is not apples-to-apples.
 - ⁴⁰ The others publish unit-test microbenchmarks, internal tuning harnesses (Duplicati's unreleased AutoTune), or vendor marketing numbers, rather than a runnable end-to-end suite. Backblaze does publish a quarterly benchmark, but of B2 object storage rather than the backup client.
 - ⁴¹ Driven's checkmark is scoped to Windows, where a VSS snapshot lets a locked file (Outlook PST, running DB, VM disk) back up while it is held open. macOS has an equivalent behind an opt-in setting (Settings > macOS): a small privileged helper mounts a read-only APFS local snapshot so a *busy* file can be read: it is off by default, and it does nothing for a Full Disk Access denial. On both macOS and Linux, a file Driven cannot open is in any case classified precisely as a transient lock (`local.file_locked`) versus a macOS Full Disk Access denial (`local.permission_denied`) and skipped with a clear reason in the activity log, rather than misreported as a disk error. Linux has no snapshot equivalent and none is planned. See `design/DESIGN.md` §5.3 and §5.3.2.
-- ⁴² Driven's checkmark is scoped to the Google Drive destination. Keeping previous versions relies on a changed file's re-upload landing on a NEW remote object, which is true of a Drive create but not of a destination whose object key is derived from the file name: on S3-compatible stores, SFTP servers, and local folders the re-upload overwrites the previous copy. Driven therefore does not offer per-source versioning or a restore-by-date on those destinations at all, rather than reporting a point-in-time restore it cannot perform. For recoverability on S3, enable the provider's own bucket versioning. See [issue #220](https://github.com/pmaxhogan/driven/issues/220).
+- ⁴² Per-source versioning works on Google Drive, on S3-compatible stores, and on a local or removable folder; it is NOT offered on SFTP. Keeping previous versions needs the superseded bytes to end up under an object of their own. A Drive create gives that for free (it mints a new file id and the old object survives in Drive's trash). A destination whose object key is derived from the file name would instead overwrite the previous copy, so on S3 and on a local folder Driven first copies the superseded object into a `.driven-versions` area it owns at the destination - a server-side `CopyObject` on S3, a file copy on a local folder - and the retained version points there. Those copies are pruned to the per-source limit you set, are hidden from the destination picker, and do not appear in the remote-existence audit. SFTP has no server-side copy, so archiving a version there would mean re-uploading the whole file over the link that is already the bottleneck; rather than silently doubling the cost of every changed file, Driven does not offer versioning or a restore-by-date on SFTP at all. Note that versioning is about CHANGED files, not deleted ones: to recover a file Driven removed from an S3 destination, enable the provider's own bucket versioning. See [issue #220](https://github.com/pmaxhogan/driven/issues/220).
 - ⁴³ Google Drive (the original destination), any S3-compatible object store (AWS S3, Cloudflare R2, MinIO, Backblaze B2 in S3-compatible mode, Wasabi), any SSH server with SFTP (a NAS, home server, or VPS - added in v2.9.0, with TOFU host-key pinning and password or private-key auth), and a local or removable folder (USB drive, external disk, NAS share) - all behind one `RemoteStore` trait. OneDrive and other non-S3-compatible cloud APIs are not implemented.
 - ⁴⁴ Driven runs four independent periodic checks, not one: a weekly local re-hash (deep-verify) that catches local bit-rot, a startup / deep-verify remote-existence audit that catches an object deleted at the destination outside Driven, and, added in v2.5.0, a weekly rolling integrity scrub that re-checks each already-backed-up object's size against the destination and, where the destination can supply one, its content checksum too - catching remote-side corruption or tampering that neither of the other two checks can see. On by default; a source's population is swept in bounded slices (500 objects per run by default) rather than all at once. Checksum coverage depends on the destination: full on Google Drive and on a local-folder destination (which always re-hashes the bytes it just wrote); size-only for an S3 object uploaded via multipart, because S3 stores no plain content digest for one, only an ETag that digests the individual parts - the scrub reports those as unverifiable rather than guessing, never as falsely clean. The fourth check is the restore drill: every one of the three above verifies the backup from the WRITE side ("is what we wrote still there?"), and none of them ever runs the reverse pipeline, so a broken restore path or an unusable key stays invisible until the day you actually need your data. Once a month Driven therefore restores a few of your backed-up files for real - download, decrypt, extract, verify the plaintext hash - into a temporary directory, then deletes them. On by default, three files per drill; both the cadence and the sample size are configurable, and the whole thing has a kill switch. A drill that verifies nothing (nothing restorable yet, or a locked keychain) is reported as inconclusive, never as a pass.
 
@@ -434,14 +434,30 @@ The destination-marker protection described below for local folders applies
 to SFTP destinations too: a wrong or unmounted server-side path reads as
 "needs reconnecting," never as an empty directory to silently fill.
 
+**S3 housekeeping worth knowing.** With per-source versioning on, Driven keeps
+previous versions of changed files in a `.driven-versions/` prefix under the
+root it was given, pruned to the per-source limit you set. It is Driven's own
+area: it is hidden from the destination picker and excluded from the
+remote-existence audit, but the objects in it are ordinary objects you are
+billed for, so the limit is the knob that controls that cost. Separately, a
+transfer that dies mid-flight can leave an incomplete multipart upload behind.
+Driven aborts one as soon as it gives up on the transfer, and sweeps anything
+an earlier version or a hard crash left behind when it next starts. As
+belt-and-braces - and good practice on any bucket, not just this one - add a
+lifecycle rule that expires incomplete multipart uploads after a few days; S3,
+R2 and MinIO all support one, and it costs nothing to have.
+
 **Local / removable-folder caveats.** Driven writes a small marker file at the
 destination's root the first time you use it, and every operation re-checks
 it - so an unmounted drive reads as "missing and needs reconnecting," never as
 an empty folder Driven backs up into by mistake (which would silently write
 your whole backup onto the boot disk underneath the mount point). Beyond that:
 
-- **No trash.** Like the S3 destination, a deleted or superseded file is gone
-  immediately; there is no 30-day recovery window the way Drive has one.
+- **No trash.** Like the S3 destination, a DELETED file is gone immediately;
+  there is no 30-day recovery window the way Drive has one. A file you CHANGED
+  is different: with per-source versioning on, the previous copy is kept in a
+  `.driven-versions` folder at the destination (pruned to the limit you set) and
+  can be restored by date.
 - **FAT32's 4 GiB per-file ceiling is enforced, not silently truncated**: a
   file at or above that size fails with a clear message naming FAT32, rather
   than writing a corrupt partial object.

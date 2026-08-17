@@ -194,6 +194,11 @@ const REQUEUE_FORCE_RESCAN_MTIME_NS: i64 = i64::MIN;
 struct VersionSupersede {
     /// The OLD Drive object id (becomes a retained, then trashed, version).
     old_drive_file_id: String,
+    /// Issue #220: where the OLD bytes were COPIED to, on a destination whose
+    /// object id is derived from the name and would therefore have overwritten
+    /// them. `None` on Google Drive, where the old object survives under its own
+    /// id. [`Self::version_object_id`] is what callers should read.
+    archive_file_id: Option<String>,
     /// The OLD plaintext size.
     old_size: u64,
     /// The OLD plaintext BLAKE3 - compared against the new hash to detect an
@@ -208,6 +213,20 @@ struct VersionSupersede {
     old_created_at: i64,
     /// The per-source retained-version cap (`>= 1`), for the post-commit prune.
     cap: u32,
+}
+
+impl VersionSupersede {
+    /// The object id the retained `file_versions` row must point at: the
+    /// ARCHIVE when the destination needed one, else the old object itself.
+    ///
+    /// Reading `old_drive_file_id` directly for this would be the #220 bug: on a
+    /// name-keyed destination that id names the object the new content is about
+    /// to be written over.
+    fn version_object_id(&self) -> &str {
+        self.archive_file_id
+            .as_deref()
+            .unwrap_or(&self.old_drive_file_id)
+    }
 }
 
 // -----------------------------------------------------------------------------
@@ -267,6 +286,23 @@ struct PendingOpPayload {
     /// (non-versioned) create or update.
     #[serde(default, skip_serializing_if = "Option::is_none")]
     supersedes_drive_file_id: Option<String>,
+    /// Issue #220: on a destination whose object id is DERIVED FROM THE NAME
+    /// (S3, a local folder), the superseded bytes were copied to a separate
+    /// archive object before this upload, and THIS is that archive's id - what
+    /// the retained `file_versions` row must point at.
+    ///
+    /// `supersedes_drive_file_id` deliberately keeps naming the ORIGINAL object,
+    /// because that is what the pre-flip `file_state` row points at and what
+    /// every recovery guard compares against. On Google Drive, where a create
+    /// mints a new object and the old one survives under its own id, this stays
+    /// absent and the version row points at the original - the pre-#220
+    /// behaviour, unchanged.
+    ///
+    /// Persisted alongside the supersede intent so a crash-recovery adopt
+    /// records the version against the ARCHIVE rather than against a live object
+    /// that now holds the new content.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    supersedes_archive_file_id: Option<String>,
     /// Issue #36: the Drive file id of a redundant DUPLICATE object created by an
     /// identical-content (mtime-only) touch, whose immediate best-effort trash
     /// FAILED (or was interrupted by a crash before it ran). The OLD object stays
@@ -1084,6 +1120,24 @@ impl RemoteStore for BreakerReportingStore {
         self.report(self.inner.resume_chunk(session, offset, chunk).await)
     }
 
+    async fn abandon_resumable_session(&self, session: &ResumableSession) -> anyhow::Result<()> {
+        // Delegated, not defaulted: the trait's default is a no-op, and a
+        // wrapper that silently took it would put the #222 leak straight back -
+        // the production store is ALWAYS reached through this wrapper.
+        self.report(self.inner.abandon_resumable_session(session).await)
+    }
+
+    async fn archive_version(
+        &self,
+        file_id: &str,
+        content_token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        // Delegated for the same reason: the trait's default answers "no archive
+        // needed", which on a name-keyed destination would leave the version row
+        // pointing at the object about to be overwritten (issue #220).
+        self.report(self.inner.archive_version(file_id, content_token).await)
+    }
+
     async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
         self.report(self.inner.trash(file_id).await)
     }
@@ -1779,6 +1833,18 @@ impl DefaultExecutor {
         } else {
             None
         };
+        // Issue #220: on a destination whose object id is derived from the name,
+        // the "create" below lands on the SAME object, so the old bytes have to
+        // be copied aside FIRST or the version row records an object that is
+        // about to hold the new content. A failure here drops versioning for
+        // this op (loudly) rather than failing the backup.
+        let version_supersede = match version_supersede {
+            Some(vs) => {
+                self.archive_superseded_version(source, relative_path, vs)
+                    .await
+            }
+            None => None,
+        };
         let versioned = version_supersede.is_some();
         // For a versioned change force the CREATE path: `effective_existing_id`
         // is None (the Drive call is a create; reconcile sees a pure create) and
@@ -1800,6 +1866,9 @@ impl DefaultExecutor {
             supersedes_drive_file_id: version_supersede
                 .as_ref()
                 .map(|v| v.old_drive_file_id.clone()),
+            supersedes_archive_file_id: version_supersede
+                .as_ref()
+                .and_then(|v| v.archive_file_id.clone()),
             ..PendingOpPayload::default()
         };
         let op_id = self
@@ -2569,7 +2638,9 @@ impl DefaultExecutor {
                     let superseded = crate::state::NewFileVersion {
                         source_id: source.id,
                         relative_path: relative_path.clone(),
-                        drive_file_id: vs.old_drive_file_id.clone(),
+                        // The ARCHIVE where the destination needed one (#220),
+                        // else the old object itself (Drive).
+                        drive_file_id: vs.version_object_id().to_string(),
                         size: vs.old_size,
                         hash_blake3: vs.old_hash_blake3,
                         drive_md5: vs.old_drive_md5,
@@ -2585,7 +2656,14 @@ impl DefaultExecutor {
                     // then prune versions beyond the per-source count cap. Both are
                     // best-effort: a failure leaves extra retained data, never loses
                     // any (the reconcile sweep retries an un-trashed version).
-                    self.guarded_trash_and_mark(&vs.old_drive_file_id).await;
+                    // Trash the object the version row points at. On Drive that
+                    // is the old object, and trashing it is what moves it out of
+                    // the live tree while keeping it restorable. Where the
+                    // destination archived instead (#220) it is the ARCHIVE, and
+                    // its store makes trashing one a no-op - the archive is
+                    // already parked, and on those stores a real trash is a
+                    // permanent delete that would destroy the version.
+                    self.guarded_trash_and_mark(vs.version_object_id()).await;
                     self.prune_versions(source.id, relative_path, vs.cap).await;
                 }
             }
@@ -3077,6 +3155,70 @@ impl DefaultExecutor {
         existing_file_id: Option<&str>,
         mime: &str,
         total: u64,
+        out_rx: tokio::sync::mpsc::Receiver<Bytes>,
+        op_id: PendingOpId,
+        payload: &mut PendingOpPayload,
+        recorded: &std::sync::atomic::AtomicU64,
+    ) -> Result<RemoteEntry, UploadError> {
+        let outcome = self
+            .upload_stage_resumable_inner(
+                target,
+                existing_file_id,
+                mime,
+                total,
+                out_rx,
+                op_id,
+                payload,
+                recorded,
+            )
+            .await;
+
+        // Issue #222: these three outcomes all end with `hash_then_upload`
+        // DELETING the pending op, and the op's payload is the only record of the
+        // session. Once it is gone nothing can ever abort the upload, and on S3
+        // that upload keeps holding - and billing for - every part already sent.
+        // So release it now, while the handle still exists.
+        //
+        // The list is deliberately an ALLOW-list rather than "any error", because
+        // the errors NOT named here are exactly the ones that KEEP the op so
+        // reconcile can finish the transfer:
+        //
+        // - `Fatal` - a mid-stream drop on a create. The op survives carrying the
+        //   live session and its acked offset, and `resume_persisted` picks the
+        //   session back up on the next start. Aborting it would turn a
+        //   resumable upload into a full re-send of everything already on the
+        //   wire, which is the opposite of the point.
+        // - `DeferToReconcile` - kept by construction, same reasoning.
+        // - `SkipPostUpload` / `ChecksumMismatch` - the upload already FINISHED,
+        //   so there is no session left to release (and abandoning a completed
+        //   upload id would be a harmless no-op anyway).
+        let abandon = matches!(
+            outcome,
+            Err(UploadError::Failed(_) | UploadError::Skip(_) | UploadError::RemoteFileMissing)
+        );
+        if abandon {
+            self.abandon_persisted_session(&target.name, payload).await;
+            if payload.resumable.take().is_some() {
+                if let Err(err) = self.persist_payload(op_id, payload).await {
+                    warn!(
+                        target: TARGET,
+                        name = %target.name,
+                        %err,
+                        "could not clear an abandoned resumable session from the op payload"
+                    );
+                }
+            }
+        }
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn upload_stage_resumable_inner(
+        &self,
+        target: &RemoteTarget,
+        existing_file_id: Option<&str>,
+        mime: &str,
+        total: u64,
         mut out_rx: tokio::sync::mpsc::Receiver<Bytes>,
         op_id: PendingOpId,
         payload: &mut PendingOpPayload,
@@ -3508,6 +3650,40 @@ impl DefaultExecutor {
         }
     }
 
+    /// Issue #222: tell the store to release the server-side resources of the
+    /// session currently in `payload`, because the caller is about to drop the
+    /// only handle to it.
+    ///
+    /// Called wherever a session becomes unreachable: a fresh session replacing
+    /// a persisted one, an invalidated session discarded before a restart, and a
+    /// streaming upload whose op is about to be deleted. (Reconcile's
+    /// `resume_persisted` releases its own, from the session it was handed.)
+    /// Without it, `S3Store` accumulated one abandoned multipart upload - parts
+    /// on the bucket, billed, invisible to `ListObjectsV2` - per failed attempt,
+    /// forever.
+    ///
+    /// Deliberately BEST-EFFORT and never fatal: a leaked upload is a cost
+    /// problem, and failing a backup over one would be a much worse trade. The
+    /// startup sweep is the backstop for whatever this misses (a crash between
+    /// the two, an offline destination).
+    async fn abandon_persisted_session(&self, name: &str, payload: &PendingOpPayload) {
+        let Some(previous) = payload.resumable.as_ref() else {
+            return;
+        };
+        if let Err(err) = self
+            .remote
+            .abandon_resumable_session(&previous.session)
+            .await
+        {
+            warn!(
+                target: TARGET,
+                name = %name,
+                %err,
+                "could not release an abandoned resumable session; the destination may hold its partial upload until the next startup sweep"
+            );
+        }
+    }
+
     /// Open a fresh resumable session against `target` and persist it (at
     /// offset 0) into the op payload BEFORE any bytes are pushed, so a crash
     /// after the first chunk lands can resume (P1-3). Shared by the buffered
@@ -3532,6 +3708,12 @@ impl DefaultExecutor {
                 app_properties: target.app_props.clone(),
             }
         };
+        // Issue #222: an op that already carries a session is about to lose the
+        // handle to it, and on S3 an abandoned multipart upload keeps its parts -
+        // and keeps being billed for them - until something aborts it. This is
+        // the moment the old session becomes unreachable, so this is where it is
+        // released. Best-effort by contract; never a reason to fail the upload.
+        self.abandon_persisted_session(&target.name, payload).await;
         if existing_file_id.is_some() {
             self.pacer.permit_request().await;
         } else {
@@ -3557,6 +3739,11 @@ impl DefaultExecutor {
         payload: &mut PendingOpPayload,
         restarts: &mut u32,
     ) -> anyhow::Result<bool> {
+        // Issue #222: release the dead session's server-side resources before
+        // dropping the only handle to it. A 4xx-d session is exactly the case S3
+        // cannot clean up on its own - the upload id stays valid enough to hold
+        // its parts (and bill for them) long after Driven stops using it.
+        self.abandon_persisted_session(name, payload).await;
         payload.resumable = None;
         self.persist_payload(op_id, payload).await?;
         *restarts += 1;
@@ -4431,6 +4618,7 @@ impl DefaultExecutor {
         }
         Some(VersionSupersede {
             old_drive_file_id,
+            archive_file_id: None,
             old_size: row.size,
             old_hash_blake3: row.hash_blake3,
             old_drive_md5: row.drive_md5,
@@ -4438,6 +4626,105 @@ impl DefaultExecutor {
             old_created_at,
             cap: cfg.effective_cap(),
         })
+    }
+
+    /// Issue #220: copy the superseded bytes aside, on a destination that would
+    /// otherwise overwrite them.
+    ///
+    /// The executor versions a change by forcing the CREATE path and recording
+    /// the old object as a retained version. That preserves nothing on a
+    /// destination whose object id is derived from the NAME (S3's
+    /// `join_key(parent, name)`, a local folder's path): the "create" lands on
+    /// the same object and the version row would end up pointing at the CURRENT
+    /// content - a point-in-time restore handing back today's bytes while
+    /// reporting success. [`RemoteStore::archive_version`] copies the old bytes
+    /// to an object of their own first, and the version row points there.
+    ///
+    /// The content token is the OLD plaintext BLAKE3, which makes the archive id
+    /// a pure function of `(object, content)`: replaying a crashed op re-derives
+    /// the same id, and the store returns the existing archive untouched instead
+    /// of copying the (by then possibly NEW) live bytes over it.
+    ///
+    /// ## When the copy fails
+    ///
+    /// The upload proceeds WITHOUT versioning - a plain in-place update, exactly
+    /// as an unversioned source would do. Failing the file instead would trade a
+    /// certain loss (this backup does not happen) for a hypothetical one (a
+    /// version cannot be kept), which is the wrong trade for a backup tool.
+    ///
+    /// But it is NOT silent. A `drive.version_archive_failed` warning lands in
+    /// the activity log, so a destination that keeps failing to archive shows up
+    /// as a destination that is not delivering the point-in-time restore its
+    /// settings page offers - rather than looking, from the outside, exactly
+    /// like one that is.
+    async fn archive_superseded_version(
+        &self,
+        source: &SourceRow,
+        relative_path: &RelativePath,
+        vs: VersionSupersede,
+    ) -> Option<VersionSupersede> {
+        let token = hex::encode(vs.old_hash_blake3);
+        self.pacer.permit_request().await;
+        match self
+            .remote
+            .archive_version(&vs.old_drive_file_id, &token)
+            .await
+        {
+            // The destination already gives every version its own object
+            // (Google Drive): nothing to copy, and the old id IS the version.
+            Ok(None) => {
+                self.pacer.note_response(ResponseClass::Ok);
+                Some(vs)
+            }
+            Ok(archive_file_id @ Some(_)) => {
+                self.pacer.note_response(ResponseClass::Ok);
+                Some(VersionSupersede {
+                    archive_file_id,
+                    ..vs
+                })
+            }
+            Err(e) => {
+                let class = classify_drive_error(&e);
+                self.pacer.note_response(class.response_class());
+                warn!(
+                    target: TARGET,
+                    source = %source.id,
+                    path = %relative_path,
+                    id = %vs.old_drive_file_id,
+                    err = %e,
+                    "could not preserve the superseded version; uploading as a plain update so the file is still backed up, but no version is retained for this change"
+                );
+                self.report_version_archive_failure(source, relative_path)
+                    .await;
+                None
+            }
+        }
+    }
+
+    /// Record a `drive.version_archive_failed` warning in the activity log.
+    ///
+    /// Best-effort: a log write that fails must not take the upload down with
+    /// it. The row is what makes the degradation visible - see
+    /// [`Self::archive_superseded_version`].
+    async fn report_version_archive_failure(
+        &self,
+        source: &SourceRow,
+        relative_path: &RelativePath,
+    ) {
+        let row = crate::state::NewActivity {
+            ts: self.clock.now_ms(),
+            source_id: Some(source.id),
+            level: crate::state::ActivityLevel::Warn,
+            event_type: ErrorCode::DriveVersionArchiveFailed.code().to_string(),
+            file_count: Some(1),
+            bytes: None,
+            message: Some(format!(
+                "could not keep a previous version of {relative_path}; the file itself is backed up and current"
+            )),
+        };
+        if let Err(err) = self.state.write_activity(row).await {
+            warn!(target: TARGET, %err, "could not record the version-archive failure in the activity log");
+        }
     }
 
     /// Issue #36: best-effort trash of a superseded object, GUARDED by the global
@@ -6033,10 +6320,49 @@ impl DefaultExecutor {
     ///
     /// If the local file changed since the crash the body would no longer
     /// match the partially-uploaded bytes; rather than corrupt the object we
-    /// discard the session (the partial create is GC'd by the store when it
-    /// expires; a partial update leaves the old object intact) and return
-    /// `None` so the caller requeues a clean upload.
+    /// discard the session and return `None` so the caller requeues a clean
+    /// upload.
+    ///
+    /// Issue #222: `Ok(None)` means exactly "this session is being abandoned",
+    /// and there are a dozen conditions that reach it (a changed file, an
+    /// unreadable one, an expired session, an encrypted source, a misbehaving
+    /// server). Releasing the destination's side of it is therefore done HERE,
+    /// once, rather than at each of those returns - a new abandon condition
+    /// added later cannot forget to. Without it an S3 multipart upload keeps
+    /// holding (and billing for) every part already sent, for as long as the
+    /// provider's own lifecycle rules allow.
+    ///
+    /// An `Err` deliberately does NOT abandon: the op survives and the next
+    /// reconcile tries the same session again.
     async fn resume_persisted(
+        &self,
+        source: &SourceRow,
+        op: &crate::state::PendingOpRow,
+        payload: &PendingOpPayload,
+        resumable: PersistedResumable,
+        crypto: Option<&dyn SourceCryptoSuite>,
+        on_recover: &RecoverProgressSink<'_>,
+    ) -> anyhow::Result<Option<(RemoteEntry, [u8; 32])>> {
+        let session = resumable.session.clone();
+        let outcome = self
+            .resume_persisted_inner(source, op, payload, resumable, crypto, on_recover)
+            .await;
+        if matches!(outcome, Ok(None)) {
+            if let Err(err) = self.remote.abandon_resumable_session(&session).await {
+                warn!(
+                    target: TARGET,
+                    source = %source.id,
+                    path = %op.relative_path,
+                    %err,
+                    "could not release an abandoned resumable session; the destination may hold its partial upload until the next startup sweep"
+                );
+            }
+        }
+        outcome
+    }
+
+    #[allow(clippy::too_many_arguments)]
+    async fn resume_persisted_inner(
         &self,
         source: &SourceRow,
         op: &crate::state::PendingOpRow,
@@ -6573,6 +6899,9 @@ impl DefaultExecutor {
         // row BEFORE the pointer flip so the version can be recorded, and trash
         // the OLD object afterwards so a crash-recovery adopt never leaks it live.
         let supersedes = payload.supersedes_drive_file_id.clone();
+        // Issue #220: where the destination copied the superseded bytes to
+        // before this (crashed) upload overwrote them. Absent on Drive.
+        let supersedes_archive = payload.supersedes_archive_file_id.clone();
         let pre_flip_old = if supersedes.is_some() {
             self.state
                 .get_file_state(source.id, &op.relative_path)
@@ -6601,7 +6930,12 @@ impl DefaultExecutor {
                 Some(NewFileVersion {
                     source_id: source.id,
                     relative_path: op.relative_path.clone(),
-                    drive_file_id: old_id.clone(),
+                    // The guard above compares the pre-flip row against the
+                    // ORIGINAL id, because that is what the row points at. The
+                    // version itself is recorded against the ARCHIVE when the
+                    // destination made one (#220), which on those stores is the
+                    // only copy of the old bytes that still exists.
+                    drive_file_id: supersedes_archive.clone().unwrap_or_else(|| old_id.clone()),
                     size: old_row.size,
                     hash_blake3: old_row.hash_blake3,
                     drive_md5: old_row.drive_md5,
@@ -12108,6 +12442,423 @@ mod tests {
             .is_empty());
     }
 
+    // --- issue #220: versioning on a NAME-KEYED destination ------------------
+
+    /// A [`RemoteStore`] that behaves like `driven-s3` / `driven-localfs`:
+    /// an object's id is DERIVED FROM ITS NAME, so a `create` over an existing
+    /// name OVERWRITES it rather than minting a second object.
+    ///
+    /// That single property is what broke per-source versioning on those
+    /// backends (issue #220): the executor versions a change by forcing the
+    /// create path, and here that lands on the same object the version row was
+    /// about to point at. The store earns versioning back by implementing
+    /// `archive_version`, and - because on a real one `trash` is a permanent
+    /// delete - by making `trash` a no-op for an archived id.
+    ///
+    /// Deliberately NOT a mode on `InMemoryRemoteStore`: the Drive-shaped fake's
+    /// create semantics are load-bearing for every other test in this file.
+    struct NameKeyedStore {
+        inner: InMemoryRemoteStore,
+        /// Ids this store archived, so `trash` can be a no-op for them and the
+        /// audit's live set can exclude them - exactly what the real stores do
+        /// by testing the key against their version prefix.
+        archived: std::sync::Mutex<HashSet<String>>,
+        /// When set, every `archive_version` fails - the "this destination
+        /// cannot keep versions right now" path.
+        archive_fails: std::sync::atomic::AtomicBool,
+    }
+
+    impl NameKeyedStore {
+        fn new(inner: InMemoryRemoteStore) -> Arc<Self> {
+            Arc::new(Self {
+                inner,
+                archived: std::sync::Mutex::new(HashSet::new()),
+                archive_fails: std::sync::atomic::AtomicBool::new(false),
+            })
+        }
+        fn failing(inner: InMemoryRemoteStore) -> Arc<Self> {
+            let s = Self::new(inner);
+            s.archive_fails
+                .store(true, std::sync::atomic::Ordering::SeqCst);
+            s
+        }
+        /// The id a name resolves to under this store, if it exists.
+        async fn id_of(&self, parent_id: &str, name: &str) -> Option<String> {
+            self.inner
+                .list_folder(parent_id, &DriveContext::MyDrive)
+                .await
+                .ok()?
+                .into_iter()
+                .find(|e| e.name == name && !e.trashed)
+                .map(|e| e.id)
+        }
+    }
+
+    #[async_trait::async_trait]
+    impl RemoteStore for NameKeyedStore {
+        async fn ensure_folder(
+            &self,
+            parent_id: &str,
+            name: &str,
+            dc: &DriveContext,
+        ) -> anyhow::Result<RemoteEntry> {
+            self.inner.ensure_folder(parent_id, name, dc).await
+        }
+        async fn list_folder(
+            &self,
+            folder_id: &str,
+            dc: &DriveContext,
+        ) -> anyhow::Result<Vec<RemoteEntry>> {
+            let archived = self.archived.lock().unwrap().clone();
+            Ok(self
+                .inner
+                .list_folder(folder_id, dc)
+                .await?
+                .into_iter()
+                .filter(|e| !archived.contains(&e.id))
+                .collect())
+        }
+        /// The #220 mechanism itself: a create over an existing name is an
+        /// UPDATE of the same object, so nothing about it is "new".
+        async fn create(
+            &self,
+            parent_id: &str,
+            name: &str,
+            mime: &str,
+            body: UploadBody,
+            app_properties: HashMap<String, String>,
+        ) -> anyhow::Result<RemoteEntry> {
+            match self.id_of(parent_id, name).await {
+                Some(existing) => self.inner.update(&existing, body, app_properties).await,
+                None => {
+                    self.inner
+                        .create(parent_id, name, mime, body, app_properties)
+                        .await
+                }
+            }
+        }
+        async fn update(
+            &self,
+            file_id: &str,
+            body: UploadBody,
+            patch: HashMap<String, String>,
+        ) -> anyhow::Result<RemoteEntry> {
+            self.inner.update(file_id, body, patch).await
+        }
+        async fn resumable_session(
+            &self,
+            kind: ResumableKind,
+            mime: &str,
+            size: u64,
+        ) -> anyhow::Result<ResumableSession> {
+            self.inner.resumable_session(kind, mime, size).await
+        }
+        async fn resume_chunk(
+            &self,
+            session: &ResumableSession,
+            offset: u64,
+            chunk: Bytes,
+        ) -> anyhow::Result<ResumeProgress> {
+            self.inner.resume_chunk(session, offset, chunk).await
+        }
+        async fn archive_version(
+            &self,
+            file_id: &str,
+            content_token: &str,
+        ) -> anyhow::Result<Option<String>> {
+            if self.archive_fails.load(std::sync::atomic::Ordering::SeqCst) {
+                anyhow::bail!("fake: the destination refused to copy the superseded bytes");
+            }
+            let src = self.inner.metadata(file_id).await?;
+            let name = format!(".driven-versions/{}@{content_token}", src.name);
+            // Deterministic + idempotent, exactly as the trait requires: the
+            // same (object, content) must reuse the same archive rather than
+            // stacking copies across a crash + replay.
+            if let Some(existing) = self.id_of(&src.parents[0], &name).await {
+                return Ok(Some(existing));
+            }
+            let bytes = read_remote_bytes(&self.inner, file_id).await;
+            let entry = self
+                .inner
+                .create(
+                    &src.parents[0],
+                    &name,
+                    &src.mime_type,
+                    UploadBody::Bytes(Bytes::from(bytes)),
+                    src.app_properties.clone(),
+                )
+                .await?;
+            self.archived.lock().unwrap().insert(entry.id.clone());
+            Ok(Some(entry.id))
+        }
+        /// A real name-keyed store's `trash` is a permanent delete, so trashing
+        /// an archived version would destroy it. It is already parked.
+        async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
+            if self.archived.lock().unwrap().contains(file_id) {
+                return Ok(());
+            }
+            self.inner.trash(file_id).await
+        }
+        async fn delete_permanent(&self, file_id: &str) -> anyhow::Result<()> {
+            self.archived.lock().unwrap().remove(file_id);
+            self.inner.delete_permanent(file_id).await
+        }
+        async fn metadata(&self, file_id: &str) -> anyhow::Result<RemoteEntry> {
+            self.inner.metadata(file_id).await
+        }
+        async fn download(&self, file_id: &str) -> anyhow::Result<DownloadStream> {
+            self.inner.download(file_id).await
+        }
+        async fn find_by_op_uuid(
+            &self,
+            parent_id: &str,
+            op_uuid: &str,
+            dc: &DriveContext,
+        ) -> anyhow::Result<Option<RemoteEntry>> {
+            self.inner.find_by_op_uuid(parent_id, op_uuid, dc).await
+        }
+        async fn list_source_object_ids(
+            &self,
+            source_id: &str,
+            dc: &DriveContext,
+        ) -> anyhow::Result<HashSet<String>> {
+            let archived = self.archived.lock().unwrap().clone();
+            Ok(self
+                .inner
+                .list_source_object_ids(source_id, dc)
+                .await?
+                .difference(&archived)
+                .cloned()
+                .collect())
+        }
+        async fn about(&self) -> anyhow::Result<AboutInfo> {
+            self.inner.about().await
+        }
+    }
+
+    async fn read_remote_bytes(store: &InMemoryRemoteStore, id: &str) -> Vec<u8> {
+        use tokio::io::AsyncReadExt as _;
+        let mut stream = store.download(id).await.expect("download");
+        let mut out = Vec::new();
+        stream.0.read_to_end(&mut out).await.expect("read");
+        out
+    }
+
+    /// Drive one versioned content change against a name-keyed destination and
+    /// return `(harness, store, relative path, the id the live object keeps)`.
+    ///
+    /// The store wraps the harness's OWN fake, so the destination folder the
+    /// source points at already exists in it.
+    async fn versioned_change_on_a_name_keyed_store(
+        archive_fails: bool,
+    ) -> (Harness, Arc<NameKeyedStore>, RelativePath, String) {
+        let h = harness().await;
+        let store = if archive_fails {
+            NameKeyedStore::failing(h.remote.clone())
+        } else {
+            NameKeyedStore::new(h.remote.clone())
+        };
+        let (rel, size) = h.write_file("a.txt", b"first");
+        let exec = executor_over(&h, store.clone());
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel, size),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+        let first_id = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap()
+            .drive_file_id
+            .unwrap();
+
+        enable_versioning(&h, 10, 0).await;
+        h.clock.advance(std::time::Duration::from_millis(1_000));
+        let (_r, size2) = h.write_file("a.txt", b"second-longer");
+        exec.execute(
+            &h.source,
+            &h.upload_plan(&rel, size2),
+            &noop_progress,
+            &noop_outcome,
+        )
+        .await
+        .unwrap();
+        (h, store, rel, first_id)
+    }
+
+    #[tokio::test]
+    async fn a_versioned_change_on_a_name_keyed_destination_records_the_archive_not_the_live_object(
+    ) {
+        // Issue #220. On S3 / a local folder the versioned "create" lands on the
+        // SAME object, so before the fix the retained version row pointed at an
+        // object that now held the CURRENT bytes - a restore-by-date returned
+        // today's content while reporting success. The version must instead name
+        // the archived copy, and that copy must still hold the OLD bytes.
+        let (h, store, rel, first_id) = versioned_change_on_a_name_keyed_store(false).await;
+
+        let live_id = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap()
+            .drive_file_id
+            .unwrap();
+        assert_eq!(
+            live_id, first_id,
+            "a name-keyed destination writes the new content over the SAME object"
+        );
+
+        let versions = h.state.list_file_versions(h.source.id, &rel).await.unwrap();
+        assert_eq!(versions.len(), 1);
+        assert_ne!(
+            versions[0].drive_file_id, live_id,
+            "the retained version must NOT be the object that now holds the current bytes"
+        );
+        assert_eq!(
+            read_remote_bytes(&store.inner, &versions[0].drive_file_id).await,
+            b"first",
+            "the retained version must hold the PREVIOUS content"
+        );
+        assert_eq!(
+            read_remote_bytes(&store.inner, &live_id).await,
+            b"second-longer"
+        );
+
+        // The archive is "trashed" in the sense the executor means - parked out
+        // of the live tree - and the no-op trash must not have destroyed it.
+        assert!(
+            versions[0].trashed,
+            "the version row must be marked parked so the reconcile sweep leaves it alone"
+        );
+        assert!(store
+            .inner
+            .metadata(&versions[0].drive_file_id)
+            .await
+            .is_ok());
+
+        // And a restore-by-date resolves to it.
+        let at = h
+            .state
+            .resolve_version_at(h.source.id, &rel, 500)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(at.drive_file_id, versions[0].drive_file_id);
+    }
+
+    #[tokio::test]
+    async fn a_failed_archive_backs_the_file_up_anyway_and_says_so() {
+        // Availability first: a version that cannot be kept must not stop the
+        // backup. But it must NOT be silent either - a destination quietly not
+        // delivering the point-in-time restore its settings page offers is the
+        // #220 bug one level down.
+        let (h, store, rel, first_id) = versioned_change_on_a_name_keyed_store(true).await;
+
+        let row = h
+            .state
+            .get_file_state(h.source.id, &rel)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(row.status, FileStateStatus::Synced);
+        assert_eq!(row.drive_file_id.as_deref(), Some(first_id.as_str()));
+        assert_eq!(
+            read_remote_bytes(&store.inner, &first_id).await,
+            b"second-longer",
+            "the file itself must still be backed up and current"
+        );
+        assert!(
+            h.state
+                .list_file_versions(h.source.id, &rel)
+                .await
+                .unwrap()
+                .is_empty(),
+            "no version row may claim bytes that were never preserved"
+        );
+
+        let page = h
+            .state
+            .query_activity(
+                crate::state::ActivityFilter::default(),
+                crate::state::PageRequest::first(50),
+            )
+            .await
+            .unwrap();
+        let warned = page
+            .rows
+            .iter()
+            .find(|r| r.event_type == ErrorCode::DriveVersionArchiveFailed.code())
+            .expect("a failed archive must be reported in the activity log");
+        assert_eq!(warned.level, crate::state::ActivityLevel::Warn);
+        assert!(warned
+            .message
+            .as_deref()
+            .unwrap_or_default()
+            .contains("a.txt"));
+    }
+
+    #[tokio::test]
+    async fn archiving_the_same_superseded_bytes_twice_reuses_one_archive() {
+        // Crash safety: an op can die between the archive and its commit and be
+        // replayed, by which time the live object may already hold the NEW
+        // bytes. A non-deterministic archive id would stack a copy per replay;
+        // a blind re-copy would overwrite a correct archive with the new
+        // content - re-creating the very bug being fixed.
+        let (h, store, rel, first_id) = versioned_change_on_a_name_keyed_store(false).await;
+        let versions = h.state.list_file_versions(h.source.id, &rel).await.unwrap();
+        let archive_id = versions[0].drive_file_id.clone();
+
+        // Replay the archive step against the SAME content token, with the live
+        // object already overwritten.
+        let token = hex::encode(*blake3::hash(b"first").as_bytes());
+        let again = store
+            .archive_version(&first_id, &token)
+            .await
+            .unwrap()
+            .unwrap();
+        assert_eq!(again, archive_id, "a replay must reuse the same archive");
+        assert_eq!(
+            read_remote_bytes(&store.inner, &archive_id).await,
+            b"first",
+            "a replayed archive must never be overwritten with the newer content"
+        );
+    }
+
+    #[tokio::test]
+    async fn an_old_pending_op_row_without_the_archive_field_still_loads() {
+        // `supersedes_archive_file_id` is additive and unmigrated: a row written
+        // by a pre-#220 build carries the supersede intent WITHOUT it, and must
+        // decode as "no archive" (the Drive behaviour) rather than failing the
+        // whole recovery.
+        let legacy = serde_json::json!({
+            "client_op_uuid": "op-1",
+            "supersedes_drive_file_id": "file-old",
+            "uploaded_blake3_hex": "ab",
+        });
+        let payload: PendingOpPayload = serde_json::from_value(legacy).unwrap();
+        assert_eq!(
+            payload.supersedes_drive_file_id.as_deref(),
+            Some("file-old")
+        );
+        assert_eq!(payload.supersedes_archive_file_id, None);
+        // And an entirely empty payload (the oldest shape of all) still loads.
+        let empty: PendingOpPayload = serde_json::from_value(serde_json::json!({})).unwrap();
+        assert_eq!(empty.supersedes_archive_file_id, None);
+        // The field is elided when absent, so a row this build writes stays
+        // byte-compatible with one an older build would have written.
+        let json = payload.to_value();
+        assert!(
+            json.get("supersedes_archive_file_id").is_none(),
+            "an absent archive id must not be serialized: {json}"
+        );
+    }
+
     #[tokio::test]
     async fn versioned_prune_hard_deletes_beyond_count_cap() {
         let h = harness().await;
@@ -12952,6 +13703,7 @@ mod tests {
             }),
             corrupt_file_id: None,
             supersedes_drive_file_id: None,
+            supersedes_archive_file_id: None,
             redundant_duplicate_file_id: None,
             resume_identity: Some(ResumeIdentity::from_file_identity(identity)),
         };
@@ -13394,6 +14146,7 @@ mod tests {
             }),
             corrupt_file_id: None,
             supersedes_drive_file_id: None,
+            supersedes_archive_file_id: None,
             redundant_duplicate_file_id: None,
             resume_identity: None,
         })

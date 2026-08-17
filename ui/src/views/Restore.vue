@@ -97,11 +97,13 @@ const retentionNote = computed<string>(() => {
  * Issue #220: whether the BROWSED source's destination can really serve an older
  * version, so the point-in-time picker is honest to offer.
  *
- * Where the destination's create key is derived from the file name (S3, local
- * folder) a changed file's re-upload overwrote the previous bytes, so a restore
- * "as of" an earlier date would return the CURRENT content while reporting that it
- * restored an older version. The backend refuses such a restore fail-closed; this
- * stops the app OFFERING it in the first place.
+ * Where the destination cannot put the superseded bytes under an object of their
+ * own, a changed file's re-upload overwrote them, so a restore "as of" an earlier
+ * date would return the CURRENT content while reporting that it restored an older
+ * version. Since #220 part 2 that is SFTP alone - Drive, S3 and the local folder
+ * all keep the old bytes - but the answer is read from the descriptors, never
+ * assumed. The backend refuses such a restore fail-closed; this stops the app
+ * OFFERING it in the first place.
  *
  * Unknown / not-yet-loaded resolves permissive (the #219 house rule) - the control
  * must not blink away on every mount, and the backend is the real gate.
@@ -429,9 +431,9 @@ async function onClearSearch(): Promise<void> {
            each file as it was backed up at that instant.
 
            Issue #220: only offered where the destination can really keep previous
-           versions. On a destination whose create key is derived from the file
-           name the older bytes were overwritten, so this control could only ever
-           hand back the current content while claiming otherwise. -->
+           versions. Where the superseded bytes were overwritten rather than
+           archived aside, this control could only ever hand back the current
+           content while claiming otherwise. -->
       <label v-if="canRestoreAsOf" class="flex items-center gap-1.5 text-sm">
         <span class="text-zinc-600 dark:text-zinc-400">{{ t("restore.asOf.label") }}</span>
         <input

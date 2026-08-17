@@ -209,7 +209,7 @@ fn build_s3(account: &AccountBackend, ctx: BackendContext<'_>) -> anyhow::Result
         );
         return Ok(StoreOutcome::NeedsReauth);
     };
-    let store = S3Store::new(&config, &creds, ctx.ca, ctx.proxy)?;
+    let store = Arc::new(S3Store::new(&config, &creds, ctx.ca, ctx.proxy)?);
     tracing::info!(
         target: TARGET,
         account_id = %account.account_id,
@@ -219,7 +219,49 @@ fn build_s3(account: &AccountBackend, ctx: BackendContext<'_>) -> anyhow::Result
         endpoint = %config.endpoint,
         "built real S3Store (keyring access key)"
     );
-    Ok(StoreOutcome::Store(Arc::new(store)))
+    spawn_multipart_sweep(&store, &account.account_id);
+    Ok(StoreOutcome::Store(store))
+}
+
+/// Kick off the abandoned-multipart-upload sweep for a freshly built store
+/// (issue #222).
+///
+/// DETACHED rather than awaited: it is a hygiene pass over the destination, and
+/// making account assembly - and therefore app startup - wait on a network round
+/// trip to a possibly-unreachable endpoint would be a poor trade for it.
+/// `driven-localfs` sweeps its equivalent (abandoned temp files) inline at
+/// construction because that sweep is local and cheap; this one is neither.
+///
+/// A missing runtime is not an error: `build_store` is also called from
+/// synchronous contexts (probes, tests), where there is simply nothing to spawn
+/// onto and no long-lived process for the sweep to serve.
+fn spawn_multipart_sweep(store: &Arc<driven_s3::S3Store>, account_id: &str) {
+    let Ok(handle) = tokio::runtime::Handle::try_current() else {
+        return;
+    };
+    let store = Arc::clone(store);
+    let account_id = account_id.to_string();
+    handle.spawn(async move {
+        match store.sweep_abandoned_multipart_uploads().await {
+            Ok(0) => tracing::debug!(
+                target: TARGET,
+                %account_id,
+                "no abandoned multipart uploads to sweep"
+            ),
+            Ok(aborted) => tracing::info!(
+                target: TARGET,
+                %account_id,
+                aborted,
+                "swept abandoned multipart uploads that were still holding (billable) parts"
+            ),
+            Err(err) => tracing::warn!(
+                target: TARGET,
+                %account_id,
+                %err,
+                "could not sweep abandoned multipart uploads; a later start will retry"
+            ),
+        }
+    });
 }
 
 /// The SFTP arm: persisted non-secret config + keychain password/private key ->

@@ -1092,6 +1092,19 @@ pub enum ErrorCode {
     /// `drive.resumable_session_invalid` - 4xx during resumable upload;
     /// caller must restart the session.
     DriveResumableSessionInvalid,
+    /// `drive.version_archive_failed` - a source has per-source versioning on
+    /// and this destination needs the superseded bytes COPIED ASIDE before the
+    /// re-upload overwrites them (`RemoteStore::archive_version`), but the copy
+    /// failed. The upload still went ahead as a plain in-place update, so the
+    /// file itself is backed up and current - what was lost is the ability to
+    /// restore THIS change's predecessor.
+    ///
+    /// Warn-level, never fatal: refusing the backup over a version that could
+    /// not be kept would trade a certain loss for a hypothetical one. But it is
+    /// reported rather than swallowed, because a destination that keeps failing
+    /// to archive is quietly not delivering the point-in-time restore its
+    /// settings page promises - the exact silence issue #220 exists to end.
+    DriveVersionArchiveFailed,
     /// `drive.dest_folder_missing` - the configured destination folder
     /// was deleted from Drive by the user.
     DriveDestFolderMissing,
@@ -1291,6 +1304,7 @@ impl ErrorCode {
             ErrorCode::DriveUnreachable => "drive.unreachable",
             ErrorCode::DriveRemoteFileMissing => "drive.remote_file_missing",
             ErrorCode::DriveResumableSessionInvalid => "drive.resumable_session_invalid",
+            ErrorCode::DriveVersionArchiveFailed => "drive.version_archive_failed",
             ErrorCode::DriveDestFolderMissing => "drive.dest_folder_missing",
             ErrorCode::DriveDestFolderPermissionDenied => "drive.dest_folder_permission_denied",
             ErrorCode::LocalFileLocked => "local.file_locked",
@@ -1354,6 +1368,7 @@ impl ErrorCode {
             "drive.unreachable" => ErrorCode::DriveUnreachable,
             "drive.remote_file_missing" => ErrorCode::DriveRemoteFileMissing,
             "drive.resumable_session_invalid" => ErrorCode::DriveResumableSessionInvalid,
+            "drive.version_archive_failed" => ErrorCode::DriveVersionArchiveFailed,
             "drive.dest_folder_missing" => ErrorCode::DriveDestFolderMissing,
             "drive.dest_folder_permission_denied" => ErrorCode::DriveDestFolderPermissionDenied,
             "local.file_locked" => ErrorCode::LocalFileLocked,

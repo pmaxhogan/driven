@@ -41,6 +41,7 @@
 use std::collections::HashMap;
 
 use base64::Engine as _;
+use md5::{Digest, Md5};
 
 /// The `x-amz-meta-` suffix carrying the base64 JSON `app_properties` map.
 ///
@@ -96,6 +97,68 @@ pub fn parent_of(key: &str) -> String {
         Some(i) => trimmed[..=i].to_string(),
         None => String::new(),
     }
+}
+
+/// The folder segment holding Driven's OWN version store (issue #220).
+///
+/// A versioned change on S3 would otherwise re-`PutObject` over the same key and
+/// destroy the bytes the retained `file_versions` row points at, because the
+/// create key is a pure function of the name. `S3Store::archive_version` instead
+/// server-side-copies the superseded object under this prefix first, and the
+/// version row points THERE.
+///
+/// Part of the stored format: renaming it would orphan every archived version
+/// written by an earlier build. The leading dot keeps it out of the way in a
+/// bucket the user also browses, and it deliberately mirrors
+/// `driven-localfs`'s `.driven-versions` directory so the two destinations read
+/// the same when a user looks at them.
+pub const VERSIONS_SEGMENT: &str = ".driven-versions";
+
+/// S3's hard limit on an object key, in bytes.
+const MAX_KEY_LEN: usize = 1024;
+
+/// The slash-terminated prefix of Driven's version store under `root_prefix`.
+pub fn versions_prefix(root_prefix: &str) -> String {
+    folder_id(root_prefix, VERSIONS_SEGMENT)
+}
+
+/// Whether `key` names an object in Driven's version store.
+///
+/// Used to keep archived versions out of the folder picker and out of the
+/// remote-existence audit's live set, and - load-bearing - to make `trash` a
+/// no-op for them: on S3 `trash` is a permanent `DeleteObject`, so trashing a
+/// superseded object the way the Drive path does would destroy the very version
+/// that was just recorded.
+pub fn is_version_key(root_prefix: &str, key: &str) -> bool {
+    key.starts_with(&versions_prefix(root_prefix))
+}
+
+/// The key an archived copy of `live_key` holding content `content_token` lives
+/// at.
+///
+/// DETERMINISTIC in `(live_key, content_token)`, which is what makes archiving
+/// idempotent: an op that crashes after the archive but before its commit is
+/// replayed against the same token and lands on the same key, so a replay can
+/// neither accumulate copies nor (because the caller skips an archive that
+/// already exists) overwrite a correct archive with the newer content.
+///
+/// The readable form keeps the original path visible - a user browsing the
+/// bucket sees `.driven-versions/notes/todo.txt@<token>` beside their backup
+/// rather than an opaque digest. The prefix and the token add a fixed ~80 bytes
+/// (the token is a full hex BLAKE3), so a live key within that of S3's
+/// 1024-byte limit would breach it; those fall back to a digest of the relative
+/// key, which fits any input while staying just as deterministic.
+pub fn version_key(root_prefix: &str, live_key: &str, content_token: &str) -> String {
+    let prefix = versions_prefix(root_prefix);
+    let relative = live_key.strip_prefix(root_prefix).unwrap_or(live_key);
+    let readable = format!("{prefix}{relative}@{content_token}");
+    if readable.len() <= MAX_KEY_LEN {
+        return readable;
+    }
+    let mut hasher = Md5::new();
+    hasher.update(relative.as_bytes());
+    let digest: [u8; 16] = hasher.finalize().into();
+    format!("{prefix}{}@{content_token}", hex::encode(digest))
 }
 
 /// Encode an `app_properties` map for the [`PROPS_METADATA_KEY`] header.
@@ -180,6 +243,51 @@ mod tests {
         assert_eq!(parent_of("p/q/"), "p/");
         assert_eq!(parent_of("a.txt"), "");
         assert_eq!(parent_of(""), "");
+    }
+
+    #[test]
+    fn version_keys_are_deterministic_and_live_under_the_version_store() {
+        // Same inputs, same key: this is what makes archiving idempotent across
+        // a crash + replay (issue #220).
+        let a = version_key("root/", "root/docs/a.txt", "deadbeef");
+        assert_eq!(a, version_key("root/", "root/docs/a.txt", "deadbeef"));
+        assert_eq!(a, "root/.driven-versions/docs/a.txt@deadbeef");
+        assert!(is_version_key("root/", &a));
+        // Different content is a DIFFERENT object; that is the whole point.
+        assert_ne!(a, version_key("root/", "root/docs/a.txt", "cafe0000"));
+        // ... and so is a different file with identical content, so pruning one
+        // file's version can never delete another file's.
+        assert_ne!(a, version_key("root/", "root/docs/b.txt", "deadbeef"));
+
+        // At the bucket root the relative key IS the key.
+        let r = version_key("", "docs/a.txt", "0123");
+        assert_eq!(r, ".driven-versions/docs/a.txt@0123");
+        assert!(is_version_key("", &r));
+
+        // A live object is never mistaken for an archived one.
+        assert!(!is_version_key("root/", "root/docs/a.txt"));
+        assert!(!is_version_key("", "docs/a.txt"));
+        // An object under ANOTHER prefix's version store is not ours.
+        assert!(!is_version_key("root/", "other/.driven-versions/a.txt@1"));
+    }
+
+    #[test]
+    fn an_over_long_version_key_falls_back_to_a_digest_but_stays_deterministic() {
+        // S3 refuses a key over 1024 bytes, so the readable form cannot be used
+        // for a live key already close to the limit.
+        let long = format!("root/{}", "x".repeat(1_010));
+        let key = version_key("root/", &long, "deadbeefdeadbeef");
+        assert!(
+            key.len() <= 1_024,
+            "an archive key must fit S3's limit, got {}",
+            key.len()
+        );
+        assert!(is_version_key("root/", &key));
+        assert_eq!(key, version_key("root/", &long, "deadbeefdeadbeef"));
+        // Still one archive per (file, content).
+        assert_ne!(key, version_key("root/", &long, "0000000000000000"));
+        let other = format!("root/{}", "y".repeat(1_010));
+        assert_ne!(key, version_key("root/", &other, "deadbeefdeadbeef"));
     }
 
     #[test]

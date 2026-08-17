@@ -653,10 +653,13 @@ Tracked as separate roadmap items, no fixed sequence yet:
   local/removable-folder backend (`driven-localfs`). The setup wizard
   and "Add source" flow are backend-driven for all three (#219).
   OneDrive (Graph API) and a native (non-S3) Backblaze B2 client remain
-  unstarted. Per-source versioning does not actually retain older
-  copies on the S3 or local-folder backends yet (a versioned change
-  overwrites the same deterministic key) - see issue #220, tracked
-  separately from this item.
+  unstarted. Per-source versioning now really retains older copies on
+  the S3 and local-folder backends too (v2.12.0, #220 part 2): the
+  superseded object is copied into a Driven-owned `.driven-versions`
+  area before the re-upload overwrites the deterministic key, and the
+  retained version points there. SFTP stays gated OFF - it has no
+  server-side copy, so archiving a version would mean re-uploading the
+  whole file over the same link.
 - **Scheduled integrity scrub** - SHIPPED (v2.5.0, #203): a weekly
   rolling pass, on by default, checks a bounded slice (500 objects) of
   each source's already-backed-up population against the destination's

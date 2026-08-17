@@ -368,6 +368,77 @@ pub trait RemoteStore: Send + Sync {
         size: u64,
     ) -> anyhow::Result<ResumableSession>;
 
+    /// Releases the server-side resources of a session the caller is GIVING UP
+    /// ON, so a backend that charges for a half-finished upload stops charging
+    /// (issue #222).
+    ///
+    /// Called at exactly the two points where a session becomes unreachable:
+    /// when a new session is opened for an op that already had one persisted,
+    /// and when an invalidated session is discarded before a restart. After
+    /// this call the session handle is dead and must never be pushed to again.
+    ///
+    /// Best-effort by contract: an error here is logged, never fatal, because
+    /// the alternative to a leaked upload is never a failed backup. Idempotent -
+    /// abandoning an already-dead session succeeds.
+    ///
+    /// The default is a no-op, which is correct for a backend whose abandoned
+    /// sessions cost nothing and expire on their own (Google Drive). `S3Store`
+    /// overrides it with a real `AbortMultipartUpload`, because S3 and R2 bill
+    /// for the parts of an incomplete multipart upload until it is aborted.
+    async fn abandon_resumable_session(&self, _session: &ResumableSession) -> anyhow::Result<()> {
+        Ok(())
+    }
+
+    /// Preserves the CURRENT bytes of `file_id` as a SEPARATE object, so a
+    /// subsequent write to `file_id` cannot overwrite them, and returns the id
+    /// the preserved copy now lives at (issue #220).
+    ///
+    /// # Why this exists
+    ///
+    /// Driven versions a change by forcing the CREATE path and recording the
+    /// superseded object as a `file_versions` row. That only preserves anything
+    /// on a backend whose create mints a NEW object for every write. A backend
+    /// whose object id is DERIVED FROM THE NAME (`driven-s3`'s
+    /// `join_key(parent, name)`, `driven-localfs`'s name-derived path) re-writes
+    /// the same object, so without this hook the retained version row would end
+    /// up pointing at an object that now holds the CURRENT content - a
+    /// point-in-time restore returning today's bytes while reporting success.
+    ///
+    /// # Contract
+    ///
+    /// - `None` means "no archival is needed here": this backend's create path
+    ///   already leaves the superseded object intact under its own id, so the
+    ///   caller keeps using that id. This is the default, and it is what Google
+    ///   Drive returns.
+    /// - `Some(id)` is the id of an object holding the bytes `file_id` held at
+    ///   call time. It must be readable by [`Self::download`] /
+    ///   [`Self::metadata`] and destroyable by [`Self::delete_permanent`].
+    /// - `content_token` is a stable, collision-resistant digest of the bytes
+    ///   being preserved. Implementations MUST derive the archive id
+    ///   DETERMINISTICALLY from `(file_id, content_token)` and MUST NOT
+    ///   re-copy over an archive that already exists. Both properties are
+    ///   load-bearing: an op can crash and be replayed after the live object
+    ///   has already been overwritten, and a non-deterministic id would
+    ///   accumulate a copy per replay while a blind re-copy would overwrite a
+    ///   correct archive with the new content - re-creating the very bug this
+    ///   method exists to fix.
+    /// - An `Err` means the bytes could NOT be preserved. The caller falls back
+    ///   to a plain in-place update (no version is recorded) and reports it, so
+    ///   a destination that cannot archive degrades LOUDLY rather than
+    ///   pretending a version exists.
+    ///
+    /// A backend that returns `Some` must also make [`Self::trash`] a no-op for
+    /// an archived id: the archive is already parked outside the live tree, and
+    /// on a store whose `trash` is a permanent delete, trashing it would destroy
+    /// the version the caller just recorded.
+    async fn archive_version(
+        &self,
+        _file_id: &str,
+        _content_token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        Ok(None)
+    }
+
     /// Pushes one chunk to a resumable session.
     ///
     /// Non-final chunks MUST be a multiple of 256 KiB. The final chunk

@@ -98,6 +98,34 @@ const SIGN_EXPIRY: Duration = Duration::from_secs(15 * 60);
 /// Objects per `ListObjectsV2` page.
 const LIST_PAGE_SIZE: usize = 1000;
 
+/// Uploads per `ListMultipartUploads` page.
+const UPLOAD_LIST_PAGE_SIZE: usize = 1000;
+
+/// S3's ceiling on a single `CopyObject`. Above it a copy must go through
+/// multipart (`UploadPartCopy`).
+const MAX_SINGLE_COPY: u64 = 5 * 1024 * 1024 * 1024;
+
+/// Byte range each `UploadPartCopy` moves when a copy is too big for one
+/// `CopyObject`.
+///
+/// 1 GiB keeps every non-final part the same size (which Cloudflare R2
+/// requires) while staying inside the 10,000-part limit for any object S3 can
+/// hold: 5 TiB / 1 GiB = 5,120 parts.
+const COPY_PART_SIZE: u64 = 1024 * 1024 * 1024;
+
+/// How long an abandoned multipart upload may sit before
+/// [`S3Store::sweep_abandoned_multipart_uploads`] aborts it (issue #222).
+///
+/// S3 and R2 bill for the parts of an incomplete multipart upload until it is
+/// aborted, so a leak here is real money. The threshold is NOT tighter than
+/// this on purpose: an upload id that outlived its process is exactly what the
+/// executor's crash-resume path re-attaches to, and Driven keeps a persisted
+/// resumable session for up to 6 days (`executor.rs::SESSION_MAX_AGE_MS`). At 7
+/// days the sweep can never abort a session anything would still resume, which
+/// is the same window - and the same reasoning - `driven-localfs` uses for its
+/// abandoned temp files.
+const ABANDONED_UPLOAD_MIN_AGE_MS: i64 = 7 * 24 * 60 * 60 * 1000;
+
 /// Concurrent `HeadObject` requests when reading `app_properties` for a whole
 /// prefix (`list_source_object_ids`, `find_by_op_uuid`).
 const HEAD_CONCURRENCY: usize = 16;
@@ -168,12 +196,24 @@ pub struct S3Store {
     credentials: Credentials,
     /// Slash-terminated key prefix, or `""` for the bucket root.
     prefix: String,
+    /// Whether the endpoint is addressed path-style (`host/bucket/key`) rather
+    /// than virtual-host-style (`bucket.host/key`). Needed to build the
+    /// `x-amz-copy-source` header, which always names the bucket explicitly.
+    path_style: bool,
     /// Total-capped client for metadata / control requests.
     http: reqwest::Client,
     /// Idle-timeout-only client for body transfers.
     http_stream: reqwest::Client,
-    /// In-flight multipart uploads, keyed by upload id.
+    /// In-flight RESUMABLE uploads, keyed by upload id.
     uploads: Mutex<HashMap<String, MultipartState>>,
+    /// EVERY multipart upload id this process has open (resumable sessions,
+    /// streamed `multipart_stream` uploads, and multipart archive copies).
+    ///
+    /// The abandoned-upload sweep consults this so it can never abort an upload
+    /// this very process is in the middle of - the age threshold alone would be
+    /// enough in practice, but a store constructed while a long transfer runs
+    /// (a second account, a re-probe) must not be able to shoot it. Issue #222.
+    owned_uploads: Mutex<HashSet<String>>,
 }
 
 impl S3Store {
@@ -208,9 +248,11 @@ impl S3Store {
                 creds.secret_access_key.clone(),
             ),
             prefix: config.root_prefix().to_string(),
+            path_style: config.path_style,
             http: build_meta_client(ca, proxy)?,
             http_stream: build_stream_client(ca, proxy)?,
             uploads: Mutex::new(HashMap::new()),
+            owned_uploads: Mutex::new(HashSet::new()),
         })
     }
 
@@ -548,7 +590,18 @@ impl S3Store {
         let parsed = actions::CreateMultipartUpload::parse_response(&text).map_err(|e| {
             anyhow::anyhow!("s3.upload_failed: could not parse CreateMultipartUpload: {e}")
         })?;
-        Ok(parsed.upload_id().to_string())
+        let upload_id = parsed.upload_id().to_string();
+        // Claim the id for as long as this process is working on it, so the
+        // abandoned-upload sweep cannot abort an upload that is very much alive
+        // (issue #222).
+        self.owned_uploads.lock().insert(upload_id.clone());
+        Ok(upload_id)
+    }
+
+    /// Release an upload id this process no longer owns (it completed, or it
+    /// was aborted). Idempotent.
+    fn release_upload(&self, upload_id: &str) {
+        self.owned_uploads.lock().remove(upload_id);
     }
 
     /// Upload one part with its own `Content-MD5`, and verify the returned ETag
@@ -616,6 +669,10 @@ impl S3Store {
             .iter()
             .map(|p| format!("\"{}\"", hex::encode(p.md5)))
             .collect();
+        // Whatever the outcome below, this process stops owning the id: a
+        // completed upload no longer exists, and a failed completion is handled
+        // by the caller (abort, or a fresh session) rather than by us.
+        self.release_upload(upload_id);
         let action = actions::CompleteMultipartUpload::new(
             &self.bucket,
             Some(&self.credentials),
@@ -677,6 +734,25 @@ impl S3Store {
     /// Best-effort `AbortMultipartUpload`, so a failed upload never leaves parts
     /// accruing storage charges.
     async fn abort_multipart(&self, key: &str, upload_id: &str) {
+        self.release_upload(upload_id);
+        if let Err(err) = self.abort_multipart_strict(key, upload_id).await {
+            tracing::warn!(
+                target: crate::TARGET,
+                %err,
+                "failed to abort a multipart upload; its parts may linger until the next startup sweep or a bucket lifecycle rule reaps them"
+            );
+        }
+    }
+
+    /// `AbortMultipartUpload`, surfacing the failure instead of logging it.
+    ///
+    /// A gone upload id is SUCCESS: the desired state is "this upload holds no
+    /// parts", and an upload that never existed (or was already aborted) is
+    /// already there. That idempotence is what lets the sweep and the
+    /// abandon-session hook both fire at the same id without one of them
+    /// reporting a spurious failure.
+    async fn abort_multipart_strict(&self, key: &str, upload_id: &str) -> anyhow::Result<()> {
+        self.release_upload(upload_id);
         let action = actions::AbortMultipartUpload::new(
             &self.bucket,
             Some(&self.credentials),
@@ -684,15 +760,13 @@ impl S3Store {
             upload_id,
         );
         let url = action.sign(SIGN_EXPIRY);
-        if let Err(err) = self
+        match self
             .execute(&self.http, reqwest::Method::DELETE, url, &[], None)
             .await
         {
-            tracing::warn!(
-                target: crate::TARGET,
-                %err,
-                "failed to abort a multipart upload; its parts may linger until a bucket lifecycle rule reaps them"
-            );
+            Ok(_) => Ok(()),
+            Err(e) if is_not_found(&e) => Ok(()),
+            Err(e) => Err(e),
         }
     }
 
@@ -765,6 +839,347 @@ impl S3Store {
             }
         }
     }
+
+    // -- server-side copy (issue #220 version store) -------------------------
+
+    /// The `x-amz-copy-source` header value naming `src_key` in this bucket.
+    ///
+    /// S3 wants `/<bucket>/<url-encoded key>` regardless of how the endpoint is
+    /// addressed, so the encoding is borrowed from `Bucket::object_url` (the
+    /// same encoder every other request path uses) and the bucket name is put
+    /// back on the front explicitly.
+    fn copy_source_header(&self, src_key: &str) -> anyhow::Result<String> {
+        let url = self
+            .bucket
+            .object_url(src_key)
+            .map_err(|e| anyhow::anyhow!("s3.copy_failed: {src_key:?} is not a valid key: {e}"))?;
+        let path = url.path();
+        let name = self.bucket.name();
+        // Path-style urls already carry `/<bucket>` in front of the key; a
+        // virtual-host url does not.
+        let key_path = if self.path_style {
+            path.strip_prefix(&format!("/{name}")).unwrap_or(path)
+        } else {
+            path
+        };
+        Ok(format!("/{name}{key_path}"))
+    }
+
+    /// Server-side `CopyObject` of `src_key` onto `dest_key`, metadata and all.
+    ///
+    /// No bytes cross the wire: the whole point of archiving a superseded
+    /// version this way is that it costs one request rather than a download plus
+    /// an upload. The copied object keeps the source's user metadata (S3's
+    /// default `COPY` metadata directive), so the archive carries the same
+    /// `driven.*` identity stamp - which is what lets a later reader tell whose
+    /// version it is.
+    async fn copy_object(&self, src_key: &str, dest_key: &str) -> anyhow::Result<()> {
+        let copy_source = self.copy_source_header(src_key)?;
+        let headers = vec![("x-amz-copy-source".to_string(), copy_source)];
+        // `PutObject` signs exactly the request `CopyObject` is - a PUT at the
+        // destination key - and rusty-s3 has no `CopyObject` action of its own,
+        // so the copy-source header is what turns one into the other.
+        let mut action = actions::PutObject::new(&self.bucket, Some(&self.credentials), dest_key);
+        for (k, v) in &headers {
+            action.headers_mut().insert(k.clone(), v.clone());
+        }
+        let url = action.sign(SIGN_EXPIRY);
+        let resp = self
+            .execute(&self.http, reqwest::Method::PUT, url, &headers, None)
+            .await?;
+        // Like `CompleteMultipartUpload`, `CopyObject` can answer 200 with an
+        // error document in the body while the copy runs, so a 2xx alone is not
+        // proof of success.
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow::Error::new(DriveError::from_transport(e)))?;
+        if text.contains("<Error") {
+            return Err(anyhow::Error::new(s3_error_from_response(
+                200,
+                text.as_bytes(),
+                None,
+            )));
+        }
+        Ok(())
+    }
+
+    /// Copy an object too large for a single `CopyObject` (over 5 GiB), by
+    /// ranged `UploadPartCopy` requests into a fresh multipart upload.
+    ///
+    /// Still server-side: each part names a byte range of the source and the
+    /// bytes never reach this process.
+    async fn multipart_copy(
+        &self,
+        src_key: &str,
+        dest_key: &str,
+        size: u64,
+        mime: &str,
+        props: &HashMap<String, String>,
+    ) -> anyhow::Result<()> {
+        let copy_source = self.copy_source_header(src_key)?;
+        let upload_id = self.create_multipart(dest_key, mime, props).await?;
+        let result = async {
+            let mut parts: Vec<String> = Vec::new();
+            let mut offset: u64 = 0;
+            let mut number: u16 = 1;
+            while offset < size {
+                let end = (offset + COPY_PART_SIZE).min(size) - 1;
+                let etag = self
+                    .upload_part_copy(dest_key, &upload_id, number, &copy_source, offset, end)
+                    .await?;
+                parts.push(etag);
+                offset = end + 1;
+                number += 1;
+            }
+            self.complete_copied_parts(dest_key, &upload_id, &parts)
+                .await
+        }
+        .await;
+        if result.is_err() {
+            self.abort_multipart(dest_key, &upload_id).await;
+        }
+        result
+    }
+
+    /// One `UploadPartCopy`: a ranged server-side copy into part `number` of
+    /// `upload_id`. Returns the part's ETag as the server reported it.
+    async fn upload_part_copy(
+        &self,
+        dest_key: &str,
+        upload_id: &str,
+        number: u16,
+        copy_source: &str,
+        start: u64,
+        end_inclusive: u64,
+    ) -> anyhow::Result<String> {
+        let headers = vec![
+            ("x-amz-copy-source".to_string(), copy_source.to_string()),
+            (
+                "x-amz-copy-source-range".to_string(),
+                format!("bytes={start}-{end_inclusive}"),
+            ),
+        ];
+        // `UploadPart` signs the same URL `UploadPartCopy` uses
+        // (`PUT <key>?partNumber=N&uploadId=X`); the two copy headers are the
+        // only difference.
+        let mut action = actions::UploadPart::new(
+            &self.bucket,
+            Some(&self.credentials),
+            dest_key,
+            number,
+            upload_id,
+        );
+        for (k, v) in &headers {
+            action.headers_mut().insert(k.clone(), v.clone());
+        }
+        let url = action.sign(SIGN_EXPIRY);
+        let resp = self
+            .execute(&self.http, reqwest::Method::PUT, url, &headers, None)
+            .await?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow::Error::new(DriveError::from_transport(e)))?;
+        if text.contains("<Error") {
+            return Err(anyhow::Error::new(s3_error_from_response(
+                200,
+                text.as_bytes(),
+                None,
+            )));
+        }
+        extract_tag(&text, "ETag").ok_or_else(|| {
+            anyhow::anyhow!("s3.copy_failed: UploadPartCopy response carried no ETag")
+        })
+    }
+
+    /// Complete a multipart upload whose parts came from `UploadPartCopy`.
+    ///
+    /// Unlike [`Self::complete_multipart`] there is no composed-ETag check to
+    /// make: the part digests are the SERVER's (this process never saw the
+    /// bytes), so re-deriving the composition from them would only prove the
+    /// server agrees with itself. The caller verifies the archive by size
+    /// instead, against the source object's own recorded size.
+    async fn complete_copied_parts(
+        &self,
+        dest_key: &str,
+        upload_id: &str,
+        etags: &[String],
+    ) -> anyhow::Result<()> {
+        self.release_upload(upload_id);
+        let action = actions::CompleteMultipartUpload::new(
+            &self.bucket,
+            Some(&self.credentials),
+            dest_key,
+            upload_id,
+            etags.iter().map(String::as_str),
+        );
+        let url = action.sign(SIGN_EXPIRY);
+        let body = action.body();
+        let headers = vec![("content-type".to_string(), "application/xml".to_string())];
+        let resp = self
+            .execute(
+                &self.http,
+                reqwest::Method::POST,
+                url,
+                &headers,
+                Some(Bytes::from(body)),
+            )
+            .await?;
+        let text = resp
+            .text()
+            .await
+            .map_err(|e| anyhow::Error::new(DriveError::from_transport(e)))?;
+        if text.contains("<Error") {
+            return Err(anyhow::Error::new(s3_error_from_response(
+                200,
+                text.as_bytes(),
+                None,
+            )));
+        }
+        Ok(())
+    }
+
+    // -- abandoned multipart uploads (issue #222) ----------------------------
+
+    /// Aborts every multipart upload under this store's prefix that no live
+    /// session can still be using.
+    ///
+    /// ## Why this exists
+    ///
+    /// S3 and R2 bill for the parts of an incomplete multipart upload until it
+    /// is aborted or a bucket lifecycle rule expires it. Driven's streaming
+    /// upload path opens a fresh `CreateMultipartUpload` per attempt, so before
+    /// this sweep (and the abandon-on-restart hook that feeds it) a run of
+    /// failed attempts left one billed, invisible upload behind each time -
+    /// invisible because `ListObjectsV2` does not show them. `driven-localfs`
+    /// has always swept its equivalent (abandoned temp files) at construction;
+    /// this is the S3 half of that symmetry.
+    ///
+    /// ## What it will not touch
+    ///
+    /// Three guards, all of them load-bearing, because an over-eager abort
+    /// destroys a transfer in progress:
+    ///
+    /// 1. **Prefix.** Only uploads whose key is under this store's configured
+    ///    root prefix. A bucket Driven shares with another application (or with
+    ///    a second Driven destination) keeps its own uploads.
+    /// 2. **Ownership.** Never an upload id THIS process opened - see
+    ///    [`S3Store::owned_uploads`].
+    /// 3. **Age.** Never an upload younger than [`ABANDONED_UPLOAD_MIN_AGE_MS`],
+    ///    which is deliberately longer than the 6 days Driven will keep trying
+    ///    to resume a persisted session for. An upload older than that can no
+    ///    longer be resumed by anything, so aborting it cannot lose work.
+    ///
+    /// Returns how many uploads were aborted. Errors from an individual abort
+    /// are logged and skipped (the next sweep retries); an error ENUMERATING is
+    /// returned, because a partial listing would understate the leak.
+    pub async fn sweep_abandoned_multipart_uploads(&self) -> anyhow::Result<usize> {
+        let now = now_ms();
+        let uploads = self.list_multipart_uploads().await?;
+        let mut aborted = 0usize;
+        for upload in uploads {
+            let owned = self.owned_uploads.lock().contains(&upload.upload_id);
+            if !is_sweepable(&upload, &self.prefix, owned, now) {
+                continue;
+            }
+            match self
+                .abort_multipart_strict(&upload.key, &upload.upload_id)
+                .await
+            {
+                Ok(()) => aborted += 1,
+                Err(err) => tracing::warn!(
+                    target: crate::TARGET,
+                    key = %upload.key,
+                    %err,
+                    "could not abort an abandoned multipart upload; a later sweep will retry"
+                ),
+            }
+        }
+        if aborted > 0 {
+            tracing::info!(
+                target: crate::TARGET,
+                aborted,
+                "aborted abandoned multipart uploads that were still holding parts"
+            );
+        }
+        Ok(aborted)
+    }
+
+    /// Page through `ListMultipartUploads` for the whole bucket.
+    ///
+    /// Bucket-wide rather than prefix-scoped: the `prefix` parameter is
+    /// applied by the caller instead, so an upload whose key sits just outside
+    /// the configured prefix still shows up in the listing and is then visibly
+    /// skipped, rather than being silently invisible to the sweep.
+    async fn list_multipart_uploads(&self) -> anyhow::Result<Vec<InFlightUpload>> {
+        let mut out = Vec::new();
+        let mut key_marker: Option<String> = None;
+        let mut upload_marker: Option<String> = None;
+        loop {
+            // rusty-s3 models no `ListMultipartUploads` action. `GetObject`
+            // against the EMPTY object name signs exactly the request this needs
+            // - a GET on the bucket url - and the `uploads` subresource in the
+            // query is what selects the multipart listing.
+            let mut action = actions::GetObject::new(&self.bucket, Some(&self.credentials), "");
+            action.query_mut().insert("uploads", "");
+            action
+                .query_mut()
+                .insert("max-uploads", UPLOAD_LIST_PAGE_SIZE.to_string());
+            if let Some(k) = key_marker.clone() {
+                action.query_mut().insert("key-marker", k);
+            }
+            if let Some(u) = upload_marker.clone() {
+                action.query_mut().insert("upload-id-marker", u);
+            }
+            let url = action.sign(SIGN_EXPIRY);
+            let resp = self
+                .execute_retrying(&self.http, reqwest::Method::GET, url, Vec::new())
+                .await?;
+            let text = resp
+                .text()
+                .await
+                .map_err(|e| anyhow::Error::new(DriveError::from_transport(e)))?;
+            let page = parse_multipart_uploads(&text);
+            out.extend(page.uploads);
+            if !page.truncated {
+                return Ok(out);
+            }
+            // A truncated page with no markers would loop forever; treat it as
+            // the end and report what was collected.
+            match (page.next_key_marker, page.next_upload_id_marker) {
+                (Some(k), Some(u)) => {
+                    key_marker = Some(k);
+                    upload_marker = Some(u);
+                }
+                _ => return Ok(out),
+            }
+        }
+    }
+}
+
+/// One multipart upload as `ListMultipartUploads` reports it.
+#[derive(Debug, Clone, PartialEq, Eq)]
+struct InFlightUpload {
+    key: String,
+    upload_id: String,
+    /// When the upload was initiated, Unix epoch ms, or `None` when the server
+    /// reported no parseable `Initiated` timestamp.
+    ///
+    /// `None` means the sweep SKIPS it. An undateable upload could be seconds
+    /// old, and the cost of guessing wrong in that direction is a destroyed
+    /// transfer, against a leak that stays visible and can be reaped by a bucket
+    /// lifecycle rule.
+    initiated_ms: Option<i64>,
+}
+
+/// The parsed shape of one `ListMultipartUploads` page.
+#[derive(Debug, Default)]
+struct MultipartUploadPage {
+    uploads: Vec<InFlightUpload>,
+    truncated: bool,
+    next_key_marker: Option<String>,
+    next_upload_id_marker: Option<String>,
 }
 
 // -- helpers -----------------------------------------------------------------
@@ -844,6 +1259,110 @@ fn xml_unescape(s: &str) -> String {
         .replace("&amp;", "&")
 }
 
+/// Whether the sweep may abort `upload` (issue #222).
+///
+/// Split out from [`S3Store::sweep_abandoned_multipart_uploads`] because getting
+/// it wrong destroys a transfer in progress, and that deserves a test that needs
+/// no server. All three guards must pass:
+///
+/// 1. **Prefix** - the key is under this store's configured root. A bucket
+///    shared with another application (or a second Driven destination) keeps its
+///    own uploads.
+/// 2. **Ownership** - not an upload id THIS process opened.
+/// 3. **Age** - older than [`ABANDONED_UPLOAD_MIN_AGE_MS`], which is longer than
+///    the 6 days Driven will keep trying to resume a persisted session for, so
+///    an upload past it can no longer be resumed by anything. An upload the
+///    server did not date is skipped: it could be seconds old, and guessing
+///    wrong in that direction costs a live transfer.
+fn is_sweepable(upload: &InFlightUpload, prefix: &str, owned: bool, now_ms: i64) -> bool {
+    if !upload.key.starts_with(prefix) || owned {
+        return false;
+    }
+    match upload.initiated_ms {
+        Some(initiated) => now_ms.saturating_sub(initiated) >= ABANDONED_UPLOAD_MIN_AGE_MS,
+        None => false,
+    }
+}
+
+/// Parse a `ListMultipartUploads` response.
+///
+/// Hand-rolled for the same reason [`extract_tag`] is: rusty-s3 models no
+/// `ListMultipartUploads` action, and pulling an XML parser in to read three
+/// fields out of one response would not make it more correct. Every field is
+/// XML-unescaped through the shared helper, so an upload id containing `&` (S3
+/// upload ids are opaque base64-ish blobs and legitimately can) round-trips
+/// rather than being truncated into an id the abort would miss.
+fn parse_multipart_uploads(xml: &str) -> MultipartUploadPage {
+    let mut page = MultipartUploadPage {
+        truncated: extract_tag(xml, "IsTruncated").as_deref() == Some("true"),
+        next_key_marker: extract_tag(xml, "NextKeyMarker").filter(|s| !s.is_empty()),
+        next_upload_id_marker: extract_tag(xml, "NextUploadIdMarker").filter(|s| !s.is_empty()),
+        ..MultipartUploadPage::default()
+    };
+    let mut rest = xml;
+    while let Some(start) = rest.find("<Upload>") {
+        let after = &rest[start + "<Upload>".len()..];
+        let Some(end) = after.find("</Upload>") else {
+            break;
+        };
+        let block = &after[..end];
+        rest = &after[end..];
+        let (Some(key), Some(upload_id)) =
+            (extract_tag(block, "Key"), extract_tag(block, "UploadId"))
+        else {
+            continue;
+        };
+        if key.is_empty() || upload_id.is_empty() {
+            continue;
+        }
+        page.uploads.push(InFlightUpload {
+            key,
+            upload_id,
+            initiated_ms: extract_tag(block, "Initiated")
+                .as_deref()
+                .and_then(parse_iso8601_ms),
+        });
+    }
+    page
+}
+
+/// Parse an ISO 8601 UTC instant (`2010-11-10T20:48:33.000Z`) into epoch ms.
+///
+/// Only the shape S3 emits is accepted; anything else yields `None`, which the
+/// sweep reads as "do not touch this upload".
+fn parse_iso8601_ms(s: &str) -> Option<i64> {
+    let s = s.trim();
+    let (date, rest) = s.split_once('T')?;
+    let mut d = date.split('-');
+    let year: i64 = d.next()?.parse().ok()?;
+    let month: i64 = d.next()?.parse().ok()?;
+    let day: i64 = d.next()?.parse().ok()?;
+    if !(1..=12).contains(&month) || !(1..=31).contains(&day) {
+        return None;
+    }
+    // Trim the zone marker and any fractional seconds; S3 always reports UTC.
+    let time = rest.trim_end_matches('Z');
+    let time = time.split_once('.').map_or(time, |(hms, _)| hms);
+    let mut t = time.split(':');
+    let hour: i64 = t.next()?.parse().ok()?;
+    let min: i64 = t.next()?.parse().ok()?;
+    let sec: i64 = t.next()?.parse().ok()?;
+    Some((days_from_civil(year, month, day) * 86_400 + hour * 3_600 + min * 60 + sec) * 1_000)
+}
+
+/// Days since the Unix epoch for a proleptic-Gregorian date (Howard Hinnant's
+/// `days_from_civil`). Exact for the whole calendar, and shared by the two date
+/// parsers so they cannot drift apart.
+fn days_from_civil(year: i64, month: i64, day: i64) -> i64 {
+    let y = if month <= 2 { year - 1 } else { year };
+    let era = if y >= 0 { y } else { y - 399 } / 400;
+    let yoe = y - era * 400;
+    let mp = (month + 9) % 12;
+    let doy = (153 * mp + 2) / 5 + day - 1;
+    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
+    era * 146_097 + doe - 719_468
+}
+
 /// Parse an RFC 1123 HTTP date into Unix epoch ms.
 ///
 /// Hand-rolled rather than pulling a date crate for one header: the format is
@@ -867,17 +1386,7 @@ fn parse_http_date_ms(s: &str) -> Option<i64> {
     let min: i64 = hms.next()?.parse().ok()?;
     let sec: i64 = hms.next()?.parse().ok()?;
 
-    // Days since the Unix epoch, via the civil-from-days algorithm (Howard
-    // Hinnant's `days_from_civil`), which is exact for the whole proleptic
-    // Gregorian calendar.
-    let y = if month <= 2 { year - 1 } else { year };
-    let era = if y >= 0 { y } else { y - 399 } / 400;
-    let yoe = y - era * 400;
-    let mp = (month + 9) % 12;
-    let doy = (153 * mp + 2) / 5 + day - 1;
-    let doe = yoe * 365 + yoe / 4 - yoe / 100 + doy;
-    let days = era * 146_097 + doe - 719_468;
-    Some((days * 86_400 + hour * 3_600 + min * 60 + sec) * 1_000)
+    Some((days_from_civil(year, month, day) * 86_400 + hour * 3_600 + min * 60 + sec) * 1_000)
 }
 
 /// Encode a multipart handle into the opaque [`ResumableSession::url`] string.
@@ -961,6 +1470,12 @@ impl RemoteStore for S3Store {
         let mut out = Vec::new();
         self.list_pages(&prefix, Some("/"), |page| {
             for cp in &page.common_prefixes {
+                // Driven's own version store is not a folder the user picks a
+                // backup destination inside; it is internal bookkeeping that
+                // happens to live in their bucket.
+                if keys::is_version_key(&self.prefix, &cp.prefix) {
+                    continue;
+                }
                 out.push(RemoteEntry {
                     name: keys::base_name(&cp.prefix).to_string(),
                     parents: vec![prefix.clone()],
@@ -1086,6 +1601,91 @@ impl RemoteStore for S3Store {
         })
     }
 
+    /// Aborts the multipart upload behind an abandoned session (issue #222).
+    ///
+    /// Without this, every abandoned attempt left its parts on the bucket -
+    /// billed, invisible to `ListObjectsV2`, and never collected. The executor
+    /// calls it at the two points a session becomes unreachable (a fresh
+    /// session replacing a persisted one, and a discarded invalid session), so
+    /// the common case never reaches
+    /// [`S3Store::sweep_abandoned_multipart_uploads`] at all.
+    ///
+    /// A session issued by another backend, or one whose upload is already gone,
+    /// is not an error: the desired end state is "these parts are not being
+    /// billed for", and both already satisfy it.
+    async fn abandon_resumable_session(&self, session: &ResumableSession) -> anyhow::Result<()> {
+        let (key, upload_id) = match decode_session_url(&session.url) {
+            Ok(pair) => pair,
+            // Not ours to abort. Never an error: the executor hands us whatever
+            // it had persisted, and a session minted by a different backend
+            // simply has nothing for this store to release.
+            Err(_) => return Ok(()),
+        };
+        self.uploads.lock().remove(&upload_id);
+        self.abort_multipart_strict(&key, &upload_id).await
+    }
+
+    /// Copies the object at `file_id` into Driven's version store so a
+    /// subsequent write to that key cannot destroy it (issue #220).
+    ///
+    /// The copy is SERVER-SIDE (`CopyObject`, or ranged `UploadPartCopy` above
+    /// S3's 5 GiB single-copy ceiling): no bytes travel through this process, so
+    /// retaining a version costs one request rather than a download plus an
+    /// upload.
+    ///
+    /// The destination key is a pure function of `(file_id, content_token)`, and
+    /// an archive that already exists is returned WITHOUT re-copying. Both
+    /// halves are load-bearing for crash safety: an op that dies between the
+    /// archive and its commit is replayed against the same token, by which time
+    /// the live key may already hold the NEW bytes - so a blind re-copy would
+    /// overwrite a correct archive with the very content it exists to preserve.
+    async fn archive_version(
+        &self,
+        file_id: &str,
+        content_token: &str,
+    ) -> anyhow::Result<Option<String>> {
+        let dest = keys::version_key(&self.prefix, file_id, content_token);
+        // An archive that EXISTS is a whole archive, so its mere presence is
+        // enough to reuse it without re-verifying the size. Neither copy path can
+        // publish a partial object: a single `CopyObject` is atomic, and a
+        // multipart copy materializes the object only at
+        // `CompleteMultipartUpload` (and aborts its upload on any failure before
+        // that). The size check further down covers the copy this call performs.
+        if self.head(&dest).await.is_ok() {
+            tracing::debug!(
+                target: crate::TARGET,
+                key = %dest,
+                "version already archived; reusing it rather than re-copying"
+            );
+            return Ok(Some(dest));
+        }
+        // HEAD the source rather than trusting a caller-supplied size: the copy
+        // strategy turns on it, and a 404 here is the honest "there is nothing to
+        // preserve" answer rather than an empty archive.
+        let src = self.head(file_id).await?;
+        let size = src.size.unwrap_or(0);
+        if size > MAX_SINGLE_COPY {
+            self.multipart_copy(file_id, &dest, size, &src.mime_type, &src.app_properties)
+                .await?;
+        } else {
+            self.copy_object(file_id, &dest).await?;
+        }
+        // Prove the archive is a whole copy before anyone records a version row
+        // pointing at it. A short archive would be a silently truncated
+        // "previous version", which is the failure this whole feature exists to
+        // prevent.
+        let archived = self.head(&dest).await?;
+        match archived.size {
+            Some(actual) if actual == size => Ok(Some(dest)),
+            other => {
+                let _ = self.delete_key(&dest).await;
+                Err(anyhow::anyhow!(
+                    "s3.copy_failed: archived version of {file_id:?} is {other:?} bytes, expected {size}"
+                ))
+            }
+        }
+    }
+
     /// Buffer wire chunks into S3-legal parts and flush them.
     ///
     /// ## The rewind
@@ -1179,7 +1779,29 @@ impl RemoteStore for S3Store {
     /// [`Self::delete_permanent`]. Users who want recoverable deletes enable
     /// bucket versioning, a server-side setting Driven does not manage. A
     /// missing key is success (idempotent).
+    ///
+    /// ## The one exception: Driven's own version store
+    ///
+    /// An object under [`keys::VERSIONS_SEGMENT`] is a retained version that
+    /// [`Self::archive_version`] put there, and trashing it is a NO-OP.
+    ///
+    /// This is not a special case bolted on; it is what makes the executor's
+    /// Drive-shaped flow correct here. After a versioned change the executor
+    /// "trashes" the superseded object, meaning "move it out of the live tree
+    /// but keep it restorable" - which is exactly what Drive's trash does, and
+    /// exactly what the archive copy ALREADY did. Deleting it instead would
+    /// destroy the version the same cycle just recorded. Every path that really
+    /// must free an archived version's storage (the count-cap prune) goes
+    /// through [`Self::delete_permanent`], which still hard-deletes it.
     async fn trash(&self, file_id: &str) -> anyhow::Result<()> {
+        if keys::is_version_key(&self.prefix, file_id) {
+            tracing::debug!(
+                target: crate::TARGET,
+                key = %file_id,
+                "trash of an archived version is a no-op; it already lives in the version store"
+            );
+            return Ok(());
+        }
         self.delete_key(file_id).await
     }
 
@@ -1281,6 +1903,15 @@ impl RemoteStore for S3Store {
     /// The caller heals `recorded - live`, so a truncated result would read as a
     /// mass deletion. Every page failure and every HEAD failure propagates as
     /// `Err`; this never returns a partial set.
+    ///
+    /// ## Archived versions are deliberately absent
+    ///
+    /// The set answers "does this recorded object still exist", and the recorded
+    /// population is `file_state` + bundles - never a `file_versions` row. An
+    /// archived version is therefore not something any caller looks up here, and
+    /// including it would cost one extra `HeadObject` per retained version on
+    /// every audit and every scrub. That mirrors Drive, where a superseded
+    /// version sits in the trash and this listing excludes trashed objects.
     async fn list_source_object_ids(
         &self,
         source_id: &str,
@@ -1290,9 +1921,13 @@ impl RemoteStore for S3Store {
         self.list_pages(&self.prefix, None, |page| {
             for obj in &page.contents {
                 // Skip any zero-byte directory marker another tool left behind.
-                if !obj.key.ends_with('/') {
-                    all_keys.push(obj.key.clone());
+                if obj.key.ends_with('/') {
+                    continue;
                 }
+                if keys::is_version_key(&self.prefix, &obj.key) {
+                    continue;
+                }
+                all_keys.push(obj.key.clone());
             }
         })
         .await?;
@@ -1633,6 +2268,216 @@ mod tests {
             Some(1_456_704_000_000)
         );
         assert_eq!(parse_http_date_ms("nonsense"), None);
+    }
+
+    #[test]
+    fn iso8601_instants_parse_to_epoch_ms() {
+        assert_eq!(parse_iso8601_ms("1970-01-01T00:00:00.000Z"), Some(0));
+        assert_eq!(
+            parse_iso8601_ms("2010-11-10T20:48:33.000Z"),
+            Some(1_289_422_113_000)
+        );
+        // No fractional part, and a leap day, are both shapes S3 emits.
+        assert_eq!(
+            parse_iso8601_ms("2016-02-29T00:00:00Z"),
+            Some(1_456_704_000_000)
+        );
+        // Anything unrecognised is None, which makes the sweep SKIP the upload
+        // rather than guess it is old enough to abort.
+        assert_eq!(parse_iso8601_ms("yesterday"), None);
+        assert_eq!(parse_iso8601_ms("2010-11-10"), None);
+        assert_eq!(parse_iso8601_ms("2010-13-10T00:00:00Z"), None);
+    }
+
+    #[test]
+    fn multipart_upload_listings_parse_keys_ids_and_ages() {
+        let xml = r#"<?xml version="1.0" encoding="UTF-8"?>
+<ListMultipartUploadsResult>
+  <Bucket>bkt</Bucket>
+  <NextKeyMarker>root/b.bin</NextKeyMarker>
+  <NextUploadIdMarker>u2&amp;plus</NextUploadIdMarker>
+  <IsTruncated>true</IsTruncated>
+  <Upload>
+    <Key>root/a.bin</Key>
+    <UploadId>u1</UploadId>
+    <Initiator><ID>x</ID></Initiator>
+    <Initiated>2026-01-02T03:04:05.000Z</Initiated>
+  </Upload>
+  <Upload>
+    <Key>root/b.bin</Key>
+    <UploadId>u2&amp;plus</UploadId>
+    <Initiated>2026-01-03T00:00:00.000Z</Initiated>
+  </Upload>
+</ListMultipartUploadsResult>"#;
+        let page = parse_multipart_uploads(xml);
+        assert!(page.truncated);
+        assert_eq!(page.next_key_marker.as_deref(), Some("root/b.bin"));
+        assert_eq!(page.next_upload_id_marker.as_deref(), Some("u2&plus"));
+        assert_eq!(page.uploads.len(), 2);
+        assert_eq!(page.uploads[0].key, "root/a.bin");
+        assert_eq!(page.uploads[0].upload_id, "u1");
+        assert_eq!(
+            page.uploads[0].initiated_ms,
+            parse_iso8601_ms("2026-01-02T03:04:05.000Z")
+        );
+        // `<Initiator>` must not be mistaken for `<Initiated>`, and an escaped
+        // upload id must come back whole - an id truncated at the `&` would name
+        // an upload the abort could never find.
+        assert_eq!(page.uploads[1].upload_id, "u2&plus");
+    }
+
+    #[test]
+    fn the_sweep_only_touches_an_upload_that_is_ours_unowned_and_long_dead() {
+        let now = 30 * 24 * 60 * 60 * 1000; // day 30
+        let long_ago = now - ABANDONED_UPLOAD_MIN_AGE_MS - 1;
+        let upload = |key: &str, initiated: Option<i64>| InFlightUpload {
+            key: key.to_string(),
+            upload_id: "u1".to_string(),
+            initiated_ms: initiated,
+        };
+
+        // The only case that gets aborted: under our prefix, not ours, ancient.
+        assert!(is_sweepable(
+            &upload("root/a.bin", Some(long_ago)),
+            "root/",
+            false,
+            now
+        ));
+
+        // Someone else's bucket space, even if it is ancient. Driven shares
+        // buckets with other tools and with other Driven destinations.
+        assert!(!is_sweepable(
+            &upload("other/a.bin", Some(long_ago)),
+            "root/",
+            false,
+            now
+        ));
+        // An upload THIS process is in the middle of.
+        assert!(!is_sweepable(
+            &upload("root/a.bin", Some(long_ago)),
+            "root/",
+            true,
+            now
+        ));
+        // Young enough that the executor could still resume it: the persisted
+        // session window is 6 days and this threshold is 7, so anything inside
+        // it is off limits.
+        assert!(!is_sweepable(
+            &upload("root/a.bin", Some(now - 1000)),
+            "root/",
+            false,
+            now
+        ));
+        assert!(!is_sweepable(
+            &upload("root/a.bin", Some(now - ABANDONED_UPLOAD_MIN_AGE_MS + 1)),
+            "root/",
+            false,
+            now
+        ));
+        // Undateable: could be seconds old, so never touched. A leak that stays
+        // visible beats a destroyed transfer.
+        assert!(!is_sweepable(
+            &upload("root/a.bin", None),
+            "root/",
+            false,
+            now
+        ));
+
+        // At the bucket root the empty prefix matches everything Driven owns -
+        // which is the whole bucket, by configuration.
+        assert!(is_sweepable(
+            &upload("a.bin", Some(long_ago)),
+            "",
+            false,
+            now
+        ));
+    }
+
+    #[test]
+    fn an_upload_listing_with_no_uploads_is_a_complete_empty_answer() {
+        let xml = "<ListMultipartUploadsResult><Bucket>bkt</Bucket>\
+                   <IsTruncated>false</IsTruncated></ListMultipartUploadsResult>";
+        let page = parse_multipart_uploads(xml);
+        assert!(page.uploads.is_empty());
+        assert!(!page.truncated);
+        assert_eq!(page.next_key_marker, None);
+        // An upload the server dated with something unparseable is kept in the
+        // listing but carries no age, so the sweep leaves it alone.
+        let undated = parse_multipart_uploads(
+            "<R><Upload><Key>k</Key><UploadId>u</UploadId><Initiated>?</Initiated></Upload></R>",
+        );
+        assert_eq!(undated.uploads.len(), 1);
+        assert_eq!(undated.uploads[0].initiated_ms, None);
+    }
+
+    #[test]
+    fn a_copy_source_names_the_bucket_explicitly_in_both_addressing_styles() {
+        // `x-amz-copy-source` is always `/<bucket>/<encoded key>`, whichever way
+        // the endpoint is addressed - getting this wrong makes every archive
+        // copy 404 against one provider and work against the other.
+        let path_style = test_store(Some("root"));
+        assert_eq!(
+            path_style.copy_source_header("root/dir/a b.txt").unwrap(),
+            "/bkt/root/dir/a%20b.txt"
+        );
+
+        let cfg = S3Config {
+            endpoint: "https://s3.example.com".into(),
+            bucket: "bkt".into(),
+            region: "us-east-1".into(),
+            path_style: false,
+            prefix: Some("root".into()),
+        }
+        .normalized()
+        .unwrap();
+        let vhost = S3Store::new(
+            &cfg,
+            &S3Credentials {
+                access_key_id: "AKIAEXAMPLE".into(),
+                secret_access_key: "secret".into(),
+            },
+            &CustomCaConfig::none(),
+            &ProxyConfig::system(),
+        )
+        .unwrap();
+        assert_eq!(
+            vhost.copy_source_header("root/dir/a b.txt").unwrap(),
+            "/bkt/root/dir/a%20b.txt"
+        );
+    }
+
+    #[tokio::test]
+    async fn trashing_an_archived_version_is_a_no_op_rather_than_a_delete() {
+        // No HTTP mock is installed, so any request fails: reaching the
+        // assertion is itself the proof that no DeleteObject was issued. On S3
+        // `trash` is a permanent delete, so if the executor's Drive-shaped
+        // "trash the superseded object" step reached the wire here it would
+        // destroy the version it had just recorded (issue #220).
+        let store = test_store(Some("root"));
+        let archived = keys::version_key("root/", "root/docs/a.txt", "abc123");
+        store.trash(&archived).await.unwrap();
+        // A LIVE object still goes to the wire (and therefore fails here), which
+        // is what proves the no-op is scoped to the version store and has not
+        // quietly disabled deletion.
+        assert!(store.trash("root/docs/a.txt").await.is_err());
+    }
+
+    #[tokio::test]
+    async fn abandoning_a_session_from_another_backend_is_not_an_error() {
+        // The executor hands over whatever it persisted; a session minted by a
+        // different backend simply has nothing for this store to release, and
+        // turning that into an error would make an abandoned-session cleanup
+        // fail an otherwise healthy op.
+        let store = test_store(None);
+        let session = ResumableSession {
+            url: "https://drive.example/upload/1".into(),
+            issued_at: 0,
+            size: 1,
+            kind: ResumableKind::Update {
+                file_id: "x".into(),
+            },
+        };
+        store.abandon_resumable_session(&session).await.unwrap();
     }
 
     #[test]

@@ -79,6 +79,25 @@ pub const TMP_PREFIX: &str = ".driven-tmp-";
 /// See `crate::config::DestinationMarker`.
 pub const MARKER_FILE: &str = ".driven-destination.json";
 
+/// Directory at the destination ROOT holding Driven's own version store
+/// (issue #220).
+///
+/// A local destination derives an object's path from its name, so a versioned
+/// change would write the new content over the previous copy and the retained
+/// `file_versions` row would end up pointing at today's bytes.
+/// `LocalFsStore::archive_version` copies the superseded object in here first,
+/// under a content-addressed name, and the version row points THERE.
+///
+/// Reserved like every other control name: hidden from listings, escaped by
+/// [`encode`] so a user folder genuinely called `.driven-versions` cannot shadow
+/// it, and - because it is reserved - excluded from the remote-existence audit's
+/// live set, exactly as a Drive version sits in the trash rather than in the
+/// live tree. Part of the stored format: renaming it orphans every archived
+/// version an earlier build wrote. Deliberately the same name `driven-s3` uses
+/// for its version prefix, so the two destinations read the same to a user
+/// looking at them.
+pub const VERSIONS_DIR: &str = ".driven-versions";
+
 /// Prefix macOS gives an "AppleDouble" shadow file.
 ///
 /// Discovered the hard way while round-tripping against a real exFAT and a real
@@ -120,6 +139,7 @@ pub fn is_reserved_control_name(name: &str) -> bool {
     let lower = name.to_ascii_lowercase();
     lower == META_DIR
         || lower == MARKER_FILE
+        || lower == VERSIONS_DIR
         || lower.starts_with(TMP_PREFIX)
         || lower.starts_with(APPLEDOUBLE_PREFIX)
 }
@@ -386,7 +406,9 @@ mod tests {
         for raw in [
             META_DIR,
             MARKER_FILE,
+            VERSIONS_DIR,
             ".driven-tmp-abc",
+            ".DRIVEN-VERSIONS",
             ".DRIVEN-META",
             ".Driven-Tmp-9",
             // A user file whose name looks like a macOS AppleDouble shadow. If
@@ -404,6 +426,8 @@ mod tests {
         // And the control names themselves are recognised.
         assert!(is_reserved_control_name(META_DIR));
         assert!(is_reserved_control_name(MARKER_FILE));
+        assert!(is_reserved_control_name(VERSIONS_DIR));
+        assert!(is_reserved_control_name(".DRIVEN-VERSIONS"));
         assert!(is_reserved_control_name(".driven-tmp-1234"));
         assert!(
             is_reserved_control_name("._photo.jpg"),

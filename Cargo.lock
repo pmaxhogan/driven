@@ -1921,6 +1921,7 @@ dependencies = [
  "driven-test-fixtures",
  "driven-tls",
  "tempfile",
+ "tokio",
  "tracing",
 ]
 

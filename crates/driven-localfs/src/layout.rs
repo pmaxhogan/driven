@@ -142,6 +142,60 @@ pub fn is_control_entry(name: &str) -> bool {
     names::is_reserved_control_name(name)
 }
 
+/// Whether `id` names an object inside Driven's version store (issue #220).
+///
+/// Load-bearing beyond tidiness: on a plain filesystem `trash` is a permanent
+/// delete, so the executor's Drive-shaped "trash the superseded object" step
+/// would otherwise destroy the archived version it had just recorded.
+pub fn is_in_version_store(id: &str) -> bool {
+    id.split('/')
+        .next()
+        .is_some_and(|first| first.eq_ignore_ascii_case(names::VERSIONS_DIR))
+}
+
+/// The id an archived copy of `file_id` holding content `content_token` lives
+/// at, inside [`names::VERSIONS_DIR`].
+///
+/// The archive MIRRORS the live tree (`.driven-versions/<the object's own
+/// folders>/<stored>@<token>`), so a user browsing the destination can see which
+/// file an old copy belongs to instead of a directory of opaque digests.
+///
+/// DETERMINISTIC in `(file_id, content_token)`, which is what makes archiving
+/// idempotent: an op that crashes after the archive but before its commit is
+/// replayed against the same token and lands on the same path, so a replay can
+/// neither accumulate copies nor overwrite a correct archive.
+///
+/// The stored component stays inside the universal 255-byte filename limit
+/// because [`names::MAX_ENCODED_LEN`] (200) already bounds it and the suffix
+/// this adds is short - `const_assert` below pins that arithmetic, since the
+/// sidecar adds `.json` on top of it.
+pub fn version_id(file_id: &str, content_token: &str) -> String {
+    let dir = parent_of(file_id);
+    let stored = base_name(file_id);
+    let token: String = content_token
+        .chars()
+        .filter(|c| c.is_ascii_alphanumeric())
+        .take(VERSION_TOKEN_LEN)
+        .collect();
+    join_id(
+        &folder_prefix(&join_id(names::VERSIONS_DIR, &dir)),
+        &format!("{stored}@{token}"),
+    )
+}
+
+/// How many characters of a content token an archive name carries.
+///
+/// A prefix of a cryptographic digest, not the whole thing: 16 hex characters is
+/// 64 bits, which makes an accidental collision between two versions OF THE SAME
+/// FILE (the only place a collision could matter) not a thing that happens,
+/// while keeping the name readable and the component inside the length budget.
+const VERSION_TOKEN_LEN: usize = 16;
+
+// The archived name is `<stored>@<token>`, and its sidecar adds `.json`. Both
+// must fit the universal 255-byte component limit, or a long-named file could be
+// backed up successfully and then fail to have a version retained.
+const _: () = assert!(names::MAX_ENCODED_LEN + 1 + VERSION_TOKEN_LEN + 5 <= 255);
+
 /// The set of destination names currently being written, so a probe can see a
 /// claim that has not been committed to a sidecar yet.
 ///

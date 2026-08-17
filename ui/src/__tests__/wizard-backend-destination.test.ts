@@ -48,9 +48,9 @@ const globalMountOptions = { plugins: [i18n] };
 
 /** The descriptors the Rust factory reports. `google_drive` and `s3` both browse
  * (Drive lists folders, S3 lists key prefixes); `local_folder` does not - its
- * destination root is fixed when the account is created. Only Drive can keep
- * previous versions: the other two derive an object's key from the file name, so
- * a re-upload overwrites the previous copy (issue #220). */
+ * destination root is fixed when the account is created. All three can keep
+ * previous versions by archiving the superseded object aside before a re-upload
+ * overwrites the create key (issue #220). */
 const BACKENDS: BackendDto[] = [
   {
     id: "google_drive",
@@ -64,7 +64,7 @@ const BACKENDS: BackendDto[] = [
     id: "s3",
     usesOauth: false,
     supportsFolderPicker: true,
-    supportsVersionHistory: false,
+    supportsVersionHistory: true,
     supportsRename: false,
     isDefault: false,
   },
@@ -72,7 +72,7 @@ const BACKENDS: BackendDto[] = [
     id: "local_folder",
     usesOauth: false,
     supportsFolderPicker: false,
-    supportsVersionHistory: false,
+    supportsVersionHistory: true,
     supportsRename: false,
     isDefault: false,
   },

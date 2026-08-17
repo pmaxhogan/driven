@@ -67,10 +67,11 @@ function bigFolder(count: number): RemoteEntryDto[] {
 
 const FILE_COUNT = 5000;
 
-/** `list_backends()` as the Rust `descriptors()` reports it. Only Google Drive can
- * really keep previous versions: S3, the local folder and SFTP all derive an
- * object's key from the file name, so a re-upload overwrites the previous copy
- * (issue #220). */
+/** `list_backends()` as the Rust `descriptors()` reports it. Google Drive, S3 and
+ * the local folder all keep previous versions by archiving the superseded object
+ * aside before a re-upload overwrites the create key. SFTP cannot: it has no
+ * server-side copy, so archiving a version there would mean re-uploading the
+ * whole file over the same link (issue #220). */
 const RESTORE_BACKENDS = [
   {
     id: "google_drive",
@@ -83,14 +84,14 @@ const RESTORE_BACKENDS = [
     id: "s3",
     usesOauth: false,
     supportsFolderPicker: true,
-    supportsVersionHistory: false,
+    supportsVersionHistory: true,
     isDefault: false,
   },
   {
     id: "local_folder",
     usesOauth: false,
     supportsFolderPicker: false,
-    supportsVersionHistory: false,
+    supportsVersionHistory: true,
     isDefault: false,
   },
   {
@@ -116,7 +117,7 @@ function account(id: string, backendKind: string) {
 }
 
 const driveSource = source("s1", "Documents");
-const s3Source: SourceDto = { ...source("s2", "Photos"), accountId: "acct-2" };
+const sftpSource: SourceDto = { ...source("s2", "Photos"), accountId: "acct-2" };
 
 /** Re-point the default IPC fake at a single source whose destination is
  * `backendKind`, with the real descriptor table. */
@@ -229,13 +230,14 @@ describe("Restore virtualization + sticky action bar (UI #47)", () => {
   });
 
   it("does not offer a point-in-time restore on a destination that overwrites versions (issue #220)", async () => {
-    // The defect: on S3 / local-folder / SFTP destinations the create key is
-    // derived from the file name, so a changed file's re-upload overwrote the
-    // previous bytes. A "restore as of an earlier date" there returns the
-    // CURRENT content while reporting that it restored an older version - the
-    // worst failure a backup tool has. The backend now refuses such a restore
+    // The defect: on an SFTP destination the create key is derived from the
+    // file name and there is no server-side copy to archive a superseded
+    // object into, so a changed file's re-upload overwrote the previous
+    // bytes. A "restore as of an earlier date" there returns the CURRENT
+    // content while reporting that it restored an older version - the worst
+    // failure a backup tool has. The backend now refuses such a restore
     // fail-closed; the picker must not offer it in the first place.
-    for (const kind of ["s3", "local_folder", "sftp"]) {
+    for (const kind of ["sftp"]) {
       seedBackend(kind);
       const wrapper = mount(Restore, { global: { plugins: [i18n] } });
       await flushPromises();
@@ -253,6 +255,20 @@ describe("Restore virtualization + sticky action bar (UI #47)", () => {
     }
   });
 
+  it("offers a point-in-time restore on an S3 source (issue #220)", async () => {
+    // S3 now archives the superseded object into .driven-versions before a
+    // changed file is re-uploaded, so a point-in-time restore can honour it.
+    // A regression that re-hides the picker should fail here.
+    seedBackend("s3");
+    const wrapper = mount(Restore, { global: { plugins: [i18n] } });
+    await flushPromises();
+
+    expect(wrapper.find('[data-testid="restore-as-of"]').exists()).toBe(true);
+    expect(wrapper.find('[data-testid="restore-as-of-unsupported"]').exists()).toBe(false);
+
+    wrapper.unmount();
+  });
+
   it("clears an already-set as-of when switching to such a destination (issue #220)", async () => {
     // Hiding the picker is not enough: an instant set while browsing a Drive
     // source would stay applied to the next source, so the restore would silently
@@ -261,9 +277,9 @@ describe("Restore virtualization + sticky action bar (UI #47)", () => {
     invokeMock.mockImplementation((cmd: string) => {
       switch (cmd) {
         case "list_sources":
-          return Promise.resolve([driveSource, s3Source]);
+          return Promise.resolve([driveSource, sftpSource]);
         case "list_accounts":
-          return Promise.resolve([account("acct-1", "google_drive"), account("acct-2", "s3")]);
+          return Promise.resolve([account("acct-1", "google_drive"), account("acct-2", "sftp")]);
         case "list_backends":
           return Promise.resolve(RESTORE_BACKENDS);
         case "list_remote_tree":
@@ -282,7 +298,7 @@ describe("Restore virtualization + sticky action bar (UI #47)", () => {
     await flushPromises();
     expect(useRestoreStore().asOf).not.toBeNull();
 
-    // Switch to the S3 source: the picker goes away AND the instant is dropped.
+    // Switch to the SFTP source: the picker goes away AND the instant is dropped.
     const select = wrapper.get('[data-testid="restore-source"]');
     await select.setValue("s2");
     await flushPromises();

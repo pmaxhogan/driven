@@ -650,7 +650,149 @@ async fn run_suite(store: &S3Store, root: &str, label: &str) {
         "[{label}] a deleted object must not read back"
     );
 
-    // --- 9. usage accounting -------------------------------------------------
+    // --- 9. the version store (issue #220) ----------------------------------
+    // The whole point: a changed file's re-upload lands on the SAME key here,
+    // so the superseded bytes only survive if they were archived first. This
+    // proves the round trip against a real server - the server-side copy, the
+    // archive surviving the overwrite, its invisibility to the picker and the
+    // audit, the no-op trash, and the hard delete that finally frees it.
+    let v1 = payload(9_000, 91);
+    let versioned = store
+        .create(
+            root,
+            "versioned.bin",
+            "application/octet-stream",
+            UploadBody::Bytes(Bytes::from(v1.clone())),
+            props(&source_id, "op-v1"),
+        )
+        .await
+        .expect("create the first version");
+    let archived = store
+        .archive_version(&versioned.id, "token-v1")
+        .await
+        .expect("archive the first version")
+        .expect("[s3] a key-deterministic backend must archive rather than answer None");
+    assert!(
+        archived.starts_with(&format!("{root}.driven-versions/")),
+        "[{label}] an archived version belongs in the version store, got {archived:?}"
+    );
+    // Idempotent: the same content token must reuse the same archive, which is
+    // what stops a crashed-and-replayed op accumulating copies.
+    assert_eq!(
+        store
+            .archive_version(&versioned.id, "token-v1")
+            .await
+            .expect("re-archive")
+            .as_deref(),
+        Some(archived.as_str())
+    );
+
+    let v2 = payload(9_000, 92);
+    store
+        .update(
+            &versioned.id,
+            UploadBody::Bytes(Bytes::from(v2.clone())),
+            props(&source_id, "op-v2"),
+        )
+        .await
+        .expect("overwrite with the second version");
+    assert_eq!(
+        read_all(store, &versioned.id).await,
+        v2,
+        "[{label}] the live key must hold the CURRENT content"
+    );
+    assert_eq!(
+        read_all(store, &archived).await,
+        v1,
+        "[{label}] the archived version must still hold the PREVIOUS content - this is issue #220"
+    );
+
+    // Internal bookkeeping, not a destination the user browses or an object the
+    // remote-existence audit should try to heal.
+    let root_listing = store
+        .list_folder(root, &DriveContext::MyDrive)
+        .await
+        .expect("list the destination root");
+    assert!(
+        !root_listing
+            .iter()
+            .any(|e| e.name == driven_s3::VERSIONS_SEGMENT),
+        "[{label}] the version store must not appear in the folder picker"
+    );
+    let live = store
+        .list_source_object_ids(&source_id, &DriveContext::MyDrive)
+        .await
+        .expect("audit listing");
+    assert!(
+        live.contains(&versioned.id),
+        "[{label}] the live object must be in the audit's live set"
+    );
+    assert!(
+        !live.contains(&archived),
+        "[{label}] an archived version must not be in the audit's live set"
+    );
+
+    // `trash` means "move out of the live tree, keep it restorable"; the archive
+    // is already there, so trashing it must NOT delete it.
+    store.trash(&archived).await.expect("trash the archive");
+    assert_eq!(
+        read_all(store, &archived).await,
+        v1,
+        "[{label}] trashing an archived version must not destroy it"
+    );
+    // The count-cap prune uses delete_permanent, which still frees the storage.
+    store
+        .delete_permanent(&archived)
+        .await
+        .expect("prune the archive");
+    assert!(
+        store.metadata(&archived).await.is_err(),
+        "[{label}] delete_permanent must really remove an archived version"
+    );
+
+    // --- 10. abandoned multipart uploads (issue #222) ------------------------
+    // An abandoned session used to leave its parts on the bucket, billed and
+    // invisible to ListObjectsV2, one per failed attempt.
+    let session = store
+        .resumable_session(
+            ResumableKind::Create {
+                parent_id: root.to_string(),
+                name: "abandoned.bin".to_string(),
+                app_properties: props(&source_id, "op-abandoned"),
+            },
+            "application/octet-stream",
+            (PART_SIZE * 2) as u64,
+        )
+        .await
+        .expect("open a session to abandon");
+    let filler = payload(CORE_WIRE_CHUNK, 93);
+    store
+        .resume_chunk(&session, 0, Bytes::from(filler))
+        .await
+        .expect("push one chunk into the session");
+    store
+        .abandon_resumable_session(&session)
+        .await
+        .expect("abandon the session");
+    // Idempotent: abandoning an already-aborted session is the desired end
+    // state, not a failure.
+    store
+        .abandon_resumable_session(&session)
+        .await
+        .expect("abandon it twice");
+    // The sweep enumerates real in-flight uploads; with the abandon above having
+    // done its job there is nothing old enough (or at all) left to abort.
+    let aborted = store
+        .sweep_abandoned_multipart_uploads()
+        .await
+        .expect("the sweep must be able to enumerate multipart uploads");
+    assert_eq!(
+        aborted, 0,
+        "[{label}] the sweep must not abort anything: the abandoned upload is already gone \
+         and nothing else here is old enough"
+    );
+
+    // --- 11. usage accounting ------------------------------------------------
     let about = store.about().await.expect("about");
     assert_eq!(about.limit, None, "[{label}] an S3 bucket has no quota");
     assert!(

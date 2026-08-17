@@ -48,7 +48,7 @@ const S3_BACKEND = {
   id: "s3",
   usesOauth: false,
   supportsFolderPicker: true,
-  supportsVersionHistory: false,
+  supportsVersionHistory: true,
   isDefault: false,
 };
 // SFTP browses (readdir over SFTP, DESIGN "SSH (SFTP) backend" s2), so unlike

@@ -464,6 +464,118 @@ async fn trash_and_delete_are_permanent_and_idempotent() {
 }
 
 #[tokio::test]
+async fn an_archived_version_survives_the_overwrite_that_supersedes_it() {
+    // Issue #220. A local destination derives an object's path from its name, so
+    // the versioned re-upload lands on the SAME file - the retained version only
+    // means anything if the previous bytes were copied aside first.
+    for_each_destination("versions", |store, _root| async move {
+        let root = store.root_id().to_string();
+        let mut props = HashMap::new();
+        props.insert(
+            driven_remote::props::SOURCE_ID_KEY.to_string(),
+            "src-1".to_string(),
+        );
+        let live = store
+            .create(
+                &root,
+                "notes.txt",
+                "text/plain",
+                UploadBody::Bytes(Bytes::from_static(b"the first version")),
+                props.clone(),
+            )
+            .await
+            .expect("create the first version");
+
+        let archived = store
+            .archive_version(&live.id, "0123456789abcdef")
+            .await
+            .expect("archive")
+            .expect("a path-keyed backend must archive rather than answer None");
+        assert!(
+            archived.starts_with(".driven-versions/"),
+            "an archived version belongs in the version store, got {archived:?}"
+        );
+        // Idempotent: the same token must reuse the same archive, which is what
+        // stops a crashed-and-replayed op accumulating copies.
+        assert_eq!(
+            store
+                .archive_version(&live.id, "0123456789abcdef")
+                .await
+                .expect("re-archive"),
+            Some(archived.clone())
+        );
+
+        store
+            .update(
+                &live.id,
+                UploadBody::Bytes(Bytes::from_static(b"the second version")),
+                HashMap::new(),
+            )
+            .await
+            .expect("overwrite");
+        assert_eq!(
+            download_to_bytes(&store, &live.id).await,
+            b"the second version",
+            "the live path must hold the CURRENT content"
+        );
+        assert_eq!(
+            download_to_bytes(&store, &archived).await,
+            b"the first version",
+            "the archived version must still hold the PREVIOUS content - this is issue #220"
+        );
+
+        // The archive keeps the original's annotation, so a restore reads back a
+        // named object with a digest to verify rather than a nameless blob.
+        let meta = store.metadata(&archived).await.expect("archive metadata");
+        assert_eq!(meta.name, "notes.txt");
+        assert_eq!(meta.size, Some(b"the first version".len() as u64));
+        assert!(
+            meta.md5.is_some(),
+            "an archived version must carry a digest"
+        );
+
+        // Internal bookkeeping: not a folder the picker offers, and not an
+        // object the remote-existence audit should try to heal.
+        let listed = store
+            .list_folder(&root, &DriveContext::MyDrive)
+            .await
+            .expect("list the root");
+        assert!(
+            !listed.iter().any(|e| e.name.contains("driven-versions")),
+            "the version store must not appear in the picker: {listed:?}"
+        );
+        let audit = store
+            .list_source_object_ids("src-1", &DriveContext::MyDrive)
+            .await
+            .expect("audit");
+        assert!(audit.contains(&live.id));
+        assert!(
+            !audit.contains(&archived),
+            "an archived version must not be in the audit's live set"
+        );
+
+        // `trash` means "out of the live tree, still restorable"; the archive is
+        // already there, so it must survive. `delete_permanent` (the count-cap
+        // prune) must still free it.
+        store.trash(&archived).await.expect("trash the archive");
+        assert_eq!(
+            download_to_bytes(&store, &archived).await,
+            b"the first version",
+            "trashing an archived version must not destroy it"
+        );
+        store
+            .delete_permanent(&archived)
+            .await
+            .expect("prune the archive");
+        assert!(
+            store.metadata(&archived).await.is_err(),
+            "delete_permanent must really remove an archived version"
+        );
+    })
+    .await;
+}
+
+#[tokio::test]
 async fn find_by_op_uuid_adopts_the_orphan_a_crash_left_behind() {
     for_each_destination("find_by_op_uuid", |store, _root| async move {
         let root = store.root_id().to_string();
