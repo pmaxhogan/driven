@@ -24,6 +24,7 @@ const DRIVE: BackendDto = {
   usesOauth: true,
   supportsFolderPicker: true,
   supportsVersionHistory: true,
+  supportsRename: true,
   isDefault: true,
 };
 
@@ -35,6 +36,7 @@ const OTHER: BackendDto = {
   usesOauth: false,
   supportsFolderPicker: false,
   supportsVersionHistory: false,
+  supportsRename: false,
   isDefault: false,
 };
 

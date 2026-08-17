@@ -269,7 +269,24 @@
     },
     "destinationLabel": "Backing up to",
     "empty": "No subfolders here - this folder is the destination.",
-    "sharedDriveBadge": "Shared drive"
+    "noMatches": "No folders match your filter.",
+    "sharedDriveBadge": "Shared drive",
+    "filterPlaceholder": "Type to filter folders...",
+    "sortLabel": "Sort folders",
+    "sort": {
+      "nameAsc": "Name (A-Z)",
+      "nameDesc": "Name (Z-A)",
+      "modifiedAsc": "Modified (oldest)",
+      "modifiedDesc": "Modified (newest)"
+    },
+    "newFolderButton": "New folder",
+    "newFolderPlaceholder": "Folder name",
+    "confirmCreate": "Create folder",
+    "cancelCreate": "Cancel new folder",
+    "renameAction": "Rename {name}",
+    "confirmRename": "Save name",
+    "cancelRename": "Cancel rename",
+    "renameUnsupportedTooltip": "This destination cannot rename folders in place - renaming here would mean copying everything inside to a new location."
   },
   "versionRetention": {
     "default": "How long an older version stays recoverable depends on your destination.",
@@ -433,7 +450,8 @@
       "preview": {
         "included": "{count} files included",
         "excluded": "{count} files excluded",
-        "includedBytes": "{size} to back up"
+        "includedBytes": "{size} to back up",
+        "excludedBytes": "{size} would be freed"
       }
     },
     "exclusionPreview": {
@@ -449,7 +467,8 @@
       "excludeAction": "Exclude {path}",
       "expandAction": "Expand {name}",
       "collapseAction": "Collapse {name}",
-      "showMore": "Show {count} more"
+      "showMore": "Show {count} more",
+      "rollup": "{count} files · {size}"
     },
     "rules": {
       "sections": {
@@ -997,6 +1016,12 @@
       "root_not_writable": {
         "short": "Cannot write there",
         "long": "That folder exists on the server, but this account cannot write into it. Check the folder's permissions - a read-only export or a folder owned by another user will look fine until Driven tries to save a file."
+      }
+    },
+    "remote": {
+      "rename_unsupported": {
+        "short": "Cannot rename here",
+        "long": "This destination cannot rename folders in place."
       }
     }
   }

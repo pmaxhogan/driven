@@ -128,6 +128,9 @@ pub struct BackendDescriptor {
     /// file, so a point-in-time restore returns the older bytes rather than
     /// today's (`BackendKind::supports_version_history`; issue #220).
     pub supports_version_history: bool,
+    /// Whether the destination picker's inline rename affordance applies to
+    /// this backend's folder rows (`BackendKind::supports_rename`; issue #307).
+    pub supports_rename: bool,
 }
 
 /// Every destination this build can construct, in picker order. The first entry
@@ -142,6 +145,7 @@ pub fn descriptors() -> Vec<BackendDescriptor> {
             uses_oauth: kind.uses_oauth(),
             supports_folder_picker: kind.supports_folder_picker(),
             supports_version_history: kind.supports_version_history(),
+            supports_rename: kind.supports_rename(),
         })
         .collect()
 }
@@ -551,6 +555,7 @@ mod tests {
                 desc.supports_version_history,
                 kind.supports_version_history()
             );
+            assert_eq!(desc.supports_rename, kind.supports_rename());
         }
         assert_eq!(d[0].kind, BackendKind::default());
     }

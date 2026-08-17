@@ -122,6 +122,33 @@ impl BackendKind {
         }
     }
 
+    /// Whether this backend's destination picker can offer an inline RENAME
+    /// on a folder row (issue #307). Mirrors
+    /// [`crate::RemoteStore::rename_folder`]'s implementations one-for-one -
+    /// this is the flag the picker UI reads to
+    /// decide whether to show the affordance at all, so it must never say
+    /// `true` for a backend whose store still falls through to the trait's
+    /// unsupported default.
+    pub const fn supports_rename(self) -> bool {
+        match self {
+            // `files.update` with just a `name` patch - id and parents
+            // untouched.
+            BackendKind::GoogleDrive => true,
+            // S3 "folders" are key prefixes with no separate identity to
+            // rename; doing so for real would mean copying every object under
+            // the prefix to a new key and deleting the old ones, a bulk
+            // operation the picker's single-row rename does not attempt.
+            BackendKind::S3 => false,
+            // The destination folder has no browsable tree at all
+            // (`supports_folder_picker` is false), so there is no row to
+            // rename.
+            BackendKind::LocalFolder => false,
+            // An SFTP RENAME of the directory, with its sidecar (if any)
+            // moved alongside it.
+            BackendKind::Sftp => true,
+        }
+    }
+
     /// Whether this backend can honour per-source VERSION HISTORY: keeping the
     /// bytes of a superseded file so a point-in-time restore ("restore this
     /// source's files as they were on an earlier date") really returns the older

@@ -130,6 +130,14 @@ export interface BackendDto {
    * the "as of" date - the app must never claim a point-in-time capability it
    * cannot honour. `setSourceVersioning` rejects enabling it regardless. */
   supportsVersionHistory: boolean;
+  /** Whether the destination picker's inline rename affordance applies to this
+   * backend's folder rows (issue #307). False for S3 - a "folder" there is a
+   * key prefix with no separate identity to rename - and for a local folder
+   * (which has no browsable tree at all). The picker replaces the pencil
+   * control with a disabled one explaining why where this is false, rather
+   * than omitting it (so the affordance's ABSENCE reads as a property of the
+   * destination, not a bug). */
+  supportsRename: boolean;
   isDefault: boolean;
 }
 
@@ -257,6 +265,10 @@ export interface DriveFolderEntry {
   /** Issue #7: true when this entry is a Shared Drive ROOT (vs an ordinary
    * folder), so the picker can badge it. */
   isSharedDrive?: boolean;
+  /** Last-modified time as Unix epoch ms, where the backend provides one
+   * (issue #306: the picker's Modified column / sort). Absent for a backend
+   * whose "folders" carry no timestamp of their own (S3 key prefixes). */
+  modifiedTime?: number | null;
 }
 
 export interface DriveFolderListing {
@@ -298,6 +310,18 @@ export interface ExclusionPreviewNode {
   included: boolean;
   /** File size in bytes; always 0 for a directory. */
   size: number;
+  /** Directories only (issue #305): the number of files discovered so far
+   * anywhere beneath this directory, regardless of their own individual
+   * verdict. 0 for a file. SETTLES upward across later batches for a
+   * directory the walk descends into (a later batch re-emits the same
+   * `path` with the updated total); already final on first arrival for a
+   * directory the walk PRUNES (excluded, never descended - see the backend
+   * module docs), which is filled by one lightweight recursive disk count. */
+  fileCount: number;
+  /** Directories only: total bytes of every file discovered so far beneath
+   * this directory (see `fileCount` for the settling / pruned-dir rules).
+   * Equal to `size` for a file. */
+  byteSize: number;
 }
 
 /** One `exclusion_preview:batch` payload: newly discovered nodes plus the
@@ -310,6 +334,9 @@ export interface ExclusionPreviewBatch {
   includedCount: number;
   excludedCount: number;
   includedBytes: number;
+  /** Total bytes of the EXCLUDED files so far (issue #305 summary line -
+   *  "N would be freed"). Mirrors `includedBytes`. */
+  excludedBytes: number;
   /** `true` once the streamed TREE hit the node cap; the counts stay exact. */
   truncated: boolean;
 }
@@ -320,6 +347,8 @@ export interface ExclusionPreviewDone {
   includedCount: number;
   excludedCount: number;
   includedBytes: number;
+  /** Final total bytes of the EXCLUDED files (issue #305). */
+  excludedBytes: number;
   truncated: boolean;
   /** `true` when the walk was stopped early (superseded, or the editor closed),
    *  so the totals are a partial snapshot and the scan is NOT complete. */

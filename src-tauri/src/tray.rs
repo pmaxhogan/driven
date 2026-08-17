@@ -804,7 +804,11 @@ fn error_code_is_network(code: ErrorCode) -> bool {
         | ErrorCode::SftpRootMissing
         | ErrorCode::SftpRootNotADirectory
         | ErrorCode::SftpRootNotWritable
-        | ErrorCode::SftpDestMarkerMismatch => false,
+        | ErrorCode::SftpDestMarkerMismatch
+        // The destination picker's inline rename is a per-backend capability
+        // question, not a reachability one - the server answered fine, this
+        // backend just has no rename primitive.
+        | ErrorCode::RemoteRenameUnsupported => false,
     }
 }
 

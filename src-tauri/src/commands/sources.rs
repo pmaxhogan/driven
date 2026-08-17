@@ -943,6 +943,10 @@ pub async fn pick_drive_folder(
             name: e.name,
             drive_id: listing_drive_id.clone(),
             is_shared_drive: false,
+            // Issue #306: 0 means "unknown" to Drive/SFTP (a real folder is
+            // never modified at the Unix epoch); S3 always reports 0 here
+            // since a key prefix carries no timestamp of its own.
+            modified_time: (e.modified_time != 0).then_some(e.modified_time),
         })
         .collect();
 
@@ -987,6 +991,8 @@ async fn shared_drive_root_entries(store: &dyn RemoteStore) -> Vec<DriveFolderEn
                 id: d.id,
                 name: d.name,
                 is_shared_drive: true,
+                // Shared Drive roots carry no modified time of their own.
+                modified_time: None,
             })
             .collect(),
         Err(e) => {
@@ -997,6 +1003,99 @@ async fn shared_drive_root_entries(store: &dyn RemoteStore) -> Vec<DriveFolderEn
             Vec::new()
         }
     }
+}
+
+/// `create_remote_folder(account_id, parent_id, name, drive_id?)` - create (or
+/// idempotently adopt) a child folder for the destination picker's "New
+/// folder" button (issue #307), on any backend that supports browsing a
+/// folder tree.
+///
+/// Delegates to [`RemoteStore::ensure_folder`], which every backend already
+/// implements for the executor's own destination-folder setup: search by name
+/// first (adopting a Driven-marked match, or the oldest non-trashed match with
+/// a warning), create only if nothing matches. That is exactly the semantics
+/// the picker's "New folder" button wants - a double-click cannot leave two
+/// folders with the same name racing each other.
+#[tauri::command]
+pub async fn create_remote_folder(
+    state: State<'_, AppState>,
+    account_id: AccountId,
+    parent_id: String,
+    name: String,
+    drive_id: Option<String>,
+) -> CommandResult<DriveFolderEntry> {
+    let account = find_account(state.state().as_ref(), account_id).await?;
+    let trimmed = name.trim();
+    if trimmed.is_empty() {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "folder name must not be empty",
+        ));
+    }
+    let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
+        .await
+        .unwrap_or_default();
+    let proxy = crate::commands::settings::load_proxy_config(state.state().as_ref()).await?;
+    let (store, _default_folder_id) = select_picker_store(state.inner(), &account, &ca, &proxy)?;
+    let drive_context = DriveContext::from_stored(drive_id.as_deref());
+
+    let entry = store
+        .ensure_folder(&parent_id, trimmed, &drive_context)
+        .await
+        .map_err(CommandError::from)?;
+    let listing_drive_id = drive_context.drive_id().map(str::to_string);
+    tracing::info!(target: TARGET, account_id = %account_id, parent_id = %parent_id, name = %trimmed, "picker: folder created");
+    Ok(DriveFolderEntry {
+        id: entry.id,
+        name: entry.name,
+        drive_id: listing_drive_id,
+        is_shared_drive: false,
+        modified_time: (entry.modified_time != 0).then_some(entry.modified_time),
+    })
+}
+
+/// `rename_remote_folder(account_id, folder_id, new_name, drive_id?)` - rename
+/// a folder in place for the destination picker's inline rename (issue #307).
+/// Drive and SFTP only (`BackendKind::supports_rename`) - the picker UI hides
+/// the affordance for S3, whose `RemoteStore::rename_folder` falls through to
+/// the trait's default and rejects with `remote.rename_unsupported`; reaching
+/// that here means a stale client called it anyway.
+#[tauri::command]
+pub async fn rename_remote_folder(
+    state: State<'_, AppState>,
+    account_id: AccountId,
+    folder_id: String,
+    new_name: String,
+    drive_id: Option<String>,
+) -> CommandResult<DriveFolderEntry> {
+    let account = find_account(state.state().as_ref(), account_id).await?;
+    let trimmed = new_name.trim();
+    if trimmed.is_empty() {
+        return Err(CommandError::with_code(
+            ErrorCode::InvalidInput,
+            "folder name must not be empty",
+        ));
+    }
+    let ca = crate::commands::settings::load_custom_ca_config(state.state().as_ref())
+        .await
+        .unwrap_or_default();
+    let proxy = crate::commands::settings::load_proxy_config(state.state().as_ref()).await?;
+    let (store, _default_folder_id) = select_picker_store(state.inner(), &account, &ca, &proxy)?;
+    let drive_context = DriveContext::from_stored(drive_id.as_deref());
+
+    let entry = store
+        .rename_folder(&folder_id, trimmed, &drive_context)
+        .await
+        .map_err(CommandError::from)?;
+    let listing_drive_id = drive_context.drive_id().map(str::to_string);
+    tracing::info!(target: TARGET, account_id = %account_id, folder_id = %folder_id, "picker: folder renamed");
+    Ok(DriveFolderEntry {
+        id: entry.id,
+        name: entry.name,
+        drive_id: listing_drive_id,
+        is_shared_drive: false,
+        modified_time: (entry.modified_time != 0).then_some(entry.modified_time),
+    })
 }
 
 /// `preview_exclusions(req)` - preview which files the candidate rules would

@@ -22,6 +22,7 @@ import type {
   CreateLocalFolderAccountRequest,
   CreateSftpAccountRequest,
   CustomCaValidation,
+  DriveFolderEntry,
   DriveFolderListing,
   ExclusionPreview,
   ExclusionPreviewRequest,
@@ -181,6 +182,36 @@ export function pickDriveFolder(
   driveId: string | null = null
 ): Promise<DriveFolderListing> {
   return invoke("pick_drive_folder", { accountId, startFolderId, driveId });
+}
+
+/** Create (or idempotently adopt) a child folder for the destination
+ * picker's "New folder" button (issue #307). Works on every backend that
+ * supports browsing a folder tree - Drive, S3, and SFTP alike. */
+export function createRemoteFolder(
+  accountId: string,
+  parentId: string,
+  name: string,
+  driveId: string | null = null
+): Promise<DriveFolderEntry> {
+  return invoke("create_remote_folder", { accountId, parentId, name, driveId });
+}
+
+/** Rename a folder in place for the destination picker's inline rename
+ * (issue #307). Drive and SFTP only - `BackendDto.supportsRename` says
+ * whether to offer the affordance; calling this against an unsupported
+ * backend (S3) rejects with `remote.rename_unsupported`.
+ *
+ * The RETURNED entry's `id` is the folder's id to use from now on - for
+ * SFTP a rename that changes the on-disk name mints a new id (an SFTP id is
+ * path-based), so the caller must replace any id it was holding rather than
+ * assume `folderId` still resolves. */
+export function renameRemoteFolder(
+  accountId: string,
+  folderId: string,
+  newName: string,
+  driveId: string | null = null
+): Promise<DriveFolderEntry> {
+  return invoke("rename_remote_folder", { accountId, folderId, newName, driveId });
 }
 
 export function previewExclusions(req: ExclusionPreviewRequest): Promise<ExclusionPreview> {

@@ -425,13 +425,29 @@ function onPhraseRevealError(code: unknown): void {
   revealErrorDetail.value = toErrorMessage(code);
 }
 
+// Issue #306: near-fullscreen sizing for the two data-heavy steps (the
+// destination-folder picker and the exclusions tree), which cramp badly into
+// the wizard's normal compact width. Every OTHER step keeps today's
+// max-w-lg card - a plain confirmation/toggle screen does not need the extra
+// width, and widening it would just leave acres of empty space either side.
+const isWideStep = computed(() => step.value === "driveFolder" || step.value === "exclusions");
+/** Whether the CURRENTLY-selected account's destination backend supports the
+ * picker's inline rename (issue #307; `BackendDto.supportsRename`). Defaults
+ * to false while `backends` is still loading, matching the fail-closed
+ * default the picker itself uses for an unrecognised prop. */
+const supportsRename = computed(
+  () =>
+    backends.value.find((b) => b.id === selectedAccount.value?.backendKind)?.supportsRename ?? false
+);
+
 defineExpose({ start });
 </script>
 
 <template>
   <div v-if="open" class="fixed inset-0 z-50 flex items-center justify-center bg-black/40 p-4">
     <div
-      class="w-full max-w-lg space-y-4 rounded-lg border border-zinc-200 bg-white p-6 shadow-xl dark:border-zinc-800 dark:bg-zinc-900"
+      class="flex flex-col space-y-4 rounded-lg border border-zinc-200 bg-white p-6 shadow-xl dark:border-zinc-800 dark:bg-zinc-900"
+      :class="isWideStep ? 'h-[85vh] w-[92vw] max-w-[1400px]' : 'w-full max-w-lg'"
     >
       <h2 class="text-lg font-medium">
         {{ t("settings.addSource.title") }}
@@ -451,196 +467,206 @@ defineExpose({ start });
         </li>
       </ol>
 
-      <!-- Step 1: local folder + account -->
-      <div v-if="step === 'localFolder'" class="space-y-3">
-        <label class="block space-y-1 text-sm">
-          <span class="text-zinc-600 dark:text-zinc-400">{{
-            t("settings.sources.column.account")
-          }}</span>
-          <select
-            v-model="accountId"
-            class="w-full"
-            :class="inputCls"
-            :disabled="accounts.accounts.length === 0"
+      <!-- Issue #306: on the two data-heavy steps this region flexes to fill
+           the near-fullscreen panel and scrolls internally, so the step
+           tabs above and the Back/Next footer below stay put. Every other
+           step is a plain block - no flex/scroll behaviour to fight. -->
+      <div :class="isWideStep ? 'flex min-h-0 flex-1 flex-col' : ''">
+        <!-- Step 1: local folder + account -->
+        <div v-if="step === 'localFolder'" class="space-y-3">
+          <label class="block space-y-1 text-sm">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.sources.column.account")
+            }}</span>
+            <select
+              v-model="accountId"
+              class="w-full"
+              :class="inputCls"
+              :disabled="accounts.accounts.length === 0"
+            >
+              <option v-if="accounts.accounts.length === 0" value="" disabled>
+                {{ t("settings.addSource.noAccounts") }}
+              </option>
+              <option v-for="account in accounts.accounts" :key="account.id" :value="account.id">
+                {{ account.email }}
+              </option>
+            </select>
+          </label>
+
+          <button type="button" :class="secondaryBtn" @click="chooseLocalFolder">
+            {{ t("settings.addSource.chooseLocalButton") }}
+          </button>
+          <p
+            v-if="localPath"
+            class="break-all text-sm text-zinc-600 dark:text-zinc-400"
+            data-testid="local-path"
           >
-            <option v-if="accounts.accounts.length === 0" value="" disabled>
-              {{ t("settings.addSource.noAccounts") }}
-            </option>
-            <option v-for="account in accounts.accounts" :key="account.id" :value="account.id">
-              {{ account.email }}
-            </option>
-          </select>
-        </label>
-
-        <button type="button" :class="secondaryBtn" @click="chooseLocalFolder">
-          {{ t("settings.addSource.chooseLocalButton") }}
-        </button>
-        <p
-          v-if="localPath"
-          class="break-all text-sm text-zinc-600 dark:text-zinc-400"
-          data-testid="local-path"
-        >
-          {{ localPath }}
-        </p>
-      </div>
-
-      <!-- Step 2: Drive folder picker (shared with the first-run setup wizard) -->
-      <div v-else-if="step === 'driveFolder'" class="space-y-3">
-        <DriveFolderPicker
-          v-model:folder-id="driveFolderId"
-          v-model:folder-path="driveFolderPath"
-          v-model:drive-id="driveId"
-          :account-id="accountId"
-          :backend-kind="selectedAccount?.backendKind"
-          @error="onDrivePickerError"
-        />
-      </div>
-
-      <!-- Step 3: exclusions preview -->
-      <div v-else-if="step === 'exclusions'" class="space-y-3">
-        <label class="flex items-center gap-2 text-sm">
-          <input
-            v-model="respectGitignore"
-            type="checkbox"
-            class="accent-teal-600"
-            @change="refreshPreview"
-          />
-          {{ t("settings.addSource.respectGitignoreLabel") }}
-        </label>
-        <label class="block space-y-1 text-sm">
-          <span class="text-zinc-600 dark:text-zinc-400">{{
-            t("settings.addSource.includePatternsLabel")
-          }}</span>
-          <textarea
-            v-model="includePatternsText"
-            rows="2"
-            class="w-full"
-            :class="inputCls"
-            @blur="refreshPreview"
-          />
-        </label>
-        <!-- An include rule the scanner cannot bound to a fixed depth forces it
-             into every excluded folder, so the walk stops being prunable. -->
-        <div
-          v-if="unconstrainedIncludes.length > 0"
-          class="rounded-lg border border-amber-400 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200"
-          data-testid="include-pattern-warning"
-          role="status"
-        >
-          <p class="font-medium">
-            {{ t("settings.addSource.includeWarning.title") }}
-          </p>
-          <ul class="mt-1 list-disc space-y-0.5 pl-5 font-mono break-all">
-            <li v-for="pattern in unconstrainedIncludes" :key="pattern">
-              {{ pattern }}
-            </li>
-          </ul>
-          <p class="mt-2">
-            {{ t("settings.addSource.includeWarning.hint") }}
+            {{ localPath }}
           </p>
         </div>
-        <label class="block space-y-1 text-sm">
-          <span class="text-zinc-600 dark:text-zinc-400">{{
-            t("settings.addSource.excludePatternsLabel")
-          }}</span>
-          <textarea
-            v-model="excludePatternsText"
-            rows="2"
-            class="w-full"
-            :class="inputCls"
-            @blur="refreshPreview"
-          />
-        </label>
 
-        <!-- Windows-only: OneDrive / cloud-only placeholder files exist only on
+        <!-- Step 2: Drive folder picker (shared with the first-run setup wizard) -->
+        <div v-else-if="step === 'driveFolder'" class="flex min-h-0 flex-1 flex-col space-y-3">
+          <DriveFolderPicker
+            v-model:folder-id="driveFolderId"
+            v-model:folder-path="driveFolderPath"
+            v-model:drive-id="driveId"
+            :account-id="accountId"
+            :backend-kind="selectedAccount?.backendKind"
+            :supports-rename="supportsRename"
+            fill
+            @error="onDrivePickerError"
+          />
+        </div>
+
+        <!-- Step 3: exclusions preview -->
+        <div v-else-if="step === 'exclusions'" class="flex min-h-0 flex-1 flex-col space-y-3">
+          <label class="flex items-center gap-2 text-sm">
+            <input
+              v-model="respectGitignore"
+              type="checkbox"
+              class="accent-teal-600"
+              @change="refreshPreview"
+            />
+            {{ t("settings.addSource.respectGitignoreLabel") }}
+          </label>
+          <label class="block space-y-1 text-sm">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.addSource.includePatternsLabel")
+            }}</span>
+            <textarea
+              v-model="includePatternsText"
+              rows="2"
+              class="w-full"
+              :class="inputCls"
+              @blur="refreshPreview"
+            />
+          </label>
+          <!-- An include rule the scanner cannot bound to a fixed depth forces it
+             into every excluded folder, so the walk stops being prunable. -->
+          <div
+            v-if="unconstrainedIncludes.length > 0"
+            class="rounded-lg border border-amber-400 bg-amber-50 p-3 text-xs text-amber-800 dark:border-amber-700 dark:bg-amber-950/40 dark:text-amber-200"
+            data-testid="include-pattern-warning"
+            role="status"
+          >
+            <p class="font-medium">
+              {{ t("settings.addSource.includeWarning.title") }}
+            </p>
+            <ul class="mt-1 list-disc space-y-0.5 pl-5 font-mono break-all">
+              <li v-for="pattern in unconstrainedIncludes" :key="pattern">
+                {{ pattern }}
+              </li>
+            </ul>
+            <p class="mt-2">
+              {{ t("settings.addSource.includeWarning.hint") }}
+            </p>
+          </div>
+          <label class="block space-y-1 text-sm">
+            <span class="text-zinc-600 dark:text-zinc-400">{{
+              t("settings.addSource.excludePatternsLabel")
+            }}</span>
+            <textarea
+              v-model="excludePatternsText"
+              rows="2"
+              class="w-full"
+              :class="inputCls"
+              @blur="refreshPreview"
+            />
+          </label>
+
+          <!-- Windows-only: OneDrive / cloud-only placeholder files exist only on
              Windows. Hiding it elsewhere does NOT change what the new source
              gets - `backupCloudOnly` stays false, which sends "skip", the same
              value a Windows user gets by leaving the box unticked and the same
              value the Rust `#[serde(default)]` would apply. -->
-        <label v-if="showPlaceholderPolicy" class="flex items-start gap-2 text-sm">
-          <input
-            v-model="backupCloudOnly"
-            type="checkbox"
-            class="mt-0.5 accent-teal-600"
-            data-testid="placeholder-policy-toggle"
-          />
-          <span>
-            {{ t("settings.addSource.placeholderPolicyLabel") }}
-            <span class="mt-0.5 block text-xs text-zinc-500 dark:text-zinc-400">
-              {{ t("settings.addSource.placeholderPolicyCaption") }}
+          <label v-if="showPlaceholderPolicy" class="flex items-start gap-2 text-sm">
+            <input
+              v-model="backupCloudOnly"
+              type="checkbox"
+              class="mt-0.5 accent-teal-600"
+              data-testid="placeholder-policy-toggle"
+            />
+            <span>
+              {{ t("settings.addSource.placeholderPolicyLabel") }}
+              <span class="mt-0.5 block text-xs text-zinc-500 dark:text-zinc-400">
+                {{ t("settings.addSource.placeholderPolicyCaption") }}
+              </span>
             </span>
-          </span>
-        </label>
+          </label>
 
-        <!-- The live streaming tree: rows appear as the walk finds them, every
+          <!-- The live streaming tree: rows appear as the walk finds them, every
              folder starts collapsed, and each row's "+"/"-" appends the matching
              glob above and re-classifies. -->
-        <ExclusionPreviewTree
-          ref="previewTree"
-          :local-path-token="localPathToken"
-          :respect-gitignore="respectGitignore"
-          :include-patterns="includePatterns"
-          :exclude-patterns="excludePatterns"
-          @append-include="onAppendInclude"
-          @append-exclude="onAppendExclude"
-        />
-      </div>
+          <ExclusionPreviewTree
+            ref="previewTree"
+            class="min-h-0 flex-1"
+            :local-path-token="localPathToken"
+            :respect-gitignore="respectGitignore"
+            :include-patterns="includePatterns"
+            :exclude-patterns="excludePatterns"
+            fill
+            @append-include="onAppendInclude"
+            @append-exclude="onAppendExclude"
+          />
+        </div>
 
-      <!-- Step 4: encryption opt-in (phrase is revealed AFTER confirm, B3) -->
-      <div v-else-if="step === 'encryption'" class="space-y-3">
-        <label class="flex items-center gap-2 text-sm">
-          <input v-model="encryptionEnabled" type="checkbox" class="accent-teal-600" />
-          {{ t("wizard.step4.enableLabel") }}
-        </label>
-        <p v-if="encryptionEnabled" class="text-xs text-amber-700 dark:text-amber-400">
-          {{ t("wizard.step4.recoveryWarning") }}
-        </p>
-      </div>
+        <!-- Step 4: encryption opt-in (phrase is revealed AFTER confirm, B3) -->
+        <div v-else-if="step === 'encryption'" class="space-y-3">
+          <label class="flex items-center gap-2 text-sm">
+            <input v-model="encryptionEnabled" type="checkbox" class="accent-teal-600" />
+            {{ t("wizard.step4.enableLabel") }}
+          </label>
+          <p v-if="encryptionEnabled" class="text-xs text-amber-700 dark:text-amber-400">
+            {{ t("wizard.step4.recoveryWarning") }}
+          </p>
+        </div>
 
-      <!-- Reveal step: shown after an encrypted add returned a recovery phrase.
+        <!-- Reveal step: shown after an encrypted add returned a recovery phrase.
            The user must acknowledge before the wizard closes (B3). -->
-      <div v-else-if="step === 'reveal'" class="space-y-3" data-testid="reveal-step">
-        <p class="text-sm text-amber-700 dark:text-amber-400">
-          {{ t("wizard.step4.recoveryWarning") }}
-        </p>
-        <RecoveryPhraseReveal
-          v-model:confirmed="phraseConfirmed"
-          :phrase="recoveryPhrase"
-          :reveal-action="pendingRecoveryAck ? revealPhraseAction : undefined"
-          @update:revealed="onPhraseRevealed"
-          @reveal-error="onPhraseRevealError"
-        />
-        <p v-if="revealErrorCode" class="text-sm text-red-600" data-testid="reveal-error">
-          {{ t(`errors.${revealErrorCode}.long`) }}
-        </p>
-        <!-- The technical detail for the same failure: the stable code plus the
+        <div v-else-if="step === 'reveal'" class="space-y-3" data-testid="reveal-step">
+          <p class="text-sm text-amber-700 dark:text-amber-400">
+            {{ t("wizard.step4.recoveryWarning") }}
+          </p>
+          <RecoveryPhraseReveal
+            v-model:confirmed="phraseConfirmed"
+            :phrase="recoveryPhrase"
+            :reveal-action="pendingRecoveryAck ? revealPhraseAction : undefined"
+            @update:revealed="onPhraseRevealed"
+            @reveal-error="onPhraseRevealError"
+          />
+          <p v-if="revealErrorCode" class="text-sm text-red-600" data-testid="reveal-error">
+            {{ t(`errors.${revealErrorCode}.long`) }}
+          </p>
+          <!-- The technical detail for the same failure: the stable code plus the
              backend's redacted message, muted and secondary. Localized text
              stays the primary line; this is what makes the failure reportable
              and two same-code failures distinguishable. -->
-        <p
-          v-if="revealErrorDetailLine"
-          class="break-words font-mono text-xs text-zinc-500 dark:text-zinc-400"
-          data-testid="reveal-error-detail"
-        >
-          {{ revealErrorDetailLine }}
-        </p>
-      </div>
+          <p
+            v-if="revealErrorDetailLine"
+            class="break-words font-mono text-xs text-zinc-500 dark:text-zinc-400"
+            data-testid="reveal-error-detail"
+          >
+            {{ revealErrorDetailLine }}
+          </p>
+        </div>
 
-      <!-- Step 5: confirm -->
-      <div v-else class="space-y-2 text-sm" data-testid="confirm-summary">
-        <p>{{ t("settings.addSource.step.localFolder") }}: {{ localPath }}</p>
-        <!-- The destination: the sub-folder picked on the destination step, else
+        <!-- Step 5: confirm -->
+        <div v-else class="space-y-2 text-sm" data-testid="confirm-summary">
+          <p>{{ t("settings.addSource.step.localFolder") }}: {{ localPath }}</p>
+          <!-- The destination: the sub-folder picked on the destination step, else
              the account's own destination - which covers BOTH a backend with no
              browsable tree and a pick that landed on the ROOT (whose display path
              is legitimately empty, e.g. a bucket root). Never a blank line. -->
-        <p data-testid="confirm-destination">
-          {{ t("settings.addSource.step.driveFolder") }}:
-          {{ driveFolderPath || (selectedAccount?.email ?? "") }}
-        </p>
-        <p>
-          {{ t("settings.sources.column.encryption") }}:
-          {{ encryptionEnabled ? t("common.enabled") : t("common.disabled") }}
-        </p>
+          <p data-testid="confirm-destination">
+            {{ t("settings.addSource.step.driveFolder") }}:
+            {{ driveFolderPath || (selectedAccount?.email ?? "") }}
+          </p>
+          <p>
+            {{ t("settings.sources.column.encryption") }}:
+            {{ encryptionEnabled ? t("common.enabled") : t("common.disabled") }}
+          </p>
+        </div>
       </div>
 
       <p v-if="errorCode" class="text-sm text-red-600" role="alert">

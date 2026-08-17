@@ -49,8 +49,15 @@ import {
 } from "../stores/exclusionPreview";
 import type { ExclusionPreviewBatch, ExclusionPreviewNode } from "../ipc/types";
 
-function node(path: string, isDir: boolean, included: boolean, size = 0): ExclusionPreviewNode {
-  return { path, isDir, included, size };
+function node(
+  path: string,
+  isDir: boolean,
+  included: boolean,
+  size = 0,
+  fileCount = 0,
+  byteSize = 0
+): ExclusionPreviewNode {
+  return { path, isDir, included, size, fileCount, byteSize };
 }
 
 function batch(
@@ -65,6 +72,7 @@ function batch(
     includedCount: files.filter((n) => n.included).length,
     excludedCount: files.filter((n) => !n.included).length,
     includedBytes: files.filter((n) => n.included).reduce((a, n) => a + n.size, 0),
+    excludedBytes: files.filter((n) => !n.included).reduce((a, n) => a + n.size, 0),
     truncated: false,
     ...over,
   };
@@ -377,6 +385,7 @@ describe("createExclusionPreview", () => {
       includedCount: 999,
       excludedCount: 999,
       includedBytes: 999,
+      excludedBytes: 0,
       truncated: false,
       cancelled: false,
     });
@@ -423,6 +432,7 @@ describe("createExclusionPreview", () => {
       includedCount: 12,
       excludedCount: 4,
       includedBytes: 4096,
+      excludedBytes: 0,
       truncated: false,
       cancelled: false,
     });
@@ -441,6 +451,7 @@ describe("createExclusionPreview", () => {
       includedCount: 3,
       excludedCount: 0,
       includedBytes: 1,
+      excludedBytes: 0,
       truncated: false,
       cancelled: true,
     });
@@ -537,6 +548,7 @@ describe("createExclusionPreview", () => {
       includedCount: 0,
       excludedCount: 0,
       includedBytes: 0,
+      excludedBytes: 0,
       truncated: false,
       cancelled: false,
     });
@@ -561,6 +573,7 @@ describe("createExclusionPreview", () => {
       includedCount: 0,
       excludedCount: 0,
       includedBytes: 0,
+      excludedBytes: 0,
       truncated: false,
       cancelled: true,
     });
@@ -732,5 +745,33 @@ describe("createExclusionPreview", () => {
     preview.flush();
     expect(preview.roots.value).toHaveLength(1);
     expect(preview.nodeAt("a.txt")?.included).toBe(false);
+  });
+
+  // Issue #305: per-folder rollups.
+  it("carries a directory's file-count and byte rollup through", async () => {
+    const preview = await started();
+    batchHandler!(batch("gen-1", [node("node_modules", true, false, 0, 31_204, 2_254_857_830)]));
+    preview.flush();
+    const dir = preview.nodeAt("node_modules");
+    expect(dir?.fileCount).toBe(31_204);
+    expect(dir?.byteSize).toBe(2_254_857_830);
+  });
+
+  it("settles a directory's rollup across later batches without duplicating the row", async () => {
+    // A pruned/excluded folder needs no settling (its rollup is final on
+    // arrival - see the Rust module docs), but a DESCENDED directory's
+    // rollup starts at 0 and the backend re-sends the SAME path with a
+    // growing total as its subtree streams in across batches.
+    const preview = await started();
+    batchHandler!(batch("gen-1", [node("docs", true, true, 0, 0, 0)]));
+    preview.flush();
+    expect(preview.nodeAt("docs")?.fileCount).toBe(0);
+
+    batchHandler!(batch("gen-1", [node("docs", true, true, 0, 5, 500)]));
+    preview.flush();
+
+    expect(preview.roots.value).toHaveLength(1);
+    expect(preview.nodeAt("docs")?.fileCount).toBe(5);
+    expect(preview.nodeAt("docs")?.byteSize).toBe(500);
   });
 });

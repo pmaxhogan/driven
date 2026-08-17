@@ -37,6 +37,12 @@ const props = defineProps<{
   respectGitignore: boolean;
   includePatterns: string[];
   excludePatterns: string[];
+  /** Issue #305: near-fullscreen sizing for a context that gives the tree the
+   * whole viewport (the add-source wizard's exclusions step, sized up per the
+   * v2.12 mockup) - the tree FLEXES to fill its container instead of capping
+   * at a fixed height. Defaults to false, which keeps today's capped-height
+   * behaviour for SourceTable's inline per-source editor unchanged. */
+  fill?: boolean;
 }>();
 
 const emit = defineEmits<{
@@ -206,7 +212,11 @@ async function applyRule(node: PreviewTreeNode): Promise<void> {
 </script>
 
 <template>
-  <div class="space-y-2" data-testid="exclusion-preview">
+  <div
+    class="space-y-2"
+    :class="fill ? 'flex h-full min-h-0 flex-col' : ''"
+    data-testid="exclusion-preview"
+  >
     <!-- Running summary: counts + bytes stay EXACT even when the tree below is
          truncated, and the scan state is spelled out in words.
 
@@ -235,6 +245,13 @@ async function applyRule(node: PreviewTreeNode): Promise<void> {
         {{
           t("settings.addSource.preview.excluded", {
             count: numberFormatter.format(preview.excludedCount.value),
+          })
+        }}
+      </span>
+      <span class="text-zinc-500 dark:text-zinc-400" data-testid="preview-excluded-bytes">
+        {{
+          t("settings.addSource.preview.excludedBytes", {
+            size: formatBytes(preview.excludedBytes.value),
           })
         }}
       </span>
@@ -278,8 +295,8 @@ async function applyRule(node: PreviewTreeNode): Promise<void> {
 
     <div
       v-else
-      class="max-h-64 overflow-auto rounded-md border border-zinc-200 bg-zinc-50/60 p-1 transition-opacity duration-150 dark:border-zinc-700 dark:bg-zinc-950/40"
-      :class="preview.recomputing.value ? 'opacity-60' : ''"
+      class="overflow-auto rounded-md border border-zinc-200 bg-zinc-50/60 p-1 transition-opacity duration-150 dark:border-zinc-700 dark:bg-zinc-950/40"
+      :class="[preview.recomputing.value ? 'opacity-60' : '', fill ? 'flex-1 min-h-0' : 'max-h-64']"
     >
       <p
         v-if="rows.length === 0"
@@ -387,6 +404,23 @@ async function applyRule(node: PreviewTreeNode): Promise<void> {
 
             <span v-if="!row.node.isDir" class="shrink-0 text-zinc-400 dark:text-zinc-600">
               {{ formatBytes(row.node.size) }}
+            </span>
+            <!-- Issue #305: the folder's rollup - how much is under it,
+                 regardless of any one child's own verdict. Settles as the
+                 walk streams more of the subtree in (a descended folder) or
+                 is already final on arrival (a pruned excluded folder - see
+                 the store's PreviewTreeNode doc). -->
+            <span
+              v-else
+              class="shrink-0 text-zinc-400 dark:text-zinc-600"
+              :data-testid="`preview-rollup-${row.node.path}`"
+            >
+              {{
+                t("settings.exclusionPreview.rollup", {
+                  count: numberFormatter.format(row.node.fileCount),
+                  size: formatBytes(row.node.byteSize),
+                })
+              }}
             </span>
 
             <!-- The one action that flips this row: "+" re-includes an excluded

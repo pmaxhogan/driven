@@ -686,6 +686,9 @@ pub fn run() {
             commands::sources::update_source,
             commands::sources::remove_source,
             commands::sources::pick_drive_folder,
+            // Issue #307: the picker's "New folder" / inline rename.
+            commands::sources::create_remote_folder,
+            commands::sources::rename_remote_folder,
             // Agent QA harness: env-gated headless twin of the native folder
             // picker (refused unless DRIVEN_E2E_HOOKS=1; see e2e_hooks docs).
             commands::e2e_hooks::e2e_pick_folder,

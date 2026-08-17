@@ -234,6 +234,7 @@ fn code_from_message(msg: &str) -> Option<ErrorCode> {
         "update.signature_invalid",
         "update.endpoint_unreachable",
         "internal.invalid_input",
+        "remote.rename_unsupported",
     ];
     CANDIDATES
         .iter()

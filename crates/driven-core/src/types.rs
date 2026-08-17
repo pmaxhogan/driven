@@ -1253,6 +1253,13 @@ pub enum ErrorCode {
     /// (the identity marker, then the write/remove round trip), since the
     /// remedy is identical either way.
     SftpRootNotWritable,
+    /// `remote.rename_unsupported` - the destination picker's inline rename
+    /// (issue #307) was called against a backend whose `RemoteStore` has no
+    /// rename primitive (S3, whose "folders" are key prefixes with no
+    /// separate identity to rename). The picker UI hides the affordance for
+    /// such backends already (`BackendKind::supports_rename`); reaching this
+    /// code means a stale client called it anyway.
+    RemoteRenameUnsupported,
 }
 
 impl ErrorCode {
@@ -1311,6 +1318,7 @@ impl ErrorCode {
             ErrorCode::SftpRootNotADirectory => "sftp.root_not_a_directory",
             ErrorCode::SftpDestMarkerMismatch => "sftp.dest_marker_mismatch",
             ErrorCode::SftpRootNotWritable => "sftp.root_not_writable",
+            ErrorCode::RemoteRenameUnsupported => "remote.rename_unsupported",
         }
     }
 
@@ -1373,6 +1381,7 @@ impl ErrorCode {
             "sftp.root_not_a_directory" => ErrorCode::SftpRootNotADirectory,
             "sftp.dest_marker_mismatch" => ErrorCode::SftpDestMarkerMismatch,
             "sftp.root_not_writable" => ErrorCode::SftpRootNotWritable,
+            "remote.rename_unsupported" => ErrorCode::RemoteRenameUnsupported,
             _ => return None,
         })
     }

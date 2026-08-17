@@ -2009,6 +2009,82 @@ impl RemoteStore for SftpStore {
         .collect()
     }
 
+    /// Renames a folder in place via SFTP `RENAME`, moving its sidecar (if it
+    /// has one) alongside it (issue #307).
+    ///
+    /// Unlike Drive, the on-disk stored name is DERIVED from the display name
+    /// (`names::encode`), so a rename that actually changes the encoded form
+    /// must move the real directory - a metadata-only patch would leave the
+    /// picker showing one name while every other SFTP client (and Driven
+    /// itself, on the next `list_folder`) sees another. `encode` is
+    /// identity-preserving for an ordinary name (it only escapes reserved
+    /// characters, a trailing dot/space, or a sidecar-suffix collision), so
+    /// this is the common case for any name change worth renaming to. Only
+    /// when the encoded form comes out UNCHANGED - retyping the same name, or
+    /// the astronomically rare case of two different over-length names
+    /// truncating to the same digest - is nothing moved and only the
+    /// sidecar's display name is rewritten.
+    ///
+    /// This is a single top-level rename of a folder the user is organizing in
+    /// the destination picker, not a source-mirrored path, so it does not go
+    /// through `resolve_stored_name`'s concurrent-upload collision-claim
+    /// machinery - there is nothing else racing to create a sibling under the
+    /// same name while this runs.
+    async fn rename_folder(
+        &self,
+        folder_id: &str,
+        new_name: &str,
+        _drive_context: &DriveContext,
+    ) -> anyhow::Result<RemoteEntry> {
+        let channel = self.channel().await?;
+        let sftp = channel.sftp();
+        self.guard_root(sftp).await?;
+
+        let dir_id = folder_prefix(folder_id);
+        let old_stored = base_name(&dir_id).to_string();
+        let parent_id = parent_of(&dir_id);
+        let parent_path = self.remote_path(&parent_id)?;
+        let new_stored = names::encode(new_name)?;
+
+        // Carry forward any app_properties the existing sidecar recorded (a
+        // rename must not silently drop Driven's own identity stamp on a
+        // folder it created).
+        let existing_props = Self::read_sidecar(sftp, &parent_path, &old_stored)
+            .await?
+            .map(|s| s.props)
+            .unwrap_or_default();
+
+        if new_stored != old_stored {
+            let old_path = self.remote_path(&dir_id)?;
+            let new_path = join_remote(&parent_path, &new_stored);
+            if Self::stat_kind(sftp, &new_path).await?.is_some() {
+                anyhow::bail!(
+                    "internal.invalid_input: a folder or file named {new_name:?} already exists here"
+                );
+            }
+            sftp.rename(old_path, new_path)
+                .await
+                .map_err(|e| sftp_op_error(&format!("rename folder to {new_name:?}"), e))?;
+            Self::remove_sidecar(sftp, &parent_path, &old_stored).await?;
+        }
+
+        let sidecar = Sidecar {
+            version: 1,
+            kind: EntryKind::Dir,
+            name: new_name.to_string(),
+            stored: new_stored.clone(),
+            size: None,
+            md5: None,
+            mime: Some(FOLDER_MIME.to_string()),
+            modified_ms: now_ms(),
+            props: existing_props,
+        };
+        Self::write_sidecar(&channel, self.write_deadline, &parent_path, &sidecar).await?;
+
+        let new_id = crate::store::folder_id(&parent_id, &new_stored);
+        self.entry_for(sftp, &new_id).await
+    }
+
     /// Write a new object at `<parent_id>/<encoded name>`.
     ///
     /// Unlike Drive, a filesystem cannot hold two files of one name in one
@@ -2856,6 +2932,110 @@ mod tests {
         assert_eq!(names, vec!["Reports 2026"], "{names:?}");
         assert_eq!(listed[0].id, "Docs/Reports 2026/");
         assert_eq!(listed[0].mime_type, FOLDER_MIME);
+    }
+
+    #[tokio::test]
+    async fn rename_folder_moves_the_real_directory_and_its_sidecar() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+
+        let folder = store
+            .ensure_folder("", "Old machines", &DriveContext::MyDrive)
+            .await
+            .expect("ensure_folder");
+        let entry = store
+            .create(
+                &folder.id,
+                "notes.txt",
+                "text/plain",
+                body(b"hi"),
+                HashMap::new(),
+            )
+            .await
+            .expect("create inside the folder");
+
+        let renamed = store
+            .rename_folder(&folder.id, "Archive", &DriveContext::MyDrive)
+            .await
+            .expect("rename_folder");
+
+        assert_eq!(renamed.name, "Archive");
+        assert!(
+            server.root().join("Archive").is_dir(),
+            "the real directory moved"
+        );
+        assert!(
+            !server.root().join("Old machines").exists(),
+            "nothing is left at the old path"
+        );
+
+        // Listed from the parent under the NEW name, and its own child (the
+        // file created before the rename) is still reachable at the new id.
+        let listed = store
+            .list_folder("", &DriveContext::MyDrive)
+            .await
+            .expect("list root");
+        let names: Vec<&str> = listed.iter().map(|e| e.name.as_str()).collect();
+        assert_eq!(names, vec!["Archive"], "{names:?}");
+        let new_folder_id = listed[0].id.clone();
+
+        let inner = store
+            .list_folder(&new_folder_id, &DriveContext::MyDrive)
+            .await
+            .expect("list the renamed folder");
+        assert_eq!(inner.len(), 1);
+        assert_eq!(inner[0].name, "notes.txt");
+        // Unlike Drive's opaque ids, an SFTP id is PATH-based, so moving the
+        // parent directory necessarily changes the child's id too - it is
+        // still reachable, just at the new path.
+        assert_eq!(inner[0].id, "Archive/notes.txt");
+        assert_ne!(inner[0].id, entry.id, "the old id no longer resolves");
+    }
+
+    #[tokio::test]
+    async fn rename_folder_refuses_to_clobber_an_existing_name() {
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+
+        store
+            .ensure_folder("", "Alpha", &DriveContext::MyDrive)
+            .await
+            .expect("ensure_folder alpha");
+        let beta = store
+            .ensure_folder("", "Beta", &DriveContext::MyDrive)
+            .await
+            .expect("ensure_folder beta");
+
+        let err = store
+            .rename_folder(&beta.id, "Alpha", &DriveContext::MyDrive)
+            .await
+            .expect_err("renaming onto an existing name must Err");
+        assert!(err.to_string().contains("internal.invalid_input"));
+        // Both directories are exactly as they were.
+        assert!(server.root().join("Alpha").is_dir());
+        assert!(server.root().join("Beta").is_dir());
+    }
+
+    #[tokio::test]
+    async fn rename_folder_to_the_same_name_only_rewrites_the_sidecar() {
+        // Retyping the same name is the ordinary case where the ENCODED form
+        // comes out unchanged: nothing needs to move on disk, just the
+        // sidecar's display name (a no-op in substance, but must not error).
+        let server = TestSftpServer::spawn().await.unwrap();
+        let store = store_for(&server);
+
+        let folder = store
+            .ensure_folder("", "docs", &DriveContext::MyDrive)
+            .await
+            .expect("ensure_folder");
+
+        let renamed = store
+            .rename_folder(&folder.id, "docs", &DriveContext::MyDrive)
+            .await
+            .expect("rename_folder to the same encoded name");
+        assert_eq!(renamed.id, folder.id, "the id (and on-disk path) is stable");
+        assert_eq!(renamed.name, "docs");
+        assert!(server.root().join("docs").is_dir());
     }
 
     #[tokio::test]

@@ -1004,3 +1004,69 @@ async fn fake_with_fileid_recycle_reuses_trashed_id() {
         "exactly one live object now holds the recycled id"
     );
 }
+
+// ---------------------------------------------------------------------------
+// rename_folder (issue #307 - the destination picker's inline rename).
+// ---------------------------------------------------------------------------
+
+#[tokio::test]
+async fn fake_rename_folder_changes_only_the_name() {
+    let store = fake();
+    let root = store.root_id().to_string();
+    let folder = store
+        .ensure_folder(&root, "Old machines", &DriveContext::MyDrive)
+        .await
+        .expect("ensure_folder");
+
+    let renamed = store
+        .rename_folder(&folder.id, "Archive", &DriveContext::MyDrive)
+        .await
+        .expect("rename_folder");
+
+    assert_eq!(renamed.id, folder.id, "id is unchanged by a rename");
+    assert_eq!(renamed.name, "Archive");
+    assert_eq!(renamed.parents, folder.parents, "location is unchanged");
+
+    // ...and list_folder agrees.
+    let listing = store
+        .list_folder(&root, &DriveContext::MyDrive)
+        .await
+        .expect("list root");
+    let entry = listing
+        .iter()
+        .find(|e| e.id == folder.id)
+        .expect("the renamed folder is still listed under the same id");
+    assert_eq!(entry.name, "Archive");
+}
+
+#[tokio::test]
+async fn fake_rename_folder_rejects_an_unknown_id() {
+    let store = fake();
+    let err = store
+        .rename_folder("does-not-exist", "New name", &DriveContext::MyDrive)
+        .await
+        .expect_err("renaming an unknown id must Err");
+    assert!(err.to_string().contains("does-not-exist"));
+}
+
+#[tokio::test]
+async fn fake_rename_folder_refuses_to_rename_a_file() {
+    let store = fake();
+    let root = store.root_id().to_string();
+    let file = store
+        .create(
+            &root,
+            "a.txt",
+            "text/plain",
+            UploadBody::Bytes(Bytes::from_static(b"x")),
+            props(&[]),
+        )
+        .await
+        .expect("create");
+
+    let err = store
+        .rename_folder(&file.id, "b.txt", &DriveContext::MyDrive)
+        .await
+        .expect_err("renaming a FILE via rename_folder must Err");
+    assert!(err.to_string().contains(&file.id));
+}
