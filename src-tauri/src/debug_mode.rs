@@ -175,12 +175,15 @@ mod tests {
     /// shared since that helper is private to its module and this module has
     /// no other reason to depend on it).
     async fn seeded_repo() -> (SqliteStateRepo, std::path::PathBuf) {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("driven-debug-mode-test-{nonce}-{:p}", &nonce));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // CodeQL `rust/path-injection` (driven-ci-flakes precedent, PR 151 /
+        // src-tauri/Cargo.toml's `tempfile` dependency comment): a hand-rolled
+        // `std::env::temp_dir().join(format!(...))` is exactly the pattern the
+        // rule flags feeding `SqliteStateRepo::open`. `tempfile::tempdir()` is
+        // an opaque external call CodeQL's dataflow does not see into, so the
+        // taint chain never forms - fix, not a dismissal. `keep()` keeps
+        // the directory alive (matching the pre-`tempfile` behaviour) so the
+        // caller's existing `cleanup(dir)` teardown still applies.
+        let dir = tempfile::tempdir().expect("create temp dir").keep();
         let repo = SqliteStateRepo::open(&dir.join("state.db"))
             .await
             .expect("open seeded state repo");
