@@ -20,6 +20,14 @@ updates:
     commit-message:
       prefix: "build(deps)"
       prefix-development: "build(deps-dev)"
+    ignore:
+      # keyring 4.1.6 regressed: it caches the first native-store failure
+      # forever, defeating the in-memory test-store latch and panicking
+      # the_test_suite_is_isolated_from_the_os_keychain on headless CI
+      # (no Secret Service). Pinned back in #298; drop this ignore once a
+      # release fixes the LazyLock latch upstream.
+      - dependency-name: keyring
+        versions: ["4.1.6"]
     groups:
       cargo-minor-patch:
         update-types:
