@@ -309,7 +309,7 @@ pub struct AppState {
     /// sampling runtime (the Activity dashboard's Bottleneck stat tile).
     bottleneck: BottleneckRuntime,
     /// issue #309: the debug-logging-mode 24h auto-off watchdog's task handle
-    /// + shutdown signal, so the app-quit drain joins it with no orphan
+    /// and shutdown signal, so the app-quit drain joins it with no orphan
     /// (mirrors [`UpdaterRuntime`]/[`IostatRuntime`]). No shared "hub" field
     /// like those two - the watchdog only reads/writes the persisted settings
     /// KV directly, nothing else on `AppState` needs to observe it.
@@ -2176,6 +2176,43 @@ pub(crate) mod tests {
 
         // Taken: a second shutdown call is again a safe no-op.
         assert!(app_state.shutdown_bottleneck_task().is_none());
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[tokio::test]
+    async fn debug_mode_runtime_task_and_shutdown_round_trip() {
+        // Issue #309: the debug-logging-mode watchdog's runtime bookkeeping.
+        // No hub getter to cover (unlike bottleneck/iostat) - just the
+        // set/shutdown task pair, mirrors
+        // `bottleneck_runtime_hub_task_and_shutdown_round_trip`.
+        let (state, dir) = temp_state().await;
+        let app_state = AppState::new(
+            state,
+            HashMap::new(),
+            RemoteMode::Fake,
+            default_fake_registry(),
+        );
+
+        // No task registered yet: shutdown is a safe no-op.
+        assert!(app_state.shutdown_debug_mode_task().is_none());
+
+        // Register a task that exits promptly on the shutdown signal (the
+        // real watchdog's own shape), then confirm shutdown signals + hands
+        // back the handle so the quit drain can join it.
+        let (shutdown_tx, mut shutdown_rx) = watch::channel(false);
+        let task = tokio::spawn(async move {
+            let _ = shutdown_rx.changed().await;
+        });
+        app_state.set_debug_mode_task(task, shutdown_tx);
+
+        let handle = app_state
+            .shutdown_debug_mode_task()
+            .expect("the just-registered task round-trips");
+        handle.await.unwrap();
+
+        // Taken: a second shutdown call is again a safe no-op.
+        assert!(app_state.shutdown_debug_mode_task().is_none());
 
         let _ = std::fs::remove_dir_all(dir);
     }
