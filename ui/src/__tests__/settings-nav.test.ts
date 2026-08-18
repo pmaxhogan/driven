@@ -56,6 +56,8 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       proxyMode: "system",
       proxyUrl: null,
       pauseWhenOffline: true,
+      debugLoggingEnabled: false,
+      debugLoggingExpiresAtMs: null,
     },
     telemetry: {
       enabled: true,

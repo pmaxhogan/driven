@@ -91,6 +91,8 @@ function makeSettings(over: Partial<SettingsDto> = {}): SettingsDto {
       proxyMode: "system",
       proxyUrl: null,
       pauseWhenOffline: true,
+      debugLoggingEnabled: false,
+      debugLoggingExpiresAtMs: null,
     },
     telemetry: {
       enabled: true,
@@ -1503,6 +1505,67 @@ describe("PrivacyPage", () => {
     await closeBtn!.trigger("click");
     await flushPromises();
     expect(wrapper.find('[data-testid="telemetry-preview-modal"]').exists()).toBe(false);
+  });
+
+  it("issue #309: debug logging warning is always shown, and toggling it on patches global.debugLoggingEnabled", async () => {
+    invokeMock.mockImplementation((cmd: string, args: unknown) => {
+      if (cmd === "get_settings") return Promise.resolve(makeSettings());
+      if (cmd === "update_settings") {
+        const patch = (args as { patch: { global?: Record<string, unknown> } }).patch;
+        return Promise.resolve(
+          makeSettings({ global: { ...makeSettings().global, ...patch.global } })
+        );
+      }
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(PrivacyPage, { global: globalMountOptions });
+    await flushPromises();
+
+    // The warning is unmissable: present BEFORE the toggle is ever switched
+    // on, not gated on the enabled state.
+    const toggle = wrapper.get('[data-testid="debug-logging-toggle"]');
+    expect((toggle.element as HTMLInputElement).checked).toBe(false);
+    expect(wrapper.get('[data-testid="debug-logging-warning"]').text()).toBe(
+      i18n.global.t("settings.rules.debugLogging.warning")
+    );
+
+    await toggle.setValue(true);
+    await flushPromises();
+
+    expect(invokeMock).toHaveBeenCalledWith("update_settings", {
+      patch: { global: { debugLoggingEnabled: true } },
+    });
+    // The backend-computed expiry round-trips back into the toggle's checked
+    // state (the store replaces the snapshot with the command's response).
+    expect(
+      (wrapper.get('[data-testid="debug-logging-toggle"]').element as HTMLInputElement).checked
+    ).toBe(true);
+  });
+
+  it("issue #309: while debug logging is on, the bundle note shows the persisted expiry", async () => {
+    const expiresAt = Date.UTC(2026, 7, 18, 12, 0, 0);
+    invokeMock.mockImplementation((cmd: string) => {
+      if (cmd === "get_settings")
+        return Promise.resolve(
+          makeSettings({
+            global: {
+              ...makeSettings().global,
+              debugLoggingEnabled: true,
+              debugLoggingExpiresAtMs: expiresAt,
+            },
+          })
+        );
+      return Promise.resolve(undefined);
+    });
+    const wrapper = mount(PrivacyPage, { global: globalMountOptions });
+    await flushPromises();
+
+    expect(
+      (wrapper.get('[data-testid="debug-logging-toggle"]').element as HTMLInputElement).checked
+    ).toBe(true);
+    expect(wrapper.get('[data-testid="debug-logging-setting"]').text()).toContain(
+      i18n.global.t("settings.rules.debugLogging.includeInBundle")
+    );
   });
 });
 

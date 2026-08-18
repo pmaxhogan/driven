@@ -34,6 +34,7 @@ use tauri::{AppHandle, State};
 use driven_core::orchestrator::{MeteredMode, OrchestratorConfig};
 use driven_core::priority::WorkPriority;
 use driven_core::state::StateRepo;
+use driven_core::time::{Clock, SystemClock};
 use driven_core::types::ErrorCode;
 
 use driven_vss::VssMode;
@@ -410,6 +411,17 @@ pub async fn update_settings(
     // it actually changed), applied after persistence to (dis)arm + eagerly
     // launch the APFS snapshot broker.
     let mut apfs_snapshot_target: Option<bool> = None;
+    // Issue #309: the `global.debug_logging_enabled` transition (Some(new) iff
+    // it actually changed), applied after persistence to reload the live
+    // tracing filter + rolling-log cap.
+    let mut debug_logging_target: Option<bool> = None;
+    // The FINAL (post-patch) debug-logging state, so a same-request
+    // `log_level` change knows whether to reload the live filter directly or
+    // defer to the (more verbose) debug-mode filter that stays authoritative
+    // until debug logging turns off. Only meaningful when `new_log_level` is
+    // `Some` (which implies `patch.global` was present, the only place this
+    // is written).
+    let mut debug_logging_now_enabled = false;
     // spec 2026-07-31 s2: whether this patch touched `macos.menu_bar` at all,
     // so the menubar engine (Task 5) can redraw immediately after persistence
     // instead of waiting for its next poll tick.
@@ -612,6 +624,19 @@ pub async fn update_settings(
             cur.pause_when_offline = v;
             orchestrator_affecting = true;
         }
+        // Issue #309: debug logging mode. `double_option` is deliberately NOT
+        // used here (unlike `pre_backup_hook`/`proxy_url`) - the toggle is a
+        // plain on/off, and the backend (not the webview) owns
+        // `debug_logging_expires_at_ms`.
+        if let Some(v) = g.debug_logging_enabled {
+            if v != cur.debug_logging_enabled {
+                debug_logging_target = Some(v);
+            }
+            let (enabled, expires_at_ms) = compute_debug_logging_state(v, SystemClock.now_ms());
+            cur.debug_logging_enabled = enabled;
+            cur.debug_logging_expires_at_ms = expires_at_ms;
+        }
+        debug_logging_now_enabled = cur.debug_logging_enabled;
         store_group(repo, KEY_GLOBAL, &storage::Global::from(cur)).await?;
     }
 
@@ -886,7 +911,14 @@ pub async fn update_settings(
 
     // Live log-level change (SPEC s22 `global.log_level`).
     if let Some(level) = &new_log_level {
-        apply_log_level(level);
+        apply_log_level(level, debug_logging_now_enabled);
+    }
+
+    // Issue #309: debug logging mode toggle. Reload the live tracing filter +
+    // rolling-log cap immediately, so the change is visible without a
+    // restart (and without waiting for the watchdog's next tick).
+    if let Some(enabled) = debug_logging_target {
+        crate::debug_mode::apply(enabled);
     }
 
     // Locale change: re-render the tray (Rust-side i18n) + notify the frontend
@@ -1182,6 +1214,12 @@ mod storage {
         // unchanged behaviour).
         #[serde(default = "default_pause_when_offline")]
         pub pause_when_offline: bool,
+        // Issue #309 (debug logging mode). `serde(default)` so a `global` blob
+        // persisted before this field still deserialises as off / unset.
+        #[serde(default)]
+        pub debug_logging_enabled: bool,
+        #[serde(default)]
+        pub debug_logging_expires_at_ms: Option<i64>,
     }
 
     /// Default hook timeout (seconds) for a pre-V2 `global` blob missing it.
@@ -1237,6 +1275,8 @@ mod storage {
                 proxy_mode: s.proxy_mode,
                 proxy_url: s.proxy_url,
                 pause_when_offline: s.pause_when_offline,
+                debug_logging_enabled: s.debug_logging_enabled,
+                debug_logging_expires_at_ms: s.debug_logging_expires_at_ms,
             }
         }
     }
@@ -1264,6 +1304,8 @@ mod storage {
                 proxy_mode: d.proxy_mode,
                 proxy_url: d.proxy_url,
                 pause_when_offline: d.pause_when_offline,
+                debug_logging_enabled: d.debug_logging_enabled,
+                debug_logging_expires_at_ms: d.debug_logging_expires_at_ms,
             }
         }
     }
@@ -1563,18 +1605,39 @@ pub async fn reconcile_autostart_on_boot(app: &AppHandle, state: &dyn StateRepo)
 
 /// Apply a `tracing` max-level change at runtime (SPEC s22 `global.log_level`).
 ///
-/// The process installs its layered subscriber once at boot (`logging::init`)
-/// with no runtime-reloadable filter handle, so this cannot mutate the
-/// LIVE subscriber's level in-process; what it CAN do honestly is export the
-/// chosen level to `RUST_LOG` so it is the effective level on the next launch and
-/// for any subsystem that reads the env. The persisted `global.log_level` is the
-/// source of truth a future reload-handle wires to (it is recorded here so the
-/// behaviour is not a silent no-op).
-fn apply_log_level(level: &str) {
+/// Issue #309 gave `logging.rs` a runtime-reloadable filter handle (it needed
+/// one anyway, to switch debug logging mode on/off with no restart), so this
+/// now ALSO reloads the LIVE subscriber via [`crate::logging::set_filter`] -
+/// no longer just exporting to `RUST_LOG` for the next launch. The one
+/// exception: while debug logging mode is on, the live filter is
+/// [`crate::logging::DEBUG_MODE_FILTER`], which is deliberately MORE verbose
+/// than any user-chosen `log_level`; reloading to `level` here would silently
+/// undo that (and the auto-off watchdog would then have nothing to restore
+/// to). So a `log_level` change while debug mode is active is recorded
+/// (`RUST_LOG` + the persisted setting) but the live reload is deferred until
+/// debug mode turns off, at which point `debug_mode::apply(false)` restores
+/// [`crate::logging::DEFAULT_FILTER`] - which itself no longer reflects a
+/// just-changed `log_level`. That residual gap (log_level changed while debug
+/// mode was on restores to the OLD default filter, not the new level, once
+/// debug mode turns off) is narrow enough to accept for now: re-saving Rules
+/// after debug mode clears reloads the intended level.
+fn apply_log_level(level: &str, debug_logging_enabled: bool) {
     // SAFETY note: `set_var` is process-global; we only ever write a validated
     // tracing level string, never untrusted bytes, and only from this command.
     std::env::set_var("RUST_LOG", level);
-    tracing::info!(target: TARGET, level, "log level setting updated (effective for new launches / env-reading subsystems)");
+    if debug_logging_enabled {
+        tracing::info!(
+            target: TARGET,
+            level,
+            "log level setting updated (debug logging mode is active; the live filter stays at debug-mode verbosity until it turns off)"
+        );
+        return;
+    }
+    if crate::logging::set_filter(level) {
+        tracing::info!(target: TARGET, level, "log level applied to the live process");
+    } else {
+        tracing::info!(target: TARGET, level, "log level setting updated (effective for new launches / env-reading subsystems)");
+    }
 }
 
 /// Apply a locale change: set the Rust-side i18n locale + re-render the tray, and
@@ -1737,6 +1800,88 @@ fn schedule_settings_to_config(s: &ScheduleSettings) -> driven_core::types::Sche
 }
 
 // ---------------------------------------------------------------------------
+// Debug logging mode (issue #309): shared read/write used by both
+// `update_settings` (the toggle IPC) and `debug_mode::spawn_watchdog`'s
+// 24h auto-off reconciler.
+// ---------------------------------------------------------------------------
+
+/// Read the persisted `(global.debug_logging_enabled,
+/// global.debug_logging_expires_at_ms)` pair. `None` on a state-DB read/parse
+/// failure (the watchdog logs and retries next tick rather than treating a
+/// transient DB error as "debug mode is off").
+pub(crate) async fn load_debug_logging_state(state: &dyn StateRepo) -> Option<(bool, Option<i64>)> {
+    let global: GlobalSettings = load_group::<storage::Global>(state, KEY_GLOBAL)
+        .await
+        .ok()?
+        .map(Into::into)
+        .unwrap_or_else(default_global);
+    Some((
+        global.debug_logging_enabled,
+        global.debug_logging_expires_at_ms,
+    ))
+}
+
+/// Persist `debug_logging_enabled = false` + clear the expiry (issue #309's
+/// 24h auto-off), preserving every other `global` field. Used by the
+/// watchdog when the persisted window has elapsed; `update_settings` handles
+/// the user-initiated off path inline (see the `global` group block) since it
+/// already has the freshly-loaded `cur: GlobalSettings` in scope.
+pub(crate) async fn persist_debug_logging_off(state: &dyn StateRepo) -> CommandResult<()> {
+    let mut global: GlobalSettings = load_group::<storage::Global>(state, KEY_GLOBAL)
+        .await?
+        .map(Into::into)
+        .unwrap_or_else(default_global);
+    global.debug_logging_enabled = false;
+    global.debug_logging_expires_at_ms = None;
+    store_group(state, KEY_GLOBAL, &storage::Global::from(global)).await
+}
+
+/// Test-only: persist an ARBITRARY `(enabled, expires_at_ms)` pair, bypassing
+/// [`compute_debug_logging_state`]'s "switching on always extends from now"
+/// rule. `debug_mode::reconcile`'s tests (in `debug_mode.rs`) need to
+/// simulate an expiry already in the PAST - as if the 24h window elapsed
+/// while the app was closed - which the production write path
+/// (`update_settings`) can never produce for a live save.
+#[cfg(test)]
+pub(crate) async fn set_debug_logging_state_for_test(
+    state: &dyn StateRepo,
+    enabled: bool,
+    expires_at_ms: Option<i64>,
+) {
+    let mut global: GlobalSettings = load_group::<storage::Global>(state, KEY_GLOBAL)
+        .await
+        .expect("load global group")
+        .map(Into::into)
+        .unwrap_or_else(default_global);
+    global.debug_logging_enabled = enabled;
+    global.debug_logging_expires_at_ms = expires_at_ms;
+    store_group(state, KEY_GLOBAL, &storage::Global::from(global))
+        .await
+        .expect("store global group");
+}
+
+/// Issue #309: compute the new `(debug_logging_enabled,
+/// debug_logging_expires_at_ms)` pair for a patched `enabled` value at
+/// `now_ms`. Extracted as a PURE function (no state-DB access, no
+/// `AppHandle`) so the 24h-window arithmetic is unit-testable directly -
+/// `update_settings` needs a live `AppHandle` for its side effects, which
+/// would otherwise drag every caller of this arithmetic into an
+/// integration-style test.
+///
+/// Switching ON (re-)starts the window from `now_ms`, including the
+/// "already on, save fires true again" case: an explicit toggle is a fresh
+/// "keep this on" signal, so extending the window is correct rather than
+/// letting a coincidental re-save silently shorten it to whatever was left.
+/// Switching off always clears the expiry.
+fn compute_debug_logging_state(enabled: bool, now_ms: i64) -> (bool, Option<i64>) {
+    if enabled {
+        (true, Some(now_ms + crate::debug_mode::AUTO_OFF_WINDOW_MS))
+    } else {
+        (false, None)
+    }
+}
+
+// ---------------------------------------------------------------------------
 // export_diagnostic_bundle (SPEC s11.6, s18)
 // ---------------------------------------------------------------------------
 
@@ -1754,10 +1899,15 @@ fn schedule_settings_to_config(s: &ScheduleSettings) -> driven_core::types::Sche
 ///
 /// The bundle (SPEC s18) carries `version.txt`, `os.txt`, a REDACTED
 /// `settings_redacted.json`, `schema.txt` (real PRAGMA user_version + table
-/// counts), `activity_last_30d.csv`, `logs/`, `crashes/`, and
-/// `redaction-policy.txt`. Every secret-bearing field (refresh tokens, recovery
+/// counts), `pending_ops.txt`, `memory.txt`, `activity_last_30d.csv`, `logs/`,
+/// `crashes/`, `redaction-policy.txt`, and `manifest.txt` (issue #309: every
+/// entry's name + size). Every secret-bearing field (refresh tokens, recovery
 /// phrases, keys, master key, account emails, drive folder names, local paths,
-/// Drive file ids) is redacted or hashed before it enters the ZIP.
+/// Drive file ids) is redacted or hashed before it enters the ZIP. Issue #309:
+/// while debug logging mode is on, the bundle ALSO gets `DEBUG_MODE.txt` and a
+/// deliberately UNREDACTED `debug/engine_state.txt` - the one exception to the
+/// paragraph above, gated on the user's explicit opt-in (see
+/// [`DEBUG_MODE_BUNDLE_NOTICE`]).
 #[tauri::command]
 pub async fn export_diagnostic_bundle(
     app: AppHandle,
@@ -1860,11 +2010,149 @@ async fn build_diagnostic_zip(app: &AppHandle, state: &dyn StateRepo) -> Command
     tokio::time::sleep(std::time::Duration::from_millis(150)).await;
     add_logs_and_crashes(&mut zip, &redactor);
 
+    // Issue #309: while debug logging mode is ON, add a clearly-labelled,
+    // DELIBERATELY UNREDACTED engine-state snapshot. This is the one place
+    // the issue #204 redaction rules do not apply (by explicit user opt-in -
+    // the whole point of debug mode, and the amber Settings warning tells the
+    // user exactly this before they turn it on). Every OTHER section above
+    // stays redacted regardless of debug mode: the toggle means "log/bundle
+    // MORE", not "stop redacting what was already safe to redact".
+    if settings.global.debug_logging_enabled {
+        zip.add_file("DEBUG_MODE.txt", DEBUG_MODE_BUNDLE_NOTICE.as_bytes());
+        let engine_state = build_debug_engine_state(state).await;
+        zip.add_file("debug/engine_state.txt", engine_state.as_bytes());
+        tracing::info!(target: TARGET, "diagnostic bundle: debug logging mode was on; included unredacted engine_state.txt");
+    }
+
     // redaction-policy.txt (SPEC s18): tell the recipient the bundle's threat
     // model + exactly what was redacted.
     zip.add_file("redaction-policy.txt", REDACTION_POLICY.as_bytes());
 
+    // manifest.txt (issue #309 bundle-usefulness follow-up): every entry
+    // added above, with its size, so a recipient can see the bundle's shape
+    // without unzipping it. Added LAST (after every other entry) so it is
+    // complete; it cannot list itself.
+    let manifest = zip.manifest_so_far();
+    zip.add_file("manifest.txt", manifest.as_bytes());
+
     Ok(zip.finish())
+}
+
+/// Issue #309: the notice at the top of a bundle captured while debug logging
+/// mode was on, explaining why `debug/` and the rolling `logs/` in this
+/// bundle are more detailed (and less redacted) than usual.
+const DEBUG_MODE_BUNDLE_NOTICE: &str = "\
+Debug logging mode was ON when this bundle was captured.
+=========================================================
+
+The user explicitly opted into this (Settings > Debug logging), after an
+on-screen warning that it would record file names, full paths, timing data,
+and other personal information into logs and diagnostic bundles.
+
+What that means for THIS bundle:
+- logs/ contains TRACE-level output for Driven's own code: per-file activity,
+  IPC command traces, state transitions, and reconcile/queue decisions - far
+  more detailed than the default INFO-level logs.
+- debug/engine_state.txt is a RAW, UNREDACTED snapshot of engine state
+  (backup source local paths, pending-op relative paths, ...). Every OTHER
+  file in this bundle (settings_redacted.json, activity_last_30d.csv,
+  pending_ops.txt, the rest of logs/) is STILL redacted exactly as documented
+  in redaction-policy.txt - debug mode does not weaken that. This file is the
+  one deliberate exception.
+
+Debug logging mode turns itself off automatically 24 hours after it was
+enabled, so this state is not persistent.
+";
+
+/// Issue #309: a RAW (unredacted) snapshot of engine state for the diagnostic
+/// bundle's `debug/engine_state.txt`, included only while debug logging mode
+/// is on (see [`build_diagnostic_zip`]). Deliberately mirrors
+/// [`build_pending_ops_summary`]'s pending-ops section but WITHOUT the
+/// redactor - support gets the real paths, which is the entire point of
+/// opting into debug mode. Best-effort per section: one query failing does
+/// not blank the rest.
+async fn build_debug_engine_state(state: &dyn StateRepo) -> String {
+    use driven_core::time::{Clock, SystemClock};
+    let now = SystemClock.now_ms();
+
+    let mut out = String::from(
+        "# Engine state snapshot (issue #309 debug logging mode).\n\
+         # UNREDACTED - see DEBUG_MODE.txt for why.\n\
+         # Secrets (OAuth tokens, encryption keys, upload-session URLs) are\n\
+         # STILL never included: they never enter this process's readable\n\
+         # settings/state, so there is nothing here to redact away.\n\n",
+    );
+
+    out.push_str("## backup_sources\n");
+    let sources = match state.list_sources().await {
+        Ok(s) => s,
+        Err(e) => {
+            out.push_str(&format!("(list_sources failed: {e})\n\n"));
+            Vec::new()
+        }
+    };
+    if sources.is_empty() {
+        out.push_str("(none)\n");
+    }
+    for s in &sources {
+        out.push_str(&format!(
+            "- id={} name={:?} enabled={} local_path={} drive_folder={} deep_verify_interval_secs={} last_full_scan_at={:?} last_deep_verify_at={:?} exclude_patterns={:?}\n",
+            s.id,
+            s.display_name,
+            s.enabled,
+            s.local_path,
+            s.drive_folder_path,
+            s.deep_verify_interval_secs,
+            s.last_full_scan_at,
+            s.last_deep_verify_at,
+            s.exclude_patterns,
+        ));
+    }
+
+    out.push_str("\n## pending_ops (unredacted)\n");
+    let mut any_pending = false;
+    for s in &sources {
+        let ops = match state.get_pending_ops_for_source(s.id).await {
+            Ok(o) => o,
+            Err(e) => {
+                out.push_str(&format!(
+                    "(get_pending_ops_for_source failed for source id={}: {e})\n",
+                    s.id
+                ));
+                continue;
+            }
+        };
+        if ops.is_empty() {
+            continue;
+        }
+        any_pending = true;
+        out.push_str(&format!(
+            "source id={} local_path={}: {} pending op(s)\n",
+            s.id,
+            s.local_path,
+            ops.len()
+        ));
+        for op in ops {
+            out.push_str(&format!(
+                "  - type={} attempts={} age_ms={} relative_path={}\n",
+                op.op_type,
+                op.attempts,
+                now.saturating_sub(op.created_at),
+                op.relative_path,
+            ));
+        }
+    }
+    if !any_pending {
+        out.push_str("(no pending ops)\n");
+    }
+
+    out.push_str("\n## memory_trend (unix_ms rss_bytes)\n");
+    for (ts_ms, rss) in crate::memlog::recent_samples() {
+        out.push_str(&format!("{ts_ms} {rss}\n"));
+    }
+
+    out.push_str(&format!("\ncaptured_at_ms={now}\n"));
+    out
 }
 
 /// SPEC s18: the maximum bytes of log content the bundle carries (the spec's
@@ -2676,7 +2964,7 @@ fn os_descriptor() -> String {
 /// redaction here is the install id).
 #[derive(serde::Serialize)]
 struct RedactedSettings {
-    global: GlobalSettings,
+    global: RedactedGlobalSettings,
     telemetry: RedactedTelemetry,
     updater: UpdaterSettings,
     ui: UiSettings,
@@ -2684,6 +2972,13 @@ struct RedactedSettings {
     windows: Option<WindowsSettings>,
     #[serde(skip_serializing_if = "Option::is_none")]
     macos: Option<MacosSettings>,
+    /// R2-P2-4 bundle-completeness follow-up: these three standalone toggles
+    /// (SPEC s22) were silently OMITTED from every prior bundle (not leaked -
+    /// just missing), which made a bundle less useful for diagnosing a
+    /// bundling / scrub / drill issue. None are secret-bearing.
+    bundle_small_files: bool,
+    scrub: crate::commands::dtos::ScrubSettings,
+    drill: crate::commands::dtos::DrillSettings,
 }
 
 /// Telemetry settings with the stable `install_id` replaced by a per-bundle
@@ -2695,18 +2990,69 @@ struct RedactedTelemetry {
     endpoint: String,
 }
 
+/// Issue #204: the redacted `global` group. Mirrors [`GlobalSettings`]
+/// FIELD-FOR-FIELD (deliberately, not a `.clone()` + patch) so a NEW
+/// secret-bearing field added to [`GlobalSettings`] in the future fails to
+/// COMPILE here until someone decides how it is redacted - the failure mode
+/// for a forgotten field is a build error, not a silent leak into a bundle
+/// handed to a stranger. This is the structural fix for issue #204: the
+/// pre-fix `redact_settings` cloned `GlobalSettings` wholesale and patched
+/// only `proxy_url`, so `pre_backup_hook` / `post_backup_hook` (command lines,
+/// a classic home for embedded secrets) and `custom_root_ca_path` (a path
+/// that routinely embeds the OS username) rode along raw.
+#[derive(serde::Serialize)]
+#[serde(rename_all = "camelCase")]
+struct RedactedGlobalSettings {
+    auto_start_on_login: bool,
+    default_concurrent_uploads: Option<u32>,
+    adaptive_parallelism_enabled: bool,
+    bandwidth_cap_mbps: Option<u32>,
+    skip_on_battery: bool,
+    skip_on_metered: bool,
+    scan_interval_secs: u32,
+    deep_verify_interval_secs: u32,
+    io_priority: String,
+    log_level: String,
+    schedule: ScheduleSettings,
+    /// Issue #204: presence is diagnostically useful (whether a hook is
+    /// configured at all, and roughly how long the command is); the CONTENTS
+    /// are not, and are a classic home for an embedded secret
+    /// (`curl -H "Authorization: ..."`, an rclone flag, a password passed as
+    /// a bare CLI arg) - so the command text itself never leaves the machine.
+    pre_backup_hook: Option<String>,
+    post_backup_hook: Option<String>,
+    hook_timeout_secs: u32,
+    metered_mode: String,
+    metered_bandwidth_cap_mbps: Option<u32>,
+    /// Issue #204: an absolute path routinely embeds the OS username. The
+    /// rest of the bundle already hashes paths to `<path:...>` (the
+    /// [`Redactor`] used for logs/activity/pending-ops); this field is routed
+    /// through the SAME `stable_hash` so occurrences correlate consistently.
+    custom_root_ca_path: Option<String>,
+    proxy_mode: String,
+    /// Issue #204: PAC mode makes this a local FILE PATH rather than a URL,
+    /// so the issue #34 userinfo-strip alone does not cover it - the path
+    /// (username and all) went out verbatim. [`redact_proxy_url_field`]
+    /// applies BOTH the userinfo strip (manual-mode URL) and the absolute-
+    /// path-run hash (PAC-mode local path); each is a no-op on the shape the
+    /// other targets, so one function is correct for both modes.
+    proxy_url: Option<String>,
+    pause_when_offline: bool,
+    /// Issue #309: not secret-bearing (a bool + an epoch-ms deadline), so it
+    /// passes through unchanged - useful context for "was debug mode on when
+    /// this bundle was captured".
+    debug_logging_enabled: bool,
+    debug_logging_expires_at_ms: Option<i64>,
+}
+
 /// Redact the secret-bearing fields of a [`SettingsDto`] for the bundle
-/// (SPEC s18): the telemetry install id becomes `installid_<hash>`, and the
-/// issue #34 proxy URL has any `user:password@` userinfo stripped.
+/// (SPEC s18 / issue #204): the telemetry install id becomes
+/// `installid_<hash>`; the proxy URL / PAC path has userinfo stripped and any
+/// local-path shape hashed; the custom root CA path is hashed; the pre/post
+/// backup hook commands are redacted wholesale (presence + length only).
 fn redact_settings(s: &SettingsDto) -> RedactedSettings {
-    let mut global = s.global.clone();
-    // Issue #34 follow-up: a `manual`-mode proxy URL may embed basic-auth
-    // credentials (`http://user:password@proxy.corp:8080`). The bundle is meant
-    // to be shareable with support, so the userinfo must never ride along - the
-    // host:port survives because that is the diagnostically useful part.
-    global.proxy_url = global.proxy_url.as_deref().map(redact_proxy_userinfo);
     RedactedSettings {
-        global,
+        global: redact_global_settings(&s.global),
         telemetry: RedactedTelemetry {
             enabled: s.telemetry.enabled,
             install_id: format!("installid_{}", stable_hash(&s.telemetry.install_id)),
@@ -2716,7 +3062,77 @@ fn redact_settings(s: &SettingsDto) -> RedactedSettings {
         ui: s.ui.clone(),
         windows: s.windows.clone(),
         macos: s.macos.clone(),
+        bundle_small_files: s.bundle_small_files,
+        scrub: s.scrub,
+        drill: s.drill,
     }
+}
+
+/// See [`RedactedGlobalSettings`] doc: the field-for-field redaction issue
+/// #204 asks for, so a future new secret-bearing field cannot ride along raw
+/// by accident (it would fail to compile here first).
+fn redact_global_settings(g: &GlobalSettings) -> RedactedGlobalSettings {
+    RedactedGlobalSettings {
+        auto_start_on_login: g.auto_start_on_login,
+        default_concurrent_uploads: g.default_concurrent_uploads,
+        adaptive_parallelism_enabled: g.adaptive_parallelism_enabled,
+        bandwidth_cap_mbps: g.bandwidth_cap_mbps,
+        skip_on_battery: g.skip_on_battery,
+        skip_on_metered: g.skip_on_metered,
+        scan_interval_secs: g.scan_interval_secs,
+        deep_verify_interval_secs: g.deep_verify_interval_secs,
+        io_priority: g.io_priority.clone(),
+        log_level: g.log_level.clone(),
+        schedule: g.schedule.clone(),
+        pre_backup_hook: redact_hook_command(g.pre_backup_hook.as_deref()),
+        post_backup_hook: redact_hook_command(g.post_backup_hook.as_deref()),
+        hook_timeout_secs: g.hook_timeout_secs,
+        metered_mode: g.metered_mode.clone(),
+        metered_bandwidth_cap_mbps: g.metered_bandwidth_cap_mbps,
+        custom_root_ca_path: g
+            .custom_root_ca_path
+            .as_ref()
+            .map(|p| format!("<path:{}>", stable_hash(&p.to_string_lossy()))),
+        proxy_mode: g.proxy_mode.clone(),
+        proxy_url: g.proxy_url.as_deref().map(redact_proxy_url_field),
+        pause_when_offline: g.pause_when_offline,
+        debug_logging_enabled: g.debug_logging_enabled,
+        debug_logging_expires_at_ms: g.debug_logging_expires_at_ms,
+    }
+}
+
+/// Issue #204: redact a pre/post-backup hook command WHOLESALE. A hook
+/// command line is a classic home for an embedded secret
+/// (`curl -H "Authorization: Bearer ..."`, an rclone `--password` flag, a
+/// token passed as a bare CLI arg) that no shape-based scrub (email / token
+/// prefix / path pattern) can be trusted to catch, so unlike every other
+/// field here this is not a hash - the exact command text must never leave
+/// the machine. What survives is purely diagnostic: THAT a hook is
+/// configured, and its rough length (a `pre_backup_hook` that's 4000
+/// characters long is itself a useful clue; the empty-vs-set case is the
+/// most common one support needs to distinguish).
+fn redact_hook_command(cmd: Option<&str>) -> Option<String> {
+    cmd.map(|c| format!("<hook-redacted: {} chars>", c.chars().count()))
+}
+
+/// Issue #204: redact a `global.proxy_url` value for BOTH shapes it can take
+/// (see [`GlobalSettings::proxy_url`] doc) without needing to branch on
+/// `proxy_mode`:
+/// - `manual` mode: a URL that may carry `user:password@` userinfo -
+///   [`redact_proxy_userinfo`] strips it, keeping `scheme://host:port`.
+/// - `pac` mode: a URL (same userinfo risk) OR a local FILE PATH (which
+///   [`redact_proxy_userinfo`] does NOT touch - it has no `://` scheme
+///   separator to key off - so the path, username and all, would otherwise
+///   ride along verbatim). [`redact_absolute_path_runs`] catches that shape.
+///
+/// Each pass is a no-op on the shape the other targets (a bare local path has
+/// no `://` for the userinfo strip to find; a remote URL never matches the
+/// absolute-path-run start patterns), so applying both unconditionally is
+/// correct regardless of mode and needs no `proxy_mode` branch to drift out
+/// of sync with this function.
+fn redact_proxy_url_field(raw: &str) -> String {
+    let stripped = redact_proxy_userinfo(raw);
+    redact_absolute_path_runs(&stripped)
 }
 
 /// Strip any `user:password@` userinfo from a proxy URL, keeping the scheme and
@@ -2816,6 +3232,13 @@ What is redacted / never included:
 Caveat: despite this policy, free-text you supplied (e.g. a display name) is not
 guaranteed to be scrubbed if it appears in a field this policy did not anticipate.
 Review the bundle before sharing if that concerns you.
+
+Debug logging mode exception (issue #309): if `DEBUG_MODE.txt` is present in
+this bundle, `debug/engine_state.txt` is DELIBERATELY UNREDACTED (real local
+paths and pending-op relative paths). This happens only when you explicitly
+turned on Settings > Debug logging, which warns you before you do it. Every
+file listed above this note stays redacted exactly as described, debug mode
+or not.
 ";
 
 // ---------------------------------------------------------------------------
@@ -3155,6 +3578,10 @@ fn default_global() -> GlobalSettings {
         // spec 2026-08-01: pause on lost network reachability by default
         // (unchanged V1 behaviour).
         pause_when_offline: true,
+        // Issue #309: debug logging mode ships off by default (it costs
+        // performance and logs paths/timings, so it is opt-in only).
+        debug_logging_enabled: false,
+        debug_logging_expires_at_ms: None,
     }
 }
 
@@ -3279,6 +3706,28 @@ impl ZipWriter {
         });
     }
 
+    /// Issue #309 bundle-usefulness follow-up: a plain-text manifest (name +
+    /// uncompressed bytes) of every entry added SO FAR, so a recipient can see
+    /// at a glance how big each bundle section is without unzipping. Must be
+    /// called - and its output added via [`Self::add_file`] - BEFORE
+    /// [`Self::finish`]; it necessarily cannot list itself.
+    fn manifest_so_far(&self) -> String {
+        let mut out = String::from(
+            "# Diagnostic bundle manifest: name<TAB>uncompressed bytes.\n\
+             # (this file is not itself listed)\n",
+        );
+        let mut total: u64 = 0;
+        for e in &self.entries {
+            out.push_str(&format!("{}\t{}\n", e.name, e.size));
+            total += u64::from(e.size);
+        }
+        out.push_str(&format!(
+            "# total: {total} bytes across {} entries\n",
+            self.entries.len()
+        ));
+        out
+    }
+
     /// Emit the central directory + end-of-central-directory record and return
     /// the finished archive bytes.
     fn finish(mut self) -> Vec<u8> {
@@ -3341,12 +3790,15 @@ mod tests {
     /// returned `PathBuf` is the temp dir, cleaned up by the caller. Uses a
     /// hand-rolled temp dir so src-tauri needs no `tempfile` dev-dep.
     async fn seeded_repo() -> (SqliteStateRepo, PathBuf) {
-        let nonce = std::time::SystemTime::now()
-            .duration_since(std::time::UNIX_EPOCH)
-            .map(|d| d.as_nanos())
-            .unwrap_or(0);
-        let dir = std::env::temp_dir().join(format!("driven-settings-test-{nonce}-{:p}", &nonce));
-        std::fs::create_dir_all(&dir).expect("create temp dir");
+        // CodeQL `rust/path-injection` (driven-ci-flakes precedent, PR 151 /
+        // src-tauri/Cargo.toml's `tempfile` dependency comment): a hand-rolled
+        // `std::env::temp_dir().join(format!(...))` is exactly the pattern the
+        // rule flags feeding `SqliteStateRepo::open`. `tempfile::tempdir()` is
+        // an opaque external call CodeQL's dataflow does not see into, so the
+        // taint chain never forms - fix, not a dismissal. `keep()` keeps
+        // the directory alive (matching the pre-`tempfile` behaviour) so every
+        // caller's existing `cleanup(dir)` teardown still applies unchanged.
+        let dir = tempfile::tempdir().expect("create temp dir").keep();
         let repo = SqliteStateRepo::open(&dir.join("state.db"))
             .await
             .expect("open seeded state repo");
@@ -3542,6 +3994,97 @@ mod tests {
         // Untouched fields keep their seeded defaults.
         assert!(dto.global.skip_on_battery, "untouched field unchanged");
         assert!(dto.global.skip_on_metered, "untouched field unchanged");
+        cleanup(dir);
+    }
+
+    // -------------------------------------------------------------------
+    // Issue #309: debug logging mode - 24h auto-off expiry arithmetic +
+    // persistence round-trip.
+    // -------------------------------------------------------------------
+
+    #[test]
+    fn compute_debug_logging_state_switching_on_sets_a_24h_expiry() {
+        let (enabled, expires_at_ms) = compute_debug_logging_state(true, 1_000);
+        assert!(enabled);
+        assert_eq!(
+            expires_at_ms,
+            Some(1_000 + crate::debug_mode::AUTO_OFF_WINDOW_MS)
+        );
+    }
+
+    #[test]
+    fn compute_debug_logging_state_switching_off_clears_the_expiry() {
+        let (enabled, expires_at_ms) = compute_debug_logging_state(false, 1_000);
+        assert!(!enabled);
+        assert_eq!(expires_at_ms, None);
+    }
+
+    #[test]
+    fn compute_debug_logging_state_re_enabling_extends_from_now_not_from_the_old_deadline() {
+        // A user who re-saves Settings while debug mode is already on gets a
+        // FRESH 24h window from now, not whatever was left of the old one -
+        // the explicit toggle is a "keep this on" signal.
+        let later_now = 50_000;
+        let (enabled, expires_at_ms) = compute_debug_logging_state(true, later_now);
+        assert!(enabled);
+        assert_eq!(
+            expires_at_ms,
+            Some(later_now + crate::debug_mode::AUTO_OFF_WINDOW_MS)
+        );
+    }
+
+    #[tokio::test]
+    async fn debug_logging_defaults_off_with_no_expiry() {
+        let (repo, dir) = seeded_repo().await;
+        let (enabled, expires_at_ms) = load_debug_logging_state(&repo)
+            .await
+            .expect("read debug logging state");
+        assert!(!enabled, "debug logging mode defaults off");
+        assert_eq!(expires_at_ms, None);
+        cleanup(dir);
+    }
+
+    #[tokio::test]
+    async fn debug_logging_enable_then_disable_round_trips_through_persistence() {
+        let (repo, dir) = seeded_repo().await;
+
+        // Turn it on with a computed expiry (mirrors what `update_settings`
+        // does), persist, and read it back.
+        let mut cur: GlobalSettings = load_group::<storage::Global>(&repo, KEY_GLOBAL)
+            .await
+            .unwrap()
+            .map(Into::into)
+            .unwrap();
+        let (enabled, expires_at_ms) = compute_debug_logging_state(true, 12_345);
+        cur.debug_logging_enabled = enabled;
+        cur.debug_logging_expires_at_ms = expires_at_ms;
+        store_group(&repo, KEY_GLOBAL, &storage::Global::from(cur))
+            .await
+            .unwrap();
+
+        let (loaded_enabled, loaded_expires_at_ms) =
+            load_debug_logging_state(&repo).await.expect("read state");
+        assert!(loaded_enabled);
+        assert_eq!(
+            loaded_expires_at_ms,
+            Some(12_345 + crate::debug_mode::AUTO_OFF_WINDOW_MS)
+        );
+
+        // The watchdog's auto-off path: `persist_debug_logging_off` clears
+        // BOTH fields and leaves the rest of the group untouched.
+        persist_debug_logging_off(&repo)
+            .await
+            .expect("persist auto-off");
+        let (off_enabled, off_expires_at_ms) =
+            load_debug_logging_state(&repo).await.expect("read state");
+        assert!(!off_enabled, "auto-off must clear the enabled flag");
+        assert_eq!(off_expires_at_ms, None, "auto-off must clear the expiry");
+
+        let dto = load_settings_dto(&repo).await.unwrap();
+        assert_eq!(
+            dto.global.scan_interval_secs, 600,
+            "auto-off must not disturb unrelated global fields"
+        );
         cleanup(dir);
     }
 
@@ -4083,6 +4626,222 @@ mod tests {
             !json.contains("hunter2"),
             "the bundle JSON must not carry the proxy password: {json}"
         );
+    }
+
+    /// Build a minimal [`SettingsDto`] for the issue #204 redaction tests below,
+    /// with the caller's `global` and everything else defaulted.
+    fn dto_with_global(global: GlobalSettings) -> SettingsDto {
+        SettingsDto {
+            global,
+            telemetry: TelemetrySettings {
+                enabled: false,
+                install_id: "id".to_string(),
+                endpoint: "https://e".to_string(),
+            },
+            updater: default_updater(),
+            ui: default_ui(),
+            windows: None,
+            macos: None,
+            bundle_small_files: false,
+            scrub: driven_core::scrub::ScrubConfig::default().into(),
+            drill: driven_core::drill::DrillConfig::default().into(),
+        }
+    }
+
+    #[test]
+    fn redact_settings_redacts_backup_hook_commands_wholesale_issue_204() {
+        // Issue #204: a hook command line is a classic home for an embedded
+        // secret (an Authorization header, a password CLI arg). Both fields
+        // must be redacted WHOLESALE, not scrubbed by shape - the leak-shaped
+        // fixture below has neither an `@email` nor a `ya29.`/`1//` token
+        // prefix, so the old whole-clone redaction (which never touched these
+        // fields at all) would ship it completely raw.
+        let mut global = default_global();
+        global.pre_backup_hook =
+            Some(r#"curl -H "Authorization: Bearer sk-live-51H8xyz9SECRET" https://hooks.example.com/pre"#.to_string());
+        global.post_backup_hook =
+            Some("rclone sync --password hunter2plaintext /src remote:".to_string());
+        let dto = dto_with_global(global);
+
+        let red = redact_settings(&dto);
+        let pre = red
+            .global
+            .pre_backup_hook
+            .as_deref()
+            .expect("pre hook present");
+        let post = red
+            .global
+            .post_backup_hook
+            .as_deref()
+            .expect("post hook present");
+        assert!(
+            !pre.contains("sk-live-51H8xyz9SECRET"),
+            "pre-hook secret leaked: {pre}"
+        );
+        assert!(
+            !pre.contains("Bearer"),
+            "pre-hook command text leaked: {pre}"
+        );
+        assert!(
+            pre.starts_with("<hook-redacted:"),
+            "pre-hook should be a redacted marker: {pre}"
+        );
+        assert!(
+            !post.contains("hunter2plaintext"),
+            "post-hook secret leaked: {post}"
+        );
+        assert!(
+            post.starts_with("<hook-redacted:"),
+            "post-hook should be a redacted marker: {post}"
+        );
+
+        // The serialized bundle document (the artifact that actually leaves
+        // the machine) must not carry either secret.
+        let json = serde_json::to_string(&red).expect("serialize");
+        assert!(
+            !json.contains("sk-live-51H8xyz9SECRET"),
+            "bundle JSON leaked the pre-hook secret: {json}"
+        );
+        assert!(
+            !json.contains("hunter2plaintext"),
+            "bundle JSON leaked the post-hook secret: {json}"
+        );
+        assert!(
+            !json.contains("Authorization"),
+            "bundle JSON leaked hook command text: {json}"
+        );
+    }
+
+    #[test]
+    fn redact_settings_hooks_stay_none_when_unset() {
+        // A hook that was never configured must serialize as absent (`null`),
+        // not as a redacted-marker string implying a hook exists.
+        let dto = dto_with_global(default_global());
+        let red = redact_settings(&dto);
+        assert!(red.global.pre_backup_hook.is_none());
+        assert!(red.global.post_backup_hook.is_none());
+    }
+
+    #[test]
+    fn redact_settings_hashes_custom_root_ca_path_issue_204() {
+        // Issue #204: `custom_root_ca_path` routinely embeds the OS username
+        // (e.g. `C:\Users\Pat Smith\certs\corp-ca.pem`), and the rest of the
+        // bundle already hashes paths to `<path:...>` - shipping this one
+        // field verbatim was an internal inconsistency, not a judgement call.
+        let mut global = default_global();
+        global.custom_root_ca_path = Some(PathBuf::from(
+            "/Users/patsmith-secret/corp-certs/root-ca.pem",
+        ));
+        let dto = dto_with_global(global);
+
+        let red = redact_settings(&dto);
+        let path = red
+            .global
+            .custom_root_ca_path
+            .as_deref()
+            .expect("ca path present");
+        assert!(
+            !path.contains("patsmith-secret"),
+            "the OS username must be gone: {path}"
+        );
+        assert!(
+            path.starts_with("<path:"),
+            "should be a hashed placeholder: {path}"
+        );
+
+        let json = serde_json::to_string(&red).expect("serialize");
+        assert!(
+            !json.contains("patsmith-secret"),
+            "bundle JSON leaked the CA path's username: {json}"
+        );
+    }
+
+    #[test]
+    fn redact_settings_hashes_pac_mode_local_file_path_issue_204() {
+        // Issue #204: PAC mode makes `proxy_url` a local FILE PATH rather than
+        // a URL, so the issue #34 userinfo-strip (which only understands
+        // `scheme://user:pass@host`) does not apply to it - the path, and any
+        // username it embeds, went out verbatim.
+        let mut global = default_global();
+        global.proxy_mode = "pac".to_string();
+        global.proxy_url = Some("/home/patsmith-secret/corp-proxy.pac".to_string());
+        let dto = dto_with_global(global);
+
+        let red = redact_settings(&dto);
+        let url = red.global.proxy_url.as_deref().expect("proxy url present");
+        assert!(
+            !url.contains("patsmith-secret"),
+            "the OS username in the PAC path must be gone: {url}"
+        );
+        assert!(
+            url.starts_with("<path:"),
+            "should be a hashed placeholder: {url}"
+        );
+
+        let json = serde_json::to_string(&red).expect("serialize");
+        assert!(
+            !json.contains("patsmith-secret"),
+            "bundle JSON leaked the PAC path's username: {json}"
+        );
+    }
+
+    #[test]
+    fn redact_settings_pac_mode_remote_url_still_strips_userinfo_issue_204() {
+        // Issue #204 fix must not regress the issue #34 fix: PAC mode can ALSO
+        // be a remote URL (not just a local path), which can itself carry
+        // `user:pass@` userinfo.
+        let mut global = default_global();
+        global.proxy_mode = "pac".to_string();
+        global.proxy_url = Some("http://wpaduser:wpadpass@wpad.corp.example/proxy.pac".to_string());
+        let dto = dto_with_global(global);
+
+        let red = redact_settings(&dto);
+        let url = red.global.proxy_url.as_deref().expect("proxy url present");
+        assert!(
+            !url.contains("wpadpass"),
+            "PAC URL password must be gone: {url}"
+        );
+        assert!(
+            !url.contains("wpaduser"),
+            "PAC URL username must be gone: {url}"
+        );
+        assert!(
+            url.contains("wpad.corp.example"),
+            "host is diagnostically useful and survives: {url}"
+        );
+    }
+
+    #[test]
+    fn redact_settings_full_leak_shaped_document_is_clean_end_to_end_issue_204() {
+        // Issue #204: "add a test asserting on the serialized JSON - the
+        // artifact that leaves the machine is what matters". One fixture that
+        // sets EVERY field the issue named at once, then asserts the whole
+        // serialized bundle document carries none of the injected secrets.
+        let mut global = default_global();
+        global.pre_backup_hook =
+            Some(r#"curl -H "Authorization: Bearer LEAK_PRE_TOKEN""#.to_string());
+        global.post_backup_hook =
+            Some("aws s3 sync --secret-key LEAK_POST_SECRET /x s3://y".to_string());
+        global.custom_root_ca_path = Some(PathBuf::from("/Users/LEAK_USERNAME/ca.pem"));
+        global.proxy_mode = "manual".to_string();
+        global.proxy_url =
+            Some("http://LEAK_PROXY_USER:LEAK_PROXY_PASS@proxy.example:3128".to_string());
+        let dto = dto_with_global(global);
+
+        let red = redact_settings(&dto);
+        let json = serde_json::to_string_pretty(&red).expect("serialize");
+        for leaked in [
+            "LEAK_PRE_TOKEN",
+            "LEAK_POST_SECRET",
+            "LEAK_USERNAME",
+            "LEAK_PROXY_USER",
+            "LEAK_PROXY_PASS",
+        ] {
+            assert!(
+                !json.contains(leaked),
+                "leak-shaped fixture value `{leaked}` must not appear in the redacted bundle JSON:\n{json}"
+            );
+        }
     }
 
     #[test]

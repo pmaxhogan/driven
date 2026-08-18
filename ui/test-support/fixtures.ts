@@ -627,6 +627,8 @@ export const SETTINGS: SettingsDto = {
     proxyMode: "system",
     proxyUrl: null,
     pauseWhenOffline: true,
+    debugLoggingEnabled: false,
+    debugLoggingExpiresAtMs: null,
   },
   telemetry: {
     enabled: true,
