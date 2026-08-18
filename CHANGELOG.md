@@ -5,6 +5,24 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.0](https://github.com/pmaxhogan/driven/compare/v2.11.1...v2.12.0) (2026-08-18)
+
+
+### Features
+
+* **app:** opt-in debug logging mode and safer, richer diagnostic bundles ([#314](https://github.com/pmaxhogan/driven/issues/314)) ([33c281c](https://github.com/pmaxhogan/driven/commit/33c281c8be56e19cabb20d44575c499baacb7b95))
+* **core:** allow nested backup sources when the parent excludes the child ([#294](https://github.com/pmaxhogan/driven/issues/294)) ([0b62df9](https://github.com/pmaxhogan/driven/commit/0b62df9dc771a4b8c05cd3b14950d586447f1826))
+* **core:** live exclusion pickup and a visible pending-work queue ([#313](https://github.com/pmaxhogan/driven/issues/313)) ([e6427c7](https://github.com/pmaxhogan/driven/commit/e6427c7faea0b2d4f7f5afd24ad84ecb08a47d83))
+* live bottleneck indicator on the Activity dashboard ([#311](https://github.com/pmaxhogan/driven/issues/311)) ([2d9d763](https://github.com/pmaxhogan/driven/commit/2d9d763b40320dbb841cac46497c054b2aa2eabc))
+* **ui:** folder picker sort/filter/create/rename and exclusions size rollups ([#315](https://github.com/pmaxhogan/driven/issues/315)) ([7e87341](https://github.com/pmaxhogan/driven/commit/7e8734120b6c16f99f072d31fc0861b116c01a8a))
+
+
+### Bug Fixes
+
+* **app:** never freeze on tray quit during a backup; quitting tray state; honest recovery status ([#312](https://github.com/pmaxhogan/driven/issues/312)) ([f951cde](https://github.com/pmaxhogan/driven/commit/f951cde9e89692e311f4b96183658807bf6d6ed0))
+* clear the attention banner after a passing run and make source removal backend-aware ([#310](https://github.com/pmaxhogan/driven/issues/310)) ([6d8e1ab](https://github.com/pmaxhogan/driven/commit/6d8e1ab2bd9cd5a6cae616f23c1d852bdb6451ce))
+* **s3:** honest per-source versioning across backends and multipart-upload leak sweep ([#316](https://github.com/pmaxhogan/driven/issues/316)) ([d462592](https://github.com/pmaxhogan/driven/commit/d462592713f70121ffb1af67ccca9e9c8e796bc6))
+
 ## [2.11.1](https://github.com/pmaxhogan/driven/compare/v2.11.0...v2.11.1) (2026-08-15)
 
 
