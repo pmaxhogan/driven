@@ -31,7 +31,7 @@
   },
   "devDependencies": {
     "@intlify/eslint-plugin-vue-i18n": "^4.0.0",
-    "@intlify/unplugin-vue-i18n": "^11.0.0",
+    "@intlify/unplugin-vue-i18n": "^11.2.5",
     "@playwright/test": "^1.62.1",
     "@tailwindcss/postcss": "^4.3.2",
     "@types/node": "^26",
@@ -51,7 +51,7 @@
     "vite": "^8.2.1",
     "vitest": "^2.1.9",
     "vue-eslint-parser": "^10.0.0",
-    "vue-tsc": "^3.3.9"
+    "vue-tsc": "^3.3.10"
   },
   "packageManager": "pnpm@10.23.0"
 }
