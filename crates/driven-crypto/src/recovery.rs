@@ -65,6 +65,25 @@ mod tests {
         assert_eq!(key.as_bytes(), recovered.as_bytes());
     }
 
+    /// Known-answer vector from the BIP39 spec (256-bit entropy, all 0x7f).
+    /// Recovery phrases are a stored format users write down, so this pins
+    /// the exact entropy <-> words encoding across `bip39` upgrades; a
+    /// round-trip test alone would pass even if a new version changed it.
+    #[test]
+    fn bip39_spec_vector_is_stable() {
+        const PHRASE: &str = "legal winner thank year wave sausage worth useful \
+                              legal winner thank year wave sausage worth useful \
+                              legal winner thank year wave sausage worth title";
+        let key = MasterKey::from_bytes([0x7f; KEY_LEN]);
+        let phrase = master_key_to_phrase(&key).unwrap();
+        assert_eq!(
+            phrase.split_whitespace().collect::<Vec<_>>(),
+            PHRASE.split_whitespace().collect::<Vec<_>>()
+        );
+        let recovered = phrase_to_master_key(PHRASE).unwrap();
+        assert_eq!(recovered.as_bytes(), &[0x7f; KEY_LEN]);
+    }
+
     #[test]
     fn phrase_is_deterministic() {
         let key = MasterKey::from_bytes([7u8; KEY_LEN]);
