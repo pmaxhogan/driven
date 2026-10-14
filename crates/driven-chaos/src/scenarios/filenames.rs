@@ -354,13 +354,13 @@ struct NameControlChars;
 fn control_char_names() -> Vec<String> {
     if cfg!(windows) {
         // Only DEL (0x7F) is a legal NTFS filename control char.
-        vec![format!("del\u{007F}name.txt")]
+        vec!["del\u{007F}name.txt".to_string()]
     } else {
         vec![
-            format!("tab\u{0009}name.txt"),
-            format!("bel\u{0007}name.txt"),
-            format!("esc\u{001B}name.txt"),
-            format!("del\u{007F}name.txt"),
+            "tab\u{0009}name.txt".to_string(),
+            "bel\u{0007}name.txt".to_string(),
+            "esc\u{001B}name.txt".to_string(),
+            "del\u{007F}name.txt".to_string(),
             "cr\u{000D}name.txt".to_string(),
             "lf\u{000A}name.txt".to_string(),
         ]

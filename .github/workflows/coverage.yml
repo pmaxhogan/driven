@@ -72,14 +72,20 @@ jobs:
       # forcing the alternative of a hand-written fake S3 server that would drift
       # from the real protocol. Mirrors the same step in ci.yml's rust-test job.
       - name: Install MinIO (S3 backend integration tests)
+        # dl.min.io stopped serving community binaries (HTTP 410) and the
+        # minio/minio repo is archived, so build the last community release
+        # (RELEASE.2025-10-15T17-29-55Z) from source. The pseudo-version is
+        # immutable on proxy.golang.org; the runner's Go fetches the module's
+        # declared toolchain itself (GOTOOLCHAIN=auto).
+        env: { CGO_ENABLED: "0", GOBIN: /tmp/gobin }
         run: |
-          curl -fsSL https://dl.min.io/server/minio/release/linux-amd64/minio -o /tmp/minio
-          sudo install -m 0755 /tmp/minio /usr/local/bin/minio
+          go install github.com/minio/minio@v0.0.0-20251015172955-9e49d5e7a648
+          sudo install -m 0755 /tmp/gobin/minio /usr/local/bin/minio
           minio --version
 
       - uses: dtolnay/rust-toolchain@stable
         with: { components: llvm-tools-preview }
-      - uses: taiki-e/install-action@v2.85.13
+      - uses: taiki-e/install-action@v2.86.1
         with: { tool: cargo-llvm-cov }
       # This is an instrumented (coverage) build with its own RUSTFLAGS, so it
       # gets its own cache key and deliberately does NOT share the `workspace`
