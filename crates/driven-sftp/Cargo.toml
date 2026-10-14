@@ -74,7 +74,7 @@ keyring.workspace = true
 #
 # `aws-lc-rs` (russh's default crypto backend) is already in this workspace's
 # tree via rustls, so it adds no new native toolchain requirement.
-russh = { version = "0.62", default-features = false, features = [
+russh = { version = "0.64", default-features = false, features = [
     "aws-lc-rs",
     "flate2",
 ] }
