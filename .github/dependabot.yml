@@ -28,6 +28,12 @@ updates:
       # release fixes the LazyLock latch upstream.
       - dependency-name: keyring
         versions: ["4.1.6"]
+      # tauri-plugin-deep-link 2.6.2 does not compile on Linux: it builds
+      # ini::ParseOption with two fields, but rust-ini 0.21.3 (the only
+      # non-yanked 0.21 that has it) requires four. Pinned to 2.6.1 in #343;
+      # drop this ignore once a fixed release ships.
+      - dependency-name: tauri-plugin-deep-link
+        versions: ["2.6.2"]
     groups:
       cargo-minor-patch:
         update-types:
