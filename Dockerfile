@@ -79,6 +79,16 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
  && mkdir -p /out \
  && cp target/release/driven-app target/debug/driven-e2e target/debug/driven-cli /out/
 
+# --- MinIO builder ----------------------------------------------------------
+# dl.min.io stopped serving community binaries (HTTP 410) and minio/minio +
+# minio/mc are archived, so build the last community releases from source
+# (minio RELEASE.2025-10-15T17-29-55Z, mc RELEASE.2025-08-13T08-35-41Z). The
+# pseudo-versions are immutable on proxy.golang.org. Native to the build arch.
+FROM golang:1-bookworm AS minio-builder
+ENV CGO_ENABLED=0
+RUN go install github.com/minio/minio@v0.0.0-20251015172955-9e49d5e7a648 \
+ && go install github.com/minio/mc@v0.0.0-20250813083541-7394ce0dd2a8
+
 # --- E2E runtime ------------------------------------------------------------
 # The agent playground: the real desktop app under Xvfb + WebKitWebDriver +
 # tauri-driver, with the tooling for network / filesystem / permission fault
@@ -114,18 +124,18 @@ RUN apt-get update \
 # MinIO (a real S3 destination for round-trip + wire-fault scenarios) and
 # toxiproxy (the network-fault proxy the suite parks between the app and
 # MinIO: latency, bandwidth, timeouts, hard cuts). Arch-aware: the image
-# builds arm64-native on the M5 dev machine and amd64 in CI.
+# builds arm64-native on the M5 dev machine and amd64 in CI. MinIO + mc come
+# from the minio-builder stage (dl.min.io no longer serves them).
+COPY --from=minio-builder /go/bin/minio /go/bin/mc /usr/local/bin/
 ARG TARGETARCH
 RUN set -eux; \
     case "${TARGETARCH}" in \
-      arm64) MINIO_ARCH=linux-arm64; TOXI_ARCH=linux-arm64 ;; \
-      *)     MINIO_ARCH=linux-amd64; TOXI_ARCH=linux-amd64 ;; \
+      arm64) TOXI_ARCH=linux-arm64 ;; \
+      *)     TOXI_ARCH=linux-amd64 ;; \
     esac; \
-    curl -fsSL "https://dl.min.io/server/minio/release/${MINIO_ARCH}/minio" -o /usr/local/bin/minio; \
-    curl -fsSL "https://dl.min.io/client/mc/release/${MINIO_ARCH}/mc" -o /usr/local/bin/mc; \
     curl -fsSL "https://github.com/Shopify/toxiproxy/releases/download/v2.12.0/toxiproxy-server-${TOXI_ARCH}" -o /usr/local/bin/toxiproxy-server; \
     curl -fsSL "https://github.com/Shopify/toxiproxy/releases/download/v2.12.0/toxiproxy-cli-${TOXI_ARCH}" -o /usr/local/bin/toxiproxy-cli; \
-    chmod +x /usr/local/bin/minio /usr/local/bin/mc /usr/local/bin/toxiproxy-server /usr/local/bin/toxiproxy-cli
+    chmod +x /usr/local/bin/toxiproxy-server /usr/local/bin/toxiproxy-cli
 
 COPY --from=e2e-builder /out/driven-app /usr/local/bin/driven-app
 COPY --from=e2e-builder /out/driven-e2e /usr/local/bin/driven-e2e
