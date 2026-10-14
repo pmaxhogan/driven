@@ -39,7 +39,7 @@ use std::time::Duration;
 use driven_remote::DriveError;
 use russh::client::AuthResult;
 use russh::keys::ssh_key::{HashAlg, PublicKey};
-use russh::keys::{decode_secret_key, PrivateKeyWithHashAlg};
+use russh::keys::{decode_secret_key, PrivateKeyWithHashAlg, PublicKeyOrCertificate};
 use russh_sftp::client::SftpSession as RusshSftpSession;
 
 use crate::config::{SftpConfig, SftpCredential};
@@ -365,9 +365,12 @@ impl russh::client::Handler for PinningHandler {
 
     async fn check_server_key(
         &mut self,
-        server_public_key: &PublicKey,
+        server_public_key: &PublicKeyOrCertificate,
     ) -> Result<bool, Self::Error> {
-        let observed = host_key_fingerprint(server_public_key);
+        // A host certificate (russh 0.63+) is pinned by the host key it
+        // certifies, so a server that starts presenting a cert for the same
+        // key keeps its existing pin; the CA signature is not a trust input.
+        let observed = host_key_fingerprint(&server_public_key.public_key());
         *self.verdict.observed.lock().expect("key verdict poisoned") = Some(observed.clone());
 
         match &self.expected {
