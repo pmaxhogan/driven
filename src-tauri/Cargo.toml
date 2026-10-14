@@ -218,7 +218,7 @@ tokio = { workspace = true, features = ["test-util"] }
 # crate to the tree (deny check unaffected); declaring them dev-deps just lets
 # the smoke call the exact same API. VERIFY needs no private key, so CI runs this
 # every build with only the committed pubkey + fixture + sig.
-minisign-verify = "0.2.5"
+minisign-verify = "0.3.0"
 base64.workspace = true
 # NOTE: `tempfile` moved to [dependencies] with the restore-drill work (the
 # drill restores into a throwaway directory in production code), so it is
