@@ -26,7 +26,7 @@ tracing = { workspace = true }
 # `windows::core::interface` macro - which expands to absolute `::windows_core`
 # paths, hence `windows-core` is a DIRECT dependency. See src/windows_vss.rs.
 [target.'cfg(windows)'.dependencies]
-windows-core = "0.62"
+windows-core = "0.100"
 windows = { version = "0.62", features = [
     "Win32_Storage_Vss",
     "Win32_System_Com",
