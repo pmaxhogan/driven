@@ -86,8 +86,15 @@ RUN --mount=type=cache,target=/usr/local/cargo/registry \
 # pseudo-versions are immutable on proxy.golang.org. Native to the build arch.
 FROM golang:1-bookworm AS minio-builder
 ENV CGO_ENABLED=0
-RUN go install github.com/minio/minio@v0.0.0-20251015172955-9e49d5e7a648 \
- && go install github.com/minio/mc@v0.0.0-20250813083541-7394ce0dd2a8
+# Retried: one dropped proxy.golang.org stream otherwise fails the build.
+RUN set -eu; \
+    for attempt in 1 2 3; do \
+      go install github.com/minio/minio@v0.0.0-20251015172955-9e49d5e7a648 \
+        && go install github.com/minio/mc@v0.0.0-20250813083541-7394ce0dd2a8 \
+        && break; \
+      [ "$attempt" = 3 ] && exit 1; \
+      sleep 15; \
+    done
 
 # --- E2E runtime ------------------------------------------------------------
 # The agent playground: the real desktop app under Xvfb + WebKitWebDriver +
