@@ -34,6 +34,13 @@ updates:
       # drop this ignore once a fixed release ships.
       - dependency-name: tauri-plugin-deep-link
         versions: ["2.6.2"]
+      # windows-core must stay on the same line as the `windows` crate:
+      # driven-vss's `windows::core::interface` COM impls mix the two, and
+      # windows 0.62.2 (latest) pins windows-core ^0.62. windows-core 0.100
+      # (#353) split them and broke the Windows build. Drop this once a
+      # matching `windows` release ships and bump both together.
+      - dependency-name: windows-core
+        versions: [">= 0.63"]
     groups:
       cargo-minor-patch:
         update-types:
