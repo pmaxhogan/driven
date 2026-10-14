@@ -71,6 +71,16 @@ jobs:
       # coverage number reflect code that is actually verified, rather than
       # forcing the alternative of a hand-written fake S3 server that would drift
       # from the real protocol. Mirrors the same step in ci.yml's rust-test job.
+      # The built binary is cached by its immutable pseudo-version, so the
+      # ~300-module source fetch from proxy.golang.org only happens on a cache
+      # miss - and is retried there, since one dropped proxy stream otherwise
+      # fails the whole job (seen on main after #341).
+      - name: Cache MinIO binary
+        id: minio-cache
+        uses: actions/cache@v6
+        with:
+          path: /tmp/gobin/minio
+          key: minio-v0.0.0-20251015172955-9e49d5e7a648-${{ runner.os }}-${{ runner.arch }}
       - name: Install MinIO (S3 backend integration tests)
         # dl.min.io stopped serving community binaries (HTTP 410) and the
         # minio/minio repo is archived, so build the last community release
@@ -79,7 +89,13 @@ jobs:
         # declared toolchain itself (GOTOOLCHAIN=auto).
         env: { CGO_ENABLED: "0", GOBIN: /tmp/gobin }
         run: |
-          go install github.com/minio/minio@v0.0.0-20251015172955-9e49d5e7a648
+          if [ "${{ steps.minio-cache.outputs.cache-hit }}" != "true" ]; then
+            for attempt in 1 2 3; do
+              go install github.com/minio/minio@v0.0.0-20251015172955-9e49d5e7a648 && break
+              [ "$attempt" = 3 ] && exit 1
+              echo "go install failed (attempt $attempt), retrying in 15s"; sleep 15
+            done
+          fi
           sudo install -m 0755 /tmp/gobin/minio /usr/local/bin/minio
           minio --version
 

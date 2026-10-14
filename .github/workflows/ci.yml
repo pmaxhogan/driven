@@ -86,6 +86,17 @@ jobs:
       # backup destination, which is worth more than the seconds it costs.
       # macOS/Windows still gate-skip: the suite is server-behaviour coverage,
       # not platform coverage.
+      # The built binary is cached by its immutable pseudo-version, so the
+      # ~300-module source fetch from proxy.golang.org only happens on a cache
+      # miss - and is retried there, since one dropped proxy stream otherwise
+      # fails the whole job (seen on main after #341).
+      - name: Cache MinIO binary
+        id: minio-cache
+        if: matrix.os == 'ubuntu-latest'
+        uses: actions/cache@v6
+        with:
+          path: /tmp/gobin/minio
+          key: minio-v0.0.0-20251015172955-9e49d5e7a648-${{ runner.os }}-${{ runner.arch }}
       - name: Install MinIO (S3 backend integration tests)
         if: matrix.os == 'ubuntu-latest'
         # dl.min.io stopped serving community binaries (HTTP 410) and the
@@ -95,7 +106,13 @@ jobs:
         # declared toolchain itself (GOTOOLCHAIN=auto).
         env: { CGO_ENABLED: "0", GOBIN: /tmp/gobin }
         run: |
-          go install github.com/minio/minio@v0.0.0-20251015172955-9e49d5e7a648
+          if [ "${{ steps.minio-cache.outputs.cache-hit }}" != "true" ]; then
+            for attempt in 1 2 3; do
+              go install github.com/minio/minio@v0.0.0-20251015172955-9e49d5e7a648 && break
+              [ "$attempt" = 3 ] && exit 1
+              echo "go install failed (attempt $attempt), retrying in 15s"; sleep 15
+            done
+          fi
           sudo install -m 0755 /tmp/gobin/minio /usr/local/bin/minio
           minio --version
       - name: cargo build (compile-only)
