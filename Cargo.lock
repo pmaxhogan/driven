@@ -1811,7 +1811,7 @@ dependencies = [
 
 [[package]]
 name = "driven-apfs"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "driven-vss",
  "libc",
@@ -1825,7 +1825,7 @@ dependencies = [
 
 [[package]]
 name = "driven-app"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1883,7 +1883,7 @@ dependencies = [
 
 [[package]]
 name = "driven-backend"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "driven-drive",
@@ -1900,7 +1900,7 @@ dependencies = [
 
 [[package]]
 name = "driven-bench"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1925,7 +1925,7 @@ dependencies = [
 
 [[package]]
 name = "driven-chaos"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -1956,7 +1956,7 @@ dependencies = [
 
 [[package]]
 name = "driven-cli"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "assert_cmd",
@@ -1979,7 +1979,7 @@ dependencies = [
 
 [[package]]
 name = "driven-core"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2015,7 +2015,7 @@ dependencies = [
 
 [[package]]
 name = "driven-crypto"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "base32",
@@ -2034,7 +2034,7 @@ dependencies = [
 
 [[package]]
 name = "driven-diskstat"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "core-foundation 0.10.1",
  "core-foundation-sys",
@@ -2043,7 +2043,7 @@ dependencies = [
 
 [[package]]
 name = "driven-drive"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2069,7 +2069,7 @@ dependencies = [
 
 [[package]]
 name = "driven-e2e"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2086,7 +2086,7 @@ dependencies = [
 
 [[package]]
 name = "driven-localfs"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2109,7 +2109,7 @@ dependencies = [
 
 [[package]]
 name = "driven-net"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2127,7 +2127,7 @@ dependencies = [
 
 [[package]]
 name = "driven-power"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2145,7 +2145,7 @@ dependencies = [
 
 [[package]]
 name = "driven-rclone"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "driven-remote",
@@ -2158,7 +2158,7 @@ dependencies = [
 
 [[package]]
 name = "driven-remote"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2173,7 +2173,7 @@ dependencies = [
 
 [[package]]
 name = "driven-s3"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2201,7 +2201,7 @@ dependencies = [
 
 [[package]]
 name = "driven-sftp"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2230,7 +2230,7 @@ dependencies = [
 
 [[package]]
 name = "driven-test-fixtures"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "anyhow",
  "async-trait",
@@ -2249,7 +2249,7 @@ dependencies = [
 
 [[package]]
 name = "driven-tls"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "boa_engine",
  "lru",
@@ -2263,7 +2263,7 @@ dependencies = [
 
 [[package]]
 name = "driven-vss"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "serde",
  "serde_json",
@@ -2275,7 +2275,7 @@ dependencies = [
 
 [[package]]
 name = "driven-vss-helper"
-version = "2.12.0"
+version = "2.12.1"
 dependencies = [
  "driven-vss",
  "serde",

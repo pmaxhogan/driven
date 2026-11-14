@@ -5,6 +5,16 @@ Released entries are appended automatically from Conventional Commits when the
 "chore: release" pull request is merged. The project follows
 [Semantic Versioning](https://semver.org/spec/v2.0.0.html).
 
+## [2.12.1](https://github.com/pmaxhogan/driven/compare/v2.12.0...v2.12.1) (2026-10-15)
+
+
+### Bug Fixes
+
+* **deps:** align tauri crates with the [@tauri-apps](https://github.com/tauri-apps) JS packages ([#343](https://github.com/pmaxhogan/driven/issues/343)) ([12315b6](https://github.com/pmaxhogan/driven/commit/12315b60588b0a217361a4538b27a43bfbccadfc))
+* **deps:** bump pageant to 0.2.4 for its out-of-bounds read advisory ([#359](https://github.com/pmaxhogan/driven/issues/359)) ([60fcac7](https://github.com/pmaxhogan/driven/commit/60fcac78ff2a06816f7549686a59c3ff4134a9a6))
+* **deps:** bump russh to 0.64.1 for its security advisories ([#352](https://github.com/pmaxhogan/driven/issues/352)) ([e9b5448](https://github.com/pmaxhogan/driven/commit/e9b544814ce59e39142d14ed2255e7a65c1a2b3a))
+* **deps:** patch rustls advisories and build MinIO from source in CI ([#341](https://github.com/pmaxhogan/driven/issues/341)) ([da8b525](https://github.com/pmaxhogan/driven/commit/da8b525092c54b84f6102bd4f2c1edc78d6842e7))
+
 ## [2.12.0](https://github.com/pmaxhogan/driven/compare/v2.11.1...v2.12.0) (2026-08-18)
 
 
